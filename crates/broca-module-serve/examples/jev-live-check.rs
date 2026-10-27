@@ -227,7 +227,7 @@ async fn main() -> Result<(), String> {
         let reply = client.call(body).await;
         let elapsed = started.elapsed().as_millis();
         let line = match reply {
-            ProviderReply::Answered(bytes) => match serde_json::from_slice::<AnswerView<'_>>(&bytes)
+            ProviderReply::Answered(bytes) | ProviderReply::AttributedAnswer { body: bytes, .. } => match serde_json::from_slice::<AnswerView<'_>>(&bytes)
             {
                 Ok(answer) => {
                     let usage = answer.usage.unwrap_or_default();

@@ -1,0 +1,1 @@
+{"result":{"state":"error","auth_selection":"apikey:cline-pass","undelivered_steers":[],"usage":{"steps":0,"unreported_steps":0,"by_model":[]},"retries_used":0,"error":{"class":"permanent","message":"credential is not entitled","status":403,"provider_code":"ENTITLEMENT_ERROR"}}}

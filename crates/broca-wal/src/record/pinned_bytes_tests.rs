@@ -12,6 +12,32 @@
 
 use super::*;
 
+/// Messages written before durable envelope times retain their original payload and framing.
+#[test]
+fn pre_message_times_records_keep_exact_bytes() {
+    use crate::framing::{
+        encode, FRAMING_VERSION, GATED_FRAMING_VERSION, HEADER_LEN, STEER_QUEUE_FEATURE,
+    };
+    for pinned in include_str!("../../tests/fixtures/before_message_times.jsonl").lines() {
+        let record: WalRecord = serde_json::from_str(pinned).unwrap();
+        assert_ne!(record, WalRecord::Unknown);
+        assert_eq!(serde_json::to_string(&record).unwrap(), pinned);
+        let frame = encode(7, 3, &record).unwrap();
+        if matches!(record, WalRecord::Steered { .. }) {
+            assert_eq!(record.required_features(), &[STEER_QUEUE_FEATURE]);
+            assert_eq!(frame[4], GATED_FRAMING_VERSION);
+            assert_eq!(
+                &frame[HEADER_LEN..],
+                format!(r#"{{"requires":["steer-queue/v1"],"record":{pinned}}}"#).as_bytes()
+            );
+        } else {
+            assert!(record.required_features().is_empty());
+            assert_eq!(frame[4], FRAMING_VERSION);
+            assert_eq!(&frame[HEADER_LEN..], pinned.as_bytes());
+        }
+    }
+}
+
 /// Pre-interrupt `run_finished` records keep their exact bytes and require no reader feature.
 #[test]
 fn pre_interrupt_reason_terminal_bytes_and_features_are_pinned() {
@@ -156,6 +182,7 @@ fn tag_of(record: &WalRecord) -> &'static str {
         WalRecord::LateDispatchIntent { .. } => "late_dispatch_intent",
         WalRecord::LateResult { .. } => "late_result",
         WalRecord::QuestionWithdrawalAcknowledged { .. } => "question_withdrawal_acknowledged",
+        WalRecord::ToolCallProviderHeld { .. } => "tool_call_provider_held",
         WalRecord::InputTokenCapFrozen { .. } => "input_token_cap_frozen",
         WalRecord::InputTokenBudgetExhausted { .. } => "input_token_budget_exhausted",
         WalRecord::ContextCeilingWait { .. } => "context_ceiling_wait",
@@ -325,6 +352,46 @@ const CANCEL_AT_PINNED: &[&str] = &[
     r#"{"type":"run_cancel_requested","run_id":"r","at":"now"}"#,
 ];
 
+/// The two values `provider-held/v1` covers: a call its tool provider holds past its reply,
+/// with and without a held detail, and the pause of a run waiting on such a call.
+const PROVIDER_HELD_PINNED: &[&str] = &[
+    r#"{"type":"tool_call_provider_held","batch_id":"r-b1","tool_call_id":"t1","call_key":"lin_9:42","module":"core","reason":"parent_answer","detail_digest":"9f2a","held_at_ms":1761220000000,"sequential":true}"#,
+    r#"{"type":"tool_call_provider_held","batch_id":"r-b1","tool_call_id":"t1","call_key":"lin_9:42","module":"core","reason":"running","held_at_ms":1761220000000,"sequential":false}"#,
+    r#"{"type":"run_paused","run_id":"r1","ts_ms":1761220000001,"reason":"tool_held"}"#,
+    r#"{"type":"run_paused","run_id":"r1","reason":"tool_held"}"#,
+];
+
+/// Each provider-held value keeps its bytes and is written only in a gated frame whose payload
+/// is exactly `{"requires":["provider-held/v1"],"record":...}`. The requirement comes from the
+/// record itself, so no writer can put either value in a frame an older build reads unchecked.
+/// This build lists the feature, so it reads such a frame back unchanged; a reader without the
+/// name refuses it as a newer writer's (`framing::provider_held_tests`).
+#[test]
+fn provider_held_records_keep_their_bytes_and_require_only_provider_held() {
+    use crate::framing::{decode_next, encode, DecodeStep, GATED_FRAMING_VERSION, HEADER_LEN};
+    for pinned in PROVIDER_HELD_PINNED {
+        let record: WalRecord = serde_json::from_str(pinned).unwrap();
+        assert_ne!(record, WalRecord::Unknown);
+        assert_eq!(serde_json::to_string(&record).unwrap(), *pinned);
+        assert!(!record.is_informational(), "{pinned}");
+        assert_eq!(
+            record.required_features(),
+            &[crate::framing::PROVIDER_HELD_FEATURE],
+            "{pinned}"
+        );
+        let frame = encode(7, 3, &record).unwrap();
+        assert_eq!(frame[4], GATED_FRAMING_VERSION, "{pinned}");
+        assert_eq!(
+            &frame[HEADER_LEN..],
+            format!(r#"{{"requires":["provider-held/v1"],"record":{pinned}}}"#).as_bytes()
+        );
+        match decode_next(&frame) {
+            DecodeStep::Record { framed, .. } => assert_eq!(framed.record, record, "{pinned}"),
+            _ => panic!("this build reads its own provider-held frame: {pinned}"),
+        }
+    }
+}
+
 #[test]
 fn cancellation_records_are_must_understand_and_round_trip() {
     use crate::framing::{decode_next, encode, DecodeStep, RUN_CANCEL_AT_FEATURE};
@@ -412,6 +479,7 @@ fn every_record_kind_keeps_its_pinned_bytes() {
         .iter()
         .chain(DEFERRED_CALL_PINNED)
         .chain(CANCEL_AT_PINNED)
+        .chain(PROVIDER_HELD_PINNED)
         .chain(DELIVERY_ORDER_PINNED)
         .chain(INPUT_CAP_PINNED)
         .chain(STRUCTURED_OUTPUT_PINNED)
@@ -531,6 +599,7 @@ fn the_pinned_bytes_cover_every_record_kind() {
         .chain(include_str!("../../tests/fixtures/compaction_records.jsonl").lines())
         .chain(DEFERRED_CALL_PINNED.iter().copied())
         .chain(CANCEL_AT_PINNED.iter().copied())
+        .chain(PROVIDER_HELD_PINNED.iter().copied())
         .chain(DELIVERY_ORDER_PINNED.iter().copied())
         .chain(INPUT_CAP_PINNED.iter().copied())
         .chain(STRUCTURED_OUTPUT_PINNED.iter().copied())
@@ -582,6 +651,7 @@ fn the_pinned_bytes_cover_every_record_kind() {
         "late_dispatch_intent",
         "late_result",
         "question_withdrawal_acknowledged",
+        "tool_call_provider_held",
         "delivery_ordered",
         "send_ended",
         "send_delivered",

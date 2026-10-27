@@ -313,8 +313,12 @@ async fn run_result_snapshot_matches_full_replay_after_crash_and_archive() {
     assert!(!path.exists(), "archive reads must not extract a live WAL");
 }
 
+/// Benchmark, not a correctness test: prints read counts, bytes and timings for seven read
+/// operations and the usage-export catch-up on a 15 MB WAL, before and after materialization.
+/// Cost regressions do not fail it; it only requires every operation and every seal to
+/// succeed. The bounded-read guarantees are asserted by the active tests in this file.
 #[tokio::test]
-#[ignore = "release-build measurement of a 15 MB WAL; run with --ignored --nocapture"]
+#[ignore = "benchmark: 15 MB WAL read costs; run optimized with --ignored --nocapture"]
 async fn large_wal_read_costs() {
     let rig = Rig::new("wal-cost", Arc::new(NoopExec));
     let key = rig.key("cost");

@@ -17,6 +17,10 @@ use crate::ids::{MessageId, ToolCallId};
 pub enum DisplayEvent {
     /// Coalesced assistant text for live rendering.
     TextDelta {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none", with = "part_key")]
+        part: Option<u64>,
         message_id: MessageId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_call_id: Option<ToolCallId>,
@@ -24,12 +28,20 @@ pub enum DisplayEvent {
     },
     /// Coalesced reasoning text for live rendering.
     ReasoningDelta {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none", with = "part_key")]
+        part: Option<u64>,
         message_id: MessageId,
         delta: String,
     },
     /// Coalesced partial tool-call input JSON (rendering only; the authoritative
     /// assembled input arrives on the control lane).
     ToolInputDelta {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none", with = "part_key")]
+        part: Option<u64>,
         tool_call_id: ToolCallId,
         delta: String,
     },
@@ -49,6 +61,122 @@ pub enum DisplayEvent {
     /// Unknown future display events use the same conservative reset fallback.
     #[serde(other)]
     DisplayReset,
+}
+
+impl DisplayEvent {
+    /// Transcript coordinates are independent of provider message and tool-call ids.
+    pub fn coordinates(&self) -> Option<(Option<&str>, u64)> {
+        match self {
+            Self::TextDelta {
+                mid,
+                part: Some(part),
+                ..
+            }
+            | Self::ReasoningDelta {
+                mid,
+                part: Some(part),
+                ..
+            }
+            | Self::ToolInputDelta {
+                mid,
+                part: Some(part),
+                ..
+            } => Some((mid.as_deref(), *part)),
+            _ => None,
+        }
+    }
+
+    pub fn set_mid(&mut self, value: Option<String>) {
+        match self {
+            Self::TextDelta { mid, .. }
+            | Self::ReasoningDelta { mid, .. }
+            | Self::ToolInputDelta { mid, .. } => *mid = value,
+            _ => {}
+        }
+    }
+
+    pub fn set_part(&mut self, value: u64) {
+        match self {
+            Self::TextDelta { part, .. }
+            | Self::ReasoningDelta { part, .. }
+            | Self::ToolInputDelta { part, .. } => *part = Some(value),
+            _ => {}
+        }
+    }
+
+    pub fn delta(&self) -> Option<&str> {
+        match self {
+            Self::TextDelta { delta, .. }
+            | Self::ReasoningDelta { delta, .. }
+            | Self::ToolInputDelta { delta, .. } => Some(delta),
+            _ => None,
+        }
+    }
+
+    pub fn append_delta(&mut self, text: &str) {
+        match self {
+            Self::TextDelta { delta, .. }
+            | Self::ReasoningDelta { delta, .. }
+            | Self::ToolInputDelta { delta, .. } => delta.push_str(text),
+            _ => {}
+        }
+    }
+
+    /// Owned string bytes retained by a coalesced delta, including its provider identities.
+    pub fn retained_bytes(&self) -> usize {
+        match self {
+            Self::TextDelta {
+                mid,
+                message_id,
+                tool_call_id,
+                delta,
+                ..
+            } => mid
+                .as_ref()
+                .map_or(0, String::len)
+                .saturating_add(message_id.0.len())
+                .saturating_add(tool_call_id.as_ref().map_or(0, |id| id.0.len()))
+                .saturating_add(delta.len()),
+            Self::ReasoningDelta {
+                mid,
+                message_id,
+                delta,
+                ..
+            } => mid
+                .as_ref()
+                .map_or(0, String::len)
+                .saturating_add(message_id.0.len())
+                .saturating_add(delta.len()),
+            Self::ToolInputDelta {
+                mid,
+                tool_call_id,
+                delta,
+                ..
+            } => mid
+                .as_ref()
+                .map_or(0, String::len)
+                .saturating_add(tool_call_id.0.len())
+                .saturating_add(delta.len()),
+            _ => 0,
+        }
+    }
+}
+
+mod part_key {
+    use serde::{Deserialize, Serialize};
+    pub fn serialize<S: serde::Serializer>(
+        value: &Option<u64>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value.map(|v| v.to_string()).serialize(serializer)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<u64>, D::Error> {
+        Option::<String>::deserialize(deserializer)?
+            .map(|v| v.parse().map_err(serde::de::Error::custom))
+            .transpose()
+    }
 }
 
 #[cfg(test)]

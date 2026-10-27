@@ -30,6 +30,8 @@
 
 mod ckdev;
 mod process;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod recorded_process;
 mod rig_logs;
 mod rig_stdio;
 mod tracing_capture;
@@ -39,6 +41,8 @@ pub use ckdev::{
     retry_executable_file_busy,
 };
 pub use process::{kill_and_reap, kill_and_reap_tree, remove_rig_dir};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use recorded_process::RecordedProcess;
 pub use rig_logs::{append_file_tail, rig_log_diagnostics};
 pub use rig_stdio::{
     dump_rig_process_logs_on_failure, rig_command, rig_process_logs, tokio_rig_command, RigChild,

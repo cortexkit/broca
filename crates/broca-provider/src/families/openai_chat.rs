@@ -61,6 +61,16 @@ impl WireFamily for OpenAiChat {
         build_request_body(frozen, opts)
     }
 
+    fn shape_with_media(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        payloads: &[crate::media_render::InlineMedia<'_>],
+    ) -> Value {
+        let media = crate::media_render::MediaRender { frozen, payloads };
+        build_request_body_with_media(frozen, opts, frozen.media.as_ref().map(|_| &media))
+    }
+
     fn endpoint(
         &self,
         frozen: &FrozenRenderConfig,
@@ -114,6 +124,14 @@ impl WireFamily for OpenAiChat {
 // ───────────────────────── request body ─────────────────────────
 
 fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
+    build_request_body_with_media(frozen, opts, None)
+}
+
+fn build_request_body_with_media(
+    frozen: &FrozenRenderConfig,
+    opts: &CallOptions,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+) -> Value {
     // A run with structured output adds its submit tool or schema instructions here; a run
     // without renders from `opts` unchanged.
     let prepared = crate::structured_output::prepare(frozen, opts);
@@ -129,6 +147,7 @@ fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value 
         frozen.tool_call_content_empty_string,
         frozen.opencode_go_reasoning_signature,
         &name_map,
+        media,
     );
 
     let mut body = json!({
@@ -230,15 +249,21 @@ fn convert_messages(
     tool_call_content_empty_string: bool,
     opencode_go: bool,
     name_map: &crate::tool_name_alias::ToolNameMap,
+    media: Option<&crate::media_render::MediaRender<'_>>,
 ) -> Vec<Value> {
     let mut out = Vec::new();
+    let mut follow_up = Vec::new();
     for m in prompt {
+        // Finish every result in a parallel tool round before inserting a synthetic user turn.
+        if m.role != Role::Tool && !follow_up.is_empty() {
+            out.push(json!({"role":"user", "content":std::mem::take(&mut follow_up)}));
+        }
         match m.role {
             Role::System => {
                 out.push(json!({ "role": "system", "content": text_content(&m.content) }))
             }
             Role::User => {
-                out.push(json!({ "role": "user", "content": user_text_content(&m.content) }))
+                out.push(json!({ "role": "user", "content": user_text_content(&m.content, media) }))
             }
             Role::Assistant => out.push(convert_assistant(
                 m,
@@ -253,14 +278,57 @@ fn convert_messages(
                         out.push(json!({
                             "role": "tool",
                             "tool_call_id": tr.tool_call_id.0,
-                            "content": tool_output_text(&tr.output),
+                            "content": tool_output_with_media(tr, media, &mut follow_up),
                         }));
                     }
                 }
             }
         }
     }
+    if !follow_up.is_empty() {
+        out.push(json!({"role":"user", "content":follow_up}));
+    }
     out
+}
+
+fn tool_output_with_media(
+    result: &broca_protocol::ToolResult,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+    follow_up: &mut Vec<Value>,
+) -> String {
+    let (ToolOutput::Parts { parts }, Some(media)) = (&result.output, media) else {
+        return tool_output_text(&result.output);
+    };
+    let grammar = super::openai_media::Grammar::Chat;
+    let mut text = Vec::new();
+    let mut blocks = Vec::new();
+    for part in parts {
+        match part {
+            broca_protocol::ToolOutputPart::Text { text: part } => text.push(part.clone()),
+            broca_protocol::ToolOutputPart::Media { media: reference } => {
+                let reason = match grammar.block(
+                    reference,
+                    Some(media),
+                    true,
+                    crate::media_profile::MediaCarrier::FollowUpUserMessage,
+                ) {
+                    Ok(block) => {
+                        blocks.push(block);
+                        broca_protocol::MediaMarkerReason::Carrier
+                    }
+                    Err(reason) => reason,
+                };
+                text.push(broca_protocol::content::media_not_shown_marker(
+                    reference, reason,
+                ));
+            }
+        }
+    }
+    if !blocks.is_empty() {
+        follow_up.push(grammar.text(&format!("Media from tool call {}:", result.tool_call_id.0)));
+        follow_up.extend(blocks);
+    }
+    text.join("\n")
 }
 
 /// An assistant turn: text content (or null) + any tool calls. Reasoning blocks are
@@ -413,7 +481,42 @@ fn echo_openrouter_details(message: &Message, wire: &mut Value) {
 }
 
 // Preserve user block boundaries without changing the legacy scalar form for one text block.
-fn user_text_content(blocks: &[ContentBlock]) -> Value {
+fn user_text_content(
+    blocks: &[ContentBlock],
+    media: Option<&crate::media_render::MediaRender<'_>>,
+) -> Value {
+    if blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Media(_)))
+    {
+        return Value::Array(
+            blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
+                        Some(json!({"type":"text", "text":text}))
+                    }
+                    ContentBlock::Media(reference) => {
+                        let grammar = super::openai_media::Grammar::Chat;
+                        Some(
+                            grammar
+                                .block(
+                                    reference,
+                                    media,
+                                    false,
+                                    crate::media_profile::MediaCarrier::Native,
+                                )
+                                .unwrap_or_else(|reason| grammar.marker(reference, reason)),
+                        )
+                    }
+                    ContentBlock::Reasoning { .. }
+                    | ContentBlock::RedactedReasoning { .. }
+                    | ContentBlock::ToolCall(_)
+                    | ContentBlock::ToolResult(_) => None,
+                })
+                .collect(),
+        );
+    }
     let texts: Vec<&str> = blocks
         .iter()
         .filter_map(|block| match block {
@@ -469,6 +572,10 @@ fn convert_tool_choice(tc: &ToolChoice, name_map: &crate::tool_name_alias::ToolN
 
 fn tool_output_text(out: &ToolOutput) -> String {
     match out {
+        ToolOutput::Parts { parts } => broca_protocol::content::media_parts_text(
+            parts,
+            broca_protocol::MediaMarkerReason::Carrier,
+        ),
         ToolOutput::Text { text } => text.clone(),
         ToolOutput::Json { value } => value.to_string(),
         ToolOutput::Denied { reason } => format!("denied: {reason}"),
@@ -499,6 +606,7 @@ struct ToolCallBuf {
 /// finish reason or the `[DONE]` sentinel confirms the response completed. Usage is
 /// taken from the optional trailing usage chunk.
 pub struct OpenAiChatNormalizer {
+    display_parts: crate::display_parts::DisplayParts,
     arguments_guard: crate::wire::ToolArgsGuard,
     step_id: StepId,
     sse: SseDecoder,
@@ -527,6 +635,7 @@ pub struct OpenAiChatNormalizer {
 impl OpenAiChatNormalizer {
     pub fn new(step_id: StepId, usage_policy: UsagePolicy) -> Self {
         Self {
+            display_parts: Default::default(),
             arguments_guard: Default::default(),
             step_id,
             sse: SseDecoder::for_content_family(crate::content_progress::ContentFamily::Chat),
@@ -626,6 +735,10 @@ impl OpenAiChatNormalizer {
         if self.openrouter {
             if let Some(details) = delta.get("reasoning_details").and_then(Value::as_array) {
                 self.reasoning_details.extend(details.iter().cloned());
+                if !details.is_empty() {
+                    self.display_parts
+                        .reserve((0, 0), "openai_chat", self.step_id, out);
+                }
             }
         }
         let reasoning_key = if self.openrouter {
@@ -636,21 +749,37 @@ impl OpenAiChatNormalizer {
         if let Some(reasoning) = delta.get(reasoning_key).and_then(Value::as_str) {
             if !reasoning.is_empty() {
                 self.reasoning.push_str(reasoning);
-                out.push(NormalizedEvent::Display(DisplayEvent::ReasoningDelta {
-                    message_id: mid.clone(),
-                    delta: reasoning.to_owned(),
-                }));
+                self.display_parts.delta(
+                    (0, 0),
+                    DisplayEvent::ReasoningDelta {
+                        mid: None,
+                        part: None,
+                        message_id: mid.clone(),
+                        delta: reasoning.to_owned(),
+                    },
+                    "openai_chat",
+                    self.step_id,
+                    out,
+                );
             }
         }
 
         if let Some(content) = delta.get("content").and_then(Value::as_str) {
             if !content.is_empty() {
                 self.text.push_str(content);
-                out.push(NormalizedEvent::Display(DisplayEvent::TextDelta {
-                    message_id: mid.clone(),
-                    tool_call_id: None,
-                    delta: content.to_owned(),
-                }));
+                self.display_parts.delta(
+                    (1, 0),
+                    DisplayEvent::TextDelta {
+                        mid: None,
+                        part: None,
+                        message_id: mid.clone(),
+                        tool_call_id: None,
+                        delta: content.to_owned(),
+                    },
+                    "openai_chat",
+                    self.step_id,
+                    out,
+                );
             }
         }
 
@@ -658,11 +787,19 @@ impl OpenAiChatNormalizer {
             self.saw_refusal = true;
             if !refusal.is_empty() {
                 self.text.push_str(refusal);
-                out.push(NormalizedEvent::Display(DisplayEvent::TextDelta {
-                    message_id: mid.clone(),
-                    tool_call_id: None,
-                    delta: refusal.to_owned(),
-                }));
+                self.display_parts.delta(
+                    (1, 0),
+                    DisplayEvent::TextDelta {
+                        mid: None,
+                        part: None,
+                        message_id: mid.clone(),
+                        tool_call_id: None,
+                        delta: refusal.to_owned(),
+                    },
+                    "openai_chat",
+                    self.step_id,
+                    out,
+                );
             }
         }
 
@@ -674,6 +811,8 @@ impl OpenAiChatNormalizer {
                     .and_then(Value::as_str)
                     .filter(|id| !id.is_empty());
                 let slot = self.tool_call_slot(index, id);
+                self.display_parts
+                    .reserve((2, slot as u64), "openai_chat", self.step_id, out);
                 let buf = &mut self.tool_calls[slot];
                 if let Some(id) = id {
                     buf.id = id.to_owned();
@@ -694,10 +833,18 @@ impl OpenAiChatNormalizer {
                             args,
                         );
                         let tcid = ToolCallId(buf.id.clone());
-                        out.push(NormalizedEvent::Display(DisplayEvent::ToolInputDelta {
-                            tool_call_id: tcid,
-                            delta: args.to_owned(),
-                        }));
+                        self.display_parts.delta(
+                            (2, slot as u64),
+                            DisplayEvent::ToolInputDelta {
+                                mid: None,
+                                part: None,
+                                tool_call_id: tcid,
+                                delta: args.to_owned(),
+                            },
+                            "openai_chat",
+                            self.step_id,
+                            out,
+                        );
                     }
                 }
             }
@@ -807,32 +954,47 @@ impl OpenAiChatNormalizer {
                 .and_then(Value::as_u64)
                 .or_else(|| u.get(k).and_then(Value::as_u64))
         };
-        // INCLUSIVE, SO SUBTRACTED: OpenAI's `cache_write_tokens` is part of `prompt_tokens`,
-        // exactly like `cached_tokens`. Measured live on 2026-09-28 against metered chat
-        // completions with `gpt-6-luna` and one ~3.2k-token prompt: the writing call reported
-        // prompt_tokens 3173 with cache_write_tokens 3170 and total_tokens 3177 (prompt plus 4
-        // completion), and the reading call prompt_tokens 3173 with cached_tokens 3170. The
-        // openai-python type lists it in the prompt-token breakdown ("The unadjusted number of
-        // prompt tokens written to cache"), and OpenRouter's documented example (prompt 194,
-        // write 100, total 196) fits the same reading. Leaving it inside fresh input counted
-        // every written token twice.
+        // INCLUSIVE, SO SUBTRACTED: both spellings of the cache-write count are part of
+        // `prompt_tokens`, exactly like `cached_tokens`, so each must come out of fresh input or
+        // every written token is counted twice -- once as fresh input, once as a cache write.
         //
-        // NOT SUBTRACTED: `cache_creation_input_tokens`. No captured response in this repo shows
-        // whether a gateway using that spelling (Alibaba) counts it inside `prompt_tokens`, so
-        // it is recorded without touching fresh input. Reopen this with an Alibaba capture.
-        match at("cache_write_tokens") {
+        // `cache_write_tokens` (OpenAI, OpenRouter): measured live on 2026-09-28 against metered
+        // chat completions with `gpt-6-luna` and one ~3.2k-token prompt. The writing call
+        // reported prompt_tokens 3173 with cache_write_tokens 3170 and total_tokens 3177 (prompt
+        // plus 4 completion), and the reading call prompt_tokens 3173 with cached_tokens 3170.
+        // The openai-python type lists it in the prompt-token breakdown ("The unadjusted number
+        // of prompt tokens written to cache"), and OpenRouter's documented example (prompt 194,
+        // write 100, total 196) fits the same reading.
+        //
+        // `cache_creation_input_tokens` (Alibaba / DashScope Model Studio) counts inside
+        // `prompt_tokens` too, per the provider's own documentation:
+        //
+        // - Context Cache (<https://www.alibabacloud.com/help/en/model-studio/context-cache>),
+        //   explicit-cache usage example: the first request reports prompt_tokens 2174 with cache
+        //   creation 2156 and cache hits 0, and the next request reports prompt_tokens 2174 with
+        //   creation 0 and hits 2156. The same page computes uncached input as prompt_tokens
+        //   minus creation minus hits, and its FAQ says tokens after the cache marker count in
+        //   the input total but in neither creation nor hits. Billing treats creation (about
+        //   125% of input), hits (10%) and the rest (standard) as three prices for ONE token
+        //   class, not as charges on top of each other.
+        // - Chat Completions reference
+        //   (<https://www.alibabacloud.com/help/en/model-studio/qwen-api-via-openai-chat-completions>):
+        //   `total_tokens = prompt_tokens + completion_tokens`, and
+        //   `cache_creation_input_tokens` is listed as a detail OF `prompt_tokens`.
+        //
+        // WHEN BOTH SPELLINGS APPEAR, `cache_write_tokens` wins and the two are never added:
+        // they name the same counter, so summing them would report one write twice. A response
+        // carrying both is a gateway translating between spellings, not a provider counting two
+        // separate kinds of writes.
+        let written = at("cache_write_tokens").or_else(|| at("cache_creation_input_tokens"));
+        match written {
             Some(written) => merge_inclusive_input_tokens_with_writes(
                 &mut self.usage,
                 g("prompt_tokens"),
                 cached,
                 Some(written),
             ),
-            None => {
-                merge_inclusive_input_tokens(&mut self.usage, g("prompt_tokens"), cached);
-                if let Some(x) = at("cache_creation_input_tokens") {
-                    self.usage.cache_write_tokens = Some(x);
-                }
-            }
+            None => merge_inclusive_input_tokens(&mut self.usage, g("prompt_tokens"), cached),
         }
         let completion = g("completion_tokens");
         let reasoning = u
@@ -864,12 +1026,22 @@ impl OpenAiChatNormalizer {
         }
     }
 
-    fn assemble_message(&mut self) -> Result<AssistantMessage, NormalizeError> {
+    fn assemble_message(
+        &mut self,
+        out: &mut Vec<NormalizedEvent>,
+    ) -> Result<AssistantMessage, NormalizeError> {
         for buf in &self.tool_calls {
             self.arguments_guard
                 .terminal(&buf.id, &buf.name, &buf.arguments);
         }
         let mut content = Vec::new();
+        let mut keys = Vec::new();
+        if !self.reasoning.is_empty() || (self.openrouter && !self.reasoning_details.is_empty()) {
+            keys.push((0, 0));
+        }
+        if !self.text.is_empty() {
+            keys.push((1, 0));
+        }
         if self.openrouter && (!self.reasoning.is_empty() || !self.reasoning_details.is_empty()) {
             content.push(ContentBlock::RedactedReasoning {
                 data: serde_json::to_string(&json!({
@@ -901,7 +1073,7 @@ impl OpenAiChatNormalizer {
                 max_output_tokens: self.max_output_tokens,
                 output_tokens: self.usage.output_tokens,
             });
-        for buf in std::mem::take(&mut self.tool_calls) {
+        for (slot, buf) in std::mem::take(&mut self.tool_calls).into_iter().enumerate() {
             let Some(input) =
                 self.arguments_guard
                     .decode(&buf.arguments, &buf.name, ceiling, false)?
@@ -914,7 +1086,10 @@ impl OpenAiChatNormalizer {
                 input,
                 thought_signature: None,
             }));
+            keys.push((2, slot as u64));
         }
+        self.display_parts
+            .retain(&keys, "openai_chat", self.step_id, out);
         Ok(AssistantMessage {
             message_id: self.message_id.clone().unwrap_or(MessageId(String::new())),
             content,
@@ -991,7 +1166,7 @@ impl StreamNormalizer for OpenAiChatNormalizer {
             Some(finish_reason) => finish_reason,
             None => FinishReason::Other,
         };
-        let message = self.assemble_message()?;
+        let message = self.assemble_message(&mut out)?;
         let finish_reason = if self.arguments_guard.fired() {
             FinishReason::ToolCalls
         } else {
@@ -1019,17 +1194,15 @@ impl StreamNormalizer for OpenAiChatNormalizer {
 
 fn openai_chat_stream_error(envelope: &Value) -> Option<ProviderError> {
     let error = envelope.get("error")?.as_object()?;
-    let provider_code = error
-        .get("code")
-        .and_then(Value::as_str)
-        .or_else(|| error.get("type").and_then(Value::as_str));
-    let provider_code = provider_code.map(|c| {
-        if c == "insufficient_quota" {
-            broca_protocol::error::BILLING_EXHAUSTED
-        } else {
-            c
-        }
-    });
+    let code = error.get("code").and_then(Value::as_str);
+    let error_type = error.get("type").and_then(Value::as_str);
+    // An exhausted prepaid balance is about the credential, not this request: relabel it so the
+    // run's terminal names the credential and routing stops using it.
+    let provider_code = if crate::normalize::openai_billing_exhausted(code, error_type) {
+        Some(broca_protocol::error::BILLING_EXHAUSTED)
+    } else {
+        code.or(error_type)
+    };
     let status = error_status(error, envelope);
     let retry_after_secs = retry_after_secs(error, envelope);
     let message = error

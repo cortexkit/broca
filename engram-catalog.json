@@ -36,6 +36,33 @@
       "reason": "sessions with caller-chosen retention; an immutable backup snapshot would outlive that promise"
     },
     {
+      "entry_id": "broca/durable-media",
+      "class": "portable",
+      "mechanism": "filetree",
+      "path": "media-durable"
+    },
+    {
+      "entry_id": "broca/session-media",
+      "class": "excluded",
+      "mechanism": "filetree",
+      "path": "media",
+      "reason": "non-durable sessions (sidekicks, one-shots, consults, masons, other modules); only sessions marked durable are backed up, and none live in this tree"
+    },
+    {
+      "entry_id": "broca/ephemeral-media",
+      "class": "excluded",
+      "mechanism": "filetree",
+      "path": "media-ephemeral",
+      "reason": "sessions with caller-chosen retention; an immutable backup snapshot would outlive that promise"
+    },
+    {
+      "entry_id": "broca/media-uploads",
+      "class": "excluded",
+      "mechanism": "filetree",
+      "path": "media-uploads",
+      "reason": "staged uploads are temporary input, not durable session data; an immutable backup snapshot would outlive their expiry"
+    },
+    {
       "entry_id": "broca/run-index",
       "class": "rebuild",
       "mechanism": "whole-db",
@@ -53,6 +80,13 @@
       "mechanism": "whole-db",
       "path": "system-one.db",
       "reason": "System One batch answers hold caller text and are kept seven days after first admission; an immutable backup snapshot would outlive that promise, and a lost batch is re-sent and answered again"
+    },
+    {
+      "entry_id": "broca/grants",
+      "class": "excluded",
+      "mechanism": "whole-db",
+      "path": "grants.db",
+      "reason": "grants are consent decisions and losing one only means the person is asked again; held calls carry request content and are kept seven days after first admission, so an immutable backup would outlive that promise"
     },
     {
       "entry_id": "broca/leases",

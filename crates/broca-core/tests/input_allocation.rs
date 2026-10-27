@@ -547,6 +547,7 @@ impl ToolPlane for ToolResultAllocationProbePlane {
 async fn terminal_no_tool_step_does_not_retain_a_second_assistant_message_copy() {
     let _allocation_test_lock = ALLOCATION_TEST_LOCK.lock().await;
     let request = RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -652,6 +653,7 @@ async fn terminal_no_tool_step_does_not_retain_a_second_assistant_message_copy()
 async fn tool_step_does_not_retain_a_second_assistant_message_copy() {
     let _allocation_test_lock = ALLOCATION_TEST_LOCK.lock().await;
     let request = RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -781,6 +783,7 @@ async fn admitted_turn_does_not_retain_a_second_input_copy() {
         serde_json::from_slice(&serialized).expect("deserialize production-shaped input");
 
     let request = RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -893,6 +896,7 @@ async fn admitted_turn_does_not_retain_a_second_tool_copy() {
         .len();
     let policy_allowed = tools.iter().map(|tool| tool.name.clone()).collect();
     let request = RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -992,6 +996,7 @@ async fn dispatch_plan_does_not_retain_a_second_tool_call_copy() {
         reply: None,
     };
     let request = RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -1118,6 +1123,7 @@ async fn dispatch_plan_does_not_retain_a_second_tool_call_copy() {
 async fn dispatched_tool_result_does_not_retain_a_second_payload_copy() {
     let _allocation_test_lock = ALLOCATION_TEST_LOCK.lock().await;
     let request = RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -1239,6 +1245,7 @@ impl Provider for StepAllocationProbeProvider {
 
 fn append_probe_request(run_id: &str, input: Vec<Message>) -> RunRequest {
     RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -1375,12 +1382,14 @@ async fn appended_episode_keeps_one_decoded_copy_of_the_prior_conversation() {
         "tracked live bytes at the appended episode's first step: {live}; prior text bytes: \
          {PRIOR_TEXT_BYTES}"
     );
-    // Without a session store the run keeps two transcript-sized owners on purpose: the WAL
-    // records it replayed (kept for late-approval checks) and the decoded conversation, which
-    // is the run's prompt. A clone of the reconstructed conversation into the episode prefix
-    // would add a third, so anything at or above two and a half copies is that duplicate.
+    // The decoded conversation, which is the run's prompt, is the only transcript-sized owner
+    // left by the first model call: this run has no deferred or approved calls, so it releases
+    // the WAL frames it replayed for approval checks before entering the turn loop (see
+    // `drop(approval_frames)` in run.rs). A clone of the reconstructed conversation into the
+    // episode prefix would add a second copy, so anything at or above one and a half copies is
+    // that duplicate. Measured: about 1.02 copies with the move, about 2.02 with a clone.
     assert!(
-        live < (PRIOR_TEXT_BYTES * 5 / 2) as isize,
+        live < (PRIOR_TEXT_BYTES * 3 / 2) as isize,
         "the appended episode retained a second decoded prior conversation: {live} tracked \
          bytes for {PRIOR_TEXT_BYTES} prior text bytes"
     );

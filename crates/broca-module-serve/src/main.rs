@@ -22,6 +22,9 @@ use subc_protocol::SUBC_MODULE_ID_ENV;
 use subc_transport::{authenticate_client, connection_file};
 use tokio::net::TcpStream;
 
+mod state_format;
+use state_format::BackgroundTask;
+
 const DEFAULT_MODULE_ID: &str = "broca";
 const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const EMBEDDED_ENGRAM_CATALOG: &[u8] = include_bytes!("../../../engram-catalog.json");
@@ -152,6 +155,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let workers_ai_base_url = provider_overrides
         .base_url(broca_module_serve::system_one::workers_ai::PROVIDER_ID)
         .map(str::to_owned);
+    // Whether a NEW state root is created in the overhaul format; see `state_format`.
+    let state_format_config =
+        broca_module_serve::config::StateFormatConfig::load_default().map_err(ServeIoError)?;
     let stop_signal = shutdown_signal()?;
     // Where the WAL, leases and run index live. Resolved before any connection is made so a
     // machine that cannot place its durable state refuses to start by name instead of first
@@ -160,6 +166,15 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let state_root = broca_module_serve::state_root::resolve_for_launch(&conn_path)
         .map_err(|e| ServeIoError(e.to_string()))?
         .path;
+    // DECIDE THE STATE FORMAT BEFORE ANY OTHER STARTUP WORK TOUCHES THE ROOT, the stall log
+    // just below included. A new root that is to become a `broca-state/2` root gets its marker first, so a
+    // power loss can never leave other files on it without one (which would read as a legacy
+    // root). A marker naming an unknown format refuses here, before anything is written.
+    let state_format = state_format::prepare(&state_root, state_format_config.overhaul_opt_in)
+        .map_err(|e| ServeIoError(e.to_string()))?;
+    state_format
+        .check_request_dumps(|key| std::env::var_os(key))
+        .map_err(ServeIoError)?;
     let _stall_watchdog = broca_module_serve::stall::start(&state_root)?;
     // An optional provider base_url override (the mock/openai-compatible path; e.g. aimock).
     // When unset, the run's model id is resolved through the catalog.
@@ -171,14 +186,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // no credentials module to open it against). Gates the vault connection below.
     let mock_provider_path = provider_base_url.is_some();
 
-    // Credential source: default the credential vault, or the pre-vault OpenCode auth file
-    // when BROCA_AUTH_SOURCE=opencode. Selecting the vault opens a SECOND outbound consumer
-    // connection to the same daemon (a process-global credentials route; credentials are
-    // handle-keyed, not session-keyed) and loads the provider→handle map. A misconfiguration
-    // here fails loud at startup (no silent fallback to the old source).
-    let auth_source =
-        executor::AuthSource::from_env(std::env::var("BROCA_AUTH_SOURCE").ok().as_deref())
-            .map_err(ServeIoError)?;
+    // Real provider calls use a second outbound consumer connection for handle-keyed vault
+    // credentials. Mock providers need no credential route.
 
     // EVERY OUTBOUND MODULE ID COMES FROM HERE, and so does the manifest's `consumes`
     // declaration, which is handed the same struct below. Routes below read these fields
@@ -203,7 +212,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var(broca_module_serve::consumer_routes::TOOL_MODULE_ENV)
             .ok()
             .as_deref(),
-        auth_source == executor::AuthSource::Vault && !mock_provider_path,
+        !mock_provider_path,
     )
     .with_account_selection(&account_selection)
     .with_bus_events(bus_event_config.enabled);
@@ -247,15 +256,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
-    let plane = Arc::new(SubcToolPlane::new(
-        tool_conn,
-        consumer_routes.tool_module.clone(),
-    ));
-    // The plane asks the daemon about a scope (`scope.describe`) over broca's own MODULE
-    // connection, because the daemon answers it only on a registered module's connection. The
-    // serve loop below attaches the describer once that connection has registered.
-    let scope_describer = Arc::new(broca_subc::ModuleScopeDescriber::new());
-    plane.set_scope_describer(scope_describer.clone());
+    let plane = SubcToolPlane::new(tool_conn, consumer_routes.tool_module.clone());
 
     // The coordinator: a registry over file-backed lease + WAL stores + the durable run
     // index, driving the real agentic loop. The module owns its state_root -- the lease, WAL,
@@ -269,6 +270,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // Create the state root up front so the SQLite run index can open its file (the file
     // stores create their own subdirs lazily, but SqliteStore::open needs the dir to exist).
     create_state_directories(&state_root)?;
+    if let Err(error) = broca_core::media_store::spawn_startup_sweep(state_root.clone()) {
+        tracing::warn!(target: "media", "could not start media maintenance; continuing to serve: {error}");
+    }
     // The catalog only guides external backup capture; a filesystem refusal must not take
     // session service offline.
     if let Err(error) = write_engram_catalog(&state_root) {
@@ -278,7 +282,11 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             "could not publish the backup catalog; continuing to serve: {error}"
         );
     }
-    let _archive_timer = archive_config.spawn(state_root.clone());
+    let _archive_timer = state_format
+        .start(BackgroundTask::ArchiveScheduler, || {
+            archive_config.spawn(state_root.clone())
+        })
+        .flatten();
     let lease_store = Arc::new(FileLeaseStore::new(state_root.join("leases")));
     let bus_hints = Arc::new(broca_module_serve::bus_events::Hints::default());
     let mut wal_store =
@@ -288,17 +296,53 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let wal_store = Arc::new(wal_store);
     let crash_orphan_wal = wal_store.clone();
+
+    // The provider-held runtime: the slots a held call waits in, and the intake that pulls each
+    // provider's late results under broca's own principal and hands them to the run's batch.
+    // Its feeds ride a consumer connection of their own, apart from the tool routes. Release
+    // builds leave `held-reply/v1` undeclared, so no call can be held and nothing is registered
+    // (see `held_runtime`).
+    let feed_conn = Arc::new(
+        SubcConnection::connect(&conn_path)
+            .await
+            .map_err(|e| ServeIoError(format!("late-results consumer connect: {e}")))?,
+    );
+    let held_resumer = Arc::new(broca_module_serve::held_runtime::LateBoundResumer::default());
+    let held_runtime = broca_module_serve::held_runtime::HeldRuntime::build(
+        &state_root,
+        wal_store.clone(),
+        feed_conn
+            .consumer_module_id()
+            .map(str::to_owned)
+            .unwrap_or_default(),
+        Arc::new(broca_module_serve::held_runtime::FeedRoutes::new(
+            Arc::clone(&feed_conn),
+            broca_module::late_results_puller::LateResultsIntake::feed_identity(&state_root),
+        )),
+        held_resumer.clone(),
+    )
+    .map_err(|e| ServeIoError(format!("open late-results store: {e}")))?;
+    let plane =
+        plane.with_provider_held_support(held_runtime.store.clone(), held_runtime.slots.clone());
+    #[cfg(debug_assertions)]
+    let plane = if broca_module_serve::held_runtime::declare_held_reply_for_tests() {
+        plane.declaring_held_reply_for_tests()
+    } else {
+        plane
+    };
+    let plane = Arc::new(plane);
+    // The plane asks the daemon about a scope (`scope.describe`) over broca's own MODULE
+    // connection, because the daemon answers it only on a registered module's connection. The
+    // serve loop below attaches the describer once that connection has registered.
+    let scope_describer = Arc::new(broca_subc::ModuleScopeDescriber::new());
+    plane.set_scope_describer(scope_describer.clone());
     let run_index = Arc::new(
         broca_store::SqliteStore::open(state_root.join("run-index.db"))
             .map_err(|e| ServeIoError(format!("open run index: {e}")))?,
     );
     wal_store.set_session_ref_index(run_index.clone());
-    // Budget caps have their own durability domain. Keeping this database separate
-    // prevents session WAL and run-index maintenance from changing admission state.
-    let cap_store = Arc::new(
-        broca_store::CapsStore::open(state_root.join("caps.db"))
-            .map_err(|e| ServeIoError(format!("open cap table: {e}")))?,
-    );
+    // Older builds kept spend caps in `caps.db` beside this file. Spend caps were removed, so the
+    // file is no longer opened; it is left on disk untouched rather than deleted.
 
     // Load the last-known-good before any admission is possible. The fetch leg gets its own
     // consumer connection, but construction performs no fusiform route.open; only the detached
@@ -313,9 +357,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     broca_catalog::install_global_catalog_cache(Arc::clone(&catalog_cache));
-    for notice in provider_overrides.notices(broca_catalog::catalog().ok().as_ref()) {
-        tracing::warn!(target: "catalog", "{notice}");
-    }
     let catalog_conn = Arc::new(
         SubcConnection::connect(&conn_path)
             .await
@@ -326,13 +367,16 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         "broca",
         "catalog-refresh",
     );
-    let _catalog_poll = spawn_catalog_poll(Arc::new(CatalogPoller::new(
-        catalog_conn,
-        catalog_identity,
-        Arc::clone(&catalog_cache),
-    )));
+    // Overrides the catalog does not serve are named once, against a loaded catalog: now when
+    // a last-known-good copy is loaded, otherwise after the first successful refresh.
+    let catalog_poller = provider_overrides.report_unserved(
+        &catalog_cache,
+        CatalogPoller::new(catalog_conn, catalog_identity, Arc::clone(&catalog_cache)),
+        |notice| tracing::warn!(target: "catalog", "{notice}"),
+    );
+    let _catalog_poll = spawn_catalog_poll(Arc::new(catalog_poller));
 
-    // Both vault and OpenCode use the same provider→method defaults to name the credential
+    // Provider→method defaults name the vault credential
     // selected for a run. The mock path deliberately skips this load; see the rule on
     // `method_config_for_launch`.
     let auth_methods = method_config_for_launch(mock_provider_path, || {
@@ -356,12 +400,12 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         plane,
         provider_base_url,
     )
+    .with_provider_held_lifecycle(held_runtime.slots.clone())
     .with_hook_plane(Arc::new(broca_subc::SubcHookPlane::new(plan_conn.clone())))
     .with_elicitation_plane(Arc::new(broca_subc::consent::ScopedConsentPlane::new(
         plan_conn.clone(),
         broca_subc::RouteOpenRetry::default_patience(),
     )))
-    .with_methods(auth_methods.clone())
     .with_provider_overrides(provider_overrides)
     .with_claude_code_install_id(
         match broca_module_serve::claude_code_identity::load_or_create_install_id(&state_root) {
@@ -393,34 +437,36 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let catch_up_index = run_index.clone();
     let catch_up_wal = wal_store.clone();
     let catch_up_resolver = charge_basis_table.clone();
-    let _export_catch_up = spawn_blocking(JobKind::Recovery, move || {
-        let started = std::time::Instant::now();
-        match broca_core::catch_up_usage_exports(
-            catch_up_index.as_ref(),
-            catch_up_wal.as_ref(),
-            catch_up_resolver.as_ref(),
-        ) {
-            // SAY IT FINISHED, AND HOW LONG IT TOOK, even when there was nothing to do. This
-            // arm used to log nothing, so "finished in 50 ms" and "still running 20 s after
-            // boot" were the same observation from outside. This pass shares the store's single
-            // connection with admission's snapshot read, so it was the first suspect for the
-            // first send after a respawn that was never admitted. Measured at 2-5.5 s, it had
-            // always finished before that send; the stall was the archive membership build,
-            // prewarmed below.
-            Ok(0) => tracing::info!(
-                target: "export",
-                "usage-export startup catch-up finished in {} ms; nothing missed",
-                started.elapsed().as_millis()
-            ),
-            Ok(count) => tracing::warn!(
-                target: "export",
-                "caught up {count} missed usage-export run(s) in {} ms",
-                started.elapsed().as_millis()
-            ),
-            Err(error) => {
-                tracing::warn!(target: "export", "usage-export startup catch-up failed: {error}")
+    let _export_catch_up = state_format.start(BackgroundTask::UsageExport, || {
+        spawn_blocking(JobKind::Recovery, move || {
+            let started = std::time::Instant::now();
+            match broca_core::catch_up_usage_exports(
+                catch_up_index.as_ref(),
+                catch_up_wal.as_ref(),
+                catch_up_resolver.as_ref(),
+            ) {
+                // SAY IT FINISHED, AND HOW LONG IT TOOK, even when there was nothing to do. This
+                // arm used to log nothing, so "finished in 50 ms" and "still running 20 s after
+                // boot" were the same observation from outside. This pass shares the store's
+                // single connection with admission's snapshot read, so it was the first suspect
+                // for the first send after a respawn that was never admitted. Measured at
+                // 2-5.5 s, it had always finished before that send; the stall was the archive
+                // membership build, prewarmed below.
+                Ok(0) => tracing::info!(
+                    target: "export",
+                    "usage-export startup catch-up finished in {} ms; nothing missed",
+                    started.elapsed().as_millis()
+                ),
+                Ok(count) => tracing::warn!(
+                    target: "export",
+                    "caught up {count} missed usage-export run(s) in {} ms",
+                    started.elapsed().as_millis()
+                ),
+                Err(error) => {
+                    tracing::warn!(target: "export", "usage-export startup catch-up failed: {error}")
+                }
             }
-        }
+        })
     });
     // Build the archive membership cache now, off the send path. Otherwise the first NEW
     // session after a restart builds it inside admission: 10,821 ms cold on production
@@ -620,17 +666,18 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let mut opener_builder = DefaultOpener::new(lease_store, wal_store, executor)
         .with_run_index(run_index.clone())
         .with_materialized_store(run_index.clone())
-        .with_export_index(run_index.clone())
-        .with_charge_basis_resolver(charge_basis_table)
-        .with_cap_store(cap_store.clone());
+        .with_charge_basis_resolver(charge_basis_table.clone());
+    // Each finished run's usage-export fact. An overhaul root exports nothing.
+    if state_format.runs(BackgroundTask::UsageExport) {
+        opener_builder = opener_builder.with_export_index(run_index.clone());
+    }
     if let Some(ttl) = idle_ttl {
         opener_builder = opener_builder.with_idle_ttl(ttl);
     }
-    let registry = Arc::new(LineageRegistry::new_with_reader_and_caps(
+    let registry = Arc::new(LineageRegistry::new_with_sources(
         Arc::new(opener_builder),
         Some(wal_reader),
         Some(store_reader),
-        Some(cap_store),
     ));
     registry.set_retention_service(retention);
     // System One: decision models served in this process with no session. Its batch record
@@ -660,7 +707,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         let clef = workers_ai(broca_module_serve::system_one::workers_ai::CLEF_MODEL_PATH)?;
         let clef_flash =
             workers_ai(broca_module_serve::system_one::workers_ai::CLEF_FLASH_MODEL_PATH)?;
-        let service = Arc::new(broca_module_serve::system_one::SystemOne::new(
+        let service = broca_module_serve::system_one::SystemOne::new(
             store,
             broca_module_serve::serve::process_launch_id(),
             Arc::new(broca_module_serve::system_one::LiveCatalog),
@@ -671,7 +718,13 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             ],
             config,
             registry.batches_in_flight_gauge(),
-        ));
+        );
+        // System One's export bridge into the usage export. An overhaul root exports nothing.
+        let service = Arc::new(if state_format.runs(BackgroundTask::UsageExport) {
+            service.with_export(run_index.clone(), charge_basis_table)
+        } else {
+            service
+        });
         let released = service
             .release_abandoned()
             .map_err(|e| ServeIoError(format!("release System One batches left running: {e}")))?;
@@ -681,7 +734,66 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         }
         service
     };
-    let _system_one_sweep = system_one.spawn_sweeper(registry.stopping_signal());
+    // System One's batch sweep deletes batches, so it counts as retention: an overhaul root runs
+    // none.
+    let _system_one_sweep = state_format.start(BackgroundTask::RetentionSweeper, || {
+        system_one.spawn_sweeper(registry.stopping_signal())
+    });
+    // Private-content admission asks cerebellum whether a scope read the person's private
+    // content and Basal which providers a flow's approved version allows. Both questions ride
+    // the module connection `plan_conn` presents under broca's own principal; cerebellum and
+    // Basal admit only `reserved:broca`.
+    let llm_tools_identity = broca_protocol::BindIdentity::new(
+        state_root.to_string_lossy().to_string(),
+        "broca",
+        "llm-tools",
+    );
+    let llm_tools_asks = Arc::new(broca_module_serve::llm_tools::SubcAsks::new(
+        Arc::new(broca_subc::PrivateContentClient::new(
+            plan_conn.clone(),
+            llm_tools_identity.clone(),
+        )),
+        Arc::new(broca_subc::FlowProvidersClient::new(
+            plan_conn.clone(),
+            llm_tools_identity.clone(),
+        )),
+    ));
+    let held_calls = Arc::new(broca_module_serve::llm_tools::held::HeldCalls::new(
+        Arc::new(
+            broca_store::grants::GrantsStore::open(state_root.join("grants.db"))
+                .map_err(|error| ServeIoError(format!("open grants store: {error}")))?,
+        ),
+        broca_module_serve::serve::process_launch_id().into(),
+    ));
+    held_calls
+        .expire_due(broca_module_serve::llm_tools::held::epoch_ms())
+        .map_err(|error| ServeIoError(format!("recover held deadlines: {error}")))?;
+    let _held_timers = held_calls.spawn_timers(registry.stopping_signal());
+    let llm_tools = Arc::new(
+        broca_module_serve::llm_tools::LlmTools::new(
+            Arc::new(system_one.fork_for_tools()),
+            broca_module_serve::config::LlmToolsConfig::load_default().map_err(ServeIoError)?,
+            llm_tools_asks,
+        )
+        .with_held(held_calls.clone())
+        .with_consent(
+            Arc::new(broca_module_serve::llm_tools::consent::Consent::new(
+                held_calls.store.clone(),
+                Arc::new(broca_module_serve::llm_tools::consent::SubcConsentIo::new(
+                    plan_conn.clone(),
+                    llm_tools_identity,
+                    scope_describer.clone(),
+                )),
+            )),
+            registry.stopping_signal(),
+        ),
+    );
+    llm_tools
+        .recover_authorized()
+        .map_err(|error| ServeIoError(format!("recover authorized held calls: {error}")))?;
+    llm_tools
+        .recover_consent()
+        .map_err(|error| ServeIoError(format!("recover consent cards: {error}")))?;
     let agent_data = Arc::new(broca_module_serve::agent_data::AgentDataService::new(
         state_root.clone(),
         registry.as_ref().clone(),
@@ -700,14 +812,14 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .boot_retention()
         .await
         .map_err(|error| ServeIoError(format!("retention boot recovery: {error}")))?;
-    let retention_sweep = {
+    let retention_sweep = state_format.start(BackgroundTask::RetentionSweeper, || {
         let registry = registry.clone();
         tokio::spawn(async move {
             if registry.run_retention_sweeper().await.is_err() {
                 tracing::warn!(target: "retention", "retention sweep stopped; durable recovery required");
             }
         })
-    };
+    });
     let bus_stop = tokio_util::sync::CancellationToken::new();
     let _bus_stop_guard = bus_stop.clone().drop_guard();
     let bus_connector: Arc<dyn broca_module_serve::bus_events::BusConnector> =
@@ -785,6 +897,21 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
+    // Late results reach a run through its session's actor, so delivery waits for the registry.
+    held_resumer.bind(registry.clone());
+    // Boot recovery for provider-held calls runs off the startup path, once the dependency
+    // routes are registered: a lost intake store is rebuilt from the live WALs first, every
+    // registered session is opened so its open-time recovery runs, and then each module that
+    // still needs its feed gets its puller.
+    let _held_recovery = {
+        let registry = registry.clone();
+        let describer = scope_describer.clone();
+        let runtime = held_runtime.clone();
+        tokio::spawn(async move {
+            describer.wait_registered().await;
+            runtime.recover(registry).await;
+        })
+    };
     let _restart_resume = {
         let registry = registry.clone();
         let index = run_index.clone();
@@ -876,7 +1003,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let stream = connect(&conn_path).await?;
     let (read_half, write_half) = tokio::io::split(stream);
-    let serving = broca_module_serve::serve::serve_connection_with_services(
+    let serving = broca_module_serve::serve::serve_connection_with_llm_tools(
         read_half,
         write_half,
         &module_id,
@@ -891,6 +1018,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         Some(scope_describer),
         Some(agent_data),
         Some(system_one),
+        Some(llm_tools),
     );
     tokio::pin!(serving);
     tokio::select! {
@@ -936,7 +1064,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             // Stop the sweep supervisor so it cannot start another deletion. Interrupted
             // blocking deletions are recoverable from their durable tombstones on next boot;
             // joining this supervisor is not a blocking-pool drain.
-            let _ = retention_sweep.await;
+            if let Some(sweep) = retention_sweep {
+                let _ = sweep.await;
+            }
             // Tokio runtime destruction waits for blocking filesystem tasks. A stuck fsync must
             // not turn the bounded seal attempt into an unbounded shutdown -- so the process ends
             // here rather than by returning. HOW it ends is the part that matters:
@@ -957,7 +1087,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             let sealed = registry.stop_and_seal().await;
             let report = registry.shutdown_report().expect("stop records its outcome");
             // Stop the sweep supervisor; incomplete deletions recover from durable tombstones.
-            let _ = retention_sweep.await;
+            if let Some(sweep) = retention_sweep {
+                let _ = sweep.await;
+            }
             if sealed {
                 // STAYS AT WARN, and it looks exactly like the boot statements demoted to info
                 // in this same commit: true on every clean shutdown, naming no fault. The
@@ -1310,36 +1442,6 @@ mod executor {
     /// cold-starts its code index, which on a large project can take seconds).
     const BIND_TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// Where the executor gets a provider credential. Selected by `BROCA_AUTH_SOURCE`
-    /// (default `vault`). The vault is the authoritative source for every credential kind
-    /// (api-key included), resolving a fresh, refresh-on-expiry token per run; `opencode`
-    /// opts back into reading the static pre-vault auth file.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum AuthSource {
-        /// Read the OpenCode auth file (the pre-vault behavior; opt-in via
-        /// `BROCA_AUTH_SOURCE=opencode`).
-        Opencode,
-        /// Resolve a fresh, refresh-on-expiry token from the credential vault (the default).
-        Vault,
-    }
-
-    impl AuthSource {
-        /// Parse `BROCA_AUTH_SOURCE`. Unset/empty ⇒ `Vault` (the default — the credential
-        /// vault is now the authoritative source for all credential kinds). `opencode`
-        /// selects the pre-vault auth-file behavior. A non-empty unrecognized value is a
-        /// MISCONFIGURATION — fail loud rather than silently fall back (which would hide an
-        /// operator's typo and quietly use a different auth source than they asked for).
-        pub fn from_env(value: Option<&str>) -> Result<Self, String> {
-            match value.map(str::trim) {
-                None | Some("") | Some("vault") => Ok(AuthSource::Vault),
-                Some("opencode") => Ok(AuthSource::Opencode),
-                Some(other) => Err(format!(
-                    "BROCA_AUTH_SOURCE must be 'opencode' or 'vault', got {other:?}"
-                )),
-            }
-        }
-    }
-
     use broca_catalog::live::WireFamilyId;
     use broca_module_serve::account_routing::{AccountChoice, RoutingClient};
     use broca_module_serve::{AuthMethod, CacheTtlTable};
@@ -1403,90 +1505,19 @@ mod executor {
     /// `Chatgpt` renders the codex `/responses` (`OpenAiResponsesChatgpt`).
     pub use broca_module_serve::family_for_method;
 
-    /// The one OpenCode method/selection decision used by family routing, the consistency guard,
-    /// and durable metadata.
-    struct OpencodeEpisodeAuth {
-        selection: Option<broca_core::AuthSelection>,
-        method: Option<AuthMethod>,
-    }
-
-    /// Resolve OpenCode auth metadata before provider construction. Fresh runs prefer a caller
-    /// pin, then the configured provider method, then the auth-file entry type. Resumes ignore all
-    /// three and recover the method from the frozen credential id so drift cannot change the family.
-    fn opencode_auth_for_episode(
-        fresh_episode: bool,
-        frozen_credential_id: Option<&str>,
-        discovered_method: Option<AuthMethod>,
-        pinned_method: Option<AuthMethod>,
-        methods: &broca_module_serve::MethodConfig,
-        provider_id: &str,
-    ) -> OpencodeEpisodeAuth {
-        if fresh_episode {
-            let method = pinned_method
-                .or_else(|| methods.method_for(provider_id))
-                .or(discovered_method);
-            let selection = method.map(|method| broca_core::AuthSelection {
-                auth_method: None,
-                credential_id: broca_module_serve::CredentialId::new(method, provider_id, None)
-                    .to_id_string(),
-                // OpenCode auth entries carry no vault account id.
-                account_ref: None,
-                resolved_credential_id: None,
-                // OpenCode auth never asks the vault for anything.
-                vault_request: None,
-                // Nor routing: the OpenCode file has no accounts to choose between.
-                account_decision: None,
-            });
-            OpencodeEpisodeAuth { selection, method }
-        } else {
-            let selection = frozen_credential_id.map(|id| broca_core::AuthSelection {
-                auth_method: None,
-                credential_id: id.to_string(),
-                // A resumed OpenCode run keeps no vault account id.
-                account_ref: None,
-                resolved_credential_id: None,
-                vault_request: None,
-                account_decision: None,
-            });
-            let method = frozen_credential_id
-                .and_then(broca_module_serve::CredentialId::parse)
-                .map(|credential| credential.method);
-            OpencodeEpisodeAuth { selection, method }
-        }
-    }
-
-    /// OpenCode auth entries expose only an access token/API key and their generic type. Unlike
-    /// the vault payload, they do not provide Antigravity's required cloud project, so selecting
-    /// that body grammar must fail before admission rather than silently falling back to Gemini.
-    fn validate_opencode_method_metadata(
-        provider_id: &str,
-        method: Option<AuthMethod>,
-    ) -> Result<(), RunError> {
-        if method == Some(AuthMethod::Antigravity) {
-            return Err(RunError::Config(format!(
-                "auth method 'antigravity' for provider '{provider_id}' requires a project_id, \
-                 but BROCA_AUTH_SOURCE=opencode provides no project metadata"
-            )));
-        }
-        Ok(())
-    }
-
     /// The full auth resolution for a run: how to authenticate, whether to pause for re-auth,
     /// what to freeze, and (for the consistency guard) which method was chosen. NO `Debug`
     /// derive — `mode` can carry a secret token.
     pub struct AuthResolution {
-        /// How the provider authenticates (the shaped credential, or none/opencode).
+        /// How the provider authenticates (the shaped vault credential, or none for mocks).
         pub mode: AuthMode,
         /// Set when the credential needs re-auth: admit then pause (no provider call).
         pub pause: Option<ProviderError>,
         /// The credential id to FREEZE into a fresh run's RunConfig. `None` on the mock path;
-        /// OpenCode resolves its configured-or-discovered method before provider construction.
         /// On a resume this is the already-frozen value (re-frozen is a no-op — the loop only
         /// writes it on a fresh RunStarted).
         pub selection: Option<broca_core::AuthSelection>,
         /// The resolved method used by provider-family selection and the consistency guard.
-        /// OpenCode resolves it before provider construction from config/auth-file metadata on a
-        /// fresh run or from the frozen credential id on resume.
         pub method: Option<AuthMethod>,
         /// The cloud project the credential carries — `Some` only for an Antigravity
         /// credential (a body render input the google-codeassist family freezes). `None`
@@ -2149,7 +2180,7 @@ mod executor {
 
     /// The credential the run actually USED, paired with the record_version of the token it
     /// was served — the identity a post-run wire-auth-failure report needs. `None` when the
-    /// run never got a vault token: the mock path, a frozen OpenCode selection, a pre-loop
+    /// run never got a vault token: the mock path, a selection without a served token, a pre-loop
     /// `needs_reauth` pause (the vault already knows; no provider call was made), or a
     /// version-less resolution (nothing served, nothing to CAS against). Requiring BOTH pieces
     /// structurally prevents a report that could invalidate a version the run never saw.
@@ -2289,146 +2320,64 @@ mod executor {
         Some((frozen_cache_policy(config), frozen_prompt_cache_key(config)))
     }
 
-    /// The output cap the episode froze at start. Read straight off the blob, like the recorded
-    /// host, so a blob the typed config cannot parse still restores the number it carries.
-    fn frozen_max_output_tokens(config: &broca_wal::RunConfig) -> Option<u32> {
-        config
-            .frozen_render_config
-            .get("max_output_tokens")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-    }
-
-    /// The reasoning variant the episode froze at start, re-applied as recorded on resume. Read
-    /// off the blob like the output cap, so a resume never re-derives it from the catalog.
-    fn frozen_variant(config: &broca_wal::RunConfig) -> Option<broca_catalog::live::FrozenVariant> {
-        config
-            .frozen_render_config
-            .get("variant")
-            .and_then(|variant| serde_json::from_value(variant.clone()).ok())
-    }
-
-    /// The Anthropic thinking-echo scope the episode froze at start, re-applied on resume. A blob
-    /// recorded before the scope existed has no `echo_scope` key and reads back as the legacy
-    /// last-assistant-message scope, which is exactly what that episode rendered with.
-    fn frozen_thinking_echo_scope(
+    /// Decode the whole admission bundle so upstream routing changes cannot move a resumed run.
+    fn decode_recorded_render_config(
         config: &broca_wal::RunConfig,
-    ) -> Option<broca_catalog::live::ThinkingEchoScope> {
-        let reasoning = config.frozen_render_config.get("reasoning")?;
-        match serde_json::from_value(reasoning.clone()).ok()? {
-            broca_provider::policy::ReasoningPolicy::AnthropicInterleaved {
-                echo_scope, ..
-            } => Some(echo_scope),
-            _ => None,
+    ) -> Result<broca_provider::wire::FrozenRenderConfig, String> {
+        serde_json::from_value(config.frozen_render_config.clone())
+            .map_err(|error| format!("recorded provider render config cannot be decoded: {error}"))
+    }
+
+    /// An unreadable bundle has no renderer or transport. Passing this null identity to
+    /// core preserves its durable, permanent frozen_render_config_unverifiable refusal.
+    struct UnverifiableRecordedProvider;
+
+    #[async_trait]
+    impl broca_core::Provider for UnverifiableRecordedProvider {
+        async fn step(
+            &self,
+            _: broca_protocol::StepId,
+            _: &broca_protocol::CallOptions,
+        ) -> mpsc::Receiver<broca_protocol::NormalizedEvent> {
+            let (_, rx) = mpsc::channel(1);
+            rx
+        }
+        fn render_request(&self, _: &broca_protocol::CallOptions) -> Vec<u8> {
+            Vec::new()
+        }
+        fn renderer_version(&self) -> u32 {
+            0
+        }
+        fn reproduces_renderer_version(&self, _: u32) -> bool {
+            false
+        }
+        fn render_config_blob(&self) -> serde_json::Value {
+            serde_json::Value::Null
         }
     }
 
-    /// The Anthropic cross-model thinking rule the episode froze at start, re-applied on resume.
-    /// A blob recorded before the rule existed has no `cross_model` key and reads back as the
-    /// legacy same-model-only rule, which is exactly what that episode rendered with.
-    fn frozen_thinking_cross_model(
-        config: &broca_wal::RunConfig,
-    ) -> Option<broca_catalog::live::CrossModelThinking> {
-        let reasoning = config.frozen_render_config.get("reasoning")?;
-        match serde_json::from_value(reasoning.clone()).ok()? {
-            broca_provider::policy::ReasoningPolicy::AnthropicInterleaved {
-                cross_model, ..
-            } => Some(cross_model),
-            _ => None,
+    fn unverifiable_recorded_resolution(
+        model: &str,
+        method: Option<AuthMethod>,
+        family_override: Option<WireFamilyId>,
+    ) -> broca_catalog::live::ProviderResolution {
+        // This family value satisfies the executor's auth-method consistency check only;
+        // the null provider cannot render or send a request for any family.
+        let family = family_override.unwrap_or(WireFamilyId::OpenAiChat);
+        broca_catalog::live::ProviderResolution {
+            provider: Box::new(UnverifiableRecordedProvider),
+            auth_method: method,
+            family_id: family,
+            family: format!("{family:?}"),
+            base_url: "<unverifiable>".into(),
+            wire_model: model.into(),
+            auth_desc: "no transport for an unverifiable render config".into(),
+            provider_tag: model
+                .split_once('/')
+                .map_or("openai-compatible", |(provider, _)| provider)
+                .into(),
+            context_limit: None,
         }
-    }
-
-    /// The Claude Code persona the episode froze at start, re-applied on resume. A blob recorded
-    /// before the persona existed has no `claude_code_persona` key and reads back as `None`,
-    /// the shape that episode rendered with.
-    fn frozen_claude_code_persona(
-        config: &broca_wal::RunConfig,
-    ) -> Option<broca_catalog::live::ClaudeCodePersona> {
-        config
-            .frozen_render_config
-            .get("claude_code_persona")
-            .and_then(|persona| serde_json::from_value(persona.clone()).ok())
-    }
-
-    fn frozen_opencode_go_qwen_thinking(config: &broca_wal::RunConfig) -> bool {
-        config
-            .frozen_render_config
-            .get("opencode_go_qwen_thinking")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    }
-
-    fn frozen_opencode_go_deepseek_thinking(config: &broca_wal::RunConfig) -> bool {
-        config
-            .frozen_render_config
-            .get("opencode_go_deepseek_thinking")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    }
-
-    fn frozen_opencode_go_long_cache_retention_unsupported(config: &broca_wal::RunConfig) -> bool {
-        config
-            .frozen_render_config
-            .get("opencode_go_long_cache_retention_unsupported")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    }
-
-    fn frozen_opencode_go_reasoning_signature(config: &broca_wal::RunConfig) -> bool {
-        config
-            .frozen_render_config
-            .get("opencode_go_reasoning_signature")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    }
-
-    fn frozen_wire_family(config: &broca_wal::RunConfig) -> Option<WireFamilyId> {
-        serde_json::from_value(config.frozen_render_config.get("family_id")?.clone()).ok()
-    }
-
-    fn frozen_responses_tools_non_strict(config: &broca_wal::RunConfig) -> bool {
-        config
-            .frozen_render_config
-            .get("responses_tools_non_strict")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    }
-
-    /// Whether the episode froze the DeepSeek reasoning echo. A config recorded before DeepSeek
-    /// was opted in has no field and reads as false, so its resume keeps the bytes it was sending.
-    fn frozen_reasoning_content_required(config: &broca_wal::RunConfig) -> bool {
-        config
-            .frozen_render_config
-            .get("reasoning_content_required")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    }
-
-    fn frozen_reasoning_echo(
-        config: &broca_wal::RunConfig,
-    ) -> Option<broca_provider::policy::ReasoningEchoPolicy> {
-        config
-            .frozen_render_config
-            .get("reasoning_echo")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-    }
-
-    /// Whether the episode froze provider text state (Responses message phases and Gemini text
-    /// signatures). A config recorded before the flag existed has no field and reads as false.
-    fn frozen_provider_text_state(config: &broca_wal::RunConfig) -> bool {
-        config
-            .frozen_render_config
-            .get("provider_text_state")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    }
-
-    /// The service tier the episode was admitted with, re-applied on resume from the durable
-    /// `RunConfig` rather than the resuming send, and without re-checking the catalog's rates.
-    fn frozen_service_tier(
-        config: &broca_wal::RunConfig,
-    ) -> Option<broca_catalog::live::ServiceTier> {
-        config.service_tier
     }
 
     fn context_limit_for_episode(
@@ -2446,7 +2395,7 @@ mod executor {
 
     /// The opened credential-vault consumer plus how each credential is addressed. Present only
     /// when the auth source is the vault AND the connection opened at startup; absent for the
-    /// OpenCode default. Process-global (credentials are not session-keyed), so one client
+    /// mock credential-free path. Process-global (credentials are not session-keyed), so one client
     /// serves every session and provider.
     pub struct VaultAuth {
         pub client: broca_subc::VaultClient,
@@ -2735,8 +2684,8 @@ mod executor {
     /// Drives the real agentic loop for each run: resolves the provider from the catalog
     /// (or a base_url override), dispatches tools through the shared `SubcToolPlane`, and
     /// threads the admission ack so the coordinator admits a run only once it's durable.
-    pub struct LiveLoopExecutor {
-        wal_store: Arc<FileWalStore>,
+    pub struct LiveLoopExecutor<W = FileWalStore> {
+        wal_store: Arc<W>,
         /// The SQLite session store is both the durable run index and the materialized
         /// transcript prefix store used by resume and `session.read`.
         session_store: Arc<broca_store::SqliteStore>,
@@ -2749,6 +2698,8 @@ mod executor {
         compaction_plane: Option<Arc<broca_subc::SubcCompactionPlane>>,
         compaction_views: Arc<broca_core::ViewReadyInbox>,
         elicitation_plane: Option<Arc<broca_subc::consent::ScopedConsentPlane>>,
+        /// Where provider-held calls wait for their late results; see `held_runtime`.
+        provider_held_lifecycle: Option<Arc<broca_module::held_slots::HeldSlots>>,
         /// One process-long HTTP client. Every per-run provider gets a cheap clone so sequential
         /// episodes retain the same DNS, TCP, TLS, and HTTP connection pool.
         provider_client: ProviderHttpClient,
@@ -2760,25 +2711,15 @@ mod executor {
         /// Configured hosts change only the endpoint. Keeping them out of provider_base_url
         /// prevents them from disabling credentials and cache planning like the mock path.
         provider_overrides: broca_module_serve::provider_overrides::ProviderOverrides,
-        /// The credential source. `None` ⇒ the OpenCode default; `Some` ⇒ resolve a fresh
-        /// token from the vault per run (the opt-in cutover, off until an operator selects it).
-        /// Shared so a run's in-step token refresher can reach the vault from the provider's
-        /// transport task.
+        /// Vault access shared with the provider transport's in-step token refresher.
+        /// Absent only for mock providers and executors not yet configured for real calls.
         vault: Option<Arc<VaultAuth>>,
-        /// Provider→method defaults used to name a credential on the OpenCode path after its
-        /// reader identifies the entry type. The value contains no secrets and is also held by
-        /// the vault path for handle lookup.
-        methods: broca_module_serve::MethodConfig,
         /// The per-session context-management defaults, used when an episode is admitted or
         /// resumed to decide (or refuse) the value it runs under.
         context_management: broca_module_serve::context_management::ContextManagementConfig,
         /// Prompt-cache defaults loaded once at boot. Resolution is pure and runs only when a
         /// fresh episode is admitted; resumes reuse the policy already frozen in the WAL.
         cache_table: CacheTtlTable,
-        /// Where the OpenCode credential source reads its auth file. `None` ⇒ the HOME-derived
-        /// OpenCode path, which is what every production launch uses. Only tests set it, so a
-        /// unit test reads a fixture instead of the operator's real credential file.
-        opencode_auth_path: Option<std::path::PathBuf>,
         /// The routing module broca asks which provider account a new run uses, and reports
         /// each run's account evidence to. `None` without the vault credential source.
         routing: Option<Arc<RoutingClient>>,
@@ -2803,9 +2744,22 @@ mod executor {
         cc_prompt_wal_bytes: Arc<std::sync::atomic::AtomicU64>,
     }
 
-    impl LiveLoopExecutor {
+    /// The executor also needs the file store's bounded prompt reader and installation path.
+    /// Bulk record reads stay on `WalStore` so decorators can observe redundant history reads;
+    /// `file_store` is only for bounded prompt counting and the installation path.
+    pub trait ExecutorWalStore: WalStore {
+        fn file_store(&self) -> &FileWalStore;
+    }
+
+    impl ExecutorWalStore for FileWalStore {
+        fn file_store(&self) -> &FileWalStore {
+            self
+        }
+    }
+
+    impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
         pub fn new(
-            wal_store: Arc<FileWalStore>,
+            wal_store: Arc<W>,
             session_store: Arc<broca_store::SqliteStore>,
             plane: Arc<SubcToolPlane>,
             provider_base_url: Option<String>,
@@ -2818,15 +2772,14 @@ mod executor {
                 compaction_plane: None,
                 compaction_views: Arc::default(),
                 elicitation_plane: None,
+                provider_held_lifecycle: None,
                 provider_client: build_provider_http_client(),
                 clock: broca_core::clock::Clock::default(),
                 provider_base_url,
                 provider_overrides: Default::default(),
                 vault: None,
-                methods: broca_module_serve::MethodConfig::empty(),
                 context_management: Default::default(),
                 cache_table: CacheTtlTable::shipped_defaults(),
-                opencode_auth_path: None,
                 routing: None,
                 claude_code_install_id: None,
                 cc_suffix_memo: Default::default(),
@@ -2849,7 +2802,6 @@ mod executor {
             last_episode_frozen_config: Option<&serde_json::Value>,
             durable_head: u64,
         ) -> Option<String> {
-            use broca_core::WalStore as _;
             use broca_module_serve::claude_code_identity::{
                 first_durable_cc_version_suffix, inherited_cc_version_suffix,
             };
@@ -2929,7 +2881,9 @@ mod executor {
             let session = req.session.clone();
             let counted =
                 broca_diagnostics::spawn_blocking(broca_diagnostics::JobKind::WalRead, move || {
-                    wal_store.human_prompt_count(&session, durable_head, base.as_ref())
+                    wal_store
+                        .file_store()
+                        .human_prompt_count(&session, durable_head, base.as_ref())
                 })
                 .await
                 .map_err(|error| {
@@ -2988,6 +2942,16 @@ mod executor {
             elicitation: Arc<broca_subc::consent::ScopedConsentPlane>,
         ) -> Self {
             self.elicitation_plane = Some(elicitation);
+            self
+        }
+
+        /// Install the slots provider-held calls wait in, so a run resumed for a late result
+        /// can take it (the same slots the tool plane's held replies wait in).
+        pub fn with_provider_held_lifecycle(
+            mut self,
+            slots: Arc<broca_module::held_slots::HeldSlots>,
+        ) -> Self {
+            self.provider_held_lifecycle = Some(slots);
             self
         }
 
@@ -3056,17 +3020,7 @@ mod executor {
             .await
         }
 
-        /// Read OpenCode credentials from this file instead of the HOME-derived one. Test-only:
-        /// production has no reason to read another file, and HOME cannot be changed per test
-        /// because every test in the process shares it.
-        #[cfg(test)]
-        pub fn with_opencode_auth_path(mut self, path: std::path::PathBuf) -> Self {
-            self.opencode_auth_path = Some(path);
-            self
-        }
-
-        /// Select the credential vault as the auth source (the cutover). Without this the
-        /// executor uses the OpenCode default — so the vault is opt-in by construction.
+        /// Install the credential vault required for real provider calls.
         pub fn with_vault(mut self, vault: VaultAuth) -> Self {
             self.vault = Some(Arc::new(vault));
             self
@@ -3087,12 +3041,6 @@ mod executor {
             overrides: broca_module_serve::provider_overrides::ProviderOverrides,
         ) -> Self {
             self.provider_overrides = overrides;
-            self
-        }
-
-        /// Install the auth-method defaults loaded during process boot.
-        pub fn with_methods(mut self, methods: broca_module_serve::MethodConfig) -> Self {
-            self.methods = methods;
             self
         }
 
@@ -3180,7 +3128,7 @@ mod executor {
 
         /// Decide this run's auth: the mock path needs none; the vault path resolves the
         /// provider's method → credential id → handle → a fresh token (mapping the outcome);
-        /// otherwise the OpenCode default. Returns the resolution auth mode plus an optional
+        /// otherwise refusing a missing vault. Returns the resolution auth mode plus an optional
         /// pause-for-reauth error (set only when the vault is authoritative that the
         /// credential is dead — the run admits then pauses, making no provider call).
         ///
@@ -3248,51 +3196,9 @@ mod executor {
                     in_run_refresh: None,
                 });
             }
-            let Some(vault) = self.vault.as_ref() else {
-                if let Some(account) = pinned_account {
-                    return Err(RunError::Config(format!(
-                        "auth account pin '{account}' requires the vault credential source; \
-                         BROCA_AUTH_SOURCE=opencode cannot select account-scoped credentials"
-                    )));
-                }
-                // OpenCode's file records only generic api/oauth entry types. Resolve the
-                // configured/frozen effective method before choosing a provider family; otherwise
-                // a special method would be stamped only after the plain catalog family was built.
-                let discovered_method = if fresh_episode {
-                    match self.opencode_auth_path.as_deref() {
-                        Some(path) => {
-                            broca_catalog::live::opencode_auth_method_at(path, provider_id)
-                        }
-                        None => broca_catalog::live::opencode_auth_method(provider_id),
-                    }
-                } else {
-                    None
-                };
-                let episode_auth = opencode_auth_for_episode(
-                    fresh_episode,
-                    frozen_credential_id,
-                    discovered_method,
-                    pinned_method,
-                    &self.methods,
-                    provider_id,
-                );
-                validate_opencode_method_metadata(provider_id, episode_auth.method)?;
-                return Ok(AuthResolution {
-                    // The provider resolver reads the secret later; an injected file travels in
-                    // the mode so that read uses the same file as the method lookup above.
-                    mode: match &self.opencode_auth_path {
-                        Some(path) => AuthMode::FromOpencodeFile(path.clone()),
-                        None => AuthMode::FromOpencode,
-                    },
-                    pause: None,
-                    selection: episode_auth.selection,
-                    method: episode_auth.method,
-                    project_id: None,
-                    account_id: None,
-                    record_version: None,
-                    in_run_refresh: None,
-                });
-            };
+            let vault = self.vault.as_ref().ok_or_else(|| {
+                RunError::Config("credential vault is required for real provider calls".into())
+            })?;
             // Which credential this run reads, under which broca key, and how it authenticates:
             //  * a credential routing chose: the vault id routing returned, verbatim, with the
             //    method from the vault metadata it was offered under. The id is never parsed;
@@ -3526,11 +3432,75 @@ mod executor {
     }
 
     #[async_trait]
-    impl RunExecutor for LiveLoopExecutor {
+    impl<W: ExecutorWalStore + 'static> RunExecutor for LiveLoopExecutor<W> {
+        async fn media_profile(
+            &self,
+            request: &broca_protocol::request::SubmissionRequest,
+        ) -> Result<Option<Box<broca_provider::media_profile::MediaProfile>>, RunError> {
+            let catalog =
+                broca_catalog::catalog().map_err(|error| RunError::Transient(error.to_string()))?;
+            let Some((provider, model)) = catalog
+                .model_for_serving(&request.model.provider_module_id, &request.model.model_id)
+            else {
+                return Ok(None);
+            };
+            let (pin, account) =
+                caller_auth_for_episode(request.auth.as_ref(), EpisodeAuthContext::FreshSession)?;
+            let method = if self.provider_base_url.is_some() {
+                None
+            } else {
+                self.vault
+                    .as_ref()
+                    .map(|vault| {
+                        broca_module_serve::auth_routing::resolve_credential_id(
+                            &request.model.provider_module_id,
+                            pin,
+                            account,
+                            &vault.methods,
+                            FALLBACK_METHOD,
+                        )
+                        .method
+                    })
+                    .or(pin)
+            };
+            let catalog_family = if catalog
+                .routing_facts(&request.model.provider_module_id, &request.model.model_id)
+                .is_some()
+            {
+                catalog
+                    .resolve_route(&request.model.provider_module_id, &request.model.model_id)
+                    .map_err(|error| RunError::Config(error.to_string()))?
+                    .0
+            } else {
+                provider.wire_family
+            };
+            let family = method.and_then(family_for_method).unwrap_or(catalog_family);
+            Ok(Some(Box::new(
+                broca_provider::media_profile::select_media_profile(
+                    family,
+                    provider.quirks.media.or_else(|| {
+                        broca_provider::media_profile::media_quirk_for_catalog_provider(
+                            &provider.id,
+                        )
+                    }),
+                    &model.id,
+                    model.input_modalities,
+                    model.limits.context,
+                ),
+            )))
+        }
         fn elicitation_plane(&self) -> Option<Arc<dyn broca_core::tool_plane::ElicitationPlane>> {
             self.elicitation_plane
                 .as_ref()
                 .map(|plane| plane.clone() as Arc<dyn broca_core::tool_plane::ElicitationPlane>)
+        }
+
+        fn provider_held_lifecycle(
+            &self,
+        ) -> Option<Arc<dyn broca_core::tool_plane::ProviderHeldLifecycle>> {
+            self.provider_held_lifecycle.as_ref().map(|slots| {
+                slots.clone() as Arc<dyn broca_core::tool_plane::ProviderHeldLifecycle>
+            })
         }
 
         fn hook_plane(&self) -> Option<Arc<dyn broca_core::HookPlane>> {
@@ -3564,6 +3534,7 @@ mod executor {
                 &self
                     .compaction_plane()
                     .ok_or("compaction provider unavailable")?,
+                self.compaction_views(),
             )
             .await
         }
@@ -3730,7 +3701,7 @@ mod executor {
             // RunConfig of the last episode) — never re-resolve the method from config/router
             // (a drift would change the wire family and bust the cache). A NEW episode
             // (append) resolves fresh — it's a new run with its own method. A fresh run / an
-            // opencode-prior run reads None and resolves from config.
+            // A prior run without a frozen credential id resolves from config.
             let frozen_credential_id: Option<String> = if fresh_episode {
                 None
             } else {
@@ -3751,7 +3722,7 @@ mod executor {
             };
 
             // Authentication comes from no credential for mock, a fresh vault token, or the
-            // opencode default. If the vault says the credential needs re-authentication, we
+            // credential source. If the vault says the credential needs re-authentication, we
             // still resolve the provider without auth to record the correct RunStarted, then
             // pause before any provider call. Auth attaches after rendering and is excluded
             // from the config hash, so omitting it does not change the frozen config.
@@ -3812,12 +3783,20 @@ mod executor {
             {
                 Ok(v) => v,
                 Err(e) => {
+                    self.provider_client
+                        .chatgpt_connections()
+                        .retire_session(&job.req.session);
                     if let Some(ack) = job.on_admitted {
                         let _ = ack.send(Err(e.clone()));
                     }
                     return Err(e);
                 }
             };
+            if resolution.pause.is_some() || resolution.method != Some(AuthMethod::Chatgpt) {
+                self.provider_client
+                    .chatgpt_connections()
+                    .retire_session(&job.req.session);
+            }
             // Public sends enter as FreshOrResume because the wire cannot know whether the
             // credential has been repaired. Once auth succeeds, mark the core attempt as
             // auth-resolved so an AuthRequired replay continues; core ignores that signal for
@@ -3933,10 +3912,6 @@ mod executor {
                 }
                 _ => None,
             };
-            let restored_persona = prior_run
-                .as_ref()
-                .filter(|_| !fresh_episode)
-                .and_then(|prior| frozen_claude_code_persona(&prior.config));
             let opencode_go_session_id =
                 if job.req.model.provider_module_id.as_str() == "opencode-go" {
                     Some(broca_module_serve::opencode_go_identity::for_session(
@@ -3945,37 +3920,28 @@ mod executor {
                 } else {
                     None
                 };
-            let opencode_go_reasoning_signature = prior_run
-                .as_ref()
-                .filter(|_| {
-                    !fresh_episode && job.req.model.provider_module_id.as_str() == "opencode-go"
-                })
-                .map(|prior| frozen_opencode_go_reasoning_signature(&prior.config));
-            let opencode_go_wire_family = prior_run
-                .as_ref()
-                .filter(|_| {
-                    !fresh_episode && job.req.model.provider_module_id.as_str() == "opencode-go"
-                })
-                .and_then(|prior| frozen_wire_family(&prior.config));
-            let codeassist_identity = match broca_module_serve::codeassist_identity::for_episode(
-                &job.req.session,
-                prior_run
-                    .as_ref()
-                    .filter(|_| !fresh_episode)
-                    .map(|prior| &prior.config.frozen_render_config),
-                prior_snapshot.head_seq,
-                epoch_millis().max(0) as u64,
-            ) {
-                Ok(identity) => identity,
-                Err(error) => {
-                    let error = format!("invalid recorded Code Assist identity: {error}");
-                    if let Some(ack) = job.on_admitted {
-                        let _ = ack.send(Err(RunError::Config(error.clone())));
+            let codeassist_identity = if fresh_episode {
+                match broca_module_serve::codeassist_identity::for_episode(
+                    &job.req.session,
+                    None,
+                    prior_snapshot.head_seq,
+                    epoch_millis().max(0) as u64,
+                ) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        let error = format!("Code Assist identity unavailable: {error}");
+                        if let Some(ack) = job.on_admitted {
+                            let _ = ack.send(Err(RunError::Config(error.clone())));
+                        }
+                        return Err(RunError::Config(error));
                     }
-                    return Err(RunError::Config(error));
                 }
+            } else {
+                None
             };
             let resolve_options = broca_catalog::live::ResolveOptions {
+                media: fresh_episode && job.has_media_input(),
+                media_profile: job.media_profile.as_deref().filter(|_| fresh_episode),
                 claude_code_persona: fresh_persona.as_ref(),
                 auth_method: resolution.method,
                 family_override,
@@ -3985,13 +3951,8 @@ mod executor {
                 account_id: resolution.account_id.as_deref(),
                 cache_policy: cache_policy.clone(),
                 prompt_cache_key: prompt_cache_key.as_deref(),
-                // Only a fresh episode resolves the caller's requested variant. A resume ignores
-                // the resuming send's variant and re-applies the one frozen in the episode's
-                // render config (`restored_variant` below), matching core, which keeps the
-                // recorded `RunConfig.variant` on resume.
+                // Only fresh admissions resolve caller render choices; resume uses the bundle.
                 variant: job.req.variant.as_deref().filter(|_| fresh_episode),
-                // The same rule for the service tier: only a fresh episode checks and freezes
-                // the caller's tier; a resume re-applies the recorded one (below).
                 service_tier: job.req.service_tier.filter(|_| fresh_episode),
                 clock: Some(&self.clock),
                 frozen_account_ref: if fresh_episode {
@@ -4009,25 +3970,21 @@ mod executor {
                     .in_run_refresh
                     .as_ref()
                     .map(|refresh| refresh.refresher.clone()),
-                // Structured output is per run: only a fresh episode decides it from its own
-                // send. A resume re-applies the decision frozen in the episode (below).
                 structured_output: job.req.structured_output.as_ref().filter(|_| fresh_episode),
             };
             let chatgpt_wire = broca_module_serve::chatgpt_identity::for_episode(
-                family_override,
-                prior_run
-                    .as_ref()
-                    .filter(|_| !fresh_episode)
-                    .map(|prior| &prior.config.frozen_render_config),
+                family_override.filter(|_| fresh_episode),
+                None,
                 || {
                     let seed = match &self.claude_code_install_id {
                         Some(seed) => seed.clone(),
                         None => {
                             broca_module_serve::claude_code_identity::load_or_create_install_id(
                                 self.wal_store
+                                    .file_store()
                                     .root()
                                     .parent()
-                                    .unwrap_or(self.wal_store.root()),
+                                    .unwrap_or(self.wal_store.file_store().root()),
                             )
                             .map_err(|error| {
                                 format!("ChatGPT installation identity unavailable: {error}")
@@ -4051,150 +4008,54 @@ mod executor {
                     return Err(RunError::Config(error));
                 }
             };
-            let restored_structured_output = prior_run
+            // Endpoint, renderer and backend ids are admission inputs. Re-reading today's
+            // catalog would move or refuse an already admitted run after an upstream change.
+            let recorded_render_config = prior_run
                 .as_ref()
                 .filter(|_| !fresh_episode)
-                .and_then(|prior| {
-                    broca_protocol::structured_output::FrozenStructuredOutput::from_frozen_render_config(
-                        Some(&prior.config.frozen_render_config),
-                    )
-                });
-            let restored_variant = prior_run
-                .as_ref()
-                .filter(|_| !fresh_episode)
-                .and_then(|prior| frozen_variant(&prior.config));
+                .map(|prior| decode_recorded_render_config(&prior.config));
             // For a ChatGPT auth-at-start pause, this provider exists solely to satisfy the
             // core's provider type until resume rebuilds real credentials and runs the pre-call
             // refreeze check. The core durably writes RunStarted and RunPaused without rendering or
-            // calling the pause-only provider; every non-pause attempt, including repaired resume,
-            // takes the strict auth path.
-            let resolved = match resolve_provider_for_episode(
-                &model_id,
-                self.provider_base_url.as_deref(),
-                // Renderers use u32 caps; saturation preserves the caller's u64 in the
-                // admitted identity while never raising the effective request bound.
-                job.req
-                    .generation
-                    .max_output_tokens
-                    .map(|limit| limit.min(u64::from(u32::MAX)) as u32),
-                &resolution,
-                &resolve_options,
-                self.provider_client.clone(),
-                broca_catalog::live::EpisodeRenderConfig {
-                    wire_family: opencode_go_wire_family,
-                    opencode_go_session_id: opencode_go_session_id.as_deref(),
-                    opencode_go_reasoning_signature,
-                    opencode_go_qwen_thinking: prior_run
-                        .as_ref()
-                        .filter(|_| {
-                            !fresh_episode
-                                && job.req.model.provider_module_id.as_str() == "opencode-go"
-                        })
-                        .map(|prior| frozen_opencode_go_qwen_thinking(&prior.config)),
-                    opencode_go_deepseek_thinking: prior_run
-                        .as_ref()
-                        .filter(|_| {
-                            !fresh_episode
-                                && job.req.model.provider_module_id.as_str() == "opencode-go"
-                        })
-                        .map(|prior| frozen_opencode_go_deepseek_thinking(&prior.config)),
-                    opencode_go_long_cache_retention_unsupported: prior_run
-                        .as_ref()
-                        .filter(|_| {
-                            !fresh_episode
-                                && job.req.model.provider_module_id.as_str() == "opencode-go"
-                        })
-                        .map(|prior| {
-                            frozen_opencode_go_long_cache_retention_unsupported(&prior.config)
-                        }),
-                    codeassist_identity: codeassist_identity.as_ref(),
-                    chatgpt_wire: chatgpt_wire.as_ref(),
-                    // Only the host and the output cap are restored. Re-resolve other catalog
-                    // fields so core's frozen_render_config_drift guard remains a real
-                    // comparison on resume. Changing the operator override must not move an
-                    // existing episode.
-                    base_url: if let Some(prior) = prior_run.as_ref().filter(|_| !fresh_episode) {
-                        prior
-                            .config
-                            .frozen_render_config
-                            .get("base_url")
-                            .and_then(|value| value.as_str())
-                    } else {
-                        self.provider_overrides
-                            .base_url(job.req.model.provider_module_id.as_str())
-                    },
-                    // A send with no cap takes its default from the catalog's limit.output,
-                    // which moves with ordinary upstream churn. The default is an episode input
-                    // frozen once: a resume reuses the recorded number instead of re-deriving it,
-                    // so a moved catalog value cannot refuse the resume. A caller's explicit cap
-                    // still wins over this inside the resolver.
-                    max_output_tokens: prior_run
-                        .as_ref()
-                        .filter(|_| !fresh_episode)
-                        .and_then(|prior| frozen_max_output_tokens(&prior.config)),
-                    // The frozen variant is restored as recorded, never re-derived from a
-                    // catalog that may have changed since the episode was admitted.
-                    variant: restored_variant.as_ref(),
-                    // The admitted tier, from the durable RunConfig, never the resuming send.
-                    service_tier: prior_run
-                        .as_ref()
-                        .filter(|_| !fresh_episode)
-                        .and_then(|prior| frozen_service_tier(&prior.config)),
-                    // The thinking-echo scope is restored as recorded, so an episode admitted
-                    // before the tool-loop scope became the default resumes with its old bytes.
-                    thinking_echo_scope: prior_run
-                        .as_ref()
-                        .filter(|_| !fresh_episode)
-                        .and_then(|prior| frozen_thinking_echo_scope(&prior.config)),
-                    // The cross-model thinking rule is restored as recorded, so an episode
-                    // admitted while signed thinking was echoed only to the model that produced
-                    // it resumes with its old bytes.
-                    thinking_cross_model: prior_run
-                        .as_ref()
-                        .filter(|_| !fresh_episode)
-                        .and_then(|prior| frozen_thinking_cross_model(&prior.config)),
-                    chatgpt_effort_updates: prior_run.as_ref().filter(|_| !fresh_episode).map(
-                        |prior| {
-                            prior.config.frozen_render_config["chatgpt_effort_updates"]
-                                .as_bool()
-                                .unwrap_or(false)
+            // calling the pause-only provider. Verifiable non-pause attempts use strict auth;
+            // an unreadable bundle uses an inert identity solely for core's refusal path.
+            let resolved = match if let Some(Err(error)) = &recorded_render_config {
+                tracing::warn!(%error, "recorded render config is unverifiable");
+                Ok(unverifiable_recorded_resolution(
+                    &model_id,
+                    resolution.method,
+                    family_override,
+                ))
+            } else {
+                resolve_provider_for_episode(
+                    &model_id,
+                    self.provider_base_url.as_deref(),
+                    // Renderers use u32 caps; saturation preserves the caller's u64 in the
+                    // admitted identity while never raising the effective request bound.
+                    job.req
+                        .generation
+                        .max_output_tokens
+                        .map(|limit| limit.min(u64::from(u32::MAX)) as u32),
+                    &resolution,
+                    &resolve_options,
+                    self.provider_client.clone(),
+                    broca_catalog::live::EpisodeRenderConfig {
+                        recorded_config: recorded_render_config
+                            .as_ref()
+                            .and_then(|config| config.as_ref().ok()),
+                        opencode_go_session_id: opencode_go_session_id.as_deref(),
+                        codeassist_identity: codeassist_identity.as_ref(),
+                        chatgpt_wire: chatgpt_wire.as_ref(),
+                        base_url: if fresh_episode {
+                            self.provider_overrides
+                                .base_url(job.req.model.provider_module_id.as_str())
+                        } else {
+                            None
                         },
-                    ),
-                    // Restored as recorded: an absent field (an episode admitted before DeepSeek
-                    // was opted into the reasoning echo) reads back as false and keeps its bytes.
-                    reasoning_content_required: prior_run
-                        .as_ref()
-                        .filter(|_| !fresh_episode)
-                        .map(|prior| frozen_reasoning_content_required(&prior.config)),
-                    reasoning_echo: prior_run
-                        .as_ref()
-                        .filter(|_| !fresh_episode)
-                        .map(|prior| frozen_reasoning_echo(&prior.config)),
-                    // Restored as recorded. `provider_text_state` makes the Responses and Gemini
-                    // families echo message phases and text signatures. An episode admitted
-                    // before the flag existed has no such field in its frozen config; it reads
-                    // back as false, so the episode resumes without the echo and sends the bytes
-                    // its own renderer version sent.
-                    provider_text_state: prior_run
-                        .as_ref()
-                        .filter(|_| !fresh_episode)
-                        .map(|prior| frozen_provider_text_state(&prior.config)),
-                    // Older episodes omitted strict; only a fresh episode takes the new default.
-                    responses_tools_non_strict: prior_run
-                        .as_ref()
-                        .filter(|_| !fresh_episode)
-                        .map(|prior| frozen_responses_tools_non_strict(&prior.config)),
-                    // Restored as recorded, never re-decided from a catalog that may have moved.
-                    structured_output: restored_structured_output.as_ref(),
-                    // Restored as recorded, including a recorded absence: an OAuth episode
-                    // admitted before the persona existed resumes with its old bytes.
-                    claude_code_persona: if fresh_episode {
-                        broca_catalog::live::EpisodePersona::Fresh
-                    } else {
-                        broca_catalog::live::EpisodePersona::Recorded(restored_persona.as_ref())
+                        ..Default::default()
                     },
-                },
-            ) {
+                )
+            } {
                 Ok(r) => r,
                 Err(e) => {
                     // Pre-loop resolution failure → fire the admission ack with the error and
@@ -4205,6 +4066,10 @@ mod executor {
                     return Err(e.into());
                 }
             };
+
+            if let Some(revision) = resolution.record_version {
+                resolved.provider.set_credential_revision(revision);
+            }
 
             // (provider, auth-method) CONSISTENCY GUARD: a method that IMPLIES a wire family
             // (the wire-changing methods) must match the family the provider actually
@@ -4230,6 +4095,19 @@ mod executor {
                         }
                         return Err(RunError::Config(msg));
                     }
+                }
+            }
+
+            if job.has_media_input() {
+                let checked = job.admit_media(
+                    resolved.provider.as_ref(),
+                    self.wal_store.uploads().as_ref(),
+                );
+                if let Err(error) = checked {
+                    if let Some(ack) = job.on_admitted {
+                        let _ = ack.send(Err(error.clone()));
+                    }
+                    return Err(error);
                 }
             }
 
@@ -4288,8 +4166,8 @@ mod executor {
             // loop's controls. The pause admits the run then writes RunPaused{AuthRequired}
             // (resumable). The selection is frozen into a fresh RunStarted's RunConfig so a
             // later resume re-gets the SAME credential (the loop ignores it on a resume —
-            // the value is already durable). Mock stays None; a fresh OpenCode run carries the
-            // method-qualified id discovered from its auth-file entry.
+            // the value is already durable). Mock stays None; a real run carries the
+            // method-qualified vault credential id.
             let mut control = job.control;
             control.hook_plane = self.hook_plane();
             // Module subscribers source ordinary AssistantMessage/ToolCall/ToolResult units from
@@ -4338,7 +4216,7 @@ mod executor {
             // USED (only when we proceeded with a vault token — `pause` is None means we got a
             // token and called the provider). A pre-loop `needs_reauth` pause is excluded (the
             // vault already knows; no provider call was made, so there's no wire rejection to
-            // report). `None` on the mock/OpenCode paths (neither has a vault record version) or
+            // report). `None` on the mock path (which has no vault record version) or
             // a pre-loop pause.
             let used_credential = used_credential_for_report(
                 &resolution.pause,
@@ -4411,6 +4289,9 @@ mod executor {
                     post_run_wire_auth_status(&summary, self.wal_store.clone(), session.clone())
                         .await
                 {
+                    self.provider_client
+                        .chatgpt_connections()
+                        .retire_session(&session);
                     report_rejection_after_run(
                         vault,
                         &used_selection,
@@ -4432,6 +4313,7 @@ mod executor {
         }
 
         async fn on_session_close(&self, session: &BindIdentity) {
+            self.retire_session_transport(session);
             // Retire this session's tool and role routes on their shared consumer connections.
             self.plane.close_session_routes(session).await;
             if let Some(hooks) = &self.hooks {
@@ -4441,22 +4323,33 @@ mod executor {
                 plane.close_session_routes(session).await;
             }
         }
+
+        fn retire_session_transport(&self, session: &BindIdentity) {
+            self.provider_client
+                .chatgpt_connections()
+                .retire_session(session);
+        }
+
+        fn retire_all_transports(&self) {
+            self.provider_client.chatgpt_connections().clear();
+        }
+
+        fn retire_idle_session_transport(&self, session: &BindIdentity) {
+            self.provider_client
+                .chatgpt_connections()
+                .retire_idle_session(session);
+        }
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
         include!("provider_override_tests.rs");
+        include!("recorded_resume_tests.rs");
         include!("vault_request_tests.rs");
         include!("role_plane_tests.rs");
-
-        fn evict_for_provider_rejection(cache: &VaultLkgCache, credential_id: &str, status: u16) {
-            let Some(record_version) = cache.get(credential_id).map(|token| token.record_version)
-            else {
-                return;
-            };
-            super::evict_for_provider_rejection(cache, credential_id, status, record_version);
-        }
+        include!("admission_wal_read_budget_tests.rs");
+        include!("credential_source_guard_tests.rs");
 
         /// A new episode whose request has `inherit_frozen_cache` set (a steer or interrupt
         /// that omitted `cache`) takes the cache policy and caller cache key frozen in the
@@ -4774,24 +4667,6 @@ mod executor {
         }
 
         #[test]
-        fn auth_source_parses_default_and_explicit() {
-            // Default (unset/empty) is now the vault.
-            assert_eq!(AuthSource::from_env(None).unwrap(), AuthSource::Vault);
-            assert_eq!(AuthSource::from_env(Some("")).unwrap(), AuthSource::Vault);
-            assert_eq!(
-                AuthSource::from_env(Some(" vault ")).unwrap(),
-                AuthSource::Vault
-            );
-            // opencode is the explicit opt-back-in to the pre-vault auth file.
-            assert_eq!(
-                AuthSource::from_env(Some("opencode")).unwrap(),
-                AuthSource::Opencode
-            );
-            // A non-empty unrecognized value is a loud misconfiguration, not a silent default.
-            assert!(AuthSource::from_env(Some("voult")).is_err());
-        }
-
-        #[test]
         fn family_for_method_drives_wire_changing_families() {
             // Header-only methods keep the catalog family (None); wire-changing methods name
             // their family — the single authority that drives resolve_provider AND the guard.
@@ -4808,10 +4683,8 @@ mod executor {
         }
 
         fn load_method_config(label: &str, defaults: &str) -> broca_module_serve::MethodConfig {
-            let path = broca_test_support::scratch_root().join(format!(
-                "broca-opencode-methods-{label}-{}.json",
-                std::process::id()
-            ));
+            let path = broca_test_support::scratch_root()
+                .join(format!("broca-methods-{label}-{}.json", std::process::id()));
             std::fs::write(&path, format!(r#"{{"defaults":{defaults}}}"#)).unwrap();
             let methods = broca_module_serve::MethodConfig::load(&path).unwrap();
             std::fs::remove_file(path).unwrap();
@@ -4942,6 +4815,8 @@ mod executor {
                         .into(),
                 ),
                 &broca_catalog::live::ResolveOptions {
+                    media: false,
+                    media_profile: None,
                     claude_code_persona: None,
                     auth_method: method,
                     family_override,
@@ -4965,139 +4840,11 @@ mod executor {
         }
 
         #[test]
-        fn opencode_freeze_uses_discovered_method_and_preserves_resume_selection() {
-            let methods = load_method_config(
-                "stamp",
-                r#"{"deepseek":"apikey","anthropic":"oauth","google":"antigravity"}"#,
-            );
-
-            let fresh = opencode_auth_for_episode(
-                true,
-                None,
-                Some(AuthMethod::ApiKey),
-                None,
-                &methods,
-                "deepseek",
-            );
-            assert_eq!(fresh.method, Some(AuthMethod::ApiKey));
-            assert_eq!(
-                fresh.selection.as_ref().unwrap().resolved_credential_id,
-                None
-            );
-            // OpenCode auth makes no vault request, so none is recorded.
-            assert_eq!(fresh.selection.as_ref().unwrap().vault_request, None);
-            assert_eq!(
-                fresh.selection.map(|selection| selection.credential_id),
-                Some("apikey:deepseek".to_string())
-            );
-
-            // A configured special-backend method wins over the generic OAuth entry type, and
-            // both the family driver and durable stamp consume that same method.
-            let antigravity = opencode_auth_for_episode(
-                true,
-                None,
-                Some(AuthMethod::Oauth),
-                None,
-                &methods,
-                "google",
-            );
-            assert_eq!(antigravity.method, Some(AuthMethod::Antigravity));
-            assert_eq!(
-                antigravity
-                    .selection
-                    .as_ref()
-                    .map(|selection| selection.credential_id.as_str()),
-                Some("antigravity:google")
-            );
-            assert_eq!(
-                antigravity.method.and_then(family_for_method),
-                Some(WireFamilyId::GoogleCodeAssist)
-            );
-
-            let empty_methods = broca_module_serve::MethodConfig::empty();
-            let unknown =
-                opencode_auth_for_episode(true, None, None, None, &empty_methods, "unknown");
-            assert!(unknown.selection.is_none());
-            assert_eq!(unknown.method, None);
-
-            let generic_oauth = opencode_auth_for_episode(
-                true,
-                None,
-                Some(AuthMethod::Oauth),
-                None,
-                &empty_methods,
-                "provider-with-oauth",
-            );
-            assert_eq!(generic_oauth.method, Some(AuthMethod::Oauth));
-            assert_eq!(
-                generic_oauth
-                    .selection
-                    .map(|selection| selection.credential_id),
-                Some("oauth:provider-with-oauth".to_string())
-            );
-
-            // A legacy OpenCode WAL with no selection remains unselected on resume.
-            let legacy = opencode_auth_for_episode(
-                false,
-                None,
-                Some(AuthMethod::Oauth),
-                None,
-                &methods,
-                "deepseek",
-            );
-            assert!(legacy.selection.is_none());
-            assert_eq!(legacy.method, None);
-
-            // A newer resume carries the exact frozen id and ignores both current config and the
-            // auth-file entry type.
-            let resumed = opencode_auth_for_episode(
-                false,
-                Some("oauth:deepseek:work"),
-                Some(AuthMethod::ApiKey),
-                None,
-                &methods,
-                "deepseek",
-            );
-            assert_eq!(resumed.method, Some(AuthMethod::Oauth));
-            assert_eq!(
-                resumed.selection.as_ref().unwrap().resolved_credential_id,
-                None
-            );
-            assert_eq!(resumed.selection.as_ref().unwrap().vault_request, None);
-            assert_eq!(
-                resumed.selection.map(|selection| selection.credential_id),
-                Some("oauth:deepseek:work".to_string())
-            );
-        }
-
-        #[test]
-        fn configured_opencode_chatgpt_selects_the_codex_family() {
-            let methods = load_method_config("chatgpt", r#"{"openai":"chatgpt"}"#);
-            let auth = opencode_auth_for_episode(
-                true,
-                None,
-                Some(AuthMethod::Oauth),
-                None,
-                &methods,
-                "openai",
-            );
-            validate_opencode_method_metadata("openai", auth.method).unwrap();
-            assert_eq!(
-                auth.selection
-                    .as_ref()
-                    .map(|selection| selection.credential_id.as_str()),
-                Some("chatgpt:openai")
-            );
-
-            let family = auth.method.and_then(family_for_method);
-            let resolved = resolve_for_test("openai/gpt-5.3-codex", auth.method, family);
-            assert_eq!(resolved.family_id, WireFamilyId::OpenAiResponsesChatgpt);
-        }
-
-        #[test]
         fn chatgpt_pause_only_construction_is_gated_and_repaired_resume_is_strict() {
             install_test_catalog();
             let options = broca_catalog::live::ResolveOptions {
+                media: false,
+                media_profile: None,
                 claude_code_persona: None,
                 auth_method: Some(AuthMethod::Chatgpt),
                 family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
@@ -5211,47 +4958,7 @@ mod executor {
         }
 
         #[test]
-        fn opencode_antigravity_fails_loud_without_project_metadata_and_resume_keeps_method() {
-            let configured = load_method_config("antigravity", r#"{"google":"antigravity"}"#);
-            let fresh = opencode_auth_for_episode(
-                true,
-                None,
-                Some(AuthMethod::Oauth),
-                None,
-                &configured,
-                "google",
-            );
-            assert_eq!(fresh.method, Some(AuthMethod::Antigravity));
-            assert!(matches!(
-                validate_opencode_method_metadata("google", fresh.method),
-                Err(RunError::Config(message))
-                    if message.contains("requires a project_id")
-                        && message.contains("BROCA_AUTH_SOURCE=opencode")
-            ));
-
-            // Current config and auth-file discovery must not replace the frozen method.
-            let removed_config = broca_module_serve::MethodConfig::empty();
-            let resumed = opencode_auth_for_episode(
-                false,
-                Some("antigravity:google"),
-                Some(AuthMethod::Oauth),
-                None,
-                &removed_config,
-                "google",
-            );
-            assert_eq!(resumed.method, Some(AuthMethod::Antigravity));
-            assert_eq!(
-                resumed.method.and_then(family_for_method),
-                Some(WireFamilyId::GoogleCodeAssist)
-            );
-            assert!(matches!(
-                validate_opencode_method_metadata("google", resumed.method),
-                Err(RunError::Config(message)) if message.contains("requires a project_id")
-            ));
-        }
-
-        #[test]
-        fn generic_opencode_methods_keep_catalog_family_render_bytes() {
+        fn generic_methods_keep_catalog_family_render_bytes() {
             let opts = broca_protocol::request::CallOptions::new(Vec::new());
             let baseline = resolve_for_test("google/gemini-2.5-flash", None, None);
             let baseline_bytes = baseline.provider.render_request(&opts);
@@ -5308,7 +5015,7 @@ mod executor {
                 used_credential_for_report(&pause, selection(), Some(7)),
                 None
             );
-            // An OpenCode selection is metadata only; with no vault-served version it cannot
+            // A selection without a vault-served version is metadata only; it cannot
             // produce a report call to the credentials module.
             assert_eq!(used_credential_for_report(&None, selection(), None), None);
             assert_eq!(used_credential_for_report(&None, None, Some(7)), None);
@@ -5734,32 +5441,19 @@ mod executor {
         }
 
         #[test]
-        fn authoritative_auth_failures_evict_lkg_entries() {
-            let cache = VaultLkgCache::default();
-            cache.insert("apikey:openai".into(), cached_token(None));
-            evict_if_vault_authoritative(
-                &cache,
-                "apikey:openai",
-                LkgErrorClass::CredentialUnusable,
-            );
-            assert!(cache.get("apikey:openai").is_none());
-
-            cache.insert("apikey:openai".into(), cached_token(None));
-            evict_for_provider_rejection(&cache, "apikey:openai", 401);
-            assert!(cache.get("apikey:openai").is_none());
-
-            cache.insert("apikey:openai".into(), cached_token(None));
-            evict_for_provider_rejection(&cache, "apikey:openai", 500);
-            assert!(cache.get("apikey:openai").is_some());
-        }
-
-        #[test]
         fn provider_rejection_evicts_only_the_failed_record_version() {
             let credential_id = "apikey:openai";
             let cache = VaultLkgCache::default();
             let mut current = cached_token(None);
             current.record_version = 8;
             cache.insert(credential_id.into(), current);
+
+            super::evict_for_provider_rejection(&cache, credential_id, 500, 8);
+            assert_eq!(
+                cache.get(credential_id).map(|token| token.record_version),
+                Some(8),
+                "a provider outage is not a verdict on the credential"
+            );
 
             super::evict_for_provider_rejection(&cache, credential_id, 401, 7);
             assert_eq!(
@@ -5832,6 +5526,7 @@ mod executor {
             framed(
                 seq,
                 broca_wal::WalRecord::RunStarted {
+                    written_at_ms: None,
                     tags: None,
                     session_class: None,
                     retention: None,
@@ -5972,8 +5667,8 @@ mod executor {
         }
 
         #[test]
-        fn opencode_wal_selection_resolves_the_metered_api_charge_basis() {
-            let mut started = run_started(1, "opencode-run");
+        fn wal_selection_resolves_the_metered_api_charge_basis() {
+            let mut started = run_started(1, "unversioned-run");
             if let broca_wal::WalRecord::RunStarted { config, .. } = &mut started.record {
                 config.model = broca_protocol::request::ModelHandle::new("deepseek", "chat");
                 config.auth_selection = Some(broca_core::AuthSelection {
@@ -6250,6 +5945,8 @@ fn create_state_directories(state_root: &std::path::Path) -> Result<(), ServeIoE
         }
     }
 
+    broca_core::media_store::create_media_directories(state_root)
+        .map_err(|error| ServeIoError(error.to_string()))?;
     Ok(())
 }
 
@@ -6509,8 +6206,8 @@ mod state_directory_tests {
                 std::fs::read_dir(&path)
                     .expect("read newly created portable directory")
                     .count(),
-                0,
-                "boot must create {entry_id} before any session writes a WAL"
+                if relative_path == "media-durable" { 2 } else { 0 },
+                "boot must create {entry_id} and only its structural subdirectories before any session writes a WAL"
             );
         }
         assert!(
@@ -6518,6 +6215,42 @@ mod state_directory_tests {
             "placed descriptor has no portable entries"
         );
         let _ = std::fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn media_trees_exist_before_catalog_and_match_backup_classes() {
+        let state_root = fresh_root("media-catalog");
+        create_state_directories(&state_root).unwrap();
+        assert!(!state_root.join("engram-catalog.json").exists());
+        for name in ["media-durable", "media", "media-ephemeral", "media-uploads"] {
+            for child in ["objects", "refs"] {
+                let path = state_root.join(name).join(child);
+                assert!(path.is_dir(), "startup must create {}", path.display());
+                broca_owner_only::validate(&path).unwrap();
+            }
+        }
+        write_engram_catalog(&state_root).unwrap();
+        let catalog: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(state_root.join("engram-catalog.json")).unwrap())
+                .unwrap();
+        let entries = catalog["entries"].as_array().unwrap();
+        for (path, class) in [
+            ("media-durable", "portable"),
+            ("media", "excluded"),
+            ("media-ephemeral", "excluded"),
+            ("media-uploads", "excluded"),
+        ] {
+            let matching: Vec<_> = entries
+                .iter()
+                .filter(|entry| entry["path"] == path)
+                .collect();
+            assert_eq!(matching.len(), 1, "one catalog entry for {path}");
+            assert_eq!(matching[0]["class"], class, "backup class for {path}");
+            if class == "excluded" {
+                assert!(!matching[0]["reason"].as_str().unwrap().is_empty());
+            }
+        }
+        let _ = std::fs::remove_dir_all(state_root);
     }
 
     #[cfg(unix)]

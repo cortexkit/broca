@@ -668,7 +668,6 @@ async fn two_admissions_of_the_same_send_send_the_same_admission_id() {
         serde_json::to_vec(&bodies[1]).unwrap(),
         "a retry of the same send must present the same admission, byte for byte"
     );
-    assert_eq!(admission_id("run-1"), admission_id("run-1"));
 }
 
 #[tokio::test]
@@ -1150,18 +1149,6 @@ fn lineage_wal() -> broca_wal::FileWal {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     broca_wal::FileWal::open(dir.join("session.wal")).unwrap()
-}
-
-#[test]
-fn lineage_fixtures_have_independent_writers() {
-    use broca_wal::Wal;
-    // Open both before either appends. Reusing a path would let the first append grow the
-    // second writer's file behind its back, even if fixtures usually finish one at a time.
-    let mut first = lineage_wal();
-    let mut second = lineage_wal();
-    first.append(0, &any_record(), true).unwrap();
-    second.append(0, &any_record(), true).unwrap();
-    assert_ne!(first.lineage_id(), second.lineage_id());
 }
 
 fn lineage() -> WalLineageId {

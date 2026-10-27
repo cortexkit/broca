@@ -80,8 +80,11 @@ reporting; a 403 must not invalidate a valid credential.
 - Normalization is the PRODUCER's job: whatever shape the provider sends
   (`Retry-After` seconds or HTTP-date, `retry-after-ms`, rate-limit-reset headers,
   reset hints in body text), the producer folds it into `retry_after_secs` so no
-  consumer ever parses headers or text. Consumers treat the value as a backoff
-  floor and may cap it — capping policy stays consumer-local.
+  consumer ever parses headers or text. Which shapes count is per provider family:
+  the OpenAI Responses and ChatGPT families read only what Codex reads (whole
+  seconds or an HTTP date in `Retry-After`, plus Codex's `try again in` text), not
+  `retry-after-ms`. Consumers treat the value as a backoff floor and may cap it —
+  capping policy stays consumer-local.
 - Producer detail (broca `provider_code`/`status`, vault `ReadError` name)
   travels alongside for diagnostics, logging, and corroboration ONLY. A consumer
   branching generically on detail is the bug this contract kills.

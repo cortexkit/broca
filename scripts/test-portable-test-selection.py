@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
 import unittest
@@ -148,6 +149,38 @@ async fn daemon_test_calls_external_helper() {
             selection.check_selection(self.root, targets=[self.target], inventory=inventory),
             [],
         )
+
+    def _feature_gated_rig_test(self, feature: str) -> list[str]:
+        main = self.source.parent / "main.rs"
+        main.write_text(
+            f"""#[cfg(feature = "{feature}")]
+#[tokio::test]
+async fn gated_daemon_test() {{
+    broca_test_support::subc_bin("ck-subc", "SUBC_CORE_BIN");
+}}
+"""
+        )
+        inventory = {"rust-suites": {"sample::it": {"status": "listed", "testcases": {}}}}
+        return selection.check_selection(
+            self.root,
+            targets=[selection.Target("sample", "it", main)],
+            inventory=inventory,
+        )
+
+    def test_a_test_behind_a_feature_the_preflight_lacks_is_not_compiled_there(self) -> None:
+        self.assertEqual(self._feature_gated_rig_test("test-attachments"), [])
+
+    def test_a_test_behind_a_preflight_feature_is_still_classified(self) -> None:
+        problems = self._feature_gated_rig_test("test-clock")
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("cannot classify rig-dependent test", problems[0])
+
+    def test_preflight_feature_list_matches_linux_preflight(self) -> None:
+        script = (ROOT / "scripts/linux-preflight.sh").read_text()
+        block = script.split("features=(", 1)[1].split(")", 1)[0]
+        flags = tuple(re.findall(r"-F\s+(\S+)", block))
+        self.assertTrue(flags, "no -F flags found in linux-preflight.sh's features array")
+        self.assertEqual(flags, selection.PREFLIGHT_FEATURE_FLAGS)
 
     def test_repository_rig_tests_are_excluded_by_nextest_filter(self) -> None:
         targets = selection._target_metadata(ROOT)

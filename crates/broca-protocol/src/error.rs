@@ -6,6 +6,11 @@
 
 use serde::{Deserialize, Serialize};
 
+pub const MEDIA_UNSUPPORTED: &str = "media_unsupported";
+pub const MEDIA_OBJECT_MISSING: &str = "media_object_missing";
+pub const MEDIA_OBJECT_CORRUPT: &str = "media_object_corrupt";
+pub const REQUEST_TOO_LARGE: &str = "request_too_large";
+
 /// Consumer-decision error classes, per the cross-producer error-class contract
 /// (docs/error-class-contract.md): the class is PRODUCED where the domain knowledge
 /// lives; consumers branch on the class tag and structured sibling fields only, never

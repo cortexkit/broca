@@ -28,6 +28,7 @@ async fn capability_for(
         .unwrap()
         .unwrap();
     let ctx = BatchCtx {
+        media_capture: None,
         batch_id: BatchId("scope-test".into()),
         bind: BindIdentity::new("/project", "test", "scope"),
         run_id: RunId("r".into()),
@@ -347,6 +348,7 @@ async fn held_retry_reads_new_denial_after_duplicate_proof_failure() {
             approval: None,
             elicitation_id: Some(id),
         }],
+        ..Default::default()
     };
     let result = rig
         .batch(&crate::AllowAll, vec![call("c")], Some(resume), true)

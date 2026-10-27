@@ -33,7 +33,7 @@ paths rather than begin an empty history (`crates/broca-module-serve/src/state_r
   wal-archive-durable/      sealed containers of durable WALs only
   run-index.db              SQLite: run index, materialized transcript,   (section 4)
                             admission checkpoints, usage export facts
-  caps.db                   SQLite: budget caps                           (section 4.6)
+  caps.db                   left over from removed spend caps; not opened (section 4.6)
   wal-manifest              diagnostic address -> identity sidecar         (section 2.7)
   leases/                   per-session lease files
   catalog/fusiform-lkg.json last-known-good model catalog
@@ -368,7 +368,7 @@ call of that batch that never left the process), commits the batch, then seals t
 |---|---|
 | `queued` | `submission_id`, `request` (the caller's full `SubmissionRequest`), `request_identity_digest` (absent), `principal` (absent), `send_id` (absent), `title` (absent; the send's title, carried onto the `run_started` that drains it, informational like `run_started.title`), `delivery` (absent; `"interrupt"` for the message an interrupting send queued before cancelling the run it interrupted). A prompt queued while a run was active. |
 | `retracted` | `submission_id`, `failure` (absent, `{run_id, error: ProviderError}` when the queued head could never be admitted). |
-| `steered` | `send_id` (absent), `request_identity_digest` (absent), `delivery` (absent; `"steer"`), `title` (absent; the steering send's title, informational like `run_started.title`), `input` (the user message(s)), `hooks` (absent; reserved, never written yet). **Must-understand, feature `steer-queue/v1`**: always a `ver = 3` frame. A message a caller added to the running turn. |
+| `steered` | `send_id` (absent), `request_identity_digest` (absent), `delivery` (absent; `"steer"`), `title` (absent; the steering send's title, informational like `run_started.title`), `input` (the user message(s), after any pre-user transformations), `hooks` (absent; optional pre-user hook metadata, written alongside the prepared `input`). **Must-understand, feature `steer-queue/v1`**: always a `ver = 3` frame. A message a caller added to the running turn. |
 | `delivery_ordered` | `submission_id`, `order` (`{modes, dedupe_key?, expires_at_ms?}`). **Must-understand, feature `delivery-order/v1`**. The ordered `delivery` list of the `queued` record for the same submission that follows it in the same barrier (a running turn's own records may lie between them). Written only for a send using the `delivery_order` group. |
 | `send_ended` | `submission_id`, `reason` (`{kind: "superseded", by}` or `{kind: "expired"}`). **Must-understand, feature `delivery-order/v1`**. A queued ordered send that will never be delivered; removes it from the pending queue like `retracted`. |
 | `send_delivered` | `submission_id`, `run_id`, `mode` (`"steer"` or `"tool_result"`), `input` (with `steer`: placed like a `steered` record's input), `tool_call_id` and `appended_text` (with `tool_result`: rendered after that result's stored output, which is never changed; written between the batch's `tool_batch_finished` and `turn_finished`). **Must-understand, feature `delivery-order/v1`**. Consumes the queued send; an `idle_start` delivery is the `run_started` naming its `submission_id`. |
@@ -385,7 +385,8 @@ A `steered` message is placed in the conversation at the first step boundary aft
 the episode's next `step_started` (that step renders it, as a user message appended after
 everything before it), or the episode's `run_finished` when no further step comes. It is never
 placed between a tool call and its result. `session.read` shows it at that position, and not
-before it is placed. Replay renders `input` exactly as written.
+before it is placed. A missing `hooks` field decodes as absent. Replay renders `input`
+exactly as written and never re-runs hooks.
 
 #### Informational
 
@@ -601,9 +602,9 @@ nothing, check the live path once more before concluding the session is absent.
 
 ## 4. SQLite stores
 
-broca writes two SQLite databases: `run-index.db` and `caps.db`. Both use
-`journal_mode=WAL`, so recent commits sit in the `-wal` sidecar until SQLite checkpoints
-them (see section 8).
+broca writes the SQLite database `run-index.db` described in this section. It uses
+`journal_mode=WAL`, so recent commits sit in the `-wal` sidecar until SQLite checkpoints them
+(see section 8). An older `caps.db` may sit beside it; broca no longer opens it (section 4.6).
 
 `run-index.db` is written by one connection per daemon. Its schema is created and migrated
 when the daemon opens it: `CREATE TABLE IF NOT EXISTS`, then `ALTER TABLE ADD COLUMN` for
@@ -742,13 +743,31 @@ separate-reasoning normalizer), `usage` (`Usage`, section 2.5), `usage_by_servic
 `pricing_at_ms`, `pricing_at_precision`, `occurred_at_ms`, `occurred_at_precision`,
 `terminal_reason` (final slice only). New fields are only ever added.
 
+Session facts have no `kind` member and retain the shape above. Sessionless classifier
+facts dispatch on `kind: "system_one"` before decoding. They contain `fact_id`,
+`batch_id`, `item_index`, `provider`, `model`, optional `auth_selection` (the resolved
+credential pin) and `account_ref`, exactly one of `run_id` or `flow_id`, `charge_basis`,
+`charge_basis_mapping_version`, `charge_basis_overrides`, `usage` (only reported
+`input_tokens` and `output_tokens`, each absent when unreported), and `occurred_at_ms`.
+There is no session, agent id, estimated usage, or price. Astrocyte prices these
+measurements against its catalog. A flow fact leaves the SQL `run_id` index column
+empty; the JSON carries its `flow_id` rather than an invented run identity.
+
+System One fact ids use domain-separated, length-prefixed SHA-256 over
+`system_one/v1`, source instance id, role, batch id, first-admission timestamp and
+item index. Thus a resend keeps its id, but new work admitted after seven-day batch
+expiry gets another id. `system-one.db` commits the exact fact bytes to a durable
+outbox in the same transaction as the paid outcome and frozen-rate ceiling spend.
+Publishing inserts once into `export_facts`, then acknowledges the outbox. A crash
+on either side of that acknowledgement only replays the same immutable bytes.
+
 A run gets a new slice at every `run_config_refrozen` and `run_auth_refrozen`. A slice's
 `usage` is the sum of its `model_step_finished` usages.
 
 **Writers.** After a run's terminal is durable and its `run_index` row is written, the
 actor spawns a detached task that reads the session's WAL and inserts that run's facts with
-`INSERT OR IGNORE` in one transaction. Only when a budget cap matches the session does the actor
-instead wait for the export, before it admits the session's next run. At every daemon start, a catch-up pass exports any terminal
+`INSERT OR IGNORE` in one transaction. The session's next run never waits for that export.
+At every daemon start, a catch-up pass exports any terminal
 `run_index` run that has no facts. An existing `fact_id` is **never overwritten**: a
 re-derivation that differs is logged and the stored row stays.
 
@@ -780,34 +799,15 @@ Consumers read `export_facts` in `run-index.db` with SQLite `mode=ro`; the
 `source_instance_id` means a different export database, and cursors from the old one must
 be reset. `sqlite_sequence` also exists; SQLite maintains it because of AUTOINCREMENT.
 
-### 4.6 `caps.db`: `cap_rows`
+### 4.6 `caps.db` (no longer opened)
 
-Daemon-scoped budget caps and the spend applied against them. This is its own durability
-domain, **not** a projection of any WAL: it is the source of truth for caps.
-
-| Column | Type |
-|---|---|
-| `cap_id` | TEXT PRIMARY KEY |
-| `cap_version` | INTEGER NOT NULL |
-| `scope_key` | TEXT NOT NULL |
-| `project_root` | TEXT |
-| `constraint_dim` | TEXT NOT NULL |
-| `period` | TEXT NOT NULL |
-| `period_bucket` | TEXT (added by migration) |
-| `period_tz` | TEXT NOT NULL |
-| `hard_cap_nanos` | INTEGER NOT NULL |
-| `max_staleness_ms` | INTEGER NOT NULL |
-| `replaces_cap_id` | TEXT |
-| `spend_nanos` | INTEGER NOT NULL |
-| `unresolved_count` | INTEGER NOT NULL |
-| `watermark_json` | TEXT NOT NULL |
-| `as_of_ms` | INTEGER NOT NULL |
-| `active` | INTEGER NOT NULL |
-| `replaced_by` | TEXT |
-
-Written only by the `cap.install` and `spend.delta` operations, each in one transaction
-with `synchronous=FULL`. `as_of_ms` comes from the caller's request, not from broca's clock.
-This table is internal.
+Older builds kept daemon-scoped spend caps in `caps.db`, table `cap_rows`, written only by
+the `cap.install` and `spend.delta` operations. Those operations and the admission check
+that read the table were removed, and nothing in the fleet called them. broca no longer
+opens, reads or writes `caps.db`. An existing file and its `-wal`/`-shm` sidecars are left on
+disk as they were; broca does not delete them, and a later build will not read them. No WAL
+record or frozen run config ever carried a cap field, so removing caps changes nothing about
+how old session logs decode or resume.
 
 ---
 
@@ -866,8 +866,7 @@ before v0.3.24). It never means zero.
 - Neither is the time the row was inserted. The catch-up pass can insert an old run's facts
   late, so `export_seq` order is not time order.
 
-**`cap_rows.as_of_ms`** comes from the caller (section 4.6). `meta`, `message` and
-`export_meta` hold no timestamps.
+`meta`, `message` and `export_meta` hold no timestamps.
 
 ### 5.3 The best "last activity" signal for an active run
 
@@ -940,7 +939,7 @@ it may change without notice.
 | `export_meta` | Metering source identity | Direct readers use `source_instance_id`, `source_epoch`, and `high_water` to detect database replacement and track incremental reads. |
 | `run_index` | Internal | An operational projection, not a declared contract. Its changes have so far been additive columns, but nothing promises that. The `session` column's JSON encoding, the state strings and `state_changed_ms` are the parts least likely to move. |
 | `meta`, `message`, `admission_checkpoint_json` | Internal | Rebuildable caches. The checkpoint has its own version envelope, which broca may bump. |
-| `caps.db` | Internal | Budget-cap implementation detail. |
+| `caps.db` | Internal | Left over from removed spend caps; broca no longer opens it. |
 | `wal-manifest`, `leases/`, `catalog/`, `logs/`, `request-dumps/` | Internal | Diagnostics and process state. |
 
 ---

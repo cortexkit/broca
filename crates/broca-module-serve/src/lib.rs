@@ -28,10 +28,13 @@ pub mod claude_code_identity;
 pub mod client;
 pub mod codeassist_identity;
 pub mod compaction_bus;
+pub mod config;
 pub mod config_home;
 pub mod consumer_routes;
 pub mod context_management;
+pub mod held_runtime;
 pub mod keep_warm_quota;
+pub mod llm_tools;
 pub mod manifest;
 pub mod opencode_go_identity;
 pub mod provider_overrides;
@@ -39,9 +42,11 @@ pub mod run_routing;
 pub mod send_audit;
 pub mod serve;
 pub mod session_class;
+pub mod session_lookup;
 pub mod stall;
 pub mod state_root;
 pub mod system_one;
+pub mod trajectory;
 pub mod transport_config;
 pub mod vault_audit;
 pub mod vault_config;
@@ -65,3 +70,5 @@ pub use serve::{
 pub use vault_config::{
     scoped_not_found_message, VaultAddressing, VaultCredentialIds, VaultHandles, VaultHandlesError,
 };
+
+pub mod devtools;

@@ -1,35 +1,31 @@
-//! The real subc tool plane. A [`SubcToolPlane`] (2nd [`broca_core::ToolPlane`]
-//! impl) dispatches the loop's tool calls runner→subc→AFT over an authenticated,
-//! multiplexed consumer connection ([`SubcConnection`]). Zero loop changes — the
-//! loop only ever sees the trait.
+//! subc adapters for the run loop's tool, compaction, and hook planes.
 //!
-//! ## Two subc-protocol/transport instances — INTENTIONAL, not a bug
+//! [`SubcToolPlane`] implements [`broca_core::tool_plane::ToolPlane`], dispatching tool calls
+//! through subc to tool providers over an authenticated, multiplexed consumer
+//! connection ([`SubcConnection`]). [`SubcCompactionPlane`] and [`SubcHookPlane`]
+//! adapt compaction and step-transform providers to the corresponding core traits.
+//! [`SubcPlanFetcher`] and [`SubcPlanAdmitter`] fetch and admit session plans.
+//! The core consumes these broca-facing traits rather than daemon socket types;
+//! this crate maps identities and provider messages at the adapter edge.
 //!
-//! The runner binary carries TWO instances each of `subc-protocol` and
-//! `subc-transport`:
-//!  - **crates.io** (subc-protocol 0.9 / subc-transport 0.4): used by
-//!    `broca-protocol`/`broca-provider` for the direct runner↔provider socket's
-//!    frame codec.
-//!  - **path-from-checkout**: used by THIS crate for the DAEMON socket, because
-//!    `subc-control` is unpublished and only available by path, and the adapter
-//!    should bind the SAME `subc-protocol` the local daemon it talks to is built
-//!    from.
+//! ## Dependency sources
 //!
-//! This is safe: the two are isolated BY SOCKET and never exchange subc types
-//! across the `broca-core`↔`broca-subc` boundary — that boundary is the `ToolPlane`
-//! trait, which speaks ONLY broca types (`broca_protocol::BindIdentity`, mapped to
-//! `subc_protocol::BindIdentity` in ONE place at this adapter's edge). Two codec
-//! copies in the binary is negligible. Do NOT collapse this by path-dep'ing the
-//! pure crates to the checkout — that loses their crates.io-clean,
-//! standalone-buildable property. When `subc-control` is published, this crate
-//! can move to all-crates.io subc deps and the doubling collapses on its own.
+//! The subc protocol, transport, control, and client crates inherit exact registry
+//! pins from the root `Cargo.toml`'s `workspace.dependencies`; `Cargo.lock` records
+//! the resolved graph. Linked dependencies do not come from sibling checkouts;
+//! those checkouts are used only to build integration-test rig binaries.
 #![forbid(unsafe_code)]
 
 pub mod compaction_plane;
 pub mod connection;
 pub mod consent;
+pub mod consent_card;
+pub mod content_v1;
+pub mod flow_providers;
 pub mod hook_plane;
+pub mod late_results;
 pub mod plan_fetch;
+pub mod private_content;
 mod role_route;
 pub mod scope_describe;
 pub mod session_door;
@@ -40,17 +36,22 @@ pub mod vault;
 
 pub use compaction_plane::SubcCompactionPlane;
 pub use connection::{
-    classifier_role_versions, rejection_is_module_reloading, rejection_is_unknown_channel,
-    ConnError, FrameDropGauge, ModuleHealthSnapshot, RouteHandle, RouteOpenRetry, SubcConnection,
-    SubscribeStream, CLASSIFIER_ROLE_VERSIONS, FRAME_DROPS, ROUTE_OPEN_ATTEMPT_TIMEOUT,
-    ROUTE_OPEN_RETRY_DEADLINE, ROUTE_OPEN_RETRY_INTERVAL,
+    classifier_role_versions, rejection_is_unknown_channel, ConnError, FrameDropGauge,
+    ModuleHealthSnapshot, RouteHandle, RouteOpenRetry, SubcConnection, SubscribeStream,
+    CLASSIFIER_ROLE_VERSIONS, FRAME_DROPS, ROUTE_OPEN_ATTEMPT_TIMEOUT, ROUTE_OPEN_RETRY_DEADLINE,
+    ROUTE_OPEN_RETRY_INTERVAL,
 };
 pub use consent::{
     AnswersPage, ConsentClient, ConsentError, ConsentRecord, ConsentState, FilingReply,
     ScopedConsentPlane, WithdrawalReply,
 };
+pub use flow_providers::{
+    ApprovedFlowProviders, FlowPolicy, FlowProvidersClient, FlowProvidersError,
+};
 pub use hook_plane::SubcHookPlane;
+pub use late_results::{late_entry_tool_result, LateResultsError, LateResultsFeed};
 pub use plan_fetch::{SubcPlanAdmitter, SubcPlanFetcher};
+pub use private_content::{PrivateContent, PrivateContentClient, PrivateContentError, SourceKind};
 pub use scope_describe::{DescribedScope, ModuleScopeDescriber, ScopeDescriber};
 pub use session_door::{DoorCoverage, DoorRead, SessionDoorClient, SessionDoorError};
 pub use subc_plane::SubcToolPlane;

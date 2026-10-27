@@ -31,6 +31,8 @@
 mod common;
 #[path = "../delivery_rig/mod.rs"]
 mod delivery_rig;
+#[path = "../common/routing_fixture.rs"]
+mod routing_fixture;
 #[path = "../step_transform_rig/mod.rs"]
 mod step_transform_rig;
 
@@ -50,8 +52,8 @@ mod graceful_stop_real_daemon;
 mod input_token_cap;
 mod launch_nonce_e2e;
 mod llm_runner_role;
-mod log_levels_are_deliberate;
 mod meta_prompt_cache_key_render;
+mod output_refs;
 #[cfg(unix)]
 mod placed_aft_preset;
 mod plan_admission;
@@ -64,7 +66,6 @@ mod renderer_version_resume_real_daemon;
 mod reply_deadline_real_daemon;
 mod retention_consent_wire;
 mod scope_carrier;
-mod scope_stamp_source;
 mod seal_line_is_filterable_e2e;
 mod send_delivery;
 mod send_tool_reply_real_daemon;
@@ -73,6 +74,5 @@ mod single_turn_module_e2e;
 mod state_root_isolation;
 mod step_transforms;
 mod structured_output;
-mod transform_route_removed;
 mod wal_known_features;
 mod wire;

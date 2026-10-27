@@ -15,27 +15,17 @@
 //!   `[{"type":"effort","values":["none","low","medium","high","xhigh","max"]}]`.
 //! - `sarvam/sarvam-30b` carries the shape fusiform's own test serves for it: a `null` inside
 //!   `values`, a toggle, a budget, and an entry type nobody has invented yet.
-//! - `google/gemini-3.5-flash` and `google/gemini-2.5-flash` are the vendored models.dev rows;
-//!   `google/gemini-3.8-flash-high` is a Broca test row, not a Fusiform row, using the served
-//!   3.8-flash alias options to exercise a live tier id with an agreeing or replacing variant.
-//! - `google/antigravity-gemini-3.8-flash` is fusiform's served alias row verbatim (the
-//!   "catalog.get — a curated alias" case of `served-payloads.json` at fusiform cf99add), and
-//!   the top-level `aliased` array starts from that case's. The 3.5-flash alias row and the
-//!   `antigravity-claude-opus-4-6-thinking` row are Broca test rows, not Fusiform rows: they
-//!   exercise the live 3.5 route's tier limit and a live non-Gemini Antigravity route without
-//!   tiers. `google/antigravity-gemini-3.6-flash` and
-//!   `google/antigravity-claude-sonnet-4-6-thinking` are retained from the served fixture only
-//!   for the retirement-before-variant test; both routes are now withdrawn.
-//! - The Argon row projects antigravity-auth's grouped registry definition into catalog facts:
-//!   low/medium/high effort, a 1,048,576 context window and a 65,536 output limit.
-#[cfg(not(feature = "live"))]
-#[test]
-fn this_suite_needs_its_feature_enabled() {
-    eprintln!(
-        "SKIP reasoning_variants: compiled without the live feature, so none of its cases \
-         exist. Re-run with `-F broca-catalog/live` to execute them."
-    );
-}
+//! - Native Gemini rows exercise ordinary thinking parameters. Historical Code Assist tier
+//!   spellings are resolved through the published alias map, not synthetic tier rows.
+//! - The 3.8-flash and Argon aliases carry Fusiform's served `route.reasoning_wire_ids`
+//!   and `route.reasoning_default` facts. Their tier ids are not inferred from model names.
+//! - `antigravity-fixture-tier-model` and `antigravity-fixture-no-tiers` are synthetic
+//!   rows: they test defined reasoning levels with missing backend tiers without claiming
+//!   that an upstream model exists.
+//! - Retired Antigravity rows carry `existence: absent`; replacement advice comes only from
+//!   their served `successor` fact.
+//! - Native endpoint fields in the synthetic fixtures keep reasoning tests independent of
+//!   SDK endpoint defaults. Live routing decode vectors are tested separately.
 
 #[cfg(feature = "live")]
 mod gated {
@@ -84,7 +74,7 @@ mod gated {
         method: AuthMethod,
         variant: Option<&str>,
         caller_max: Option<u32>,
-        restored: Option<&FrozenVariant>,
+        restored: Option<&FrozenRenderConfig>,
     ) -> Result<FrozenRenderConfig, String> {
         resolve_with_typed(model, method, variant, caller_max, restored)
             .map_err(|error| error.to_string())
@@ -95,7 +85,7 @@ mod gated {
         method: AuthMethod,
         variant: Option<&str>,
         caller_max: Option<u32>,
-        restored: Option<&FrozenVariant>,
+        restored: Option<&FrozenRenderConfig>,
     ) -> Result<FrozenRenderConfig, broca_catalog::live::ResolutionError> {
         install();
         let family_override = match method {
@@ -111,11 +101,12 @@ mod gated {
             ..ResolveOptions::default()
         };
         let render = EpisodeRenderConfig {
+            recorded_config: restored,
             codeassist_identity: None,
             claude_code_persona: Default::default(),
             base_url: None,
             max_output_tokens: None,
-            variant: restored,
+            variant: restored.and_then(|config| config.variant.as_ref()),
             service_tier: None,
             thinking_echo_scope: None,
             thinking_cross_model: None,
@@ -410,50 +401,46 @@ mod gated {
         );
     }
 
-    /// Without a catalog row the resolver cannot know a model's variants, even if the renderer
-    /// knows some tiers. Sending no variant is still allowed through the explicit family route.
+    /// An unknown backend id is not evidence that Code Assist serves a route.
     #[test]
-    fn code_assist_variant_without_a_catalog_row_is_refused_but_no_variant_is_admitted() {
-        for (model, variant) in [
-            ("google/antigravity-gemini-3.8-flash-low", "high"),
-            ("google/antigravity-gemini-3.8-flash-medium", "low"),
-            ("google/antigravity-gpt-oss-120b-medium", "high"),
-            ("google/antigravity-gemini-3.8-flash-medium", "max"),
-            ("google/antigravity-gemini-4-argon-high", "low"),
-            ("google/antigravity-gemini-3.8-flash-low", "invented-level"),
-        ] {
-            install();
-            let catalog = broca_catalog::catalog().expect("catalog installed");
-            let (provider, id) = model.split_once('/').unwrap();
-            assert!(
-                catalog.model_for_serving(provider, id).is_none(),
-                "{model} must have no catalog row for this case"
-            );
-            let plain = resolved(model, AuthMethod::Antigravity, None);
-            assert!(plain.variant.is_none());
-            assert_eq!(body(&plain)["model"], json!(plain.wire_model_id));
-            let error =
-                resolve_with_typed(model, AuthMethod::Antigravity, Some(variant), None, None)
-                    .unwrap_err();
-            let broca_core::RunError::VariantUnsupported(refusal) =
-                broca_core::RunError::from(error)
-            else {
-                panic!("missing catalog row must be variant_unsupported");
-            };
-            assert_eq!(refusal.model, model);
-            assert_eq!(refusal.variant, variant);
-            assert!(refusal.defined.is_empty());
-            assert_eq!(
-                refusal.reason,
-                format!(
-                    "model '{model}' cannot use variant '{variant}': the catalog has no \
-                         row for this model, so its variants cannot be known"
-                )
-            );
-        }
-        // The same kind of undefined variant on another family is still refused.
-        let error = refusal("anthropic/claude-opus-4-6", AuthMethod::Oauth, "xhigh");
+    fn code_assist_unknown_route_refuses_with_or_without_variant() {
+        let model = "google/antigravity-unpublished-backend";
+        assert!(
+            resolve_with_typed(model, AuthMethod::Antigravity, None, None, None)
+                .unwrap_err()
+                .to_string()
+                .contains("missing route.reasoning_wire_ids")
+        );
+        let error = resolve_with_typed(model, AuthMethod::Antigravity, Some("high"), None, None)
+            .unwrap_err();
+        let broca_core::RunError::VariantUnsupported(refusal) = broca_core::RunError::from(error)
+        else {
+            panic!("missing catalog row must be variant_unsupported");
+        };
+        assert!(refusal.reason.contains("the catalog has no row"));
+        assert!(refusal.defined.is_empty());
+        let error = self::refusal("anthropic/claude-opus-4-6", AuthMethod::Oauth, "xhigh");
         assert!(error.contains("does not define variant 'xhigh'"), "{error}");
+    }
+
+    #[test]
+    fn historical_tier_spellings_resolve_through_the_published_alias() {
+        for (model, wire) in [
+            (
+                "google/antigravity-gemini-3.8-flash-low",
+                "gemini-3.8-flash-low",
+            ),
+            (
+                "google/antigravity-gemini-4-argon-high",
+                "gemini-4-argon-high",
+            ),
+        ] {
+            let plain = resolved(model, AuthMethod::Antigravity, None);
+            assert_eq!(plain.wire_model_id, wire);
+            assert!(plain.variant.is_none());
+            let high = resolved(model, AuthMethod::Antigravity, Some("high"));
+            assert_eq!(high.variant.as_ref().unwrap().name, "high");
+        }
     }
 
     /// The Code Assist request for `model` with `variant`, serialized. The renderer emits
@@ -565,14 +552,8 @@ mod gated {
                 rendered["request"]["generationConfig"]["thinkingConfig"],
                 json!({"includeThoughts": true, "thinkingLevel": level})
             );
-            let resumed = resolve_with(
-                model,
-                AuthMethod::Antigravity,
-                None,
-                None,
-                frozen.variant.as_ref(),
-            )
-            .expect("Argon resumes its frozen tier");
+            let resumed = resolve_with(model, AuthMethod::Antigravity, None, None, Some(&frozen))
+                .expect("Argon resumes its frozen tier");
             assert_eq!(resumed, frozen);
         }
         let error = resolve_with_typed(model, AuthMethod::Antigravity, Some("xhigh"), None, None)
@@ -599,7 +580,7 @@ mod gated {
                 vec!["none", "low", "medium", "high"],
             ),
             (
-                "google/antigravity-gemini-3.5-flash",
+                "google/antigravity-fixture-tier-model",
                 AuthMethod::Antigravity,
                 "minimal",
                 vec!["minimal", "low", "medium", "high"],
@@ -635,32 +616,25 @@ mod gated {
         assert!(refusal.defined.is_empty());
     }
 
-    /// A level the row defines but the route has no tier for is refused at admission, and the
-    /// refusal names the tiers the route has and says the limit is the route's, not the
-    /// catalog's. The test row for antigravity-gemini-3.5-flash defines [minimal, low, medium,
-    /// high], while Code Assist has only low and high tiers for it.
+    /// A catalog-defined effort is insufficient without a published backend tier for it.
     #[test]
     fn code_assist_level_without_a_tier_is_refused_naming_the_tiers() {
         let error = refusal(
-            "google/antigravity-gemini-3.5-flash",
+            "google/antigravity-fixture-tier-model",
             AuthMethod::Antigravity,
             "minimal",
         );
-        assert_eq!(
-            error,
-            "model 'google/antigravity-gemini-3.5-flash' defines variant 'minimal', but the \
-             Google Code Assist route cannot render it: this route sends a reasoning level as a \
-             backend tier, and its tiers for 'gemini-3.5-flash' are [low, high]. This is \
-             a limit of the route, not of the catalog; request one of those tiers or send no \
-             variant"
+        assert!(
+            error.contains("route.reasoning_wire_ids has no tier 'minimal'"),
+            "{error}"
         );
-        // The same row's levels that do have tiers render them.
+        assert!(error.contains("available tiers are [low, high]"), "{error}");
         let high = resolved(
-            "google/antigravity-gemini-3.5-flash",
+            "google/antigravity-fixture-tier-model",
             AuthMethod::Antigravity,
             Some("high"),
         );
-        assert_eq!(high.wire_model_id, "gemini-3-flash-agent");
+        assert_eq!(high.wire_model_id, "gemini-3.8-flash-high");
     }
 
     /// A name the row does not define is refused on Code Assist as on every family.
@@ -678,13 +652,16 @@ mod gated {
         );
     }
 
-    /// A catalog-defined effort must still be refused if Code Assist cannot render it as a tier.
+    /// A catalog-defined effort must still be refused without a route's tier ids.
     #[test]
     fn code_assist_variant_on_a_model_without_tiers_is_refused() {
-        let model = "google/antigravity-claude-opus-4-6-thinking";
-        let plain = resolved(model, AuthMethod::Antigravity, None);
-        assert_eq!(plain.wire_model_id, "claude-opus-4-6-thinking");
-        assert!(plain.variant.is_none());
+        let model = "google/antigravity-fixture-no-tiers";
+        assert!(
+            resolve_with_typed(model, AuthMethod::Antigravity, None, None, None)
+                .unwrap_err()
+                .to_string()
+                .contains("missing route.reasoning_wire_ids")
+        );
         let error = resolve_with_typed(model, AuthMethod::Antigravity, Some("high"), None, None)
             .unwrap_err();
         let broca_core::RunError::VariantUnsupported(refusal) = broca_core::RunError::from(error)
@@ -692,16 +669,8 @@ mod gated {
             panic!("a route without tiers must be variant_unsupported");
         };
         assert_eq!(refusal.model, model);
-        assert_eq!(refusal.variant, "high");
         assert_eq!(refusal.defined, ["low", "medium", "high", "max"]);
-        assert_eq!(
-            refusal.reason,
-            format!(
-                "model '{model}' cannot use variant 'high': the Google Code Assist route \
-                     sends a reasoning level as a backend tier id and has no tiers for \
-                     'claude-opus-4-6-thinking'"
-            )
-        );
+        assert!(refusal.reason.contains("missing route.reasoning_wire_ids"));
         let error = self::refusal(model, AuthMethod::Antigravity, "xhigh");
         assert!(error.contains("does not define variant 'xhigh'"), "{error}");
     }
@@ -714,8 +683,8 @@ mod gated {
         assert!(
             catalog
                 .model_for_serving("google", "antigravity-gemini-3.6-flash")
-                .is_some(),
-            "the fixture deliberately retains the withdrawn route's row"
+                .is_none(),
+            "the withdrawn row is not serveable"
         );
 
         let error = resolve_with_typed(model, AuthMethod::Antigravity, Some("minimal"), None, None)
@@ -726,8 +695,7 @@ mod gated {
         ));
         assert_eq!(
             error.to_string(),
-            "model 'google/antigravity-gemini-3.6-flash' is unservable: Google withdrew this \
-             Antigravity route; use 'google/antigravity-gemini-3.8-flash' (medium) instead"
+            "catalog model 'google/antigravity-gemini-3.6-flash' was withdrawn upstream; use 'google/antigravity-gemini-3.8-flash' instead"
         );
     }
 
@@ -785,14 +753,14 @@ mod gated {
             AuthMethod::ApiKey,
             Some("high"),
         );
-        let frozen_variant = admitted.variant.clone().expect("the variant is frozen");
+        assert!(admitted.variant.is_some(), "the variant is frozen");
         // Same model: re-resolving from the frozen variant reproduces the admitted config.
         let resumed = resolve_with(
             "anyapi/anthropic/claude-opus-4-6",
             AuthMethod::ApiKey,
             None,
             None,
-            Some(&frozen_variant),
+            Some(&admitted),
         )
         .expect("resume resolves");
         assert_eq!(resumed, admitted);
@@ -802,7 +770,7 @@ mod gated {
             AuthMethod::ApiKey,
             None,
             None,
-            Some(&frozen_variant),
+            Some(&admitted),
         )
         .expect("a resume never re-checks the catalog");
         assert_eq!(
@@ -810,7 +778,7 @@ mod gated {
             json!("high")
         );
 
-        // On Code Assist the frozen name re-selects the same backend tier.
+        // Code Assist restores the recorded backend id, not a tier derived from today's facts.
         let admitted = resolved(
             "google/antigravity-gemini-3.8-flash",
             AuthMethod::Antigravity,
@@ -821,7 +789,7 @@ mod gated {
             AuthMethod::Antigravity,
             None,
             None,
-            admitted.variant.as_ref(),
+            Some(&admitted),
         )
         .expect("resume resolves");
         assert_eq!(resumed, admitted);

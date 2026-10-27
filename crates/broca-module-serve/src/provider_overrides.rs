@@ -71,13 +71,43 @@ impl ProviderOverrides {
         self.0.get(provider).map(|entry| entry.base_url.as_str())
     }
 
-    /// Called once at boot; keep unknown entries so a later catalog refresh can serve them.
-    pub fn notices(&self, catalog: Option<&broca_catalog::CatalogSnapshot>) -> Vec<String> {
-        self.0.keys().filter(|provider| {
-            catalog.is_none_or(|catalog| !catalog.contains_provider(provider))
-        }).map(|provider| format!(
-            "provider base_url override for '{provider}' is inert: provider is not currently catalog-served"
+    /// Name every override whose provider `catalog` does not serve. Overrides are applied
+    /// when each new run starts, so a later catalog refresh that serves the provider makes
+    /// the override take effect; the notice only describes the catalog it was given.
+    pub fn notices(&self, catalog: &broca_catalog::CatalogSnapshot) -> Vec<String> {
+        self.0.keys().filter(|provider| !catalog.contains_provider(provider)).map(|provider| format!(
+            "provider base_url override for '{provider}' is unused: the loaded catalog does not serve this provider; new runs use the override once a catalog refresh serves it"
         )).collect()
+    }
+
+    /// Report, once at boot, the overrides the catalog does not serve.
+    ///
+    /// The catalog comes from fusiform and nothing is bundled, so at boot there may be no
+    /// catalog loaded yet, and judging overrides then would call every one of them unused.
+    /// The report is therefore made against a loaded catalog: at once when `cache` already
+    /// holds one (a last-known-good copy), otherwise after `poller`'s first successful
+    /// refresh. Returns the poller to start.
+    pub fn report_unserved(
+        &self,
+        cache: &broca_catalog::CatalogCache,
+        poller: crate::catalog_refresh::CatalogPoller,
+        report: impl Fn(String) + Send + 'static,
+    ) -> crate::catalog_refresh::CatalogPoller {
+        if self.0.is_empty() {
+            return poller;
+        }
+        match cache.snapshot() {
+            Ok(catalog) => {
+                self.notices(&catalog).into_iter().for_each(report);
+                poller
+            }
+            Err(_) => {
+                let overrides = self.clone();
+                poller.on_first_refresh(move |catalog| {
+                    overrides.notices(catalog).into_iter().for_each(report);
+                })
+            }
+        }
     }
 }
 
@@ -126,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_provider_is_inert_with_notice() {
+    fn unknown_provider_is_unused_with_notice() {
         let overrides = ProviderOverrides::parse(
             r#"{"providers":{"not-served":{"base_url":"http://localhost:4010"}}}"#,
         )
@@ -134,8 +164,8 @@ mod tests {
         let catalog = broca_catalog::Catalog::from_json_str("{}", "{}").unwrap();
         let cache = broca_catalog::CatalogCache::empty();
         cache.install_parsed_for_test(&catalog, 0, broca_catalog::CatalogSource::Fusiform);
-        assert_eq!(overrides.notices(Some(&cache.snapshot().unwrap())), vec![
-            "provider base_url override for 'not-served' is inert: provider is not currently catalog-served"
+        assert_eq!(overrides.notices(&cache.snapshot().unwrap()), vec![
+            "provider base_url override for 'not-served' is unused: the loaded catalog does not serve this provider; new runs use the override once a catalog refresh serves it"
         ]);
         assert!(catalog.provider("not-served").is_none());
     }

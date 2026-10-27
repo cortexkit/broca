@@ -156,6 +156,7 @@ mod tests {
 
     fn started(run: &str, session: &BindIdentity) -> WalRecord {
         WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -211,6 +212,7 @@ mod tests {
 
     fn step(content: ContentBlock) -> WalRecord {
         WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(1),
@@ -248,6 +250,7 @@ mod tests {
             })),
             batch_started(),
             WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 hooks: None,
                 batch_id: BatchId("r-b1".into()),
                 tool_call_id: ToolCallId("t1".into()),

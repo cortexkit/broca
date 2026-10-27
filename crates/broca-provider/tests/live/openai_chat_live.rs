@@ -13,26 +13,25 @@ use crate::live_common;
 
 use broca_provider::families::{openai_chat_frozen_config, OpenAiChat};
 use broca_provider::wire::AuthHandle;
-use live_common::{opencode_api_key, run_live, LiveResult, LiveSpec};
+use live_common::{run_live, vault_api_key, LiveResult, LiveSpec};
 use serde_json::json;
 
 const BASE_URL: &str = "https://api.deepseek.com";
 const MODEL: &str = "deepseek-v4-flash";
 
 fn auth() -> Result<AuthHandle, String> {
-    // TWO ABSENCES MUST NOT SHARE ONE MESSAGE. `opencode_api_key` returns None both when the key
+    // TWO ABSENCES MUST NOT SHARE ONE MESSAGE. `vault_api_key` returns None both when the key
     // is missing AND when BROCA_LIVE_TESTS consent is absent, so naming only the key sends a
     // reader hunting a credential they may already have. Reported from outside: the skip line read
     // "no deepseek api key" on a machine that had one.
-    opencode_api_key("deepseek")
+    vault_api_key("deepseek")
         .map(AuthHandle::Bearer)
         .ok_or_else(|| {
-            if std::env::var("BROCA_LIVE_TESTS").is_ok_and(|v| !v.trim().is_empty()) {
-                "SKIP openai_chat_live: consent is given, but no deepseek api key in the opencode \
-                 auth file."
+            if std::env::var("BROCA_LIVE_TESTS").is_ok_and(|v| v == "1") {
+                "SKIP openai_chat_live: consent is given, but no deepseek API key available through its vault dev-tools handle."
                     .into()
             } else {
-                "SKIP openai_chat_live: BROCA_LIVE_TESTS is not set, so no live call was attempted \
+                "SKIP openai_chat_live: BROCA_LIVE_TESTS is not 1, so no live call was attempted \
                  (a deepseek key may or may not be present)."
                     .into()
             }

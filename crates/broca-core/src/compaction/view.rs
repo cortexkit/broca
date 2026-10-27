@@ -78,6 +78,8 @@ impl Announced {
 /// `session.read` returns it. `None` for a message without an ordinal.
 pub fn transcript_message(message: &Message) -> Option<TranscriptMessage> {
     let ordinal = message.ordinal?;
+    #[cfg(test)]
+    super::carried_encoding_tests::note_encoded();
     Some(TranscriptMessage::new(
         ordinal,
         format!("m{ordinal}"),
@@ -88,13 +90,30 @@ pub fn transcript_message(message: &Message) -> Option<TranscriptMessage> {
     ))
 }
 
+/// The transcript message at `ordinal` in `prompt`: the lookup [`decide_stored_at`] passes to
+/// `dispose_fetched`, for tests that compare what that lookup returns over two prompts.
+#[cfg(test)]
+pub(crate) fn transcript_at(prompt: &[Message], ordinal: u64) -> Option<TranscriptMessage> {
+    transcript(ordinal_range(prompt, ordinal, ordinal.saturating_add(1)))
+        .next()
+        .and_then(transcript_message)
+}
+
 /// The transcript messages of `prompt`: every message with an ordinal, in order, except
 /// system messages, which the runner places ahead of the history itself (as it does under
 /// Setup's initial message).
-fn transcript(prompt: &[Message]) -> impl Iterator<Item = &Message> {
+fn transcript(prompt: &[Message]) -> impl DoubleEndedIterator<Item = &Message> {
     prompt
         .iter()
         .filter(|message| message.ordinal.is_some() && message.role != Role::System)
+}
+
+/// Locate a half-open ordinal range in the stamped, append-only prompt. Unstamped system
+/// messages, when present, precede the transcript and are not part of an ordinal range.
+pub(super) fn ordinal_range(prompt: &[Message], from: u64, to: u64) -> &[Message] {
+    let start = prompt.partition_point(|m| m.ordinal.is_none_or(|o| o < from));
+    let end = start + prompt[start..].partition_point(|m| m.ordinal.is_some_and(|o| o < to));
+    &prompt[start..end]
 }
 
 /// Why a view cannot be assembled over the transcript.
@@ -114,11 +133,23 @@ pub enum AssemblyProblem {
 /// replace range's messages, then every transcript message after the coverage. Transcript
 /// messages keep their ordinals; the provider's messages have none. `CompactionView::assemble`
 /// is the role's reference for the same rule over JSON.
+/// Without a session's capture index, media fail closed to provenance markers. The session
+/// render paths supply their WAL-folded index instead.
 pub fn assemble(
     view: &CompactionView,
     prompt: &[Message],
 ) -> Result<Vec<Message>, AssemblyProblem> {
-    assemble_judged(view, prompt, None)
+    assemble_captured(view, prompt, &super::CapturedMedia::default())
+}
+
+fn assemble_captured(
+    view: &CompactionView,
+    prompt: &[Message],
+    captured: &super::CapturedMedia,
+) -> Result<Vec<Message>, AssemblyProblem> {
+    let mut history = assemble_judged(view, prompt, None)?;
+    captured.enforce(&mut history);
+    Ok(history)
 }
 
 /// [`assemble`], also judging who wrote the view's bytes when `stored` is given: the transcript
@@ -130,15 +161,11 @@ pub fn assemble(
 fn assemble_judged(
     view: &CompactionView,
     prompt: &[Message],
-    stored: Option<&[Message]>,
+    stored: Option<super::StoredTranscript<'_>>,
 ) -> Result<Vec<Message>, AssemblyProblem> {
     use crate::compaction_provider::view::ViewRange;
-    let stored_at = |ordinal: u64| {
-        stored.and_then(|stored| transcript(stored).find(|m| m.ordinal == Some(ordinal)))
-    };
-    let in_range = |from: u64, to: u64| {
-        transcript(prompt).filter(move |m| m.ordinal.is_some_and(|o| o >= from && o < to))
-    };
+    let stored_at = |ordinal: u64| stored.and_then(|stored| stored.at(ordinal));
+    let in_range = |from: u64, to: u64| transcript(ordinal_range(prompt, from, to));
     let mut out = Vec::new();
     for range in &view.ranges {
         match range {
@@ -174,9 +201,33 @@ fn assemble_judged(
             ViewRange::Replace { from, to, bytes } => {
                 let values: Vec<Value> = serde_json::from_str(bytes)
                     .map_err(|_| AssemblyProblem::Rejected(ViewProblem::ReplacementNotArray))?;
+                let candidates: Vec<_> = values.iter().filter_map(native_schema_message).collect();
                 let carried: Option<Vec<Message>> = stored.map(|stored| {
-                    transcript(stored)
-                        .filter(|m| m.ordinal.is_some_and(|o| o >= *from && o < *to))
+                    if !candidates.iter().any(|candidate| {
+                        candidate.origin.is_some()
+                            || candidate.content.iter().any(super::is_signed)
+                            || stored.has_model_origin(candidate.role)
+                            || super::media_refs(&candidate.content).next().is_some()
+                    }) {
+                        return Vec::new();
+                    }
+                    stored
+                        .range(*from, *to)
+                        // Keep possible signed copies and media sources without cloning unrelated
+                        // transcript text. Media can be reused without copying the whole message.
+                        .filter(|original| {
+                            candidates.iter().any(|candidate| {
+                                (candidate.role == original.role
+                                    && candidate.content == original.content
+                                    && (original.origin.is_some()
+                                        || candidate.origin.is_some()
+                                        || candidate.content.iter().any(super::is_signed)))
+                                    || super::media_refs(&candidate.content).any(|reference| {
+                                        super::media_refs(&original.content)
+                                            .any(|original| original == reference)
+                                    })
+                            })
+                        })
                         .cloned()
                         .collect()
                 });
@@ -199,19 +250,34 @@ fn assemble_judged(
         }
     }
     let covered = view.covers_through.ordinal;
-    out.extend(
-        transcript(prompt)
-            .filter(|m| m.ordinal.is_some_and(|o| o > covered))
-            .cloned(),
-    );
+    out.extend(transcript(ordinal_range(prompt, covered.saturating_add(1), u64::MAX)).cloned());
     Ok(out)
 }
 
+/// Whether a replacement needs its stored range to judge media provenance or model authorship.
+/// A model origin removed from an otherwise unchanged copy still needs authorship checking.
+/// The same test `assemble_judged` makes
+/// before it reads those stored messages; the two must agree, or a decision reads a stored
+/// message the run never read back.
+pub(super) fn carries_stored_content(
+    candidate: &Message,
+    stored: super::StoredTranscript<'_>,
+) -> bool {
+    super::media_refs(&candidate.content).next().is_some()
+        || candidate.origin.is_some()
+        || candidate.content.iter().any(super::is_signed)
+        || stored.has_model_origin(candidate.role)
+}
+
 /// A replacement message broca refuses: bytes that are not a message in broca's schema are
-/// rejected; a message in the schema that claims model authorship is a provider constraint.
+/// rejected; a message in the schema that violates provenance or authorship is a provider constraint.
 fn replacement_problem(value: &Value) -> AssemblyProblem {
-    match serde_json::from_value::<Message>(value.clone()) {
-        Ok(message) if message.origin.is_some() || message.content.iter().any(is_signed) => {
+    match native_schema_message(value) {
+        Some(message)
+            if message.origin.is_some()
+                || message.content.iter().any(is_signed)
+                || super::media_refs(&message.content).next().is_some() =>
+        {
             AssemblyProblem::ProviderConstraint
         }
         _ => AssemblyProblem::Rejected(ViewProblem::ReplacementNotArray),
@@ -221,6 +287,8 @@ fn replacement_problem(value: &Value) -> AssemblyProblem {
 /// One edited part: `bytes` decoded as a content block of broca's schema. A block that only
 /// the model may author (signed or encrypted reasoning, provider-signed text) is accepted only
 /// as a byte-identical copy of the part it replaces.
+/// Text may be edited freely or replace media; each reference that remains must match a
+/// reference in the original stored part, never merely another capture in the session.
 /// `original` is the stored part the edit replaces, when the caller judges authorship
 /// (`Some(None)` when there is no such stored part); `None` to skip that judgement.
 fn edited_part(
@@ -238,6 +306,13 @@ fn edited_part(
     };
     if let Some(original) = original {
         if is_signed(&block) && original != Some(&block) {
+            return Err(AssemblyProblem::ProviderConstraint);
+        }
+        if !super::media_refs(std::slice::from_ref(&block)).all(|reference| {
+            original.is_some_and(|original| {
+                super::media_refs(std::slice::from_ref(original)).any(|stored| stored == reference)
+            })
+        }) {
             return Err(AssemblyProblem::ProviderConstraint);
         }
     }
@@ -289,12 +364,12 @@ pub fn is_prefix_bound(block: &ContentBlock) -> bool {
 /// place of its range, or else the transcript as written.
 pub fn rendered_history(state: &CompactionState, prompt: &[Message]) -> Vec<Message> {
     if let Some(applied) = &state.view {
-        if let Ok(mut history) = assemble(&applied.view, prompt) {
+        if let Ok(mut history) = assemble_captured(&applied.view, prompt, &state.captured) {
             apply_strips(&mut history, &state.strips, strips_copies(state));
             return history;
         }
     }
-    match &state.applied {
+    let mut history: Vec<Message> = match &state.applied {
         Some(applied) => applied
             .replacement
             .iter()
@@ -310,7 +385,9 @@ pub fn rendered_history(state: &CompactionState, prompt: &[Message]) -> Vec<Mess
             )
             .collect(),
         None => transcript(prompt).cloned().collect(),
-    }
+    };
+    state.captured.enforce(&mut history);
+    history
 }
 
 /// The reason broca gives in `view_refused:<version>:<reason>` for a view that carries a `cut`.
@@ -318,6 +395,13 @@ pub fn rendered_history(state: &CompactionState, prompt: &[Message]) -> Vec<Mess
 /// one is broca's own, because the role names none for a runner that does not serve cut
 /// lineages.
 pub const CUT_UNSUPPORTED: &str = "cut_unsupported";
+
+/// The reason broca gives in `view_refused:<version>:<reason>` for a view that keeps, edits or
+/// copies a message the run released from memory and that neither the materialized store nor
+/// the WAL can supply. Rendering the view without that message would send a shorter history
+/// than the view asks for, so the view is refused instead. Broca's own reason, like
+/// [`CUT_UNSUPPORTED`].
+pub const HISTORY_UNAVAILABLE: &str = "history_unavailable";
 
 /// What the runner does with a fetched view at a step boundary.
 #[derive(Debug, Clone, PartialEq)]
@@ -338,9 +422,27 @@ pub enum Decision {
     /// Not the view asked for, malformed, or not in broca's message schema. Not recorded and
     /// not reported; the current view stays.
     Rejected(ViewProblem),
+    /// A newer version is known: announced and receipted while this one was fetched, or
+    /// answered by the provider in its place. Not recorded and not reported; the caller
+    /// decides the newest version instead, so one boundary rewrites the prefix only once.
+    Superseded,
 }
 
 impl Decision {
+    /// The decision's name and reason as log fields: `("deferred", "open_turn")` and the
+    /// like. Apply and Stale carry no reason, so their reason is empty.
+    pub fn choice(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::Apply(_) => ("applied", ""),
+            Self::Defer(reason) => ("deferred", reason),
+            Self::Refuse(reason) => ("refused", reason),
+            Self::Discard => ("discarded", "not_a_prefix"),
+            Self::Stale => ("stale", ""),
+            Self::Rejected(problem) => ("rejected", problem.name()),
+            Self::Superseded => ("superseded", "newer_version"),
+        }
+    }
+
     /// The event this decision reports on the next notice. An applied view is reported by
     /// `applied_view_version` itself, and its companion edit by the fold of its record.
     pub fn event(&self, view_version: u64) -> Option<Event> {
@@ -353,7 +455,9 @@ impl Decision {
                 view_version,
                 reason: (*reason).into(),
             }),
-            Self::Apply(_) | Self::Discard | Self::Stale | Self::Rejected(_) => None,
+            Self::Apply(_) | Self::Discard | Self::Stale | Self::Rejected(_) | Self::Superseded => {
+                None
+            }
         }
     }
 }
@@ -423,14 +527,35 @@ pub fn decide_at(
     prefix_bound: bool,
     run_start: bool,
 ) -> Decision {
-    let entries: BTreeMap<u64, TranscriptMessage> = transcript(prompt)
-        .filter_map(transcript_message)
-        .map(|entry| (entry.ordinal, entry))
-        .collect();
+    decide_stored_at(
+        view,
+        ready,
+        state,
+        lineage_id,
+        prompt,
+        super::StoredTranscript::plain(stored),
+        prefix_bound,
+        run_start,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decide_stored_at(
+    view: &CompactionView,
+    ready: &ViewReady,
+    state: &CompactionState,
+    lineage_id: &str,
+    prompt: &[Message],
+    stored: super::StoredTranscript<'_>,
+    prefix_bound: bool,
+    run_start: bool,
+) -> Decision {
     let current = state.view.as_ref().map(|applied| applied.view.view_version);
     // broca never cuts (see CUT_UNSUPPORTED below), so every lineage it serves starts at ordinal 0.
     match dispose_fetched(view, ready, current, lineage_id, 0, |ordinal| {
-        entries.get(&ordinal).cloned()
+        transcript(ordinal_range(prompt, ordinal, ordinal.saturating_add(1)))
+            .next()
+            .and_then(transcript_message)
     }) {
         ViewDisposition::Apply => {}
         ViewDisposition::Stale => return Decision::Stale,
@@ -502,10 +627,7 @@ pub fn decide_at(
     if invalidated.is_empty() && !invalidated_copies {
         return Decision::Apply(CompactionViewChoice::Applied);
     }
-    let to_ordinal = transcript(prompt)
-        .filter_map(|message| message.ordinal)
-        .max()
-        .map_or(0, |last| last + 1);
+    let to_ordinal = stored.extent();
     // With only copies invalidated the recorded range is empty; the companion choice itself
     // strips the copies' reasoning when the view renders.
     let from_ordinal = invalidated.iter().min().copied().unwrap_or(to_ordinal);
@@ -568,9 +690,10 @@ impl std::fmt::Display for ViewNotRenderable {
 pub(crate) fn render(
     opts: &broca_protocol::CallOptions,
     state: &CompactionState,
+    systems: &[usize],
 ) -> Option<Result<broca_protocol::CallOptions, ViewNotRenderable>> {
     let applied = state.view.as_ref()?;
-    let mut history = match assemble(&applied.view, &opts.prompt) {
+    let mut history = match assemble_captured(&applied.view, &opts.prompt, &state.captured) {
         Ok(history) => history,
         Err(problem) => {
             return Some(Err(ViewNotRenderable {
@@ -580,12 +703,7 @@ pub(crate) fn render(
         }
     };
     apply_strips(&mut history, &state.strips, strips_copies(state));
-    let mut prompt: Vec<_> = opts
-        .prompt
-        .iter()
-        .filter(|m| m.role == Role::System)
-        .cloned()
-        .collect();
+    let mut prompt: Vec<_> = systems.iter().map(|&i| opts.prompt[i].clone()).collect();
     let history_start = prompt.len();
     prompt.extend(history);
     let mut view = opts.with_prompt(prompt);
@@ -596,32 +714,7 @@ pub(crate) fn render(
             .applied
             .as_ref()
             .map(|applied| applied.thinking_prefix_len),
-        episodes: opts
-            .render_episodes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, episode)| {
-                let end = opts
-                    .render_episodes
-                    .get(index + 1)
-                    .map_or(usize::MAX, |next| next.prompt_start);
-                let kept = view.prompt[history_start..].iter().position(|m| {
-                    m.ordinal
-                        .is_some_and(|o| o >= episode.prompt_start as u64 && o < end as u64)
-                })?;
-                let first_user = episode.first_user.and_then(|first| {
-                    view.prompt[history_start..]
-                        .iter()
-                        .position(|m| m.ordinal == Some(first as u64))
-                        .map(|i| history_start + i)
-                });
-                Some(broca_protocol::request::EpisodeRenderInput {
-                    prompt_start: history_start + kept,
-                    first_user,
-                    frozen_config: episode.frozen_config.clone(),
-                })
-            })
-            .collect(),
+        episodes: super::retained_episodes(opts, &view.prompt, history_start),
     });
     Some(Ok(view))
 }
@@ -660,9 +753,40 @@ pub fn next_notice(
     prompt: &[Message],
     facts: NoticeFacts<'_>,
 ) -> Option<AdvanceNotice> {
-    let through = transcript(prompt).last()?;
+    let through = transcript(prompt).next_back()?;
+    notice_through(state, through, facts)
+}
+
+pub(crate) fn notice_through(
+    state: &CompactionState,
+    through: &Message,
+    facts: NoticeFacts<'_>,
+) -> Option<AdvanceNotice> {
+    notice_at(state, &notice_anchor(through)?, facts)
+}
+
+pub(crate) struct NoticeAnchor {
+    pub(crate) ordinal: u64,
+    digest: String,
+}
+
+/// Only the ordinal and digest are needed after a view releases the newest raw message.
+pub(crate) fn notice_anchor(through: &Message) -> Option<NoticeAnchor> {
     let through_ordinal = through.ordinal?;
     let through_digest = content_digest(&serde_json::to_value(through).expect("native JSON"));
+    Some(NoticeAnchor {
+        ordinal: through_ordinal,
+        digest: through_digest,
+    })
+}
+
+pub(crate) fn notice_at(
+    state: &CompactionState,
+    through: &NoticeAnchor,
+    facts: NoticeFacts<'_>,
+) -> Option<AdvanceNotice> {
+    let through_ordinal = through.ordinal;
+    let through_digest = through.digest.clone();
     let applied = state.applied_view_version(facts.lineage_id);
     let mut events: Vec<Event> = state
         .unannounced

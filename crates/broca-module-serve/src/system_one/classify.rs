@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use broca_catalog::ModelBatchRow;
 use broca_store::system_one::{BatchClaim, Claimed, Outcome, StoredOutcome};
+use broca_store::SystemOneStore;
 use cortexkit_model_batch::{
     absent::{add_reported, input_cost_nanos},
     estimate::{
@@ -31,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 
-use super::{internal_refusal, ModelPin, ProviderReply, SystemOne, STORE_ROLE};
+use super::{internal_refusal, ModelPin, ProviderReply, SystemOne, ToolAdmission};
 
 /// The catalog kind fusiform gives a decision model. `classifier/v1` calls the same kind
 /// `classifier`; a row stating either is a classifier.
@@ -70,6 +71,8 @@ struct FrozenRow {
     input_rate_nanos: Option<i64>,
     #[serde(default)]
     output_rate_nanos: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    charge_basis: Option<broca_core::ChargeBasis>,
 }
 
 impl FrozenRow {
@@ -151,24 +154,77 @@ enum Slot {
 }
 
 /// This call's hold on a batch: the in-process claim, and the store's `running` row once it
-/// is written. Dropping it releases both, so a call that ends any way (a reply, a refusal, a
-/// panic, a dropped future) never leaves its batch held.
+/// is written. A call that ends normally (a reply or a refusal) gives it up through
+/// [`Hold::release`], which waits for the store write. Dropping it is the fallback for a call
+/// that panics or whose future is dropped: it removes the in-process claim and starts the
+/// store release in the background, since nothing is left to wait for it. Either way a
+/// failed store release is logged and the row stays held until the next start releases it.
 struct Hold<'a> {
     service: &'a Arc<SystemOne>,
     batch_id: String,
     stored: bool,
 }
 
+/// End this process's store hold on a batch. A failure is only logged: the call is answered
+/// anyway, and the next start releases every hold a previous process left.
+fn release_stored(store: &SystemOneStore, role: &str, batch_id: &str, owner: &str) {
+    if let Err(error) = store.release(role, batch_id, owner) {
+        tracing::warn!(target: "system_one", %error, batch_id,
+            "could not release a batch hold; the next start releases it");
+    }
+}
+
+impl Hold<'_> {
+    /// Release the store's row and wait for it, then the in-process claim (by dropping the
+    /// hold). The reply leaves only after this, so once the release succeeds a caller that
+    /// re-sends the same batch the moment it is answered finds the batch free, not
+    /// `batch_in_progress`.
+    async fn release(mut self) {
+        if self.stored {
+            // Cleared first so the drop below does not start a second release. If this future
+            // is dropped mid-wait, the blocking task still runs to completion.
+            self.stored = false;
+            let store = Arc::clone(&self.service.store);
+            let (role, batch_id, owner) = (
+                self.service.role.clone(),
+                self.batch_id.clone(),
+                self.service.owner.clone(),
+            );
+            let released = tokio::task::spawn_blocking(move || {
+                release_stored(&store, &role, &batch_id, &owner)
+            })
+            .await;
+            if let Err(error) = released {
+                tracing::warn!(target: "system_one", %error, batch_id = %self.batch_id,
+                    "could not release a batch hold; the next start releases it");
+            }
+        }
+    }
+}
+
 impl Drop for Hold<'_> {
     fn drop(&mut self) {
         if self.stored {
             let store = Arc::clone(&self.service.store);
-            let (batch_id, owner) = (self.batch_id.clone(), self.service.owner.clone());
+            let (role, batch_id, owner) = (
+                self.service.role.clone(),
+                self.batch_id.clone(),
+                self.service.owner.clone(),
+            );
+            #[cfg(test)]
+            let gate = self
+                .service
+                .fallback_release_gate
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
             let release = move || {
-                if let Err(error) = store.release(STORE_ROLE, &batch_id, &owner) {
-                    tracing::warn!(target: "system_one", %error, batch_id,
-                        "could not release a batch hold; the next start releases it");
+                #[cfg(test)]
+                if let Some(gate) = gate {
+                    // Returns once the test drops the sending side.
+                    let _ = gate.recv();
                 }
+                release_stored(&store, &role, &batch_id, &owner);
             };
             match tokio::runtime::Handle::try_current() {
                 Ok(runtime) => drop(runtime.spawn_blocking(release)),
@@ -288,6 +344,9 @@ fn first_call_refusal(error: &ItemError, model: &str, pin: &ModelPin) -> Refusal
 /// TypeSafe's errors by status).
 fn map_reply(reply: ProviderReply, pin: &ModelPin) -> Result<(String, Option<Usage>), ItemError> {
     match reply {
+        ProviderReply::AttributedAnswer { body, .. } => {
+            map_reply(ProviderReply::Answered(body), pin)
+        }
         ProviderReply::Answered(body) => {
             let decoded: ProviderAnswer<'_> = serde_json::from_slice(&body).map_err(|e| {
                 ItemError::for_code(
@@ -386,7 +445,7 @@ async fn call_provider(
     service: &SystemOne,
     pin: &ModelPin,
     body: String,
-) -> Result<(String, Option<Usage>), ItemError> {
+) -> Result<PaidAnswer, ItemError> {
     let slot = service.model_slot(&pin.catalog_id);
     let mut attempt = 0;
     loop {
@@ -395,17 +454,154 @@ async fn call_provider(
             let _permit = slot.acquire().await;
             pin.provider.call(body.clone()).await
         };
+        let code = match &reply {
+            ProviderReply::Answered(_) | ProviderReply::AttributedAnswer { .. } => None,
+            ProviderReply::Status { status, .. } => Some(status.to_string()),
+            ProviderReply::WorkersAiError { status, code, .. } => {
+                Some(code.map_or_else(|| status.to_string(), |code| code.to_string()))
+            }
+            ProviderReply::Transport(_) => Some("transport_error".into()),
+            ProviderReply::Credential(_) => Some("auth_failed".into()),
+        };
+        if let Some(code) = code {
+            service
+                .metrics
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .last_provider_error
+                .insert(
+                    pin.catalog_id.split('/').next().unwrap_or_default().into(),
+                    code,
+                );
+        }
         match retry_wait(&reply, service) {
             Some(wait) if attempt < service.config.max_attempts => {
                 tokio::time::sleep(wait).await;
             }
-            _ => return map_reply(reply, pin),
+            _ => {
+                let (auth_selection, account_ref) = match &reply {
+                    ProviderReply::AttributedAnswer {
+                        auth_selection,
+                        account_ref,
+                        ..
+                    } => (auth_selection.clone(), account_ref.clone()),
+                    _ => (pin.provider.credential_id(), None),
+                };
+                return map_reply(reply, pin).map(|(answers, usage)| PaidAnswer {
+                    answers,
+                    usage,
+                    auth_selection,
+                    account_ref,
+                });
+            }
         }
     }
 }
 
-/// Serve one `classify.run`.
-pub(crate) async fn run(service: &Arc<SystemOne>, params: &str) -> Result<Box<RawValue>, Refusal> {
+struct PaidAnswer {
+    answers: String,
+    usage: Option<Usage>,
+    auth_selection: Option<String>,
+    account_ref: Option<String>,
+}
+
+/// Serve one `classify.run`. `admitted_at_ms`, when given, is when the call was first admitted:
+/// a new batch's retention runs from it instead of from now.
+pub(crate) async fn run(
+    service: &Arc<SystemOne>,
+    params: &str,
+    scope: &broca_store::system_one::BatchScope,
+    admitted_at_ms: Option<i64>,
+) -> Result<Box<RawValue>, Refusal> {
+    run_inner(service, params, scope, admitted_at_ms, None).await
+}
+
+pub(super) fn admit_tool(
+    service: &SystemOne,
+    params: &str,
+    stored: Option<&broca_store::system_one::StoredBatch>,
+) -> Result<ToolAdmission, Refusal> {
+    let request = parse_request(params)?;
+    let frozen = if let Some(stored) = stored {
+        serde_json::from_str::<FrozenRow>(&stored.frozen_row)
+            .map_err(|_| internal_refusal("the stored tool price does not decode"))?
+    } else {
+        check_request_bytes(
+            params.len(),
+            &cortexkit_role_classifier::describe::Limits::new(
+                service.config.max_items,
+                service.config.max_request_bytes,
+            ),
+        )?;
+        let row = service.catalog.row(&request.model);
+        check_catalog_row(&request.model, catalog_row(row.as_ref()))?;
+        let row = row.expect("catalog admission checked presence");
+        let pin = service
+            .pin(&request.model)
+            .ok_or_else(|| Refusal::model_unavailable(&request.model))?;
+        check_request(&request, &service.model_entry(pin, &row))?;
+        use broca_core::ChargeBasisResolver;
+        FrozenRow {
+            input_rate_nanos: row.input_rate_nanos,
+            output_rate_nanos: row.output_rate_nanos,
+            charge_basis: Some(
+                service
+                    .charge_basis
+                    .resolve_charge_basis(
+                        request.model.split('/').next().unwrap_or_default(),
+                        "apikey",
+                    )
+                    .0,
+            ),
+        }
+    };
+    if frozen.charge_basis != Some(broca_core::ChargeBasis::MeteredApi)
+        || frozen.input_rate_nanos.is_none_or(|rate| rate < 0)
+        || frozen.output_rate_nanos.is_some_and(|rate| rate > 0)
+    {
+        return Err(Refusal::new(
+            "cost_unpriceable",
+            "the model requires a per-token input price and no positive output price",
+        ));
+    }
+    Ok(ToolAdmission {
+        frozen_row: serde_json::to_string(&frozen).expect("admitted pricing encodes"),
+    })
+}
+
+pub(super) fn replay_tool(
+    params: &str,
+    stored: &broca_store::system_one::StoredBatch,
+) -> Result<Box<RawValue>, Refusal> {
+    let request = parse_request(params)?;
+    let frozen: FrozenRow = serde_json::from_str(&stored.frozen_row)
+        .map_err(|_| internal_refusal("the stored tool price does not decode"))?;
+    reply(
+        &request,
+        &frozen,
+        stored
+            .outcomes
+            .iter()
+            .cloned()
+            .map(|outcome| Some(Slot::Stored(outcome)))
+            .collect(),
+    )
+}
+
+/// The tool supplies its argument digest and a read-only replay snapshot. Classifier callers
+/// retain their identity digest and live-catalog admission, including their original bytes.
+pub(super) async fn run_inner(
+    service: &Arc<SystemOne>,
+    params: &str,
+    scope: &broca_store::system_one::BatchScope,
+    admitted_at_ms: Option<i64>,
+    tool: Option<(&str, &ToolAdmission)>,
+) -> Result<Box<RawValue>, Refusal> {
+    let flush = Arc::clone(service);
+    tokio::task::spawn_blocking(move || flush.flush_facts())
+        .await
+        .map_err(|_| internal_refusal("usage export recovery task failed"))?
+        .map_err(|_| internal_refusal("usage export is unavailable; re-send the batch"))?;
     let limits = cortexkit_role_classifier::describe::Limits::new(
         service.config.max_items,
         service.config.max_request_bytes,
@@ -415,7 +611,21 @@ pub(crate) async fn run(service: &Arc<SystemOne>, params: &str) -> Result<Box<Ra
     let request = parse_request(params)?;
     let raw: RawParams<'_> = serde_json::from_str(params)
         .map_err(|e| Refusal::invalid_params("params", e.to_string()))?;
-    let row = service.catalog.row(&request.model);
+    let row = if let Some((_, admission)) = tool {
+        let frozen: FrozenRow = serde_json::from_str(&admission.frozen_row)
+            .map_err(|_| internal_refusal("the stored tool price does not decode"))?;
+        Some(broca_catalog::ModelBatchRow {
+            model_name: None,
+            provider_name: None,
+            kind: Some(DECISION_KIND.into()),
+            context_tokens: None,
+            attachment: false,
+            input_rate_nanos: frozen.input_rate_nanos,
+            output_rate_nanos: frozen.output_rate_nanos,
+        })
+    } else {
+        service.catalog.row(&request.model)
+    };
     check_catalog_row(&request.model, catalog_row(row.as_ref()))?;
     let row = row.expect("check_catalog_row refuses an absent row");
     // A classifier row broca has no route to: the catalog knows it, broca cannot serve it.
@@ -424,12 +634,17 @@ pub(crate) async fn run(service: &Arc<SystemOne>, params: &str) -> Result<Box<Ra
         .ok_or_else(|| Refusal::model_unavailable(&request.model))?
         .clone();
     let entry = service.model_entry(&pin, &row);
-    check_request(&request, &entry)?;
+    if tool.is_none() {
+        check_request(&request, &entry)?;
+    }
 
     let identity =
         BatchIdentity::of(&request).map_err(|e| Refusal::invalid_params("items", e.0))?;
     let identity_json = serde_json::to_string(&identity).expect("an identity encodes");
-    let digest = sha256_hex(&identity_json);
+    let digest = tool.map_or_else(
+        || sha256_hex(&identity_json),
+        |(digest, _)| digest.to_owned(),
+    );
     // A ceiling too large for the arithmetic is no ceiling at all in practice.
     let sent_ceiling = request
         .max_cost_usd
@@ -439,54 +654,124 @@ pub(crate) async fn run(service: &Arc<SystemOne>, params: &str) -> Result<Box<Ra
     // §3, in process: a second call for a batch this process holds is refused at once.
     {
         let mut claims = service.claims.lock().unwrap_or_else(|p| p.into_inner());
-        if !claims.insert(request.batch_id.clone()) {
+        if let Some(recorded) = claims.get(&request.batch_id) {
+            if recorded != scope {
+                return Err(Refusal::new(
+                    "batch_scope_mismatch",
+                    "batch_id is running under a different scope",
+                ));
+            }
             return Err(Refusal::batch_in_progress(
                 super::BATCH_IN_PROGRESS_RETRY_AFTER_MS,
             ));
         }
+        claims.insert(request.batch_id.clone(), scope.clone());
     }
     let mut hold = Hold {
         service,
         batch_id: request.batch_id.clone(),
         stored: false,
     };
+    // Everything after the in-process claim runs in `serve_claimed`, so that every way the
+    // call can end normally once the store row may exist (a reply, a scope or reuse refusal,
+    // a failed outcome or usage-export write, a failed outbox flush) passes through the
+    // awaited release below before `run` returns.
+    let answer = serve_claimed(
+        service,
+        scope,
+        &mut hold,
+        &request,
+        &raw,
+        &row,
+        &pin,
+        &identity,
+        &identity_json,
+        &digest,
+        sent_ceiling,
+        admitted_at_ms,
+        tool.map(|(_, admission)| admission.frozen_row.as_str()),
+    )
+    .await;
+    hold.release().await;
+    answer
+}
 
-    let live_frozen = FrozenRow {
-        input_rate_nanos: row.input_rate_nanos,
-        output_rate_nanos: row.output_rate_nanos,
+/// The part of one `classify.run` that runs while this call holds the batch: the store claim,
+/// each item's provider call and outcome write, and the reply. `run` releases `hold` after
+/// it, whatever it returns.
+// The arguments are the request as `run` already checked it; a struct for one call site
+// would only rename them.
+#[allow(clippy::too_many_arguments)]
+async fn serve_claimed(
+    service: &Arc<SystemOne>,
+    scope: &broca_store::system_one::BatchScope,
+    hold: &mut Hold<'_>,
+    request: &ClassifyRequest,
+    raw: &RawParams<'_>,
+    row: &ModelBatchRow,
+    pin: &ModelPin,
+    identity: &BatchIdentity,
+    identity_json: &str,
+    digest: &str,
+    sent_ceiling: Option<u64>,
+    admitted_at_ms: Option<i64>,
+    tool_frozen: Option<&str>,
+) -> Result<Box<RawValue>, Refusal> {
+    let is_tool = tool_frozen.is_some();
+    let live_frozen = if let Some(frozen) = tool_frozen {
+        serde_json::from_str(frozen)
+            .map_err(|_| internal_refusal("the admitted tool price does not decode"))?
+    } else {
+        FrozenRow {
+            input_rate_nanos: row.input_rate_nanos,
+            output_rate_nanos: row.output_rate_nanos,
+            charge_basis: None,
+        }
     };
     let now = (service.clock)();
     let claimed = {
         let store = Arc::clone(&service.store);
-        let (batch_id, model, owner) = (
+        let (role, batch_id, model, owner) = (
+            service.role.clone(),
             request.batch_id.clone(),
             request.model.clone(),
             service.owner.clone(),
         );
-        let (identity_json, digest) = (identity_json.clone(), digest.clone());
+        let (identity_json, digest) = (identity_json.to_owned(), digest.to_owned());
         let frozen = serde_json::to_string(&live_frozen).expect("frozen facts encode");
+        let scope = scope.clone();
         blocking(move || {
-            store.claim(&BatchClaim {
-                role: STORE_ROLE,
-                batch_id: &batch_id,
-                model: &model,
-                identity: &identity_json,
-                body_digest: &digest,
-                frozen_row: &frozen,
-                ceiling_nanos: sent_ceiling,
-                owner: &owner,
-                now_ms: now,
-            })
+            store.claim_admitted_at(
+                &BatchClaim {
+                    role: &role,
+                    batch_id: &batch_id,
+                    model: &model,
+                    identity: &identity_json,
+                    body_digest: &digest,
+                    frozen_row: &frozen,
+                    scope: &scope,
+                    ceiling_nanos: sent_ceiling,
+                    owner: &owner,
+                    now_ms: now,
+                },
+                admitted_at_ms.unwrap_or(now),
+            )
         })
         .await?
     };
     let (fresh, frozen, ceiling, mut spent, stored) = match claimed {
+        Claimed::ScopeMismatch => {
+            return Err(Refusal::new(
+                "batch_scope_mismatch",
+                "batch_id belongs to a different scope; a retry cannot change its attribution",
+            ))
+        }
         // §2: a different body under a recorded id names the first part that differs.
         Claimed::Reuse { recorded_identity } => {
             let recorded: BatchIdentity = serde_json::from_str(&recorded_identity)
                 .map_err(|_| internal_refusal("a recorded batch identity does not decode"))?;
             let field = recorded
-                .first_difference(&identity)
+                .first_difference(identity)
                 .unwrap_or_else(|| "items".to_owned());
             return Err(Refusal::batch_id_reuse(field));
         }
@@ -525,7 +810,7 @@ pub(crate) async fn run(service: &Arc<SystemOne>, params: &str) -> Result<Box<Ra
         }
     }
     let estimates = (0..request.items.len())
-        .map(|index| estimate(&request, index, rate))
+        .map(|index| estimate(request, index, rate))
         .collect::<Result<Vec<_>, _>>()?;
 
     // CONTRACT §6.9: an estimate of what this call would send above the ceiling is refused
@@ -609,7 +894,7 @@ pub(crate) async fn run(service: &Arc<SystemOne>, params: &str) -> Result<Box<Ra
             serde_json::to_string(&pin.provider_model).expect("a string encodes"),
             raw.items[index].state.get(),
         );
-        let answer = call_provider(service, &pin, body).await;
+        let answer = call_provider(service, pin, body).await;
         if first_provider_call {
             first_provider_call = false;
             if let Err(error) = &answer {
@@ -621,7 +906,7 @@ pub(crate) async fn run(service: &Arc<SystemOne>, params: &str) -> Result<Box<Ra
                         discard_fresh(service, &request.batch_id).await;
                         hold.stored = false;
                     }
-                    return Err(first_call_refusal(error, &request.model, &pin));
+                    return Err(first_call_refusal(error, &request.model, pin));
                 }
             }
             for outcome in std::mem::take(&mut pending) {
@@ -629,15 +914,62 @@ pub(crate) async fn run(service: &Arc<SystemOne>, params: &str) -> Result<Box<Ra
             }
         }
         match answer {
-            Ok((answers, usage)) => {
+            Ok(PaidAnswer {
+                answers,
+                usage,
+                auth_selection,
+                account_ref,
+            }) => {
+                if is_tool {
+                    tool_answer_cut().await;
+                }
                 let cost = spend_of(&frozen, usage.as_ref(), &estimates[index]);
+                let measured = usage
+                    .as_ref()
+                    .and_then(|usage| usage.input_tokens)
+                    .is_some();
+                let result = if is_tool && !measured {
+                    let refusal = crate::llm_tools::unmeasured_cost_refusal();
+                    Outcome::Failed(item_error_json(&ItemError::new(
+                        refusal.code,
+                        refusal.detail.class,
+                        refusal.message,
+                    )))
+                } else {
+                    Outcome::Answered(answers)
+                };
                 let outcome = StoredOutcome {
                     index: index as u64,
-                    outcome: Outcome::Answered(answers),
+                    outcome: result,
                     input_tokens: usage.and_then(|u| u.input_tokens),
                     output_tokens: usage.and_then(|u| u.output_tokens),
                 };
-                record(service, &request.batch_id, &outcome, cost).await?;
+                let fact = service.export.as_ref().map(|export| {
+                    use broca_core::ChargeBasisResolver;
+                    let provider = request
+                        .model
+                        .split('/')
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned();
+                    let method = auth_selection
+                        .as_deref()
+                        .and_then(|id| id.split(':').next())
+                        .unwrap_or("apikey");
+                    let (charge_basis, charge_basis_mapping_version) =
+                        service.charge_basis.resolve_charge_basis(&provider, method);
+                    broca_store::system_one::FactContext {
+                        source_instance_id: export.source_instance_id().into(),
+                        provider,
+                        model: request.model.clone(),
+                        auth_selection,
+                        account_ref,
+                        charge_basis,
+                        charge_basis_mapping_version,
+                        charge_basis_overrides: service.charge_basis.charge_basis_overrides(),
+                    }
+                });
+                record_paid(service, &request.batch_id, &outcome, cost, fact).await?;
                 spent = spent.saturating_add(cost);
                 slots[index] = Some(Slot::Stored(outcome));
             }
@@ -663,8 +995,29 @@ pub(crate) async fn run(service: &Arc<SystemOne>, params: &str) -> Result<Box<Ra
     for outcome in pending {
         record(service, &request.batch_id, &outcome, 0).await?;
     }
-    drop(hold);
-    reply(&request, &frozen, slots)
+    reply(request, &frozen, slots)
+}
+
+/// The debug test hook can stop after a provider answer, before the atomic outcome/fact write.
+/// The create-once marker prevents the restarted process from stopping at the same cut.
+async fn tool_answer_cut() {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("BROCA_PROVIDER_BASE_URL").is_some() {
+        if let Some(path) = std::env::var_os("BROCA_TEST_SYSTEM_ONE_ANSWER_GATE") {
+            use std::io::Write;
+            let path = std::path::PathBuf::from(path);
+            if let Ok(mut marker) = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                let _ = writeln!(marker, "{}", std::process::id());
+                while !path.with_extension("release").exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        }
+    }
 }
 
 async fn record(
@@ -673,13 +1026,46 @@ async fn record(
     outcome: &StoredOutcome,
     spend_nanos: u64,
 ) -> Result<(), Refusal> {
+    record_paid(service, batch_id, outcome, spend_nanos, None).await
+}
+
+async fn record_paid(
+    service: &Arc<SystemOne>,
+    batch_id: &str,
+    outcome: &StoredOutcome,
+    spend_nanos: u64,
+    fact: Option<broca_store::system_one::FactContext>,
+) -> Result<(), Refusal> {
     let store = Arc::clone(&service.store);
-    let (batch_id, owner, outcome) = (batch_id.to_owned(), service.owner.clone(), outcome.clone());
+    let (role, batch_id, owner) = (
+        service.role.clone(),
+        batch_id.to_owned(),
+        service.owner.clone(),
+    );
+    let outcome_for_metrics = outcome.clone();
+    let outcome = outcome.clone();
     let now = (service.clock)();
-    let held =
-        blocking(move || store.record(STORE_ROLE, &batch_id, &owner, &outcome, spend_nanos, now))
-            .await?;
+    let held = blocking(move || {
+        store.record_paid(
+            &role,
+            &batch_id,
+            &owner,
+            &outcome,
+            &broca_store::system_one::PaidRecord {
+                spend_nanos,
+                now_ms: now,
+                fact: fact.as_ref(),
+            },
+        )
+    })
+    .await?;
     if held {
+        service.publish_facts().await?;
+        let mut metrics = service.metrics.lock().unwrap_or_else(|p| p.into_inner());
+        match &outcome_for_metrics.outcome {
+            Outcome::Answered(_) => metrics.items_answered += 1,
+            Outcome::Failed(_) => metrics.items_failed += 1,
+        }
         Ok(())
     } else {
         Err(internal_refusal(
@@ -690,9 +1076,12 @@ async fn record(
 
 async fn discard_fresh(service: &Arc<SystemOne>, batch_id: &str) {
     let store = Arc::clone(&service.store);
-    let (batch_id, owner) = (batch_id.to_owned(), service.owner.clone());
-    if let Err(refusal) = blocking(move || store.discard_fresh(STORE_ROLE, &batch_id, &owner)).await
-    {
+    let (role, batch_id, owner) = (
+        service.role.clone(),
+        batch_id.to_owned(),
+        service.owner.clone(),
+    );
+    if let Err(refusal) = blocking(move || store.discard_fresh(&role, &batch_id, &owner)).await {
         tracing::warn!(target: "system_one", message = %refusal.message,
             "could not remove a refused batch's record");
     }

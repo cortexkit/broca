@@ -141,6 +141,7 @@ fn tool(name: &str) -> Tool {
 
 fn request(dir: &std::path::Path, run: &str, model: &str, user: Message) -> RunRequest {
     RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,

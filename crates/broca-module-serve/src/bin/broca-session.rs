@@ -50,13 +50,13 @@ use sha2::{Digest, Sha256};
 struct Args {
     /// Path to the subc daemon's connection file (subc-connection.json).
     #[arg(long)]
-    subc: PathBuf,
+    subc: Option<PathBuf>,
     /// The broca module id to bind (the ManagementSurface).
     #[arg(long, default_value = "broca")]
     module_id: String,
     /// The session identity: project root, harness, session name.
-    #[arg(long)]
-    project_root: PathBuf,
+    #[arg(long, global = true)]
+    project_root: Option<PathBuf>,
     /// An OPAQUE key component: joined with U+001F into the WAL, lease, store and idempotency
     /// keys, validated only for that separator.
     ///
@@ -70,10 +70,13 @@ struct Args {
     /// v0.3.106 is addressed under `runner`, because harness is joined into the WAL filename.
     /// Passing `--harness runner` reopens it; the default now names a different lineage. 79
     /// such sessions exist (measured 2026-09-20), 3 of which were ever reopened.
-    #[arg(long, default_value = "broca")]
-    harness: String,
-    #[arg(long)]
+    #[arg(long, global = true)]
+    harness: Option<String>,
+    #[arg(long, global = true, default_value = "")]
     session: String,
+    /// State root for reading the session-ref inventory (read-only; never migrates the store).
+    #[arg(long, global = true)]
+    state_root: Option<PathBuf>,
     /// Emit one JSON object per line instead of greppable markers.
     #[arg(long)]
     json_events: bool,
@@ -89,6 +92,7 @@ struct Args {
 struct CacheDumpArgs {
     /// Bind session names to export. Repeat to select several sessions.
     #[arg(
+        id = "session",
         long = "session",
         required_unless_present = "since",
         conflicts_with = "since"
@@ -96,7 +100,7 @@ struct CacheDumpArgs {
     sessions: Vec<String>,
     /// Export only calls whose selected attempt ended at or after RFC3339 or epoch milliseconds.
     /// Earlier WAL history is replayed to reconstruct exact request bodies.
-    #[arg(long, required_unless_present = "sessions")]
+    #[arg(long, required_unless_present = "session")]
     since: Option<String>,
     #[arg(long)]
     out: PathBuf,
@@ -104,20 +108,127 @@ struct CacheDumpArgs {
     #[arg(long)]
     state_root: Option<PathBuf>,
     /// Address these sessions directly without consulting run-index.db.
-    #[arg(long, requires_all = ["sessions", "harness"], conflicts_with = "since")]
+    #[arg(long, requires_all = ["session", "harness"], conflicts_with = "since")]
     project_root: Option<PathBuf>,
-    #[arg(long, requires_all = ["sessions", "project_root"], conflicts_with = "since")]
+    #[arg(long, requires_all = ["session", "project_root"], conflicts_with = "since")]
     harness: Option<String>,
 }
 
 #[derive(Parser)]
 struct OfflineArgs {
+    /// Parse the daemon flag only to give the same refusal in either argument order.
+    #[arg(long, global = true, hide = true)]
+    subc: Option<PathBuf>,
     #[command(subcommand)]
     command: OfflineCommand,
 }
 #[derive(Subcommand)]
 enum OfflineCommand {
     CacheDump(CacheDumpArgs),
+    Trajectory(TrajectoryArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct TrajectoryArgs {
+    id: String,
+    #[arg(long)]
+    out: Option<PathBuf>,
+    #[arg(long)]
+    transcript: bool,
+    #[arg(long)]
+    state_root: Option<PathBuf>,
+    #[arg(long, requires = "harness")]
+    project_root: Option<PathBuf>,
+    #[arg(long, requires = "project_root")]
+    harness: Option<String>,
+}
+
+fn state_root(root: Option<&PathBuf>) -> Result<PathBuf, String> {
+    root.cloned().map(Ok).unwrap_or_else(|| {
+        broca_module_serve::state_root::resolve_state_root()
+            .map(|resolved| resolved.path)
+            .map_err(|_| "cannot resolve state root".into())
+    })
+}
+
+fn offline_daemon_refusal(name: &str) -> String {
+    format!(
+        "{name} must be invoked without daemon arguments; put the subcommand first and omit --subc"
+    )
+}
+
+fn subc_path(args: &Args) -> Result<&std::path::Path, String> {
+    args.subc
+        .as_deref()
+        .ok_or_else(|| "--subc is required for daemon commands".into())
+}
+
+fn trajectory(args: TrajectoryArgs) -> Result<i32, String> {
+    let root = state_root(args.state_root.as_ref())?;
+    let bind = match (args.project_root, args.harness) {
+        (Some(project), Some(harness)) => {
+            broca_protocol::BindIdentity::new(project, harness, &args.id)
+        }
+        (None, None) => broca_module_serve::session_lookup::lookup(&root, &args.id)?,
+        _ => return Err("--project-root and --harness must be provided together".into()),
+    };
+    let rows = broca_module_serve::trajectory::read(&root, &bind, args.transcript)?;
+    let mut output: Box<dyn Write> = match args.out {
+        Some(path) => {
+            let mut options = broca_owner_only::OpenOptions::new();
+            options.write(true).create_new(true);
+            Box::new(options.open(path).map_err(|_| {
+                "cannot create private trajectory output (existing files are never overwritten)"
+            })?)
+        }
+        None => Box::new(std::io::stdout().lock()),
+    };
+    for row in rows {
+        serde_json::to_writer(&mut output, &row).map_err(|_| "cannot write trajectory")?;
+        writeln!(output).map_err(|_| "cannot write trajectory")?;
+    }
+    output.flush().map_err(|_| "cannot flush trajectory")?;
+    Ok(0)
+}
+
+fn bind_identity(args: &Args) -> Result<broca_protocol::BindIdentity, String> {
+    let id = match &args.cmd {
+        Cmd::Read { id: Some(id), .. } => {
+            if !args.session.is_empty() {
+                return Err("read accepts either an id or --session, not both".into());
+            }
+            id.as_str()
+        }
+        _ => args.session.as_str(),
+    };
+    if id.is_empty() {
+        return Err("a session id or --session is required".into());
+    }
+    if let (Some(project), Some(harness)) = (&args.project_root, &args.harness) {
+        return Ok(broca_protocol::BindIdentity::new(project, harness, id));
+    }
+    if matches!(args.cmd, Cmd::Read { .. }) {
+        let bind =
+            broca_module_serve::session_lookup::lookup(&state_root(args.state_root.as_ref())?, id)?;
+        if args
+            .harness
+            .as_ref()
+            .is_some_and(|harness| *harness != bind.harness)
+        {
+            return Err(format!("session {id:?} does not match --harness"));
+        }
+        if let Some(project) = &args.project_root {
+            let project = std::fs::canonicalize(project).unwrap_or_else(|_| project.clone());
+            if project != bind.project_root {
+                return Err(format!("session {id:?} does not match --project-root; pass both --project-root and --harness for literal addressing"));
+            }
+        }
+        return Ok(bind);
+    }
+    if let Some(project) = &args.project_root {
+        return Ok(broca_protocol::BindIdentity::new(project, "broca", id));
+    }
+    Err("--project-root is required for this command".into())
 }
 
 fn cache_dump(args: CacheDumpArgs) -> Result<i32, String> {
@@ -175,11 +286,31 @@ impl From<CliCacheRole> for CacheRole {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Replay a unary management op. Stdout is the exact response or refusal body;
+    /// stderr reports its byte count, SHA-256 and elapsed milliseconds. Refusals exit 1.
+    Raw {
+        #[arg(long)]
+        op: String,
+        /// JSON params, for example '{"from":0,"limit":10}'.
+        #[arg(long, default_value = "{}")]
+        params: String,
+    },
     /// Export digest-verified request bodies directly from live or archived WALs (no daemon).
     CacheDump(CacheDumpArgs),
+    /// Export run, model and tool events from a live or archived session WAL (no daemon).
+    Trajectory(TrajectoryArgs),
+    /// Compose a tool-only fetch plan from live provider catalogs, without sending a turn.
+    ComposePlan {
+        /// JSON with tool_items and empty system_text_items/step_transform_items; omit
+        /// composition, composition_digest, and compaction_item.
+        #[arg(long)]
+        items: PathBuf,
+    },
     /// The combined single-turn flow: subscribe, send a prompt, drain the control stream to
     /// the run's terminal. This is the single-client/single-turn proof.
     Run {
+        #[command(flatten)]
+        admission: AdmissionArgs,
         #[arg(long)]
         prompt: String,
         /// `<provider>/<model>` (the run's model handle; the module resolves the provider).
@@ -188,6 +319,9 @@ enum Cmd {
         /// Tool schemas (JSON array) the turn may call. Omit to inherit; pass `[]` for none.
         #[arg(long)]
         tools: Option<String>,
+        /// Maximum output tokens for the turn. Must be greater than zero.
+        #[arg(long = "max-output-tokens")]
+        max_output_tokens: Option<u64>,
         /// Per-send tool-call budget JSON.
         #[arg(long = "budget-json")]
         budget_json: Option<String>,
@@ -228,6 +362,8 @@ enum Cmd {
     /// This command only sends; it does not wait for the runs to finish (a separate observer
     /// drains them).
     Send {
+        #[command(flatten)]
+        admission: AdmissionArgs,
         #[arg(long = "prompt")]
         prompts: Vec<String>,
         #[arg(long)]
@@ -357,6 +493,8 @@ enum Cmd {
     /// `session.read`: one durable transcript page (lease-free; works on idle and
     /// active sessions). Prints per-message role/ordinal/summary plus page timing.
     Read {
+        /// Task id or full session name; omit when using --session.
+        id: Option<String>,
         /// First ordinal of the page (omit for the first page in the chosen direction).
         #[arg(long)]
         from_ordinal: Option<u64>,
@@ -367,6 +505,34 @@ enum Cmd {
         #[arg(long)]
         include_tools: bool,
     },
+}
+
+#[derive(clap::Args, Debug)]
+struct AdmissionArgs {
+    /// Session class to freeze on the first send (for example, "acceptance").
+    #[arg(long)]
+    session_class: Option<String>,
+    /// Read the fetch plan JSON from a file; the daemon checks and freezes provider answers.
+    #[arg(long, conflicts_with = "tools")]
+    plan: Option<PathBuf>,
+}
+
+fn load_plan(path: &Option<PathBuf>) -> Result<Option<serde_json::Value>, String> {
+    path.as_ref()
+        .map(|path| {
+            let bytes = std::fs::read(path)
+                .map_err(|error| format!("read --plan {}: {error}", path.display()))?;
+            let plan: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("parse --plan {}: {error}", path.display()))?;
+            if !plan.is_object() {
+                return Err(format!(
+                    "parse --plan {}: expected a JSON object",
+                    path.display()
+                ));
+            }
+            Ok(plan)
+        })
+        .transpose()
 }
 
 fn split_model(model: &str) -> Result<(String, String), String> {
@@ -441,6 +607,9 @@ fn auth_params(method: Option<String>, account: Option<String>) -> Option<AuthPa
 /// A caller passing them positionally has adjacent `None`s and no way to see a transposition.
 #[derive(Default)]
 struct SendKnobs {
+    session_class: Option<String>,
+    plan: Option<serde_json::Value>,
+    max_output_tokens: Option<u64>,
     budget: Option<broca_protocol::BudgetConfig>,
     cache: Option<CacheParams>,
     auth: Option<AuthParams>,
@@ -496,13 +665,24 @@ fn content_import_id(messages: &[broca_protocol::Message]) -> Result<String, Str
 async fn main() {
     if std::env::args_os()
         .nth(1)
-        .is_some_and(|a| a == "cache-dump")
+        .is_some_and(|a| a == "cache-dump" || a == "trajectory")
     {
-        let OfflineCommand::CacheDump(args) = OfflineArgs::parse().command;
-        std::process::exit(match cache_dump(args) {
+        let args = OfflineArgs::parse();
+        let result = if args.subc.is_some() {
+            Err(offline_daemon_refusal(match &args.command {
+                OfflineCommand::CacheDump(_) => "cache-dump",
+                OfflineCommand::Trajectory(_) => "trajectory",
+            }))
+        } else {
+            match args.command {
+                OfflineCommand::CacheDump(args) => cache_dump(args),
+                OfflineCommand::Trajectory(args) => trajectory(args),
+            }
+        };
+        std::process::exit(match result {
             Ok(code) => code,
             Err(error) => {
-                eprintln!("cache-dump: {error}");
+                eprintln!("{error}");
                 1
             }
         });
@@ -528,6 +708,9 @@ fn validate_max_output_tokens(cmd: &Cmd) -> Result<(), String> {
         Cmd::Send {
             max_output_tokens: Some(0),
             ..
+        } | Cmd::Run {
+            max_output_tokens: Some(0),
+            ..
         }
     ) {
         return Err("--max-output-tokens must be greater than 0".into());
@@ -536,7 +719,17 @@ fn validate_max_output_tokens(cmd: &Cmd) -> Result<(), String> {
 }
 
 async fn run(args: Args) -> Result<i32, String> {
+    match &args.cmd {
+        Cmd::CacheDump(_) => return Err(offline_daemon_refusal("cache-dump")),
+        Cmd::Trajectory(_) => return Err(offline_daemon_refusal("trajectory")),
+        _ => {}
+    }
+    subc_path(&args)?;
     validate_max_output_tokens(&args.cmd)?;
+    let plan = match &args.cmd {
+        Cmd::Run { admission, .. } | Cmd::Send { admission, .. } => load_plan(&admission.plan)?,
+        _ => None,
+    };
     let json = args.json_events;
     // The audit is dispatched before the broca management-surface bind, and it returns its own
     // exit code rather than an error: every way it can fail to run is exit 2, and an `Err` out
@@ -544,18 +737,20 @@ async fn run(args: Args) -> Result<i32, String> {
     if let Cmd::CredentialAudit { .. } = &args.cmd {
         return Ok(credential_audit(&args, json).await);
     }
-    let session =
-        broca_protocol::BindIdentity::new(&args.project_root, &args.harness, &args.session);
+    if let Cmd::ComposePlan { items } = &args.cmd {
+        return compose_plan(&args, items).await;
+    }
+    let session = bind_identity(&args)?;
     session
         .validate_keyable()
         .map_err(|error| format!("invalid bind identity: {error}"))?;
-    let conn = SubcConnection::connect(&args.subc)
+    let conn = SubcConnection::connect(subc_path(&args)?)
         .await
-        .map_err(|e| format!("connect subc ({}): {e}", args.subc.display()))?;
+        .map_err(|_| "cannot connect subc".to_string())?;
     let client = SessionClient::bind_with_timeout(
         conn,
         &args.module_id,
-        session,
+        session.clone(),
         std::time::Duration::from_millis(args.bind_timeout_ms),
     )
     .await
@@ -589,20 +784,21 @@ async fn run(args: Args) -> Result<i32, String> {
     // canonicalisation agrees -- only the daemon knows that. When they differ the typed form
     // is printed too, because a caller who typed a path and sees a different one needs to
     // know it is the same path and not a silently redirected bind.
-    let keyed_root =
-        std::fs::canonicalize(&args.project_root).unwrap_or_else(|_| args.project_root.clone());
-    let root_display = if keyed_root == args.project_root {
+    let keyed_root = std::fs::canonicalize(&session.project_root)
+        .unwrap_or_else(|_| session.project_root.clone());
+    let root_display = if keyed_root == session.project_root {
         keyed_root.display().to_string()
     } else {
         format!(
             "{} (as typed: {})",
             keyed_root.display(),
-            args.project_root.display()
+            session.project_root.display()
         )
     };
     let raw_output = matches!(
         &args.cmd,
         Cmd::Status { raw: true, .. }
+            | Cmd::Raw { .. }
             | Cmd::Result { raw: true, .. }
             | Cmd::Describe
             | Cmd::EventGet { .. }
@@ -613,26 +809,33 @@ async fn run(args: Args) -> Result<i32, String> {
             &serde_json::json!({
                 "event": "bound",
                 "module": args.module_id,
-                "harness": args.harness,
+                "harness": session.harness,
                 "project_root": keyed_root.display().to_string(),
-                "project_root_as_typed": args.project_root.display().to_string(),
-                "session": args.session,
+                "project_root_as_typed": session.project_root.display().to_string(),
+                "session": session.session,
             }),
             || {
                 format!(
                     "BOUND module={} harness={} project_root={} session={}",
-                    args.module_id, args.harness, root_display, args.session
+                    args.module_id, session.harness, root_display, session.session
                 )
             },
         );
     }
 
     match args.cmd {
-        Cmd::CacheDump(_) => Err("cache-dump must be invoked without daemon arguments".into()),
+        Cmd::ComposePlan { .. } => {
+            unreachable!("compose-plan is dispatched before the management-surface bind")
+        }
+        Cmd::CacheDump(_) | Cmd::Trajectory(_) => {
+            unreachable!("offline commands are refused before the management-surface bind")
+        }
         Cmd::Run {
+            admission,
             prompt,
             model,
             tools,
+            max_output_tokens,
             budget_json,
             cache_role,
             cache_ttl,
@@ -650,6 +853,9 @@ async fn run(args: Args) -> Result<i32, String> {
                 &model,
                 &tools,
                 SendKnobs {
+                    session_class: admission.session_class,
+                    plan,
+                    max_output_tokens,
                     budget: parse_budget(&budget_json)?,
                     cache: cache_params(cache_role, cache_ttl, None, no_cache),
                     auth: auth_params(auth_method, auth_account),
@@ -661,6 +867,7 @@ async fn run(args: Args) -> Result<i32, String> {
             .await
         }
         Cmd::Send {
+            admission,
             prompts,
             model,
             tools,
@@ -713,9 +920,17 @@ async fn run(args: Args) -> Result<i32, String> {
                         auth: None,
                         one_shot: None,
                         context_management: None,
+                        session_class: admission.session_class.as_deref(),
+                        plan: plan.clone(),
                     })
-                    .await
-                    .map_err(|e| format!("send: {e}"))?;
+                    .await;
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        emit_send_error(json, &error);
+                        return Ok(1);
+                    }
+                };
                 emit_send_outcome(json, &outcome);
             }
             Ok(0)
@@ -768,6 +983,32 @@ async fn run(args: Args) -> Result<i32, String> {
                 || format!("IMPORT {response:?}"),
             );
             Ok(0)
+        }
+        Cmd::Raw { op, params } => {
+            if op == "session.subscribe" {
+                return Err(
+                    "raw accepts unary operations, not session.subscribe; use subscribe".into(),
+                );
+            }
+            let params: serde_json::Value =
+                serde_json::from_str(&params).map_err(|error| format!("raw params: {error}"))?;
+            let started = std::time::Instant::now();
+            let reply = client
+                .management_raw(&op, &params)
+                .await
+                .map_err(|error| format!("raw transport: {error}"))?;
+            let elapsed_ms = started.elapsed().as_millis();
+            let (body, exit) = match reply {
+                Ok(body) => (body, 0),
+                Err(body) => (body, 1),
+            };
+            write_raw_reply_to(
+                &body,
+                Some(elapsed_ms),
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            )?;
+            Ok(exit)
         }
         Cmd::Status { run_id, raw } => {
             match run_id {
@@ -867,6 +1108,7 @@ async fn run(args: Args) -> Result<i32, String> {
             unreachable!("credential-audit is dispatched before the management-surface bind")
         }
         Cmd::Read {
+            id: _,
             from_ordinal,
             limit,
             include_tools,
@@ -956,6 +1198,28 @@ async fn run(args: Args) -> Result<i32, String> {
             Ok(0)
         }
     }
+}
+
+async fn compose_plan(args: &Args, path: &std::path::Path) -> Result<i32, String> {
+    let bytes =
+        std::fs::read(path).map_err(|error| format!("read --items {}: {error}", path.display()))?;
+    let items = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse --items {}: {error}", path.display()))?;
+    let identity = bind_identity(args)?;
+    identity
+        .validate_keyable()
+        .map_err(|error| format!("invalid bind identity: {error}"))?;
+    let conn = SubcConnection::connect(subc_path(args)?)
+        .await
+        .map_err(|_| "cannot connect subc".to_string())?;
+    let fetcher = broca_subc::SubcPlanFetcher::new(std::sync::Arc::new(conn), identity, None);
+    let result =
+        broca_fetch_plan::compose(&items, &fetcher, broca_fetch_plan::ADMISSION_DEADLINE).await;
+    fetcher.close().await;
+    let plan =
+        result.map_err(|error| format!("compose-plan: {}: {}", error.code(), error.message()))?;
+    println!("{plan}");
+    Ok(0)
 }
 
 // -- credential-audit ------------------------------------------------------------------------
@@ -1105,14 +1369,13 @@ fn audit_events(answer: &Result<VaultAuditResponse, String>) -> Vec<(serde_json:
 /// Ask the daemon for `vault.audit`. A request that got no reply at all (no connection, no
 /// bind, a refused op) is an `Err`; the daemon's own `Unanswered` comes back as `Ok`.
 async fn request_vault_audit(args: &Args) -> Result<VaultAuditResponse, String> {
-    let session =
-        broca_protocol::BindIdentity::new(&args.project_root, &args.harness, &args.session);
+    let session = bind_identity(args)?;
     session
         .validate_keyable()
         .map_err(|error| format!("invalid bind identity: {error}"))?;
-    let conn = SubcConnection::connect(&args.subc)
+    let conn = SubcConnection::connect(subc_path(args)?)
         .await
-        .map_err(|error| format!("connect subc ({}): {error}", args.subc.display()))?;
+        .map_err(|_| "cannot connect subc".to_string())?;
     let client = SessionClient::bind_with_timeout(
         conn,
         &args.module_id,
@@ -1403,6 +1666,9 @@ async fn run_turn(
     knobs: SendKnobs,
 ) -> Result<i32, String> {
     let SendKnobs {
+        session_class,
+        plan,
+        max_output_tokens,
         budget,
         cache,
         auth,
@@ -1431,15 +1697,23 @@ async fn run_turn(
             service_tier,
             tools,
             send_id: None,
-            max_output_tokens: None,
+            max_output_tokens,
             cache,
             budget,
             auth,
             one_shot: None,
             context_management,
+            session_class: session_class.as_deref(),
+            plan,
         })
-        .await
-        .map_err(|e| format!("send: {e}"))?;
+        .await;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            emit_send_error(json, &error);
+            return Ok(1);
+        }
+    };
     emit_send_outcome(json, &outcome);
     if let SendOutcome::Finished { reason, .. } = &outcome {
         return Ok(
@@ -1493,6 +1767,14 @@ async fn run_turn(
                     RunTurnAction::Ignore | RunTurnAction::Continue => {}
                 }
             }
+            Ok(SubscribeEvent::UnknownControlUnit {
+                wal_seq,
+                sub_index,
+                unit_type,
+                ..
+            }) => {
+                emit_unknown_control_unit(json, wal_seq, sub_index, &unit_type);
+            }
             Ok(SubscribeEvent::Display(_)) => {} // lossy display, not asserted on
             Err(e) => return Err(format!("decode subscribe event: {e}")),
         }
@@ -1502,6 +1784,17 @@ async fn run_turn(
     // Preserve the finish-reason classification here: reporting success for a failed run silently
     // turns an automation failure into a passing step, which is worse than crashing.
     Ok(tracker.exit_code())
+}
+
+fn send_error_event(error: &broca_subc::ConnError) -> serde_json::Value {
+    serde_json::json!({"event": "error", "operation": "session.send", "code": error.code(),
+                      "msg": format!("send: {error}")})
+}
+
+fn emit_send_error(json: bool, error: &broca_subc::ConnError) {
+    emit(json, &send_error_event(error), || {
+        format!("ERROR send: {error}")
+    });
 }
 
 /// One display-lane event for an operator: its arrival time, type and text length. The text
@@ -1519,6 +1812,16 @@ fn display_line(event: &broca_protocol::DisplayEvent) -> serde_json::Value {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis() as u64);
     serde_json::json!({"event": "display", "type": kind, "chars": chars, "at_ms": at_ms})
+}
+
+fn emit_unknown_control_unit(json: bool, wal_seq: u64, sub_index: u32, unit_type: &str) {
+    emit(
+        json,
+        &serde_json::json!({
+            "event":"unknown_control_unit", "wal_seq":wal_seq, "sub_index":sub_index, "type":unit_type,
+        }),
+        || format!("UNKNOWN_CONTROL_UNIT type={unit_type} cursor={wal_seq}:{sub_index}"),
+    );
 }
 
 /// A pure observer: subscribe and drain the control stream, printing each event, until
@@ -1574,6 +1877,15 @@ async fn observe(
                         break;
                     }
                 }
+            }
+            Ok(SubscribeEvent::UnknownControlUnit {
+                wal_seq,
+                sub_index,
+                unit_type,
+                ..
+            }) => {
+                last_cursor = Some((wal_seq, sub_index));
+                emit_unknown_control_unit(json, wal_seq, sub_index, &unit_type);
             }
             Ok(SubscribeEvent::Display(event)) => {
                 if display {
@@ -1943,12 +2255,35 @@ fn emit_run_final_text_to(json: bool, text: &str, output: &mut impl FnMut(String
 }
 
 fn write_raw_reply(body: &[u8]) -> Result<(), String> {
-    let mut stdout = std::io::stdout().lock();
+    write_raw_reply_to(
+        body,
+        None,
+        &mut std::io::stdout().lock(),
+        &mut std::io::stderr().lock(),
+    )
+}
+
+fn write_raw_reply_to(
+    body: &[u8],
+    elapsed_ms: Option<u128>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> Result<(), String> {
     stdout
         .write_all(body)
         .and_then(|()| stdout.flush())
         .map_err(|error| format!("write raw daemon reply to stdout: {error}"))?;
-    eprintln!("RAW bytes={} sha256={:x}", body.len(), Sha256::digest(body));
+    writeln!(
+        stderr,
+        "RAW bytes={} sha256={:x}",
+        body.len(),
+        Sha256::digest(body)
+    )
+    .map_err(|error| format!("write raw reply metadata: {error}"))?;
+    if let Some(elapsed_ms) = elapsed_ms {
+        writeln!(stderr, "RAW elapsed_ms={elapsed_ms}")
+            .map_err(|error| format!("write raw reply elapsed time: {error}"))?;
+    }
     Ok(())
 }
 
@@ -1970,7 +2305,41 @@ fn emit_to(
 mod tests {
     use std::sync::Arc;
 
-    use super::{cache_params, read_page_event, run, Args, Cmd};
+    use super::{cache_params, load_plan, read_page_event, run, Args, Cmd, PathBuf};
+
+    #[test]
+    fn generic_raw_command_preserves_json_params() {
+        use clap::Parser;
+        let params = r#"{"from":12,"limit":3}"#;
+        let args = Args::try_parse_from([
+            "broca-session",
+            "--subc",
+            "unused",
+            "--project-root",
+            ".",
+            "--session",
+            "s",
+            "raw",
+            "--op",
+            "session.history",
+            "--params",
+            params,
+        ])
+        .unwrap();
+        assert!(
+            matches!(args.cmd, Cmd::Raw { op, params: parsed } if op == "session.history" && parsed == params)
+        );
+    }
+
+    #[test]
+    fn raw_reply_bytes_and_digest_are_exact_with_elapsed_metadata() {
+        let body = b"abc";
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        super::write_raw_reply_to(body, Some(2001), &mut stdout, &mut stderr).unwrap();
+        assert_eq!(stdout, body);
+        assert_eq!(String::from_utf8(stderr).unwrap(), "RAW bytes=3 sha256=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\nRAW elapsed_ms=2001\n");
+    }
 
     #[test]
     fn cache_dump_reads_all_compaction_records_live_and_archived() {
@@ -2416,6 +2785,149 @@ mod tests {
         );
 
         assert_eq!(content_import_id(&messages).unwrap(), legacy);
+    }
+
+    #[test]
+    fn run_and_send_accept_class_and_plan_flags() {
+        for command in ["run", "send"] {
+            let args = Args::try_parse_from([
+                "broca-session",
+                "--subc",
+                "unused",
+                "--project-root",
+                ".",
+                "--session",
+                "s",
+                command,
+                "--prompt",
+                "hello",
+                "--model",
+                "provider/model",
+                "--session-class",
+                "acceptance",
+                "--plan",
+                "plan.json",
+                "--max-output-tokens",
+                "32",
+            ])
+            .unwrap();
+            let (admission, max_output_tokens) = match args.cmd {
+                Cmd::Run {
+                    admission,
+                    max_output_tokens,
+                    ..
+                }
+                | Cmd::Send {
+                    admission,
+                    max_output_tokens,
+                    ..
+                } => (admission, max_output_tokens),
+                _ => panic!("expected run or send"),
+            };
+            assert_eq!(admission.session_class.as_deref(), Some("acceptance"));
+            assert_eq!(admission.plan, Some(PathBuf::from("plan.json")));
+            assert_eq!(max_output_tokens, Some(32));
+        }
+    }
+
+    #[test]
+    fn compose_plan_accepts_items_without_a_model_or_prompt() {
+        let args = Args::try_parse_from([
+            "broca-session",
+            "--subc",
+            "connection.json",
+            "--project-root",
+            ".",
+            "--session",
+            "compose-probe",
+            "compose-plan",
+            "--items",
+            "items.json",
+        ])
+        .unwrap();
+        assert!(
+            matches!(args.cmd, Cmd::ComposePlan { items } if items == std::path::Path::new("items.json"))
+        );
+    }
+
+    #[test]
+    fn send_error_code_is_never_inferred_from_message_text() {
+        for error in [
+            broca_subc::ConnError::Transport("plan_stale".into()),
+            broca_subc::ConnError::Rejected("plan_stale — legacy refusal".into()),
+        ] {
+            let event = super::send_error_event(&error);
+            assert_eq!(event["operation"], "session.send");
+            assert!(event["code"].is_null());
+            assert!(event["msg"].as_str().unwrap().contains("plan_stale"));
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_plan_is_refused_before_connecting() {
+        let dir = broca_test_support::scratch_root().join("session-cli-plan");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plan.json");
+        for contents in ["{", "[]"] {
+            std::fs::write(&path, contents).unwrap();
+            let args = Args::try_parse_from([
+                "broca-session",
+                "--subc",
+                "absent-connection",
+                "--project-root",
+                ".",
+                "--session",
+                "s",
+                "run",
+                "--prompt",
+                "hello",
+                "--model",
+                "provider/model",
+                "--plan",
+                path.to_str().unwrap(),
+            ])
+            .unwrap();
+            assert!(run(args).await.unwrap_err().starts_with("parse --plan"));
+        }
+        std::fs::write(
+            &path,
+            r#"{"tool_items":[{"provider":"aft","preset":"reader"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load_plan(&Some(path.clone())).unwrap().unwrap()["tool_items"][0]["provider"],
+            "aft"
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert!(load_plan(&Some(path))
+            .unwrap_err()
+            .starts_with("read --plan"));
+        assert_eq!(load_plan(&None).unwrap(), None);
+    }
+
+    #[test]
+    fn plan_and_inline_tools_conflict() {
+        for command in ["run", "send"] {
+            assert!(Args::try_parse_from([
+                "broca-session",
+                "--subc",
+                "unused",
+                "--project-root",
+                ".",
+                "--session",
+                "s",
+                command,
+                "--prompt",
+                "hello",
+                "--model",
+                "provider/model",
+                "--plan",
+                "plan.json",
+                "--tools",
+                "[]",
+            ])
+            .is_err());
+        }
     }
 
     #[test]

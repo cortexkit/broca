@@ -271,7 +271,8 @@ impl Drop for RouteLease {
 fn expired() -> FetchError {
     FetchError::Lost("role call deadline expired".into())
 }
-fn open_error(error: ConnError) -> FetchError {
+/// Role and tool-provider admission opens share the protocol's retry allowlist.
+pub(crate) fn open_error(error: ConnError) -> FetchError {
     match error {
         ConnError::Rejected(message) => {
             let code = message.code();
@@ -286,5 +287,45 @@ fn open_error(error: ConnError) -> FetchError {
             }
         }
         error => FetchError::Lost(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admission_opens_use_the_protocol_retry_allowlist() {
+        for (code, retryable) in [
+            ("module_warming", true),
+            ("module_reloading", true),
+            ("target_unavailable", true),
+            ("module_timeout", true),
+            ("unknown_module", false),
+            ("module_rejected", false),
+            ("permission_denied", false),
+            ("future_code", false),
+        ] {
+            let body = subc_protocol::ErrorBody::new(code, "module_warming — diagnostic only");
+            let error = ConnError::Rejected(crate::connection::decode_error_body(
+                &serde_json::to_vec(&body).unwrap(),
+            ));
+            match open_error(error) {
+                FetchError::UnknownModule => assert_eq!(code, "unknown_module"),
+                FetchError::Refused {
+                    code: actual,
+                    retryable: actual_retryable,
+                    ..
+                } => {
+                    assert_eq!(actual, code);
+                    assert_eq!(actual_retryable, retryable, "{code}");
+                }
+                other => panic!("unexpected classification for {code}: {other:?}"),
+            }
+        }
+        assert!(matches!(
+            open_error(ConnError::Transport("lost".into())),
+            FetchError::Lost(_)
+        ));
     }
 }

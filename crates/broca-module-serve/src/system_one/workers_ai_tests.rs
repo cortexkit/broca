@@ -222,6 +222,7 @@ impl CredentialSource for Vaulted {
         Ok(Some(ProviderSecret {
             token: TOKEN.to_owned(),
             account_id: self.account_id.clone(),
+            auth_selection: Some(format!("{CREDENTIAL_ID}:resolved")),
         }))
     }
 }
@@ -238,6 +239,8 @@ impl BatchCatalog for Rows {
 /// (0.24 and 0.038 USD per million tokens), output stated free, contexts 65,536 and 24,576.
 fn catalog() -> Arc<Rows> {
     let row = |context, input| ModelBatchRow {
+        model_name: None,
+        provider_name: None,
         kind: Some("decision".into()),
         context_tokens: Some(context),
         attachment: true,
@@ -254,6 +257,7 @@ struct Rig {
     service: Arc<SystemOne>,
     cloudflare: Arc<Cloudflare>,
     store: Arc<SystemOneStore>,
+    export: Arc<broca_store::SqliteStore>,
 }
 
 async fn rig_with(account_id: Option<&str>, config: Config) -> Rig {
@@ -274,21 +278,29 @@ async fn rig_with(account_id: Option<&str>, config: Config) -> Rig {
         )
     };
     let store = Arc::new(SystemOneStore::open_in_memory().unwrap());
-    let service = Arc::new(SystemOne::new(
-        Arc::clone(&store),
-        "this-process",
-        catalog(),
-        vec![
-            ModelPin::clef(client(CLEF_MODEL_PATH)),
-            ModelPin::clef_flash(client(CLEF_FLASH_MODEL_PATH)),
-        ],
-        config,
-        Arc::new(AtomicUsize::new(0)),
-    ));
+    let export = Arc::new(broca_store::SqliteStore::open_in_memory().unwrap());
+    let service = Arc::new(
+        SystemOne::new(
+            Arc::clone(&store),
+            "this-process",
+            catalog(),
+            vec![
+                ModelPin::clef(client(CLEF_MODEL_PATH)),
+                ModelPin::clef_flash(client(CLEF_FLASH_MODEL_PATH)),
+            ],
+            config,
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .with_export(
+            export.clone(),
+            Arc::new(crate::billing_routing::ChargeBasisTable::shipped_defaults()),
+        ),
+    );
     Rig {
         service,
         cloudflare,
         store,
+        export,
     }
 }
 
@@ -312,14 +324,20 @@ fn params(batch: &str, model: &str, states: &[&str]) -> String {
 }
 
 async fn admitted(rig: &Rig, params: String) -> String {
-    match Arc::clone(&rig.service).spawn_call(params).await {
+    match Arc::clone(&rig.service)
+        .spawn_call(params, test_scope())
+        .await
+    {
         Ok(reply) => reply.get().to_owned(),
         Err(body) => panic!("refused: {}", String::from_utf8_lossy(&body)),
     }
 }
 
 async fn refused(rig: &Rig, params: String) -> Value {
-    match Arc::clone(&rig.service).spawn_call(params).await {
+    match Arc::clone(&rig.service)
+        .spawn_call(params, test_scope())
+        .await
+    {
         Ok(reply) => panic!("admitted: {}", reply.get()),
         Err(body) => serde_json::from_slice(&body).unwrap(),
     }
@@ -672,6 +690,7 @@ async fn a_credential_without_a_usable_account_id_sends_nothing() {
     let secret = ProviderSecret {
         token: TOKEN.into(),
         account_id: Some(ACCOUNT.into()),
+        auth_selection: Some(CREDENTIAL_ID.into()),
     };
     let shown = format!("{secret:?}");
     assert!(
@@ -739,5 +758,47 @@ async fn describe_lists_clef_and_clef_flash_from_their_rows() {
                 json!(64)
             ),
         ]
+    );
+}
+
+fn test_scope() -> broca_store::system_one::BatchScope {
+    broca_store::system_one::BatchScope::Run {
+        agent_id: "agent".into(),
+        run_id: "run".into(),
+    }
+}
+
+#[tokio::test]
+async fn workers_ai_metering_uses_the_attempts_resolved_credential_and_only_measured_usage() {
+    let rig = rig().await;
+    rig.cloudflare.script(
+        "measured",
+        vec![Answer::Result(result(
+            "clef",
+            "0.5",
+            Some(r#"{"input_tokens":7,"output_tokens":0}"#),
+        ))],
+    );
+    rig.cloudflare.script(
+        "unreported",
+        vec![Answer::Result(result("clef", "0.5", None))],
+    );
+    admitted(&rig, params("metered", CLEF, &["measured", "unreported"])).await;
+    let page = rig.export.read_export_page(None, 100).unwrap();
+    assert_eq!(page.facts.len(), 2);
+    let first = serde_json::to_value(&page.facts[0].segment).unwrap();
+    assert_eq!(first["auth_selection"], format!("{CREDENTIAL_ID}:resolved"));
+    assert_eq!(first["account_ref"], ACCOUNT);
+    assert_eq!(
+        first["usage"],
+        json!({"input_tokens": 7, "output_tokens": 0})
+    );
+    let second = serde_json::to_value(&page.facts[1].segment).unwrap();
+    assert_eq!(second["usage"], json!({}));
+    assert!(second.get("cost_nanos").is_none());
+    admitted(&rig, params("metered", CLEF, &["measured", "unreported"])).await;
+    assert_eq!(
+        rig.export.read_export_page(None, 100).unwrap().facts.len(),
+        2
     );
 }

@@ -143,6 +143,7 @@ fn queued_record(
     ts_ms: Option<u64>,
 ) -> WalRecord {
     WalRecord::Queued {
+        written_at_ms: None,
         retention,
         ts_ms,
         hooks: None,
@@ -225,7 +226,7 @@ impl broca_wal::Wal for RefusingWal {
 
 impl Fixture {
     async fn refuse_next_append(&mut self, clear_at_sync: usize) {
-        self.actor.shutdown_writer().await;
+        let _ = self.actor.shutdown_writer().await;
         let writer = Arc::new(std::sync::Mutex::new(std::sync::Weak::new()));
         let handle = Arc::new(
             WalHandle::spawn(
@@ -251,6 +252,13 @@ impl Fixture {
     }
 
     async fn with_retention(history: bool, retained: bool) -> Self {
+        Self::with_placement(history, retained, retained).await
+    }
+
+    /// `service` installs the retention service; `retained` also places the WAL under the
+    /// ephemeral root, as a retained first send does. A service without a retained WAL
+    /// models a fresh state root whose first session is not (yet) retained.
+    async fn with_placement(history: bool, service: bool, retained: bool) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let root = broca_test_support::scratch_root().join(format!(
             "broca-wal-proof-{}-{}",
@@ -279,6 +287,7 @@ impl Fixture {
             wal.append(
                 1,
                 &WalRecord::RunStarted {
+                    written_at_ms: None,
                     tags: None,
                     session_class: None,
                     retention: retained.then_some(3600),
@@ -329,7 +338,7 @@ impl Fixture {
             idle_ttl: Duration::from_secs(60),
             executor: executor.clone(),
         }));
-        if retained {
+        if service {
             let store = Arc::new(broca_store::SqliteStore::open_in_memory().unwrap());
             registry.set_retention_service(Arc::new(
                 crate::retention::RetentionService::new(
@@ -348,6 +357,7 @@ impl Fixture {
         let (terminal_tx, terminal_rx) = mpsc::unbounded_channel();
         let mut actor = LineageActor {
             ceiling_drain_held: false,
+            compaction_watch: Default::default(),
             admitting_session_class: None,
             agent_run_scope: None,
             #[cfg(all(test, feature = "test-clock"))]
@@ -364,7 +374,7 @@ impl Fixture {
             actor_jobs: Arc::default(),
             key,
             gen: 1,
-            lease: Some(lease),
+            lease: Some(ActorTenure::Lease(lease)),
             writer: Some(writer),
             executor: executor.clone(),
             wal_store,
@@ -384,8 +394,6 @@ impl Fixture {
             materialized_store: None,
             export_index: None,
             charge_basis_resolver: None,
-            cap_store: None,
-            pending_capped_export: None,
             startup_recovery_pending: false,
             prior_snapshot: None,
             pending_fifo: Vec::new(),
@@ -412,6 +420,7 @@ impl Fixture {
             restart_admitting: false,
             restart_waiters: Vec::new(),
             restart_recovery_owns_waiters: false,
+            resuming_for_late_result: false,
             nested_exit_requested: false,
             warm_in_flight: Default::default(),
         };
@@ -447,7 +456,7 @@ impl Fixture {
     }
 
     async fn close(mut self) {
-        self.actor.shutdown_writer().await;
+        let _ = self.actor.shutdown_writer().await;
         drop(self.actor.lease.take());
         std::fs::remove_dir_all(self.root).unwrap();
     }
@@ -543,6 +552,7 @@ async fn refused_queue_and_retract_leave_memory_unchanged() {
     retract.actor.ensure_wal_scan_loaded().await.unwrap();
     let steer = broca_core::SteerInbox::new();
     steer.seed_ordered(vec![broca_core::delivery_order::OrderedSend {
+        admitted_at_ms: None,
         submission_id: id.clone(),
         principal: None,
         input: retract.request.input.clone(),
@@ -565,6 +575,8 @@ async fn refused_queue_and_retract_leave_memory_unchanged() {
         step_progress: Default::default(),
         handle: tokio::spawn(async {}),
         durable_finish: Arc::default(),
+        // This fixture deliberately takes the durable cancellation path when held state is unknown.
+        provider_held: None,
     });
     retract.refuse_next_append(1).await;
     // The run appends after the actor captures its read head, leaving work for the
@@ -656,7 +668,7 @@ async fn long_retention_sync_is_bounded_and_repair_survives_restart() {
     // The actor's lease defers enrollment repair; repeated syncs enqueue one retry path.
     assert_eq!(service.enroll_changes().unwrap(), 0);
     drop(writer);
-    fixture.actor.shutdown_writer().await;
+    let _ = fixture.actor.shutdown_writer().await;
     drop(fixture.actor.lease.take());
     let restarted = crate::retention::RetentionService::new(
         service.wal.clone(),
@@ -678,6 +690,166 @@ async fn long_retention_sync_is_bounded_and_repair_survives_restart() {
             .len()
     );
     fixture.close().await;
+}
+
+#[tokio::test]
+async fn retention_sync_before_the_first_run_is_a_quiet_no_op_on_a_fresh_state_root() {
+    // An actor syncs the retention index when it starts, before its first send has
+    // appended RunStarted. On a fresh state root the ephemeral directory does not exist
+    // yet, and an unstarted lineage has no retention policy to project, so the sync must
+    // succeed without touching the ephemeral root or enrolling repair.
+    let mut fixture = Fixture::with_placement(false, true, false).await;
+    let service = fixture.actor.registry.retention_service().unwrap();
+    let ephemeral = service.wal.ephemeral_root();
+    assert!(!ephemeral.exists(), "fixture must model a fresh state root");
+    for _ in 0..2 {
+        let result = fixture.actor.sync_retention_index().await;
+        assert_eq!(result, Ok(()), "unstarted lineage sync must not fail");
+    }
+    assert!(fixture.actor.retention_deadline.is_none());
+    assert!(
+        !ephemeral.exists(),
+        "an unstarted lineage must not be remembered as a retained session"
+    );
+    assert!(service.index.live(&fixture.actor.key).unwrap().is_none());
+    assert_eq!(
+        fixture.actor.registry.retention_repairs_pending(),
+        0,
+        "nothing is unprojected, so nothing needs repair"
+    );
+    fixture.close().await;
+}
+
+/// The actor-start sync no longer writes a session sidecar before the first RunStarted, so a
+/// retained session's sidecar and index row are first written by the sync that follows
+/// admission. A crash between the retained RunStarted append and that sync leaves a retained
+/// WAL with neither, and the writer's in-memory change hints die with the process. Boot
+/// recovery must still find the WAL by walking the ephemeral root, rediscover its session from
+/// the WAL itself, and give it its deadline once its interrupted run is sealed.
+#[tokio::test]
+async fn retained_first_send_cut_before_its_index_sync_is_recovered_at_boot() {
+    let mut fixture = Fixture::with_placement(false, true, false).await;
+    let service = fixture.actor.registry.retention_service().unwrap();
+    let key = fixture.actor.key.clone();
+    let sidecar = service
+        .wal
+        .ephemeral_wal_path(&key)
+        .with_extension("session");
+    // Production state roots already hold retained logs, so the ephemeral root exists and the
+    // removed actor-start sidecar write would have succeeded there.
+    std::fs::create_dir_all(service.wal.ephemeral_root()).unwrap();
+    fixture.actor.sync_retention_index().await.unwrap();
+    assert!(!sidecar.exists(), "actor start writes no sidecar");
+
+    // Admission's durable step: the retained first RunStarted, which moves the WAL under
+    // the ephemeral root. The process then dies before the post-admission index sync.
+    let request = fixture.request.clone();
+    let writer = fixture.actor.writer.as_ref().unwrap().clone();
+    let digest = send_identity_digest(&request, broca_protocol::Delivery::Queue, None);
+    writer
+        .record(WalRecord::RunStarted {
+            written_at_ms: None,
+            tags: None,
+            session_class: None,
+            retention: Some(3600),
+            hooks: None,
+            title: None,
+            on_restart: None,
+            keep_warm: None,
+            marker_order_version: None,
+            manifest: None,
+            scope: None,
+            send_id: Some("first".into()),
+            request_identity_digest: Some(digest),
+            project_id: None,
+            principal: None,
+            ts_ms: Some(1000),
+            run_id: RunId("first".into()),
+            session: key.clone(),
+            config: Box::new(min_config()),
+            input: request.input.clone().into(),
+            origin: broca_wal::RunOrigin::Fresh,
+            submission_id: None,
+        })
+        .into_result()
+        .unwrap();
+    writer.sync().await.unwrap();
+    drop(writer);
+    let _ = fixture.actor.shutdown_writer().await;
+    drop(fixture.actor.lease.take());
+    assert!(
+        service.wal.ephemeral_wal_path(&key).exists(),
+        "the WAL is retained"
+    );
+    assert!(!sidecar.exists(), "the cut leaves no sidecar");
+    assert!(
+        service.index.live(&key).unwrap().is_none(),
+        "the cut leaves no index row"
+    );
+
+    // A restarted process: same durable state, but a new WAL store, so no writer hints.
+    let restart = || {
+        crate::retention::RetentionService::new(
+            Arc::new(FileWalStore::new(fixture.root.join("wal"))),
+            service.index.clone(),
+            Arc::new(FileLeaseStore::new(fixture.root.join("leases"))),
+            Arc::new(broca_store::SqliteStore::open_in_memory().unwrap()),
+            Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::MeteredApi, 1)),
+        )
+        .unwrap()
+    };
+    let booted = restart();
+    assert_eq!(booted.wal.take_retention_changes(), (vec![], false));
+    assert_eq!(booted.recover_enrollment().unwrap(), 1);
+    let row = service
+        .index
+        .live(&key)
+        .unwrap()
+        .expect("boot recovery finds the WAL");
+    assert_eq!(row.retention_s, 3600);
+    assert_eq!(
+        row.expires_at_ms, None,
+        "an unfinished run has no deadline yet"
+    );
+    assert!(sidecar.exists(), "recovery rewrites the sidecar");
+
+    // Boot's crash-orphan seal finishes the interrupted run. It is appended through yet
+    // another store so it nominates nothing to the next boot's service either.
+    let mut sealed = FileWalStore::new(fixture.root.join("wal"))
+        .open(&key)
+        .unwrap();
+    sealed
+        .append(
+            1,
+            &WalRecord::RunFinished {
+                interrupt_reason: None,
+                reason: broca_protocol::RunFinishReason::Interrupted,
+                ts_ms: Some(2000),
+                usage: Default::default(),
+                error: None,
+                retries_used: 0,
+            },
+            true,
+        )
+        .unwrap();
+    drop(sealed);
+    let rebooted = restart();
+    assert_eq!(rebooted.recover_enrollment().unwrap(), 1);
+    let row = service.index.live(&key).unwrap().unwrap();
+    assert_eq!(row.expires_at_ms, Some(2000 + 3600 * 1000));
+    fixture.close().await;
+}
+
+#[test]
+fn retention_warning_errors_keep_their_reason_and_drop_paths() {
+    assert_eq!(
+        content_free_error("No such file or directory (os error 2)"),
+        "No such file or directory (os error 2)"
+    );
+    assert_eq!(
+        content_free_error("conflicting live WALs: /home/u/.local/wal/ab.wal and C:\\s\\ab.wal"),
+        "conflicting live WALs: <path> and <path>"
+    );
 }
 
 #[tokio::test]
@@ -708,7 +880,7 @@ async fn stale_retention_summary_never_schedules_early_deletion() {
             old
         );
         drop(writer);
-        fixture.actor.shutdown_writer().await;
+        let _ = fixture.actor.shutdown_writer().await;
         drop(fixture.actor.lease.take());
         assert_eq!(service.enroll_changes().unwrap(), 1);
         let repaired = service.index.live(&fixture.actor.key).unwrap().unwrap();

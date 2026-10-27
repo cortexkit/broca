@@ -28,6 +28,7 @@ struct SlowLateFeed {
     prepared: WalRecord,
     id: String,
     positions: Mutex<Vec<u64>>,
+    interrupted: AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -38,7 +39,11 @@ impl ElicitationPlane for SlowLateFeed {
         cursor: Option<&ApprovalCursor>,
     ) -> Result<ApprovalPage, ApprovalRouteError> {
         let position = cursor.map_or(0, |cursor| cursor.seq);
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        super::consent_second_audit_tests::advance_feed_time(
+            std::time::Duration::from_millis(80),
+            &self.interrupted,
+        )
+        .await;
         self.positions.lock().unwrap().push(position);
         let records = match position {
             0..16 => vec![json!({"requester_ref":"another-call","state":"pending"})],
@@ -67,6 +72,7 @@ async fn late_admission_continues_healthy_feed_beyond_one_budget() {
         prepared,
         id,
         positions: Mutex::new(Vec::new()),
+        interrupted: AtomicUsize::new(0),
     });
     rig.control.elicitation_plane = Some(feed.clone());
     let mut history = approval_gate::History::new(&rig.writer, rig.frames()).unwrap();
@@ -88,6 +94,10 @@ async fn late_admission_continues_healthy_feed_beyond_one_budget() {
         rig.tools.provider_requests.load(Ordering::SeqCst),
         1,
         "a healthy late feed must finish across one-second admission budgets"
+    );
+    assert!(
+        feed.interrupted.load(Ordering::SeqCst) > 0,
+        "the admission budget must interrupt a pending page"
     );
     assert_eq!(
         feed.positions
@@ -272,6 +282,7 @@ async fn live_expired_older_approval_proves_recorded_duplicate_before_adoption()
             approval: None,
             elicitation_id: Some("waiting-sibling".into()),
         }],
+        ..Default::default()
     };
     let interrupt = async {
         loop {

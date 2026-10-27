@@ -61,6 +61,7 @@ pub(crate) fn records(session: &BindIdentity) -> Vec<FramedRecord> {
         records.push(framed(
             seq,
             WalRecord::ApprovalRecorded {
+                closed_at_ms: None,
                 tags: None,
                 call_key: format!("5a5a5a5a-5a5a-5a5a-5a5a-5a5a5a5a5a5a:{anchor}"),
                 call_id: ToolCallId(id.into()),
@@ -83,6 +84,7 @@ pub(crate) fn records(session: &BindIdentity) -> Vec<FramedRecord> {
     records.push(framed(
         9,
         WalRecord::ToolResult {
+            finished_at_ms: None,
             tags: None,
             batch_id: BatchId("b1".into()),
             result: broca_core::not_dispatched_result(&ToolCallId("withdrawn".into())).into(),
@@ -356,6 +358,7 @@ pub fn withdrawal_projection_excludes_answered_calls<S: SessionStore + RunIndex>
         framed(
             9,
             WalRecord::ApprovalRecorded {
+                closed_at_ms: None,
                 tags: None,
                 call_key: "5a5a5a5a-5a5a-5a5a-5a5a-5a5a5a5a5a5a:6".into(),
                 call_id: ToolCallId("withdrawn".into()),

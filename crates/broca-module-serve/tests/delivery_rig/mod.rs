@@ -107,16 +107,33 @@ impl Step {
             .into(),
         );
         if matches!(self, Step::Stream(_) | Step::StreamEmpty(_)) {
-            for block in &content {
-                if let ContentBlock::Text { text } = block {
-                    events.push(NormalizedEvent::Display(
-                        broca_protocol::DisplayEvent::TextDelta {
+            for (part, block) in content.iter().enumerate() {
+                let mut event = match block {
+                    ContentBlock::Text { text } => broca_protocol::DisplayEvent::TextDelta {
+                        mid: None,
+                        part: None,
+                        message_id: message_id.clone(),
+                        tool_call_id: None,
+                        delta: text.clone(),
+                    },
+                    ContentBlock::Reasoning { text, .. } => {
+                        broca_protocol::DisplayEvent::ReasoningDelta {
+                            mid: None,
+                            part: None,
                             message_id: message_id.clone(),
-                            tool_call_id: None,
                             delta: text.clone(),
-                        },
-                    ));
-                }
+                        }
+                    }
+                    ContentBlock::ToolCall(call) => broca_protocol::DisplayEvent::ToolInputDelta {
+                        mid: None,
+                        part: None,
+                        tool_call_id: call.tool_call_id.clone(),
+                        delta: call.input.to_string(),
+                    },
+                    _ => continue,
+                };
+                event.set_part(part as u64);
+                events.push(NormalizedEvent::Display(event));
             }
         }
         events.extend([
@@ -142,6 +159,9 @@ impl Step {
 /// What the provider and tool plane of the rig do, shared with the test.
 #[derive(Default)]
 pub struct Script {
+    pub attempt_time: Mutex<Option<u64>>,
+    pub hold_stream: Mutex<bool>,
+    pub stream_gate: Notify,
     /// Model steps, consumed in order across every run. An exhausted script answers text.
     pub steps: Mutex<VecDeque<Step>>,
     /// The prompt each model step was called with, in call order.
@@ -187,6 +207,12 @@ pub struct Script {
 }
 
 impl Script {
+    pub fn hold_stream(&self, hold: bool) {
+        *self.hold_stream.lock().unwrap() = hold;
+        if !hold {
+            self.stream_gate.notify_waiters();
+        }
+    }
     pub fn push(&self, steps: &[Step]) {
         self.steps.lock().unwrap().extend(steps.iter().cloned());
     }
@@ -264,14 +290,39 @@ impl Provider for ScriptedProvider {
             .pop_front()
             .unwrap_or(Step::Text("done"));
         let (tx, rx) = mpsc::channel(8);
-        for event in step.events() {
-            self.0
-                .provider_output
-                .lock()
-                .unwrap()
-                .push(format!("step {} output: {event:?}", step_id.0));
-            tx.send(event).await.unwrap();
+        let script = self.0.clone();
+        let mut events = step.events();
+        if let Some(at) = *self.0.attempt_time.lock().unwrap() {
+            events.insert(0, NormalizedEvent::Control(ProviderControl::AttemptFinished {
+                attempt: serde_json::from_value(serde_json::json!({"attempt":0,"outcome":"complete","ts_ms":at,
+                    "request_body_len":0,"request_body_sha256":"a","response_body_len":0,"response_body_sha256":"b"})).unwrap(),
+            }));
         }
+        tokio::spawn(async move {
+            for event in events {
+                if matches!(
+                    event,
+                    NormalizedEvent::Control(ProviderControl::AssistantMessage { .. })
+                ) {
+                    loop {
+                        let gate = script.stream_gate.notified();
+                        if !*script.hold_stream.lock().unwrap() {
+                            break;
+                        }
+                        script.entered.notify_one();
+                        gate.await;
+                    }
+                }
+                script
+                    .provider_output
+                    .lock()
+                    .unwrap()
+                    .push(format!("step {} output: {event:?}", step_id.0));
+                if tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
         rx
     }
 }
@@ -690,17 +741,16 @@ impl Rig {
         params: serde_json::Value,
         quiet: Duration,
     ) -> Vec<Frame> {
-        self.subscribe_collect_inner(channel, params, quiet, None::<fn()>)
+        self.subscribe_collect_inner(channel, params, quiet, None::<fn()>, |_| true)
             .await
     }
 
     /// `subscribe_collect`, calling `on_attach` once the subscription's first frame arrives.
     /// Subscribed with `{"from": "start"}`, the control lane replays the lineage's durable
-    /// records at attach, so for a run that has started, that first frame proves the subscriber
-    /// is attached. A live subscription (`{}`) sends nothing until something new happens, so its
-    /// first frame proves nothing and `on_attach` would wait for an event it gates. A test that
-    /// releases a held model from `on_attach` cannot stream display deltas before anyone
-    /// listens; the display lane is lossy and never replayed.
+    /// records at attach, so its first control frame proves control replay has started, not
+    /// that the later display snapshot has crossed serve. Display-sensitive callers use
+    /// `subscribe_collect_after_display_reset` or `subscribe_release_after_part`. A live
+    /// subscription (`{}`) receives its initial display reset even when the session is idle.
     /// Attachment uses the shared hang guard; `quiet` applies only after replay arrives.
     pub async fn subscribe_collect_after_attach(
         &mut self,
@@ -709,8 +759,26 @@ impl Rig {
         quiet: Duration,
         on_attach: impl FnOnce(),
     ) -> Vec<Frame> {
-        self.subscribe_collect_inner(channel, params, quiet, Some(on_attach))
+        self.subscribe_collect_inner(channel, params, quiet, Some(on_attach), |_| true)
             .await
+    }
+
+    /// Wait for the display snapshot barrier, not merely a control replay frame, before
+    /// releasing a provider. Subsequent original deltas and hook resets cannot be lost
+    /// before the display receiver exists.
+    pub async fn subscribe_collect_after_display_reset(
+        &mut self,
+        channel: u16,
+        params: serde_json::Value,
+        quiet: Duration,
+        on_attach: impl FnOnce(),
+    ) -> Vec<Frame> {
+        self.subscribe_collect_inner(channel, params, quiet, Some(on_attach), |frame| {
+            serde_json::from_slice::<serde_json::Value>(&frame.body).is_ok_and(|body| {
+                body["kind"] == "display" && body["event"]["type"] == "display_reset"
+            })
+        })
+        .await
     }
 
     async fn subscribe_collect_inner(
@@ -719,6 +787,7 @@ impl Rig {
         params: serde_json::Value,
         quiet: Duration,
         on_attach: Option<impl FnOnce()>,
+        attach_condition: fn(&Frame) -> bool,
     ) -> Vec<Frame> {
         self.bind(channel).await;
         self.corr += 1;
@@ -736,7 +805,64 @@ impl Rig {
         )
         .unwrap();
         write_frame(&mut self.writer, &frame).await.unwrap();
-        collect_subscription_frames(&mut self.reader, corr, quiet, on_attach).await
+        collect_subscription_frames_at(&mut self.reader, corr, quiet, on_attach, attach_condition)
+            .await
+    }
+
+    /// Release a held provider only after the requested display part actually crossed serve.
+    pub async fn subscribe_release_after_part(&mut self, channel: u16, part: u64) -> Vec<Frame> {
+        self.bind(channel).await;
+        self.corr += 1;
+        let corr = self.corr;
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            u32::from(channel != 0),
+            corr,
+            serde_json::to_vec(
+                &serde_json::json!({"method":"session.subscribe","params":{"from":"start"}}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        write_frame(&mut self.writer, &frame).await.unwrap();
+        let expected_part = part.to_string();
+        let mut frames = broca_test_support::wait_for(
+            "held display snapshot",
+            async {
+                let mut frames = Vec::new();
+                loop {
+                    let frame = read_frame(&mut self.reader)
+                        .await
+                        .unwrap()
+                        .expect("stream stays open");
+                    if frame.header.corr != corr {
+                        continue;
+                    }
+                    let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+                    let reached = body["kind"] == "display"
+                        && body["event"]["part"].as_str() == Some(expected_part.as_str());
+                    frames.push(frame);
+                    if reached {
+                        break frames;
+                    }
+                }
+            },
+            || "waiting for the coalesced snapshot part before releasing its provider".into(),
+        )
+        .await;
+        self.script.hold_stream(false);
+        frames.extend(
+            collect_subscription_frames(
+                &mut self.reader,
+                corr,
+                Duration::from_millis(300),
+                None::<fn()>,
+            )
+            .await,
+        );
+        frames
     }
 
     pub async fn bind(&mut self, channel: u16) {
@@ -1078,6 +1204,7 @@ impl Rig {
         } = self;
         script.hold_model(false);
         script.hold_tool(false);
+        script.hold_stream(false);
         drop(writer);
         drop(reader);
         let _ = tokio::time::timeout(Duration::from_secs(5), serve).await;
@@ -1149,19 +1276,35 @@ async fn collect_subscription_frames(
     quiet: Duration,
     on_attach: Option<impl FnOnce()>,
 ) -> Vec<Frame> {
+    collect_subscription_frames_at(reader, corr, quiet, on_attach, |_| true).await
+}
+
+async fn collect_subscription_frames_at(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    corr: u64,
+    quiet: Duration,
+    on_attach: Option<impl FnOnce()>,
+    attach_condition: impl Fn(&Frame) -> bool,
+) -> Vec<Frame> {
     let mut frames = Vec::new();
     if let Some(attached) = on_attach {
         // A slow first replay is not a quiet subscription: the caller may still hold the model.
         let first = broca_test_support::wait_for(
             "subscription attachment replay",
             async {
+                let mut prefix = Vec::new();
                 loop {
                     let next = read_frame(reader)
                         .await
                         .unwrap()
                         .expect("subscription stays open");
                     if next.header.corr == corr {
-                        return next;
+                        let attached =
+                            next.header.ty != FrameType::StreamData || attach_condition(&next);
+                        prefix.push(next);
+                        if attached {
+                            return prefix;
+                        }
                     }
                 }
             },
@@ -1169,11 +1312,11 @@ async fn collect_subscription_frames(
         )
         .await;
         assert_eq!(
-            first.header.ty,
+            first.last().unwrap().header.ty,
             FrameType::StreamData,
             "subscription did not attach: {first:?}"
         );
-        frames.push(first);
+        frames.extend(first);
         attached();
     }
     while let Ok(next) = tokio::time::timeout(quiet, read_frame(reader)).await {
@@ -1237,11 +1380,70 @@ mod subscription_tests {
             assert!(stderr.contains(marker), "missing {marker}: {stderr}");
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
+        // libtest prints `test <name> ... ` without a newline before the child's own output, so
+        // the marker can sit mid-line rather than at its start.
         let dir = stdout
             .lines()
-            .find_map(|line| line.strip_prefix("RIG_DIR="))
-            .unwrap();
+            .find_map(|line| line.split_once("RIG_DIR=").map(|(_, dir)| dir.trim()))
+            .unwrap_or_else(|| panic!("child printed no RIG_DIR= line: {stdout}"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn display_barrier_keeps_control_prefix_and_releases_only_on_display_reset() {
+        let script = Arc::new(Script::default());
+        script.hold_model(true);
+        let held = script.clone();
+        let (mut reader, mut writer) = tokio::io::duplex(4096);
+        let quiet = Duration::from_millis(500);
+        let collect = collect_subscription_frames_at(
+            &mut reader,
+            9,
+            quiet,
+            Some(move || held.hold_model(false)),
+            |frame| {
+                serde_json::from_slice::<serde_json::Value>(&frame.body).is_ok_and(|body| {
+                    body["kind"] == "display" && body["event"]["type"] == "display_reset"
+                })
+            },
+        );
+        tokio::pin!(collect);
+        let control = Frame::build(
+            FrameType::StreamData,
+            Flags::new(false, Priority::Interactive, false),
+            8,
+            8,
+            9,
+            br#"{"kind":"control","event":{"type":"display_reset"}}"#.to_vec(),
+        )
+        .unwrap();
+        write_frame(&mut writer, &control).await.unwrap();
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(collect.as_mut().poll(cx).is_pending())).await
+        );
+        assert!(
+            *script.hold_model.lock().unwrap(),
+            "control replay is not the display barrier"
+        );
+        let reset = Frame::build(
+            FrameType::StreamData,
+            Flags::new(false, Priority::Background, false),
+            8,
+            8,
+            9,
+            br#"{"kind":"display","event":{"type":"display_reset"}}"#.to_vec(),
+        )
+        .unwrap();
+        write_frame(&mut writer, &reset).await.unwrap();
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(collect.as_mut().poll(cx).is_pending())).await
+        );
+        assert!(!*script.hold_model.lock().unwrap());
+        tokio::time::advance(quiet).await;
+        let frames = collect.await;
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].body, control.body);
+        assert_eq!(frames[1].body, reset.body);
     }
 
     #[tokio::test(start_paused = true)]

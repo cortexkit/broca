@@ -1,378 +1,700 @@
 {
-  "generated_at": "2026-09-25",
+  "generated_at": "2026-10-24",
   "window_days": 30,
   "source": "export_facts",
   "pairs": [
     {
       "provider": "openai",
-      "model": "gpt-5.6-luna",
+      "model": "gpt-6-luna",
       "auth_method": "chatgpt",
-      "facts": 2131,
-      "last_used": "2026-09-16"
-    },
-    {
-      "provider": "openai",
-      "model": "gpt-5.4",
-      "auth_method": "chatgpt",
-      "facts": 1924,
-      "last_used": "2026-09-12"
-    },
-    {
-      "provider": "openai",
-      "model": "gpt-5.6-luna",
-      "auth_method": "chatgpt",
-      "facts": 1761,
-      "last_used": "2026-09-22"
+      "facts": 61573,
+      "last_used": "2026-10-24"
     },
     {
       "provider": "openai",
       "model": "gpt-6-luna",
       "auth_method": "chatgpt",
-      "facts": 1550,
-      "last_used": "2026-09-25"
+      "facts": 57566,
+      "last_used": "2026-10-24"
     },
     {
-      "provider": "google",
-      "model": "antigravity-gemini-3.8-flash",
-      "auth_method": "antigravity",
-      "facts": 1469,
-      "last_used": "2026-09-25"
-    },
-    {
-      "provider": "openai",
-      "model": "gpt-5.6-luna-pro",
-      "auth_method": "chatgpt",
-      "facts": 695,
-      "last_used": "2026-09-16"
-    },
-    {
-      "provider": "anthropic",
-      "model": "claude-opus-5",
+      "provider": "meta",
+      "model": "muse-spark-1.3-contributor",
       "auth_method": "oauth",
-      "facts": 593,
-      "last_used": "2026-09-25"
-    },
-    {
-      "provider": "anthropic",
-      "model": "claude-opus-5",
-      "auth_method": "oauth",
-      "facts": 574,
-      "last_used": "2026-09-25"
-    },
-    {
-      "provider": "ollama-cloud",
-      "model": "deepseek-v4-flash:0731",
-      "auth_method": "apikey",
-      "facts": 517,
-      "last_used": "2026-09-19"
-    },
-    {
-      "provider": "openai",
-      "model": "gpt-6-astra",
-      "auth_method": "chatgpt",
-      "facts": 451,
-      "last_used": "2026-09-16"
-    },
-    {
-      "provider": "openai",
-      "model": "gpt-5.6-sol",
-      "auth_method": "chatgpt",
-      "facts": 440,
-      "last_used": "2026-09-16"
-    },
-    {
-      "provider": "xai",
-      "model": "grok-4.6",
-      "auth_method": "oauth",
-      "facts": 328,
-      "last_used": "2026-09-17"
-    },
-    {
-      "provider": "opencode",
-      "model": "muse-spark-1.3-contributor-free",
-      "auth_method": "apikey",
-      "facts": 282,
-      "last_used": "2026-09-19"
-    },
-    {
-      "provider": "google",
-      "model": "antigravity-claude-opus-4-6-thinking",
-      "auth_method": "antigravity",
-      "facts": 255,
-      "last_used": "2026-09-19"
-    },
-    {
-      "provider": "openai",
-      "model": "gpt-6-astra",
-      "auth_method": "chatgpt",
-      "facts": 232,
-      "last_used": "2026-09-25"
-    },
-    {
-      "provider": "kimi-code-plan-global",
-      "model": "k3",
-      "auth_method": "apikey",
-      "facts": 187,
-      "last_used": "2026-09-25"
-    },
-    {
-      "provider": "openai",
-      "model": "gpt-5.6-luna-pro",
-      "auth_method": "chatgpt",
-      "facts": 178,
-      "last_used": "2026-09-24"
-    },
-    {
-      "provider": "google",
-      "model": "antigravity-gemini-3.7-flash",
-      "auth_method": "antigravity",
-      "facts": 165,
-      "last_used": "2026-09-04"
-    },
-    {
-      "provider": "xai",
-      "model": "grok-composer-2.5-fast",
-      "auth_method": "oauth",
-      "facts": 162,
-      "last_used": "2026-09-11"
-    },
-    {
-      "provider": "anthropic",
-      "model": "claude-fable-5",
-      "auth_method": "oauth",
-      "facts": 153,
-      "last_used": "2026-08-27"
-    },
-    {
-      "provider": "anthropic",
-      "model": "claude-fable-5-1",
-      "auth_method": "oauth",
-      "facts": 124,
-      "last_used": "2026-09-25"
-    },
-    {
-      "provider": "openai",
-      "model": "gpt-6-sol",
-      "auth_method": "chatgpt",
-      "facts": 100,
-      "last_used": "2026-09-25"
-    },
-    {
-      "provider": "ollama-cloud",
-      "model": "glm-5.2",
-      "auth_method": "apikey",
-      "facts": 75,
-      "last_used": "2026-09-18"
-    },
-    {
-      "provider": "ollama-cloud",
-      "model": "deepseek-v4-pro",
-      "auth_method": "apikey",
-      "facts": 74,
-      "last_used": "2026-09-22"
-    },
-    {
-      "provider": "ollama-cloud",
-      "model": "deepseek-v4.1-flash",
-      "auth_method": "apikey",
-      "facts": 72,
-      "last_used": "2026-09-25"
-    },
-    {
-      "provider": "anthropic",
-      "model": "claude-opus-5",
-      "auth_method": "oauth",
-      "facts": 64,
-      "last_used": "2026-09-11"
-    },
-    {
-      "provider": "xai",
-      "model": "grok-4.7",
-      "auth_method": "oauth",
-      "facts": 60,
-      "last_used": "2026-09-25"
-    },
-    {
-      "provider": "google",
-      "model": "gemini-3.5-flash",
-      "auth_method": "antigravity",
-      "facts": 56,
-      "last_used": "2026-09-07"
-    },
-    {
-      "provider": "ollama-cloud",
-      "model": "kimi-k2.7-code",
-      "auth_method": "apikey",
-      "facts": 51,
-      "last_used": "2026-09-07"
-    },
-    {
-      "provider": "ollama-cloud",
-      "model": "glm-5.3-flash",
-      "auth_method": "apikey",
-      "facts": 42,
-      "last_used": "2026-09-23"
-    },
-    {
-      "provider": "openai",
-      "model": "gpt-5.6-sol",
-      "auth_method": "chatgpt",
-      "facts": 34,
-      "last_used": "2026-09-23"
-    },
-    {
-      "provider": "anthropic",
-      "model": "claude-opus-5-5",
-      "auth_method": "oauth",
-      "facts": 32,
-      "last_used": "2026-09-25"
-    },
-    {
-      "provider": "anthropic",
-      "model": "claude-opus-4-8",
-      "auth_method": "oauth",
-      "facts": 27,
-      "last_used": "2026-09-06"
-    },
-    {
-      "provider": "openai",
-      "model": "gpt-5.4-mini",
-      "auth_method": "apikey",
-      "facts": 25,
-      "last_used": "2026-09-19"
-    },
-    {
-      "provider": "anthropic",
-      "model": "claude-opus-5-5",
-      "auth_method": "oauth",
-      "facts": 24,
-      "last_used": "2026-09-25"
-    },
-    {
-      "provider": "ollama-cloud",
-      "model": "glm-5.3",
-      "auth_method": "apikey",
-      "facts": 19,
-      "last_used": "2026-09-22"
-    },
-    {
-      "provider": "ollama-cloud",
-      "model": "kimi-k3",
-      "auth_method": "apikey",
-      "facts": 19,
-      "last_used": "2026-09-09"
-    },
-    {
-      "provider": "openai",
-      "model": "gpt-5.6-terra-pro",
-      "auth_method": "chatgpt",
-      "facts": 17,
-      "last_used": "2026-09-22"
-    },
-    {
-      "provider": "openai",
-      "model": "gpt-6-sol",
-      "auth_method": "chatgpt",
-      "facts": 10,
-      "last_used": "2026-09-25"
-    },
-    {
-      "provider": "deepseek",
-      "model": "deepseek-v4-flash",
-      "auth_method": "apikey",
-      "facts": 9,
-      "last_used": "2026-09-20"
-    },
-    {
-      "provider": "openai",
-      "model": "gpt-5.6-terra-pro",
-      "auth_method": "chatgpt",
-      "facts": 8,
-      "last_used": "2026-09-16"
-    },
-    {
-      "provider": "openai",
-      "model": "gpt-6-luna",
-      "auth_method": "chatgpt",
-      "facts": 6,
-      "last_used": "2026-09-25"
+      "facts": 38087,
+      "last_used": "2026-10-23"
     },
     {
       "provider": "google",
       "model": "gemini-3.8-flash",
       "auth_method": "antigravity",
-      "facts": 5,
-      "last_used": "2026-09-23"
+      "facts": 22115,
+      "last_used": "2026-10-11"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-6-luna",
+      "auth_method": "chatgpt",
+      "facts": 17970,
+      "last_used": "2026-10-24"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-6.1-sol",
+      "auth_method": "chatgpt",
+      "facts": 7622,
+      "last_used": "2026-10-24"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-6.1-sol",
+      "auth_method": "chatgpt",
+      "facts": 6756,
+      "last_used": "2026-10-24"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5-5",
+      "auth_method": "oauth",
+      "facts": 2776,
+      "last_used": "2026-10-24"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-6.1-sol",
+      "auth_method": "chatgpt",
+      "facts": 2618,
+      "last_used": "2026-10-24"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5-5",
+      "auth_method": "oauth",
+      "facts": 2256,
+      "last_used": "2026-10-24"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5-5",
+      "auth_method": "oauth",
+      "facts": 2161,
+      "last_used": "2026-10-24"
+    },
+    {
+      "provider": "google",
+      "model": "antigravity-gemini-3.8-flash",
+      "auth_method": "antigravity",
+      "facts": 1992,
+      "last_used": "2026-10-20"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5-5",
+      "auth_method": "oauth",
+      "facts": 1955,
+      "last_used": "2026-10-22"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5-5",
+      "auth_method": "oauth",
+      "facts": 1516,
+      "last_used": "2026-10-24"
+    },
+    {
+      "provider": "inception",
+      "model": "mercury-3",
+      "auth_method": "apikey",
+      "facts": 1123,
+      "last_used": "2026-10-24"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-6-sol",
+      "auth_method": "chatgpt",
+      "facts": 817,
+      "last_used": "2026-10-01"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-6-astra",
+      "auth_method": "chatgpt",
+      "facts": 765,
+      "last_used": "2026-10-24"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-6-astra",
+      "auth_method": "chatgpt",
+      "facts": 741,
+      "last_used": "2026-10-24"
+    },
+    {
+      "provider": "xai",
+      "model": "grok-4.7",
+      "auth_method": "oauth",
+      "facts": 589,
+      "last_used": "2026-10-17"
     },
     {
       "provider": "ollama-cloud",
-      "model": "minimax-m3",
+      "model": "glm-5.3-flash",
       "auth_method": "apikey",
-      "facts": 5,
-      "last_used": "2026-09-18"
+      "facts": 498,
+      "last_used": "2026-10-02"
+    },
+    {
+      "provider": "openrouter",
+      "model": "openai/gpt-6-luna",
+      "auth_method": "apikey",
+      "facts": 498,
+      "last_used": "2026-10-17"
+    },
+    {
+      "provider": "deepseek",
+      "model": "deepseek-flash",
+      "auth_method": "apikey",
+      "facts": 405,
+      "last_used": "2026-10-17"
+    },
+    {
+      "provider": "kimi-code-plan-global",
+      "model": "k3",
+      "auth_method": "apikey",
+      "facts": 363,
+      "last_used": "2026-10-18"
+    },
+    {
+      "provider": "meta",
+      "model": "muse-wonder-full-1.0",
+      "auth_method": "oauth",
+      "facts": 313,
+      "last_used": "2026-10-22"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-fable-5-1",
+      "auth_method": "oauth",
+      "facts": 274,
+      "last_used": "2026-10-15"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5",
+      "auth_method": "oauth",
+      "facts": 207,
+      "last_used": "2026-10-22"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-fable-5-1",
+      "auth_method": "oauth",
+      "facts": 206,
+      "last_used": "2026-10-13"
     },
     {
       "provider": "openai",
-      "model": "gpt-5.4-mini",
+      "model": "gpt-6-astra",
       "auth_method": "chatgpt",
-      "facts": 4,
-      "last_used": "2026-09-25"
-    },
-    {
-      "provider": "anthropic",
-      "model": "claude-haiku-4-5",
-      "auth_method": "oauth",
-      "facts": 3,
-      "last_used": "2026-09-19"
-    },
-    {
-      "provider": "anthropic",
-      "model": "claude-haiku-4-5",
-      "auth_method": "oauth",
-      "facts": 1,
-      "last_used": "2026-09-23"
-    },
-    {
-      "provider": "anthropic",
-      "model": "claude-sonnet-4-5",
-      "auth_method": "oauth",
-      "facts": 1,
-      "last_used": "2026-09-22"
-    },
-    {
-      "provider": "google",
-      "model": "antigravity-gemini-3.8-flash-high",
-      "auth_method": "antigravity",
-      "facts": 1,
-      "last_used": "2026-09-04"
-    },
-    {
-      "provider": "google",
-      "model": "antigravity-gemini-3.8-flash-medium",
-      "auth_method": "antigravity",
-      "facts": 1,
-      "last_used": "2026-09-04"
+      "facts": 172,
+      "last_used": "2026-10-24"
     },
     {
       "provider": "openai",
-      "model": "gpt-5.4-mini",
+      "model": "gpt-6-sol",
+      "auth_method": "chatgpt",
+      "facts": 164,
+      "last_used": "2026-09-28"
+    },
+    {
+      "provider": "meta",
+      "model": "muse-wonder-1.0",
+      "auth_method": "oauth",
+      "facts": 137,
+      "last_used": "2026-10-16"
+    },
+    {
+      "provider": "google",
+      "model": "antigravity-gemini-4-argon",
+      "auth_method": "antigravity",
+      "facts": 128,
+      "last_used": "2026-10-20"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5",
+      "auth_method": "oauth",
+      "facts": 108,
+      "last_used": "2026-10-24"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-fable-5-1",
+      "auth_method": "oauth",
+      "facts": 106,
+      "last_used": "2026-10-15"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-fable-5-1",
+      "auth_method": "oauth",
+      "facts": 90,
+      "last_used": "2026-10-16"
+    },
+    {
+      "provider": "opencode-go",
+      "model": "deepseek-v4.1-flash",
       "auth_method": "apikey",
-      "facts": 1,
-      "last_used": "2026-09-25"
+      "facts": 90,
+      "last_used": "2026-10-24"
+    },
+    {
+      "provider": "openrouter",
+      "model": "deepseek/deepseek-v4.1-flash",
+      "auth_method": "apikey",
+      "facts": 90,
+      "last_used": "2026-10-06"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.6",
+      "auth_method": "chatgpt",
+      "facts": 88,
+      "last_used": "2026-10-23"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-daybreak-blue-latest",
+      "auth_method": "chatgpt",
+      "facts": 82,
+      "last_used": "2026-10-22"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-fable-5-1",
+      "auth_method": "oauth",
+      "facts": 79,
+      "last_used": "2026-10-16"
+    },
+    {
+      "provider": "kimi-code-plan-global",
+      "model": "k3-256k",
+      "auth_method": "apikey",
+      "facts": 78,
+      "last_used": "2026-10-23"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5",
+      "auth_method": "oauth",
+      "facts": 76,
+      "last_used": "2026-10-24"
+    },
+    {
+      "provider": "kimi-code-plan-global",
+      "model": "k3.1-pro",
+      "auth_method": "apikey",
+      "facts": 70,
+      "last_used": "2026-10-24"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.6",
+      "auth_method": "chatgpt",
+      "facts": 66,
+      "last_used": "2026-10-23"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5-5",
+      "auth_method": "apikey",
+      "facts": 62,
+      "last_used": "2026-10-24"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5-5",
+      "auth_method": "apikey",
+      "facts": 60,
+      "last_used": "2026-10-24"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5-5",
+      "auth_method": "apikey",
+      "facts": 47,
+      "last_used": "2026-10-24"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-daybreak-blue-latest",
+      "auth_method": "chatgpt",
+      "facts": 38,
+      "last_used": "2026-10-18"
+    },
+    {
+      "provider": "ollama-cloud",
+      "model": "deepseek-v4.1-flash",
+      "auth_method": "apikey",
+      "facts": 37,
+      "last_used": "2026-10-02"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.6",
+      "auth_method": "chatgpt",
+      "facts": 34,
+      "last_used": "2026-10-23"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-daybreak-blue-latest",
+      "auth_method": "chatgpt",
+      "facts": 34,
+      "last_used": "2026-10-24"
+    },
+    {
+      "provider": "google",
+      "model": "antigravity-gemini-4-argon-low",
+      "auth_method": "antigravity",
+      "facts": 31,
+      "last_used": "2026-10-17"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-6.1-sol",
+      "auth_method": "apikey",
+      "facts": 25,
+      "last_used": "2026-10-23"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5",
+      "auth_method": "oauth",
+      "facts": 23,
+      "last_used": "2026-10-24"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5",
+      "auth_method": "oauth",
+      "facts": 22,
+      "last_used": "2026-10-23"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "auth_method": "chatgpt",
+      "facts": 19,
+      "last_used": "2026-09-28"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-sonnet-5",
+      "auth_method": "oauth",
+      "facts": 16,
+      "last_used": "2026-09-29"
+    },
+    {
+      "provider": "google",
+      "model": "antigravity-gemini-4-argon-high",
+      "auth_method": "antigravity",
+      "facts": 12,
+      "last_used": "2026-10-17"
+    },
+    {
+      "provider": "opencode",
+      "model": "muse-spark-1.3-contributor-free",
+      "auth_method": "apikey",
+      "facts": 12,
+      "last_used": "2026-10-17"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "auth_method": "chatgpt",
+      "facts": 10,
+      "last_used": "2026-10-02"
+    },
+    {
+      "provider": "openrouter",
+      "model": "openai/gpt-5.6-luna",
+      "auth_method": "apikey",
+      "facts": 10,
+      "last_used": "2026-10-17"
     },
     {
       "provider": "openai",
       "model": "gpt-5.6-terra",
       "auth_method": "chatgpt",
-      "facts": 1,
-      "last_used": "2026-09-01"
+      "facts": 8,
+      "last_used": "2026-10-02"
     },
     {
       "provider": "xai",
-      "model": "grok-build-0.1",
+      "model": "grok-4.6",
+      "auth_method": "oauth",
+      "facts": 8,
+      "last_used": "2026-10-02"
+    },
+    {
+      "provider": "meta",
+      "model": "muse-spark-1.3",
+      "auth_method": "oauth",
+      "facts": 7,
+      "last_used": "2026-10-20"
+    },
+    {
+      "provider": "openrouter",
+      "model": "google/gemini-3.8-flash",
+      "auth_method": "apikey",
+      "facts": 7,
+      "last_used": "2026-10-17"
+    },
+    {
+      "provider": "ollama-cloud",
+      "model": "minimax-m3",
+      "auth_method": "apikey",
+      "facts": 6,
+      "last_used": "2026-09-29"
+    },
+    {
+      "provider": "openrouter",
+      "model": "openai/gpt-5.6-luna-pro",
+      "auth_method": "apikey",
+      "facts": 6,
+      "last_used": "2026-10-17"
+    },
+    {
+      "provider": "opencode",
+      "model": "deepseek-v4-flash",
+      "auth_method": "apikey",
+      "facts": 5,
+      "last_used": "2026-09-29"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-haiku-4-5",
+      "auth_method": "oauth",
+      "facts": 4,
+      "last_used": "2026-10-24"
+    },
+    {
+      "provider": "fireworks-ai",
+      "model": "accounts/fireworks/models/deepseek-v4p1-flash",
+      "auth_method": "apikey",
+      "facts": 4,
+      "last_used": "2026-10-17"
+    },
+    {
+      "provider": "fireworks-ai",
+      "model": "accounts/fireworks/models/glm-5p3-flash",
+      "auth_method": "apikey",
+      "facts": 4,
+      "last_used": "2026-10-17"
+    },
+    {
+      "provider": "fireworks-ai",
+      "model": "accounts/fireworks/routers/glm-flash-latest",
+      "auth_method": "apikey",
+      "facts": 4,
+      "last_used": "2026-10-17"
+    },
+    {
+      "provider": "ollama-cloud",
+      "model": "glm-5.3",
+      "auth_method": "apikey",
+      "facts": 4,
+      "last_used": "2026-10-02"
+    },
+    {
+      "provider": "opencode",
+      "model": "deepseek-v4.1-flash",
+      "auth_method": "apikey",
+      "facts": 4,
+      "last_used": "2026-10-23"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5-5",
+      "auth_method": "apikey",
+      "facts": 3,
+      "last_used": "2026-10-23"
+    },
+    {
+      "provider": "cline-pass",
+      "model": "cline-pass/deepseek-v4.1-flash",
+      "auth_method": "apikey",
+      "facts": 3,
+      "last_used": "2026-10-23"
+    },
+    {
+      "provider": "cline-pass",
+      "model": "cline-pass/glm-5.3-flash",
+      "auth_method": "apikey",
+      "facts": 3,
+      "last_used": "2026-10-23"
+    },
+    {
+      "provider": "cline-pass",
+      "model": "cline-pass/muse-spark-1.3-contributor",
+      "auth_method": "apikey",
+      "facts": 3,
+      "last_used": "2026-10-23"
+    },
+    {
+      "provider": "cloudflare-workers-ai",
+      "model": "@cf/zai-org/glm-5.3-flash",
+      "auth_method": "apikey",
+      "facts": 3,
+      "last_used": "2026-10-23"
+    },
+    {
+      "provider": "fireworks-ai",
+      "model": "accounts/fireworks/models/qwen3p8-max",
+      "auth_method": "apikey",
+      "facts": 3,
+      "last_used": "2026-10-17"
+    },
+    {
+      "provider": "fireworks-ai",
+      "model": "accounts/fireworks/routers/deepseek-flash-latest",
+      "auth_method": "apikey",
+      "facts": 3,
+      "last_used": "2026-10-17"
+    },
+    {
+      "provider": "fireworks-ai",
+      "model": "accounts/fireworks/routers/qwen-max-latest",
+      "auth_method": "apikey",
+      "facts": 3,
+      "last_used": "2026-10-17"
+    },
+    {
+      "provider": "openrouter",
+      "model": "openai/gpt-6-sol",
+      "auth_method": "apikey",
+      "facts": 2,
+      "last_used": "2026-10-17"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-sonnet-5",
       "auth_method": "oauth",
       "facts": 1,
-      "last_used": "2026-09-04"
+      "last_used": "2026-09-28"
+    },
+    {
+      "provider": "cline-pass",
+      "model": "cline-pass/glm-5.3",
+      "auth_method": "apikey",
+      "facts": 1,
+      "last_used": "2026-10-23"
+    },
+    {
+      "provider": "cloudflare-workers-ai",
+      "model": "@cf/zai-org/glm-5.2",
+      "auth_method": "apikey",
+      "facts": 1,
+      "last_used": "2026-10-23"
+    },
+    {
+      "provider": "google",
+      "model": "antigravity-gemini-3.7-flash",
+      "auth_method": "antigravity",
+      "facts": 1,
+      "last_used": "2026-10-16"
+    },
+    {
+      "provider": "inception",
+      "model": "mercury-2",
+      "auth_method": "apikey",
+      "facts": 1,
+      "last_used": "2026-10-22"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.4",
+      "auth_method": "chatgpt",
+      "facts": 1,
+      "last_used": "2026-09-26"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.4-mini",
+      "auth_method": "apikey",
+      "facts": 1,
+      "last_used": "2026-09-25"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.4-mini",
+      "auth_method": "chatgpt",
+      "facts": 1,
+      "last_used": "2026-09-25"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.6-luna-pro",
+      "auth_method": "chatgpt",
+      "facts": 1,
+      "last_used": "2026-09-24"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-6-luna",
+      "auth_method": "apikey",
+      "facts": 1,
+      "last_used": "2026-09-28"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-6-luna-fast",
+      "auth_method": "chatgpt",
+      "facts": 1,
+      "last_used": "2026-09-25"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-6-luna-pro",
+      "auth_method": "chatgpt",
+      "facts": 1,
+      "last_used": "2026-09-25"
+    },
+    {
+      "provider": "opencode",
+      "model": "deepseek-v4.1-flash-free",
+      "auth_method": "apikey",
+      "facts": 1,
+      "last_used": "2026-10-18"
+    },
+    {
+      "provider": "opencode-go",
+      "model": "gpt-6-luna",
+      "auth_method": "apikey",
+      "facts": 1,
+      "last_used": "2026-10-22"
+    },
+    {
+      "provider": "opencode-go",
+      "model": "kimi-k2.7-code",
+      "auth_method": "apikey",
+      "facts": 1,
+      "last_used": "2026-10-22"
+    },
+    {
+      "provider": "opencode-go",
+      "model": "minimax-m3.1-flash-free",
+      "auth_method": "apikey",
+      "facts": 1,
+      "last_used": "2026-10-22"
+    },
+    {
+      "provider": "openrouter",
+      "model": "openai/gpt-6.1-sol",
+      "auth_method": "apikey",
+      "facts": 1,
+      "last_used": "2026-10-17"
     }
   ]
 }

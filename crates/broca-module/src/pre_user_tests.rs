@@ -75,12 +75,25 @@ impl HooksRig {
     }
 }
 struct Model {
+    media: Mutex<Option<broca_provider::media_profile::MediaProfile>>,
     permits: Semaphore,
     entered: Notify,
     tool_calls: usize,
 }
 #[async_trait::async_trait]
 impl Provider for Model {
+    fn render_config_blob(&self) -> serde_json::Value {
+        let media = self.media.lock().unwrap();
+        if media.is_none() {
+            return json!({"render_config":"stateless"});
+        }
+        let mut config = broca_provider::families::frozen_config_for_family(
+            broca_provider::spec::WireFamilyId::AnthropicMessages,
+            "m",
+        );
+        config.media = media.clone();
+        serde_json::to_value(config).unwrap()
+    }
     async fn step(
         &self,
         step: StepId,
@@ -140,6 +153,12 @@ struct CoreExecutor {
 }
 #[async_trait::async_trait]
 impl RunExecutor for CoreExecutor {
+    async fn media_profile(
+        &self,
+        _: &SubmissionRequest,
+    ) -> Result<Option<Box<broca_provider::media_profile::MediaProfile>>, RunError> {
+        Ok(self.model.media.lock().unwrap().clone().map(Box::new))
+    }
     fn hook_plane(&self) -> Option<Arc<dyn HookPlane>> {
         Some(self.hooks.clone())
     }
@@ -148,6 +167,12 @@ impl RunExecutor for CoreExecutor {
         mut job: RunJob,
         out: mpsc::Sender<OutputEvent>,
     ) -> Result<RunSummary, RunError> {
+        if let Err(error) = job.admit_media(self.model.as_ref(), self.wal.uploads().as_ref()) {
+            if let Some(ack) = job.on_admitted {
+                let _ = ack.send(Err(error.clone()));
+            }
+            return Err(error);
+        }
         *self.writer.lock().unwrap() = Some(Arc::downgrade(&job.writer));
         *self.hooks.inbox.lock().unwrap() = job.control.steer.clone();
         if self.ignore_graceful_stop {
@@ -238,6 +263,7 @@ impl Fixture {
         let wal = Arc::new(FileWalStore::new(root.join("wal")));
         let hooks = Arc::new(HooksRig::default());
         let model = Arc::new(Model {
+            media: Mutex::new(None),
             permits: Semaphore::new(0),
             entered: Notify::new(),
             tool_calls,
@@ -618,6 +644,7 @@ async fn paused_restart_steer_is_transformed_and_retry_is_hookless() {
     wal.append(
         1,
         &WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -880,4 +907,364 @@ async fn all_pass_inputs_have_no_hooks_and_legacy_queue_drain_is_hookless() {
         matches!(records.iter().find(|r| matches!(r, WalRecord::RunStarted { run_id, .. } if run_id.0 == "queued")).unwrap(), WalRecord::RunStarted { hooks: None, input, .. } if text(input) == "next")
     );
     f.stop().await;
+}
+
+#[cfg(feature = "test-attachments")]
+mod person_send_gate {
+    use super::*;
+    use broca_core::media_uploads::Uploads;
+    use cortexkit_role_llm_runner::attachments::UploadBeginRequest;
+    use sha2::{Digest, Sha256};
+
+    fn upload(fixture: &Fixture, hex: &str) -> (String, broca_protocol::MediaRef) {
+        broca_core::media_store::create_media_directories(&fixture.root).unwrap();
+        let bytes: Vec<_> = hex
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        let uploads = Uploads::at(&fixture.root);
+        let now = crate::person_media::now_seconds();
+        let id = uploads
+            .begin(
+                &fixture.key,
+                &UploadBeginRequest::new(
+                    "image/png",
+                    bytes.len() as u64,
+                    format!("{:x}", Sha256::digest(&bytes)),
+                ),
+                now,
+            )
+            .unwrap()
+            .upload_id;
+        uploads.append(&fixture.key, &id, 0, &bytes, now).unwrap();
+        uploads.commit(&fixture.key, &id, now).unwrap();
+        (
+            id,
+            broca_core::media_validation::validate_media(&bytes, "image/png").unwrap(),
+        )
+    }
+    const PNG: &str = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c49444154789c63f8cfc0000003010100c9fe92ef0000000049454e44ae426082";
+    const WIDE: &str = "89504e470d0a1a0a0000000d49484452000000030000000208020000001216f14d0000001049444154789c63f8cfc000410c70160041d205fb87f0b9480000000049454e44ae426082";
+
+    async fn steer(fixture: &Fixture, send: &str, id: &str) -> SendOutcome {
+        let mut request = fixture.request("attachment");
+        request.content =
+            serde_json::from_value(json!([{"type":"upload","upload_id":id}])).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            fixture.registry.route_submission_with_plan(
+                &fixture.key,
+                RunId(send.into()),
+                request,
+                RunKind::FreshOrResume,
+                SendKey::SendId(send.into()),
+                false,
+                Delivery::Steer,
+                None,
+            ),
+        )
+        .await
+        .expect("steer terminates")
+        .unwrap()
+    }
+
+    fn image_profile(count: u32) -> broca_provider::media_profile::MediaProfile {
+        let mut profile = broca_provider::media_profile::select_media_profile(
+            broca_provider::spec::WireFamilyId::AnthropicMessages,
+            Some(broca_provider::media_profile::MediaQuirk::Anthropic),
+            "m",
+            broca_provider::spec::InputModalities::from_value(&json!(["text", "image"])),
+            Some(200_000),
+        );
+        profile.image.max_count = Some(count);
+        profile
+    }
+
+    #[tokio::test]
+    async fn fresh_input_is_checked_with_prequeued_ordered_steers_before_publication() {
+        let fixture = Fixture::new("pre_user", &[], 0);
+        *fixture.model.media.lock().unwrap() = Some(image_profile(1));
+        let (first, first_media) = upload(&fixture, PNG);
+        let (fresh, fresh_media) = upload(&fixture, WIDE);
+        let mut request = fixture.request("prequeued");
+        request.content =
+            serde_json::from_value(json!([{"type":"upload","upload_id":first}])).unwrap();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(15),
+            fixture.registry.route_submission_with_order(
+                &fixture.key,
+                RunId("ordered".into()),
+                request,
+                RunKind::FreshOrResume,
+                SendKey::SendId("ordered".into()),
+                false,
+                Delivery::Queue,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                Some(broca_protocol::DeliveryOrder {
+                    modes: vec![broca_protocol::DeliveryMode::Steer],
+                    dedupe_key: None,
+                    expires_at_ms: None,
+                    template: None,
+                }),
+            ),
+        )
+        .await
+        .expect("ordered enqueue completes")
+        .unwrap();
+        assert!(
+            matches!(outcome, SendOutcome::Pending { .. }),
+            "{outcome:?}"
+        );
+        let mut request = fixture.request("new input");
+        request.content =
+            serde_json::from_value(json!([{"type":"upload","upload_id":fresh}])).unwrap();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(15),
+            fixture.registry.route_submission_with_plan(
+                &fixture.key,
+                RunId("new-run".into()),
+                request,
+                RunKind::FreshOrResume,
+                SendKey::SendId("new-run".into()),
+                false,
+                Delivery::Queue,
+                None,
+            ),
+        )
+        .await
+        .expect("fresh admission completes")
+        .unwrap();
+        assert!(
+            matches!(outcome, SendOutcome::DeliveryRefused { code: "media_unsupported", ref message, .. } if message.contains("request_cap")),
+            "{outcome:?}"
+        );
+        assert!(!fixture.records().iter().any(|record| matches!(
+            record,
+            WalRecord::RunStarted { .. } | WalRecord::Steered { .. }
+        )));
+        let store = broca_core::media_store::MediaStore::open(
+            &fixture.root,
+            broca_core::media_store::MediaStoreClass::NonDurable,
+        )
+        .unwrap();
+        store.read_verified(&first_media).unwrap();
+        assert!(
+            store.read_verified(&fresh_media).is_err(),
+            "refused fresh input is never published"
+        );
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    async fn accepted_fresh_send_publishes_staged_bytes_in_contract_order() {
+        let fixture = Fixture::new("pre_user", &[], 0);
+        *fixture.model.media.lock().unwrap() = Some(image_profile(2));
+        let (first, first_media) = upload(&fixture, PNG);
+        let (second, second_media) = upload(&fixture, WIDE);
+        let mut request = fixture.request("inspect");
+        request.content = serde_json::from_value(
+            json!([{"type":"upload","upload_id":first},{"type":"upload","upload_id":second}]),
+        )
+        .unwrap();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(15),
+            fixture.registry.route_submission_with_plan(
+                &fixture.key,
+                RunId("fresh-media".into()),
+                request,
+                RunKind::FreshOrResume,
+                SendKey::SendId("fresh-media".into()),
+                false,
+                Delivery::Queue,
+                Some(SendPlan {
+                    identity: "plan".into(),
+                    manifest: Some(fixture.manifest.clone()),
+                    model_check: None,
+                }),
+            ),
+        )
+        .await
+        .expect("admission completes")
+        .unwrap();
+        assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+        let records = fixture.records();
+        let input = records
+            .iter()
+            .find_map(|record| {
+                if let WalRecord::RunStarted { input, .. } = record {
+                    Some(input)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let refs: Vec<_> = broca_provider::person_media::references(input)
+            .cloned()
+            .collect();
+        assert_eq!(refs, vec![first_media.clone(), second_media.clone()]);
+        let store = broca_core::media_store::MediaStore::open(
+            &fixture.root,
+            broca_core::media_store::MediaStoreClass::NonDurable,
+        )
+        .unwrap();
+        assert_eq!(store.read_verified(&first_media).unwrap().len(), 69);
+        store.read_verified(&second_media).unwrap();
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    async fn queued_media_is_checked_again_at_admission_and_keeps_the_same_refusal() {
+        let fixture = Fixture::new("pre_user", &[], 0);
+        *fixture.model.media.lock().unwrap() = Some(image_profile(1));
+        fixture.start().await;
+        let (id, media) = upload(&fixture, PNG);
+        let mut request = fixture.request("queued media");
+        request.content =
+            serde_json::from_value(json!([{"type":"upload","upload_id":id}])).unwrap();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(15),
+            fixture.registry.route_submission_with_plan(
+                &fixture.key,
+                RunId("queued-image".into()),
+                request,
+                RunKind::FreshOrResume,
+                SendKey::SendId("queued-image".into()),
+                false,
+                Delivery::Queue,
+                None,
+            ),
+        )
+        .await
+        .expect("enqueue completes")
+        .unwrap();
+        assert!(
+            matches!(outcome, SendOutcome::Pending { .. }),
+            "{outcome:?}"
+        );
+        let store = broca_core::media_store::MediaStore::open(
+            &fixture.root,
+            broca_core::media_store::MediaStoreClass::NonDurable,
+        )
+        .unwrap();
+        store.read_verified(&media).unwrap();
+        *fixture.model.media.lock().unwrap() = None;
+        fixture.model.permits.add_permits(1);
+        broca_test_support::event_timeout(
+            "queued media admission refusal",
+            async {
+                loop {
+                    if let Some(error) =
+                        fixture
+                            .records()
+                            .into_iter()
+                            .find_map(|record| match record {
+                                WalRecord::Retracted {
+                                    failure: Some(failure),
+                                    ..
+                                } => Some(failure.error),
+                                _ => None,
+                            })
+                    {
+                        assert_eq!(error.provider_code.as_deref(), Some("media_unsupported"));
+                        assert!(
+                            error.message.contains("modality") && error.message.contains("image")
+                        );
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            },
+            || format!("records={:?}", fixture.records()),
+        )
+        .await
+        .expect("queued admission gets its refusal, not a hung queue");
+        assert!(!fixture.records().iter().any(|record| matches!(record, WalRecord::RunStarted { run_id, .. } if run_id.0 == "queued-image")));
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    async fn text_only_steer_refuses_image_before_publication_or_steered_sync() {
+        let fixture = Fixture::new("pre_user", &[], 0);
+        fixture.start().await;
+        let (id, _) = upload(&fixture, PNG);
+        let path = fixture.wal.wal_path(&fixture.key);
+        let before = std::fs::read(&path).unwrap();
+        let outcome = steer(&fixture, "image", &id).await;
+        assert!(
+            matches!(outcome, SendOutcome::DeliveryRefused { code: "media_unsupported", ref message, .. } if message.contains("image") && message.contains("modality")),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "refused image must not sync a Steered record"
+        );
+        assert_eq!(
+            std::fs::read_dir(fixture.root.join("media/objects"))
+                .unwrap()
+                .count(),
+            0,
+            "per-item refusal must precede publication"
+        );
+        assert_eq!(
+            std::fs::read_dir(fixture.root.join("media/refs"))
+                .unwrap()
+                .count(),
+            0
+        );
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    async fn later_steer_cap_refusal_leaves_only_lease_protected_manifest_entries() {
+        let fixture = Fixture::new("pre_user", &[], 0);
+        let mut profile = broca_provider::media_profile::select_media_profile(
+            broca_provider::spec::WireFamilyId::AnthropicMessages,
+            Some(broca_provider::media_profile::MediaQuirk::Anthropic),
+            "m",
+            broca_provider::spec::InputModalities::from_value(&json!(["text", "image"])),
+            Some(200_000),
+        );
+        profile.image.max_count = Some(1);
+        *fixture.model.media.lock().unwrap() = Some(profile);
+        fixture.start().await;
+        let (first, first_media) = upload(&fixture, PNG);
+        let (later, later_media) = upload(&fixture, WIDE);
+        assert!(matches!(
+            steer(&fixture, "first-image", &first).await,
+            SendOutcome::Active { .. }
+        ));
+        let before = std::fs::read(fixture.wal.wal_path(&fixture.key)).unwrap();
+        let outcome = steer(&fixture, "later-image", &later).await;
+        assert!(
+            matches!(outcome, SendOutcome::DeliveryRefused { code: "media_unsupported", ref message, .. } if message.contains("request_cap")),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read(fixture.wal.wal_path(&fixture.key)).unwrap(),
+            before
+        );
+        let store = broca_core::media_store::MediaStore::open(
+            &fixture.root,
+            broca_core::media_store::MediaStoreClass::NonDurable,
+        )
+        .unwrap();
+        store.read_verified(&first_media).unwrap();
+        store.read_verified(&later_media).unwrap();
+        broca_core::media_store::sweep(&fixture.root).unwrap();
+        store.read_verified(&later_media).unwrap();
+        fixture.stop().await;
+        broca_core::media_store::sweep(&fixture.root).unwrap();
+        store.read_verified(&first_media).unwrap();
+        assert!(
+            store.read_verified(&later_media).is_err(),
+            "refused-only object is reclaimed after lease release"
+        );
+    }
 }

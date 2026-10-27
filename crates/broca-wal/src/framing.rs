@@ -22,6 +22,10 @@
 //! is what makes rolling back to them safe: they stop instead of skipping or misreading a record
 //! a newer build wrote.
 //!
+//! Overhaul roots additionally use version 4, with requirements in a CRC32C-
+//! protected header and a separate payload SHA-256. Its codec lives in
+//! `broca-wal-reader`; legacy encode entry points keep their original bytes.
+//!
 //! SHA-256 (not crc32) because this is a source-of-truth log; records are
 //! low-volume (off the hot path) so a strong digest is cheap. `len` is capped +
 //! validated before allocation, so a corrupt length can't force a huge alloc.
@@ -52,6 +56,10 @@ pub struct FramedRecord {
 pub struct WalLineageId([u8; 16]);
 
 impl WalLineageId {
+    /// Only a UUID v4 header supplies the non-repeating identity exposed as `session.head.incarnation`.
+    pub fn incarnation(self) -> Option<String> {
+        (self.0[6] >> 4 == 4 && self.0[8] >> 6 == 2).then(|| self.to_string())
+    }
     pub(crate) fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
@@ -77,6 +85,8 @@ impl std::fmt::Display for WalLineageId {
 pub enum FrameError {
     Serialize(serde_json::Error),
     Deserialize(serde_json::Error),
+    /// Version 4 header or encoding failure from the shared codec.
+    V4(broca_wal_reader::Error),
     /// `len` exceeded `MAX_PAYLOAD_LEN`.
     PayloadTooLarge {
         len: u32,
@@ -111,6 +121,7 @@ impl std::fmt::Display for FrameError {
         match self {
             FrameError::Serialize(e) => write!(f, "serialize record: {e}"),
             FrameError::Deserialize(e) => write!(f, "deserialize record: {e}"),
+            FrameError::V4(e) => write!(f, "{e}"),
             FrameError::PayloadTooLarge { len } => {
                 write!(
                     f,
@@ -148,6 +159,7 @@ const LINEAGE_PAYLOAD_LEN: u32 = 16;
 /// Framing version of a gated record: its payload is `{"requires": [...], "record": ...}`,
 /// and a reader must know every feature name in `requires` before it interprets `record`.
 pub const GATED_FRAMING_VERSION: u8 = 3;
+pub const V4_FRAMING_VERSION: u8 = broca_wal_reader::frame::VERSION;
 pub const INTERRUPT_REASON_FEATURE: &str = "interrupt-reason/v1";
 pub const TURN_DIRECTIVES_FEATURE: &str = "turn-directives/v1";
 /// A `RunStarted`, `Queued` or `Steered` record whose `request_identity_digest` carries the
@@ -159,6 +171,15 @@ pub const CLIENT_MESSAGE_ID_FEATURE: &str = "client-message-id/v1";
 /// build without it would give the session's rides its own short deadline), and the
 /// `CompactionRideWait` / `CompactionRideWaitEnded` records of a ride whose wait was reported.
 pub const COMPACTION_RIDE_WAIT_FEATURE: &str = "compaction-ride-wait/v1";
+/// Media references and ordered tool parts extend closed content enums.
+pub const MEDIA_CONTENT_FEATURE: &str = "media-content/v1";
+
+/// Tool-provider declarations frozen into a session's plan manifest (a provider's per-tool
+/// result format and its `late_results` session capability). A build without the feature would
+/// skip the fields and then read a reply by the global catalog instead of by what the provider
+/// declared when the session was admitted, so the declared shapes are must-understand. Nothing
+/// requires it unless a provider declared something.
+pub const PROVIDER_DECLARATIONS_FEATURE: &str = "provider-declarations/v1";
 
 /// The feature names this build understands in a gated frame's `requires` list.
 ///
@@ -190,8 +211,12 @@ pub const KNOWN_FEATURES: &[&str] = &[
     FLOW_SCOPE_FEATURE,
     GOOGLE_RPC_ERROR_DETAILS_FEATURE,
     INPUT_TOKEN_CAP_FEATURE,
+    MEDIA_CONTENT_FEATURE,
     OPENROUTER_REASONING_FEATURE,
     PLAN_MANIFEST_FEATURE,
+    PLAN_REFERENCE_SLOTS_FEATURE,
+    PROVIDER_DECLARATIONS_FEATURE,
+    PROVIDER_HELD_FEATURE,
     PROVIDER_TEXT_STATE_FEATURE,
     RESTART_PAUSE_FEATURE,
     RETENTION_FEATURE,
@@ -206,7 +231,15 @@ pub const KNOWN_FEATURES: &[&str] = &[
     STRUCTURED_OUTPUT_DOWNGRADE_FEATURE,
     STRUCTURED_OUTPUT_PARAGRAPH_FEATURE,
     TOOL_REPLY_FEATURE,
+    TOOL_TIMES_FEATURE,
+    MESSAGE_TIMES_FEATURE,
 ];
+
+/// A plan manifest that froze a provider's catalog reference slots (`FetchOutcome::Answered`'s
+/// `reference_slots`): the arguments output references are read from (llm-runner §9.13). A
+/// reader without it would decode the manifest without the slots and write later episodes'
+/// `RunStarted` records without them, so it must refuse the WAL instead.
+pub const PLAN_REFERENCE_SLOTS_FEATURE: &str = "plan-reference-slots/v1";
 
 /// Google RPC quota details on a stored provider error must not be silently discarded on read.
 pub const GOOGLE_RPC_ERROR_DETAILS_FEATURE: &str = "google-rpc-error-details/v1";
@@ -259,6 +292,19 @@ pub const PLAN_MANIFEST_FEATURE: &str = "plan-manifest/v1";
 
 /// A durable graceful-restart pause preserves an unfinished episode for boot recovery.
 pub const RESTART_PAUSE_FEATURE: &str = "restart-pause/v1";
+
+/// A tool call its provider holds past its reply (tool-provider contract §4.1 and §7): the
+/// `ToolCallProviderHeld` record, and a `RunPaused` whose reason is `tool_held`. Nothing else
+/// requires it; the held call's later result is an ordinary `ToolResult`. A reader without it
+/// must refuse such a WAL: skipping the held record would class the call indeterminate and
+/// seal the run Interrupted while the provider still owes its result, and `PauseReason` is a
+/// closed enum that has no other value to read `tool_held` as.
+///
+/// In [`KNOWN_FEATURES`] reader-first: this build's replay classes a held call as open rather
+/// than indeterminate, and its runtime resumes the run when the late result arrives. No
+/// production path writes either value yet, because release builds leave the `held-reply/v1`
+/// route capability undeclared, so no provider can hold a call.
+pub const PROVIDER_HELD_FEATURE: &str = "provider-held/v1";
 
 /// Retention policy and queued/steered activity times affect expiry and deletion. A reader
 /// must not ignore them and keep content indefinitely. Reader builds enforce retention across
@@ -316,6 +362,13 @@ pub const STRUCTURED_OUTPUT_PARAGRAPH_FEATURE: &str = "structured-output-paragra
 /// such a WAL: decoding the tool would silently drop the deadline, and the resumed or drained
 /// run would cut that tool's long calls at the default wait and end the run interrupted.
 pub const TOOL_REPLY_FEATURE: &str = "tool-reply/v1";
+
+/// Preserve the tool timestamps subscriptions replay after a restart; older readers refuse
+/// these frames rather than silently discarding the observations.
+pub const TOOL_TIMES_FEATURE: &str = "tool-times/v1";
+
+/// Preserve read-entry times across rollback; dropping them would change an already served entry.
+pub const MESSAGE_TIMES_FEATURE: &str = "message-times/v1";
 
 /// The feature a `RunStarted` carrying the session's frozen scope requires
 /// (`WalRecord::RunStarted::scope`). A reader without it must refuse such a WAL: skipping the
@@ -460,15 +513,7 @@ struct GatedRequires<'a> {
 /// Whether `name` is in the capability grammar: one or more of `[a-z0-9-]`, then `/v`, then
 /// one or more ASCII digits.
 fn is_feature_name(name: &str) -> bool {
-    let Some((stem, version)) = name.split_once("/v") else {
-        return false;
-    };
-    !stem.is_empty()
-        && stem
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        && !version.is_empty()
-        && version.bytes().all(|b| b.is_ascii_digit())
+    broca_wal_reader::features::is_feature_name(name)
 }
 
 fn compute_digest(ver: u8, seq: u64, fence: u64, payload: &[u8]) -> [u8; DIGEST_LEN] {
@@ -483,6 +528,9 @@ fn compute_digest(ver: u8, seq: u64, fence: u64, payload: &[u8]) -> [u8; DIGEST_
 /// Verify the fixed frame envelope without interpreting its version or payload.
 /// Intact bytes that this reader rejects may belong to a newer writer, not a crash.
 pub(crate) fn digest_verifies(buf: &[u8]) -> bool {
+    if buf.get(4) == Some(&V4_FRAMING_VERSION) {
+        return broca_wal_reader::frame::digest_verifies(buf);
+    }
     if buf.len() < HEADER_LEN {
         return false;
     }
@@ -563,6 +611,25 @@ pub fn encode_with_requires(
     })
     .map_err(FrameError::Serialize)?;
     frame(GATED_FRAMING_VERSION, seq, fence, &payload)
+}
+
+/// Encode an overhaul-root record with caller-supplied writer metadata. This is
+/// deliberately separate from legacy encoding: adding the codec must not turn
+/// version 4 writes on for existing state roots.
+pub fn encode_v4(
+    metadata: broca_wal_reader::frame::Metadata,
+    requires: &[&str],
+    record: &WalRecord,
+) -> Result<Vec<u8>, FrameError> {
+    let own = record.required_features();
+    let requires: Vec<&str> = requires.iter().chain(own.iter()).copied().collect();
+    let payload = serde_json::to_vec(record).map_err(FrameError::Serialize)?;
+    broca_wal_reader::frame::encode(metadata, &requires, &payload).map_err(|error| match error {
+        broca_wal_reader::Error::InvalidFeatureName { name } => {
+            FrameError::InvalidFeatureName { name }
+        }
+        error => FrameError::V4(error),
+    })
 }
 
 /// Frame an already-serialized record payload, with the same header and digest as
@@ -681,6 +748,9 @@ fn decode_projected_with<T>(
     known: &[&str],
     project: impl FnOnce(u64, u64, &[u8]) -> Result<T, serde_json::Error>,
 ) -> DecodeStep<T> {
+    if buf.get(4) == Some(&V4_FRAMING_VERSION) {
+        return decode_v4_projected(buf, known, project);
+    }
     if buf.len() < HEADER_LEN {
         return DecodeStep::TornTail; // not even a full header → torn
     }
@@ -750,6 +820,50 @@ fn decode_projected_with<T>(
     }
 }
 
+fn decode_v4_projected<T>(
+    buf: &[u8],
+    known: &[&str],
+    project: impl FnOnce(u64, u64, &[u8]) -> Result<T, serde_json::Error>,
+) -> DecodeStep<T> {
+    use broca_wal_reader::features::Policy;
+    use broca_wal_reader::frame::{decode_next_with_policy, DecodeStep as V4Step};
+
+    let known: Vec<&str> = known
+        .iter()
+        .copied()
+        .filter(|name| !forgotten_for_test(name))
+        .chain(TEST_KNOWN_FEATURES.iter().copied())
+        .collect();
+    match decode_next_with_policy(buf, &known, Policy::All) {
+        Ok(V4Step::Incomplete) => DecodeStep::TornTail,
+        Ok(V4Step::PayloadCorrupt { header, .. }) => {
+            DecodeStep::Corrupt(FrameError::DigestMismatch {
+                seq: header.metadata.seq,
+            })
+        }
+        Ok(V4Step::Frame(frame)) => {
+            let metadata = frame.header.metadata;
+            match project(metadata.seq, metadata.fence, frame.payload) {
+                Ok(record) => DecodeStep::Record {
+                    framed: Box::new(record),
+                    consumed: frame.consumed,
+                },
+                Err(error) => DecodeStep::Corrupt(FrameError::Deserialize(error)),
+            }
+        }
+        Err(broca_wal_reader::Error::NewerWriter { features }) => DecodeStep::NewerWriter {
+            ver: V4_FRAMING_VERSION,
+            missing: features,
+        },
+        Err(error) => DecodeStep::Corrupt(FrameError::V4(error)),
+        // Policy::All never skips: every unknown name is a whole-log refusal.
+        Ok(V4Step::Skipped { header, .. }) => DecodeStep::NewerWriter {
+            ver: V4_FRAMING_VERSION,
+            missing: header.requires,
+        },
+    }
+}
+
 /// Serializes the tests in this crate that hide a feature with [`forget_feature_for_test`]
 /// against tests that decode frames requiring that feature. The hiding is process-wide, so
 /// without this a test asserting that a known feature decodes can run while another test hides
@@ -769,15 +883,202 @@ mod deferred_call_tests;
 mod openrouter_reasoning_tests;
 
 #[cfg(test)]
+mod media_content_tests;
+
+#[cfg(test)]
 mod retention_tests;
 
 #[cfg(test)]
+mod provider_held_tests;
+
+#[cfg(test)]
 mod tests {
+    #[test]
+    fn message_times_require_an_understanding_reader() {
+        use super::*;
+        let old = include_str!("../tests/fixtures/before_message_times.jsonl");
+        let known: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|feature| *feature != MESSAGE_TIMES_FEATURE)
+            .collect();
+        for line in old.lines().take(3) {
+            let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+            value["written_at_ms"] = serde_json::json!(42);
+            let record: WalRecord = serde_json::from_value(value).unwrap();
+            assert!(record.required_features().contains(&MESSAGE_TIMES_FEATURE));
+            let bytes = encode(1, 1, &record).unwrap();
+            assert!(matches!(decode_next(&bytes), DecodeStep::Record { .. }));
+            match decode_next_with(&bytes, &known) {
+                DecodeStep::NewerWriter { missing, .. } => {
+                    assert_eq!(missing, vec![MESSAGE_TIMES_FEATURE])
+                }
+                _ => panic!("a reader without message times must refuse the complete frame"),
+            }
+        }
+    }
+
+    #[test]
+    fn message_times_compose_with_existing_admission_features() {
+        use super::*;
+        let mut value: serde_json::Value = serde_json::from_str(
+            include_str!("../tests/fixtures/before_message_times.jsonl")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        value["written_at_ms"] = serde_json::json!(42);
+        value["session_class"] = serde_json::json!("head");
+        value["config"]["budget"] = serde_json::json!({"max_input_tokens":5});
+        let record: WalRecord = serde_json::from_value(value).unwrap();
+        for feature in [
+            MESSAGE_TIMES_FEATURE,
+            SESSION_CLASS_FEATURE,
+            INPUT_TOKEN_CAP_FEATURE,
+        ] {
+            assert!(record.required_features().contains(&feature));
+        }
+        assert!(matches!(
+            decode_next(&encode(1, 1, &record).unwrap()),
+            DecodeStep::Record { .. }
+        ));
+    }
+
+    #[test]
+    fn incarnation_requires_a_uuid_v4_header() {
+        use super::*;
+        assert!(WalLineageId::from_bytes([0; 16]).incarnation().is_none());
+        let mut bytes = [1; 16];
+        bytes[6] = 0x41;
+        bytes[8] = 0x81;
+        let id = WalLineageId::from_bytes(bytes);
+        assert_eq!(id.incarnation(), Some(id.to_string()));
+    }
     use super::*;
     use broca_protocol::StepId;
 
     fn rec(n: u64) -> WalRecord {
         WalRecord::TurnFinished { step_id: StepId(n) }
+    }
+
+    fn v4_metadata() -> broca_wal_reader::frame::Metadata {
+        broca_wal_reader::frame::Metadata {
+            seq: 7,
+            fence: 3,
+            appended_ms: 123,
+            writer_id: [5; 16],
+        }
+    }
+
+    #[test]
+    fn v4_round_trip_and_projection_delegate_to_shared_codec() {
+        let bytes = encode_v4(v4_metadata(), &[], &rec(1)).unwrap();
+        assert_eq!(bytes[4], V4_FRAMING_VERSION);
+        assert!(digest_verifies(&bytes));
+        match decode_next(&bytes) {
+            DecodeStep::Record { framed, consumed } => {
+                assert_eq!(consumed, bytes.len());
+                assert_eq!((framed.seq, framed.fence), (7, 3));
+                assert_eq!(framed.record, rec(1));
+            }
+            _ => panic!("expected v4 record"),
+        }
+        assert!(matches!(
+            decode_projected(&bytes, |seq, fence, payload| {
+                assert_eq!((seq, fence), (7, 3));
+                serde_json::from_slice::<WalRecord>(payload)
+            }),
+            DecodeStep::Record { .. }
+        ));
+        // Existing roots must not start writing v4 merely because it is readable.
+        assert_eq!(encode(7, 3, &rec(1)).unwrap()[4], FRAMING_VERSION);
+    }
+
+    #[test]
+    fn v4_unknown_features_refuse_before_record_projection() {
+        for feature in ["future-content/v1", "bill-future/v1"] {
+            let bytes =
+                broca_wal_reader::frame::encode(v4_metadata(), &[feature], b"not JSON").unwrap();
+            match decode_projected::<()>(&bytes, |_, _, _| {
+                panic!("must not interpret unknown record")
+            }) {
+                DecodeStep::NewerWriter { ver, missing } => {
+                    assert_eq!(ver, V4_FRAMING_VERSION);
+                    assert_eq!(missing, vec![feature]);
+                }
+                _ => panic!("unknown feature must refuse the whole log"),
+            }
+        }
+    }
+
+    #[test]
+    fn v4_own_features_are_required_and_unknown_names_do_not_panic_writer() {
+        let mut value: serde_json::Value = serde_json::from_str(
+            include_str!("../tests/fixtures/before_message_times.jsonl")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        value["written_at_ms"] = serde_json::json!(42);
+        value["session_class"] = serde_json::json!("head");
+        value["config"]["budget"] = serde_json::json!({"max_input_tokens":5});
+        let record: WalRecord = serde_json::from_value(value).unwrap();
+        let bytes = encode_v4(v4_metadata(), &["future-content/v1"], &record).unwrap();
+        let header = broca_wal_reader::frame::decode_header(&bytes)
+            .unwrap()
+            .unwrap();
+        for feature in record.required_features() {
+            assert!(header.requires.iter().any(|name| name == feature));
+        }
+        assert!(matches!(
+            decode_next(&bytes),
+            DecodeStep::NewerWriter { .. }
+        ));
+        assert!(matches!(
+            encode_v4(v4_metadata(), &["Bad/v1"], &record),
+            Err(FrameError::InvalidFeatureName { .. })
+        ));
+    }
+
+    #[test]
+    fn v4_corruption_distinguishes_header_from_payload() {
+        let bytes = encode_v4(v4_metadata(), &[], &rec(1)).unwrap();
+        let mut header_bad = bytes.clone();
+        header_bad[21] ^= 1;
+        assert!(matches!(
+            decode_next(&header_bad),
+            DecodeStep::Corrupt(FrameError::V4(
+                broca_wal_reader::Error::HeaderCorrupt { .. }
+            ))
+        ));
+        let mut payload_bad = bytes;
+        *payload_bad.last_mut().unwrap() ^= 1;
+        assert!(matches!(
+            decode_next(&payload_bad),
+            DecodeStep::Corrupt(FrameError::DigestMismatch { seq: 7 })
+        ));
+    }
+
+    #[test]
+    fn v4_broca_unlinks_log_held_open_by_reader() {
+        use std::io::Read;
+        let dir = broca_test_support::scratch_root()
+            .join(format!("v4-reader-unlink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.wal");
+        let bytes = encode_v4(v4_metadata(), &[], &rec(1)).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut held = broca_wal_reader::open_log(&path).unwrap();
+        std::fs::remove_file(&path)
+            .expect("a read-only billing handle must not block broca's unlink");
+        assert!(!path.exists());
+        let mut read = Vec::new();
+        held.read_to_end(&mut read).unwrap();
+        assert_eq!(read, bytes);
+        drop(held);
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[test]
@@ -926,20 +1227,20 @@ mod tests {
     ///
     /// Builds that predate gated frames refuse a version-3 frame with exactly this wording,
     /// "unsupported WAL framing version 3", and that refusal is what makes rolling back to
-    /// them safe once version-3 frames exist. This build reads version 3, so the property is
+    /// them safe once version-3 frames exist. This build reads versions 3 and 4, so the property is
     /// asserted for the next unknown version: if a future build writes a new framing version,
     /// rolling back to this build must meet the same named refusal.
     #[test]
     fn an_unknown_framing_version_is_refused_as_unsupported() {
         let bytes = frame_with_version(
-            4,
+            5,
             1,
             1,
             br#"{"requires":["test-feature/v1"],"record":{"type":"turn_finished","step_id":1}}"#,
         );
         match decode_next(&bytes) {
-            DecodeStep::Corrupt(error @ FrameError::UnsupportedVersion { ver: 4 }) => {
-                assert_eq!(error.to_string(), "unsupported WAL framing version 4");
+            DecodeStep::Corrupt(error @ FrameError::UnsupportedVersion { ver: 5 }) => {
+                assert_eq!(error.to_string(), "unsupported WAL framing version 5");
             }
             _ => panic!("expected an unsupported-version refusal"),
         }
@@ -971,8 +1272,12 @@ mod tests {
                 FLOW_SCOPE_FEATURE,
                 GOOGLE_RPC_ERROR_DETAILS_FEATURE,
                 INPUT_TOKEN_CAP_FEATURE,
+                MEDIA_CONTENT_FEATURE,
                 OPENROUTER_REASONING_FEATURE,
                 PLAN_MANIFEST_FEATURE,
+                PLAN_REFERENCE_SLOTS_FEATURE,
+                PROVIDER_DECLARATIONS_FEATURE,
+                PROVIDER_HELD_FEATURE,
                 PROVIDER_TEXT_STATE_FEATURE,
                 RESTART_PAUSE_FEATURE,
                 RETENTION_FEATURE,
@@ -987,9 +1292,12 @@ mod tests {
                 STRUCTURED_OUTPUT_DOWNGRADE_FEATURE,
                 STRUCTURED_OUTPUT_PARAGRAPH_FEATURE,
                 TOOL_REPLY_FEATURE,
+                TOOL_TIMES_FEATURE,
+                MESSAGE_TIMES_FEATURE,
             ]
         );
         assert_eq!(TOOL_REPLY_FEATURE, "tool-reply/v1");
+        assert_eq!(MESSAGE_TIMES_FEATURE, "message-times/v1");
         assert_eq!(RUNNER_TAGS_FEATURE, "runner-tags/v1");
         assert_eq!(RUNNER_TAGS_V2_FEATURE, "runner-tags/v2");
         assert_eq!(ARCHIVE_INDEX_V2_FEATURE, "archive-index/v2");
@@ -998,10 +1306,13 @@ mod tests {
         assert_eq!(DEFERRED_CALL_FEATURE, "deferred-call/v1");
         assert_eq!(DISPATCH_MODULE_FEATURE, "dispatch-module/v1");
         assert_eq!(PLAN_MANIFEST_FEATURE, "plan-manifest/v1");
+        assert_eq!(PLAN_REFERENCE_SLOTS_FEATURE, "plan-reference-slots/v1");
+        assert_eq!(PROVIDER_DECLARATIONS_FEATURE, "provider-declarations/v1");
         assert_eq!(PROVIDER_TEXT_STATE_FEATURE, "provider-text-state/v1");
         assert_eq!(CHATGPT_CODEX_WIRE_FEATURE, "chatgpt-codex-wire/v1");
         assert_eq!(OPENROUTER_REASONING_FEATURE, "openrouter-reasoning/v1");
         assert_eq!(RESTART_PAUSE_FEATURE, "restart-pause/v1");
+        assert_eq!(PROVIDER_HELD_FEATURE, "provider-held/v1");
         assert_eq!(SCOPE_FEATURE, "scope/v1");
         assert_eq!(FLOW_SCOPE_FEATURE, "flow-scopes/v1");
         assert_eq!(
@@ -1154,6 +1465,9 @@ mod tests {
 
     #[test]
     fn provider_text_state_is_must_understand_before_record_decode() {
+        // One record is a steered frame decoded with the shipped table; a sibling test hides
+        // steer-queue/v1 process-wide.
+        let _table = lock_feature_table_for_test();
         let block = serde_json::json!({"type":"text_with_state","text":"","provider_state":{"format":"gemini","data":"opaque+/="}});
         let message = serde_json::json!({"role":"assistant","content":[block.clone()]});
         let run = serde_json::json!({"type":"run_started","run_id":"r","session":{"project_root":"/tmp/p","harness":"h","session":"s"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[],"origin":{"kind":"fresh"}});
@@ -1387,6 +1701,9 @@ mod tests {
     /// tags keep their ungated bytes.
     #[test]
     fn runner_tags_are_must_understand_and_older_readers_refuse_them_by_name() {
+        // One record is a steered frame decoded with the shipped table; a sibling test hides
+        // steer-queue/v1 process-wide.
+        let _table = lock_feature_table_for_test();
         let run = serde_json::json!({"type":"run_started","run_id":"r","session":{"project_root":"/tmp/p","harness":"h","session":"s"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"origin":{"kind":"fresh"}});
         let result = serde_json::json!({"type":"tool_result","batch_id":"b","result":{"tool_call_id":"c","output":{"kind":"text","text":"r"}},"outcome":"completed"});
         let untagged = [
@@ -1476,6 +1793,127 @@ mod tests {
                 matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [TOOL_REPLY_FEATURE]),
                 "an older reader refuses {declared} by name"
             );
+        }
+    }
+
+    #[test]
+    fn tool_times_are_must_understand_and_legacy_records_remain_untimed() {
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != TOOL_TIMES_FEATURE)
+            .collect();
+        for (mut value, field) in [
+            (
+                serde_json::json!({"type":"tool_dispatch_intent","batch_id":"b","tool_call_id":"c","args":{}}),
+                "dispatched_at_ms",
+            ),
+            (
+                serde_json::json!({"type":"tool_no_dispatch","batch_id":"b","tool_call_id":"c","reason":{"kind":"denied","reason":"no"}}),
+                "dispatched_at_ms",
+            ),
+            (
+                serde_json::json!({"type":"tool_result","batch_id":"b","result":{"tool_call_id":"c","output":{"kind":"text","text":"ok"},"is_error":false},"outcome":"completed"}),
+                "finished_at_ms",
+            ),
+        ] {
+            let legacy: WalRecord = serde_json::from_value(value.clone()).unwrap();
+            let legacy_bytes = encode(1, 1, &legacy).unwrap();
+            assert!(legacy.required_features().is_empty());
+            assert!(serde_json::to_value(&legacy).unwrap().get(field).is_none());
+            assert!(matches!(
+                decode_next_with(&legacy_bytes, &older),
+                DecodeStep::Record { .. }
+            ));
+            value[field] = serde_json::json!(1_800_000_000_123_u64);
+            let timed: WalRecord = serde_json::from_value(value).unwrap();
+            assert_eq!(timed.required_features(), &[TOOL_TIMES_FEATURE]);
+            let bytes = encode(1, 1, &timed).unwrap();
+            assert!(
+                matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [TOOL_TIMES_FEATURE])
+            );
+            let DecodeStep::Record { framed, .. } = decode_next(&bytes) else {
+                panic!("the current reader must retain tool observation times");
+            };
+            assert_eq!(framed.record, timed);
+        }
+    }
+
+    #[test]
+    fn tool_times_publish_the_feature_floor_before_the_first_timed_record() {
+        use crate::{FileWal, Wal, WalError};
+        let root = broca_test_support::scratch_root().join(format!(
+            "tool-times-floor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("session.wal");
+        let floor = root.join("wal-feature-floor");
+        let legacy: WalRecord = serde_json::from_value(serde_json::json!({
+            "type":"tool_no_dispatch","batch_id":"b","tool_call_id":"c",
+            "reason":{"kind":"denied","reason":"no"}
+        }))
+        .unwrap();
+        let mut value = serde_json::to_value(&legacy).unwrap();
+        value["dispatched_at_ms"] = serde_json::json!(1_800_000_000_123_u64);
+        let timed: WalRecord = serde_json::from_value(value).unwrap();
+        let mut wal = FileWal::open(&path).unwrap();
+        wal.append(1, &legacy, true).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(!floor.exists());
+        assert!(matches!(
+            wal.append(1, &timed, true),
+            Err(WalError::FeatureFloor { path: None, .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(wal);
+        let mut wal = FileWal::open(&path).unwrap().with_feature_floor(&floor);
+        wal.append(1, &timed, true).unwrap();
+        assert_eq!(
+            crate::floor::read_floor(&floor).unwrap(),
+            std::collections::BTreeSet::from([TOOL_TIMES_FEATURE.to_owned()])
+        );
+        assert_eq!(wal.replay().unwrap().last().unwrap().record, timed);
+    }
+
+    #[test]
+    fn deferred_tool_times_are_must_understand_and_legacy_times_are_absent() {
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != TOOL_TIMES_FEATURE)
+            .collect();
+        for (mut value, field) in [
+            (
+                serde_json::json!({"type":"tool_call_deferred","batch_id":"b","call_id":"c","executor":"broca","module":"tools","tool":"edit","args_jcs":"{}","args_hash":"hash","scope":{"owner":{"kind":"reserved","module_id":"agent"},"ref":"s","scope_epoch":1},"ask":{"prompt":"Allow?","options":[],"expires_at_ms":1000,"on_expiry":"deny","material_damage":false,"late_execution":"execute"}}),
+                "deferred_at_ms",
+            ),
+            (
+                serde_json::json!({"type":"approval_recorded","call_key":"key","call_id":"c","decision":"declined","closing_result":{"tool_call_id":"c","output":{"kind":"text","text":"pre_tool_declined"},"is_error":true}}),
+                "closed_at_ms",
+            ),
+        ] {
+            let legacy: WalRecord = serde_json::from_value(value.clone()).unwrap();
+            assert!(!legacy.required_features().contains(&TOOL_TIMES_FEATURE));
+            assert!(serde_json::to_value(&legacy).unwrap().get(field).is_none());
+            assert!(matches!(
+                decode_next_with(&encode(1, 1, &legacy).unwrap(), &older),
+                DecodeStep::Record { .. }
+            ));
+            value[field] = serde_json::json!(1_800_000_000_123_u64);
+            let timed: WalRecord = serde_json::from_value(value).unwrap();
+            assert!(timed.required_features().contains(&TOOL_TIMES_FEATURE));
+            let bytes = encode(1, 1, &timed).unwrap();
+            assert!(
+                matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [TOOL_TIMES_FEATURE])
+            );
+            let DecodeStep::Record { framed, .. } = decode_next(&bytes) else {
+                panic!("timed approval records decode");
+            };
+            assert_eq!(framed.record, timed);
         }
     }
 
@@ -1627,6 +2065,72 @@ mod tests {
         );
     }
 
+    /// The known-name table of a release from before `provider-held/v1`: this build's table
+    /// without it.
+    fn known_without_provider_held() -> Vec<&'static str> {
+        KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != PROVIDER_HELD_FEATURE)
+            .collect()
+    }
+
+    /// Both values `provider-held/v1` covers gate themselves through `required_features`, with
+    /// no caller-supplied names. This build knows the feature and reads them back exactly; a
+    /// build from before it refuses the frame as a newer writer's instead of skipping the held
+    /// record or failing on the unknown pause reason.
+    #[test]
+    fn provider_held_records_are_gated_and_an_older_reader_refuses_them() {
+        assert!(KNOWN_FEATURES.contains(&PROVIDER_HELD_FEATURE));
+        let held: WalRecord = serde_json::from_str(
+            r#"{"type":"tool_call_provider_held","batch_id":"b","tool_call_id":"c","call_key":"lin_9:42","module":"core","reason":"parent_answer","held_at_ms":1761220000000,"sequential":false}"#,
+        )
+        .unwrap();
+        let paused: WalRecord =
+            serde_json::from_str(r#"{"type":"run_paused","run_id":"r","reason":"tool_held"}"#)
+                .unwrap();
+        let older = known_without_provider_held();
+        for record in [held, paused] {
+            assert_eq!(record.required_features(), &[PROVIDER_HELD_FEATURE]);
+            let bytes = encode(7, 1, &record).unwrap();
+            assert_eq!(bytes[4], GATED_FRAMING_VERSION);
+            let DecodeStep::Record { framed, consumed } = decode_next(&bytes) else {
+                panic!("this build must decode {record:?}");
+            };
+            assert_eq!(consumed, bytes.len());
+            assert_eq!(framed.record, record);
+            match decode_next_with(&bytes, &older) {
+                DecodeStep::NewerWriter { missing, .. } => {
+                    assert_eq!(missing, ["provider-held/v1"], "{record:?}")
+                }
+                _ => panic!("a reader without provider-held/v1 must refuse {record:?}"),
+            }
+        }
+    }
+
+    /// The pause reasons that existed before `provider-held/v1` keep their frames: an
+    /// auth pause stays an ordinary frame and a restart pause needs only `restart-pause/v1`,
+    /// so this build still reads both.
+    #[test]
+    fn older_pause_reasons_do_not_require_provider_held() {
+        let auth: WalRecord =
+            serde_json::from_str(r#"{"type":"run_paused","run_id":"r","reason":"auth_required"}"#)
+                .unwrap();
+        assert!(auth.required_features().is_empty());
+        assert_eq!(encode(7, 1, &auth).unwrap()[4], FRAMING_VERSION);
+        let restart: WalRecord =
+            serde_json::from_str(r#"{"type":"run_paused","run_id":"r","reason":"restart"}"#)
+                .unwrap();
+        assert_eq!(restart.required_features(), &[RESTART_PAUSE_FEATURE]);
+        for record in [auth, restart] {
+            let bytes = encode(7, 1, &record).unwrap();
+            assert!(
+                matches!(decode_next(&bytes), DecodeStep::Record { .. }),
+                "{record:?}"
+            );
+        }
+    }
+
     #[test]
     fn reader_decodes_frozen_restart_policy_and_historical_absence() {
         let old: WalRecord = serde_json::from_str(SCOPED_RUN_STARTED).unwrap();
@@ -1656,6 +2160,8 @@ mod tests {
     /// through plain [`encode`], and this build reads it back intact.
     #[test]
     fn a_steered_record_is_a_gated_frame_requiring_steer_queue_v1_and_round_trips() {
+        // Decodes with the shipped table, which a sibling test edits to hide steer-queue/v1.
+        let _table = lock_feature_table_for_test();
         let record: WalRecord = serde_json::from_str(STEERED).unwrap();
         assert_eq!(record.required_features(), &[STEER_QUEUE_FEATURE]);
         let bytes = encode(5, 1, &record).unwrap();
@@ -1704,6 +2210,8 @@ mod tests {
     /// 1 as u64 LE, and the payload.
     #[test]
     fn a_dispatch_module_intent_is_a_gated_frame_requiring_dispatch_module_v1_and_round_trips() {
+        // Decodes with the shipped table, which a sibling test edits to hide dispatch-module/v1.
+        let _table = lock_feature_table_for_test();
         let record: WalRecord = serde_json::from_str(DISPATCH_MODULE_INTENT).unwrap();
         assert_eq!(record.required_features(), &[DISPATCH_MODULE_FEATURE]);
         let bytes = encode(1, 1, &record).unwrap();
@@ -1746,6 +2254,8 @@ mod tests {
     /// carry no schema digests) and a pin without a module both require `dispatch-module/v1`.
     #[test]
     fn either_dispatch_module_field_alone_gates_the_intent() {
+        // Decodes with the shipped table, which a sibling test edits to hide dispatch-module/v1.
+        let _table = lock_feature_table_for_test();
         let module_only = DISPATCH_MODULE_INTENT.replacen(
             r#","schema_pin":{"schema_digest":"sha256:5f2c","semantics":2}"#,
             "",
@@ -2151,6 +2661,9 @@ mod tests {
     /// golden and a declarations-only record. Feature refusal must precede payload decoding.
     #[test]
     fn a_build_without_step_transforms_refuses_hooked_wal_as_newer_writer() {
+        // The current-reader check decodes steered and module-naming intent frames with the
+        // shipped table; sibling tests hide steer-queue/v1 and dispatch-module/v1 process-wide.
+        let _table = lock_feature_table_for_test();
         let older: Vec<&str> = KNOWN_FEATURES
             .iter()
             .copied()

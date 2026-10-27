@@ -162,6 +162,7 @@ fn request(project_root: &Path) -> RunRequest {
     }];
     let policy_allowed = tools.iter().map(|t| t.name.clone()).collect();
     RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -546,6 +547,7 @@ fn assert_all_output_results_are_real_stub_text(events: &[OutputEvent]) {
 
 fn tool_output_text(output: &ToolOutput) -> &str {
     match output {
+        ToolOutput::Parts { .. } => "",
         ToolOutput::Text { text } => text,
         ToolOutput::Error { message } => message,
         ToolOutput::Denied { reason } => reason,

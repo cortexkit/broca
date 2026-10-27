@@ -4,7 +4,7 @@
 //! openai-compat long tail is config, not code.
 //!
 //! Gated on explicit `BROCA_LIVE_TESTS` consent and an `api`-type provider key in the
-//! OpenCode auth file; skips cleanly (clear message, never a silent pass) when either is
+//! vault dev-tools handle map; skips cleanly (clear message, never a silent pass) when either is
 //! absent — the secret is read from disk and never echoed. This is the live regression guard that
 //! the generic driver's `finish()`-on-EOF path actually assembles a message for a no-in-band-terminal
 //! grammar.
@@ -23,9 +23,9 @@ use broca_protocol::{
 use broca_provider::families::{openai_chat_frozen_config, OpenAiChat};
 use broca_provider::wire::AuthHandle;
 use broca_provider::LiveProvider;
-use live_common::opencode_api_key;
+use live_common::vault_api_key;
 
-/// One OpenAI-compatible provider we can reach with a key from the auth file.
+/// One OpenAI-compatible provider we can reach with a vault dev-tools credential.
 struct CompatTarget {
     base_url: &'static str,
     model: &'static str,
@@ -50,7 +50,7 @@ async fn openai_chat_family_runs_live_against_a_compatible_provider() {
     // Pick the first target we have a key for.
     let Some((target, key)) = TARGETS
         .iter()
-        .find_map(|t| opencode_api_key(t.auth_key).map(|k| (t, k)))
+        .find_map(|t| vault_api_key(t.auth_key).map(|k| (t, k)))
     else {
         eprintln!(
             "SKIP openai_chat_family_runs_live: explicit BROCA_LIVE_TESTS consent or an api-type key is absent for every {:?} target",

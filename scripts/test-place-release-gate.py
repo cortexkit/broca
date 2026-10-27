@@ -112,15 +112,45 @@ int main(int argc, char **argv) {
                                "test", *args], cwd=ROOT, env=self.env, capture_output=True,
                               text=True, timeout=30)
 
-    def place(self) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(["bash", str(PLACE), "--staged", str(self.staged),
-                               "--dest", str(self.dest)], env=self.env, capture_output=True,
+    def place(self, *, staged: Path | None = None) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["bash", str(PLACE), "--staged", str(staged or self.staged), "--dest", str(self.dest)],
+                              env=self.env, capture_output=True,
                               text=True, timeout=60)
 
-    def verify(self, sha: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(["bash", str(VERIFY), "--bin", str(self.dest), "--sha", sha, "--staged", str(self.staged),
-                               "--marker", "new-release-marker", "--control", "ck-broca"],
-                              env=self.env, capture_output=True, text=True, timeout=30)
+    def verify(self, sha: str, *, staged: Path | None = None,
+               marker: str = "new-release-marker", control: str = "ck-broca") -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["bash", str(VERIFY), "--bin", str(self.dest), "--sha", sha, "--staged", str(staged or self.staged),
+                               "--marker", marker, "--control", control],
+                               env=self.env, capture_output=True, text=True, timeout=60)
+
+    def test_linux_release_verification_uses_placed_artifact_client_sidecars(self) -> None:
+        release = self.tmp / "release seam"
+        release.mkdir()
+        artifact = release / "ck-broca.deadbeef"
+        shutil.copy2(self.staged, artifact)
+        client_shas = {}
+        for client in ("broca-session", "broca-run"):
+            staged_client = release / f"{client}.deadbeef"
+            shutil.copy2(self.tmp / f"{client}.staged", staged_client)
+            # Same version, different bytes: stale fixture sidecars must not verify this release.
+            with staged_client.open("ab") as output:
+                output.write(b"\nrelease client trailer\n")
+            write_client_sidecar(staged_client)
+            client_shas[client] = hashlib.sha256(staged_client.read_bytes()).hexdigest()
+        placed = self.place(staged=artifact)
+        self.assertEqual(placed.returncode, 0, placed.stdout + placed.stderr)
+        self.launch()
+        sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        verified = self.verify(sha, staged=artifact)
+        self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
+        for client, digest in client_shas.items():
+            self.assertIn(f"{self.dest.parent / client} -- version 0.0.1, sha256 {digest} MATCH", verified.stdout)
+
+        stale = self.verify(sha)
+        self.assertEqual(stale.returncode, 1, stale.stdout + stale.stderr)
+        for client in client_shas:
+            self.assertIn(f"client sha256 mismatch at {self.dest.parent / client}", stale.stderr)
+            self.assertIn(str(self.tmp / f"{client}.staged.sha256.postsign"), stale.stderr)
 
     def test_linux_elf_placement_preserves_running_image_and_rollback(self) -> None:
         process = self.launch()
@@ -328,7 +358,9 @@ int main(int argc, char **argv) {
             scratch = self.tmp / "scratch"
             scratch.mkdir()
             env = dict(self.env, BUILT=built, BUILD_SCRATCH=str(scratch))
-            staged = subprocess.run(["bash", "-c", "set -euo pipefail\n" + source[start:end]],
+            # The slice skips the script's prologue, so load the helpers it calls, as the prologue does.
+            prologue = "set -euo pipefail\nsource scripts/nonshipping-markers.sh\n"
+            staged = subprocess.run(["bash", "-c", prologue + source[start:end]],
                                     cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
             self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
             seam = Path(self.env["HOME"]) / ".local/share/cortexkit/staging"
@@ -342,11 +374,12 @@ int main(int argc, char **argv) {
             self.assertEqual(placed.returncode, 0, placed.stdout + placed.stderr + log.read_text())
             new_pid = self.shell('broca_pid_for_binary "$1"', str(self.dest)).stdout.strip()
             self.assertNotEqual(old_pid, new_pid)
-            verified = subprocess.run(["bash", str(VERIFY), "--bin", str(self.dest), "--sha", sha, "--staged", str(self.staged),
-                                      "--marker", "ck-broca", "--control", "broca"], env=self.env,
-                                     capture_output=True, text=True, timeout=60)
+            # Client sidecars must come from the release just placed, not the setup fixtures.
+            verified = self.verify(sha, staged=artifact, marker="ck-broca", control="broca")
             self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
             self.assertIn("running sha256", verified.stdout)
+            for client in ("broca-session", "broca-run"):
+                self.assertIn(f"client   {self.dest.parent / client} -- version ", verified.stdout)
             print(f"real Linux deploy: pid {old_pid} -> {new_pid}; ELF sha256 {sha}; inode/hash MATCH")
         finally:
             # The supervisor and modules inherit this isolated process group, not the test's.
@@ -758,11 +791,28 @@ print(f"ck-broca 4243 user txt REG 1 1 {{inode}} {self.dest}")
 
     def test_live_approval_never_overrides_unknown_live_run_state(self):
         env = self.restart_fixture()
-        result = self.place("--restart", "--live-approved", PLACE_RELEASE_GATE_CMD="exit 2", **env)
+        gate = 'echo "cannot compare: probe reason one" >&2; exit 2'
+        result = self.place("--restart", "--live-approved", PLACE_RELEASE_GATE_CMD=gate, **env)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("gate could not determine live runs", result.stderr)
+        # The refusal names the gate's own reason, not only that it refused.
+        self.assertIn("cannot compare: probe reason one", result.stderr)
         self.assertEqual(self.dest.read_bytes(), self.deployed_bytes)
         self.assertFalse(self.rollback.exists())
+
+    def test_second_gate_that_cannot_tell_names_its_reason(self):
+        # The re-check right before the restart must keep the gate's reason even when the gate
+        # printed no live-run lines.
+        env = self.restart_fixture()
+        counter = self.tmp / "gate-called"
+        gate = (
+            f'if [ -f "{counter}" ]; then echo "cannot compare: probe reason two" >&2; exit 2; fi; '
+            f'touch "{counter}"; exit 0'
+        )
+        result = self.place("--restart", "--live-approved", PLACE_RELEASE_GATE_CMD=gate, **env)
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertIn("no longer clear (exit 2)", result.stderr)
+        self.assertIn("cannot compare: probe reason two", result.stderr)
 
     def test_live_approved_still_requires_a_new_pid(self):
         env = self.restart_fixture(new_pid=False)

@@ -1,0 +1,16 @@
+{
+  "tool_items": [
+    {
+      "provider": "aft",
+      "preset": "reader",
+      "params": {
+        "behavior": "autonomous",
+        "scope": "read",
+        "tool_descs": "concise",
+        "host": "broca"
+      }
+    }
+  ],
+  "system_text_items": [],
+  "step_transform_items": []
+}

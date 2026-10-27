@@ -57,8 +57,8 @@ impl ConsumerRoutes {
     }
 
     /// Name the routing module `account_selection` configures, when this configuration opens a
-    /// route to it: always alongside the vault, and never without it (the OpenCode source and
-    /// a mock provider resolve no accounts).
+    /// route to it: always alongside the vault, and never without it (a mock provider resolves
+    /// no accounts).
     pub fn with_account_selection(
         mut self,
         config: &crate::account_routing::AccountSelectionConfig,

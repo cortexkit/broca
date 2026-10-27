@@ -25,7 +25,7 @@ use subc_protocol::FrameType;
 
 /// The `RunStarted` a plan-less first send writes, as record JSON, with the parts that differ
 /// per run (the scratch project root, the run id and the timestamp) replaced by placeholders. Every other byte is pinned.
-const PLAN_LESS_RUN_STARTED: &str = r#"{"type":"run_started","run_id":"@RUN_ID@","session":{"project_root":"@ROOT@","harness":"runner","session":"delivery"},"ts_ms":0,"config":{"model":{"provider_module_id":"fake","model_id":"fake"},"tools":[{"name":"work","description":"does work","input_schema":{"type":"object"},"execution_mode":"parallel"}],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1,"frozen_render_config":{"render_config":"stateless"},"computed_tags":{"checkpoint":0}},"input":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"origin":{"kind":"fresh"},"send_id":"turn-1","request_identity_digest":"{\"version\":1,\"model\":\"158ff0524c84046f8e4277fe15cb3c7c9b77118fc5b296d09e0dea85c0fa281f\",\"input\":\"4047097b2648d6b400be8a670f467110f9366f7b79e3b450d3eb138e36acdab4\",\"tools\":\"0c1c3c61240370c46bbf8b8cf618a7ac639f1f2c70481bf04a1497d7069e0594\",\"policy_allowed\":\"22f199ad3c03aa6cdc52d4e7e38efd8ae9d46f28bfcdf960d1d4a16de4f4bb30\",\"tool_choice\":\"d7522ccd58caaccd080ff42fc701046086ea73d690df7b1b597b620e0aa33284\",\"generation\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"cache\":\"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\",\"budget\":\"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\",\"stop_when\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\"}","marker_order_version":1}"#;
+const PLAN_LESS_RUN_STARTED: &str = r#"{"type":"run_started","written_at_ms":0,"run_id":"@RUN_ID@","session":{"project_root":"@ROOT@","harness":"runner","session":"delivery"},"ts_ms":0,"config":{"model":{"provider_module_id":"fake","model_id":"fake"},"tools":[{"name":"work","description":"does work","input_schema":{"type":"object"},"execution_mode":"parallel"}],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1,"frozen_render_config":{"render_config":"stateless"},"computed_tags":{"checkpoint":0}},"input":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"origin":{"kind":"fresh"},"send_id":"turn-1","request_identity_digest":"{\"version\":1,\"model\":\"158ff0524c84046f8e4277fe15cb3c7c9b77118fc5b296d09e0dea85c0fa281f\",\"input\":\"4047097b2648d6b400be8a670f467110f9366f7b79e3b450d3eb138e36acdab4\",\"tools\":\"0c1c3c61240370c46bbf8b8cf618a7ac639f1f2c70481bf04a1497d7069e0594\",\"policy_allowed\":\"22f199ad3c03aa6cdc52d4e7e38efd8ae9d46f28bfcdf960d1d4a16de4f4bb30\",\"tool_choice\":\"d7522ccd58caaccd080ff42fc701046086ea73d690df7b1b597b620e0aa33284\",\"generation\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"cache\":\"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\",\"budget\":\"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\",\"stop_when\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\"}","marker_order_version":1}"#;
 
 /// The `session.baseline` reply of a session admitted without a plan, running the rig's one
 /// tool: no items, no composition digest, both generations 0.
@@ -34,8 +34,14 @@ const PLAN_LESS_BASELINE_REPLY: &str = r#"{"result":{"state":"ready","baseline":
 /// `record` as JSON with the per-run parts replaced, so the rest can be compared byte for byte.
 fn normalized_run_started(record: &WalRecord, run_id: &str, root: &str) -> String {
     let mut normalized = record.clone();
-    if let WalRecord::RunStarted { ts_ms, .. } = &mut normalized {
+    if let WalRecord::RunStarted {
+        ts_ms,
+        written_at_ms,
+        ..
+    } = &mut normalized
+    {
         *ts_ms = Some(0);
+        *written_at_ms = Some(0);
     }
     // The root as it appears inside a JSON string (backslashes escaped on Windows).
     let escaped_root = serde_json::to_string(root).unwrap();
@@ -69,11 +75,14 @@ async fn a_plan_less_session_keeps_its_bytes() {
         unreachable!()
     };
     assert!(manifest.is_none());
-    // Every run a computed-tag build admits freezes the computed tag rules, which are the only
-    // must-understand member a plan-less first episode carries.
+    // Plan-less episodes freeze computed tags and their newly recorded input time; both
+    // facts require an understanding reader even without a plan manifest.
     assert_eq!(
         started.required_features(),
-        [broca_wal::RUNNER_TAGS_V2_FEATURE]
+        [
+            broca_wal::MESSAGE_TIMES_FEATURE,
+            broca_wal::RUNNER_TAGS_V2_FEATURE
+        ]
     );
 
     let baseline = rig
@@ -139,7 +148,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// records every call it is asked to make. `refuse` makes one provider's catalog fetch refuse
 /// with a code.
 #[derive(Default)]
-struct CountingAdmitter {
+pub(super) struct CountingAdmitter {
     calls: Mutex<Vec<String>>,
     refuse: Mutex<Option<(String, String)>>,
     /// A composition digest every provider answers instead of the plan's, so the answers
@@ -147,11 +156,28 @@ struct CountingAdmitter {
     stale_digest: Mutex<Option<String>>,
     reply: Mutex<Option<Value>>,
     reply_schema: Mutex<Option<Value>>,
+    /// Every provider's catalog answer declares late results and a `content/v1` result format
+    /// for each of its tools, as AFT's and Core's do in production.
+    declare: Mutex<bool>,
+    /// A catalog `reference_slots` member every answered tool carries, when set.
+    reference_slots: Mutex<Option<Value>>,
+    /// Whether the admitter accepts plan items opting into output references.
+    output_refs: Mutex<bool>,
 }
 
 impl CountingAdmitter {
     fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// Make every answered catalog tool declare `slots` as its `reference_slots`.
+    pub(super) fn answer_reference_slots(&self, slots: Value) {
+        *self.reference_slots.lock().unwrap() = Some(slots);
+    }
+
+    /// Accept plan items that opt into output references, as a runner serving the group does.
+    pub(super) fn admit_output_refs(&self) {
+        *self.output_refs.lock().unwrap() = true;
     }
 }
 
@@ -185,8 +211,12 @@ impl Fetcher for Answering<'_> {
             .unwrap()
             .clone()
             .unwrap_or_else(|| self.plan.composition_digest.clone());
-        let tools: Vec<Value> = self.plan.composed[provider]
-            .iter()
+        let tools: Vec<Value> = self
+            .plan
+            .composed
+            .get(provider)
+            .into_iter()
+            .flatten()
             .map(|tool| {
                 let schema = self.admitter.reply_schema.lock().unwrap().clone()
                     .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
@@ -201,6 +231,12 @@ impl Fetcher for Answering<'_> {
                 if let Some(reply) = self.admitter.reply.lock().unwrap().clone() {
                     answer["reply"] = reply;
                 }
+                if *self.admitter.declare.lock().unwrap() {
+                    answer["result_format"] = json!("content/v1");
+                }
+                if let Some(slots) = self.admitter.reference_slots.lock().unwrap().clone() {
+                    answer["reference_slots"] = slots;
+                }
                 answer
             })
             .collect();
@@ -210,6 +246,9 @@ impl Fetcher for Answering<'_> {
             "composition_digest": digest,
             "tools": tools,
         });
+        if *self.admitter.declare.lock().unwrap() {
+            answer["capabilities"] = json!({"late_results": true});
+        }
         if request.system_text.is_some() {
             let text = text_of(provider);
             answer["system_text"] = json!({
@@ -279,9 +318,13 @@ impl PlanAdmitter for CountingAdmitter {
         )
         .await
     }
+
+    fn admits_output_refs(&self) -> bool {
+        *self.output_refs.lock().unwrap()
+    }
 }
 
-async fn plan_rig(tag: &str) -> (Rig, Arc<CountingAdmitter>) {
+pub(super) async fn plan_rig(tag: &str) -> (Rig, Arc<CountingAdmitter>) {
     let rig = Rig::start(tag).await;
     let admitter = Arc::new(CountingAdmitter::default());
     rig.registry().set_plan_admitter(admitter.clone());
@@ -332,6 +375,33 @@ async fn a_worker_preset_plan_requires_a_scoped_route() {
         !admitter.calls().is_empty(),
         "a scoped worker plan is admitted"
     );
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn absent_system_text_preset_refuses_before_fetch_or_wal_write() {
+    let (mut rig, admitter) = plan_rig("no-default-system-text").await;
+    let mut plan = vector("plans/broca-head-no-compaction.json");
+    plan["system_text_items"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("preset");
+    let frame = send_plan(
+        &mut rig,
+        7,
+        "missing-text-preset",
+        "hi",
+        Some(&plan),
+        json!({}),
+    )
+    .await;
+    assert_eq!(error_body(&frame)["code"], "invalid_params");
+    assert_eq!(
+        error_body(&frame)["detail"],
+        json!({"field":"plan.system_text_items[0].preset"})
+    );
+    assert!(admitter.calls().is_empty());
+    assert!(rig.wal_bytes().is_empty());
     rig.finish().await;
 }
 
@@ -1033,6 +1103,7 @@ async fn the_first_planned_episode_raises_the_feature_floor() {
     assert_eq!(
         started[0].required_features(),
         [
+            broca_wal::MESSAGE_TIMES_FEATURE,
             broca_wal::PLAN_MANIFEST_FEATURE,
             broca_wal::RUNNER_TAGS_V2_FEATURE
         ]
@@ -2338,9 +2409,10 @@ fn joint_exchanges() -> Value {
     serde_json::from_slice(&std::fs::read(root.join("exchanges.json")).unwrap()).unwrap()
 }
 
-#[test]
-fn joint_fixture_has_seven_ordered_cases_and_extensible_unknown_refusal() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_mc_compaction_client_uses_isolated_daemon_and_joint_setup() {
     use broca_core::compaction_provider::setup::SetupAnswer;
+    use broca_core::CompactionPlane;
     let cases = joint_exchanges();
     let names: Vec<_> = cases
         .as_array()
@@ -2372,11 +2444,6 @@ fn joint_fixture_has_seven_ordered_cases_and_extensible_unknown_refusal() {
     assert_eq!(code.as_str(), "future_provider_reason");
     assert!(!code.retryable());
     assert_eq!(provider_code.as_deref(), Some("joint_unknown_control"));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn real_mc_compaction_client_uses_isolated_daemon_and_joint_setup() {
-    use broca_core::CompactionPlane;
     // Magic Context is another module's build, which neither the gate nor CI provides, so it has
     // its own requirement switch: BROCA_REQUIRE_MC=1 makes a missing build fail instead of skip.
     let mc = std::env::var_os("MAGIC_CONTEXT_BIN").map(std::path::PathBuf::from);
@@ -2425,7 +2492,6 @@ async fn real_mc_compaction_client_uses_isolated_daemon_and_joint_setup() {
             .await
             .unwrap(),
     );
-    let cases = joint_exchanges();
     let bind = broca_protocol::BindIdentity::new(&rig.dir, "broca", "alfonso:joint");
     // A published daemon connection does not mean its supervised MC module is live.
     // The shared route-open policy retries only typed readiness refusals and preserves
@@ -2624,4 +2690,122 @@ async fn a_model_less_steer_checks_its_plan_against_the_inherited_model() {
     );
     assert_eq!(rig.wal_bytes(), before, "refusal must preserve WAL bytes");
     rig.finish().await;
+}
+
+/// The `requires` list of every gated `RunStarted` frame in `wal`, read from the raw frames
+/// (a decoded record does not keep its frame's `requires`).
+fn run_started_requires(wal: &[u8]) -> Vec<Vec<String>> {
+    use broca_wal::{GATED_FRAMING_VERSION, HEADER_LEN};
+    let mut lists = Vec::new();
+    let mut at = 0;
+    while at + HEADER_LEN <= wal.len() {
+        let len = u32::from_le_bytes(wal[at..at + 4].try_into().unwrap()) as usize;
+        let payload = &wal[at + HEADER_LEN..at + HEADER_LEN + len];
+        if wal[at + 4] == GATED_FRAMING_VERSION {
+            let gated: Value = serde_json::from_slice(payload).unwrap();
+            if gated["record"]["type"] == "run_started" {
+                lists.push(serde_json::from_value(gated["requires"].clone()).unwrap());
+            }
+        }
+        at += HEADER_LEN + len;
+    }
+    lists
+}
+
+fn agent_run_stamp() -> subc_protocol::scope::ScopeStamp {
+    use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeStamp};
+    ScopeStamp::new(scope_owner(), "head-1", 1, ScopeKind::Head)
+        .with_attributes(
+            ScopeAttributes::new()
+                .with_agent_id(Some("agent-1".into()))
+                .with_run_id(Some("agent-run-1".into())),
+        )
+        .with_owner_authorized(true)
+}
+
+/// A session with a session class, admitted with a plan whose providers declare result formats
+/// and late results (every worker Core launches), writes its first `RunStarted` in a frame
+/// that requires both the session-class and the provider-declarations features. The same
+/// holds with an agent-run scope and with an input cap, the other two features added through
+/// a precomputed union. The provider-declarations feature once reached the session-class
+/// union, which did not list it, and the WAL writer panicked on every such send.
+#[tokio::test]
+async fn a_classed_session_with_declaring_providers_frames_its_run_started() {
+    use broca_wal::framing::{
+        AGENT_RUN_SCOPE_FEATURE, INPUT_TOKEN_CAP_FEATURE, PLAN_MANIFEST_FEATURE,
+        PROVIDER_DECLARATIONS_FEATURE, SESSION_CLASS_FEATURE,
+    };
+    for case in ["classed", "agent-run", "input-cap"] {
+        let tag = format!("declaring-{case}");
+        let mut plan = vector("plans/broca-head-no-compaction.json");
+        let (mut rig, admitter, channel) = if case == "agent-run" {
+            // An agent-run scope admits model-only plans, so its providers answer for system
+            // text alone and declare late results without any tool's result format.
+            plan["tool_items"] = json!([]);
+            // An agent-run scope accepts sends only from its basal carrier, never its owner.
+            let carrier = subc_protocol::Principal::Reserved {
+                module_id: "basal".into(),
+            };
+            let mut rig = Rig::start_with_scopes(&tag).await;
+            rig.bind_with_scope(8, Some(carrier), Some(agent_run_stamp()))
+                .await;
+            let admitter = Arc::new(CountingAdmitter::default());
+            rig.registry().set_plan_admitter(admitter.clone());
+            (rig, admitter, 8)
+        } else {
+            let (rig, admitter) = plan_rig(&tag).await;
+            (rig, admitter, 7)
+        };
+        *admitter.declare.lock().unwrap() = true;
+        rig.script.push(&[Step::Text("done")]);
+        let mut extra = json!({"session_class": "mason"});
+        let mut expected = vec![
+            PLAN_MANIFEST_FEATURE,
+            PROVIDER_DECLARATIONS_FEATURE,
+            SESSION_CLASS_FEATURE,
+        ];
+        match case {
+            "agent-run" => expected.push(AGENT_RUN_SCOPE_FEATURE),
+            "input-cap" => {
+                extra["budget"] = json!({"max_input_tokens": 1_000_000});
+                expected.push(INPUT_TOKEN_CAP_FEATURE);
+            }
+            _ => {}
+        }
+        let reply = send_plan(&mut rig, channel, "turn-1", "hi", Some(&plan), extra).await;
+        result(&reply);
+        let records = rig.wait_for_finished(1).await;
+
+        // The catalog answers' declarations were frozen into the manifest.
+        let manifest = serde_json::to_value(manifest_of(run_started(&records)[0])).unwrap();
+        let fetches = manifest["fetches"].as_array().unwrap();
+        assert!(!fetches.is_empty(), "{case}: {manifest}");
+        for fetch in fetches {
+            assert_eq!(
+                fetch["declarations_frozen"]["late_results"], true,
+                "{case}: {fetch}"
+            );
+        }
+        if case != "agent-run" {
+            assert!(
+                fetches
+                    .iter()
+                    .any(|fetch| fetch["declarations_frozen"]["result_formats"]
+                        .as_object()
+                        .is_some_and(|formats| !formats.is_empty())),
+                "{case}: {manifest}"
+            );
+        }
+
+        let requires = run_started_requires(&rig.wal_bytes());
+        assert_eq!(requires.len(), 1, "{case}: {requires:?}");
+        for feature in expected {
+            assert!(
+                requires[0].iter().any(|name| name == feature),
+                "{case}: the RunStarted frame requires {:?}, without {feature}",
+                requires[0]
+            );
+        }
+        rig.finish().await;
+    }
 }

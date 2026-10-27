@@ -6,6 +6,7 @@
 use super::*;
 use broca_core::WalStore;
 use broca_wal::{CompactionMessageKind, WalRecord};
+use cortexkit_role_llm_runner_conformance::{ScriptedToolCall, ScriptedTurn};
 use sha2::{Digest, Sha256};
 
 const SESSION: &str = "mc-e2e";
@@ -50,8 +51,11 @@ impl McConfig {
         std::fs::write(
             root.join("config/cortexkit/magic-context.jsonc"),
             serde_json::to_vec_pretty(
-                &json!({"historian":{"broca":{"model":"scripted/historian"}},
-                "execute_threshold_percentage":20}),
+                // Magic Context reads this from its user-tier file only. The session runs a
+                // worker compaction preset, which writes no summaries, so no historian model
+                // is configured. The window the threshold applies to is the one broca reports
+                // for the session: `context_window` in the rig's test-compaction `config` file.
+                &json!({"execute_threshold_percentage":50}),
             )
             .unwrap(),
         )
@@ -121,87 +125,44 @@ impl McConfig {
     }
 }
 
-/// Rust port of the supplied model-free responder; reference pairs pin its exact output.
-fn historian_response(prompt: &str) -> Option<String> {
-    fn digits(s: &str) -> Option<u64> {
-        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-            .then(|| s.parse().ok())
-            .flatten()
-    }
-    fn block(line: &str) -> bool {
-        let Some((range, role)) = line.strip_prefix('[').and_then(|s| s.split_once("] ")) else {
-            return false;
-        };
-        let valid = match range.split_once('-') {
-            Some((a, b)) => digits(a).is_some() && digits(b).is_some(),
-            None => digits(range).is_some(),
-        };
-        let letters = role.bytes().take_while(u8::is_ascii_uppercase).count();
-        valid && letters > 0 && role.as_bytes().get(letters) == Some(&b':')
-    }
-    let (_, rest) = prompt.split_once("<new_messages>\n\nMessages ")?;
-    let (header, _) = rest.split_once(":\n\n")?;
-    let (start, end) = header.split_once('-')?;
-    let (start, end) = (digits(start)?, digits(end)?);
-    if end < start {
-        return None;
-    }
-    let close = rest.rfind("\n\n</new_messages>")?;
-    let body = rest.get(header.len() + 3..close).unwrap_or_default();
-    let blocks = body.lines().filter(|s| block(s)).count();
-    let next = end.checked_add(1)?;
-    Some(format!(concat!("<output>\n<compartments>\n",
-        "<compartment start=\"{}\" end=\"{}\" title=\"Scripted fold {}-{}\" episode_type=\"feature\" importance=\"50\">\n",
-        "<p1>Scripted summary of raw messages {}-{}: {} transcript blocks.</p1>\n",
-        "<p2>Scripted summary of raw messages {}-{}.</p2>\n<p3>Messages {}-{}.</p3>\n<p4 />\n",
-        "</compartment>\n</compartments>\n<meta><messages_processed>{}-{}</messages_processed>",
-        "<unprocessed_from>{}</unprocessed_from></meta>\n</output>\n"),
-        start,end,start,end,start,end,blocks,start,end,start,end,start,end,next))
-}
-
-pub(super) async fn serve_historian(
-    mut stream: tokio::net::TcpStream,
-    request: &Value,
-) -> std::io::Result<()> {
-    let prompt = request["messages"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|m| m["role"] == "user")
-        .filter_map(|m| m["content"].as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let answer =
-        historian_response(&prompt).expect("MC historian prompt must match the supplied grammar");
-    eprintln!(
-        "MC scripted historian: prompt={} response={} bytes",
-        prompt.len(),
-        answer.len()
-    );
-    let chunk = json!({"id":"scripted-historian","object":"chat.completion.chunk","model":"historian",
-        "choices":[{"index":0,"delta":{"role":"assistant","content":answer},"finish_reason":null}]});
-    let end = json!({"id":"scripted-historian","object":"chat.completion.chunk","model":"historian",
-        "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
-    let body = format!("data: {chunk}\n\ndata: {end}\n\ndata: [DONE]\n\n");
-    stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await?;
-    stream.shutdown().await
-}
-
 #[test]
-fn historian_matches_mc_reference_pairs() {
+fn compaction_log_reads_fleet_logger_lines() {
     let root =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scripted-historian/pairs");
-    for i in 1..=3 {
-        let prompt = std::fs::read_to_string(root.join(format!("pair-{i}.prompt.txt"))).unwrap();
-        let expected =
-            std::fs::read_to_string(root.join(format!("pair-{i}.response.xml"))).unwrap();
-        assert_eq!(
-            historian_response(&prompt).as_deref(),
-            Some(expected.as_str()),
-            "pair {i}"
-        );
-    }
-    assert!(historian_response("ordinary conversation").is_none());
+        broca_test_support::scratch_root().join(format!("mc-log-parse-{}", std::process::id()));
+    let logs = root.join("data-home/cortexkit/broca/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    // Lines as broca wrote them in a real run against Magic Context.
+    std::fs::write(logs.join("broca.2026-10-22.log"), concat!(
+        "2026-10-22T15:47:27.640Z INFO  broca.compaction: compaction consumer attached account=box_compaction_test durable=m_broca\n",
+        "2026-10-22T15:47:32.497Z INFO  broca.compaction: compaction view_ready handled session_ref=d22579b49da13fb908f3c244f73c6776 view_version=1 outcome=receipted\n",
+        "2026-10-22T15:47:32.545Z INFO  broca.compaction: compaction view_ready handled session_ref=d22579b49da13fb908f3c244f73c6776 view_version=2 outcome=receipted\n",
+        "2026-10-22T15:47:32.600Z INFO  broca.compaction: compaction view_ready handled session_ref=00000000000000000000000000000000 view_version=9 outcome=receipted\n",
+        "2026-10-22T15:47:32.649Z INFO  broca.compaction: compaction view decided at the idle boundary session_ref=d22579b49da13fb908f3c244f73c6776 view_version=2 choice=applied reason=\"\"\n",
+    )).unwrap();
+    let log = compaction_log(&root, "d22579b49da13fb908f3c244f73c6776");
+    let summary: Vec<_> = log
+        .iter()
+        .map(|f| {
+            (
+                f["message"].as_str(),
+                f["view_version"].as_str(),
+                f.get("outcome").or(f.get("choice")).unwrap().as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            ("compaction view_ready handled", "1", "receipted"),
+            ("compaction view_ready handled", "2", "receipted"),
+            (
+                "compaction view decided at the idle boundary",
+                "2",
+                "applied"
+            ),
+        ]
+    );
+    assert_eq!(log[2]["reason"], "");
 }
 
 fn note(root: &Path, text: impl AsRef<str>) {
@@ -282,15 +243,7 @@ fn fields(subject: &BrocaSubject, first: bool, index: usize) -> Value {
         "Private deterministic conversation evidence. ".repeat(100)
     ));
     fields["send_id"] = json!(format!("mc-turn-{index}"));
-    fields["stop_when"] = json!({"max_steps":1});
-    if first {
-        let composition = json!({"providers":[{"provider":"magic-context","tools":[]}],
-            "compaction":{"provider":"magic-context"},"step_transform_items":[]});
-        fields["plan"] = json!({"tool_items":[],"system_text_items":[],"step_transform_items":[],
-            "compaction_item":{"provider":"magic-context","preset":"head","params":{}},
-            "composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(),
-            "composition":composition});
-    }
+    fields["stop_when"] = json!({"max_steps":2});
     fields
 }
 
@@ -323,6 +276,352 @@ async fn finished(subject: &BrocaSubject, live: &Live, expected: usize) {
         }
     })
     .await;
+}
+
+/// Holds the next send until Magic Context can have read everything the previous run wrote:
+/// that run's last advance notice is durable in the WAL and the rig's bus subscriber has seen
+/// it published. Back-to-back turns otherwise outrun MC, which publishes its view while later
+/// runs are already going. No `view_ready` is awaited: MC publishes one only when it decides
+/// to compact.
+async fn previous_notice_published(subject: &BrocaSubject, live: &Live, events: &Events) {
+    broca_test_support::wait_until(
+        "the previous run's last advance notice on the bus",
+        || async {
+            let records = subject.records(live, SESSION);
+            let run_start = records
+                .iter()
+                .rposition(|r| matches!(r, WalRecord::RunStarted { .. }))
+                .ok_or("no run has started")?;
+            let Some(headers) = records[run_start..].iter().rev().find_map(|r| match r {
+                WalRecord::CompactionNotice { headers, .. } => Some(headers),
+                _ => None,
+            }) else {
+                return Err(format!(
+                    "the last run recorded no advance notice; records={records:?}"
+                ));
+            };
+            if events
+                .messages
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| published_with(m, headers))
+            {
+                Ok(())
+            } else {
+                Err(format!("advance notice not yet published: {headers:?}"))
+            }
+        },
+    )
+    .await;
+}
+
+/// Whether a published bus message carries every one of `headers`.
+fn published_with(
+    message: &async_nats::Message,
+    headers: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    message.headers.as_ref().is_some_and(|actual| {
+        headers.iter().all(|(key, value)| {
+            actual
+                .get(key.as_str())
+                .is_some_and(|v| v.as_str() == value)
+        })
+    })
+}
+
+/// The scope the conversation runs under. Its worker tool preset is confined by the scope on
+/// its route, and broca refuses a worker preset on an unscoped route (`scope_required`).
+const SCOPE_REF: &str = "mc-e2e-scope";
+const SCOPE_EPOCH: u64 = 1;
+/// The fake owner stub answers its nth `scope.sync` with correlation `base + n`.
+const SCOPE_SYNC_CORR: u64 = 1_000_001;
+
+fn scope_sync_path(root: &Path) -> PathBuf {
+    root.join("owner-scopes.json")
+}
+
+fn owner_events_path(root: &Path) -> PathBuf {
+    root.join("owner-events.jsonl")
+}
+
+/// Make the conformance owner the daemon's scope authority, have it sync the scope written by
+/// [`write_scopes`], and make broca a reserved principal so the scope can list it as the carrier
+/// that opens scoped provider routes for plan admission.
+pub(super) fn scope_config(config: &mut Value, root: &Path) {
+    config["scope_authority_owners"] = json!([OWNER_MODULE]);
+    config["modules"]["broca"]["reserved"] = json!(true);
+    let env = &mut config["modules"][OWNER_MODULE]["env"];
+    env["FAKE_AFT_SCOPE_SYNC_PATH"] = json!(scope_sync_path(root));
+    env["FAKE_AFT_EVENTS_PATH"] = json!(owner_events_path(root));
+}
+
+/// The owner stub syncs this file when it starts, so it is written before the stack starts.
+fn write_scopes(root: &Path) {
+    let record = json!([{
+        "ref": SCOPE_REF,
+        "scope_epoch": SCOPE_EPOCH,
+        "kind": "head",
+        "attributes": {},
+        "carriers": [{"principal": {"kind": "reserved", "module_id": "broca"}}],
+    }]);
+    let path = scope_sync_path(root);
+    let staging = path.with_extension("staging");
+    std::fs::write(&staging, serde_json::to_vec(&record).unwrap()).unwrap();
+    std::fs::rename(&staging, &path).unwrap();
+}
+
+/// Lines already in the owner's event log, so a restart waits for its own sync answer.
+fn scope_sync_lines(root: &Path) -> usize {
+    std::fs::read_to_string(owner_events_path(root))
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+/// Wait for the daemon to accept the owner's scope sync, logged after line `after`.
+async fn wait_scope_synced(root: &Path, after: usize) {
+    broca_test_support::wait_until("the owner's scope.sync answer", || async {
+        let text = std::fs::read_to_string(owner_events_path(root)).unwrap_or_default();
+        let reply = text
+            .lines()
+            .skip(after)
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|event| {
+                event["corr"] == SCOPE_SYNC_CORR
+                    && (event["kind"] == "scope_sync_response" || event["kind"] == "error")
+            });
+        match reply {
+            None => Err(format!("no scope.sync answer yet: {text}")),
+            Some(reply) => {
+                assert_eq!(
+                    reply["kind"], "scope_sync_response",
+                    "scope.sync refused: {reply}"
+                );
+                for result in reply["body_json"]["results"].as_array().unwrap() {
+                    assert_ne!(
+                        result["outcome"], "refused",
+                        "the scope was refused: {result}"
+                    );
+                }
+                Ok(())
+            }
+        }
+    })
+    .await;
+}
+
+/// The conversation's management route, opened by the scope owner under [`SCOPE_REF`].
+async fn scoped_session_route(subject: &BrocaSubject, live: &Live) -> BrocaRoute {
+    use subc_protocol::{scope::ScopeSelector, Principal};
+    let stamp = subject.owner_stamp();
+    let connection = subject.connection(live, &stamp).await.unwrap();
+    let identity = subject.bind_identity(SESSION);
+    subject
+        .shared
+        .session_roots
+        .lock()
+        .unwrap()
+        .insert(SESSION.to_owned(), live.state_root.clone());
+    subject
+        .shared
+        .session_bindings
+        .lock()
+        .unwrap()
+        .insert(SESSION.into(), identity.clone());
+    let selector = || {
+        ScopeSelector::new(
+            Principal::Reserved {
+                module_id: OWNER_MODULE.into(),
+            },
+            SCOPE_REF,
+            Some(SCOPE_EPOCH),
+        )
+    };
+    let route = broca_test_support::wait_until("broca's scoped management route", || async {
+        match connection
+            .route_open_management_scoped_within(
+                "broca",
+                &identity,
+                selector(),
+                broca_subc::RouteOpenRetry::within(
+                    Duration::from_secs(2),
+                    Duration::from_millis(100),
+                ),
+            )
+            .await
+        {
+            Ok(route) => Ok(route),
+            // A scope refusal is an answer, not a module still starting.
+            Err(error) if error.to_string().contains("scope_") => {
+                panic!("broca refused the scoped route: {error}")
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    })
+    .await;
+    BrocaRoute {
+        subject: subject.clone(),
+        connection,
+        route,
+        session: identity,
+        describe_calls: std::sync::atomic::AtomicUsize::new(0),
+        logs_dir: live.logs_dir.clone(),
+    }
+}
+
+/// The plan the conversation is admitted with, the shape a worker ships with: Magic Context's
+/// tool, system-text and compaction items all on preset `worker`, so it serves ctx_reduce,
+/// ctx_expand and ctx_search with the worker guidance and writes no summaries. The scripted
+/// tool beside it gives each turn a tool output to drop. Tags are rendered so ctx_reduce can
+/// name outputs by their `§N§` tag.
+fn worker_plan() -> Value {
+    let item = json!({"provider":"magic-context","preset":"worker","params":{"compacting":true}});
+    // broca refuses a composition that is not in canonical order: providers sorted bytewise by
+    // id, and each provider's tools by name.
+    let composition = json!({
+        "providers":[
+            {"provider":TOOL_MODULE,"tools":[{"name":SCRIPTED_TOOL,"capabilities":[]}]},
+            {"provider":"magic-context","tools":[
+                {"name":"ctx_expand","capabilities":["magic-context:history.expand/v1"]},
+                {"name":"ctx_reduce","capabilities":["magic-context:context.reduce/v1"]},
+                {"name":"ctx_search","capabilities":["magic-context:archive.search/v1"]},
+            ]},
+        ],
+        "compaction":{"provider":"magic-context"},
+        "step_transform_items":[],
+    });
+    json!({
+        "tool_items":[item, {"provider":TOOL_MODULE,"preset":"conformance","params":{}}],
+        "system_text_items":[item],
+        "step_transform_items":[],
+        "compaction_item":{"provider":"magic-context","preset":"worker","params":{}},
+        "render_tags":true,
+        "composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(),
+        "composition":composition,
+    })
+}
+
+/// The frozen plan of the conversation's first run carries the worker shape it was sent with.
+fn assert_frozen_worker_plan(records: &[WalRecord]) {
+    let manifest = records
+        .iter()
+        .find_map(|r| match r {
+            WalRecord::RunStarted { manifest, .. } => manifest.clone(),
+            _ => None,
+        })
+        .expect("the first run froze no plan manifest");
+    let plan: Value = serde_json::from_str(manifest.plan.as_json_text()).unwrap();
+    let worker = json!({"provider":"magic-context","preset":"worker","params":{"compacting":true}});
+    let mc_tools: Vec<_> = plan["tool_items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["provider"] == "magic-context")
+        .collect();
+    assert_eq!(mc_tools.len(), 1, "frozen plan: {plan}");
+    for key in ["provider", "preset", "params"] {
+        assert_eq!(mc_tools[0][key], worker[key], "frozen tool item: {plan}");
+        assert_eq!(
+            plan["system_text_items"][0][key], worker[key],
+            "frozen system-text item: {plan}"
+        );
+    }
+    assert_eq!(
+        plan["compaction_item"]["provider"], "magic-context",
+        "frozen compaction item: {plan}"
+    );
+    assert_eq!(
+        plan["compaction_item"]["preset"], "worker",
+        "frozen compaction item: {plan}"
+    );
+}
+
+/// The large, distinct output the scripted tool answers for read `index`.
+fn tool_output(index: usize) -> String {
+    format!(
+        "Tool output {index}: {}",
+        "deterministic tool evidence line. ".repeat(700)
+    )
+}
+
+/// The two model turns of one run: a call, then a short answer that ends the run.
+fn run_turns(call: ScriptedToolCall, answer: &str) -> [ScriptedTurn; 2] {
+    [
+        ScriptedTurn::new(vec![ScriptedPart::ToolCall(call)]),
+        ScriptedTurn::new(vec![ScriptedPart::Text(answer.into())]),
+    ]
+}
+
+fn read_call(index: usize) -> ScriptedToolCall {
+    ScriptedToolCall {
+        tool_call_id: format!("read_{index}"),
+        tool: SCRIPTED_TOOL.into(),
+        arguments: json!({"read": index}),
+        result: json!(tool_output(index)),
+        hold: false,
+    }
+}
+
+/// The `§N§` tags broca rendered on the tool outputs of `reads` in the model request `body`.
+fn output_tags(body: &[u8], reads: &[usize]) -> Vec<u64> {
+    let request: Value = serde_json::from_slice(body).unwrap();
+    let mut tags = Vec::new();
+    for message in request["messages"].as_array().into_iter().flatten() {
+        if message["role"] != "tool" {
+            continue;
+        }
+        let texts: Vec<&str> = match &message["content"] {
+            Value::String(text) => vec![text.as_str()],
+            Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect(),
+            _ => Vec::new(),
+        };
+        for text in texts {
+            let Some(rest) = text.strip_prefix('§') else {
+                continue;
+            };
+            let Some((tag, output)) = rest.split_once("§ ") else {
+                continue;
+            };
+            let named = reads.iter().any(|read| {
+                // The scripted result is a JSON string, so its text keeps the quotes.
+                output
+                    .trim_start_matches('"')
+                    .starts_with(&format!("Tool output {read}:"))
+            });
+            if let (true, Ok(tag)) = (named, tag.parse()) {
+                tags.push(tag);
+            }
+        }
+    }
+    tags
+}
+
+/// The newest durable advance notice: its sequence, estimated tokens and window.
+fn last_notice(records: &[WalRecord]) -> Option<(u64, u64, Option<u64>)> {
+    records.iter().rev().find_map(|r| match r {
+        WalRecord::CompactionNotice { seq, headers } => {
+            let notice =
+                broca_core::compaction_provider::notice::AdvanceNotice::from_headers(headers)
+                    .ok()?;
+            Some((*seq, notice.est_tokens, notice.window))
+        }
+        _ => None,
+    })
+}
+
+#[test]
+fn output_tags_reads_the_tags_rendered_on_named_tool_outputs() {
+    let body = json!({"messages":[
+        {"role":"user","content":"§1§ question"},
+        {"role":"tool","tool_call_id":"read_0","content":format!("§4§ \"{}\"", tool_output(0))},
+        {"role":"tool","tool_call_id":"read_1","content":[{"type":"text","text":format!("§9§ \"{}\"", tool_output(1))}]},
+        {"role":"tool","tool_call_id":"read_2","content":format!("§12§ \"{}\"", tool_output(2))},
+    ]});
+    let body = serde_json::to_vec(&body).unwrap();
+    assert_eq!(output_tags(&body, &[0, 1]), vec![4, 9]);
+    assert_eq!(output_tags(&body, &[2]), vec![12]);
+    assert!(output_tags(&body, &[3]).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -375,40 +674,30 @@ async fn real_mc_async_compaction_end_to_end() {
     subject.mc = Some(mc.clone());
     subject
         .shared
-        .mc_historian
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    subject
-        .shared
         .plan_sessions
         .lock()
         .unwrap()
         .insert(SESSION.into());
+    // An applied view can drop messages, so the scripted model counts the turns it served.
+    subject
+        .shared
+        .counted_turns
+        .lock()
+        .unwrap()
+        .insert(SESSION.into(), 0);
     let mut evidence = Evidence {
         events: None,
         root: root.clone(),
         identity: subject.bind_identity(SESSION),
     };
-    note(&root, format!("Authenticated MC sha256={binary_sha}; fixture sha256={database_sha}; no billed models; artifacts={}", root.display()));
-    subject
-        .install_script(
-            SESSION,
-            Script {
-                turns: vec![
-                    cortexkit_role_llm_runner_conformance::ScriptedTurn::new(vec![
-                        ScriptedPart::Text("Deterministic assistant evidence. ".repeat(80))
-                    ]);
-                    128
-                ],
-            },
-        )
-        .await
-        .unwrap();
+    let session_ref = broca_core::agent_session_ref(&subject.bind_identity(SESSION));
+    note(&root, format!("Authenticated MC sha256={binary_sha}; fixture sha256={database_sha}; no billed models; session_ref={session_ref}; artifacts={}", root.display()));
     let controls = root.join("broca-state/test-compaction").join(SESSION);
     std::fs::create_dir_all(&controls).unwrap();
     std::fs::write(
         controls.join("config"),
         serde_json::to_vec(&json!({
-        "context_window":32000,"output_limit":4096,"call_timeout_ms":30000}))
+        "context_window":128000,"output_limit":4096,"call_timeout_ms":30000}))
         .unwrap(),
     )
     .unwrap();
@@ -421,12 +710,16 @@ async fn real_mc_async_compaction_end_to_end() {
     let events = observe_events(&bus).await;
     evidence.events = Some(events.messages.clone());
     subject.bus = Some(bus.clone());
-    let receipt_gate = root.join("broca-state/test-compaction-bus-gate");
-    std::fs::write(&receipt_gate, "ViewReceiptRecorded").unwrap();
+    // The receipt gate is not armed here. Magic Context may publish a view after any advance
+    // notice, the first one included, so a gate armed at startup would hold whichever view came
+    // first rather than the one this test means to observe. It is armed later, just before the
+    // step that should make Magic Context publish the view carrying the drops.
+    write_scopes(&root);
     let mut live = subject
         .start(&root)
         .await
         .expect("start private supervised stack");
+    wait_scope_synced(&root, 0).await;
     // Route readiness also waits for the module to finish opening its databases.
     let connection = SubcConnection::connect(&live.connection_file)
         .await
@@ -451,90 +744,201 @@ async fn real_mc_async_compaction_end_to_end() {
         .expect("real MC must serve compaction-provider 0.3");
     connection.route_close(&mc_route).await.unwrap();
     note(&root, mc.assert_private_databases(&live));
-    let route = subject
-        .session_route(&live, SESSION, &subject.owner_stamp())
-        .await
-        .unwrap();
-    let sent = std::sync::atomic::AtomicUsize::new(0);
-    broca_test_support::wait_until("MC view_ready's durable receipt", || async {
-        if root
-            .join("broca-state/test-compaction-bus-reached")
-            .exists()
-        {
-            return Ok(());
+    let route = scoped_session_route(&subject, &live).await;
+
+    // The scripted model's turns, extended run by run. Each run is a tool call and an answer.
+    let mut turns: Vec<ScriptedTurn> = Vec::new();
+    let mut runs = 0;
+    let mut reads = 0;
+    // Start one turn of the conversation: install its two model turns, pace on the previous
+    // run's published notice, and send. `end_run!` waits for its terminal.
+    macro_rules! begin_run {
+        ($call:expr, $answer:expr) => {{
+            turns.extend(run_turns($call, $answer));
+            subject
+                .install_script(
+                    SESSION,
+                    Script {
+                        turns: turns.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+            if runs > 0 {
+                previous_notice_published(&subject, &live, &events).await;
+            }
+            let mut sent = fields(&subject, runs == 0, runs);
+            if runs == 0 {
+                sent["plan"] = worker_plan();
+            }
+            send(&route, sent, &root).await;
+            runs += 1;
+        }};
+    }
+    // Wait for the turn `begin_run!` started last to reach its terminal; returns the WAL.
+    macro_rules! end_run {
+        () => {{
+            finished(&subject, &live, runs).await;
+            let records = subject.records(&live, SESSION);
+            note(
+                &root,
+                format!(
+                    "run={} model_request_bytes={:?} last_notice(seq, est_tokens, window)={:?}",
+                    runs - 1,
+                    requests(&subject).last().map(Vec::len),
+                    last_notice(&records)
+                ),
+            );
+            records
+        }};
+    }
+    // One whole turn: start it and wait for its terminal.
+    macro_rules! run {
+        ($call:expr, $answer:expr) => {{
+            begin_run!($call, $answer);
+            end_run!()
+        }};
+    }
+    // A few tool outputs, then ctx_reduce on the two oldest. The tags come from the request
+    // the model just received, as a model would read them.
+    for _ in 0..3 {
+        let records = run!(read_call(reads), "Noted that output.");
+        reads += 1;
+        if runs == 1 {
+            assert_frozen_worker_plan(&records);
+            note(&root, "Frozen plan: Magic Context tool, system-text and compaction items on preset worker; tool and system text with params {\"compacting\":true}");
         }
-        let index = sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        assert!(
-            index < 40,
-            "MC produced no view_ready after 40 turns; STOP and inspect MC logs"
-        );
-        send(&route, fields(&subject, index == 0, index), &root).await;
-        finished(&subject, &live, index + 1).await;
-        note(
-            &root,
-            format!(
-                "turn={index} model_request_bytes={:?}",
-                requests(&subject).last().map(Vec::len)
-            ),
-        );
-        if root
-            .join("broca-state/test-compaction-bus-reached")
-            .exists()
-        {
-            Ok(())
-        } else {
-            Err(format!("turn {index} complete, no view_ready receipt yet"))
-        }
-    })
-    .await;
-    let mut sent = sent.into_inner();
+    }
+    let dropped = [0, 1];
+    let tags = output_tags(requests(&subject).last().unwrap(), &dropped);
     assert_eq!(
-        std::fs::read_to_string(root.join("broca-state/test-compaction-bus-reached"))
-            .ok()
-            .as_deref(),
-        Some("ViewReceiptRecorded"),
-        "MC never published view_ready; STOP and inspect MC logs"
+        tags.len(),
+        dropped.len(),
+        "broca rendered no §N§ tag on the outputs of reads {dropped:?}; the plan sets render_tags"
     );
-    let store = broca_store::SqliteStore::open(live.state_root.join("run-index.db")).unwrap();
-    let receipts = store.compaction_receipts("", 256).unwrap();
-    assert_eq!(
-        receipts.len(),
-        1,
-        "view_ready must have a durable receipt before ACK"
+    let drop_tags = tags
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let records = run!(
+        ScriptedToolCall {
+            tool_call_id: "reduce_old_outputs".into(),
+            tool: "ctx_reduce".into(),
+            arguments: json!({"drop": drop_tags}),
+            result: Value::Null,
+            hold: false,
+        },
+        "Dropped the old outputs."
     );
-    let ready = receipts[0].ready.clone();
+    let reduce_result = records
+        .iter()
+        .find_map(|r| match r {
+            WalRecord::ToolResult { result, .. }
+                if result.tool_call_id.0 == "reduce_old_outputs" =>
+            {
+                Some(format!("{:?}", result.output))
+            }
+            _ => None,
+        })
+        .expect("ctx_reduce produced no tool result");
     note(
         &root,
-        format!("Durable receipt before ACK: {:?}", receipts[0]),
+        format!("ctx_reduce drop={drop_tags}: {reduce_result}"),
     );
-    assert!(
-        !subject
-            .records(&live, SESSION)
-            .iter()
-            .any(|r| matches!(r, WalRecord::CompactionViewApplied { .. })),
-        "receipt alone must not apply a view before inbox announcement"
+    // More tool output until usage passes Magic Context's execute threshold, 50% of the window.
+    let (crossed_seq, _, _) = loop {
+        assert!(
+            runs < 60,
+            "usage never passed 50% of the window after {runs} runs"
+        );
+        let records = run!(read_call(reads), "Noted that output.");
+        reads += 1;
+        let notice = last_notice(&records).expect("no durable advance notice");
+        let (_, est_tokens, window) = notice;
+        if est_tokens * 2 > window.unwrap_or(128_000) {
+            break notice;
+        }
+    };
+    note(&root, format!("Usage passed 50% of the window at notice seq {crossed_seq}, with drops queued for reads {dropped:?}"));
+    // Arm the receipt gate for the view this test observes: the one Magic Context publishes after
+    // usage passed its threshold with drops queued, which in practice comes after the step that
+    // follows the crossing. Views it published earlier (it may publish one after any advance
+    // notice, with or without drops) were handled ungated; first wait until broca has logged
+    // every one seen so far, so the gate cannot be credited to one of them.
+    let applied_before = highest_applied(&subject.records(&live, SESSION));
+    let settled_before = handled_announcements(&root, &bus, &events, &session_ref).await;
+    let receipt_gate = root.join("broca-state/test-compaction-bus-gate");
+    let reached = root.join("broca-state/test-compaction-bus-reached");
+    match std::fs::remove_file(&reached) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("{}: {error}", reached.display()),
+    }
+    std::fs::write(&receipt_gate, "ViewReceiptRecorded").unwrap();
+    note(
+        &root,
+        format!("Receipt gate armed: broca has applied up to view {applied_before}; view_ready versions handled before arming: {settled_before:?}"),
     );
-    drop(store);
-    std::fs::remove_file(receipt_gate).unwrap();
+    // The gate holds broca's view_ready consumer, not the conversation, so the run goes on
+    // while the gate waits; its terminal is awaited only after the gate is released, because
+    // the consumer gives up on a delivery it holds for 15 seconds and the broker redelivers it.
+    begin_run!(read_call(reads), "Noted that output.");
+    reads += 1;
+    let held = gated_view(
+        &root,
+        &bus,
+        &events,
+        &session_ref,
+        &settled_before,
+        applied_before,
+    )
+    .await;
+    note(
+        &root,
+        format!("Real MC view_ready held at the receipt gate: {held:?}"),
+    );
+    // The ACK is held, so the receipt must already be durable. The idle boundary may have
+    // decided the view meanwhile from that durable receipt (applied, refused or passed over
+    // for a newer one) and cleared it, so a recorded decision counts as the same proof.
+    let proof = receipt_or_decision(&live, &subject, &held);
+    note(
+        &root,
+        format!("Before ACK of view_ready v{}: {proof}", held.view_version),
+    );
+    std::fs::remove_file(&receipt_gate).unwrap();
     wait_for_ack(&bus).await;
     note(&root, "Broker m_broca durable confirms view_ready ACK");
-    broca_test_support::wait_until("real MC view applied at the idle boundary", || async {
-        let records = subject.records(&live, SESSION);
-        if records
-            .iter()
-            .any(|r| matches!(r, WalRecord::CompactionViewApplied { .. }))
-        {
-            Ok(())
-        } else {
-            Err(format!("records={records:?}"))
-        }
-    })
+    let records = end_run!();
+    let last_seq = last_notice(&records).map_or(crossed_seq, |(seq, _, _)| seq);
+    let awaited = broca_test_support::wait_until(
+        &format!("broca applying Magic Context's view v{} or a newer one (last advance notice seq={last_seq})", held.view_version),
+        || async {
+            let records = subject.records(&live, SESSION);
+            let newest = highest_applied(&records);
+            let log = compaction_log(&root, &session_ref);
+            if gated_view_applied(&log, held.view_version, newest) {
+                return Ok(newest);
+            }
+            if let Some((seq, _, reason)) = view_refusals(&records)
+                .into_iter()
+                .find(|(_, refused, _)| *refused == held.view_version)
+            {
+                panic!("broca refused Magic Context's view v{} (advance notice seq {seq}, reason {reason}); see broca's log and MC's logs", held.view_version);
+            }
+            Err(format!(
+                "newest applied view is v{newest}; log={log:?}; advance notice events: {:?}; WAL record kinds: {:?}",
+                notice_events(&records),
+                records.iter().map(record_kind).collect::<Vec<_>>()
+            ))
+        },
+    )
     .await;
+    // The next model request, the first of the next run, against the one before it.
     let before = requests(&subject).last().unwrap().len();
-    send(&route, fields(&subject, false, sent), &root).await;
-    sent += 1;
-    finished(&subject, &live, sent).await;
-    let records = subject.records(&live, SESSION);
+    let served = requests(&subject).len();
+    let records = run!(read_call(reads), "Noted that output.");
+    let next = requests(&subject)[served].clone();
     let setups: Vec<_> = records
         .iter()
         .filter(|r| {
@@ -551,42 +955,86 @@ async fn real_mc_async_compaction_end_to_end() {
     assert!(
         matches!(setups[0], WalRecord::CompactionMessage { provider, ceiling:Some(_), .. } if provider == "magic-context")
     );
-    let view_at = records
+    // The view `next` renders: the newest one broca applied before the first step of the run
+    // that sent it. Earlier views (Magic Context may have published one before any drop) are
+    // not this one, and it may be newer than the one awaited above if Magic Context published
+    // again in between.
+    let run_start = records
         .iter()
-        .position(|r| matches!(r, WalRecord::CompactionViewApplied { .. }))
-        .expect("MC never produced an applicable async view; STOP and inspect MC logs");
+        .rposition(|r| matches!(r, WalRecord::RunStarted { .. }))
+        .expect("the last run recorded no start");
+    let first_step = run_start
+        + records[run_start..]
+            .iter()
+            .position(|r| matches!(r, WalRecord::StepStarted { .. }))
+            .expect("the last run recorded no step");
+    let view_at = records[..first_step]
+        .iter()
+        .rposition(|r| matches!(r, WalRecord::CompactionViewApplied { .. }))
+        .unwrap_or_else(|| panic!("the WAL records view v{awaited} as applied, yet no applied view precedes the next run's first step; STOP and inspect MC logs"));
     let view = records[view_at].clone();
-    assert!(
-        matches!(&view, WalRecord::CompactionViewApplied { provider, view_version, .. }
-        if provider == "magic-context" && *view_version == ready.view_version),
-        "applied view does not match the real bus announcement"
-    );
-    let WalRecord::CompactionViewApplied { view: raw, .. } = &view else {
+    let WalRecord::CompactionViewApplied {
+        provider,
+        view_version: applied_version,
+        view: raw,
+        ..
+    } = &view
+    else {
         unreachable!();
     };
+    let applied_version = *applied_version;
+    assert!(
+        applied_version >= held.view_version,
+        "the next request renders view v{applied_version}, older than the gated view v{}",
+        held.view_version
+    );
+    assert_eq!(provider, "magic-context");
+    // The WAL records the view exactly as broca's `view.get` returned it.
     let decoded: broca_core::compaction_provider::view::CompactionView =
         serde_json::from_str(raw.as_json_text()).unwrap();
-    assert_eq!(
-        broca_core::compaction_provider::notice::ViewReady::for_view(&decoded),
-        ready
-    );
+    let ready = applied_announcement(
+        &root,
+        &bus,
+        &events,
+        &decoded,
+        applied_version,
+        held.view_version,
+    )
+    .await;
     assert_bus_notices(&root, &bus, &events, &records, &ready).await;
-    let after = requests(&subject).last().unwrap().len();
-    note(&root, format!("Setup recorded once; view at WAL index {view_at}: {view:?}; request bytes before={before}, after={after}"));
+    note(&root, format!("Setup recorded once; view v{applied_version} at WAL index {view_at}: {view:?}; request bytes before={before}, next={}", next.len()));
+    assert_dropped_parts_gone(&root, &records, &decoded, &dropped, &drop_tags);
     assert!(
-        after < before,
-        "view must shrink the next real model request: {before} -> {after}"
+        next.len() < before,
+        "the worker view v{applied_version} must shrink the next model request: {before} -> {}",
+        next.len()
     );
-    assert_rendered_view(requests(&subject).last().unwrap(), &decoded);
+    assert_worker_view(&root, &next, &decoded, &dropped);
     assert!(
         records[view_at + 1..]
             .iter()
             .any(|r| matches!(r, WalRecord::StepStarted { .. })),
-        "view must precede its consuming step"
+        "view v{applied_version} must precede its consuming step"
     );
 
+    // A real kill mid-step, then a resume with byte-identical request bytes. The held run is
+    // answered with text only, and after the restart the scripted model serves its next turn.
+    turns.extend([
+        ScriptedTurn::new(vec![ScriptedPart::Text("Held answer.".into())]),
+        ScriptedTurn::new(vec![ScriptedPart::Text("Resumed answer.".into())]),
+    ]);
+    subject
+        .install_script(
+            SESSION,
+            Script {
+                turns: turns.clone(),
+            },
+        )
+        .await
+        .unwrap();
     subject.hold_next_model_step(SESSION).await.unwrap();
-    let resume_fields = fields(&subject, false, sent);
+    let resume_fields = fields(&subject, false, runs);
+    previous_notice_published(&subject, &live, &events).await;
     send(&route, resume_fields.clone(), &root).await;
     subject.await_model_step(SESSION).await.unwrap();
     let before_kill = requests(&subject).last().unwrap().clone();
@@ -603,11 +1051,10 @@ async fn real_mc_async_compaction_end_to_end() {
         "SIGKILL delivered to broca; restarting private stack on the same WAL",
     );
     subject.hold_next_model_step(SESSION).await.unwrap();
+    let synced = scope_sync_lines(&root);
     live = subject.start(&root).await.unwrap();
-    let route = subject
-        .session_route(&live, SESSION, &subject.owner_stamp())
-        .await
-        .unwrap();
+    wait_scope_synced(&root, synced).await;
+    let route = scoped_session_route(&subject, &live).await;
     send(&route, resume_fields, &root).await;
     subject.await_model_step(SESSION).await.unwrap();
     let resumed = requests(&subject).last().unwrap().clone();
@@ -628,9 +1075,9 @@ async fn real_mc_async_compaction_end_to_end() {
         ),
     );
     subject.release_model_step(SESSION).await.unwrap();
-    finished(&subject, &live, sent + 1).await;
+    finished(&subject, &live, runs + 1).await;
     note(&root, mc.assert_private_databases(&live));
-    note(&root, "Ceiling wait/refusal not forced: this fixture's successful proactive compaction keeps usage below ceiling");
+    note(&root, "Not checked: ride views, reminder text, and the ceiling beyond Setup recording one. No historian is configured, so no summarizer child run can be made.");
 }
 
 async fn provision_consumers(bus: &bus::BusRig) {
@@ -683,6 +1130,175 @@ async fn observe_events(bus: &bus::BusRig) -> Events {
     });
     Events { messages, task }
 }
+/// The `view_ready` announcements of the rig's session seen on the bus, in arrival order.
+fn announcements(
+    bus: &bus::BusRig,
+    events: &Events,
+    session_ref: &str,
+) -> Vec<broca_core::compaction_provider::notice::ViewReady> {
+    use broca_core::compaction_provider::notice::{event_subject, ViewReady, VIEW_READY_EVENT};
+    let subject = event_subject(bus.names.account(), "magic-context", VIEW_READY_EVENT);
+    events
+        .messages
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|m| m.subject.as_str() == subject)
+        .filter_map(|m| {
+            let headers: std::collections::BTreeMap<String, String> = m
+                .headers
+                .as_ref()?
+                .iter()
+                .filter_map(|(name, values)| {
+                    let name: &str = name.as_ref();
+                    Some((name.to_owned(), values.last()?.as_str().to_owned()))
+                })
+                .collect();
+            ViewReady::from_headers(&headers).ok()
+        })
+        .filter(|ready| ready.session_ref == session_ref)
+        .collect()
+}
+
+/// The `broca.compaction` lines of broca's log for `session_ref`, in the order written, each
+/// as its `key=value` fields. The fleet logger quotes a value only when it holds a space or a
+/// quote, which none of the fields read here do.
+fn compaction_log(
+    root: &Path,
+    session_ref: &str,
+) -> Vec<std::collections::BTreeMap<String, String>> {
+    let mut files: Vec<_> = std::fs::read_dir(root.join("data-home/cortexkit/broca/logs"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    files.sort();
+    files
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .flat_map(|text| {
+            text.lines()
+                .filter_map(|line| line.split_once(" broca.compaction: "))
+                .map(|(_, rest)| {
+                    let mut fields: std::collections::BTreeMap<String, String> = rest
+                        .split(' ')
+                        .filter_map(|token| token.split_once('='))
+                        .map(|(k, v)| (k.to_owned(), v.trim_matches('"').to_owned()))
+                        .collect();
+                    let message = rest.split(" session_ref=").next().unwrap_or(rest);
+                    fields.insert("message".into(), message.to_owned());
+                    fields
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|fields| fields.get("session_ref").map(String::as_str) == Some(session_ref))
+        .collect()
+}
+
+/// The bus announcement of the view broca applied, after checking that broca applied the
+/// newest view it had. Magic Context may publish several views before broca reaches an idle
+/// or step boundary (in one real run, versions 1 and 2 arrived 48 ms apart), and broca then
+/// applies only the newest, so the applied view is matched to its own announcement, not to
+/// the first one seen. Checks:
+/// - an announcement of the applied version is on the bus, with the applied view's digest;
+/// - broca's log receipted no version above it before it logged applying it;
+/// - every announcement seen on the bus was receipted.
+///
+/// `gated` is the version the rig held at broca's receipt gate and proved durable before its
+/// ACK. Broca logs a delivery's `receipted` line only after the gate releases it, so when the
+/// idle boundary decided that view during the hold, from its durable receipt, the log shows the
+/// decision first. The gate proof stands in for the log order for that one version.
+async fn applied_announcement(
+    root: &Path,
+    bus: &bus::BusRig,
+    events: &Events,
+    view: &broca_core::compaction_provider::view::CompactionView,
+    applied_version: u64,
+    gated: u64,
+) -> broca_core::compaction_provider::notice::ViewReady {
+    let expected = broca_core::compaction_provider::notice::ViewReady::for_view(view);
+    assert_eq!(expected.view_version, applied_version);
+    let session_ref = expected.session_ref.clone();
+    let version = |fields: &std::collections::BTreeMap<String, String>| {
+        fields
+            .get("view_version")
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+    let (announced, receipted, before_apply) = broca_test_support::wait_until(
+        "broca's log of receipting every announced view and applying the newest",
+        || async {
+            let announced = announcements(bus, events, &session_ref);
+            let log = compaction_log(root, &session_ref);
+            let receipted: Vec<u64> = log
+                .iter()
+                .filter(|f| f.get("outcome").map(String::as_str) == Some("receipted"))
+                .filter_map(version)
+                .collect();
+            let Some(applied_at) = log.iter().position(|f| {
+                f["message"].starts_with("compaction view decided at ")
+                    && f.get("choice").map(String::as_str) == Some("applied")
+                    && version(f) == Some(applied_version)
+            }) else {
+                return Err(format!(
+                    "no log line applying view {applied_version}; log={log:?}"
+                ));
+            };
+            let unreceipted: Vec<u64> = announced
+                .iter()
+                .map(|a| a.view_version)
+                .filter(|v| !receipted.contains(v))
+                .collect();
+            if !unreceipted.is_empty() {
+                return Err(format!(
+                    "announced but not yet receipted: {unreceipted:?}; log={log:?}"
+                ));
+            }
+            let mut before_apply: Vec<u64> = log[..applied_at]
+                .iter()
+                .filter(|f| f.get("outcome").map(String::as_str) == Some("receipted"))
+                .filter_map(version)
+                .collect();
+            if !before_apply.contains(&gated) {
+                before_apply.push(gated);
+            }
+            Ok((announced, receipted, before_apply))
+        },
+    )
+    .await;
+    let ready = announced
+        .iter()
+        .find(|a| a.view_version == applied_version)
+        .unwrap_or_else(|| {
+            panic!("broca applied view {applied_version}, which MC never announced: {announced:?}")
+        })
+        .clone();
+    assert_eq!(
+        ready.digest, expected.digest,
+        "applied view's digest differs from its bus announcement"
+    );
+    assert_eq!(
+        ready, expected,
+        "applied view does not match its announcement"
+    );
+    assert!(
+        before_apply.contains(&applied_version),
+        "broca applied view {applied_version} before receipting it: receipted first {before_apply:?}"
+    );
+    assert!(
+        before_apply.iter().all(|v| *v <= applied_version),
+        "broca applied view {applied_version} while it held a newer one: receipted first {before_apply:?}"
+    );
+    note(
+        root,
+        format!(
+            "Announced view versions on the bus: {:?}; receipted: {receipted:?}; receipted before applying: {before_apply:?}; applied: {applied_version}",
+            announced.iter().map(|a| a.view_version).collect::<Vec<_>>()
+        ),
+    );
+    ready
+}
+
 async fn wait_for_ack(bus: &bus::BusRig) {
     broca_test_support::wait_until("broker ACK for real MC view_ready", || async {
         let consumer = async_nats::jetstream::new(bus.connection.client())
@@ -701,6 +1317,289 @@ async fn wait_for_ack(bus: &bus::BusRig) {
     })
     .await;
 }
+
+/// The highest `view_version` broca's WAL records as applied, or 0 when none is.
+fn highest_applied(records: &[WalRecord]) -> u64 {
+    records
+        .iter()
+        .filter_map(|r| match r {
+            WalRecord::CompactionViewApplied { view_version, .. } => Some(*view_version),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// A gated receipt is settled by its own application, or by a newer applied view
+/// and an explicit superseded receipt. Refusal or merely announcing a newer view
+/// does not prove application.
+fn gated_view_applied(
+    log: &[std::collections::BTreeMap<String, String>],
+    gated: u64,
+    newest: u64,
+) -> bool {
+    let version = |fields: &std::collections::BTreeMap<String, String>| {
+        fields
+            .get("view_version")
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+    let applied = |v| {
+        log.iter().any(|f| {
+            f["message"].starts_with("compaction view decided at ")
+                && f.get("choice").map(String::as_str) == Some("applied")
+                && version(f) == Some(v)
+        })
+    };
+    newest >= gated
+        && (applied(gated)
+            || (newest > gated
+                && applied(newest)
+                && log.iter().any(|f| {
+                    f["message"] == "compaction view receipt cleared"
+                        && version(f) == Some(gated)
+                        && f.get("reason").map(String::as_str) == Some("superseded")
+                })))
+}
+
+#[test]
+fn gated_view_wait_accepts_only_applied_or_explicitly_superseded() {
+    let applied = |version: &str| {
+        std::collections::BTreeMap::from([
+            (
+                "message".into(),
+                "compaction view decided at a step boundary".into(),
+            ),
+            ("view_version".into(), version.into()),
+            ("choice".into(), "applied".into()),
+        ])
+    };
+    let mut cleared = std::collections::BTreeMap::from([
+        ("message".into(), "compaction view receipt cleared".into()),
+        ("view_version".into(), "2".into()),
+        ("reason".into(), "superseded".into()),
+    ]);
+    assert!(gated_view_applied(&[applied("2")], 2, 2));
+    assert!(gated_view_applied(&[applied("3"), cleared.clone()], 2, 3));
+    assert!(!gated_view_applied(&[applied("3")], 2, 3));
+    assert!(!gated_view_applied(&[cleared.clone()], 2, 3));
+    assert!(!gated_view_applied(&[applied("1"), cleared.clone()], 2, 1));
+    assert!(!gated_view_applied(&[applied("3"), cleared.clone()], 2, 2));
+    cleared.insert("reason".into(), "refused".into());
+    assert!(!gated_view_applied(&[applied("3"), cleared.clone()], 2, 3));
+    cleared.insert("reason".into(), "superseded".into());
+    cleared.insert("view_version".into(), "1".into());
+    assert!(!gated_view_applied(&[applied("3"), cleared], 2, 3));
+}
+
+/// A WAL record's `type` tag, for failure messages that would be unreadable with whole records.
+fn record_kind(record: &WalRecord) -> String {
+    serde_json::to_value(record)
+        .ok()
+        .and_then(|v| v["type"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| "?".into())
+}
+
+/// Every `view_refused` event the WAL's advance notices carry, as `(notice seq, view_version,
+/// reason)`.
+fn view_refusals(records: &[WalRecord]) -> Vec<(u64, u64, String)> {
+    use broca_core::compaction_provider::notice::{AdvanceNotice, Event};
+    records
+        .iter()
+        .filter_map(|r| match r {
+            WalRecord::CompactionNotice { seq, headers } => {
+                Some((*seq, AdvanceNotice::from_headers(headers).ok()?))
+            }
+            _ => None,
+        })
+        .flat_map(|(seq, notice)| {
+            notice
+                .events
+                .into_iter()
+                .filter_map(move |event| match event {
+                    Event::ViewRefused {
+                        view_version,
+                        reason,
+                    } => Some((seq, view_version, reason)),
+                    _ => None,
+                })
+        })
+        .collect()
+}
+
+/// The `events` header of every advance notice in the WAL, in order: the decisions broca
+/// announced on views (applied with a companion edit, deferred, refused, discarded).
+fn notice_events(records: &[WalRecord]) -> Vec<String> {
+    use broca_core::compaction_provider::notice::headers::EVENTS;
+    records
+        .iter()
+        .filter_map(|r| match r {
+            WalRecord::CompactionNotice { seq, headers } => headers
+                .get(EVENTS)
+                .map(|events| format!("seq {seq}: {events}")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The WAL's decision on view `version`, the kind of record after which broca clears that
+/// view's receipt: the view applied, or passed over because a newer one was applied (recorded
+/// directly or announced in an advance notice's `applied_view_version`), or a refusal of it or a
+/// newer view in an advance notice's events. `None` while the WAL records none.
+fn view_decision(records: &[WalRecord], version: u64) -> Option<String> {
+    use broca_core::compaction_provider::notice::AdvanceNotice;
+    if let Some((seq, refused, reason)) = view_refusals(records)
+        .into_iter()
+        .find(|(_, refused, _)| *refused >= version)
+    {
+        return Some(format!(
+            "advance notice seq {seq} reports view_refused:{refused}:{reason}"
+        ));
+    }
+    records.iter().find_map(|r| match r {
+        WalRecord::CompactionViewApplied { view_version, .. } if *view_version == version => {
+            Some(format!("view {version} applied"))
+        }
+        WalRecord::CompactionViewApplied { view_version, .. } if *view_version > version => {
+            Some(format!("passed over: view {view_version} applied"))
+        }
+        WalRecord::CompactionNotice { seq, headers } => AdvanceNotice::from_headers(headers)
+            .ok()?
+            .applied_view_version
+            .filter(|applied| *applied >= version)
+            .map(|applied| format!("advance notice seq {seq} reports view {applied} applied")),
+        _ => None,
+    })
+}
+
+/// The session's view versions broca's log reports as handled by its view_ready consumer, in
+/// any outcome. Broca writes that line only after the receipt gate lets the delivery go.
+fn handled_versions(root: &Path, session_ref: &str) -> Vec<u64> {
+    compaction_log(root, session_ref)
+        .iter()
+        .filter(|f| f["message"] == "compaction view_ready handled")
+        .filter_map(|f| f.get("view_version")?.parse().ok())
+        .collect()
+}
+
+/// Waits until broca's log reports every `view_ready` of the session the rig has seen on the
+/// bus as handled, and returns those versions: every delivery seen so far has passed the point
+/// where the receipt gate would hold it.
+async fn handled_announcements(
+    root: &Path,
+    bus: &bus::BusRig,
+    events: &Events,
+    session_ref: &str,
+) -> Vec<u64> {
+    broca_test_support::wait_until(
+        "broca's log handling every view_ready seen on the bus so far",
+        || async {
+            let announced: Vec<u64> = announcements(bus, events, session_ref)
+                .iter()
+                .map(|a| a.view_version)
+                .collect();
+            let handled = handled_versions(root, session_ref);
+            let pending: Vec<u64> = announced
+                .iter()
+                .copied()
+                .filter(|v| !handled.contains(v))
+                .collect();
+            if pending.is_empty() {
+                Ok(announced)
+            } else {
+                Err(format!(
+                    "announced {announced:?}; not yet handled in broca's log: {pending:?}"
+                ))
+            }
+        },
+    )
+    .await
+}
+
+/// The `view_ready` broca's receipt gate holds. Waits until the gate reports it was reached and
+/// the rig's bus subscriber has seen an announcement that was not handled before the gate was
+/// armed (`settled_before`) and that broca's log does not report as handled yet. The first such
+/// announcement in bus order is the held one, because broca's consumer settles deliveries one
+/// at a time in stream order. It must be newer than `applied_before`, the newest view broca had
+/// applied when the gate was armed.
+async fn gated_view(
+    root: &Path,
+    bus: &bus::BusRig,
+    events: &Events,
+    session_ref: &str,
+    settled_before: &[u64],
+    applied_before: u64,
+) -> broca_core::compaction_provider::notice::ViewReady {
+    let reached = root.join("broca-state/test-compaction-bus-reached");
+    let held = broca_test_support::wait_until(
+        &format!("a view_ready above version {applied_before} for session_ref={session_ref} held at broca's receipt gate"),
+        || async {
+            let announced = announcements(bus, events, session_ref);
+            let handled = handled_versions(root, session_ref);
+            let candidate = announced.iter().find(|a| {
+                !settled_before.contains(&a.view_version) && !handled.contains(&a.view_version)
+            });
+            let gate = reached.exists();
+            if let (true, Some(ready)) = (gate, candidate) {
+                return Ok(ready.clone());
+            }
+            let versions: Vec<u64> = announced.iter().map(|a| a.view_version).collect();
+            let early: Vec<u64> = versions
+                .iter()
+                .copied()
+                .filter(|v| *v > applied_before && settled_before.contains(v))
+                .collect();
+            Err(format!(
+                "gate reached={gate}; announced versions {versions:?}; handled in broca's log {handled:?}; handled before the gate was armed {settled_before:?}{}",
+                if early.is_empty() {
+                    String::new()
+                } else {
+                    format!("; Magic Context published {early:?} above version {applied_before} before the gate was armed, so only a later view can reach it")
+                }
+            ))
+        },
+    )
+    .await;
+    assert!(
+        held.view_version > applied_before,
+        "the receipt gate held view_ready version {}, which is not above version {applied_before}, the newest view broca had applied when the gate was armed: {held:?}",
+        held.view_version
+    );
+    held
+}
+
+/// Proof, taken while the receipt gate holds the ACK of `held`, that broca made the view
+/// durable before acknowledging it: a receipt for exactly `(session_ref, view_version)` in
+/// broca's store, or a decision on that version in its WAL. The idle boundary can decide a view
+/// from its durable receipt while the ACK is held, and a decision clears the receipt, so
+/// either is the proof. Broca makes the decision durable in the WAL before it clears the
+/// receipt, and the receipt is read first, so one snapshot cannot miss both.
+fn receipt_or_decision(
+    live: &Live,
+    subject: &BrocaSubject,
+    held: &broca_core::compaction_provider::notice::ViewReady,
+) -> String {
+    let receipts = broca_store::SqliteStore::open(live.state_root.join("run-index.db"))
+        .unwrap()
+        .compaction_receipts("", 256)
+        .unwrap();
+    if let Some(receipt) = receipts.iter().find(|r| {
+        r.ready.session_ref == held.session_ref && r.ready.view_version == held.view_version
+    }) {
+        return format!("durable receipt {receipt:?}");
+    }
+    let records = subject.records(live, SESSION);
+    if let Some(decision) = view_decision(&records, held.view_version) {
+        return format!("receipt already cleared; the WAL records the decision: {decision}");
+    }
+    panic!(
+        "view_ready version {} for session_ref={} must have a durable receipt before ACK, or a recorded decision: with its ACK held, broca's store has no receipt for that version and its WAL records no decision on it; receipts in the store: {receipts:?}; newest applied view: {}; advance notice events: {:?}",
+        held.view_version,
+        held.session_ref,
+        highest_applied(&records),
+        notice_events(&records)
+    );
+}
+
 async fn assert_bus_notices(
     root: &Path,
     bus: &bus::BusRig,
@@ -709,18 +1608,7 @@ async fn assert_bus_notices(
     ready: &broca_core::compaction_provider::notice::ViewReady,
 ) {
     use broca_core::compaction_provider::notice::{event_subject, VIEW_READY_EVENT};
-    fn matches(
-        message: &async_nats::Message,
-        headers: &std::collections::BTreeMap<String, String>,
-    ) -> bool {
-        message.headers.as_ref().is_some_and(|actual| {
-            headers.iter().all(|(key, value)| {
-                actual
-                    .get(key.as_str())
-                    .is_some_and(|v| v.as_str() == value)
-            })
-        })
-    }
+    let matches = published_with;
     let notices: Vec<_> = records
         .iter()
         .filter_map(|r| match r {
@@ -788,10 +1676,7 @@ async fn replay_preserved_mc_read() {
         binary: root.join("mc/ckdev-mc"),
         root: root.join("mc"),
     });
-    subject
-        .shared
-        .mc_historian
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    write_scopes(&root);
     let replay_bus = root.join(format!("read-replay-bus-{}", std::process::id()));
     // `BusRig::new` has already reported the skip, or failed under CK_BUS_TESTKIT_REQUIRE.
     let Some(bus) = bus::BusRig::new(&replay_bus).await else {
@@ -800,11 +1685,10 @@ async fn replay_preserved_mc_read() {
     let bus = Arc::new(bus);
     provision_consumers(&bus).await;
     subject.bus = Some(bus.clone());
+    let synced = scope_sync_lines(&root);
     let live = subject.start(&root).await.unwrap();
-    let route = subject
-        .session_route(&live, SESSION, &subject.owner_stamp())
-        .await
-        .unwrap();
+    wait_scope_synced(&root, synced).await;
+    let route = scoped_session_route(&subject, &live).await;
     let records = subject.records(&live, SESSION);
     let headers = records
         .iter()
@@ -874,7 +1758,16 @@ async fn replay_preserved_mc_read() {
     assert!(other_value["result"].get("lineage_id").is_none());
 }
 
-fn assert_rendered_view(body: &[u8], view: &broca_core::compaction_provider::view::CompactionView) {
+/// What a worker view does: it drops or replaces parts of the transcript, never summarizes it
+/// into a fold of its own. Checks that the view changes something, that every replacement text
+/// it carries reaches the model, and that the tool outputs the model's ctx_reduce call named by
+/// tag are no longer sent.
+fn assert_worker_view(
+    root: &Path,
+    body: &[u8],
+    view: &broca_core::compaction_provider::view::CompactionView,
+    dropped: &[usize],
+) {
     use broca_core::compaction_provider::view::ViewRange;
     let request: Value = serde_json::from_slice(body).unwrap();
     let wire_text: Vec<&str> = request["messages"]
@@ -894,28 +1787,126 @@ fn assert_rendered_view(body: &[u8], view: &broca_core::compaction_provider::vie
             }
         })
         .collect();
-    let mut replacements = 0;
+    let (mut edits, mut replaced) = (0, 0);
     for range in &view.ranges {
-        if let ViewRange::Replace { bytes, .. } = range {
-            let messages: Vec<broca_protocol::Message> = serde_json::from_str(bytes).unwrap();
-            for message in messages {
-                for part in message.content {
-                    if let broca_protocol::ContentBlock::Text { text } = part {
-                        if text.is_empty() {
-                            continue;
+        match range {
+            ViewRange::Keep { edits: changed, .. } => edits += changed.len(),
+            ViewRange::Replace { bytes, .. } => {
+                replaced += 1;
+                let messages: Vec<broca_protocol::Message> = serde_json::from_str(bytes).unwrap();
+                for message in messages {
+                    for part in message.content {
+                        if let broca_protocol::ContentBlock::Text { text } = part {
+                            if !text.is_empty() {
+                                assert!(
+                                    wire_text.iter().any(|wire| wire.contains(&text)),
+                                    "the model did not receive text from MC's applied view: {text:?}"
+                                );
+                            }
                         }
-                        replacements += 1;
-                        assert!(
-                            wire_text.iter().any(|wire| wire.contains(&text)),
-                            "scripted model did not receive text from MC's applied view: {text:?}"
-                        );
                     }
                 }
             }
+            // A range kind this rig does not know yet changes nothing it can check.
+            _ => {}
         }
     }
     assert!(
-        replacements > 0,
-        "real MC view must replace transcript text, not merely keep it"
+        edits + replaced > 0,
+        "MC's applied view changes nothing: {view:?}"
+    );
+    let still_sent: Vec<usize> = dropped
+        .iter()
+        .copied()
+        .filter(|read| {
+            let marker = format!("Tool output {read}:");
+            wire_text.iter().any(|wire| wire.contains(&marker))
+        })
+        .collect();
+    assert!(
+        still_sent.is_empty(),
+        "tool outputs named in the ctx_reduce call are still sent after MC's view: reads {still_sent:?}"
+    );
+    note(
+        root,
+        format!("Worker view: {edits} part edits, {replaced} replaced ranges; stamped reads {dropped:?} no longer sent"),
+    );
+}
+
+/// Checks the view itself, not only the request it shaped: the history broca assembles under
+/// `view` no longer holds the tool outputs of `dropped`, the reads whose tags (`drop_tags`) the
+/// model's ctx_reduce call named. The transcript is the one the WAL replays, with ordinals
+/// stamped as broca stamps them, and the assembly is broca's own, so a part the view drops or
+/// replaces by its key (`m<ordinal>#<index>`), or covers with a Replace range, is gone, and a
+/// part it keeps as written is still there. The raw transcript is checked to hold every one of
+/// those outputs first, so the check can fail.
+fn assert_dropped_parts_gone(
+    root: &Path,
+    records: &[WalRecord],
+    view: &broca_core::compaction_provider::view::CompactionView,
+    dropped: &[usize],
+    drop_tags: &str,
+) {
+    use broca_protocol::ContentBlock;
+    let mut prompt = broca_core::replay::replay(records)
+        .expect("the session's WAL must replay")
+        .prompt;
+    broca_protocol::content::stamp_ordinals(&mut prompt);
+    let holds = |messages: &[broca_protocol::Message], read: usize| {
+        let marker = format!("Tool output {read}:");
+        messages
+            .iter()
+            .any(|m| serde_json::to_string(m).unwrap().contains(&marker))
+    };
+    // Each dropped read's part key in the transcript, to name it in a failure.
+    let parts: Vec<(usize, String)> = dropped
+        .iter()
+        .map(|&read| {
+            let call = format!("read_{read}");
+            let part = prompt.iter().find_map(|message| {
+                let index = message.content.iter().position(|block| {
+                    matches!(block, ContentBlock::ToolResult(result) if result.tool_call_id.0 == call)
+                })?;
+                Some(broca_protocol::tags::part_key(message.ordinal?, index))
+            });
+            let part = part.unwrap_or_else(|| {
+                panic!("the replayed transcript holds no tool result for call {call}")
+            });
+            assert!(
+                holds(&prompt, read),
+                "the replayed transcript does not hold tool output {read} at part {part}"
+            );
+            (read, part)
+        })
+        .collect();
+    let assembled = broca_core::compaction::view::assemble(view, &prompt).unwrap_or_else(|problem| {
+        panic!(
+            "broca cannot assemble Magic Context's view v{} over the replayed transcript: {problem:?}",
+            view.view_version
+        )
+    });
+    let kept: Vec<&(usize, String)> = parts
+        .iter()
+        .filter(|(read, _)| holds(&assembled, *read))
+        .collect();
+    let edits: Vec<_> = view
+        .edits()
+        .filter(|edit| parts.iter().any(|(_, part)| *part == edit.part))
+        .collect();
+    assert!(
+        kept.is_empty(),
+        "Magic Context's view v{} still carries the parts of the dropped tags {drop_tags}: (read, part) {kept:?}; the view's edits of those parts: {edits:?}; its ranges cover {:?}",
+        view.view_version,
+        view.ranges
+            .iter()
+            .map(|r| (r.from(), r.to()))
+            .collect::<Vec<_>>()
+    );
+    note(
+        root,
+        format!(
+            "View v{} drops the parts of tags {drop_tags}: (read, part) {parts:?}; edits of those parts: {edits:?}",
+            view.view_version
+        ),
     );
 }

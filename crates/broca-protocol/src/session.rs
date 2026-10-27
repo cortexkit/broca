@@ -182,15 +182,42 @@ pub struct SessionScope {
     pub run_id: Option<String>,
 }
 
+/// The daemon-attested kind of a scope, fixed for its epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeKind {
+    Head,
+    Worker,
+    Ephemeral,
+}
+
+/// A parent reference is owner-local and names one epoch, not just a reusable scope ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeParent {
+    pub owner: BindPrincipal,
+    pub scope_ref: String,
+    pub scope_epoch: u64,
+}
+
+/// Whether the daemon has validated the parent link against its live scope registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParentState {
+    Linked,
+    Pending,
+    Ended,
+}
+
 /// The scope stamp the subc daemon put on the bind a send arrived over, as broca keeps it.
 ///
 /// The identity (`scope`) takes part in broca's decisions. On a flow scope its `sender` comes
 /// from the bind's attested principal: the daemon admits a scoped opener only as owner or
-/// listed carrier. `owner_authorized` is informational; broca grants nothing on that flag. The stamp's `agent_id` and `delegates` are deliberately
-/// not carried at all: broca never acts as the scope's agent.
+/// listed carrier. `owner_authorized` alone grants no permission. The stamp's `agent_id` is
+/// retained for agent-run scopes, but `delegates` is not carried: broca never acts as the agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindScope {
     pub scope: SessionScope,
+    pub kind: ScopeKind,
+    pub parent: Option<Box<ScopeParent>>,
+    pub parent_state: Option<ParentState>,
     /// Whether the daemon lists the scope's owner in its `scope_authority_owners`.
     pub owner_authorized: bool,
 }

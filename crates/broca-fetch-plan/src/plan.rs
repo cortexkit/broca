@@ -28,14 +28,18 @@ pub const PERSONA_PRESET: &str = "persona";
 /// `session.send` members a send carrying a plan must not carry: the plan replaces them.
 pub const MEMBERS_REPLACED_BY_PLAN: &[&str] = &["tools", "system", "context_management"];
 
-/// One plan item: a provider, the preset it defines, and params passed to it verbatim.
+/// One plan item: a provider, an optional named preset, and verbatim provider params.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Item {
     pub provider: String,
-    pub preset: String,
+    pub preset: Option<String>,
     pub params: Map<String, Value>,
     /// Tool and non-persona system-text items may be optional.
     pub optional: bool,
+    /// The item opts into output references (llm-runner §9.13): its provider's tools have
+    /// their declared reference slots scanned. Only a runner serving the group accepts the
+    /// member at all ([`OutputRefsSupport`]); absent means false.
+    pub output_refs: bool,
 }
 
 /// A step-transform item: an [`Item`] and the hook subscriptions frozen into the plan.
@@ -130,7 +134,20 @@ pub fn check_later_plan(frozen: Option<&str>, sent: &str) -> Result<(), Refusal>
 }
 
 /// Refuse a send that carries a plan beside a member the plan replaces, naming the member.
+/// A plan item's `output_refs` member is refused as on a runner without the `output_refs` group.
 pub fn check_send_members(params: &Map<String, Value>) -> Result<(), Refusal> {
+    check_send_members_with(params, OutputRefsSupport::Unsupported)
+}
+
+/// [`check_send_members`] on a runner whose `output_refs` support is `output_refs`: with
+/// [`OutputRefsSupport::Supported`] a plan item may carry a boolean `output_refs` member.
+pub fn check_send_members_with(
+    params: &Map<String, Value>,
+    output_refs: OutputRefsSupport,
+) -> Result<(), Refusal> {
+    if let Some(plan) = params.get("plan") {
+        check_output_refs(plan, output_refs)?;
+    }
     match MEMBERS_REPLACED_BY_PLAN
         .iter()
         .find(|member| params.get(**member).is_some_and(|value| !value.is_null()))
@@ -138,6 +155,68 @@ pub fn check_send_members(params: &Map<String, Value>) -> Result<(), Refusal> {
         Some(member) => Err(Refusal::invalid(*member)),
         None => Ok(()),
     }
+}
+
+/// Whether the runner serves llm-runner's `output_refs` group (§9.13), which decides what a plan
+/// item's `output_refs` member means. It must be `Supported` exactly when `role.describe`
+/// declares the group: a runner without the group refuses the member, even `false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputRefsSupport {
+    Unsupported,
+    Supported,
+}
+
+/// Check every plan item's `output_refs` member before anything else in the plan. Without the
+/// group any member is refused, even `false`; with it, a present member must be a boolean (absent
+/// means false). Either refusal names `plan.items[].output_refs`.
+fn check_output_refs(plan: &Value, support: OutputRefsSupport) -> Result<(), Refusal> {
+    if support == OutputRefsSupport::Unsupported {
+        return check_unsupported_output_refs(plan);
+    }
+    let lists = [
+        "items",
+        "tool_items",
+        "system_text_items",
+        "step_transform_items",
+    ]
+    .into_iter()
+    .filter_map(|name| plan.get(name).and_then(Value::as_array))
+    .flatten();
+    let compaction = plan.get("compaction_item").into_iter();
+    let malformed = lists.chain(compaction).any(|item| {
+        item.get("output_refs")
+            .is_some_and(|member| !member.is_boolean())
+    });
+    if malformed {
+        return Err(Refusal::invalid("plan.items[].output_refs"));
+    }
+    Ok(())
+}
+
+fn check_unsupported_output_refs(plan: &Value) -> Result<(), Refusal> {
+    // An unsupported plan member is not an ignored opt-out, even when its flag is false.
+    // Check it before plan overrides or provider parsing can obscure the offending member.
+    let in_lists = [
+        "items",
+        "tool_items",
+        "system_text_items",
+        "step_transform_items",
+    ]
+    .into_iter()
+    .filter_map(|name| plan.get(name).and_then(Value::as_array))
+    .flatten()
+    .any(|item| {
+        item.as_object()
+            .is_some_and(|item| item.contains_key("output_refs"))
+    });
+    let in_compaction = plan
+        .get("compaction_item")
+        .and_then(Value::as_object)
+        .is_some_and(|item| item.contains_key("output_refs"));
+    if in_lists || in_compaction {
+        return Err(Refusal::invalid("plan.items[].output_refs"));
+    }
+    Ok(())
 }
 
 fn string_member(object: &Map<String, Value>, key: &str, at: &str) -> Result<String, Refusal> {
@@ -153,13 +232,17 @@ fn string_member(object: &Map<String, Value>, key: &str, at: &str) -> Result<Str
 fn item(value: &Value, at: &str, may_be_optional: bool) -> Result<Item, Refusal> {
     let object = value.as_object().ok_or_else(|| Refusal::invalid(at))?;
     let provider = string_member(object, "provider", at)?;
-    let preset = string_member(object, "preset", at)?;
-    if preset.is_empty()
-        || preset.len() > 64
-        || !preset.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
-        })
-    {
+    let preset = object
+        .get("preset")
+        .map(|_| string_member(object, "preset", at))
+        .transpose()?;
+    if preset.as_ref().is_some_and(|preset| {
+        preset.is_empty()
+            || preset.len() > 64
+            || !preset.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
+            })
+    }) {
         return Err(Refusal::invalid(format!("{at}.preset")));
     }
     let params = object
@@ -177,10 +260,11 @@ fn item(value: &Value, at: &str, may_be_optional: bool) -> Result<Item, Refusal>
         preset,
         params,
         optional,
+        output_refs: object.get("output_refs") == Some(&Value::Bool(true)),
     })
 }
 
-fn items(
+pub(crate) fn items(
     plan: &Map<String, Value>,
     list: &str,
     may_be_optional: bool,
@@ -292,9 +376,31 @@ pub enum CompactionSupport {
 /// order, does not list exactly the plan's providers, or does not repeat the plan's
 /// step-transform items and compaction provider.
 pub fn parse_plan(plan: &Value, compaction: CompactionSupport) -> Result<Plan, Refusal> {
+    parse_plan_with(plan, compaction, OutputRefsSupport::Unsupported)
+}
+
+/// [`parse_plan`] on a runner whose `output_refs` support is `output_refs`: with
+/// [`OutputRefsSupport::Supported`], a
+/// plan item may carry a boolean `output_refs` member.
+pub fn parse_plan_with(
+    plan: &Value,
+    compaction: CompactionSupport,
+    output_refs: OutputRefsSupport,
+) -> Result<Plan, Refusal> {
+    check_output_refs(plan, output_refs)?;
     let object = plan.as_object().ok_or_else(|| Refusal::invalid("plan"))?;
     let tool_items = items(object, "tool_items", true)?;
     let system_text_items = items(object, "system_text_items", true)?;
+    // tool-provider 0.10.4 has no default system-text selector: its nested item requires
+    // `preset`. Refuse the missing name rather than sending an unrepresentable request.
+    if let Some(index) = system_text_items
+        .iter()
+        .position(|item| item.preset.is_none())
+    {
+        return Err(Refusal::invalid(format!(
+            "plan.system_text_items[{index}].preset"
+        )));
+    }
     if let Some((index, _)) = system_text_items
         .iter()
         .enumerate()
@@ -529,5 +635,130 @@ mod sender_tests {
                 "{value}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod unsupported_output_refs_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_output_refs_is_diagnosed_before_other_plan_fields() {
+        for key in [
+            "items",
+            "tool_items",
+            "system_text_items",
+            "step_transform_items",
+            "compaction_item",
+        ] {
+            for flag in [Value::Bool(true), Value::Bool(false), Value::Null] {
+                let mut plan = serde_json::json!({});
+                let item = serde_json::json!({"output_refs":flag});
+                plan[key] = if key == "compaction_item" {
+                    item
+                } else {
+                    serde_json::json!([item])
+                };
+                let refusal = parse_plan(&plan, CompactionSupport::Supported).unwrap_err();
+                assert_eq!(refusal.code(), "invalid_params");
+                assert_eq!(
+                    refusal.detail()["field"],
+                    "plan.items[].output_refs",
+                    "{plan}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_output_refs_precedes_tools_and_system_overrides() {
+        for flag in [true, false] {
+            let params = serde_json::json!({"tools":[],"system":"override","plan":{"items":[{"output_refs":flag}]}});
+            let refusal = check_send_members(params.as_object().unwrap()).unwrap_err();
+            assert_eq!(refusal.detail()["field"], "plan.items[].output_refs");
+        }
+    }
+
+    #[test]
+    fn provider_params_are_not_plan_members_and_existing_override_refusals_remain() {
+        let params = serde_json::json!({"plan":{"tool_items":[{"params":{"output_refs":true}}]}});
+        check_send_members(params.as_object().unwrap()).unwrap();
+        let params = serde_json::json!({"tools":[],"plan":{"items":[]}});
+        assert_eq!(
+            check_send_members(params.as_object().unwrap())
+                .unwrap_err()
+                .detail()["field"],
+            "tools"
+        );
+    }
+
+    /// A plan with one tool item for `p`, whose item carries `output_refs` when given.
+    fn tool_plan(output_refs: Option<Value>) -> Value {
+        let composition = serde_json::json!({"providers": [{"provider": "p", "tools": []}], "step_transform_items": []});
+        let mut item = serde_json::json!({"provider": "p", "params": {}});
+        if let Some(flag) = output_refs {
+            item["output_refs"] = flag;
+        }
+        serde_json::json!({
+            "tool_items": [item], "system_text_items": [], "step_transform_items": [],
+            "composition_digest":
+                cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(),
+            "composition": composition,
+        })
+    }
+
+    #[test]
+    fn a_runner_with_the_group_accepts_boolean_members_and_refuses_any_other_value() {
+        let supported = OutputRefsSupport::Supported;
+        for flag in [None, Some(Value::Bool(true)), Some(Value::Bool(false))] {
+            let plan = tool_plan(flag);
+            parse_plan_with(&plan, CompactionSupport::Supported, supported)
+                .unwrap_or_else(|refusal| panic!("{plan} refused: {refusal:?}"));
+            check_send_members_with(
+                serde_json::json!({"plan": plan}).as_object().unwrap(),
+                supported,
+            )
+            .unwrap();
+        }
+        for flag in [Value::Null, serde_json::json!("true"), serde_json::json!(1)] {
+            let plan = tool_plan(Some(flag));
+            let refusal =
+                parse_plan_with(&plan, CompactionSupport::Supported, supported).unwrap_err();
+            assert_eq!(
+                refusal.detail()["field"],
+                "plan.items[].output_refs",
+                "{plan}"
+            );
+            let refusal = check_send_members_with(
+                serde_json::json!({"plan": plan}).as_object().unwrap(),
+                supported,
+            )
+            .unwrap_err();
+            assert_eq!(refusal.detail()["field"], "plan.items[].output_refs");
+        }
+    }
+
+    #[test]
+    fn the_plain_entry_points_refuse_as_a_runner_without_the_group() {
+        for flag in [true, false] {
+            let plan = tool_plan(Some(Value::Bool(flag)));
+            assert_eq!(
+                parse_plan(&plan, CompactionSupport::Supported)
+                    .unwrap_err()
+                    .detail()["field"],
+                "plan.items[].output_refs"
+            );
+            assert_eq!(
+                parse_plan_with(
+                    &plan,
+                    CompactionSupport::Supported,
+                    OutputRefsSupport::Unsupported
+                )
+                .unwrap_err()
+                .detail()["field"],
+                "plan.items[].output_refs"
+            );
+        }
+        parse_plan(&tool_plan(None), CompactionSupport::Supported).unwrap();
     }
 }

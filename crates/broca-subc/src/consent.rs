@@ -10,7 +10,7 @@ use broca_core::tool_plane::{
 use broca_protocol::{BindIdentity, SessionScope};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
-use subc_protocol::scope::{ScopeSelector, CAP_SCOPES_V1};
+use subc_protocol::scope::CAP_SCOPES_V1;
 
 use crate::connection::{ConnError, RouteHandle, RouteOpenRetry, SubcConnection};
 
@@ -180,19 +180,15 @@ impl ConsentClient {
                 detail: None,
             });
         }
-        let owner =
-            crate::subc_plane::owner_principal(scope).map_err(|message| ConsentError::Refused {
+        let selector = crate::subc_plane::frozen_scope_selector(scope).map_err(|message| {
+            ConsentError::Refused {
                 code: "scope_unverifiable".into(),
                 message,
                 detail: None,
-            })?;
+            }
+        })?;
         let route = conn
-            .route_open_management_scoped_within(
-                CONSENT_MODULE,
-                identity,
-                ScopeSelector::new(owner, scope.scope_ref.clone(), Some(scope.scope_epoch)),
-                retry,
-            )
+            .route_open_management_scoped_within(CONSENT_MODULE, identity, selector, retry)
             .await?;
         Ok(Self::on_route(conn, route, REPLY_TIMEOUT))
     }
@@ -651,6 +647,7 @@ mod tests {
     fn prepared() -> WalRecord {
         let input = fixture("broca/held-call-input.json");
         WalRecord::ToolCallDeferred {
+            deferred_at_ms: None,
             batch_id: broca_protocol::BatchId("b".into()),
             call_id: broca_protocol::ToolCallId("c".into()),
             executor: broca_wal::DeferredExecutor::Broca,
@@ -682,6 +679,7 @@ mod tests {
 
     fn scoped_ctx() -> BatchCtx {
         BatchCtx {
+            media_capture: None,
             batch_id: broca_protocol::BatchId("b".into()),
             run_id: broca_protocol::RunId("r".into()),
             bind: BindIdentity::new("/p", "broca", "s"),
@@ -723,12 +721,14 @@ mod tests {
         let plane = ScopedConsentPlane::new(Arc::new(conn), RouteOpenRetry::default_patience());
         let ctx = scoped_ctx();
 
-        for _ in 0..2 {
+        for attempt in 0..2 {
             tokio::time::advance(Duration::from_secs(60)).await;
             let started = tokio::time::Instant::now();
             let (client, ()) = tokio::time::timeout(Duration::from_secs(5), async {
                 tokio::join!(plane.client(&ctx), async {
-                    advertise_scopes(&mut module).await;
+                    if attempt == 0 {
+                        advertise_scopes(&mut module).await;
+                    }
                     let first = module.next_request().await;
                     let body: Value = serde_json::from_slice(&first.body).unwrap();
                     assert_eq!(body["op"], "route.open");
@@ -752,9 +752,11 @@ mod tests {
             .expect("consent route open must finish");
             let client = client.expect("temporary refusal must recover after idle");
             assert_eq!(client.route, route);
-            assert_eq!(
-                tokio::time::Instant::now() - started,
-                crate::connection::ROUTE_OPEN_RETRY_INTERVAL,
+            // The retry waits a random part of the first backoff envelope (full jitter), so
+            // the bound is the envelope, not an exact interval.
+            assert!(
+                tokio::time::Instant::now() - started
+                    <= crate::connection::ROUTE_OPEN_RETRY_INTERVAL,
             );
             assert!(module.take_written_for_test().is_empty());
         }
@@ -1124,6 +1126,7 @@ mod tests {
         let plane =
             ScopedConsentPlane::new(client.conn.clone(), RouteOpenRetry::default_patience());
         let ctx = BatchCtx {
+            media_capture: None,
             batch_id: broca_protocol::BatchId("b".into()),
             run_id: broca_protocol::RunId("r".into()),
             bind: BindIdentity::new("/p", "broca", "s"),

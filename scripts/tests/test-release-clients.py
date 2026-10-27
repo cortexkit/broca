@@ -32,11 +32,17 @@ class StageClientsTests(unittest.TestCase):
             root = Path(directory)
             scripts = root / "scripts"
             scripts.mkdir()
-            for name in ("stage-release.sh", "dsym.sh", "wal-floor.sh", "running-image.sh", "signing-posture.sh"):
+            for name in ("stage-release.sh", "dsym.sh", "wal-floor.sh", "running-image.sh", "signing-posture.sh", "nonshipping-markers.sh"):
                 shutil.copy2(ROOT / "scripts" / name, scripts / name)
             script = scripts / "stage-release.sh"
-            script.write_text(script.read_text().replace(
-                "BUILD_SCRATCH=/tmp/broca-release-staging", f'BUILD_SCRATCH="{root}/scratch"'))
+            source = script.read_text()
+            anchor = "BUILD_SCRATCH=/tmp/broca-release-staging"
+            self.assertEqual(source.count(anchor), 1, "staging scratch assignment must be replaced exactly once")
+            replacement = f'BUILD_SCRATCH="{root / "scratch"}"'
+            rewritten = source.replace(anchor, replacement, 1)
+            self.assertEqual([line for line in rewritten.splitlines() if line.startswith("BUILD_SCRATCH=")],
+                             [replacement], "fixture staging must use its owned scratch directory")
+            script.write_text(rewritten)
             (scripts / "prune-staging.sh").write_text("#!/bin/sh\nexit 0\n")
             (scripts / "prune-staging.sh").chmod(0o755)
             (root / "Cargo.toml").write_text('[workspace.package]\nversion = "0.0.2"\n')

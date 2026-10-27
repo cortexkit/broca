@@ -106,6 +106,8 @@ impl ChargeBasisTable {
             ("apikey", "openrouter"),
             ("apikey", "fireworks-ai"),
             ("apikey", "google"),
+            ("apikey", "typesafe"),
+            ("apikey", "cloudflare-workers-ai"),
         ] {
             table.insert(provider, method, ChargeBasis::MeteredApi);
         }
@@ -492,6 +494,21 @@ mod tests {
     }
 
     #[test]
+    fn system_one_api_keys_resolve_metered_from_the_shipped_table() {
+        let table = ChargeBasisTable::shipped_defaults();
+        for provider in ["typesafe", "cloudflare-workers-ai"] {
+            assert_eq!(
+                table.resolve(provider, AuthMethod::ApiKey),
+                (ChargeBasis::MeteredApi, CHARGE_BASIS_MAPPING_VERSION)
+            );
+            assert_eq!(
+                table.resolve(provider, AuthMethod::Oauth),
+                (ChargeBasis::Unknown, CHARGE_BASIS_MAPPING_VERSION)
+            );
+        }
+    }
+
+    #[test]
     fn meta_oauth_is_included_for_muse_subscription_facts() {
         let table = ChargeBasisTable::shipped_defaults();
         assert_eq!(
@@ -512,12 +529,15 @@ mod tests {
             "../../broca-catalog/data/resolution-report.json"
         ))
         .expect("vendored resolution report is valid JSON");
-        let provider_ids = report
+        let mut provider_ids = report
             .as_array()
             .expect("resolution report is an array")
             .iter()
             .filter_map(|row| row.get("provider_id").and_then(serde_json::Value::as_str))
             .collect::<std::collections::HashSet<_>>();
+        // Jev is a Fusiform-curated decision model, not a models.dev chat row. Its pinned
+        // route names the canonical provider even though the vendored chat report cannot.
+        provider_ids.insert(crate::system_one::JEV_1_13_0.split('/').next().unwrap());
 
         for provider_id in ChargeBasisTable::shipped_defaults()
             .rows
@@ -542,6 +562,7 @@ mod tests {
             framed(
                 1,
                 broca_wal::WalRecord::RunStarted {
+                    written_at_ms: None,
                     tags: None,
                     session_class: None,
                     retention: None,

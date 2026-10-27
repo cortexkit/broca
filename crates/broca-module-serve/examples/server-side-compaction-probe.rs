@@ -82,11 +82,11 @@ struct Args {
     dry_run: bool,
     #[arg(long, value_enum, default_value = "all")]
     only: Case,
-    #[arg(long, default_value = "gpt-5.4")]
+    #[arg(long, default_value = "gpt-6-luna")]
     openai_model: String,
-    #[arg(long, default_value = "gpt-5.3-codex")]
+    #[arg(long, default_value = "gpt-6.1-sol")]
     replay_model: String,
-    #[arg(long, default_value = "claude-opus-4-6")]
+    #[arg(long, default_value = "claude-opus-5-5")]
     anthropic_model: String,
     #[arg(long)]
     subc: Option<PathBuf>,
@@ -651,8 +651,19 @@ async fn send(args: &Args, step: &Step, req: HttpRequest, number: usize) -> Answ
                     );
                     cancel.cancel();
                 }
-                NormalizedEvent::Control(ProviderControl::Error { .. }) => {
+                NormalizedEvent::Control(ProviderControl::Error { error, .. }) => {
                     failed = true;
+                    // Without the provider's own reason a refusal can't be told apart from a
+                    // retired model or an exhausted account. The request text is synthetic and
+                    // credentials travel only in headers, so the message is safe to print; cap it
+                    // so a large echoed body stays readable.
+                    let message: String = error.message.chars().take(600).collect();
+                    println!(
+                        "attempt {number} {}: error class={:?} provider_code={} message={message}",
+                        step.name,
+                        error.class,
+                        error.provider_code.as_deref().unwrap_or("absent"),
+                    );
                 }
                 _ => {}
             }

@@ -20,6 +20,9 @@ use serde_json::json;
 const LINEAGE: &str = "lineage-1";
 const SESSION_REF: &str = "0123456789abcdef0123456789abcdef";
 
+#[path = "media_view_tests.rs"]
+mod media;
+
 fn stamped(mut prompt: Vec<Message>) -> Vec<Message> {
     broca_protocol::content::stamp_ordinals(&mut prompt);
     prompt
@@ -79,6 +82,414 @@ fn conversation() -> Vec<Message> {
         ]),
         text(Role::User, "third question"),
     ])
+}
+
+#[test]
+fn companion_strip_ends_at_extent_not_the_last_held_ordinal() {
+    let mut prompt = stamped(vec![
+        assistant(vec![signed("copy")]),
+        text(Role::User, "tail"),
+    ]);
+    prompt[1].ordinal = Some(5);
+    let (view, ready) = make_view(
+        2,
+        5,
+        vec![ViewRange::replace(
+            0,
+            6,
+            replace_bytes(&[
+                text(Role::User, "summary"),
+                prompt[0].clone(),
+                text(Role::User, "continue"),
+            ]),
+        )],
+    );
+    let decision = decide_stored_at(
+        &view,
+        &ready,
+        &after_setup(),
+        LINEAGE,
+        &prompt,
+        crate::compaction::StoredTranscript::plain(&prompt).with_extent(100),
+        true,
+        false,
+    );
+    assert_eq!(
+        decision,
+        Decision::Apply(CompactionViewChoice::Companion {
+            edit: companion_edits::STRIP_SIGNED_REASONING.into(),
+            strip: CompactionStrip {
+                from_ordinal: 100,
+                to_ordinal: 100
+            },
+        })
+    );
+}
+
+#[test]
+fn sparse_render_maps_original_first_users_without_promoting_later_steers() {
+    use broca_protocol::request::EpisodeRenderInput;
+    let prompt = stamped(vec![
+        text(Role::User, "original"),
+        text(Role::Assistant, "answer"),
+        text(Role::User, "discarded original"),
+        text(Role::Assistant, "answer"),
+        text(Role::User, "later steer"),
+        text(Role::Assistant, "admitted without a user"),
+        text(Role::User, "another later steer"),
+    ]);
+    let mut opts = CallOptions::new(prompt);
+    opts.render_episodes = std::sync::Arc::new(
+        vec![
+            EpisodeRenderInput {
+                prompt_start: 0,
+                first_user: Some(0),
+                frozen_config: json!({"effort":"low"}),
+            },
+            EpisodeRenderInput {
+                prompt_start: 2,
+                first_user: Some(2),
+                frozen_config: json!({"effort":"medium"}),
+            },
+            EpisodeRenderInput {
+                prompt_start: 5,
+                first_user: None,
+                frozen_config: json!({"effort":"high"}),
+            },
+        ]
+        .into(),
+    );
+    let (view, _) = make_view(
+        2,
+        6,
+        vec![
+            ViewRange::keep(0, 1),
+            ViewRange::replace(1, 4, "[]"),
+            ViewRange::keep(4, 7),
+        ],
+    );
+    let mut state = after_setup();
+    state.view = Some(AppliedView {
+        view,
+        choice: CompactionViewChoice::Applied,
+    });
+    let full = model_options(&opts, &state).unwrap();
+    opts.prompt.retain(|message| {
+        crate::run::held_prompt::held_by(&state.view.as_ref().unwrap().view, message)
+    });
+    let sparse = model_options(&opts, &state).unwrap();
+    assert_eq!(sparse, full);
+    let episodes = &sparse.render_episodes.episodes;
+    assert_eq!(
+        episodes
+            .iter()
+            .map(|episode| (episode.prompt_start, episode.first_user))
+            .collect::<Vec<_>>(),
+        vec![(0, Some(0)), (1, None), (2, None)]
+    );
+}
+
+#[test]
+fn ordinal_ranges_bound_the_work_to_the_requested_window() {
+    let mut prompt = stamped(vec![text(Role::User, "old"); 150_000]);
+    prompt[0].role = Role::System;
+    let window = ordinal_range(&prompt, 149_800, 149_999);
+    assert_eq!(window.len(), 199);
+    assert_eq!(window[0].ordinal, Some(149_800));
+    assert!(ordinal_range(&prompt, 150_000, u64::MAX).is_empty());
+    assert_eq!(ordinal_range(&prompt, 10, 10).len(), 0);
+}
+
+#[test]
+fn view_validation_encodes_only_requested_entries_and_possible_signed_copies() {
+    let mut prompt = stamped(vec![text(Role::User, "hidden"); 10_000]);
+    prompt[1] = assistant(vec![ContentBlock::Text {
+        text: "model output".into(),
+    }]);
+    prompt[1].ordinal = Some(1);
+    let (view, ready) = make_view(
+        2,
+        9_998,
+        vec![ViewRange::replace(
+            0,
+            9_999,
+            replace_bytes(&[
+                text(Role::User, "summary"),
+                text(Role::Assistant, "short answer"),
+            ]),
+        )],
+    );
+    let (decision, encodings) = crate::compaction::carried_encoding_tests::measure(|| {
+        decide(
+            &view,
+            &ready,
+            &after_setup(),
+            LINEAGE,
+            &prompt,
+            &prompt,
+            false,
+        )
+    });
+    assert!(matches!(decision, Decision::Apply(_)), "{decision:?}");
+    assert_eq!(
+        encodings, 3,
+        "only the coverage anchor and the replacements need encoding"
+    );
+}
+
+#[test]
+fn removing_a_model_origin_does_not_make_a_stored_copy_provider_authored() {
+    let raw = stamped(vec![
+        text(Role::User, "q"),
+        assistant(vec![ContentBlock::Text {
+            text: "answer".into(),
+        }]),
+        text(Role::User, "next"),
+    ]);
+    let mut stripped = raw[1].clone();
+    stripped.origin = None;
+    let (view, ready) = make_view(
+        2,
+        1,
+        vec![ViewRange::replace(
+            0,
+            2,
+            replace_bytes(&[text(Role::User, "summary"), stripped]),
+        )],
+    );
+    assert_eq!(
+        decide(
+            &view,
+            &ready,
+            &after_setup(),
+            LINEAGE,
+            &tagged(&raw),
+            &raw,
+            false
+        ),
+        Decision::Rejected(ViewProblem::ReplacementNotArray)
+    );
+    let (view, ready) = make_view(
+        2,
+        1,
+        vec![ViewRange::replace(
+            0,
+            2,
+            replace_bytes(&[text(Role::User, "summary"), raw[1].clone()]),
+        )],
+    );
+    assert!(matches!(
+        decide(
+            &view,
+            &ready,
+            &after_setup(),
+            LINEAGE,
+            &tagged(&raw),
+            &raw,
+            false
+        ),
+        Decision::Apply(_)
+    ));
+}
+
+#[test]
+fn sparse_originals_preserve_signed_authorship_and_notice_digests() {
+    let raw = conversation();
+    let prompt = tagged(&raw);
+    let mut originals = crate::compaction::OriginalMessages::default();
+    for (i, (original, rendered)) in raw.iter().zip(&prompt).enumerate() {
+        originals.retain_change(i, original.clone(), rendered);
+    }
+    let stored = crate::compaction::StoredTranscript::new(&prompt, Some(&originals));
+    let state = after_setup();
+    for mut copy in [raw[1].clone(), raw[4].clone()] {
+        for changed in [false, true] {
+            if changed {
+                copy.content[0] = signed("forged");
+            }
+            let (view, ready) = make_view(
+                2,
+                4,
+                vec![ViewRange::replace(
+                    0,
+                    5,
+                    replace_bytes(&[text(Role::User, "summary"), copy.clone()]),
+                )],
+            );
+            assert_eq!(
+                decide_stored_at(&view, &ready, &state, LINEAGE, &prompt, stored, false, false),
+                decide_at(&view, &ready, &state, LINEAGE, &prompt, &raw, false, false)
+            );
+        }
+    }
+    let facts = || NoticeFacts {
+        session_ref: SESSION_REF.into(),
+        lineage_id: LINEAGE,
+        est_tokens: 123,
+        model: "model",
+        window: Some(1000),
+        usage: None,
+        events: vec![],
+        seq_floor: 0,
+    };
+    let expected = next_notice(&state, &raw, facts()).unwrap();
+    let actual = notice_through(&state, stored.newest().unwrap(), facts()).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn indexed_plain_summary_does_not_walk_the_replaced_transcript() {
+    let mut prompt = stamped(vec![text(Role::User, "hidden"); 150_000]);
+    prompt[1] = assistant(vec![ContentBlock::Text {
+        text: "model output".into(),
+    }]);
+    prompt[1].ordinal = Some(1);
+    let mut originals = crate::compaction::OriginalMessages::default();
+    originals.index_origins(&prompt);
+    let stored = crate::compaction::StoredTranscript::new(&prompt, Some(&originals));
+    let (view, ready) = make_view(
+        2,
+        149_998,
+        vec![ViewRange::replace(
+            0,
+            149_999,
+            replace_bytes(&[text(Role::User, "summary")]),
+        )],
+    );
+    let (decision, visits) = crate::compaction::stored::measure_range_visits(|| {
+        decide_stored_at(
+            &view,
+            &ready,
+            &after_setup(),
+            LINEAGE,
+            &prompt,
+            stored,
+            false,
+            false,
+        )
+    });
+    assert!(matches!(decision, Decision::Apply(_)));
+    assert_eq!(
+        visits, 0,
+        "a user summary cannot copy an origin that no user message has"
+    );
+}
+
+#[test]
+fn indexed_origins_still_refuse_a_user_copy_with_its_model_origin_removed() {
+    let mut prompt = stamped(vec![
+        text(Role::User, "model-owned input"),
+        text(Role::User, "tail"),
+    ]);
+    prompt[0].origin = Some(broca_protocol::ModelHandle::new("provider", "model"));
+    let mut originals = crate::compaction::OriginalMessages::default();
+    originals.index_origins(&prompt[..1]);
+    originals.index_origins(&prompt);
+    let stored = crate::compaction::StoredTranscript::new(&prompt, Some(&originals));
+    let mut stripped = prompt[0].clone();
+    stripped.origin = None;
+    let (view, ready) = make_view(
+        2,
+        0,
+        vec![ViewRange::replace(0, 1, replace_bytes(&[stripped]))],
+    );
+    assert_eq!(
+        decide_stored_at(
+            &view,
+            &ready,
+            &after_setup(),
+            LINEAGE,
+            &prompt,
+            stored,
+            false,
+            false
+        ),
+        Decision::Rejected(ViewProblem::ReplacementNotArray)
+    );
+}
+
+#[test]
+fn indexed_render_keeps_interior_system_messages_and_episode_coordinates() {
+    let prompt = stamped(vec![
+        text(Role::User, "hidden"),
+        text(Role::System, "system"),
+        text(Role::User, "kept"),
+        text(Role::Assistant, "answer"),
+    ]);
+    let mut opts = CallOptions::new(prompt.clone());
+    opts.render_episodes = std::sync::Arc::new(broca_protocol::request::RenderHistory {
+        compaction_prefix_len: None,
+        episodes: (0..4)
+            .map(|i| broca_protocol::request::EpisodeRenderInput {
+                prompt_start: i,
+                first_user: Some(i),
+                frozen_config: json!({}),
+            })
+            .collect(),
+    });
+    let (view, _) = make_view(
+        2,
+        1,
+        vec![ViewRange::replace(
+            0,
+            2,
+            replace_bytes(&[text(Role::User, "summary")]),
+        )],
+    );
+    let mut state = after_setup();
+    state.view = Some(AppliedView {
+        view,
+        choice: broca_wal::CompactionViewChoice::Applied,
+    });
+    let rendered = crate::compaction::model_options_indexed(&opts, &state, &[1]).unwrap();
+    assert_eq!(rendered.prompt[0], prompt[1]);
+    let coords: Vec<_> = rendered
+        .render_episodes
+        .iter()
+        .map(|e| (e.prompt_start, e.first_user))
+        .collect();
+    assert_eq!(coords, vec![(2, Some(2)), (3, Some(3))]);
+}
+
+#[test]
+fn boundary_request_reuses_exact_bytes_until_a_view_changes() {
+    let opts = CallOptions::new(conversation());
+    let mut state = after_setup();
+    let mut request = crate::compaction::BoundaryRequest::default();
+    let renders = std::cell::Cell::new(0);
+    let render = |opts: &CallOptions| {
+        renders.set(renders.get() + 1);
+        crate::canonical_request_bytes(opts)
+    };
+    for _ in 0..4 {
+        request.refresh(&opts, &state, &[], render).unwrap();
+        assert_eq!(
+            request.bytes,
+            crate::canonical_request_bytes(&model_options(&opts, &state).unwrap()).len()
+        );
+    }
+    assert_eq!(renders.get(), 1);
+    let (view, _) = make_view(
+        2,
+        2,
+        vec![ViewRange::replace(
+            0,
+            3,
+            replace_bytes(&[text(Role::User, "short")]),
+        )],
+    );
+    state.view = Some(AppliedView {
+        view,
+        choice: broca_wal::CompactionViewChoice::Applied,
+    });
+    request.refresh(&opts, &state, &[], render).unwrap();
+    assert_eq!(renders.get(), 2);
+    let expected = crate::canonical_request_bytes(&model_options(&opts, &state).unwrap());
+    assert_eq!(request.bytes, expected.len());
+    assert_eq!(
+        crate::canonical_request_bytes(&request.into_options()),
+        expected
+    );
 }
 
 /// A view may replace several ranges and edit single parts of the messages it keeps. The

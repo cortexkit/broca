@@ -126,6 +126,32 @@ jobs:
       - name: Verify clean worktree
         run: test -z "$(git status --porcelain)" || { git status --short; git diff; exit 1; }
 
+  wal-reader:
+    name: WAL reader (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: wal-reader
+          cache-on-failure: 'true'
+      - name: Golden v4 codec and broca unlink while reader holds a log
+        shell: bash
+        run: |
+          cargo test --locked -p broca-wal-reader
+          cargo test --locked -p broca-wal --lib framing::tests::v4
+      - name: Verify clean worktree
+        shell: bash
+        run: test -z "$(git status --porcelain)" || { git status --short; git diff; exit 1; }
+
   integration-build:
     name: Archive (${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
@@ -206,6 +232,7 @@ jobs:
       BROCA_REQUIRE_VAULT: ${{ matrix.os == 'ubuntu' && '1' || '' }}
       SUBC_CORE_BIN: ${{ github.workspace }}/fixtures/bin/ck-subc${{ matrix.os == 'windows' && '.exe' || '' }}
       FAKE_AFT_STUB_BIN: ${{ github.workspace }}/fixtures/bin/fake-aft-stub${{ matrix.os == 'windows' && '.exe' || '' }}
+      FAKE_SURFACE_BIN: ${{ github.workspace }}/fixtures/bin/fake-surface${{ matrix.os == 'windows' && '.exe' || '' }}
       CK_CLAUSTRUM_BIN: ${{ matrix.os == 'ubuntu' && format('{0}/fixtures/bin/ck-claustrum', github.workspace) || '' }}
       CK_AUTH_BIN: ${{ matrix.os == 'ubuntu' && format('{0}/fixtures/bin/ck-auth', github.workspace) || '' }}
       CK_CLAUSTRUM_CHECKOUT: ${{ matrix.os == 'ubuntu' && format('{0}/fixtures/claustrum', github.workspace) || '' }}
@@ -278,8 +305,10 @@ jobs:
           SUBC_CORE_BIN: ${{ github.workspace }}/fixtures/bin/ck-subc
           BROCA_DEPLOY_TEST_BIN: ${{ github.workspace }}/broca/target/release/ck-broca
           BROCA_REQUIRE_LINUX_DEPLOY: '1'
+        # Build the same three binaries stage-release.sh builds: its publication sequence stages
+        # broca-session and broca-run from target/release beside the module.
         run: |
-          cargo build --release --locked -p broca-module-serve
+          cargo build --release --locked -p broca-module-serve -p broca-run --bin ck-broca --bin broca-session --bin broca-run
           python3 -B scripts/test-place-release-gate.py LinuxDeployTests.test_real_linux_subc_stage_place_restart_verify -v
       - name: Verify clean worktree
         run: test -z "$(git status --porcelain)" || { git status --short; git diff; exit 1; }
@@ -305,6 +334,7 @@ jobs:
       BROCA_REQUIRE_VAULT: '1'
       SUBC_CORE_BIN: ${{ github.workspace }}/fixtures/bin/ck-subc
       FAKE_AFT_STUB_BIN: ${{ github.workspace }}/fixtures/bin/fake-aft-stub
+      FAKE_SURFACE_BIN: ${{ github.workspace }}/fixtures/bin/fake-surface
       CK_CLAUSTRUM_BIN: ${{ github.workspace }}/fixtures/bin/ck-claustrum
       CK_AUTH_BIN: ${{ github.workspace }}/fixtures/bin/ck-auth
       CK_CLAUSTRUM_CHECKOUT: ${{ github.workspace }}/fixtures/claustrum
@@ -346,7 +376,7 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     if: always()
-    needs: [lint, scripts, unit, production-features, store-contention-macos, integration-build, fixtures, integration, linux-deploy]
+    needs: [lint, scripts, unit, production-features, store-contention-macos, integration-build, fixtures, integration, linux-deploy, wal-reader]
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -442,6 +472,7 @@ jobs:
           BROCA_REQUIRE_VAULT: ${{ matrix.os == 'ubuntu' && '1' || '' }}
           SUBC_CORE_BIN: ${{ github.workspace }}/fixtures/bin/ck-subc${{ runner.os == 'Windows' && '.exe' || '' }}
           FAKE_AFT_STUB_BIN: ${{ github.workspace }}/fixtures/bin/fake-aft-stub${{ runner.os == 'Windows' && '.exe' || '' }}
+          FAKE_SURFACE_BIN: ${{ github.workspace }}/fixtures/bin/fake-surface${{ runner.os == 'Windows' && '.exe' || '' }}
           CK_CLAUSTRUM_BIN: ${{ matrix.os == 'ubuntu' && format('{0}/fixtures/bin/ck-claustrum', github.workspace) || '' }}
           CK_AUTH_BIN: ${{ matrix.os == 'ubuntu' && format('{0}/fixtures/bin/ck-auth', github.workspace) || '' }}
           CK_CLAUSTRUM_CHECKOUT: ${{ matrix.os == 'ubuntu' && format('{0}/fixtures/claustrum', github.workspace) || '' }}
@@ -463,36 +494,6 @@ jobs:
           name: rig-survivors-unit-${{ matrix.os }}
           path: broca/target/rig-survivors/*.txt
           if-no-files-found: ignore
-
-      # Exercised 2026-08-12 against a scratch repo, because this gate had been green on
-      # every run since the repo existed and nothing showed it COULD go red:
-      #   clean tree                     -> passes
-      #   modified tracked file          -> fails, naming it
-      #   untracked file left behind     -> fails, naming it
-      # The third case is the one worth protecting and it rests on a default: porcelain
-      # reports untracked files, so a build that emits a generated source nobody added trips
-      # this. Adding --untracked-files=no while tidying would silently remove exactly that
-      # case, and the remaining two would keep passing.
-      # The diff is EMPTY for an untracked file, so it is printed conditionally: an
-      # unconditional `git diff` under a porcelain listing makes the listing look redundant,
-      # and the listing is the only output naming the file.
-      - name: Verify clean worktree
-        shell: bash
-        run: |
-          dirty="$(git status --porcelain)"
-          if [ -n "$dirty" ]; then
-            echo "::error::Working tree changed during CI (modified tracked files, or new files a build left behind)"
-            printf '%s\n' "$dirty"
-            diff_out="$(git diff -- . | head -c 20000)"
-            if [ -n "$diff_out" ]; then
-              echo "git diff (first 20000 bytes):"
-              printf '%s\n' "$diff_out"
-            else
-              echo "(no diff: the change is untracked files the build left behind -- see the list above)"
-            fi
-            exit 1
-          fi
-
 
       # Exercised 2026-08-12 against a scratch repo, because this gate had been green on
       # every run since the repo existed and nothing showed it COULD go red:

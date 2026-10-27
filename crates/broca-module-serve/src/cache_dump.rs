@@ -174,6 +174,14 @@ fn select_addresses(
             })
             .collect());
     }
+    if since.is_none() {
+        let mut addresses = BTreeMap::new();
+        for name in sessions.iter().collect::<BTreeSet<_>>() {
+            let bind = crate::session_lookup::lookup(root, name)?;
+            addresses.insert(session_addr(&bind), bind);
+        }
+        return Ok(addresses);
+    }
     let index = root.join("run-index.db");
     let failure = || format!("cannot read run index {}", index.display());
     let absolute = if index.is_absolute() {
@@ -215,21 +223,6 @@ fn select_addresses(
             add(raw.map_err(|_| failure())?)?;
         }
         summary.undated_runs_not_selected = connection.query_row("SELECT count(*) FROM run_index WHERE state_changed_ms IS NULL AND state NOT IN ('active', 'paused')", [], |row| row.get(0)).map_err(|_| failure())?;
-    } else {
-        let mut statement = connection.prepare("SELECT DISTINCT session FROM run_index WHERE json_extract(session, '$.session') = ?1").map_err(|_| failure())?;
-        for name in sessions.iter().collect::<BTreeSet<_>>() {
-            let mut found = false;
-            for raw in statement
-                .query_map([name], |row| row.get::<_, String>(0))
-                .map_err(|_| failure())?
-            {
-                found = true;
-                add(raw.map_err(|_| failure())?)?;
-            }
-            if !found {
-                summary.sessions_not_found.push(name.clone());
-            }
-        }
     }
     Ok(addresses)
 }
@@ -280,6 +273,21 @@ fn exportable_records(
     key: &BindIdentity,
     now_ms: u64,
 ) -> Result<Vec<WalRecord>, String> {
+    exportable_frames(store, key, now_ms)
+        .map(|(_, frames)| frames.into_iter().map(|frame| frame.record).collect())
+}
+
+pub(crate) fn exportable_frames(
+    store: &FileWalStore,
+    key: &BindIdentity,
+    now_ms: u64,
+) -> Result<
+    (
+        Option<broca_wal::WalLineageId>,
+        Vec<broca_wal::FramedRecord>,
+    ),
+    String,
+> {
     store.check_move(key, true).map_err(|e| e.to_string())?;
     let read = store
         .read_records_range(key, 0, None, None)
@@ -328,11 +336,10 @@ fn exportable_records(
     if let Some(expired_at_ms) = expired_at_ms {
         return Err(format!("expired {{expired_at_ms: {expired_at_ms}}}"));
     }
+    let lineage = read.lineage_id;
     match read.into_records() {
-        broca_wal::WalRangeRecords::Complete(frames) => {
-            Ok(frames.into_iter().map(|frame| frame.record).collect())
-        }
-        broca_wal::WalRangeRecords::Absent => Ok(Vec::new()),
+        broca_wal::WalRangeRecords::Complete(frames) => Ok((lineage, frames)),
+        broca_wal::WalRangeRecords::Absent => Ok((lineage, Vec::new())),
         _ => Err("incomplete WAL read".into()),
     }
 }

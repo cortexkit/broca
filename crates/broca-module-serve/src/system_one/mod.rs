@@ -28,7 +28,7 @@ pub mod credential;
 pub mod typesafe;
 pub mod workers_ai;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -43,8 +43,14 @@ use cortexkit_role_classifier::{
 use serde_json::value::RawValue;
 use tokio::sync::Semaphore;
 
-/// The store's role key for `classifier/v1` batches.
+/// The store's role key for `classifier/v1` batches, and the role a [`SystemOne`] serves
+/// under unless [`SystemOne::with_store_role`] names another.
 pub(crate) const STORE_ROLE: &str = "classifier";
+
+/// The store's role key for the `llm.classify/v1` tool's batches. The tool runs on its own
+/// [`SystemOne`] under this role, so a tool call and a `classifier/v1` batch that happen to
+/// share a `batch_id` are two batches: neither replays, holds or refuses the other.
+pub const LLM_CLASSIFY_STORE_ROLE: &str = "llm.classify";
 
 /// The method names this surface answers.
 pub const OP_ROLE_DESCRIBE: &str = cortexkit_role_classifier::ops::ROLE_DESCRIBE;
@@ -125,6 +131,12 @@ impl BatchCatalog for LiveCatalog {
 pub enum ProviderReply {
     /// HTTP 200, with the body as received.
     Answered(Vec<u8>),
+    /// An answer tied to the credential resolved for this attempt, not a later lookup.
+    AttributedAnswer {
+        body: Vec<u8>,
+        auth_selection: Option<String>,
+        account_ref: Option<String>,
+    },
     /// Any other HTTP status, with the wait the provider asked for, if it asked.
     Status {
         status: u16,
@@ -177,6 +189,17 @@ pub struct ModelPin {
 /// answer, and be billed, as 1.13.0.
 const JEV_1_13_0_WIRE: &str = cortexkit_role_classifier::provider::models::JEV_1_13_0;
 
+/// Consent uses only the catalog's human labels. A missing display fact is not permission
+/// to show a provider or model identifier on the person's approval card.
+pub(crate) fn consent_model_labels(row: &ModelBatchRow) -> Option<(&str, &str)> {
+    let provider = row.provider_name.as_deref()?;
+    let model = row.model_name.as_deref()?;
+    if provider.trim().is_empty() || model.trim().is_empty() {
+        return None;
+    }
+    Some((provider, model))
+}
+
 impl ModelPin {
     /// TypeSafe's Jev 1.13.0, text only. Its question limit is the role's own question-id
     /// space at the clef bound, since TypeSafe states none.
@@ -228,6 +251,8 @@ impl ModelPin {
 /// The System One service: the batch store, the routing pins, and the concurrency caps.
 pub struct SystemOne {
     store: Arc<SystemOneStore>,
+    /// The store role every batch this service claims, records and releases is keyed under.
+    role: String,
     /// This process's name on a batch it holds, so a hold left by another process is told
     /// apart and a write after a lost hold is refused.
     owner: String,
@@ -235,11 +260,41 @@ pub struct SystemOne {
     pins: Vec<ModelPin>,
     config: Config,
     /// Batch ids a call in this process holds now: the in-process half of single flight.
-    claims: Mutex<HashSet<String>>,
+    claims: Mutex<HashMap<String, broca_store::system_one::BatchScope>>,
     call_slots: Arc<Semaphore>,
     model_slots: Mutex<HashMap<String, Arc<Semaphore>>>,
     in_flight: Arc<AtomicUsize>,
     clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+    metrics: Mutex<Metrics>,
+    export: Option<Arc<broca_store::SqliteStore>>,
+    charge_basis: Arc<crate::billing_routing::ChargeBasisTable>,
+    /// Tests only: when set, the next store release made from a hold's `Drop` (the fallback
+    /// for a panicked or dropped call) waits until the sender side is dropped. A test holds
+    /// it shut to prove that a call which ends normally never leaves its release to that
+    /// fallback, since a release still pending after the reply refuses an immediate re-send.
+    #[cfg(test)]
+    fallback_release_gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    /// Tests hold publication after the outcome/outbox commit to expose premature replay.
+    #[cfg(test)]
+    pub(crate) fact_publish_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+/// Pricing accepted before private-content admission. Keeping this snapshot with a delayed
+/// call prevents a catalog refresh from changing what was already admitted.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ToolAdmission {
+    frozen_row: String,
+}
+
+/// Process-lifetime observations only. No batch ids, questions, states or answers enter health.
+#[derive(Default, serde::Serialize)]
+struct Metrics {
+    batches_answered: u64,
+    batches_failed: u64,
+    items_answered: u64,
+    items_failed: u64,
+    spend_nanos_by_model: std::collections::BTreeMap<String, u64>,
+    last_provider_error: std::collections::BTreeMap<String, String>,
 }
 
 /// The wall clock in milliseconds since the Unix epoch.
@@ -262,16 +317,178 @@ impl SystemOne {
     ) -> Self {
         Self {
             store,
+            role: STORE_ROLE.to_owned(),
             owner: owner.into(),
             catalog,
             pins,
             call_slots: Arc::new(Semaphore::new(config.process_calls.max(1))),
             config,
-            claims: Mutex::new(HashSet::new()),
+            claims: Mutex::new(HashMap::new()),
             model_slots: Mutex::new(HashMap::new()),
             in_flight,
             clock: Arc::new(now_ms),
+            metrics: Mutex::new(Metrics::default()),
+            export: None,
+            charge_basis: Arc::new(crate::billing_routing::ChargeBasisTable::shipped_defaults()),
+            #[cfg(test)]
+            fallback_release_gate: Mutex::new(None),
+            #[cfg(test)]
+            fact_publish_hook: Mutex::new(None),
         }
+    }
+
+    /// Reuse the daemon-wide immutable export stream, without opening any session projection.
+    pub fn with_export(
+        mut self,
+        export: Arc<broca_store::SqliteStore>,
+        charge_basis: Arc<crate::billing_routing::ChargeBasisTable>,
+    ) -> Self {
+        self.export = Some(export);
+        self.charge_basis = charge_basis;
+        self
+    }
+
+    fn flush_facts(&self) -> Result<(), String> {
+        let Some(export) = &self.export else {
+            return Ok(());
+        };
+        for pending in self.store.pending_facts().map_err(|e| e.to_string())? {
+            #[cfg(test)]
+            {
+                let hook = self.fact_publish_hook.lock().unwrap().clone();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            if export
+                .emit_system_one_fact(&pending.fact)
+                .map_err(|e| e.to_string())?
+            {
+                let mut metrics = self.metrics.lock().unwrap_or_else(|p| p.into_inner());
+                let spend = metrics
+                    .spend_nanos_by_model
+                    .entry(pending.fact.model.clone())
+                    .or_default();
+                *spend = spend.saturating_add(pending.spend_nanos);
+            }
+            self.store
+                .acknowledge_fact(&pending.fact.fact_id)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    async fn publish_facts(self: &Arc<Self>) -> Result<(), Refusal> {
+        let service = Arc::clone(self);
+        tokio::task::spawn_blocking(move || service.flush_facts())
+            .await
+            .map_err(|_| internal_refusal("usage export task failed"))?
+            .map_err(|_| internal_refusal("usage export is unavailable; re-send the batch"))
+    }
+
+    pub fn health(&self) -> serde_json::Value {
+        let metrics = self.metrics.lock().unwrap_or_else(|p| p.into_inner());
+        let mut value = serde_json::to_value(&*metrics).expect("health counters encode");
+        value["batches_in_flight"] = self.in_flight.load(Ordering::Relaxed).into();
+        value
+    }
+
+    /// Serve under another store role. Each `SystemOne` keeps its own in-process claims and its
+    /// own process-call and per-model semaphores, so a second instance under another role (the
+    /// `llm.classify/v1` tool's, [`LLM_CLASSIFY_STORE_ROLE`]) can share the batch store
+    /// without sharing a batch id space or concurrency with `classifier/v1`.
+    pub fn with_store_role(mut self, role: impl Into<String>) -> Self {
+        self.role = role.into();
+        self
+    }
+
+    /// The store role this service's batches are keyed under.
+    pub fn store_role(&self) -> &str {
+        &self.role
+    }
+
+    /// Share durable storage and provider clients, but not claims or concurrency permits.
+    /// Startup releases abandoned claims once, before either instance starts serving.
+    pub fn fork_for_tools(&self) -> Self {
+        let mut service = Self::new(
+            self.store.clone(),
+            self.owner.clone(),
+            self.catalog.clone(),
+            self.pins.clone(),
+            self.config.clone(),
+            self.in_flight.clone(),
+        )
+        .with_store_role(LLM_CLASSIFY_STORE_ROLE)
+        .with_clock(self.clock.clone());
+        service.export = self.export.clone();
+        service.charge_basis = self.charge_basis.clone();
+        service
+    }
+
+    pub(crate) fn tool_now(&self) -> i64 {
+        (self.clock)()
+    }
+
+    pub(crate) fn admit_tool(
+        &self,
+        params: &str,
+        stored: Option<&broca_store::system_one::StoredBatch>,
+    ) -> Result<ToolAdmission, Refusal> {
+        classify::admit_tool(self, params, stored)
+    }
+
+    pub(crate) fn tool_model_row(&self, model: &str) -> Option<ModelBatchRow> {
+        self.catalog.row(model)
+    }
+
+    pub(crate) async fn replay_tool(
+        self: &Arc<Self>,
+        params: &str,
+        stored: &broca_store::system_one::StoredBatch,
+    ) -> Result<Box<RawValue>, Refusal> {
+        // The outcome and outbox commit together, but publication is a separate transaction.
+        // A replay can see that outcome while its original execution is still exporting it.
+        self.publish_facts().await?;
+        classify::replay_tool(params, stored)
+    }
+
+    pub(crate) async fn execute_tool(
+        self: Arc<Self>,
+        params: String,
+        scope: broca_store::system_one::BatchScope,
+        args_digest: String,
+        admission: ToolAdmission,
+        admitted_at_ms: Option<i64>,
+    ) -> Result<Box<RawValue>, Refusal> {
+        self.sweep()
+            .await
+            .map_err(|_| internal_refusal("batch retention is unavailable"))?;
+        let gauge = self.in_flight.clone();
+        gauge.fetch_add(1, Ordering::Relaxed);
+        let _lowered = GaugeGuard(gauge);
+        let _slot = self.call_slots.clone().acquire_owned().await;
+        classify::run_inner(
+            &self,
+            &params,
+            &scope,
+            admitted_at_ms,
+            Some((&args_digest, &admission)),
+        )
+        .await
+    }
+
+    /// The batch recorded under this service's role for `batch_id`, with its outcomes; `None`
+    /// when there is none. Reads only: nothing is claimed or written.
+    pub async fn stored_batch(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<broca_store::system_one::StoredBatch>, String> {
+        let store = Arc::clone(&self.store);
+        let (role, batch_id) = (self.role.clone(), batch_id.to_owned());
+        tokio::task::spawn_blocking(move || store.lookup(&role, &batch_id))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())
     }
 
     /// Replace the clock; tests drive retention with it.
@@ -280,8 +497,9 @@ impl SystemOne {
         self
     }
 
-    /// Release every batch a previous process left running. Call once, before serving.
+    /// Release provably abandoned batches without disturbing a live owner. Call before serving.
     pub fn release_abandoned(&self) -> Result<usize, String> {
+        self.flush_facts()?;
         self.store.release_abandoned().map_err(|e| e.to_string())
     }
 
@@ -385,7 +603,12 @@ impl SystemOne {
     /// Answer one request on a classifier route. The reply is the `result` text, or the body
     /// of the `ERROR` frame. `role.describe` is answered at once; `classify.run` on the
     /// caller's task (see [`Self::spawn_call`]).
-    pub async fn answer(self: Arc<Self>, body: &[u8]) -> Result<Box<RawValue>, Vec<u8>> {
+    pub async fn answer(
+        self: Arc<Self>,
+        body: &[u8],
+        principal: Option<&broca_protocol::BindPrincipal>,
+        send: &broca_protocol::SendScope,
+    ) -> Result<Box<RawValue>, Vec<u8>> {
         #[derive(serde::Deserialize)]
         struct Envelope<'a> {
             method: String,
@@ -415,7 +638,16 @@ impl SystemOne {
                 serde_json::value::to_raw_value(&self.describe())
                     .map_err(|e| error_body(INTERNAL_ERROR, &e.to_string()))
             }
-            OP_CLASSIFY_RUN => self.spawn_call(params.to_owned()).await,
+            OP_CLASSIFY_RUN => {
+                let scope = caller_scope(principal, send).map_err(|e| {
+                    self.metrics
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .batches_failed += 1;
+                    refusal_body(&e)
+                })?;
+                self.spawn_call(params.to_owned(), scope).await
+            }
             other => Err(error_body(
                 "unknown_method",
                 &format!("unknown method '{other}' on a classifier/v1 route"),
@@ -425,7 +657,24 @@ impl SystemOne {
 
     /// Run one `classify.run` on a task of its own and wait for it. A panic inside answers
     /// this call `internal_error`; the batch it held is released by its hold's drop.
-    pub async fn spawn_call(self: Arc<Self>, params: String) -> Result<Box<RawValue>, Vec<u8>> {
+    pub async fn spawn_call(
+        self: Arc<Self>,
+        params: String,
+        scope: broca_store::system_one::BatchScope,
+    ) -> Result<Box<RawValue>, Vec<u8>> {
+        self.spawn_call_admitted_at(params, scope, None).await
+    }
+
+    /// [`Self::spawn_call`] for a call admitted before it runs. When `admitted_at_ms` is given
+    /// and the batch is new, its seven-day retention runs from that time rather than from
+    /// now, so a call held for consent and executed later expires on the same day as the
+    /// record of its admission. A batch already recorded keeps its first admission time.
+    pub async fn spawn_call_admitted_at(
+        self: Arc<Self>,
+        params: String,
+        scope: broca_store::system_one::BatchScope,
+        admitted_at_ms: Option<i64>,
+    ) -> Result<Box<RawValue>, Vec<u8>> {
         // Raised here and lowered by the task itself, so a caller that stops waiting (its
         // route closed) does not hide a call that is still running.
         let gauge = Arc::clone(&self.in_flight);
@@ -435,9 +684,9 @@ impl SystemOne {
         let task = tokio::spawn(async move {
             let _lowered = lowered;
             let _slot = Arc::clone(&service.call_slots).acquire_owned().await;
-            classify::run(&service, &params).await
+            classify::run(&service, &params, &scope, admitted_at_ms).await
         });
-        match task.await {
+        let result = match task.await {
             Ok(Ok(reply)) => Ok(reply),
             Ok(Err(refusal)) => Err(refusal_body(&refusal)),
             Err(error) => {
@@ -447,8 +696,51 @@ impl SystemOne {
                     "serving this call failed inside broca; re-send the batch",
                 )))
             }
+        };
+        let mut metrics = self.metrics.lock().unwrap_or_else(|p| p.into_inner());
+        if result.is_ok() {
+            metrics.batches_answered += 1;
+        } else {
+            metrics.batches_failed += 1;
+        }
+        result
+    }
+}
+
+fn caller_scope(
+    principal: Option<&broca_protocol::BindPrincipal>,
+    send: &broca_protocol::SendScope,
+) -> Result<broca_store::system_one::BatchScope, Refusal> {
+    use broca_store::system_one::BatchScope;
+    let stamp = match send {
+        broca_protocol::SendScope::Stamped(bind) => Some(&bind.scope),
+        _ => None,
+    };
+    if broca_core::scope_admission::is_flow_only(principal)
+        && stamp.and_then(|s| s.flow_id.as_ref()).is_none()
+    {
+        return Err(Refusal::new(
+            "flow_scope_required",
+            "Basal classifier calls require a daemon-stamped flow scope",
+        ));
+    }
+    if let Some(stamp) = stamp {
+        if let Some(flow_id) = &stamp.flow_id {
+            return Ok(BatchScope::Flow {
+                flow_id: flow_id.clone(),
+            });
+        }
+        if let (Some(agent_id), Some(run_id)) = (&stamp.agent_id, &stamp.run_id) {
+            return Ok(BatchScope::Run {
+                agent_id: agent_id.clone(),
+                run_id: run_id.clone(),
+            });
         }
     }
+    Err(Refusal::new(
+        "scope_required",
+        "classifier calls require a daemon-stamped agent/run or flow scope",
+    ))
 }
 
 /// Lowers the busy gauge when a call ends, however it ends.
@@ -480,3 +772,94 @@ mod tests;
 #[cfg(test)]
 #[path = "workers_ai_tests.rs"]
 mod workers_ai_tests;
+
+#[cfg(test)]
+mod tool_admission_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicI64};
+
+    struct Catalog {
+        present: AtomicBool,
+        reads: AtomicUsize,
+    }
+    impl BatchCatalog for Catalog {
+        fn row(&self, _: &str) -> Option<ModelBatchRow> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.present.load(Ordering::SeqCst).then(|| ModelBatchRow {
+                model_name: None,
+                provider_name: None,
+                kind: Some("decision".into()),
+                context_tokens: None,
+                attachment: false,
+                input_rate_nanos: Some(42_000_000),
+                output_rate_nanos: Some(0),
+            })
+        }
+    }
+    struct Answer;
+    #[async_trait::async_trait]
+    impl ClassifierProvider for Answer {
+        fn egress_host(&self) -> String {
+            "localhost".into()
+        }
+        fn credential_id(&self) -> Option<String> {
+            None
+        }
+        async fn call(&self, _: String) -> ProviderReply {
+            ProviderReply::Answered(br#"{"model":"jev-1.13.0","answers":{"q":{"type":"noul","noul":0.5}},"usage":{"input_tokens":100}}"#.to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn frozen_admission_and_original_time_survive_delayed_execution() {
+        let catalog = Arc::new(Catalog {
+            present: AtomicBool::new(true),
+            reads: AtomicUsize::new(0),
+        });
+        let clock = Arc::new(AtomicI64::new(1000 + 24 * 60 * 60 * 1000));
+        let read_clock = clock.clone();
+        let service = Arc::new(
+            SystemOne::new(
+                Arc::new(SystemOneStore::open_in_memory().unwrap()),
+                "delayed-owner",
+                catalog.clone(),
+                vec![ModelPin::jev(Arc::new(Answer))],
+                Config::default(),
+                Arc::default(),
+            )
+            .with_store_role(LLM_CLASSIFY_STORE_ROLE)
+            .with_clock(Arc::new(move || read_clock.load(Ordering::SeqCst))),
+        );
+        let params = serde_json::json!({"batch_id":"held","model":JEV_1_13_0,"questions":{"q":{"type":"noul","instructions":"Flag?"}},"items":[{"state":"invented"}],"max_cost_usd":0.01}).to_string();
+        let admission = service.admit_tool(&params, None).unwrap();
+        catalog.present.store(false, Ordering::SeqCst);
+        let scope = broca_store::system_one::BatchScope::Run {
+            agent_id: "agent".into(),
+            run_id: "run".into(),
+        };
+        service
+            .clone()
+            .execute_tool(params, scope, "digest".into(), admission, Some(1000))
+            .await
+            .unwrap();
+        let stored = service.stored_batch("held").await.unwrap().unwrap();
+        assert_eq!(
+            stored.admitted_at_ms, 1000,
+            "execution must not reset the admission anchor"
+        );
+        assert_eq!(stored.args_digest, "digest");
+        assert_eq!(stored.outcomes.len(), 1);
+        assert_eq!(
+            catalog.reads.load(Ordering::SeqCst),
+            1,
+            "execution must not reread the admitted catalog row"
+        );
+        clock.store(
+            1000 + broca_store::system_one::RETENTION_MS - 1,
+            Ordering::SeqCst,
+        );
+        assert_eq!(service.sweep().await.unwrap(), 0);
+        clock.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(service.sweep().await.unwrap(), 1);
+    }
+}

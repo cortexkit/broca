@@ -275,6 +275,7 @@ impl AnthropicNormalizer {
             }
             "content_block_delta" => {
                 let idx = block_index(v);
+                let part = self.blocks.range(..idx).count() as u64;
                 let delta = v.get("delta");
                 let dty = delta
                     .and_then(|d| d.get("type"))
@@ -294,6 +295,8 @@ impl AnthropicNormalizer {
                             text.push_str(t);
                         }
                         out.push(NormalizedEvent::Display(DisplayEvent::TextDelta {
+                            mid: None,
+                            part: Some(part),
                             message_id: mid,
                             tool_call_id: None,
                             delta: t.to_owned(),
@@ -308,6 +311,8 @@ impl AnthropicNormalizer {
                             text.push_str(t);
                         }
                         out.push(NormalizedEvent::Display(DisplayEvent::ReasoningDelta {
+                            mid: None,
+                            part: Some(part),
                             message_id: mid,
                             delta: t.to_owned(),
                         }));
@@ -344,6 +349,8 @@ impl AnthropicNormalizer {
                             _ => return Ok(out),
                         };
                         out.push(NormalizedEvent::Display(DisplayEvent::ToolInputDelta {
+                            mid: None,
+                            part: Some(part),
                             tool_call_id: tcid,
                             delta: p.to_owned(),
                         }));
@@ -707,6 +714,20 @@ pub(crate) fn classify_error(code: Option<&str>, status: Option<u16>) -> Option<
         Some("invalid_request_error") | Some("not_found_error") => Some(ErrorClass::Permanent),
         _ => None,
     }
+}
+
+/// Whether an OpenAI error says the organization's prepaid credit or quota is used up, so the
+/// credential that sent it cannot be served until someone pays. OpenAI says so in three ways: the
+/// older `insufficient_quota` code, the `credit_balance_exhausted` code its API sends when a
+/// prepaid balance reaches zero, or an error whose `type` is `insufficient_quota` whatever its
+/// code. `code` and `error_type` are the error object's own `code` and `type` fields, from an HTTP
+/// error body or from an in-band stream error event alike. Callers relabel a match
+/// [`broca_protocol::error::BILLING_EXHAUSTED`], which is permanent and names the credential.
+pub(crate) fn openai_billing_exhausted(code: Option<&str>, error_type: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("insufficient_quota" | "credit_balance_exhausted")
+    ) || error_type == Some("insufficient_quota")
 }
 
 /// Apply the provider-code table before generic HTTP-status defaults. An in-band error with no

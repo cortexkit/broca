@@ -1,6 +1,6 @@
 //! Where broca's operator-edited config files live — resolved ONCE, for every file.
 //!
-//! Cache, billing, auth-method and vault-handle loaders share this resolver so a new home
+//! Cache, billing, auth-method and dev-tools handle loaders share this resolver so a new home
 //! variable cannot move only some of their files. Ignoring a configured home can silently
 //! select shipped defaults instead of an operator's overrides.
 //!
@@ -85,17 +85,12 @@ pub fn config_home_with(env: impl Fn(&str) -> Option<OsString>) -> ConfigHome {
     ConfigHome::Unresolvable
 }
 
-/// `config_home_with` against the real process environment.
-pub fn config_home() -> ConfigHome {
-    config_home_with(|key| std::env::var_os(key))
-}
-
 /// The path to one config file, or `Unresolvable` if no config home can be formed.
 ///
 /// `explicit_env` is the file's own override (`BROCA_CONFIG_PATH` and friends) and stays
 /// EXCLUSIVE: a file override never falls back to a discovered path. Its provenance travels
 /// with the path so loaders can distinguish an absent optional file from a broken override.
-/// Auth-method and vault-handle loaders reject missing overrides. The `broca.jsonc` loaders
+/// Auth-method and dev-tools handle loaders reject missing overrides. The `broca.jsonc` loaders
 /// keep shipped defaults for a missing file; boot refuses a missing named `broca.jsonc` first,
 /// through [`require_explicit_file`].
 pub fn config_file_with(
@@ -315,16 +310,13 @@ mod tests {
         );
     }
 
-    /// Every config file resolves through ONE ladder. This is the regression guard for the
-    /// three-copies state: a rung added here reaches all of them, and a file that grows its own
-    /// resolver fails this by diverging from its siblings.
+    /// Config files share one ladder so a home-variable change cannot move only some files.
     #[test]
     fn every_config_file_shares_one_directory() {
         let env = env_of(&[("XDG_CONFIG_HOME", "/xdg")]);
         for (var, file) in [
             ("BROCA_CONFIG_PATH", "broca.jsonc"),
             ("BROCA_AUTH_METHODS_PATH", "auth-methods.json"),
-            ("BROCA_VAULT_HANDLES_PATH", "vault-handles.json"),
         ] {
             assert_eq!(
                 config_file_with(&env, var, file),
@@ -344,7 +336,7 @@ mod config_loading {
     use crate::auth_routing::{AuthMethod, MethodConfig, METHODS_PATH_ENV};
     use crate::billing_routing::ChargeBasisTable;
     use crate::cache_routing::{CacheTtlTable, CONFIG_PATH_ENV};
-    use crate::vault_config::{VaultHandles, HANDLES_PATH_ENV};
+    use crate::vault_config::VaultHandles;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     struct Fixture(PathBuf);
@@ -448,59 +440,19 @@ mod config_loading {
     }
 
     #[test]
-    fn vault_missing_is_fatal_for_both_origins() {
-        let fixture = Fixture::new();
-        for explicit in [false, true] {
-            assert!(
-                VaultHandles::load_resolved(fixture.resolve(
-                    HANDLES_PATH_ENV,
-                    "vault-handles.json",
-                    explicit
-                ))
-                .is_err(),
-                "explicit={explicit}"
-            );
-        }
-    }
-
-    #[test]
-    fn vault_explicit_missing_names_override_and_path() {
-        let fixture = Fixture::new();
-        let error = VaultHandles::load_resolved(fixture.resolve(
-            HANDLES_PATH_ENV,
-            "vault-handles.json",
-            true,
-        ))
-        .err()
-        .expect("missing explicit handle file must fail")
-        .to_string();
-        assert!(error.contains(HANDLES_PATH_ENV), "{error}");
-        assert!(
-            error.contains(&fixture.path("vault-handles.json").display().to_string()),
-            "{error}"
-        );
-    }
-
-    #[test]
     fn vault_parse_diagnostic_never_echoes_handle_contents() {
         let fixture = Fixture::new();
         let secret = "ckh_secret_config_loading_sentinel";
         fixture.write(
-            "vault-handles.json",
+            "handle-map.json",
             &format!(r#"{{"handles":{{}},"{secret}":1}}"#),
         );
-        for explicit in [false, true] {
-            let error = VaultHandles::load_resolved(fixture.resolve(
-                HANDLES_PATH_ENV,
-                "vault-handles.json",
-                explicit,
-            ))
+        let error = VaultHandles::load(&fixture.path("handle-map.json"))
             .err()
             .expect("unknown field must fail parsing")
             .to_string();
-            assert!(error.contains("parse vault handle file"), "{error}");
-            assert!(!error.contains(secret), "parse diagnostic leaked a handle");
-        }
+        assert!(error.contains("parse vault handle file"), "{error}");
+        assert!(!error.contains(secret), "parse diagnostic leaked a handle");
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //! existed. The golden file holds the canonical bytes of every request of a two-episode session
 //! (a system prompt, failing tool calls that draw loop guidance, an appended episode), as the
 //! build before compaction (`122fe3a7`) rendered them; this build must render the same.
-//! `BROCA_WRITE_NON_COMPACTION_GOLDEN=1` rewrites the file, for the reference build only.
+//! The ignored `generate_non_compaction_request_bytes` test writes the golden explicitly;
+//! run it only on the reference build, never as part of verification.
 
 use std::sync::{Arc, Mutex};
 
@@ -95,6 +96,7 @@ fn text_step(id: &str, text: &str) -> Vec<NormalizedEvent> {
 
 fn request(run: &str, dir: &std::path::Path, text: &str) -> RunRequest {
     RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -176,8 +178,7 @@ const GOLDEN: &str = concat!(
     "/tests/fixtures/non_compaction_request_bytes.json"
 );
 
-#[tokio::test]
-async fn a_session_without_compaction_renders_the_bytes_it_rendered_before_compaction() {
+async fn session_request_bytes() -> Vec<String> {
     let dir = broca_test_support::scratch_root().join(format!(
         "non-compaction-request-bytes-{}",
         std::process::id()
@@ -216,10 +217,19 @@ async fn a_session_without_compaction_renders_the_bytes_it_rendered_before_compa
         .collect();
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(sent.len(), 6);
-    if std::env::var_os("BROCA_WRITE_NON_COMPACTION_GOLDEN").is_some() {
-        std::fs::write(GOLDEN, serde_json::to_string_pretty(&sent).unwrap() + "\n").unwrap();
-        return;
-    }
+    sent
+}
+
+#[tokio::test]
+#[ignore = "writes the byte oracle; invoke explicitly on the reference build only"]
+async fn generate_non_compaction_request_bytes() {
+    let sent = session_request_bytes().await;
+    std::fs::write(GOLDEN, serde_json::to_string_pretty(&sent).unwrap() + "\n").unwrap();
+}
+
+#[tokio::test]
+async fn a_session_without_compaction_renders_the_bytes_it_rendered_before_compaction() {
+    let sent = session_request_bytes().await;
     let golden: Vec<String> =
         serde_json::from_str(&std::fs::read_to_string(GOLDEN).unwrap()).unwrap();
     assert_eq!(sent.len(), golden.len());

@@ -22,6 +22,9 @@ use broca_protocol::content::Message;
 #[derive(Default)]
 struct State {
     pending: Vec<Message>,
+    protected: Vec<Message>,
+    next_protected: Vec<Message>,
+    protected_step: Option<broca_protocol::StepId>,
     closed: bool,
     /// Queued sends with an ordered `delivery` list, in queue order, that this turn may still
     /// deliver (see `crate::delivery_order`). The actor adds them and the run takes them, both
@@ -72,20 +75,90 @@ impl SteerInbox {
     /// into it.
     pub fn deliver(
         &self,
-        mut messages: Vec<Message>,
+        messages: Vec<Message>,
         record: impl FnOnce() -> Option<Vec<broca_protocol::tags::MessageTags>>,
     ) -> bool {
+        self.deliver_checked(messages, |_| Ok::<_, std::convert::Infallible>(()), record)
+            .unwrap()
+    }
+
+    /// Check the new input together with every still-protected input under the
+    /// same lock as its Steered append. Storage barriers must happen before entry.
+    pub fn deliver_checked<E>(
+        &self,
+        mut messages: Vec<Message>,
+        check: impl FnOnce(&[Message]) -> Result<(), E>,
+        record: impl FnOnce() -> Option<Vec<broca_protocol::tags::MessageTags>>,
+    ) -> Result<bool, E> {
         let mut state = self.lock();
         if state.closed {
-            return false;
+            return Ok(false);
         }
+        let ordered = state
+            .ordered
+            .iter()
+            .filter(|send| {
+                send.order
+                    .modes
+                    .contains(&broca_protocol::DeliveryMode::Steer)
+            })
+            .flat_map(|send| send.input.iter());
+        let protected: Vec<_> = state
+            .protected
+            .iter()
+            .chain(&state.next_protected)
+            .chain(&state.pending)
+            .chain(ordered)
+            .chain(&messages)
+            .cloned()
+            .collect();
+        check(&protected)?;
         if let Some(tags) = record() {
             for (message, tags) in messages.iter_mut().zip(&tags) {
                 crate::tags::attach(message, Some(tags));
             }
         }
         state.pending.extend(messages);
-        true
+        Ok(true)
+    }
+
+    pub fn seed_protected(&self, messages: Vec<Message>) {
+        self.lock().next_protected = messages;
+    }
+
+    /// Admission checks the initial input together with ordered steers already
+    /// queued for the episode's first step, before RunStarted can admit the bundle.
+    pub fn protected_inputs(&self) -> Vec<Message> {
+        let state = self.lock();
+        let ordered = state
+            .ordered
+            .iter()
+            .filter(|send| {
+                send.order
+                    .modes
+                    .contains(&broca_protocol::DeliveryMode::Steer)
+            })
+            .flat_map(|send| send.input.iter());
+        state
+            .protected
+            .iter()
+            .chain(&state.next_protected)
+            .chain(&state.pending)
+            .chain(ordered)
+            .cloned()
+            .collect()
+    }
+
+    pub fn seed_replayed_protection(
+        &self,
+        current: Vec<Message>,
+        pending: Vec<Message>,
+        step: Option<broca_protocol::StepId>,
+    ) {
+        let mut state = self.lock();
+        state.protected = current;
+        state.next_protected = pending;
+        state.protected_step = step;
     }
 
     /// Take every queued message and call `record` (which appends `StepStarted`) under the same
@@ -93,6 +166,8 @@ impl SteerInbox {
     pub fn take_at_step(&self, record: impl FnOnce()) -> Vec<Message> {
         let mut state = self.lock();
         let taken = std::mem::take(&mut state.pending);
+        state.protected = std::mem::take(&mut state.next_protected);
+        state.protected.extend(taken.iter().cloned());
         record();
         taken
     }
@@ -178,17 +253,55 @@ impl SteerInbox {
         send: crate::delivery_order::OrderedSend,
         record: impl FnOnce(Option<&broca_protocol::SubmissionId>),
     ) -> OrderedAcceptance {
+        self.accept_ordered_checked(send, |_| Ok::<_, std::convert::Infallible>(()), record)
+            .unwrap()
+    }
+
+    pub fn accept_ordered_checked<E>(
+        &self,
+        send: crate::delivery_order::OrderedSend,
+        check: impl FnOnce(&[Message]) -> Result<(), E>,
+        record: impl FnOnce(Option<&broca_protocol::SubmissionId>),
+    ) -> Result<OrderedAcceptance, E> {
         let mut state = self.lock();
         if state.closed {
-            return OrderedAcceptance::Closed;
+            return Ok(OrderedAcceptance::Closed);
         }
         let replaced = state.ordered.iter().position(|queued| {
             queued.replaced_by(send.principal.as_ref(), send.order.dedupe_key.as_deref())
         });
+        if send
+            .order
+            .modes
+            .contains(&broca_protocol::DeliveryMode::Steer)
+        {
+            let ordered = state
+                .ordered
+                .iter()
+                .enumerate()
+                .filter(|(at, queued)| {
+                    Some(*at) != replaced
+                        && queued
+                            .order
+                            .modes
+                            .contains(&broca_protocol::DeliveryMode::Steer)
+                })
+                .flat_map(|(_, queued)| queued.input.iter());
+            let protected: Vec<_> = state
+                .protected
+                .iter()
+                .chain(&state.next_protected)
+                .chain(&state.pending)
+                .chain(ordered)
+                .chain(&send.input)
+                .cloned()
+                .collect();
+            check(&protected)?;
+        }
         let superseded = replaced.map(|at| state.ordered.remove(at).submission_id);
         record(superseded.as_ref());
         state.ordered.push(send);
-        OrderedAcceptance::Queued { superseded }
+        Ok(OrderedAcceptance::Queued { superseded })
     }
 
     /// The ordered sends this turn delivered or ended since the last call.
@@ -235,6 +348,30 @@ impl SteerInbox {
             Vec<broca_wal::WalRecord>,
         ) -> Vec<Option<Vec<broca_protocol::tags::MessageTags>>>,
     ) -> Option<Vec<Message>> {
+        self.take_ordered(run_id, now_ms, None, record)
+    }
+
+    pub fn try_take_at_step_ordered_for(
+        &self,
+        run_id: &broca_protocol::RunId,
+        now_ms: u64,
+        step: broca_protocol::StepId,
+        record: impl FnOnce(
+            Vec<broca_wal::WalRecord>,
+        ) -> Vec<Option<Vec<broca_protocol::tags::MessageTags>>>,
+    ) -> Option<Vec<Message>> {
+        self.take_ordered(run_id, now_ms, Some(step), record)
+    }
+
+    fn take_ordered(
+        &self,
+        run_id: &broca_protocol::RunId,
+        now_ms: u64,
+        step: Option<broca_protocol::StepId>,
+        record: impl FnOnce(
+            Vec<broca_wal::WalRecord>,
+        ) -> Vec<Option<Vec<broca_protocol::tags::MessageTags>>>,
+    ) -> Option<Vec<Message>> {
         use crate::delivery_order::{choose_mode, ended, steered, Boundary};
         let mut state = self.lock();
         if self.boundary_cancel.is_cancelled() {
@@ -275,6 +412,13 @@ impl SteerInbox {
             }
             taken.extend(messages);
         }
+        if step.is_none() || state.protected_step != step {
+            state.protected.clear();
+        }
+        state.protected_step = step;
+        let pending = std::mem::take(&mut state.next_protected);
+        state.protected.extend(pending);
+        state.protected.extend(taken.iter().cloned());
         Some(taken)
     }
 
@@ -380,6 +524,7 @@ mod tests {
         key: Option<&str>,
     ) -> crate::delivery_order::OrderedSend {
         crate::delivery_order::OrderedSend {
+            admitted_at_ms: None,
             submission_id: broca_protocol::SubmissionId(id.into()),
             order: broca_protocol::DeliveryOrder {
                 modes: modes.to_vec(),
@@ -490,6 +635,7 @@ mod retract_tests {
 
     fn queued(mode: DeliveryMode) -> crate::delivery_order::OrderedSend {
         crate::delivery_order::OrderedSend {
+            admitted_at_ms: None,
             submission_id: SubmissionId("queued".into()),
             order: broca_protocol::DeliveryOrder {
                 modes: vec![mode],
@@ -558,5 +704,111 @@ mod retract_tests {
                 "delivery already won; no retraction may be recorded"
             ))
             .unwrap());
+    }
+}
+
+#[cfg(test)]
+mod media_gate_tests {
+    use super::*;
+    use broca_protocol::content::Role;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn input() -> Vec<Message> {
+        vec![Message::new(Role::User, vec![])]
+    }
+    fn cap_one(protected: &[Message]) -> Result<(), &'static str> {
+        if protected.len() > 1 {
+            Err("request_cap")
+        } else {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn later_steer_is_refused_before_append_until_protection_ends() {
+        let inbox = SteerInbox::new();
+        let appends = AtomicUsize::new(0);
+        let append = || {
+            appends.fetch_add(1, Ordering::SeqCst);
+            None
+        };
+        assert_eq!(inbox.deliver_checked(input(), cap_one, append), Ok(true));
+        assert_eq!(
+            inbox.deliver_checked(input(), cap_one, append),
+            Err("request_cap")
+        );
+        assert_eq!(appends.load(Ordering::SeqCst), 1);
+        assert_eq!(inbox.take_at_step(|| {}).len(), 1);
+        assert_eq!(
+            inbox.deliver_checked(input(), cap_one, append),
+            Err("request_cap")
+        );
+        assert!(inbox.take_at_step(|| {}).is_empty());
+        assert_eq!(inbox.deliver_checked(input(), cap_one, append), Ok(true));
+        assert_eq!(appends.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn replayed_first_step_protects_input_across_retry_but_not_the_next_step() {
+        let inbox = SteerInbox::new();
+        inbox.seed_replayed_protection(input(), Vec::new(), Some(broca_protocol::StepId(1)));
+        inbox
+            .try_take_at_step_ordered_for(
+                &broca_protocol::RunId("r".into()),
+                0,
+                broca_protocol::StepId(1),
+                |_| vec![],
+            )
+            .unwrap();
+        assert_eq!(
+            inbox.deliver_checked(input(), cap_one, || None),
+            Err("request_cap")
+        );
+        inbox
+            .try_take_at_step_ordered_for(
+                &broca_protocol::RunId("r".into()),
+                0,
+                broca_protocol::StepId(2),
+                |_| vec![],
+            )
+            .unwrap();
+        assert_eq!(inbox.deliver_checked(input(), cap_one, || None), Ok(true));
+    }
+
+    #[test]
+    fn concurrent_steers_share_one_atomic_admission_budget() {
+        let inbox = SteerInbox::new();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let appends = Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let inbox = inbox.clone();
+                let barrier = barrier.clone();
+                let appends = appends.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    inbox.deliver_checked(input(), cap_one, || {
+                        appends.fetch_add(1, Ordering::SeqCst);
+                        None
+                    })
+                })
+            })
+            .collect();
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(
+            results.iter().filter(|result| **result == Ok(true)).count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == Err("request_cap"))
+                .count(),
+            1
+        );
+        assert_eq!(appends.load(Ordering::SeqCst), 1);
     }
 }

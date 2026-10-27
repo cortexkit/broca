@@ -141,6 +141,7 @@ struct Exec {
     store: Arc<broca_store::SqliteStore>,
     compactor: Arc<dyn CompactionPlane>,
     model: Arc<Model>,
+    completed: Arc<Semaphore>,
 }
 
 #[async_trait]
@@ -162,7 +163,7 @@ impl RunExecutor for Exec {
         let tools =
             StubToolPlane::new().with_tool("lookup", |_| StubReply::ExecError("failed".into()));
         let store = job.materialized_store(self.store.clone());
-        broca_core::run_loop_on_writer_admitted_with_prior_snapshot(
+        let result = broca_core::run_loop_on_writer_admitted_with_prior_snapshot(
             job.req,
             &job.writer,
             mode,
@@ -176,17 +177,22 @@ impl RunExecutor for Exec {
             job.on_admitted,
             Some(&job.prior_snapshot),
         )
-        .await
+        .await;
+        self.completed.add_permits(1);
+        result
     }
 }
 
 struct Rig {
     dir: std::path::PathBuf,
     wal: Arc<FileWalStore>,
+    store: Arc<broca_store::SqliteStore>,
     registry: LineageRegistry,
+    opener: Arc<dyn broca_module::registry::LineageOpener>,
     key: BindIdentity,
     model: Arc<Model>,
     prompts: Mutex<mpsc::UnboundedReceiver<Vec<Message>>>,
+    completed: Arc<Semaphore>,
 }
 
 fn manifest() -> Arc<PlanManifest> {
@@ -237,11 +243,13 @@ impl Rig {
             prompts: prompt_tx,
             finish: Semaphore::new(0),
         });
+        let completed = Arc::new(Semaphore::new(0));
         let exec = Arc::new(Exec {
             wal: wal.clone(),
             store: store.clone(),
             compactor,
             model: model.clone(),
+            completed: completed.clone(),
         });
         let opener = Arc::new(
             DefaultOpener::new(
@@ -253,15 +261,19 @@ impl Rig {
             .with_run_index(store.clone())
             .with_materialized_store(store.clone()),
         );
-        let registry = LineageRegistry::new_with_reader(opener, wal.clone(), Some(store));
+        let registry =
+            LineageRegistry::new_with_reader(opener.clone(), wal.clone(), Some(store.clone()));
         let key = BindIdentity::new(dir.clone(), "caller", "session");
         Self {
             dir,
             wal,
+            store,
             registry,
+            opener,
             key,
             model,
             prompts: Mutex::new(prompt_rx),
+            completed,
         }
     }
 
@@ -270,16 +282,22 @@ impl Rig {
     }
 
     async fn send_manifest(&self, manifest: Option<Arc<PlanManifest>>) {
+        let result = self.submit("run", manifest).await;
+        assert!(matches!(result, SendOutcome::Active { .. }), "{result:?}");
+    }
+
+    /// Send under `run_id`, carrying a plan with `manifest` when one is given, and return the
+    /// coordinator's answer.
+    async fn submit(&self, run_id: &str, manifest: Option<Arc<PlanManifest>>) -> SendOutcome {
         let request = serde_json::from_value(json!({
             "model":{"provider_module_id":"stub","model_id":"model"},
             "input":[text(Role::User, "user")], "context_limit":100000
         }))
         .unwrap();
-        let result = self
-            .registry
+        self.registry
             .route_submission_with_plan(
                 &self.key,
-                RunId("run".into()),
+                RunId(run_id.into()),
                 request,
                 RunKind::FreshOrResume,
                 SendKey::RunId,
@@ -292,8 +310,12 @@ impl Rig {
                 }),
             )
             .await
-            .unwrap();
-        assert!(matches!(result, SendOutcome::Active { .. }), "{result:?}");
+            .unwrap()
+    }
+
+    /// Every WAL record the session holds.
+    fn records(&self) -> Vec<broca_wal::FramedRecord> {
+        broca_core::WalStore::read_records(self.wal.as_ref(), &self.key).unwrap()
     }
 
     async fn prompt(&self) -> Vec<Message> {
@@ -356,6 +378,68 @@ async fn setup_head_renders_and_the_notice_is_durable_before_the_model_call() {
     rig.close().await;
 }
 
+/// A session enrolls in compaction only on its first episode, when it has no stored messages
+/// yet: a session whose first episode ran without a plan cannot take one naming a compaction
+/// provider later. Its send is refused `plan_drift` (no frozen plan, the plan it sent) and writes
+/// nothing, so a long session can never start compacting over the whole history it already holds.
+#[tokio::test]
+async fn a_session_first_run_without_a_plan_cannot_enroll_in_compaction_later() {
+    let rig = Rig::new(0);
+    rig.send(false).await;
+    // The planless run holds its model call, so its WAL is quiet while the plan is refused.
+    rig.prompt().await;
+    let before = rig.records();
+    let refused = rig.submit("later", Some(manifest())).await;
+    let SendOutcome::PlanRefused(refusal) = refused else {
+        panic!("a later compaction plan must be refused: {refused:?}");
+    };
+    assert_eq!(refusal.code(), "plan_drift");
+    assert_eq!(refusal.detail(), json!({"sent": "plan"}));
+    assert_eq!(rig.records(), before, "the refused send wrote nothing");
+    rig.close().await;
+}
+
+/// An imported session froze no plan on its import episode, so a plan naming a compaction
+/// provider is refused `plan_drift` on its first send after the import, and nothing is written.
+#[tokio::test]
+async fn an_imported_session_cannot_enroll_in_compaction() {
+    let rig = Rig::new(0);
+    let imported = rig
+        .registry
+        .route_import(
+            &rig.key,
+            broca_core::ImportRequest {
+                project_id: None,
+                principal: None,
+                run_id: RunId("import".into()),
+                session: rig.key.clone(),
+                messages: vec![
+                    text(Role::User, "imported question"),
+                    text(Role::Assistant, "imported answer"),
+                ],
+                origin: broca_core::ImportOrigin {
+                    source_ref: "test:compaction-enrollment".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(imported, broca_module::actor::ImportOutcome::Imported(_)),
+        "{imported:?}"
+    );
+    let before = rig.records();
+    assert!(!before.is_empty());
+    let refused = rig.submit("after-import", Some(manifest())).await;
+    let SendOutcome::PlanRefused(refusal) = refused else {
+        panic!("a compaction plan after an import must be refused: {refused:?}");
+    };
+    assert_eq!(refusal.code(), "plan_drift");
+    assert_eq!(refusal.detail(), json!({"sent": "plan"}));
+    assert_eq!(rig.records(), before, "the refused send wrote nothing");
+    rig.close().await;
+}
+
 /// While a run that renders tags waits for its first Setup answer, which may anchor its numbers
 /// at a checkpoint, `session.read` and `session.resolve` refuse `transient` and write nothing.
 /// Once the answer is durable they answer, with the checkpoint's numbers: no read ever shows a
@@ -405,6 +489,105 @@ async fn reads_wait_out_the_setup_answer_and_never_show_a_number_that_changes() 
         vec!["§501§".to_owned()],
         "the prompt shows the checkpoint's number"
     );
+    rig.close().await;
+}
+
+#[tokio::test]
+async fn reads_after_projected_setup_do_not_wait_again_in_a_later_run() {
+    use broca_core::MaterializedStore;
+
+    let rig = Rig::new(0);
+    rig.send_manifest(Some(manifest_rendering(true))).await;
+    rig.prompt().await;
+    rig.model.finish.add_permits(1);
+    broca_test_support::event_timeout("first run completion", rig.completed.acquire(), || {
+        format!("session={:?}", rig.key)
+    })
+    .await
+    .expect("first run completes")
+    .unwrap()
+    .forget();
+
+    let setup_seq = rig
+        .records()
+        .iter()
+        .find_map(|frame| {
+            matches!(
+                frame.record,
+                broca_wal::WalRecord::CompactionMessage {
+                    kind: broca_wal::CompactionMessageKind::Setup,
+                    ..
+                }
+            )
+            .then_some(frame.seq)
+        })
+        .expect("Setup is durable");
+    let snapshot = rig
+        .store
+        .read_page_with_watermark(&rig.key, Some(0), 1, broca_core::ReadView::Raw)
+        .unwrap();
+    assert!(snapshot.watermark_seq >= setup_seq);
+
+    let outcome = rig.submit("run2", None).await;
+    assert!(
+        matches!(
+            outcome,
+            SendOutcome::Active { .. } | SendOutcome::Pending { .. }
+        ),
+        "{outcome:?}"
+    );
+    rig.prompt().await;
+    let snapshot = rig
+        .store
+        .read_page_with_watermark(&rig.key, Some(0), 1, broca_core::ReadView::Raw)
+        .unwrap();
+    let tail: Vec<_> = rig
+        .records()
+        .into_iter()
+        .filter(|frame| frame.seq > snapshot.watermark_seq)
+        .collect();
+    assert!(tail.iter().any(|frame| matches!(
+        &frame.record,
+        broca_wal::WalRecord::RunStarted { run_id, .. } if run_id.0 == "run2"
+    )));
+    assert!(!tail.iter().any(|frame| matches!(
+        frame.record,
+        broca_wal::WalRecord::CompactionMessage {
+            kind: broca_wal::CompactionMessageKind::Setup,
+            ..
+        }
+    )));
+    let read = rig
+        .registry
+        .read(SessionReadRequest::new(rig.key.clone(), Some(0), Some(1)))
+        .await;
+    assert!(
+        read.is_ok(),
+        "a durable Setup cannot become pending again: {read:?}"
+    );
+    let read = read.unwrap();
+    assert_eq!(read.messages.len(), 1);
+    assert_eq!(
+        read.messages[0]
+            .tags
+            .iter()
+            .filter_map(|row| row.tag.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["§1§"]
+    );
+    let closed = LineageRegistry::new_with_reader(
+        rig.opener.clone(),
+        rig.wal.clone(),
+        Some(rig.store.clone()),
+    );
+    let read = closed
+        .read(SessionReadRequest::new(rig.key.clone(), Some(0), Some(1)))
+        .await;
+    assert!(
+        read.is_ok(),
+        "the closed-actor read must use the same Setup fact: {read:?}"
+    );
+    assert_eq!(closed.slot_counts().open, 0, "reads must not open an actor");
     rig.close().await;
 }
 

@@ -13,11 +13,11 @@ pub enum Event {
 /// Observe the actual handle's successful sync, rather than the caller's intent
 /// to sync. Skipping a helper's sync_all call therefore produces no success event.
 pub(crate) struct SyncFile<'a> {
-    inner: &'a std::fs::File,
+    inner: &'a crate::fs_ops::File,
     event: Event,
 }
 impl<'a> SyncFile<'a> {
-    pub(crate) fn new(inner: &'a std::fs::File, event: Event) -> Self {
+    pub(crate) fn new(inner: &'a crate::fs_ops::File, event: Event) -> Self {
         Self { inner, event }
     }
     pub(crate) fn sync_all(&self) -> io::Result<()> {
@@ -29,6 +29,13 @@ impl<'a> SyncFile<'a> {
         self.inner.sync_all()?;
         observe(self.event.clone())
     }
+}
+/// Only Unix syncs directories (see `migration::sync_dir`), so only Unix records the event.
+#[cfg(unix)]
+pub(crate) fn sync_dir(path: &std::path::Path) -> io::Result<()> {
+    observe(Event::BeforeDirectorySync(path.to_owned()))?;
+    crate::fs_ops::sync_dir(path)?;
+    observe(Event::DirectorySync(path.to_owned()))
 }
 type Hook = Box<dyn FnMut(Event) -> io::Result<()>>;
 thread_local! {

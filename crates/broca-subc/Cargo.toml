@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 description = "The real subc tool-plane: a SubcToolPlane (2nd ToolPlane impl) that dispatches the loop's tool calls runner->subc->AFT over an authenticated direct consumer connection."
 
+[features]
+test-attachments = ["broca-core/test-attachments", "broca-protocol/test-attachments"]
+
 [dependencies]
 broca-diagnostics = { path = "../broca-diagnostics" }
 broca-core = { path = "../broca-core" }
@@ -30,8 +33,11 @@ tokio.workspace = true
 tokio-util.workspace = true
 async-trait.workspace = true
 futures.workspace = true
+base64 = "=0.22.1"
+sha2.workspace = true
 
 [dev-dependencies]
+broca-module-serve = { path = "../broca-module-serve" }
 cortexkit-role-tool-provider-conformance.workspace = true
 subc-client-rs = { workspace = true }
 broca-wal = { path = "../broca-wal" }

@@ -31,6 +31,7 @@ fn claim<'a>(
         identity: digest,
         body_digest: digest,
         frozen_row: "{}",
+        scope: test_scope(),
         ceiling_nanos: ceiling,
         owner,
         now_ms: now,
@@ -299,9 +300,125 @@ fn the_store_is_owner_only_and_keeps_no_wal_sidecar() {
         .unwrap();
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
-    let siblings: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+    let mut siblings: Vec<String> = std::fs::read_dir(path.parent().unwrap())
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(siblings, vec!["system-one.db".to_string()], "{siblings:?}");
+    siblings.sort();
+    let owner_file = store.owner_path("p1").unwrap();
+    let mut expected = vec![
+        "system-one.db".to_string(),
+        owner_file
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    expected.sort();
+    assert_eq!(siblings, expected, "{siblings:?}");
+    assert!(std::fs::read(&owner_file).unwrap().is_empty());
+    assert_eq!(
+        std::fs::metadata(owner_file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+fn test_scope() -> &'static BatchScope {
+    static SCOPE: std::sync::OnceLock<BatchScope> = std::sync::OnceLock::new();
+    SCOPE.get_or_init(|| BatchScope::Run {
+        agent_id: "agent".into(),
+        run_id: "run".into(),
+    })
+}
+
+#[test]
+fn paid_outcome_and_outbox_survive_reopen_and_publish_only_once() {
+    let path = scratch("paid-recovery");
+    let export_path = path.with_file_name("run-index.db");
+    let export = crate::SqliteStore::open(&export_path).unwrap();
+    let context = FactContext {
+        source_instance_id: export.source_instance_id().into(),
+        provider: "typesafe".into(),
+        model: "typesafe/jev-1.13.0".into(),
+        auth_selection: Some("apikey:typesafe:paid".into()),
+        account_ref: Some("paid".into()),
+        charge_basis: broca_core::ChargeBasis::MeteredApi,
+        charge_basis_mapping_version: 5,
+        charge_basis_overrides: "none".into(),
+    };
+    {
+        let store = SystemOneStore::open(&path).unwrap();
+        assert_eq!(
+            store
+                .claim(&claim("paid", "digest", None, "dead", 1))
+                .unwrap(),
+            Claimed::Fresh
+        );
+        assert!(store
+            .record_paid(
+                ROLE,
+                "paid",
+                "dead",
+                &answered(0, "{}", Some(100)),
+                &PaidRecord {
+                    spend_nanos: 4200,
+                    now_ms: 2,
+                    fact: Some(&context)
+                }
+            )
+            .unwrap());
+    }
+    let store = SystemOneStore::open(&path).unwrap();
+    assert_eq!(store.release_abandoned().unwrap(), 1);
+    let pending = store.pending_facts().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].fact.run_id.as_deref(), Some("run"));
+    assert_eq!(pending[0].fact.usage.input_tokens, Some(100));
+    assert!(export.emit_system_one_fact(&pending[0].fact).unwrap());
+    drop(export);
+    // A crash after export committed but before the outbox was acknowledged replays the same
+    // bytes. The unique export identity, not an in-memory sent flag, makes that replay harmless.
+    let export = crate::SqliteStore::open(&export_path).unwrap();
+    assert!(!export.emit_system_one_fact(&pending[0].fact).unwrap());
+    let page = export.read_export_page(None, 100).unwrap();
+    assert_eq!(page.facts.len(), 1);
+    assert_eq!(export.export_high_water(), 1);
+    store.acknowledge_fact(&pending[0].fact.fact_id).unwrap();
+    assert!(store.pending_facts().unwrap().is_empty());
+    let record = resumed(
+        store
+            .claim(&claim("paid", "digest", None, "new", 3))
+            .unwrap(),
+    );
+    assert_eq!(record.outcomes.len(), 1);
+    assert_eq!(record.spent_nanos, 4200);
+    store.release(ROLE, "paid", "new").unwrap();
+    // After retention the same batch id is new paid work, so its fact must not collide with
+    // the earlier admission's immutable fact.
+    store.sweep(RETENTION_MS + 2).unwrap();
+    assert_eq!(
+        store
+            .claim(&claim("paid", "digest", None, "new", RETENTION_MS + 3))
+            .unwrap(),
+        Claimed::Fresh
+    );
+    assert!(store
+        .record_paid(
+            ROLE,
+            "paid",
+            "new",
+            &answered(0, "{}", None),
+            &PaidRecord {
+                spend_nanos: 9000,
+                now_ms: RETENTION_MS + 4,
+                fact: Some(&context)
+            }
+        )
+        .unwrap());
+    let next = store.pending_facts().unwrap();
+    assert_eq!(next.len(), 1);
+    assert_ne!(next[0].fact.fact_id, pending[0].fact.fact_id);
+    assert_eq!(next[0].fact.usage.input_tokens, None);
+    assert!(export.emit_system_one_fact(&next[0].fact).unwrap());
+    assert_eq!(export.read_export_page(None, 100).unwrap().facts.len(), 2);
 }

@@ -23,8 +23,8 @@ use serde_json::Value;
 
 mod plan_manifest;
 pub use plan_manifest::{
-    FetchOutcome, FrozenDeclaration, FrozenHoldArgument, FrozenReply, OpaqueJson, PlanManifest,
-    ProviderFetch,
+    FetchOutcome, FrozenDeclaration, FrozenHoldArgument, FrozenProviderDeclarations,
+    FrozenReferenceSlot, FrozenReply, FrozenResultFormat, OpaqueJson, PlanManifest, ProviderFetch,
 };
 mod compaction;
 pub use compaction::{
@@ -114,6 +114,9 @@ pub struct HookOp {
 /// skippable: an older build would silently compute the wrong session from it. Such a record
 /// requires a must-understand feature through `required_features`, shipped in a reader
 /// release before any writer uses it, never reliance on the `Unknown` arm to hide it.
+/// `media-content/v1` is a same-release reader/writer exception: its writer raises the
+/// machine's feature floor before the first media frame. Placement and WAL open then refuse
+/// older builds by feature name, so rollback past that release is blocked after media is written.
 ///
 /// The EXHAUSTIVE matches on this enum name `Unknown` explicitly, so adding a variant still
 /// fails to compile at each of them until someone decides what it means there. Many other
@@ -135,6 +138,9 @@ pub enum WalRecord {
     /// into the immutable conversation prefix and opens a new one. It is
     /// run_id-authoritative.
     RunStarted {
+        /// Admission time of the input, preserved across queue drain and restart.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        written_at_ms: Option<u64>,
         /// Graceful restart policy frozen at admission. Absent means interrupt.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         on_restart: Option<broca_protocol::request::OnRestart>,
@@ -289,6 +295,9 @@ pub enum WalRecord {
     },
     /// The assembled assistant unit for a completed model step.
     ModelStepFinished {
+        /// End of the successful model attempt, before any post-assistant hooks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        written_at_ms: Option<u64>,
         step_id: StepId,
         assistant_message: Arc<AssistantMessage>,
         usage: Usage,
@@ -417,6 +426,10 @@ pub enum WalRecord {
     },
     /// The barrier's "before" half — ONLY for a call planned dispatchable.
     ToolDispatchIntent {
+        /// Unix milliseconds observed by broca when it queued this durable dispatch record.
+        /// Absent for records written before tool timing was recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dispatched_at_ms: Option<u64>,
         batch_id: BatchId,
         tool_call_id: ToolCallId,
         /// The tool name (replay/projection DISPLAY only — the reconstructed prompt
@@ -458,6 +471,9 @@ pub enum WalRecord {
     /// validation-failed / unavailable-before-send / policy-blocked. Resume NEVER
     /// re-dispatches these.
     ToolNoDispatch {
+        /// Unix milliseconds observed when broca recorded the no-dispatch decision.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dispatched_at_ms: Option<u64>,
         batch_id: BatchId,
         tool_call_id: ToolCallId,
         reason: NoDispatchReason,
@@ -477,6 +493,9 @@ pub enum WalRecord {
     /// repair. The embedded `ToolResult` is always provider-valid (so the
     /// reconstructed prompt is valid).
     ToolResult {
+        /// Unix milliseconds observed when broca recorded the result, not a replay-time clock.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finished_at_ms: Option<u64>,
         batch_id: BatchId,
         result: Arc<ToolResult>,
         outcome: DispatchOutcome,
@@ -508,6 +527,10 @@ pub enum WalRecord {
         /// flight, or a `decision_pending` result naming the question it filed. Replay renders
         /// `result` unchanged. Must-understand (feature `deferred-call/v1`): a reader that
         /// skipped it would lose the obligation to withdraw the call from the provider.
+        ///
+        /// Superseded by [`WalRecord::ToolCallProviderHeld`] and never written: a provider-held
+        /// call is to be recorded with that record instead, whose interim reply never reaches the
+        /// model. Always `None` on every record broca writes; kept so the reader still decodes it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider_held: Option<ProviderHeld>,
         /// Runner tags (feature `runner-tags/v1`): the per-part tags of the message(s)
@@ -669,6 +692,9 @@ pub enum WalRecord {
     /// dropping path. Consume/retract is unambiguous across a crash: the pending set is
     /// `Queued − Retracted − consumed-by-a-RunStarted`.
     Queued {
+        /// Admission time carried into the input record when this send is delivered.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        written_at_ms: Option<u64>,
         /// A shortened lineage retention in seconds, when this send changes it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retention: Option<u64>,
@@ -743,6 +769,9 @@ pub enum WalRecord {
     /// gated frame requiring [`crate::framing::STEER_QUEUE_FEATURE`] (see
     /// [`WalRecord::required_features`]), which such a build refuses as a newer writer.
     Steered {
+        /// Admission time of this input, not the later boundary that places it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        written_at_ms: Option<u64>,
         /// A shortened lineage retention in seconds, when this send changes it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retention: Option<u64>,
@@ -971,6 +1000,9 @@ pub enum WalRecord {
     /// `elicitation_id` is not stored either: it comes back from the filing, and after a crash
     /// re-filing under the same key returns it again.
     ToolCallDeferred {
+        /// Unix milliseconds observed when broca recorded the call's approval deferral.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deferred_at_ms: Option<u64>,
         batch_id: BatchId,
         call_id: ToolCallId,
         /// Who executes the call once approved. Always `broca` in this build.
@@ -999,6 +1031,10 @@ pub enum WalRecord {
     /// renders `closing_result` as the call's result, and no `ToolNoDispatch` or `ToolResult` is
     /// written for the call.
     ApprovalRecorded {
+        /// Unix milliseconds observed when a closing result was recorded. An approval that
+        /// permits dispatch has no closing result and leaves this absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        closed_at_ms: Option<u64>,
         call_key: String,
         call_id: ToolCallId,
         /// Absent only for an `unavailable` call whose question was never filed.
@@ -1075,6 +1111,45 @@ pub enum WalRecord {
         reason: Option<String>,
     },
 
+    // ── calls a tool provider holds past its reply (feature `provider-held/v1`) ──
+    //
+    // Must-understand: written only in a gated frame requiring
+    // `crate::framing::PROVIDER_HELD_FEATURE`, as is a `RunPaused` with `PauseReason::ToolHeld`.
+    // An older build that skipped this record would see a dispatched call without a result,
+    // class it indeterminate and seal the run Interrupted, losing a result the provider still
+    // owes.
+    /// A tool provider accepted the call and answered with a `held` marker (tool-provider
+    /// contract §4.1, `held-reply/v1`): the real result arrives later as a `late_results` entry
+    /// for `call_key` (§7). The writer must append and sync it before acting on anything else
+    /// in the reply. No production path writes it yet (see `framing::PROVIDER_HELD_FEATURE`).
+    ///
+    /// The call's `ToolDispatchIntent` precedes this record, and no terminal does: the call is
+    /// open but not indeterminate, because the provider confirmed it holds the call. Its later
+    /// terminal is an ordinary `ToolResult` under the same `batch_id`. The held reply's interim
+    /// content is never stored and never enters a prompt; this record adds nothing to the
+    /// transcript.
+    ToolCallProviderHeld {
+        batch_id: BatchId,
+        tool_call_id: ToolCallId,
+        /// The key the call was sent with, which the provider's late entry names.
+        call_key: String,
+        /// The tool provider module the call was dispatched to; its feed delivers the result.
+        module: String,
+        /// The `held.reason` the provider gave, verbatim. An open snake_case string: reasons a
+        /// later contract adds are kept as sent. Informational only, never a decision input.
+        reason: String,
+        /// Lowercase hex SHA-256 of the held marker's `detail` object as serialized JSON, when
+        /// the provider sent one. The detail itself is provider-owned and not stored.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail_digest: Option<String>,
+        /// Wall-clock time the held reply was accepted, in milliseconds.
+        held_at_ms: u64,
+        /// True when the batch dispatches its calls one after another
+        /// (`ExecutionMode::Sequential`): calls planned after this one have their intents but
+        /// are not sent before this call has its terminal.
+        sequential: bool,
+    },
+
     // ── sends with an ordered `delivery` list (feature `delivery-order/v1`) ──
     //
     // Every record in this group is must-understand and is only ever written in a gated frame
@@ -1120,6 +1195,8 @@ pub enum WalRecord {
     /// A send delivered with `idle_start` has no record of this kind: the `RunStarted` that
     /// consumes it (naming its `submission_id`) is its delivery.
     SendDelivered {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        written_at_ms: Option<u64>,
         submission_id: SubmissionId,
         run_id: RunId,
         mode: broca_protocol::DeliveryMode,
@@ -1241,51 +1318,11 @@ impl WalRecord {
     /// would read without checking.
     pub fn required_features(&self) -> &'static [&'static str] {
         let base = self.base_required_features();
-        let base = if matches!(
-            self,
-            WalRecord::RunFinished {
-                interrupt_reason: Some(_),
-                ..
-            }
-        ) {
-            with_feature(base, crate::framing::INTERRUPT_REASON_FEATURE)
-        } else {
-            base
-        };
-        let has_directives = match self {
-            WalRecord::RunStarted { config, .. } => config.turn_directives_v1.is_some(),
-            WalRecord::Queued { request, .. } => request.directives.is_some(),
-            _ => false,
-        };
-        let base = if has_directives {
-            with_feature(base, crate::framing::TURN_DIRECTIVES_FEATURE)
-        } else {
-            base
-        };
-        // A send's client_message_id lives in its identity digest (see
-        // `SubmissionRequest::client_message_id`). An older build would read the digest without
-        // it and answer a re-send under the same `send_id` with another id as a plain retry,
-        // where this build refuses it `send_id_reuse`, so the record is must-understand.
-        let identity_digest = match self {
-            WalRecord::RunStarted {
-                request_identity_digest,
-                ..
-            }
-            | WalRecord::Queued {
-                request_identity_digest,
-                ..
-            }
-            | WalRecord::Steered {
-                request_identity_digest,
-                ..
-            } => request_identity_digest.as_deref(),
-            _ => None,
-        };
-        let base = if identity_digest.is_some_and(digest_carries_client_message_id) {
-            with_feature(base, crate::framing::CLIENT_MESSAGE_ID_FEATURE)
-        } else {
-            base
-        };
+        // The agent-run, session-class and input-cap unions below are precomputed tables that
+        // cover only what `base_required_features` returns, plus the names the earlier tables
+        // add. Every other feature is added after them, by `with_feature`, so a new feature
+        // added here never reaches a table it was not listed in. A name a table does not list
+        // still gets a correct answer, through `FeatureUnionTable::lookup`'s fallback.
         let scope = match self {
             WalRecord::RunStarted { scope, .. } => scope.as_ref(),
             WalRecord::ToolCallDeferred { scope, .. } => Some(scope),
@@ -1332,6 +1369,77 @@ impl WalRecord {
         };
         let base = if capped {
             input_cap_features(base)
+        } else {
+            base
+        };
+        let base = if self.carries_media_content() {
+            with_feature(base, crate::framing::MEDIA_CONTENT_FEATURE)
+        } else {
+            base
+        };
+        let base = if matches!(
+            self,
+            WalRecord::RunFinished {
+                interrupt_reason: Some(_),
+                ..
+            }
+        ) {
+            with_feature(base, crate::framing::INTERRUPT_REASON_FEATURE)
+        } else {
+            base
+        };
+        let has_directives = match self {
+            WalRecord::RunStarted { config, .. } => config.turn_directives_v1.is_some(),
+            WalRecord::Queued { request, .. } => request.directives.is_some(),
+            _ => false,
+        };
+        let base = if has_directives {
+            with_feature(base, crate::framing::TURN_DIRECTIVES_FEATURE)
+        } else {
+            base
+        };
+        // A send's client_message_id lives in its identity digest (see
+        // `SubmissionRequest::client_message_id`). An older build would read the digest without
+        // it and answer a re-send under the same `send_id` with another id as a plain retry,
+        // where this build refuses it `send_id_reuse`, so the record is must-understand.
+        // A manifest that froze any provider declaration is must-understand: an older reader
+        // would skip the fields and read replies by a catalog that may have changed since.
+        let base = if matches!(
+            self,
+            WalRecord::RunStarted {
+                manifest: Some(manifest),
+                ..
+            } if manifest.fetches.iter().any(|fetch| {
+                matches!(
+                    &fetch.outcome,
+                    FetchOutcome::Answered {
+                        declarations_frozen: Some(declarations),
+                        ..
+                    } if !declarations.is_empty()
+                )
+            })
+        ) {
+            with_feature(base, crate::framing::PROVIDER_DECLARATIONS_FEATURE)
+        } else {
+            base
+        };
+        let identity_digest = match self {
+            WalRecord::RunStarted {
+                request_identity_digest,
+                ..
+            }
+            | WalRecord::Queued {
+                request_identity_digest,
+                ..
+            }
+            | WalRecord::Steered {
+                request_identity_digest,
+                ..
+            } => request_identity_digest.as_deref(),
+            _ => None,
+        };
+        let base = if identity_digest.is_some_and(digest_carries_client_message_id) {
+            with_feature(base, crate::framing::CLIENT_MESSAGE_ID_FEATURE)
         } else {
             base
         };
@@ -1416,11 +1524,73 @@ impl WalRecord {
         } else {
             base
         };
-        if self.carries_google_rpc_error_details() {
+        let base = if self.carries_reference_slots() {
+            with_feature(base, crate::framing::PLAN_REFERENCE_SLOTS_FEATURE)
+        } else {
+            base
+        };
+        let base = if self.carries_google_rpc_error_details() {
             with_feature(base, crate::framing::GOOGLE_RPC_ERROR_DETAILS_FEATURE)
         } else {
             base
+        };
+        // Like every feature added after the precomputed unions above, message times never reach
+        // their tables.
+        let base = if matches!(
+            self,
+            Self::RunStarted {
+                written_at_ms: Some(_),
+                ..
+            } | Self::ModelStepFinished {
+                written_at_ms: Some(_),
+                ..
+            } | Self::Steered {
+                written_at_ms: Some(_),
+                ..
+            } | Self::Queued {
+                written_at_ms: Some(_),
+                ..
+            } | Self::SendDelivered {
+                written_at_ms: Some(_),
+                ..
+            }
+        ) {
+            with_feature(base, crate::framing::MESSAGE_TIMES_FEATURE)
+        } else {
+            base
+        };
+        if matches!(
+            self,
+            Self::ToolDispatchIntent {
+                dispatched_at_ms: Some(_),
+                ..
+            } | Self::ToolNoDispatch {
+                dispatched_at_ms: Some(_),
+                ..
+            } | Self::ToolResult {
+                finished_at_ms: Some(_),
+                ..
+            } | Self::ToolCallDeferred {
+                deferred_at_ms: Some(_),
+                ..
+            } | Self::ApprovalRecorded {
+                closed_at_ms: Some(_),
+                ..
+            }
+        ) {
+            with_feature(base, crate::framing::TOOL_TIMES_FEATURE)
+        } else {
+            base
         }
+    }
+
+    /// A `RunStarted` whose plan manifest froze a provider's catalog reference slots.
+    fn carries_reference_slots(&self) -> bool {
+        matches!(self, WalRecord::RunStarted { manifest: Some(manifest), .. }
+        if manifest.fetches.iter().any(|fetch| matches!(
+            fetch.outcome,
+            FetchOutcome::Answered { reference_slots: Some(_), .. }
+        )))
     }
 
     /// Whether a tool this record freezes or queues declares its own reply deadline, which an
@@ -1444,6 +1614,132 @@ impl WalRecord {
             _ => None,
         };
         selection.is_some_and(|selection| selection.auth_method.is_some())
+    }
+
+    fn carries_media_content(&self) -> bool {
+        use broca_protocol::{ContentBlock, ToolOutput};
+        let result = |result: &ToolResult| matches!(result.output, ToolOutput::Parts { .. });
+        let blocks = |content: &[ContentBlock]| {
+            content.iter().any(|block| match block {
+                ContentBlock::Media(_) => true,
+                ContentBlock::ToolResult(value) => result(value),
+                ContentBlock::Text { .. }
+                | ContentBlock::TextWithState { .. }
+                | ContentBlock::Reasoning { .. }
+                | ContentBlock::RedactedReasoning { .. }
+                | ContentBlock::ToolCall(_) => false,
+            })
+        };
+        let messages = |messages: &[Message]| messages.iter().any(|m| blocks(&m.content));
+        let hooks = |hooks: &Option<Box<Hooks>>, subject| {
+            hooks.as_ref().is_some_and(|hooks| {
+                hooks
+                    .original
+                    .iter()
+                    .chain(hooks.final_value.iter())
+                    .any(|value| hook_subject_carries_media(value, subject))
+            })
+        };
+        match self {
+            Self::RunStarted {
+                config,
+                input,
+                hooks: h,
+                ..
+            } => {
+                config
+                    .frozen_render_config
+                    .get("media")
+                    .is_some_and(|media| !media.is_null())
+                    || messages(input)
+                    || hooks(h, MediaHookSubject::Messages)
+            }
+            Self::RunConfigRefrozen {
+                frozen_render_config,
+                ..
+            } => frozen_render_config
+                .get("media")
+                .is_some_and(|media| !media.is_null()),
+            Self::Steered {
+                input, hooks: h, ..
+            } => messages(input) || hooks(h, MediaHookSubject::Messages),
+            Self::Queued {
+                request, hooks: h, ..
+            } => messages(&request.input) || hooks(h, MediaHookSubject::Messages),
+            Self::ModelStepFinished {
+                assistant_message,
+                hooks: h,
+                ..
+            } => blocks(&assistant_message.content) || hooks(h, MediaHookSubject::Assistant),
+            Self::ToolResult {
+                result: value,
+                hooks: h,
+                reason,
+                ..
+            } => {
+                // Intentless pre-tool refusals store arguments, not a post-tool result.
+                let pre_tool = matches!(
+                    reason.as_deref(),
+                    Some("pre_tool_denied" | "pre_tool_unavailable")
+                ) || h
+                    .as_ref()
+                    .is_some_and(|hooks| hooks.ops.iter().any(|op| op.hook == "pre_tool"));
+                let subject = if pre_tool {
+                    MediaHookSubject::ToolInput
+                } else {
+                    MediaHookSubject::Result
+                };
+                result(value) || hooks(h, subject)
+            }
+            Self::LateResult { result: value, .. } => result(value),
+            Self::ApprovalRecorded { closing_result, .. } => {
+                closing_result.as_deref().is_some_and(result)
+            }
+            Self::SendDelivered { input, .. } => {
+                input.as_deref().is_some_and(|input| messages(input))
+            }
+            Self::ToolNoDispatch { hooks: h, .. } | Self::ToolDispatchIntent { hooks: h, .. } => {
+                hooks(h, MediaHookSubject::ToolInput)
+            }
+            Self::CompactionMessage { replacement, .. } => messages(replacement),
+            Self::CompactionViewApplied { view, .. } => view_carries_media_content(view),
+            Self::ModelAttemptFinished { .. }
+            | Self::StepStarted { .. }
+            | Self::ToolBatchStarted { .. }
+            | Self::ToolBatchFinished { .. }
+            | Self::TurnFinished { .. }
+            | Self::BudgetFired { .. }
+            | Self::InputTokenCapFrozen { .. }
+            | Self::InputTokenBudgetExhausted { .. }
+            | Self::ContextCeilingWait { .. }
+            | Self::ContextCeilingDecided { .. }
+            | Self::StructuredOutputDowngraded { .. }
+            | Self::StructuredOutputResult { .. }
+            | Self::RunFinished { .. }
+            | Self::RunCancelRequested { .. }
+            | Self::RunPaused { .. }
+            | Self::RunAuthRefrozen { .. }
+            | Self::Retracted { .. }
+            | Self::ApprovalRequested { .. }
+            | Self::ApprovalResolved { .. }
+            | Self::ResumeStarted { .. }
+            | Self::CacheWarmed { .. }
+            | Self::CompactionRequest { .. }
+            | Self::CompactionAnswer { .. }
+            | Self::CompactionWait { .. }
+            | Self::CompactionRideWait { .. }
+            | Self::CompactionRideWaitEnded { .. }
+            | Self::CompactionNotice { .. }
+            | Self::ToolCallDeferred { .. }
+            | Self::AwaitingApproval { .. }
+            | Self::LateApprovalRecorded { .. }
+            | Self::LateDispatchIntent { .. }
+            | Self::QuestionWithdrawalAcknowledged { .. }
+            | Self::ToolCallProviderHeld { .. }
+            | Self::DeliveryOrdered { .. }
+            | Self::SendEnded { .. }
+            | Self::Unknown => false,
+        }
     }
 
     fn carries_google_rpc_error_details(&self) -> bool {
@@ -1660,6 +1956,11 @@ impl WalRecord {
                 reason: PauseReason::Restart,
                 ..
             } => &[RESTART_PAUSE_FEATURE],
+            WalRecord::RunPaused {
+                reason: PauseReason::ToolHeld,
+                ..
+            }
+            | WalRecord::ToolCallProviderHeld { .. } => &[crate::framing::PROVIDER_HELD_FEATURE],
             WalRecord::RunStarted {
                 scope,
                 manifest,
@@ -1844,6 +2145,118 @@ impl WalRecord {
     }
 }
 
+#[derive(Clone, Copy)]
+enum MediaHookSubject {
+    Messages,
+    Assistant,
+    Result,
+    ToolInput,
+}
+
+/// Decode the phase's known subject shape once, borrowing its fields. Tool input is opaque:
+/// a media-looking object in arguments is not native content and must not raise the floor.
+fn hook_subject_carries_media(value: &Value, subject: MediaHookSubject) -> bool {
+    match subject {
+        MediaHookSubject::Messages => Vec::<MediaMessage>::deserialize(value)
+            .is_ok_and(|messages| messages.iter().any(MediaMessage::carries_media)),
+        MediaHookSubject::Assistant => {
+            MediaMessage::deserialize(value).is_ok_and(|message| message.carries_media())
+        }
+        MediaHookSubject::Result => {
+            MediaToolResult::deserialize(value).is_ok_and(|result| result.output.kind == "parts")
+        }
+        MediaHookSubject::ToolInput => false,
+    }
+}
+
+// These borrowed projections read only native grammar discriminators. Unrelated fields,
+// notably tool-call input and JSON result values, are ignored without copying their trees.
+#[derive(Deserialize)]
+struct MediaMessage<'a> {
+    #[serde(borrow)]
+    content: Vec<MediaBlock<'a>>,
+}
+
+impl MediaMessage<'_> {
+    fn carries_media(&self) -> bool {
+        self.content.iter().any(MediaBlock::carries_media)
+    }
+}
+
+#[derive(Deserialize)]
+struct MediaBlock<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: std::borrow::Cow<'a, str>,
+    #[serde(default, borrow)]
+    output: Option<MediaOutput<'a>>,
+}
+
+impl MediaBlock<'_> {
+    fn carries_media(&self) -> bool {
+        self.kind == "media"
+            || (self.kind == "tool_result"
+                && self
+                    .output
+                    .as_ref()
+                    .is_some_and(|output| output.kind == "parts"))
+    }
+}
+
+#[derive(Deserialize)]
+struct MediaToolResult<'a> {
+    #[serde(borrow)]
+    output: MediaOutput<'a>,
+}
+
+#[derive(Deserialize)]
+struct MediaOutput<'a> {
+    #[serde(borrow)]
+    kind: std::borrow::Cow<'a, str>,
+}
+
+#[derive(Deserialize)]
+struct MediaView<'a> {
+    #[serde(borrow)]
+    ranges: Vec<MediaViewRange<'a>>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum MediaViewRange<'a> {
+    Keep {
+        #[serde(default, borrow)]
+        edits: Vec<MediaViewEdit<'a>>,
+    },
+    Replace {
+        #[serde(borrow)]
+        bytes: std::borrow::Cow<'a, str>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+struct MediaViewEdit<'a> {
+    #[serde(default, borrow)]
+    bytes: Option<std::borrow::Cow<'a, str>>,
+}
+
+fn view_carries_media_content(view: &OpaqueJson) -> bool {
+    serde_json::from_str::<MediaView>(view.as_json_text()).is_ok_and(|view| {
+        view.ranges.iter().any(|range| match range {
+            MediaViewRange::Keep { edits } => edits.iter().any(|edit| {
+                edit.bytes.as_ref().is_some_and(|bytes| {
+                    serde_json::from_str::<MediaBlock>(bytes)
+                        .is_ok_and(|block| block.carries_media())
+                })
+            }),
+            MediaViewRange::Replace { bytes } => serde_json::from_str::<Vec<MediaMessage>>(bytes)
+                .is_ok_and(|messages| messages.iter().any(MediaMessage::carries_media)),
+            MediaViewRange::Other => false,
+        })
+    })
+}
+
 /// Cancellation points recorded in the WAL. The run.cancel endpoint rejects all other strings
 /// before writing, rather than interpreting an unknown point as immediate cancellation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1873,11 +2286,19 @@ impl SendEndReason {
     }
 }
 
-// `WalRecord::required_features` returns sorted static slices without allocation. Records
-// without agent-run identifiers keep their existing requirements; records carrying those
-// identifiers add the agent-run requirement to every combination of other frozen fields,
-// including malformed combinations a reader may encounter.
-const AGENT_RUN_BASE_FEATURES: [&str; 6] = [
+// `WalRecord::required_features` adds the agent-run, session-class and input-cap features
+// through precomputed tables, so the common records find their sorted feature list without
+// taking a lock or allocating. All three tables are generated from one list, and a name a
+// table does not list falls back to the cached sorted union `with_feature` computes, so a
+// feature added later can make a lookup slower but can never make it panic or answer wrongly.
+
+/// Every feature name `base_required_features` returns for a record that reaches one of the
+/// tables below, sorted: `RunStarted` (all three tables), `ToolCallDeferred` (agent-run) and
+/// `Queued`, `ToolResult`, `RunFinished`, `InputTokenCapFrozen` and
+/// `InputTokenBudgetExhausted` (input cap). Each later table also lists the features the
+/// earlier tables add. `required_features` adds every other feature after the tables, so none
+/// of them needs listing here.
+const UNION_TABLE_BASE_FEATURES: [&str; 6] = [
     crate::framing::DEFERRED_CALL_FEATURE,
     crate::framing::FLOW_SCOPE_FEATURE,
     crate::framing::PLAN_MANIFEST_FEATURE,
@@ -1885,155 +2306,175 @@ const AGENT_RUN_BASE_FEATURES: [&str; 6] = [
     crate::framing::SCOPE_FEATURE,
     crate::framing::STEP_TRANSFORMS_FEATURE,
 ];
-
-struct AgentRunFeatures {
-    names: [&'static str; 7],
-    len: usize,
-}
-
-const AGENT_RUN_FEATURE_SETS: [AgentRunFeatures; 64] = {
-    let mut sets = [const {
-        AgentRunFeatures {
-            names: [""; 7],
-            len: 0,
-        }
-    }; 64];
-    let mut mask = 0;
-    while mask < sets.len() {
-        sets[mask].names[0] = crate::framing::AGENT_RUN_SCOPE_FEATURE;
-        sets[mask].len = 1;
-        let mut bit = 0;
-        while bit < AGENT_RUN_BASE_FEATURES.len() {
-            if mask & (1 << bit) != 0 {
-                let at = sets[mask].len;
-                sets[mask].names[at] = AGENT_RUN_BASE_FEATURES[bit];
-                sets[mask].len += 1;
-            }
-            bit += 1;
-        }
-        mask += 1;
-    }
-    sets
-};
-
-fn agent_run_features(base: &[&str]) -> &'static [&'static str] {
-    let mask = base.iter().fold(0, |mask, name| {
-        let bit = AGENT_RUN_BASE_FEATURES
-            .iter()
-            .position(|known| known == name)
-            .expect("agent-run scope's existing features must be listed");
-        mask | (1 << bit)
-    });
-    let set = &AGENT_RUN_FEATURE_SETS[mask];
-    &set.names[..set.len]
-}
-
-// Precompute the possible feature-name combinations so append discovers them without allocating.
-const CLASS_BASE_FEATURES: [&str; 7] = [
+/// What a classed `RunStarted` can carry when it reaches the session-class table: the shared
+/// list plus the agent-run feature that table runs after.
+const CLASS_BASE_FEATURES: [&str; 7] = insert_sorted(
+    UNION_TABLE_BASE_FEATURES,
     crate::framing::AGENT_RUN_SCOPE_FEATURE,
-    crate::framing::DEFERRED_CALL_FEATURE,
-    crate::framing::FLOW_SCOPE_FEATURE,
-    crate::framing::PLAN_MANIFEST_FEATURE,
-    crate::framing::RETENTION_FEATURE,
-    crate::framing::SCOPE_FEATURE,
-    crate::framing::STEP_TRANSFORMS_FEATURE,
-];
-struct ClassFeatures {
-    names: [&'static str; 8],
-    len: usize,
-}
-static CLASS_FEATURE_SETS: [ClassFeatures; 128] = {
-    let mut sets = [const {
-        ClassFeatures {
-            names: [""; 8],
-            len: 0,
-        }
-    }; 128];
-    let mut mask = 0;
-    while mask < sets.len() {
-        let mut bit = 0;
-        while bit < CLASS_BASE_FEATURES.len() {
-            if bit == 6 {
-                sets[mask].names[sets[mask].len] = crate::framing::SESSION_CLASS_FEATURE;
-                sets[mask].len += 1;
-            }
-            if mask & (1 << bit) != 0 {
-                sets[mask].names[sets[mask].len] = CLASS_BASE_FEATURES[bit];
-                sets[mask].len += 1;
-            }
-            bit += 1;
-        }
-        mask += 1;
-    }
-    sets
-};
-fn session_class_features(base: &[&str]) -> &'static [&'static str] {
-    let mask = base.iter().fold(0, |mask, name| {
-        let bit = CLASS_BASE_FEATURES
-            .iter()
-            .position(|known| known == name)
-            .expect("classed RunStarted features must be listed");
-        mask | (1 << bit)
-    });
-    let set = &CLASS_FEATURE_SETS[mask];
-    &set.names[..set.len]
-}
+);
+/// What a capped record can carry when it reaches the input-cap table: the session-class
+/// table's list plus the session-class feature.
+const INPUT_CAP_BASE_FEATURES: [&str; 8] =
+    insert_sorted(CLASS_BASE_FEATURES, crate::framing::SESSION_CLASS_FEATURE);
 
-// Precompute sorted feature unions: capped records can also carry scope, hooks or retention.
-const INPUT_CAP_BASE_FEATURES: [&str; 8] = [
+static AGENT_RUN_FEATURE_SETS: FeatureUnionTable<6, 7, 64> = FeatureUnionTable::new(
+    UNION_TABLE_BASE_FEATURES,
     crate::framing::AGENT_RUN_SCOPE_FEATURE,
-    crate::framing::DEFERRED_CALL_FEATURE,
-    crate::framing::FLOW_SCOPE_FEATURE,
-    crate::framing::PLAN_MANIFEST_FEATURE,
-    crate::framing::RETENTION_FEATURE,
-    crate::framing::SCOPE_FEATURE,
-    crate::framing::SESSION_CLASS_FEATURE,
-    crate::framing::STEP_TRANSFORMS_FEATURE,
-];
-struct InputCapFeatures {
-    names: [&'static str; 9],
-    len: usize,
-}
-static INPUT_CAP_FEATURE_SETS: [InputCapFeatures; 256] = {
-    let mut sets = [const {
-        InputCapFeatures {
-            names: [""; 9],
-            len: 0,
-        }
-    }; 256];
-    let mut mask = 0;
-    while mask < sets.len() {
-        let mut bit = 0;
-        while bit < INPUT_CAP_BASE_FEATURES.len() {
-            if bit == 3 {
-                sets[mask].names[sets[mask].len] = crate::framing::INPUT_TOKEN_CAP_FEATURE;
-                sets[mask].len += 1;
-            }
-            if mask & (1 << bit) != 0 {
-                sets[mask].names[sets[mask].len] = INPUT_CAP_BASE_FEATURES[bit];
-                sets[mask].len += 1;
-            }
-            bit += 1;
-        }
-        mask += 1;
-    }
-    sets
-};
-fn input_cap_features(base: &[&str]) -> &'static [&'static str] {
-    let mask = base.iter().fold(0, |mask, name| {
-        let bit = INPUT_CAP_BASE_FEATURES
-            .iter()
-            .position(|known| known == name)
-            .expect("input cap's existing features must be listed");
-        mask | (1 << bit)
-    });
-    let set = &INPUT_CAP_FEATURE_SETS[mask];
-    &set.names[..set.len]
+);
+static CLASS_FEATURE_SETS: FeatureUnionTable<7, 8, 128> =
+    FeatureUnionTable::new(CLASS_BASE_FEATURES, crate::framing::SESSION_CLASS_FEATURE);
+static INPUT_CAP_FEATURE_SETS: FeatureUnionTable<8, 9, 256> = FeatureUnionTable::new(
+    INPUT_CAP_BASE_FEATURES,
+    crate::framing::INPUT_TOKEN_CAP_FEATURE,
+);
+
+fn agent_run_features(base: &'static [&'static str]) -> &'static [&'static str] {
+    AGENT_RUN_FEATURE_SETS.lookup(base)
 }
 
-/// `base` with `feature` added in sorted position. The feature sets a record can require are a
-/// small fixed family, so each distinct union is built once and kept for the process lifetime;
-/// the cache is keyed by the address of `base`, which is always a static slice.
+fn session_class_features(base: &'static [&'static str]) -> &'static [&'static str] {
+    CLASS_FEATURE_SETS.lookup(base)
+}
+
+fn input_cap_features(base: &'static [&'static str]) -> &'static [&'static str] {
+    INPUT_CAP_FEATURE_SETS.lookup(base)
+}
+
+/// One sorted feature list of a [`FeatureUnionTable`]; only the first `len` names are used.
+#[derive(Clone, Copy)]
+struct FeatureUnion<const W: usize> {
+    names: [&'static str; W],
+    len: usize,
+}
+
+/// `added` united with every subset of the `N` sorted names in `listed`, indexed by the subset's
+/// bitmask (bit `i` set means `listed[i]` is present). `W` is `N + 1` and `S` is `2^N`; stable
+/// Rust cannot compute either from `N`, so [`FeatureUnionTable::new`] checks them at compile
+/// time.
+struct FeatureUnionTable<const N: usize, const W: usize, const S: usize> {
+    listed: [&'static str; N],
+    added: &'static str,
+    sets: [FeatureUnion<W>; S],
+}
+
+impl<const N: usize, const W: usize, const S: usize> FeatureUnionTable<N, W, S> {
+    const fn new(listed: [&'static str; N], added: &'static str) -> Self {
+        assert!(
+            W == N + 1 && S == 1 << N,
+            "a table needs N + 1 names and 2^N sets"
+        );
+        let mut i = 1;
+        while i < N {
+            assert!(
+                str_lt(listed[i - 1], listed[i]),
+                "listed names must be sorted"
+            );
+            i += 1;
+        }
+        let mut i = 0;
+        while i < N {
+            assert!(
+                str_lt(listed[i], added) || str_lt(added, listed[i]),
+                "the added name cannot also be listed"
+            );
+            i += 1;
+        }
+        let mut sets = [FeatureUnion {
+            names: [""; W],
+            len: 0,
+        }; S];
+        let mut mask = 0;
+        while mask < S {
+            let mut len = 0;
+            let mut placed = false;
+            let mut bit = 0;
+            while bit < N {
+                // `added` goes before the first listed name that sorts after it, so every set
+                // comes out sorted whichever listed names it holds.
+                if !placed && str_lt(added, listed[bit]) {
+                    sets[mask].names[len] = added;
+                    len += 1;
+                    placed = true;
+                }
+                if mask & (1 << bit) != 0 {
+                    sets[mask].names[len] = listed[bit];
+                    len += 1;
+                }
+                bit += 1;
+            }
+            if !placed {
+                sets[mask].names[len] = added;
+                len += 1;
+            }
+            sets[mask].len = len;
+            mask += 1;
+        }
+        Self {
+            listed,
+            added,
+            sets,
+        }
+    }
+
+    /// The sorted union of `base` (itself sorted and duplicate-free, as every list
+    /// `required_features` builds is) and this table's added name.
+    ///
+    /// A name this table does not list is answered by `with_feature`, which builds that union
+    /// once and caches it, instead of panicking: a must-understand feature added after this
+    /// table was written must still let the record be framed. The coverage test in
+    /// `feature_union_tests` fails when one of its records brings an unlisted name here, so
+    /// the slower path is reported rather than left in place silently.
+    fn lookup(&'static self, base: &'static [&'static str]) -> &'static [&'static str] {
+        #[cfg(test)]
+        feature_union_tests::note_lookup(self.added, base);
+        let mut mask = 0;
+        for name in base {
+            let Some(bit) = self.listed.iter().position(|known| known == name) else {
+                return with_feature(base, self.added);
+            };
+            mask |= 1 << bit;
+        }
+        let set = &self.sets[mask];
+        &set.names[..set.len]
+    }
+}
+
+/// `a < b` in the byte order `str`'s `Ord` uses, for sorting in a `const` context.
+const fn str_lt(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut i = 0;
+    while i < a.len() && i < b.len() {
+        if a[i] != b[i] {
+            return a[i] < b[i];
+        }
+        i += 1;
+    }
+    a.len() < b.len()
+}
+
+/// `list` with `name` inserted in sorted position; `M` must be `N + 1`.
+const fn insert_sorted<const N: usize, const M: usize>(
+    list: [&'static str; N],
+    name: &'static str,
+) -> [&'static str; M] {
+    assert!(M == N + 1, "inserting one name needs one more slot");
+    let mut out = [""; M];
+    let mut from = 0;
+    let mut to = 0;
+    let mut placed = false;
+    while to < M {
+        if !placed && (from == N || str_lt(name, list[from])) {
+            out[to] = name;
+            placed = true;
+        } else {
+            out[to] = list[from];
+            from += 1;
+        }
+        to += 1;
+    }
+    out
+}
+
 /// Whether a stored request identity digest (a JSON object of per-field digests written by
 /// broca-core) carries the send's `client_message_id`. A digest that does not parse carries
 /// none: it is compared as an opaque string, and this build never writes such a digest with
@@ -2047,6 +2488,9 @@ fn digest_carries_client_message_id(digest: &str) -> bool {
     serde_json::from_str::<Probe>(digest).is_ok_and(|probe| probe.client_message_id.is_some())
 }
 
+/// `base` with `feature` added in sorted position. The feature sets a record can require are a
+/// small fixed family, so each distinct union is built once and kept for the process lifetime;
+/// the cache is keyed by the address of `base`, which is always a static slice.
 fn with_feature(base: &'static [&'static str], feature: &'static str) -> &'static [&'static str] {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -2231,6 +2675,9 @@ pub struct WithdrawElicitation {
 }
 
 /// A call a tool provider holds past its reply ([`WalRecord::ToolResult`]).
+///
+/// Superseded by [`WalRecord::ToolCallProviderHeld`] and never written; the reader still
+/// decodes it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderHeld {
     pub call_key: String,
@@ -2308,7 +2755,7 @@ pub struct RunConfig {
     /// → different rendered bytes → a cache bust and a provider-invalid history). This is
     /// NOT a render input: the loop never feeds it to the renderer, and the wire family it
     /// implies is already captured in `frozen_render_config`. `None` on a run with no vault
-    /// auth source (the OpenCode/mock path), so a pre-existing record replays unchanged.
+    /// token (for example, the mock path), so a pre-existing record replays unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_selection: Option<AuthSelection>,
     /// Whether the caller omitted the tool surface that resolved to `tools`. This is admission
@@ -2742,6 +3189,7 @@ mod schema_tests {
     #[test]
     fn model_step_finished_arc_keeps_existing_wal_bytes() {
         let record = WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(1),
@@ -2776,6 +3224,7 @@ mod schema_tests {
     #[test]
     fn tool_dispatch_intent_arc_keeps_existing_wal_bytes() {
         let record = WalRecord::ToolDispatchIntent {
+            dispatched_at_ms: None,
             hooks: None,
             batch_id: BatchId("b1".into()),
             tool_call_id: ToolCallId("t1".into()),
@@ -2840,6 +3289,7 @@ mod schema_tests {
     #[test]
     fn tool_result_arc_keeps_existing_wal_bytes() {
         let record = WalRecord::ToolResult {
+            finished_at_ms: None,
             tags: None,
             hooks: None,
             batch_id: BatchId("b1".into()),
@@ -2964,6 +3414,7 @@ mod schema_tests {
             account_decision: None,
         });
         let record = WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -3019,6 +3470,7 @@ mod schema_tests {
             account_decision: None,
         });
         let record = WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -3095,6 +3547,7 @@ mod schema_tests {
         // reported. A step whose response reported no tier must keep exactly these bytes, and
         // these bytes must keep decoding to the same record.
         let full = WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(3),
@@ -3116,6 +3569,7 @@ mod schema_tests {
             speed_used: None,
         };
         let bare = WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(0),
@@ -3146,6 +3600,7 @@ mod schema_tests {
     #[test]
     fn old_records_default_retries_used_to_zero() {
         let model = WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(1),
@@ -3186,6 +3641,7 @@ mod schema_tests {
     #[test]
     fn pre_fix_run_started_omits_ts_ms_and_decodes_as_none() {
         let record = WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -3239,6 +3695,7 @@ mod schema_tests {
     #[test]
     fn pre_work_class_run_started_bytes_are_pinned() {
         let record = WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -3276,6 +3733,7 @@ mod schema_tests {
     #[test]
     fn pre_context_management_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -3330,6 +3788,7 @@ mod schema_tests {
     #[test]
     fn pre_variant_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -3388,6 +3847,7 @@ mod schema_tests {
     #[test]
     fn pre_service_tier_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -3500,6 +3960,7 @@ mod schema_tests {
             let mut config = min_config();
             config.frozen_render_config = frozen_render_config;
             WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -3663,6 +4124,7 @@ mod schema_tests {
         };
         let records = vec![
             WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -3686,6 +4148,7 @@ mod schema_tests {
                 submission_id: Some(SubmissionId("sub1".into())),
             },
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(1),
@@ -3702,6 +4165,7 @@ mod schema_tests {
             },
             WalRecord::StepStarted { step_id: StepId(1) },
             WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 hooks: None,
                 batch_id: BatchId("b1".into()),
                 tool_call_id: ToolCallId("t1".into()),
@@ -3751,6 +4215,7 @@ mod schema_tests {
                 caller_text: Some("nudge text".into()),
             },
             WalRecord::Queued {
+                written_at_ms: None,
                 retention: None,
                 ts_ms: None,
                 hooks: None,
@@ -3761,6 +4226,8 @@ mod schema_tests {
                 delivery: None,
                 submission_id: SubmissionId("sub2".into()),
                 request: Box::new(SubmissionRequest {
+                    staged_uploads: None,
+                    content: Vec::new(),
                     directives: None,
                     on_restart: None,
                     keep_warm: None,
@@ -4309,6 +4776,7 @@ mod schema_tests {
     #[test]
     fn model_step_finished_preserves_signed_tool_call() {
         let rec = WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(1),
@@ -4352,6 +4820,7 @@ mod schema_tests {
         assert_eq!(decoded_call, call);
 
         let rec = WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(1),
@@ -4999,6 +5468,9 @@ mod schema_tests {
 
 #[cfg(test)]
 mod pinned_bytes_tests;
+
+#[cfg(test)]
+mod feature_union_tests;
 
 #[cfg(test)]
 mod step_transform_bytes_tests;

@@ -543,8 +543,8 @@ fn frozen_scopes(records: &[WalRecord]) -> Vec<Option<(String, String, u64)>> {
 /// How many `RunStarted` records sit in gated frames requiring `scope/v1`, found by their
 /// payload bytes: such a payload opens with the envelope, so an ordinary frame never matches.
 fn gated_run_started_count(bytes: &[u8]) -> usize {
-    // Every episode of a session a tag-writing build admits also carries runner tags.
-    let needle = br#"{"requires":["runner-tags/v2","scope/v1"],"record":{"type":"run_started""#;
+    // Newly admitted episodes carry computed tags and a durable input time beside the scope.
+    let needle = br#"{"requires":["message-times/v1","runner-tags/v2","scope/v1"],"record":{"type":"run_started""#;
     bytes
         .windows(needle.len())
         .filter(|window| *window == needle)
@@ -594,7 +594,10 @@ async fn a_scoped_session_refuses_a_send_under_a_different_identity_or_none() {
         ))]
     );
     assert_eq!(gated_run_started_count(&rig.wal_bytes()), 1);
-    assert_eq!(rig.floor().as_deref(), Some("runner-tags/v2\nscope/v1\n"));
+    assert_eq!(
+        rig.floor().as_deref(),
+        Some("message-times/v1\nrunner-tags/v2\nscope/v1\n")
+    );
     let before = rig.wal_bytes();
 
     rig.bind_ok(8, Some(other()), Some(stamp(core(), 3))).await;
@@ -747,7 +750,7 @@ async fn adoption_follows_the_recorded_principals_on_the_send_reply_and_the_bind
         // The unscoped episode's runner tags raised the floor; the refusal added no scope.
         assert_eq!(
             rig.floor().as_deref(),
-            Some("runner-tags/v2\n"),
+            Some("message-times/v1\nrunner-tags/v2\n"),
             "{tag}: nothing scoped was written"
         );
         rig.finish().await;

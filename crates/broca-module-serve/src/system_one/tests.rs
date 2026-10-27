@@ -115,6 +115,8 @@ impl BatchCatalog for Rows {
 
 fn row(kind: Option<&str>) -> ModelBatchRow {
     ModelBatchRow {
+        model_name: None,
+        provider_name: None,
         kind: kind.map(str::to_owned),
         context_tokens: None,
         attachment: false,
@@ -193,14 +195,20 @@ fn params(batch: &str, model: &str, states: &[&str], max_cost_usd: Option<f64>) 
 
 /// The reply text of an admitted call.
 async fn admitted(rig: &Rig, params: String) -> String {
-    match Arc::clone(&rig.service).spawn_call(params).await {
+    match Arc::clone(&rig.service)
+        .spawn_call(params, test_scope())
+        .await
+    {
         Ok(reply) => reply.get().to_owned(),
         Err(body) => panic!("refused: {}", String::from_utf8_lossy(&body)),
     }
 }
 
 async fn refused(rig: &Rig, params: String) -> Value {
-    match Arc::clone(&rig.service).spawn_call(params).await {
+    match Arc::clone(&rig.service)
+        .spawn_call(params, test_scope())
+        .await
+    {
         Ok(reply) => panic!("admitted: {}", reply.get()),
         Err(body) => serde_json::from_slice(&body).unwrap(),
     }
@@ -317,7 +325,7 @@ async fn a_resend_after_an_interrupted_call_asks_only_unanswered_items() {
     let service = Arc::clone(&rig.service);
     let call = {
         let body = body.clone();
-        tokio::spawn(async move { classify::run(&service, &body).await })
+        tokio::spawn(async move { classify::run(&service, &body, &test_scope(), None).await })
     };
     while rig.stand_in.held.load(Ordering::SeqCst) == 0 {
         rig.stand_in.entered.notified().await;
@@ -328,14 +336,17 @@ async fn a_resend_after_an_interrupted_call_asks_only_unanswered_items() {
     let _ = call.await;
     // The dropped call's hold is released on its own; wait for the blocking release.
     for _ in 0..1000 {
-        if !rig.service.claims.lock().unwrap().contains("crash") {
+        if !rig.service.claims.lock().unwrap().contains_key("crash") {
             break;
         }
         tokio::task::yield_now().await;
     }
     let mut reply = None;
     for _ in 0..1000 {
-        match Arc::clone(&rig.service).spawn_call(body.clone()).await {
+        match Arc::clone(&rig.service)
+            .spawn_call(body.clone(), test_scope())
+            .await
+        {
             Ok(text) => {
                 reply = Some(text.get().to_owned());
                 break;
@@ -365,8 +376,8 @@ async fn a_resend_after_an_interrupted_call_asks_only_unanswered_items() {
     );
 }
 
-/// The process-kill form of the same: a process died holding the batch (its row is still
-/// `running`). Startup releases it, and the re-send asks only the unanswered item.
+/// A partial batch stays running while its owner's lifetime lock is held. Once the owner
+/// disappears, startup releases it and a re-send asks only the unanswered item.
 #[tokio::test]
 async fn a_batch_a_dead_process_held_is_released_at_startup_and_resumed() {
     let path = broca_test_support::scratch_root()
@@ -376,24 +387,46 @@ async fn a_batch_a_dead_process_held_is_released_at_startup_and_resumed() {
         Arc::new(SystemOneStore::open(&path).unwrap()),
         Config::default(),
     );
-    first
-        .stand_in
-        .script("a", vec![Script::Answer(noul("0.5", None))]);
-    let gate = Arc::new(Semaphore::new(0));
-    first
-        .stand_in
-        .script("b", vec![Script::Held(gate, noul("0.6", None))]);
-    let service = Arc::clone(&first.service);
     let body = params("dead", JEV, &["a", "b"], None);
-    let call = {
-        let body = body.clone();
-        tokio::spawn(async move { classify::run(&service, &body).await })
-    };
-    while first.stand_in.held.load(Ordering::SeqCst) == 0 {
-        first.stand_in.entered.notified().await;
-    }
-    // A killed process runs no drop: forget the call's future so its hold is never released.
-    std::mem::forget(call);
+    use broca_store::system_one::{BatchClaim, Outcome, StoredOutcome};
+    use sha2::{Digest, Sha256};
+    let request = cortexkit_role_classifier::request::parse_request(&body).unwrap();
+    let identity = serde_json::to_string(
+        &cortexkit_role_classifier::identity::BatchIdentity::of(&request).unwrap(),
+    )
+    .unwrap();
+    let digest = format!("{:x}", Sha256::digest(identity.as_bytes()));
+    first
+        .store
+        .claim(&BatchClaim {
+            role: STORE_ROLE,
+            batch_id: "dead",
+            model: JEV,
+            identity: &identity,
+            body_digest: &digest,
+            frozen_row: r#"{"input_rate_nanos":42000000,"output_rate_nanos":0}"#,
+            scope: &test_scope(),
+            ceiling_nanos: None,
+            owner: &first.service.owner,
+            now_ms: 1,
+        })
+        .unwrap();
+    first
+        .store
+        .record(
+            STORE_ROLE,
+            "dead",
+            &first.service.owner,
+            &StoredOutcome {
+                index: 0,
+                outcome: Outcome::Answered(r#"{"q":{"type":"noul","noul":0.5}}"#.into()),
+                input_tokens: None,
+                output_tokens: None,
+            },
+            0,
+            2,
+        )
+        .unwrap();
 
     let second = rig_owned(
         Arc::new(SystemOneStore::open(&path).unwrap()),
@@ -405,6 +438,12 @@ async fn a_batch_a_dead_process_held_is_released_at_startup_and_resumed() {
         .script("b", vec![Script::Answer(noul("0.6", None))]);
     let blocked = refused(&second, body.clone()).await;
     assert_eq!(blocked["code"], "batch_in_progress");
+    assert_eq!(
+        second.service.release_abandoned().unwrap(),
+        0,
+        "a live owner must keep its claim"
+    );
+    drop(first);
     assert_eq!(second.service.release_abandoned().unwrap(), 1);
     let reply = admitted(&second, body).await;
     assert_eq!(
@@ -428,7 +467,7 @@ async fn a_concurrent_call_for_a_held_batch_is_refused_at_once() {
         vec![Script::Held(Arc::clone(&gate), noul("0.4", None))],
     );
     let body = params("flight", JEV, &["a"], None);
-    let first = tokio::spawn(Arc::clone(&rig.service).spawn_call(body.clone()));
+    let first = tokio::spawn(Arc::clone(&rig.service).spawn_call(body.clone(), test_scope()));
     while rig.stand_in.held.load(Ordering::SeqCst) == 0 {
         rig.stand_in.entered.notified().await;
     }
@@ -524,6 +563,35 @@ async fn a_tighter_resend_is_recorded_before_anything_is_sent() {
     assert!(third[0]["answers"].is_object());
     assert_eq!(third[1]["error"]["code"], "cost_exceeded");
     assert_eq!(rig.stand_in.calls("x"), 2);
+}
+
+/// A call releases its stored hold (here, successfully) before it answers, so a caller that
+/// re-sends the same batch the moment it is answered is served, not refused
+/// `batch_in_progress` by the finished call.
+/// The release a dropped hold would start is held shut for the whole test: if a normally
+/// ended call left its release to that path, the re-send would find the row still `running`
+/// every time, not only when the release thread happened to lose the race.
+#[tokio::test]
+async fn an_immediate_resend_after_a_reply_finds_the_batch_released() {
+    let rig = rig();
+    rig.stand_in.script(
+        "a",
+        vec![Script::Answer(noul("0.4", None)), Script::Status(500, None)],
+    );
+    rig.stand_in.script(
+        "t",
+        vec![Script::Status(503, None), Script::Answer(noul("0.5", None))],
+    );
+    let (_shut, gate) = std::sync::mpsc::channel::<()>();
+    *rig.service.fallback_release_gate.lock().unwrap() = Some(gate);
+    let body = params("prompt", JEV, &["a", "t"], None);
+    let first = admitted(&rig, body.clone()).await;
+    assert_eq!(items(&first)[1]["error"]["code"], "provider_error");
+    let again = admitted(&rig, body).await;
+    let again = items(&again);
+    assert_eq!(again[0]["answers"], items(&first)[0]["answers"]);
+    assert!(again[1]["answers"].is_object());
+    assert_eq!((rig.stand_in.calls("a"), rig.stand_in.calls("t")), (1, 2));
 }
 
 #[tokio::test]
@@ -711,7 +779,7 @@ async fn a_panic_answers_its_call_and_releases_the_batch() {
     let mut reply = None;
     for _ in 0..1000 {
         if let Ok(text) = Arc::clone(&rig.service)
-            .spawn_call(params("panic", JEV, &["a"], None))
+            .spawn_call(params("panic", JEV, &["a"], None), test_scope())
             .await
         {
             reply = Some(text);
@@ -798,7 +866,7 @@ async fn retention_deletes_a_batch_seven_days_after_its_first_admission() {
     );
     stand_in.script("a", vec![Script::Answer(noul("0.1", None))]);
     Arc::clone(&service)
-        .spawn_call(params("old", JEV, &["a"], None))
+        .spawn_call(params("old", JEV, &["a"], None), test_scope())
         .await
         .unwrap();
     now.fetch_add(broca_store::system_one::RETENTION_MS - 1, Ordering::SeqCst);
@@ -806,7 +874,7 @@ async fn retention_deletes_a_batch_seven_days_after_its_first_admission() {
     now.fetch_add(1, Ordering::SeqCst);
     assert_eq!(service.sweep().await.unwrap(), 1);
     Arc::clone(&service)
-        .spawn_call(params("old", JEV, &["a"], None))
+        .spawn_call(params("old", JEV, &["a"], None), test_scope())
         .await
         .unwrap();
     assert_eq!(
@@ -816,8 +884,8 @@ async fn retention_deletes_a_batch_seven_days_after_its_first_admission() {
     );
 }
 
-/// The batch store is its own file: serving batches writes nothing beside it in broca's state
-/// root, and leaves the run index and the session WAL tree byte for byte as they were.
+/// Serving batches writes only its database and owner-lifetime lock, leaving the run index
+/// and the session WAL tree byte for byte as they were.
 #[tokio::test]
 async fn the_store_never_touches_the_run_index_or_any_wal() {
     let root = broca_test_support::scratch_root()
@@ -826,6 +894,13 @@ async fn the_store_never_touches_the_run_index_or_any_wal() {
     std::fs::create_dir_all(root.join("wal/ab")).unwrap();
     std::fs::write(root.join("run-index.db"), b"run index bytes").unwrap();
     std::fs::write(root.join("wal/ab/session.wal"), b"wal bytes").unwrap();
+    use sha2::{Digest, Sha256};
+    let owner_file = root.join(format!(
+        "system-one.db.owner-{:x}.lock",
+        Sha256::digest(b"this-process")
+    ));
+    // The live store holds an OS lock on its owner file, and Windows refuses to read a locked
+    // range, so the snapshot never reads that file; its emptiness is checked by length below.
     let snapshot = |root: &std::path::Path| {
         let mut files = Vec::new();
         let mut stack = vec![root.to_path_buf()];
@@ -834,7 +909,7 @@ async fn the_store_never_touches_the_run_index_or_any_wal() {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
                     stack.push(path);
-                } else {
+                } else if path != owner_file {
                     let meta = std::fs::metadata(&path).unwrap();
                     files.push((
                         path.clone(),
@@ -858,12 +933,353 @@ async fn the_store_never_touches_the_run_index_or_any_wal() {
     admitted(&rig, params("files", JEV, &["a", "b"], None)).await;
     admitted(&rig, params("files", JEV, &["a", "b"], None)).await;
     rig.service.sweep().await.unwrap();
+    assert_eq!(std::fs::metadata(&owner_file).unwrap().len(), 0);
     let after: Vec<_> = snapshot(&root)
         .into_iter()
         .filter(|(path, _, _)| path != &root.join("system-one.db"))
         .collect();
     assert_eq!(
         after, before,
-        "only system-one.db is new; nothing else changed"
+        "only system-one.db and its exact owner-lifetime lock are new; nothing else changed"
     );
+}
+
+fn test_scope() -> broca_store::system_one::BatchScope {
+    broca_store::system_one::BatchScope::Run {
+        agent_id: "agent".into(),
+        run_id: "run".into(),
+    }
+}
+
+/// A service on a shared `store` under store `role`, calling `stand_in`, exporting facts to
+/// `export`: two of these on one store play the `classifier/v1` route and the
+/// `llm.classify/v1` tool in one process.
+fn role_service(
+    store: &Arc<SystemOneStore>,
+    role: &str,
+    config: Config,
+    stand_in: &Arc<StandIn>,
+    export: &Arc<broca_store::SqliteStore>,
+) -> Arc<SystemOne> {
+    Arc::new(
+        SystemOne::new(
+            Arc::clone(store),
+            "this-process",
+            catalog(),
+            vec![ModelPin::jev(stand_in.clone())],
+            config,
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .with_store_role(role)
+        .with_export(
+            Arc::clone(export),
+            Arc::new(crate::billing_routing::ChargeBasisTable::shipped_defaults()),
+        ),
+    )
+}
+
+/// Wait, at most ten seconds, until `n` provider calls are held inside the stand-in.
+async fn wait_held(stand_in: &StandIn, n: usize) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            // Registered before the count is read, so an entry between the two still wakes us.
+            let entered = stand_in.entered.notified();
+            tokio::pin!(entered);
+            entered.as_mut().enable();
+            if stand_in.held.load(Ordering::SeqCst) >= n {
+                return;
+            }
+            entered.await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{n} provider calls were never held at once"));
+}
+
+/// The batch id a keyed `llm.classify/v1` call derives: the lowercase hex SHA-256 of the JCS
+/// encoding of the caller, the scope's owner and identity, and the caller's raw `call_key`.
+fn derived_batch_id(
+    principal: &str,
+    owner: &str,
+    scope_ref: &str,
+    scope_epoch: u64,
+    call_key: &str,
+) -> String {
+    use sha2::Digest;
+    let encoded = serde_jcs::to_vec(&json!({
+        "principal": principal,
+        "owner": owner,
+        "scope_ref": scope_ref,
+        "scope_epoch": scope_epoch,
+        "call_key": call_key,
+    }))
+    .unwrap();
+    sha2::Sha256::digest(encoded)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// A tool call and a `classifier/v1` batch that share a batch id run at the same time on one
+/// store: each is held, answered, stored and billed under its own role, and a re-send of
+/// either replays its own bytes.
+#[tokio::test]
+async fn a_tool_call_and_a_classifier_batch_with_one_batch_id_both_execute() {
+    use broca_core::system_one_fact::UsageExportSegment;
+    use broca_store::system_one::{BatchScope, Outcome};
+    let store = Arc::new(SystemOneStore::open_in_memory().unwrap());
+    let export = Arc::new(broca_store::SqliteStore::open_in_memory().unwrap());
+    let stand_in = Arc::new(StandIn::default());
+    let classifier = role_service(&store, STORE_ROLE, Config::default(), &stand_in, &export);
+    let tool = role_service(
+        &store,
+        LLM_CLASSIFY_STORE_ROLE,
+        Config::default(),
+        &stand_in,
+        &export,
+    );
+    let d = derived_batch_id("reserved:core", "owner", "scope-ref", 1, "call-1");
+    let gate = Arc::new(Semaphore::new(0));
+    stand_in.script(
+        "tool-item",
+        vec![Script::Held(
+            Arc::clone(&gate),
+            noul("0.1", Some(r#"{"input_tokens":10}"#)),
+        )],
+    );
+    stand_in.script(
+        "classifier-item",
+        vec![Script::Held(
+            Arc::clone(&gate),
+            noul("0.2", Some(r#"{"input_tokens":20}"#)),
+        )],
+    );
+    // A different scope too, so sharing one batch row would surface batch_scope_mismatch.
+    let tool_scope = BatchScope::Run {
+        agent_id: "agent".into(),
+        run_id: "tool-run".into(),
+    };
+    let tool_body = params(&d, JEV, &["tool-item"], Some(1.0));
+    let classifier_body = params(&d, JEV, &["classifier-item"], None);
+    let tool_call =
+        tokio::spawn(Arc::clone(&tool).spawn_call(tool_body.clone(), tool_scope.clone()));
+    let classifier_call =
+        tokio::spawn(Arc::clone(&classifier).spawn_call(classifier_body.clone(), test_scope()));
+    // Both provider calls are in flight together: neither call was refused or queued behind
+    // the other.
+    wait_held(&stand_in, 2).await;
+    gate.add_permits(2);
+    let reply =
+        |result: Result<Result<Box<RawValue>, Vec<u8>>, tokio::task::JoinError>| match result
+            .unwrap()
+        {
+            Ok(reply) => reply.get().to_owned(),
+            Err(body) => panic!("refused: {}", String::from_utf8_lossy(&body)),
+        };
+    let tool_reply = reply(tool_call.await);
+    let classifier_reply = reply(classifier_call.await);
+    assert_eq!(
+        answers_text(&tool_reply, 0),
+        r#"{"q":{"type":"noul","noul":0.1}}"#
+    );
+    assert_eq!(
+        answers_text(&classifier_reply, 0),
+        r#"{"q":{"type":"noul","noul":0.2}}"#
+    );
+
+    let tool_row = tool
+        .stored_batch(&d)
+        .await
+        .unwrap()
+        .expect("the tool's row");
+    let classifier_row = classifier
+        .stored_batch(&d)
+        .await
+        .unwrap()
+        .expect("the classifier's row");
+    assert_eq!(tool_row.scope, Some(tool_scope.clone()));
+    assert_eq!(classifier_row.scope, Some(test_scope()));
+    assert_eq!(
+        tool_row.outcomes[0].outcome,
+        Outcome::Answered(r#"{"q":{"type":"noul","noul":0.1}}"#.into())
+    );
+    assert_eq!(
+        classifier_row.outcomes[0].outcome,
+        Outcome::Answered(r#"{"q":{"type":"noul","noul":0.2}}"#.into())
+    );
+    assert!(!tool_row.running && !classifier_row.running);
+
+    let facts = export.read_export_page(None, 100).unwrap().facts;
+    // (fact id, batch id, run id) of each exported fact.
+    let facts: Vec<(String, String, Option<String>)> = facts
+        .iter()
+        .map(|fact| match &fact.segment {
+            UsageExportSegment::SystemOne(fact) => (
+                fact.fact_id.clone(),
+                fact.batch_id.clone(),
+                fact.run_id.clone(),
+            ),
+            _ => panic!("not a System One fact"),
+        })
+        .collect();
+    assert_eq!(facts.len(), 2, "one spend fact for each role's call");
+    assert_ne!(facts[0].0, facts[1].0, "the two facts have different ids");
+    assert!(facts.iter().all(|(_, batch_id, _)| *batch_id == d));
+    let mut runs: Vec<_> = facts.iter().map(|(_, _, run_id)| run_id.clone()).collect();
+    runs.sort();
+    assert_eq!(runs, [Some("run".to_owned()), Some("tool-run".to_owned())]);
+
+    // Each re-send is served from its own role's record, with no provider call.
+    let tool_again = Arc::clone(&tool)
+        .spawn_call(tool_body, tool_scope)
+        .await
+        .unwrap();
+    assert_eq!(tool_again.get(), tool_reply);
+    assert_eq!(
+        admitted_by(&classifier, classifier_body).await,
+        classifier_reply
+    );
+    assert_eq!(
+        (
+            stand_in.calls("tool-item"),
+            stand_in.calls("classifier-item")
+        ),
+        (1, 1)
+    );
+    assert_eq!(export.read_export_page(None, 100).unwrap().facts.len(), 2);
+}
+
+async fn admitted_by(service: &Arc<SystemOne>, params: String) -> String {
+    match Arc::clone(service).spawn_call(params, test_scope()).await {
+        Ok(reply) => reply.get().to_owned(),
+        Err(body) => panic!("refused: {}", String::from_utf8_lossy(&body)),
+    }
+}
+
+/// The tool's instance has its own process-call and per-model semaphores. With every limit at
+/// one and the tool's only call stuck at the provider, the tool's next call waits, and a
+/// `classifier/v1` call for the same model still completes.
+#[tokio::test]
+async fn a_stuck_tool_call_leaves_classifier_calls_their_own_slots() {
+    let config = Config {
+        process_calls: 1,
+        model_calls: 1,
+        ..Config::default()
+    };
+    let store = Arc::new(SystemOneStore::open_in_memory().unwrap());
+    let export = Arc::new(broca_store::SqliteStore::open_in_memory().unwrap());
+    let stand_in = Arc::new(StandIn::default());
+    let classifier = role_service(&store, STORE_ROLE, config.clone(), &stand_in, &export);
+    let tool = role_service(&store, LLM_CLASSIFY_STORE_ROLE, config, &stand_in, &export);
+    let stuck_gate = Arc::new(Semaphore::new(0));
+    stand_in.script(
+        "stuck",
+        vec![Script::Held(Arc::clone(&stuck_gate), noul("0.1", None))],
+    );
+    stand_in.script("queued", vec![Script::Answer(noul("0.2", None))]);
+    stand_in.script("classified", vec![Script::Answer(noul("0.3", None))]);
+    let stuck = tokio::spawn(
+        Arc::clone(&tool).spawn_call(params("stuck", JEV, &["stuck"], None), test_scope()),
+    );
+    wait_held(&stand_in, 1).await;
+    let queued = tokio::spawn(
+        Arc::clone(&tool).spawn_call(params("queued", JEV, &["queued"], None), test_scope()),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !queued.is_finished() && stand_in.calls("queued") == 0,
+        "the tool's own slots are full, so its next call waits"
+    );
+
+    let classified = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        Arc::clone(&classifier).spawn_call(
+            params("classified", JEV, &["classified"], None),
+            test_scope(),
+        ),
+    )
+    .await
+    .expect("a classifier call waited on the tool's semaphores")
+    .unwrap_or_else(|body| panic!("refused: {}", String::from_utf8_lossy(&body)));
+    assert!(items(classified.get())[0]["answers"].is_object());
+    assert_eq!(stand_in.calls("classified"), 1);
+    assert!(!queued.is_finished(), "the tool stays stuck meanwhile");
+
+    stuck_gate.add_permits(1);
+    for call in [stuck, queued] {
+        tokio::time::timeout(std::time::Duration::from_secs(10), call)
+            .await
+            .expect("the tool's calls finish once released")
+            .unwrap()
+            .unwrap();
+    }
+}
+
+/// A call admitted earlier and executed now (one held for consent, say) keeps the retention
+/// window of its admission: the batch goes seven days after that, not after its execution.
+#[tokio::test]
+async fn an_earlier_admission_anchors_the_batch_retention() {
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+    let now = Arc::new(std::sync::atomic::AtomicI64::new(100 * DAY_MS));
+    let clock = Arc::clone(&now);
+    let stand_in = Arc::new(StandIn::default());
+    let service = Arc::new(
+        SystemOne::new(
+            Arc::new(SystemOneStore::open_in_memory().unwrap()),
+            "p",
+            catalog(),
+            vec![ModelPin::jev(stand_in.clone())],
+            Config::default(),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .with_store_role(LLM_CLASSIFY_STORE_ROLE)
+        .with_clock(Arc::new(move || clock.load(Ordering::SeqCst))),
+    );
+    stand_in.script("a", vec![Script::Answer(noul("0.1", None))]);
+    let admitted_at = 99 * DAY_MS;
+    let body = params("held-then-run", JEV, &["a"], None);
+    Arc::clone(&service)
+        .spawn_call_admitted_at(body.clone(), test_scope(), Some(admitted_at))
+        .await
+        .unwrap();
+    let row = service
+        .stored_batch("held-then-run")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.admitted_at_ms, admitted_at);
+    now.store(
+        admitted_at + broca_store::system_one::RETENTION_MS - 1,
+        Ordering::SeqCst,
+    );
+    assert_eq!(service.sweep().await.unwrap(), 0);
+    now.fetch_add(1, Ordering::SeqCst);
+    assert_eq!(
+        service.sweep().await.unwrap(),
+        1,
+        "seven days after admission, a day earlier than after execution"
+    );
+    Arc::clone(&service)
+        .spawn_call(body, test_scope())
+        .await
+        .unwrap();
+    assert_eq!(stand_in.calls("a"), 2, "past retention the key is new work");
+}
+
+#[tokio::test]
+async fn health_counts_new_outcomes_and_provider_codes_without_item_content() {
+    let rig = rig();
+    rig.stand_in
+        .script("private-state", vec![Script::Status(400, None)]);
+    admitted(&rig, params("private-batch", JEV, &["private-state"], None)).await;
+    let before = rig.service.health();
+    assert_eq!(before["batches_answered"], 1);
+    assert_eq!(before["items_failed"], 1);
+    assert_eq!(before["last_provider_error"]["typesafe"], "400");
+    assert!(!before.to_string().contains("private"));
+    admitted(&rig, params("private-batch", JEV, &["private-state"], None)).await;
+    let after = rig.service.health();
+    assert_eq!(after["batches_answered"], 2);
+    assert_eq!(after["items_failed"], 1);
+    assert_eq!(after["batches_in_flight"], 0);
 }

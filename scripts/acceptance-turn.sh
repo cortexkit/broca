@@ -61,7 +61,10 @@ CONN="$HOME/.local/share/cortexkit/run/subc-connection.json"
 }
 
 # A real schema rather than a name, per (3). filePath is what the tool module expects.
-TOOLS='[{"name":"read","description":"Read a file from disk","input_schema":{"type":"object","properties":{"filePath":{"type":"string"}},"required":["filePath"]}}]'
+# The tool names its module. Without it, broca resolves `read` by name across every module's
+# catalog, so any other module that also serves a `read` tool makes the call ambiguous and
+# fails the turn, which says nothing about the placed build.
+TOOLS='[{"name":"read","module":"aft","description":"Read a file from disk","input_schema":{"type":"object","properties":{"filePath":{"type":"string"}},"required":["filePath"]}}]'
 SID="acceptance-$(date +%s)-$$"
 OUT="$(mktemp)"
 trap 'rm -f "$OUT"' EXIT
@@ -81,7 +84,9 @@ trap 'rm -f "$OUT"' EXIT
 # DELIBERATELY SPANS THREE WIRE FAMILIES (Anthropic, Google Code-Assist, OpenAI-compatible)
 # rather than three models on one provider, so a single upstream outage cannot wall the whole
 # list. Order is by how much of the render path each exercises, not by cost.
-MODELS="${ACCEPTANCE_MODELS:-anthropic/claude-opus-5 google/antigravity-gemini-3.8-flash deepseek/deepseek-v4-flash}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The tool and worker acceptance legs share defaults and the ACCEPTANCE_MODELS override.
+MODELS="${ACCEPTANCE_MODELS:-$(<"$SCRIPT_DIR/lib/acceptance-models.txt")}"
 
 served=0
 refused=""

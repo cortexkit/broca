@@ -2,6 +2,7 @@ use super::*;
 use crate::{FileWalStore, WalStore};
 use broca_protocol::{RunId, StepId};
 use broca_wal::{RunConfig, RunOrigin};
+use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const START: u64 = COLD_MS * 3;
@@ -134,6 +135,7 @@ impl Fixture {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -1290,6 +1292,7 @@ async fn fold_send_age_refold_reads_post_append_member() {
         }),
     ]]);
     let req = RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -1972,6 +1975,7 @@ fn a_steered_session_folds_and_extracts_with_its_gate() {
         wal.append(
             1,
             &WalRecord::Steered {
+                written_at_ms: None,
                 tags: None,
                 retention: None,
                 ts_ms: None,
@@ -2497,4 +2501,82 @@ fn pending_move_intent_refuses_open_before_restoring_archived_copy() {
     fs::remove_file(&authority).unwrap();
     drop(f.store.open(&session).unwrap());
     assert_eq!(fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn fold_skips_a_held_range_without_an_intake_store() {
+    let f = Fixture::new();
+    let (session, mut bytes) = f.session("held-open", Some(1));
+    append_decoded_approval_records(
+        &mut bytes,
+        vec![WalRecord::ToolCallProviderHeld {
+            batch_id: broca_protocol::BatchId("batch".into()),
+            tool_call_id: broca_protocol::ToolCallId("call".into()),
+            call_key: "lineage:4".into(),
+            module: "tools".into(),
+            reason: "running".into(),
+            detail_digest: None,
+            held_at_ms: 1,
+            sequential: false,
+        }],
+    );
+    fs::write(f.store.wal_path(&session), &bytes).unwrap();
+    // An open held call keeps the range live whatever the caller knows.
+    assert_eq!(eligible(&bytes, START, COLD_MS), Err("provider_held_open"));
+    assert_eq!(
+        eligible_with(
+            &bytes,
+            START,
+            COLD_MS,
+            HeldRanges::Store(StoreHeld { complete: true })
+        ),
+        Err("provider_held_open")
+    );
+    let report = f.fold();
+    assert_eq!(
+        report.skipped["provider_held_open"],
+        [session_addr(&session)]
+    );
+    assert_eq!(fs::read(f.store.wal_path(&session)).unwrap(), bytes);
+
+    // With the held call terminal, only a caller that cannot prove the intake store's state
+    // keeps the range: the registration may still name it.
+    let mut resolved = f.session("held-settled", Some(1)).1;
+    append_decoded_approval_records(
+        &mut resolved,
+        vec![
+            WalRecord::ToolCallProviderHeld {
+                batch_id: broca_protocol::BatchId("batch".into()),
+                tool_call_id: broca_protocol::ToolCallId("call".into()),
+                call_key: "lineage:4".into(),
+                module: "tools".into(),
+                reason: "running".into(),
+                detail_digest: None,
+                held_at_ms: 1,
+                sequential: false,
+            },
+            WalRecord::ToolResult {
+                finished_at_ms: None,
+                batch_id: broca_protocol::BatchId("batch".into()),
+                result: crate::replay::deferred_tests::result("call", "late"),
+                outcome: broca_wal::DispatchOutcome::Completed,
+                reason: None,
+                tags: None,
+                hooks: None,
+                withdraw_elicitation: None,
+                provider_held: None,
+            },
+        ],
+    );
+    assert_eq!(
+        eligible(&resolved, START, COLD_MS),
+        Err("provider_held_registered")
+    );
+    assert!(eligible_with(
+        &resolved,
+        START,
+        COLD_MS,
+        HeldRanges::Store(StoreHeld { complete: true })
+    )
+    .is_ok());
 }

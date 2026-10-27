@@ -59,12 +59,23 @@ impl WireFamily for OpenAiResponses {
     }
 
     fn shape(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
-        let mut body = build_request_body(frozen, opts);
-        apply_prompt_cache_hints(&mut body, frozen);
-        if let Some(cache_key) = &frozen.prompt_cache_key {
-            body["prompt_cache_key"] = Value::String(cache_key.clone());
-        }
-        body
+        finish_platform_body(frozen, build_request_body(frozen, opts))
+    }
+
+    fn shape_with_media(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        payloads: &[crate::media_render::InlineMedia<'_>],
+    ) -> Value {
+        let media = crate::media_render::MediaRender { frozen, payloads };
+        let body = build_prepared_request_body_with_media(
+            frozen,
+            opts,
+            frozen.media.as_ref().map(|_| &media),
+        )
+        .body;
+        finish_platform_body(frozen, body)
     }
 
     fn endpoint(
@@ -123,6 +134,14 @@ pub(crate) fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions
     build_prepared_request_body(frozen, opts).body
 }
 
+fn finish_platform_body(frozen: &FrozenRenderConfig, mut body: Value) -> Value {
+    apply_prompt_cache_hints(&mut body, frozen);
+    if let Some(cache_key) = &frozen.prompt_cache_key {
+        body["prompt_cache_key"] = Value::String(cache_key.clone());
+    }
+    body
+}
+
 /// The shared Responses body together with the inputs it was rendered from, so the ChatGPT
 /// wrapper can finish the body without preparing the request or planning effort a second
 /// time: each of those clones the prompt or parses every episode's frozen config.
@@ -138,6 +157,14 @@ pub(crate) fn build_prepared_request_body<'a>(
     frozen: &FrozenRenderConfig,
     opts: &'a CallOptions,
 ) -> PreparedRequestBody<'a> {
+    build_prepared_request_body_with_media(frozen, opts, None)
+}
+
+pub(crate) fn build_prepared_request_body_with_media<'a>(
+    frozen: &FrozenRenderConfig,
+    opts: &'a CallOptions,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+) -> PreparedRequestBody<'a> {
     // A run with structured output adds its submit tool or schema instructions here; a run
     // without renders from `opts` unchanged.
     let prepared = crate::structured_output::prepare(frozen, opts);
@@ -148,7 +175,7 @@ pub(crate) fn build_prepared_request_body<'a>(
             Some((anchor, updates)) => (Some(anchor), updates),
             None => (None, Vec::new()),
         };
-    let body = render_prepared_body(frozen, prepared.as_ref(), &updates);
+    let body = render_prepared_body(frozen, prepared.as_ref(), &updates, media);
     PreparedRequestBody {
         body,
         prepared,
@@ -160,6 +187,7 @@ fn render_prepared_body(
     frozen: &FrozenRenderConfig,
     prepared: &CallOptions,
     updates: &[super::openai_responses_chatgpt::EffortUpdate],
+    media: Option<&crate::media_render::MediaRender<'_>>,
 ) -> Value {
     let view = crate::families::compaction_view(frozen.family_id, prepared);
     let opts = view.as_ref();
@@ -175,6 +203,7 @@ fn render_prepared_body(
             provider_text_state: frozen.provider_text_state,
             stateless: frozen.static_options.get("store") == Some(&Value::Bool(false)),
         },
+        media,
     );
 
     let mut body = json!({
@@ -335,6 +364,7 @@ fn convert_input_items(
     name_map: &crate::tool_name_alias::ToolNameMap,
     updates: &[super::openai_responses_chatgpt::EffortUpdate],
     replay: &ReplayPolicy<'_>,
+    media: Option<&crate::media_render::MediaRender<'_>>,
 ) -> Vec<Value> {
     let skip_system = matches!(system_policy, SystemPromptPolicy::InstructionsField);
     let mut out = Vec::new();
@@ -362,9 +392,9 @@ fn convert_input_items(
             continue;
         }
         match message.role {
-            Role::System | Role::User => out.push(convert_easy_message(message)),
+            Role::System | Role::User => out.push(convert_easy_message(message, media)),
             Role::Assistant => out.extend(convert_assistant_items(message, name_map, replay)),
-            Role::Tool => out.extend(convert_tool_output_items(message)),
+            Role::Tool => out.extend(convert_tool_output_items(message, media)),
         }
     }
     for update in updates {
@@ -423,7 +453,32 @@ fn reasoning_request_item(raw_response_item: &str, stateless: bool) -> Option<Va
 }
 
 // Preserve user block boundaries as input_text parts, retaining scalars for single text blocks.
-fn user_text_content(blocks: &[ContentBlock]) -> Value {
+fn user_text_content(
+    blocks: &[ContentBlock],
+    media: Option<&crate::media_render::MediaRender<'_>>,
+) -> Value {
+    if blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Media(_)))
+    {
+        return Value::Array(
+            blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
+                        Some(json!({"type":"input_text", "text":text}))
+                    }
+                    ContentBlock::Media(reference) => {
+                        Some(responses_media_block(reference, media, false))
+                    }
+                    ContentBlock::Reasoning { .. }
+                    | ContentBlock::RedactedReasoning { .. }
+                    | ContentBlock::ToolCall(_)
+                    | ContentBlock::ToolResult(_) => None,
+                })
+                .collect(),
+        );
+    }
     let texts: Vec<&str> = blocks
         .iter()
         .filter_map(|block| match block {
@@ -445,7 +500,10 @@ fn user_text_content(blocks: &[ContentBlock]) -> Value {
     }
 }
 
-fn convert_easy_message(m: &Message) -> Value {
+fn convert_easy_message(
+    m: &Message,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+) -> Value {
     let role = match m.role {
         Role::System => "system",
         Role::User => "user",
@@ -456,7 +514,7 @@ fn convert_easy_message(m: &Message) -> Value {
         "type": "message",
         "role": role,
         "content": if m.role == Role::User {
-            user_text_content(&m.content)
+            user_text_content(&m.content, media)
         } else {
             Value::String(text_content(&m.content))
         },
@@ -487,6 +545,12 @@ fn convert_assistant_items(
     let mut text = String::new();
     for block in &message.content {
         match block {
+            ContentBlock::Media(media) => {
+                text.push_str(&broca_protocol::content::media_not_shown_marker(
+                    media,
+                    broca_protocol::MediaMarkerReason::Carrier,
+                ))
+            }
             ContentBlock::Text { text: part } => text.push_str(part),
             ContentBlock::TextWithState {
                 text: part,
@@ -545,18 +609,59 @@ fn convert_assistant_items(
     out
 }
 
-fn convert_tool_output_items(m: &Message) -> Vec<Value> {
+fn convert_tool_output_items(
+    m: &Message,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+) -> Vec<Value> {
     let mut out = Vec::new();
     for b in &m.content {
         if let ContentBlock::ToolResult(tr) = b {
             out.push(json!({
                 "type": "function_call_output",
                 "call_id": tr.tool_call_id.0,
-                "output": tool_output_text(&tr.output),
+                "output": tool_output_content(&tr.output, media),
             }));
         }
     }
     out
+}
+
+fn tool_output_content(
+    out: &ToolOutput,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+) -> Value {
+    if let (ToolOutput::Parts { parts }, Some(media)) = (out, media) {
+        return Value::Array(
+            parts
+                .iter()
+                .map(|part| match part {
+                    broca_protocol::ToolOutputPart::Text { text } => {
+                        super::openai_media::Grammar::Responses.text(text)
+                    }
+                    broca_protocol::ToolOutputPart::Media { media: reference } => {
+                        responses_media_block(reference, Some(media), true)
+                    }
+                })
+                .collect(),
+        );
+    }
+    Value::String(tool_output_text(out))
+}
+
+fn responses_media_block(
+    reference: &broca_protocol::MediaRef,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+    tool: bool,
+) -> Value {
+    let grammar = super::openai_media::Grammar::Responses;
+    grammar
+        .block(
+            reference,
+            media,
+            tool,
+            crate::media_profile::MediaCarrier::Native,
+        )
+        .unwrap_or_else(|reason| grammar.marker(reference, reason))
 }
 
 fn text_content(blocks: &[ContentBlock]) -> String {
@@ -607,6 +712,10 @@ pub(crate) fn convert_tool_choice(
 
 fn tool_output_text(out: &ToolOutput) -> String {
     match out {
+        ToolOutput::Parts { parts } => broca_protocol::content::media_parts_text(
+            parts,
+            broca_protocol::MediaMarkerReason::Carrier,
+        ),
         ToolOutput::Text { text } => text.clone(),
         ToolOutput::Json { value } => value.to_string(),
         ToolOutput::Denied { reason } => format!("denied: {reason}"),
@@ -684,6 +793,7 @@ struct ResponsesOutputTokenDetails {
 }
 
 pub struct OpenAiResponsesNormalizer {
+    display_parts: crate::display_parts::DisplayParts,
     arguments_guard: crate::wire::ToolArgsGuard,
     completed_items: std::collections::HashSet<u64>,
     completed_text_parts: std::collections::HashSet<(u64, u64)>,
@@ -736,6 +846,7 @@ impl OpenAiResponsesNormalizer {
         reasoning_format: EncryptedReasoningFormat,
     ) -> Self {
         Self {
+            display_parts: Default::default(),
             arguments_guard: Default::default(),
             completed_items: Default::default(),
             completed_text_parts: Default::default(),
@@ -867,11 +978,19 @@ impl OpenAiResponsesNormalizer {
                         .response_id
                         .clone()
                         .unwrap_or_else(|| MessageId(String::new()));
-                    out.push(NormalizedEvent::Display(DisplayEvent::TextDelta {
-                        message_id: mid,
-                        tool_call_id: None,
-                        delta: delta.to_owned(),
-                    }));
+                    self.display_parts.delta(
+                        (index, 1),
+                        DisplayEvent::TextDelta {
+                            mid: None,
+                            part: None,
+                            message_id: mid,
+                            tool_call_id: None,
+                            delta: delta.to_owned(),
+                        },
+                        "openai_responses",
+                        self.step_id,
+                        out,
+                    );
                 }
             }
             // The finalized text is authoritative over streamed fragments. Do not re-emit it
@@ -882,6 +1001,14 @@ impl OpenAiResponsesNormalizer {
                 self.completed_text_parts.insert((index, part));
                 if let Some(text) = v.get("text").and_then(Value::as_str) {
                     self.text_items.insert((index, part), text.to_owned());
+                    if !text.is_empty() {
+                        self.display_parts.reserve(
+                            (index, 1),
+                            "openai_responses",
+                            self.step_id,
+                            out,
+                        );
+                    }
                 }
             }
             // Reasoning summaries are shown live as reasoning text, the way Anthropic thinking
@@ -906,10 +1033,18 @@ impl OpenAiResponsesNormalizer {
                         .response_id
                         .clone()
                         .unwrap_or_else(|| MessageId(String::new()));
-                    out.push(NormalizedEvent::Display(DisplayEvent::ReasoningDelta {
-                        message_id: mid,
-                        delta: text,
-                    }));
+                    self.display_parts.delta(
+                        (part.0, 0),
+                        DisplayEvent::ReasoningDelta {
+                            mid: None,
+                            part: None,
+                            message_id: mid,
+                            delta: text,
+                        },
+                        "openai_responses",
+                        self.step_id,
+                        out,
+                    );
                 }
             }
             "response.refusal.delta" => {
@@ -924,11 +1059,19 @@ impl OpenAiResponsesNormalizer {
                         .response_id
                         .clone()
                         .unwrap_or_else(|| MessageId(String::new()));
-                    out.push(NormalizedEvent::Display(DisplayEvent::TextDelta {
-                        message_id: mid,
-                        tool_call_id: None,
-                        delta: delta.to_owned(),
-                    }));
+                    self.display_parts.delta(
+                        (self.refusal_output_index.unwrap_or(0), 2),
+                        DisplayEvent::TextDelta {
+                            mid: None,
+                            part: None,
+                            message_id: mid,
+                            tool_call_id: None,
+                            delta: delta.to_owned(),
+                        },
+                        "openai_responses",
+                        self.step_id,
+                        out,
+                    );
                 }
             }
             // Refusal deltas are display progress; the done event is the authoritative reply.
@@ -941,14 +1084,44 @@ impl OpenAiResponsesNormalizer {
                 }
                 if let Some(refusal) = v.get("refusal").and_then(Value::as_str) {
                     self.refusal = refusal.to_owned();
+                    if !refusal.is_empty() {
+                        self.display_parts.reserve(
+                            (self.refusal_output_index.unwrap_or(0), 2),
+                            "openai_responses",
+                            self.step_id,
+                            out,
+                        );
+                    }
                 }
             }
             "response.output_item.added" => {
                 if let Some(item) = v.get("item") {
+                    if let Some(kind) = match item.get("type").and_then(Value::as_str) {
+                        Some("reasoning") => Some(0),
+                        Some("function_call") => Some(3),
+                        _ => None,
+                    } {
+                        let index = v.get("output_index").and_then(Value::as_u64).unwrap_or(0);
+                        self.display_parts.reserve(
+                            (index, kind),
+                            "openai_responses",
+                            self.step_id,
+                            out,
+                        );
+                    }
                     self.capture_text_state(
                         v.get("output_index").and_then(Value::as_u64).unwrap_or(0),
                         item,
                     );
+                    let index = v.get("output_index").and_then(Value::as_u64).unwrap_or(0);
+                    if self.text_states.contains_key(&index) {
+                        self.display_parts.reserve(
+                            (index, 1),
+                            "openai_responses",
+                            self.step_id,
+                            out,
+                        );
+                    }
                     if item.get("type").and_then(Value::as_str) == Some("function_call") {
                         let idx = v.get("output_index").and_then(Value::as_u64).unwrap_or(0);
                         let buf = self.tool_calls.entry(idx).or_default();
@@ -978,10 +1151,18 @@ impl OpenAiResponsesNormalizer {
                 self.arguments_guard
                     .stream(idx, &buf.call_id, &buf.name, &buf.arguments, delta);
                 if !buf.call_id.is_empty() && !delta.is_empty() {
-                    out.push(NormalizedEvent::Display(DisplayEvent::ToolInputDelta {
-                        tool_call_id: ToolCallId(buf.call_id.clone()),
-                        delta: delta.to_owned(),
-                    }));
+                    self.display_parts.delta(
+                        (idx, 3),
+                        DisplayEvent::ToolInputDelta {
+                            mid: None,
+                            part: None,
+                            tool_call_id: ToolCallId(buf.call_id.clone()),
+                            delta: delta.to_owned(),
+                        },
+                        "openai_responses",
+                        self.step_id,
+                        out,
+                    );
                 }
             }
             // The authoritative complete-arguments event. Some backends/models (observed
@@ -1007,6 +1188,26 @@ impl OpenAiResponsesNormalizer {
                     let idx = v.get("output_index").and_then(Value::as_u64).unwrap_or(0);
                     self.completed_items.insert(idx);
                     self.capture_text_state(idx, item);
+                    let kind = match item.get("type").and_then(Value::as_str) {
+                        Some("reasoning") => Some(0),
+                        Some("function_call") => Some(3),
+                        _ if message_item_output_text_parts(item)
+                            .iter()
+                            .any(|(_, text)| !text.is_empty())
+                            || self.text_states.contains_key(&idx) =>
+                        {
+                            Some(1)
+                        }
+                        _ => None,
+                    };
+                    if let Some(kind) = kind {
+                        self.display_parts.reserve(
+                            (idx, kind),
+                            "openai_responses",
+                            self.step_id,
+                            out,
+                        );
+                    }
                     match item.get("type").and_then(Value::as_str) {
                         Some("function_call") => {
                             let buf = self.tool_calls.entry(idx).or_default();
@@ -1056,6 +1257,14 @@ impl OpenAiResponsesNormalizer {
                                 self.saw_refusal = true;
                                 self.refusal_output_index = Some(idx);
                                 self.refusal = refusal;
+                                if !self.refusal.is_empty() {
+                                    self.display_parts.reserve(
+                                        (idx, 2),
+                                        "openai_responses",
+                                        self.step_id,
+                                        out,
+                                    );
+                                }
                             }
                         }
                     }
@@ -1148,7 +1357,7 @@ impl OpenAiResponsesNormalizer {
         }
         if !self.completed {
             self.completed = true;
-            let message = self.assemble_message()?;
+            let message = self.assemble_message(out)?;
             out.extend(self.arguments_guard.event());
             out.push(NormalizedEvent::Control(
                 ProviderControl::AssistantMessage { message },
@@ -1199,7 +1408,10 @@ impl OpenAiResponsesNormalizer {
         }
     }
 
-    fn assemble_message(&mut self) -> Result<AssistantMessage, NormalizeError> {
+    fn assemble_message(
+        &mut self,
+        out: &mut Vec<NormalizedEvent>,
+    ) -> Result<AssistantMessage, NormalizeError> {
         for buf in self.tool_calls.values() {
             self.arguments_guard
                 .terminal(&buf.call_id, &buf.name, &buf.arguments);
@@ -1301,6 +1513,12 @@ impl OpenAiResponsesNormalizer {
             ));
         }
         ordered.sort_by_key(|(index, kind_order, _)| (*index, *kind_order));
+        let keys: Vec<_> = ordered
+            .iter()
+            .map(|(index, kind, _)| (*index, u64::from(*kind)))
+            .collect();
+        self.display_parts
+            .retain(&keys, "openai_responses", self.step_id, out);
         Ok(AssistantMessage {
             message_id: self.response_id.clone().unwrap_or(MessageId(String::new())),
             content: ordered.into_iter().map(|(_, _, block)| block).collect(),
@@ -1419,6 +1637,10 @@ fn response_stream_error(event: &Value, nested: bool, private_diagnostics: bool)
         .and_then(Value::as_str)
         .unwrap_or("unknown");
     let code = error.get("code").and_then(Value::as_str);
+    let error_type = error.get("type").and_then(Value::as_str);
+    // An exhausted prepaid balance is about the credential, not this request: relabel it so the
+    // run's terminal names the credential and routing stops using it.
+    let billing_exhausted = crate::normalize::openai_billing_exhausted(code, error_type);
     let message = if private_diagnostics {
         "Responses websocket backend reported an error; response body omitted".to_owned()
     } else {
@@ -1431,7 +1653,6 @@ fn response_stream_error(event: &Value, nested: bool, private_diagnostics: bool)
             format!("OpenAI Responses stream reported an error (event {event_type:?}, {code_description})")
         })
     };
-    let error_type = error.get("type").and_then(Value::as_str);
     if private_diagnostics {
         // Error messages, codes and even event discriminators are arbitrary backend strings.
         tracing::warn!(
@@ -1451,18 +1672,29 @@ fn response_stream_error(event: &Value, nested: bool, private_diagnostics: bool)
         provider_details: None,
         provider_subcode: None,
         refusal: None,
-        class: response_error_class(event, code),
+        class: if billing_exhausted {
+            ErrorClass::Permanent
+        } else {
+            response_error_class(event, code)
+        },
         message,
         status: None,
-        retry_after_secs: None,
-        provider_code: code.map(|c| {
-            if c == "insufficient_quota" {
-                broca_protocol::error::BILLING_EXHAUSTED
-            } else {
-                c
-            }
-            .to_owned()
-        }),
+        // Only `response.failed` carries a retry time Codex reads; it ignores a bare `error`
+        // event's fields (`codex-api/src/sse/responses.rs:349-352`). The value is read from the
+        // provider's own message even when `message` above is replaced.
+        retry_after_secs: if nested {
+            crate::codex_retry_after::failed_response_retry_after(
+                error,
+                std::time::SystemTime::now(),
+            )
+        } else {
+            None
+        },
+        provider_code: if billing_exhausted {
+            Some(broca_protocol::error::BILLING_EXHAUSTED.to_owned())
+        } else {
+            code.map(str::to_owned)
+        },
         resets_at_ms: None,
         resets_at_source: None,
         limit_window: None,
@@ -1667,7 +1899,11 @@ mod tests {
         let display: Vec<(&str, &str)> = events
             .iter()
             .filter_map(|event| match event {
-                NormalizedEvent::Display(DisplayEvent::ReasoningDelta { message_id, delta }) => {
+                NormalizedEvent::Display(DisplayEvent::ReasoningDelta {
+                    message_id,
+                    delta,
+                    ..
+                }) => {
                     assert_eq!(message_id.0, "resp_1");
                     Some(("reasoning", delta.as_str()))
                 }

@@ -31,11 +31,12 @@ use broca_protocol::{
     provider::{NormalizedEvent, ProviderControl},
     request::{CallOptions, ModelHandle, Tool, ToolChoice},
     usage::Usage,
-    StepId,
+    MediaKind, MediaMarkerReason, MediaRef, StepId, ToolOutputPart,
 };
 use serde_json::{json, Map, Value};
 
 use crate::families::{apply_generation_controls, merge_inclusive_input_tokens};
+use crate::media_render::{InlineMedia, MediaRender};
 use crate::policy::{SystemPromptPolicy, ToolIdPolicy};
 use crate::sse::SseDecoder;
 use crate::wire::{
@@ -55,6 +56,16 @@ pub struct Gemini;
 impl WireFamily for Gemini {
     fn shape(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
         build_request_body(frozen, opts)
+    }
+
+    fn shape_with_media(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        payloads: &[InlineMedia<'_>],
+    ) -> Value {
+        let media = MediaRender { frozen, payloads };
+        build_request_body_with_media(frozen, opts, frozen.media.as_ref().map(|_| &media))
     }
 
     fn endpoint(
@@ -109,6 +120,14 @@ impl WireFamily for Gemini {
 /// `cloudcode-pa` envelope's `request` field — so the inner body is byte-identical to a
 /// direct Gemini request by construction.
 pub(crate) fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
+    build_request_body_with_media(frozen, opts, None)
+}
+
+pub(crate) fn build_request_body_with_media(
+    frozen: &FrozenRenderConfig,
+    opts: &CallOptions,
+    media: Option<&MediaRender<'_>>,
+) -> Value {
     // A run with structured output adds its submit tool or schema instructions here; a run
     // without renders from `opts` unchanged.
     let prepared = crate::structured_output::prepare(frozen, opts);
@@ -116,7 +135,13 @@ pub(crate) fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions
     let view = crate::families::compaction_view(frozen.family_id, opts);
     let opts = view.as_ref();
     let name_map = crate::tool_name_alias::ToolNameMap::build(&opts.tools, &opts.prompt);
-    let contents = convert_contents(&opts.prompt, frozen, opts.target_model.as_ref(), &name_map);
+    let contents = convert_contents(
+        &opts.prompt,
+        frozen,
+        opts.target_model.as_ref(),
+        &name_map,
+        media,
+    );
 
     let mut body = json!({ "contents": contents });
 
@@ -224,6 +249,7 @@ fn convert_contents(
     frozen: &FrozenRenderConfig,
     target_model: Option<&ModelHandle>,
     name_map: &crate::tool_name_alias::ToolNameMap,
+    media: Option<&MediaRender<'_>>,
 ) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     let non_system: Vec<&Message> = prompt.iter().filter(|m| m.role != Role::System).collect();
@@ -234,7 +260,7 @@ fn convert_contents(
         let m = non_system[i];
         match m.role {
             Role::User => {
-                let parts = convert_user_parts(&m.content, &current_tool_call_names);
+                let parts = convert_user_parts(&m.content, &current_tool_call_names, media);
                 current_tool_call_names.clear();
                 // Gemini rejects turns left empty after unsupported blocks are stripped.
                 if !parts.is_empty() {
@@ -279,6 +305,7 @@ fn convert_contents(
                     parts.extend(convert_tool_result_parts(
                         non_system[i],
                         &current_tool_call_names,
+                        media,
                     ));
                     i += 1;
                 }
@@ -299,10 +326,12 @@ fn convert_contents(
 fn convert_user_parts(
     blocks: &[ContentBlock],
     id_to_name: &BTreeMap<String, String>,
+    media: Option<&MediaRender<'_>>,
 ) -> Vec<Value> {
     blocks
         .iter()
         .filter_map(|block| match block {
+            ContentBlock::Media(reference) => Some(media_part(reference, false, media)),
             // Drop an empty text part (Gemini rejects `text:""`). Defensive — see above.
             ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. }
                 if text.is_empty() =>
@@ -312,7 +341,9 @@ fn convert_user_parts(
             ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
                 Some(json!({ "text": text }))
             }
-            ContentBlock::ToolResult(result) => Some(convert_tool_result_part(result, id_to_name)),
+            ContentBlock::ToolResult(result) => {
+                Some(convert_tool_result_part(result, id_to_name, media))
+            }
             _ => None,
         })
         .collect()
@@ -331,6 +362,7 @@ fn convert_model_parts(
     let mut call_index: u32 = 0;
     for (idx, b) in blocks.iter().enumerate() {
         match b {
+            ContentBlock::Media(media) => parts.push(json!({"text": broca_protocol::content::media_not_shown_marker(media, broca_protocol::MediaMarkerReason::Carrier)})),
             // Drop an empty text part (Gemini rejects `text:""`). Defensive — see above.
             ContentBlock::Text { text } if text.is_empty() => {}
             ContentBlock::Text { text } => parts.push(json!({ "text": text })),
@@ -437,31 +469,88 @@ fn tool_call_names_in_message(
         .collect()
 }
 
-fn convert_tool_result_parts(m: &Message, id_to_name: &BTreeMap<String, String>) -> Vec<Value> {
+fn convert_tool_result_parts(
+    m: &Message,
+    id_to_name: &BTreeMap<String, String>,
+    media: Option<&MediaRender<'_>>,
+) -> Vec<Value> {
     m.content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::ToolResult(result) => Some(convert_tool_result_part(result, id_to_name)),
+            ContentBlock::ToolResult(result) => {
+                Some(convert_tool_result_part(result, id_to_name, media))
+            }
             _ => None,
         })
         .collect()
 }
 
-fn convert_tool_result_part(result: &ToolResult, id_to_name: &BTreeMap<String, String>) -> Value {
+fn convert_tool_result_part(
+    result: &ToolResult,
+    id_to_name: &BTreeMap<String, String>,
+    media: Option<&MediaRender<'_>>,
+) -> Value {
     let name = id_to_name
         .get(&result.tool_call_id.0)
         .cloned()
         .unwrap_or_default();
-    json!({
+    let mut part = json!({
         "functionResponse": {
             "name": name,
             "response": function_response_payload(&result.output),
         }
-    })
+    });
+    if let (Some(media), ToolOutput::Parts { parts }) = (media, &result.output) {
+        let mut text = Vec::new();
+        let mut inline = Vec::new();
+        for part in parts {
+            match part {
+                ToolOutputPart::Text { text: value } => text.push(value.clone()),
+                ToolOutputPart::Media { media: reference } => {
+                    let rendered = media_part(reference, true, Some(media));
+                    if let Some(marker) = rendered["text"].as_str() {
+                        text.push(marker.to_owned());
+                    } else {
+                        inline.push(rendered);
+                    }
+                }
+            }
+        }
+        // FunctionResponsePart accepts inlineData, not text. Keep ordered text and fallback
+        // markers in the response object, and native media in the sibling parts array.
+        let key = if result.is_error { "error" } else { "result" };
+        part["functionResponse"]["response"] = json!({key: text.join("\n")});
+        if !inline.is_empty() {
+            part["functionResponse"]["parts"] = json!(inline);
+        }
+    }
+    part
+}
+
+fn media_part(reference: &MediaRef, tool: bool, media: Option<&MediaRender<'_>>) -> Value {
+    // FunctionResponse parts support image and PDF only, even when the user carrier supports
+    // audio and video. The frozen media profile determines whether this model can send images
+    // and PDFs as native tool-result parts.
+    let data = if tool && matches!(reference.kind, MediaKind::Audio | MediaKind::Video) {
+        Err(MediaMarkerReason::Carrier)
+    } else {
+        media
+            .ok_or(MediaMarkerReason::Carrier)
+            .and_then(|media| media.native(reference, tool))
+    };
+    match data {
+        Ok(data) => json!({"inlineData": {"mimeType": reference.mime, "data": data}}),
+        Err(reason) => {
+            json!({"text": broca_protocol::content::media_not_shown_marker(reference, reason)})
+        }
+    }
 }
 
 fn function_response_payload(out: &ToolOutput) -> Value {
     match out {
+        ToolOutput::Parts { parts } => {
+            json!({"result": broca_protocol::content::media_parts_text(parts, broca_protocol::MediaMarkerReason::Carrier)})
+        }
         ToolOutput::Text { text } => json!({ "result": text }),
         // Gemini models FunctionResponse.response as a protobuf Struct, so it must be a JSON
         // object. Keep objects unchanged and give every other JSON value the same `result`
@@ -701,7 +790,7 @@ impl GeminiNormalizer {
         self
     }
 
-    fn push_part(&mut self, part: GeminiPartBuf) {
+    fn push_part(&mut self, part: GeminiPartBuf) -> u64 {
         match (self.parts.last_mut(), &part) {
             (
                 Some(GeminiPartBuf::Text {
@@ -714,7 +803,7 @@ impl GeminiNormalizer {
                 },
             ) => {
                 buffered.push_str(text);
-                return;
+                return (self.parts.len() - 1) as u64;
             }
             (
                 Some(GeminiPartBuf::Reasoning {
@@ -727,11 +816,12 @@ impl GeminiNormalizer {
                 },
             ) => {
                 buffered.push_str(text);
-                return;
+                return (self.parts.len() - 1) as u64;
             }
             _ => {}
         }
         self.parts.push(part);
+        (self.parts.len() - 1) as u64
     }
 
     fn handle_chunk(
@@ -870,7 +960,7 @@ impl GeminiNormalizer {
                     .to_owned();
                 let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
                 let display_delta = args.to_string();
-                self.push_part(GeminiPartBuf::FunctionCall(FunctionCallBuf {
+                let part_index = self.push_part(GeminiPartBuf::FunctionCall(FunctionCallBuf {
                     index,
                     name,
                     args,
@@ -878,6 +968,8 @@ impl GeminiNormalizer {
                 }));
                 let tcid = synthetic_inbound_id(index, self.tool_id_policy);
                 out.push(NormalizedEvent::Display(DisplayEvent::ToolInputDelta {
+                    mid: None,
+                    part: Some(part_index),
                     tool_call_id: ToolCallId(tcid),
                     delta: display_delta,
                 }));
@@ -891,11 +983,13 @@ impl GeminiNormalizer {
             // the wire part prevents model summaries from being persisted and replayed as answers.
             if is_thought {
                 if let Some(text) = text.filter(|text| !text.is_empty()) {
-                    self.push_part(GeminiPartBuf::Reasoning {
+                    let part_index = self.push_part(GeminiPartBuf::Reasoning {
                         text: text.to_owned(),
                         signature: thought_signature,
                     });
                     out.push(NormalizedEvent::Display(DisplayEvent::ReasoningDelta {
+                        mid: None,
+                        part: Some(part_index),
                         message_id: message_id.clone(),
                         delta: text.to_owned(),
                     }));
@@ -925,6 +1019,8 @@ impl GeminiNormalizer {
             }
             if let Some(text) = text.filter(|text| !text.is_empty()) {
                 out.push(NormalizedEvent::Display(DisplayEvent::TextDelta {
+                    mid: None,
+                    part: Some((self.parts.len() - 1) as u64),
                     message_id: message_id.clone(),
                     tool_call_id: None,
                     delta: text.to_owned(),
@@ -1187,6 +1283,7 @@ mod tests {
             &super::super::gemini_frozen_config("model"),
             None,
             &name_map,
+            None,
         );
         let legacy = legacy_convert_user_parts(&prompt[1].content);
 
@@ -1221,7 +1318,7 @@ mod tests {
         ];
 
         assert_eq!(
-            serde_json::to_vec(&convert_user_parts(&blocks, &BTreeMap::new())).unwrap(),
+            serde_json::to_vec(&convert_user_parts(&blocks, &BTreeMap::new(), None)).unwrap(),
             serde_json::to_vec(&legacy_convert_user_parts(&blocks)).unwrap()
         );
     }
@@ -1243,6 +1340,7 @@ mod tests {
             &super::super::gemini_frozen_config("model"),
             None,
             &name_map,
+            None,
         );
 
         assert_eq!(

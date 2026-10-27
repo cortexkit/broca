@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 struct RunFacts {
     prepared: Option<bool>,
     title: Option<Option<String>>,
+    auth_selection: Option<broca_wal::AuthSelection>,
     pending: BTreeMap<String, (String, broca_wire::PendingApproval)>,
 }
 #[derive(Default)]
@@ -76,12 +77,18 @@ impl ApprovalState {
             usage.observe(record);
         }
         match record {
-            WalRecord::RunStarted { run_id, title, .. } => {
+            WalRecord::RunStarted {
+                run_id,
+                title,
+                config,
+                ..
+            } => {
                 facts.current = Some(run_id.clone());
                 facts.runs.clear();
                 let run = facts.runs.entry(run_id.clone()).or_default();
                 run.prepared.get_or_insert(false);
                 run.title = Some(title.clone());
+                run.auth_selection = config.auth_selection.clone();
             }
             WalRecord::ToolCallDeferred {
                 batch_id,
@@ -287,6 +294,23 @@ impl ApprovalState {
             return None;
         }
         self.facts.lock().ok()?.runs.get(run_id)?.title.clone()
+    }
+
+    /// Admission identity only: an auth refreeze or checkpoint's effective config cannot
+    /// replace the original RunStarted selection. A seed without that record leaves it absent.
+    pub(crate) fn auth_selection(
+        &self,
+        run_id: &RunId,
+        head: u64,
+    ) -> Option<broca_wal::AuthSelection> {
+        if !self.healthy.load(Ordering::Acquire) {
+            return None;
+        }
+        let facts = self.facts.lock().ok()?;
+        if self.covered.load(Ordering::Acquire) < head {
+            return None;
+        }
+        facts.runs.get(run_id)?.auth_selection.clone()
     }
     pub(crate) fn finished(&self, run_id: &RunId) {
         if let Ok(mut facts) = self.facts.lock() {

@@ -67,6 +67,7 @@ fn run_config() -> RunConfig {
 
 fn started(run: &str) -> WalRecord {
     WalRecord::RunStarted {
+        written_at_ms: None,
         tags: None,
         session_class: None,
         retention: None,
@@ -125,6 +126,7 @@ fn assistant_two_calls() -> AssistantMessage {
 
 fn step_with_two_calls(step: u64) -> WalRecord {
     WalRecord::ModelStepFinished {
+        written_at_ms: None,
         tags: None,
         hooks: None,
         step_id: StepId(step),
@@ -143,6 +145,7 @@ fn tool_result(id: &str, text: &str) -> WalRecord {
 
 fn tool_result_with_outcome(id: &str, text: &str, outcome: DispatchOutcome) -> WalRecord {
     WalRecord::ToolResult {
+        finished_at_ms: None,
         tags: None,
         hooks: None,
         batch_id: BatchId("b1".into()),
@@ -221,11 +224,27 @@ fn run_started_projects_submission_id_on_live_and_replay_paths() {
             },
         ),
         (
+            Cursor::new(1, 1),
+            ControlUnit::MessageBoundary { mid: "m0".into() },
+        ),
+        (
+            Cursor::new(1, 2),
+            ControlUnit::MessageBoundary { mid: "m0".into() },
+        ),
+        (
             Cursor::new(2, 0),
             ControlUnit::RunStarted {
                 run_id: RunId("queued".into()),
                 submission_id: Some(submission_id),
             },
+        ),
+        (
+            Cursor::new(2, 1),
+            ControlUnit::MessageBoundary { mid: "m1".into() },
+        ),
+        (
+            Cursor::new(2, 2),
+            ControlUnit::MessageBoundary { mid: "m1".into() },
         ),
     ];
 
@@ -302,6 +321,7 @@ fn projection_shape_and_cursors() {
 #[test]
 fn run_terminal_carries_last_recorded_step_finish_reason() {
     let terminal_step = WalRecord::ModelStepFinished {
+        written_at_ms: None,
         tags: None,
         hooks: None,
         step_id: StepId(1),
@@ -359,6 +379,7 @@ fn interrupted_projection_matches_replay_and_excludes_abandoned_call() {
         framed(
             4,
             WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 hooks: None,
                 batch_id: BatchId("b1".into()),
                 tool_call_id: ToolCallId("c1".into()),
@@ -373,6 +394,7 @@ fn interrupted_projection_matches_replay_and_excludes_abandoned_call() {
         framed(
             5,
             WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 hooks: None,
                 batch_id: BatchId("b1".into()),
                 tool_call_id: ToolCallId("c2".into()),
@@ -495,6 +517,7 @@ fn completed_terminal_omits_indeterminate_set() {
         framed(
             3,
             WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 hooks: None,
                 batch_id: BatchId("b1".into()),
                 tool_call_id: ToolCallId("c1".into()),
@@ -789,86 +812,177 @@ fn per_record_projection_equals_batch_projection() {
 /// live `out` channel to avoid double-publishing). A control unit the loop emits that
 /// isn't projectable would be SILENTLY LOST on both the live and resubscribe paths.
 ///
-/// The 9 units below are exactly those the loop emits to `out` (traced in run.rs). The
-/// `classify_control_unit` match is EXHAUSTIVE (no catch-all), so a NEW ControlUnit variant
-/// is a COMPILE error until classified — this test then guarantees that if it's a unit the
-/// loop emits, it was classified ControlProjectable (not silently DisplayLiveOnly /
-/// NotEmittedByLoop). The two non-emitted variants (ApprovalRequest, DisplayReset) are
-/// asserted to be classified as NOT ControlProjectable, documenting the boundary.
-#[test]
-fn every_loop_emitted_control_unit_is_projectable() {
-    use broca_core::{classify_control_unit, ControlClass};
+/// Collect actual output on tool, budget, error and auth-pause paths. This covers the exercised
+/// paths rather than claiming that a handwritten list discovers every possible loop emission.
+#[tokio::test]
+async fn every_loop_emitted_control_unit_is_projectable() {
+    use broca_core::{
+        classify_control_unit, ControlClass, RunRequest, StubProvider, StubToolPlane,
+    };
     use broca_protocol::approval::ApprovalRequest;
+    use broca_protocol::provider::{NormalizedEvent, ProviderControl};
+    use broca_protocol::request::{BudgetConfig, BudgetNudge, ExecutionMode, Tool};
 
-    // The exact set the loop emits to `out` (run.rs emit sites).
-    let loop_emitted: Vec<ControlUnit> = vec![
-        ControlUnit::RunStarted {
-            run_id: RunId("r".into()),
-            submission_id: None,
-        },
-        ControlUnit::StepStarted { step_id: StepId(1) },
-        ControlUnit::BudgetFired {
-            run_id: RunId("r".into()),
-            kind: BudgetKind::Nudge,
-            threshold: 2,
-            ordinal: 3,
-        },
-        ControlUnit::AssistantMessage {
-            message: assistant_two_calls().into(),
-        },
-        ControlUnit::ToolCall {
-            call: ToolCall {
-                thought_signature: None,
-                tool_call_id: ToolCallId("c".into()),
-                tool_name: "t".into(),
-                input: serde_json::Value::Null,
-            },
-        },
-        ControlUnit::ToolResult {
-            result: ToolResult {
-                tool_call_id: ToolCallId("c".into()),
-                output: ToolOutput::Text { text: "r".into() },
-                is_error: false,
-            },
-        },
-        ControlUnit::StepFinished {
-            step_id: StepId(1),
-            usage: Usage::default(),
-            finish_reason: FinishReason::Stop,
-        },
-        ControlUnit::Error {
-            error: ProviderError {
-                provider_details: None,
-                provider_subcode: None,
-                refusal: None,
-                class: ErrorClass::Permanent,
-                message: "e".into(),
-                status: None,
-                retry_after_secs: None,
-                provider_code: None,
-                resets_at_ms: None,
-                resets_at_source: None,
-                limit_window: None,
-                account_ref: None,
-                credential_id: None,
-                affordable_max_tokens: None,
+    let mut loop_emitted = Vec::new();
+    for (name, class) in [
+        ("tools", None),
+        ("error", Some(ErrorClass::Permanent)),
+        ("auth", Some(ErrorClass::Auth)),
+    ] {
+        let dir = broca_test_support::scratch_root()
+            .join(format!("projectable-{name}-{}", std::process::id()));
+        let mut req = RunRequest::from_submission(
+            serde_json::from_value(serde_json::json!({
+                "model": {"provider_module_id": "stub", "model_id": "m"},
+                "input": [{"role": "user", "content": [{"type": "text", "text": "go"}]}]
+            }))
+            .unwrap(),
+            RunId(name.into()),
+            BindIdentity::new(&dir, "projection", name),
+            SubmissionId(name.into()),
+        );
+        let scripts = if let Some(class) = class {
+            vec![vec![NormalizedEvent::Control(ProviderControl::Error {
+                error: ProviderError {
+                    provider_details: None,
+                    provider_subcode: None,
+                    refusal: None,
+                    class,
+                    message: "e".into(),
+                    status: None,
+                    retry_after_secs: None,
+                    provider_code: None,
+                    resets_at_ms: None,
+                    resets_at_source: None,
+                    limit_window: None,
+                    account_ref: None,
+                    credential_id: None,
+                    affordable_max_tokens: None,
+                },
+                retries_used: 0,
+            })]]
+        } else {
+            req.tools = ["alpha", "beta"]
+                .into_iter()
+                .map(|name| Tool {
+                    name: name.into(),
+                    description: name.into(),
+                    input_schema: serde_json::json!({"type":"object"}),
+                    module: None,
+                    execution_mode: ExecutionMode::Sequential,
+                    reply: None,
+                })
+                .collect();
+            req.policy_allowed = ["alpha".into(), "beta".into()].into_iter().collect();
+            req.budget = Some(BudgetConfig {
+                max_input_tokens: None,
+                nudges: vec![BudgetNudge {
+                    at_tool_calls: 1,
+                    text: "nudge".into(),
+                }],
+                finalize_at_tool_calls: 9,
+                finalize_text: "finish".into(),
+            });
+            vec![
+                vec![
+                    NormalizedEvent::Control(ProviderControl::AssistantMessage {
+                        message: assistant_two_calls(),
+                    }),
+                    NormalizedEvent::Control(ProviderControl::Finished {
+                        usage: Usage::default(),
+                        finish_reason: FinishReason::ToolCalls,
+                        retries_used: 0,
+                    }),
+                ],
+                vec![
+                    NormalizedEvent::Control(ProviderControl::AssistantMessage {
+                        message: AssistantMessage {
+                            message_id: MessageId("done".into()),
+                            content: vec![ContentBlock::Text {
+                                text: "done".into(),
+                            }],
+                        },
+                    }),
+                    NormalizedEvent::Control(ProviderControl::Finished {
+                        usage: Usage::default(),
+                        finish_reason: FinishReason::Stop,
+                        retries_used: 0,
+                    }),
+                ],
+            ]
+        };
+        let plane = StubToolPlane::new()
+            .with_tool("alpha", |_| {
+                broca_core::StubReply::Output(ToolOutput::Text {
+                    text: "alpha".into(),
+                })
+            })
+            .with_tool("beta", |_| {
+                broca_core::StubReply::Output(ToolOutput::Text {
+                    text: "beta".into(),
+                })
+            });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+        let summary = broca_core::run_loop(
+            req,
+            &StubProvider::new(scripts),
+            &plane,
+            &broca_core::FileLeaseStore::new(dir.join("leases")),
+            &broca_core::AllowAll,
+            &broca_core::FileWalStore::new(dir.join("wal")),
+            &tx,
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        let mut units = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let broca_core::OutputEvent::Control(unit) = event {
+                units.push(unit);
             }
-            .into(),
-        },
-        ControlUnit::Paused {
-            run_id: RunId("r".into()),
-            reason: PauseReason::AuthRequired,
-            error: None,
-        },
-        ControlUnit::RunFinished {
-            run_id: None,
-            reason: RunFinishReason::Completed,
-            usage: None,
-            final_step_finish_reason: None,
-            indeterminate_tool_calls: None,
-            retries_used: 0,
-        },
-    ];
+        }
+        assert!(
+            units
+                .iter()
+                .any(|unit| matches!(unit, ControlUnit::RunStarted { .. })),
+            "{name}"
+        );
+        if name == "auth" {
+            assert!(units.iter().any(|unit| matches!(
+                unit,
+                ControlUnit::Paused {
+                    reason: PauseReason::AuthRequired,
+                    ..
+                }
+            )));
+        } else {
+            assert_eq!(
+                summary.reason,
+                if name == "tools" {
+                    RunFinishReason::Completed
+                } else {
+                    RunFinishReason::Error
+                }
+            );
+            assert!(units
+                .iter()
+                .any(|unit| matches!(unit, ControlUnit::RunFinished { .. })));
+        }
+        loop_emitted.extend(units);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    assert!(loop_emitted
+        .iter()
+        .any(|unit| matches!(unit, ControlUnit::ToolCall { .. })));
+    assert!(loop_emitted
+        .iter()
+        .any(|unit| matches!(unit, ControlUnit::ToolResult { .. })));
+    assert!(loop_emitted
+        .iter()
+        .any(|unit| matches!(unit, ControlUnit::BudgetFired { .. })));
+    assert!(loop_emitted
+        .iter()
+        .any(|unit| matches!(unit, ControlUnit::Error { .. })));
     for unit in &loop_emitted {
         assert_eq!(
             classify_control_unit(unit),
@@ -927,6 +1041,8 @@ fn budget_firing_projects_to_control_stream() {
 /// Multi-unit records deliberately include two calls and a typed terminal error.
 fn all_projection_record_variants() -> Vec<FramedRecord> {
     let queued_request = SubmissionRequest {
+        staged_uploads: None,
+        content: Vec::new(),
         directives: None,
         on_restart: None,
         keep_warm: None,
@@ -971,6 +1087,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
             planned_calls: vec![ToolCallId("c1".into()), ToolCallId("c2".into())],
         },
         WalRecord::ToolDispatchIntent {
+            dispatched_at_ms: None,
             hooks: None,
             batch_id: BatchId("b-all".into()),
             tool_call_id: ToolCallId("c1".into()),
@@ -982,6 +1099,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
             call_key: None,
         },
         WalRecord::ToolNoDispatch {
+            dispatched_at_ms: None,
             tags: None,
             hooks: None,
             batch_id: BatchId("b-all".into()),
@@ -1049,6 +1167,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
             },
         },
         WalRecord::Queued {
+            written_at_ms: None,
             retention: None,
             ts_ms: None,
             hooks: None,
@@ -1104,12 +1223,12 @@ fn cursor_only_projection_matches_full_projection_for_every_record_prefix() {
     }
 }
 
-/// A steered message carries no control unit (the stream carries no caller input), so the
-/// control stream of a WAL with one is the stream without it, cursor for cursor, and the last
-/// cursor through the steer is the one before it.
+/// The steer record carries no unit. Its message boundaries appear only when the next step
+/// places the held input, after that step's existing payload and without moving old cursors.
 #[test]
-fn a_steered_record_projects_no_control_unit() {
+fn a_steered_record_has_no_unit_until_placement_boundary() {
     let steered = WalRecord::Steered {
+        written_at_ms: None,
         tags: None,
         retention: None,
         ts_ms: None,
@@ -1136,8 +1255,39 @@ fn a_steered_record_projects_no_control_unit() {
         .filter(|frame| frame.seq != 2)
         .cloned()
         .collect();
-    assert_eq!(project_control(&with), project_control(&without));
-    assert_eq!(project_control(&with).len(), 2);
+    let projected = project_control(&with);
+    assert_eq!(
+        projected,
+        vec![
+            (
+                Cursor::new(1, 0),
+                ControlUnit::StepStarted { step_id: StepId(1) }
+            ),
+            (
+                Cursor::new(3, 0),
+                ControlUnit::StepStarted { step_id: StepId(2) }
+            ),
+            (
+                Cursor::new(3, 1),
+                ControlUnit::MessageBoundary { mid: "m0".into() }
+            ),
+            (
+                Cursor::new(3, 2),
+                ControlUnit::MessageBoundary { mid: "m0".into() }
+            ),
+        ]
+    );
+    let old_payloads: Vec<_> = projected
+        .iter()
+        .filter(|(_, unit)| !matches!(unit, ControlUnit::MessageBoundary { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(old_payloads, project_control(&without));
+    assert!(projected.iter().all(|(cursor, _)| cursor.wal_seq != 2));
+    assert_eq!(
+        last_control_cursor_through(&with, Some(2)),
+        Some(Cursor::new(1, 0))
+    );
 }
 
 /// A rewrite ride's reported wait (llm-runner 0.5.2 §6) projects one durable `compaction_wait`

@@ -4,16 +4,16 @@
 //!   prompt → live Anthropic stream (reasoning + text) → model picks `get_time`
 //!   → real subc route → fake-aft-stub returns → model answers.
 //!
-//! Gated on explicit `BROCA_LIVE_TESTS` consent and a valid OAuth token (read from the
-//! OpenCode auth file; this test does not refresh tokens). Skips cleanly (clear message) if
-//! consent is absent, the token is missing/expired, or the subc binaries are absent — never a
-//! silent pass.
+//! Requires `BROCA_LIVE_TESTS=1` and a vault dev-tools handle for `oauth:anthropic`.
+//! Skips with a clear message if consent, the credential, or subc binaries are absent.
 //!
 //! This proves the live-model→loop→subc→tool path IN-PROCESS (LiveAnthropicProvider
 //! is the 2nd Provider::step impl). It does NOT yet exercise a real stream through
 //! the separate-process provider-module socket.
 
 mod common;
+#[path = "../../broca-provider/tests/live_common/vault.rs"]
+mod vault;
 
 use std::time::Instant;
 
@@ -34,21 +34,13 @@ const MODEL: &str = "claude-opus-4-8";
 const TOOL_RESULT: &str = "14:32 (Europe/Madrid)";
 
 fn live_anthropic_provider(label: &str, max_tokens: u32) -> Option<LiveAnthropicProvider> {
-    let opted_in = std::env::var("BROCA_LIVE_TESTS")
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
-    if !opted_in {
-        eprintln!("SKIP {label}: set BROCA_LIVE_TESTS to permit real provider calls.");
+    let Some(token) = vault::live_credential("oauth:anthropic") else {
+        eprintln!(
+            "SKIP {label}: BROCA_LIVE_TESTS=1 and a vault dev-tools credential are required."
+        );
         return None;
-    }
-
-    match LiveAnthropicProvider::from_opencode_auth(MODEL) {
-        Ok(provider) => Some(provider.with_max_tokens(max_tokens)),
-        Err(error) => {
-            eprintln!("SKIP {label}: {error}");
-            None
-        }
-    }
+    };
+    Some(LiveAnthropicProvider::new(MODEL, token).with_max_tokens(max_tokens))
 }
 
 /// THE full-stack-live integration proof: a REAL Anthropic model → run_loop → REAL
@@ -127,6 +119,7 @@ async fn live_model_reads_a_real_file_through_real_aft() {
         reply: None,
     };
     let req = RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -149,7 +142,7 @@ async fn live_model_reads_a_real_file_through_real_aft() {
             role: broca_protocol::content::Role::User,
             content: vec![ContentBlock::Text {
                 text: "Use the read tool to read the file \"status.txt\", then reply with its \
-           exact contents verbatim and nothing else."
+       exact contents verbatim and nothing else."
                     .into(),
             }],
         }],
@@ -265,7 +258,7 @@ async fn live_model_drives_a_real_subc_tool_call() {
         execution_mode: ExecutionMode::Parallel,
         reply: None,
     };
-    let req = RunRequest { directives: None, session_class: None, retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None, project_id: None, principal: None, run_id: RunId("live-demo".into()),
+    let req = RunRequest { input_written_at_ms: None, directives: None, session_class: None, retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None, project_id: None, principal: None, run_id: RunId("live-demo".into()),
     scope: None,
     session: BindIdentity::new(&rig.dir, "dogfood", "live-1"),
     model: ModelHandle::new("anthropic", MODEL),
@@ -397,6 +390,7 @@ async fn live_interleaved_thinking_echo_back_survives_multiturn() {
         reply: None,
     };
     let req = RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -419,8 +413,8 @@ async fn live_interleaved_thinking_echo_back_survives_multiturn() {
             role: broca_protocol::content::Role::User,
             content: vec![ContentBlock::Text {
                 text: "Think carefully, step by step, about which IANA timezone identifier Madrid \
-           uses and why, before doing anything. Then call get_time with that exact \
-           timezone, and finally tell me the time."
+       uses and why, before doing anything. Then call get_time with that exact \
+       timezone, and finally tell me the time."
                     .into(),
             }],
         }],

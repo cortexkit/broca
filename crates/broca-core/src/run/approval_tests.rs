@@ -489,7 +489,7 @@ impl ToolPlane for Tools {
     async fn batch_finished(&self, _: &BatchCtx) -> Result<(), ToolPlaneError> {
         Ok(())
     }
-    async fn dispatch(&self, _: &BatchCtx, call: &ToolCall) -> DispatchResult {
+    async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
         self.provider_requests.fetch_add(1, Ordering::SeqCst);
         self.started.store(true, Ordering::SeqCst);
         let hold = self.hold.lock().unwrap().clone();
@@ -497,6 +497,27 @@ impl ToolPlane for Tools {
             hold.notified().await;
         }
         self.completed.store(true, Ordering::SeqCst);
+        if *self.outcome.lock().unwrap() == "media" {
+            let media = ctx
+                .media_capture
+                .as_ref()
+                .expect("dispatch must carry the session capture handle")
+                .capture(
+                    &ctx.batch_id,
+                    &call.tool_call_id,
+                    b"%PDF-1.7\nlate capture\n%%EOF".to_vec(),
+                    "application/pdf".into(),
+                )
+                .await
+                .unwrap();
+            return DispatchResult::Completed(ToolResult {
+                tool_call_id: call.tool_call_id.clone(),
+                output: ToolOutput::Parts {
+                    parts: vec![broca_protocol::ToolOutputPart::Media { media }],
+                },
+                is_error: false,
+            });
+        }
         DispatchResult::Completed(ToolResult {
             tool_call_id: call.tool_call_id.clone(),
             output: ToolOutput::Text {
@@ -689,6 +710,7 @@ async fn late_feed_wait_bounds_real_reads_and_picks_up_mid_backoff_answer() {
             approval: None,
             elicitation_id: Some(id),
         }],
+        ..Default::default()
     };
     let (entered, mut waiting) = mpsc::unbounded_channel();
     let (release, resume_wait) = mpsc::unbounded_channel();
@@ -1127,6 +1149,7 @@ async fn restart_pause_refiles_same_key_without_mutate_and_continues_approved_ca
                 elicitation_id: held.id.clone(),
             })
             .collect(),
+        ..Default::default()
     };
     rig.control.stop_requested = None;
     let result = rig
@@ -1182,6 +1205,7 @@ async fn cancel_racing_restart_pause_withdraws_deferred_questions() {
         Usage::default(),
         0,
         &paused.open,
+        false,
     )
     .await
     .unwrap();
@@ -1595,6 +1619,7 @@ async fn expire_rig(mut rig: Rig) -> Rig {
         &out,
         None,
         Some(rig.wal_store()),
+        None,
         None,
     ));
     let expire = async {
@@ -2033,6 +2058,7 @@ async fn approved_not_dispatched_restart_resumes_only_second_validation() {
             approval: Some(Arc::new(recorded)),
             elicitation_id: paused.open[0].id.clone(),
         }],
+        ..Default::default()
     };
     rig.control.stop_requested = None;
     rig.hooks = Arc::new(Hooks {
@@ -2217,6 +2243,7 @@ async fn deferred_resume_uses_saved_target_when_catalog_resolution_changes() {
                 elicitation_id: held.id.clone(),
             })
             .collect(),
+        ..Default::default()
     };
     rig.control.stop_requested = None;
     *rig.tools.default_module.lock().unwrap() = "changed-provider".into();
@@ -2238,7 +2265,13 @@ async fn approved_schema_pin_is_refused_instead_of_silently_dropped_by_raw_carri
         planned_calls: vec![ToolCallId("c".into())],
     });
     let mut prepared = crate::replay::deferred_tests::prepared("c", &batch.0);
-    if let WalRecord::ToolCallDeferred { schema_pin, .. } = &mut prepared {
+    if let WalRecord::ToolCallDeferred {
+        schema_pin,
+        deferred_at_ms,
+        ..
+    } = &mut prepared
+    {
+        *deferred_at_ms = epoch_millis();
         *schema_pin = Some(broca_wal::DispatchSchemaPin {
             schema_digest: "sha256:pinned".into(),
             semantics: 1,
@@ -2247,6 +2280,7 @@ async fn approved_schema_pin_is_refused_instead_of_silently_dropped_by_raw_carri
     let seq = rig.writer.record(prepared.clone()).into_result().unwrap();
     let key = crate::context::call_key(rig.writer.lineage_id().unwrap(), seq);
     let approval = WalRecord::ApprovalRecorded {
+        closed_at_ms: None,
         tags: None,
         call_key: key,
         call_id: ToolCallId("c".into()),
@@ -2266,6 +2300,7 @@ async fn approved_schema_pin_is_refused_instead_of_silently_dropped_by_raw_carri
             approval: Some(Arc::new(approval)),
             elicitation_id: Some("q".into()),
         }],
+        ..Default::default()
     };
     let result = rig
         .batch(&crate::AllowAll, vec![call("c")], Some(resume), false)
@@ -2482,6 +2517,7 @@ async fn running_approved_resume_without_elicitation_plane_never_dispatches() {
         .unwrap();
     let key = crate::context::call_key(writer.lineage_id().unwrap(), prepared.seq);
     writer.record(WalRecord::ApprovalRecorded {
+        closed_at_ms: None,
         tags: None,
         call_key: key,
         call_id: ToolCallId("c".into()),
@@ -2525,6 +2561,7 @@ async fn running_approved_resume_without_elicitation_plane_never_dispatches() {
         &out,
         None,
         Some(&tools.store),
+        None,
         None,
     ))
     .await;
@@ -2588,6 +2625,7 @@ async fn recorded_late_approval_without_elicitation_plane_never_dispatches() {
         &out,
         None,
         Some(rig.wal_store()),
+        None,
         None,
     ))
     .await;
@@ -2842,5 +2880,65 @@ async fn boundary_cancel_preserves_active_approval_wait_until_immediate_escalati
         .unwrap();
     assert_eq!(result.interruption, Some(BatchInterruption::CallerCancel));
     drop(batch);
+    rig.finish().await;
+}
+
+#[cfg(all(feature = "test-clock", feature = "test-attachments"))]
+#[tokio::test]
+async fn late_admission_carries_capture_and_records_registered_media() {
+    let mut rig = expired_run("pass").await;
+    let state = rig.root.join("capture-state");
+    let wal = crate::FileWalStore::new(state.join("wal"));
+    drop(wal.open(&rig.bind).unwrap());
+    rig.writer.bind_media_capture(&wal, &rig.bind);
+    *rig.tools.outcome.lock().unwrap() = "media";
+    *rig.questions.answer.lock().unwrap() = "approve";
+    let mut history = approval_gate::History::new(&rig.writer, rig.frames()).unwrap();
+    approval_gate::admission(
+        &mut history,
+        &rig.writer,
+        &rig.bind,
+        &rig.control,
+        &rig.tools,
+    )
+    .await
+    .unwrap();
+    let frames = rig.frames();
+    let result = frames
+        .iter()
+        .find_map(|frame| match &frame.record {
+            WalRecord::LateResult { result, .. } => Some(result),
+            _ => None,
+        })
+        .expect("late result must be durable");
+    assert!(!result.is_error);
+    let ToolOutput::Parts { parts } = &result.output else {
+        panic!("late result lost captured parts")
+    };
+    let broca_protocol::ToolOutputPart::Media { media } = &parts[0] else {
+        panic!("late result lost captured reference")
+    };
+    assert_eq!(media.kind, broca_protocol::MediaKind::Document);
+    assert_eq!(rig.tools.sent.lock().unwrap().len(), 1);
+    assert!(rig.tools.sent.lock().unwrap()[0].2 .0.starts_with("late:"));
+    let store = crate::media_store::MediaStore::open(
+        &state,
+        crate::media_store::MediaStoreClass::NonDurable,
+    )
+    .unwrap();
+    assert_eq!(
+        store.read_verified(media).unwrap(),
+        b"%PDF-1.7\nlate capture\n%%EOF"
+    );
+    let manifest = state
+        .join("media/refs")
+        .join(crate::wal_writer::session_addr(&rig.bind));
+    assert_eq!(
+        std::fs::read_to_string(manifest).unwrap(),
+        format!("{}\n", media.sha256)
+    );
+    let round_trip: ToolResult =
+        serde_json::from_value(serde_json::to_value(result).unwrap()).unwrap();
+    assert_eq!(&round_trip, result.as_ref());
     rig.finish().await;
 }

@@ -14,6 +14,19 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{PendingSubmission, ReplayError};
 
+fn logical_input(request: &SubmissionRequest) -> std::borrow::Cow<'_, [Message]> {
+    if request.content.is_empty() {
+        return std::borrow::Cow::Borrowed(&request.input);
+    }
+    let mut input = request.input.clone();
+    for message in &mut input {
+        message
+            .content
+            .retain(|block| !matches!(block, broca_protocol::ContentBlock::Media(_)));
+    }
+    std::borrow::Cow::Owned(input)
+}
+
 /// Return the first caller-payload field that differs between two deterministic sends.
 ///
 /// The exhaustive destructuring is intentional: adding a submission field cannot silently
@@ -23,6 +36,8 @@ pub fn submission_difference(
     requested: &SubmissionRequest,
 ) -> Option<&'static str> {
     let SubmissionRequest {
+        staged_uploads: _,
+        content: existing_content,
         directives: existing_directives,
         project_id: _, // Record the bind in the WAL, but Some/None must not change send-id identity.
         principal: _,  // Same send from two principals is one send; the principal is only recorded.
@@ -30,7 +45,7 @@ pub fn submission_difference(
         on_restart: existing_on_restart,
         keep_warm: existing_keep_warm,
         model: existing_model,
-        input: existing_input,
+        input: _,
         tools: existing_tools,
         policy_allowed: existing_policy_allowed,
         tool_choice: existing_tool_choice,
@@ -51,6 +66,8 @@ pub fn submission_difference(
         client_message_id: _,
     } = existing;
     let SubmissionRequest {
+        staged_uploads: _,
+        content: requested_content,
         directives: requested_directives,
         project_id: _, // Record the bind in the WAL, but Some/None must not change send-id identity.
         principal: _,  // Same send from two principals is one send; the principal is only recorded.
@@ -58,7 +75,7 @@ pub fn submission_difference(
         on_restart: requested_on_restart,
         keep_warm: requested_keep_warm,
         model: requested_model,
-        input: requested_input,
+        input: _,
         tools: requested_tools,
         policy_allowed: requested_policy_allowed,
         tool_choice: requested_tool_choice,
@@ -78,6 +95,7 @@ pub fn submission_difference(
     } = requested;
 
     [
+        (existing_content != requested_content, "content"),
         (existing_directives != requested_directives, "directives"),
         (
             existing_on_restart.unwrap_or_default() != requested_on_restart.unwrap_or_default(),
@@ -88,7 +106,7 @@ pub fn submission_difference(
             "keep_warm",
         ),
         (existing_model != requested_model, "model"),
-        (existing_input != requested_input, "input"),
+        (logical_input(existing) != logical_input(requested), "input"),
         (existing_tools != requested_tools, "tools"),
         (
             existing_policy_allowed != requested_policy_allowed,
@@ -194,6 +212,8 @@ struct SubmissionIdentityDigestV1 {
     /// `client-message-id/v1` (`WalRecord::required_features`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     client_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
 }
 
 /// The `client_message_id` a stored identity digest carries, or `None` when it carries none
@@ -242,6 +262,8 @@ fn identity_digest_v1(
     conversation_key: Option<&str>,
 ) -> SubmissionIdentityDigestV1 {
     let SubmissionRequest {
+        staged_uploads: _,
+        content,
         directives,
         project_id: _, // Record the bind in the WAL, but Some/None must not change send-id identity.
         principal: _,  // Same send from two principals is one send; the principal is only recorded.
@@ -249,7 +271,7 @@ fn identity_digest_v1(
         on_restart,
         keep_warm,
         model,
-        input,
+        input: _,
         tools,
         policy_allowed,
         tool_choice,
@@ -270,6 +292,7 @@ fn identity_digest_v1(
     let mut policy_allowed: Vec<&str> = policy_allowed.iter().map(String::as_str).collect();
     policy_allowed.sort_unstable();
     SubmissionIdentityDigestV1 {
+        content: (!content.is_empty()).then(|| digest_json(serde_json::json!(content))),
         directives: directives
             .as_ref()
             .map(|names| digest_json(serde_json::json!(names))),
@@ -279,7 +302,7 @@ fn identity_digest_v1(
         keep_warm: (*keep_warm == Some(broca_protocol::request::KeepWarm::Auto))
             .then(|| "auto".to_owned()),
         model: digest_json(serde_json::json!(model)),
-        input: digest_json(serde_json::json!(input)),
+        input: digest_json(serde_json::json!(logical_input(request))),
         tools: digest_json(serde_json::json!(tools)),
         policy_allowed: digest_json(serde_json::json!(policy_allowed)),
         tool_choice: digest_json(serde_json::json!(tool_choice)),
@@ -347,6 +370,7 @@ pub fn send_identity_difference_with_conversation_key(
             stored.client_message_id != requested.client_message_id,
             "client_message_id",
         ),
+        (stored.content != requested.content, "content"),
         (stored.directives != requested.directives, "directives"),
         (stored.keep_warm != requested.keep_warm, "keep_warm"),
         (stored.delivery != requested.delivery, "delivery"),
@@ -600,6 +624,9 @@ impl EffortHistoryV1 {
 /// Version-one admission projection at an exact WAL sequence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdmissionCheckpointV1 {
+    /// Missing on older checkpoints: reconstruct from the full WAL before extending totals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<crate::head::HeadProjection>,
     /// Whether any deferred call occurred in the complete prefix. Missing means an older
     /// checkpoint cannot show whether a call before its watermark still needs an answer,
     /// a withdrawal, or a late execution report.
@@ -683,6 +710,7 @@ impl AdmissionCheckpointV1 {
 
     pub fn empty() -> Self {
         Self {
+            head: Some(crate::head::HeadProjection::default()),
             has_deferred_calls: Some(false),
             input_budget: Some(crate::input_budget::InputTokenBudget::default()),
             session_class: None,
@@ -702,6 +730,7 @@ impl AdmissionCheckpointV1 {
     pub fn from_frames(records: &[FramedRecord]) -> Result<Self, ReplayError> {
         let mut checkpoint = Self::empty();
         if !records.is_empty() && !crate::retention::starts_at_lineage_origin(records) {
+            checkpoint.head = None;
             checkpoint.has_deferred_calls = None;
             checkpoint.lineage_retention = None;
             checkpoint.tags = None;
@@ -738,6 +767,9 @@ impl AdmissionCheckpointV1 {
 
     /// Fold one WAL record. The mutation is committed only after all corruption checks pass.
     pub fn fold_record(&mut self, seq: u64, record: &WalRecord) -> Result<(), ReplayError> {
+        if let Some(head) = &mut self.head {
+            head.observe(record);
+        }
         if matches!(record, WalRecord::ToolCallDeferred { .. }) {
             self.has_deferred_calls = Some(true);
         }
@@ -940,6 +972,8 @@ impl AdmissionCheckpointV1 {
             }
             WalRecord::Queued {
                 keep_warm,
+                written_at_ms,
+                ts_ms,
                 submission_id,
                 request,
                 request_identity_digest,
@@ -953,6 +987,7 @@ impl AdmissionCheckpointV1 {
             } => crate::queue::insert_in_drain_order(
                 Arc::make_mut(&mut self.pending_fifo),
                 PendingSubmission {
+                    admitted_at_ms: written_at_ms.or(*ts_ms),
                     hooks: hooks.clone(),
                     conversation_key: conversation_key.clone(),
                     submission_id: submission_id.clone(),
@@ -1012,6 +1047,9 @@ impl AdmissionCheckpointV1 {
             | WalRecord::LateApprovalRecorded { .. }
             | WalRecord::LateDispatchIntent { .. }
             | WalRecord::LateResult { .. } => {}
+            // A provider-held call admits nothing and owns nothing: admission ownership and
+            // episode/queue membership come from the call's batch and run records, not this one.
+            WalRecord::ToolCallProviderHeld { .. } => {}
             // An informational record, skipped exactly like `Unknown`.
             WalRecord::InputTokenCapFrozen { .. }
             | WalRecord::InputTokenBudgetExhausted { .. }
@@ -1387,6 +1425,8 @@ mod tests {
 
     fn request(text: &str) -> SubmissionRequest {
         SubmissionRequest {
+            staged_uploads: None,
+            content: Vec::new(),
             directives: None,
             on_restart: None,
             keep_warm: None,
@@ -1426,6 +1466,7 @@ mod tests {
         frame(
             seq,
             WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -1459,6 +1500,7 @@ mod tests {
             frame(
                 3,
                 WalRecord::ModelStepFinished {
+                    written_at_ms: None,
                     tags: None,
                     hooks: None,
                     step_id: StepId(1),
@@ -1506,6 +1548,7 @@ mod tests {
             frame(
                 2,
                 WalRecord::ModelStepFinished {
+                    written_at_ms: None,
                     tags: None,
                     hooks: None,
                     step_id: StepId(1),
@@ -1537,6 +1580,7 @@ mod tests {
             frame(
                 4,
                 WalRecord::ToolDispatchIntent {
+                    dispatched_at_ms: None,
                     hooks: None,
                     batch_id,
                     tool_call_id: call_id,
@@ -1643,6 +1687,7 @@ mod tests {
             frame(
                 1,
                 WalRecord::Queued {
+                    written_at_ms: None,
                     retention: None,
                     ts_ms: None,
                     hooks: None,
@@ -1660,6 +1705,7 @@ mod tests {
             frame(
                 2,
                 WalRecord::Queued {
+                    written_at_ms: None,
                     retention: None,
                     ts_ms: None,
                     hooks: None,
@@ -1715,6 +1761,7 @@ mod tests {
             frame(
                 10,
                 WalRecord::Queued {
+                    written_at_ms: None,
                     retention: None,
                     ts_ms: None,
                     hooks: None,
@@ -1733,6 +1780,7 @@ mod tests {
             frame(
                 12,
                 WalRecord::ModelStepFinished {
+                    written_at_ms: None,
                     tags: None,
                     hooks: None,
                     step_id: StepId(1),
@@ -1769,6 +1817,7 @@ mod tests {
             frame(
                 14,
                 WalRecord::ToolNoDispatch {
+                    dispatched_at_ms: None,
                     tags: None,
                     hooks: None,
                     batch_id: broca_protocol::BatchId("batch".into()),
@@ -1781,6 +1830,7 @@ mod tests {
             frame(
                 15,
                 WalRecord::ToolNoDispatch {
+                    dispatched_at_ms: None,
                     tags: None,
                     hooks: None,
                     batch_id: broca_protocol::BatchId("batch".into()),
@@ -1821,6 +1871,7 @@ mod tests {
             frame(
                 19,
                 WalRecord::ModelStepFinished {
+                    written_at_ms: None,
                     tags: None,
                     hooks: None,
                     step_id: StepId(2),
@@ -2159,6 +2210,7 @@ mod tests {
             frame(
                 2,
                 WalRecord::ModelStepFinished {
+                    written_at_ms: None,
                     tags: None,
                     hooks: None,
                     step_id: StepId(1),
@@ -2232,6 +2284,7 @@ mod tests {
         };
         config.budget = Some(budget.clone());
         let step = |id, content| WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(id),
@@ -2351,6 +2404,7 @@ mod tests {
     #[test]
     fn checkpoint_json_with_pending_payload_is_byte_stable() {
         let checkpoint = AdmissionCheckpointV1 {
+            head: None,
             has_deferred_calls: None,
             tags: None,
             pending_order: None,
@@ -2363,6 +2417,7 @@ mod tests {
             at_seq: 7,
             last_episode: None,
             pending_fifo: Arc::new(vec![PendingSubmission {
+                admitted_at_ms: None,
                 order: None,
                 sent_by: None,
                 hooks: None,

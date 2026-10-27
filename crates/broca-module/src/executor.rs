@@ -33,6 +33,10 @@ pub enum RunKind {
 /// run never spawns or shuts down a writer — a run ends with a `sync()` barrier and the
 /// writer lives on for the next episode.
 pub struct RunJob {
+    pub media: Vec<crate::person_media::StagedMedia>,
+    /// Keep the full profile off the actor's nested admission-future stack, including
+    /// text-only sends whose optional profile is absent.
+    pub media_profile: Option<Box<broca_provider::media_profile::MediaProfile>>,
     /// Routing affinity supplied by the admitting send, including a drained queued send.
     pub conversation_key: Option<String>,
     pub req: RunRequest,
@@ -60,6 +64,48 @@ pub struct RunJob {
 }
 
 impl RunJob {
+    fn protected_input(&self) -> Vec<broca_protocol::Message> {
+        self.control
+            .steer
+            .as_ref()
+            .map_or_else(|| self.req.input.clone(), |inbox| inbox.protected_inputs())
+    }
+
+    pub fn has_media_input(&self) -> bool {
+        broca_provider::person_media::references(&self.protected_input())
+            .next()
+            .is_some()
+    }
+    /// Validate against the provider that will actually admit the run, then publish
+    /// held bytes before RunStarted can name any reference.
+    pub fn admit_media(
+        &self,
+        provider: &dyn broca_core::Provider,
+        uploads: Option<&broca_core::media_uploads::Uploads>,
+    ) -> Result<(), RunError> {
+        let protected = self.protected_input();
+        if broca_provider::person_media::references(&protected)
+            .next()
+            .is_none()
+        {
+            return Ok(());
+        }
+        let frozen = serde_json::from_value::<broca_provider::wire::FrozenRenderConfig>(
+            provider.render_config_blob(),
+        )
+        .ok();
+        let model = format!(
+            "{}/{}",
+            self.req.model.provider_module_id, self.req.model.model_id
+        );
+        crate::person_media::check(
+            frozen.as_ref().and_then(|frozen| frozen.media.as_ref()),
+            &model,
+            &protected,
+        )?;
+        crate::person_media::publish(uploads, &self.req.session, &self.media)
+    }
+
     /// Apply this send's projection policy to an available store. Only an explicit one-shot send
     /// sets `skip_materialization`; every omitted, false, or recovery-defaulted policy keeps the
     /// existing materialization behavior.
@@ -77,10 +123,26 @@ impl RunJob {
 /// fake.
 #[async_trait]
 pub trait RunExecutor: Send + Sync + 'static {
+    /// Quote current catalog media facts for enqueue and read-only fresh-send preflight.
+    /// Actual admission checks again against the provider's frozen render config.
+    async fn media_profile(
+        &self,
+        _request: &broca_protocol::request::SubmissionRequest,
+    ) -> Result<Option<Box<broca_provider::media_profile::MediaProfile>>, RunError> {
+        Ok(None)
+    }
     /// The scoped question adapter shared by approval waits and withdrawals after a run ends.
     /// Without it, calls waiting for approval close with ordinary not-dispatched results;
     /// no approval-feature WAL records or question operations are written by the actor.
     fn elicitation_plane(&self) -> Option<Arc<dyn broca_core::tool_plane::ElicitationPlane>> {
+        None
+    }
+
+    /// Where a provider-held call waits for its late result (see `crate::held_slots`). Without
+    /// it a run that resumes on a held call stays paused, because nothing can deliver to it.
+    fn provider_held_lifecycle(
+        &self,
+    ) -> Option<Arc<dyn broca_core::tool_plane::ProviderHeldLifecycle>> {
         None
     }
 
@@ -124,6 +186,15 @@ pub trait RunExecutor: Send + Sync + 'static {
     /// sessions. Default no-op (the in-process fakes hold nothing per session). Best-effort:
     /// a failure here must not block the close.
     async fn on_session_close(&self, _session: &BindIdentity) {}
+
+    /// Discard authenticated connection state when a session is deleted or moved.
+    fn retire_session_transport(&self, _session: &BindIdentity) {}
+
+    /// Drop only idle connections while a move probes whether a session is busy.
+    fn retire_idle_session_transport(&self, _session: &BindIdentity) {}
+
+    /// Discard idle and borrowed connections after the module's shutdown grace period.
+    fn retire_all_transports(&self) {}
 
     /// Called after the actor has durably written an `Interrupted` terminal for a run it
     /// sealed: one stopped by the module's shutdown, or one a crash left in flight. The run

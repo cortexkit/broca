@@ -267,6 +267,8 @@ async fn with_only_the_descriptor_hello_registers_and_a_later_route_is_attested_
             auth: None,
             one_shot: None,
             context_management: None,
+            session_class: None,
+            plan: None,
         })
         .await;
     assert!(

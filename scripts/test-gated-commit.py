@@ -216,8 +216,6 @@ class QuickcheckSelection(unittest.TestCase):
         shutil.copy2(ROOT / "scripts/lib/cargo-watchdog.py", library / "cargo-watchdog.py")
         shutil.copy2(ROOT / "scripts/quickcheck-guards.list", self.root / "scripts")
         shutil.copy2(ROOT / "scripts/quickcheck-feature-tests.list", self.root / "scripts")
-        for name in ("verify-mutation-platforms.py", "verify-windows-mutations.py"):
-            (self.root / "scripts" / name).write_text("print('fixture platform check')\n")
         for name in ("test-portable-test-selection.py", "check-portable-test-selection.py"):
             shutil.copy2(ROOT / "scripts" / name, self.root / "scripts")
         bins = self.root / ".cargo/bin"
@@ -250,14 +248,14 @@ if args[0] == os.environ.get("FAIL_PHASE") or ("--doc" in args and os.environ.ge
         tests = [c for c in commands if c[0] == "test"]
         self.assertEqual(tests[:2], [["test", "--locked", "-p", "changed", "--lib", "--bins", "--quiet"],
                                      ["test", "--locked", "-p", "changed", "--doc", "--quiet"]])
-        self.assertIn(["test", "--locked", "-p", "broca-test-support", "--test", "event_wait_guard", "--quiet"], tests)
+        self.assertIn(["test", "--locked", "-p", "broca-module", "--test", "it", "open_failed_classes::", "-F", "broca-module/test-clock", "--quiet"], tests)
 
     def test_binary_only_package_keeps_binary_tests_without_invalid_library_selectors(self):
         result, commands = self.check(KIND="bin")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         tests = [c for c in commands if c[0] == "test"]
         self.assertEqual(tests[0], ["test", "--locked", "-p", "changed", "--bins", "--quiet"])
-        self.assertIn(["test", "--locked", "-p", "broca-test-support", "--test", "event_wait_guard", "--quiet"], tests)
+        self.assertIn(["test", "--locked", "-p", "broca-module", "--test", "it", "open_failed_classes::", "-F", "broca-module/test-clock", "--quiet"], tests)
 
     def test_any_failed_crate_check_stops_quickcheck(self):
         for phase in ("fmt", "clippy", "test", "doc"):

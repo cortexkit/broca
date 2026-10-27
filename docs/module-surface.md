@@ -3,6 +3,53 @@
 This document describes the module's session and run contracts, durable lineage
 model, and coordinator invariants.
 
+## Session inspection CLI
+
+`broca-session trajectory <id> [--transcript] [--out FILE]` exports JSONL directly
+from the recorded WAL, without a daemon connection. Without `--out`, JSONL goes
+to stdout. Output files are created owner-only and must not already exist. It uses
+broca's read-only WAL reader, live-first and then `wal-archive/`,
+and respects retention expiration; it never opens a recovery writer or extracts
+an archived session into the live directory.
+
+The event kinds are `run`, `run_end`, `gap`, `model_request` (one per attempt),
+`model_step`, and `tool_call`. Tool rows appear at their intent/no-dispatch record
+and include later recorded result metadata. Bash rows include recorded execution
+knobs and an `exit_code` only when the result prints a `[exit code: N]` line.
+Missing timestamps, usage, routing, and result observations remain null or absent,
+not zero. `--transcript` adds `message` rows containing text and complete tool
+arguments/results, plus a `reasoning` byte-count row per step, never reasoning text
+or provider continuation state. Message `ordinal` and `mid` use the same placement
+as `session.read`; multiple results in one tool-role message share its coordinate.
+Messages not yet visible in `session.read`, including pending inputs and open
+tool turns before dispatch, have null coordinates. Transcript rows
+stay at their source record's position, even when a later boundary places them.
+Treat transcript exports as sensitive conversation data.
+
+Task/session-name lookup is shared by trajectory, `cache-dump --session <id>`, and
+`broca-session --subc CONNECTION read <id>` (also `--session <id> read`). It tries
+the supplied name first, then `alfonso:<id>` for an unprefixed name. The lookup
+scans only the compact session-ref inventory, with the name predicate in SQL;
+it does not scan run-index history or add an index/migration. Lookup duration is
+logged at debug level. Missing names refuse with the searched spellings; an
+incomplete inventory is identified rather than claiming the session is unknown,
+and a single candidate is not treated as unique until the inventory is complete.
+Ambiguous names list up to 100 candidates' project-root, harness, and session
+values, say when more were omitted, and refuse to choose one.
+
+`--state-root DIR` overrides the normal state-root resolver for these lookups and
+offline exports. Explicit `--project-root ROOT --harness HARNESS` bypass lookup
+and keep the session name literal, as before; use the full recorded session name
+(including `alfonso:` when present) when selecting an ambiguous candidate. Existing
+read calls with only one bind flag use lookup and require that flag to match the
+recorded identity. Other daemon commands still accept their original bind flags.
+The connection file is
+only an argument; its path and contents are not printed on connection failures.
+Put the offline `trajectory` and `cache-dump` subcommands before their flags;
+prefixed global flags are refused by command name before any session lookup.
+These commands refuse `--subc` by command name,
+whether the daemon flag appears before or after the subcommand, without binding.
+
 ---
 
 ## 1. What it is
@@ -49,6 +96,24 @@ model identities or qualification rows, and repeated continuation tokens are
 protocol errors. A failed poll retains the previous memory snapshot and LKG and
 counts once toward catalog health, just as an unpaged failure does.
 
+Routing is resolved from each model row's `wire.npm`, `wire.api` and optional
+`wire.shape`; provenance (`from`) is an open string. An unstated endpoint or
+unsupported package/shape refuses a new send with the model and missing fact
+named. Native defaults are now published as curated facts, not local endpoint pins.
+Code Assist and Meta subscription credentials permanently select their own required
+client protocol and endpoint. Go rows that Pi does not route have no published
+`wire.api`; they refuse because that fact is missing, with the model and missing fact
+named, without a local model list or guessed provider-default URL. Unknown members such as `wire_corrections.notes`
+remain diagnostic data and do not affect decoding or routing.
+
+Code Assist reasoning tiers use `route.reasoning_wire_ids` and
+`route.reasoning_default`. A historical tier-suffixed id is recognized only by
+reverse lookup in the published tier map. A withdrawn model's `successor` is
+replacement advice, never a redirect. `wire_corrections` is logged for diagnosis
+and never selects a route. A resume restores its entire recorded render config
+before any catalog lookup, so changed or withdrawn routing facts cannot change
+the endpoint, wire family, model id or request bytes of an admitted run.
+
 The fusiform catalog service's reference pagination request/response fixtures
 have not yet been published. Until those fixtures confirm interoperability,
 Broca makes these compatibility assumptions:
@@ -60,6 +125,22 @@ instant; the final continuation token is absent, not null. Error codes arrive as
 a routed error or a direct/tool-result JSON error document. A stale continuation
 uses the distinct `catalog_changed` code; `refused` and other codes do not signal
 a snapshot restart.
+
+### 1b. Provider credentials
+
+Real provider calls read credentials only from the claustrum vault, by credential id
+and the supervised module's read grant. A missing vault configuration or refused
+credential read never falls back to another application's credential store. Mock
+providers selected with `BROCA_PROVIDER_BASE_URL` need no credential route.
+
+Foreground developer tools use a separately provisioned capability handle:
+`broca-run` resolves a catalog model's provider and configured auth method, loads
+its handle through `vault_config::load_devtools_handle`, and reads it through subc.
+An explicit `--auth-bearer` overrides this; `--base-url` without a bearer remains
+credential-free for mocks. Live tests require `BROCA_LIVE_TESTS=1` before loading
+any handle or reading a credential, and use the same dev-tools handle map
+(`BROCA_DEVTOOLS_HANDLES` or `~/.config/cortexkit/broca/dev-tools-handles.json`).
+`BROCA_LIVE_SUBC` or `SUBC_SOCKET` can select their subc connection file.
 
 ## 2. Two consumer roles
 
@@ -110,18 +191,30 @@ RST: [RFC 9293 §3.10.7.4](https://www.rfc-editor.org/rfc/rfc9293.html#section-3
 requires outstanding SEND/RECEIVE operations to receive reset responses and moves
 TCP to CLOSED. An unrelated write error remains a serve error.
 
+broca has no spend-cap operations. `cap.install` and `spend.delta` were removed: a call to
+either gets the ordinary `unknown_method` refusal and writes nothing. Budget enforcement
+across sessions is not built (see SECURITY.md).
+
 ```
 session.read { from_ordinal?, limit?, include_tools?, after_mid?, lineage_id?, max_bytes?,
                  include_originals? }
-    → { messages: [{ ordinal, mid, message,
+    → { messages: [{ ordinal, mid, message, written_at?,
                      tool_calls?: [{ tool_call_id, call_key?, dispatched_to?, indeterminate }] }],
         next_from_ordinal?, head?, lineage_id?, lineage_state,
         tools?: [{ name, description, input_schema, module? }], tools_run_id? }
-                                                                     (OBSERVER; §15)
+                                                                      (OBSERVER; §15)
+
+session.history { cursor?, from_mid?, before_mid?, from_ordinal?, before_ordinal?,
+                  limit?, max_bytes?, media?, include_originals?, view?, form?, limits? }
+    → { messages: [{ ordinal, mid, written_at, message | row, tags?, ... }],
+        lineage_id?, history_version?, older?, newer? }
+session.output_refs { set_id, after? } → { records, next? }
+session.output_ref_read { ref_id, offset, length } → { format, size, data }
 
 session.head {} → { lineage_id?, last_ordinal?, head?, last_run_state?, updated_at?,
                        cache?: { last_sent_at_ms, ttl_ms?, expires_at_ms?, expiry_basis },
-                       title? }
+                       title?, model?: { provider, model, variant? }, usage?,
+                       sender?: { modes, interrupt, owner?: true }, incarnation? }
 session.warm { lineage_id? }
     → { request_body_sha256, warm_body_sha256, cache_read_tokens?, cache_write_tokens?,
         input_tokens?, ttl_ms, expires_at_ms, expiry_basis: "estimated" } (§4a)
@@ -144,9 +237,71 @@ session.retract { session, submission_id }
 
 run.cancel { run_id, at?: "now" | "step_boundary" } → "ack" | "not_active" (§13)
 run.status { run_id | session }
+    auth_selection?: credential id exactly as frozen at admission (also on run.result); omitted, never empty, when none was frozen or its config is not cheaply readable; never re-derived from current routing.
 send.status { send_id }
     → { state, run_id?, step?, last_error?, head: cursor, title?, usage } (state enum §14)
 ```
+
+`session.history` follows llm-runner §4.6 and §4.7 (`host_history`, `history_display`):
+absent `form` serves raw entries; `form: "display"` serves canonical rows with optional
+UTF-8 tool-payload `limits`. Newest pages and `before_*` seeks page backward; `from_*`
+seeks page forward. Entries are always oldest first, and opaque `older`/`newer` cursors
+are session-lineage bound. Broca has no unnumbered host history or history rewrites;
+its surviving history is the full append-only lineage and its history version is zero.
+If the shared `session.read` timestamp derivation has no creation time, history refuses the whole page with
+`history_unrepresentable`, class `permanent`, and `detail: {ordinal, field}` naming
+the first unrepresentable row and `written_at`. It never substitutes an
+invented value or returns a partial page. Raw `session.read` remains the recovery path.
+Under llm-runner 0.6.13 §4.7, assistant rows carry their recorded producing model.
+Imported or adopted messages without one omit `model` (unknown); the projection
+never guesses or copies the session's current model. Messages written by a run keep theirs.
+Display rows alone expose the output-reference descriptors from §9.13: the reply
+set on `row.output_refs`, and each opted-in call's set on its tool-call part.
+Default `session.read`, `run.status`, stored messages and subscribe bytes are unchanged.
+
+Read-entry `written_at` is an optional Unix-millisecond time in the **entry envelope**, never
+inside the opaque `message`. It is part of default reads, with no request opt-in. New input
+and steers record admission time; a completed assistant records the end of its successful model
+attempt, before post-assistant hooks. The `message-times/v1` WAL feature preserves those times
+across rollback. Existing records are not rewritten: reads expose only recorded admission or
+successful-attempt times, and tool results' recorded `tool-times/v1` finish times. Unknown times
+stay absent, never zero. The same placement rules attach these facts before and after projection.
+
+`session.head.model` is the latest recorded next-send selection, not a model guessed from plan
+JSON. `usage`, behind the `session_usage` group, is incremental durable session spend with
+`since` naming the first counted run. Its selection keys, first-use ordering and lower-bound
+totals are exactly run usage's: a field no counted step reported is absent; unreported steps
+are counted, not silently treated as measured zeros. Projection commits totals with its WAL
+watermark. `reasoning_tokens` is already included in `output_tokens`, not an additional charge;
+the session and run totals preserve that breakdown without adding it again. Head folds only
+the unprojected suffix. Retained sessions use a separate,
+lineage-bound checkpoint of content-free spend and grant facts; its watermark never advances
+the transcript projection. Expiry deletes that checkpoint in the retained-metadata transaction,
+and late writes cannot recreate it. A missing or unreadable checkpoint is reconstructed from
+the WAL, never served as a partial total. The retained head operation still uses its existing
+full-WAL latest-message read for older metadata and titles: spend is incremental, but the whole
+retained `session.head` operation is not yet constant-time.
+
+`sender`, behind `head_sender`, reports
+the attested caller's own effective grant, using send admission's owner and plan checks. Owners
+receive all supported modes and interruption; named senders receive `idle_start` and interruption
+only when their entries grant them. An absent sender means no grant. `incarnation` is the UUID v4
+already stored in the WAL header, preserved by restart, archive and move; it is omitted for an
+unverifiable or missing header and is never minted by a read.
+
+Sessions recorded before attested owners were stamped, and direct or unverified sessions, retain
+their pre-existing unrestricted admission: any attested caller is admitted as owner. Head therefore
+reports the full owner grant to those callers too; reporting absence would incorrectly deny the
+permission the next send actually has. This does not tighten or otherwise change legacy admission.
+
+Tool, step-transform and compaction plan items may omit `preset`. Broca preserves the omission
+on catalog, declaration and compaction calls; it never substitutes an empty string. An explicit
+`"worker"` tool preset still requires scope. **System-text items still require a preset**:
+tool-provider 0.10.4 defines `system_text: {preset, params}` and has no default selector. A
+preset-less system-text item is refused before fetching or writing as `invalid_params`, naming
+`plan.system_text_items[index].preset`, rather than sending a shape the provider contract cannot
+express. A preset-less step declaration refused by its provider keeps the provider's code,
+message and field; it does not invent a `preset_missing` difference for a nonexistent name.
 
 ### Health counters and per-request diagnostics
 
@@ -406,6 +561,11 @@ tools is refused before it can freeze that list, even if it queues or steers; it
 retrofit a plan (the existing `plan_drift` rule still applies). Omitting tools does not
 revalidate or replace an older run's frozen tool list.
 
+A session freezes its fetch plan on its first episode, so compaction enrollment happens only on
+a session's first episode, before it has stored messages. A session whose first episode ran
+without a plan, including one seeded by `session.import`, refuses a later plan naming a
+compaction provider as `plan_drift`, and the refused send writes nothing.
+
 `role.describe.capabilities` includes `send_tool_reply_bound` (a broca extension). A tool
 declared directly in `session.send.tools` may carry `reply: {"max_ms": N}`, the longest one of
 its calls may take to answer, with N from 1 to 86,400,000 (the bound a tool provider's catalog
@@ -600,7 +760,7 @@ Omitting the variant renders exactly what the same send rendered before variants
 **Code Assist (Antigravity) renders a variant as a backend tier.** Which levels a model
 accepts still comes from its catalog row; fusiform serves alias rows for several Antigravity ids
 (`antigravity-gemini-3.8-flash` carries `gemini-3.8-flash`'s facts). How a level is sent is the
-family's: Code Assist selects a different backend model id by tier suffix, so `high` on
+family's: Code Assist selects the backend id published in `route.reasoning_wire_ids`, so `high` on
 `antigravity-gemini-3.8-flash` sends `gemini-3.8-flash-high` with that tier's thinking settings,
 exactly as if the caller had spelled the tier in the id. With no variant the bare id keeps its
 default tier (`gemini-3.8-flash-medium`). A level the row defines but the live route has no tier
@@ -613,8 +773,9 @@ row does not define is refused as above.
 A variant is also refused with `variant_unsupported` if the id has no catalog row (its variants
 cannot be known), or the Code Assist route has no tiers for the model (it cannot apply the
 variant). The message identifies the missing catalog row or route tiers; `defined` is empty
-without a catalog row and otherwise lists the catalog-defined variants. Neither refusal prevents
-sending the model with no variant through an explicit Code Assist route.
+without a catalog row and otherwise lists the catalog-defined variants. A fresh send without
+a variant still requires a published tier map and default; no suffix or bare-id fallback is
+guessed when those route facts are missing.
 
 `antigravity-gemini-4-argon` defaults to `gemini-4-argon-medium`; its `low`, `medium`, and `high`
 variants select the corresponding native tier ids. Argon tiers use uppercase `thinkingLevel`
@@ -637,13 +798,33 @@ The manifest lists `classifier/v1` in `capabilities.provides`.
   and `llm-runner`, or a `classifier` version other than `v1`, is refused at bind
   with `role_versions_unsupported`.
 - **No session.** A classifier route names no session: nothing opens a session,
-  takes a lease, or touches a WAL or `run-index.db`. Each call runs on its own task,
+  takes a lease, touches a WAL, or writes session projections. Each call runs on its own task,
   capped per process and per model, and holds none of the connection's request slots.
+- **Work scope.** `classify.run` requires a daemon-stamped run scope (`agent_id` and
+  `run_id`) or flow scope (`flow_id`), otherwise `scope_required` before any write or
+  provider call. `reserved:basal` requires a flow, even when it presents a run stamp,
+  otherwise `flow_scope_required`. A batch freezes its first attribution; a retry
+  under another scope gets `batch_scope_mismatch`, without changing its ceiling or
+  stored outcomes. A flow is never attributed to its owner agent. `role.describe`
+  remains available without a work scope.
 - **Durable batches.** `system-one.db` under the state root records each admitted
   batch and every item outcome before the reply, and is the authority for them.
   Batches a dead process left `running` are released at startup. A batch and its
   outcomes are deleted seven days after first admission. The file is excluded from
   Engram backups.
+- **Metering.** Each paid item commits an immutable measurement intent alongside its
+  outcome, then publishes it to `run-index.db`'s `export_facts` before replying. Startup
+  republishes pending intents idempotently. These sessionless facts carry
+  `kind: "system_one"`; existing session facts keep their bytes and ids. Only reported
+  tokens enter `usage`; estimates and prices stay inside batch ceiling accounting.
+  Consumers must deploy kind-aware decoding before these facts are produced.
+- **Health.** Channel-0 `health.check` metrics include `system_one`, with the in-flight
+  batch gauge, answered/refused batch calls, newly recorded answered/failed items,
+  nanodollars of batch-accounted spend newly exported per model since process start,
+  and the last provider error code per provider. This spend uses frozen ceiling rates
+  (and input estimates when unreported), not Astrocyte's pricing of measurements.
+  It contains no item content. Replayed facts and
+  served cached outcomes do not increase item or spend counters.
 - **Catalog.** A row whose `model.kind` is `decision` is a classifier; another
   stated kind, or no kind, is refused `model_not_classifier`; a model the catalog
   does not list is `model_unknown`.
@@ -1177,6 +1358,78 @@ and "no reverse-request handler is registered for <family>", the same reply the 
 consumer SDK sends. It never reaches a pending call, even one with the same corr, and each
 refusal is counted in `health.check` as `reverse_requests_refused`.
 
+**Provider-held calls: the runtime is installed, the route capabilities are not declared.**
+The daemon installs the provider-held runtime (`broca-module-serve/src/held_runtime.rs`) on
+its tool plane: the waiting slots a held call's batch waits in, a late-results intake store
+(`late-results.db` under the state root, a projection of the WAL kept out of the backup
+catalog), one puller per provider module, and boot recovery. Release builds still leave
+`content/v1` and `held-reply/v1` undeclared on every tool route, because a held call cannot be
+cancelled or stopped yet; with them undeclared no provider may hold a call, no plain call
+carries a key, nothing is registered, and every call keeps its exact wire bytes. Debug builds
+declare both when `BROCA_TEST_DECLARE_HELD_REPLY_V1=1`; that name is a non-shipping marker the
+release fence refuses. Role and plan-fetch routes declare neither. A reply carrying `held` on
+an undeclared route becomes a malformed-reply error result with reason
+`malformed_provider_held_reply`, without pausing or exposing its interim content to the model.
+
+With the capabilities declared, the core batch passes durable intent keys through its keyed
+dispatch methods and registers each dispatch group in one synced intake transaction before
+sending it. Plain keys (`<lineage_id>:<seq of the call's ToolDispatchIntent>`) go only to
+providers whose frozen plan manifest declares `late_results`, on a consumer-identity
+connection; approved calls keep their deferred key and exact argument bytes. Routing and
+decoding read only the provider declarations frozen into the session's plan manifest (on a
+fresh run the admitted manifest, on a resume the one its `RunStarted` recorded), never a live
+catalog. An accepted held reply first syncs `ToolCallProviderHeld`, then waits in its slot;
+when every remaining call is held the run pauses through `pause_run_impl` with
+`RunPaused {tool_held}` and sends nothing to the model. `provider-held/v1` is a known reader
+feature.
+
+A late result IS the held call's result: broca never sends a held call to its provider again.
+The puller pulls `late_results` under broca's own principal on one unscoped route per module
+(the custodian is the carrier, tool-provider contract §7), every 3 s while the module needs
+its feed, backing off to 30 s after errors. Each entry is classed from the intake registrations
+and the registered session's own WAL, never from `run-index.db`: an entry for an open held call
+is mapped with the same `content/v1` mapper a synchronous reply uses (`not_started` and
+`expired` become error results whose text is pinned by golden), deposited in the call's slot,
+and the session's actor resumes a paused run into its original batch, which writes the result
+as the call's `ToolResult` at the call's position and syncs it. Only then is the entry acked,
+through exactly the cursor the provider returned. An entry whose call already has its terminal,
+an entry of an unknown kind, and an entry no registration names are acked as no-ops; an entry
+whose held record is not yet durable pins the ack. Entries are deduplicated on
+`(provider, custodian, call_key, event_id)`, and `cursor_incarnation_changed` re-reads from the
+start. A registration is pruned once its call's terminal and batch commit are durable.
+
+At boot tombstoned lineages are pruned from the intake without opening an actor. Every remaining
+session with a registration is opened so its open-time recovery runs, then each
+module that still needs its feed gets its puller. A missing or unreadable `late-results.db` is
+rebuilt off the startup path by scanning the live WALs, decoding only those holding a
+provider-held frame; until that scan completes no entry is delivered or acked. A state root
+whose WAL feature floor never named `provider-held/v1` holds no such frame, so its rebuild reads
+no WAL at all.
+
+Ack guarantee, narrowed: broca puts no bound of its own on a hold. A provider keeps at most
+1,000 unacked results per session and drops the oldest first; a held call whose entry was
+dropped that way never receives one and its run stays paused until it is cancelled or stopped,
+which arrives with cancel and stop support for held calls. A finished session that retention
+deletes while its ack is still owed keeps its feed row, and entries for its lineage are then
+no-ops.
+
+For a retention session, held calls last only as long as the session. Deletion removes the
+lineage's registrations and receipts, and late entries for that lineage are acked as no-ops.
+The shared module feed row, cursor and owed ack survive so other sessions can still receive
+their results. Deletion sends no `tool.withdraw`.
+
+Until archive folding can verify intake ownership per session, its production default keeps
+every held-record range live. Retention separately blocks deletion while a decoded held record
+or an intake registration remains. A missing intake
+store also prevents deletion after any registration history, held feature floor or rebuild
+marker; an unreadable store prevents deletion and counts in retention's unreadable-session
+health total. Before the first registration, `late-results-registered` is synced at the state
+root so losing the rebuildable database cannot erase that history. None of these guards changes
+ordinary expiry on roots that have never enabled held intake.
+Recreating a missing projection with held history leaves `late-results-rebuild-required` set;
+the current runtime cannot durably verify full-scan completion and does not clear this marker.
+Retention remains fenced pending that capability.
+
 ## 20. Persistence + storage
 
 ```
@@ -1188,7 +1441,7 @@ refusal is counted in `health.check` as `reverse_requests_refused`.
   wal-archive/, wal-archive-durable/ ← sealed archive containers of cold WALs
   run-index.db              ← SQLite: the durable run index, materialized transcript,
                               admission checkpoints, usage export facts
-  caps.db                   ← SQLite: budget caps, a durability domain of its own
+  caps.db                   ← left over from removed spend caps; broca no longer opens it
   leases/                   ← single-writer lease files
 ```
 WAL = source of truth (portable unit); `run-index.db` = derived projection. Resume =
@@ -1208,9 +1461,10 @@ start and names both paths.
 Additive WAL changes must retain the existing compatibility rules:
 1. **Episode-aware replay state machine**: per-`RunStarted` episode reset; prior
    episodes → prefix; last-unfinished resumable; explicit append-new-episode path.
-   **`recover_run_config` MUST return the LAST active/resumable episode's
-   config/run_id/counters, not the first `RunStarted`** (today it returns the first —
-   correct for a single-run WAL, wrong for a lineage). Replay classification: last
+   **Resume uses the LAST active/resumable episode's config/run_id/counters,
+   not the first `RunStarted`**. The `recover_run_config` test helper likewise returns
+   the last started episode's effective config, including subsequent render-config
+   and auth refreezes. Replay classification: last
    episode `RunPaused` → `AuthRequired`; last episode `RunFinished` → idle/appendable;
    last episode open → resume it.
 2. **WAL enrichment** (§18): `origin`+`submission_id` on `RunStarted`; `StepStarted`;
@@ -1220,9 +1474,10 @@ Additive WAL changes must retain the existing compatibility rules:
    durable cursor. **The durable head MUST be the last FSYNCED WAL seq, NOT
    `FileWal::last_seq()`** — `append(sync=false)` advances `next_seq` before fsync, so a
    client cursor must only advance past the fsync barrier (the live tail backpatches its
-   events with assigned seqs once fsynced; `WalHandle::record`/`sync` must surface the
-   assigned seq, which they discard today). Cursor state does NOT reset at episode
-   boundaries (WAL seq is monotonic per lineage file across episodes).
+   events with assigned seqs once fsynced). `WalHandle::record` returns `RecordOutcome`
+   (`Accepted(seq)` or `Refused(error)`); `sync` returns the last fsynced head on success.
+   An accepted append's seq is not durable until sync succeeds. Cursor state does NOT
+   reset at episode boundaries (WAL seq is monotonic per lineage file across episodes).
 4. **Durable queue + identity**: wire the queue records, replay = queued − retracted
    − consumed.
 5. **AuthRequired = RunPaused**: non-terminal record + `ReplayResolution::AuthRequired`

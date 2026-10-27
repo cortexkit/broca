@@ -1,6 +1,7 @@
 //! Where a System One provider's credential comes from: the bearer token, and for a provider
 //! that addresses an account in its URL (Cloudflare Workers AI), the account id the vault
-//! returns with it. Neither value is ever logged, printed or put into a reply.
+//! returns with it. The token is never logged, printed or put into a reply; the account
+//! identity is retained only as the usage export's credential attribution.
 
 use std::sync::Arc;
 
@@ -15,6 +16,8 @@ pub struct ProviderSecret {
     /// The provider-side account the vault returned with the token; `None` when it returned
     /// none.
     pub account_id: Option<String>,
+    /// The vault's resolved pin, when returned; never a bearer secret.
+    pub auth_selection: Option<String>,
 }
 
 impl std::fmt::Debug for ProviderSecret {
@@ -42,6 +45,7 @@ pub trait CredentialSource: Send + Sync {
         Ok(self.bearer().await?.map(|token| ProviderSecret {
             token,
             account_id: None,
+            auth_selection: self.credential_id(),
         }))
     }
 }
@@ -94,6 +98,9 @@ impl CredentialSource for VaultCredential {
                 Some(ProviderSecret {
                     token: token.token,
                     account_id: token.account_id,
+                    auth_selection: token
+                        .resolved_credential_id
+                        .or_else(|| Some(self.credential_id.clone())),
                 })
             })
             .map_err(|error| error.to_string())

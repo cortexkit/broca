@@ -11,6 +11,77 @@ use std::sync::{
     Mutex,
 };
 
+#[path = "held_history_tests.rs"]
+mod held_history;
+
+pub(super) fn image() -> broca_protocol::MediaRef {
+    broca_protocol::MediaRef {
+        kind: broca_protocol::MediaKind::Image,
+        mime: "image/png".into(),
+        byte_size: 68,
+        sha256: "a".repeat(64),
+        width: Some(1),
+        height: Some(1),
+    }
+}
+
+pub(super) fn altered_media() -> Vec<broca_protocol::MediaRef> {
+    let mut variants = vec![image(); 6];
+    variants[0].sha256 = "b".repeat(64);
+    variants[1].mime = "image/jpeg".into();
+    variants[2].byte_size += 1;
+    variants[3].width = Some(2);
+    variants[4].height = Some(2);
+    variants[5].kind = broca_protocol::MediaKind::Document;
+    variants[5].width = None;
+    variants[5].height = None;
+    variants
+}
+
+#[test]
+fn initial_media_must_equal_a_reference_in_its_replaced_range() {
+    let mut transcript = vec![
+        Message::new(Role::User, vec![ContentBlock::Media(image())]),
+        text(Role::Assistant, "answer"),
+        text(Role::User, "tail"),
+    ];
+    broca_protocol::content::stamp_ordinals(&mut transcript);
+    let replacement = |reference| {
+        encoded(&Message::new(
+            Role::User,
+            vec![ContentBlock::Media(reference)],
+        ))
+    };
+    assert!(validate_initial(
+        &initial(Range::new(0, 1), vec![replacement(image())]),
+        &transcript
+    )
+    .is_some());
+    refused(
+        initial(Range::new(1, 2), vec![replacement(image())]),
+        &transcript,
+    );
+    for reference in altered_media() {
+        refused(
+            initial(Range::new(0, 1), vec![replacement(reference)]),
+            &transcript,
+        );
+    }
+}
+
+#[tokio::test]
+async fn setup_with_uncaptured_media_records_nothing() {
+    let mut answer = ready();
+    answer["initial"]["replacement"] =
+        json!([Message::new(Role::User, vec![ContentBlock::Media(image())])]);
+    let (outcome, records) = run_setup(answer).await;
+    assert_eq!(
+        outcome.unwrap_err().provider_code.as_deref(),
+        Some("compaction_unavailable")
+    );
+    assert!(records.is_empty());
+}
+
 pub(super) fn text(role: Role, text: &str) -> Message {
     Message::new(role, vec![ContentBlock::Text { text: text.into() }])
 }
@@ -597,7 +668,7 @@ async fn ride_after(
 /// deadline, ended once the ride resolves, and the control lane reports it as
 /// `compaction_wait`. A ride answered sooner records nothing, and a session whose Setup gave no
 /// `ride_wait_ms` keeps broca's own short ride deadline.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_slow_ride_is_reported_as_a_compaction_wait_and_a_fast_one_is_not() {
     let mut state = CompactionState {
         ride_wait_ms: Some(4000),
@@ -720,12 +791,20 @@ fn model_page_folds_snapshot_and_mid_turn_tail_and_refuses_after_mid() {
     captured.fold(&setup_record(None));
     let raw = raw();
     let snapshot = crate::StorePageSnapshot {
+        model_history: Some(crate::context::ModelHistory {
+            spans: vec![],
+            open_span: None,
+            episodes: None,
+            row_ranges: std::iter::once(0..raw.len() as u64).collect(),
+            prefix_len: raw.len() as u64,
+        }),
         prefix_len: raw.len() as u64,
         rows: raw
             .iter()
             .cloned()
             .enumerate()
             .map(|(i, message)| crate::StorePageRow {
+                written_at: None,
                 run: None,
                 ordinal: i as u64,
                 message,
@@ -1149,6 +1228,59 @@ fn history_request() -> (crate::RunRequest, crate::RunControl, Arc<OneView>) {
     (request, control, views)
 }
 
+#[tokio::test]
+async fn presetless_compaction_setup_omits_the_member_on_the_real_call() {
+    struct DefaultSetup(AtomicUsize);
+    #[async_trait::async_trait]
+    impl CompactionPlane for DefaultSetup {
+        async fn setup(
+            &self,
+            _: &str,
+            _: &BindIdentity,
+            request: SetupRequest,
+        ) -> Result<SetupAnswer, CompactionUnavailable> {
+            assert!(serde_json::to_value(&request)
+                .unwrap()
+                .get("preset")
+                .is_none());
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let mut answer = ready();
+            answer["request_id"] = json!(request.request_id);
+            Ok(serde_json::from_value(answer).unwrap())
+        }
+    }
+    let shared = Shared::default();
+    let writer = shared.writer();
+    let (request, mut control, _) = history_request();
+    let mut manifest = control.manifest.take().unwrap().as_ref().clone();
+    manifest.plan = OpaqueJson::from_json_text(
+        json!({"compaction_item":{"provider":"provider","params":{}},"composition":{}}).to_string(),
+    )
+    .unwrap();
+    let plane = Arc::new(DefaultSetup(AtomicUsize::new(0)));
+    control.manifest = Some(Arc::new(manifest));
+    control.compaction_plane = Some(plane.clone());
+    control.compaction_views = None;
+    let model = PrefixBound(crate::StubProvider::new(vec![model_events()]));
+    let (out, _events) = tokio::sync::mpsc::channel(256);
+    crate::run_loop_on_writer(
+        request,
+        &writer,
+        crate::StartMode::FreshOrResume,
+        &model,
+        &crate::StubToolPlane::new(),
+        &crate::AllowAll,
+        &shared,
+        None,
+        control,
+        &out,
+    )
+    .await
+    .unwrap();
+    assert_eq!(plane.0.load(Ordering::SeqCst), 1);
+    writer.shutdown().await.unwrap();
+}
+
 async fn run_history(shared: &Shared) -> (PrefixBound, Arc<OneView>) {
     run_history_with(shared, OneView::default()).await
 }
@@ -1427,12 +1559,32 @@ fn views_applied(records: &[WalRecord]) -> Vec<u64> {
 #[tokio::test]
 async fn an_announced_view_is_fetched_at_the_step_boundary_and_applied() {
     let shared = Shared::default();
-    let (model, views) = run_history(&shared).await;
+    let ((model, views), logs) = broca_test_support::capture_logs(run_history(&shared)).await;
     assert_eq!(*views.fetches.lock().unwrap(), vec![(2, true)]);
     assert_eq!(views_applied(&shared.records()), vec![2]);
     let sent =
         String::from_utf8_lossy(&crate::canonical_request_bytes(&model.0.calls()[0])).into_owned();
     assert!(sent.contains("summary"), "{sent}");
+    assert_step_decisions(&logs, &[(2, "applied", "")]);
+}
+
+fn assert_step_decisions(logs: &[broca_test_support::LogEvent], expected: &[(u64, &str, &str)]) {
+    let session_ref = crate::agent_session_ref(&bind());
+    let decisions: Vec<_> = logs
+        .iter()
+        .filter(|event| event.message() == "compaction view decided at a step boundary")
+        .map(|event| {
+            assert_eq!(event.target, "compaction");
+            assert_eq!(event.level, tracing::Level::INFO);
+            assert_eq!(event.fields.get("session_ref"), Some(&session_ref));
+            (
+                event.fields["view_version"].parse::<u64>().unwrap(),
+                event.fields["choice"].as_str(),
+                event.fields.get("superseded").map_or("", String::as_str),
+            )
+        })
+        .collect();
+    assert_eq!(decisions, expected, "one correlated INFO decision per view");
 }
 
 /// A fetched view whose bytes are not the ones its `view_ready` announced (its digest differs
@@ -1613,6 +1765,212 @@ async fn a_model_change_rides_for_a_view_and_applies_it() {
     assert_eq!(last_notice["model"], "other");
 }
 
+/// Serves views 1 and 2 of one session. The `view.get` for version 1 signals `fetching_first`
+/// and waits for `release` before it answers, so a test can announce version 2 while the
+/// decision for version 1 is in flight.
+struct RacingViews {
+    fetching_first: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    fetches: Mutex<Vec<u64>>,
+}
+impl RacingViews {
+    fn view(session_ref: &str, version: u64) -> crate::compaction_provider::view::CompactionView {
+        use crate::compaction_provider::{lineage::MessageRef, view::*};
+        let fold = vec![text(Role::User, &format!("summary {version}"))];
+        CompactionView::new(
+            session_ref,
+            version,
+            fixture_lineage_id().to_string(),
+            MessageRef {
+                ordinal: 0,
+                mid: "m0".into(),
+            },
+            vec![ViewRange::replace(
+                0,
+                1,
+                serde_json::to_string(&fold).unwrap(),
+            )],
+        )
+    }
+}
+#[async_trait::async_trait]
+impl CompactionPlane for RacingViews {
+    async fn setup(
+        &self,
+        _: &str,
+        _: &BindIdentity,
+        _: SetupRequest,
+    ) -> Result<SetupAnswer, CompactionUnavailable> {
+        Err(CompactionUnavailable)
+    }
+    async fn view_get(
+        &self,
+        _: &str,
+        _: &BindIdentity,
+        request: crate::compaction_provider::view::ViewGetRequest,
+    ) -> Result<crate::compaction_provider::view::ViewGetAnswer, CompactionUnavailable> {
+        self.fetches.lock().unwrap().push(request.view_version);
+        if request.view_version == 1 {
+            self.fetching_first.notify_one();
+            self.release.notified().await;
+        }
+        Ok(crate::compaction_provider::view::ViewGetAnswer::view(
+            Self::view(&request.session_ref, request.view_version),
+        ))
+    }
+}
+
+/// Two views announced close together are applied once, as the newest. The idle boundary
+/// starts deciding version 1; version 2 is receipted and announced while version 1 is being
+/// fetched; the boundary then discards version 1 as superseded and applies version 2 alone, so
+/// the session's prefix is rewritten once rather than twice.
+#[tokio::test]
+async fn idle_boundary_applies_only_the_newest_view_announced_during_its_fetch() {
+    use crate::compaction_provider::notice::ViewReady;
+    let mut raw = vec![
+        text(Role::User, &"large history ".repeat(2000)),
+        text(Role::Assistant, "answer"),
+        text(Role::User, "next"),
+    ];
+    broca_protocol::content::stamp_ordinals(&mut raw);
+    let options = CallOptions::new(raw.clone());
+    let shared = Shared::with_records(vec![setup_record(Some("{}"))]);
+    let writer = shared.writer();
+    writer.sync().await.unwrap();
+    let session_ref = crate::agent_session_ref(&bind());
+    let first = ViewReady::for_view(&RacingViews::view(&session_ref, 1));
+    let second = ViewReady::for_view(&RacingViews::view(&session_ref, 2));
+    let inbox = Arc::new(crate::ViewReadyInbox::default());
+    inbox.announce(first.clone());
+    let racing = Arc::new(RacingViews {
+        fetching_first: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        fetches: Mutex::new(Vec::new()),
+    });
+    let plane: Arc<dyn CompactionPlane> = racing.clone();
+    let mut state = CompactionState::default();
+    for record in shared.records() {
+        state.fold(&record);
+    }
+    let views: Arc<dyn CompactionViews> = inbox.clone();
+    let session = bind();
+    let (applied, ()) = tokio::join!(
+        runtime::apply_idle_view(
+            &session,
+            &writer,
+            &plane,
+            Some(views),
+            &first,
+            &mut state,
+            &raw,
+            &raw,
+            false,
+            "model",
+            Some(100_000),
+            |state| Ok(
+                serde_json::to_vec(&model_options(&options, state).unwrap().prompt)
+                    .unwrap()
+                    .len()
+            ),
+        ),
+        async {
+            // Hold the decision for version 1 at its fetch and announce version 2 to the inbox,
+            // as the bus intake does once version 2's receipt is durable.
+            racing.fetching_first.notified().await;
+            assert!(inbox.announce(second.clone()));
+            racing.release.notify_one();
+        }
+    );
+    assert!(applied.unwrap(), "the newest view was not applied");
+    assert_eq!(
+        views_applied(&shared.records()),
+        vec![2],
+        "exactly one applied view, the newest"
+    );
+    assert_eq!(*racing.fetches.lock().unwrap(), vec![1, 2]);
+    let _ = writer.shutdown().await;
+}
+
+#[tokio::test]
+async fn step_boundary_logs_applied_and_superseded_views_with_session_ref() {
+    use crate::compaction_provider::notice::ViewReady;
+    let mut raw = vec![
+        text(Role::User, &"large history ".repeat(2000)),
+        text(Role::Assistant, "answer"),
+        text(Role::User, "next"),
+    ];
+    broca_protocol::content::stamp_ordinals(&mut raw);
+    let shared = Shared::with_records(vec![setup_record(Some("{}"))]);
+    let writer = shared.writer();
+    let session = bind();
+    let session_ref = crate::agent_session_ref(&session);
+    let inbox = Arc::new(crate::ViewReadyInbox::default());
+    inbox.announce(ViewReady::for_view(&RacingViews::view(&session_ref, 1)));
+    let racing = Arc::new(RacingViews {
+        fetching_first: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        fetches: Mutex::new(Vec::new()),
+    });
+    let plane: Arc<dyn CompactionPlane> = racing.clone();
+    let control = crate::RunControl {
+        compaction_views: Some(inbox.clone()),
+        ..Default::default()
+    };
+    let runtime = runtime::Runtime {
+        provider: "provider",
+        bind: &session,
+        plane: Some(&plane),
+        writer: &writer,
+        control: &control,
+    };
+    let mut state = CompactionState::default();
+    for record in shared.records() {
+        state.fold(&record);
+    }
+    let mut boundary = runtime::BoundaryViews::default();
+    let lineage = fixture_lineage_id().to_string();
+    let ((), logs) = broca_test_support::capture_logs(async {
+        broca_test_support::wait_for(
+            "step boundary deciding the newest view",
+            async {
+                let (result, ()) = tokio::join!(
+                    runtime.views_at_boundary(
+                        &mut boundary,
+                        &mut state,
+                        Some(inbox.as_ref()),
+                        &session_ref,
+                        &lineage,
+                        "model",
+                        &raw,
+                        super::StoredTranscript::plain(&raw),
+                        false,
+                        true,
+                        runtime::StepAt {
+                            run_id: "run",
+                            step: 1,
+                            superseded: &[]
+                        },
+                        None,
+                    ),
+                    async {
+                        racing.fetching_first.notified().await;
+                        inbox.announce(ViewReady::for_view(&RacingViews::view(&session_ref, 2)));
+                        racing.release.notify_one();
+                    }
+                );
+                result.unwrap();
+            },
+            || format!("fetches={:?}", racing.fetches.lock().unwrap()),
+        )
+        .await;
+    })
+    .await;
+    assert_eq!(views_applied(&shared.records()), vec![2]);
+    assert_eq!(*racing.fetches.lock().unwrap(), vec![1, 2]);
+    assert_step_decisions(&logs, &[(1, "superseded", ""), (2, "applied", "1")]);
+    let _ = writer.shutdown().await;
+}
+
 #[tokio::test]
 async fn idle_view_records_lower_estimate_and_repairs_every_cut_before_wake() {
     let mut raw = vec![
@@ -1655,6 +2013,7 @@ async fn idle_view_records_lower_estimate_and_repairs_every_cut_before_wake() {
             &bind(),
             &writer,
             &plane,
+            None,
             &ready,
             &mut state,
             &raw,

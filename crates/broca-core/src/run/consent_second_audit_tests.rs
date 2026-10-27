@@ -1,11 +1,37 @@
 use super::*;
 
+// Simulate feed-page latency without sleeping. Restore Tokio's running clock even if a
+// timeout drops the page future: approval retry pacing reads RunControl's epoch clock,
+// and WAL acknowledgments must not compete with automatically advanced Tokio deadlines.
+pub(super) async fn advance_feed_time(duration: std::time::Duration, interrupted: &AtomicUsize) {
+    struct ResumeTime<'a> {
+        interrupted: &'a AtomicUsize,
+        completed: bool,
+    }
+    impl Drop for ResumeTime<'_> {
+        fn drop(&mut self) {
+            tokio::time::resume();
+            if !self.completed {
+                self.interrupted.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+    tokio::time::pause();
+    let mut resume = ResumeTime {
+        interrupted,
+        completed: false,
+    };
+    tokio::time::advance(duration).await;
+    resume.completed = true;
+}
+
 struct SlowHealthyFeed {
     finished: std::sync::atomic::AtomicBool,
     positions: Mutex<Vec<u64>>,
     key: String,
     prepared: WalRecord,
     gets: AtomicUsize,
+    interrupted: AtomicUsize,
 }
 #[async_trait::async_trait]
 impl ElicitationPlane for SlowHealthyFeed {
@@ -17,7 +43,7 @@ impl ElicitationPlane for SlowHealthyFeed {
         let position = cursor.map_or(0, |cursor| cursor.seq);
         self.positions.lock().unwrap().push(position);
         if !self.finished.load(Ordering::SeqCst) {
-            tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+            advance_feed_time(std::time::Duration::from_millis(450), &self.interrupted).await;
         }
         let records = if position < 24 {
             vec![
@@ -57,10 +83,16 @@ impl ElicitationPlane for SlowHealthyFeed {
 
 fn seed_known_call(rig: &Rig) -> (String, WalRecord) {
     let mut prepared = crate::replay::deferred_tests::prepared("c", "r-b1");
-    let WalRecord::ToolCallDeferred { ask, .. } = &mut prepared else {
+    let WalRecord::ToolCallDeferred {
+        ask,
+        deferred_at_ms,
+        ..
+    } = &mut prepared
+    else {
         unreachable!()
     };
     ask.expires_at_ms = rig.hooks.expires;
+    *deferred_at_ms = epoch_millis();
     let seq = rig.writer.record(prepared.clone()).into_result().unwrap();
     (
         crate::context::call_key(rig.writer.lineage_id().unwrap(), seq),
@@ -79,6 +111,7 @@ async fn healthy_known_id_feed_longer_than_one_budget_reaches_get_and_await() {
         key,
         prepared: prepared.clone(),
         gets: AtomicUsize::new(0),
+        interrupted: AtomicUsize::new(0),
     });
     rig.control.elicitation_plane = Some(feed.clone());
     let resume = ResumeCtx {
@@ -90,16 +123,22 @@ async fn healthy_known_id_feed_longer_than_one_budget_reaches_get_and_await() {
             approval: None,
             elicitation_id: Some("known".into()),
         }],
+        ..Default::default()
     };
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(24),
+    let result = broca_test_support::event_timeout(
+        "healthy owner-feed traversal across retry budgets",
         rig.batch(&crate::AllowAll, vec![call("c")], Some(resume), false),
+        || format!("feed positions: {:?}", feed.positions.lock().unwrap()),
     )
     .await
     .expect("healthy owner-feed traversal must finish across retry budgets");
     assert!(!result.results[0].is_error);
     assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 1);
     assert_eq!(feed.gets.load(Ordering::SeqCst), 1);
+    assert!(
+        feed.interrupted.load(Ordering::SeqCst) > 0,
+        "the filing budget must interrupt a pending page"
+    );
     let positions = feed.positions.lock().unwrap().clone();
     let first_head = positions
         .iter()
@@ -209,6 +248,7 @@ async fn await_conflict(mode: &'static str) {
             approval: None,
             elicitation_id: Some("new".into()),
         }],
+        ..Default::default()
     };
     let result = rig
         .batch(&crate::AllowAll, vec![call("c")], Some(resume), false)
@@ -359,6 +399,7 @@ async fn live_old_approval_proves_recorded_duplicate_withdrawal_before_adoption(
             approval: None,
             elicitation_id: Some("new".into()),
         }],
+        ..Default::default()
     };
     let result = rig
         .batch(&crate::AllowAll, vec![call("held")], Some(resume), false)
@@ -409,6 +450,7 @@ async fn live_feed_traversal_has_total_budget_and_keeps_progress() {
     let rig = Rig::new("pass", "none", false, false);
     let mut history = approval_gate::History::new(&rig.writer, rig.frames()).unwrap();
     let ctx = BatchCtx {
+        media_capture: None,
         batch_id: BatchId("scan".into()),
         bind: rig.bind.clone(),
         run_id: RunId("r".into()),
@@ -435,16 +477,18 @@ async fn healthy_live_feed_continues_after_budget_without_restarting() {
     let rig = Rig::new("pass", "none", false, false);
     let mut history = approval_gate::History::new(&rig.writer, rig.frames()).unwrap();
     let ctx = BatchCtx {
+        media_capture: None,
         batch_id: BatchId("scan".into()),
         bind: rig.bind.clone(),
         run_id: RunId("r".into()),
         scope: None,
     };
     let feed = LongLiveFeed {
-        delay: std::time::Duration::from_millis(1),
+        delay: std::time::Duration::ZERO,
         positions: Mutex::new(Vec::new()),
         head: Some(70),
     };
+    tokio::time::pause();
     let mut budgets = 0;
     loop {
         match approval_gate::scan_live_for_test(&feed, &ctx, &mut history).await {
@@ -464,6 +508,7 @@ async fn healthy_live_feed_continues_after_budget_without_restarting() {
         *feed.positions.lock().unwrap(),
         (0..=70).collect::<Vec<_>>()
     );
+    tokio::time::resume();
     rig.finish().await;
 }
 
@@ -472,6 +517,7 @@ async fn live_feed_slow_pages_share_one_total_time_budget() {
     let rig = Rig::new("pass", "none", false, false);
     let mut history = approval_gate::History::new(&rig.writer, rig.frames()).unwrap();
     let ctx = BatchCtx {
+        media_capture: None,
         batch_id: BatchId("slow-scan".into()),
         bind: rig.bind.clone(),
         run_id: RunId("r".into()),
@@ -482,12 +528,24 @@ async fn live_feed_slow_pages_share_one_total_time_budget() {
         positions: Mutex::new(Vec::new()),
         head: None,
     };
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        approval_gate::scan_live_for_test(&feed, &ctx, &mut history),
-    )
-    .await
-    .expect("slow but healthy pages cannot reset the traversal deadline");
+    tokio::time::pause();
+    let result = {
+        let scan = approval_gate::scan_live_for_test(&feed, &ctx, &mut history);
+        tokio::pin!(scan);
+        assert!(futures::poll!(&mut scan).is_pending());
+        for completed in 1..=3 {
+            // Tokio rounds timer deadlines to milliseconds; pass each page's tick explicitly.
+            tokio::time::advance(std::time::Duration::from_millis(251)).await;
+            assert!(futures::poll!(&mut scan).is_pending());
+            assert_eq!(feed.positions.lock().unwrap().len(), completed);
+        }
+        tokio::time::advance(std::time::Duration::from_millis(251)).await;
+        let std::task::Poll::Ready(result) = futures::poll!(&mut scan) else {
+            panic!("slow but healthy pages cannot reset the traversal deadline");
+        };
+        result
+    };
+    tokio::time::resume();
     assert_eq!(result.unwrap_err().code, "consent_feed_budget_exhausted");
     assert!(feed.positions.lock().unwrap().len() <= 4);
     rig.finish().await;
@@ -597,6 +655,7 @@ async fn live_feed_budget_preserves_prefix_until_later_conflict() {
             approval: None,
             elicitation_id: Some("new".into()),
         }],
+        ..Default::default()
     };
     let result = rig
         .batch(&crate::AllowAll, vec![call("held")], Some(resume), false)

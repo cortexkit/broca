@@ -38,6 +38,39 @@ pub struct FrozenReply {
     pub hold_argument: Option<FrozenHoldArgument>,
 }
 
+/// The provider's own result-format declaration for one tool, frozen with the plan. The WAL
+/// treats it as an open string so a contract's later format is stored verbatim rather than
+/// refused; only the surface that reads it decides which names it understands.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FrozenResultFormat(pub String);
+
+/// Session-level declarations of one tool provider, frozen with the plan.
+///
+/// A run routes and decodes a tool reply by what its provider declared when the session was
+/// admitted, never by what a later catalog says: a provider that starts (or stops) supporting a
+/// result format or late results between admission and a resumed step must not change how
+/// broca reads a reply. Everything here is optional and absent when the provider did not
+/// declare it, so a manifest from a provider with no such declarations keeps its exact bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenProviderDeclarations {
+    /// Per-tool result formats, by tool name, frozen only for tools that opt in. Absent means no
+    /// tool of this provider declared one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_formats: Option<BTreeMap<String, FrozenResultFormat>>,
+    /// Whether the provider declared the `late_results` session capability, frozen only when it
+    /// answered yes. Absent means the provider cannot settle a call after its reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub late_results: Option<bool>,
+}
+
+impl FrozenProviderDeclarations {
+    /// Whether nothing was declared, so the declaration writes no bytes at all.
+    pub fn is_empty(&self) -> bool {
+        self.result_formats.is_none() && self.late_results.is_none()
+    }
+}
+
 /// The numeric hold argument saved with a tool's reply declaration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrozenHoldArgument {
@@ -59,6 +92,14 @@ impl OpaqueJson {
     pub fn as_json_text(&self) -> &str {
         &self.0
     }
+}
+
+/// One reference slot a catalog tool declared, as frozen: the argument's top-level name and its
+/// kind (`token`, or `source:<dialect>`). Kinds stay open strings, as the catalog sends them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenReferenceSlot {
+    pub name: String,
+    pub kind: String,
 }
 
 /// What one provider's fetch at admission came back with.
@@ -86,6 +127,17 @@ pub enum FetchOutcome {
         /// Reply deadlines by tool name, frozen only when the provider declares them.
         /// Absent keeps manifests from providers without deadlines byte-compatible.
         reply: Option<BTreeMap<String, FrozenReply>>,
+        /// Result formats and session capabilities the provider declared, frozen only when it
+        /// declared some. Absent keeps manifests from providers without declarations
+        /// byte-compatible.
+        declarations_frozen: Option<FrozenProviderDeclarations>,
+        /// The catalog's reference slots by tool name: the top-level string arguments in which
+        /// output references are read (llm-runner §9.13). Frozen only when the provider's plan
+        /// item opts into output references and one of its tools declares slots; absent
+        /// otherwise, which keeps every other manifest's bytes. Must-understand (feature
+        /// `plan-reference-slots/v1`): a reader that dropped it would re-freeze later episodes
+        /// without the slots.
+        reference_slots: Option<BTreeMap<String, Vec<FrozenReferenceSlot>>>,
     },
     /// An optional tool or system-text provider that gave no usable answer, so the session was
     /// admitted without it. Written as `"absent": "<reason>"`. The reason is an open string
@@ -128,6 +180,10 @@ struct ProviderFetchOut<'a> {
     result_ops: Option<&'a BTreeMap<String, Vec<String>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reply: Option<&'a BTreeMap<String, FrozenReply>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    declarations_frozen: Option<&'a FrozenProviderDeclarations>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference_slots: Option<&'a BTreeMap<String, Vec<FrozenReferenceSlot>>>,
 }
 
 #[derive(Deserialize)]
@@ -145,6 +201,10 @@ struct ProviderFetchIn {
     result_ops: Option<BTreeMap<String, Vec<String>>>,
     #[serde(default)]
     reply: Option<BTreeMap<String, FrozenReply>>,
+    #[serde(default)]
+    declarations_frozen: Option<FrozenProviderDeclarations>,
+    #[serde(default)]
+    reference_slots: Option<BTreeMap<String, Vec<FrozenReferenceSlot>>>,
 }
 
 impl Serialize for ProviderFetch {
@@ -157,6 +217,8 @@ impl Serialize for ProviderFetch {
             absent: None,
             result_ops: None,
             reply: None,
+            declarations_frozen: None,
+            reference_slots: None,
         };
         match &self.outcome {
             FetchOutcome::Answered {
@@ -165,12 +227,16 @@ impl Serialize for ProviderFetch {
                 text,
                 result_ops,
                 reply,
+                declarations_frozen,
+                reference_slots,
             } => {
                 out.catalog_digest = Some(catalog_digest);
                 out.tools = Some(tools.as_slice());
                 out.text = text.as_deref();
                 out.result_ops = result_ops.as_ref();
                 out.reply = reply.as_ref();
+                out.declarations_frozen = declarations_frozen.as_ref();
+                out.reference_slots = reference_slots.as_ref();
             }
             FetchOutcome::Absent { reason } => out.absent = Some(reason),
             FetchOutcome::Unknown => {
@@ -186,6 +252,13 @@ impl Serialize for ProviderFetch {
 impl<'de> Deserialize<'de> for ProviderFetch {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let fetch = ProviderFetchIn::deserialize(deserializer)?;
+        // A declaration is frozen only beside an answered fetch: an absent provider declared
+        // nothing, so a record carrying one next to `absent` is malformed.
+        if fetch.absent.is_some() && fetch.declarations_frozen.is_some() {
+            return Err(serde::de::Error::custom(
+                "an absent provider fetch cannot carry frozen declarations",
+            ));
+        }
         let outcome = match (fetch.catalog_digest, fetch.absent) {
             (Some(catalog_digest), None) => FetchOutcome::Answered {
                 catalog_digest,
@@ -195,6 +268,8 @@ impl<'de> Deserialize<'de> for ProviderFetch {
                 text: fetch.text,
                 result_ops: fetch.result_ops,
                 reply: fetch.reply,
+                declarations_frozen: fetch.declarations_frozen,
+                reference_slots: fetch.reference_slots,
             },
             (None, Some(reason)) => {
                 if fetch.tools.is_some() || fetch.text.is_some() {
@@ -278,6 +353,90 @@ mod tests {
         assert_eq!(serde_json::to_string(&record).unwrap(), bytes);
     }
 
+    /// Frozen reference slots round-trip through a whole `RunStarted`, written after `reply`,
+    /// and make the record require `plan-reference-slots/v1`; the fixture without them requires
+    /// no such feature.
+    #[test]
+    fn frozen_reference_slots_round_trip_and_are_must_understand() {
+        let mut record: WalRecord = serde_json::from_str(FIXTURE.trim_end()).unwrap();
+        assert!(!record
+            .required_features()
+            .contains(&crate::framing::PLAN_REFERENCE_SLOTS_FEATURE));
+        let WalRecord::RunStarted {
+            manifest: Some(manifest),
+            ..
+        } = &mut record
+        else {
+            panic!("fixture must carry a manifest")
+        };
+        let FetchOutcome::Answered {
+            reference_slots, ..
+        } = &mut manifest.fetches[0].outcome
+        else {
+            panic!("fixture must carry an answered fetch")
+        };
+        *reference_slots = Some(
+            [(
+                "read".into(),
+                vec![FrozenReferenceSlot {
+                    name: "data".into(),
+                    kind: "token".into(),
+                }],
+            )]
+            .into(),
+        );
+        let bytes = serde_json::to_string(&record).unwrap();
+        assert!(bytes.contains(r#""reference_slots":{"read":[{"name":"data","kind":"token"}]}"#));
+        let decoded: WalRecord = serde_json::from_str(&bytes).unwrap();
+        assert_eq!(decoded, record);
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), bytes);
+        assert!(record
+            .required_features()
+            .contains(&crate::framing::PLAN_REFERENCE_SLOTS_FEATURE));
+    }
+
+    /// A manifest that froze both reference slots and provider declarations writes both members,
+    /// declarations first, round-trips byte for byte, and requires both features.
+    #[test]
+    fn reference_slots_and_provider_declarations_together_require_both_features() {
+        let mut record: WalRecord = serde_json::from_str(FIXTURE.trim_end()).unwrap();
+        let WalRecord::RunStarted {
+            manifest: Some(manifest),
+            ..
+        } = &mut record
+        else {
+            panic!("fixture must carry a manifest")
+        };
+        let FetchOutcome::Answered {
+            reference_slots,
+            declarations_frozen,
+            ..
+        } = &mut manifest.fetches[0].outcome
+        else {
+            panic!("fixture must carry an answered fetch")
+        };
+        *reference_slots = Some(BTreeMap::from([(
+            "read".to_owned(),
+            vec![FrozenReferenceSlot {
+                name: "data".into(),
+                kind: "token".into(),
+            }],
+        )]));
+        *declarations_frozen = Some(FrozenProviderDeclarations {
+            result_formats: None,
+            late_results: Some(true),
+        });
+        let bytes = serde_json::to_string(&record).unwrap();
+        assert!(bytes.contains(
+            r#""declarations_frozen":{"late_results":true},"reference_slots":{"read":[{"name":"data","kind":"token"}]}"#
+        ));
+        let decoded: WalRecord = serde_json::from_str(&bytes).unwrap();
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), bytes);
+        let features = record.required_features();
+        assert!(features.contains(&crate::framing::PLAN_REFERENCE_SLOTS_FEATURE));
+        assert!(features.contains(&crate::framing::PROVIDER_DECLARATIONS_FEATURE));
+    }
+
     #[test]
     fn frozen_reply_round_trips_through_wal_record() {
         let mut record: WalRecord = serde_json::from_str(FIXTURE.trim_end()).unwrap();
@@ -359,6 +518,8 @@ mod tests {
             text: text.map(str::to_owned),
             result_ops: None,
             reply: None,
+            declarations_frozen: None,
+            reference_slots: None,
         }
     }
 
@@ -370,6 +531,8 @@ mod tests {
                 text,
                 result_ops,
                 reply,
+                declarations_frozen,
+                reference_slots,
                 ..
             } => FetchOutcome::Answered {
                 catalog_digest: String::new(),
@@ -377,6 +540,8 @@ mod tests {
                 text: text.clone(),
                 result_ops: result_ops.clone(),
                 reply: reply.clone(),
+                declarations_frozen: declarations_frozen.clone(),
+                reference_slots: reference_slots.clone(),
             },
             other => other.clone(),
         }
@@ -551,5 +716,87 @@ mod tests {
         // The full old manifest frame remains pinned independently of the new member.
         let fixture: WalRecord = serde_json::from_str(FIXTURE.trim_end()).unwrap();
         assert_eq!(serde_json::to_string(&fixture).unwrap(), FIXTURE.trim_end());
+    }
+    /// A frozen declaration writes its fields only when the provider declared them, and a
+    /// provider that declared nothing keeps the exact bytes it wrote before this field existed.
+    #[test]
+    fn frozen_declarations_are_optional_and_absent_keeps_old_bytes() {
+        let declared = ProviderFetch {
+            provider: "aft".into(),
+            outcome: FetchOutcome::Answered {
+                catalog_digest: "digest".into(),
+                tools: Arc::new(Vec::new()),
+                text: None,
+                result_ops: None,
+                reply: None,
+                declarations_frozen: Some(FrozenProviderDeclarations {
+                    result_formats: Some(BTreeMap::from([(
+                        "ask".to_owned(),
+                        FrozenResultFormat("content/v1".into()),
+                    )])),
+                    late_results: Some(true),
+                }),
+                reference_slots: None,
+            },
+        };
+        let bytes = serde_json::to_string(&declared).unwrap();
+        assert_eq!(
+            bytes,
+            r#"{"provider":"aft","catalog_digest":"digest","tools":[],"declarations_frozen":{"result_formats":{"ask":"content/v1"},"late_results":true}}"#
+        );
+        let read: ProviderFetch = serde_json::from_str(&bytes).unwrap();
+        assert_eq!(read, declared);
+
+        // A provider that declared nothing writes none of it.
+        let old = r#"{"provider":"aft","catalog_digest":"digest","tools":[]}"#;
+        let fetch: ProviderFetch = serde_json::from_str(old).unwrap();
+        assert_eq!(serde_json::to_string(&fetch).unwrap(), old);
+
+        // An absent fetch cannot carry declarations at all.
+        assert!(serde_json::from_str::<ProviderFetch>(
+            r#"{"provider":"aft","absent":"timeout","declarations_frozen":{"late_results":true}}"#
+        )
+        .is_err());
+    }
+
+    /// A `RunStarted` whose manifest froze a provider declaration is must-understand: a reader
+    /// that skipped the fields would read replies by a catalog that may have changed. A
+    /// manifest with no declarations keeps the frame it wrote before the feature existed.
+    #[test]
+    fn a_frozen_declaration_gates_the_frame_that_carries_it() {
+        use crate::framing::{decode_next, encode, DecodeStep, PROVIDER_DECLARATIONS_FEATURE};
+        let fixture: WalRecord = serde_json::from_str(FIXTURE.trim_end()).unwrap();
+        let mut declared = fixture.clone();
+        let WalRecord::RunStarted {
+            manifest: Some(manifest),
+            ..
+        } = &mut declared
+        else {
+            panic!("the fixture carries a manifest")
+        };
+        for fetch in &mut manifest.fetches {
+            if let FetchOutcome::Answered {
+                declarations_frozen,
+                ..
+            } = &mut fetch.outcome
+            {
+                *declarations_frozen = Some(FrozenProviderDeclarations {
+                    result_formats: None,
+                    late_results: Some(true),
+                });
+            }
+        }
+        assert!(declared
+            .required_features()
+            .contains(&PROVIDER_DECLARATIONS_FEATURE));
+        let bytes = encode(1, 1, &declared).unwrap();
+        match decode_next(&bytes) {
+            DecodeStep::Record { framed, .. } => assert_eq!(framed.record, declared),
+            _ => panic!("this build writes and reads its own declaration"),
+        }
+        // The same manifest without a declaration requires nothing new.
+        assert!(!fixture
+            .required_features()
+            .contains(&PROVIDER_DECLARATIONS_FEATURE));
     }
 }

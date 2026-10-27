@@ -58,6 +58,8 @@ fn tool_step(calls: &[(&str, &str, serde_json::Value)]) -> Vec<NormalizedEvent> 
 fn text_step(text: &str) -> Vec<NormalizedEvent> {
     vec![
         NormalizedEvent::Display(DisplayEvent::TextDelta {
+            mid: None,
+            part: Some(0),
             message_id: MessageId("m2".into()),
             tool_call_id: None,
             delta: text.into(),
@@ -79,6 +81,7 @@ fn text_step(text: &str) -> Vec<NormalizedEvent> {
 fn request(session: &str, project_root: &std::path::Path, tools: Vec<Tool>) -> RunRequest {
     let policy_allowed = tools.iter().map(|t| t.name.clone()).collect();
     RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -622,6 +625,7 @@ async fn module_restart_between_dispatches_is_one_transparent_retry() {
     // Dispatch on the stale route: the daemon rejects unknown_channel; the plane must
     // evict, re-open, and complete against the respawned module.
     let ctx = BatchCtx {
+        media_capture: None,
         batch_id: BatchId("b-restart".into()),
         bind: bind.clone(),
         run_id: broca_protocol::RunId("r1".into()),
@@ -796,6 +800,7 @@ async fn check_route_refusal(code: &str, refusals: usize, retry: bool, unknown: 
         // require review of the prior unknown side effect before another run can proceed.
         use broca_core::{BatchCtx, DispatchResult, ToolManifest, ToolPlane};
         let next_ctx = BatchCtx {
+            media_capture: None,
             batch_id: broca_protocol::BatchId("next-batch".into()),
             bind: bind.clone(),
             run_id: RunId("next-run".into()),

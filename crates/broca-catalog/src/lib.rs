@@ -4,17 +4,17 @@
 //! Admission only reads an immutable in-memory snapshot. A detached poll refreshes that snapshot
 //! and its disk last-known-good copy, so fusiform and filesystem latency never enter resolution.
 //!
-//! Layering: fusiform's point-in-time response is the base; the overlay is applied on top
-//! (a `patch` deep-merges onto an existing provider, an `add` introduces one
-//! not in the catalog). Overlay `wire_family` pins are either authored or
-//! generated — see `family.rs`. Known fields map into the typed spec; the FULL
+//! Fusiform owns model and provider facts, including wire packages, shapes, endpoints,
+//! reasoning tier ids and retirement successors. Broca maps packages and shapes to its
+//! implemented renderers. The serving overlay contains no copied model routing facts.
+//! The legacy snapshot importer remains available for offline tooling. Its FULL
 //! original object is preserved verbatim in `raw` (forward-compat — models.dev adds
 //! fields, and an unmapped field must never be silently dropped). The renderer NEVER
 //! reads `raw`; any field that can change request bytes is promoted to a typed field
 //! (a test over the real snapshot enforces that every key is classified).
 //!
-//! Wire-family (renderer) selection is OUR decision, never sourced from the catalog —
-//! see `family.rs`.
+//! Renderer implementation is Broca's decision; the upstream protocol being implemented
+//! comes from the row's wire facts. See `family.rs`.
 #![forbid(unsafe_code)]
 
 pub mod family;
@@ -25,6 +25,7 @@ pub mod keep_warm;
 #[cfg(feature = "live")]
 pub mod live;
 pub mod merge;
+pub mod routing;
 pub mod runtime;
 
 pub use runtime::{
@@ -37,14 +38,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use broca_provider::policy::{Quirks, TokenLimitField, UsagePolicy};
 use broca_provider::spec::{
-    AuthKind, Capabilities, CapabilityFlag, CostSchedule, CostTier, Limits, ModelSpec, Overlay,
-    ProviderSpec, ReasoningOptions, WireFamilyId,
+    AuthKind, Capabilities, CapabilityFlag, CostSchedule, CostTier, InputModalities, Limits,
+    ModelSpec, Overlay, ProviderSpec, ReasoningOptions, WireFamilyId,
 };
 use family::{resolve_provider_family, FamilyResolution, ResolutionSource};
 use serde::Deserialize;
 use serde_json::Value;
 
-/// Broca-owned corrections, additions, endpoints, and wire-family pins layered over fusiform.
+/// Serving exceptions for renderer or transport behavior, never copied model routing facts.
 const OVERLAY: &str = include_str!("../data/overlay.json");
 
 /// Where the vendored snapshot came from and when — so a stale catalog is visible
@@ -177,7 +178,8 @@ pub struct Catalog {
     pending: Vec<PendingProvider>,
     /// provider ids introduced by the overlay `add` block (not in the snapshot).
     overlay_added: Vec<String>,
-    /// Models suppressed by the overlay `remove` block, retained after their serving rows are gone.
+    /// Suppressed identities retained only to seed the test fixture cache after rows are removed.
+    #[cfg(any(test, feature = "test-support"))]
     overlay_removed_models: BTreeMap<String, BTreeSet<String>>,
     /// Explicit upstream withdrawals retained from fusiform's `include_retired` response. These
     /// are not serveable rows, but keeping the identity distinguishes a withdrawal from a typo.
@@ -300,6 +302,7 @@ impl Catalog {
 
         // Suppress retired models after the merge, so a suppression can target a row that
         // `patch` also touches and the ordering stays obvious: merge, then delete.
+        #[cfg(any(test, feature = "test-support"))]
         let mut overlay_removed_models: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for (provider_id, model_ids) in validated_remove {
             let entry = providers
@@ -316,6 +319,7 @@ impl Catalog {
                         model: model_id.to_string(),
                     });
                 }
+                #[cfg(any(test, feature = "test-support"))]
                 overlay_removed_models
                     .entry(provider_id.clone())
                     .or_default()
@@ -328,7 +332,35 @@ impl Catalog {
         let mut pending = Vec::new();
         for (id, entry) in &providers {
             let overlay_family = entry.get("wire_family").and_then(parse_family);
-            match resolve_provider_family(id, overlay_family) {
+            let resolution =
+                if overlay_family.is_some() || entry.get("npm").and_then(Value::as_str).is_none() {
+                    resolve_provider_family(id, overlay_family)
+                } else {
+                    FamilyResolution::Pending {
+                        reason: format!("{id}: unsupported published wire package"),
+                    }
+                };
+            let resolution = match resolution {
+                FamilyResolution::Pending { .. } => entry
+                    .get("npm")
+                    .and_then(Value::as_str)
+                    .and_then(|npm| family::wire_family(npm, None))
+                    .map(|family| FamilyResolution::Supported {
+                        family,
+                        source: ResolutionSource::WireFacts,
+                    })
+                    .or_else(|| {
+                        family::credential_persona_route(id, "oauth").map(|(family, _)| {
+                            FamilyResolution::Supported {
+                                family,
+                                source: ResolutionSource::CredentialPersona,
+                            }
+                        })
+                    })
+                    .unwrap_or(resolution),
+                _ => resolution,
+            };
+            match resolution {
                 FamilyResolution::Supported { family, source } => {
                     resolved_family.insert(id.clone(), (family, source));
                 }
@@ -347,6 +379,7 @@ impl Catalog {
             resolved_family,
             pending,
             overlay_added,
+            #[cfg(any(test, feature = "test-support"))]
             overlay_removed_models,
             withdrawn_models: BTreeSet::new(),
             metadata: None,
@@ -464,20 +497,46 @@ impl Catalog {
         let entry = self.providers.get(provider_id)?;
         let model_entry = entry.get("models").and_then(|m| m.get(model_id))?;
 
-        // A model may override the provider's family (Chat vs Responses, etc.).
-        let model_family = model_entry
-            .get("wire_family")
-            .and_then(parse_family)
-            .unwrap_or(provider_family);
+        // The snapshot's per-model provider object carries the same package/shape override
+        // that Fusiform publishes as wire facts. An unsupported shape cannot borrow a default.
+        let model_family = if let Some(family) =
+            model_entry.get("wire_family").and_then(parse_family)
+        {
+            family
+        } else if let Some(overrides) = model_entry.get("provider").filter(|value| !value.is_null())
+        {
+            let overrides = overrides.as_object()?;
+            let npm = overrides.get("npm").filter(|value| !value.is_null());
+            let shape = overrides.get("shape").filter(|value| !value.is_null());
+            if npm.is_some() || shape.is_some() {
+                let npm = match npm {
+                    Some(value) => value.as_str()?,
+                    None => entry.get("npm")?.as_str()?,
+                };
+                let shape = match shape {
+                    Some(value) => Some(value.as_str()?),
+                    None => None,
+                };
+                family::wire_family(npm, shape)?
+            } else {
+                provider_family
+            }
+        } else {
+            provider_family
+        };
 
         let mut provider_spec = map_provider(provider_id, entry, model_family, raw_policy);
         // The serving spec speaks for THIS model: carry the per-model family.
         provider_spec.wire_family = model_family;
-        // Mixed-protocol providers can pin a model to its own endpoint root. OpenCode Go's
-        // roots intentionally follow Pi 1.4.0 (`/inference/go/v1` and `/inference/go`); its
-        // current docs list `/openai/v1`, `/google/v1beta`, and `/anthropic` alternatives.
+        // Model-level endpoint facts take precedence over the provider's root.
         if let Some(base_url) = model_entry.get("base_url").and_then(Value::as_str) {
             provider_spec.base_url = base_url.to_string();
+        } else if let Some(api) = model_entry
+            .get("provider")
+            .and_then(|provider| provider.get("api"))
+            .and_then(Value::as_str)
+        {
+            provider_spec.base_url = routing::renderer_base_url(model_family, api);
         }
         Some((provider_spec, map_model(model_id, model_entry, raw_policy)))
     }
@@ -654,8 +713,14 @@ fn map_provider(
     let base_url = entry
         .get("base_url")
         .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+        .map(str::to_string)
+        .or_else(|| {
+            entry
+                .get("api")
+                .and_then(Value::as_str)
+                .map(|api| routing::renderer_base_url(family, api))
+        })
+        .unwrap_or_default();
     ProviderSpec {
         id: provider_id.to_string(),
         wire_family: family,
@@ -666,7 +731,8 @@ fn map_provider(
         // override from the catalog bridge. This keeps the OpenAI provider fix out of the shared
         // OpenAI-Chat family default while leaving the hand-built family helpers unchanged.
         quirks: provider_quirks(provider_id, family, &base_url),
-        // The overlay owns provider endpoints; absent/empty means the family default.
+        // Prefer an explicit native hold, then the published API. Empty is metadata-only;
+        // migrated live admission requires the row's wire.api rather than a family default.
         base_url,
         raw: raw_policy.map(entry),
     }
@@ -712,6 +778,11 @@ fn map_model(model_id: &str, entry: &Value, raw_policy: RawPolicy) -> ModelSpec 
             // the other snapshot capability keys.
             structured_output: capability_flag(entry, "structured_output"),
         },
+        input_modalities: entry
+            .get("modalities")
+            .and_then(|modalities| modalities.get("input"))
+            .map(InputModalities::from_value)
+            .unwrap_or_default(),
         limits: map_limits(entry.get("limit")),
         cost: map_cost(entry.get("cost")),
         // models.dev `reasoning_options`, the snapshot spelling of fusiform's
@@ -879,6 +950,82 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_input_modalities_use_only_the_snapshot_source() {
+        let mut base = base();
+        let row = &mut base["anthropic"]["models"]["claude-x"];
+        row["attachment"] = json!(false);
+        row["capability.input_modalities"] = json!(["audio", "video"]);
+        row["modalities"] =
+            json!({"input": ["text", "image", "pdf", "future"], "output": ["audio", "video"]});
+        let catalog = Catalog::from_json_str(&base.to_string(), "{}").unwrap();
+        let expected = InputModalities {
+            text: Some(true),
+            image: Some(true),
+            pdf: Some(true),
+            audio: Some(false),
+            video: Some(false),
+        };
+        assert_eq!(
+            catalog
+                .model("anthropic", "claude-x")
+                .unwrap()
+                .1
+                .input_modalities,
+            expected
+        );
+        let cache = CatalogCache::empty();
+        cache.install_parsed_for_test(&catalog, 100, CatalogSource::LastKnownGood);
+        assert_eq!(
+            cache
+                .snapshot()
+                .unwrap()
+                .model_for_serving("anthropic", "claude-x")
+                .unwrap()
+                .1
+                .input_modalities,
+            expected
+        );
+    }
+
+    #[test]
+    fn snapshot_input_modalities_preserve_empty_and_unknown() {
+        for (value, expected) in [
+            (None, InputModalities::default()),
+            (Some(Value::Null), InputModalities::default()),
+            (
+                Some(json!({"output": ["image"]})),
+                InputModalities::default(),
+            ),
+            (Some(json!({"input": "image"})), InputModalities::default()),
+            (
+                Some(json!({"input": ["image", false]})),
+                InputModalities::default(),
+            ),
+            (
+                Some(json!({"input": []})),
+                InputModalities {
+                    text: Some(false),
+                    image: Some(false),
+                    pdf: Some(false),
+                    audio: Some(false),
+                    video: Some(false),
+                },
+            ),
+        ] {
+            let mut entry =
+                json!({"attachment": true, "capability.input_modalities": ["image", "pdf"]});
+            if let Some(value) = value.clone() {
+                entry["modalities"] = value;
+            }
+            assert_eq!(
+                map_model("model", &entry, RawPolicy::Skip).input_modalities,
+                expected,
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
     fn native_provider_resolves_and_preserves_raw() {
         let c = Catalog::from_json_str(&base().to_string(), "{}").unwrap();
         let p = c.provider("anthropic").unwrap();
@@ -890,12 +1037,51 @@ mod tests {
     }
 
     #[test]
-    fn unpinned_openai_compatible_provider_is_pending() {
-        // The long-tail default used to be `npm == @ai-sdk/openai-compatible`.
-        // That rule is gone: without an overlay pin, deepseek is not served.
-        let c = Catalog::from_json_str(&base().to_string(), "{}").unwrap();
-        assert!(c.provider("deepseek").is_none());
-        assert!(c.pending_providers().iter().any(|p| p.id == "deepseek"));
+    fn published_package_resolves_metadata_without_an_overlay_pin() {
+        let mut facts = base();
+        let c = Catalog::from_json_str(&facts.to_string(), "{}").unwrap();
+        let provider = c
+            .provider("deepseek")
+            .expect("published compatible package and API resolve");
+        assert_eq!(provider.wire_family, WireFamilyId::OpenAiChat);
+        assert_eq!(provider.base_url, "https://api.deepseek.com");
+        facts["deepseek"].as_object_mut().unwrap().remove("api");
+        let c = Catalog::from_json_str(&facts.to_string(), "{}").unwrap();
+        assert!(
+            c.provider("deepseek").unwrap().base_url.is_empty(),
+            "metadata must not invent an endpoint; live admission requires wire.api"
+        );
+    }
+
+    #[test]
+    fn snapshot_model_provider_shape_is_consumed_without_guessing() {
+        let mut base = base();
+        base["deepseek"]["models"]["shape-test"] = json!({
+            "provider":{"npm":"@ai-sdk/openai","api":"https://row.example/v1","shape":"completions"}
+        });
+        let catalog = Catalog::from_json_str(&base.to_string(), "{}").unwrap();
+        let (provider, _) = catalog.model_for_serving("deepseek", "shape-test").unwrap();
+        assert_eq!(provider.wire_family, WireFamilyId::OpenAiChat);
+        assert_eq!(provider.base_url, "https://row.example/v1");
+        base["deepseek"]["models"]["shape-test"]["provider"]
+            .as_object_mut()
+            .unwrap()
+            .remove("npm");
+        base["deepseek"]["models"]["shape-test"]["provider"]["shape"] = json!("responses");
+        let catalog = Catalog::from_json_str(&base.to_string(), "{}").unwrap();
+        assert_eq!(
+            catalog
+                .model_for_serving("deepseek", "shape-test")
+                .unwrap()
+                .0
+                .wire_family,
+            WireFamilyId::OpenAiResponses
+        );
+        base["deepseek"]["models"]["shape-test"]["provider"]["shape"] = json!("unsupported-shape");
+        let catalog = Catalog::from_json_str(&base.to_string(), "{}").unwrap();
+        assert!(catalog
+            .model_for_serving("deepseek", "shape-test")
+            .is_none());
     }
 
     #[test]
@@ -1203,16 +1389,13 @@ mod tests {
     #[test]
     fn every_snapshot_key_is_classified() {
         // Keys mapped into typed ProviderSpec fields.
-        const PROVIDER_MAPPED: &[&str] = &["id", "models"];
+        const PROVIDER_MAPPED: &[&str] = &["id", "models", "api", "npm"];
         // Keys intentionally NOT mapped — none can change request BODY bytes:
-        //  - api: an upstream endpoint copied into the harness-owned overlay as `base_url`;
-        //    serving never reads the document field directly;
         //  - doc: a documentation URL;
         //  - env: the NAMES of auth env vars (auth is attached after render, off the
         //    hash domain; the auth KIND comes from the family, not this);
         //  - name: provider display name;
-        //  - npm: leftover catalog packaging; family resolution no longer reads it.
-        const PROVIDER_IGNORED: &[&str] = &["api", "doc", "env", "name", "npm"];
+        const PROVIDER_IGNORED: &[&str] = &["doc", "env", "name"];
 
         // Keys mapped into typed ModelSpec fields.
         const MODEL_MAPPED: &[&str] = &[
@@ -1222,6 +1405,7 @@ mod tests {
             "id",
             "interleaved",
             "limit",
+            "modalities",
             "name",
             "reasoning",
             // Typed as `ModelSpec::reasoning_options`: a caller's reasoning variant is resolved
@@ -1232,6 +1416,8 @@ mod tests {
             "structured_output",
             "temperature",
             "tool_call",
+            // Per-model package, endpoint and shape become bounded serving fields.
+            "provider",
         ];
         // Keys intentionally NOT mapped. None is consumed by the renderer today:
         //  - description: human-readable model prose for display only; never read by any
@@ -1246,34 +1432,12 @@ mod tests {
         //    RENDERER decisions and the renderer is ours: a caller's `service_tier` is
         //    rendered by broca's own family table (broca-provider's `service_tier`), never
         //    from this field. Mapping it would let an upstream edit change our request bytes;
-        //  - modalities: capability metadata — NOT byte-affecting until multimodal
-        //    rendering exists; promote it then;
-        //  - provider: NOT a provider id — see the note at its entry below;
         const MODEL_IGNORED: &[&str] = &[
             "description",
             "experimental",
             "knowledge",
             "last_updated",
-            "modalities",
             "open_weights",
-            // NOT a redundant provider id, which an earlier comment here claimed and a
-            // reader could act on. Measured on the snapshot: it is always an OBJECT, on 228
-            // models, carrying `npm` (224), `api` (122) and `shape` (33, `responses` or
-            // `completions`). That is a per-model transport override triple -- renderer,
-            // endpoint, and request shape.
-            //
-            // So it is ignored because renderer selection belongs to this code, not
-            // because the catalog data duplicates another field. Family resolution never
-            // reads `npm`: an overlay pin or the provider-id hand-table chooses the
-            // renderer. Upstream has been observed deleting an `npm` override without
-            // changing `last_updated`, which can silently reroute a model to a different
-            // wire family within an hour.
-            //
-            // Mapping it "for completeness" would hand renderer choice to a field that
-            // changes without notice. The providers carrying overrides are aggregators whose
-            // models span several families, which is why per-provider resolution leaves them
-            // Pending; every provider we serve is family-homogeneous and carries none.
-            "provider",
         ];
 
         let snapshot: Value =
@@ -1310,19 +1474,14 @@ mod tests {
         );
     }
 
-    /// Lock representative overlay-served providers against the REAL bundled catalog.
-    /// Cerebras, xAI, and OpenRouter need overlay family pins, while their endpoint pins
-    /// are respectively authored, authored, and generated from the retired document field.
-    /// This asserts real model ids resolve through `model()` to OpenAI Chat at the expected
-    /// host, so losing either kind of pin fails here rather than silently rerouting requests.
+    /// Published package and endpoint facts replace duplicate overlay pins.
     #[cfg(feature = "bundled-catalog")]
     #[test]
-    fn overlay_served_providers_resolve_to_openai_chat_with_base_url() {
+    fn fact_served_providers_resolve_to_openai_chat_with_base_url() {
         // (provider, a real snapshot model id, expected base_url after overlay).
         let cases = [
-            ("cerebras", "gpt-oss-120b", "https://api.cerebras.ai/v1"),
-            ("xai", "grok-composer-2.5-fast", "https://api.x.ai/v1"),
-            // OpenRouter's base_url pin was generated from the snapshot's api value.
+            ("deepseek", "deepseek-v4-flash", "https://api.deepseek.com"),
+            // OpenRouter's root comes directly from its published API field.
             (
                 "openrouter",
                 "aion-labs/aion-2.0",
@@ -1347,7 +1506,16 @@ mod tests {
 
     #[cfg(feature = "bundled-catalog")]
     #[test]
-    fn opencode_go_models_use_their_pinned_pi_protocol_and_endpoint() {
+    fn opencode_go_models_use_fusiform_pi_protocol_and_endpoint() {
+        let cache = crate::CatalogCache::empty();
+        cache
+            .install_for_test(
+                serde_json::from_str(include_str!("../tests/fixtures/fusiform_opencode_go.json"))
+                    .unwrap(),
+                crate::CatalogSource::Fusiform,
+            )
+            .unwrap();
+        let snapshot = cache.snapshot().unwrap();
         let cases = [
             (
                 "gpt-6-luna",
@@ -1370,11 +1538,6 @@ mod tests {
                 "https://opencode.ai/inference/go/v1",
             ),
             (
-                "grok-4.6",
-                WireFamilyId::OpenAiResponses,
-                "https://opencode.ai/inference/go/v1",
-            ),
-            (
                 "grok-4.7",
                 WireFamilyId::OpenAiResponses,
                 "https://opencode.ai/inference/go/v1",
@@ -1388,16 +1551,6 @@ mod tests {
                 "muse-spark-1.3-contributor",
                 WireFamilyId::OpenAiResponses,
                 "https://opencode.ai/inference/go/v1",
-            ),
-            (
-                "minimax-m2.5",
-                WireFamilyId::AnthropicMessages,
-                "https://opencode.ai/inference/go",
-            ),
-            (
-                "minimax-m2.7",
-                WireFamilyId::AnthropicMessages,
-                "https://opencode.ai/inference/go",
             ),
             (
                 "minimax-m3",
@@ -1429,23 +1582,13 @@ mod tests {
                 WireFamilyId::OpenAiChat,
                 "https://opencode.ai/inference/go/v1",
             ),
-            (
-                "qwen3.5-plus",
-                WireFamilyId::OpenAiChat,
-                "https://opencode.ai/inference/go/v1",
-            ),
-            (
-                "qwen3.6-plus",
-                WireFamilyId::OpenAiChat,
-                "https://opencode.ai/inference/go/v1",
-            ),
         ];
         for (model_id, family, base_url) in cases {
-            let (provider, _) = catalog()
-                .model("opencode-go", model_id)
-                .unwrap_or_else(|| panic!("opencode-go/{model_id} must be in the bundled catalog"));
-            assert_eq!(provider.wire_family, family, "{model_id} protocol pin");
-            assert_eq!(provider.base_url, base_url, "{model_id} endpoint pin");
+            let route = snapshot
+                .resolve_route("opencode-go", model_id)
+                .unwrap_or_else(|error| panic!("{error}"));
+            assert_eq!(route.0, family, "{model_id} protocol fact");
+            assert_eq!(route.1, base_url, "{model_id} endpoint fact");
         }
     }
 
@@ -1509,14 +1652,26 @@ mod tests {
         assert!(serving_model.raw.is_null());
     }
 
-    /// The bundled catalog must keep OpenAI's provider-specific token-limit override scoped to
-    /// OpenAI itself while leaving the OpenAI-compatible long tail on the family default.
+    #[cfg(feature = "bundled-catalog")]
+    fn published_chat_shape_fixture() -> Catalog {
+        Catalog::from_json_str(&json!({
+            "openai":{"npm":"@ai-sdk/openai","api":"https://api.openai.com/v1","models":{
+                "chat-fixture":{"reasoning":false,"provider":{"shape":"completions"}},
+                "second-chat-fixture":{"reasoning":false,"provider":{"shape":"completions"}}
+            }},
+            "deepseek":{"npm":"@ai-sdk/openai-compatible","api":"https://api.deepseek.com","models":{"compatible-fixture":{"reasoning":false}}}
+        }).to_string(), "{}").unwrap()
+    }
+
+    /// Explicit published Chat shapes keep the native token-field quirk without
+    /// inferring a model's protocol from its name or reasoning capability.
     #[cfg(feature = "bundled-catalog")]
     #[test]
-    fn bundled_openai_chat_models_use_max_completion_tokens_but_long_tail_keeps_max_tokens() {
-        for model_id in ["gpt-4.1", "gpt-4o"] {
-            let (spec, _model) = catalog().model("openai", model_id).unwrap_or_else(|| {
-                panic!("openai/{model_id} must resolve from the bundled snapshot")
+    fn published_chat_shapes_keep_the_native_token_field_quirk_scoped() {
+        let catalog = published_chat_shape_fixture();
+        for model_id in ["chat-fixture", "second-chat-fixture"] {
+            let (spec, _model) = catalog.model("openai", model_id).unwrap_or_else(|| {
+                panic!("openai/{model_id} must resolve from its published shape")
             });
             assert_eq!(spec.wire_family, WireFamilyId::OpenAiChat);
             assert_eq!(
@@ -1526,8 +1681,8 @@ mod tests {
             );
         }
 
-        let (deepseek, _model) = catalog()
-            .model("deepseek", "deepseek-v4-flash")
+        let (deepseek, _model) = catalog
+            .model("deepseek", "compatible-fixture")
             .expect("deepseek/deepseek-v4-flash must stay on the OpenAI-compatible family default");
         assert_eq!(deepseek.wire_family, WireFamilyId::OpenAiChat);
         assert_eq!(
@@ -1540,15 +1695,15 @@ mod tests {
     /// long-tail family default `max_tokens`.
     #[cfg(feature = "bundled-catalog")]
     #[test]
-    fn bundled_openai_chat_render_uses_max_completion_tokens() {
+    fn published_chat_shape_renders_max_completion_tokens() {
         use broca_protocol::content::{ContentBlock, Message, Role};
         use broca_protocol::request::CallOptions;
         use broca_provider::families::{renderer_version_for, resolve_frozen};
         use broca_provider::registry::wire_family;
 
-        let (provider_spec, model_spec) = catalog()
-            .model("openai", "gpt-4.1")
-            .expect("openai/gpt-4.1 must resolve from the bundled snapshot");
+        let (provider_spec, model_spec) = published_chat_shape_fixture()
+            .model("openai", "chat-fixture")
+            .expect("the explicit Chat shape resolves");
         let family = provider_spec.wire_family;
         assert_eq!(family, WireFamilyId::OpenAiChat);
 

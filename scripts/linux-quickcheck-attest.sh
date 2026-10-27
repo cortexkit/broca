@@ -24,10 +24,12 @@ while IFS= read -r crate; do
 done < <(printf '%s\n' "$@" | LC_ALL=C sort -u)
 crate_list=$(IFS=,; printf '%s' "${crates[*]}")
 
-scratch_root="${TMPDIR:-$root/target/scratch}"
-mkdir -p "$scratch_root"
-scratch=$(mktemp -d "$scratch_root/broca-linux-attest.XXXXXX")
-trap 'rm -rf "$scratch"' EXIT
+# The scratch index and objects must live outside the working tree: `git add -A` below hashes
+# everything not ignored, so scratch inside the tree would change the very tree being attested.
+# The remote runner does not pass TMPDIR, hence the /tmp fallback rather than a path in the repo.
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/broca-linux-attest.XXXXXX")
+temporary=""
+trap 'rm -rf "$scratch"; [[ -z "$temporary" ]] || rm -f "$temporary"' EXIT
 objects="$scratch/objects"
 mkdir -p "$objects"
 alternate_objects=$(git rev-parse --git-path objects)
@@ -67,10 +69,9 @@ else
   output_dir=$(dirname "$output")
   mkdir -p "$output_dir"
   temporary=$(mktemp "$output.tmp.XXXXXX")
-  trap 'rm -f "$temporary"' EXIT
   printf '%s' "$record" > "$temporary"
   mv "$temporary" "$output"
-  trap - EXIT
+  temporary=""
   echo "linux-quickcheck-attest: passing attestation written to $output"
   printf '%s' "$record"
 fi

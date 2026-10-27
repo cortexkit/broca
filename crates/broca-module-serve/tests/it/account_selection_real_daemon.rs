@@ -912,7 +912,7 @@ impl Rig {
         // falls back to when the catalog module is unreachable, as on a cold start.
         std::fs::write(
             state_root.join("catalog").join("fusiform-lkg.json"),
-            serde_json::to_vec_pretty(&json!({
+            serde_json::to_vec_pretty(&super::routing_fixture::with_served_routing(json!({
                 "catalog_version": 1,
                 "models": {
                     format!("anthropic/{MODEL}"): {
@@ -957,7 +957,7 @@ impl Rig {
                         "limit.context": 1047576,
                         "limit.output": 32768,
                     },
-                    "google/gemini-3.8-flash-high": {
+                    "google/antigravity-gemini-3.8-flash": {
                         "capability.attachment": false,
                         "capability.reasoning": true,
                         "capability.tool_call": true,
@@ -968,7 +968,7 @@ impl Rig {
                 },
                 "resolved_at_ms": 1,
                 "source": "models.dev",
-            }))
+            })))
             .unwrap(),
         )
         .unwrap();
@@ -1012,7 +1012,6 @@ impl Rig {
                         "env": {
                             "BROCA_STATE_ROOT": state_root,
                             "XDG_DATA_HOME": data_home,
-                            "BROCA_AUTH_SOURCE": "vault",
                             "BROCA_CONFIG_PATH": broca_config,
                             "BROCA_AUTH_METHODS_PATH": methods,
                             "BROCA_TOOL_MODULE": "unused-tools",
@@ -1538,6 +1537,8 @@ fn spec<'a>(send_id: &'a str, auth: Option<broca_wire::AuthParams>) -> SendSpec<
         auth,
         one_shot: None,
         context_management: None,
+        session_class: None,
+        plan: None,
     }
 }
 
@@ -2659,7 +2660,7 @@ async fn paused_auth_routed_status_matches_golden_through_real_serve() {
     let golden = std::fs::read(&path).expect("generate the routed auth golden through real serve");
     assert_eq!(
         format!("{:x}", Sha256::digest(&golden)),
-        "f975a084cb4e89e88c01de1c17343919d6f2f06da9d3fb500bf7ccfaf4edb169"
+        "1e94f0ff4f4da6bc39f1758fc87e004494dd94c423aae6273a6c8c8beeb06953"
     );
     assert_eq!(usage_compat::legacy_bytes(&bytes, &golden), golden);
     let value = serde_json::to_value(status).unwrap();
@@ -2717,7 +2718,7 @@ async fn session_too_large_status_matches_golden_through_real_serve() {
     use sha2::{Digest, Sha256};
     assert_eq!(
         format!("{:x}", Sha256::digest(&golden)),
-        "3bcd6d3df82bcf4f59695db4386d8a628a8cfbca321c63ec7da02000a83d9b37"
+        "81970d6a91a19b4e39c5e0bf1b02cdaf3a84159ed823189504e73eba7c8aecee"
     );
     assert_eq!(usage_compat::legacy_bytes(&bytes, &golden), golden);
 }
@@ -2774,7 +2775,7 @@ async fn output_ceiling_status_matches_golden_through_real_serve() {
     use sha2::{Digest, Sha256};
     assert_eq!(
         format!("{:x}", Sha256::digest(&golden)),
-        "309db3ddb13181b8be1cc1407ef818d4fc57613002861bdf514e5ddc490f01c5"
+        "59d6bb3c0b8046b1dc2858199fb14b352a5fedac243a4ccbba885726c36148f4"
     );
     assert_eq!(usage_compat::legacy_bytes(&bytes, &golden), golden);
 }

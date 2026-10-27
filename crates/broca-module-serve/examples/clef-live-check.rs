@@ -208,6 +208,7 @@ async fn fetch_secret(args: &Args, handle: &str) -> Result<ProviderSecret, Strin
     Ok(ProviderSecret {
         token: token.token,
         account_id: token.account_id,
+        auth_selection: token.resolved_credential_id,
     })
 }
 
@@ -294,7 +295,7 @@ async fn main() -> Result<(), String> {
         let elapsed = started.elapsed().as_millis();
         let at = model.path();
         let line = match reply {
-            ProviderReply::Answered(bytes) => match serde_json::from_slice::<AnswerView<'_>>(&bytes)
+            ProviderReply::Answered(bytes) | ProviderReply::AttributedAnswer { body: bytes, .. } => match serde_json::from_slice::<AnswerView<'_>>(&bytes)
             {
                 Ok(answer) => {
                     let usage = answer.usage.unwrap_or_default();

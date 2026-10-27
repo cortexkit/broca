@@ -305,13 +305,14 @@ impl Fixture {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         static CATALOG: std::sync::Once = std::sync::Once::new();
         CATALOG.call_once(|| {
-            let catalog = broca_catalog::Catalog::from_json_str(
-                include_str!("../../broca-catalog/data/models.dev.json"),
-                include_str!("../../broca-catalog/data/overlay.json"),
-            )
-            .unwrap();
+            // These unchanged rows from a live Fusiform response include both withdrawn aliases
+            // and a present alias without backend tiers. A models.dev snapshot cannot express
+            // retirement or successor facts, so it cannot exercise admission's refusal path.
+            let response =
+                serde_json::from_str(include_str!("fixtures/fusiform_cache_warm_admission.json"))
+                    .unwrap();
             let cache = Arc::new(broca_catalog::CatalogCache::empty());
-            cache.install_parsed_for_test(&catalog, 0, broca_catalog::CatalogSource::Fusiform);
+            cache.refresh(response).unwrap();
             broca_catalog::install_global_catalog_cache(cache);
         });
         let root = broca_test_support::scratch_root().join(format!(
@@ -743,72 +744,79 @@ async fn unconfigured_chat_and_gemini_admission_remain_unsupported() {
 
 #[tokio::test]
 async fn retired_antigravity_sends_refuse_before_wal_writes_or_model_calls() {
-    for (route, replacement) in [
-        ("gemini-3.7-flash", "antigravity-gemini-3.8-flash"),
-        ("gemini-3.7-flash-low", "antigravity-gemini-3.8-flash"),
-        ("gemini-3.7-flash-medium", "antigravity-gemini-3.8-flash"),
-        ("gemini-3.7-flash-high", "antigravity-gemini-3.8-flash"),
-        ("gemini-3.6-flash", "antigravity-gemini-3.8-flash"),
-        ("gemini-3.6-flash-low", "antigravity-gemini-3.8-flash"),
-        ("gemini-3.6-flash-medium", "antigravity-gemini-3.8-flash"),
-        ("gemini-3.6-flash-high", "antigravity-gemini-3.8-flash"),
-        ("gemini-3.1-pro", "antigravity-gemini-4-argon"),
-        ("gemini-3.1-pro-low", "antigravity-gemini-4-argon"),
-        ("gemini-3.1-pro-high", "antigravity-gemini-4-argon"),
-        ("gemini-pro-agent", "antigravity-gemini-4-argon"),
-        ("claude-sonnet-4-6-thinking", "anthropic/claude-sonnet-5-5"),
+    for (model, replacement) in [
+        (
+            "antigravity-gemini-3.7-flash",
+            Some("google/antigravity-gemini-3.8-flash"),
+        ),
+        (
+            "antigravity-gemini-3.6-flash",
+            Some("google/antigravity-gemini-3.8-flash"),
+        ),
+        ("antigravity-claude-sonnet-4-6-thinking", None),
     ] {
-        for prefix in ["", "antigravity-"] {
-            let f = Fixture::start_for(false, WireFamilyId::GoogleCodeAssist).await;
-            let model = format!("{prefix}{route}");
-            for attempt in ["fresh", "already-open"] {
-                let params: broca_wire::SendParams = serde_json::from_value(json!({
-                    "prompt": "ping",
-                    "model": {"provider": "google", "model": model},
-                }))
-                .unwrap();
-                let request = params
-                    .into_send_request(f.key.clone(), RunId(format!("retired-{model}-{attempt}")))
-                    .unwrap();
-                let before = f.executor.store.0.bytes_for_move(&f.key).unwrap();
-                let error = tokio::time::timeout(
-                    Duration::from_secs(4),
-                    ServeHandler::send(&f.registry, request),
-                )
-                .await
-                .expect("retired send admission hung")
-                .expect_err(&format!("{model} {attempt} was admitted"));
-                let message = error.to_string();
-                assert!(message.contains(&format!("google/{model}")), "{message}");
-                assert!(message.contains("Google withdrew"), "{message}");
-                assert!(message.contains(replacement), "{message}");
-                if route == "claude-sonnet-4-6-thinking" {
-                    assert!(
-                        message.contains("through the Anthropic provider"),
-                        "{message}"
-                    );
-                } else {
-                    assert!(message.contains("(medium)"), "{message}");
-                }
-                assert_eq!(
-                    f.executor.store.1.load(std::sync::atomic::Ordering::SeqCst),
-                    0,
-                    "{model} attempted a WAL append"
-                );
-                // Opening a fresh session can initialize the WAL header, but refusal must append
-                // no records. A later send on that open session must leave every byte unchanged.
-                assert!(f.records().is_empty(), "{model} wrote a WAL record");
-                if attempt == "already-open" {
-                    assert!(before.is_some());
-                    assert_eq!(f.executor.store.0.bytes_for_move(&f.key).unwrap(), before);
-                }
-                assert!(
-                    f.bodies.lock().unwrap().is_empty(),
-                    "{model} made a model call"
-                );
-                assert!(f.executor.provider.lock().unwrap().is_none());
-                f.idle().await;
-            }
+        let advice = replacement
+            .map(|successor| format!("use '{successor}' instead"))
+            .unwrap_or_else(|| "choose a different model for this episode".into());
+        assert_code_assist_admission_refused(
+            model,
+            &format!("catalog model 'google/{model}' was withdrawn upstream; {advice}"),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn present_antigravity_without_backend_tiers_explains_unavailable_code_assist() {
+    assert_code_assist_admission_refused(
+        "antigravity-gemini-3.1-flash-image",
+        "Google Code Assist is unavailable for this model: Fusiform has not published reasoning-tier backend model IDs (missing route.reasoning_wire_ids); choose a model with a published Google Code Assist route",
+    )
+    .await;
+    assert!(broca_catalog::catalog()
+        .unwrap()
+        .contains_model("google", "antigravity-gemini-3.1-flash-image"));
+}
+
+async fn assert_code_assist_admission_refused(model: &str, expected_reason: &str) {
+    let f = Fixture::start_for(false, WireFamilyId::GoogleCodeAssist).await;
+    for attempt in ["fresh", "already-open"] {
+        let params: broca_wire::SendParams = serde_json::from_value(json!({
+            "prompt": "ping",
+            "model": {"provider": "google", "model": model},
+        }))
+        .unwrap();
+        let request = params
+            .into_send_request(f.key.clone(), RunId(format!("refused-{model}-{attempt}")))
+            .unwrap();
+        let before = f.executor.store.0.bytes_for_move(&f.key).unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(4),
+            ServeHandler::send(&f.registry, request),
+        )
+        .await
+        .expect("Code Assist send admission hung")
+        .expect_err(&format!("{model} {attempt} was admitted"));
+        let message = error.to_string();
+        assert!(message.contains(&format!("google/{model}")), "{message}");
+        assert!(message.contains(expected_reason), "{message}");
+        assert_eq!(
+            f.executor.store.1.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{model} attempted a WAL append"
+        );
+        // Opening a fresh session can initialize the WAL header, but refusal must append
+        // no records. A later send on that open session must leave every byte unchanged.
+        assert!(f.records().is_empty(), "{model} wrote a WAL record");
+        if attempt == "already-open" {
+            assert!(before.is_some());
+            assert_eq!(f.executor.store.0.bytes_for_move(&f.key).unwrap(), before);
         }
+        assert!(
+            f.bodies.lock().unwrap().is_empty(),
+            "{model} made a model call"
+        );
+        assert!(f.executor.provider.lock().unwrap().is_none());
+        f.idle().await;
     }
 }

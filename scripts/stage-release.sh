@@ -44,6 +44,7 @@ source "$ROOT/scripts/dsym.sh"
 # The WAL feature floor is printed on the card so the placing seat sees which feature names the
 # build must know; place-release enforces it.
 source "$ROOT/scripts/wal-floor.sh"
+source "$ROOT/scripts/nonshipping-markers.sh"
 WAL_FLOOR_FILE=$(broca_wal_floor_path)
 
 # THE BUILD SCRATCH AREA, NOT THE SEAM THE PLACER READS. Age-swept below, so it must never
@@ -85,36 +86,6 @@ probe_hits() { # <file> <needle>
     s=$(grep -F -c -- "$2" <<<"$listing" || true)
     n=$(nm -a "$1" 2>/dev/null | grep -F -c -- "$2" || true)
     echo "$s $n"
-}
-
-# A filesystem clock override can advance deletion deadlines. Refuse it before any
-# signing or publication, even when the caller supplies no optional release marker.
-refuse_test_clock() {
-    local marker="BROCA_TEST_CLOCK_RETENTION_CLOCK_OVERRIDE_V1"
-    local control counts control_s control_n artifact_s artifact_n
-    control=$(mktemp)
-    printf '%s\n' "$marker" > "$control"
-    if ! counts=$(probe_hits "$control" "$marker"); then
-        rm -f "$control"
-        echo "stage-release: REFUSING -- test-clock marker control could not be read." >&2
-        return 2
-    fi
-    rm -f "$control"
-    read -r control_s control_n <<<"$counts"
-    if [[ $control_s -eq 0 ]]; then
-        echo "stage-release: REFUSING -- strings cannot see the planted test-clock marker control." >&2
-        return 2
-    fi
-    if ! counts=$(probe_hits "$1" "$marker"); then
-        echo "stage-release: REFUSING -- could not read the artifact for the test-clock check." >&2
-        return 2
-    fi
-    read -r artifact_s artifact_n <<<"$counts"
-    if [[ $(( artifact_s + artifact_n )) -gt 0 ]]; then
-        echo "stage-release: REFUSING -- artifact contains the test-clock override marker: $marker" >&2
-        return 2
-    fi
-    echo "== test-clock absent (planted strings control reads $control_s)"
 }
 
 # THE VERDICT AS ONE FUNCTION: removal assertion, marker/control readings, card lines,
@@ -291,7 +262,7 @@ fi
 if [[ -n $PROBE_ONLY ]]; then
     [[ -f $PROBE_ONLY ]] || { echo "stage-release: --probe-only: no such artifact: $PROBE_ONLY" >&2; exit 2; }
     STAGED=$PROBE_ONLY
-    refuse_test_clock "$STAGED"
+    broca_refuse_nonshipping_markers "$STAGED" stage-release
     echo "== probe-only: $(basename "$STAGED") vs deployed $DEPLOYED"
     report_verdict
     exit $?
@@ -404,7 +375,7 @@ DRIFT
 fi
 BUILT=target/release/ck-broca
 [[ -f $BUILT ]] || { echo "stage-release: $BUILT missing after build" >&2; exit 2; }
-refuse_test_clock "$BUILT"
+broca_refuse_nonshipping_markers "$BUILT" stage-release
 
 # Save line tables before stripping the Mach-O. The symbol table stays in the executable for
 # function names; the detached bundle supplies the file and line information for sample/Instruments.
@@ -719,6 +690,7 @@ for client in broca-session broca-run; do
             exit 2
         fi
     fi
+    broca_refuse_nonshipping_markers "$client_tmp" stage-release
     client_sha=$(shasum -a 256 "$client_tmp" | cut -d' ' -f1)
     printf '%s  %s\n' "$client_sha" "$(basename "$client_staged")" > "$client_tmp.sha256.postsign"
     chmod 600 "$client_tmp.sha256.postsign"

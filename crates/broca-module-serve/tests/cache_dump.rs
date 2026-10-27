@@ -38,9 +38,22 @@ fn scratch(tag: &str) -> PathBuf {
     root
 }
 fn index(root: &Path) -> rusqlite::Connection {
+    drop(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
     let connection = rusqlite::Connection::open(root.join("run-index.db")).unwrap();
-    connection.execute_batch("CREATE TABLE IF NOT EXISTS run_index (run_id TEXT PRIMARY KEY, session TEXT NOT NULL, state TEXT NOT NULL, state_changed_ms INTEGER)").unwrap();
+    complete_inventory(&connection);
     connection
+}
+fn complete_inventory(connection: &rusqlite::Connection) {
+    // These fixtures supply every synthetic bind directly, rather than relying on
+    // a background census to discover the WALs before a name lookup can run.
+    connection
+        .execute_batch(
+            "INSERT OR REPLACE INTO agent_data_projection VALUES(1,1);
+        INSERT OR REPLACE INTO agent_data_census_done VALUES(1);
+        DELETE FROM agent_data_pending_session;
+        UPDATE agent_data_census SET covered=1;",
+        )
+        .unwrap();
 }
 fn index_bind(
     connection: &rusqlite::Connection,
@@ -50,7 +63,7 @@ fn index_bind(
 ) {
     connection
         .execute(
-            "INSERT OR REPLACE INTO run_index VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR REPLACE INTO run_index(run_id,session,state,state_changed_ms) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![
                 broca_core::wal_writer::session_addr(bind),
                 serde_json::to_string(bind).unwrap(),
@@ -59,6 +72,19 @@ fn index_bind(
             ],
         )
         .unwrap();
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO agent_data_session_ref VALUES(?1,?2,?3,?4,?5)",
+            rusqlite::params![
+                broca_core::agent_session_ref(bind),
+                broca_core::session_addr(bind),
+                bind.project_root.to_str().unwrap(),
+                bind.harness,
+                bind.session
+            ],
+        )
+        .unwrap();
+    complete_inventory(connection);
 }
 
 fn retained_wal(root: &Path, key: &BindIdentity, activity_ms: u64, retention_s: u64) -> String {
@@ -308,6 +334,7 @@ async fn fixture<F: WireFamily + 'static>(
         vec![]
     };
     let request = RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -845,10 +872,10 @@ fn empty_selection_exits_nonzero_without_daemon() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
-    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(summary["calls_examined"], 0);
-    assert_eq!(summary["sessions_not_found"], json!(["absent"]));
-    assert!(output.stderr.is_empty());
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("unknown session") && error.contains("alfonso:absent"));
+    assert!(!root.join("out").exists());
 }
 
 #[tokio::test]
@@ -879,7 +906,7 @@ async fn response_without_durable_usage_is_examined_and_body_only() {
 }
 
 #[tokio::test]
-async fn session_selection_reads_only_indexed_matching_binds() {
+async fn session_selection_reads_only_inventory_matching_binds() {
     let (root, _, captured) = fixture(
         "indexed-target",
         AnthropicMessages,
@@ -1062,7 +1089,7 @@ async fn digest_mismatch_outranks_missing_usage_with_one_skip_reason() {
 }
 
 #[tokio::test]
-async fn session_absent_from_index_is_reported_by_name_even_with_valid_exports() {
+async fn session_absent_from_inventory_refuses_before_any_valid_export() {
     let (root, _, _) = fixture(
         "known",
         AnthropicMessages,
@@ -1086,10 +1113,10 @@ async fn session_absent_from_index_is_reported_by_name_even_with_valid_exports()
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
-    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(summary["calls_exported"], 1);
-    assert_eq!(summary["sessions_not_found"], json!(["missing-name"]));
-    assert!(output.stderr.is_empty());
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("missing-name") && error.contains("alfonso:missing-name"));
+    assert!(!root.join("partial").exists());
 }
 
 #[tokio::test]

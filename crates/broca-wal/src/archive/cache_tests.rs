@@ -163,7 +163,15 @@ fn file_open_preserves_explicit_reader_type_and_buffers_index_reads() {
         .join(format!("broca-buffered-open-{}.ark", std::process::id()));
     std::fs::write(&path, bytes).unwrap();
     let mut reader: ArchiveReader<File> = ArchiveReader::open(&path, 100).unwrap();
-    assert_eq!(reader.source.capacity(), 64 * 1024);
+    // `open` must buffer the file, unlike `new`, which keeps a caller's source unbuffered. The
+    // buffer size is a tuning choice, so only its presence is pinned.
+    assert!(reader.source.capacity() > 0, "open must buffer file reads");
+    assert_eq!(
+        ArchiveReader::new(File::open(&path).unwrap(), 100)
+            .source
+            .capacity(),
+        0
+    );
     assert_eq!(
         reader.read_member(&addr(127)).unwrap().unwrap().payload,
         vec![127; 16]

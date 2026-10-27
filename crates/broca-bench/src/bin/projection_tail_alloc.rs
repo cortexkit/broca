@@ -109,6 +109,7 @@ impl Fixture {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -168,6 +169,7 @@ impl Fixture {
         wal.append(
             1,
             &WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(1),

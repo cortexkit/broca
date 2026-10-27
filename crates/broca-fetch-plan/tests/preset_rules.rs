@@ -7,6 +7,43 @@ fn plan() -> Value {
 }
 
 #[test]
+fn absent_tool_preset_is_left_off_the_catalog_request() {
+    let mut raw = plan();
+    raw["tool_items"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("preset");
+    let parsed =
+        broca_fetch_plan::parse_plan(&raw, broca_fetch_plan::CompactionSupport::Unsupported)
+            .unwrap();
+    assert!(parsed.tool_items[0].preset.is_none());
+    let request =
+        broca_fetch_plan::admit::catalog_request(&parsed, Some(&parsed.tool_items[0]), None);
+    let encoded = serde_json::to_value(request).unwrap();
+    assert!(encoded.get("preset").is_none());
+    assert_eq!(encoded["params"], json!({}));
+    assert!(!broca_fetch_plan::names_confined_preset(&raw));
+    assert!(broca_fetch_plan::names_confined_preset(&plan()));
+}
+
+#[test]
+fn absent_system_text_preset_is_refused_by_name() {
+    let mut raw = plan();
+    raw["system_text_items"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("preset");
+    let refusal =
+        broca_fetch_plan::parse_plan(&raw, broca_fetch_plan::CompactionSupport::Unsupported)
+            .unwrap_err();
+    assert_eq!(refusal.code(), "invalid_params");
+    assert_eq!(
+        refusal.detail(),
+        json!({"field":"plan.system_text_items[0].preset"})
+    );
+}
+
+#[test]
 fn daemon_preset_syntax_boundaries_are_checked_for_every_item_role() {
     for preset in ["a".to_owned(), "a".repeat(64), "az09_-".to_owned()] {
         let mut value = plan();

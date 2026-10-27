@@ -99,6 +99,7 @@ pub fn classify_control_unit(unit: &ControlUnit) -> ControlClass {
         | ControlUnit::AssistantMessage { .. }
         | ControlUnit::ToolCall { .. }
         | ControlUnit::ToolResult { .. }
+        | ControlUnit::MessageBoundary { .. }
         | ControlUnit::StepFinished { .. }
         | ControlUnit::Error { .. }
         | ControlUnit::Paused { .. }
@@ -172,22 +173,24 @@ impl IndeterminateToolCalls {
     }
 }
 
-/// Episode-local context needed when records are projected incrementally.
+/// Context needed when records are projected incrementally. Placement keeps absolute
+/// lineage ordinals across episodes; the other fields describe the current episode.
 ///
 /// Batch replay can construct this state internally, while the live projector keeps one instance
 /// across observed records so a later `RunFinished` can describe its last model step and dispatches.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ControlProjectionState {
-    /// The run this episode's records belong to, so the TERMINAL can name it.
-    ///
-    /// `RunFinished` is the only run-lifecycle control unit that did not carry its run,
-    /// which left a subscriber attaching mid-stream unable to attribute it. The WAL
-    /// record does not carry one either, so it is tracked here from `RunStarted`.
-    ///
-    /// Stays `None` when the state is restored from a persisted watermark: the
-    /// `RunStarted` may sit before the watermark, and this projector does not read back
-    /// to find it. `None` therefore means "this producer does not know", which is exactly
-    /// what the optional wire field expresses -- not "the terminal has no run".
+    placement: crate::placement::Placement,
+    placement_error: Option<String>,
+    assistant_ordinal: Option<u64>,
+    tool_result_ordinal: Option<u64>,
+    assistant_message: Option<Arc<broca_protocol::AssistantMessage>>,
+    assistant_started: bool,
+    started_tools: std::collections::HashSet<broca_protocol::ToolCallId>,
+    cancelled: bool,
+    pending_inputs: Vec<Arc<Vec<broca_protocol::Message>>>,
+    /// The recorded episode identity, including when restored from a store seed.
+    /// `RunFinished` carries no run id in the WAL, so its control unit needs this context.
     run_id: Option<RunId>,
     final_step_finish_reason: Option<FinishReason>,
     has_completed_step: bool,
@@ -195,8 +198,8 @@ pub struct ControlProjectionState {
 }
 
 impl ControlProjectionState {
-    /// Restore the episode-local fields needed to continue control projection from a persisted
-    /// materialization watermark.
+    /// Restore legacy control attributes without a message-position seed. Use
+    /// `from_projection_seed` when projecting stored-message coordinates after a watermark.
     pub fn from_completed_steps_and_final_step_finish_reason(
         completed_steps: u64,
         final_step_finish_reason: Option<FinishReason>,
@@ -212,7 +215,66 @@ impl ControlProjectionState {
             final_step_finish_reason,
             has_completed_step: completed_steps > 0,
             indeterminate_tool_calls: IndeterminateToolCalls::default(),
+            placement: Default::default(),
+            placement_error: None,
+            assistant_ordinal: None,
+            tool_result_ordinal: None,
+            assistant_message: None,
+            assistant_started: false,
+            started_tools: Default::default(),
+            cancelled: false,
+            pending_inputs: Vec::new(),
         }
+    }
+
+    /// A materialization boundary has no pending steer or open tool batch. Restore the
+    /// absolute next ordinal and frozen budget facts rather than inferring them from a tail.
+    pub fn from_projection_seed(seed: &crate::ProjectionSeed) -> Option<Self> {
+        if !crate::budget_replay_seed_is_valid(seed) {
+            return None;
+        }
+        let episode = seed.admission_checkpoint.last_episode.as_ref()?;
+        let mut state = Self::from_completed_steps_and_final_step_finish_reason(
+            seed.completed_steps,
+            seed.last_step_finish_reason,
+            seed.last_run_id.clone(),
+        );
+        // Budgeted seeds supplied validated firing facts above. Without a budget, missing
+        // firing facts cannot change placement and need no full-prefix reconstruction.
+        state.placement = crate::placement::Placement::seeded(
+            seed.prefix_len,
+            seed.last_run_id.clone(),
+            episode.config.budget.clone(),
+            episode.budget_replay_state.clone().unwrap_or_default(),
+            seed.completed_steps,
+        );
+        state.cancelled = episode.cancel_at.is_some()
+            && !matches!(episode.disposition, crate::EpisodeDisposition::Finished);
+        Some(state)
+    }
+
+    /// The state a projection holds just before an episode's `RunStarted`, given the
+    /// transcript ordinal where that episode's input starts.
+    ///
+    /// A `RunStarted` resets every episode-local field, and placement keeps only the absolute
+    /// next ordinal across episodes (its batch, held steers and budget facts reset at the run
+    /// start too). So projecting an episode from its `RunStarted` with this state yields the
+    /// same units and the same final state as projecting the whole log, as long as the
+    /// ordinal is the episode's own first ordinal. Use it only immediately before a
+    /// `RunStarted` record; anywhere else the episode-local fields would be missing.
+    pub fn at_episode_start(first_ord: u64) -> Self {
+        Self {
+            placement: crate::placement::Placement::new(first_ord),
+            ..Self::default()
+        }
+    }
+
+    pub fn placement(&self) -> &crate::placement::Placement {
+        &self.placement
+    }
+
+    pub fn placement_error(&self) -> Option<&str> {
+        self.placement_error.as_deref()
     }
 
     fn reset_episode(&mut self) {
@@ -220,7 +282,43 @@ impl ControlProjectionState {
         self.final_step_finish_reason = None;
         self.has_completed_step = false;
         self.indeterminate_tool_calls.reset_episode();
+        self.assistant_ordinal = None;
+        self.tool_result_ordinal = None;
+        self.assistant_message = None;
+        self.assistant_started = false;
+        self.started_tools.clear();
+        self.cancelled = false;
+        self.pending_inputs.clear();
     }
+}
+
+/// A control payload's stored-message coordinate, from the same placement walk as replay.
+#[derive(Debug, Clone)]
+pub struct PlacedControlUnit {
+    pub cursor: Cursor,
+    pub unit: ControlUnit,
+    pub message_ordinal: Option<u64>,
+    pub event: cortexkit_role_llm_runner::live::LiveEvent,
+}
+
+impl PlacedControlUnit {
+    pub fn mid(&self) -> Option<String> {
+        self.message_ordinal.map(|ordinal| format!("m{ordinal}"))
+    }
+}
+
+pub fn project_control_with_mids(
+    records: &[FramedRecord],
+    state: &mut ControlProjectionState,
+) -> Result<Vec<PlacedControlUnit>, String> {
+    let mut sink = PlacedUnitSink::default();
+    for framed in records {
+        project_control_record(framed, state, &mut sink);
+        if let Some(error) = &state.placement_error {
+            return Err(error.clone());
+        }
+    }
+    Ok(sink.units)
 }
 
 /// Project records while retaining episode context across calls.
@@ -268,15 +366,17 @@ pub fn last_control_cursor_through(
 }
 
 trait ControlProjectionSink {
-    fn push<F>(&mut self, cursor: Cursor, make_unit: F)
+    fn push<F, E>(&mut self, cursor: Cursor, ordinal: Option<u64>, make_unit: F, make_event: E)
     where
-        F: FnOnce() -> ControlUnit;
+        F: FnOnce() -> ControlUnit,
+        E: FnOnce() -> cortexkit_role_llm_runner::live::LiveEvent;
 }
 
 struct RecordSink<'a, S> {
     sink: &'a mut S,
     seq: u64,
     next_sub_index: u32,
+    ordinal: Option<u64>,
 }
 
 impl<'a, S: ControlProjectionSink> RecordSink<'a, S> {
@@ -285,6 +385,7 @@ impl<'a, S: ControlProjectionSink> RecordSink<'a, S> {
             sink,
             seq,
             next_sub_index: 0,
+            ordinal: None,
         }
     }
 
@@ -292,9 +393,34 @@ impl<'a, S: ControlProjectionSink> RecordSink<'a, S> {
     where
         F: FnOnce() -> ControlUnit,
     {
+        // Older payload-only markers have no independent lifecycle event. Use the defined
+        // conservative reset instead of inventing an unknown no-op event type.
+        self.push_with_event(make_unit, || {
+            cortexkit_role_llm_runner::live::LiveEvent::DisplayReset
+        });
+    }
+
+    fn push_with_event<F, E>(&mut self, make_unit: F, make_event: E)
+    where
+        F: FnOnce() -> ControlUnit,
+        E: FnOnce() -> cortexkit_role_llm_runner::live::LiveEvent,
+    {
         let cursor = Cursor::new(self.seq, self.next_sub_index);
         self.next_sub_index += 1;
-        self.sink.push(cursor, make_unit);
+        self.sink.push(cursor, self.ordinal, make_unit, make_event);
+    }
+
+    fn boundary<E>(&mut self, ordinal: u64, make_event: E)
+    where
+        E: FnOnce() -> cortexkit_role_llm_runner::live::LiveEvent,
+    {
+        self.ordinal = Some(ordinal);
+        self.push_with_event(
+            || ControlUnit::MessageBoundary {
+                mid: format!("m{ordinal}"),
+            },
+            make_event,
+        );
     }
 }
 
@@ -304,11 +430,32 @@ struct UnitSink {
 }
 
 impl ControlProjectionSink for UnitSink {
-    fn push<F>(&mut self, cursor: Cursor, make_unit: F)
+    fn push<F, E>(&mut self, cursor: Cursor, _ordinal: Option<u64>, make_unit: F, _make_event: E)
     where
         F: FnOnce() -> ControlUnit,
+        E: FnOnce() -> cortexkit_role_llm_runner::live::LiveEvent,
     {
         self.units.push((cursor, make_unit()));
+    }
+}
+
+#[derive(Default)]
+struct PlacedUnitSink {
+    units: Vec<PlacedControlUnit>,
+}
+
+impl ControlProjectionSink for PlacedUnitSink {
+    fn push<F, E>(&mut self, cursor: Cursor, ordinal: Option<u64>, make_unit: F, make_event: E)
+    where
+        F: FnOnce() -> ControlUnit,
+        E: FnOnce() -> cortexkit_role_llm_runner::live::LiveEvent,
+    {
+        self.units.push(PlacedControlUnit {
+            cursor,
+            unit: make_unit(),
+            message_ordinal: ordinal,
+            event: make_event(),
+        });
     }
 }
 
@@ -318,9 +465,10 @@ struct LastCursorSink {
 }
 
 impl ControlProjectionSink for LastCursorSink {
-    fn push<F>(&mut self, cursor: Cursor, _make_unit: F)
+    fn push<F, E>(&mut self, cursor: Cursor, _ordinal: Option<u64>, _make_unit: F, _make_event: E)
     where
         F: FnOnce() -> ControlUnit,
+        E: FnOnce() -> cortexkit_role_llm_runner::live::LiveEvent,
     {
         self.last = Some(cursor);
     }
@@ -334,8 +482,20 @@ fn project_control_record<S: ControlProjectionSink>(
     state: &mut ControlProjectionState,
     sink: &mut S,
 ) {
+    use crate::placement::{AppendKind, PlacementAction};
+    use cortexkit_role_llm_runner::live::{self, LiveEvent};
+    let actions = match state.placement.observe(&framed.record) {
+        Ok(actions) => actions,
+        Err(error) => {
+            state.placement_error = Some(error);
+            Vec::new()
+        }
+    };
     let mut record_sink = RecordSink::new(sink, framed.seq);
     macro_rules! push {
+        ($unit:expr, $event:expr) => {
+            record_sink.push_with_event(|| $unit, || $event)
+        };
         ($unit:expr) => {
             record_sink.push(|| $unit)
         };
@@ -351,13 +511,24 @@ fn project_control_record<S: ControlProjectionSink>(
             // Remember it for the TERMINAL, which carries no run in its WAL record and
             // could not otherwise name one.
             state.run_id = Some(run_id.clone());
-            push!(ControlUnit::RunStarted {
-                run_id: run_id.clone(),
-                submission_id: submission_id.clone(),
-            });
+            push!(
+                ControlUnit::RunStarted {
+                    run_id: run_id.clone(),
+                    submission_id: submission_id.clone(),
+                },
+                LiveEvent::RunStarted(live::RunStarted::new(run_id.0.clone()))
+            );
         }
         WalRecord::StepStarted { step_id } => {
-            push!(ControlUnit::StepStarted { step_id: *step_id });
+            state.assistant_ordinal = Some(state.placement.next_ordinal());
+            state.assistant_message = None;
+            state.assistant_started = true;
+            state.started_tools.clear();
+            record_sink.ordinal = state.assistant_ordinal;
+            push!(
+                ControlUnit::StepStarted { step_id: *step_id },
+                message_event(state.assistant_ordinal, false)
+            );
         }
         WalRecord::BudgetFired {
             run_id,
@@ -366,12 +537,24 @@ fn project_control_record<S: ControlProjectionSink>(
             ordinal,
             ..
         } => {
-            push!(ControlUnit::BudgetFired {
-                run_id: run_id.clone(),
-                kind: *kind,
-                threshold: *threshold,
-                ordinal: *ordinal,
+            record_sink.ordinal = actions.iter().find_map(|action| match action {
+                PlacementAction::Append {
+                    first,
+                    kind: AppendKind::Budget,
+                    ..
+                } => Some(*first),
+                _ => None,
             });
+            let budget_ordinal = record_sink.ordinal;
+            push!(
+                ControlUnit::BudgetFired {
+                    run_id: run_id.clone(),
+                    kind: *kind,
+                    threshold: *threshold,
+                    ordinal: *ordinal,
+                },
+                message_event(budget_ordinal, false)
+            );
         }
         WalRecord::ModelStepFinished {
             step_id,
@@ -380,13 +563,32 @@ fn project_control_record<S: ControlProjectionSink>(
             finish_reason,
             ..
         } => {
+            state.assistant_ordinal = actions
+                .iter()
+                .find_map(|action| match action {
+                    PlacementAction::Append {
+                        first,
+                        kind: AppendKind::Assistant | AppendKind::Finalize,
+                        ..
+                    } => Some(*first),
+                    _ => None,
+                })
+                .or_else(|| state.placement.held_assistant_ordinal());
+            state.tool_result_ordinal = state.placement.held_tool_result_ordinal();
+            state.assistant_message = Some(Arc::clone(assistant_message));
+            state.started_tools.clear();
+            let already_started = std::mem::take(&mut state.assistant_started);
+            record_sink.ordinal = state.assistant_ordinal;
             state.final_step_finish_reason = *finish_reason;
             state.has_completed_step = true;
             // Fixed order, matching the live loop's emission: the assembled assistant message,
             // then one ToolCall per tool call in source order, then the step-finished marker.
-            push!(ControlUnit::AssistantMessage {
-                message: Arc::clone(assistant_message),
-            });
+            push!(
+                ControlUnit::AssistantMessage {
+                    message: Arc::clone(assistant_message),
+                },
+                message_event(state.assistant_ordinal, already_started)
+            );
             for call in assistant_message.tool_calls() {
                 push!(ControlUnit::ToolCall { call: call.clone() });
             }
@@ -396,30 +598,120 @@ fn project_control_record<S: ControlProjectionSink>(
                 finish_reason: finish_reason
                     .unwrap_or_else(|| message_shape_finish_reason(assistant_message)),
             });
+            if !already_started {
+                if let Some(ordinal) = state.assistant_ordinal {
+                    record_sink.boundary(ordinal, || message_event(Some(ordinal), true));
+                }
+            }
         }
         WalRecord::ToolResult {
-            result, outcome, ..
+            result,
+            outcome,
+            finished_at_ms,
+            ..
         } => {
+            record_sink.ordinal = state.tool_result_ordinal;
+            let assistant = state.assistant_message.clone();
+            let call = assistant.as_ref().and_then(|message| {
+                message
+                    .tool_calls()
+                    .find(|call| call.tool_call_id == result.tool_call_id)
+            });
+            let owner = state.assistant_ordinal.filter(|_| call.is_some());
+            let first_start =
+                call.is_some() && state.started_tools.insert(result.tool_call_id.clone());
+            let outcome_name = tool_outcome(*outcome, result, state.cancelled);
             state
                 .indeterminate_tool_calls
                 .record_dispatch_terminal(&result.tool_call_id, outcome.is_indeterminate());
-            push!(ControlUnit::ToolResult {
-                result: result.as_ref().clone(),
-            });
+            push!(
+                ControlUnit::ToolResult {
+                    result: result.as_ref().clone(),
+                },
+                match (owner, call) {
+                    (Some(ordinal), Some(call)) if first_start =>
+                        tool_started_event(ordinal, call, None, None, *finished_at_ms),
+                    (Some(ordinal), Some(_)) => tool_finished_event(
+                        ordinal,
+                        &result.tool_call_id,
+                        outcome_name,
+                        result,
+                        *finished_at_ms
+                    ),
+                    _ => LiveEvent::DisplayReset,
+                }
+            );
+            // A synthetic terminal may be a call's first durable lifecycle observation.
+            // Both lifecycle events then use that record's one recorded observation.
+            if first_start {
+                if let Some(ordinal) = owner {
+                    record_sink.boundary(ordinal, || {
+                        tool_finished_event(
+                            ordinal,
+                            &result.tool_call_id,
+                            outcome_name,
+                            result,
+                            *finished_at_ms,
+                        )
+                    });
+                }
+            }
         }
         WalRecord::ToolNoDispatch {
             tool_call_id,
             reason,
+            dispatched_at_ms,
             ..
         } => {
+            record_sink.ordinal = state.tool_result_ordinal;
+            let assistant = state.assistant_message.clone();
+            let call = assistant.as_ref().and_then(|message| {
+                message
+                    .tool_calls()
+                    .find(|call| &call.tool_call_id == tool_call_id)
+            });
+            let owner = state.assistant_ordinal.filter(|_| call.is_some());
+            let first_start = call.is_some() && state.started_tools.insert(tool_call_id.clone());
+            let outcome_name = match reason {
+                broca_wal::NoDispatchReason::Denied { .. }
+                | broca_wal::NoDispatchReason::PolicyBlocked { .. } => "denied",
+                _ => "error",
+            };
             state
                 .indeterminate_tool_calls
                 .record_dispatch_terminal(tool_call_id, false);
             // A no-dispatch terminal's reconstructed result is what the prompt uses; surface it
             // through the same deterministic rebuild as replay.
-            push!(ControlUnit::ToolResult {
-                result: crate::replay::no_dispatch_result(tool_call_id, reason),
-            });
+            push!(
+                ControlUnit::ToolResult {
+                    result: crate::replay::no_dispatch_result(tool_call_id, reason),
+                },
+                match (owner, call) {
+                    (Some(ordinal), Some(call)) if first_start =>
+                        tool_started_event(ordinal, call, None, None, *dispatched_at_ms),
+                    (Some(ordinal), Some(_)) => tool_finished_event(
+                        ordinal,
+                        tool_call_id,
+                        outcome_name,
+                        &crate::replay::no_dispatch_result(tool_call_id, reason),
+                        *dispatched_at_ms
+                    ),
+                    _ => LiveEvent::DisplayReset,
+                }
+            );
+            if first_start {
+                if let Some(ordinal) = owner {
+                    record_sink.boundary(ordinal, || {
+                        tool_finished_event(
+                            ordinal,
+                            tool_call_id,
+                            outcome_name,
+                            &crate::replay::no_dispatch_result(tool_call_id, reason),
+                            *dispatched_at_ms,
+                        )
+                    });
+                }
+            }
         }
         WalRecord::RunFinished {
             reason,
@@ -434,15 +726,29 @@ fn project_control_record<S: ControlProjectionSink>(
                     error: error.clone().into(),
                 });
             }
-            push!(ControlUnit::RunFinished {
-                run_id: state.run_id.clone(),
-                reason: *reason,
-                usage: state.has_completed_step.then_some(*usage),
-                final_step_finish_reason: state.final_step_finish_reason,
-                indeterminate_tool_calls: (*reason == RunFinishReason::Interrupted)
-                    .then(|| state.indeterminate_tool_calls.snapshot()),
-                retries_used: *retries_used,
-            });
+            push!(
+                ControlUnit::RunFinished {
+                    run_id: state.run_id.clone(),
+                    reason: *reason,
+                    usage: state.has_completed_step.then_some(*usage),
+                    final_step_finish_reason: state.final_step_finish_reason,
+                    indeterminate_tool_calls: (*reason == RunFinishReason::Interrupted)
+                        .then(|| state.indeterminate_tool_calls.snapshot()),
+                    retries_used: *retries_used,
+                },
+                state
+                    .run_id
+                    .as_ref()
+                    .map_or(LiveEvent::DisplayReset, |run_id| LiveEvent::RunFinished(
+                        live::RunEnded::new(run_id.0.clone(), reason.as_str())
+                    ))
+            );
+            state.assistant_ordinal = None;
+            state.tool_result_ordinal = None;
+            state.assistant_message = None;
+            state.assistant_started = false;
+            state.started_tools.clear();
+            state.cancelled = false;
         }
         WalRecord::RunPaused {
             run_id,
@@ -450,11 +756,14 @@ fn project_control_record<S: ControlProjectionSink>(
             error,
             ..
         } => {
-            push!(ControlUnit::Paused {
-                run_id: run_id.clone(),
-                reason: *reason,
-                error: error.clone().map(SharedProviderError::from),
-            });
+            push!(
+                ControlUnit::Paused {
+                    run_id: run_id.clone(),
+                    reason: *reason,
+                    error: error.clone().map(SharedProviderError::from),
+                },
+                LiveEvent::RunPaused(live::RunEnded::new(run_id.0.clone(), reason.as_str()))
+            );
         }
         WalRecord::Retracted {
             submission_id,
@@ -463,52 +772,86 @@ fn project_control_record<S: ControlProjectionSink>(
             // A permanently unadmittable queued send resolves atomically in this tombstone.
             // Expand it to the same visible bracket as an admitted run that fails terminally.
             state.reset_episode();
-            push!(ControlUnit::RunStarted {
-                run_id: failure.run_id.clone(),
-                submission_id: Some(submission_id.clone()),
-            });
+            push!(
+                ControlUnit::RunStarted {
+                    run_id: failure.run_id.clone(),
+                    submission_id: Some(submission_id.clone()),
+                },
+                LiveEvent::RunStarted(live::RunStarted::new(failure.run_id.0.clone()))
+            );
             push!(ControlUnit::Error {
                 error: failure.error.clone().into(),
             });
-            push!(ControlUnit::RunFinished {
-                run_id: Some(failure.run_id.clone()),
-                reason: RunFinishReason::Error,
-                usage: None,
-                final_step_finish_reason: None,
-                indeterminate_tool_calls: None,
-                retries_used: 0,
-            });
+            push!(
+                ControlUnit::RunFinished {
+                    run_id: Some(failure.run_id.clone()),
+                    reason: RunFinishReason::Error,
+                    usage: None,
+                    final_step_finish_reason: None,
+                    indeterminate_tool_calls: None,
+                    retries_used: 0,
+                },
+                LiveEvent::RunFinished(live::RunEnded::new(failure.run_id.0.clone(), "error"))
+            );
         }
-        // These records carry no caller-facing control unit: batch brackets and dispatch intent
-        // are internal durability records; ordinary queue/retract and approval records belong to
-        // other surfaces.
+        // These records add lifecycle boundaries after their existing units, without moving
+        // any cursor belonging to an older payload.
         WalRecord::ToolBatchStarted { .. } => {
             state.indeterminate_tool_calls.reset_batch();
+            if let Some(ordinal) = state.tool_result_ordinal {
+                record_sink.boundary(ordinal, || message_event(Some(ordinal), false));
+            }
         }
-        WalRecord::ToolDispatchIntent { tool_call_id, .. } => {
+        WalRecord::ToolDispatchIntent {
+            tool_call_id,
+            tool_name,
+            args,
+            dispatched_at_ms,
+            ..
+        } => {
             state
                 .indeterminate_tool_calls
                 .record_dispatch_intent(tool_call_id);
+            let assistant = state.assistant_message.clone();
+            let call = assistant.as_ref().and_then(|message| {
+                message
+                    .tool_calls()
+                    .find(|call| &call.tool_call_id == tool_call_id)
+            });
+            if let (Some(ordinal), Some(call)) = (state.assistant_ordinal, call) {
+                if state.started_tools.insert(tool_call_id.clone()) {
+                    record_sink.boundary(ordinal, || {
+                        tool_started_event(
+                            ordinal,
+                            call,
+                            tool_name.as_deref(),
+                            Some(args),
+                            *dispatched_at_ms,
+                        )
+                    });
+                }
+            }
         }
-        WalRecord::ToolBatchFinished { .. }
-        | WalRecord::TurnFinished { .. }
+        WalRecord::ToolBatchFinished { .. } => {}
+        WalRecord::TurnFinished { .. }
         | WalRecord::RunConfigRefrozen { .. }
         | WalRecord::RunAuthRefrozen { .. }
         | WalRecord::Queued { .. }
         | WalRecord::Retracted { failure: None, .. }
         | WalRecord::ApprovalRequested { .. }
         | WalRecord::ApprovalResolved { .. } => {}
-        // A steered message is caller input, and the control stream carries no caller input
-        // (a `RunStarted` unit does not carry its prompt either). It reaches readers through
-        // `session.read`, placed where the model saw it.
-        WalRecord::Steered { .. } => {}
-        // Ordered sends are caller input and queue state, like steers and queued sends: no
-        // control unit. A delivered one reaches readers through `session.read`.
+        // Hold only references to the durable input; Placement decides when its messages land.
+        WalRecord::Steered { input, .. } => state.pending_inputs.push(Arc::clone(input)),
+        WalRecord::SendDelivered {
+            input: Some(input), ..
+        } => state.pending_inputs.push(Arc::clone(input)),
         WalRecord::DeliveryOrdered { .. }
         | WalRecord::SendEnded { .. }
-        | WalRecord::SendDelivered { .. } => {}
+        | WalRecord::SendDelivered { input: None, .. } => {}
         // The request changes recovery, not lifecycle: only RunFinished publishes a terminal.
-        WalRecord::RunCancelRequested { .. } => {}
+        WalRecord::RunCancelRequested { run_id, .. } => {
+            state.cancelled |= state.run_id.as_ref() == Some(run_id);
+        }
         // A record type written by a newer build: informational by the contract on
         // `WalRecord`, so it emits no control unit and leaves the projection state untouched.
         WalRecord::Unknown => {}
@@ -553,29 +896,263 @@ fn project_control_record<S: ControlProjectionSink>(
         // A cache warm is never a transcript message and ends no run: informational, so the
         // control stream and the store are identical without it.
         WalRecord::CacheWarmed { .. } => {}
-        WalRecord::ApprovalRecorded { closing_result, .. } => {
+        WalRecord::ApprovalRecorded {
+            call_id,
+            closing_result,
+            closed_at_ms,
+            ..
+        } => {
             if let Some(result) = closing_result {
+                record_sink.ordinal = state.tool_result_ordinal;
+                let assistant = state.assistant_message.clone();
+                let call = assistant.as_ref().and_then(|message| {
+                    message
+                        .tool_calls()
+                        .find(|call| &call.tool_call_id == call_id)
+                });
+                let owner = state.assistant_ordinal.filter(|_| call.is_some());
+                let first_start = call.is_some() && state.started_tools.insert(call_id.clone());
                 state
                     .indeterminate_tool_calls
                     .record_dispatch_terminal(&result.tool_call_id, false);
-                push!(ControlUnit::ToolResult {
-                    result: result.as_ref().clone()
-                });
+                push!(
+                    ControlUnit::ToolResult {
+                        result: result.as_ref().clone()
+                    },
+                    match (owner, call) {
+                        (Some(ordinal), Some(call)) if first_start =>
+                            tool_started_event(ordinal, call, None, None, *closed_at_ms),
+                        (Some(ordinal), Some(_)) =>
+                            tool_finished_event(ordinal, call_id, "denied", result, *closed_at_ms),
+                        _ => LiveEvent::DisplayReset,
+                    }
+                );
+                if first_start {
+                    if let Some(ordinal) = owner {
+                        record_sink.boundary(ordinal, || {
+                            tool_finished_event(ordinal, call_id, "denied", result, *closed_at_ms)
+                        });
+                    }
+                }
             }
         }
-        // Prepared state and pending markers affect approval membership, not the control lane.
+        WalRecord::ToolCallDeferred {
+            call_id,
+            tool,
+            args_jcs,
+            deferred_at_ms,
+            ..
+        } => {
+            let assistant = state.assistant_message.clone();
+            let call = assistant.as_ref().and_then(|message| {
+                message
+                    .tool_calls()
+                    .find(|call| &call.tool_call_id == call_id)
+            });
+            if let (Some(ordinal), Some(call)) = (state.assistant_ordinal, call) {
+                if state.started_tools.insert(call_id.clone()) {
+                    record_sink.boundary(ordinal, || {
+                        let mut event = live::ToolStarted::new(
+                            format!("m{ordinal}"),
+                            call.tool_call_id.0.clone(),
+                            tool.clone(),
+                            &serde_json::Value::Null,
+                            None,
+                            *deferred_at_ms,
+                        );
+                        event.arguments = args_jcs.clone();
+                        LiveEvent::ToolStarted(event)
+                    });
+                }
+            }
+        }
         // Late execution is isolated from the conversation and must not emit prompt/control units.
-        WalRecord::ToolCallDeferred { .. }
-        | WalRecord::AwaitingApproval { .. }
+        WalRecord::AwaitingApproval { .. }
         | WalRecord::LateApprovalRecorded { .. }
         | WalRecord::LateDispatchIntent { .. }
         | WalRecord::LateResult { .. } => {}
+        // A held call's interim reply never reaches the model or the control lane: the run's
+        // `Paused {tool_held}` unit and, later, the call's ordinary `ToolResult` are what a
+        // subscriber sees.
+        WalRecord::ToolCallProviderHeld { .. } => {}
         // An informational record, skipped exactly like `Unknown`.
         WalRecord::InputTokenCapFrozen { .. }
         | WalRecord::InputTokenBudgetExhausted { .. }
         | WalRecord::StructuredOutputResult { .. }
         | WalRecord::StructuredOutputDowngraded { .. }
         | WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
+    }
+    // Appending boundaries here keeps every older payload at its original sub_index.
+    for action in actions {
+        match action {
+            PlacementAction::Append {
+                first,
+                count,
+                kind: AppendKind::Input,
+            } => {
+                if let WalRecord::RunStarted { input, .. } = &framed.record {
+                    input_lifecycles(&mut record_sink, first, input.iter().take(count as usize));
+                }
+            }
+            PlacementAction::PlaceHeld { first, count } => {
+                let inputs = std::mem::take(&mut state.pending_inputs);
+                input_lifecycles(
+                    &mut record_sink,
+                    first,
+                    inputs
+                        .iter()
+                        .flat_map(|input| input.iter())
+                        .take(count as usize),
+                );
+            }
+            PlacementAction::Append {
+                first,
+                count,
+                kind: AppendKind::Budget,
+            } => {
+                for offset in 0..count {
+                    let ordinal = first.saturating_add(offset);
+                    record_sink.boundary(ordinal, || message_event(Some(ordinal), true));
+                }
+            }
+            PlacementAction::Append {
+                first,
+                count,
+                kind: AppendKind::ToolTurn,
+            } if count != 0 => {
+                let ordinal = first.saturating_add(count - 1);
+                record_sink.boundary(ordinal, || message_event(Some(ordinal), true));
+                state.assistant_ordinal = None;
+                state.tool_result_ordinal = None;
+                state.assistant_message = None;
+                state.started_tools.clear();
+            }
+            _ => {}
+        }
+    }
+}
+
+fn message_event(
+    ordinal: Option<u64>,
+    finished: bool,
+) -> cortexkit_role_llm_runner::live::LiveEvent {
+    use cortexkit_role_llm_runner::live::{LiveEvent, MessageEvent};
+    match ordinal {
+        Some(ordinal) if finished => {
+            LiveEvent::MessageFinished(MessageEvent::new(format!("m{ordinal}")))
+        }
+        Some(ordinal) => LiveEvent::MessageStarted(MessageEvent::new(format!("m{ordinal}"))),
+        None => LiveEvent::DisplayReset,
+    }
+}
+
+fn tool_started_event(
+    ordinal: u64,
+    call: &broca_protocol::ToolCall,
+    name: Option<&str>,
+    arguments: Option<&serde_json::Value>,
+    observed_at: Option<u64>,
+) -> cortexkit_role_llm_runner::live::LiveEvent {
+    use cortexkit_role_llm_runner::live::{LiveEvent, ToolStarted};
+    LiveEvent::ToolStarted(ToolStarted::new(
+        format!("m{ordinal}"),
+        call.tool_call_id.0.clone(),
+        name.unwrap_or(&call.tool_name),
+        arguments.unwrap_or(&call.input),
+        None,
+        observed_at,
+    ))
+}
+
+fn tool_finished_event(
+    ordinal: u64,
+    call_id: &ToolCallId,
+    outcome: &str,
+    result: &broca_protocol::ToolResult,
+    observed_at: Option<u64>,
+) -> cortexkit_role_llm_runner::live::LiveEvent {
+    use broca_protocol::ToolOutput;
+    use cortexkit_role_llm_runner::live::{LiveEvent, ToolFinished};
+    let bytes = match &result.output {
+        ToolOutput::Text { text } => text.len(),
+        ToolOutput::Json { value } => serde_json::to_vec(value)
+            .expect("JSON values serialize")
+            .len(),
+        // A multi-part result counts its text and the stored size of each media object, so a
+        // screenshot reads as the bytes the tool returned rather than its short marker text.
+        ToolOutput::Parts { parts } => parts
+            .iter()
+            .map(|part| match part {
+                broca_protocol::ToolOutputPart::Text { text } => text.len(),
+                broca_protocol::ToolOutputPart::Media { media } => media.byte_size as usize,
+            })
+            .sum(),
+        ToolOutput::Denied { reason } => reason.len(),
+        ToolOutput::Error { message } => message.len(),
+    };
+    LiveEvent::ToolFinished(ToolFinished::new(
+        format!("m{ordinal}"),
+        call_id.0.clone(),
+        outcome,
+        bytes as u64,
+        observed_at,
+    ))
+}
+
+fn tool_outcome(
+    outcome: broca_wal::DispatchOutcome,
+    result: &broca_protocol::ToolResult,
+    cancelled: bool,
+) -> &'static str {
+    use broca_wal::DispatchOutcome;
+    match outcome {
+        DispatchOutcome::Interrupted if cancelled => "cancelled",
+        DispatchOutcome::Interrupted | DispatchOutcome::Unknown => "interrupted",
+        DispatchOutcome::MaxSteps => "error",
+        DispatchOutcome::Completed
+            if matches!(result.output, broca_protocol::ToolOutput::Denied { .. }) =>
+        {
+            "denied"
+        }
+        DispatchOutcome::Completed if result.is_error => "error",
+        DispatchOutcome::Completed => "ok",
+    }
+}
+
+fn input_lifecycles<'a, S: ControlProjectionSink>(
+    sink: &mut RecordSink<'_, S>,
+    first: u64,
+    messages: impl Iterator<Item = &'a broca_protocol::Message>,
+) {
+    let mut owners = std::collections::HashMap::new();
+    for (index, message) in messages.enumerate() {
+        let ordinal = first.saturating_add(index as u64);
+        sink.boundary(ordinal, || message_event(Some(ordinal), false));
+        for block in &message.content {
+            match block {
+                broca_protocol::ContentBlock::ToolCall(call) => {
+                    owners.insert(call.tool_call_id.clone(), (ordinal, call));
+                    sink.boundary(ordinal, || {
+                        tool_started_event(ordinal, call, None, None, None)
+                    });
+                }
+                broca_protocol::ContentBlock::ToolResult(result) => {
+                    if let Some((owner, _)) = owners.remove(&result.tool_call_id) {
+                        sink.boundary(owner, || {
+                            tool_finished_event(
+                                owner,
+                                &result.tool_call_id,
+                                tool_outcome(broca_wal::DispatchOutcome::Completed, result, false),
+                                result,
+                                None,
+                            )
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        sink.boundary(ordinal, || message_event(Some(ordinal), true));
     }
 }
 
@@ -596,3 +1173,250 @@ fn message_shape_finish_reason(
         FinishReason::Stop
     }
 }
+
+// Episode-bounded reads from the offset index.
+//
+// On overhaul state roots the offset index records where each run episode starts. The model
+// view and a live attach then decode only the frames of the episodes they show, folding at
+// most one episode's records to rebuild state, instead of replaying the whole log. These
+// helpers check everything they take from the index against the log before relying on it, and
+// a read that fails any check replays the whole log instead.
+
+/// One run episode as the offset index's `episode` row locates it.
+///
+/// Each field mirrors a column the indexer wrote, so episode-bounded reads never depend on the
+/// store crate. None is trusted on its own: [`replay_from_episode_start`] re-reads the episode's
+/// `RunStarted` frame and checks the ordinal where its input starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexedEpisode {
+    /// WAL sequence of the episode's `RunStarted`; `None` for records written before the first run.
+    pub run_started_seq: Option<u64>,
+    /// Byte offset where that `RunStarted` frame starts.
+    pub run_started_off: Option<u64>,
+    /// Transcript ordinal where the episode's input starts.
+    pub first_ord: u64,
+    /// Transcript ordinal just past the episode's last placed message.
+    pub end_ord: u64,
+}
+
+/// The index's tail seed at the committed projection boundary an episode read starts from.
+///
+/// The boundary is the last qualified `projection_boundary` row before the episode's
+/// `RunStarted`; the other fields are the tail seed the index holds at that boundary: exactly
+/// the inputs [`crate::replay::replay_seeded_at_validated_boundary`] takes, which validates the
+/// boundary frame before anything is replayed.
+#[derive(Debug, Clone)]
+pub struct EpisodeSeed {
+    pub boundary: crate::replay::SeedBoundary,
+    /// Transcript length the boundary covers.
+    pub ordinal_base: u64,
+    /// Steers recorded before the boundary that no step boundary has placed yet.
+    pub held_steers: Vec<broca_protocol::Message>,
+    pub tag_seed: crate::tags::TagSeed,
+    /// Model, run id and budget of the episode open at the boundary.
+    pub seed_origin: Option<broca_protocol::request::ModelHandle>,
+    pub seed_run_id: Option<RunId>,
+    pub seed_budget: Option<broca_protocol::request::BudgetConfig>,
+}
+
+/// A replay that starts at a validated position and reaches an episode's `RunStarted`.
+#[derive(Debug, Clone)]
+pub struct EpisodeReplay {
+    /// Replay of every frame given, seeded at the boundary or from the log's first record.
+    pub state: crate::replay::ReplayState,
+    /// Transcript ordinal of `state.prompt[0]`.
+    pub ordinal_base: u64,
+    /// Index, among the frames given, of the episode's `RunStarted`.
+    pub run_started: usize,
+}
+
+/// Byte offset of the log's first record: past the header frame when the log has one.
+pub fn first_record_offset(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+) -> std::io::Result<u64> {
+    let header = read_at(0, broca_wal::framing::LINEAGE_FRAME_LEN as u64)?;
+    Ok(match broca_wal::framing::decode_next(&header) {
+        broca_wal::framing::DecodeStep::Lineage { consumed, .. } => consumed as u64,
+        _ => 0,
+    })
+}
+
+/// Decode the frames in the byte range `from..to`, which must start and end on frame
+/// boundaries, counting each decoded frame when `decode_counter` is given.
+///
+/// The range is read once through `read_at`. A log shorter than the range, a torn or corrupt
+/// frame, or a frame from a newer writer is an error: the index named a range the log does not
+/// hold, and the caller replays the whole log instead. With counting on, tests assert that a
+/// read decodes only the frames of the range it asked for, never the whole log.
+pub fn decode_positioned_frames(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    from: u64,
+    to: u64,
+    decode_counter: Option<&std::cell::Cell<u64>>,
+) -> Result<Vec<crate::replay::PositionedFrame>, String> {
+    use broca_wal::framing::{decode_next, DecodeStep};
+    let len = to
+        .checked_sub(from)
+        .ok_or_else(|| format!("WAL range {from}..{to} is reversed"))?;
+    let bytes = read_at(from, len).map_err(|error| format!("WAL read at {from}: {error}"))?;
+    if (bytes.len() as u64) < len {
+        return Err(format!(
+            "WAL ends at {} before the range end {to}",
+            from + bytes.len() as u64
+        ));
+    }
+    let mut frames = Vec::new();
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let at = from + off as u64;
+        match decode_next(&bytes[off..]) {
+            DecodeStep::Record { framed, consumed } => {
+                if let Some(counter) = decode_counter {
+                    counter.set(counter.get() + 1);
+                }
+                frames.push(crate::replay::PositionedFrame {
+                    off: at,
+                    framed: *framed,
+                });
+                off += consumed;
+            }
+            DecodeStep::Lineage { consumed, .. } => {
+                if let Some(counter) = decode_counter {
+                    counter.set(counter.get() + 1);
+                }
+                off += consumed;
+            }
+            DecodeStep::TornTail => return Err(format!("torn WAL frame at {at}")),
+            DecodeStep::Corrupt(error) => return Err(format!("corrupt WAL at {at}: {error}")),
+            DecodeStep::NewerWriter { ver, .. } => {
+                return Err(format!("newer WAL writer version {ver} at {at}"))
+            }
+        }
+    }
+    Ok(frames)
+}
+
+/// The episode whose records hold WAL sequence `seq`: the last one started at or before it.
+///
+/// `episodes` are the session's `episode` rows in episode order. `None` when `seq` precedes
+/// every run start.
+pub fn episode_holding_seq(episodes: &[IndexedEpisode], seq: u64) -> Option<usize> {
+    episodes
+        .iter()
+        .rposition(|episode| episode.run_started_seq.is_some_and(|start| start <= seq))
+}
+
+/// Where the episode's `RunStarted` sits among `frames`, if the frame at its recorded sequence
+/// is a `RunStarted` at its recorded byte offset.
+pub fn episode_start_index(
+    episode: &IndexedEpisode,
+    frames: &[crate::replay::PositionedFrame],
+) -> Option<usize> {
+    let seq = episode.run_started_seq?;
+    let index = frames
+        .iter()
+        .position(|positioned| positioned.framed.seq == seq)?;
+    let frame = &frames[index];
+    (matches!(frame.framed.record, WalRecord::RunStarted { .. })
+        && episode.run_started_off == Some(frame.off))
+    .then_some(index)
+}
+
+/// Replay `frames` from a validated position through an episode's `RunStarted` and beyond.
+///
+/// With a seed, `frames` must continue its boundary, and the replay goes through
+/// [`crate::replay::replay_seeded_at_validated_boundary`], which re-reads the boundary frame and
+/// checks its sequence, hash, lineage and qualification and the frames' contiguity. Without a
+/// seed, `frames` must begin at the log's first record, so nothing stored is relied on. Either
+/// way the frames must hold the episode's `RunStarted` at its recorded sequence and offset, and
+/// the replay must place that episode's input at the episode's recorded first ordinal. Any
+/// mismatch returns the [`crate::replay::SeedFallback`] reason, and the caller replays the whole
+/// log instead.
+pub fn replay_from_episode_start(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    seed: Option<&EpisodeSeed>,
+    episode: &IndexedEpisode,
+    frames: &[crate::replay::PositionedFrame],
+) -> Result<EpisodeReplay, crate::replay::SeedFallback> {
+    use crate::replay::SeedFallback;
+    let run_started = episode_start_index(episode, frames).ok_or(SeedFallback {
+        reason: "episode start not in the frames read",
+    })?;
+    let (state, ordinal_base) = match seed {
+        Some(seed) => (
+            crate::replay::replay_seeded_at_validated_boundary(
+                read_at,
+                &seed.boundary,
+                frames,
+                seed.seed_origin.clone(),
+                seed.seed_run_id.clone(),
+                seed.seed_budget.clone(),
+                None,
+                seed.ordinal_base,
+                false,
+                seed.tag_seed,
+                seed.held_steers.clone(),
+            )?,
+            seed.ordinal_base,
+        ),
+        None => {
+            let start = first_record_offset(read_at).map_err(|_| SeedFallback {
+                reason: "log unreadable",
+            })?;
+            // `run_started` was found, so `frames` is not empty.
+            if frames[0].framed.seq != 1 || frames[0].off != start {
+                return Err(SeedFallback {
+                    reason: "frames do not start at the log's first record",
+                });
+            }
+            if frames
+                .windows(2)
+                .any(|pair| pair[0].framed.seq + 1 != pair[1].framed.seq)
+            {
+                return Err(SeedFallback {
+                    reason: "frames have a sequence gap",
+                });
+            }
+            let state = crate::replay::replay_seeded(
+                frames.iter().map(|positioned| &positioned.framed.record),
+                None,
+                None,
+                None,
+                None,
+                0,
+                false,
+                crate::tags::TagSeed::default(),
+            )
+            .map_err(|_| SeedFallback {
+                reason: "replay refused the frames",
+            })?;
+            (state, 0)
+        }
+    };
+    // Replay records one render episode per `RunStarted`, at the ordinal where its input starts.
+    let starts_before = frames[..run_started]
+        .iter()
+        .filter(|positioned| matches!(positioned.framed.record, WalRecord::RunStarted { .. }))
+        .count();
+    let prompt_start = state
+        .render_episodes
+        .as_deref()
+        .and_then(|episodes| episodes.get(starts_before))
+        .map(|rendered| rendered.prompt_start as u64);
+    if prompt_start != Some(episode.first_ord) {
+        return Err(SeedFallback {
+            reason: "episode first ordinal mismatch",
+        });
+    }
+    Ok(EpisodeReplay {
+        state,
+        ordinal_base,
+        run_started,
+    })
+}
+
+#[cfg(test)]
+mod placement_tests;
+
+#[cfg(test)]
+mod live_tests;

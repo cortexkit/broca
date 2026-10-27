@@ -4,7 +4,9 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use broca_catalog::{CatalogCache, FusiformCatalogResponse, FUSIFORM_FACT_PREFIXES};
+use broca_catalog::{
+    CatalogCache, CatalogSnapshot, FusiformCatalogResponse, FUSIFORM_FACT_PREFIXES,
+};
 use broca_protocol::BindIdentity;
 use broca_subc::{ConnError, RouteHandle, SubcConnection};
 use serde::Deserialize;
@@ -110,7 +112,11 @@ pub struct CatalogPoller {
     identity: BindIdentity,
     cache: Arc<CatalogCache>,
     handle: Mutex<Option<PollRouteHandle>>,
+    first_refresh: Mutex<Option<FirstRefreshHook>>,
 }
+
+/// Work that needs a loaded catalog and cannot run at boot because none is loaded yet.
+type FirstRefreshHook = Box<dyn FnOnce(&CatalogSnapshot) + Send>;
 
 impl CatalogPoller {
     pub fn new(
@@ -131,7 +137,14 @@ impl CatalogPoller {
             identity,
             cache,
             handle: Mutex::new(None),
+            first_refresh: Mutex::new(None),
         }
+    }
+
+    /// Run `hook` once, with the cache's catalog, after the first poll that succeeds.
+    pub fn on_first_refresh(self, hook: impl FnOnce(&CatalogSnapshot) + Send + 'static) -> Self {
+        *self.first_refresh.lock().unwrap() = Some(Box::new(hook));
+        self
     }
 
     pub async fn poll(&self) -> Result<(), PollError> {
@@ -143,6 +156,12 @@ impl CatalogPoller {
         self.cache
             .refresh_polled(response, page_count, poll_started)
             .map_err(|error| PollError::Cache(error.to_string()))?;
+        if let Ok(catalog) = self.cache.snapshot() {
+            let hook = self.first_refresh.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(&catalog);
+            }
+        }
         Ok(())
     }
 
@@ -513,6 +532,7 @@ fn merge_page(
     }
     assembled.withheld.extend(page.withheld);
     assembled.uncertain.extend(page.uncertain);
+    assembled.wire_corrections.extend(page.wire_corrections);
     validate_qualifications(assembled)
 }
 
@@ -595,6 +615,7 @@ mod tests {
             ]),
             withheld: Vec::new(),
             uncertain: Vec::new(),
+            wire_corrections: Vec::new(),
         }
     }
 
@@ -732,6 +753,51 @@ mod tests {
         })
     }
 
+    /// With no catalog loaded at boot, an override for a provider the first refresh serves is
+    /// never reported as unused; one the refreshed catalog does not serve is, exactly once.
+    #[tokio::test]
+    async fn provider_override_notices_wait_for_the_first_refresh() {
+        let overrides = crate::provider_overrides::ProviderOverrides::parse(
+            r#"{"providers":{
+                "openai":{"base_url":"http://127.0.0.1:4010/v1"},
+                "not-served":{"base_url":"http://127.0.0.1:4011/v1"}
+            }}"#,
+        )
+        .unwrap();
+        let full = full_response(7, 10);
+        let [first, last] = split_pages(&full);
+        let route = scripted_route(vec![
+            Ok(tool_reply(first.clone(), false)),
+            Ok(tool_reply(last.clone(), false)),
+            Ok(tool_reply(first, false)),
+            Ok(tool_reply(last, false)),
+        ]);
+        let cache = Arc::new(CatalogCache::open(test_dir().join("lkg.json")));
+        assert!(
+            cache.snapshot().is_err(),
+            "boot must have no catalog loaded"
+        );
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        let sink = reported.clone();
+        let poller = overrides.report_unserved(
+            &cache,
+            CatalogPoller::with_route(route, identity(), cache.clone()),
+            move |notice| sink.lock().unwrap().push(notice),
+        );
+        assert!(
+            reported.lock().unwrap().is_empty(),
+            "no notice before a catalog loads: {:?}",
+            reported.lock().unwrap()
+        );
+        poller.poll().await.unwrap();
+        assert!(cache.snapshot().unwrap().contains_provider("openai"));
+        poller.poll().await.unwrap();
+        assert_eq!(
+            *reported.lock().unwrap(),
+            vec!["provider base_url override for 'not-served' is unused: the loaded catalog does not serve this provider; new runs use the override once a catalog refresh serves it".to_owned()]
+        );
+    }
+
     #[tokio::test]
     async fn paged_catalog_is_byte_identical_to_unpaged_lkg() {
         let full = full_response(7, 10);
@@ -794,6 +860,9 @@ mod tests {
                 args["fact_prefixes"],
                 serde_json::json!(FUSIFORM_FACT_PREFIXES)
             );
+            let prefixes = args["fact_prefixes"].as_array().unwrap();
+            assert!(prefixes.contains(&serde_json::json!("model.name")));
+            assert!(prefixes.contains(&serde_json::json!("provider.")));
         }
     }
 

@@ -10,6 +10,7 @@ members = [
     "crates/broca-replay",
     "crates/broca-subc",
     "crates/broca-wal",
+    "crates/broca-wal-reader",
     "crates/broca-store",
     "crates/broca-store-contention-tests",
     "crates/broca-catalog",
@@ -31,12 +32,13 @@ members = [
 # - crates/broca-protocol : canonical types ONLY (no IO). The provider<->runner
 #   stream-part schema, the runner<->caller control-unit schema, the framed
 #   two-lane OutputStream envelope, the error taxonomy, Usage, cache-tier
-#   markers. This crate is where the Phase-0 wire contract is frozen.
-# - crates/broca-provider  : a provider module binary. Owns one provider's WAN
-#   SSE transport + auth, normalizes wire->canonical stream-parts, emits the two
-#   lanes over the direct runner<->provider socket (reusing subc-transport).
-# - crates/broca-core      : the runner. Direct client of provider modules
-#   (Phase 0); the agentic loop lands in Phase 1.
+#   markers. This crate defines the shared wire contract.
+# - crates/broca-provider  : wire-family renderers, normalizers, and live provider
+#   transports. Its producer binary also serves the process-separated benchmark.
+# - crates/broca-core      : the agentic run loop, model steps, tool dispatch, and
+#   WAL-backed resume.
+# - crates/broca-subc      : daemon connections and adapters for tool routing,
+#   compaction, and hooks.
 # - crates/broca-bench     : the (A) latency/jitter test bench — in-process vs
 #   process-separated, deterministic SSE replay, CLOCK_MONOTONIC one-way timing.
 #
@@ -44,7 +46,7 @@ members = [
 # checkouts are used only to build integration-test rig binaries.
 
 [workspace.package]
-version = "0.3.250"
+version = "0.3.268"
 edition = "2021"
 rust-version = "1.96"
 license = "MIT"
@@ -76,21 +78,22 @@ subc-os = "=0.1.14"
 cortexkit-lease = "=0.1.2"
 cortexkit-log = "=0.3.5"
 cortexkit-role-harness = "=0.1.0"
-cortexkit-role-tool-provider = "=0.10.1"
-cortexkit-role-tool-provider-conformance = "=0.10.0"
-cortexkit-role-llm-runner = "=0.5.2"
+cortexkit-role-tool-provider = "=0.10.6"
+cortexkit-llm-tools = "=0.1.1"
+cortexkit-role-tool-provider-conformance = "=0.10.1"
+cortexkit-role-llm-runner = "=0.6.13"
 cortexkit-bus-naming = "=0.2.7"
 cortexkit-bus-trait = "=0.3.0"
 cortexkit-bus-nats = "=0.3.0"
-cortexkit-role-llm-runner-conformance = "=0.10.2"
+cortexkit-role-llm-runner-conformance = "=0.12.9"
 # Draft 2020-12 validation of structured-output values. Default features are off so the
 # validator has no HTTP or file retriever: a schema can never make broca fetch anything.
 jsonschema = { version = "=0.58.6", default-features = false }
 cortexkit-role-agent-data = "=0.2.2"
-cortexkit-role-step-transform-provider = "=0.3.2"
-cortexkit-role-compaction-provider = "=0.5.1"
+cortexkit-role-step-transform-provider = "=0.3.3"
+cortexkit-role-compaction-provider = "=0.6.0"
 # System One: the one-pass decision-model role and the batch rules it shares with extraction.
-cortexkit-role-classifier = "=0.4.2"
+cortexkit-role-classifier = "=0.4.3"
 cortexkit-role-classifier-conformance = "=0.4.1"
 cortexkit-model-batch = "=0.2.1"
 
@@ -123,8 +126,7 @@ tryhard = { git = "https://github.com/cortexkit/commons", rev = "fe59258998db489
 panic = "unwind"
 
 # Test rigs hash full debug executables before launching their dev-named copies.
-# The mutation runner runs a whole integration target serially under one deadline;
-# optimize hashing so repeated rig startups do not consume that test-run budget.
+# Optimize hashing so repeated rig startups do not dominate integration test time.
 [profile.dev.package.broca-test-support]
 opt-level = 3
 

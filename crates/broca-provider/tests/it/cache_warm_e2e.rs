@@ -2,15 +2,6 @@
 //! every request body it receives. The expected warm body is derived from the base request's own
 //! bytes by a plain text edit, never by the code that builds warms.
 
-#[cfg(not(feature = "live"))]
-#[test]
-fn this_suite_needs_its_feature_enabled() {
-    eprintln!(
-        "SKIP cache_warm_e2e: compiled without its feature, so none of its cases exist. \
-         This reports `ok` -- re-run with `-F broca-provider/live` to execute them."
-    );
-}
-
 #[cfg(feature = "live")]
 mod gated {
     use std::{
@@ -328,6 +319,7 @@ data: {"type":"message_start","message":{"id":"msg_s","type":"message","role":"a
 
     fn request(dir: &Path, tools: Vec<Tool>) -> RunRequest {
         RunRequest {
+            input_written_at_ms: None,
             directives: None,
             session_class: None,
             retention: None,

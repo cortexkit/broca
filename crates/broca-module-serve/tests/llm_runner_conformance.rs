@@ -37,7 +37,7 @@ use cortexkit_role_harness::{
 use cortexkit_role_llm_runner::points;
 use cortexkit_role_llm_runner_conformance::{
     run_suite, Capability, CaseOutcome, LlmRunnerSubject, Reply, RouteFailure, RunnerRoute, Script,
-    ScriptedPart, SubscribeOutcome, SCRIPTED_TOOL,
+    ScriptedPart, ScriptedUsage, SubscribeOutcome, SCRIPTED_TOOL,
 };
 use serde_json::{json, Map, Value};
 use subc_control::ConsumerIdentity;
@@ -51,14 +51,34 @@ const TOOL_MODULE: &str = "conformance-tools";
 /// The stand-in module whose launch nonce gives the suite a second caller identity.
 const OWNER_MODULE: &str = "conformance-owner";
 const SENDER_MODULE: &str = "conformance-sender";
+const HEAD_SENDER_MODULE: &str = "conformance-head-sender";
 const PLAN_MODEL_PREFIX: &str = "conformance-plan-";
 /// The system-prompt marker naming the session a model request belongs to.
 const SESSION_MARKER: &str = "conformance-session:";
+
+/// Only the kit's dedicated history/display families omit the extra stored system entry.
+/// Match complete minted names, not arbitrary sessions whose labels contain those words.
+fn history_display_kit_session(session: &str) -> bool {
+    let counter = |value: &str| {
+        value
+            .parse::<u64>()
+            .is_ok_and(|number| number > 0 && number.to_string() == value)
+    };
+    if let Some(tail) = session.strip_prefix("cf-cf-history-") {
+        return tail
+            .split_once('-')
+            .is_some_and(|(label, session)| counter(label) && counter(session));
+    }
+    ["cf-display-", "cf-display-sender-", "cf-display-model-"]
+        .iter()
+        .any(|prefix| session.strip_prefix(*prefix).is_some_and(counter))
+}
 /// The harness every session the suite opens is bound under.
 const HARNESS: &str = "conformance";
 /// The member of a scripted tool result that holds the content blocks the scripted tool
 /// provider answers with as they are, instead of the result's JSON as one text block.
 const OWN_CONTENT: &str = "$broca_content";
+const OWN_STRUCTURED: &str = "$broca_structured";
 #[cfg(feature = "test-clock")]
 #[path = "llm_runner_conformance/bus.rs"]
 mod bus;
@@ -79,8 +99,12 @@ mod attribution;
 mod boundary_cancel;
 #[path = "llm_runner_conformance/evidence.rs"]
 mod evidence;
+#[path = "llm_runner_conformance/held_late_results.rs"]
+mod held_late_results;
 #[path = "llm_runner_conformance/optional_tools.rs"]
 mod optional_tools;
+#[path = "llm_runner_conformance/output_refs.rs"]
+mod output_refs;
 #[path = "llm_runner_conformance/reader_identity.rs"]
 mod reader_identity;
 /// Retention deletion scenarios on the same real-daemon rig. They move the daemon's clock
@@ -162,13 +186,19 @@ struct Armed {
 
 #[derive(Default)]
 struct Shared {
+    /// Turns served so far for each session whose scripted model counts its own turns. The
+    /// real Magic Context rig needs this: an applied view can drop messages, so the number of
+    /// assistant messages in a request no longer says which turn comes next.
     #[cfg(feature = "test-clock")]
-    mc_historian: std::sync::atomic::AtomicBool,
+    counted_turns: Mutex<HashMap<String, usize>>,
     /// The `mid` of every message a `session.read` answered, keyed by the message's JSON: broca
     /// keys a part `<mid>#<index>`, so naming a message's parts needs the message's `mid`.
     read_mids: Mutex<HashMap<String, String>>,
     plan_sessions: Mutex<BTreeSet<String>>,
+    output_refs_sessions: Mutex<BTreeSet<String>>,
+    model_id_marker_sessions: Mutex<BTreeSet<String>>,
     model_holds: Mutex<HashMap<String, Arc<HoldGate>>>,
+    stream_holds: Mutex<HashMap<String, usize>>,
     raw_bodies: Mutex<HashMap<String, Vec<Vec<u8>>>>,
     compaction: Mutex<HashMap<String, compaction::Session>>,
     session_roots: Mutex<HashMap<String, PathBuf>>,
@@ -206,6 +236,8 @@ struct Shared {
     /// What each structured-output session's scripted route reports about schema-constrained
     /// output, as a catalog row would: `Some(true)`, `Some(false)` or `None` (not stated).
     structured_output_support: Mutex<HashMap<String, Option<bool>>>,
+    /// The scripted provider's held calls and its `late_results` feed (see `held_late_results`).
+    held_feed: Mutex<held_late_results::FeedState>,
 }
 
 /// One held call's two edges: the tool provider has received it, and the suite has released it.
@@ -258,7 +290,7 @@ impl Shared {
 
 // ---- the scripted model -------------------------------------------------------------------------
 
-/// Serve OpenAI-compatible chat completions on a loopback port; returns the base URL.
+/// Serve scripted Chat and Messages responses on a loopback port; returns the base URL.
 async fn start_model(shared: Arc<Shared>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -284,15 +316,15 @@ const STRUCTURED_OUTPUT_PROVIDER: &str = "xai";
 /// The catalog model a structured-output session resolves against, by what its route reports.
 fn structured_output_model(support: Option<bool>) -> &'static str {
     match support {
-        Some(true) => "grok-composer-2.5-fast",
-        Some(false) => "grok-4.20-0309-non-reasoning",
-        None => "grok-imagine-image",
+        Some(true) => "conformance-structured-supported",
+        Some(false) => "conformance-structured-unsupported",
+        None => "conformance-structured-unknown",
     }
 }
 
-/// Write the catalog the structured-output sessions resolve against into broca's state root,
-/// as its last-known-good fusiform answer: one row per route support, differing only in
-/// `capability.structured_output` (true, false, and not stated). broca reaches these rows at
+/// Seed the scripted catalog in broca's state root: Chat rows with tri-state structured-output
+/// support, plus the Messages route that preserves independent output-reference samples.
+/// broca reaches these rows at
 /// the scripted model's address, because `BROCA_PROVIDER_BASE_URL` overrides the endpoint of
 /// a catalog model. Kept across restarts of the same root.
 fn seed_structured_output_catalog(state_root: &Path) -> std::io::Result<()> {
@@ -310,6 +342,11 @@ fn seed_structured_output_catalog(state_root: &Path) -> std::io::Result<()> {
             "existence": "present",
             "limit.context": 128000
         });
+        // The scripted provider speaks Chat Completions. Declare that synthetic transport
+        // explicitly so schema support depends on the authored tri-state capability, not on
+        // whichever real model happens to share a name with the rig.
+        row["wire.npm"] = json!({"value":"@ai-sdk/openai-compatible", "from":"fixture"});
+        row["wire.api"] = json!({"value":"https://conformance.invalid/v1", "from":"fixture"});
         if let Some(support) = support {
             row["capability.structured_output"] = json!(support);
         }
@@ -325,6 +362,10 @@ fn seed_structured_output_catalog(state_root: &Path) -> std::io::Result<()> {
             row(support),
         );
     }
+    models.insert(
+        format!("{}/{}", output_refs::PROVIDER, output_refs::MODEL),
+        output_refs::catalog_row(),
+    );
     let lkg = json!({
         "catalog_version": 1,
         "models": models,
@@ -332,6 +373,80 @@ fn seed_structured_output_catalog(state_root: &Path) -> std::io::Result<()> {
         "source": "models.dev"
     });
     std::fs::write(path, serde_json::to_vec_pretty(&lkg).unwrap())
+}
+
+#[test]
+fn structured_output_catalogs_preserve_admission_decisions_without_a_daemon() {
+    let root = broca_test_support::scratch_root()
+        .join(format!("structured-output-catalog-{}", std::process::id()));
+    seed_structured_output_catalog(&root).unwrap();
+    let mut response: broca_catalog::FusiformCatalogResponse =
+        serde_json::from_slice(&std::fs::read(root.join("catalog/fusiform-lkg.json")).unwrap())
+            .unwrap();
+    let real: broca_catalog::FusiformCatalogResponse =
+        serde_json::from_str(include_str!("fixtures/fusiform_cache_warm_admission.json")).unwrap();
+    response
+        .models
+        .insert("openai/gpt-5".into(), real.models["openai/gpt-5"].clone());
+    let cache = std::sync::Arc::new(broca_catalog::CatalogCache::empty());
+    cache.refresh(response).unwrap();
+    broca_catalog::install_global_catalog_cache(cache);
+    let request = serde_json::from_value(json!({
+        "mode":"final_text", "name":"answer",
+        "schema":{"type":"object", "properties":{"answer":{"type":"string"}}, "required":["answer"], "additionalProperties":false}
+    }))
+    .unwrap();
+    for (model, enforcement, reason) in [
+        (
+            format!("xai/{}", structured_output_model(Some(true))),
+            "enforced",
+            None,
+        ),
+        (
+            format!("xai/{}", structured_output_model(Some(false))),
+            "best_effort",
+            Some("route_unsupported"),
+        ),
+        (
+            format!("xai/{}", structured_output_model(None)),
+            "best_effort",
+            Some("catalog_unknown"),
+        ),
+        ("openai/gpt-5".into(), "enforced", None),
+    ] {
+        let resolved = broca_catalog::live::resolve_provider_with_catalog_base_url(
+            &model,
+            "http://127.0.0.1:1",
+            None,
+            None,
+            &broca_catalog::live::AuthMode::None,
+            &broca_catalog::live::ResolveOptions {
+                structured_output: Some(&request),
+                ..Default::default()
+            },
+            broca_provider::build_provider_http_client(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.family_id,
+            if model.starts_with("xai/") {
+                broca_catalog::live::WireFamilyId::OpenAiChat
+            } else {
+                broca_catalog::live::WireFamilyId::OpenAiResponses
+            },
+            "{model} must use its declared wire package"
+        );
+        let blob = resolved.provider.render_config_blob();
+        assert_eq!(
+            blob["structured_output"]["enforcement"], enforcement,
+            "{model}"
+        );
+        assert_eq!(
+            blob["structured_output"]["reason"].as_str(),
+            reason,
+            "{model}"
+        );
+    }
 }
 
 /// What one OpenAI Chat request carried, as the scripted model received it: the offered tool
@@ -414,20 +529,12 @@ async fn serve_model_request(
     let messages = request["messages"].as_array().cloned().unwrap_or_default();
     let model = request["model"].as_str().unwrap_or_default();
     let model = model.strip_prefix("mock/").unwrap_or(model);
-    #[cfg(feature = "test-clock")]
-    if shared
-        .mc_historian
-        .load(std::sync::atomic::Ordering::SeqCst)
-        && matches!(model, "historian" | "scripted/historian")
-    {
-        return mc_e2e::serve_historian(stream, &request).await;
-    }
     let session = if let Some(session) = model.strip_prefix(PLAN_MODEL_PREFIX) {
         shared
-            .plan_sessions
+            .scripts
             .lock()
             .unwrap()
-            .contains(session)
+            .contains_key(session)
             .then(|| session.to_owned())
     } else if let Some(session) = request["model"].as_str().and_then(|model| {
         model
@@ -437,11 +544,15 @@ async fn serve_model_request(
     }) {
         self::compaction::known_session(&shared, session).then(|| session.to_owned())
     } else {
-        messages
-            .iter()
-            .filter(|message| message["role"] == "system" || message["role"] == "user")
+        std::iter::once(&request["system"])
+            .chain(
+                messages
+                    .iter()
+                    .filter(|message| message["role"] == "system" || message["role"] == "user")
+                    .map(|message| &message["content"]),
+            )
             .find_map(|message| {
-                let text = message["content"].to_string();
+                let text = message.to_string();
                 let at = text.find(SESSION_MARKER)? + SESSION_MARKER.len();
                 let name: String = text[at..]
                     .chars()
@@ -465,6 +576,12 @@ async fn serve_model_request(
     // Legacy sessions are matched to their scripted turn by the number of assistant messages
     // already in the request. A step cut at StepRecorded stays in the transcript (the seal keeps
     // it with a never-executed result), so this count is the number of turns already served.
+    #[cfg(feature = "test-clock")]
+    let counted = session
+        .as_ref()
+        .and_then(|session| shared.counted_turns.lock().unwrap().get(session).copied());
+    #[cfg(not(feature = "test-clock"))]
+    let counted: Option<usize> = None;
     let turn_index = session
         .as_ref()
         .and_then(|session| {
@@ -475,6 +592,7 @@ async fn serve_model_request(
                 .get(session)
                 .map(|state| state.emitted)
         })
+        .or(counted)
         .unwrap_or_else(|| {
             messages
                 .iter()
@@ -514,6 +632,10 @@ async fn serve_model_request(
         return Ok(());
     };
     let session = session.expect("a turn was found for it");
+    #[cfg(feature = "test-clock")]
+    if let Some(served) = shared.counted_turns.lock().unwrap().get_mut(&session) {
+        *served += 1;
+    }
     shared
         .requests
         .lock()
@@ -529,7 +651,8 @@ async fn serve_model_request(
         .or_default()
         .push(request.clone());
     let model_gate = shared.model_holds.lock().unwrap().get(&session).cloned();
-    if let Some(gate) = model_gate {
+    let stream_parts = shared.stream_holds.lock().unwrap().remove(&session);
+    if let Some(gate) = model_gate.as_ref().filter(|_| stream_parts.is_none()) {
         HoldGate::set(&gate.arrived, &gate.arrived_wake);
         tokio::select! {
             () = HoldGate::wait(&gate.released, &gate.released_wake) => {},
@@ -561,6 +684,13 @@ async fn serve_model_request(
 
     *shared.last_session.lock().unwrap() = Some(session.clone());
     let id = format!("chatcmpl-{session}-{turn_index}");
+    if model.ends_with(output_refs::MODEL) {
+        let body = output_refs::stream(&id, &turn);
+        let headers = format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+        stream.write_all(headers.as_bytes()).await?;
+        stream.write_all(body.as_bytes()).await?;
+        return stream.shutdown().await;
+    }
     let chunk = |delta: Value, finish: Option<&str>| {
         json!({"id": id, "object": "chat.completion.chunk", "model": "mock-model",
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
@@ -604,26 +734,34 @@ async fn serve_model_request(
         Some(if calls > 0 { "tool_calls" } else { "stop" }),
     ));
     if let Some(usage) = &turn.usage {
-        let prompt = usage
-            .input_tokens
-            .saturating_add(usage.cache_read_tokens)
-            .saturating_add(usage.cache_write_tokens);
-        let output = usage.output_tokens.min(output_cap);
-        events.push(json!({"id": id, "object": "chat.completion.chunk", "choices": [],
-            "usage": {"prompt_tokens": prompt, "completion_tokens": output,
-                "total_tokens": prompt.saturating_add(output),
-                "prompt_tokens_details": {"cached_tokens": usage.cache_read_tokens, "cache_write_tokens": usage.cache_write_tokens}}}));
+        events.push(scripted_usage_chunk(&id, usage, output_cap));
     }
     let mut body = String::new();
-    for event in events {
+    let mut prefix_bytes = 0;
+    for (index, event) in events.into_iter().enumerate() {
         body.push_str(&format!("data: {event}\n\n"));
+        if stream_parts.is_some_and(|parts| index == parts) {
+            prefix_bytes = body.len();
+        }
     }
     body.push_str("data: [DONE]\n\n");
-    let reply = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
     );
-    stream.write_all(reply.as_bytes()).await?;
+    stream.write_all(headers.as_bytes()).await?;
+    if let Some(gate) = model_gate.as_ref().filter(|_| stream_parts.is_some()) {
+        stream.write_all(&body.as_bytes()[..prefix_bytes]).await?;
+        stream.flush().await?;
+        HoldGate::set(&gate.arrived, &gate.arrived_wake);
+        tokio::select! {
+            () = HoldGate::wait(&gate.released, &gate.released_wake) => {},
+            () = shared.released.notified() => return Ok(()),
+        }
+        stream.write_all(&body.as_bytes()[prefix_bytes..]).await?;
+    } else {
+        stream.write_all(body.as_bytes()).await?;
+    }
     if let Some(state) = shared.compaction.lock().unwrap().get_mut(&session) {
         state.emitted += 1;
     }
@@ -646,13 +784,24 @@ impl subc_client_rs::ModuleHandler for ToolProvider {
         body: Vec<u8>,
     ) -> subc_client_rs::HandlerOutcome {
         let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        if let Some(outcome) = held_late_results::serve_feed(&self.shared, &request).await {
+            return outcome;
+        }
         if request["name"] == "tool.catalog" {
-            return subc_client_rs::HandlerOutcome::Response(
-                serde_json::to_vec(&compaction::catalog(&request)).unwrap(),
-            );
+            let mut answer = compaction::catalog(&request);
+            held_late_results::declare_in_catalog(&self.shared, &mut answer);
+            return subc_client_rs::HandlerOutcome::Response(serde_json::to_vec(&answer).unwrap());
         }
         let arguments = request["arguments"].to_string();
         let handle = ctx.route_handle();
+        if let Some(outcome) = held_late_results::answer_held(
+            &self.shared,
+            (handle.channel, handle.epoch),
+            &arguments,
+            &request,
+        ) {
+            return outcome;
+        }
         let session = self
             .routes
             .lock()
@@ -710,9 +859,20 @@ impl subc_client_rs::ModuleHandler for ToolProvider {
                 serde_json::to_vec(&json!({ "content": content })).unwrap(),
             );
         }
+        if let Some(value) = result
+            .as_ref()
+            .and_then(|result| result.get(OWN_STRUCTURED))
+        {
+            return subc_client_rs::HandlerOutcome::Response(
+                serde_json::to_vec(&json!({ "structuredContent": value })).unwrap(),
+            );
+        }
         let text = result.map_or_else(
             || format!("no scripted result for arguments {arguments}"),
-            |result| result.to_string(),
+            |result| match result {
+                Value::String(text) => text,
+                value => value.to_string(),
+            },
         );
         subc_client_rs::HandlerOutcome::Response(
             serde_json::to_vec(&json!({"content": [{"type": "text", "text": text}]})).unwrap(),
@@ -726,6 +886,11 @@ impl subc_client_rs::ModuleHandler for ToolProvider {
         self.routes.lock().unwrap().insert(
             (req.handle.channel, req.handle.epoch),
             req.identity.session.clone(),
+        );
+        held_late_results::note_bind(
+            &self.shared,
+            (req.handle.channel, req.handle.epoch),
+            req.consumer_capabilities.as_deref(),
         );
         subc_client_rs::BindDecision::accept()
     }
@@ -876,6 +1041,9 @@ struct BrocaSubject {
     bus_events_enabled: bool,
     process_kills_disabled: bool,
     reserved_reader: bool,
+    /// Start `ck-broca` with its tool routes declaring `content/v1` and `held-reply/v1`, which
+    /// only a debug build honours (see `broca_module_serve::held_runtime`).
+    declare_held_reply: bool,
     #[cfg(feature = "test-clock")]
     bus: Option<Arc<bus::BusRig>>,
     #[cfg(feature = "test-clock")]
@@ -899,6 +1067,7 @@ impl BrocaSubject {
             bus_events_enabled: true,
             process_kills_disabled: false,
             reserved_reader: false,
+            declare_held_reply: false,
             #[cfg(feature = "test-clock")]
             bus: None,
             #[cfg(feature = "test-clock")]
@@ -968,6 +1137,16 @@ impl BrocaSubject {
                     "enabled": true,
                     "reserved": true,
                 },
+                HEAD_SENDER_MODULE: {
+                    "program": sibling_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN"),
+                    "args": [],
+                    "env": {
+                        "FAKE_AFT_MODULE_ID": HEAD_SENDER_MODULE,
+                        "FAKE_AFT_LAUNCH_NONCE_PATH": root.join("head-sender.nonce"),
+                    },
+                    "enabled": true,
+                    "reserved": true,
+                },
             }
         });
         let mut config = config;
@@ -986,6 +1165,7 @@ impl BrocaSubject {
         #[cfg(feature = "test-clock")]
         if let Some(mc) = &self.mc {
             config["modules"]["magic-context"] = mc.module();
+            mc_e2e::scope_config(&mut config, root);
         }
         let broca_config = config_home.join("cortexkit/broca.jsonc");
         std::fs::write(
@@ -1003,6 +1183,9 @@ impl BrocaSubject {
         config["modules"]["broca"]["env"]["BROCA_CONFIG_PATH"] = json!(broca_config);
         if let Some(dump_dir) = &self.dump_dir {
             config["modules"]["broca"]["env"]["BROCA_DUMP_REQUEST_DIR"] = json!(dump_dir);
+        }
+        if self.declare_held_reply {
+            config["modules"]["broca"]["env"]["BROCA_TEST_DECLARE_HELD_REPLY_V1"] = json!("1");
         }
         std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap())
             .map_err(|e| fail(e.to_string()))?;
@@ -1103,6 +1286,7 @@ impl BrocaSubject {
             let nonce_path = match module {
                 OWNER_MODULE => live.owner_nonce.clone(),
                 SENDER_MODULE => live.owner_nonce.with_file_name("sender.nonce"),
+                HEAD_SENDER_MODULE => live.owner_nonce.with_file_name("head-sender.nonce"),
                 "magic-context" => live.owner_nonce.with_file_name("reader.nonce"),
                 _ => return Err(HarnessError::new("unknown conformance module principal")),
             };
@@ -1511,10 +1695,64 @@ struct BrocaRoute {
     logs_dir: PathBuf,
 }
 
-fn error_body(bytes: &[u8]) -> subc_protocol::ErrorBody {
+fn scripted_usage_chunk(id: &str, usage: &ScriptedUsage, output_cap: u64) -> Value {
+    let prompt = usage
+        .input_tokens
+        .saturating_add(usage.cache_read_tokens)
+        .saturating_add(usage.cache_write_tokens);
+    let output = usage.output_tokens.min(output_cap);
+    let mut event = json!({"id":id,"object":"chat.completion.chunk","choices":[],"usage":{
+        "prompt_tokens":prompt,"completion_tokens":output,"total_tokens":prompt.saturating_add(output),
+        "prompt_tokens_details":{"cached_tokens":usage.cache_read_tokens,"cache_write_tokens":usage.cache_write_tokens}
+    }});
+    if let Some(reasoning) = usage.reasoning_tokens {
+        event["usage"]["completion_tokens_details"] =
+            json!({"reasoning_tokens":reasoning.min(output)});
+    }
+    event
+}
+
+#[test]
+fn scripted_usage_chunk_preserves_reasoning_as_an_output_breakdown() {
+    let usage = ScriptedUsage::new(7, 2, 1, 10).with_reasoning_tokens(3);
+    let event = scripted_usage_chunk("id", &usage, u64::MAX);
+    assert_eq!(event["usage"]["completion_tokens"], 10);
+    assert_eq!(
+        event["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        3
+    );
+    let capped = scripted_usage_chunk("id", &usage, 2);
+    assert_eq!(capped["usage"]["completion_tokens"], 2);
+    assert_eq!(
+        capped["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        2
+    );
+    let event = scripted_usage_chunk("id", &ScriptedUsage::new(7, 2, 1, 10), u64::MAX);
+    assert!(event["usage"].get("completion_tokens_details").is_none());
+}
+
+// Decode the kit's error type from wire bytes, independently of the connection's protocol version.
+fn error_body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> T {
     serde_json::from_slice(bytes).unwrap_or_else(|_| {
-        subc_protocol::ErrorBody::new("undecodable_error", String::from_utf8_lossy(bytes))
+        serde_json::from_value(
+            json!({"code":"undecodable_error", "message":String::from_utf8_lossy(bytes)}),
+        )
+        .expect("the fallback refusal has a valid protocol error shape")
     })
+}
+
+#[test]
+fn role_kit_error_body_keeps_served_refusal_fields() {
+    let wire = json!({"code":"invalid_params","message":"bad selector","detail":{"field":"preset","class":"permanent"}});
+    let Reply::Error(body) = Reply::Error(error_body(&serde_json::to_vec(&wire).unwrap())) else {
+        unreachable!()
+    };
+    assert_eq!(serde_json::to_value(body).unwrap(), wire);
+    let Reply::Error(body) = Reply::Error(error_body(b"not-json")) else {
+        unreachable!()
+    };
+    assert_eq!(body.code, "undecodable_error");
+    assert_eq!(body.message, "not-json");
 }
 
 impl BrocaRoute {
@@ -1614,7 +1852,13 @@ impl RunnerRoute for BrocaRoute {
                             .map_err(|e| RouteFailure::new(e.to_string()))?;
                     }
                     self.subject
-                        .settle_compaction(&self.session.session)
+                        // Own live run: the actor synced this run's terminal before
+                        // replying, so it cannot be mistaken for a terminal left by
+                        // a crashed run.
+                        .settle_compaction(
+                            &self.session.session,
+                            compaction::file_terminal_is_enough(),
+                        )
                         .await
                         .map_err(|e| RouteFailure::new(e.to_string()))?;
                 }
@@ -1662,7 +1906,11 @@ impl RunnerRoute for BrocaRoute {
                     let (code, message) = rejection
                         .split_once(" — ")
                         .unwrap_or((rejection.as_ref(), ""));
-                    break SubscribeOutcome::Refused(subc_protocol::ErrorBody::new(code, message));
+                    break SubscribeOutcome::Refused(
+                        serde_json::from_value(json!({"code":code,"message":message})).map_err(
+                            |error| RouteFailure::new(format!("an undecodable refusal: {error}")),
+                        )?,
+                    );
                 }
                 Ok(Err(error)) => return Err(RouteFailure::new(error.to_string())),
             }
@@ -1675,6 +1923,107 @@ impl RunnerRoute for BrocaRoute {
 
 #[async_trait]
 impl LlmRunnerSubject for BrocaSubject {
+    async fn seed_untimed_tool_call(
+        &self,
+        handle: &Live,
+        session: &str,
+        call: &cortexkit_role_llm_runner_conformance::ScriptedToolCall,
+    ) -> Result<(), HarnessError> {
+        use broca_core::{FileLeaseStore, FileWalStore, LeaseStore, WalHandle, WalStore};
+        use broca_protocol::{
+            ContentBlock, Message, Role, ToolCall, ToolCallId, ToolOutput, ToolResult,
+        };
+        let fail = |e: String| HarnessError::new(e);
+        let identity = self.bind_identity(session);
+        let seed_root = handle.state_root.join(format!("untimed-fixture-{session}"));
+        let source = FileWalStore::new(&seed_root);
+        let writer = WalHandle::spawn(source.open(&identity).map_err(|e| fail(e.to_string()))?, 1)
+            .map_err(|e| fail(e.to_string()))?;
+        broca_core::run_import(
+            broca_core::ImportRequest {
+                project_id: None,
+                principal: None,
+                run_id: broca_protocol::RunId(format!("untimed-import-{session}")),
+                session: identity.clone(),
+                messages: vec![
+                    Message::new(
+                        Role::Assistant,
+                        vec![ContentBlock::ToolCall(ToolCall {
+                            thought_signature: None,
+                            tool_call_id: ToolCallId(call.tool_call_id.clone()),
+                            tool_name: call.tool.clone(),
+                            input: call.arguments.clone(),
+                        })],
+                    ),
+                    Message::new(
+                        Role::Tool,
+                        vec![ContentBlock::ToolResult(ToolResult {
+                            tool_call_id: ToolCallId(call.tool_call_id.clone()),
+                            output: ToolOutput::Text {
+                                text: "historical result".into(),
+                            },
+                            is_error: false,
+                        })],
+                    ),
+                ],
+                origin: broca_core::ImportOrigin {
+                    source_ref: "fixture:untimed-history".into(),
+                },
+            },
+            &writer,
+            &source,
+        )
+        .await
+        .map_err(|e| fail(e.to_string()))?;
+        writer.shutdown().await.map_err(|e| fail(e.to_string()))?;
+        let records = source
+            .read_records(&identity)
+            .map_err(|e| fail(e.to_string()))?;
+        let leases = FileLeaseStore::new(handle.state_root.join("leases"));
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let lease = loop {
+            match leases.acquire(&broca_core::lease_key_for(&identity)) {
+                Ok(lease) => break lease,
+                Err(broca_core::LeaseError::Held { .. }) if Instant::now() < deadline => {
+                    sleep(Duration::from_millis(25)).await
+                }
+                Err(error) => {
+                    return Err(fail(format!(
+                        "untimed fixture could not obtain idle lease: {error}"
+                    )))
+                }
+            }
+        };
+        let target = FileWalStore::new(handle.state_root.join("wal"));
+        let mut wal = target.open(&identity).map_err(|e| fail(e.to_string()))?;
+        for frame in records {
+            wal.append(lease.epoch(), &frame.record, false)
+                .map_err(|e| fail(e.to_string()))?;
+        }
+        wal.sync().map_err(|e| fail(e.to_string()))?;
+        drop(wal);
+        drop(lease);
+        std::fs::remove_dir_all(seed_root).map_err(|e| fail(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn hold_next_model_stream(
+        &self,
+        session: &str,
+        parts: usize,
+    ) -> Result<(), HarnessError> {
+        self.shared
+            .model_holds
+            .lock()
+            .unwrap()
+            .insert(session.into(), Arc::default());
+        self.shared
+            .stream_holds
+            .lock()
+            .unwrap()
+            .insert(session.into(), parts);
+        Ok(())
+    }
     async fn hold_next_model_step(&self, session: &str) -> Result<(), HarnessError> {
         self.shared
             .model_holds
@@ -1725,6 +2074,8 @@ impl LlmRunnerSubject for BrocaSubject {
     fn capabilities(&self) -> BTreeSet<Capability> {
         let mut capabilities: BTreeSet<_> = [
             Capability::TranscriptReads,
+            Capability::HostHistory,
+            Capability::HistoryDisplay,
             Capability::RunOps,
             Capability::RunToolCalls,
             Capability::InputTokenCap,
@@ -1734,10 +2085,12 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::NoTools,
             Capability::RunStatus,
             Capability::RunUsage,
+            Capability::SessionUsage,
             Capability::RunCancel,
             Capability::Retract,
             Capability::DispatchAttribution,
             Capability::Streaming,
+            Capability::LiveEvents,
             Capability::Steer,
             Capability::Queue,
             Capability::Interrupt,
@@ -1761,6 +2114,25 @@ impl LlmRunnerSubject for BrocaSubject {
             capabilities.extend([Capability::Retention, Capability::RetentionClock]);
         }
         capabilities
+    }
+
+    fn session_usage_fixtures(&self) -> bool {
+        true
+    }
+
+    fn head_sender_identities(
+        &self,
+    ) -> Option<[cortexkit_role_llm_runner_conformance::PlanSenderIdentity; 2]> {
+        let identity = |module: &str| {
+            cortexkit_role_llm_runner_conformance::PlanSenderIdentity::new(
+                RouteStamp {
+                    principal: format!("reserved:{module}"),
+                    scope: None,
+                },
+                module,
+            )
+        };
+        Some([identity(SENDER_MODULE), identity(HEAD_SENDER_MODULE)])
     }
 
     fn owner_stamp(&self) -> RouteStamp {
@@ -1802,7 +2174,20 @@ impl LlmRunnerSubject for BrocaSubject {
         if self.shared.compaction.lock().unwrap().contains_key(session)
             && !self.records(handle, session).is_empty()
         {
-            self.settle_compaction(session).await?;
+            // After a restart the startup sealer appends the crash-orphan
+            // terminal before its fsync publishes the actor's durable head.
+            // A terminal that is only visible in the WAL file must not release
+            // this route: the kit reads `session.head` once and would see the
+            // previous `active` prefix and never send its continuation. Wait
+            // for the same run to report terminal through the public head.
+            let head_connection = connection.clone();
+            let head_route = route;
+            let mut probe = move || -> compaction::HeadFuture {
+                let head_connection = head_connection.clone();
+                let head_route = head_route;
+                Box::pin(async move { Self::public_head_run(&head_connection, &head_route).await })
+            };
+            self.settle_compaction(session, Some(&mut probe)).await?;
         }
         eprintln!(
             "route.open session={} channel={} epoch={} elapsed_us={}",
@@ -1822,6 +2207,18 @@ impl LlmRunnerSubject for BrocaSubject {
     }
 
     fn send_fields(&self, session: &str, first: bool) -> Map<String, Value> {
+        if self
+            .shared
+            .output_refs_sessions
+            .lock()
+            .unwrap()
+            .contains(session)
+        {
+            return json!({"model":{"provider":output_refs::PROVIDER,"model":output_refs::MODEL}})
+                .as_object()
+                .unwrap()
+                .clone();
+        }
         if self.shared.plan_sessions.lock().unwrap().contains(session) {
             return json!({"model":{"provider":"mock","model":format!("{PLAN_MODEL_PREFIX}{session}")}})
                 .as_object().unwrap().clone();
@@ -1830,9 +2227,14 @@ impl LlmRunnerSubject for BrocaSubject {
             return fields;
         }
         // Legacy cases name tools directly; compaction cases use the plan-aware catalogue.
-        let fields = json!({
-            "model": {"provider": "mock", "model": "mock-model"},
-            "system": format!("{SESSION_MARKER}{session}"),
+        let markerless = self
+            .shared
+            .model_id_marker_sessions
+            .lock()
+            .unwrap()
+            .contains(session);
+        let mut fields = json!({
+            "model": {"provider": "mock", "model": if markerless { format!("{PLAN_MODEL_PREFIX}{session}") } else { "mock-model".into() }},
             "tools": [{
                 "name": SCRIPTED_TOOL,
                 "description": "Answers each call with its scripted result.",
@@ -1840,6 +2242,11 @@ impl LlmRunnerSubject for BrocaSubject {
                 "module": TOOL_MODULE,
             }],
         });
+        // Native durability, reader-identity and retention fixtures depend on this original
+        // system marker, including error sessions that never install a model script.
+        if !markerless {
+            fields["system"] = json!(format!("{SESSION_MARKER}{session}"));
+        }
         fields.as_object().cloned().expect("an object")
     }
 
@@ -1899,6 +2306,26 @@ impl LlmRunnerSubject for BrocaSubject {
         TOOL_MODULE.into()
     }
 
+    fn output_refs_fields(&self, session: &str) -> Result<Map<String, Value>, HarnessError> {
+        let mut fields = self
+            .send_fields_with_plan(
+                session,
+                true,
+                json!({"render_tags": true}).as_object().unwrap(),
+            )
+            .ok_or_else(|| HarnessError::new("output references need a scripted tool plan"))?;
+        fields["plan"]["tool_items"][0]["output_refs"] = json!(true);
+        fields["model"] = json!({"provider":output_refs::PROVIDER,"model":output_refs::MODEL});
+        self.shared
+            .output_refs_sessions
+            .lock()
+            .unwrap()
+            .insert(session.into());
+        fields["plan"]["system_text_items"] =
+            json!([{"provider":TOOL_MODULE,"preset":"conformance","params":{"session":session}}]);
+        Ok(fields)
+    }
+
     fn send_fields_with_tools(
         &self,
         session: &str,
@@ -1953,6 +2380,12 @@ impl LlmRunnerSubject for BrocaSubject {
             .unwrap()
             .get(session)
         {
+            // These fixed catalog rows cannot carry a session-specific model id.
+            if fields.get("plan").is_none_or(Value::is_null) {
+                fields.insert("system".into(), json!(format!("{SESSION_MARKER}{session}")));
+            } else {
+                fields["plan"]["system_text_items"] = json!([{"provider":TOOL_MODULE,"preset":"conformance","params":{"session":session}}]);
+            }
             fields.insert(
                 "model".into(),
                 json!({"provider": STRUCTURED_OUTPUT_PROVIDER, "model": structured_output_model(*support)}),
@@ -1998,6 +2431,13 @@ impl LlmRunnerSubject for BrocaSubject {
     }
 
     async fn install_script(&self, session: &str, script: Script) -> Result<(), HarnessError> {
+        if history_display_kit_session(session) {
+            self.shared
+                .model_id_marker_sessions
+                .lock()
+                .unwrap()
+                .insert(session.into());
+        }
         let mut results = self.shared.results.lock().unwrap();
         let mut holds = self.shared.holds.lock().unwrap();
         for call in script.tool_calls() {
@@ -2046,9 +2486,84 @@ impl LlmRunnerSubject for BrocaSubject {
             .collect()
     }
 
-    /// An image-only tool result. Broca keeps no image bytes: its tool plane maps the image to
-    /// a placeholder naming its MIME type, which carries `marker` so the case finds the entry.
+    /// Preserve the supplied blocks exactly. Media-only and empty results have nowhere to
+    /// store arbitrary locator text, so the kit must locate them through `run.tool_calls`.
+    fn numbering_tool_result(
+        &self,
+        marker: &str,
+        blocks: &[cortexkit_role_llm_runner::tags::ToolResultBlock<'_>],
+    ) -> Option<Value> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use cortexkit_role_llm_runner::tags::ToolResultBlock;
+        if !broca_protocol::attachments_enabled()
+            && blocks
+                .iter()
+                .any(|block| matches!(block, ToolResultBlock::Image | ToolResultBlock::Media))
+        {
+            return None;
+        }
+        if blocks.is_empty() {
+            return Some(json!({OWN_STRUCTURED: {"marker": marker}}));
+        }
+        let png_hex = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c49444154789c63f8cfc0000003010100c9fe92ef0000000049454e44ae426082";
+        let png: Vec<_> = png_hex
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        let content: Vec<_> = blocks
+            .iter()
+            .map(|block| match block {
+                ToolResultBlock::Text(text) => json!({"type":"text", "text":text}),
+                ToolResultBlock::Image => {
+                    json!({"type":"image", "mimeType":"image/png", "data":STANDARD.encode(&png)})
+                }
+                ToolResultBlock::Media => json!({"type":"resource", "resource":{
+                    "uri":"fixture:///invented.pdf", "mimeType":"application/pdf",
+                    "blob":STANDARD.encode(b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n"),
+                }}),
+                _ => panic!("unmapped numbering fixture block"),
+            })
+            .collect();
+        Some(json!({OWN_CONTENT: content}))
+    }
+
+    /// Resolve identity only from the listed call and the actual read entry. Its tag row
+    /// supplies the part key; fixture markers and the adapter's remembered messages do not.
+    fn tool_result_part(
+        &self,
+        call: &cortexkit_role_llm_runner::tool_calls::RunToolCall,
+        result: &cortexkit_role_llm_runner::read::ReadMessage,
+    ) -> Option<String> {
+        if call.result_ordinal != Some(result.ordinal) {
+            return None;
+        }
+        let mut matching = result
+            .message
+            .get("content")?
+            .as_array()?
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| {
+                block["type"] == "tool_result"
+                    && block["tool_call_id"].as_str() == Some(call.tool_call_id.as_str())
+            });
+        let (index, _) = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        result.tags.get(index).map(|row| row.part.clone())
+    }
+
+    /// The older image fixture requires marker text in the stored payload. Captured references
+    /// cannot carry arbitrary text; the marker-free numbering fixture checks those images.
+    /// Without capture, the legacy placeholder's MIME type can carry the marker.
     fn image_tool_result(&self, marker: &str) -> Option<Value> {
+        if broca_protocol::attachments_enabled() {
+            return None;
+        }
         Some(json!({ OWN_CONTENT: [{
             "type": "image",
             "mimeType": format!("image/png; name={marker}"),
@@ -2151,7 +2666,9 @@ impl LlmRunnerSubject for BrocaSubject {
             .get(&arguments.to_string())
             .cloned();
         match gate {
-            Some(gate) if gate.arrived.load(std::sync::atomic::Ordering::SeqCst) => {
+            Some(gate) => {
+                // Release is a permit for an installed script, not a claim that it arrived.
+                // A later held turn must observe this permit when it reaches the provider.
                 HoldGate::set(&gate.released, &gate.released_wake);
                 Ok(())
             }
@@ -2505,6 +3022,29 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
     // a case that drifts to skipped or inapplicable would otherwise pass this test without
     // checking anything.
     for name in [
+        "history_pages_back_to_the_first_message",
+        "history_mid_matches_read",
+        "history_from_ordinal_and_before_ordinal",
+        "history_unknown_ordinal_refused",
+        "display_limits_cut_on_a_utf8_boundary",
+        "display_without_limits_is_whole",
+        "display_pages_carry_finished_messages_only",
+        "display_own_run_records_model",
+        "client_message_id_on_display_rows_never_in_read",
+        "display_row_names_the_sender_never_in_read",
+        "output_refs_scanning",
+        "output_refs_target_reasons",
+        "output_refs_descriptor_digest",
+        "output_refs_session_isolation",
+        "output_refs_slots",
+        "output_refs_shared_samples",
+        "output_refs_reference_limit",
+        "output_refs_read_limits",
+        "output_refs_snapshot_budget",
+        #[cfg(feature = "test-attachments")]
+        "tags_tool_result_blocks_share_one_number",
+        #[cfg(not(feature = "test-attachments"))]
+        "tags_count_only_parts_rendered_with_a_number",
         "compaction_setup_durable_once",
         "model_view_half_open_ranges_and_travel",
         "compaction_unavailable_distinct_from_refuse",
@@ -2579,6 +3119,25 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
             CaseOutcome::Passed,
             "{name}\n{}",
             report.render()
+        );
+    }
+    for name in [
+        "output_refs_unsupported_plan",
+        "output_refs_writing_request",
+        "output_refs_held_placeholder",
+        "output_refs_snapshot_size",
+        "output_refs_rewind",
+        "output_refs_compaction",
+    ] {
+        let case = report
+            .cases
+            .iter()
+            .find(|case| case.case == name)
+            .unwrap_or_else(|| panic!("the suite has no case {name}"));
+        assert!(
+            matches!(case.outcome, CaseOutcome::Inapplicable { .. }),
+            "{name}: {:?}",
+            case.outcome
         );
     }
     let cap_cases: Vec<_> = report
@@ -4122,4 +4681,149 @@ async fn pending_delivery_order_send_is_retracted_before_tool_result() {
         !serde_json::to_string(&page).unwrap().contains(marker),
         "retracted send reached the transcript: {page}"
     );
+}
+
+#[cfg(test)]
+mod held_call_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn subject(shared: Arc<Shared>) -> BrocaSubject {
+        BrocaSubject {
+            shared,
+            model_url: String::new(),
+            project_root: PathBuf::new(),
+            dump_dir: None,
+            binary: None,
+            backup_classes: None,
+            bus_events_enabled: false,
+            process_kills_disabled: true,
+            reserved_reader: false,
+            declare_held_reply: false,
+            #[cfg(feature = "test-clock")]
+            bus: None,
+            #[cfg(feature = "test-clock")]
+            mc: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_fixture_fields_keep_legacy_system_marker() {
+        let shared = Arc::new(Shared::default());
+        let subject = subject(shared.clone());
+        for session in ["step-cut", "mc-e2e"] {
+            subject
+                .install_script(session, Script::default())
+                .await
+                .unwrap();
+        }
+        for session in [
+            "step-cut",
+            "mc-e2e",
+            "provider-error-retained",
+            "provider-error-forever",
+        ] {
+            let fields = subject.send_fields(session, true);
+            assert_eq!(
+                fields["system"],
+                format!("{SESSION_MARKER}{session}"),
+                "{session}"
+            );
+            assert_eq!(fields["model"]["model"], "mock-model", "{session}");
+        }
+        assert!(
+            !shared
+                .scripts
+                .lock()
+                .unwrap()
+                .contains_key("provider-error-forever"),
+            "provider-error fixtures must route by their system marker even without a script"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_registered_history_and_display_fixture_names_use_model_routing() {
+        let subject = subject(Arc::new(Shared::default()));
+        for session in [
+            "cf-cf-history-3-4",
+            "cf-display-5",
+            "cf-display-sender-6",
+            "cf-display-model-7",
+        ] {
+            assert!(
+                subject.send_fields(session, true).contains_key("system"),
+                "unregistered {session}"
+            );
+            subject
+                .install_script(session, Script::default())
+                .await
+                .unwrap();
+            let fields = subject.send_fields(session, true);
+            assert!(!fields.contains_key("system"), "{session}");
+            assert_eq!(
+                fields["model"]["model"],
+                format!("{PLAN_MODEL_PREFIX}{session}")
+            );
+        }
+        for session in [
+            "cf-cf-history-3-4-extra",
+            "cf-display-ish-5",
+            "prefix-cf-display-5",
+            "cf-display-0",
+            "cf-display-05",
+            "cf-cf-history-0-7",
+        ] {
+            assert!(!history_display_kit_session(session), "{session}");
+            subject
+                .install_script(session, Script::default())
+                .await
+                .unwrap();
+            let fields = subject.send_fields(session, true);
+            assert_eq!(
+                fields["system"],
+                format!("{SESSION_MARKER}{session}"),
+                "{session}"
+            );
+            assert_eq!(fields["model"]["model"], "mock-model", "{session}");
+        }
+    }
+
+    #[tokio::test]
+    async fn release_registered_future_call_keeps_release_until_arrival() {
+        let shared = Arc::new(Shared::default());
+        let arguments = json!({"nonce":"future-held-call"});
+        let gate = Arc::new(HoldGate::default());
+        shared
+            .holds
+            .lock()
+            .unwrap()
+            .insert(arguments.to_string(), gate.clone());
+        let subject = subject(shared);
+        subject
+            .release_tool_call(&arguments)
+            .await
+            .expect("a registered future hold can be released");
+        assert!(
+            !gate.arrived.load(Ordering::SeqCst),
+            "release must not fabricate provider arrival"
+        );
+        assert!(gate.released.load(Ordering::SeqCst));
+        HoldGate::set(&gate.arrived, &gate.arrived_wake);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            HoldGate::wait(&gate.released, &gate.released_wake),
+        )
+        .await
+        .expect("a later arriving provider must see the earlier release");
+    }
+
+    #[tokio::test]
+    async fn unregistered_call_release_is_rejected() {
+        let subject = subject(Arc::new(Shared::default()));
+        let error = subject
+            .release_tool_call(&json!({"nonce":"unknown-call"}))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("the call is not held"));
+    }
 }

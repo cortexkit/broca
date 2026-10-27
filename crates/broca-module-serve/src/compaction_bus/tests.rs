@@ -343,3 +343,139 @@ async fn replaced_file_identity_invalidates_cached_facts_without_a_full_read() {
         fixture.wal.file_identity(&fixture.session).unwrap()
     );
 }
+
+/// Hands out queued `view_ready` messages, answers "nothing waiting" once they are gone,
+/// and checks at each ACK that the durable receipt and the inbox already hold the view.
+struct QueuedCursor {
+    queue: std::collections::VecDeque<cortexkit_bus_trait::Message>,
+    in_flight: Option<ViewReady>,
+    store: Arc<SqliteStore>,
+    inbox: Arc<broca_core::ViewReadyInbox>,
+    acked: Arc<Mutex<Vec<u64>>>,
+    all_acked: Arc<tokio::sync::Notify>,
+    expected: usize,
+}
+#[async_trait::async_trait]
+impl StreamCursor for QueuedCursor {
+    async fn next(
+        &mut self,
+    ) -> cortexkit_bus_trait::BusResult<Option<cortexkit_bus_trait::StreamDelivery>> {
+        assert!(
+            self.in_flight.is_none(),
+            "next() before the delivery settled"
+        );
+        let Some(message) = self.queue.pop_front() else {
+            return Ok(None);
+        };
+        self.in_flight = Some(ViewReady::from_headers(&message.headers).unwrap());
+        Ok(Some(cortexkit_bus_trait::StreamDelivery {
+            stream_seq: self.expected as u64 - self.queue.len() as u64,
+            delivery_count: 1,
+            message,
+        }))
+    }
+    async fn ack(&mut self) -> cortexkit_bus_trait::BusResult<()> {
+        use broca_core::CompactionViews;
+        let ready = self.in_flight.take().expect("ACK without a delivery");
+        let receipts = self.store.compaction_receipts("", 256).unwrap();
+        assert_eq!(
+            receipts.first().map(|r| &r.ready),
+            Some(&ready),
+            "ACK preceded the durable receipt"
+        );
+        assert_eq!(
+            self.inbox.newest_ready(&ready.session_ref, "ignored", None),
+            Some(ready.clone()),
+            "ACK preceded the inbox enqueue"
+        );
+        let mut acked = self.acked.lock().unwrap();
+        acked.push(ready.view_version);
+        if acked.len() == self.expected {
+            self.all_acked.notify_one();
+        }
+        Ok(())
+    }
+    async fn nak(&mut self, _: Duration) -> cortexkit_bus_trait::BusResult<()> {
+        unreachable!("the consumer never naks a view_ready")
+    }
+    async fn term(&mut self, _: Option<&str>) -> cortexkit_bus_trait::BusResult<()> {
+        unreachable!("the consumer never terms a view_ready")
+    }
+    async fn in_progress(&mut self) -> cortexkit_bus_trait::BusResult<()> {
+        unreachable!("the consumer never reports progress")
+    }
+}
+
+struct NoPublisher;
+#[async_trait::async_trait]
+impl broca_store::bus_events::BusPublisher for NoPublisher {
+    async fn publish(
+        &self,
+        _: &broca_store::bus_events::Publication,
+    ) -> Result<cortexkit_bus_trait::PublishReceipt, String> {
+        Err("the compaction consumer publishes nothing".into())
+    }
+}
+
+/// Attaches the `box_test` account once, with the one cursor it was given.
+struct QueuedConnector(Mutex<Option<QueuedCursor>>);
+#[async_trait::async_trait]
+impl BusConnector for QueuedConnector {
+    async fn connect(&self) -> Result<crate::bus_events::BusConnection, String> {
+        Ok(crate::bus_events::BusConnection {
+            publisher: Arc::new(NoPublisher),
+            account: cortexkit_bus_naming::AccountNames::derive("box_test").unwrap(),
+            refresh_at_ms: u64::MAX,
+        })
+    }
+    async fn compaction_consumer(&self) -> Result<Box<dyn StreamCursor>, String> {
+        let cursor = self
+            .0
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or("cursor already taken")?;
+        Ok(Box::new(cursor))
+    }
+}
+
+/// A backlog of announcements drains without the one-second retry wait between them: the
+/// wait is for a failed pass, not for every delivery. The clock is paused, so any wait the
+/// consumer makes shows as virtual time passing.
+#[tokio::test(start_paused = true)]
+async fn queued_view_ready_backlog_is_receipted_and_acked_without_retry_waits() {
+    let mut fixture = Fixture::new("compaction-backlog-consume");
+    const QUEUED: usize = 5;
+    let acked = Arc::new(Mutex::new(Vec::new()));
+    let all_acked = Arc::new(tokio::sync::Notify::new());
+    let cursor = QueuedCursor {
+        queue: (1..=QUEUED as u64)
+            .map(|version| message(&fixture.session, version))
+            .collect(),
+        in_flight: None,
+        store: fixture.store.clone(),
+        inbox: fixture.service.inbox.clone(),
+        acked: acked.clone(),
+        all_acked: all_acked.clone(),
+        expected: QUEUED,
+    };
+    fixture.service.connector = Arc::new(QueuedConnector(Mutex::new(Some(cursor))));
+    let service = &fixture.service;
+    let started = tokio::time::Instant::now();
+    let elapsed = tokio::join!(service.consume(), async {
+        tokio::time::timeout(Duration::from_secs(5), all_acked.notified())
+            .await
+            .expect("five queued view_ready messages were not all acked within five seconds");
+        let elapsed = started.elapsed();
+        service.stop.cancel();
+        elapsed
+    })
+    .1;
+    assert_eq!(*acked.lock().unwrap(), vec![1, 2, 3, 4, 5]);
+    assert_eq!(service.metrics.acked.load(Ordering::Relaxed), QUEUED as u64);
+    assert_eq!(service.metrics.last_error.lock().unwrap().clone(), None);
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "the consumer waited between deliveries: {elapsed:?} passed for {QUEUED} messages"
+    );
+}

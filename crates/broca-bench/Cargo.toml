@@ -20,6 +20,10 @@ serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+# The session-length benchmark clears one store column to model a store written before the
+# episode projection existed. Same version and features as broca-store's, so the lock gains
+# no new package.
+rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { workspace = true, features = ["test-util"] }
 
 [[bin]]

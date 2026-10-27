@@ -20,21 +20,23 @@
 //!  - no Prepared, intent or terminal → safe to re-dispatch.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
+use crate::placement::{AppendKind, HoldKind, Placement, PlacementAction};
 use broca_protocol::{
     caller::RunFinishReason,
     content::{AssistantMessage, ContentBlock, Message, Role, ToolOutput, ToolResult},
     error::ProviderError,
     request::BudgetConfig,
-    BatchId, FinishReason, RunId, StepId, ToolCallId, Usage,
+    BatchId, BindIdentity, FinishReason, RunId, StepId, ToolCallId, Usage,
 };
 use broca_wal::{
     DeferredDecision, DispatchOutcome, FramedRecord, LateDecision, LateExecution, NoDispatchReason,
     PauseReason, RunConfig, WalByteAnchor, WalLineageId, WalRecord, WithdrawElicitation,
 };
+use sha2::Digest;
 /// WAL-derived identity of the run that produced one transcript message.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RunAttribution {
@@ -100,6 +102,8 @@ impl std::error::Error for ReplayError {}
 /// The result of replaying a session's WAL — a LINEAGE of one or more episodes.
 #[derive(Debug, Clone)]
 pub struct ReplayState {
+    /// Next absolute transcript ordinal, including messages not held in the prompt.
+    pub extent: u64,
     /// The last episode renders tags under the computed rules on a compaction-managed session,
     /// is still running, and no Setup answer is recorded yet: the answer may carry a tag
     /// checkpoint that renumbers the run's parts from its cut (llm-runner §9.6), so no read
@@ -195,6 +199,10 @@ pub struct ReplayState {
     pub pending_steers: Vec<Message>,
     /// What to do next.
     pub resolution: ReplayResolution,
+    /// Set only by a resume that loaded the held set of an applied compaction view instead of
+    /// the whole transcript: `prompt` then holds only those messages, already in prompt form,
+    /// and this carries what the run loop would otherwise derive from the whole prompt.
+    pub(crate) held: Option<Box<crate::run::held_prompt::HeldResume>>,
 }
 
 /// An opened, uncommitted tool batch as the WAL left it.
@@ -215,6 +223,10 @@ pub enum OpenCallState {
     Terminated,
     /// A dispatch intent is durable and no terminal is: the call may or may not have run.
     Dispatched,
+    /// The provider durably accepted responsibility for returning a late result.
+    ProviderHeld,
+    /// A sequential intent behind an open or closed-out held call; it was never sent.
+    HeldSuccessor,
     /// Neither Prepared, intent nor terminal is durable: the call never left the process.
     NotSent,
     /// Prepared arguments are durable, but no approval or terminal is durable.
@@ -239,6 +251,13 @@ pub enum ReplayResolution {
     /// A clean resume point. `pending` is the trailing tool-turn that needs
     /// completing (None ⇒ resume re-runs the model from `prompt`).
     Resume { pending: Option<PendingTurn> },
+    /// A provider-held batch, including one whose delivered terminals still owe its barrier.
+    /// This is a runner-owned wait, never an authentication pause.
+    ProviderHeld {
+        run_id: RunId,
+        pending: PendingTurn,
+        open_held: Vec<ToolCallId>,
+    },
     /// The last episode is PAUSED awaiting (re-)auth — a NON-terminal, resumable
     /// state (a `RunPaused` record, distinct from a terminal `RunFinished`). Resume
     /// continues the SAME run_id from the last durable boundary; no new episode starts
@@ -281,6 +300,10 @@ pub struct PendingTurn {
     pub deferred: Vec<PreparedCall>,
     /// Approved calls awaiting second validation, never ordinary redispatch.
     pub approved: Vec<PreparedCall>,
+    /// Durable held replies to rejoin without sending the call again.
+    pub provider_held: Vec<ProviderHeldCall>,
+    /// Intents already written at barrier 1 but kept behind a sequential hold.
+    pub held_successors: Vec<ToolCallId>,
     /// The assistant message's runner tags, when the session has tags.
     pub assistant_tags: Option<broca_protocol::tags::MessageTags>,
     /// The runner tag of each already-durable terminal in `existing`, by call id in planned
@@ -298,6 +321,30 @@ pub struct PreparedCall {
     pub approval: Option<Arc<WalRecord>>,
     /// Latest filing marker's id, if filing returned before the cut.
     pub elicitation_id: Option<String>,
+}
+
+/// The durable metadata needed to rejoin a provider's waiting slot without another send.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderHeldCall {
+    pub tool_call_id: ToolCallId,
+    pub call_key: String,
+    pub module: String,
+    pub reason: String,
+    pub detail_digest: Option<String>,
+    pub held_at_ms: u64,
+    pub sequential: bool,
+}
+
+impl ProviderHeldCall {
+    pub fn reply(&self) -> crate::tool_plane::ProviderHeldReply {
+        crate::tool_plane::ProviderHeldReply {
+            tool_call_id: self.tool_call_id.clone(),
+            call_key: self.call_key.clone(),
+            module: self.module.clone(),
+            reason: self.reason.clone(),
+            detail_digest: self.detail_digest.clone(),
+        }
+    }
 }
 
 /// A closed Prepared call whose unanswered question still needs a withdrawal.
@@ -321,6 +368,312 @@ impl DeferredCallObligations {
             && self.expired_without_late_record.is_empty()
             && self.pending_late_execution.is_empty()
     }
+}
+
+/// What one WAL says about provider-held calls: what the intake needs to class a late entry.
+///
+/// A registration (and its WAL) outlives the batches it names, so this covers the WHOLE file,
+/// not just the trailing episode: a call can be held by one batch and closed out by a later one.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HeldCallFacts {
+    /// Every `ToolCallProviderHeld` in the WAL, open or closed.
+    pub held: Vec<ProviderHeldCall>,
+    /// The latest durable terminal of each held call.
+    pub terminals: Vec<(ToolCallId, DispatchOutcome)>,
+    /// Calls of a sequential batch that keep a dispatch intent with no terminal behind a held
+    /// call, so they were never sent.
+    pub held_successors: Vec<ToolCallId>,
+    /// A batch whose calls all have terminals but whose commit was never recorded.
+    pub barrier_owed: bool,
+    /// The session identity a `RunStarted` recorded, when the WAL has one.
+    pub session: Option<BindIdentity>,
+    /// The WAL could not be read or decoded completely, so these facts are incomplete.
+    pub unreadable: bool,
+}
+
+impl HeldCallFacts {
+    /// The terminal of a held call, if the WAL has one.
+    pub fn terminal(&self, id: &ToolCallId) -> Option<DispatchOutcome> {
+        self.terminals
+            .iter()
+            .find(|(call, _)| call == id)
+            .map(|(_, outcome)| *outcome)
+    }
+
+    /// The held call this key names, when the WAL records one.
+    pub fn held_call(&self, call_key: &str) -> Option<&ProviderHeldCall> {
+        self.held.iter().find(|held| held.call_key == call_key)
+    }
+
+    /// Whether the WAL shows anything a late-results puller must watch: an open held call or a
+    /// batch that still owes its commit barrier.
+    pub fn needs_intake(&self) -> bool {
+        !self.unreadable
+            && (self.barrier_owed
+                || self
+                    .held
+                    .iter()
+                    .any(|held| self.terminal(&held.tool_call_id).is_none()))
+    }
+}
+
+/// Read provider-held facts out of one session WAL.
+///
+/// `call_key` names a single call the caller already knows about, which is how a registration
+/// asks about its own entry. It still counts a held call whose close-out terminal is durable
+/// (the entry is then classed rather than delivered), and only that read also lists the
+/// sequential held successors, which no delivery needs.
+pub fn held_call_facts(records: &[FramedRecord], call_key: Option<&str>) -> HeldCallFacts {
+    let mut facts = HeldCallFacts::default();
+    for frame in records {
+        match &frame.record {
+            WalRecord::RunStarted { session, .. } => facts.session = Some(session.clone()),
+            WalRecord::ToolCallProviderHeld {
+                tool_call_id,
+                call_key,
+                module,
+                reason,
+                detail_digest,
+                held_at_ms,
+                sequential,
+                ..
+            } => {
+                if facts
+                    .held
+                    .iter()
+                    .any(|held| &held.tool_call_id == tool_call_id)
+                {
+                    continue;
+                }
+                facts.held.push(ProviderHeldCall {
+                    tool_call_id: tool_call_id.clone(),
+                    call_key: call_key.clone(),
+                    module: module.clone(),
+                    reason: reason.clone(),
+                    detail_digest: detail_digest.clone(),
+                    held_at_ms: *held_at_ms,
+                    sequential: *sequential,
+                });
+            }
+            WalRecord::ToolResult {
+                result, outcome, ..
+            } => {
+                if facts
+                    .held
+                    .iter()
+                    .any(|held| held.tool_call_id == result.tool_call_id)
+                {
+                    facts
+                        .terminals
+                        .retain(|(call, _)| call != &result.tool_call_id);
+                    facts
+                        .terminals
+                        .push((result.tool_call_id.clone(), *outcome));
+                }
+            }
+            WalRecord::ToolNoDispatch { tool_call_id, .. }
+                if facts
+                    .held
+                    .iter()
+                    .any(|held| &held.tool_call_id == tool_call_id) =>
+            {
+                facts.terminals.retain(|(call, _)| call != tool_call_id);
+                facts
+                    .terminals
+                    .push((tool_call_id.clone(), DispatchOutcome::Interrupted));
+            }
+            _ => {}
+        }
+    }
+    // Each registered call is asked about its own key. Successors are read only then, so the
+    // per-registration scan stays linear.
+    let registered = call_key.is_some();
+    if let Some(key) = call_key {
+        if !facts.held.iter().any(|held| held.call_key == key) {
+            // An approved call's key is its deferred anchor, so the intent carries it.
+            let anchor = records.iter().find_map(|frame| match &frame.record {
+                WalRecord::ToolDispatchIntent {
+                    tool_call_id,
+                    call_key: Some(intent_key),
+                    ..
+                } if intent_key == key => Some(tool_call_id.clone()),
+                _ => None,
+            });
+            if let Some(tool_call_id) = anchor {
+                facts.held.push(ProviderHeldCall {
+                    tool_call_id,
+                    call_key: key.to_owned(),
+                    module: String::new(),
+                    reason: String::new(),
+                    detail_digest: None,
+                    held_at_ms: 0,
+                    sequential: false,
+                });
+            }
+        }
+    }
+    facts.held_successors = if registered {
+        held_successor_calls(records)
+    } else {
+        Vec::new()
+    };
+    facts.barrier_owed = barrier_owed(records);
+    facts
+}
+
+/// Calls that keep a dispatch intent with no terminal behind a held call of the same sequential
+/// batch. Barrier 1 writes every intent before the first send, and a sequential batch sends a
+/// call only after its predecessor resolves, so such a call was never sent.
+fn held_successor_calls(records: &[FramedRecord]) -> Vec<ToolCallId> {
+    struct Batch {
+        planned: Vec<ToolCallId>,
+        intents: Vec<ToolCallId>,
+        terminals: Vec<ToolCallId>,
+        held: Vec<ToolCallId>,
+        sequential_held: bool,
+    }
+    let mut batches: Vec<(BatchId, Batch)> = Vec::new();
+    let batch = |id: &BatchId, batches: &mut Vec<(BatchId, Batch)>| {
+        if let Some(index) = batches.iter().position(|(existing, _)| existing == id) {
+            return index;
+        }
+        batches.push((
+            id.clone(),
+            Batch {
+                planned: Vec::new(),
+                intents: Vec::new(),
+                terminals: Vec::new(),
+                held: Vec::new(),
+                sequential_held: false,
+            },
+        ));
+        batches.len() - 1
+    };
+    for frame in records {
+        match &frame.record {
+            WalRecord::ToolBatchStarted {
+                batch_id,
+                planned_calls,
+                ..
+            } => {
+                let index = batch(batch_id, &mut batches);
+                batches[index].1.planned = planned_calls.clone();
+            }
+            WalRecord::ToolDispatchIntent {
+                batch_id,
+                tool_call_id,
+                ..
+            } => {
+                let index = batch(batch_id, &mut batches);
+                batches[index].1.intents.push(tool_call_id.clone());
+            }
+            WalRecord::ToolResult {
+                batch_id, result, ..
+            } => {
+                let index = batch(batch_id, &mut batches);
+                batches[index].1.terminals.push(result.tool_call_id.clone());
+            }
+            WalRecord::ToolNoDispatch {
+                batch_id,
+                tool_call_id,
+                ..
+            } => {
+                let index = batch(batch_id, &mut batches);
+                batches[index].1.terminals.push(tool_call_id.clone());
+            }
+            WalRecord::ToolCallProviderHeld {
+                batch_id,
+                tool_call_id,
+                sequential,
+                ..
+            } => {
+                let index = batch(batch_id, &mut batches);
+                batches[index].1.held.push(tool_call_id.clone());
+                batches[index].1.sequential_held |= *sequential;
+            }
+            _ => {}
+        }
+    }
+    let mut successors = Vec::new();
+    for (_, batch) in batches {
+        if !batch.sequential_held || batch.held.is_empty() {
+            continue;
+        }
+        let calls = batch.planned.clone();
+        let first_held = calls
+            .iter()
+            .position(|call| batch.held.contains(call))
+            .unwrap_or(calls.len());
+        for call in calls.iter().skip(first_held + 1) {
+            if batch.intents.contains(call) && !batch.terminals.contains(call) {
+                successors.push(call.clone());
+            }
+        }
+    }
+    successors
+}
+
+/// One batch as the scan has read it so far.
+struct ScannedBatch {
+    planned: Option<Vec<ToolCallId>>,
+    terminals: Vec<ToolCallId>,
+}
+
+/// A batch that reached a terminal for every planned call while its commit record never came.
+fn barrier_owed(records: &[FramedRecord]) -> bool {
+    let mut open: Vec<(BatchId, ScannedBatch)> = Vec::new();
+    let slot = |id: &BatchId, open: &mut Vec<(BatchId, ScannedBatch)>| {
+        if let Some(index) = open.iter().position(|(existing, _)| existing == id) {
+            return index;
+        }
+        open.push((
+            id.clone(),
+            ScannedBatch {
+                planned: None,
+                terminals: Vec::new(),
+            },
+        ));
+        open.len() - 1
+    };
+    for frame in records {
+        match &frame.record {
+            WalRecord::ToolBatchStarted {
+                batch_id,
+                planned_calls,
+                ..
+            } => {
+                let index = slot(batch_id, &mut open);
+                open[index].1.planned = Some(planned_calls.clone());
+            }
+            WalRecord::ToolResult {
+                batch_id, result, ..
+            } => {
+                let index = slot(batch_id, &mut open);
+                open[index].1.terminals.push(result.tool_call_id.clone());
+            }
+            WalRecord::ToolNoDispatch {
+                batch_id,
+                tool_call_id,
+                ..
+            } => {
+                let index = slot(batch_id, &mut open);
+                open[index].1.terminals.push(tool_call_id.clone());
+            }
+            WalRecord::ToolBatchFinished { batch_id } => {
+                open.retain(|(existing, _)| existing != batch_id);
+            }
+            // A finished run owes no barrier: a run sealed (interrupted, cancelled, stopped)
+            // with a batch whose calls all have terminals never commits that batch.
+            WalRecord::RunFinished { .. } => open.clear(),
+            _ => {}
+        }
+    }
+    open.iter().any(|(_, batch)| {
+        batch
+            .planned
+            .as_ref()
+            .is_some_and(|planned| planned.iter().all(|call| batch.terminals.contains(call)))
+    })
 }
 
 /// Derive approval debt from a complete WAL, never from a projection tail or a pending marker.
@@ -743,6 +1096,7 @@ struct OpenBatch {
     intents: HashSet<ToolCallId>,
     terminals: Vec<Option<Terminal>>,
     prepared: Vec<Option<PreparedCall>>,
+    provider_held: HashMap<ToolCallId, ProviderHeldCall>,
 }
 
 impl OpenBatch {
@@ -753,11 +1107,8 @@ impl OpenBatch {
             prepared: vec![None; planned.len()],
             planned,
             intents: HashSet::new(),
+            provider_held: HashMap::new(),
         }
-    }
-
-    fn all_terminated(&self) -> bool {
-        self.terminals.iter().all(Option::is_some)
     }
 
     /// Whether any record after the batch start says something about one of its calls: a
@@ -828,6 +1179,13 @@ impl OpenBatch {
             .filter(|(position, _)| match &self.terminals[*position] {
                 Some(Terminal::Result(_, DispatchOutcome::Unknown, _)) => true,
                 Some(_) => false,
+                None if matches!(
+                    self.call_state(*position),
+                    OpenCallState::ProviderHeld | OpenCallState::HeldSuccessor
+                ) =>
+                {
+                    false
+                }
                 None => self.has_intent(*position), // intent ∧ ¬terminal
             })
             .map(|(_, id)| id.clone())
@@ -838,7 +1196,29 @@ impl OpenBatch {
         if self.terminals[position].is_some() {
             OpenCallState::Terminated
         } else if self.has_intent(position) {
-            OpenCallState::Dispatched
+            if self.provider_held.contains_key(&self.planned[position]) {
+                OpenCallState::ProviderHeld
+            } else if self.planned[..position]
+                .iter()
+                .enumerate()
+                .any(|(index, id)| {
+                    self.provider_held.get(id).is_some_and(|held| {
+                        held.sequential
+                            && matches!(
+                                self.terminals[index],
+                                None | Some(Terminal::Result(
+                                    _,
+                                    DispatchOutcome::Interrupted | DispatchOutcome::MaxSteps,
+                                    _
+                                ))
+                            )
+                    })
+                })
+            {
+                OpenCallState::HeldSuccessor
+            } else {
+                OpenCallState::Dispatched
+            }
         } else if let Some(prepared) = &self.prepared[position] {
             if prepared.approval.is_some() {
                 OpenCallState::Approved
@@ -930,8 +1310,6 @@ struct Episode {
     open_step_record: Option<usize>,
     /// Provider-free SeededFrom episodes are imports/forks, not resumable model runs.
     seeded_from: bool,
-    /// Prompt length before an import's input, used to discard a torn import during repair.
-    seeded_prompt_start: Option<usize>,
     /// The model that produced THIS episode's assistant turns — the episode's frozen
     /// `RunConfig.model`. Stamped onto each assistant `Message` this episode commits, so a
     /// later episode under a DIFFERENT model can detect the cross-model boundary at render
@@ -946,7 +1324,6 @@ struct Episode {
     first_step_message: Option<usize>,
     /// Durable model steps in THIS episode (each billed). Resets per episode.
     completed_steps: u64,
-    budget: crate::BudgetReplayStateV1,
     /// Whether this episode has already replaced its pre-call render config.
     config_refrozen: bool,
     /// Usage accumulated across THIS episode's steps. Resets per episode.
@@ -1000,8 +1377,12 @@ struct Episode {
 impl Episode {
     /// Place every pending steered message at the end of `prompt`: the step boundary the
     /// replay has just reached.
-    fn place_steers(&mut self, prompt: &mut Vec<Message>) {
-        prompt.append(&mut self.pending_steers);
+    fn place_steers(&mut self, prompt: &mut Vec<Message>, actions: &[PlacementAction]) {
+        for action in actions {
+            if let PlacementAction::PlaceHeld { count, .. } = *action {
+                prompt.extend(self.pending_steers.drain(..count as usize));
+            }
+        }
     }
 }
 
@@ -1013,7 +1394,7 @@ impl Episode {
 /// the last episode is a resume/continue target. Fails with [`ReplayError`] on a
 /// corrupt lineage (a new episode opened over an unfinished prior one).
 pub fn replay(records: &[WalRecord]) -> Result<ReplayState, ReplayError> {
-    let mut state = replay_seeded(
+    replay_seeded(
         records,
         None,
         None,
@@ -1022,19 +1403,21 @@ pub fn replay(records: &[WalRecord]) -> Result<ReplayState, ReplayError> {
         0,
         false,
         crate::tags::TagSeed::default(),
-    )?;
-    // Stamp the fully-assembled prompt with each message's durable lineage position. Done at
-    // this top-level finalization point (not inside `replay_seeded`, which produces sub-lists
-    // like a store-merge tail) so the position is over the WHOLE prompt. The store-merge fast
-    // path stamps the same way in `effective_context`/`resume_state_from_store`, so live and
-    // resume assign identical ordinals — asserted by `merge_equals_full_replay`.
-    broca_protocol::content::stamp_ordinals(&mut state.prompt);
-    Ok(state)
+    )
 }
 
 /// Persisted state needed to project a WAL suffix without replaying the materialized prefix.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectionSeed {
+    /// First model-produced message of the episode open at the watermark, if it has one.
+    pub open_episode_span: Option<u64>,
+    /// The episode open at the watermark, as the projection holds it, and every earlier
+    /// episode's render inputs.
+    pub open_episode: Option<crate::context::EpisodeRenderProjection>,
+    pub earlier_episodes: Vec<crate::context::EpisodeRenderProjection>,
+    /// Every episode the projection holds, when it computed them and its reader may reuse any.
+    /// `None` while they are absent or superseded, which is when a projection refills them.
+    pub projection_episodes: Option<Vec<crate::context::EpisodeRenderProjection>>,
     pub watermark_seq: u64,
     pub anchor: Option<WalByteAnchor>,
     pub prefix_len: u64,
@@ -1055,6 +1438,10 @@ pub struct ProjectionSeed {
 impl ProjectionSeed {
     pub fn empty() -> Self {
         Self {
+            open_episode_span: None,
+            open_episode: None,
+            earlier_episodes: Vec::new(),
+            projection_episodes: None,
             watermark_seq: 0,
             anchor: None,
             prefix_len: 0,
@@ -1075,6 +1462,11 @@ impl ProjectionSeed {
 /// The store-ready result of folding records after a [`ProjectionSeed`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectionDelta {
+    pub episode_spans: Vec<std::ops::Range<u64>>,
+    pub open_episode_span: Option<u64>,
+    /// Every episode's render inputs after the tail, in lineage order; `None` while the seed's
+    /// projection holds none (see [`ProjectionSeed::projection_episodes`]).
+    pub episodes: Option<Vec<crate::context::EpisodeRenderProjection>>,
     pub messages: Vec<Message>,
     pub message_runs: Vec<Option<RunAttribution>>,
     pub run_finals: BTreeMap<u64, RunAttribution>,
@@ -1118,6 +1510,7 @@ pub fn replay_projection_tail(
         (seed.prefix_len, seed.prefix_len > 0),
         seed.admission_checkpoint.compaction.as_ref(),
         seed.tag_seed,
+        Vec::new(),
     )?;
     let mut starts_new_episode = false;
     let mut tail_updates_last_step_usage = false;
@@ -1180,7 +1573,19 @@ pub fn replay_projection_tail(
     if admission_checkpoint.compaction.is_some() {
         admission_checkpoint.compaction = Some(tail_state.compaction.clone());
     }
-    let last_run_id = tail_state.run_id.or_else(|| seed.last_run_id.clone());
+    let (episode_spans, open_episode_span) = projected_episode_spans(
+        &tail_state,
+        truncate_prefix_to.unwrap_or(seed.prefix_len),
+        if truncate_prefix_to.is_some() {
+            None
+        } else {
+            seed.open_episode_span
+        },
+    );
+    let last_run_id = tail_state
+        .run_id
+        .clone()
+        .or_else(|| seed.last_run_id.clone());
     debug_assert_eq!(
         last_run_id.as_ref(),
         admission_checkpoint
@@ -1188,7 +1593,21 @@ pub fn replay_projection_tail(
             .as_ref()
             .map(|episode| &episode.run_id)
     );
+    // A truncation restarts the transcript from ordinal zero, so no earlier episode survives
+    // it and the tail's own ordinals are already the projection's.
+    let episodes = if truncate_prefix_to.is_some() {
+        Some(projected_episode_metadata(&tail_state))
+    } else {
+        projected_episodes_after_tail(
+            &tail_state,
+            seed.prefix_len,
+            seed.projection_episodes.as_deref(),
+        )
+    };
     Ok(ProjectionDelta {
+        episode_spans,
+        open_episode_span,
+        episodes,
         messages: tail_state.prompt,
         message_runs: tail_state.message_runs,
         run_finals: tail_state.run_finals,
@@ -1207,6 +1626,138 @@ pub fn replay_projection_tail(
             seed.last_run_id.as_ref(),
         ),
     })
+}
+
+/// Every replayed episode's render inputs as durable ordinals, for the store's episode
+/// projection. A resumed run under an applied view reads the projection instead of replaying the
+/// whole WAL, and this is the WAL-derived truth it must match.
+///
+/// Each episode's coordinates come from the same replay facts the run loop renders from: its
+/// `RunStarted` position, its admitted first user, its `frozen_render_config`, and the start of
+/// its first model-step span (`episode_step_spans`, which runs from the first model-produced
+/// message to the end of the episode). A value for an episode present in the replay is always
+/// known here: a known absence is `Some(None)`.
+pub fn projected_episode_metadata(
+    state: &ReplayState,
+) -> Vec<crate::context::EpisodeRenderProjection> {
+    let step_starts: Vec<u64> = state
+        .episode_step_spans
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|span| span.start as u64)
+        .collect();
+    episodes_with_first_steps(
+        state.render_episodes.as_deref().unwrap_or_default(),
+        &step_starts,
+    )
+}
+
+/// Each episode's projected render inputs, with its first model step found among `step_starts`
+/// (absolute ordinals) inside the episode itself. Spans exist only for episodes that committed a
+/// model step, so they are matched by position, never by index: an episode without one would
+/// otherwise take the next episode's step and shift every later episode's.
+fn episodes_with_first_steps(
+    episodes: &[broca_protocol::request::EpisodeRenderInput],
+    step_starts: &[u64],
+) -> Vec<crate::context::EpisodeRenderProjection> {
+    episodes
+        .iter()
+        .enumerate()
+        .map(|(index, episode)| {
+            let start = episode.prompt_start as u64;
+            let end = episodes
+                .get(index + 1)
+                .map_or(u64::MAX, |next| next.prompt_start as u64);
+            crate::context::EpisodeRenderProjection {
+                start: Some(start),
+                first_user: Some(episode.first_user.map(|first| first as u64)),
+                first_step: Some(
+                    step_starts
+                        .iter()
+                        .copied()
+                        .find(|first| start <= *first && *first < end),
+                ),
+                render_config: Some(episode.frozen_config.clone()),
+            }
+        })
+        .collect()
+}
+
+/// The projection's episodes after a replay tail continued them: `previous` (the projection
+/// the seed holds) with its open episode taking its first model step from the tail if it took
+/// none before, followed by every episode the tail starts. `None` while `previous` is absent,
+/// so a store that never computed its episodes keeps reading as "replay the WAL" rather than
+/// claiming only the tail's.
+fn projected_episodes_after_tail(
+    state: &ReplayState,
+    base: u64,
+    previous: Option<&[crate::context::EpisodeRenderProjection]>,
+) -> Option<Vec<crate::context::EpisodeRenderProjection>> {
+    let mut episodes = match previous {
+        Some(previous) => previous.to_vec(),
+        // Nothing is materialized yet, so there is no earlier episode to know.
+        None if base == 0 => Vec::new(),
+        None => return None,
+    };
+    let tail = state.render_episodes.as_deref().unwrap_or_default();
+    let step_starts: Vec<u64> = state
+        .episode_step_spans
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|span| base + span.start as u64)
+        .collect();
+    let tail_start = tail
+        .first()
+        .map_or(u64::MAX, |episode| episode.prompt_start as u64);
+    if let Some(open) = episodes.last_mut() {
+        if open.first_step == Some(None) {
+            if let Some(first) = step_starts
+                .iter()
+                .copied()
+                .find(|first| *first < tail_start)
+            {
+                open.first_step = Some(Some(first));
+            }
+        }
+    }
+    episodes.extend(episodes_with_first_steps(tail, &step_starts));
+    Some(episodes)
+}
+
+/// Continue the materialized episode across a replay seam, closing it before the next
+/// episode's input. Tail replay alone only knows the first model message after the seam.
+pub(crate) fn projected_episode_spans(
+    state: &ReplayState,
+    base: u64,
+    previous_open: Option<u64>,
+) -> (Vec<std::ops::Range<u64>>, Option<u64>) {
+    let episodes = state.render_episodes.as_deref().unwrap_or_default();
+    let first_boundary = episodes
+        .first()
+        .map_or(state.prompt.len(), |e| e.prompt_start - base as usize);
+    let mut spans = Vec::new();
+    if let Some(start) = previous_open {
+        spans.push(start..base + first_boundary as u64);
+    }
+    spans.extend(
+        state
+            .episode_step_spans
+            .iter()
+            .flatten()
+            .filter(|span| previous_open.is_none() || span.start >= first_boundary)
+            .map(|span| base + span.start as u64..base + span.end as u64),
+    );
+    let open = match episodes.last() {
+        Some(episode) => spans
+            .iter()
+            .rev()
+            .find(|span| span.start >= episode.prompt_start as u64)
+            .map(|span| span.start),
+        None => previous_open.or_else(|| spans.last().map(|span| span.start)),
+    };
+    (spans, open)
 }
 
 /// Validate a budgeted projection/admission seed before it can affect replay.
@@ -1302,6 +1853,11 @@ pub(crate) fn first_session_record_is_interrupted<'a>(
 /// (the prefix's trailing assistant origin) so those turns are stamped identically to a
 /// full replay; a `RunStarted` appearing later in the tail overrides it for its episode.
 /// Passing `None` is the full-replay case (the first `RunStarted` sets the origin).
+///
+/// Steers held at the indexed sequence are seeded through the validated boundary
+/// entry point [`replay_seeded_at_validated_boundary`], which checks the stored
+/// boundary identity before replaying. This entry point carries no held steers, so
+/// existing prefix-merge callers keep their behaviour.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn replay_seeded<'a>(
     records: impl IntoIterator<Item = &'a WalRecord>,
@@ -1322,7 +1878,330 @@ pub(crate) fn replay_seeded<'a>(
         (ordinal_base, require_caller_text),
         None,
         tag_seed,
+        Vec::new(),
     )
+}
+
+/// Tail replay seeded with the steers held at the indexed sequence.
+///
+/// A steer recorded before the index caught up waits for the next step boundary:
+/// it is not in the materialized prefix, and a replay of only the tail would lose
+/// it. The caller decodes those held inputs from their indexed offsets and passes
+/// them here in WAL order; the tail places them at its first `StepStarted` or
+/// `RunFinished` exactly as a full replay would. A `RunStarted` in the tail opens
+/// a new episode and discards them, matching the index which clears held steers
+/// when a new run starts.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn replay_seeded_with_held_steers<'a>(
+    records: impl IntoIterator<Item = &'a WalRecord>,
+    seed_origin: Option<broca_protocol::request::ModelHandle>,
+    seed_run_id: Option<RunId>,
+    seed_budget: Option<BudgetConfig>,
+    seed_budget_state: Option<crate::BudgetReplayStateV1>,
+    ordinal_base: u64,
+    require_caller_text: bool,
+    tag_seed: crate::tags::TagSeed,
+    held_steers: Vec<Message>,
+) -> Result<ReplayState, ReplayError> {
+    replay_seeded_with_compaction(
+        records,
+        seed_origin,
+        seed_run_id,
+        seed_budget,
+        seed_budget_state,
+        (ordinal_base, require_caller_text),
+        None,
+        tag_seed,
+        held_steers,
+    )
+}
+
+/// Identity of one committed projection boundary, mirrored from the offset index so
+/// offset reads never depend on the store crate.
+///
+/// Each field copies the `projection_boundary` row column the indexer wrote at commit:
+/// the lineage the boundary was indexed under, the WAL sequence of its candidate
+/// frame, the exact byte range of that frame, the SHA-256 over those bytes, and the
+/// index's attested qualification. The validator below re-reads the frame from the log
+/// and compares every field; the wiring must pass the stored row through unmodified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedBoundary {
+    /// WAL identity the boundary was indexed under.
+    pub lineage_id: Option<String>,
+    /// WAL sequence of the boundary's candidate frame.
+    pub seq: u64,
+    /// Byte offset where the boundary frame starts.
+    pub frame_off: u64,
+    /// Byte offset just past the boundary frame.
+    pub frame_end: u64,
+    /// SHA-256 over the exact bytes `frame_off..frame_end`.
+    pub frame_identity: Vec<u8>,
+    /// The index's attested qualification: only a qualified boundary may seed a tail.
+    pub qualified: bool,
+}
+
+/// A decoded tail frame positioned in the log, as a bounded tail read returns it.
+///
+/// The validator requires byte contiguity: the first frame starts exactly where the
+/// boundary frame ends, so no record between them can silently vanish from the replay.
+/// Later frames must continue the sequence gaplessly; the wiring reads them in order
+/// from the durable log, so their offsets chain by construction and only the first is
+/// checked.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PositionedFrame {
+    /// Byte offset where this frame starts in the log.
+    pub off: u64,
+    /// The decoded frame.
+    pub framed: FramedRecord,
+}
+/// Why a seeded tail was refused: the caller replays the whole log instead.
+///
+/// Every reason names a boundary the index must advance past or a log that changed
+/// under it. The caller treats them all the same way, by taking the full-replay path;
+/// the reason exists so a test can pin which guard fired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedFallback {
+    /// Which validation failed; always a static string so callers can match on it.
+    pub reason: &'static str,
+}
+
+/// Replay a WAL tail seeded only at a validated, committed projection boundary.
+///
+/// A bare sequence watermark cannot prove the log still holds the boundary it names:
+/// the log may have been restored shorter, replaced, or rewritten under the same
+/// lineage, and an unqualified cut may sit inside an open tool turn or behind a held
+/// steer the tail would then lose. So this entry point takes the boundary's stored
+/// identity, reads exactly that frame and the log's header frame through `read_at`,
+/// and compares the sequence, the frame hash and the log lineage before replaying
+/// anything. Only those two ranges are ever read: the cost stays flat while the log
+/// grows, which is what sparse resume needs on a 150k-message session. Any
+/// mismatch — a missing, torn, moved, different-lineage or different-hash frame, an
+/// unqualified boundary, a tail that is not contiguous with the boundary, or a frame
+/// whose kind can never seed a tail — returns a [`SeedFallback`] instead of replaying.
+/// The future offset reads must call this, never the unvalidated engine below, so the
+/// wiring cannot skip the check.
+///
+/// `read_at(offset, len)` reads up to `len` bytes at `offset`, returning fewer at or
+/// past the log's end and an error only on a real I/O failure (which also falls back,
+/// letting the full-replay path report it). `tail` holds the positioned frames after
+/// the boundary: the first must continue its sequence and start where it ends, with no
+/// gaps after that; an empty tail is valid only at the log's durable end. `held_steers`
+/// carries the inputs the tail seed still holds at the cut, and `ordinal_base` the
+/// prefix length those rows cover; all three come from the same index snapshot as the
+/// boundary. A Setup in the tail still needs its own index catch-up first: see
+/// [`tail_contains_compaction_setup`].
+#[allow(clippy::too_many_arguments)]
+pub fn replay_seeded_at_validated_boundary(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    boundary: &SeedBoundary,
+    tail: &[PositionedFrame],
+    seed_origin: Option<broca_protocol::request::ModelHandle>,
+    seed_run_id: Option<RunId>,
+    seed_budget: Option<BudgetConfig>,
+    seed_budget_state: Option<crate::BudgetReplayStateV1>,
+    ordinal_base: u64,
+    require_caller_text: bool,
+    tag_seed: crate::tags::TagSeed,
+    held_steers: Vec<Message>,
+) -> Result<ReplayState, SeedFallback> {
+    if !boundary.qualified {
+        return Err(SeedFallback {
+            reason: "unqualified boundary",
+        });
+    }
+    if let Some((first, rest)) = tail.split_first() {
+        // The tail must continue the boundary with no gap: the first frame follows its
+        // sequence and starts where it ends, and no later frame skips one. Anything
+        // between them would silently vanish from the replay.
+        if first.framed.seq != boundary.seq + 1 {
+            return Err(SeedFallback {
+                reason: "tail not contiguous with boundary",
+            });
+        }
+        if first.off != boundary.frame_end {
+            return Err(SeedFallback {
+                reason: "tail byte offset mismatch",
+            });
+        }
+        let mut seq = first.framed.seq;
+        for positioned in rest {
+            seq += 1;
+            if positioned.framed.seq != seq {
+                return Err(SeedFallback {
+                    reason: "tail has a sequence gap",
+                });
+            }
+        }
+    } else if !durable_end_reached(read_at, boundary.frame_end)? {
+        // No tail is only valid at the log's durable end: bytes past the boundary mean
+        // records the caller did not supply.
+        return Err(SeedFallback {
+            reason: "empty tail before log end",
+        });
+    }
+    let frame_len = boundary
+        .frame_end
+        .checked_sub(boundary.frame_off)
+        .filter(|len| *len > 0)
+        .ok_or(SeedFallback {
+            reason: "boundary frame outside log",
+        })?;
+    // A short read is a shorter log, not an error: fewer bytes than the committed frame
+    // means the boundary was never durably written here (torn), and no bytes at all
+    // means the log ends before it (missing or moved). Both fall back.
+    let frame_bytes = read_at(boundary.frame_off, frame_len).map_err(|_| SeedFallback {
+        reason: "log unreadable",
+    })?;
+    let frame_bytes = if frame_bytes.is_empty() {
+        return Err(SeedFallback {
+            reason: "boundary frame outside log",
+        });
+    } else if (frame_bytes.len() as u64) < frame_len {
+        return Err(SeedFallback {
+            reason: "torn boundary frame",
+        });
+    } else {
+        &frame_bytes[..frame_len as usize]
+    };
+    let (framed, consumed) = match broca_wal::framing::decode_next(frame_bytes) {
+        broca_wal::framing::DecodeStep::Record { framed, consumed } => (*framed, consumed),
+        broca_wal::framing::DecodeStep::Lineage { .. } => {
+            return Err(SeedFallback {
+                reason: "boundary frame is not a record",
+            });
+        }
+        broca_wal::framing::DecodeStep::TornTail => {
+            return Err(SeedFallback {
+                reason: "torn boundary frame",
+            });
+        }
+        broca_wal::framing::DecodeStep::Corrupt(_) => {
+            return Err(SeedFallback {
+                reason: "corrupt boundary frame",
+            });
+        }
+        broca_wal::framing::DecodeStep::NewerWriter { .. } => {
+            return Err(SeedFallback {
+                reason: "newer boundary frame",
+            });
+        }
+    };
+    if consumed != frame_bytes.len() {
+        return Err(SeedFallback {
+            reason: "boundary frame length changed",
+        });
+    }
+    if framed.seq != boundary.seq {
+        return Err(SeedFallback {
+            reason: "boundary sequence mismatch",
+        });
+    }
+    if sha2::Sha256::digest(frame_bytes).as_slice() != boundary.frame_identity {
+        return Err(SeedFallback {
+            reason: "boundary frame identity mismatch",
+        });
+    }
+    // The log's header frame carries its lineage; only that fixed-size range is read.
+    // A record-only byte string assembled in a test carries none, and an unreadable
+    // header falls back the same as any other short log.
+    let header =
+        read_at(0, broca_wal::framing::LINEAGE_FRAME_LEN as u64).map_err(|_| SeedFallback {
+            reason: "log unreadable",
+        })?;
+    if log_lineage_id(&header) != boundary.lineage_id {
+        return Err(SeedFallback {
+            reason: "boundary lineage mismatch",
+        });
+    }
+    if !boundary_frame_is_seedable(&framed.record) {
+        return Err(SeedFallback {
+            reason: "boundary frame cannot seed a tail",
+        });
+    }
+    replay_seeded_with_held_steers(
+        tail.iter().map(|positioned| &positioned.framed.record),
+        seed_origin,
+        seed_run_id,
+        seed_budget,
+        seed_budget_state,
+        ordinal_base,
+        require_caller_text,
+        tag_seed,
+        held_steers,
+    )
+    .map_err(|_| SeedFallback {
+        reason: "tail replay refused the seeded records",
+    })
+}
+
+/// Whether `off` is the log's durable end: a one-byte probe past it reads short.
+///
+/// The probe is the only read past the boundary an empty tail needs. Bytes past the
+/// end mean records the caller did not supply, so the reader falls back instead of
+/// serving a prefix that silently drops them.
+fn durable_end_reached(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    off: u64,
+) -> Result<bool, SeedFallback> {
+    match read_at(off, 1) {
+        Ok(bytes) => Ok(bytes.is_empty()),
+        Err(_) => Err(SeedFallback {
+            reason: "log unreadable",
+        }),
+    }
+}
+
+/// The log's lineage identity as its header frame records it, if any.
+///
+/// A log the writer opened carries one seq-0 lineage frame; a record-only byte string
+/// assembled in a test carries none. Either way the value is compared verbatim against
+/// the boundary's attested lineage, so a restored or replaced log cannot pass.
+fn log_lineage_id(header: &[u8]) -> Option<String> {
+    match broca_wal::framing::decode_next(header) {
+        broca_wal::framing::DecodeStep::Lineage { lineage_id, .. } => Some(lineage_id.to_string()),
+        _ => None,
+    }
+}
+
+/// Whether the boundary frame's record can ever seed a tail.
+///
+/// Only a committed turn boundary qualifies: a `TurnFinished`, a model step with no
+/// tool calls, or an import-seeded `RunStarted`. Anything else — a tool-calling step
+/// swallowed before its batch committed, a bare dispatch intent with an empty suffix
+/// after it, a queued or steered record held before unfinished tool work, or any
+/// informational record — leaves state the tail cannot reconstruct, so the reader
+/// falls back to a full replay even when the frame itself is intact.
+fn boundary_frame_is_seedable(record: &WalRecord) -> bool {
+    match record {
+        WalRecord::TurnFinished { .. } => true,
+        WalRecord::ModelStepFinished {
+            assistant_message, ..
+        } if assistant_message.tool_calls().next().is_none() => true,
+        WalRecord::RunStarted {
+            origin: broca_wal::RunOrigin::SeededFrom { .. },
+            ..
+        } => true,
+        _ => false,
+    }
+}
+
+/// Whether a WAL tail holds a compaction Setup that renumbers indexed tags.
+///
+/// A Setup's `tag_checkpoint` renumbers tags inside the already-indexed prefix,
+/// so a read whose tail contains one must advance the index before serving: the
+/// stored tag numbers below the cut are stale. Informational compaction records
+/// without a checkpoint, and Step answers, never trigger this.
+pub fn tail_contains_compaction_setup(frames: &[FramedRecord]) -> bool {
+    frames.iter().any(|frame| {
+        matches!(
+            &frame.record,
+            WalRecord::CompactionMessage {
+                kind: broca_wal::CompactionMessageKind::Setup,
+                tag_checkpoint: Some(_),
+                ..
+            }
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1335,8 +2214,43 @@ fn replay_seeded_with_compaction<'a>(
     position: (u64, bool),
     seed_compaction: Option<&crate::compaction::CompactionCheckpoint>,
     tag_seed: crate::tags::TagSeed,
+    held_steers: Vec<Message>,
 ) -> Result<ReplayState, ReplayError> {
     let (ordinal_base, require_caller_text) = position;
+    let mut placement = Placement::seeded(
+        ordinal_base,
+        seed_run_id.clone(),
+        seed_budget.clone(),
+        seed_budget_state.clone().unwrap_or_default(),
+        0,
+    );
+    // Held steers recorded before the tail are pending input of the episode open at
+    // the cut. Replay them through placement as synthetic steers so the tail's
+    // first step boundary places held and new steers together, exactly as a full
+    // replay would. A `RunStarted` in the tail opens a new episode and clears
+    // them, matching the index which drops held steers when a new run starts.
+    // Synthetic records carry only the input length placement reads; no budget,
+    // delivery or tag state is synthesized.
+    for held in &held_steers {
+        let synthetic = WalRecord::Steered {
+            written_at_ms: None,
+            input: vec![held.clone()].into(),
+            tags: None,
+            retention: None,
+            ts_ms: None,
+            title: None,
+            send_id: None,
+            request_identity_digest: None,
+            delivery: None,
+            hooks: None,
+        };
+        placement
+            .observe(&synthetic)
+            .map_err(|reason| ReplayError::CorruptLineage {
+                episode_run_id: seed_run_id.clone().unwrap_or_else(|| RunId(String::new())),
+                reason,
+            })?;
+    }
     // Tag numbers under the computed rules, given in the order the transcript renders: each
     // message as it is placed in the prompt, a run's rules from its `RunStarted` on.
     let mut numbering = crate::tags::TagNumbering::new(tag_seed, 0);
@@ -1375,7 +2289,7 @@ fn replay_seeded_with_compaction<'a>(
         attributable: run_id.as_ref().is_some_and(|id| !id.0.is_empty()),
         seeded_last_ordinal: ordinal_base.checked_sub(1),
         origin: seed_origin,
-        budget: seed_budget_state.unwrap_or_default(),
+        pending_steers: held_steers,
         ..Episode::default()
     };
     let mut episode_step_spans: Vec<std::ops::Range<usize>> = Vec::new();
@@ -1403,13 +2317,33 @@ fn replay_seeded_with_compaction<'a>(
                 .map_err(ReplayError::TagNumbering)?;
             numbering.start_run(config);
         }
-        compaction.fold_at(rec, ordinal_base.saturating_add(prompt.len() as u64));
+        let extent_before = placement.next_ordinal();
+        compaction.fold_at(rec, extent_before);
         if compaction_session || compaction.state().is_some() {
             compaction_history.fold(rec);
             if let crate::compaction::CompactionCheckpoint::State(state) = &mut compaction {
                 state.history = compaction_history.clone();
             }
         }
+        let expected_budget_text = matches!(rec, WalRecord::BudgetFired { .. })
+            .then(|| {
+                run_config
+                    .as_ref()
+                    .and_then(|config| config.budget.as_ref())
+                    .or(seeded_budget.as_ref())
+            })
+            .flatten()
+            .and_then(|budget| {
+                crate::budget_kernel::decide(placement.budget(), budget)
+                    .first()
+                    .map(|due| due.text.clone())
+            });
+        let actions = placement
+            .observe(rec)
+            .map_err(|reason| ReplayError::CorruptLineage {
+                episode_run_id: run_id.clone().unwrap_or_else(|| RunId(String::new())),
+                reason,
+            })?;
         match rec {
             WalRecord::RunStarted {
                 on_restart: on_restart_policy,
@@ -1462,14 +2396,6 @@ fn replay_seeded_with_compaction<'a>(
                 // Import/fork inputs describe historical messages, not messages produced by the
                 // synthetic seed run. A missing or empty producer id is never invented.
                 ep.attributable = !ep.seeded_from && !rid.0.is_empty();
-                ep.seeded_prompt_start = matches!(
-                    origin,
-                    broca_wal::RunOrigin::SeededFrom {
-                        origin_kind: broca_wal::SeedOriginKind::Import,
-                        ..
-                    }
-                )
-                .then_some(prompt.len());
                 // Stamp this episode's assistant turns with the model that produced them,
                 // so a later episode under a different model can strip a cross-model
                 // signature at render. From the durable per-episode config → reproduces on
@@ -1484,29 +2410,42 @@ fn replay_seeded_with_compaction<'a>(
                 seeded_budget = None;
                 saw_run_started = true;
                 render_episodes.push(broca_protocol::request::EpisodeRenderInput {
-                    prompt_start: prompt.len(),
+                    prompt_start: extent_before as usize,
                     first_user: input
                         .iter()
                         .position(|m| m.role == Role::User)
-                        .map(|i| prompt.len() + i),
+                        .map(|i| extent_before as usize + i),
                     frozen_config: config.frozen_render_config.clone(),
                 });
                 let input_tags = rec.runner_tags();
                 let idle_delivery = submission_id
                     .as_ref()
                     .is_some_and(|id| ordered_submissions.remove(id));
-                prompt.extend(input.iter().enumerate().map(|(index, message)| {
-                    let mut message = tagged(message.clone(), input_tags.get(index));
-                    if idle_delivery {
+                let count = actions
+                    .iter()
+                    .find_map(|action| match action {
+                        PlacementAction::Append {
+                            count,
+                            kind: AppendKind::Input,
+                            ..
+                        } => Some(*count),
+                        _ => None,
+                    })
+                    .expect("RunStarted places input");
+                prompt.extend(input.iter().take(count as usize).enumerate().map(
+                    |(index, message)| {
+                        let mut message = tagged(message.clone(), input_tags.get(index));
+                        if idle_delivery {
+                            message
+                                .tags
+                                .set_delivery(broca_protocol::tags::DeliveryAttribution {
+                                    mode: broca_protocol::DeliveryMode::IdleStart,
+                                    tool_call_id: None,
+                                });
+                        }
                         message
-                            .tags
-                            .set_delivery(broca_protocol::tags::DeliveryAttribution {
-                                mode: broca_protocol::DeliveryMode::IdleStart,
-                                tool_call_id: None,
-                            });
-                    }
-                    message
-                }));
+                    },
+                ));
             }
             WalRecord::ModelStepFinished {
                 step_id,
@@ -1522,18 +2461,17 @@ fn replay_seeded_with_compaction<'a>(
                 ep.retries_used = ep.retries_used.saturating_add(*retries_used);
                 ep.last_step_usage = Some(*u);
                 ep.last_step_finish_reason = *finish_reason;
-                ep.completed_steps += 1;
+                ep.completed_steps = placement.completed_steps();
                 ep.natural_stop_reason = None;
-                let was_finalize_turn = ep.budget.finalize_pending;
-                crate::budget_kernel::apply(
-                    crate::budget_kernel::State {
-                        facts: &mut ep.budget,
-                        config: None,
-                        run_id: run_id.as_ref(),
-                    },
-                    rec,
-                )
-                .expect("model steps cannot invalidate budget facts");
+                let was_finalize_turn = actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        PlacementAction::Append {
+                            kind: AppendKind::Finalize,
+                            ..
+                        }
+                    )
+                });
                 if was_finalize_turn {
                     // A finalize turn is terminal even if a provider emits undeclared calls.
                     // Preserve its answer text in future history, but omit tool calls because
@@ -1575,7 +2513,15 @@ fn replay_seeded_with_compaction<'a>(
                     ep.open_batch = None;
                     ep.natural_end = true;
                     ep.natural_end_extendable = false;
-                } else if assistant_message.tool_calls().next().is_some() {
+                } else if actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        PlacementAction::Hold {
+                            kind: HoldKind::Assistant,
+                            ..
+                        }
+                    )
+                }) {
                     // Each tool turn opens and commits its own batch. A batch still open from an
                     // earlier turn cannot belong to this one: fail closed if it holds call
                     // evidence, and otherwise drop it so this turn is never paired with another
@@ -1594,7 +2540,15 @@ fn replay_seeded_with_compaction<'a>(
                     ep.open_step_record = Some(record_index);
                     ep.open_batch_id = None; // a new tool turn; its batch hasn't opened yet
                     ep.natural_end = false;
-                } else {
+                } else if actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        PlacementAction::Append {
+                            kind: AppendKind::Assistant,
+                            ..
+                        }
+                    )
+                }) {
                     // Terminal turn (no tools) — commit immediately. This step ends
                     // the loop, so the episode ended naturally here.
                     ep.first_step_message.get_or_insert(prompt.len());
@@ -1748,7 +2702,15 @@ fn replay_seeded_with_compaction<'a>(
             WalRecord::ToolBatchFinished { .. } => {
                 // Commit the tool turn IFF complete (every planned call terminated).
                 if let Some(b) = &ep.open_batch {
-                    if b.all_terminated() {
+                    if actions.iter().any(|action| {
+                        matches!(
+                            action,
+                            PlacementAction::Append {
+                                kind: AppendKind::ToolTurn,
+                                ..
+                            }
+                        )
+                    }) {
                         // A committed all-synthetic-stop batch means the run hit its stop
                         // limit before dispatching → finish the lineage here even if the
                         // trailing RunFinished was lost in a crash (else replay would see a
@@ -1792,9 +2754,20 @@ fn replay_seeded_with_compaction<'a>(
             // never lands between a tool call and its result or ahead of the step it arrived in.
             WalRecord::Steered { input, .. } => {
                 let steer_tags = rec.runner_tags();
+                let count = actions
+                    .iter()
+                    .find_map(|action| match action {
+                        PlacementAction::Hold {
+                            count,
+                            kind: HoldKind::Steer,
+                        } => Some(*count),
+                        _ => None,
+                    })
+                    .expect("Steered holds input");
                 ep.pending_steers.extend(
                     input
                         .iter()
+                        .take(count as usize)
                         .enumerate()
                         .map(|(index, message)| tagged(message.clone(), steer_tags.get(index))),
                 );
@@ -1814,17 +2787,30 @@ fn replay_seeded_with_compaction<'a>(
                 ordered_submissions.remove(submission_id);
                 if let Some(input) = input {
                     let delivered_tags = rec.runner_tags();
+                    let count = actions
+                        .iter()
+                        .find_map(|action| match action {
+                            PlacementAction::Hold {
+                                count,
+                                kind: HoldKind::Steer,
+                            } => Some(*count),
+                            _ => None,
+                        })
+                        .expect("SendDelivered holds its input");
                     ep.pending_steers
-                        .extend(input.iter().enumerate().map(|(index, message)| {
-                            let mut message = tagged(message.clone(), delivered_tags.get(index));
-                            message
-                                .tags
-                                .set_delivery(broca_protocol::tags::DeliveryAttribution {
-                                    mode: *mode,
-                                    tool_call_id: None,
-                                });
-                            message
-                        }));
+                        .extend(input.iter().take(count as usize).enumerate().map(
+                            |(index, message)| {
+                                let mut message =
+                                    tagged(message.clone(), delivered_tags.get(index));
+                                message.tags.set_delivery(
+                                    broca_protocol::tags::DeliveryAttribution {
+                                        mode: *mode,
+                                        tool_call_id: None,
+                                    },
+                                );
+                                message
+                            },
+                        ));
                 }
                 if let (Some(tool_call_id), Some(text)) = (tool_call_id, appended_text) {
                     crate::delivery_order::apply_to_prompt(&mut prompt, tool_call_id, text);
@@ -1851,45 +2837,23 @@ fn replay_seeded_with_compaction<'a>(
             }
             WalRecord::BudgetFired {
                 run_id: fired_run_id,
-                ordinal,
                 caller_text,
                 ..
             } => {
-                let budget = run_config
-                    .as_ref()
-                    .and_then(|config| config.budget.as_ref())
-                    .or(seeded_budget.as_ref());
-                let Some(budget) = budget else {
+                if !actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        PlacementAction::Append {
+                            kind: AppendKind::Budget,
+                            ..
+                        }
+                    )
+                }) {
                     // Read-only transcript assembly has no checkpoint budget seed. Preserve its
                     // established best-effort behavior; admission and projection fail closed.
                     continue;
-                };
-                let expected_ordinal = ordinal_base.saturating_add(prompt.len() as u64);
-                if *ordinal != expected_ordinal {
-                    return Err(ReplayError::CorruptLineage {
-                        episode_run_id: fired_run_id.clone(),
-                        reason: format!(
-                            "budget message ordinal {ordinal} does not match prompt position {expected_ordinal}"
-                        ),
-                    });
                 }
-
-                let expected_text = crate::budget_kernel::decide(&ep.budget, budget)
-                    .first()
-                    .map(|due| due.text.clone());
-                crate::budget_kernel::apply(
-                    crate::budget_kernel::State {
-                        facts: &mut ep.budget,
-                        config: Some(budget),
-                        run_id: run_id.as_ref(),
-                    },
-                    rec,
-                )
-                .map_err(|reason| ReplayError::CorruptLineage {
-                    episode_run_id: fired_run_id.clone(),
-                    reason,
-                })?;
-                let expected_text = expected_text.expect("accepted firing was due");
+                let expected_text = expected_budget_text.expect("accepted firing was due");
                 let text = match caller_text {
                     Some(text) if text == &expected_text => text.clone(),
                     Some(_) => {
@@ -1917,14 +2881,14 @@ fn replay_seeded_with_compaction<'a>(
                 retries_used,
                 ..
             } => {
-                if ep.completed_steps == 0 && *reason == RunFinishReason::Interrupted {
-                    if let Some(start) = ep.seeded_prompt_start {
-                        prompt.truncate(start);
+                for action in &actions {
+                    if let PlacementAction::Truncate { to } = action {
+                        prompt.truncate(to.saturating_sub(ordinal_base) as usize);
                     }
                 }
                 // A steer no later step rendered stays in the transcript exactly once, at the
                 // episode's close, after anything the terminal's barrier committed.
-                ep.place_steers(&mut prompt);
+                ep.place_steers(&mut prompt, &actions);
                 ep.finished = Some(*reason);
                 ep.retries_used = *retries_used;
                 // A terminal SEALS any earlier pause in this episode (e.g. a cancel of a
@@ -1994,7 +2958,7 @@ fn replay_seeded_with_compaction<'a>(
                 ep.paused = None;
                 ep.provider_call_started = true;
                 // Pending steers are rendered by this step, after everything before it.
-                ep.place_steers(&mut prompt);
+                ep.place_steers(&mut prompt, &actions);
                 // A step after a no-tool step means that step did not end the episode: the live
                 // loop continued to render a steer.
                 ep.natural_end = false;
@@ -2042,11 +3006,59 @@ fn replay_seeded_with_compaction<'a>(
             WalRecord::LateApprovalRecorded { .. }
             | WalRecord::LateDispatchIntent { .. }
             | WalRecord::LateResult { .. } => {}
+            // A held call stays open until its late result is written as its terminal; replay
+            // keeps it out of the indeterminate set so recovery never seals or re-sends it.
+            WalRecord::ToolCallProviderHeld {
+                tool_call_id,
+                call_key,
+                module,
+                reason,
+                detail_digest,
+                held_at_ms,
+                sequential,
+                ..
+            } => {
+                if let Some(batch) = &mut ep.open_batch {
+                    batch.provider_held.insert(
+                        tool_call_id.clone(),
+                        ProviderHeldCall {
+                            tool_call_id: tool_call_id.clone(),
+                            call_key: call_key.clone(),
+                            module: module.clone(),
+                            reason: reason.clone(),
+                            detail_digest: detail_digest.clone(),
+                            held_at_ms: *held_at_ms,
+                            sequential: *sequential,
+                        },
+                    );
+                }
+            }
             // These metadata records are omitted from prompt construction: they contain no messages.
             WalRecord::InputTokenCapFrozen { .. }
             | WalRecord::InputTokenBudgetExhausted { .. }
             | WalRecord::StructuredOutputResult { .. }
             | WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
+        }
+        // Placement is the authority for transcript positions, including a seeded prefix and
+        // steers held until a boundary. Assign its ordinals as each record places its messages.
+        let placed = actions
+            .iter()
+            .map(|action| match action {
+                PlacementAction::Append { count, .. }
+                | PlacementAction::PlaceHeld { count, .. } => *count as usize,
+                _ => 0,
+            })
+            .sum::<usize>();
+        let placed_start = prompt.len() - placed;
+        let mut newly_placed = prompt[placed_start..].iter_mut();
+        for action in &actions {
+            if let PlacementAction::Append { first, count, .. }
+            | PlacementAction::PlaceHeld { first, count } = *action
+            {
+                for ordinal in first..first + count {
+                    newly_placed.next().expect("placement message").ordinal = Some(ordinal);
+                }
+            }
         }
         message_runs.truncate(prompt.len());
         for message in &prompt[message_runs.len()..] {
@@ -2066,11 +3078,7 @@ fn replay_seeded_with_compaction<'a>(
                     .last()
                     .and_then(|run| run.as_ref())
                     .filter(|run| Some(&run.run_id) == run_id.as_ref().map(|id| &id.0))
-                    .and_then(|_| {
-                        ordinal_base
-                            .checked_add(prompt.len() as u64)?
-                            .checked_sub(1)
-                    })
+                    .and_then(|_| placement.next_ordinal().checked_sub(1))
                     .or_else(|| {
                         prompt
                             .is_empty()
@@ -2125,11 +3133,11 @@ fn replay_seeded_with_compaction<'a>(
     let run_finished_durable = ep.finished.is_some();
     let provider_call_started = ep.provider_call_started;
     let completed_steps = ep.completed_steps;
-    let tool_call_count = ep.budget.tool_call_count;
+    let tool_call_count = placement.budget().tool_call_count;
     // Checkpoints encode sorted indexes; the replay API retains its seed prefix followed
     // by new firings in threshold order. This is an output representation, not budget state.
-    let mut tail_nudge_indices: Vec<_> = ep
-        .budget
+    let mut tail_nudge_indices: Vec<_> = placement
+        .budget()
         .fired_nudge_indices
         .iter()
         .copied()
@@ -2146,8 +3154,8 @@ fn replay_seeded_with_compaction<'a>(
         .into_iter()
         .chain(tail_nudge_indices)
         .collect();
-    let budget_finalize_fired = ep.budget.finalize_fired;
-    let budget_finalize_pending = ep.budget.finalize_pending;
+    let budget_finalize_fired = placement.budget().finalize_fired;
+    let budget_finalize_pending = placement.budget().finalize_pending;
     let usage = ep.usage;
     let retries_used = ep.retries_used;
     let last_step_usage = ep.last_step_usage;
@@ -2179,21 +3187,27 @@ fn replay_seeded_with_compaction<'a>(
             .as_ref()
             .zip(ep.open_step_record)
             .map(|(assistant, step_record)| {
-                (
-                    tagged(
-                        Message {
-                            cache_prefix_blocks: None,
-                            role: Role::Assistant,
-                            content: assistant.content.clone(),
-                            origin: ep.origin.clone(),
-                            ordinal: None,
-                            tags: Default::default(),
-                        },
-                        ep.open_assistant_tags.as_ref(),
-                    ),
-                    step_record,
-                )
+                let mut message = tagged(
+                    Message {
+                        cache_prefix_blocks: None,
+                        role: Role::Assistant,
+                        content: assistant.content.clone(),
+                        origin: ep.origin.clone(),
+                        ordinal: None,
+                        tags: Default::default(),
+                    },
+                    ep.open_assistant_tags.as_ref(),
+                );
+                // Reads expose this turn before its batch commits. Commit appends it right
+                // after the numbered prompt, so number it now exactly as commit will: an
+                // exposed part that later gained a number would be a renumbering within the
+                // lineage.
+                numbering
+                    .number_pending(&mut message)
+                    .map_err(ReplayError::TagNumbering)?;
+                Ok::<_, ReplayError>((message, step_record))
             })
+            .transpose()?
     } else {
         None
     };
@@ -2212,7 +3226,7 @@ fn replay_seeded_with_compaction<'a>(
             ep.hard_stopped = Some(RunFinishReason::BudgetExhausted);
         }
     }
-    let mut resolution = classify(ep);
+    let mut resolution = classify(ep, run_id.as_ref(), cancel_at.is_some());
     if input_budget.exhausted().is_some() {
         match &mut resolution {
             ReplayResolution::Resume {
@@ -2221,7 +3235,8 @@ fn replay_seeded_with_compaction<'a>(
             | ReplayResolution::AuthRequired {
                 pending: Some(pending),
                 ..
-            } => {
+            }
+            | ReplayResolution::ProviderHeld { pending, .. } => {
                 // Recovery still needs the assistant and existing results to close the turn,
                 // but none of its unexecuted calls is authorized for redispatch.
                 pending.redispatch.clear();
@@ -2244,6 +3259,7 @@ fn replay_seeded_with_compaction<'a>(
             .as_ref()
             .is_some_and(|config| config.render_tags && config.computed_tags.is_some());
     Ok(ReplayState {
+        extent: placement.next_ordinal(),
         tags_await_setup,
         input_budget,
         cancel_at,
@@ -2278,76 +3294,28 @@ fn replay_seeded_with_compaction<'a>(
         open_tool_batch,
         pending_steers,
         resolution,
+        held: None,
     })
 }
 
 /// Return the newest WAL sequence after `watermark` that a materialized store may
 /// safely fold into its projection.
 ///
-/// This helper is the single authority for projection boundaries so every store advances
-/// its watermark under the same replay-domain rule. A `TurnFinished` is always safe. A
+/// Planning and offset indexing use the same eligibility fold. A `TurnFinished`
+/// is safe only with no steer pending across it. A
 /// no-tool `ModelStepFinished` becomes safe only when a later `RunFinished` closes the same
 /// episode; the boundary remains at the step so the terminal record stays in the WAL tail.
 pub fn latest_projection_boundary(
     records: &[broca_wal::FramedRecord],
     watermark: u64,
 ) -> Option<u64> {
-    let mut latest = None;
-    let mut pending_no_tool_steps = Vec::new();
-    let mut pending_zero_step_seed = None;
-    // Whether a steered message has been written but not yet placed by a step boundary. A
-    // boundary with a steer pending across it is never offered: the store would fold the
-    // records before it without the steer, and a tail replay starting after it would never
-    // see the steer's record, so the message would be lost from the materialized transcript.
-    let mut steer_pending = false;
-
-    for framed in records {
-        match &framed.record {
-            WalRecord::RunStarted { origin, .. } => {
-                pending_no_tool_steps.clear();
-                pending_zero_step_seed =
-                    matches!(origin, broca_wal::RunOrigin::SeededFrom { .. }).then_some(framed.seq);
-            }
-            WalRecord::Steered { .. } | WalRecord::SendDelivered { input: Some(_), .. } => {
-                steer_pending = true
-            }
-            WalRecord::ModelStepFinished {
-                assistant_message, ..
-            } if assistant_message.tool_calls().next().is_none() => {
-                pending_zero_step_seed = None;
-                if !steer_pending {
-                    pending_no_tool_steps.push(framed.seq);
-                }
-            }
-            WalRecord::StepStarted { .. } => {
-                pending_zero_step_seed = None;
-                steer_pending = false;
-            }
-            WalRecord::ModelStepFinished { .. } => {
-                pending_zero_step_seed = None;
-            }
-            WalRecord::RunFinished { .. } => {
-                steer_pending = false;
-                if let Some(seed_seq) = pending_zero_step_seed.take().filter(|seq| *seq > watermark)
-                {
-                    // Fold the imported prompt but leave RunFinished in the WAL tail so the
-                    // store-merge path retains the episode's durable idle classification.
-                    latest = Some(latest.map_or(seed_seq, |current: u64| current.max(seed_seq)));
-                }
-                for seq in pending_no_tool_steps.drain(..) {
-                    if seq > watermark {
-                        latest = Some(latest.map_or(seq, |current: u64| current.max(seq)));
-                    }
-                }
-            }
-            WalRecord::TurnFinished { .. } if !steer_pending && framed.seq > watermark => {
-                latest = Some(latest.map_or(framed.seq, |current: u64| current.max(framed.seq)));
-            }
-            _ => {}
-        }
-    }
-
-    latest
+    let mut state = crate::projection_plan::ProjectionBoundaryState::default();
+    records
+        .iter()
+        .flat_map(|frame| state.observe(frame))
+        .filter(|fact| fact.qualified && fact.seq > watermark)
+        .map(|fact| fact.seq)
+        .max()
 }
 
 /// A completed-step usage fold for one run id. The same durable records feed
@@ -2384,33 +3352,27 @@ impl RunUsageProjection {
             }
             WalRecord::ModelStepFinished { usage, .. } if self.active => {
                 if let Some((model, variant)) = &self.model {
-                    let mut step_usage = cortexkit_role_llm_runner::usage::StepUsage::unreported();
-                    if let Some(tokens) = usage.input_tokens {
-                        step_usage = step_usage.with_input_tokens(tokens);
-                    }
-                    if let Some(tokens) = usage.cached_input_tokens {
-                        step_usage = step_usage.with_cached_input_tokens(tokens);
-                    }
-                    if let Some(tokens) = usage.cache_write_tokens {
-                        step_usage = step_usage.with_cache_write_tokens(tokens);
-                    }
-                    if let Some(tokens) = usage.output_tokens {
-                        step_usage = step_usage.with_output_tokens(tokens);
-                    }
-                    if let Some(tokens) = usage.reasoning_tokens {
-                        step_usage = step_usage.with_reasoning_tokens(tokens);
-                    }
                     self.usage.record_step(
                         &model.provider_module_id,
                         &model.model_id,
                         variant.as_deref().filter(|value| !value.is_empty()),
-                        step_usage,
+                        reported_step_usage(usage),
                     );
                 }
             }
             _ => {}
         }
     }
+}
+
+pub(crate) fn reported_step_usage(usage: &Usage) -> cortexkit_role_llm_runner::usage::StepUsage {
+    let mut step = cortexkit_role_llm_runner::usage::StepUsage::unreported();
+    step.input_tokens = usage.input_tokens;
+    step.cached_input_tokens = usage.cached_input_tokens;
+    step.cache_write_tokens = usage.cache_write_tokens;
+    step.output_tokens = usage.output_tokens;
+    step.reasoning_tokens = usage.reasoning_tokens;
+    step
 }
 
 /// A run state reconciled from the WAL, including terminal metadata absent from the index.
@@ -2430,6 +3392,8 @@ pub struct ReconciledRunState {
     pub structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     /// Only the live actor fills this; WAL reconciliation never guesses an in-flight step.
     pub live_step: Option<broca_protocol::provider::InFlightStep>,
+    /// Provider-held calls without a durable terminal, in held-record order.
+    pub held_calls: Vec<cortexkit_role_llm_runner::run::HeldCall>,
     pub state: crate::RunIndexState,
     /// Durable steer send ids with no later StepStarted to give their input to the model,
     /// in WAL order. Reported only after the run ends: adding the input to the transcript
@@ -2476,6 +3440,12 @@ pub fn reconcile_run_state<'a>(
     let mut title: Option<String> = None;
     let mut budget_detail = None;
     let mut context_ceiling = None;
+    let mut tool_names = HashMap::new();
+    let mut held_calls: Vec<(
+        BatchId,
+        ToolCallId,
+        cortexkit_role_llm_runner::run::HeldCall,
+    )> = Vec::new();
     // The structured-output settings the target run froze, and the result it recorded.
     let mut frozen_structured_output = None;
     let mut structured_output_result = None;
@@ -2493,6 +3463,7 @@ pub fn reconcile_run_state<'a>(
                 ..
             } => {
                 if rid.0 == run_id {
+                    held_calls.clear();
                     auth_selection = config.auth_selection.clone();
                     title = started_title.clone();
                     frozen_structured_output =
@@ -2501,6 +3472,7 @@ pub fn reconcile_run_state<'a>(
                         );
                 }
                 active_run = Some(rid.0.clone());
+                tool_names.clear();
                 budget_detail = None;
                 context_ceiling = None;
                 pending_steer_ids.clear();
@@ -2518,6 +3490,7 @@ pub fn reconcile_run_state<'a>(
                         ceiling_deadline_ms: None,
                         structured_output: None,
                         live_step: None,
+                        held_calls: Vec::new(),
                         title: None,
                         state: RunIndexState::Active,
                         undelivered_steers: None,
@@ -2572,11 +3545,15 @@ pub fn reconcile_run_state<'a>(
                 result,
             } if rid.0 == run_id => structured_output_result = Some(result.clone()),
             WalRecord::ModelStepFinished {
+                assistant_message,
                 usage,
                 finish_reason,
                 retries_used,
                 ..
             } => {
+                for call in assistant_message.tool_calls() {
+                    tool_names.insert(call.tool_call_id.clone(), call.tool_name.clone());
+                }
                 active_zero_step_seed = false;
                 has_completed_step = true;
                 total_usage.accumulate(usage);
@@ -2590,15 +3567,60 @@ pub fn reconcile_run_state<'a>(
                 }
             }
             WalRecord::ToolBatchStarted { .. } => indeterminate_tool_calls.reset_batch(),
-            WalRecord::ToolDispatchIntent { tool_call_id, .. } => {
+            WalRecord::ToolDispatchIntent {
+                tool_call_id,
+                tool_name,
+                ..
+            } => {
+                if let Some(tool) = tool_name {
+                    tool_names
+                        .entry(tool_call_id.clone())
+                        .or_insert_with(|| tool.clone());
+                }
                 indeterminate_tool_calls.record_dispatch_intent(tool_call_id);
             }
-            WalRecord::ToolNoDispatch { tool_call_id, .. } => {
+            WalRecord::ToolCallProviderHeld {
+                batch_id,
+                tool_call_id,
+                call_key,
+                module,
+                reason,
+                held_at_ms,
+                ..
+            } if active_run.as_deref() == Some(run_id) => {
+                held_calls.push((
+                    batch_id.clone(),
+                    tool_call_id.clone(),
+                    cortexkit_role_llm_runner::run::HeldCall::new(
+                        call_key.clone(),
+                        tool_names.get(tool_call_id).cloned().unwrap_or_default(),
+                        module.clone(),
+                        reason.clone(),
+                        *held_at_ms,
+                    ),
+                ));
+            }
+            WalRecord::ToolNoDispatch {
+                batch_id,
+                tool_call_id,
+                ..
+            } => {
+                if active_run.as_deref() == Some(run_id) {
+                    held_calls.retain(|(batch, call, _)| batch != batch_id || call != tool_call_id);
+                }
                 indeterminate_tool_calls.record_dispatch_terminal(tool_call_id, false);
             }
             WalRecord::ToolResult {
-                result, outcome, ..
+                batch_id,
+                result,
+                outcome,
+                ..
             } => {
+                if active_run.as_deref() == Some(run_id) {
+                    held_calls.retain(|(batch, call, _)| {
+                        batch != batch_id || call != &result.tool_call_id
+                    });
+                }
                 indeterminate_tool_calls
                     .record_dispatch_terminal(&result.tool_call_id, outcome.is_indeterminate());
             }
@@ -2653,6 +3675,7 @@ pub fn reconcile_run_state<'a>(
                         ceiling_deadline_ms: None,
                         structured_output,
                         live_step: None,
+                        held_calls: Vec::new(),
                         title: None,
                         state,
                         undelivered_steers: Some(pending_steer_ids.clone()),
@@ -2681,6 +3704,7 @@ pub fn reconcile_run_state<'a>(
                     ceiling_deadline_ms: None,
                     structured_output: None,
                     live_step: None,
+                    held_calls: Vec::new(),
                     title: None,
                     state: RunIndexState::Paused,
                     undelivered_steers: None,
@@ -2712,6 +3736,7 @@ pub fn reconcile_run_state<'a>(
                     ceiling_deadline_ms: None,
                     structured_output: None,
                     live_step: None,
+                    held_calls: Vec::new(),
                     title: None,
                     state: RunIndexState::Error,
                     undelivered_steers: Some(Vec::new()),
@@ -2736,6 +3761,7 @@ pub fn reconcile_run_state<'a>(
             ceiling_deadline_ms: None,
             structured_output: None,
             live_step: None,
+            held_calls: Vec::new(),
             state: RunIndexState::Interrupted,
             undelivered_steers: Some(pending_steer_ids.clone()),
             final_step_finish_reason: None,
@@ -2745,12 +3771,18 @@ pub fn reconcile_run_state<'a>(
             retries_used: 0,
             error: None,
             pause_reason: None,
-            auth_selection: None,
+            auth_selection,
             title,
             ride_wait_deadline_ms: None,
         });
     }
     found.map(|state| ReconciledRunState {
+        held_calls: if matches!(state.state, RunIndexState::Active | RunIndexState::Paused) {
+            held_calls.into_iter().map(|(_, _, held)| held).collect()
+        } else {
+            Vec::new()
+        },
+        auth_selection,
         title,
         run_usage: run_usage.usage,
         ..state
@@ -2763,10 +3795,61 @@ pub fn reconcile_run_state<'a>(
 /// effects, so exactly-once execution requires `Interrupted`, never a retry. The producer currently
 /// pauses only at a step-entry boundary after the previous batch finished, but replay enforces this
 /// fail-closed rule as defense in depth.
-fn classify(ep: Episode) -> ReplayResolution {
+fn classify(ep: Episode, run_id: Option<&RunId>, cancelling: bool) -> ReplayResolution {
+    let closing = ep.open_batch.as_ref().is_some_and(|batch| {
+        batch.provider_held.keys().any(|id| {
+            batch
+                .planned
+                .iter()
+                .position(|planned| planned == id)
+                .is_some_and(|position| {
+                    matches!(
+                        batch.terminals[position],
+                        Some(Terminal::Result(
+                            _,
+                            DispatchOutcome::Interrupted | DispatchOutcome::MaxSteps,
+                            _
+                        ))
+                    )
+                })
+        })
+    });
+    if closing && ep.finished.is_none() {
+        return ReplayResolution::Interrupted {
+            indeterminate: ep.indeterminate,
+        };
+    }
+    if ep.finished.is_none() && ep.indeterminate.is_empty() && !cancelling {
+        if let Some(batch) = &ep.open_batch {
+            if !batch.provider_held.is_empty()
+                && (batch.terminals.iter().all(Option::is_some)
+                    || batch.planned.iter().enumerate().any(|(position, _)| {
+                        batch.call_state(position) == OpenCallState::ProviderHeld
+                    }))
+            {
+                if let (Some(run_id), Some(pending)) = (run_id, pending_turn(&ep)) {
+                    let open_held = pending
+                        .provider_held
+                        .iter()
+                        .map(|reply| reply.tool_call_id.clone())
+                        .collect();
+                    return ReplayResolution::ProviderHeld {
+                        run_id: run_id.clone(),
+                        pending,
+                        open_held,
+                    };
+                }
+            }
+        }
+    }
     // A non-terminal pause is resumable, not finished — check it FIRST so a paused
     // episode is never read as terminal (which would seal a resumable run).
-    if ep.paused.is_some() && ep.indeterminate.is_empty() {
+    if ep
+        .paused
+        .as_ref()
+        .is_some_and(|(_, reason, _)| *reason != PauseReason::ToolHeld)
+        && ep.indeterminate.is_empty()
+    {
         let pending = pending_turn(&ep);
         let (run_id, reason, error) = match ep.paused {
             Some(paused) => paused,
@@ -2860,6 +3943,23 @@ fn pending_turn(ep: &Episode) -> Option<PendingTurn> {
             redispatch: b.redispatchable(),
             deferred: b.prepared_in_state(OpenCallState::Deferred),
             approved: b.prepared_in_state(OpenCallState::Approved),
+            provider_held: b
+                .planned
+                .iter()
+                .enumerate()
+                .filter_map(|(position, id)| {
+                    (b.call_state(position) == OpenCallState::ProviderHeld)
+                        .then(|| b.provider_held.get(id).cloned())
+                        .flatten()
+                })
+                .collect(),
+            held_successors: b
+                .planned
+                .iter()
+                .enumerate()
+                .filter(|(position, _)| b.call_state(*position) == OpenCallState::HeldSuccessor)
+                .map(|(_, id)| id.clone())
+                .collect(),
             assistant_tags: ep.open_assistant_tags.clone(),
             existing_tags: b.existing_tags(),
         },
@@ -2879,6 +3979,8 @@ fn pending_turn(ep: &Episode) -> Option<PendingTurn> {
                 existing: Vec::new(),
                 deferred: Vec::new(),
                 approved: Vec::new(),
+                provider_held: Vec::new(),
+                held_successors: Vec::new(),
                 assistant_tags: ep.open_assistant_tags.clone(),
                 existing_tags: Vec::new(),
             }
@@ -2969,6 +4071,7 @@ pub(crate) mod projection_boundary_tests {
         framed(
             seq,
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(step_id),
@@ -3027,6 +4130,7 @@ pub(crate) mod projection_boundary_tests {
         framed(
             seq,
             WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -3094,6 +4198,10 @@ pub(crate) mod projection_boundary_tests {
             unreachable!("fixture starts a run")
         };
         ProjectionSeed {
+            projection_episodes: None,
+            open_episode_span: Some(1),
+            open_episode: None,
+            earlier_episodes: Vec::new(),
             deferred_calls: None,
             watermark_seq: 8,
             anchor: None,
@@ -3114,6 +4222,7 @@ pub(crate) mod projection_boundary_tests {
             trailing_origin: Some(ModelHandle::new("stub", "old-model")),
             last_run_id: Some(RunId("r1".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                head: None,
                 has_deferred_calls: None,
                 tags: None,
                 pending_order: None,
@@ -3526,6 +4635,7 @@ pub(crate) mod deferred_tests {
 
     pub(crate) fn prepared(id: &str, batch: &str) -> WalRecord {
         WalRecord::ToolCallDeferred {
+            deferred_at_ms: None,
             batch_id: BatchId(batch.into()),
             call_id: ToolCallId(id.into()),
             executor: DeferredExecutor::Broca,
@@ -3559,6 +4669,7 @@ pub(crate) mod deferred_tests {
 
     pub(crate) fn approval(id: &str, key: &str, decision: DeferredDecision) -> WalRecord {
         WalRecord::ApprovalRecorded {
+            closed_at_ms: None,
             tags: None,
             call_key: key.into(),
             call_id: ToolCallId(id.into()),
@@ -3583,6 +4694,7 @@ pub(crate) mod deferred_tests {
         vec![
             super::projection_boundary_tests::run_started(1, "r").record,
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(1),
@@ -3616,6 +4728,7 @@ pub(crate) mod deferred_tests {
 
     pub(crate) fn terminal(id: &str, withdrawal: Option<WithdrawElicitation>) -> WalRecord {
         WalRecord::ToolResult {
+            finished_at_ms: None,
             tags: None,
             hooks: None,
             batch_id: BatchId("b".into()),
@@ -3798,6 +4911,7 @@ pub(crate) mod deferred_tests {
             prepared("approved", "b"),
             approval("approved", "key-approved", DeferredDecision::Approved),
             WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 hooks: None,
                 batch_id: BatchId("b".into()),
                 tool_call_id: ToolCallId("approved".into()),
@@ -3856,5 +4970,1475 @@ pub(crate) mod deferred_tests {
                 before
             );
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod provider_held_tests {
+    use super::*;
+
+    pub(crate) fn intent(id: &str) -> WalRecord {
+        WalRecord::ToolDispatchIntent {
+            dispatched_at_ms: None,
+            batch_id: BatchId("b".into()),
+            tool_call_id: ToolCallId(id.into()),
+            tool_name: Some("edit".into()),
+            args: Arc::new(serde_json::json!({"n":1})),
+            module_id: Some("tools".into()),
+            schema_pin: None,
+            hooks: None,
+            approval_digest: None,
+            call_key: None,
+        }
+    }
+
+    pub(crate) fn held(sequential: bool) -> WalRecord {
+        WalRecord::ToolCallProviderHeld {
+            batch_id: BatchId("b".into()),
+            tool_call_id: ToolCallId("a".into()),
+            call_key: "lineage:4".into(),
+            module: "tools".into(),
+            reason: "running".into(),
+            detail_digest: None,
+            held_at_ms: 42,
+            sequential,
+        }
+    }
+
+    pub(crate) fn terminal(id: &str, outcome: DispatchOutcome) -> WalRecord {
+        WalRecord::ToolResult {
+            finished_at_ms: None,
+            batch_id: BatchId("b".into()),
+            result: deferred_tests::result(id, "answer"),
+            outcome,
+            reason: None,
+            tags: None,
+            hooks: None,
+            withdraw_elicitation: None,
+            provider_held: None,
+        }
+    }
+
+    pub(crate) fn prefix(sequential: bool) -> Vec<WalRecord> {
+        let mut records = deferred_tests::batch(&["a", "b"]);
+        records.extend([intent("a"), intent("b"), held(sequential)]);
+        records
+    }
+
+    #[test]
+    fn held_calls_status_rebuilds_live_and_paused_calls_and_drops_each_terminal() {
+        let mut records = prefix(false);
+        let held_a = serde_json::json!({
+            "call_key": "lineage:4", "tool": "edit", "provider": "tools",
+            "reason": "running", "held_at_ms": 42
+        });
+        let status = |records: &[WalRecord]| reconcile_run_state(records, "r").unwrap();
+        let live = status(&records);
+        assert_eq!(live.state, crate::RunIndexState::Active);
+        assert_eq!(
+            serde_json::to_value(&live.held_calls).unwrap(),
+            serde_json::json!([held_a])
+        );
+
+        // The assistant's tool name remains authoritative when the optional intent name is absent.
+        let WalRecord::ToolDispatchIntent { tool_name, .. } = &mut records[3] else {
+            panic!("expected first dispatch intent")
+        };
+        *tool_name = None;
+        assert_eq!(status(&records).held_calls, live.held_calls);
+        let mut second = held(false);
+        if let WalRecord::ToolCallProviderHeld {
+            tool_call_id,
+            call_key,
+            reason,
+            ..
+        } = &mut second
+        {
+            *tool_call_id = ToolCallId("b".into());
+            *call_key = "lineage:5".into();
+            *reason = "future_reason".into();
+        }
+        records.push(second);
+        records.push(WalRecord::RunPaused {
+            run_id: RunId("r".into()),
+            reason: PauseReason::ToolHeld,
+            error: None,
+            ts_ms: Some(43),
+        });
+        let paused = status(&records);
+        assert_eq!(paused.state, crate::RunIndexState::Paused);
+        assert_eq!(paused.held_calls.len(), 2);
+        assert_eq!(paused.held_calls[1].reason(), "future_reason");
+        let restored: Vec<WalRecord> =
+            serde_json::from_slice(&serde_json::to_vec(&records).unwrap()).unwrap();
+        assert_eq!(status(&restored).held_calls, paused.held_calls);
+
+        for outcome in [
+            DispatchOutcome::Completed,
+            DispatchOutcome::Interrupted,
+            DispatchOutcome::MaxSteps,
+            DispatchOutcome::Unknown,
+        ] {
+            let mut closed = records.clone();
+            closed.push(terminal("a", outcome));
+            assert_eq!(status(&closed).held_calls, paused.held_calls[1..]);
+            closed.push(terminal("b", outcome));
+            assert!(
+                status(&closed).held_calls.is_empty(),
+                "held calls must disappear at their terminals, before the batch barrier"
+            );
+        }
+        records.push(WalRecord::ToolNoDispatch {
+            dispatched_at_ms: None,
+            hooks: None,
+            tags: None,
+            batch_id: BatchId("b".into()),
+            tool_call_id: ToolCallId("a".into()),
+            reason: NoDispatchReason::Unavailable {
+                detail: "unavailable".into(),
+            },
+        });
+        assert_eq!(status(&records).held_calls, paused.held_calls[1..]);
+        assert!(status(&deferred_tests::batch(&["a"])).held_calls.is_empty());
+    }
+
+    #[test]
+    fn provider_held_and_sequential_successor_are_not_indeterminate() {
+        let records = prefix(true);
+        let state = replay(&records).unwrap();
+        assert_eq!(
+            state.open_tool_batch.as_ref().unwrap().calls,
+            vec![
+                (ToolCallId("a".into()), OpenCallState::ProviderHeld),
+                (ToolCallId("b".into()), OpenCallState::HeldSuccessor),
+            ]
+        );
+        let ReplayResolution::ProviderHeld {
+            pending, open_held, ..
+        } = &state.resolution
+        else {
+            panic!("{:?}", state.resolution)
+        };
+        assert_eq!(open_held, &[ToolCallId("a".into())]);
+        assert_eq!(pending.held_successors, [ToolCallId("b".into())]);
+        assert!(pending.redispatch.is_empty());
+        assert!(
+            matches!(crate::resume::resume_started_record(&state, 6, vec![]), WalRecord::ResumeStarted { indeterminate, .. } if indeterminate.is_empty())
+        );
+        for reason in [PauseReason::ToolHeld, PauseReason::Restart] {
+            let mut paused = records.clone();
+            paused.push(WalRecord::RunPaused {
+                run_id: RunId("r".into()),
+                reason,
+                error: None,
+                ts_ms: None,
+            });
+            assert!(matches!(
+                replay(&paused).unwrap().resolution,
+                ReplayResolution::ProviderHeld { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn delivered_held_terminal_makes_both_successor_kill_points_interrupted() {
+        let mut records = prefix(true);
+        records.push(terminal("a", DispatchOutcome::Completed));
+        // No durable boundary separates a successor just before send from one already sent.
+        for _kill_after_send in [false, true] {
+            let state = replay(&records).unwrap();
+            assert_eq!(
+                state.open_tool_batch.as_ref().unwrap().calls[1].1,
+                OpenCallState::Dispatched
+            );
+            assert_eq!(
+                state.resolution,
+                ReplayResolution::Interrupted {
+                    indeterminate: vec![ToolCallId("b".into())]
+                }
+            );
+            let close = crate::resume::close_out_open_batch(&state, |_| {
+                crate::resume::DeferredCloseKind::NotDispatched
+            });
+            assert_eq!(
+                close
+                    .iter()
+                    .filter(|record| matches!(record, WalRecord::ToolResult { .. }))
+                    .count(),
+                1
+            );
+            assert!(
+                matches!(&close[0], WalRecord::ToolResult { result, outcome: DispatchOutcome::Unknown, .. } if result.tool_call_id.0 == "b")
+            );
+        }
+        records.push(terminal("b", DispatchOutcome::Completed));
+        assert!(
+            matches!(replay(&records).unwrap().resolution, ReplayResolution::ProviderHeld { open_held, .. } if open_held.is_empty())
+        );
+        records.push(WalRecord::ToolBatchFinished {
+            batch_id: BatchId("b".into()),
+        });
+        assert!(matches!(
+            replay(&records).unwrap().resolution,
+            ReplayResolution::Resume { pending: None }
+        ));
+    }
+
+    #[test]
+    fn provider_held_parallel_indeterminate_sibling_uses_full_close_out() {
+        let state = replay(&prefix(false)).unwrap();
+        assert_eq!(
+            state.resolution,
+            ReplayResolution::Interrupted {
+                indeterminate: vec![ToolCallId("b".into())]
+            }
+        );
+        let close = crate::resume::close_out_open_batch(&state, |_| {
+            crate::resume::DeferredCloseKind::NotDispatched
+        });
+        assert!(
+            matches!(&close[0], WalRecord::ToolResult { outcome: DispatchOutcome::Interrupted, reason: Some(reason), .. } if reason == "provider_held_interrupted")
+        );
+        assert!(matches!(
+            &close[1],
+            WalRecord::ToolResult {
+                outcome: DispatchOutcome::Unknown,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn closed_out_held_predecessor_keeps_successor_never_sent() {
+        for outcome in [DispatchOutcome::Interrupted, DispatchOutcome::MaxSteps] {
+            let mut records = prefix(true);
+            records.push(terminal("a", outcome));
+            let state = replay(&records).unwrap();
+            assert_eq!(
+                state.open_tool_batch.as_ref().unwrap().calls[1].1,
+                OpenCallState::HeldSuccessor
+            );
+            assert!(
+                matches!(state.resolution, ReplayResolution::Interrupted { ref indeterminate } if indeterminate.is_empty())
+            );
+            let close = crate::resume::close_out_open_batch(&state, |_| {
+                crate::resume::DeferredCloseKind::NotDispatched
+            });
+            assert!(
+                matches!(&close[0], WalRecord::ToolResult { result, outcome: DispatchOutcome::Interrupted, .. } if result.tool_call_id.0 == "b")
+            );
+        }
+    }
+
+    #[test]
+    fn held_and_ordinary_tool_turns_share_placement_and_model_bytes() {
+        use crate::placement::{AppendKind, Placement, PlacementAction};
+        let mut delayed = prefix(false);
+        delayed.push(terminal("b", DispatchOutcome::Completed));
+        delayed.push(WalRecord::RunPaused {
+            run_id: RunId("r".into()),
+            reason: PauseReason::ToolHeld,
+            error: None,
+            ts_ms: Some(43),
+        });
+        let mut placement = Placement::default();
+        for record in &delayed {
+            placement.observe(record).unwrap();
+        }
+        let before = placement.next_ordinal();
+        assert_eq!(before, replay(&delayed).unwrap().prompt.len() as u64);
+        let delivered = terminal("a", DispatchOutcome::Completed);
+        assert!(placement.observe(&delivered).unwrap().is_empty());
+        delayed.push(delivered);
+        assert_eq!(
+            placement.next_ordinal(),
+            before,
+            "a delivered terminal still owes its batch barrier"
+        );
+        assert!(
+            matches!(replay(&delayed).unwrap().resolution, ReplayResolution::ProviderHeld { open_held, .. } if open_held.is_empty())
+        );
+        let barrier = WalRecord::ToolBatchFinished {
+            batch_id: BatchId("b".into()),
+        };
+        assert_eq!(
+            placement.observe(&barrier).unwrap(),
+            vec![PlacementAction::Append {
+                first: before,
+                count: 2,
+                kind: AppendKind::ToolTurn
+            }]
+        );
+        delayed.push(barrier.clone());
+        let mut ordinary = deferred_tests::batch(&["a", "b"]);
+        ordinary.extend([
+            intent("a"),
+            intent("b"),
+            terminal("a", DispatchOutcome::Completed),
+            terminal("b", DispatchOutcome::Completed),
+            barrier,
+        ]);
+        let held_prompt = replay(&delayed).unwrap().prompt;
+        let ordinary_prompt = replay(&ordinary).unwrap().prompt;
+        assert_eq!(placement.next_ordinal(), held_prompt.len() as u64);
+        assert_eq!(
+            crate::canonical_request_bytes(&broca_protocol::CallOptions::new(held_prompt)),
+            crate::canonical_request_bytes(&broca_protocol::CallOptions::new(ordinary_prompt))
+        );
+    }
+
+    #[test]
+    fn provider_held_with_approval_retains_approved_argument_bytes() {
+        let mut records = deferred_tests::batch(&["a", "b"]);
+        records.extend([
+            intent("a"),
+            held(false),
+            deferred_tests::prepared("b", "b"),
+            deferred_tests::approval("b", "lineage:6", DeferredDecision::Approved),
+        ]);
+        let state = replay(&records).unwrap();
+        let ReplayResolution::ProviderHeld { pending, .. } = state.resolution else {
+            panic!("not provider-held")
+        };
+        assert_eq!(pending.approved.len(), 1);
+        assert!(
+            matches!(&*pending.approved[0].prepared, WalRecord::ToolCallDeferred { args_jcs, .. } if args_jcs == "{\"n\":1}")
+        );
+    }
+    /// One held call's records as `FramedRecord`s, the shape a registration's WAL read returns.
+    fn framed(records: Vec<WalRecord>) -> Vec<FramedRecord> {
+        records
+            .into_iter()
+            .enumerate()
+            .map(|(index, record)| FramedRecord {
+                seq: index as u64 + 2,
+                fence: 1,
+                record,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_registered_call_needs_its_feed_only_while_it_is_held() {
+        // The registered read of a held call: it names the call, reports its held record and its
+        // sequential successor, and keeps the feed alive.
+        let held_read = held_call_facts(&framed(prefix(true)), Some("lineage:4"));
+        assert!(held_read.needs_intake());
+        assert_eq!(held_read.held.len(), 1);
+        assert_eq!(held_read.held_successors, vec![ToolCallId("b".into())]);
+        // Once the held call has its terminal the same read needs nothing, though it still
+        // reports the call so its entry can be classed.
+        let mut settled = prefix(true);
+        // The entries of a closed-out or delivered call are still reported by a read that names
+        // it, so its late entry can be classed.
+        settled.push(terminal("a", DispatchOutcome::Completed));
+        let settled_read = held_call_facts(&framed(settled.clone()), Some("lineage:4"));
+        assert!(!settled_read.needs_intake());
+        assert_eq!(settled_read.held.len(), 1);
+        // A read that names no call reports the WAL's held records but no successors, which no
+        // delivery needs.
+        let unnamed = held_call_facts(&framed(settled), None);
+        assert_eq!(unnamed.held.len(), 1);
+        assert!(unnamed.held_successors.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod projected_episode_tests {
+    use super::episodes_with_first_steps;
+    use broca_protocol::request::EpisodeRenderInput;
+
+    #[test]
+    fn an_episode_without_a_model_step_takes_no_other_episodes_step() {
+        let render = |start: usize| EpisodeRenderInput {
+            prompt_start: start,
+            first_user: Some(start),
+            frozen_config: serde_json::json!({}),
+        };
+        // The first episode ended before any model step; only the second has one.
+        let projected = episodes_with_first_steps(&[render(0), render(3)], &[4]);
+        assert_eq!(
+            projected
+                .iter()
+                .map(|episode| episode.first_step)
+                .collect::<Vec<_>>(),
+            vec![Some(None), Some(Some(4))]
+        );
+    }
+}
+
+/// Offset tail replay: the indexed prefix holds messages by offset and the
+/// tail is replayed from the indexed sequence with held steers seeded.
+///
+/// These tests pin the seeded tail against a full replay at every cut, including the
+/// corpus edge cases page assembly must preserve. They run on records, not bytes,
+/// so a byte-level offset reader that decodes the same records inherits the property.
+#[cfg(test)]
+mod offset_tail_tests {
+    use std::sync::Arc;
+
+    use broca_protocol::{
+        caller::RunFinishReason,
+        content::{
+            AssistantMessage, ContentBlock, Message, Role, ToolCall, ToolOutput, ToolResult,
+        },
+        request::ModelHandle,
+        BatchId, BindIdentity, Delivery, MessageId, RunId, StepId, ToolCallId, Usage,
+    };
+    use broca_wal::{
+        CompactionMessageKind, DispatchOutcome, FramedRecord, RunConfig, RunOrigin,
+        SetupTagCheckpoint, WalRecord,
+    };
+
+    use super::{
+        replay, replay_seeded_at_validated_boundary, replay_seeded_with_held_steers,
+        tail_contains_compaction_setup, PositionedFrame, SeedBoundary,
+    };
+    use sha2::Digest;
+
+    fn user(text: &str) -> Message {
+        Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }])
+    }
+
+    fn run_config() -> Box<RunConfig> {
+        Box::new(RunConfig {
+            turn_directives_v1: None,
+            render_tags: false,
+            computed_tags: None,
+            model: ModelHandle::new("stub", "m"),
+            tools: vec![].into(),
+            tool_choice: Default::default(),
+            generation: Default::default(),
+            response_format: Default::default(),
+            provider_options: serde_json::Value::Null,
+            cache_tiers: serde_json::Value::Null,
+            context_epoch: 0,
+            renderer_version: 1,
+            frozen_render_config: serde_json::Value::Null,
+            auth_selection: None,
+            tools_were_omitted: false,
+            budget: None,
+            context_limit: None,
+            work_class: None,
+            variant: None,
+            service_tier: None,
+            stop_when: Vec::new(),
+            context_management: None,
+        })
+    }
+
+    fn run_started(run_id: &str, input: Vec<Message>) -> WalRecord {
+        WalRecord::RunStarted {
+            written_at_ms: None,
+            tags: None,
+            session_class: None,
+            retention: None,
+            hooks: None,
+            title: None,
+            on_restart: None,
+            keep_warm: None,
+            marker_order_version: None,
+            manifest: None,
+            scope: None,
+            send_id: None,
+            request_identity_digest: None,
+            project_id: None,
+            principal: None,
+            ts_ms: None,
+            run_id: RunId(run_id.into()),
+            session: BindIdentity::new("/tmp/project", "runner", "session"),
+            config: run_config(),
+            input: input.into(),
+            origin: RunOrigin::Fresh,
+            submission_id: None,
+        }
+    }
+
+    fn seeded_run_started(run_id: &str, input: Vec<Message>) -> WalRecord {
+        let mut record = run_started(run_id, input);
+        if let WalRecord::RunStarted { origin, .. } = &mut record {
+            *origin = RunOrigin::SeededFrom {
+                origin_kind: broca_wal::SeedOriginKind::Import,
+                source_ref: "fixture:import".into(),
+                origin_device_pseudonym: None,
+                base_seq: None,
+            };
+        }
+        record
+    }
+
+    fn steered(text: &str) -> WalRecord {
+        WalRecord::Steered {
+            written_at_ms: None,
+            tags: None,
+            retention: None,
+            ts_ms: None,
+            title: None,
+            send_id: Some(format!("steer-{text}")),
+            request_identity_digest: None,
+            delivery: Some(Delivery::Steer),
+            input: Arc::new(vec![user(text)]),
+            hooks: None,
+        }
+    }
+
+    fn step_started(step: u64) -> WalRecord {
+        WalRecord::StepStarted {
+            step_id: StepId(step),
+        }
+    }
+
+    fn text_step(step: u64, text: &str) -> WalRecord {
+        WalRecord::ModelStepFinished {
+            written_at_ms: None,
+            tags: None,
+            hooks: None,
+            step_id: StepId(step),
+            assistant_message: Arc::new(AssistantMessage {
+                message_id: MessageId(format!("m{step}")),
+                content: vec![ContentBlock::Text { text: text.into() }],
+            }),
+            usage: Usage::default(),
+            finish_reason: None,
+            retries_used: 0,
+            service_tier_used: None,
+            speed_used: None,
+        }
+    }
+
+    fn run_finished(reason: RunFinishReason) -> WalRecord {
+        WalRecord::RunFinished {
+            interrupt_reason: None,
+            ts_ms: None,
+            reason,
+            usage: Usage::default(),
+            error: None,
+            retries_used: 0,
+        }
+    }
+
+    fn setup_message(seq: u64) -> FramedRecord {
+        FramedRecord {
+            seq,
+            fence: 1,
+            record: WalRecord::CompactionMessage {
+                provider: "test".into(),
+                kind: CompactionMessageKind::Setup,
+                compaction_id: "cmp-1".into(),
+                version: 1,
+                range: broca_wal::CompactionRange { from: 0, to: 0 },
+                replacement: Arc::new(Vec::new()),
+                sha256: "0".repeat(64),
+                request_id: None,
+                cursor: None,
+                call_when: None,
+                stability: None,
+                ceiling: None,
+                tag_checkpoint: Some(SetupTagCheckpoint {
+                    tag_checkpoint: 7,
+                    cut: "m1".into(),
+                }),
+                ride_wait_ms: None,
+            },
+        }
+    }
+
+    fn framed(seq: u64, record: WalRecord) -> FramedRecord {
+        FramedRecord {
+            seq,
+            fence: 1,
+            record,
+        }
+    }
+
+    /// The corpus edge cases page assembly must preserve, as one WAL: a tool
+    /// turn whose results arrive in reverse plan order, a `RunFinished` that adds no
+    /// message, a second episode, and a steer held across the first episode's close.
+    fn corpus_records() -> Vec<WalRecord> {
+        let mut records = vec![run_started("r1", vec![user("task")]), step_started(1)];
+        // One model step with two tool calls, planned as [a, b] but arriving as [b, a].
+        // The tools message orders results by plan, not by arrival.
+        records.push(WalRecord::ModelStepFinished {
+            written_at_ms: None,
+            tags: None,
+            hooks: None,
+            step_id: StepId(1),
+            assistant_message: Arc::new(AssistantMessage {
+                message_id: MessageId("m1".into()),
+                content: vec![
+                    ContentBlock::ToolCall(ToolCall {
+                        tool_call_id: ToolCallId("a".into()),
+                        tool_name: "work".into(),
+                        input: serde_json::json!({}),
+                        thought_signature: None,
+                    }),
+                    ContentBlock::ToolCall(ToolCall {
+                        tool_call_id: ToolCallId("b".into()),
+                        tool_name: "work".into(),
+                        input: serde_json::json!({}),
+                        thought_signature: None,
+                    }),
+                ],
+            }),
+            usage: Usage::default(),
+            finish_reason: None,
+            retries_used: 0,
+            service_tier_used: None,
+            speed_used: None,
+        });
+        let batch_id = BatchId("r1-b1".into());
+        records.push(WalRecord::ToolBatchStarted {
+            batch_id: batch_id.clone(),
+            step_id: StepId(1),
+            planned_calls: vec![ToolCallId("a".into()), ToolCallId("b".into())],
+        });
+        for call in ["a", "b"] {
+            records.push(WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
+                hooks: None,
+                batch_id: batch_id.clone(),
+                tool_call_id: ToolCallId(call.into()),
+                tool_name: Some("work".into()),
+                args: Arc::new(serde_json::json!({})),
+                module_id: None,
+                schema_pin: None,
+                approval_digest: None,
+                call_key: None,
+            });
+        }
+        for call in ["b", "a"] {
+            records.push(WalRecord::ToolResult {
+                finished_at_ms: None,
+                tags: None,
+                hooks: None,
+                batch_id: batch_id.clone(),
+                result: Arc::new(ToolResult {
+                    tool_call_id: ToolCallId(call.into()),
+                    output: ToolOutput::Text {
+                        text: format!("out-{call}"),
+                    },
+                    is_error: false,
+                }),
+                outcome: DispatchOutcome::Completed,
+                reason: None,
+                withdraw_elicitation: None,
+                provider_held: None,
+            });
+        }
+        records.push(WalRecord::ToolBatchFinished { batch_id });
+        records.push(WalRecord::TurnFinished { step_id: StepId(1) });
+        records.push(steered("held-across-close"));
+        // The terminal adds no message; the held steer lands at the close.
+        records.push(run_finished(RunFinishReason::Completed));
+        // A second episode under a new run id.
+        records.push(run_started("r2", vec![user("next")]));
+        records.push(step_started(1));
+        records.push(text_step(1, "answer"));
+        records.push(run_finished(RunFinishReason::Completed));
+        records
+    }
+
+    fn non_attributable_records() -> Vec<WalRecord> {
+        // An import-seeded episode: messages render, but no run owns them.
+        vec![
+            seeded_run_started("seed", vec![user("imported")]),
+            run_finished(RunFinishReason::Completed),
+        ]
+    }
+
+    fn prompt_shape(prompt: &[Message]) -> Vec<(Role, String)> {
+        prompt
+            .iter()
+            .map(|message| {
+                let label = match message.content.first() {
+                    Some(ContentBlock::Text { text }) => text.clone(),
+                    Some(ContentBlock::ToolCall(_)) => "call".into(),
+                    Some(ContentBlock::ToolResult(_)) => "result".into(),
+                    _ => String::new(),
+                };
+                (message.role, label)
+            })
+            .collect()
+    }
+
+    /// Seeds a tail replay at `cut` from the prefix replay, mirroring what the offset
+    /// index stores: the episode origin, run id and budget of the open episode, the
+    /// ordinal base, and the steers still held at the cut.
+    fn tail_state_at_cut(records: &[WalRecord], cut: usize) -> (Vec<Message>, super::ReplayState) {
+        let prefix = replay(&records[..cut]).unwrap();
+        let suffix: Vec<WalRecord> = records[cut..].to_vec();
+        let held = prefix.pending_steers.clone();
+        let tail = replay_seeded_with_held_steers(
+            &suffix,
+            prefix
+                .run_config
+                .as_ref()
+                .map(|config| config.model.clone())
+                .or(prefix
+                    .prompt
+                    .iter()
+                    .find_map(|message| message.origin.clone())),
+            prefix.run_id.clone(),
+            prefix
+                .run_config
+                .as_ref()
+                .and_then(|config| config.budget.clone()),
+            None,
+            prefix.prompt.len() as u64,
+            false,
+            crate::tags::TagSeed::default(),
+            held.clone(),
+        )
+        .unwrap();
+        (held, tail)
+    }
+
+    #[test]
+    fn tail_seeds_held_steers() {
+        // A steer held before the first step boundary must appear once, at that
+        // boundary, when the tail is replayed with it seeded.
+        let records = vec![
+            run_started("r1", vec![user("task")]),
+            steered("held"),
+            step_started(1),
+            text_step(1, "answer"),
+            run_finished(RunFinishReason::Completed),
+        ];
+        let full = replay(&records).unwrap();
+        assert_eq!(
+            prompt_shape(&full.prompt),
+            vec![
+                (Role::User, "task".into()),
+                (Role::User, "held".into()),
+                (Role::Assistant, "answer".into()),
+            ]
+        );
+        // The cut falls after the steer is recorded but before its step boundary:
+        // the prefix holds it, the tail has not seen it.
+        let cut = 2;
+        let prefix = replay(&records[..cut]).unwrap();
+        assert_eq!(
+            prompt_shape(&prefix.pending_steers),
+            vec![(Role::User, "held".into())]
+        );
+        let tail_records: Vec<WalRecord> = records[cut..].to_vec();
+        let seeded = replay_seeded_with_held_steers(
+            &tail_records,
+            None,
+            prefix.run_id.clone(),
+            None,
+            None,
+            prefix.prompt.len() as u64,
+            false,
+            crate::tags::TagSeed::default(),
+            prefix.pending_steers.clone(),
+        )
+        .unwrap();
+        let mut merged = prefix.prompt.clone();
+        merged.extend(seeded.prompt.clone());
+        assert_eq!(prompt_shape(&merged), prompt_shape(&full.prompt));
+        // Without the seed the held steer is lost: the seeded tail is the only one
+        // that equals the full replay. This is the break the seeding guards.
+        let unseeded = super::replay_seeded(
+            &tail_records,
+            None,
+            prefix.run_id.clone(),
+            None,
+            None,
+            prefix.prompt.len() as u64,
+            false,
+            crate::tags::TagSeed::default(),
+        )
+        .unwrap();
+        assert_ne!(prompt_shape(&unseeded.prompt), prompt_shape(&seeded.prompt));
+        assert_eq!(unseeded.prompt.len() + 1, seeded.prompt.len());
+    }
+
+    #[test]
+    fn tail_replay_equals_full_replay_at_every_cut() {
+        for records in [corpus_records(), non_attributable_records()] {
+            let full = replay(&records).unwrap();
+            for cut in 0..=records.len() {
+                let prefix = replay(&records[..cut]);
+                // A cut inside a corrupt lineage is not a servable prefix; the full
+                // replay and the prefix replay refuse it together.
+                let prefix = match prefix {
+                    Ok(prefix) => prefix,
+                    Err(_) => {
+                        assert!(replay(&records).is_err());
+                        continue;
+                    }
+                };
+                // The index commits whole turns: a cut inside an open tool turn has no
+                // rows for that turn, and its tail needs the turn's held assistant and
+                // batch plan, not just held steers. Those cuts are not servable prefix
+                // boundaries, so the seeded tail is only required to match at cuts
+                // where no tool turn is open. Detect an open turn by scanning for a
+                // tool-call step without its TurnFinished or RunFinished.
+                if tool_turn_open(&records[..cut]) {
+                    continue;
+                }
+                let (_held, tail) = tail_state_at_cut(&records, cut);
+                let mut merged = prefix.prompt.clone();
+                merged.extend(tail.prompt.clone());
+                assert_eq!(
+                    prompt_shape(&merged),
+                    prompt_shape(&full.prompt),
+                    "merged tail at cut {cut} of {} records",
+                    records.len()
+                );
+                // Attributable episodes keep their run; the import episode owns nothing.
+                assert_eq!(merged.len(), full.prompt.len(), "cut {cut}");
+            }
+        }
+    }
+
+    /// Whether the prefix ends inside an open tool turn: a model step with tool calls
+    /// whose batch has not finished and whose episode has not closed. The offset index
+    /// holds no rows for that turn yet, so no read splits the prefix here.
+    fn tool_turn_open(prefix: &[WalRecord]) -> bool {
+        let mut open = false;
+        for record in prefix {
+            match record {
+                WalRecord::ModelStepFinished {
+                    assistant_message, ..
+                } if assistant_message.tool_calls().next().is_some() => {
+                    open = true;
+                }
+                WalRecord::TurnFinished { .. } | WalRecord::RunFinished { .. } => {
+                    open = false;
+                }
+                WalRecord::RunStarted { .. } => {
+                    open = false;
+                }
+                _ => {}
+            }
+        }
+        open
+    }
+
+    #[test]
+    fn setup_in_tail_catches_index_up() {
+        // A compaction Setup durable but not yet indexed sits in the tail. The
+        // detector names it so the reader advances the index before serving: the
+        // stored tag numbers below the cut are stale until it does.
+        let mut records = vec![
+            run_started("r1", vec![user("task")]),
+            step_started(1),
+            text_step(1, "answer"),
+        ];
+        let setup_seq = records.len() as u64 + 1;
+        let framed_tail: Vec<FramedRecord> = records
+            .iter()
+            .enumerate()
+            .map(|(i, r)| framed(i as u64 + 1, r.clone()))
+            .collect();
+        assert!(!tail_contains_compaction_setup(&framed_tail));
+        let mut with_setup = framed_tail.clone();
+        with_setup.push(setup_message(setup_seq));
+        assert!(tail_contains_compaction_setup(&with_setup));
+        // A Step answer without a checkpoint never forces a catch-up.
+        let step_answer = FramedRecord {
+            seq: setup_seq,
+            fence: 1,
+            record: WalRecord::CompactionMessage {
+                provider: "test".into(),
+                kind: CompactionMessageKind::Step,
+                compaction_id: "cmp-1".into(),
+                version: 1,
+                range: broca_wal::CompactionRange { from: 0, to: 0 },
+                replacement: Arc::new(Vec::new()),
+                sha256: "0".repeat(64),
+                request_id: None,
+                cursor: None,
+                call_when: None,
+                stability: None,
+                ceiling: None,
+                tag_checkpoint: None,
+                ride_wait_ms: None,
+            },
+        };
+        assert!(!tail_contains_compaction_setup(&[step_answer]));
+        // The tail past the Setup still replays: the catch-up is an index advance,
+        // not a replay refusal.
+        records.push(with_setup.last().unwrap().record.clone());
+        records.push(run_finished(RunFinishReason::Completed));
+        let full = replay(&records).unwrap();
+        assert!(!full.prompt.is_empty());
+    }
+
+    /// Encode test records as WAL bytes, one frame per record with gapless seqs.
+    fn encode_log(records: &[WalRecord]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (index, record) in records.iter().enumerate() {
+            bytes.extend(
+                broca_wal::framing::encode(index as u64 + 1, 1, record).expect("encode test log"),
+            );
+        }
+        bytes
+    }
+
+    /// Every frame of test log bytes as `(byte start, byte end, frame)`.
+    /// `encode_log` output carries no lineage frame, so every entry is a record.
+    fn scan_frames(bytes: &[u8]) -> Vec<(u64, u64, FramedRecord)> {
+        let mut out = Vec::new();
+        let mut off = 0usize;
+        while off < bytes.len() {
+            match broca_wal::framing::decode_next(&bytes[off..]) {
+                broca_wal::framing::DecodeStep::Record { framed, consumed } => {
+                    out.push((off as u64, (off + consumed) as u64, *framed));
+                    off += consumed;
+                }
+                broca_wal::framing::DecodeStep::Lineage { consumed, .. } => {
+                    off += consumed;
+                }
+                broca_wal::framing::DecodeStep::TornTail => break,
+                _ => panic!("test log must decode at byte {off}"),
+            }
+        }
+        out
+    }
+
+    /// The stored identity for one scanned frame, as the index would have written it.
+    /// Test logs carry no lineage frame, so the attested lineage is `None`.
+    fn seed_boundary_for(
+        bytes: &[u8],
+        scanned: &[(u64, u64, FramedRecord)],
+        seq: u64,
+        qualified: bool,
+    ) -> SeedBoundary {
+        let (off, end, _) = scanned
+            .iter()
+            .find(|(_, _, framed)| framed.seq == seq)
+            .expect("boundary seq is in the scan");
+        SeedBoundary {
+            lineage_id: None,
+            seq,
+            frame_off: *off,
+            frame_end: *end,
+            frame_identity: sha2::Sha256::digest(&bytes[*off as usize..*end as usize]).to_vec(),
+            qualified,
+        }
+    }
+
+    /// Seeds for a tail starting after `cut` records, as the index snapshot carries them:
+    /// the open episode's model and run, the prefix length, and the steers still held.
+    fn seeds_at_cut(
+        records: &[WalRecord],
+        cut: usize,
+    ) -> (Option<ModelHandle>, Option<RunId>, u64, Vec<Message>) {
+        let prefix = replay(&records[..cut]).unwrap();
+        let origin = prefix
+            .run_config
+            .as_ref()
+            .map(|config| config.model.clone());
+        (
+            origin,
+            prefix.run_id.clone(),
+            prefix.prompt.len() as u64,
+            prefix.pending_steers.clone(),
+        )
+    }
+
+    /// A positioned reader over test bytes: short reads at or past the end, exactly like
+    /// a file read, counting returned bytes when asked.
+    fn log_reader<'b>(
+        bytes: &'b [u8],
+        counted: Option<&'b std::cell::Cell<u64>>,
+    ) -> impl Fn(u64, u64) -> std::io::Result<Vec<u8>> + 'b {
+        move |off: u64, len: u64| {
+            let off = off as usize;
+            let end = off.saturating_add(len as usize).min(bytes.len());
+            let out = bytes.get(off..end).unwrap_or(&[]).to_vec();
+            if let Some(counted) = counted {
+                counted.set(counted.get() + out.len() as u64);
+            }
+            Ok(out)
+        }
+    }
+
+    /// The positioned tail starting at scanned frame index `from`.
+    fn positioned_tail(scanned: &[(u64, u64, FramedRecord)], from: usize) -> Vec<PositionedFrame> {
+        scanned[from..]
+            .iter()
+            .map(|(off, _, framed)| PositionedFrame {
+                off: *off,
+                framed: framed.clone(),
+            })
+            .collect()
+    }
+
+    /// A tail seeded at a validated boundary replays exactly what a full replay holds
+    /// past that boundary: a committed turn, a qualified no-tool step, and an
+    /// import-seeded episode each merge with their prefix.
+    #[test]
+    fn validated_boundary_seeds_and_equals_full_replay() {
+        let records = corpus_records();
+        let full = replay(&records).unwrap();
+        let bytes = encode_log(&records);
+        let scanned = scan_frames(&bytes);
+        let seed_at = |seq: u64| {
+            let boundary = seed_boundary_for(&bytes, &scanned, seq, true);
+            let cut = seq as usize;
+            let tail = positioned_tail(&scanned, cut);
+            let (origin, run_id, ordinal_base, held) = seeds_at_cut(&records, cut);
+            let read_at = log_reader(&bytes, None);
+            let tail_state = replay_seeded_at_validated_boundary(
+                &read_at,
+                &boundary,
+                &tail,
+                origin,
+                run_id,
+                None,
+                None,
+                ordinal_base,
+                false,
+                Default::default(),
+                held,
+            )
+            .expect("valid boundary seeds");
+            let mut merged = replay(&records[..cut]).unwrap().prompt;
+            merged.extend(tail_state.prompt);
+            assert_eq!(prompt_shape(&merged), prompt_shape(&full.prompt));
+            assert_eq!(merged.len(), full.prompt.len());
+        };
+        // Committed tool turn, then a held steer placed at the episode close.
+        let turn_seq = records
+            .iter()
+            .position(|record| matches!(record, WalRecord::TurnFinished { .. }))
+            .expect("corpus commits a turn") as u64
+            + 1;
+        seed_at(turn_seq);
+        // Qualified no-tool step: the second episode's answer, terminal after it.
+        let step_seq = records
+            .iter()
+            .rposition(|record| {
+                matches!(
+                    record,
+                    WalRecord::ModelStepFinished { assistant_message, .. }
+                        if assistant_message.tool_calls().next().is_none()
+                )
+            })
+            .expect("corpus answers without tools") as u64
+            + 1;
+        seed_at(step_seq);
+        // Import-seeded episode: renders, owns nothing, still seeds from its start.
+        let import = non_attributable_records();
+        let import_full = replay(&import).unwrap();
+        let import_bytes = encode_log(&import);
+        let import_scanned = scan_frames(&import_bytes);
+        let boundary = seed_boundary_for(&import_bytes, &import_scanned, 1, true);
+        let import_tail = positioned_tail(&import_scanned, 1);
+        let (origin, run_id, ordinal_base, held) = seeds_at_cut(&import, 1);
+        let read_at = log_reader(&import_bytes, None);
+        let tail_state = replay_seeded_at_validated_boundary(
+            &read_at,
+            &boundary,
+            &import_tail,
+            origin,
+            run_id,
+            None,
+            None,
+            ordinal_base,
+            false,
+            Default::default(),
+            held,
+        )
+        .expect("seeded start seeds");
+        let mut merged = replay(&import[..1]).unwrap().prompt;
+        merged.extend(tail_state.prompt);
+        assert_eq!(prompt_shape(&merged), prompt_shape(&import_full.prompt));
+    }
+
+    /// Each way the log can stop matching its stored boundary falls back to a full
+    /// replay: a shorter restored copy, a torn frame, moved offsets, rewritten bytes,
+    /// a different lineage, and an unqualified boundary.
+    #[test]
+    fn validated_boundary_rejects_unreadable_or_moved_frames() {
+        let records = vec![
+            run_started("r1", vec![user("task")]),
+            step_started(1),
+            text_step(1, "answer"),
+            run_finished(RunFinishReason::Completed),
+        ];
+        let full = replay(&records).unwrap();
+        let bytes = encode_log(&records);
+        let scanned = scan_frames(&bytes);
+        // Seed at the no-tool step; the suffix after it is the terminal.
+        let boundary = seed_boundary_for(&bytes, &scanned, 3, true);
+        let tail = positioned_tail(&scanned, 3);
+        let (origin, run_id, ordinal_base, held) = seeds_at_cut(&records, 3);
+        let seed = |log: &[u8], boundary: &SeedBoundary, tail: &[PositionedFrame]| {
+            let read_at = log_reader(log, None);
+            replay_seeded_at_validated_boundary(
+                &read_at,
+                boundary,
+                tail,
+                origin.clone(),
+                run_id.clone(),
+                None,
+                None,
+                ordinal_base,
+                false,
+                Default::default(),
+                held.clone(),
+            )
+        };
+        // A restored copy that ends before the boundary frame: missing.
+        let short = &bytes[..boundary.frame_off as usize];
+        assert_eq!(
+            seed(short, &boundary, &[]).unwrap_err().reason,
+            "boundary frame outside log"
+        );
+        // A copy torn inside the boundary frame.
+        let torn = &bytes[..boundary.frame_off as usize + 2];
+        assert_eq!(
+            seed(torn, &boundary, &[]).unwrap_err().reason,
+            "torn boundary frame"
+        );
+        // Offsets moved to the neighbouring frame with nothing after it: the decoded
+        // sequence no longer matches the stored one.
+        let mut moved = boundary.clone();
+        let (next_off, next_end, _) = scanned[3].clone();
+        moved.frame_off = next_off;
+        moved.frame_end = next_end;
+        assert_eq!(
+            seed(&bytes, &moved, &[]).unwrap_err().reason,
+            "boundary sequence mismatch"
+        );
+        // Rewritten bytes under the same lineage: the frame codec rejects the rewrite.
+        // The tail is present, so the probe is skipped and the frame itself is checked.
+        let mut rewritten = bytes.clone();
+        let last = rewritten[boundary.frame_end as usize - 1].wrapping_add(1);
+        rewritten[boundary.frame_end as usize - 1] = last;
+        assert_eq!(
+            seed(&rewritten, &boundary, &tail).unwrap_err().reason,
+            "corrupt boundary frame"
+        );
+        // A stored identity that no longer matches intact bytes.
+        let mut forged = boundary.clone();
+        forged.frame_identity = vec![0u8; 32];
+        assert_eq!(
+            seed(&bytes, &forged, &tail).unwrap_err().reason,
+            "boundary frame identity mismatch"
+        );
+        // A log restored under a different lineage.
+        let mut relined = boundary.clone();
+        relined.lineage_id = Some("other-lineage".into());
+        assert_eq!(
+            seed(&bytes, &relined, &tail).unwrap_err().reason,
+            "boundary lineage mismatch"
+        );
+        // The frame is intact but the index never qualified it.
+        let mut unqualified = boundary.clone();
+        unqualified.qualified = false;
+        assert_eq!(
+            seed(&bytes, &unqualified, &tail).unwrap_err().reason,
+            "unqualified boundary"
+        );
+        // The intact, qualified boundary seeds, merging with its prefix.
+        let tail_state = seed(&bytes, &boundary, &tail).expect("valid boundary seeds");
+        let mut merged = replay(&records[..3]).unwrap().prompt;
+        merged.extend(tail_state.prompt);
+        assert_eq!(prompt_shape(&merged), prompt_shape(&full.prompt));
+    }
+
+    /// Cuts no committed boundary can ever cover fall back even when their frame is
+    /// intact: a tool-calling step swallowed before its batch committed, an empty
+    /// suffix after a durable dispatch intent, and a queued or steered record held
+    /// before unfinished tool work. Each names a kind that can never seed a tail.
+    #[test]
+    fn invalid_states_fall_back_to_full_replay() {
+        let batch_id = BatchId("r1-b9".into());
+        let tool_step = WalRecord::ModelStepFinished {
+            written_at_ms: None,
+            tags: None,
+            hooks: None,
+            step_id: StepId(9),
+            assistant_message: Arc::new(AssistantMessage {
+                message_id: MessageId("m9".into()),
+                content: vec![ContentBlock::ToolCall(ToolCall {
+                    tool_call_id: ToolCallId("c".into()),
+                    tool_name: "work".into(),
+                    input: serde_json::json!({}),
+                    thought_signature: None,
+                })],
+            }),
+            usage: Usage::default(),
+            finish_reason: None,
+            retries_used: 0,
+            service_tier_used: None,
+            speed_used: None,
+        };
+        let batch_started = WalRecord::ToolBatchStarted {
+            batch_id: batch_id.clone(),
+            step_id: StepId(9),
+            planned_calls: vec![ToolCallId("c".into())],
+        };
+        let intent = WalRecord::ToolDispatchIntent {
+            dispatched_at_ms: None,
+            hooks: None,
+            batch_id: batch_id.clone(),
+            tool_call_id: ToolCallId("c".into()),
+            tool_name: Some("work".into()),
+            args: Arc::new(serde_json::json!({})),
+            module_id: None,
+            schema_pin: None,
+            approval_digest: None,
+            call_key: None,
+        };
+        let try_cut = |records: Vec<WalRecord>, cut_seq: u64| {
+            let bytes = encode_log(&records);
+            let scanned = scan_frames(&bytes);
+            // The caller claims the cut frame qualified; the kind gate still refuses.
+            // The cut frame is last, so the empty tail is at the durable end.
+            let boundary = seed_boundary_for(&bytes, &scanned, cut_seq, true);
+            let read_at = log_reader(&bytes, None);
+            replay_seeded_at_validated_boundary(
+                &read_at,
+                &boundary,
+                &[],
+                None,
+                Some(RunId("r1".into())),
+                None,
+                None,
+                1,
+                false,
+                Default::default(),
+                Vec::new(),
+            )
+            .unwrap_err()
+            .reason
+        };
+        // A tool-calling step swallowed before its batch committed.
+        assert_eq!(
+            try_cut(
+                vec![
+                    run_started("r1", vec![user("task")]),
+                    step_started(9),
+                    tool_step.clone()
+                ],
+                3,
+            ),
+            "boundary frame cannot seed a tail"
+        );
+        // An empty suffix after a durable dispatch intent.
+        assert_eq!(
+            try_cut(
+                vec![
+                    run_started("r1", vec![user("task")]),
+                    step_started(9),
+                    tool_step,
+                    batch_started,
+                    intent,
+                ],
+                5,
+            ),
+            "boundary frame cannot seed a tail"
+        );
+        // A queued record, and a steered record, held before unfinished tool work.
+        let queued = WalRecord::Queued {
+            written_at_ms: None,
+            retention: None,
+            ts_ms: None,
+            keep_warm: None,
+            conversation_key: None,
+            submission_id: broca_protocol::SubmissionId("q".into()),
+            request: Box::new(
+                serde_json::from_value(serde_json::json!({
+                    "model": serde_json::to_value(&run_config().model).unwrap(),
+                    "input": [],
+                }))
+                .unwrap(),
+            ),
+            request_identity_digest: None,
+            principal: None,
+            send_id: None,
+            title: None,
+            delivery: None,
+            hooks: None,
+        };
+        assert_eq!(
+            try_cut(
+                vec![
+                    run_started("r1", vec![user("task")]),
+                    step_started(9),
+                    queued
+                ],
+                3,
+            ),
+            "boundary frame cannot seed a tail"
+        );
+        assert_eq!(
+            try_cut(
+                vec![
+                    run_started("r1", vec![user("task")]),
+                    step_started(9),
+                    steered("held")
+                ],
+                3,
+            ),
+            "boundary frame cannot seed a tail"
+        );
+    }
+
+    /// The validator reads only the header frame and the boundary frame: the counted
+    /// bytes stay flat while the log grows, which is what sparse resume needs. The same
+    /// boundary in a 10-frame and a 10,000-frame log costs the same reads.
+    #[test]
+    fn validation_reads_do_not_grow_with_log_length() {
+        let mut small = vec![
+            run_started("r1", vec![user("task")]),
+            step_started(1),
+            text_step(1, "answer"),
+            run_finished(RunFinishReason::Completed),
+        ];
+        for i in 0..9996u64 {
+            small.push(WalRecord::ModelStepFinished {
+                written_at_ms: None,
+                tags: None,
+                hooks: None,
+                step_id: StepId(100 + i),
+                assistant_message: Arc::new(AssistantMessage {
+                    message_id: MessageId(format!("pad-{i}")),
+                    content: vec![ContentBlock::Text { text: "pad".into() }],
+                }),
+                usage: Usage::default(),
+                finish_reason: None,
+                retries_used: 0,
+                service_tier_used: None,
+                speed_used: None,
+            });
+        }
+        let small_bytes = encode_log(&small[..4]);
+        let big_bytes = encode_log(&small);
+        assert!(big_bytes.len() > 100 * small_bytes.len());
+        let check = |bytes: &[u8]| {
+            let scanned = scan_frames(&bytes[..small_bytes.len()]);
+            let boundary = seed_boundary_for(&small_bytes, &scanned, 3, true);
+            let tail = positioned_tail(&scanned, 3);
+            let (origin, run_id, ordinal_base, held) = seeds_at_cut(&small[..4], 3);
+            // Only 4 prefix records are replayed for seeds; the filler is never decoded.
+            let counted = std::cell::Cell::new(0u64);
+            let read_at = log_reader(bytes, Some(&counted));
+            replay_seeded_at_validated_boundary(
+                &read_at,
+                &boundary,
+                &tail,
+                origin,
+                run_id,
+                None,
+                None,
+                ordinal_base,
+                false,
+                Default::default(),
+                held,
+            )
+            .expect("valid boundary seeds");
+            counted.get()
+        };
+        let small_reads = check(&small_bytes);
+        let big_reads = check(&big_bytes);
+        assert_eq!(small_reads, big_reads);
+        assert!(
+            big_reads < 2048,
+            "two frames, not the log: {big_reads} bytes"
+        );
+        assert!(big_reads * 100 < big_bytes.len() as u64);
+    }
+
+    /// The tail must continue the boundary with no gap: a skipped first frame, a hole
+    /// inside, or a first frame starting anywhere but the boundary end all fall back.
+    /// An empty tail is valid only at the log's durable end.
+    #[test]
+    fn tail_contiguity_is_required() {
+        let records = vec![
+            run_started("r1", vec![user("task")]),
+            step_started(1),
+            text_step(1, "answer-a"),
+            step_started(2),
+            text_step(2, "answer-b"),
+            run_finished(RunFinishReason::Completed),
+        ];
+        let bytes = encode_log(&records);
+        let scanned = scan_frames(&bytes);
+        let boundary = seed_boundary_for(&bytes, &scanned, 3, true);
+        let (origin, run_id, ordinal_base, held) = seeds_at_cut(&records, 3);
+        let seed_with = |tail: &[PositionedFrame]| {
+            let read_at = log_reader(&bytes, None);
+            replay_seeded_at_validated_boundary(
+                &read_at,
+                &boundary,
+                tail,
+                origin.clone(),
+                run_id.clone(),
+                None,
+                None,
+                ordinal_base,
+                false,
+                Default::default(),
+                held.clone(),
+            )
+        };
+        let positioned = positioned_tail(&scanned, 3);
+        // A skipped first frame: the step record between them vanishes.
+        let mut gapped_start = positioned.clone();
+        gapped_start.remove(0);
+        assert_eq!(
+            seed_with(&gapped_start).unwrap_err().reason,
+            "tail not contiguous with boundary"
+        );
+        // A hole inside the tail.
+        let mut gapped_inside = positioned.clone();
+        gapped_inside.remove(1);
+        assert_eq!(
+            seed_with(&gapped_inside).unwrap_err().reason,
+            "tail has a sequence gap"
+        );
+        // The first frame starting anywhere but the boundary end.
+        let mut shifted = positioned.clone();
+        shifted[0].off += 1;
+        assert_eq!(
+            seed_with(&shifted).unwrap_err().reason,
+            "tail byte offset mismatch"
+        );
+        // No tail while the log continues past the boundary.
+        assert_eq!(
+            seed_with(&[]).unwrap_err().reason,
+            "empty tail before log end"
+        );
+    }
+
+    /// An empty tail at the log's durable end seeds: nothing follows the boundary, so
+    /// there is nothing to place and nothing to skip.
+    #[test]
+    fn empty_tail_valid_only_at_durable_end() {
+        let records = corpus_records();
+        let bytes = encode_log(&records);
+        let scanned = scan_frames(&bytes);
+        let turn_seq = records
+            .iter()
+            .position(|record| matches!(record, WalRecord::TurnFinished { .. }))
+            .expect("corpus commits a turn") as u64
+            + 1;
+        let boundary = seed_boundary_for(&bytes, &scanned, turn_seq, true);
+        // The log truncated to the boundary frame's end: the boundary is the durable end.
+        let cut_bytes = &bytes[..boundary.frame_end as usize];
+        let read_at = log_reader(cut_bytes, None);
+        let tail_state = replay_seeded_at_validated_boundary(
+            &read_at,
+            &boundary,
+            &[],
+            None,
+            Some(RunId("r1".into())),
+            None,
+            None,
+            3,
+            false,
+            Default::default(),
+            Vec::new(),
+        )
+        .expect("empty tail at the durable end seeds");
+        assert!(tail_state.prompt.is_empty());
     }
 }

@@ -9,22 +9,8 @@
 //! `live_provider` → real `/v1/messages` — and asserts a real reply assembles, which is
 //! only possible if the identity-lead block is present.
 //!
-//! Gated on explicit `BROCA_LIVE_TESTS` consent and a valid Anthropic OAuth token in the
-//! OpenCode auth file; skips cleanly (no silent pass) when consent is absent or the token is
-//! absent/expired. Secrets are read from disk and never echoed.
-// A file-level `cfg` DELETES this file when the feature is off, and a deleted file reports
-// "running 0 tests ... test result: ok" -- indistinguishable at a glance from a suite that
-// ran and passed, and impossible to instrument because no code survives to carry a notice.
-// Gating a module instead leaves this shell compiled, so the absence can announce itself.
-#[cfg(not(all(feature = "bundled-catalog", feature = "live")))]
-#[test]
-fn this_suite_needs_its_feature_enabled() {
-    eprintln!(
-        "SKIP catalog_native_live_e2e: compiled without its feature, so none of its cases exist. \
-         This reports `ok` -- re-run with `-F broca-catalog/live` to execute them."
-    );
-}
-
+//! Requires `BROCA_LIVE_TESTS=1` and a vault dev-tools handle for `oauth:anthropic`.
+//! Skips cleanly when either is absent. Secrets are never echoed.
 #[cfg(all(feature = "bundled-catalog", feature = "live"))]
 use crate::common;
 
@@ -42,38 +28,8 @@ mod gated {
     use broca_provider::live_provider;
     use broca_provider::wire::AuthHandle;
 
-    fn live_calls_opted_in() -> bool {
-        std::env::var("BROCA_LIVE_TESTS")
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false)
-    }
-
-    /// Read the Anthropic OAuth access token from the OpenCode auth file (never logged).
-    /// Returns `None` (→ clean skip) if missing or expired.
     fn anthropic_oauth_token() -> Option<String> {
-        if !live_calls_opted_in() {
-            return None;
-        }
-        let home = std::env::var("HOME").ok()?;
-        let path = std::path::PathBuf::from(home).join(".local/share/opencode/auth.json");
-        let bytes = std::fs::read(&path).ok()?;
-        let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-        let a = v.get("anthropic")?;
-        let access = a
-            .get("access")
-            .and_then(|s| s.as_str())
-            .filter(|s| !s.is_empty())?;
-        // Skip if the token is expired (this path does not refresh).
-        if let Some(exp) = a.get("expires").and_then(|e| e.as_u64()) {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            if exp <= now + 5_000 {
-                return None;
-            }
-        }
-        Some(access.to_string())
+        crate::vault::live_credential("oauth:anthropic")
     }
 
     #[tokio::test(flavor = "multi_thread")]

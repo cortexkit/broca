@@ -25,6 +25,7 @@ impl RunExecutor for DispatchHeld {
         let call = ToolCallId("shutdown-call".into());
         let batch = BatchId("shutdown-batch".into());
         job.writer.record(WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -48,6 +49,7 @@ impl RunExecutor for DispatchHeld {
             submission_id: None,
         });
         job.writer.record(WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: broca_protocol::StepId(1),
@@ -77,6 +79,7 @@ impl RunExecutor for DispatchHeld {
             planned_calls,
         });
         job.writer.record(WalRecord::ToolDispatchIntent {
+            dispatched_at_ms: None,
             hooks: None,
             batch_id: batch.clone(),
             tool_call_id: call.clone(),
@@ -89,6 +92,7 @@ impl RunExecutor for DispatchHeld {
         });
         if self.resolved {
             job.writer.record(WalRecord::ToolResult {
+                finished_at_ms: None,
                 tags: None,
                 hooks: None,
                 batch_id: batch,

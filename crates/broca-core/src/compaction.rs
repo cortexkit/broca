@@ -25,15 +25,21 @@ use broca_wal::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
 pub use broca_wal::MAX_REPLACEMENT_BYTES;
+mod media;
+mod released;
+pub use media::CapturedMedia;
+mod stored;
+pub(crate) use released::{ReleasedHistory, ReleasedMessages, ReleasedNeeds};
 pub use runtime::{
     apply_idle_view, CompactionConfig, CompactionPlane, CompactionUnavailable, CompactionViews,
     ViewReadyInbox,
 };
+pub(crate) use stored::{OriginalMessages, StoredTranscript};
 pub(crate) mod runtime;
 #[cfg(feature = "test-clock")]
 pub mod test_control;
@@ -44,12 +50,13 @@ pub const COMPACTION_CALL_BUDGET_MS: u64 = 2_000;
 /// Two bytes per token deliberately overcounts typical text/JSON's unmeasured input.
 pub const ESTIMATE_BYTES_PER_TOKEN: u64 = 2;
 
-/// Absent checkpoint field means not captured; `None` means captured before Setup; `State`
+/// Absent checkpoint field means not captured; `None` and `Captures` precede Setup; `State`
 /// carries everything needed to continue without consulting the provider or the old WAL.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", content = "value", rename_all = "snake_case")]
 pub enum CompactionCheckpoint {
     None,
+    Captures(CapturedMedia),
     State(Box<CompactionState>),
 }
 impl CompactionCheckpoint {
@@ -64,7 +71,7 @@ impl CompactionCheckpoint {
 
     pub fn state(&self) -> Option<&CompactionState> {
         match self {
-            Self::None => None,
+            Self::None | Self::Captures(_) => None,
             Self::State(state) => Some(state),
         }
     }
@@ -76,10 +83,32 @@ impl CompactionCheckpoint {
                 ..
             }
         ) {
-            *self = Self::State(Box::default());
+            let captured = self.captured().cloned().unwrap_or_default();
+            *self = Self::State(Box::new(CompactionState {
+                captured,
+                ..Default::default()
+            }));
         }
-        if let Self::State(state) = self {
-            state.fold(record);
+        match self {
+            Self::State(state) => state.fold(record),
+            Self::Captures(captured) => captured.fold(record),
+            Self::None => {
+                if CapturedMedia::captures_any(record) {
+                    let mut captured = CapturedMedia::default();
+                    captured.fold(record);
+                    if !captured.is_empty() {
+                        *self = Self::Captures(captured);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn captured(&self) -> Option<&CapturedMedia> {
+        match self {
+            Self::None => None,
+            Self::Captures(captured) => Some(captured),
+            Self::State(state) => Some(&state.captured),
         }
     }
 }
@@ -126,6 +155,9 @@ pub struct OpenCompactionWait {
 }
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CompactionState {
+    /// Captures survive view replacement and sparse resume; provider content never adds entries.
+    /// Required on decode so older materialized states replay instead of silently losing captures.
+    pub captured: CapturedMedia,
     /// The current step's wait or completed decision. Folded before any request can be sent.
     #[serde(default)]
     pub ceiling_check: Option<CeilingCheck>,
@@ -238,6 +270,7 @@ impl CompactionState {
     }
 
     pub fn fold(&mut self, record: &WalRecord) {
+        self.captured.fold(record);
         self.history.fold(record);
         match record {
             WalRecord::RunStarted { .. } => {
@@ -503,6 +536,18 @@ pub(crate) fn native_fields(value: &Value) -> bool {
             blocks
                 .iter()
                 .all(|block| match block.get("type").and_then(Value::as_str) {
+                    Some("media") => keys(
+                        block,
+                        &[
+                            "type",
+                            "kind",
+                            "mime",
+                            "byte_size",
+                            "sha256",
+                            "width",
+                            "height",
+                        ],
+                    ),
                     Some("text") => keys(block, &["type", "text"]),
                     Some("text_with_state") => {
                         keys(block, &["type", "text", "provider_state"])
@@ -530,6 +575,7 @@ pub(crate) fn native_fields(value: &Value) -> bool {
                                     Some("json") => keys(output, &["kind", "value"]),
                                     Some("denied") => keys(output, &["kind", "reason"]),
                                     Some("error") => keys(output, &["kind", "message"]),
+                                    Some("parts") => keys(output, &["kind", "parts"]),
                                     _ => false,
                                 }
                             })
@@ -595,8 +641,18 @@ impl<'a> CarriedMessages<'a> {
 /// copy of one in `carried` (the transcript messages it stands in for) is authored by the
 /// provider, and may then carry no model origin, signed or encrypted reasoning, or
 /// provider-signed text: those would claim the model wrote what the provider wrote.
+/// Every media reference must equal a reference in the carried range, including its metadata.
 pub(crate) fn native_message(value: &Value, carried: &CarriedMessages<'_>) -> Option<Message> {
     let message = native_schema_message(value)?;
+    if !media_refs(&message.content).all(|reference| {
+        carried
+            .messages
+            .iter()
+            .flat_map(|message| media_refs(&message.content))
+            .any(|stored| stored == reference)
+    }) {
+        return None;
+    }
     let candidate = encoded(&message);
     let unchanged = carried.encoded.contains(&candidate);
     if !unchanged {
@@ -613,6 +669,33 @@ pub(crate) fn native_message(value: &Value, carried: &CarriedMessages<'_>) -> Op
         }
     }
     Some(message)
+}
+
+/// References are compared as complete metadata, not just digests: a provider cannot change
+/// the kind, size or dimensions of an object the session captured.
+pub(crate) fn media_refs(
+    blocks: &[ContentBlock],
+) -> impl Iterator<Item = &broca_protocol::MediaRef> {
+    use broca_protocol::{ToolOutput, ToolOutputPart};
+    blocks.iter().flat_map(|block| {
+        let direct = match block {
+            ContentBlock::Media(media) => Some(media),
+            _ => None,
+        };
+        let parts = match block {
+            ContentBlock::ToolResult(broca_protocol::ToolResult {
+                output: ToolOutput::Parts { parts },
+                ..
+            }) => parts.as_slice(),
+            _ => &[],
+        };
+        direct
+            .into_iter()
+            .chain(parts.iter().filter_map(|part| match part {
+                ToolOutputPart::Media { media } => Some(media),
+                ToolOutputPart::Text { .. } => None,
+            }))
+    })
 }
 
 /// One provider-written message in broca's schema, without judging who wrote its content: no
@@ -759,18 +842,27 @@ pub fn model_options(
     opts: &broca_protocol::CallOptions,
     state: &CompactionState,
 ) -> Result<broca_protocol::CallOptions, view::ViewNotRenderable> {
-    if let Some(view) = view::render(opts, state) {
+    let systems: Vec<_> = opts
+        .prompt
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| (m.role == Role::System).then_some(i))
+        .collect();
+    model_options_indexed(opts, state, &systems)
+}
+
+pub(crate) fn model_options_indexed(
+    opts: &broca_protocol::CallOptions,
+    state: &CompactionState,
+    systems: &[usize],
+) -> Result<broca_protocol::CallOptions, view::ViewNotRenderable> {
+    if let Some(view) = view::render(opts, state, systems) {
         return view;
     }
     let Some(applied) = &state.applied else {
         return Ok(opts.clone());
     };
-    let mut prompt: Vec<_> = opts
-        .prompt
-        .iter()
-        .filter(|m| m.role == Role::System)
-        .cloned()
-        .collect();
+    let mut prompt: Vec<_> = systems.iter().map(|&i| opts.prompt[i].clone()).collect();
     let replacement_start = prompt.len();
     prompt.extend(applied.replacement.iter().cloned().map(|mut m| {
         m.ordinal = None;
@@ -778,11 +870,12 @@ pub fn model_options(
     }));
     let tail_start = prompt.len();
     prompt.extend(
-        opts.prompt
+        view::ordinal_range(&opts.prompt, applied.range.to, u64::MAX)
             .iter()
-            .filter(|m| m.role != Role::System && m.ordinal.is_some_and(|o| o >= applied.range.to))
+            .filter(|m| m.role != Role::System)
             .cloned(),
     );
+    state.captured.enforce(&mut prompt);
     let mut view = opts.with_prompt(prompt);
     view.declared_markers = state
         .stability
@@ -797,36 +890,77 @@ pub fn model_options(
     // retained raw messages; replacement messages must not inherit episode decorations.
     view.render_episodes = Arc::new(broca_protocol::request::RenderHistory {
         compaction_prefix_len: Some(applied.thinking_prefix_len),
-        episodes: opts
-            .render_episodes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, episode)| {
-                let end = opts
-                    .render_episodes
-                    .get(index + 1)
-                    .map_or(usize::MAX, |next| next.prompt_start);
-                let retained = view.prompt[tail_start..].iter().position(|m| {
-                    m.ordinal
-                        .is_some_and(|o| o >= episode.prompt_start as u64 && o < end as u64)
-                })?;
-                let first_user = episode
-                    .first_user
-                    .and_then(|first| {
-                        view.prompt[tail_start..]
-                            .iter()
-                            .position(|m| m.ordinal == Some(first as u64))
-                    })
-                    .map(|i| tail_start + i);
-                Some(broca_protocol::request::EpisodeRenderInput {
-                    prompt_start: tail_start + retained,
-                    first_user,
-                    frozen_config: episode.frozen_config.clone(),
-                })
-            })
-            .collect(),
+        episodes: retained_episodes(opts, &view.prompt, tail_start),
     });
     Ok(view)
+}
+
+/// Translate only episodes represented by retained transcript messages. Searching the episode
+/// boundaries from each retained ordinal avoids walking episodes hidden by a compaction view.
+fn retained_episodes(
+    opts: &broca_protocol::CallOptions,
+    prompt: &[Message],
+    start: usize,
+) -> Vec<broca_protocol::request::EpisodeRenderInput> {
+    let mut kept = BTreeMap::new();
+    let mut positions = BTreeMap::new();
+    for (position, message) in prompt.iter().enumerate().skip(start) {
+        let Some(ordinal) = message.ordinal else {
+            continue;
+        };
+        positions.entry(ordinal).or_insert(position);
+        let end = opts
+            .render_episodes
+            .partition_point(|episode| episode.prompt_start as u64 <= ordinal);
+        if let Some(index) = end.checked_sub(1) {
+            kept.entry(index).or_insert(position);
+        }
+    }
+    kept.into_iter()
+        .map(|(index, position)| {
+            let episode = &opts.render_episodes[index];
+            broca_protocol::request::EpisodeRenderInput {
+                prompt_start: position,
+                first_user: episode
+                    .first_user
+                    .and_then(|first| positions.get(&(first as u64)).copied()),
+                frozen_config: episode.frozen_config.clone(),
+            }
+        })
+        .collect()
+}
+
+/// One boundary's rendered model input and its exact wire size. Only an accepted view can
+/// change this input during a ceiling wait; notices and wait records do not change it.
+#[derive(Default)]
+pub(crate) struct BoundaryRequest {
+    options: Option<broca_protocol::CallOptions>,
+    view_version: Option<u64>,
+    pub(crate) bytes: usize,
+}
+
+impl BoundaryRequest {
+    pub(crate) fn refresh(
+        &mut self,
+        opts: &broca_protocol::CallOptions,
+        state: &CompactionState,
+        systems: &[usize],
+        render: impl FnOnce(&broca_protocol::CallOptions) -> Vec<u8>,
+    ) -> Result<(), view::ViewNotRenderable> {
+        let version = state.view.as_ref().map(|view| view.view.view_version);
+        if self.options.is_some() && self.view_version == version {
+            return Ok(());
+        }
+        let options = model_options_indexed(opts, state, systems)?;
+        self.bytes = render(&options).len();
+        self.options = Some(options);
+        self.view_version = version;
+        Ok(())
+    }
+
+    pub(crate) fn into_options(self) -> broca_protocol::CallOptions {
+        self.options.expect("boundary request was rendered")
+    }
 }
 
 pub fn estimate_tokens(rendered_bytes: usize, previous: Option<(u64, usize)>) -> u64 {
@@ -894,6 +1028,12 @@ mod carried_encoding_tests {
 
     pub(super) fn note_encoded() {
         ENCODED.with(|cell| cell.set(cell.get() + 1));
+    }
+
+    pub(super) fn measure<T>(run: impl FnOnce() -> T) -> (T, usize) {
+        ENCODED.with(|cell| cell.set(0));
+        let result = run();
+        (result, ENCODED.with(std::cell::Cell::get))
     }
 
     fn text(role: Role, text: String) -> Message {

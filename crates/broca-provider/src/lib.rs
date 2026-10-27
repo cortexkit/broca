@@ -16,12 +16,18 @@ pub mod cache_warm;
 mod chatgpt_continuation;
 pub mod chatgpt_wire;
 pub mod claude_code_persona;
+mod codex_retry_after;
 pub mod conformance;
 pub mod credential_refresh;
 pub mod families;
 pub mod hash;
+pub mod media_profile;
+pub mod media_render;
+#[cfg(feature = "live")]
+pub mod media_request;
 pub mod normalize;
 mod opencode_go;
+pub mod person_media;
 pub mod policy;
 pub mod reasoning;
 pub mod registry;
@@ -52,7 +58,9 @@ pub use safe_provider_code::safe_provider_code;
 #[cfg(feature = "live")]
 pub use factory::{live_provider, live_provider_with_clock_and_refresher, UnsupportedFamily};
 #[cfg(feature = "live")]
-pub use live::{LiveAnthropicProvider, LiveAuthError};
+pub use live::LiveAnthropicProvider;
 #[cfg(feature = "live")]
 pub use transport::{build_provider_http_client, LiveProvider, ProviderHttpClient};
 mod content_progress;
+mod display_parts;
+pub use display_parts::index_resets as display_index_resets;

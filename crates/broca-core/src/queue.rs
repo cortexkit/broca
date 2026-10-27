@@ -36,6 +36,8 @@ use serde::{Deserialize, Serialize};
 /// with the SAME config it was submitted with.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingSubmission {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_at_ms: Option<u64>,
     /// Durable pre_user output. The caller request stays unchanged for keyed retries;
     /// the drain uses hooks.final as the rendered input without running hooks again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -166,6 +168,8 @@ pub fn pending_submissions(records: &[WalRecord]) -> Vec<PendingSubmission> {
             orders.insert(submission_id, (order, sent_by));
         }
         if let WalRecord::Queued {
+            written_at_ms,
+            ts_ms,
             keep_warm,
             submission_id,
             request,
@@ -185,6 +189,7 @@ pub fn pending_submissions(records: &[WalRecord]) -> Vec<PendingSubmission> {
             insert_in_drain_order(
                 &mut pending,
                 PendingSubmission {
+                    admitted_at_ms: written_at_ms.or(*ts_ms),
                     hooks: hooks.clone(),
                     conversation_key: conversation_key.clone(),
                     submission_id: submission_id.clone(),
@@ -315,6 +320,7 @@ mod tests {
 
     fn queued_as(id: &str, text: &str, delivery: Option<broca_protocol::Delivery>) -> WalRecord {
         WalRecord::Queued {
+            written_at_ms: None,
             retention: None,
             ts_ms: None,
             hooks: None,
@@ -325,6 +331,8 @@ mod tests {
             send_id: None,
             submission_id: SubmissionId(id.into()),
             request: Box::new(SubmissionRequest {
+                staged_uploads: None,
+                content: Vec::new(),
                 directives: None,
                 on_restart: None,
                 keep_warm: None,
@@ -404,6 +412,7 @@ mod tests {
 
     fn consumed(run: &str, sub: &str) -> WalRecord {
         WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,

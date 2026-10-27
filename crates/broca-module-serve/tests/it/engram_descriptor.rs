@@ -27,7 +27,7 @@ fn tracked_descriptor() -> serde_json::Value {
     serde_json::from_str(&raw).unwrap_or_else(|e| panic!("tracked descriptor is not JSON: {e}"))
 }
 
-/// The backup descriptor declares ten entries. Engram includes only `portable` entries in
+/// Engram includes only `portable` entries in
 /// each backup generation; `rebuild`, `device-local` and `excluded` entries are left out.
 /// Only durable sessions are backed up, in their own trees. `wal/` and
 /// `wal-archive/` hold disposable sessions whose callers relaunch rather than restore
@@ -37,7 +37,7 @@ fn tracked_descriptor() -> serde_json::Value {
 /// not depend on these trees surviving a disk loss: the billing collector ingests export
 /// facts into its own backed-up store.
 #[test]
-fn the_tracked_descriptor_declares_brocas_ten_entries_with_their_classes() {
+fn the_tracked_descriptor_declares_brocas_entries_with_their_classes() {
     let d = tracked_descriptor();
     assert_eq!(d["module_id"], "broca");
 
@@ -55,19 +55,17 @@ fn the_tracked_descriptor_declares_brocas_ten_entries_with_their_classes() {
     got.sort();
 
     let mut want: Vec<(String, String, String)> = [
-        // `rebuild` IS IMPRECISE HERE AND IS KEPT DELIBERATELY. The class means "safely
-        // skippable at capture", which is true, but it READS as "the owner can reproject
-        // this" -- and broca cannot: `crates/broca-wal/src/record.rs` has zero cap-shaped
-        // records (control: RunStarted and two others do exist), because cap rows arrive as
-        // `cap.install` over the wire. ASTRO then corrected the other half: their v2 cutover
-        // deleted the cap delivery machine, so no peer re-provides it either. On machine loss
-        // caps.db is simply gone, and nothing recovers it. Zero rows today, so nothing is at
-        // risk; the fleet ruling (ENGRAM, #store-contract) was to record the recovery rather
-        // than grow a taxonomy for one instance. If a producer ever returns, its contract is
-        // written first and this row changes with it.
+        // `caps.db` is left over from spend caps, which broca no longer has: nothing opens or
+        // writes it, and it is left on disk rather than deleted. The entry stays so engram still
+        // knows what the file is. `rebuild` only means "safely skippable at capture"; nothing
+        // reprojects it, and nothing needs to, because no build reads it.
         ("broca/caps", "rebuild", "whole-db"),
         ("broca/durable-wals", "portable", "filetree"),
         ("broca/durable-archive", "portable", "filetree"),
+        ("broca/durable-media", "portable", "filetree"),
+        ("broca/session-media", "excluded", "filetree"),
+        ("broca/ephemeral-media", "excluded", "filetree"),
+        ("broca/media-uploads", "excluded", "filetree"),
         ("broca/ephemeral-wals", "excluded", "filetree"),
         ("broca/leases", "device-local", "filetree"),
         ("broca/request-dumps", "device-local", "filetree"),
@@ -77,6 +75,7 @@ fn the_tracked_descriptor_declares_brocas_ten_entries_with_their_classes() {
         // System One's batch store keeps caller text for seven days by ruling; a backup
         // generation would keep it longer.
         ("broca/system-one", "excluded", "whole-db"),
+        ("broca/grants", "excluded", "whole-db"),
     ]
     .iter()
     .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()))
@@ -97,13 +96,24 @@ fn the_tracked_descriptor_declares_brocas_ten_entries_with_their_classes() {
         .filter_map(|e| e["entry_id"].as_str())
         .collect();
     portable.sort();
-    assert_eq!(portable, ["broca/durable-archive", "broca/durable-wals"]);
+    assert_eq!(
+        portable,
+        [
+            "broca/durable-archive",
+            "broca/durable-media",
+            "broca/durable-wals"
+        ]
+    );
     for (id, path) in [
         ("broca/session-wals", "wal"),
         ("broca/session-archive", "wal-archive"),
         ("broca/ephemeral-wals", "wal-ephemeral"),
         ("broca/durable-wals", "wal-durable"),
         ("broca/durable-archive", "wal-archive-durable"),
+        ("broca/durable-media", "media-durable"),
+        ("broca/session-media", "media"),
+        ("broca/ephemeral-media", "media-ephemeral"),
+        ("broca/media-uploads", "media-uploads"),
     ] {
         let entry = entries.iter().find(|e| e["entry_id"] == id).unwrap();
         assert_eq!(entry["path"], path, "{id} must describe `{path}/`");

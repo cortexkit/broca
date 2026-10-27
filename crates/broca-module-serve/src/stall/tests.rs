@@ -149,7 +149,7 @@ fn parked_runtime_workers_trigger_heartbeat_snapshot() {
         std::thread::park_timeout(Duration::from_millis(5));
     }
     let records = witness.records();
-    // Release and join before assertions, including the intentionally red mutation run.
+    // Release and join before assertions so a failure cannot leave the task parked.
     for release in releases {
         let _ = release.send(());
     }

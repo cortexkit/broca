@@ -73,6 +73,7 @@ fn run_config() -> RunConfig {
 /// The ONE atomic run-start record (config + input).
 fn start(run: &str, text: &str) -> WalRecord {
     WalRecord::RunStarted {
+        written_at_ms: None,
         tags: None,
         session_class: None,
         retention: None,
@@ -119,6 +120,7 @@ fn assistant_tool_call(id: &str, name: &str) -> AssistantMessage {
 
 fn step_with_call(step: u64, id: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        written_at_ms: None,
         tags: None,
         hooks: None,
         step_id: StepId(step),
@@ -150,6 +152,7 @@ fn usage_with_cache(input_tokens: u64, cached_input_tokens: u64, output_tokens: 
 
 fn step_text_with_usage(step: u64, text: &str, usage: Usage) -> WalRecord {
     WalRecord::ModelStepFinished {
+        written_at_ms: None,
         tags: None,
         hooks: None,
         step_id: StepId(step),
@@ -176,6 +179,7 @@ fn batch_started(b: &str, step: u64, ids: &[&str]) -> WalRecord {
 
 fn intent(b: &str, id: &str) -> WalRecord {
     WalRecord::ToolDispatchIntent {
+        dispatched_at_ms: None,
         hooks: None,
         batch_id: BatchId(b.into()),
         tool_call_id: ToolCallId(id.into()),
@@ -190,6 +194,7 @@ fn intent(b: &str, id: &str) -> WalRecord {
 
 fn result(b: &str, id: &str, outcome: DispatchOutcome) -> WalRecord {
     WalRecord::ToolResult {
+        finished_at_ms: None,
         tags: None,
         hooks: None,
         batch_id: BatchId(b.into()),
@@ -208,6 +213,7 @@ fn result(b: &str, id: &str, outcome: DispatchOutcome) -> WalRecord {
 
 fn no_dispatch(b: &str, id: &str) -> WalRecord {
     WalRecord::ToolNoDispatch {
+        dispatched_at_ms: None,
         tags: None,
         hooks: None,
         batch_id: BatchId(b.into()),
@@ -688,6 +694,7 @@ fn tool_then_text() -> Vec<Vec<NormalizedEvent>> {
 
 fn demo_request(run: &str, dir: &std::path::Path) -> RunRequest {
     RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -792,6 +799,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
         let mut wal = FileWal::open(&wal_path).unwrap();
         let recs = vec![
             WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -837,6 +845,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(1),
@@ -853,6 +862,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
                 planned_calls: vec![ToolCallId("t1".into()), ToolCallId("t2".into())],
             },
             WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 hooks: None,
                 batch_id: BatchId("r-b1".into()),
                 tool_call_id: ToolCallId("t1".into()),
@@ -864,6 +874,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
                 call_key: None,
             },
             WalRecord::ToolResult {
+                finished_at_ms: None,
                 tags: None,
                 hooks: None,
                 batch_id: BatchId("r-b1".into()),
@@ -902,6 +913,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
     });
     let lease = FileLeaseStore::new(dir.join("lease"));
     let req = RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -1446,6 +1458,7 @@ async fn provider_attempt_records_change_nothing_replay_reads() {
 /// A text-only request that runs one model step and ends `Completed`.
 fn text_request(run: &str, session: &broca_protocol::BindIdentity, prompt: &str) -> RunRequest {
     RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -1853,6 +1866,7 @@ async fn append_seals_an_inferred_natural_end_before_starting_the_next_episode()
     let mut file = wal.open(&session).expect("open WAL for crash cut");
     let crash_cut = [
         WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -1952,6 +1966,7 @@ async fn append_seals_an_inferred_hard_stop_before_starting_the_next_episode() {
     let mut file = wal.open(&session).expect("open WAL for hard-stop cut");
     let crash_cut = [
         WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -2361,6 +2376,7 @@ async fn cross_episode_resume_is_exactly_once() {
 
     // A tool request whose model calls `edit` once, then answers.
     let req1 = RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -2447,6 +2463,7 @@ async fn cross_episode_resume_is_exactly_once() {
         let mut wal = FileWal::open(&wal_path).unwrap();
         let recs = vec![
             WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -2491,6 +2508,7 @@ async fn cross_episode_resume_is_exactly_once() {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(1),
@@ -2842,6 +2860,7 @@ async fn append_episode_cannot_introduce_a_system_prompt_mid_lineage() {
 /// resume, so this id is only the caller's handle).
 fn req2(session: &BindIdentity) -> RunRequest {
     RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -3082,6 +3101,7 @@ fn budgeted_start(run: &str) -> WalRecord {
             submission_id,
             ..
         } => WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -3162,6 +3182,7 @@ fn budget_fired_semantic_validation_rejects_wrong_early_reordered_and_duplicate_
     let mut reordered = vec![
         budgeted_start("r"),
         WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(1),
@@ -3421,6 +3442,7 @@ async fn a_new_episode_appends_onto_a_lineage_sealed_by_an_interrupt() {
         w.append(
             1,
             &WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,

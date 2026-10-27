@@ -13,7 +13,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use broca_protocol::request::{ExecutionMode, Tool};
-use broca_wal::{FetchOutcome, FrozenDeclaration, OpaqueJson, PlanManifest, ProviderFetch};
+use broca_wal::{
+    FetchOutcome, FrozenDeclaration, FrozenProviderDeclarations, FrozenResultFormat, OpaqueJson,
+    PlanManifest, ProviderFetch,
+};
 use cortexkit_role_llm_runner::baseline::{AbsentItem, BaselineItem};
 use cortexkit_role_step_transform_provider::subscription::{
     check_item, Declaration, DeclareRequest, ItemRefusal,
@@ -443,6 +446,14 @@ pub trait PlanAdmitter: Send + Sync {
         session: &broca_protocol::BindIdentity,
         scope: Option<&broca_protocol::SessionScope>,
     ) -> Result<Admitted, Refusal>;
+
+    /// Whether sessions this admitter freezes may carry plan items opting into output
+    /// references (llm-runner §9.13), so a send's `output_refs` member is accepted rather than
+    /// refused. It must hold exactly when `role.describe` declares the `output_refs` group;
+    /// broca does not declare it yet, so every production admitter answers false.
+    fn admits_output_refs(&self) -> bool {
+        false
+    }
 }
 
 /// An admitted plan: the manifest to freeze.
@@ -458,22 +469,117 @@ pub fn catalog_request(
     tool_item: Option<&Item>,
     text_item: Option<&Item>,
 ) -> CatalogRequest {
-    let mut request = CatalogRequest::new(
-        tool_item
-            .map(|item| item.params.clone())
-            .unwrap_or_default(),
-    )
-    .with_composition(plan.composition.clone());
-    if let Some(item) = tool_item {
-        request = request.with_preset(item.preset.clone());
-    }
+    let mut request = tool_catalog_request(tool_item).with_composition(plan.composition.clone());
     if let Some(item) = text_item {
         request = request.with_system_text(SystemTextItem {
-            preset: item.preset.clone(),
+            preset: item
+                .preset
+                .clone()
+                .expect("system-text presets are checked before fetching"),
             params: item.params.clone(),
         });
     }
     request
+}
+
+fn tool_catalog_request(tool_item: Option<&Item>) -> CatalogRequest {
+    let mut request = CatalogRequest::new(
+        tool_item
+            .map(|item| item.params.clone())
+            .unwrap_or_default(),
+    );
+    if let Some(preset) = tool_item.and_then(|item| item.preset.clone()) {
+        request = request.with_preset(preset);
+    }
+    request
+}
+
+/// Compose a tool-only plan by preflighting and decoding each provider's live catalog.
+/// Admission fetches again with the resulting composition and validates it before a send.
+/// Text and transform items are not served by this operator helper. No model request or
+/// durable write is made.
+pub async fn compose(
+    items: &Value,
+    fetcher: &dyn Fetcher,
+    budget: Duration,
+) -> Result<Value, Refusal> {
+    let object = items.as_object().ok_or_else(|| Refusal::invalid("plan"))?;
+    for field in ["composition", "composition_digest", "compaction_item"] {
+        if object.contains_key(field) {
+            return Err(Refusal::invalid(format!("plan.{field}")));
+        }
+    }
+    for field in ["system_text_items", "step_transform_items"] {
+        if !object
+            .get(field)
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        {
+            return Err(Refusal::invalid(format!("plan.{field}")));
+        }
+    }
+    let tools = crate::plan::items(object, "tool_items", true)?;
+    let mut providers: BTreeMap<_, Value> = tools
+        .iter()
+        .map(|item| {
+            (
+                item.provider.clone(),
+                serde_json::json!({"provider": item.provider, "tools": []}),
+            )
+        })
+        .collect();
+    let mut plan = items.clone();
+    let set_composition =
+        |plan: &mut Value, providers: &BTreeMap<String, Value>| -> Result<(), Refusal> {
+            plan["composition"] = serde_json::json!({
+                "providers": providers.values().collect::<Vec<_>>(), "step_transform_items": []
+            });
+            plan["composition_digest"] = serde_json::json!(
+                cortexkit_role_tool_provider::catalog::composition_digest(&plan["composition"])
+                    .map_err(|_| Refusal::invalid("plan.composition"))?
+            );
+            Ok(())
+        };
+    set_composition(&mut plan, &providers)?;
+    let parsed = crate::parse_plan(&plan, crate::CompactionSupport::Unsupported)?;
+    let deadline = Instant::now() + budget;
+    for item in &parsed.tool_items {
+        // Preflight omits composition and system text: tools establish the composition that
+        // admission will send back to the provider when it freezes the catalog.
+        let request = tool_catalog_request(Some(item));
+        let fetched = within_deadline(deadline, || fetcher.catalog(&item.provider, &request))
+            .await
+            .map_err(FetchMiss::from_error)
+            .and_then(|value| decode_answer(value, false))
+            .and_then(|fetched| {
+                if fetched.answer.composition_digest.is_some() {
+                    Err(FetchMiss::invalid_answer(None))
+                } else {
+                    Ok(fetched)
+                }
+            })
+            .map_err(|miss| Refusal::FetchUnavailable {
+                provider: item.provider.clone(),
+                provider_detail: miss.provider_detail(CATALOG_OP),
+                unanswered: miss.unanswered,
+            })?;
+        let mut composed: Vec<_> = fetched
+            .answer
+            .tools
+            .iter()
+            .map(|tool| {
+                let capabilities: BTreeSet<_> = tool.capabilities.iter().collect();
+                serde_json::json!({"name": tool.name, "capabilities": capabilities})
+            })
+            .collect();
+        composed.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+        providers
+            .get_mut(&item.provider)
+            .expect("parsed provider is composed")["tools"] = Value::Array(composed);
+    }
+    set_composition(&mut plan, &providers)?;
+    crate::parse_plan(&plan, crate::CompactionSupport::Unsupported)?;
+    Ok(plan)
 }
 
 /// Check every item carrying `params.model` before opening or calling any provider.
@@ -681,6 +787,53 @@ fn decode_answer(value: Value, text_asked: bool) -> Result<Fetched, FetchMiss> {
     Ok(Fetched { answer, text })
 }
 
+/// Refuse a catalog whose reference slots break the catalog's own rules
+/// (`check_reference_slots`), naming the tool and member, when the provider's tool item opts
+/// into output references. A provider that does not opt in is not checked: its slots are never
+/// read or frozen, so its admission is exactly what it was before slots existed.
+fn check_opted_in_slots(fetched: Fetched, tool_item: Option<&Item>) -> Result<Fetched, FetchMiss> {
+    if tool_item.is_some_and(|item| item.output_refs) {
+        for tool in &fetched.answer.tools {
+            cortexkit_role_tool_provider::catalog::check_reference_slots(&tool.reference_slots)
+                .map_err(|problem| FetchMiss::invalid_reply(&tool.name, problem.field))?;
+        }
+    }
+    Ok(fetched)
+}
+
+/// The reference slots to freeze for `provider`: every tool's declared slots by tool name, when
+/// the provider's tool item opts into output references and some tool declares any. `None`
+/// otherwise, which writes no bytes.
+fn frozen_reference_slots(
+    plan: &Plan,
+    provider: &str,
+    fetched: &Fetched,
+) -> Option<BTreeMap<String, Vec<broca_wal::FrozenReferenceSlot>>> {
+    plan.tool_items
+        .iter()
+        .find(|item| item.provider == provider)
+        .filter(|item| item.output_refs)?;
+    let slots: BTreeMap<_, _> = fetched
+        .answer
+        .tools
+        .iter()
+        .filter(|tool| !tool.reference_slots.is_empty())
+        .map(|tool| {
+            (
+                tool.name.clone(),
+                tool.reference_slots
+                    .iter()
+                    .map(|slot| broca_wal::FrozenReferenceSlot {
+                        name: slot.name.clone(),
+                        kind: slot.kind.clone(),
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    (!slots.is_empty()).then_some(slots)
+}
+
 /// The tool a fetched catalog tool becomes in the session: routed to `provider`, with the
 /// provider's description and schema.
 fn session_tool(provider: &str, tool: &cortexkit_role_tool_provider::catalog::CatalogTool) -> Tool {
@@ -707,6 +860,71 @@ fn freeze_reply(reply: &cortexkit_role_tool_provider::catalog::Reply) -> broca_w
                 grace_ms: hold.grace_ms,
             }),
     }
+}
+
+/// The provider declarations a fetched answer carries, frozen so a later step reads a reply by
+/// what the provider declared at admission. `None` when it declared nothing, which keeps the
+/// manifest bytes of every provider that never opted in or never serves late results.
+fn frozen_provider_declarations(
+    answer: &cortexkit_role_tool_provider::catalog::CatalogAnswer,
+) -> Option<FrozenProviderDeclarations> {
+    let result_formats: BTreeMap<String, FrozenResultFormat> = answer
+        .tools
+        .iter()
+        .filter_map(|tool| {
+            tool.result_format.as_ref().map(|format| {
+                (
+                    tool.name.clone(),
+                    FrozenResultFormat(format.as_str().to_owned()),
+                )
+            })
+        })
+        .collect();
+    let declarations = FrozenProviderDeclarations {
+        result_formats: (!result_formats.is_empty()).then_some(result_formats),
+        late_results: answer
+            .declares(cortexkit_role_tool_provider::catalog::session_capabilities::LATE_RESULTS)
+            .then_some(true),
+    };
+    (!declarations.is_empty()).then_some(declarations)
+}
+
+/// The declarations one provider froze into `manifest`. These are the only declarations a run
+/// may route or decode by: a later catalog answer can differ from what the session admitted.
+pub fn frozen_provider_declarations_of<'a>(
+    manifest: &'a PlanManifest,
+    provider: &str,
+) -> Option<&'a FrozenProviderDeclarations> {
+    manifest
+        .fetches
+        .iter()
+        .find(|fetch| fetch.provider == provider)
+        .and_then(|fetch| match &fetch.outcome {
+            FetchOutcome::Answered {
+                declarations_frozen,
+                ..
+            } => declarations_frozen.as_ref(),
+            _ => None,
+        })
+}
+
+/// Whether `provider` froze the `late_results` session capability into `manifest`.
+pub fn frozen_declares_late_results(manifest: &PlanManifest, provider: &str) -> bool {
+    frozen_provider_declarations_of(manifest, provider)
+        .and_then(|declarations| declarations.late_results)
+        .unwrap_or(false)
+}
+
+/// The result format `provider` froze for `tool` into `manifest`, if it opted in.
+pub fn frozen_result_format<'a>(
+    manifest: &'a PlanManifest,
+    provider: &str,
+    tool: &str,
+) -> Option<&'a FrozenResultFormat> {
+    frozen_provider_declarations_of(manifest, provider)?
+        .result_formats
+        .as_ref()?
+        .get(tool)
 }
 
 fn names_missing<'a>(from: &'a [String], against: &[String]) -> Vec<&'a str> {
@@ -913,9 +1131,11 @@ pub async fn admit(
         }
     }));
     let declarations = futures::future::join_all(plan.step_items.iter().map(|step| {
-        let request = DeclareRequest::new(step.item.params.clone())
-            .with_preset(step.item.preset.clone())
+        let mut request = DeclareRequest::new(step.item.params.clone())
             .with_composition(plan.composition.clone());
+        if let Some(preset) = &step.item.preset {
+            request = request.with_preset(preset.clone());
+        }
         async move {
             match within_deadline(deadline, || fetcher.declare(&step.item.provider, &request)).await
             {
@@ -929,7 +1149,9 @@ pub async fn admit(
                     ))),
                 },
                 // A provider that no longer knows the item's preset makes the plan stale.
-                Err(error) if error.refused_field() == Some("preset") => {
+                Err(error)
+                    if step.item.preset.is_some() && error.refused_field() == Some("preset") =>
+                {
                     DeclarationOutcome::RefusedPreset(FetchMiss::from_error(error))
                 }
                 Err(error) => DeclarationOutcome::Unanswered(FetchMiss::from_error(error)),
@@ -953,7 +1175,8 @@ pub async fn admit(
     let mut absent_tools = BTreeSet::new();
     for (fetch, outcome) in catalog_fetches.iter().zip(&catalogs) {
         let mut decoded = match outcome {
-            Ok(answer) => decode_answer(answer.clone(), fetch.text_item.is_some()),
+            Ok(answer) => decode_answer(answer.clone(), fetch.text_item.is_some())
+                .and_then(|fetched| check_opted_in_slots(fetched, fetch.tool_item)),
             Err(_) => continue,
         };
         if let Ok(answer) = outcome {
@@ -996,7 +1219,8 @@ pub async fn admit(
             if let Some(answer) = raw_answers.get(fetch.provider) {
                 // Ignore first-round text validation after the tool set changes. Required
                 // tool catalogs still have to match the original planned tool set.
-                let tools = decode_answer(answer.clone(), false);
+                let tools = decode_answer(answer.clone(), false)
+                    .and_then(|fetched| check_opted_in_slots(fetched, fetch.tool_item));
                 if let Ok(fetched) = &tools {
                     differences.extend(differences_of(plan, fetch.provider, fetched));
                 }
@@ -1187,14 +1411,26 @@ pub async fn admit(
                 unreachable!("an unanswered declaration refused admission above")
             }
         };
-        match check_item(
-            index,
-            &step.item.provider,
-            &step.item.preset,
-            declaration.as_deref(),
-            &step.subscriptions,
-            reduction_owner,
-        ) {
+        let checked = match step.item.preset.as_deref() {
+            Some(preset) => check_item(
+                index,
+                &step.item.provider,
+                preset,
+                declaration.as_deref(),
+                &step.subscriptions,
+                reduction_owner,
+            ),
+            None => check_default_item(
+                index,
+                &step.item.provider,
+                declaration.as_deref().expect(
+                    "a refused default declaration stops admission before subscription checks",
+                ),
+                &step.subscriptions,
+                reduction_owner,
+            ),
+        };
+        match checked {
             Ok(_) => {}
             Err(ItemRefusal::PlanStale(stale)) => differences.extend(
                 stale
@@ -1281,6 +1517,7 @@ pub async fn admit(
                             .collect();
                         (!replies.is_empty()).then_some(replies)
                     },
+                    reference_slots: frozen_reference_slots(plan, provider, fetched),
                     // Resolve the catalog's omitted-means-all default now. An absent frozen
                     // permission is deliberately ungranted on legacy/non-catalog tools.
                     result_ops: Some(
@@ -1299,6 +1536,7 @@ pub async fn admit(
                             })
                             .collect(),
                     ),
+                    declarations_frozen: frozen_provider_declarations(&fetched.answer),
                 },
                 Err(missed) => FetchOutcome::Absent {
                     reason: missed.unanswered.absence(),
@@ -1329,6 +1567,56 @@ pub async fn admit(
             role_versions,
         },
     })
+}
+
+/// A default declaration has no preset name to attach to a `preset_missing` difference.
+/// All other subscription checks retain the provider role's rules and difference shapes.
+fn check_default_item(
+    item: usize,
+    provider: &str,
+    declaration: &Declaration,
+    planned: &[cortexkit_role_step_transform_provider::subscription::Subscription],
+    reduction_owner: Option<&str>,
+) -> Result<Vec<usize>, ItemRefusal> {
+    use cortexkit_role_step_transform_provider::subscription::{
+        check_reduction, InvalidSubscriptionDetail, StaleDifference, SubscriptionProblem,
+    };
+    let mut bounds = Vec::new();
+    let mut differences = Vec::new();
+    for (index, subscription) in planned.iter().enumerate() {
+        match subscription
+            .check()
+            .and_then(|()| check_reduction(subscription, provider, reduction_owner))
+            .and_then(|()| declaration.bound(subscription))
+        {
+            Ok(bound) => bounds.push(bound),
+            Err(SubscriptionProblem::SubscriptionMissing) => {
+                differences.push(StaleDifference::SubscriptionMissing {
+                    provider: provider.into(),
+                    hook: subscription.hook,
+                    phase: subscription.phase,
+                })
+            }
+            Err(SubscriptionProblem::SubscriptionLoosened(field)) => {
+                differences.push(StaleDifference::SubscriptionLoosened {
+                    provider: provider.into(),
+                    hook: subscription.hook,
+                    phase: subscription.phase,
+                    field,
+                })
+            }
+            Err(problem) => {
+                return Err(ItemRefusal::InvalidParams(InvalidSubscriptionDetail::new(
+                    item, index, problem,
+                )))
+            }
+        }
+    }
+    if differences.is_empty() {
+        Ok(bounds)
+    } else {
+        Err(ItemRefusal::PlanStale(differences))
+    }
 }
 
 /// The `session.baseline` facts a manifest froze, read from the manifest alone so the admission
@@ -1429,6 +1717,122 @@ mod tests {
         }
     }
 
+    struct Preflight {
+        answer: Result<Value, FetchError>,
+        requests: std::sync::Mutex<Vec<Value>>,
+    }
+
+    #[async_trait]
+    impl Fetcher for Preflight {
+        async fn catalog(
+            &self,
+            provider: &str,
+            request: &CatalogRequest,
+        ) -> Result<Value, FetchError> {
+            assert_eq!(provider, "aft");
+            self.requests
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(request).unwrap());
+            self.answer.clone()
+        }
+        async fn declare(&self, _: &str, _: &DeclareRequest) -> Result<Value, FetchError> {
+            panic!("tool-only composition must not declare transforms")
+        }
+        async fn describe_compaction(&self, _: &str) -> Result<DescribeAnswer, FetchError> {
+            panic!("tool-only composition must not describe a compactor")
+        }
+    }
+
+    fn composition_items() -> Value {
+        json!({"tool_items": [{"provider": "aft", "preset": "reader", "params": {"scope": "read"}}],
+               "system_text_items": [], "step_transform_items": []})
+    }
+
+    fn preflight_answer() -> Value {
+        json!({"generation": "live", "catalog_digest": "opaque", "tools": [
+            {"name": "zoom", "description": "Zoom", "input_schema": {}, "schema_digest": "z",
+             "semantics": 1, "capabilities": ["z/v1", "a/v1"]},
+            {"name": "read", "description": "Read", "input_schema": {}, "schema_digest": "r",
+             "semantics": 1, "capabilities": ["code.read/v1"]}
+        ]})
+    }
+
+    #[tokio::test]
+    async fn composition_preflights_live_tools_and_canonical_digest() {
+        let fetcher = Preflight {
+            answer: Ok(preflight_answer()),
+            requests: Default::default(),
+        };
+        let plan = compose(&composition_items(), &fetcher, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            *fetcher.requests.lock().unwrap(),
+            vec![json!({"preset": "reader", "params": {"scope": "read"}})]
+        );
+        assert_eq!(plan["tool_items"], composition_items()["tool_items"]);
+        assert_eq!(
+            plan["composition"],
+            json!({"providers": [{"provider": "aft", "tools": [
+            {"name": "read", "capabilities": ["code.read/v1"]},
+            {"name": "zoom", "capabilities": ["a/v1", "z/v1"]}
+        ]}], "step_transform_items": []})
+        );
+        assert_eq!(
+            plan["composition_digest"],
+            "9881838597e87f35274e5d544969fb8f626aeee745ea81057a2f03909bf25fd8"
+        );
+    }
+
+    #[tokio::test]
+    async fn composition_refuses_invalid_items_before_fetching() {
+        let fetcher = Preflight {
+            answer: Ok(preflight_answer()),
+            requests: Default::default(),
+        };
+        for (field, value) in [
+            ("composition", json!({})),
+            ("composition_digest", json!("old")),
+            ("system_text_items", json!([{"provider": "persona"}])),
+            ("step_transform_items", json!([{"provider": "transform"}])),
+            ("compaction_item", json!({"provider": "compactor"})),
+            ("tool_items", json!([{"provider": "aft", "params": []}])),
+        ] {
+            let mut items = composition_items();
+            items[field] = value;
+            assert_eq!(
+                compose(&items, &fetcher, Duration::from_secs(1))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                "invalid_params"
+            );
+        }
+        assert!(fetcher.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn composition_fetch_failures_and_invalid_answers_name_the_provider() {
+        let mut answered_composition = preflight_answer();
+        answered_composition["composition_digest"] = json!("not-a-preflight");
+        for answer in [
+            Err(FetchError::UnknownModule),
+            Ok(json!({"tools": "not-an-array"})),
+            Ok(answered_composition),
+        ] {
+            let fetcher = Preflight {
+                answer,
+                requests: Default::default(),
+            };
+            let refusal = compose(&composition_items(), &fetcher, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert_eq!(refusal.code(), "fetch_unavailable");
+            assert_eq!(refusal.detail()["provider"], "aft");
+        }
+    }
+
     async fn capture_admission_logs<F: std::future::Future>(future: F) -> (F::Output, Vec<String>) {
         let (output, events) = broca_test_support::capture_logs(future).await;
         let logs = events
@@ -1473,9 +1877,10 @@ mod tests {
             step_items: vec![crate::plan::StepItem {
                 item: Item {
                     provider: provider.into(),
-                    preset: "worker".into(),
+                    preset: Some("worker".into()),
                     params: serde_json::Map::new(),
                     optional: false,
+                    output_refs: false,
                 },
                 subscriptions: Vec::new(),
             }],
@@ -1612,6 +2017,93 @@ mod tests {
                 "provider":"magic-context",
                 "preset":"worker"
             }]})
+        );
+    }
+
+    struct DefaultDeclaration(Result<Value, FetchError>);
+    #[async_trait::async_trait]
+    impl Fetcher for DefaultDeclaration {
+        async fn catalog(&self, _: &str, _: &CatalogRequest) -> Result<Value, FetchError> {
+            panic!("a step-only plan fetches no catalogs")
+        }
+        async fn declare(&self, _: &str, request: &DeclareRequest) -> Result<Value, FetchError> {
+            assert!(serde_json::to_value(request)
+                .unwrap()
+                .get("preset")
+                .is_none());
+            self.0.clone()
+        }
+        async fn describe_compaction(&self, _: &str) -> Result<DescribeAnswer, FetchError> {
+            panic!("a step-only plan names no compaction provider")
+        }
+    }
+
+    #[tokio::test]
+    async fn default_declaration_omits_preset_and_preserves_provider_refusal() {
+        let mut plan = plan_with_declaration("magic-context");
+        plan.step_items[0].item.preset = None;
+        let session =
+            broca_protocol::BindIdentity::new("/tmp/default-declaration", "runner", "session");
+        admit(
+            &plan,
+            &DefaultDeclaration(Ok(json!({"subscriptions":[]}))),
+            &session,
+            ADMISSION_DEADLINE,
+        )
+        .await
+        .unwrap();
+        for code in ["invalid_params", "invalid_request"] {
+            let refusal = admit(
+                &plan,
+                &DefaultDeclaration(Err(FetchError::provider_refused(
+                    code.into(),
+                    Some(json!({"field":"preset"})),
+                    "no default selector",
+                    false,
+                ))),
+                &session,
+                ADMISSION_DEADLINE,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(refusal.code(), "fetch_unavailable");
+            assert_eq!(
+                refusal.detail(),
+                json!({"provider":"magic-context","reason":"refused","provider_code":code,
+                "op":DECLARE_OP,"message":"no default selector","field":"preset","retryable":false})
+            );
+            assert!(!refusal.detail().to_string().contains("preset_missing"));
+        }
+    }
+
+    #[tokio::test]
+    async fn default_declaration_rechecks_reduction_and_subscription_bounds() {
+        let mut plan = plan_with_declaration("other-context");
+        plan.step_items[0].item.preset = None;
+        plan.step_items[0].subscriptions = vec![serde_json::from_value(json!({
+            "hook":"pre_user","ops":["replace"],"budget_ms":1000,"on_unavailable":"pass"
+        }))
+        .unwrap()];
+        let session = broca_protocol::BindIdentity::new("/tmp/default-bounds", "runner", "session");
+        let empty = DefaultDeclaration(Ok(json!({"subscriptions":[]})));
+        let refusal = admit(&plan, &empty, &session, ADMISSION_DEADLINE)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refusal.detail(),
+            json!({"field":"plan.step_transform_items","item":0,"subscription":0,"problem":"replace_not_reduction_owner"})
+        );
+        plan.step_items[0].subscriptions[0] = serde_json::from_value(json!({
+            "hook":"pre_user","ops":["append"],"budget_ms":1000,"on_unavailable":"pass"
+        }))
+        .unwrap();
+        let refusal = admit(&plan, &empty, &session, ADMISSION_DEADLINE)
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.code(), "plan_stale");
+        assert_eq!(
+            refusal.detail(),
+            json!({"differences":[{"kind":"subscription_missing","provider":"other-context","hook":"pre_user","phase":null}]})
         );
     }
 

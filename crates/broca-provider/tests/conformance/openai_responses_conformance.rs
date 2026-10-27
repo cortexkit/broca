@@ -103,6 +103,7 @@ fn responses_spec() -> (ProviderSpec, ModelSpec) {
         limits: Limits::default(),
         cost: CostSchedule::default(),
         reasoning_options: Default::default(),
+        input_modalities: Default::default(),
         release_date: None,
         status: None,
         overlay: Overlay::default(),
@@ -357,7 +358,7 @@ fn response_failed_context_length_is_context_overflow() {
 fn response_failed_known_fatal_codes_are_permanent() {
     for (code, expected_code) in [
         ("insufficient_quota", "billing_exhausted"),
-        ("credit_balance_exhausted", "credit_balance_exhausted"),
+        ("credit_balance_exhausted", "billing_exhausted"),
         (
             "organization_spend_limit_exceeded",
             "organization_spend_limit_exceeded",
@@ -384,6 +385,30 @@ fn response_failed_known_fatal_codes_are_permanent() {
         let error = response_error(&events);
         assert_eq!(error.class, ErrorClass::Permanent, "{code}");
         assert_eq!(error.provider_code.as_deref(), Some(expected_code));
+    }
+}
+
+/// OpenAI's in-band error for an empty prepaid balance becomes `billing_exhausted` whichever
+/// shape it arrives in: the code at the top level of the event, or a nested error object whose
+/// `type` is `insufficient_quota`. The provider's message is kept.
+#[test]
+fn stream_error_for_an_empty_prepaid_balance_is_billing_exhausted() {
+    let message = "You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.";
+    for event in [
+        json!({"type":"error","code":"credit_balance_exhausted","message":message,"param":null,"sequence_number":2}),
+        json!({"type":"error","error":{"type":"insufficient_quota","code":"credit_balance_exhausted","message":message}}),
+        json!({"type":"error","error":{"type":"insufficient_quota","code":null,"message":message}}),
+        json!({"type":"response.failed","response":{"error":{"type":"insufficient_quota","code":"some_new_quota_code","message":message}}}),
+    ] {
+        let events = normalize_responses(&format!("data: {event}\n\n"), 18);
+        let error = response_error(&events);
+        assert_eq!(error.class, ErrorClass::Permanent, "{event}");
+        assert_eq!(
+            error.provider_code.as_deref(),
+            Some("billing_exhausted"),
+            "{event}"
+        );
+        assert_eq!(error.message, message, "{event}");
     }
 }
 

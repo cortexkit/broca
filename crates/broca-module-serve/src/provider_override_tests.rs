@@ -88,9 +88,9 @@ fn runtime_override_moves_only_host() {
 
 /// Resolve the provider for `auth` the way an episode does, send one step to a local listener,
 /// and return the `authorization` header it carried. That header is the only observable place
-/// the resolved secret lands, so it is what shows which auth file the credential came from.
+/// the resolved secret lands, so it proves the vault-served credential reached the wire.
 /// `None` when resolution fails (no usable credential) or no request arrives.
-async fn read_opencode_authorization(auth: &AuthResolution) -> Option<String> {
+async fn read_vault_authorization(auth: &AuthResolution) -> Option<String> {
     use tokio::io::AsyncReadExt;
     install_test_catalog();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -175,80 +175,22 @@ fn runtime_override_resume_keeps_frozen_host_and_bytes() {
 
 #[tokio::test]
 async fn runtime_override_preserves_auth_billing_and_cache_predicates() {
-    // Only the tool-plane connection is stubbed. Auth and cache decisions below are the
-    // executor's real methods; no daemon, vault process or real provider is needed.
-    use subc_transport::connection_file::{ConnectionInfo, Endpoint, SCHEMA_VERSION};
-    let root = broca_test_support::scratch_root().join(format!("broca-host-override-{}", std::process::id()));
-    std::fs::create_dir_all(&root).unwrap();
-    // With no vault the executor takes the OpenCode credential source. Point it at a fixture:
-    // otherwise it reads the operator's real ~/.local/share/opencode/auth.json. The key is
-    // deliberately one no real auth file holds, so finding it on the wire below proves the
-    // credential came from this file and not from the host.
-    const FIXTURE_KEY: &str = "broca-test-fixture-deepseek-key-not-a-real-credential";
-    let opencode_auth = root.join("opencode-auth.json");
-    std::fs::write(
-        &opencode_auth,
-        serde_json::json!({"deepseek": {"type": "api", "key": FIXTURE_KEY}}).to_string(),
-    )
-    .unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let key = vec![0x5c; 32];
-    let connection_file = root.join("connection.json");
-    subc_transport::connection_file::write_atomic(
-        &connection_file,
-        &ConnectionInfo {
-            schema: SCHEMA_VERSION,
-            wire_version: None,
-            endpoints: vec![Endpoint {
-                host: "127.0.0.1".into(),
-                port,
-            }],
-            key: key.clone(),
-            daemon_id: [0xc5; 16],
-            pid: std::process::id(),
-            daemon_ver: "test".into(),
-        },
-    )
-    .unwrap();
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        subc_transport::authenticate_server(
-            &mut stream,
-            &key,
-            &[0xc5; 16],
-            "test",
-            broca_test_support::STAND_IN_AUTH_DEADLINE,
-        )
+    // The capturing vault serves a synthetic token over the real subc credential route.
+    let root = fresh_vault_root("host-override");
+    let daemon = CapturingVaultDaemon::start(&root).await;
+    let mut executor = executor_with_capturing_vault(&root, &daemon)
         .await
-        .unwrap();
-        std::future::pending::<()>().await;
-    });
-    let connection = broca_subc::SubcConnection::connect(&connection_file)
-        .await
-        .unwrap();
-    let mut executor = LiveLoopExecutor::new(
-        Arc::new(FileWalStore::new(root.join("wal"))),
-        Arc::new(broca_store::SqliteStore::open(root.join("store.db")).unwrap()),
-        Arc::new(SubcToolPlane::new(connection, "unused")),
-        None,
-    )
-    .with_provider_overrides(runtime_overrides("http://127.0.0.1:4010/v1"))
-    .with_opencode_auth_path(opencode_auth.clone());
+        .with_provider_overrides(runtime_overrides("http://127.0.0.1:4010/v1"));
     let auth = executor
         .decide_auth("deepseek", None, true, Some(AuthMethod::ApiKey), None)
         .await
         .unwrap();
+    assert!(matches!(&auth.mode, AuthMode::Secret(_)));
+    // A failed equality assertion must not reveal a credential header.
+    let authorization = read_vault_authorization(&auth).await;
     assert!(
-        matches!(&auth.mode, AuthMode::FromOpencodeFile(path) if *path == opencode_auth),
-        "the OpenCode auth mode must carry the injected file"
-    );
-    // Compare without assert_eq: on a failure that would print the header, and when the
-    // injection is ignored that header holds the operator's real key.
-    let authorization = read_opencode_authorization(&auth).await;
-    assert!(
-        authorization.as_deref() == Some(format!("Bearer {FIXTURE_KEY}").as_str()),
-        "the resolved credential must come from the fixture auth file (request carried an \
+        authorization.as_deref() == Some(format!("Bearer {}", stand_in_token(1)).as_str()),
+        "the resolved credential must come from the stand-in vault (request carried an \
          authorization header: {}; value withheld because it may be a real credential)",
         authorization.is_some()
     );
@@ -263,7 +205,7 @@ async fn runtime_override_preserves_auth_billing_and_cache_predicates() {
         broca_core::ChargeBasis::MeteredApi
     );
     install_test_catalog();
-    let mut req = broca_core::RunRequest { directives: None, session_class: None, retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None,
+    let mut req = broca_core::RunRequest { input_written_at_ms: None, directives: None, session_class: None, retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None,
         scope: None,
         project_id: None,
         principal: None,
@@ -312,7 +254,7 @@ async fn runtime_override_preserves_auth_billing_and_cache_predicates() {
     let mock = executor.decide_auth("deepseek", None, true, Some(AuthMethod::ApiKey), None).await.unwrap();
     assert!(mock.selection.is_none(), "mock auth has no vault witness, vault request, or selection");
     drop(executor);
-    server.abort();
+    daemon.assert_healthy();
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -416,8 +358,8 @@ fn install_drift_revision(reasoning: bool, output: u64) {
 }
 
 /// Resolve the drift model the way the executor does. `recorded` is the prior episode's
-/// RunConfig on a resume, and both restored inputs (host and output cap) come from it through
-/// the executor's own reader, so the test cannot restore something production does not.
+/// RunConfig on a resume. Using the executor's decoder ensures this test and production
+/// resume use the same complete recorded render bundle.
 fn resolve_drift_revision(
     recorded: Option<&broca_wal::RunConfig>,
     caller_max_tokens: Option<u32>,
@@ -432,6 +374,7 @@ fn resolve_drift_revision(
         record_version: None,
         in_run_refresh: None,
     };
+    let recorded_render = recorded.map(decode_recorded_render_config).transpose().unwrap();
     resolve_provider_for_episode(
         "anthropic/resume-drift",
         None,
@@ -443,6 +386,7 @@ fn resolve_drift_revision(
         },
         broca_provider::build_provider_http_client(),
         broca_catalog::live::EpisodeRenderConfig {
+            recorded_config: recorded_render.as_ref(),
             codeassist_identity: None,
             claude_code_persona: Default::default(),
             base_url: Some(
@@ -469,7 +413,7 @@ fn resolve_drift_revision(
 }
 
 fn drift_request(root: &std::path::Path) -> broca_core::RunRequest {
-    broca_core::RunRequest { directives: None, session_class: None, retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None,
+    broca_core::RunRequest { input_written_at_ms: None, directives: None, session_class: None, retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None,
         scope: None,
         project_id: None,
         principal: None,
@@ -598,7 +542,7 @@ async fn resume_through_core(
     let mut wal = wal_store.open(&req.session).unwrap();
     wal.append(
         1,
-        &broca_wal::WalRecord::RunStarted { tags: None, session_class: None, retention: None,
+        &broca_wal::WalRecord::RunStarted { written_at_ms: None, tags: None, session_class: None, retention: None,
         hooks: None,
          title: None,
          on_restart: None,
@@ -644,13 +588,11 @@ async fn resume_through_core(
     (codes, summary.reason, calls)
 }
 
-/// The control for the output-cap restore: a catalog-owned field OTHER than the output limit
-/// (reasoning) moved between start and resume, and the resume is still refused. Run with no
-/// caller cap so the restored cap is in play, which proves the restore does not mask drift in
-/// the rest of the frozen config.
+/// A changed reasoning fact affects new admissions, not an episode whose complete render
+/// bundle is already recorded. The resumed run must render its original bytes and proceed.
 #[tokio::test]
-async fn runtime_override_catalog_drift_refuses_resume() {
-    if !run_catalog_drift_child("runtime_override_catalog_drift_refuses_resume") {
+async fn runtime_override_catalog_drift_resumes_recorded_bytes() {
+    if !run_catalog_drift_child("runtime_override_catalog_drift_resumes_recorded_bytes") {
         return;
     }
     let root = broca_test_support::scratch_root()
@@ -659,7 +601,11 @@ async fn runtime_override_catalog_drift_refuses_resume() {
     let started = resolve_drift_revision(None, None);
     let recorded = drift_run_config(&drift_request(&root), &started);
     install_drift_revision(false, 8192);
+    assert_ne!(resolve_drift_revision(None, None).provider.render_config_blob(), started.provider.render_config_blob(), "the new catalog changes fresh admissions");
     let resumed = resolve_drift_revision(Some(&recorded), None);
+    assert_eq!(resumed.provider.render_config_blob(), started.provider.render_config_blob());
+    let prompt = broca_protocol::CallOptions::new(vec![]);
+    assert_eq!(resumed.provider.render_request(&prompt), started.provider.render_request(&prompt));
     assert_eq!(
         started.provider.renderer_version(),
         resumed.provider.renderer_version()
@@ -669,14 +615,9 @@ async fn runtime_override_catalog_drift_refuses_resume() {
     let (codes, reason, calls) = resume_through_core(&root, recorded, resumed).await;
     eprintln!("resume outcome: {reason:?}; provider_codes={codes:?}; provider_calls={calls}");
     std::fs::remove_dir_all(root).unwrap();
-    assert!(
-        codes
-            .iter()
-            .any(|code| code.as_deref() == Some("frozen_render_config_drift")),
-        "expected catalog-drift refusal, got {codes:?}; outcome={reason:?}; calls={calls}"
-    );
-    assert_eq!(reason, broca_protocol::caller::RunFinishReason::Interrupted);
-    assert_eq!(calls, 0);
+    assert!(codes.is_empty(), "a catalog change cannot refuse a recorded episode: {codes:?}");
+    assert_eq!(reason, broca_protocol::caller::RunFinishReason::Completed);
+    assert_eq!(calls, 1);
 }
 
 /// A send with no cap freezes the catalog's limit.output (A). The catalog then moves that fact
@@ -736,6 +677,8 @@ fn install_tier_revision(fast_mode_priced: bool) {
     };
     let mut row = serde_json::json!({
         "existence": "present",
+        "wire.npm": {"value":"@ai-sdk/anthropic","from":"provider"},
+        "wire.api": {"value":"https://api.anthropic.com/v1","from":"curated"},
         "limit.context": 200000,
         "limit.output": 64000,
         "capability.attachment": false,
@@ -886,9 +829,12 @@ async fn a_non_chat_catalog_model_is_refused_at_admission() {
         models: Default::default(),
         withheld: vec![],
         uncertain: vec![],
+        wire_corrections: vec![],
     };
     let tier_row = serde_json::json!({
         "existence": "present",
+        "wire.npm": {"value":"@ai-sdk/anthropic","from":"provider"},
+        "wire.api": {"value":"https://api.anthropic.com/v1","from":"curated"},
         "limit.context": 200000,
         "capability.attachment": false,
         "capability.reasoning": false,
@@ -1071,110 +1017,6 @@ async fn withdrawn_reasoning_options_resume_with_the_frozen_variant() {
     );
     assert_eq!(calls, 1, "the resumed run reaches the provider");
     assert_eq!(reason, broca_protocol::caller::RunFinishReason::Completed);
-}
-
-/// A resume restores the Anthropic thinking-echo scope from the recorded blob. A blob written
-/// before the scope existed carries no `echo_scope` key and must read back as the legacy
-/// last-assistant-message scope; a blob without interleaved thinking restores nothing.
-#[test]
-fn resume_reads_the_recorded_thinking_echo_scope() {
-    use broca_catalog::live::ThinkingEchoScope;
-
-    let root = broca_test_support::scratch_root()
-        .join(format!("broca-echo-scope-{}", std::process::id()));
-    let started = resolve_runtime_override(&runtime_overrides("http://127.0.0.1:9"), None);
-    let mut recorded = drift_run_config(&drift_request(&root), &started);
-    let with_reasoning = |reasoning: serde_json::Value| {
-        serde_json::json!({ "family_id": "anthropic_messages", "reasoning": reasoning })
-    };
-
-    recorded.frozen_render_config = with_reasoning(serde_json::json!({
-        "mode": "anthropic_interleaved", "budget_tokens": 1024, "last_turn_only": true
-    }));
-    assert_eq!(
-        frozen_thinking_echo_scope(&recorded),
-        Some(ThinkingEchoScope::LastAssistantMessage)
-    );
-
-    recorded.frozen_render_config = with_reasoning(serde_json::json!({
-        "mode": "anthropic_interleaved", "budget_tokens": 1024, "last_turn_only": true,
-        "echo_scope": "all_assistant_messages"
-    }));
-    assert_eq!(
-        frozen_thinking_echo_scope(&recorded),
-        Some(ThinkingEchoScope::AllAssistantMessages)
-    );
-
-    recorded.frozen_render_config = with_reasoning(serde_json::json!({ "mode": "none" }));
-    assert_eq!(frozen_thinking_echo_scope(&recorded), None);
-}
-
-/// A resume restores the Claude Code persona from the recorded blob. A blob written before the
-/// persona existed has no `claude_code_persona` key and reads back as `None`, which the resolver
-/// keeps (`EpisodePersona::Recorded(None)`), so that episode resumes with its old bytes.
-#[test]
-fn resume_reads_the_recorded_claude_code_persona() {
-    let root = broca_test_support::scratch_root()
-        .join(format!("broca-persona-restore-{}", std::process::id()));
-    let started = resolve_runtime_override(&runtime_overrides("http://127.0.0.1:9"), None);
-    let mut recorded = drift_run_config(&drift_request(&root), &started);
-    recorded.frozen_render_config = serde_json::json!({ "family_id": "anthropic_messages" });
-    assert_eq!(frozen_claude_code_persona(&recorded), None);
-
-    let persona = serde_json::json!({
-        "version": "2.1.280",
-        "device_id": "0".repeat(64),
-        "session_id": "11111111-1111-4111-8111-111111111111",
-        "prompt_id": "33333333-3333-4333-8333-333333333333"
-    });
-    recorded.frozen_render_config = serde_json::json!({
-        "family_id": "anthropic_messages", "claude_code_persona": persona
-    });
-    let restored = frozen_claude_code_persona(&recorded).expect("the recorded persona restores");
-    assert_eq!(serde_json::to_value(&restored).unwrap(), persona);
-}
-
-#[test]
-fn resume_reads_the_recorded_responses_tool_strictness() {
-    let root = broca_test_support::scratch_root()
-        .join(format!("broca-tool-strictness-{}", std::process::id()));
-    let started = resolve_runtime_override(&runtime_overrides("http://127.0.0.1:9"), None);
-    let mut recorded = drift_run_config(&drift_request(&root), &started);
-    recorded.frozen_render_config = serde_json::json!({});
-    assert!(!frozen_responses_tools_non_strict(&recorded));
-    recorded.frozen_render_config = serde_json::json!({"responses_tools_non_strict": true});
-    assert!(frozen_responses_tools_non_strict(&recorded));
-    recorded.frozen_render_config = serde_json::json!({"responses_tools_non_strict": false});
-    assert!(!frozen_responses_tools_non_strict(&recorded));
-}
-
-#[test]
-fn resume_reads_the_recorded_reasoning_content_required() {
-    let root = broca_test_support::scratch_root()
-        .join(format!("broca-reasoning-echo-{}", std::process::id()));
-    let started = resolve_runtime_override(&runtime_overrides("http://127.0.0.1:9"), None);
-    let mut recorded = drift_run_config(&drift_request(&root), &started);
-    recorded.frozen_render_config = serde_json::json!({});
-    assert!(!frozen_reasoning_content_required(&recorded));
-    recorded.frozen_render_config = serde_json::json!({"reasoning_content_required": true});
-    assert!(frozen_reasoning_content_required(&recorded));
-}
-
-#[test]
-fn resume_reads_the_recorded_reasoning_echo_policy() {
-    use broca_provider::policy::{ReasoningEchoPolicy, ReasoningEchoTurns};
-    let root = broca_test_support::scratch_root()
-        .join(format!("broca-echo-policy-{}", std::process::id()));
-    let started = resolve_runtime_override(&runtime_overrides("http://127.0.0.1:9"), None);
-    let mut recorded = drift_run_config(&drift_request(&root), &started);
-    recorded.frozen_render_config = serde_json::json!({"reasoning_content_required": true});
-    assert_eq!(frozen_reasoning_echo(&recorded), None);
-    let policy = ReasoningEchoPolicy {
-        turns: ReasoningEchoTurns::ToolCalls,
-        ..ReasoningEchoPolicy::OPENROUTER
-    };
-    recorded.frozen_render_config["reasoning_echo"] = serde_json::to_value(policy).unwrap();
-    assert_eq!(frozen_reasoning_echo(&recorded), Some(policy));
 }
 
 /// A conversation with a reasoning-carrying tool-call turn and a plain text turn, the two
@@ -1434,13 +1276,12 @@ async fn later_persona_admissions_inherit_the_ordinal_without_reading_wal_bytes(
         *origin = serde_json::from_value(serde_json::json!({"kind": "seeded_from"})).unwrap();
     }
     wal.append(1, &imported, true).unwrap();
-    let tool = |n| broca_wal::WalRecord::ToolResult { tags: None,
+    let tool = |n| broca_wal::WalRecord::ToolResult { finished_at_ms: None, tags: None,
         batch_id: broca_protocol::BatchId("batch".into()),
         result: Arc::new(broca_protocol::ToolResult { tool_call_id: broca_protocol::ToolCallId("tool".into()),
             output: broca_protocol::ToolOutput::Text { text: "x".repeat(n) }, is_error: false }),
         outcome: broca_wal::DispatchOutcome::Completed, hooks: None, reason: None,
-        withdraw_elicitation: None, provider_held: None,
-    };
+        withdraw_elicitation: None, provider_held: None, };
     wal.append(1, &tool(1 << 20), true).unwrap();
     let legacy = serde_json::json!({"claude_code_persona": {"version": "2.1.280"}});
     let mut old = run_started_with_user_text(&req.session, "legacy", "third prompt");
@@ -1491,12 +1332,9 @@ async fn an_unreadable_prompt_history_is_refused_through_the_admission_ack() {
         .join(format!("broca-prompt-ack-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
-    let (executor, server) = stand_in_executor(&root).await;
-    // An absent auth file: no operator credential is read, and the episode is not API-key auth,
-    // so it speaks as Claude Code.
-    let executor = executor
-        .with_claude_code_install_id(Some("install-test".into()))
-        .with_opencode_auth_path(root.join("absent-auth.json"));
+    let daemon = CapturingVaultDaemon::start(&root).await;
+    let executor = executor_with_capturing_vault(&root, &daemon).await;
+    let executor = executor.with_claude_code_install_id(Some("install-test".into()));
     let mut req = drift_request(&root);
     req.input = vec![broca_protocol::Message::new(
         broca_protocol::Role::User,
@@ -1516,9 +1354,11 @@ async fn an_unreadable_prompt_history_is_refused_through_the_admission_ack() {
     prior_snapshot.head_seq = 5;
     let (ack, admitted) = tokio::sync::oneshot::channel();
     let job = RunJob {
+        media: Vec::new(),
+        media_profile: None,
         conversation_key: None,
         req,
-        auth: None,
+        auth: Some(broca_protocol::AuthRequest { method: "oauth".into(), account: None }),
         writer: Arc::new(broca_core::WalHandle::spawn(wal, 1).unwrap()),
         kind: RunKind::AppendEpisode,
         skip_materialization: true,
@@ -1541,7 +1381,7 @@ async fn an_unreadable_prompt_history_is_refused_through_the_admission_ack() {
         other => panic!("the admission ack must carry the Config refusal, got {other:?}"),
     }
     drop(executor);
-    server.abort();
+    drop(daemon);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1710,21 +1550,6 @@ async fn chatgpt_run_recorded_at_undeclared_version_6_is_refused() {
     assert_eq!(codes, vec![Some("renderer_version_drift".to_string())]);
     assert_eq!(reason, broca_protocol::caller::RunFinishReason::Interrupted);
     assert_eq!(calls, 0);
-}
-
-#[test]
-fn frozen_provider_text_state_reads_an_absent_field_as_false() {
-    let mut recorded = drift_run_config(
-        &drift_request(std::path::Path::new("project")),
-        &resolve_chatgpt_episode(None, true),
-    );
-    assert!(frozen_provider_text_state(&recorded));
-    recorded
-        .frozen_render_config
-        .as_object_mut()
-        .unwrap()
-        .remove("provider_text_state");
-    assert!(!frozen_provider_text_state(&recorded));
 }
 
 #[tokio::test]
@@ -1901,9 +1726,20 @@ async fn every_declared_previous_version_resumes_through_the_executor_restore_pa
         let fresh_identity =
             broca_module_serve::codeassist_identity::for_episode(&request.session, None, 0, 0)
                 .unwrap();
+        // This route represents an older admitted Code Assist run, not a fresh catalog send.
+        // Its recorded backend id must remain reproducible even without a current tier row.
+        let historical = (route.family == WireFamilyId::GoogleCodeAssist).then(|| {
+            let mut config = broca_provider::families::google_codeassist_frozen_config("gemini-2.5-flash");
+            config.project_id = route.project_id.map(str::to_owned);
+            config.max_output_tokens = 2048;
+            config.caller_max_output_tokens = Some(2048);
+            config.codeassist_identity = fresh_identity.clone();
+            config
+        });
         let started = resolve_declared_route(
             route,
             broca_catalog::live::EpisodeRenderConfig {
+                recorded_config: historical.as_ref(),
                 codeassist_identity: fresh_identity.as_ref(),
                 ..Default::default()
             },
@@ -1926,10 +1762,12 @@ async fn every_declared_previous_version_resumes_through_the_executor_restore_pa
         )
         .unwrap();
         assert_eq!(identity.is_none(), predates_text_state);
-        let resumed = resolve_declared_route(
-            route,
-            restored_episode_render(&recorded, identity.as_ref()),
-        );
+        let frozen = decode_recorded_render_config(&recorded).unwrap();
+        let resumed = resolve_declared_route(route, broca_catalog::live::EpisodeRenderConfig {
+            recorded_config: Some(&frozen),
+            ..restored_episode_render(&recorded, identity.as_ref())
+        });
+        assert_eq!(resumed.provider.renderer_version(), renderer_version_for(route.family), "resume provider must identify the current implementation");
         assert!(resumed.provider.reproduces_renderer_version(previous));
         let stated = resumed.provider.render_config_blob_for_version(previous);
         assert_eq!(stated, recorded.frozen_render_config, "{:?}", route.family);
@@ -1956,3 +1794,28 @@ async fn every_declared_previous_version_resumes_through_the_executor_restore_pa
         }
     }
 }
+
+// These readers construct historical partial-config fixtures. Production resume decodes
+// the complete recorded bundle instead of rebuilding it from individual fields.
+fn fixture_field<T: serde::de::DeserializeOwned>(config: &broca_wal::RunConfig, key: &str) -> Option<T> {
+    serde_json::from_value(config.frozen_render_config.get(key)?.clone()).ok()
+}
+fn frozen_max_output_tokens(config: &broca_wal::RunConfig) -> Option<u32> { fixture_field(config, "max_output_tokens") }
+fn frozen_variant(config: &broca_wal::RunConfig) -> Option<broca_catalog::live::FrozenVariant> { fixture_field(config, "variant") }
+fn frozen_thinking_echo_scope(config: &broca_wal::RunConfig) -> Option<broca_catalog::live::ThinkingEchoScope> {
+    match fixture_field(config, "reasoning")? {
+        broca_provider::policy::ReasoningPolicy::AnthropicInterleaved { echo_scope, .. } => Some(echo_scope),
+        _ => None,
+    }
+}
+fn frozen_thinking_cross_model(config: &broca_wal::RunConfig) -> Option<broca_catalog::live::CrossModelThinking> {
+    match fixture_field(config, "reasoning")? {
+        broca_provider::policy::ReasoningPolicy::AnthropicInterleaved { cross_model, .. } => Some(cross_model),
+        _ => None,
+    }
+}
+fn frozen_responses_tools_non_strict(config: &broca_wal::RunConfig) -> bool { fixture_field(config, "responses_tools_non_strict").unwrap_or(false) }
+fn frozen_reasoning_content_required(config: &broca_wal::RunConfig) -> bool { fixture_field(config, "reasoning_content_required").unwrap_or(false) }
+fn frozen_reasoning_echo(config: &broca_wal::RunConfig) -> Option<broca_provider::policy::ReasoningEchoPolicy> { fixture_field(config, "reasoning_echo") }
+fn frozen_provider_text_state(config: &broca_wal::RunConfig) -> bool { fixture_field(config, "provider_text_state").unwrap_or(false) }
+fn frozen_service_tier(config: &broca_wal::RunConfig) -> Option<broca_catalog::live::ServiceTier> { config.service_tier }

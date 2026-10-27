@@ -33,7 +33,7 @@ fn records(session: &BindIdentity) -> Vec<FramedRecord> {
     records
 }
 
-fn compaction_message(seq: u64, kind: CompactionMessageKind) -> FramedRecord {
+pub(super) fn compaction_message(seq: u64, kind: CompactionMessageKind) -> FramedRecord {
     let setup = kind == CompactionMessageKind::Setup;
     let replacement = Arc::new(vec![Message::new(
         Role::User,
@@ -102,15 +102,81 @@ fn assert_model_snapshot(snapshot: &StorePageSnapshot, records: &[FramedRecord])
     let checkpoint = AdmissionCheckpointV1::from_frames(&prefix).unwrap();
     let replay = replay(&records_only(&prefix)).unwrap();
     assert_eq!(snapshot.compaction, checkpoint.compaction);
+    // A model snapshot omits replaced input, but includes the complete episode history
+    // needed by its first visible message. Derive that start independently from WAL replay.
+    let visible = checkpoint
+        .compaction
+        .as_ref()
+        .and_then(CompactionCheckpoint::state)
+        .and_then(|state| state.applied.as_ref())
+        .map_or(0, |applied| applied.range.to as usize);
+    let start = replay
+        .episode_step_spans
+        .iter()
+        .flatten()
+        .find(|span| span.contains(&visible))
+        .map_or(visible, |span| span.start);
     assert_eq!(
         snapshot
             .rows
             .iter()
             .map(|row| row.message.clone())
             .collect::<Vec<_>>(),
-        replay.prompt,
+        replay.prompt[start..],
     );
-    assert_eq!(snapshot.prefix_len, snapshot.rows.len() as u64);
+    assert_eq!(snapshot.prefix_len, (start + snapshot.rows.len()) as u64);
+}
+
+#[test]
+fn raw_pages_backfill_the_setup_summary_once_without_loading_replacements_again() {
+    let store = crate::SqliteStore::open_in_memory().unwrap();
+    let session = session("raw-setup-summary");
+    let mut before_setup = base_records(&session);
+    before_setup.extend(text_turn(1, 1, "before Setup"));
+    Persister::project(&store, &session, &before_setup).unwrap();
+    assert!(!page(&store, &session, ReadView::Raw).compaction_setup_seen);
+
+    let mut records = before_setup;
+    records.push(compaction_message(3, CompactionMessageKind::Setup));
+    records.extend(text_turn(4, 2, "after Setup"));
+    Persister::project(&store, &session, &records).unwrap();
+    let expected = page(&store, &session, ReadView::Raw);
+    assert!(expected.compaction_setup_seen);
+    assert_eq!(expected.compaction, None);
+
+    let key = crate::SqliteStore::key(&session);
+    store
+        .conn
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE meta SET compaction_setup_seen=NULL WHERE session=?1",
+            [&key],
+        )
+        .unwrap();
+    assert_eq!(page(&store, &session, ReadView::Raw), expected);
+    let cached: bool = store
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT compaction_setup_seen FROM meta WHERE session=?1",
+            [&key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(cached);
+
+    store
+        .conn
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE meta SET admission_checkpoint_json='not a checkpoint' WHERE session=?1",
+            [&key],
+        )
+        .unwrap();
+    assert_eq!(page(&store, &session, ReadView::Raw), expected);
 }
 
 /// Replacement state and transcript rows share one watermark. An uncommitted turn or
@@ -150,6 +216,7 @@ pub fn model_pages_return_atomic_compaction_and_rows<S: PageUsageConformance>(st
             "raw and head reads do not expose compaction"
         );
         assert_eq!(raw.watermark_seq, old.watermark_seq);
+        assert!(raw.compaction_setup_seen);
     }
 
     append_step(&mut records);

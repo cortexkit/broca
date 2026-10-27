@@ -135,6 +135,7 @@ source "$REPO_ROOT/scripts/wal-floor.sh"
 source "$REPO_ROOT/scripts/running-image.sh"
 source "$REPO_ROOT/scripts/dsym.sh"
 source "$REPO_ROOT/scripts/release-clients.sh"
+source "$REPO_ROOT/scripts/nonshipping-markers.sh"
 GATE_LOG="$(mktemp "${TMPDIR:-/tmp}/place-gate.XXXXXX")"
 ACTIVE_RUNS_FILE="$(mktemp "${TMPDIR:-/tmp}/place-runs.XXXXXX")"
 TMP=""
@@ -172,6 +173,17 @@ run_gate() {
   fi
   gate_rc=$?
   set -e
+}
+
+# Print why the gate could not decide. live-runs.py states its reason on a "cannot compare:"
+# line; filtering the log for live-run lines alone dropped it, so a refused deploy could not say
+# why. Fall back to the log's last lines when the gate printed no such line.
+gate_reason() {
+  if grep -aq "cannot compare" "$GATE_LOG" 2>/dev/null; then
+    grep -a "cannot compare" "$GATE_LOG" | head -3 | sed 's/^/  gate: /' >&2
+  else
+    tail -3 "$GATE_LOG" 2>/dev/null | sed 's/^/  gate: /' >&2
+  fi
 }
 
 write_report() {
@@ -292,6 +304,7 @@ if [ "$SKIP_GATE" -eq 0 ]; then
            exit 1
          fi ;;
       *) echo "place-release: REFUSING -- gate could not determine live runs (exit $gate_rc)." >&2
+         gate_reason
          echo "  A gate that cannot tell must not be read as a clear gate." >&2
          exit 2 ;;
     esac
@@ -485,6 +498,10 @@ run_candidate() {
   perl -e 'alarm shift; exec @ARGV or exit 127' "${PLACE_RELEASE_RUN_SECONDS:-30}" "$@" </dev/null
 }
 
+# Read the final signed copy, not the caller's staging path, before executing or publishing it.
+broca_refuse_nonshipping_markers "$TMP" place-release || \
+  gate_refuse nonshipping-marker "$TMP" "the copy contains test-only code, or its marker could not be checked."
+
 if [ "$BROCA_DEPLOY_HOST" = Darwin ]; then
 PLACED_FLAGS="$(broca_codesign_flags "$TMP" || true)"
 DEPLOYED_FLAGS="$(broca_codesign_flags "$DEST" || true)"
@@ -610,6 +627,8 @@ for i in 0 1; do
       gate_refuse client-signing "$client_tmp" "the client has get-task-allow."
     fi
   fi
+  broca_refuse_nonshipping_markers "$client_tmp" place-release || \
+    gate_refuse nonshipping-marker "$client_tmp" "the client contains test-only code, or its marker could not be checked."
   client_version="$(run_candidate "$client_tmp" --version)" \
     || gate_refuse client-version "$client_tmp" "the client's --version failed."
   [ "$client_version" = "$client ${SMOKE_LINE#ck-broca }" ] \
@@ -798,7 +817,11 @@ if [ "$SKIP_GATE" -eq 0 ]; then
     cat "$GATE_LOG"
   elif [ "$gate_rc" -ne 0 ]; then
     echo "place-release: PLACED but NOT restarted -- the live-run gate is no longer clear (exit $gate_rc)." >&2
-    grep -aE "live runs|session" "$GATE_LOG" | head -3 >&2 || true
+    if [ "$gate_rc" -eq 1 ]; then
+      grep -aE "live runs|session" "$GATE_LOG" | head -3 >&2 || true
+    else
+      gate_reason
+    fi
     echo "  The new binary is on disk and not loaded. Restart when the gate is clear:" >&2
     echo "    scripts/place-release.sh --restart-only --dest '$DEST'" >&2
     exit 3

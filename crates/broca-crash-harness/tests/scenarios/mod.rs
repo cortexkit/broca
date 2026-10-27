@@ -149,6 +149,7 @@ pub fn one_text_step_scripts() -> Vec<Vec<NormalizedEvent>> {
 
 pub fn edit_request() -> RunRequest {
     RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -417,6 +418,8 @@ pub fn planned_manifest() -> broca_wal::PlanManifest {
                 text: Some(PLANNED_TEXT.into()),
                 result_ops: None,
                 reply: None,
+                declarations_frozen: None,
+                reference_slots: None,
             },
         }],
         tools,

@@ -13,6 +13,8 @@ description = "broca catalog: ingests a vendored models.dev snapshot + a hand-ma
 # disk can turn it off to avoid linking the JSON into every binary.
 default = ["bundled-catalog"]
 bundled-catalog = []
+# Snapshot replacement bypasses normal refresh validation and is only for test setup.
+test-support = []
 # Pull in the provider's live transport so catalog-resolved configs can actually run
 # (the catalog→live resolver in `live.rs` + the end-to-end test). Also needs the core
 # `Provider` trait the resolver returns a boxed instance of, and the shared ChatGPT policy
@@ -41,6 +43,8 @@ tracing.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+broca-catalog = { path = ".", features = ["test-support"] }
+broca-module-serve = { path = "../broca-module-serve" }
 broca-owner-only = { workspace = true, features = ["test-support"] }
 # Shared account-id vectors used by the Codex auth tests.
 cortexkit-chatgpt-policy = { workspace = true, features = ["test-vectors"] }

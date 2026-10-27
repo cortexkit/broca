@@ -21,6 +21,20 @@ use std::{borrow::Cow, collections::HashMap};
 /// changing the byte comparison of equivalent results.
 pub(crate) fn result_bytes(output: &ToolOutput) -> Cow<'_, [u8]> {
     match output {
+        ToolOutput::Parts { parts } => {
+            let identity: Vec<_> = parts
+                .iter()
+                .map(|part| match part {
+                    broca_protocol::ToolOutputPart::Text { text } => {
+                        serde_json::json!({"text":text})
+                    }
+                    broca_protocol::ToolOutputPart::Media { media } => {
+                        serde_json::json!({"sha256":media.sha256})
+                    }
+                })
+                .collect();
+            Cow::Owned(canonical_json_bytes(&serde_json::Value::Array(identity)))
+        }
         ToolOutput::Text { text } => Cow::Borrowed(text.as_bytes()),
         ToolOutput::Json { value } => Cow::Owned(canonical_json_bytes(value)),
         ToolOutput::Denied { reason } => Cow::Borrowed(reason.as_bytes()),
@@ -136,7 +150,7 @@ fn is_read_only(tool_name: &str) -> bool {
 ///
 /// Scoped to one episode deliberately: a new turn is a new intent, and carrying counts across turns
 /// would warn about a call the model has legitimately returned to after doing something else.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RepetitionObserver {
     exact_failures: HashMap<CallSignature, u32>,
     tool_failures: HashMap<String, u32>,
@@ -166,34 +180,11 @@ impl RepetitionObserver {
     /// are only step-unique, so an episode-wide ID lookup would attach a later step's result to an
     /// earlier call. A call without a paired result is skipped because its outcome is unknown.
     pub fn from_prompt(prompt: &[Message]) -> Self {
-        let mut observer = Self::new();
-        let mut index = 0;
-        while index + 1 < prompt.len() {
-            if prompt[index].role != Role::Assistant || prompt[index + 1].role != Role::Tool {
-                index += 1;
-                continue;
-            }
-
-            let mut calls = prompt[index]
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::ToolCall(call) => Some(call),
-                    _ => None,
-                });
-            for block in &prompt[index + 1].content {
-                let ContentBlock::ToolResult(result) = block else {
-                    continue;
-                };
-                let Some(call) = calls.next() else {
-                    continue;
-                };
-                let bytes = result_bytes(&result.output);
-                observer.observe(call, bytes.as_ref(), result.is_error);
-            }
-            index += 2;
+        let mut fold = RepetitionFold::default();
+        for message in prompt {
+            fold.push(message);
         }
-        observer
+        fold.into_observer()
     }
 
     /// Record one completed call and report what it means.
@@ -279,6 +270,55 @@ impl RepetitionObserver {
     }
 }
 
+/// The episode fold shared by whole-prompt restoration and streamed store reads.
+/// Only the immediately preceding assistant's calls survive a page boundary; no message rows do.
+#[derive(Default)]
+pub(crate) struct RepetitionFold {
+    observer: RepetitionObserver,
+    pending_calls: Option<Vec<ToolCall>>,
+}
+
+impl RepetitionFold {
+    /// Observe raw outputs before a caller decorates its model-visible copies. Block indexes
+    /// identify results within this message, not by provider IDs (which may repeat across steps).
+    pub(crate) fn push(&mut self, message: &Message) -> Vec<(usize, RepetitionVerdict)> {
+        let previous = self.pending_calls.take();
+        let mut verdicts = Vec::new();
+        if message.role == Role::Tool {
+            if let Some(calls) = previous {
+                let mut calls = calls.iter();
+                for (index, block) in message.content.iter().enumerate() {
+                    if let ContentBlock::ToolResult(result) = block {
+                        if let Some(call) = calls.next() {
+                            let bytes = result_bytes(&result.output);
+                            verdicts.push((
+                                index,
+                                self.observer.observe(call, bytes.as_ref(), result.is_error),
+                            ));
+                        }
+                    }
+                }
+            }
+        } else if message.role == Role::Assistant {
+            self.pending_calls = Some(
+                message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::ToolCall(call) => Some(call.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            );
+        }
+        verdicts
+    }
+
+    pub(crate) fn into_observer(self) -> RepetitionObserver {
+        self.observer
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,6 +335,8 @@ mod tests {
 
     fn legacy_result_bytes(output: &ToolOutput) -> Vec<u8> {
         match output {
+            // Multipart output had no representation in the legacy model.
+            ToolOutput::Parts { .. } => Vec::new(),
             ToolOutput::Text { text } => text.as_bytes().to_vec(),
             ToolOutput::Json { value } => canonical_json_bytes(value),
             ToolOutput::Denied { reason } => reason.as_bytes().to_vec(),
@@ -321,6 +363,54 @@ mod tests {
         );
         assert_eq!(bytes.as_ptr(), source.as_ptr());
         assert_eq!(bytes.len(), PRODUCTION_PAYLOAD_BYTES);
+    }
+
+    #[test]
+    fn multipart_repetition_identity_is_ordered_text_and_media_digest() {
+        let media = broca_protocol::MediaRef {
+            kind: broca_protocol::MediaKind::Image,
+            mime: "image/png".into(),
+            byte_size: 42,
+            sha256: "a".repeat(64),
+            width: Some(3),
+            height: Some(2),
+        };
+        let parts = vec![
+            broca_protocol::ToolOutputPart::Text {
+                text: "before".into(),
+            },
+            broca_protocol::ToolOutputPart::Media {
+                media: media.clone(),
+            },
+        ];
+        let output = ToolOutput::Parts {
+            parts: parts.clone(),
+        };
+        assert_eq!(
+            result_bytes(&output).as_ref(),
+            format!(
+                "[{{\"text\":\"before\"}},{{\"sha256\":\"{}\"}}]",
+                "a".repeat(64)
+            )
+            .as_bytes()
+        );
+        let mut metadata_only = media;
+        metadata_only.mime = "image/jpeg".into();
+        let same_bytes = ToolOutput::Parts {
+            parts: vec![
+                parts[0].clone(),
+                broca_protocol::ToolOutputPart::Media {
+                    media: metadata_only,
+                },
+            ],
+        };
+        assert_eq!(result_bytes(&output), result_bytes(&same_bytes));
+        let mut reversed = parts;
+        reversed.reverse();
+        assert_ne!(
+            result_bytes(&output),
+            result_bytes(&ToolOutput::Parts { parts: reversed })
+        );
     }
 
     #[test]

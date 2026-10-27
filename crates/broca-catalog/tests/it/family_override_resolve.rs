@@ -7,19 +7,6 @@
 //!
 //! No network: it inspects the resolved provider's RENDERED bytes (the boxed provider exposes
 //! `render_request`), so it needs no live credential — a dummy token suffices.
-// A file-level `cfg` DELETES this file when the feature is off, and a deleted file reports
-// "running 0 tests ... test result: ok" -- indistinguishable at a glance from a suite that
-// ran and passed, and impossible to instrument because no code survives to carry a notice.
-// Gating a module instead leaves this shell compiled, so the absence can announce itself.
-#[cfg(not(all(feature = "bundled-catalog", feature = "live")))]
-#[test]
-fn this_suite_needs_its_feature_enabled() {
-    eprintln!(
-        "SKIP family_override_resolve: compiled without its feature, so none of its cases exist. \
-         This reports `ok` -- re-run with `-F broca-catalog/live` to execute them."
-    );
-}
-
 #[cfg(all(feature = "bundled-catalog", feature = "live"))]
 use crate::common;
 
@@ -78,6 +65,47 @@ mod gated {
     }
 
     #[test]
+    fn media_freezes_only_when_needed_and_uses_the_final_override_family() {
+        common::install_snapshot();
+        for family_override in [None, Some(WireFamilyId::OpenAiResponsesChatgpt)] {
+            for media in [false, true] {
+                let resolved = ok(
+                    resolve_provider(
+                        "openai/gpt-5.3-codex",
+                        None,
+                        2048,
+                        &AuthMode::Bearer(CHATGPT_JWT.into()),
+                        &ResolveOptions {
+                            media,
+                            family_override,
+                            ..Default::default()
+                        },
+                    ),
+                    "media profile resolution",
+                );
+                let frozen: broca_provider::wire::FrozenRenderConfig =
+                    serde_json::from_value(resolved.provider.render_config_blob()).unwrap();
+                assert_eq!(frozen.media.is_some(), media);
+                if let Some(profile) = frozen.media {
+                    let expected = match frozen.family_id {
+                        WireFamilyId::OpenAiResponsesChatgpt => {
+                            broca_provider::media_profile::MediaProfileId::OpenaiResponsesChatgpt
+                        }
+                        WireFamilyId::OpenAiResponses => {
+                            broca_provider::media_profile::MediaProfileId::OpenaiResponses
+                        }
+                        WireFamilyId::OpenAiChat => {
+                            broca_provider::media_profile::MediaProfileId::OpenaiChat
+                        }
+                        family => panic!("unexpected family {family:?}"),
+                    };
+                    assert_eq!(profile.profile, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn catalog_resolution_surfaces_the_model_context_limit() {
         common::install_snapshot();
         // A catalog-resolved model carries its context-window limit (the pressure ground truth
@@ -113,6 +141,8 @@ mod gated {
         // account claim, which no dummy credential can satisfy; the limit is read from the catalog
         // before any of that, so this reaches the code under test without a live credential.
         let opts = ResolveOptions {
+            media: false,
+            media_profile: None,
             family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
             auth_method: Some(AuthMethod::Chatgpt),
             ..Default::default()
@@ -166,11 +196,13 @@ mod gated {
         common::install_snapshot();
         let resolved = ok(
             resolve_provider(
-                "google/gemini-2.5-flash",
+                "google/antigravity-gemini-3.8-flash",
                 None,
                 2048,
                 &AuthMode::Bearer("dummy-token".into()),
                 &ResolveOptions {
+                    media: false,
+                    media_profile: None,
                     claude_code_persona: None,
                     auth_method: None,
                     family_override: Some(WireFamilyId::GoogleCodeAssist),
@@ -196,23 +228,25 @@ mod gated {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["project"], serde_json::json!("proj-override"));
         assert_eq!(v["userAgent"], serde_json::json!("antigravity"));
-        assert_eq!(v["model"], serde_json::json!("gemini-2.5-flash"));
+        assert_eq!(v["model"], serde_json::json!("gemini-3.8-flash-medium"));
         // The inner gemini body is nested under `request`.
         assert!(v.get("request").and_then(|r| r.get("contents")).is_some());
     }
 
-    /// Antigravity's caller-facing prefix and untiered routes resolve before freeze, so the wire
-    /// carries the backend tier id while unrelated and already-tiered ids remain untouched.
+    /// Published defaults and historical tier spellings resolve before freeze. Both select
+    /// only backend ids explicitly named by the served alias row.
     #[test]
     fn antigravity_override_resolves_the_frozen_wire_tier() {
         common::install_snapshot();
         let resolved = ok(
             resolve_provider(
-                "google/antigravity-gemini-3.5-flash",
+                "google/antigravity-gemini-3.8-flash",
                 None,
                 2048,
                 &AuthMode::Bearer("dummy-token".into()),
                 &ResolveOptions {
+                    media: false,
+                    media_profile: None,
                     claude_code_persona: None,
                     auth_method: None,
                     family_override: Some(WireFamilyId::GoogleCodeAssist),
@@ -232,10 +266,10 @@ mod gated {
             "aliased antigravity model resolves",
         );
 
-        assert_eq!(resolved.wire_model, "gemini-3.5-flash-low");
+        assert_eq!(resolved.wire_model, "gemini-3.8-flash-medium");
         let bytes = resolved.provider.render_request(&opts());
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["model"], serde_json::json!("gemini-3.5-flash-low"));
+        assert_eq!(v["model"], serde_json::json!("gemini-3.8-flash-medium"));
         assert_eq!(
             v["request"]["generationConfig"]["maxOutputTokens"],
             serde_json::json!(2048),
@@ -244,11 +278,13 @@ mod gated {
 
         let unchanged = ok(
             resolve_provider(
-                "google/antigravity-gemini-2.5-flash",
+                "google/antigravity-gemini-3.8-flash-low",
                 None,
                 2048,
                 &AuthMode::Bearer("dummy-token".into()),
                 &ResolveOptions {
+                    media: false,
+                    media_profile: None,
                     claude_code_persona: None,
                     auth_method: None,
                     family_override: Some(WireFamilyId::GoogleCodeAssist),
@@ -265,9 +301,9 @@ mod gated {
                     clock: None,
                 },
             ),
-            "untiered antigravity 2.5 model resolves",
+            "published historical tier spelling resolves",
         );
-        assert_eq!(unchanged.wire_model, "gemini-2.5-flash");
+        assert_eq!(unchanged.wire_model, "gemini-3.8-flash-low");
 
         // A ChatGPT-family override must NOT strip anything: the prefix rule is scoped to
         // the codeassist family alone.
@@ -278,6 +314,8 @@ mod gated {
                 2048,
                 &AuthMode::Bearer(CHATGPT_JWT.into()),
                 &ResolveOptions {
+                    media: false,
+                    media_profile: None,
                     claude_code_persona: None,
                     auth_method: None,
                     family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
@@ -304,11 +342,13 @@ mod gated {
         common::install_snapshot();
         let resolved = ok(
             resolve_provider_with_client(
-                "google/antigravity-gemini-3.5-flash",
+                "google/antigravity-gemini-3.8-flash",
                 None,
                 None,
                 &AuthMode::Bearer("dummy-token".into()),
                 &ResolveOptions {
+                    media: false,
+                    media_profile: None,
                     claude_code_persona: None,
                     auth_method: None,
                     family_override: Some(WireFamilyId::GoogleCodeAssist),
@@ -341,6 +381,8 @@ mod gated {
     fn chatgpt_ids_resolve_verbatim_with_no_tier_suffixes() {
         common::install_snapshot();
         let options = ResolveOptions {
+            media: false,
+            media_profile: None,
             claude_code_persona: None,
             auth_method: None,
             family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
@@ -420,6 +462,8 @@ mod gated {
                     2048,
                     &AuthMode::Bearer(CHATGPT_JWT.into()),
                     &ResolveOptions {
+                        media: false,
+                        media_profile: None,
                         claude_code_persona: None,
                         auth_method: None,
                         family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
@@ -471,6 +515,8 @@ mod gated {
                 2048,
                 &AuthMode::Bearer(CHATGPT_JWT.into()),
                 &ResolveOptions {
+                    media: false,
+                    media_profile: None,
                     claude_code_persona: None,
                     auth_method: None,
                     family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
@@ -504,6 +550,8 @@ mod gated {
                 2048,
                 &AuthMode::Bearer(CHATGPT_JWT.into()),
                 &ResolveOptions {
+                    media: false,
+                    media_profile: None,
                     claude_code_persona: None,
                     auth_method: None,
                     family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
@@ -539,6 +587,8 @@ mod gated {
     fn chatgpt_pause_only_construction_skips_auth_but_ordinary_none_stays_strict() {
         common::install_snapshot();
         let options = ResolveOptions {
+            media: false,
+            media_profile: None,
             claude_code_persona: None,
             auth_method: None,
             family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
@@ -594,6 +644,8 @@ mod gated {
             2048,
             &AuthMode::Bearer("not-a-codex-token".into()),
             &ResolveOptions {
+                media: false,
+                media_profile: None,
                 claude_code_persona: None,
                 auth_method: None,
                 family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
@@ -647,6 +699,8 @@ mod gated {
                 2048,
                 &AuthMode::Bearer("dummy".into()),
                 &ResolveOptions {
+                    media: false,
+                    media_profile: None,
                     cache_policy: Some(CachePolicy {
                         version: 1,
                         class: CacheClass::Markers {

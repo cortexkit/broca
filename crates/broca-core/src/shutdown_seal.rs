@@ -297,9 +297,10 @@ mod tests {
     #[tokio::test]
     async fn nothing_in_flight_returns_at_once_and_blocks_later_attempts() {
         let seal = ShutdownSeal::new();
-        let started = tokio::time::Instant::now();
-        assert_eq!(seal.seal_and_collect(Duration::from_secs(5)).await, None);
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            futures::poll!(Box::pin(seal.seal_and_collect(Duration::from_secs(5)))),
+            std::task::Poll::Ready(None)
+        );
         assert!(!seal.begin_attempt(), "no attempt may start after the seal");
     }
 
@@ -334,19 +335,16 @@ mod tests {
         assert_eq!(seal.seal_and_collect(Duration::from_secs(5)).await, None);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_transport_that_ignores_the_seal_costs_at_most_the_bound() {
         let seal = ShutdownSeal::new();
         assert!(seal.begin_attempt());
-        let started = tokio::time::Instant::now();
-        assert_eq!(
-            seal.seal_and_collect(Duration::from_millis(300)).await,
-            None
-        );
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed >= Duration::from_millis(300) && elapsed < Duration::from_secs(3),
-            "waited {elapsed:?} for a 300ms bound"
-        );
+        let collect = seal.seal_and_collect(Duration::from_millis(300));
+        tokio::pin!(collect);
+        assert!(futures::poll!(&mut collect).is_pending());
+        tokio::time::advance(Duration::from_millis(299)).await;
+        assert!(futures::poll!(&mut collect).is_pending());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(futures::poll!(&mut collect), std::task::Poll::Ready(None));
     }
 }

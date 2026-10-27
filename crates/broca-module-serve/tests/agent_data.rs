@@ -186,6 +186,7 @@ impl Rig {
         let mut records = vec![
             started(session, run),
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(0),
@@ -215,6 +216,7 @@ impl Rig {
                 planned_calls: vec![call.clone()],
             },
             WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 batch_id: batch.clone(),
                 tool_call_id: call.clone(),
                 tool_name: Some("read_file".into()),
@@ -226,6 +228,7 @@ impl Rig {
                 call_key: None,
             },
             WalRecord::ToolResult {
+                finished_at_ms: None,
                 tags: None,
                 batch_id: batch.clone(),
                 result: Arc::new(ToolResult {
@@ -255,13 +258,11 @@ impl Rig {
             },
         ];
         if owes_withdrawal {
-            records[3] = WalRecord::ToolCallDeferred {
-                batch_id: batch, call_id: ToolCallId(format!("{run}-call")), executor:broca_wal::DeferredExecutor::Broca,
-                module:Some("aft".into()),tool:"read_file".into(),schema_pin:None,args_jcs:r#"{"path":"fixture.txt"}"#.into(),
-                args_hash:broca_wal::migration::digest(br#"{"path":"fixture.txt"}"#),
-                scope:serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"agent"},"ref":"approval-scope","scope_epoch":1})).unwrap(),
-                ask:broca_wal::DeferredAsk {prompt:"Allow file read?".into(),options:vec![],expires_at_ms:1000,on_expiry:broca_wal::OnExpiry::Deny,material_damage:false,late_execution:broca_wal::LateExecution::Execute},
-            };
+            records[3] = WalRecord::ToolCallDeferred { deferred_at_ms: None, batch_id: batch, call_id: ToolCallId(format!("{run}-call")), executor:broca_wal::DeferredExecutor::Broca,
+            module:Some("aft".into()),tool:"read_file".into(),schema_pin:None,args_jcs:r#"{"path":"fixture.txt"}"#.into(),
+            args_hash:broca_wal::migration::digest(br#"{"path":"fixture.txt"}"#),
+            scope:serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"agent"},"ref":"approval-scope","scope_epoch":1})).unwrap(),
+            ask:broca_wal::DeferredAsk {prompt:"Allow file read?".into(),options:vec![],expires_at_ms:1000,on_expiry:broca_wal::OnExpiry::Deny,material_damage:false,late_execution:broca_wal::LateExecution::Execute}, };
         }
         let mut wal = self.wal.open(session).unwrap();
         let mut prepared_key = None;
@@ -302,11 +303,10 @@ impl Rig {
             &broca_core::ReadOnlyWalReader::new(&root),
         )
         .unwrap();
-        let registry = Arc::new(LineageRegistry::new_with_reader_and_caps(
+        let registry = Arc::new(LineageRegistry::new_with_sources(
             Arc::new(NeverOpen),
             Some(wal.clone()),
             Some(index.clone()),
-            None,
         ));
         let service = Arc::new(AgentDataService::new(
             root.clone(),
@@ -340,6 +340,7 @@ impl Rig {
             wal.append(
                 1,
                 &WalRecord::ModelStepFinished {
+                    written_at_ms: None,
                     tags: None,
                     hooks: None,
                     step_id: broca_protocol::StepId(0),
@@ -381,6 +382,7 @@ impl Rig {
 }
 fn started(session: &BindIdentity, run: &str) -> WalRecord {
     WalRecord::RunStarted {
+        written_at_ms: None,
         tags: None,
         session_class: None,
         retention: None,
@@ -613,14 +615,13 @@ fn assert_code(result: Result<Value, Value>, code: &str) -> Value {
 async fn stamped_principal_admission_precedes_json_and_every_store_read() {
     let mut rig = Rig::new("admission", Arc::new(FakeDoor::default()));
     let reads = Arc::new(AtomicUsize::new(0));
-    rig.registry = Arc::new(LineageRegistry::new_with_reader_and_caps(
+    rig.registry = Arc::new(LineageRegistry::new_with_sources(
         Arc::new(NeverOpen),
         Some(Arc::new(CountingWalReads {
             inner: rig.wal.clone(),
             reads: reads.clone(),
         })),
         Some(rig.index.clone()),
-        None,
     ));
     std::fs::write(
         rig.root.join("wal/not-a-valid-address.wal"),
@@ -2105,6 +2106,7 @@ async fn closed_session_with_a_queued_send_is_busy_before_prepare() {
     let session = rig.session("queued");
     rig.seed(&session, "complete", true);
     let queued = WalRecord::Queued {
+        written_at_ms: None,
         retention: None,
         ts_ms: None,
         hooks: None,
@@ -2117,6 +2119,8 @@ async fn closed_session_with_a_queued_send_is_busy_before_prepare() {
         request_identity_digest: None,
         principal: None,
         request: Box::new(broca_protocol::request::SubmissionRequest {
+            staged_uploads: None,
+            content: Vec::new(),
             directives: None,
             on_restart: None,
             keep_warm: None,

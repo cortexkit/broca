@@ -1,8 +1,8 @@
 // Adapted from OpenAI Codex, revision a6baf8867cb4c9726213c0884a5c8b11f0cfd8bf (Apache-2.0).
 // Copyright 2025 OpenAI. See THIRD-PARTY-NOTICES.md and LICENSES/Apache-2.0.txt.
-// broca integrates run-local sockets with its shared Responses normalizer and HTTPS fallback.
+// broca integrates session-owned sockets with its shared Responses normalizer and HTTPS fallback.
 
-//! Run-local Responses sockets. The pump answers pings even between model steps; it never
+//! Responses sockets. The pump answers pings even between model steps and runs; it never
 //! decodes model output. Text records go through the same Responses normalizer as HTTPS.
 
 use super::*;
@@ -18,16 +18,24 @@ use tungstenite::{
     Message,
 };
 
+#[path = "transport_websocket_pool.rs"]
+mod pool;
+pub use pool::Connections;
+pub(super) use pool::Lease;
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 // Codex's default stream budget is five retries after the initial request. Retain its
 // six-failure threshold across this run, including upgrades that fell back before sending.
 const FAILURE_LIMIT: usize = 6;
-// Retire before the backend's 60-minute connection lifetime, not in the middle of a response.
-const MAX_SOCKET_AGE: Duration = Duration::from_secs(55 * 60);
+// OpenAI limits connections to 60 minutes. Retire at 40 minutes to leave headroom
+// above the longest healthy request we have measured (about 14 minutes).
+const MAX_SOCKET_AGE: Duration = Duration::from_secs(40 * 60);
 const BETA: &str = "responses_websockets=2026-02-06";
 // Only the first 512 bytes of a refused upgrade's body are read, and only to recognise a ChatGPT
 // usage-limit refusal (whose body is about 200 bytes). The body is never logged or stored.
 const UPGRADE_BODY_CLASSIFY_LIMIT: usize = 512;
+// How much of a wrapped error frame the local WARN line carries; see `WrappedErrorFrame`.
+const WRAPPED_FRAME_LOG_LIMIT: usize = 1024;
 
 const DISTINCT_LIMIT: usize = 4096;
 
@@ -300,6 +308,9 @@ enum UpgradeFailure {
     /// The upgrade's own body already says the account's usage limit is reached, so an HTTPS
     /// round trip would only repeat the refusal.
     AccountLimit(u16, Box<ProviderError>),
+    /// The upgrade was refused with a 429, or with a server retry time. This refusal is the
+    /// attempt's answer, classified like an HTTPS answer.
+    Refused(u16, Box<ProviderError>),
     /// No socket for this attempt: send it over HTTPS instead.
     Transport,
 }
@@ -332,6 +343,26 @@ impl Default for Session {
 }
 
 impl Session {
+    fn retire_socket(&self) {
+        if let Some(socket) = self.state.lock().unwrap().socket.take() {
+            socket.shutdown.cancel();
+        }
+    }
+
+    fn take_completed_socket(&self) -> Option<Arc<Socket>> {
+        let mut state = self.state.lock().unwrap();
+        let socket = state.socket.take()?;
+        if state.force_https
+            || socket.closed.load(Ordering::Acquire)
+            || socket.shutdown.is_cancelled()
+            || socket.continuation.lock().unwrap().is_none()
+        {
+            socket.shutdown.cancel();
+            return None;
+        }
+        Some(socket)
+    }
+
     pub(super) fn set_policy(&self, policy: HttpsPolicy) {
         *self.policy.write().unwrap() = policy;
     }
@@ -361,6 +392,28 @@ impl Session {
         if let Some(socket) = state.socket.take() {
             socket.shutdown.cancel();
         }
+    }
+
+    /// Codex's `try_switch_fallback_transport` (`core/src/client.rs:2454-2464`): send the rest of
+    /// the run over HTTPS, and answer whether this call made the switch. It did not when the run
+    /// was already switched, or when configuration already sends everything over HTTPS. Reaching
+    /// `FAILURE_LIMIT` socket failures also sends attempts over HTTPS (see `forced_https`), but
+    /// it does not count as this switch: Codex has no such threshold, so in its terms the
+    /// WebSocket is still enabled and the retry count may still fall back once.
+    pub(super) fn try_switch_to_https(&self) -> bool {
+        let policy = Arc::clone(&self.policy.read().unwrap());
+        if policy() {
+            return false;
+        }
+        let mut state = self.state.lock().unwrap();
+        if state.force_https {
+            return false;
+        }
+        state.force_https = true;
+        if let Some(socket) = state.socket.take() {
+            socket.shutdown.cancel();
+        }
+        true
     }
 
     fn now(&self) -> Instant {
@@ -413,19 +466,18 @@ impl Session {
         {
             let mut state = self.state.lock().unwrap();
             if let Some(socket) = &state.socket {
+                let age = now.saturating_duration_since(socket.established_at);
                 if !socket.closed.load(Ordering::Acquire)
-                    && socket.headers == request.headers
-                    && (!request.codex_wire || socket.auth_revision == request.auth_revision)
-                    && (!request.codex_wire || socket.url == request.url)
-                    && now.saturating_duration_since(socket.established_at) < MAX_SOCKET_AGE
+                    && connection_identity_matches(socket, request)
+                    && age < MAX_SOCKET_AGE
                 {
                     return Ok((Arc::clone(socket), true));
                 }
+                if age >= MAX_SOCKET_AGE {
+                    tracing::info!(target: "provider", transport = "websocket", socket_generation = socket.generation, socket_age_ms = age.as_millis() as u64, "Retiring Responses websocket before its connection lifetime limit");
+                }
                 socket.shutdown.cancel();
-                let auth_changed = socket.headers != request.headers
-                    || (request.codex_wire
-                        && (socket.auth_revision != request.auth_revision
-                            || socket.url != request.url));
+                let auth_changed = !connection_identity_matches(socket, request);
                 state.socket = None;
                 if auth_changed {
                     state.turn_state = None;
@@ -460,6 +512,14 @@ impl Session {
                 {
                     warn_upgrade_refusal(status, response.headers(), "account_limit");
                     return Err(UpgradeFailure::AccountLimit(status, Box::new(error)));
+                }
+                if let Some(error) = upgrade_refusal_with_retry_time(
+                    status,
+                    response.headers(),
+                    response.body().as_deref(),
+                ) {
+                    warn_upgrade_refusal(status, response.headers(), "retry_decision");
+                    return Err(UpgradeFailure::Refused(status, Box::new(error)));
                 }
                 warn_upgrade_refusal(status, response.headers(), "https");
                 if status == 403 {
@@ -514,6 +574,8 @@ struct SendCommand {
 
 struct Socket {
     auth_revision: u64,
+    credential_id: Option<String>,
+    account_ref: Option<String>,
     url: String,
     continuation: Mutex<Option<crate::chatgpt_continuation::CompletedResponse>>,
     send: mpsc::Sender<SendCommand>,
@@ -527,6 +589,50 @@ struct Socket {
     established_at: Instant,
     last_completed_at: Mutex<Option<Instant>>,
     attempt_active: tokio::sync::watch::Sender<bool>,
+}
+
+impl Drop for Socket {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
+fn connection_identity_matches(socket: &Socket, request: &PreparedHttpRequest) -> bool {
+    if request.codex_wire
+        && (socket.auth_revision != request.auth_revision
+            || socket.url != request.url
+            || socket.credential_id != request.credential_id
+            || socket.account_ref != request.account_ref)
+    {
+        return false;
+    }
+    // Turn id/time also travel in every response.create. Stable identity inside the
+    // metadata header, and every other header, still fence the authenticated connection.
+    socket.headers.len() == request.headers.len()
+        && socket.headers.iter().zip(&request.headers).all(
+            |((saved_name, saved), (name, current))| {
+                saved_name == name
+                    && if request.codex_wire && name.eq_ignore_ascii_case("x-codex-turn-metadata") {
+                        stable_turn_metadata_matches(saved, current)
+                    } else {
+                        saved == current
+                    }
+            },
+        )
+}
+
+fn stable_turn_metadata_matches(saved: &str, current: &str) -> bool {
+    let stable = |text: &str| {
+        let mut value: Value = serde_json::from_str(text).ok()?;
+        let object = value.as_object_mut()?;
+        object.remove("turn_id");
+        object.remove("turn_started_at_unix_ms");
+        Some(value)
+    };
+    match (stable(saved), stable(current)) {
+        (Some(saved), Some(current)) => saved == current,
+        _ => saved == current,
+    }
 }
 
 struct AttemptActivity(tokio::sync::watch::Sender<bool>);
@@ -625,6 +731,8 @@ async fn connect(
     let (attempt_active, activity) = tokio::sync::watch::channel(false);
     let socket = Arc::new(Socket {
         auth_revision: request.auth_revision,
+        credential_id: request.credential_id.clone(),
+        account_ref: request.account_ref.clone(),
         url: request.url.clone(),
         continuation: Mutex::new(None),
         send,
@@ -798,6 +906,12 @@ pub(super) async fn drive(
         if trace.transport.as_deref() != Some("websocket") {
             return failure;
         }
+        if trace.socket_reused == Some(true)
+            && session.state.lock().unwrap().socket.as_ref()
+                .is_some_and(|socket| socket.closed.load(Ordering::Acquire))
+        {
+            tracing::info!(target: "provider", reason = "peer_closed_after_checkout", "Reused Responses websocket closed; leaving recovery to the accounted attempt loop");
+        }
         // An upgrade refused for authentication is not a socket failure: the shared 401 path
         // re-reads the credential and tries the socket again, so it must not count toward the
         // switch to HTTPS for the rest of the run.
@@ -809,10 +923,17 @@ pub(super) async fn drive(
         // Backends can echo authorization headers in error bodies or parser diagnostics.
         // Only typed ceiling evidence has a message built entirely from safe metadata.
         if failure.output_ceiling.is_none() {
-            failure.error.message = format!(
-                "Responses websocket attempt failed ({:?}); response body omitted",
-                failure.outcome
-            );
+            failure.error.message = match trace
+                .wrapped_error_frame
+                .as_deref()
+                .filter(|_| failure.outcome == AttemptOutcome::HttpError)
+            {
+                Some(frame) => frame.run_error_message(),
+                None => format!(
+                    "Responses websocket attempt failed ({:?}); response body omitted",
+                    failure.outcome
+                ),
+            };
         }
         failure.error.provider_code = failure
             .error
@@ -862,6 +983,10 @@ async fn drive_socket(
             });
             // An exhausted account refills in hours or days: no retry within the step.
             return Err(AttemptFailure::http(*error, true));
+        }
+        Err(UpgradeFailure::Refused(status, error)) => {
+            trace.http_status = Some(status);
+            return Err(AttemptFailure::http(*error, false));
         }
         Err(UpgradeFailure::Transport) => {
             return drive_attempt(
@@ -1034,6 +1159,12 @@ async fn drive_socket(
         if let Ok(raw) = &record {
             if let Ok(value) = serde_json::from_slice(raw) {
                 session.observe_turn_state(&value);
+                if value["type"] == "error"
+                    && value.pointer("/error/code").and_then(Value::as_str)
+                        == Some("websocket_connection_limit_reached")
+                {
+                    client.chatgpt_connections.retire_idle_credential(request);
+                }
                 if value["type"] == "response.completed" {
                     *completed_id.lock().unwrap() =
                         value["response"]["id"].as_str().map(str::to_owned);
@@ -1125,6 +1256,7 @@ pub(super) fn warn_failure_decision(
         output_seen = trace.output_seen,
         retry_decision = decision,
         retry_reason = reason,
+        error_frame = trace.wrapped_error_frame.as_deref().map(|frame| frame.log_body.as_str()),
         "model websocket attempt failed"
     );
 }
@@ -1147,14 +1279,7 @@ pub(super) fn wrapped_error(raw: &[u8], trace: &mut AttemptTrace) -> Option<Atte
         // Codex 0.163.0 treats this named cache miss as retryable before status mapping,
         // even for a wrapped 400. Failure guards retire the established socket; the normal
         // accounted attempt loop retries with full input, never a resend inside this attempt.
-        let retry = [value.pointer("/error/headers"), value.get("headers")]
-            .into_iter()
-            .flatten()
-            .find_map(|source| {
-                let mut headers = reqwest::header::HeaderMap::new();
-                extend_wrapped_headers(&mut headers, source);
-                parse_retry_after_header(&headers)
-            });
+        let retry = codex_frame_retry_after(&value);
         let mut error = transport_error("Previous response was not found; retrying full input");
         error.class = ErrorClass::Transient;
         error.provider_code = Some("previous_response_not_found".into());
@@ -1176,11 +1301,12 @@ pub(super) fn wrapped_error(raw: &[u8], trace: &mut AttemptTrace) -> Option<Atte
     {
         extend_wrapped_headers(&mut headers, source);
     }
-    let retry = parse_retry_after_header(&headers);
+    let retry = codex_frame_retry_after(&value);
     trace.account_observation.ratelimit_headers = ratelimit_unified_headers(&headers);
     let headers = response_headers(&headers);
     let text = String::from_utf8_lossy(raw);
     let family = crate::spec::WireFamilyId::OpenAiResponsesChatgpt;
+    trace.wrapped_error_frame = Some(Box::new(WrappedErrorFrame::read(status, &value)));
     let error = classify_http_error(status, &text, retry, None);
     let error = classify_chatgpt_upstream_key_rejection(family, status, &text, error);
     let error =
@@ -1198,6 +1324,119 @@ pub(super) fn wrapped_error(raw: &[u8], trace: &mut AttemptTrace) -> Option<Atte
             .get("x-should-retry")
             .is_some_and(|value| value.eq_ignore_ascii_case("false"));
     Some(AttemptFailure::http(error, forbidden))
+}
+
+/// A provider refusal the Responses websocket wrapped in an error frame (`{"type":"error",
+/// "status":400,"error":{...}}`), kept so the attempt's failure can say why without carrying the
+/// frame's text.
+///
+/// The frame answers a `response.create` that was already sent, so its `error.message` can quote
+/// the request back: a schema refusal repeats the schema, and backends have echoed credentials.
+/// The run error is returned to the caller that started the run, so it gets only
+/// [`Self::run_error_message`]: the HTTP status and the frame's short identifier fields, each kept
+/// only when it has an identifier's shape, so none of them can hold a sentence of request content.
+/// The frame's message text is never part of it.
+///
+/// A copy of the frame, minus any `headers` object it wraps and cut to
+/// [`WRAPPED_FRAME_LOG_LIMIT`] bytes, goes only to broca's own WARN line for the failed attempt
+/// (`log_body`). broca's log is written on the machine that ran the request, which already holds
+/// the full transcript in its session log, so the frame adds nothing that machine did not have;
+/// and it is often the only place the backend's reason (such as a model the account cannot use) is
+/// written down. Ephemeral sessions, which promise to retain no content, never log it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct WrappedErrorFrame {
+    status: u16,
+    code: Option<String>,
+    error_type: Option<String>,
+    param: Option<String>,
+    /// The frame without its `headers` objects, cut to [`WRAPPED_FRAME_LOG_LIMIT`] bytes.
+    pub(super) log_body: String,
+}
+
+impl WrappedErrorFrame {
+    fn read(status: u16, frame: &Value) -> Self {
+        let field = |pointer: &str| frame.pointer(pointer).and_then(Value::as_str);
+        let identifier = |value: Option<&str>| {
+            value
+                .filter(|value| crate::safe_provider_subcode(value))
+                .map(str::to_owned)
+        };
+        let mut logged = frame.clone();
+        if let Some(object) = logged.as_object_mut() {
+            object.remove("headers");
+            if let Some(error) = object.get_mut("error").and_then(Value::as_object_mut) {
+                error.remove("headers");
+            }
+        }
+        let mut log_body = logged.to_string();
+        if log_body.len() > WRAPPED_FRAME_LOG_LIMIT {
+            let mut end = WRAPPED_FRAME_LOG_LIMIT;
+            while !log_body.is_char_boundary(end) {
+                end -= 1;
+            }
+            log_body.truncate(end);
+        }
+        Self {
+            status,
+            code: identifier(field("/error/code")),
+            error_type: identifier(field("/error/type")),
+            param: field("/error/param")
+                .or_else(|| field("/param"))
+                .filter(|param| safe_error_param(param))
+                .map(str::to_owned),
+            log_body,
+        }
+    }
+
+    /// `Responses websocket attempt failed (HttpError 400); code=<c> type=<t> param=<p>; message
+    /// omitted`, naming only the fields the frame had in an identifier's shape. With none, the
+    /// message says the body was omitted, as for every other websocket failure.
+    pub(super) fn run_error_message(&self) -> String {
+        let fields = [
+            ("code", &self.code),
+            ("type", &self.error_type),
+            ("param", &self.param),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| value.as_ref().map(|value| format!("{name}={value}")))
+        .collect::<Vec<_>>();
+        if fields.is_empty() {
+            format!(
+                "Responses websocket attempt failed (HttpError {}); response body omitted",
+                self.status
+            )
+        } else {
+            format!(
+                "Responses websocket attempt failed (HttpError {}); {}; message omitted",
+                self.status,
+                fields.join(" ")
+            )
+        }
+    }
+}
+
+/// Whether an `error.param` may be named in a run error: 1 to 128 characters, each a lowercase
+/// ASCII letter, a digit, `_`, `.`, `[` or `]`. That is the shape of the request path OpenAI puts
+/// there (`text.format.schema`, `input[3].content`). It has no space, `:`, `/`, `-` or capital, so
+/// it cannot hold a sentence, a URL, a bearer token or a JWT. Any other value is left out.
+fn safe_error_param(param: &str) -> bool {
+    (1..=128).contains(&param.len())
+        && param.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'_' | b'.' | b'[' | b']')
+        })
+}
+
+/// The server's retry time in a wrapped error frame, read as Codex reads it: the `Retry-After` in
+/// the nested `error.headers` first, then in the top-level `headers`, the first one that parses
+/// (`codex-api/src/endpoint/responses_websocket.rs:659-668`).
+fn codex_frame_retry_after(frame: &Value) -> Option<f64> {
+    let now = SystemTime::now();
+    [frame.pointer("/error/headers"), frame.get("headers")]
+        .into_iter()
+        .flatten()
+        .find_map(|headers| crate::codex_retry_after::json_headers_retry_after(headers, now))
 }
 
 fn extend_wrapped_headers(headers: &mut reqwest::header::HeaderMap, source: &Value) {
@@ -1274,6 +1513,40 @@ fn upgrade_account_limit(
         error,
     );
     error.is_account_limit_exhausted().then_some(error)
+}
+
+/// The error a refused upgrade states when the refusal is a 429 or carries a server retry time,
+/// classified the way an HTTPS answer is (status, the first [`UPGRADE_BODY_CLASSIFY_LIMIT`]
+/// bytes of the body, and the `Retry-After` header). Any other refusal returns `None`, and the
+/// caller sends the request over HTTPS within the same attempt.
+///
+/// Codex reads a refused upgrade as an ordinary HTTP answer and retries it by its own rules
+/// (`codex-api/src/endpoint/responses_websocket.rs:597-611`). A 429 without a retry time ends
+/// the step; with one, the next send waits until that time. Sending the request over HTTPS at
+/// once would re-send before the server's time, which is how a capacity refusal used to end
+/// runs early.
+fn upgrade_refusal_with_retry_time(
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    body: Option<&[u8]>,
+) -> Option<ProviderError> {
+    let retry_after = codex_retry::retry_after_secs(headers);
+    if status != 429 && retry_after.is_none() {
+        return None;
+    }
+    let body = body.unwrap_or_default();
+    let text = String::from_utf8_lossy(&body[..body.len().min(UPGRADE_BODY_CLASSIFY_LIMIT)]);
+    let family = crate::spec::WireFamilyId::OpenAiResponsesChatgpt;
+    let error = classify_http_error(status, &text, retry_after, None);
+    let error = classify_chatgpt_upstream_key_rejection(family, status, &text, error);
+    Some(classify_account_limit_exhausted(
+        family,
+        status,
+        &response_headers(headers),
+        &text,
+        SystemTime::now(),
+        error,
+    ))
 }
 
 pub(super) fn frame_record(raw: &[u8]) -> Vec<u8> {
@@ -1636,6 +1909,8 @@ mod pump_tests {
         let (attempt_active, activity) = tokio::sync::watch::channel(false);
         let socket = Arc::new(Socket {
             auth_revision: 0,
+            credential_id: None,
+            account_ref: None,
             url: String::new(),
             continuation: Mutex::new(None),
             send,
@@ -1848,6 +2123,8 @@ async fn codex_failed_send_retires_socket_and_consumes_receipt() {
     let (attempt_active, _) = tokio::sync::watch::channel(false);
     let socket = Arc::new(Socket {
         auth_revision: 0,
+        credential_id: None,
+        account_ref: None,
         url: request.url.clone(),
         continuation: Mutex::new(Some(crate::chatgpt_continuation::CompletedResponse {
             request: logical,
@@ -1912,6 +2189,8 @@ async fn codex_completed_write_is_counted_when_cancelled_before_acknowledgement(
     let (attempt_active, _) = tokio::sync::watch::channel(false);
     let socket = Arc::new(Socket {
         auth_revision: 0,
+        credential_id: None,
+        account_ref: None,
         url: request.url.clone(),
         continuation: Mutex::new(Some(crate::chatgpt_continuation::CompletedResponse {
             request: logical,

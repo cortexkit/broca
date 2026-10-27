@@ -34,8 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use broca_core::{
-    advance_control_projection_state, project_control_with_state, ControlProjectionState, Cursor,
-    SessionStore, WalStore,
+    advance_control_projection_state, ControlProjectionState, Cursor, SessionStore, WalStore,
 };
 use broca_protocol::caller::ControlUnit;
 use broca_protocol::BindIdentity;
@@ -44,7 +43,36 @@ use tokio_util::sync::CancellationToken;
 
 /// One cursor-tagged control unit on the stream. The bounded Tokio broadcast channel shares this
 /// tuple behind an [`Arc`] so each receiver clones a pointer, not the owned message/tool payload.
-pub type ControlEvent = (Cursor, ControlUnit);
+pub type ControlEvent = (
+    Cursor,
+    ControlUnit,
+    cortexkit_role_llm_runner::live::LiveEvent,
+);
+
+fn project_events(
+    records: &[broca_wal::FramedRecord],
+    state: &mut ControlProjectionState,
+) -> Result<Vec<ControlEvent>, String> {
+    broca_core::project_control_with_mids(records, state).map(|frames| {
+        frames
+            .into_iter()
+            .map(|frame| (frame.cursor, frame.unit, frame.event))
+            .collect()
+    })
+}
+
+#[cfg(test)]
+fn project_control_with_state(
+    records: &[broca_wal::FramedRecord],
+    state: &mut ControlProjectionState,
+) -> Vec<ControlEvent> {
+    project_events(records, state).expect("fixture placement is valid")
+}
+
+#[cfg(test)]
+fn project_control(records: &[broca_wal::FramedRecord]) -> Vec<ControlEvent> {
+    project_control_with_state(records, &mut Default::default())
+}
 
 /// What a subscriber receives on the unified session stream. Per the module surface, one
 /// `session.subscribe` carries BOTH the reliable+replayable control stream and the
@@ -52,7 +80,7 @@ pub type ControlEvent = (Cursor, ControlUnit);
 ///
 /// `Control` is a cursor-tagged control unit (reliable; replayed on attach, deduped).
 /// Both event variants share their owned payload so fan-out only clones an [`Arc`] per subscriber.
-/// `Display` is a live display event (lossy; live-only, never replayed).
+/// `Display` is advisory current-step replay followed by live display (both lossy).
 /// `Detached` means the subscriber fell behind the bounded control broadcast channel and must
 /// resubscribe from its last cursor. A client never consumes a post-gap control event as contiguous.
 /// Display lag is signalled in-band by a `DisplayGap` event, not a detach.
@@ -105,7 +133,7 @@ struct AttachReplay {
     /// The resolved attach point; `Live` becomes "after the prefix's last cursor".
     from: FromCursor,
     /// The units past the attach point, in order.
-    units: Vec<(Cursor, ControlUnit)>,
+    units: Vec<ControlEvent>,
     /// How many control units were constructed, delivered or not. Only tests read it: it is
     /// how they show that an attach does not build the history it skips.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -123,17 +151,32 @@ fn replay_for_attach(
     records: Vec<broca_wal::FramedRecord>,
     h: u64,
     from: AttachFrom,
-) -> AttachReplay {
+) -> Result<AttachReplay, String> {
     let durable_prefix: Vec<broca_wal::FramedRecord> =
         records.into_iter().filter(|f| f.seq <= h).collect();
+    project_attach(&durable_prefix, ControlProjectionState::default(), from)
+}
+
+/// Project a durable prefix for one attach, starting from `state`.
+///
+/// `durable_prefix` ends at the barrier head. `state` must be the projection state just before
+/// its first record: the default for a prefix starting at the log's first record, or
+/// [`ControlProjectionState::at_episode_start`] for one starting at an episode's `RunStarted`.
+fn project_attach(
+    durable_prefix: &[broca_wal::FramedRecord],
+    mut state: ControlProjectionState,
+    from: AttachFrom,
+) -> Result<AttachReplay, String> {
     let seeded_h = durable_prefix.last().map_or(0, |record| record.seq);
-    let mut state = ControlProjectionState::default();
-    match from {
+    Ok(match from {
         // Live uses the existing strictly-after comparison once the barrier has projected H.
         // An empty lineage has no cursor to resume after, but Start is equivalent because its
         // replay is empty.
         AttachFrom::Live => {
-            let last = advance_control_projection_state(&durable_prefix, &mut state);
+            let last = advance_control_projection_state(durable_prefix, &mut state);
+            if let Some(error) = state.placement_error() {
+                return Err(error.to_owned());
+            }
             AttachReplay {
                 state,
                 seeded_h,
@@ -150,7 +193,7 @@ fn replay_for_attach(
                 }
             };
             advance_control_projection_state(&durable_prefix[..skipped], &mut state);
-            let projected = project_control_with_state(&durable_prefix[skipped..], &mut state);
+            let projected = project_events(&durable_prefix[skipped..], &mut state)?;
             let built = projected.len();
             AttachReplay {
                 state,
@@ -158,12 +201,137 @@ fn replay_for_attach(
                 from,
                 units: projected
                     .into_iter()
-                    .filter(|(cursor, _)| from.includes(*cursor))
+                    .filter(|(cursor, _, _)| from.includes(*cursor))
                     .collect(),
                 built,
             }
         }
+    })
+}
+
+/// Where an attach by episode starts its fold, from the offset index.
+#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
+pub(crate) struct AttachEpisodeStart {
+    /// The episode holding the attach cursor, or, for a live attach, the barrier head (see
+    /// [`broca_core::projection::episode_holding_seq`]).
+    pub episode: broca_core::projection::IndexedEpisode,
+    /// The last qualified projection boundary before that episode's `RunStarted`, with the
+    /// index's tail seed there; `None` to read from the log's first record.
+    pub seed: Option<broca_core::projection::EpisodeSeed>,
+}
+
+/// Replay an attach from the episode holding its attach point instead of the whole log.
+///
+/// Only the frames from the episode's seed boundary to the barrier head are decoded (through
+/// `read_at`, counting each when `decode_counter` is given), where `durable_end` is the byte
+/// offset just past the barrier head's frame. The fold that rebuilds projection state before
+/// the attach point covers that one episode from its `RunStarted`, which resets every
+/// episode-local field; placement carries only the episode's first ordinal across episodes. The
+/// ordinal and the episode start are validated against the log by
+/// [`broca_core::projection::replay_from_episode_start`] before they are used.
+///
+/// An attach from the lineage start, or without an episode start, decodes from the log's first
+/// record: everything it decodes is delivered. Any failed check, an unreadable range, or a
+/// projection error falls back to `complete_read` and a full replay, so the delivered units and
+/// the state handed to the live projector are the same either way; the second value names the
+/// fallback reason, `None` when the attach was served by episode.
+#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
+fn replay_for_attach_by_episode(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    durable_end: u64,
+    h: u64,
+    from: AttachFrom,
+    start: Option<&AttachEpisodeStart>,
+    decode_counter: Option<&std::cell::Cell<u64>>,
+    complete_read: impl FnOnce() -> Result<Vec<broca_wal::FramedRecord>, String>,
+) -> Result<(AttachReplay, Option<&'static str>), String> {
+    match attach_by_episode(read_at, durable_end, h, from, start, decode_counter) {
+        Ok(replay) => Ok((replay, None)),
+        Err(reason) => Ok((replay_for_attach(complete_read()?, h, from)?, Some(reason))),
     }
+}
+
+#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
+fn attach_by_episode(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    durable_end: u64,
+    h: u64,
+    from: AttachFrom,
+    start: Option<&AttachEpisodeStart>,
+    decode_counter: Option<&std::cell::Cell<u64>>,
+) -> Result<AttachReplay, &'static str> {
+    let records_start =
+        broca_core::projection::first_record_offset(read_at).map_err(|_| "log unreadable")?;
+    let start = match from {
+        AttachFrom::Cursor(FromCursor::Start) => None,
+        _ => start,
+    };
+    let frames_from = start
+        .and_then(|start| start.seed.as_ref())
+        .map_or(records_start, |seed| seed.boundary.frame_end);
+    let frames = broca_core::projection::decode_positioned_frames(
+        read_at,
+        frames_from,
+        durable_end,
+        decode_counter,
+    )
+    .map_err(|_| "attach frames unreadable")?;
+    if frames
+        .windows(2)
+        .any(|pair| pair[0].framed.seq + 1 != pair[1].framed.seq)
+    {
+        return Err("attach frames have a sequence gap");
+    }
+    if frames.last().map_or(0, |last| last.framed.seq) < h {
+        return Err("attach frames end before the barrier head");
+    }
+    let Some(start) = start else {
+        // Everything from the log's first record: nothing stored is relied on.
+        if frames
+            .first()
+            .is_some_and(|first| first.framed.seq != 1 || first.off != records_start)
+        {
+            return Err("frames do not start at the log's first record");
+        }
+        let prefix: Vec<_> = frames
+            .into_iter()
+            .map(|positioned| positioned.framed)
+            .filter(|framed| framed.seq <= h)
+            .collect();
+        return project_attach(&prefix, ControlProjectionState::default(), from)
+            .map_err(|_| "attach projection refused");
+    };
+    let run_started = broca_core::projection::episode_start_index(&start.episode, &frames)
+        .ok_or("episode start not in the frames read")?;
+    // Validate the seed and the episode's first ordinal on the frames up to its start only:
+    // the frames after it are projected below, not replayed.
+    broca_core::projection::replay_from_episode_start(
+        read_at,
+        start.seed.as_ref(),
+        &start.episode,
+        &frames[..=run_started],
+    )
+    .map_err(|fallback| fallback.reason)?;
+    let episode_seq = frames[run_started].framed.seq;
+    match from {
+        AttachFrom::Cursor(FromCursor::After(cursor)) if cursor.wal_seq < episode_seq => {
+            return Err("attach point precedes the episode");
+        }
+        AttachFrom::Live if h < episode_seq => return Err("barrier head precedes the episode"),
+        _ => {}
+    }
+    let prefix: Vec<_> = frames
+        .into_iter()
+        .skip(run_started)
+        .map(|positioned| positioned.framed)
+        .filter(|framed| framed.seq <= h)
+        .collect();
+    project_attach(
+        &prefix,
+        ControlProjectionState::at_episode_start(start.episode.first_ord),
+        from,
+    )
+    .map_err(|_| "attach projection refused")
 }
 
 /// The attach-barrier decision for a unit arriving on the LIVE ring (step 2 of the
@@ -255,7 +423,9 @@ impl<T> From<broadcast::Sender<T>> for LazyRing<T> {
 }
 
 /// The live display stream's sender, handed to a run's output drain.
-pub type DisplaySender = LazyRing<Arc<broca_protocol::display::DisplayEvent>>;
+#[path = "display_replay.rs"]
+mod display_replay;
+pub use display_replay::DisplaySender;
 
 /// The fan-out: a control ring (fed by the projector from the writer's record observer)
 /// and a display ring (fed by the run's live `out` display events). Owned by the actor;
@@ -268,8 +438,8 @@ pub struct Fanout<W: WalStore> {
     detach_ring: broadcast::Sender<()>,
     /// The LOSSY display ring. The actor forwards the run's live display events here; it is
     /// NEVER fed control (control is sourced only from the WAL projection, so it can't
-    /// double-publish). Live-only, never replayed — a fresh display subscriber gets events
-    /// from attach onward, with a `DisplayGap` on lag.
+    /// double-publish). A bounded current-step snapshot precedes live events on attach;
+    /// overflow and receiver lag are marked by `DisplayGap` rather than a false full prefix.
     display_ring: DisplaySender,
     wal_store: Arc<W>,
     session: BindIdentity,
@@ -306,7 +476,7 @@ struct ProjectionSeed {
 }
 
 enum ProjectionSeedMessage {
-    State(ProjectionSeed),
+    State(Box<ProjectionSeed>),
     /// The gate-owning attach could not replay the WAL. A concurrent attach's deferred seed may
     /// take ownership so one failed subscriber cannot stall every other subscriber in the tenure.
     GateOwnerFailed {
@@ -449,7 +619,7 @@ impl<W: WalStore + 'static> Fanout<W> {
     pub fn new(wal_store: Arc<W>, session: BindIdentity) -> (Self, broca_core::RecordObserver) {
         let approvals = Arc::new(crate::approval_state::ApprovalState::default());
         let ring = LazyRing::new(RING_CAPACITY);
-        let display_ring = LazyRing::new(DISPLAY_RING_CAPACITY);
+        let display_ring = DisplaySender::new(DISPLAY_RING_CAPACITY);
         let (detach_ring, _) = broadcast::channel(1);
         let (obs_tx, obs_rx) = broadcast::channel(OBSERVER_RING_CAPACITY);
         let (projection_seed, seed_rx) = mpsc::unbounded_channel();
@@ -532,8 +702,8 @@ impl<W: WalStore + 'static> Fanout<W> {
 
     /// Spawn a subscriber task with an already-registered CONTROL ring receiver, the attach
     /// reservation that kept the gate enabled through `writer.sync()`, and the durable head
-    /// `H` returned by that sync. The task also subscribes the DISPLAY ring (live-only, no
-    /// barrier because display has no durable replay) and forwards both on the unified
+    /// `H` returned by that sync. After durable replay the task atomically snapshots and
+    /// subscribes the advisory DISPLAY state, and forwards both lanes on the unified
     /// `sink`. The actor only performed the small receiver-registration + sync step; the
     /// slower WAL replay happens in this task so a subscriber's catch-up work never blocks
     /// the actor.
@@ -549,7 +719,7 @@ impl<W: WalStore + 'static> Fanout<W> {
         materialized_store: Option<Arc<dyn SessionStore>>,
     ) {
         self.reap_finished();
-        let display_rx = self.display_ring.subscribe();
+        let display = self.display_ring.clone();
         let cancel = CancellationToken::new();
         let handle = tokio::spawn(subscriber_task(
             slot,
@@ -557,7 +727,7 @@ impl<W: WalStore + 'static> Fanout<W> {
             h,
             rx,
             detach_rx,
-            display_rx,
+            display,
             sink.clone(),
             self.wal_store.clone(),
             self.session.clone(),
@@ -680,6 +850,7 @@ async fn projector_loop(
                 }
                 let seed = match message {
                     ProjectionSeedMessage::State(seed) => {
+                        let seed = *seed;
                         if seed.gate_tenure != gate_tenure.load(Ordering::Acquire) {
                             // A prior 0 -> 1 transition finished replay after a newer tenure began.
                             // Its state cannot cover records written while the gate was empty.
@@ -733,11 +904,20 @@ async fn projector_loop(
                 gate_seed_required = None;
                 deferred_gate_seed = None;
                 covered_head = covered_head.max(seed.head);
-                for framed in buffered.drain(..).filter(|record| record.seq > seed.head) {
-                    for event in broca_core::project_control_with_state(
+                for framed in std::mem::take(&mut buffered).into_iter().filter(|record| record.seq > seed.head) {
+                    let events = match project_events(
                         std::slice::from_ref(&*framed),
                         &mut projection_state,
                     ) {
+                        Ok(events) => events,
+                        Err(error) => {
+                            tracing::error!(target: "fanout", %error, "durable control placement failed");
+                            let _ = detach_ring.send(());
+                            reset_projection_handshake(&mut projection_state, &mut seeded, &mut buffered);
+                            break;
+                        }
+                    };
+                    for event in events {
                         let _ = ring.send(Arc::new(event));
                     }
                     covered_head = covered_head.max(framed.seq);
@@ -760,10 +940,19 @@ async fn projector_loop(
                         if framed.seq <= covered_head {
                             continue;
                         }
-                        for event in broca_core::project_control_with_state(
+                        let events = match project_events(
                             std::slice::from_ref(&*framed),
                             &mut projection_state,
                         ) {
+                            Ok(events) => events,
+                            Err(error) => {
+                                tracing::error!(target: "fanout", %error, "durable control placement failed");
+                                let _ = detach_ring.send(());
+                                reset_projection_handshake(&mut projection_state, &mut seeded, &mut buffered);
+                                continue;
+                            }
+                        };
+                        for event in events {
                             // A send error means no live subscribers right now — fine, the WAL is
                             // the source of truth and a future attach replays from it.
                             let _ = ring.send(Arc::new(event));
@@ -800,16 +989,10 @@ async fn projector_loop(
 fn control_projection_state_from_seed(
     seed: &broca_core::ProjectionSeed,
 ) -> Option<ControlProjectionState> {
-    (seed.completed_steps == 0 || seed.last_step_finish_reason.is_some()).then(|| {
-        ControlProjectionState::from_completed_steps_and_final_step_finish_reason(
-            seed.completed_steps,
-            seed.last_step_finish_reason,
-            // The seed knows which run the watermark sits inside. Without it a
-            // live-attached subscriber sees a terminal naming NO run while a
-            // replaying one sees the same terminal naming it.
-            seed.last_run_id.clone(),
-        )
-    })
+    if seed.completed_steps > 0 && seed.last_step_finish_reason.is_none() {
+        return None;
+    }
+    ControlProjectionState::from_projection_seed(seed)
 }
 
 /// Restore the control projection at `h` without decoding the materialized WAL prefix.
@@ -854,6 +1037,9 @@ async fn try_live_projection_seed<W: WalStore + 'static>(
             return None;
         }
         advance_control_projection_state(records, &mut state);
+        if state.placement_error().is_some() {
+            return None;
+        }
         Some(state)
     })
     .await
@@ -871,7 +1057,7 @@ async fn subscriber_task<W: WalStore + 'static>(
     h: u64,
     mut rx: broadcast::Receiver<Arc<ControlEvent>>,
     mut detach_rx: broadcast::Receiver<()>,
-    mut display_rx: broadcast::Receiver<Arc<broca_protocol::display::DisplayEvent>>,
+    display: DisplaySender,
     sink: mpsc::Sender<Delivery>,
     wal_store: Arc<W>,
     session: BindIdentity,
@@ -892,12 +1078,12 @@ async fn subscriber_task<W: WalStore + 'static>(
         // The store seed and validated suffix cover exactly H. Register that state before awaiting
         // any sink operation; records appended after H are already buffered in the live receiver.
         if projection_seed
-            .send(ProjectionSeedMessage::State(ProjectionSeed {
+            .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
                 head: h,
                 state,
                 gate_reopen,
                 gate_tenure,
-            }))
+            })))
             .is_ok()
         {
             slot.as_mut()
@@ -909,8 +1095,7 @@ async fn subscriber_task<W: WalStore + 'static>(
         // STEP 1 — replay the durable CONTROL projection for records seq <= H. read_records
         // returns committed (fsynced) records; HARD-FILTER seq <= H so a concurrent append of
         // seq > H during the read is excluded, keeping the read prefix-consistent at H.
-        // (Display is live-only, so there's no display replay — a fresh subscriber sees display
-        // from attach onward.)
+        // Advisory display replay is snapshotted separately after durable control replay.
         let records = match spawn_blocking(JobKind::WalRead, {
             let wal_store = wal_store.clone();
             let session = session.clone();
@@ -957,7 +1142,19 @@ async fn subscriber_task<W: WalStore + 'static>(
         })
         .await
         {
-            Ok(replay) => replay,
+            Ok(Ok(replay)) => replay,
+            Ok(Err(error)) => {
+                slot.as_mut()
+                    .expect("subscriber slot remains owned during replay")
+                    .report_gate_owner_failure();
+                let _ = deliver(
+                    &sink,
+                    &cancel,
+                    Delivery::Error(format!("WAL placement failed: {error}")),
+                )
+                .await;
+                return;
+            }
             Err(error) => {
                 slot.as_mut()
                     .expect("subscriber slot remains owned during replay")
@@ -974,20 +1171,20 @@ async fn subscriber_task<W: WalStore + 'static>(
         // Hand the projector the exact state this replay produced. Send before awaiting the subscriber
         // sink so live projection cannot remain unseeded behind a slow replay consumer.
         if projection_seed
-            .send(ProjectionSeedMessage::State(ProjectionSeed {
+            .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
                 head: seeded_h,
                 state: replay_state,
                 gate_reopen,
                 gate_tenure,
-            }))
+            })))
             .is_ok()
         {
             slot.as_mut()
                 .expect("subscriber slot remains owned during seed handoff")
                 .projection_seed_handed_off();
         }
-        for (cursor, unit) in replay {
-            if deliver(&sink, &cancel, Delivery::Control(Arc::new((cursor, unit))))
+        for event in replay {
+            if deliver(&sink, &cancel, Delivery::Control(Arc::new(event)))
                 .await
                 .is_break()
             {
@@ -997,7 +1194,16 @@ async fn subscriber_task<W: WalStore + 'static>(
         from
     };
 
-    // STEP 2 — forward the live streams: CONTROL (deduped past H) + DISPLAY (live, lossy).
+    let (mut display_rx, snapshot) = display.subscribe_snapshot();
+    for event in snapshot {
+        if deliver(&sink, &cancel, Delivery::Display(Arc::new(event)))
+            .await
+            .is_break()
+        {
+            return;
+        }
+    }
+    // STEP 2 — forward the live streams after the atomic current-step display snapshot.
     // `display_open` guards the display arm so a CLOSED display ring (returns Closed on
     // every poll) doesn't busy-loop the select — once display closes we stop polling it but
     // keep serving control until the control ring closes.
@@ -1164,6 +1370,15 @@ async fn deliver(
 
 #[cfg(test)]
 mod tests {
+    async fn assert_attach_reset(deliveries: &mut tokio::sync::mpsc::Receiver<super::Delivery>) {
+        let delivery = tokio::time::timeout(std::time::Duration::from_secs(5), deliveries.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(delivery, super::Delivery::Display(event) if matches!(*event, broca_protocol::DisplayEvent::DisplayReset))
+        );
+    }
     use super::*;
 
     /// THE DELIVERY COUNTERS MOVE ON A REAL DELIVERY, AND ONLY ON ONE.
@@ -1184,6 +1399,8 @@ mod tests {
 
         let before = display_deliveries();
         let event = Arc::new(broca_protocol::display::DisplayEvent::TextDelta {
+            mid: None,
+            part: Some(0),
             message_id: broca_protocol::MessageId("m1".to_string()),
             tool_call_id: None,
             delta: "hi".to_string(),
@@ -1200,8 +1417,7 @@ mod tests {
 
         // A GAP IS THE ARM THIS TEST DID NOT HAVE, and its absence is why the defect
         // shipped: a DisplayGap rides in a Delivery::Display envelope, so a match on the
-        // envelope alone counted display LOSS as a delivery. The mutation that restores
-        // the envelope-only match passes every other assertion here.
+        // envelope alone counted display LOSS as a delivery.
         let before_gap_d = display_deliveries();
         let before_gap_g = display_gaps();
         assert!(matches!(
@@ -1266,6 +1482,7 @@ mod tests {
 
     fn run_started(session: &BindIdentity) -> WalRecord {
         WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -1315,6 +1532,7 @@ mod tests {
 
     fn tool_step() -> WalRecord {
         WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(1),
@@ -1367,6 +1585,7 @@ mod tests {
                 run_started(&session),
                 tool_step(),
                 WalRecord::ToolResult {
+                    finished_at_ms: None,
                     tags: None,
                     hooks: None,
                     batch_id: broca_protocol::BatchId("b1".into()),
@@ -1389,16 +1608,28 @@ mod tests {
             }
         }
         let h = records.len() as u64;
-        let full = broca_core::project_control(&records);
+        let full = project_control(&records);
         let whole_state = state_through(&records);
-        let cursor = full[full.len() - 3].0;
+        let cursor = full
+            .iter()
+            .rev()
+            .find(|event| matches!(event.1, ControlUnit::StepFinished { .. }))
+            .unwrap()
+            .0;
 
         let resumed = replay_for_attach(
             records.clone(),
             h,
             AttachFrom::Cursor(FromCursor::After(cursor)),
+        )
+        .unwrap();
+        assert_eq!(
+            resumed.units,
+            full.iter()
+                .filter(|(next, ..)| *next > cursor)
+                .cloned()
+                .collect::<Vec<_>>()
         );
-        assert_eq!(resumed.units, full[full.len() - 2..].to_vec());
         assert_eq!(resumed.state, whole_state);
         assert_eq!(resumed.seeded_h, h);
         assert!(
@@ -1408,7 +1639,7 @@ mod tests {
             full.len()
         );
 
-        let live = replay_for_attach(records.clone(), h, AttachFrom::Live);
+        let live = replay_for_attach(records.clone(), h, AttachFrom::Live).unwrap();
         assert_eq!(
             live.built, 0,
             "a live attach delivers no replay and builds none"
@@ -1417,7 +1648,8 @@ mod tests {
         assert_eq!(live.state, whole_state);
         assert!(matches!(live.from, FromCursor::After(last) if last == full.last().unwrap().0));
 
-        let from_start = replay_for_attach(records, h, AttachFrom::Cursor(FromCursor::Start));
+        let from_start =
+            replay_for_attach(records, h, AttachFrom::Cursor(FromCursor::Start)).unwrap();
         assert_eq!(from_start.units, full);
     }
 
@@ -1430,6 +1662,7 @@ mod tests {
     #[cfg(unix)]
     fn text_step(step_id: u64) -> WalRecord {
         WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(step_id),
@@ -1513,6 +1746,10 @@ mod tests {
         final_step_finish_reason: Option<FinishReason>,
     ) -> broca_core::ProjectionSeed {
         broca_core::ProjectionSeed {
+            open_episode_span: None,
+            open_episode: None,
+            earlier_episodes: Vec::new(),
+            projection_episodes: None,
             deferred_calls: None,
             watermark_seq,
             anchor: Some(anchor),
@@ -1578,12 +1815,39 @@ mod tests {
 
         writer.record(run_started(&session));
         writer.record(tool_step());
+        writer.record(WalRecord::ToolBatchStarted {
+            batch_id: broca_protocol::BatchId("b1".into()),
+            step_id: StepId(1),
+            planned_calls: vec![ToolCallId("c1".into())],
+        });
+        writer.record(WalRecord::ToolResult {
+            finished_at_ms: None,
+            tags: None,
+            hooks: None,
+            batch_id: broca_protocol::BatchId("b1".into()),
+            result: broca_protocol::ToolResult {
+                tool_call_id: ToolCallId("c1".into()),
+                output: broca_protocol::ToolOutput::Text {
+                    text: "done".into(),
+                },
+                is_error: false,
+            }
+            .into(),
+            outcome: broca_wal::DispatchOutcome::Completed,
+            reason: None,
+            withdraw_elicitation: None,
+            provider_held: None,
+        });
+        writer.record(WalRecord::ToolBatchFinished {
+            batch_id: broca_protocol::BatchId("b1".into()),
+        });
+        writer.record(WalRecord::TurnFinished { step_id: StepId(1) });
         writer.sync().await.expect("sync projected prefix");
         let prefix = wal_store
-            .read_records_range(&session, 0, Some(2), None)
+            .read_records_range(&session, 0, Some(6), None)
             .expect("read prefix anchor");
         let anchor = prefix
-            .anchor_at(2)
+            .anchor_at(6)
             .expect("file WAL returns an exact anchor");
 
         writer.record(WalRecord::RunConfigRefrozen {
@@ -1593,16 +1857,23 @@ mod tests {
         });
         writer.record(text_step(2));
         let h = writer.sync().await.expect("sync attach head");
-        assert_eq!(h, 4);
+        assert_eq!(h, 8);
 
-        let seed_store = Arc::new(FixedProjectionSeedStore {
-            seed: Some(fixed_projection_seed(
-                2,
-                anchor,
-                1,
-                Some(FinishReason::ToolCalls),
-            )),
+        let mut seed = fixed_projection_seed(6, anchor, 2, Some(FinishReason::ToolCalls));
+        let broca_wal::WalRangeRecords::Complete(prefix_records) = prefix.records() else {
+            panic!("the materialized boundary has a complete prefix");
+        };
+        seed.admission_checkpoint =
+            broca_core::AdmissionCheckpointV1::from_frames(prefix_records).unwrap();
+        seed.admission_checkpoint
+            .last_episode
+            .as_mut()
+            .unwrap()
+            .budget_replay_state = Some(broca_core::BudgetReplayStateV1 {
+            tool_call_count: 1,
+            ..Default::default()
         });
+        let seed_store = Arc::new(FixedProjectionSeedStore { seed: Some(seed) });
         let fast_state = try_live_projection_seed(
             wal_store.clone(),
             session.clone(),
@@ -1618,7 +1889,7 @@ mod tests {
             "seed plus suffix must equal full replay at H"
         );
 
-        let next = [framed(5, run_finished())];
+        let next = [framed(9, run_finished())];
         let mut expected_state = full_state.clone();
         let expected = project_control_with_state(&next, &mut expected_state);
         let mut continued_state = fast_state;
@@ -1644,6 +1915,7 @@ mod tests {
         // handshake must buffer it and deliver it exactly once after installing state at H.
         writer.record(run_finished());
         writer.sync().await.expect("sync post-barrier record");
+        assert_attach_reset(&mut deliveries).await;
 
         let delivery = broca_test_support::event_timeout(
             "live_seed_matches_full_projection_and_buffers_the_first_post_barrier_record",
@@ -1663,7 +1935,7 @@ mod tests {
         assert!(matches!(
             delivery,
             Delivery::Control(event)
-                if event.0 == Cursor::new(5, 0)
+                if event.0 == Cursor::new(9, 0)
                     && matches!(
                         &event.1,
                         ControlUnit::RunFinished {
@@ -1733,14 +2005,14 @@ mod tests {
             },
             &mut fast_state,
         );
-        let expected_tail: Vec<_> = broca_core::project_control(match full_range.records() {
+        let expected_tail: Vec<_> = project_control(match full_range.records() {
             broca_wal::WalRangeRecords::Complete(records)
             | broca_wal::WalRangeRecords::Partial(records)
             | broca_wal::WalRangeRecords::Unknown(records) => records,
             broca_wal::WalRangeRecords::Absent => &[],
         })
         .into_iter()
-        .filter(|(cursor, _)| cursor.wal_seq > watermark)
+        .filter(|(cursor, ..)| cursor.wal_seq > watermark)
         .collect();
         assert_eq!(fast_tail, expected_tail);
         assert!(matches!(
@@ -1750,7 +2022,8 @@ mod tests {
                 ControlUnit::RunFinished {
                     final_step_finish_reason: Some(FinishReason::Stop),
                     ..
-                }
+                },
+                _,
             )]
         ));
 
@@ -1856,9 +2129,9 @@ mod tests {
         let full_records = wal_store
             .read_records(&session)
             .expect("read full WAL oracle");
-        let expected_tail: Vec<_> = broca_core::project_control(&full_records)
+        let expected_tail: Vec<_> = project_control(&full_records)
             .into_iter()
-            .filter(|(cursor, _)| cursor.wal_seq > watermark)
+            .filter(|(cursor, ..)| cursor.wal_seq > watermark)
             .collect();
         assert_eq!(fast_tail, expected_tail);
         assert!(matches!(
@@ -1868,7 +2141,8 @@ mod tests {
                 ControlUnit::RunFinished {
                     final_step_finish_reason: None,
                     ..
-                }
+                },
+                _,
             )]
         ));
 
@@ -1915,6 +2189,7 @@ mod tests {
         );
         writer.record(run_finished());
         writer.sync().await.expect("sync post-barrier terminal");
+        assert_attach_reset(&mut deliveries).await;
 
         let delivery = broca_test_support::event_timeout(
             "live_attach_without_a_persisted_seed_falls_back_to_full_replay",
@@ -2092,6 +2367,8 @@ mod tests {
 
         writer.record(run_started(&session));
         writer.sync().await.expect("sync run start");
+        assert_attach_reset(&mut deliveries_a).await;
+        assert_attach_reset(&mut deliveries_b).await;
         let control_a = broca_test_support::event_timeout(
             "multiple_subscribers_receive_identical_shared_live_payloads",
             deliveries_a.recv(),
@@ -2131,6 +2408,8 @@ mod tests {
         }
 
         let display = Arc::new(broca_protocol::display::DisplayEvent::TextDelta {
+            mid: None,
+            part: Some(0),
             message_id: MessageId("m1".into()),
             tool_call_id: None,
             delta: "shared delta".into(),
@@ -2213,6 +2492,7 @@ mod tests {
         );
         writer.record(run_started(&session));
         writer.sync().await.expect("sync run start");
+        assert_attach_reset(&mut deliveries_a).await;
         let delivery = broca_test_support::event_timeout(
             "gate_reopen_reseeds_state_before_live_terminal",
             deliveries_a.recv(),
@@ -2400,7 +2680,7 @@ mod tests {
         // first tenure's delayed seed must not clear the pending handshake or project this record.
         observer_tx.send(framed(3, run_finished()).into()).unwrap();
         seed_tx
-            .send(ProjectionSeedMessage::State(ProjectionSeed {
+            .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
                 head: 2,
                 state: ControlProjectionState::from_completed_steps_and_final_step_finish_reason(
                     1,
@@ -2410,10 +2690,10 @@ mod tests {
                 ),
                 gate_reopen: true,
                 gate_tenure: first_tenure,
-            }))
+            })))
             .unwrap();
         seed_tx
-            .send(ProjectionSeedMessage::State(ProjectionSeed {
+            .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
                 head: 2,
                 state: ControlProjectionState::from_completed_steps_and_final_step_finish_reason(
                     1,
@@ -2423,7 +2703,7 @@ mod tests {
                 ),
                 gate_reopen: true,
                 gate_tenure: second_tenure,
-            }))
+            })))
             .unwrap();
 
         let terminal = tokio::time::timeout(std::time::Duration::from_secs(1), ring_rx.recv())
@@ -2437,7 +2717,8 @@ mod tests {
                 ControlUnit::RunFinished {
                     final_step_finish_reason: Some(FinishReason::Stop),
                     ..
-                }
+                },
+                _,
             )
         ));
         assert!(matches!(
@@ -2479,12 +2760,12 @@ mod tests {
             Err(broadcast::error::TryRecvError::Empty)
         ));
         seed_tx
-            .send(ProjectionSeedMessage::State(ProjectionSeed {
+            .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
                 head: 2,
                 state: state_through(&prefix),
                 gate_reopen: true,
                 gate_tenure: 1,
-            }))
+            })))
             .unwrap();
 
         let terminal = tokio::time::timeout(std::time::Duration::from_secs(1), ring_rx.recv())
@@ -2498,7 +2779,8 @@ mod tests {
                 ControlUnit::RunFinished {
                     final_step_finish_reason: Some(FinishReason::ToolCalls),
                     ..
-                }
+                },
+                _,
             )
         ));
         assert!(matches!(
@@ -2519,6 +2801,7 @@ mod tests {
             framed(
                 3,
                 WalRecord::ToolResult {
+                    finished_at_ms: None,
                     tags: None,
                     hooks: None,
                     batch_id: broca_protocol::BatchId("b1".into()),
@@ -2538,7 +2821,7 @@ mod tests {
             ),
             framed(4, run_finished()),
         ];
-        let expected = broca_core::project_control(&records);
+        let expected = project_control(&records);
         let gate = SubscriberGate::new();
         let owner = gate.begin_attach();
         let later = gate.begin_attach();
@@ -2564,20 +2847,20 @@ mod tests {
         // not skip seq 3 for the older attach; seq 3 stays buffered until the owner installs.
         observer_tx.send(records[2].clone().into()).unwrap();
         seed_tx
-            .send(ProjectionSeedMessage::State(ProjectionSeed {
+            .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
                 head: 3,
                 state: state_through(&records[..3]),
                 gate_reopen: later.gate_reopen,
                 gate_tenure: later.gate_tenure,
-            }))
+            })))
             .unwrap();
         seed_tx
-            .send(ProjectionSeedMessage::State(ProjectionSeed {
+            .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
                 head: 2,
                 state: state_through(&records[..2]),
                 gate_reopen: owner.gate_reopen,
                 gate_tenure: owner.gate_tenure,
-            }))
+            })))
             .unwrap();
         observer_tx.send(records[3].clone().into()).unwrap();
 
@@ -2590,9 +2873,9 @@ mod tests {
                     .expect("ring remains open"),
             );
         }
-        let mut owner_view = broca_core::project_control(&records[..2]);
+        let mut owner_view = project_control(&records[..2]);
         owner_view.extend(live.iter().map(|event| event.as_ref().clone()));
-        let mut later_view = broca_core::project_control(&records[..3]);
+        let mut later_view = project_control(&records[..3]);
         later_view.extend(
             live.iter()
                 .filter(|event| event.0.wal_seq > 3)
@@ -2649,11 +2932,19 @@ mod tests {
         );
 
         // Send 1 event to the ring. The subscriber task receives it and delivers it (succeeds, filling the sink buffer).
-        let event1 = (Cursor::new(1, 0), ControlUnit::DisplayReset);
+        let event1 = (
+            Cursor::new(1, 0),
+            ControlUnit::DisplayReset,
+            cortexkit_role_llm_runner::live::LiveEvent::DisplayReset,
+        );
         fanout.ring.send(Arc::new(event1)).unwrap();
 
         // Send 2nd event to the ring. The subscriber task receives it and blocks on deliver (since sink is full).
-        let event2 = (Cursor::new(2, 0), ControlUnit::DisplayReset);
+        let event2 = (
+            Cursor::new(2, 0),
+            ControlUnit::DisplayReset,
+            cortexkit_role_llm_runner::live::LiveEvent::DisplayReset,
+        );
         // Give it a tiny bit of time to make sure the first event is processed.
         tokio::time::sleep(Duration::from_millis(10)).await;
         fanout.ring.send(Arc::new(event2)).unwrap();
@@ -2664,7 +2955,11 @@ mod tests {
         // Overflow the control ring so the subscriber lags.
         // RING_CAPACITY is 1024, so sending 1025 events is enough.
         for i in 0..1025 {
-            let event = (Cursor::new(3 + i, 0), ControlUnit::DisplayReset);
+            let event = (
+                Cursor::new(3 + i, 0),
+                ControlUnit::DisplayReset,
+                cortexkit_role_llm_runner::live::LiveEvent::DisplayReset,
+            );
             let _ = fanout.ring.send(Arc::new(event));
         }
 
@@ -2776,6 +3071,7 @@ mod tests {
                 seq: 1,
                 fence: 1,
                 record: WalRecord::RunStarted {
+                    written_at_ms: None,
                     tags: None,
                     session_class: None,
                     retention: None,
@@ -2826,6 +3122,7 @@ mod tests {
                 seq: 2,
                 fence: 1,
                 record: WalRecord::ModelStepFinished {
+                    written_at_ms: None,
                     tags: None,
                     hooks: None,
                     step_id: broca_protocol::StepId(1),
@@ -2868,7 +3165,7 @@ mod tests {
                 },
             },
         ];
-        let full = broca_core::project_control(&records);
+        let full = project_control(&records);
         let split = 2;
         let mut replay_state = ControlProjectionState::default();
         let replay = project_control_with_state(&records[..split], &mut replay_state);
@@ -2882,8 +3179,8 @@ mod tests {
 
         let step_cursors: Vec<Cursor> = replay
             .iter()
-            .filter(|(cursor, _)| cursor.wal_seq == 2)
-            .map(|(cursor, _)| *cursor)
+            .filter(|(cursor, ..)| cursor.wal_seq == 2)
+            .map(|(cursor, ..)| *cursor)
             .collect();
         assert_eq!(
             step_cursors,
@@ -2892,12 +3189,13 @@ mod tests {
                 Cursor::new(2, 1),
                 Cursor::new(2, 2),
                 Cursor::new(2, 3),
+                Cursor::new(2, 4),
             ],
             "the replay side of the handoff preserves every multi-unit record cursor"
         );
 
         let (observer_tx, observer_rx) = broadcast::channel(4);
-        let (ring, mut ring_rx) = broadcast::channel(4);
+        let (ring, mut ring_rx) = broadcast::channel(expected_live.len().max(4));
         let (detach_ring, _) = broadcast::channel(1);
         let cancel = CancellationToken::new();
         let (seed_tx, seed_rx) = mpsc::unbounded_channel();
@@ -2913,12 +3211,12 @@ mod tests {
 
         observer_tx.send(records[split].clone().into()).unwrap();
         seed_tx
-            .send(ProjectionSeedMessage::State(ProjectionSeed {
+            .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
                 head: records[split - 1].seq,
                 state: replay_state,
                 gate_reopen: true,
                 gate_tenure: 1,
-            }))
+            })))
             .unwrap();
 
         let mut continued = replay;
@@ -2985,7 +3283,11 @@ mod tests {
         drop(deliveries);
         fanout
             .ring
-            .send(Arc::new((Cursor::new(1, 0), ControlUnit::DisplayReset)))
+            .send(Arc::new((
+                Cursor::new(1, 0),
+                ControlUnit::DisplayReset,
+                cortexkit_role_llm_runner::live::LiveEvent::DisplayReset,
+            )))
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
@@ -3011,7 +3313,11 @@ mod tests {
             "an actor with no subscriber must not reserve either ring"
         );
         // Before any subscriber exists a publish reaches nobody, as it did with an eager ring.
-        let unit = Arc::new((Cursor::new(1, 0), ControlUnit::DisplayReset));
+        let unit = Arc::new((
+            Cursor::new(1, 0),
+            ControlUnit::DisplayReset,
+            cortexkit_role_llm_runner::live::LiveEvent::DisplayReset,
+        ));
         assert!(fanout.ring.send(unit.clone()).is_err());
         assert!(
             !fanout.ring.is_allocated(),
@@ -3033,11 +3339,16 @@ mod tests {
             sink,
             None,
         );
+        assert_attach_reset(&mut deliveries).await;
         assert!(
             fanout.display_ring.is_allocated(),
-            "the first subscriber creates the display ring"
+            "the first subscriber creates the display ring after durable replay"
         );
-        let unit = Arc::new((Cursor::new(2, 0), ControlUnit::DisplayReset));
+        let unit = Arc::new((
+            Cursor::new(2, 0),
+            ControlUnit::DisplayReset,
+            cortexkit_role_llm_runner::live::LiveEvent::DisplayReset,
+        ));
         let delivered = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 // The subscriber task may still be replaying; keep publishing until it is live.
@@ -3055,5 +3366,549 @@ mod tests {
         .expect("a unit published after the lazy ring exists reaches the subscriber");
         assert_eq!(delivered.0, Cursor::new(2, 0));
         fanout.teardown().await;
+    }
+}
+
+/// Attach by episode: the delivered units and the state handed to the live projector equal a
+/// full replay's at every cut and every attach point, while decoding only the frames from the
+/// attach point's episode boundary to the barrier head.
+#[cfg(test)]
+mod episode_attach_tests {
+    use std::cell::Cell;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use broca_core::projection::{
+        decode_positioned_frames, episode_holding_seq, EpisodeSeed, IndexedEpisode,
+    };
+    use broca_core::projection_plan::{OffsetEpisode, OffsetSeed};
+    use broca_core::replay::SeedBoundary;
+    use broca_protocol::caller::RunFinishReason;
+    use broca_protocol::content::{
+        AssistantMessage, ContentBlock, Message, Role, ToolCall, ToolOutput, ToolResult,
+    };
+    use broca_protocol::{BatchId, Delivery, MessageId, RunId, StepId, ToolCallId, Usage};
+    use broca_wal::{CompactionMessageKind, FramedRecord, RunConfig, RunOrigin, WalRecord};
+    use sha2::Digest;
+
+    use super::{
+        replay_for_attach, replay_for_attach_by_episode, AttachEpisodeStart, AttachFrom,
+        AttachReplay, FromCursor,
+    };
+
+    fn user(text: &str) -> Message {
+        Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }])
+    }
+
+    fn run_started(run_id: &str, input: Vec<Message>) -> WalRecord {
+        WalRecord::RunStarted {
+            written_at_ms: None,
+            tags: None,
+            session_class: None,
+            retention: None,
+            hooks: None,
+            title: None,
+            on_restart: None,
+            keep_warm: None,
+            marker_order_version: None,
+            manifest: None,
+            scope: None,
+            send_id: None,
+            request_identity_digest: None,
+            project_id: None,
+            principal: None,
+            ts_ms: None,
+            run_id: RunId(run_id.into()),
+            session: broca_protocol::BindIdentity::new("/tmp/project", "runner", "attach"),
+            config: Box::new(RunConfig {
+                turn_directives_v1: None,
+                render_tags: false,
+                computed_tags: None,
+                model: broca_protocol::request::ModelHandle::new("fake", "fake"),
+                tools: vec![].into(),
+                tool_choice: Default::default(),
+                generation: Default::default(),
+                response_format: Default::default(),
+                provider_options: serde_json::Value::Null,
+                cache_tiers: serde_json::Value::Null,
+                context_epoch: 0,
+                renderer_version: 1,
+                frozen_render_config: serde_json::Value::Null,
+                auth_selection: None,
+                tools_were_omitted: false,
+                budget: None,
+                context_limit: None,
+                work_class: None,
+                variant: None,
+                service_tier: None,
+                stop_when: Vec::new(),
+                context_management: None,
+            }),
+            input: input.into(),
+            origin: RunOrigin::Fresh,
+            submission_id: None,
+        }
+    }
+
+    fn step(step: u64, content: Vec<ContentBlock>) -> Vec<WalRecord> {
+        vec![
+            WalRecord::StepStarted {
+                step_id: StepId(step),
+            },
+            WalRecord::ModelStepFinished {
+                written_at_ms: None,
+                tags: None,
+                hooks: None,
+                step_id: StepId(step),
+                assistant_message: Arc::new(AssistantMessage {
+                    message_id: MessageId(format!("m{step}")),
+                    content,
+                }),
+                usage: Usage::default(),
+                finish_reason: None,
+                retries_used: 0,
+                service_tier_used: None,
+                speed_used: None,
+            },
+        ]
+    }
+
+    /// A model step calling `calls`, then its committed tool turn with the results arriving in
+    /// reverse plan order.
+    fn tool_step(step_id: u64, batch: &str, calls: &[&str]) -> Vec<WalRecord> {
+        let mut records = step(
+            step_id,
+            calls
+                .iter()
+                .map(|id| {
+                    ContentBlock::ToolCall(ToolCall {
+                        tool_call_id: ToolCallId((*id).into()),
+                        tool_name: "lookup".into(),
+                        input: serde_json::json!({ "id": id }),
+                        thought_signature: None,
+                    })
+                })
+                .collect(),
+        );
+        let batch_id = BatchId(batch.into());
+        records.push(WalRecord::ToolBatchStarted {
+            batch_id: batch_id.clone(),
+            step_id: StepId(step_id),
+            planned_calls: calls.iter().map(|id| ToolCallId((*id).into())).collect(),
+        });
+        for id in calls {
+            records.push(WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
+                hooks: None,
+                batch_id: batch_id.clone(),
+                tool_call_id: ToolCallId((*id).into()),
+                tool_name: Some("lookup".into()),
+                args: Arc::new(serde_json::json!({ "id": id })),
+                module_id: None,
+                schema_pin: None,
+                approval_digest: None,
+                call_key: None,
+            });
+        }
+        for id in calls.iter().rev() {
+            records.push(WalRecord::ToolResult {
+                finished_at_ms: None,
+                tags: None,
+                hooks: None,
+                batch_id: batch_id.clone(),
+                result: Arc::new(ToolResult {
+                    tool_call_id: ToolCallId((*id).into()),
+                    output: ToolOutput::Text {
+                        text: format!("out-{id}"),
+                    },
+                    is_error: false,
+                }),
+                outcome: broca_wal::DispatchOutcome::Completed,
+                reason: None,
+                withdraw_elicitation: None,
+                provider_held: None,
+            });
+        }
+        records.push(WalRecord::ToolBatchFinished { batch_id });
+        records.push(WalRecord::TurnFinished {
+            step_id: StepId(step_id),
+        });
+        records
+    }
+
+    fn text(text: &str) -> Vec<ContentBlock> {
+        vec![ContentBlock::Text { text: text.into() }]
+    }
+
+    fn run_finished() -> WalRecord {
+        WalRecord::RunFinished {
+            interrupt_reason: None,
+            ts_ms: None,
+            reason: RunFinishReason::Completed,
+            usage: Usage::default(),
+            error: None,
+            retries_used: 0,
+        }
+    }
+
+    /// Four episodes: tool turns with reverse-order results and a steer placed at the first
+    /// episode's close; a non-attributable import; a third episode recording a compaction
+    /// Setup whose cuts fall inside the first episode; and a fourth after it.
+    fn corpus() -> Vec<WalRecord> {
+        let mut records = vec![run_started("r1", vec![user("task")])];
+        records.extend(tool_step(1, "r1-b1", &["a", "b"]));
+        records.extend(step(2, text("done")));
+        records.push(WalRecord::Steered {
+            written_at_ms: None,
+            tags: None,
+            retention: None,
+            ts_ms: None,
+            title: None,
+            send_id: Some("steer-late".into()),
+            request_identity_digest: None,
+            delivery: Some(Delivery::Steer),
+            input: Arc::new(vec![user("late")]),
+            hooks: None,
+        });
+        records.push(run_finished());
+        let mut import = run_started("seed", vec![user("imported")]);
+        if let WalRecord::RunStarted { origin, .. } = &mut import {
+            *origin = RunOrigin::SeededFrom {
+                origin_kind: broca_wal::SeedOriginKind::Import,
+                source_ref: "fixture:import".into(),
+                origin_device_pseudonym: None,
+                base_seq: None,
+            };
+        }
+        records.extend([import, run_finished()]);
+        records.push(run_started("r3", vec![user("next")]));
+        records.extend(step(1, text("answer")));
+        records.push(WalRecord::CompactionMessage {
+            provider: "test".into(),
+            kind: CompactionMessageKind::Setup,
+            compaction_id: "cmp-1".into(),
+            version: 1,
+            range: broca_wal::CompactionRange { from: 0, to: 2 },
+            replacement: Arc::new(vec![Message::new(
+                Role::Assistant,
+                vec![ContentBlock::Text {
+                    text: "summary".into(),
+                }],
+            )]),
+            sha256: "0".repeat(64),
+            request_id: None,
+            cursor: None,
+            call_when: None,
+            stability: None,
+            ceiling: None,
+            tag_checkpoint: Some(broca_wal::SetupTagCheckpoint {
+                tag_checkpoint: 50,
+                cut: "m3".into(),
+            }),
+            ride_wait_ms: None,
+        });
+        records.push(run_finished());
+        records.push(run_started("r4", vec![user("after")]));
+        records.extend(tool_step(1, "r4-b1", &["c"]));
+        records.extend(step(2, text("last")));
+        records.push(run_finished());
+        records
+    }
+
+    /// Each record's frame and its byte range in the encoded log.
+    fn encode(records: &[WalRecord]) -> (Vec<u8>, Vec<(u64, u64)>) {
+        let mut bytes = Vec::new();
+        let mut ranges = Vec::new();
+        for (index, record) in records.iter().enumerate() {
+            let start = bytes.len() as u64;
+            bytes.extend(broca_wal::framing::encode(index as u64 + 1, 1, record).unwrap());
+            ranges.push((start, bytes.len() as u64));
+        }
+        (bytes, ranges)
+    }
+
+    fn framed(records: &[WalRecord]) -> Vec<FramedRecord> {
+        records
+            .iter()
+            .enumerate()
+            .map(|(index, record)| FramedRecord {
+                seq: index as u64 + 1,
+                fence: 1,
+                record: record.clone(),
+            })
+            .collect()
+    }
+
+    /// The episode rows and committed projection boundaries the offset index holds for a log,
+    /// from the same fold the indexer runs.
+    fn index_log(bytes: &[u8], ranges: &[(u64, u64)]) -> (Vec<IndexedEpisode>, Vec<SeedBoundary>) {
+        let mut seed = OffsetSeed::default();
+        let mut episodes: BTreeMap<u64, OffsetEpisode> = BTreeMap::new();
+        let mut boundaries: Vec<SeedBoundary> = Vec::new();
+        for (frame, (off, end)) in framed_from(bytes).iter().zip(ranges) {
+            let delta = seed.observe(frame, *off, *end).unwrap();
+            if let Some(closed) = delta.closed_episode {
+                episodes.insert(closed.n, closed);
+            }
+            if let Some(open) = &seed.episode {
+                episodes.insert(open.n, open.clone());
+            }
+            for fact in delta.boundaries {
+                if fact.terminal_seq.is_some() {
+                    boundaries
+                        .iter_mut()
+                        .find(|boundary| boundary.seq == fact.seq)
+                        .expect("a qualifier names an earlier candidate")
+                        .qualified = true;
+                } else {
+                    boundaries.push(SeedBoundary {
+                        lineage_id: None,
+                        seq: fact.seq,
+                        frame_off: *off,
+                        frame_end: *end,
+                        frame_identity: sha2::Sha256::digest(&bytes[*off as usize..*end as usize])
+                            .to_vec(),
+                        qualified: fact.qualified,
+                    });
+                }
+            }
+        }
+        let episodes = episodes
+            .into_values()
+            .map(|episode| IndexedEpisode {
+                run_started_seq: episode.run_started_seq,
+                run_started_off: episode.run_started_off,
+                first_ord: episode.first_ord,
+                end_ord: episode.end_ord,
+            })
+            .collect();
+        (episodes, boundaries)
+    }
+
+    fn framed_from(bytes: &[u8]) -> Vec<FramedRecord> {
+        let read_at = reader(bytes);
+        decode_positioned_frames(&read_at, 0, bytes.len() as u64, None)
+            .unwrap()
+            .into_iter()
+            .map(|positioned| positioned.framed)
+            .collect()
+    }
+
+    fn reader(bytes: &[u8]) -> impl Fn(u64, u64) -> std::io::Result<Vec<u8>> + '_ {
+        move |off, len| {
+            let start = (off as usize).min(bytes.len());
+            let end = (off.saturating_add(len) as usize).min(bytes.len());
+            Ok(bytes[start..end].to_vec())
+        }
+    }
+
+    /// The attach start the index gives for WAL sequence `seq`: the episode holding it and the
+    /// tail seed at the last qualified boundary before that episode's `RunStarted`.
+    fn start_for(
+        records: &[WalRecord],
+        episodes: &[IndexedEpisode],
+        boundaries: &[SeedBoundary],
+        seq: u64,
+    ) -> Option<AttachEpisodeStart> {
+        let episode = episodes[episode_holding_seq(episodes, seq)?];
+        let run_started = episode.run_started_seq?;
+        let seed = boundaries
+            .iter()
+            .filter(|boundary| boundary.qualified && boundary.seq < run_started)
+            .max_by_key(|boundary| boundary.seq)
+            .map(|boundary| {
+                let prefix = broca_core::replay::replay(&records[..boundary.seq as usize]).unwrap();
+                EpisodeSeed {
+                    boundary: boundary.clone(),
+                    ordinal_base: prefix.prompt.len() as u64,
+                    held_steers: prefix.pending_steers.clone(),
+                    tag_seed: broca_core::tags::TagSeed::from_prefix(&prefix.prompt),
+                    seed_origin: prefix
+                        .run_config
+                        .as_ref()
+                        .map(|config| config.model.clone()),
+                    seed_run_id: prefix.run_id.clone(),
+                    seed_budget: None,
+                }
+            });
+        Some(AttachEpisodeStart { episode, seed })
+    }
+
+    fn assert_same(by_episode: &AttachReplay, full: &AttachReplay, context: &str) {
+        assert_eq!(by_episode.units, full.units, "{context}");
+        assert_eq!(by_episode.state, full.state, "{context}");
+        assert_eq!(by_episode.seeded_h, full.seeded_h, "{context}");
+        assert_eq!(
+            format!("{:?}", by_episode.from),
+            format!("{:?}", full.from),
+            "{context}"
+        );
+    }
+
+    /// One attach by episode over the log `records` (barrier head at its last record),
+    /// returning the replay and how many frames it decoded.
+    fn attach(
+        records: &[WalRecord],
+        from: AttachFrom,
+        start: Option<&AttachEpisodeStart>,
+    ) -> (AttachReplay, Option<&'static str>, u64) {
+        let (bytes, _) = encode(records);
+        let read_at = reader(&bytes);
+        let decoded = Cell::new(0);
+        let (replay, fallback) = replay_for_attach_by_episode(
+            &read_at,
+            bytes.len() as u64,
+            records.len() as u64,
+            from,
+            start,
+            Some(&decoded),
+            || Ok(framed(records)),
+        )
+        .unwrap();
+        (replay, fallback, decoded.get())
+    }
+
+    #[test]
+    fn attach_by_episode_equals_full_replay_at_every_cut() {
+        let records = corpus();
+        let mut checked = 0;
+        for cut in 1..=records.len() {
+            let log = &records[..cut];
+            let (bytes, ranges) = encode(log);
+            let (episodes, boundaries) = index_log(&bytes, &ranges);
+            let h = cut as u64;
+            let full_units = super::project_control(&framed(log));
+            let mut points: Vec<AttachFrom> =
+                vec![AttachFrom::Live, AttachFrom::Cursor(FromCursor::Start)];
+            points.extend(
+                full_units
+                    .iter()
+                    .map(|(cursor, ..)| AttachFrom::Cursor(FromCursor::After(*cursor))),
+            );
+            for from in points {
+                let point_seq = match from {
+                    AttachFrom::Live => h,
+                    AttachFrom::Cursor(FromCursor::After(cursor)) => cursor.wal_seq,
+                    AttachFrom::Cursor(FromCursor::Start) => 1,
+                };
+                let start = start_for(log, &episodes, &boundaries, point_seq);
+                let (by_episode, fallback, decoded) = attach(log, from, start.as_ref());
+                let context = format!("cut {cut} from {from:?}");
+                assert_eq!(fallback, None, "{context}");
+                assert_same(
+                    &by_episode,
+                    &replay_for_attach(framed(log), h, from).unwrap(),
+                    &context,
+                );
+                // Only the frames from the episode's seed boundary to the head are decoded,
+                // and the frames before the episode's start are the end of a single earlier
+                // episode: the fold never crosses a second run start.
+                let frames_from_seq = match (&from, &start) {
+                    (AttachFrom::Cursor(FromCursor::Start), _) | (_, None) => 1,
+                    (_, Some(start)) => start.seed.as_ref().map_or(1, |seed| seed.boundary.seq + 1),
+                };
+                assert_eq!(decoded, h + 1 - frames_from_seq, "{context}");
+                if let (AttachFrom::Cursor(FromCursor::After(_)) | AttachFrom::Live, Some(start)) =
+                    (&from, &start)
+                {
+                    let run_started = start.episode.run_started_seq.unwrap();
+                    let before_start = &log[frames_from_seq as usize - 1..run_started as usize - 1];
+                    assert!(
+                        !before_start
+                            .iter()
+                            .any(|record| matches!(record, WalRecord::RunStarted { .. })),
+                        "{context}"
+                    );
+                    let fold = log
+                        .get(run_started as usize..(point_seq as usize).saturating_sub(1))
+                        .unwrap_or_default();
+                    assert!(
+                        !fold
+                            .iter()
+                            .any(|record| matches!(record, WalRecord::RunStarted { .. })),
+                        "{context}: the fold covers one episode"
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 300, "{checked} attaches checked");
+    }
+
+    #[test]
+    fn an_attach_near_the_head_decodes_only_the_last_episode() {
+        let records = corpus();
+        let (bytes, ranges) = encode(&records);
+        let (episodes, boundaries) = index_log(&bytes, &ranges);
+        let h = records.len() as u64;
+        let last_start = episodes.last().unwrap().run_started_seq.unwrap();
+
+        let start = start_for(&records, &episodes, &boundaries, h).unwrap();
+        let boundary = start.seed.as_ref().unwrap().boundary.seq;
+        assert!(
+            boundary < last_start,
+            "the seed sits in the previous episode"
+        );
+        let (live, fallback, decoded) = attach(&records, AttachFrom::Live, Some(&start));
+        assert_eq!(fallback, None);
+        assert_same(
+            &live,
+            &replay_for_attach(framed(&records), h, AttachFrom::Live).unwrap(),
+            "live",
+        );
+        assert_eq!(decoded, h - boundary, "of {h} frames");
+        assert!(decoded < h / 2);
+
+        // A resume from the last episode's tool call decodes the same frames.
+        let cursor = super::project_control(&framed(&records))
+            .into_iter()
+            .map(|(cursor, ..)| cursor)
+            .find(|cursor| cursor.wal_seq > last_start)
+            .unwrap();
+        let start = start_for(&records, &episodes, &boundaries, cursor.wal_seq).unwrap();
+        let from = AttachFrom::Cursor(FromCursor::After(cursor));
+        let (resumed, fallback, decoded) = attach(&records, from, Some(&start));
+        assert_eq!(fallback, None);
+        assert_same(
+            &resumed,
+            &replay_for_attach(framed(&records), h, from).unwrap(),
+            "resume",
+        );
+        assert_eq!(decoded, h - boundary);
+    }
+
+    #[test]
+    fn stale_episode_facts_fall_back_to_a_full_replay() {
+        let records = corpus();
+        let (bytes, ranges) = encode(&records);
+        let (episodes, boundaries) = index_log(&bytes, &ranges);
+        let h = records.len() as u64;
+        let full = replay_for_attach(framed(&records), h, AttachFrom::Live).unwrap();
+
+        let mut start = start_for(&records, &episodes, &boundaries, h).unwrap();
+        start.episode.first_ord += 1;
+        let (live, fallback, _) = attach(&records, AttachFrom::Live, Some(&start));
+        assert_eq!(fallback, Some("episode first ordinal mismatch"));
+        assert_same(&live, &full, "shifted ordinal");
+
+        let mut start = start_for(&records, &episodes, &boundaries, h).unwrap();
+        if let Some(seed) = &mut start.seed {
+            seed.boundary.frame_identity[0] ^= 1;
+        }
+        let (live, fallback, _) = attach(&records, AttachFrom::Live, Some(&start));
+        assert_eq!(fallback, Some("boundary frame identity mismatch"));
+        assert_same(&live, &full, "forged boundary");
+
+        // A cursor before the episode the index named would lose the units between them.
+        let cursor = super::project_control(&framed(&records))[0].0;
+        let start = start_for(&records, &episodes, &boundaries, h).unwrap();
+        let from = AttachFrom::Cursor(FromCursor::After(cursor));
+        let (resumed, fallback, _) = attach(&records, from, Some(&start));
+        assert_eq!(fallback, Some("attach point precedes the episode"));
+        assert_same(
+            &resumed,
+            &replay_for_attach(framed(&records), h, from).unwrap(),
+            "early cursor",
+        );
     }
 }

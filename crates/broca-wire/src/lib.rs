@@ -46,81 +46,6 @@ pub struct RouteRequest {
     pub params: serde_json::Value,
 }
 
-/// `cap.install` params. Cap operations are daemon-scoped; the bound route identity
-/// is intentionally not part of the request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapInstallParams {
-    pub cap_id: String,
-    pub cap_version: u64,
-    pub op: broca_core::CapOperation,
-    pub scope_key: String,
-    pub project_root: Option<String>,
-    pub constraint_dim: String,
-    pub period: String,
-    pub period_tz: String,
-    pub hard_cap_nanos: i64,
-    pub max_staleness_ms: u64,
-    pub replaces_cap_id: Option<String>,
-    #[serde(default)]
-    pub baseline: Option<broca_core::CapBaseline>,
-}
-
-impl CapInstallParams {
-    pub fn into_core(self) -> broca_core::CapInstallRequest {
-        broca_core::CapInstallRequest {
-            cap_id: self.cap_id,
-            cap_version: self.cap_version,
-            op: self.op,
-            scope_key: self.scope_key,
-            project_root: self.project_root,
-            constraint_dim: self.constraint_dim,
-            period: self.period,
-            period_tz: self.period_tz,
-            hard_cap_nanos: self.hard_cap_nanos,
-            max_staleness_ms: self.max_staleness_ms,
-            replaces_cap_id: self.replaces_cap_id,
-            baseline: self.baseline,
-        }
-    }
-}
-
-/// `spend.delta` params carrying a pre-priced increment and both full watermarks.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SpendDeltaParams {
-    pub cap_id: String,
-    pub cap_version: u64,
-    pub from_watermark: broca_core::CapWatermark,
-    pub to_watermark: broca_core::CapWatermark,
-    pub priced_delta_nanos: i64,
-    pub unresolved_delta: i64,
-    pub period_bucket: String,
-}
-
-impl SpendDeltaParams {
-    pub fn into_core(self) -> broca_core::SpendDeltaRequest {
-        broca_core::SpendDeltaRequest {
-            cap_id: self.cap_id,
-            cap_version: self.cap_version,
-            from_watermark: self.from_watermark,
-            to_watermark: self.to_watermark,
-            priced_delta_nanos: self.priced_delta_nanos,
-            unresolved_delta: self.unresolved_delta,
-            period_bucket: self.period_bucket,
-        }
-    }
-}
-
-/// Total success body for both cap mutations.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapMutationResponse {
-    pub result: CapMutationResult,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapMutationResult {
-    pub applied_watermark: broca_core::AppliedCapWatermark,
-}
-
 fn deserialize_on_restart<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<broca_protocol::request::OnRestart>, D::Error> {
@@ -139,6 +64,8 @@ fn deserialize_session_class<'de, D: serde::Deserializer<'de>>(
 /// `session.send` params. The session comes from the bound route identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SendParams {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<cortexkit_role_llm_runner::attachments::ContentPart>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -364,6 +291,69 @@ pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
     request.no_tools()?;
     request.directives()?;
     Ok(())
+}
+
+/// Shipping builds refuse uploads by name before decoding a send. Debug builds
+/// must explicitly opt into the attachment admission path; neither path permits
+/// a client to supply stored media references inline.
+pub fn check_upload_references(params: &serde_json::Value) -> Result<(), String> {
+    if let Some(content) = params.get("content").filter(|value| !value.is_null()) {
+        // A content part is an upload reference and nothing else. A `media` block, or a tool
+        // result with a media part, is refused by the closed decode below anyway; naming the
+        // rule here tells the caller how to send media instead of only that the variant is
+        // unknown.
+        if let Some(index) = content
+            .as_array()
+            .and_then(|parts| parts.iter().position(names_media_inline))
+        {
+            return Err(format!(
+                "content[{index}] names media inline; a message names media only through \
+                 upload references"
+            ));
+        }
+        let parts: Vec<cortexkit_role_llm_runner::attachments::ContentPart> =
+            serde_json::from_value(content.clone())
+                .map_err(|error| format!("invalid content: {error}"))?;
+        if broca_protocol::attachments_enabled() {
+            return Ok(());
+        }
+        if let Some(part) = parts.first() {
+            return Err(format!(
+                "upload {} cannot be sent: attachment admission is unavailable",
+                part.upload_id()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A raw content entry shaped like a stored `media` block, or a stored tool result whose
+/// `parts` output holds a media part.
+fn names_media_inline(part: &serde_json::Value) -> bool {
+    match part.get("type").and_then(serde_json::Value::as_str) {
+        Some("media") => true,
+        Some("tool_result") => part
+            .pointer("/output/parts")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|parts| {
+                parts.iter().any(|entry| {
+                    entry.get("kind").and_then(serde_json::Value::as_str) == Some("media")
+                })
+            }),
+        _ => false,
+    }
+}
+
+/// Refuse a caller-supplied transcript (a `session.import`'s `messages`) that names media
+/// directly, as a `media` block or a `Parts` media part. A `MediaRef` enters a WAL record only
+/// from broca's own capture path (an upload commit or a tool capture), which publishes bytes broca
+/// holds; an inline reference holds no bytes and could name an object the session never
+/// captured. The error is `(field, message)`, naming the offending member's path.
+pub fn check_supplied_media(messages: &[broca_protocol::Message]) -> Result<(), (String, String)> {
+    match broca_core::media_provenance::find_supplied_media(messages) {
+        Some(found) => Err((found.path(), found.to_string())),
+        None => Ok(()),
+    }
 }
 
 /// Check every `tools[i].reply` of a `session.send` before anything else reads the send, so a
@@ -899,6 +889,8 @@ pub struct CursorWire {
 pub struct SubscribeParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<FromWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<cortexkit_role_llm_runner::display::Limits>,
 }
 
 /// `session.read` params. The session comes from the bound route identity.
@@ -981,9 +973,9 @@ pub struct ReadParams {
     /// so no message carries any.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub include_originals: bool,
-    /// `inline` (the default) or `descriptors`, which serves large payloads as refs in place
-    /// and every entry's content identities (llm-runner §4.1). Any other value is refused
-    /// naming `media`; a model-view read refuses `descriptors`.
+    /// `inline` (the default), `blocks` (stored media references), or `descriptors`, which
+    /// serves large payloads as refs in place and every entry's content identities. Any other
+    /// value is refused naming `media`; a model-view read refuses `descriptors`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<cortexkit_role_llm_runner::read::MediaMode>,
 }
@@ -1046,15 +1038,61 @@ pub enum SendResult {
 
 /// Serialize `message` as callers read it: every `text_with_state` block becomes a plain `text`
 /// block with the same text, the model's text is cleaned where its writing run cleans it, and
-/// every other block is written unchanged.
+/// stored media is exposed as not-requested text markers for readers that do not
+/// understand the media grammar.
 fn serialize_caller_message<S: serde::Serializer>(
     message: &broca_protocol::Message,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serialize_read_message(message, false, serializer)
+}
+
+fn serialize_read_message<S: serde::Serializer>(
+    message: &broca_protocol::Message,
+    media_blocks: bool,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     use broca_protocol::ContentBlock;
     // The model's text as every exposure shows it: cleaned of tag notation where the run that
     // wrote it cleans (llm-runner §9.6). The stored message keeps the raw text.
     let exposed = broca_protocol::tags::exposed_message(message);
+    let mut exposed = exposed;
+    if exposed.content.iter().any(|block| {
+        !media_blocks
+            && matches!(
+                block,
+                ContentBlock::Media(_)
+                    | ContentBlock::ToolResult(broca_protocol::ToolResult {
+                        output: broca_protocol::ToolOutput::Parts { .. },
+                        ..
+                    })
+            )
+    }) {
+        use broca_protocol::{MediaMarkerReason, ToolOutput};
+        for block in &mut exposed.to_mut().content {
+            match block {
+                ContentBlock::Media(media) => {
+                    *block = ContentBlock::Text {
+                        text: broca_protocol::content::media_not_shown_marker(
+                            media,
+                            MediaMarkerReason::NotRequested,
+                        ),
+                    }
+                }
+                ContentBlock::ToolResult(result) => {
+                    if let ToolOutput::Parts { parts } = &result.output {
+                        result.output = ToolOutput::Text {
+                            text: broca_protocol::content::media_parts_text(
+                                parts,
+                                MediaMarkerReason::NotRequested,
+                            ),
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     let message: &broca_protocol::Message = &exposed;
     if !message
         .content
@@ -1133,6 +1171,8 @@ impl serde::Serialize for CallerBlockRef<'_> {
 /// One message in a `session.read` page.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SessionReadMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_at: Option<u64>,
     pub ordinal: u64,
     /// Message-coordinate spelling used by consumers for stable message badges.
     pub mid: String,
@@ -1153,13 +1193,13 @@ pub struct SessionReadMessage {
     /// each call's dispatch. Absent on a message with no tool call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<SessionReadToolCall>,
-    /// The message's runner tags: one row per tagged part, in block order. Absent on a message
-    /// of a session admitted before tags existed.
+    /// One row per exposed part, in block order. A row has a number only when that part has
+    /// been counted by a tag-rendering session; legacy and not-yet-counted parts still have keys.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<SessionReadTag>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_as: Option<cortexkit_role_llm_runner::delivery_order::EntryDelivery>,
-    /// The content identity of the whole message exactly as an inline read serves it
+    /// The content identity of the whole stored message, before read-time media markers
     /// (`content_digest`, JCS SHA-256). Served on every entry of a descriptors read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
@@ -1167,7 +1207,7 @@ pub struct SessionReadMessage {
     /// key them. Served beside `digest`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part_digests: Option<Vec<cortexkit_role_llm_runner::read::descriptors::PartDigest>>,
-    /// The message as a descriptors read serves it, large payloads replaced by refs in place.
+    /// The message for an opt-in read: stored media blocks, or descriptors with payload refs.
     /// When present it is what `message` serializes as; never decoded.
     #[serde(skip)]
     pub described: Option<serde_json::Value>,
@@ -1190,6 +1230,8 @@ impl Serialize for SessionReadMessage {
         // inline read keeps its exact bytes.
         #[derive(Serialize)]
         struct Wire<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            written_at: Option<u64>,
             ordinal: u64,
             mid: &'a str,
             message: Body<'a>,
@@ -1210,6 +1252,7 @@ impl Serialize for SessionReadMessage {
             part_digests: &'a Option<Vec<cortexkit_role_llm_runner::read::descriptors::PartDigest>>,
         }
         Wire {
+            written_at: self.written_at,
             ordinal: self.ordinal,
             mid: &self.mid,
             message: Body(&self.message, self.described.as_ref()),
@@ -1225,8 +1268,27 @@ impl Serialize for SessionReadMessage {
 }
 
 impl SessionReadMessage {
+    fn has_media_grammar(&self) -> bool {
+        self.message.content.iter().any(|block| {
+            matches!(block, broca_protocol::ContentBlock::Media(_))
+                || matches!(block, broca_protocol::ContentBlock::ToolResult(result)
+                    if matches!(result.output, broca_protocol::ToolOutput::Parts { .. }))
+        })
+    }
+
+    /// Expose stored media references only for a reader opting in to `media: "blocks"`.
+    /// Leave entries using only the legacy grammar on their byte-identical serializer.
+    pub fn show_media_blocks(&mut self) {
+        if self.has_media_grammar() {
+            self.described = Some(
+                serde_json::to_value(CallerMessage(&self.message, true))
+                    .expect("a stored message serializes"),
+            );
+        }
+    }
+
     /// Serve this entry as a descriptors read does (llm-runner §4.2): its content identities
-    /// over the full inline message, and large payloads replaced by refs in place, largest first
+    /// before media markers or refs, and large payloads replaced by refs in place, largest first
     /// past the fixed per-message budget. Selection depends only on this message, so every
     /// read of it on one lineage gives the same bytes. `Err` when the message's structure alone
     /// exceeds the budget, which a descriptors read refuses `reply_too_large`.
@@ -1235,7 +1297,7 @@ impl SessionReadMessage {
             describe, PartDigest, Payload, Reference, DESCRIPTOR_MESSAGE_MAX,
         };
         self.described = None;
-        let inline = serde_json::to_value(CallerMessage(&self.message))
+        let inline = serde_json::to_value(CallerMessage(&self.message, true))
             .expect("a stored message serializes");
         self.digest = Some(cortexkit_role_llm_runner::content_digest::content_digest(
             &inline,
@@ -1259,6 +1321,13 @@ impl SessionReadMessage {
             let at = |field: &str| format!("/content/{index}/{field}");
             let text = |value: &serde_json::Value| value.as_str().map(str::to_owned);
             match part.get("type").and_then(serde_json::Value::as_str) {
+                Some("media") => payloads.push((
+                    format!("/content/{index}"),
+                    media_reference(
+                        part,
+                        Some(broca_protocol::tags::part_key(self.ordinal, index)),
+                    ),
+                )),
                 Some("text") => {
                     if let Some(text) = text(&part["text"]) {
                         payloads.push((at("text"), Reference::text(None, &text)));
@@ -1293,6 +1362,22 @@ impl SessionReadMessage {
                         let encoded = serde_json::to_string(value).expect("JSON");
                         payloads.push((at("output/value"), Reference::text(None, &encoded)));
                     }
+                    if let Some(parts) = output.get("parts").and_then(serde_json::Value::as_array) {
+                        for (j, part) in parts.iter().enumerate() {
+                            if let Some(text) = text(&part["text"]) {
+                                payloads.push((
+                                    at(&format!("output/parts/{j}/text")),
+                                    Reference::text(None, &text),
+                                ));
+                            }
+                            if let Some(media) = part.get("media") {
+                                payloads.push((
+                                    at(&format!("output/parts/{j}/media")),
+                                    media_reference(media, None),
+                                ));
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1301,18 +1386,18 @@ impl SessionReadMessage {
             .into_iter()
             .map(|(pointer, reference)| Payload {
                 pointer,
+                required: matches!(reference, Reference::MediaRef { .. }),
                 reference,
-                required: false,
             })
             .collect();
         // The budget is the fixed per-message bound less this entry's envelope, measured with
         // the message itself left out.
         let envelope = serialized_json_len(&*self)
-            .saturating_sub(serde_json::to_vec(&inline).expect("JSON").len());
+            .saturating_sub(serialized_json_len(&CallerMessage(&self.message, false)));
         let budget = DESCRIPTOR_MESSAGE_MAX.saturating_sub(envelope);
         match describe(&inline, &payloads, budget) {
             Ok(described) => {
-                if described != inline {
+                if described != inline || self.has_media_grammar() {
                     self.described = Some(described);
                 }
                 Ok(())
@@ -1323,11 +1408,30 @@ impl SessionReadMessage {
 }
 
 /// A message as callers read it, for serializing outside a read entry.
-struct CallerMessage<'a>(&'a broca_protocol::Message);
+struct CallerMessage<'a>(&'a broca_protocol::Message, bool);
 
 impl Serialize for CallerMessage<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serialize_caller_message(self.0, serializer)
+        serialize_read_message(self.0, self.1, serializer)
+    }
+}
+
+fn media_reference(
+    value: &serde_json::Value,
+    part: Option<String>,
+) -> cortexkit_role_llm_runner::read::descriptors::Reference {
+    let mut value = value.clone();
+    value.as_object_mut().expect("media object").remove("type");
+    let media: broca_protocol::MediaRef =
+        serde_json::from_value(value).expect("stored media has validated reference metadata");
+    cortexkit_role_llm_runner::read::descriptors::Reference::MediaRef {
+        part,
+        kind: media.kind.as_str().into(),
+        mime: media.mime,
+        byte_size: media.byte_size,
+        sha256: media.sha256,
+        width: media.width.map(u64::from),
+        height: media.height.map(u64::from),
     }
 }
 
@@ -1364,6 +1468,7 @@ pub fn describe_resolved_part(
         message.content.get(index).cloned().into_iter().collect(),
     );
     let mut entry = SessionReadMessage {
+        written_at: None,
         ordinal,
         mid: format!("m{ordinal}"),
         message: single,
@@ -1376,13 +1481,19 @@ pub fn describe_resolved_part(
         described: None,
     };
     let _ = entry.describe();
-    let body = entry
-        .described
-        .unwrap_or_else(|| serde_json::to_value(CallerMessage(&entry.message)).expect("JSON"));
-    body.get("content")
+    let body = entry.described.unwrap_or_else(|| {
+        serde_json::to_value(CallerMessage(&entry.message, true)).expect("JSON")
+    });
+    let mut content = body
+        .get("content")
         .and_then(|content| content.get(0))
         .cloned()
-        .unwrap_or(serde_json::Value::Null)
+        .unwrap_or(serde_json::Value::Null);
+    if content.get("type").and_then(serde_json::Value::as_str) == Some("media_ref") {
+        // The temporary single-part message used index zero; resolution keeps the original key.
+        content["part"] = serde_json::Value::String(part);
+    }
+    content
 }
 
 fn serialized_json_len(value: &impl Serialize) -> usize {
@@ -1404,26 +1515,26 @@ fn serialize_run_attribution<S: serde::Serializer>(
 
 pub use cortexkit_role_llm_runner::tags::PartTag as SessionReadTag;
 
-/// The tag rows of `message`, the transcript message at `ordinal`; empty when it has no tags.
+/// One row per exposed part, in content order. A message can be read before its parts are
+/// counted, so missing ledger entries omit only the number, never the stable part key.
 pub fn tag_rows(ordinal: u64, message: &broca_protocol::Message) -> Vec<SessionReadTag> {
     message
-        .part_tags()
-        .map(|tags| {
-            tags.parts
-                .iter()
-                .enumerate()
-                .map(|(index, tag)| {
-                    let part = broca_protocol::tags::part_key(ordinal, index);
-                    match tag {
-                        Some(tag) => {
-                            SessionReadTag::tagged(part, broca_protocol::tags::tag_mark(*tag))
-                        }
-                        None => SessionReadTag::untagged(part),
-                    }
-                })
-                .collect()
+        .content
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let part = broca_protocol::tags::part_key(ordinal, index);
+            match message
+                .part_tags()
+                .and_then(|tags| tags.parts.get(index))
+                .copied()
+                .flatten()
+            {
+                Some(tag) => SessionReadTag::tagged(part, broca_protocol::tags::tag_mark(tag)),
+                None => SessionReadTag::untagged(part),
+            }
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// The lineage state returned beside a `session.read` page.
@@ -1573,6 +1684,10 @@ pub struct PendingApproval {
 mod usage_compat;
 
 #[cfg(test)]
+#[path = "supplied_media_tests.rs"]
+mod supplied_media_tests;
+
+#[cfg(test)]
 mod approval_wire_tests {
     use super::*;
     use sha2::{Digest, Sha256};
@@ -1634,6 +1749,8 @@ mod approval_wire_tests {
     #[test]
     fn active_awaiting_approval_golden() {
         let response = RunStatusResponse::Active {
+            held_calls: Vec::new(),
+            auth_selection: None,
             reason: None,
             deadline_ms: None,
             usage: None,
@@ -1838,10 +1955,14 @@ pub struct PausedRunAuth {
 }
 
 /// A run-keyed status response resolved from the live actor, durable index, or WAL.
+/// `auth_selection` is the credential id frozen at admission, never a current routing
+/// decision. It is absent when no credential was frozen or the frozen config is unavailable.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum RunStatusResponse {
     Active {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_selection: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1863,8 +1984,13 @@ pub enum RunStatusResponse {
         /// WAL marker may supply filing IDs but cannot keep an approved or closed call pending.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         awaiting_approval: Option<AwaitingApproval>,
+        /// Open provider-held calls are a runner-owned wait, independent of `reason`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        held_calls: Vec<cortexkit_role_llm_runner::run::HeldCall>,
     },
     Paused {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_selection: Option<String>,
         /// Explicit restart-pause discriminator; authentication-pause replies omit this field to preserve their existing wire shape.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pause_reason: Option<broca_protocol::OpenPauseReason>,
@@ -1886,12 +2012,17 @@ pub enum RunStatusResponse {
         error: Option<SharedProviderError>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth: Option<PausedRunAuth>,
+        /// Only open provider-held calls are reported; an empty list is omitted.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        held_calls: Vec<cortexkit_role_llm_runner::run::HeldCall>,
         /// The title the run's send carried, as its WAL record holds it. Absent (never empty)
         /// when the send carried none or the run predates titles.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
     },
     Interrupted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_selection: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
         /// Diagnostic cause of the interruption, when the terminal records one. Its presence
@@ -1930,6 +2061,8 @@ pub enum RunStatusResponse {
     },
     Completed {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_selection: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         directives: Option<Vec<cortexkit_role_llm_runner::directives::Directive>>,
         #[serde(
             default,
@@ -1960,6 +2093,8 @@ pub enum RunStatusResponse {
         structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     MaxSteps {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_selection: Option<String>,
         #[serde(
             default,
             deserialize_with = "broca_protocol::content::deserialize_optional_caller_finish_reason",
@@ -1989,6 +2124,8 @@ pub enum RunStatusResponse {
         structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     BudgetExhausted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_selection: Option<String>,
         detail: broca_protocol::BudgetExhaustedDetail,
         #[serde(
             default,
@@ -2014,6 +2151,8 @@ pub enum RunStatusResponse {
         structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     ContextCeiling {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_selection: Option<String>,
         context_ceiling: broca_protocol::ContextCeilingDetail,
         #[serde(
             default,
@@ -2037,6 +2176,8 @@ pub enum RunStatusResponse {
         structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     Cancelled {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_selection: Option<String>,
         #[serde(
             default,
             deserialize_with = "broca_protocol::content::deserialize_optional_caller_finish_reason",
@@ -2066,6 +2207,8 @@ pub enum RunStatusResponse {
         structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     Error {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_selection: Option<String>,
         #[serde(
             default,
             deserialize_with = "broca_protocol::content::deserialize_optional_caller_finish_reason",
@@ -2099,6 +2242,8 @@ pub enum RunStatusResponse {
         structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     TransformUnavailable {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_selection: Option<String>,
         #[serde(
             default,
             deserialize_with = "broca_protocol::content::deserialize_optional_caller_finish_reason",
@@ -2147,6 +2292,56 @@ mod open_state_tests {
             serde_json::from_str(r#"{"state":"future_runner_state","extra":"future field"}"#)
                 .unwrap();
         assert!(matches!(status, RunStatusResponse::Unknown));
+    }
+
+    #[test]
+    fn run_status_auth_selection_is_optional_and_round_trips() {
+        for state in [
+            "active",
+            "paused",
+            "interrupted",
+            "completed",
+            "max_steps",
+            "cancelled",
+            "error",
+            "transform_unavailable",
+        ] {
+            for selection in [None, Some("apikey:cline-pass")] {
+                let mut wire = serde_json::json!({"state": state});
+                if let Some(selection) = selection {
+                    wire["auth_selection"] = selection.into();
+                }
+                let status: RunStatusResponse = serde_json::from_value(wire).unwrap();
+                let encoded = serde_json::to_value(&status).unwrap();
+                assert_eq!(
+                    encoded.get("auth_selection").and_then(|v| v.as_str()),
+                    selection
+                );
+                assert_eq!(encoded.get("auth_selection").is_some(), selection.is_some());
+                assert_eq!(
+                    serde_json::from_value::<RunStatusResponse>(encoded).unwrap(),
+                    status
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn run_result_auth_selection_is_optional_and_round_trips() {
+        for selection in [None, Some("apikey:cline-pass")] {
+            let mut wire = serde_json::json!({"run_id": "run-1", "state": "error"});
+            if let Some(selection) = selection {
+                wire["auth_selection"] = selection.into();
+            }
+            let result: super::RunResultResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(result.auth_selection.as_deref(), selection);
+            let encoded = serde_json::to_value(&result).unwrap();
+            assert_eq!(encoded.get("auth_selection").is_some(), selection.is_some());
+            assert_eq!(
+                serde_json::from_value::<super::RunResultResponse>(encoded).unwrap(),
+                result
+            );
+        }
     }
 
     #[test]
@@ -2305,7 +2500,7 @@ mod open_state_tests {
     }
 
     #[test]
-    fn unknown_subscribe_envelopes_and_event_types_reset_display_state() {
+    fn unknown_lanes_and_display_reset_while_unknown_control_units_are_named() {
         let envelope: SubscribeEvent =
             serde_json::from_str(r#"{"kind":"future_lane_event"}"#).unwrap();
         assert_eq!(
@@ -2328,10 +2523,12 @@ mod open_state_tests {
         .unwrap();
         assert!(matches!(
             control,
-            SubscribeEvent::Control {
-                unit: broca_protocol::caller::ControlUnit::DisplayReset,
-                ..
-            }
+            SubscribeEvent::UnknownControlUnit {
+                wal_seq: 1,
+                sub_index: 0,
+                unit_type,
+                unit,
+            } if unit_type == "future_control_unit" && unit["payload"] == "ignored"
         ));
     }
 
@@ -2496,6 +2693,14 @@ pub enum SubscribeEvent {
         sub_index: u32,
         state: UnrecognizedRunState,
     },
+    /// A newer control-unit name, retained with its cursor and payload rather than
+    /// confused with a known display reset or rejected as a broken stream.
+    UnknownControlUnit {
+        wal_seq: u64,
+        sub_index: u32,
+        unit_type: String,
+        unit: serde_json::Value,
+    },
 }
 
 /// A run pause or ending whose reason this client does not know, as the subscribe stream
@@ -2619,6 +2824,54 @@ enum SubscribeEventRef<'a> {
     },
 }
 
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum LiveSubscribeEventRef<'a> {
+    Control {
+        cursor: CursorWire,
+        unit: &'a broca_protocol::caller::ControlUnit,
+        seq: u64,
+        event: &'a cortexkit_role_llm_runner::live::LiveEvent,
+    },
+    Display {
+        event: &'a DisplayEvent,
+        seq: u64,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum UnknownControlEventRef<'a> {
+    Control {
+        cursor: CursorWire,
+        unit: &'a serde_json::Value,
+    },
+}
+
+/// Append live metadata without rebuilding or reordering the existing control payload.
+pub fn encode_live_subscribe_control(
+    wal_seq: u64,
+    sub_index: u32,
+    unit: &broca_protocol::caller::ControlUnit,
+    seq: u64,
+    event: &cortexkit_role_llm_runner::live::LiveEvent,
+) -> serde_json::Result<Vec<u8>> {
+    serde_json::to_vec(&LiveSubscribeEventRef::Control {
+        cursor: CursorWire { wal_seq, sub_index },
+        unit,
+        seq,
+        event,
+    })
+}
+
+/// A display frame already has its typed event; its stream sequence follows that payload.
+pub fn encode_live_subscribe_display(
+    event: &DisplayEvent,
+    seq: u64,
+) -> serde_json::Result<Vec<u8>> {
+    serde_json::to_vec(&LiveSubscribeEventRef::Display { event, seq })
+}
+
 /// Encode one control-lane subscribe event directly from its borrowed payload.
 ///
 /// This avoids building an owned JSON value before emitting the stream frame while keeping
@@ -2691,6 +2944,19 @@ impl Serialize for SubscribeEvent {
                 unit: state.into(),
             }
             .serialize(serializer),
+            Self::UnknownControlUnit {
+                wal_seq,
+                sub_index,
+                unit,
+                ..
+            } => UnknownControlEventRef::Control {
+                cursor: CursorWire {
+                    wal_seq: *wal_seq,
+                    sub_index: *sub_index,
+                },
+                unit,
+            }
+            .serialize(serializer),
         }
     }
 }
@@ -2703,11 +2969,28 @@ impl<'de> Deserialize<'de> for SubscribeEvent {
         match SubscribeEventOwned::deserialize(deserializer)? {
             SubscribeEventOwned::Control { cursor, unit } => {
                 match broca_protocol::caller::ControlUnit::deserialize(&unit) {
-                    Ok(control) => Ok(Self::Control {
-                        wal_seq: cursor.wal_seq,
-                        sub_index: cursor.sub_index,
-                        unit: control,
-                    }),
+                    Ok(control) => {
+                        let unknown_type =
+                            matches!(control, broca_protocol::caller::ControlUnit::DisplayReset)
+                                .then(|| unit.get("type").and_then(serde_json::Value::as_str))
+                                .flatten()
+                                .filter(|name| *name != "display_reset")
+                                .map(str::to_owned);
+                        if let Some(unit_type) = unknown_type {
+                            Ok(Self::UnknownControlUnit {
+                                wal_seq: cursor.wal_seq,
+                                sub_index: cursor.sub_index,
+                                unit_type,
+                                unit,
+                            })
+                        } else {
+                            Ok(Self::Control {
+                                wal_seq: cursor.wal_seq,
+                                sub_index: cursor.sub_index,
+                                unit: control,
+                            })
+                        }
+                    }
                     Err(error) => match unrecognized_run_state(&unit) {
                         Some(state) => Ok(Self::UnrecognizedRunState {
                             wal_seq: cursor.wal_seq,
@@ -3817,47 +4100,6 @@ mod tests {
         }));
         assert_json_round_trip::<FromWire>(serde_json::json!({"wal_seq": 8, "sub_index": 2}));
         assert_json_round_trip::<CursorWire>(serde_json::json!({"wal_seq": 8, "sub_index": 2}));
-        assert_json_round_trip::<CapInstallParams>(serde_json::json!({
-            "cap_id": "cap-org-x",
-            "cap_version": 4,
-            "op": "install",
-            "scope_key": "subject",
-            "project_root": "/abs/path",
-            "constraint_dim": "spend_dollars",
-            "period": "2026-07",
-            "period_tz": "Europe/Madrid",
-            "hard_cap_nanos": 50000000000i64,
-            "max_staleness_ms": 60000,
-            "replaces_cap_id": null,
-            "baseline": {
-                "spend_nanos": 1200000000i64,
-                "unresolved_count": 0,
-                "watermark": {
-                    "source_instance_id": "source-a",
-                    "source_epoch": 1,
-                    "consumed_export_seq": 40
-                },
-                "period_bucket": "2026-07",
-                "as_of_ms": 1789000000000i64
-            }
-        }));
-        assert_json_round_trip::<SpendDeltaParams>(serde_json::json!({
-            "cap_id": "cap-org-x",
-            "cap_version": 4,
-            "from_watermark": {
-                "source_instance_id": "source-a",
-                "source_epoch": 1,
-                "consumed_export_seq": 40
-            },
-            "to_watermark": {
-                "source_instance_id": "source-a",
-                "source_epoch": 1,
-                "consumed_export_seq": 55
-            },
-            "priced_delta_nanos": 340000000i64,
-            "unresolved_delta": 0,
-            "period_bucket": "2026-07"
-        }));
     }
 
     #[test]
@@ -3894,6 +4136,7 @@ mod tests {
         assert_eq!(
             send_params_keys(),
             &[
+                "content",
                 "directives",
                 "session_class",
                 "on_restart",
@@ -4054,35 +4297,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_cap_baseline_without_period_bucket_deserializes() {
-        let params: CapInstallParams = serde_json::from_value(serde_json::json!({
-            "cap_id": "cap-org-x",
-            "cap_version": 4,
-            "op": "install",
-            "scope_key": "subject",
-            "project_root": null,
-            "constraint_dim": "spend_dollars",
-            "period": "calendar_month",
-            "period_tz": "Europe/Madrid",
-            "hard_cap_nanos": 50000000000i64,
-            "max_staleness_ms": 60000,
-            "replaces_cap_id": null,
-            "baseline": {
-                "spend_nanos": 1200000000i64,
-                "unresolved_count": 0,
-                "watermark": {
-                    "source_instance_id": "source-a",
-                    "source_epoch": 1,
-                    "consumed_export_seq": 40
-                },
-                "as_of_ms": 1789000000000i64
-            }
-        }))
-        .unwrap();
-        assert_eq!(params.baseline.unwrap().period_bucket, None);
-    }
-
-    #[test]
     fn moved_response_types_round_trip_without_shape_drift() {
         assert_json_round_trip::<SendResult>(serde_json::json!({
             "state": "active", "run_id": "run-1"
@@ -4117,15 +4331,6 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(legacy_read.lineage_id, None);
-        assert_json_round_trip::<CapMutationResponse>(serde_json::json!({
-            "result": {
-                "applied_watermark": {
-                    "source_instance_id": "source-a",
-                    "source_epoch": 1,
-                    "seq": 55
-                }
-            }
-        }));
         assert_run_status_round_trip(serde_json::json!({
             "state": "completed",
             "final_step_finish_reason": "stop",
@@ -4148,7 +4353,7 @@ mod tests {
         let bytes = include_bytes!("../tests/golden/run_status.context_overflow_anthropic.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "3adae8212da6e360bccb3749042dd951e493339885c04a2f31cf39f0ee99c106"
+            "dfe4248d27cbc09736639c53b9e6d0a158338e553d20f11b47801964c9ee9cc2"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
         assert_eq!(
@@ -4171,7 +4376,7 @@ mod tests {
         let bytes = include_bytes!("../tests/golden/run_status.billing_exhausted_xai.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "f07df1b323d8f3647244a19f71f789b1c34bbbb7ba2501e49533c67a95979070"
+            "2c7dde5dd91989a2d95170669ff367ce69d4eccbd86c5ecaf3a0aa6938de7e55"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
         assert_eq!(
@@ -4199,7 +4404,7 @@ mod tests {
             include_bytes!("../tests/golden/run_status.credit_insufficient_openrouter.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "b08ee350f532852dde29bf65be3457275bcb49ad2cd4bb84a848c41ac2f31aed"
+            "990411488c11dbe4e8ae47d36db3c663c80a656257a89caec8eec56f920c389b"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
         assert_eq!(
@@ -4229,7 +4434,7 @@ mod tests {
             include_bytes!("../tests/golden/run_status.billing_exhausted_anthropic_apikey.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "ae4eeb23f2a63b7f01310a255d289f88b59fa834b782ab2344d36a31da4521e1"
+            "c003efaaf2dc4fc88d742c3fbe38da331f8d6912dab22d0ce243f7f478323b97"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
         assert_eq!(
@@ -4259,7 +4464,7 @@ mod tests {
         let bytes = include_bytes!("../tests/golden/run_status.request_invalid_openai.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "f3c98f18ec6bc276b28958c1832f66ff14244e305bb47b976b93dfd39b7f7d58"
+            "cb03a7ce9d9fa35ff201b6efc4ce3824ab1bdd18da3594bd5c130c8878a86f25"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
         assert_eq!(
@@ -4284,7 +4489,7 @@ mod tests {
         let bytes = include_bytes!("../tests/golden/run_status.grammar_too_large.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "765110eaddd433895df1b9ef548f5a7e1318af772c6a21f5f42d83e761b13502"
+            "11f75a0f522e8f178a6a55f3e77b98dffd1eda031f71ccbeba8531fe2b6143bc"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
         assert_eq!(
@@ -4309,7 +4514,7 @@ mod tests {
             include_bytes!("../tests/golden/run_status.transient_rate_limited_credential.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "0808b7ea8077acca9e76567a7564bd20a892a58677a10c6b0c168bd4c85303ce"
+            "e31d5d8e7c850ff68c335ea2f7148b5590abaa6e827319549d209be83b87fbe2"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
         assert_eq!(
@@ -4334,7 +4539,7 @@ mod tests {
             include_bytes!("../tests/golden/run_status.account_limit_exhausted_code_assist.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "145639eefc4bbaea47e7e69f683c6e2306385e773089aa8e05f5a740aa96ffce"
+            "727d64c8b28f7215d38c74e0b89cca5294c4fbaedeea248fdb1aa31e15761ef5"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
         assert_eq!(
@@ -4457,6 +4662,7 @@ mod tests {
         assert_eq!(
             decoded,
             RunStatusResponse::Error {
+                auth_selection: None,
                 title: None,
                 final_step_finish_reason: None,
                 undelivered_steers: None,
@@ -4473,6 +4679,8 @@ mod tests {
         assert_eq!(
             decoded,
             RunStatusResponse::Paused {
+                held_calls: Vec::new(),
+                auth_selection: None,
                 title: None,
                 pause_reason: None,
                 usage: None,
@@ -4588,6 +4796,8 @@ mod tests {
 
     fn display_delta() -> DisplayEvent {
         DisplayEvent::TextDelta {
+            mid: None,
+            part: None,
             message_id: MessageId("message-1".into()),
             tool_call_id: None,
             delta: "streamed text".into(),
@@ -5049,6 +5259,8 @@ mod restart_wire_tests {
     fn restart_pause_status_and_invalid_policy_match_goldens() {
         scope_refusal_golden::assert_golden(
             RunStatusResponse::Paused {
+                held_calls: Vec::new(),
+                auth_selection: None,
                 title: None,
                 pause_reason: Some(broca_protocol::PauseReason::Restart.into()),
                 usage: None,
@@ -5242,6 +5454,7 @@ mod title_wire_tests {
         assert_eq!(
             status,
             RunStatusResponse::Completed {
+                auth_selection: None,
                 directives: None,
                 final_step_finish_reason: Some(FinishReason::Stop),
                 undelivered_steers: Some(Vec::new()),
@@ -5271,6 +5484,8 @@ mod title_wire_tests {
         // A live run's status carries the title too, and an untitled one keeps its bare shape.
         assert_eq!(
             serde_json::to_value(RunStatusResponse::Active {
+                held_calls: Vec::new(),
+                auth_selection: None,
                 reason: None,
                 deadline_ms: None,
                 usage: None,
@@ -5287,6 +5502,8 @@ mod title_wire_tests {
             )
             .unwrap(),
             RunStatusResponse::Active {
+                held_calls: Vec::new(),
+                auth_selection: None,
                 reason: None,
                 deadline_ms: None,
                 usage: None,
@@ -5591,6 +5808,7 @@ mod caller_message_tests {
 
     fn read_message(content: Vec<ContentBlock>) -> SessionReadMessage {
         SessionReadMessage {
+            written_at: None,
             delivered_as: None,
             tags: Vec::new(),
             ordinal: 3,
@@ -5602,6 +5820,55 @@ mod caller_message_tests {
             digest: None,
             part_digests: None,
         }
+    }
+
+    #[test]
+    fn default_media_read_uses_text_markers_without_changing_the_stored_message() {
+        use broca_protocol::{
+            MediaKind, MediaRef, ToolCallId, ToolOutput, ToolOutputPart, ToolResult,
+        };
+        let media = MediaRef {
+            kind: MediaKind::Image,
+            mime: "image/png".into(),
+            byte_size: 69,
+            sha256: "b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640".into(),
+            width: Some(1),
+            height: Some(1),
+        };
+        let marker = "[media not shown: kind=image mime=image/png bytes=69 sha256=b1ff9c8ea3a7 reason=not_requested]";
+        let row = read_message(vec![
+            ContentBlock::Text {
+                text: "before".into(),
+            },
+            ContentBlock::Media(media.clone()),
+            ContentBlock::ToolResult(ToolResult {
+                tool_call_id: ToolCallId("call".into()),
+                is_error: true,
+                output: ToolOutput::Parts {
+                    parts: vec![
+                        ToolOutputPart::Text {
+                            text: "left".into(),
+                        },
+                        ToolOutputPart::Media { media },
+                        ToolOutputPart::Text {
+                            text: "right".into(),
+                        },
+                    ],
+                },
+            }),
+        ]);
+        let stored = row.message.clone();
+        let value = serde_json::to_value(&row).unwrap();
+        assert_eq!(
+            value["message"]["content"][1],
+            json!({"type":"text","text":marker})
+        );
+        assert_eq!(
+            value["message"]["content"][2]["output"],
+            json!({"kind":"text","text":format!("left\n{marker}\nright")})
+        );
+        assert_eq!(value["message"]["content"][2]["is_error"], true);
+        assert_eq!(row.message, stored);
     }
 
     /// The member names of a JSON object, sorted.
@@ -5799,9 +6066,8 @@ mod caller_message_tests {
         assert_eq!(serde_json::to_value(&again).unwrap(), inline);
     }
 
-    /// A read entry carries one tag row per tagged part, after `tool_calls`; the message
-    /// itself keeps the exact bytes it had before tags existed, and an untagged entry has no
-    /// `tags` member at all.
+    /// Part rows sit beside the unchanged message. A complete ledger keeps its byte spelling;
+    /// a missing ledger still exposes the same keys without inventing numbers.
     #[test]
     fn tagged_entries_carry_part_tag_rows_beside_an_unchanged_message() {
         let content = vec![
@@ -5812,17 +6078,20 @@ mod caller_message_tests {
                 text: "second".into(),
             },
         ];
-        let plain = read_message(content.clone());
+        let mut plain = read_message(content.clone());
+        plain.tags = tag_rows(plain.ordinal, &plain.message);
         let mut tagged = read_message(content);
         tagged.message.set_tags(Some(std::sync::Arc::new(
             broca_protocol::tags::PartTags::all([7, 8]),
         )));
         tagged.tags = tag_rows(tagged.ordinal, &tagged.message);
-        assert!(tag_rows(plain.ordinal, &plain.message).is_empty());
 
         let plain_json = serde_json::to_value(&plain).unwrap();
         let tagged_json = serde_json::to_value(&tagged).unwrap();
-        assert!(plain_json.get("tags").is_none());
+        assert_eq!(
+            plain_json["tags"],
+            json!([{"part": "m3#0"}, {"part": "m3#1"}])
+        );
         assert_eq!(tagged_json["message"], plain_json["message"]);
         assert_eq!(
             serde_json::to_string(&tagged).unwrap(),
@@ -5830,6 +6099,36 @@ mod caller_message_tests {
         );
         let decoded: SessionReadMessage = serde_json::from_value(tagged_json).unwrap();
         assert_eq!(decoded.tags, tagged.tags);
+    }
+
+    #[test]
+    fn part_rows_cover_short_ledgers_without_using_surplus_numbers() {
+        let mut entry = read_message(vec![
+            ContentBlock::Text {
+                text: "first".into(),
+            },
+            ContentBlock::Text {
+                text: "second".into(),
+            },
+        ]);
+        for (parts, expected) in [
+            (
+                vec![Some(7)],
+                json!([{"part": "m3#0", "tag": "§7§"}, {"part": "m3#1"}]),
+            ),
+            (
+                vec![Some(7), None, Some(9)],
+                json!([{"part": "m3#0", "tag": "§7§"}, {"part": "m3#1"}]),
+            ),
+        ] {
+            entry.message.set_tags(Some(std::sync::Arc::new(
+                broca_protocol::tags::PartTags::new(parts),
+            )));
+            assert_eq!(
+                serde_json::to_value(tag_rows(entry.ordinal, &entry.message)).unwrap(),
+                expected
+            );
+        }
     }
 
     /// A caller reads the transcript's text, never the provider bytes kept to send back. A
@@ -5875,6 +6174,7 @@ mod caller_message_tests {
         );
         message.cache_prefix_blocks = Some(1);
         let response = SessionReadMessage {
+            written_at: None,
             delivered_as: None,
             tags: Vec::new(),
             ordinal: 0,
@@ -5894,23 +6194,6 @@ mod caller_message_tests {
         assert_eq!(
             wire["message"]["content"],
             json!([{"type": "text", "text": "final text"}])
-        );
-    }
-
-    #[test]
-    fn stateful_caller_message_serializer_uses_borrowed_content() {
-        let source = include_str!("lib.rs");
-        let start = source.find("fn serialize_caller_message").unwrap();
-        let end = source[start..]
-            .find("/// One message in a `session.read` page.")
-            .map(|offset| start + offset)
-            .unwrap();
-        let serializer = &source[start..end];
-
-        assert!(serializer.contains("CallerMessageRef(message).serialize(serializer)"));
-        assert!(
-            !serializer.contains(".clone()"),
-            "caller-facing state conversion must not clone message blocks"
         );
     }
 
@@ -5965,4 +6248,69 @@ pub struct RunEventGetParams {
 pub enum RunEventGetResponse {
     Found { event_key: String, jcs: String },
     Absent,
+}
+
+#[cfg(test)]
+mod live_subscribe_tests {
+    use super::*;
+    use broca_protocol::caller::ControlUnit;
+    use cortexkit_role_llm_runner::live::{LiveEvent, MessageEvent};
+
+    #[test]
+    fn unknown_control_units_keep_their_name_cursor_and_payload() {
+        let value = serde_json::json!({"kind":"control","cursor":{"wal_seq":7,"sub_index":9},"unit":{"type":"future_message_boundary","mid":"m8","future":{"kept":true}}});
+        let event = decode_subscribe_event(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(
+            matches!(&event, SubscribeEvent::UnknownControlUnit { wal_seq:7, sub_index:9, unit_type, unit } if unit_type == "future_message_boundary" && unit == &value["unit"])
+        );
+        assert_eq!(serde_json::to_value(&event).unwrap(), value);
+    }
+
+    #[test]
+    fn a_known_reset_is_not_an_unknown_control_unit() {
+        let event = decode_subscribe_event(br#"{"kind":"control","cursor":{"wal_seq":1,"sub_index":0},"unit":{"type":"display_reset"}}"#).unwrap();
+        assert!(matches!(
+            event,
+            SubscribeEvent::Control {
+                unit: ControlUnit::DisplayReset,
+                ..
+            }
+        ));
+        assert!(decode_subscribe_event(br#"{"kind":"control","cursor":{"wal_seq":1,"sub_index":0},"unit":{"type":"step_started","step_id":"not a number"}}"#).is_err());
+    }
+
+    #[test]
+    fn live_members_follow_the_unchanged_borrowed_control_bytes() {
+        let unit = ControlUnit::MessageBoundary { mid: "m3".into() };
+        let old = encode_subscribe_control(4, 2, &unit).unwrap();
+        let event = LiveEvent::MessageFinished(MessageEvent::new("m3"));
+        let live = encode_live_subscribe_control(4, 2, &unit, 12, &event).unwrap();
+        let mut expected = old;
+        assert_eq!(expected.pop(), Some(b'}'));
+        expected.extend_from_slice(br#","seq":12,"event":{"type":"message_finished","mid":"m3"}}"#);
+        assert_eq!(live, expected);
+        let value: serde_json::Value = serde_json::from_slice(&live).unwrap();
+        assert_eq!(value["seq"], 12);
+        assert_eq!(LiveEvent::decode_strict(&value["event"]).unwrap(), event);
+        let display = DisplayEvent::DisplayReset;
+        let old = encode_subscribe_display(&display).unwrap();
+        let live = encode_live_subscribe_display(&display, 13).unwrap();
+        let mut expected = old;
+        expected.pop();
+        expected.extend_from_slice(br#","seq":13}"#);
+        assert_eq!(live, expected);
+    }
+}
+
+#[cfg(test)]
+mod envelope_time_tests {
+    use super::SessionReadMessage;
+
+    #[test]
+    fn untimed_entries_keep_their_pre_addition_bytes() {
+        let pinned = r#"{"ordinal":0,"mid":"m0","message":{"role":"user","content":[{"type":"text","text":"legacy"}]}}"#;
+        let entry: SessionReadMessage = serde_json::from_str(pinned).unwrap();
+        assert_eq!(entry.written_at, None);
+        assert_eq!(serde_json::to_string(&entry).unwrap(), pinned);
+    }
 }

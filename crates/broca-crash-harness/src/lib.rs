@@ -43,6 +43,7 @@
 //! ordinary test run.
 
 pub mod invariants;
+pub mod power_loss;
 pub mod scenario;
 pub mod wal;
 

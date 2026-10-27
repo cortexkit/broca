@@ -47,7 +47,7 @@
 # generally; the private copy is what makes THIS one safe without anyone remembering. Lifted
 # from cortexkit/aft origin/main (8b8a7f0fa) into this diverged copy.
 #
-# I hit this a SECOND time within the hour, mutation-testing this very file while its own
+# I hit this a SECOND time within the hour, editing this very file while its own
 # train watched CI -- so the note above, which I had just written, is evidently not enough
 # on its own. That is the argument for stating the mechanism: "do not edit" is a rule you
 # must recall while busy; "rename into place" is a habit that holds whether you recall it

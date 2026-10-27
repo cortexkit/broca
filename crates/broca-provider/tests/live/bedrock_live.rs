@@ -4,8 +4,7 @@
 //! normalizer (CRC32-validated framing → assembled message). This is the only family
 //! whose live wire is binary, so it's the highest-value structural conformance check.
 //!
-//! Auth: the `amazon-bedrock` api key (a long-term Bearer key) from the opencode auth
-//! file → `Authorization: Bearer`. Region us-east-1 (encoded in the key). Skips cleanly
+//! Auth: the `amazon-bedrock` api key (a long-term Bearer key) through a vault dev-tools handle → `Authorization: Bearer`. Region us-east-1 (encoded in the key). Skips cleanly
 //! if the key is absent or the provider is unavailable.
 //!
 //! Run: `cargo test -p broca-provider --features live --test live bedrock_live:: -- --nocapture`
@@ -14,7 +13,7 @@ use crate::live_common;
 
 use broca_provider::families::{bedrock_frozen_config_with_region, BedrockConverse};
 use broca_provider::wire::AuthHandle;
-use live_common::{opencode_api_key, run_live, LiveResult, LiveSpec};
+use live_common::{run_live, vault_api_key, LiveResult, LiveSpec};
 use serde_json::json;
 
 // Amazon Nova Lite — a current, non-legacy Bedrock model reachable with this key in
@@ -24,10 +23,10 @@ const MODEL: &str = "amazon.nova-lite-v1:0";
 const REGION: &str = "us-east-1";
 
 fn auth() -> Result<AuthHandle, String> {
-    opencode_api_key("amazon-bedrock")
+    vault_api_key("amazon-bedrock")
         .map(AuthHandle::Bearer)
         .ok_or_else(|| {
-            "SKIP bedrock_live: no amazon-bedrock api key in the opencode auth file.".into()
+            "SKIP bedrock_live: no amazon-bedrock api key in the vault dev-tools handle map.".into()
         })
 }
 

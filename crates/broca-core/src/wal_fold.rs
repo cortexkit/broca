@@ -4,17 +4,16 @@ use crate::{
     lease::acquire_archive_pass, lease_key_for, wal_writer::session_addr, FileLeaseStore,
     LeaseError, LeaseStore,
 };
-use broca_owner_only::OpenOptions;
-use broca_protocol::BindIdentity;
+use broca_protocol::{BindIdentity, ToolCallId};
+use broca_wal::fs_ops::{self as fs, File, OpenOptions};
 use broca_wal::{
     archive::{ArchiveReader, ArchiveWriter, ContainerState},
-    WalRecord,
+    FramedRecord, WalRecord,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    fs::{self, File},
     io::{self, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -170,10 +169,7 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
 /// error that might mean something else.
 #[cfg(unix)]
 fn sync_dir(path: &Path) -> io::Result<()> {
-    File::open(path)
-        .map_err(at(path))?
-        .sync_all()
-        .map_err(at(path))
+    fs::sync_dir(path).map_err(at(path))
 }
 
 /// See the unix arm. NTFS does not require a directory handle to make a rename or unlink durable,
@@ -269,10 +265,76 @@ fn live_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
     }
     Ok(Some(bytes))
 }
+/// How a range's provider-held calls keep it out of the archive, as far as the caller can say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldRanges {
+    /// No intake store is given, or its state is unknown to the caller. A range holding a
+    /// `ToolCallProviderHeld` record is skipped: without the store, no reader can prove that the
+    /// call was delivered, closed out, or that its lineage is free of a registration.
+    UnknownStore,
+    /// What the intake store knows, for a range holding a provider-held record.
+    Store(StoreHeld),
+}
+
+/// What the intake store can say about provider-held calls for the fold.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StoreHeld {
+    /// Whether the intake store is present. A caller that cannot answer this should pass
+    /// `HeldRanges::UnknownStore` instead, which keeps every held range.
+    pub complete: bool,
+}
+impl HeldRanges {
+    /// The fold's default: no store, so no proof.
+    pub const DEFAULT: HeldRanges = HeldRanges::UnknownStore;
+}
+
+/// The provider-held calls and terminals of one range.
+#[derive(Default)]
+struct Batch {
+    held: Vec<ToolCallId>,
+    terminals: Vec<ToolCallId>,
+}
+impl Batch {
+    fn open_held(&self) -> bool {
+        self.held.iter().any(|held| !self.terminals.contains(held))
+    }
+    fn needs_intake(&self) -> bool {
+        !self.held.is_empty()
+    }
+}
+
+fn held_batches(records: &[FramedRecord]) -> Batch {
+    let mut batch = Batch::default();
+    for frame in records {
+        match &frame.record {
+            WalRecord::ToolCallProviderHeld { tool_call_id, .. } => {
+                batch.held.push(tool_call_id.clone())
+            }
+            WalRecord::ToolResult {
+                result, outcome, ..
+            } if !outcome.is_indeterminate() => batch.terminals.push(result.tool_call_id.clone()),
+            WalRecord::ToolNoDispatch { tool_call_id, .. } => {
+                batch.terminals.push(tool_call_id.clone())
+            }
+            _ => {}
+        }
+    }
+    batch
+}
+
 fn eligible(
     bytes: &[u8],
     start: u64,
     cold_ms: u64,
+) -> Result<(Option<BindIdentity>, bool), &'static str> {
+    eligible_with(bytes, start, cold_ms, HeldRanges::DEFAULT)
+}
+
+fn eligible_with(
+    bytes: &[u8],
+    start: u64,
+    cold_ms: u64,
+    held_ranges: HeldRanges,
 ) -> Result<(Option<BindIdentity>, bool), &'static str> {
     if bytes.is_empty() {
         return Err("zero_byte");
@@ -304,6 +366,22 @@ fn eligible(
     {
         // Prepared anchors require a lineage. Without it, no reader can prove debt discharged.
         return Err("deferred_call_open");
+    }
+    // A held call's late result is pulled by the intake, not read back from this range, so the
+    // range must stay live while the call can still be delivered or its lineage still registered.
+    let held = held_batches(records);
+    if held.open_held() {
+        return Err("provider_held_open");
+    }
+    if matches!(held_ranges, HeldRanges::UnknownStore) && held.needs_intake() {
+        return Err("provider_held_registered");
+    }
+    if matches!(
+        held_ranges,
+        HeldRanges::Store(StoreHeld { complete: false })
+    ) && held.needs_intake()
+    {
+        return Err("provider_held_registered");
     }
     let mut identity = None;
     let mut last_ts = None;
@@ -420,7 +498,7 @@ pub fn unfinished_pass(root: &Path) -> io::Result<Option<String>> {
 }
 
 fn unfinished(dir: &Path) -> io::Result<Vec<PathBuf>> {
-    if !dir.exists() {
+    if !fs::exists(dir) {
         return Ok(Vec::new());
     }
     let mut result = Vec::new();
@@ -431,7 +509,7 @@ fn unfinished(dir: &Path) -> io::Result<Vec<PathBuf>> {
             // Before the first admission, a crash can leave only a journal. No
             // session state or archive bytes need recovery, so it cannot block folds.
             if !journal.terminal()
-                && !(journal.latest().is_empty() && !path.with_extension("ark").try_exists()?)
+                && !(journal.latest().is_empty() && !fs::try_exists(&path.with_extension("ark"))?)
             {
                 result.push(path);
             }
@@ -527,14 +605,14 @@ fn run_with_threshold(
             Tree::Ordinary,
         );
     }
-    if !Tree::Ordinary.live(root).is_dir() && !Tree::Durable.live(root).is_dir() {
+    if !fs::is_dir(Tree::Ordinary.live(root)) && !fs::is_dir(Tree::Durable.live(root)) {
         return Err(invalid("state root must contain wal/ or wal-durable/"));
     }
     let mut report = FoldReport::default();
     // Only durable archives are backed up. A container holding both populations
     // would either back up disposable sessions or omit durable ones.
     for tree in [Tree::Ordinary, Tree::Durable] {
-        if !tree.live(root).is_dir() {
+        if !fs::is_dir(tree.live(root)) {
             continue;
         }
         let next = run_tree(root, options, start, boundary, identities, cold_ms, tree)?;
@@ -661,7 +739,7 @@ fn run_tree(
             }
             return Ok(report);
         }
-        if journal.latest().is_empty() && !ark.try_exists()? {
+        if journal.latest().is_empty() && !fs::try_exists(&ark)? {
             finish(
                 root,
                 &mut journal,
@@ -720,7 +798,7 @@ fn run_tree(
     if let Some(path) = unfinished(&dir)?.first() {
         return Err(invalid(format!("unfinished archive pass {}; use --resume {} (or explicit --abandon) before starting another", path.display(), tree.resume_name(&path.file_name().unwrap().to_string_lossy()))));
     }
-    broca_owner_only::create_dir_all(&dir)?;
+    fs::create_dir_all(&dir)?;
     sync_dir(root)?;
     let mut stamp = start;
     for entry in fs::read_dir(&dir)? {
@@ -850,8 +928,8 @@ fn wal_paths(root: &Path, tree: Tree) -> io::Result<Vec<PathBuf>> {
     for entry in fs::read_dir(tree.live(root))? {
         let entry = entry?;
         if entry.path().extension().is_some_and(|e| e == "wal") && entry.file_type()?.is_file() {
-            if entry.path().with_extension("moving").try_exists()?
-                || entry.path().with_extension("moved").try_exists()?
+            if fs::try_exists(&entry.path().with_extension("moving"))?
+                || fs::try_exists(&entry.path().with_extension("moved"))?
             {
                 continue;
             }
@@ -1122,7 +1200,7 @@ fn unfold(root: &Path, journal: &Journal, ark: &Path, write: bool) -> io::Result
         let temp = path.with_extension("unfold-tmp");
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        if temp.exists() {
+        if fs::exists(&temp) {
             // Only our deterministic temp pathname is replaced, under the session
             // lease. A failed prior extraction never made it authoritative.
             fs::remove_file(&temp)?;
@@ -1226,5 +1304,58 @@ mod windows_acl_tests {
         }
         assert_private(&path);
         assert_private(&fixture.path.join("wal-archive"));
+    }
+}
+
+#[cfg(test)]
+mod provider_held_store_tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_intake_keeps_a_terminal_held_range_live() {
+        let records = [
+            WalRecord::ToolCallProviderHeld {
+                batch_id: broca_protocol::BatchId("batch".into()),
+                tool_call_id: ToolCallId("call".into()),
+                call_key: "lineage:1".into(),
+                module: "provider".into(),
+                reason: "running".into(),
+                detail_digest: None,
+                held_at_ms: 1,
+                sequential: false,
+            },
+            WalRecord::ToolResult {
+                finished_at_ms: None,
+                batch_id: broca_protocol::BatchId("batch".into()),
+                result: crate::replay::deferred_tests::result("call", "late"),
+                outcome: broca_wal::DispatchOutcome::Completed,
+                reason: None,
+                tags: None,
+                hooks: None,
+                withdraw_elicitation: None,
+                provider_held: None,
+            },
+        ];
+        let bytes = records
+            .iter()
+            .enumerate()
+            .flat_map(|(index, record)| {
+                broca_wal::framing::encode_payload(
+                    index as u64 + 1,
+                    1,
+                    &serde_json::to_vec(record).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for knowledge in [
+            HeldRanges::UnknownStore,
+            HeldRanges::Store(StoreHeld { complete: false }),
+        ] {
+            assert_eq!(
+                eligible_with(&bytes, COLD_MS * 3, COLD_MS, knowledge),
+                Err("provider_held_registered")
+            );
+        }
     }
 }

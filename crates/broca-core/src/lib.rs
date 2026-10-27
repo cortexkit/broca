@@ -17,16 +17,23 @@ pub mod billing;
 mod budget_kernel;
 pub mod cache_warm;
 pub mod capability;
-pub mod caps;
 pub mod clock;
 pub mod compaction;
 pub mod consent;
 pub mod context;
 pub mod delivery_order;
+pub mod head;
 pub mod hooks;
 pub mod import;
 pub mod input_budget;
 pub mod lease;
+pub mod media_provenance;
+pub mod media_request;
+pub mod media_store;
+pub mod media_uploads;
+pub mod media_validation;
+pub mod message_times;
+pub mod placement;
 pub mod projection;
 mod projection_health;
 pub mod projection_plan;
@@ -45,7 +52,9 @@ pub mod scope_admission;
 pub mod shutdown_seal;
 pub mod steer;
 pub mod stub_plane;
+pub mod system_one_fact;
 pub mod tags;
+pub mod tool_media;
 pub mod tool_plane;
 pub mod tool_repetition;
 pub mod wal_fold;
@@ -67,10 +76,6 @@ pub use billing::{
 pub use capability::{
     AllowAll, ApprovalPolicy, CapabilityViolation, DenyAll, ScriptedApproval, ToolManifest,
 };
-pub use caps::{
-    AppliedCapWatermark, CapBaseline, CapInstallRequest, CapMutation, CapOperation, CapRow,
-    CapStore, CapStoreError, CapWatermark, SpendDeltaRequest,
-};
 pub use clock::Clock;
 pub use compaction::{
     CompactionCheckpoint, CompactionPlane, CompactionState, CompactionUnavailable, CompactionViews,
@@ -80,12 +85,12 @@ pub use context::{
     call_key, catch_up_usage_exports, dispatches_of_turns, effective_context,
     emit_lineage_usage_exports, read_session_page, read_session_page_owned,
     read_session_page_owned_with_dispatches, record_time_ms, replay_transcript,
-    resume_state_from_store, tool_call_dispatches, AdmissionStoreSnapshot, ExportCursor,
-    ExportError, ExportFact, ExportIndex, ExportPage, MaterializedStore, MissingExportRun,
-    Persister, RunIndex, RunIndexRow, RunIndexState, SessionReadLineageState, SessionReadMessage,
-    SessionReadPage, SessionReadReason, SessionReadStateKind, SessionStore, StorePageRow,
-    StorePageSnapshot, StorePrefix, TagLocation, ToolCallDispatch, WithdrawalRun,
-    SESSION_READ_DEFAULT_LIMIT, SESSION_READ_MAX_LIMIT,
+    resume_state_from_store, select_held_episodes, tool_call_dispatches, AdmissionStoreSnapshot,
+    ExportCursor, ExportError, ExportFact, ExportIndex, ExportPage, HeldEpisode, HeldPrefix,
+    HeldRowsRequest, MaterializedStore, MissingExportRun, Persister, RunIndex, RunIndexRow,
+    RunIndexState, SessionReadLineageState, SessionReadMessage, SessionReadPage, SessionReadReason,
+    SessionReadStateKind, SessionStore, StorePageRow, StorePageSnapshot, StorePrefix, TagLocation,
+    ToolCallDispatch, WithdrawalRun, SESSION_READ_DEFAULT_LIMIT, SESSION_READ_MAX_LIMIT,
 };
 pub use context::{
     read_session_model_page, ModelEntry, ModelPage, ModelPageError, ModelPageRequest, ReadView,
@@ -98,7 +103,8 @@ pub use import::{
 pub use lease::{lease_key_for, FileLeaseStore, LeaseError, LeaseHandle, LeaseStore};
 pub use projection::{
     advance_control_projection_state, classify_control_unit, last_control_cursor_through,
-    project_control, project_control_with_state, ControlClass, ControlProjectionState, Cursor,
+    project_control, project_control_with_mids, project_control_with_state, ControlClass,
+    ControlProjectionState, Cursor, PlacedControlUnit,
 };
 pub use provider::{Provider, StubProvider};
 pub use queue::{
@@ -109,12 +115,12 @@ pub use render::{
     canonical_request_bytes, request_digest, request_digest_hex, CANONICAL_RENDERER_VERSION,
 };
 pub use replay::{
-    budget_replay_seed_is_valid, deferred_call_obligations, latest_projection_boundary,
-    no_dispatch_result, reconcile_run_state, replay, replay_projection_tail,
-    DeferredCallObligations, DeferredCallProjection, LateApprovalView, OpenCallState,
-    OpenToolBatch, OwedWithdrawal, PendingTurn, PreparedCall, ProjectedDeferredCall,
-    ProjectionDelta, ProjectionSeed, ReconciledRunState, ReplayError, ReplayResolution,
-    ReplayState, RunUsageProjection,
+    budget_replay_seed_is_valid, deferred_call_obligations, held_call_facts,
+    latest_projection_boundary, no_dispatch_result, reconcile_run_state, replay,
+    replay_projection_tail, DeferredCallObligations, DeferredCallProjection, HeldCallFacts,
+    LateApprovalView, OpenCallState, OpenToolBatch, OwedWithdrawal, PendingTurn, PreparedCall,
+    ProjectedDeferredCall, ProjectionDelta, ProjectionSeed, ReconciledRunState, ReplayError,
+    ReplayResolution, ReplayState, RunUsageProjection,
 };
 pub use resume::{
     close_out_open_batch, close_out_pending_turn, not_dispatched_result, outcome_unknown_result,

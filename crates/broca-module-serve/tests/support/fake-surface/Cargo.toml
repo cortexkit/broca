@@ -1,0 +1,22 @@
+[package]
+name = "fake-surface"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "A stand-in management surface for broca-module-serve's private-content tests: it declares private_content.query and flow.private_content_providers, answers them from a fixture file, and records each request. Test-only; it is built by the test that needs it."
+
+# Exactly the releases the `broca-subc` and `broca-module-serve` workspace pins resolve to, so
+# this process speaks the same wire as the daemon and module it stands in for. Kept out of the
+# workspace so its manifest is only built on demand by the tests.
+[workspace]
+
+[[bin]]
+name = "fake-surface"
+path = "src/main.rs"
+
+[dependencies]
+subc-protocol = "=0.32.4"
+subc-transport = "=0.13.0"
+libc = "0.2"
+serde_json = { version = "1", features = ["raw_value"] }
+tokio = { version = "1", features = ["rt", "io-util", "net", "time"] }

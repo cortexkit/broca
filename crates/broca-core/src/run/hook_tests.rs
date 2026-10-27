@@ -36,6 +36,20 @@ fn writer() -> (WalHandle, Arc<Mutex<Vec<WalRecord>>>) {
         records,
     )
 }
+
+fn records_with_observed_result_times(records: &Mutex<Vec<WalRecord>>) -> Vec<WalRecord> {
+    let mut records = records.lock().unwrap().clone();
+    for record in &mut records {
+        if let WalRecord::ToolResult { finished_at_ms, .. } = record {
+            // Content and source order are deterministic; the observation clock is not.
+            assert!(
+                finished_at_ms.take().is_some(),
+                "a written result has an observed finish time"
+            );
+        }
+    }
+    records
+}
 enum Reply {
     Answer(HookAnswer),
     Unavailable,
@@ -119,11 +133,13 @@ pub(super) fn frozen(
                 tools: vec![tool()].into(),
                 text: None,
                 reply: None,
+                reference_slots: None,
                 result_ops: permissions.map(|ops| {
                     [("edit".into(), ops.into_iter().map(str::to_owned).collect())]
                         .into_iter()
                         .collect()
                 }),
+                declarations_frozen: None,
             },
         }],
         declarations: subscriptions
@@ -272,6 +288,7 @@ async fn mutated_input_is_revalidated_before_validate_and_terminal_is_not_rehook
         batch_already_started: true,
         prepared: Vec::new(),
         existing: [(ToolCallId("c".into()), [output.results[0].clone()].into())].into(),
+        ..Default::default()
     };
     batch(
         vec![call("c")],
@@ -758,6 +775,8 @@ impl Provider for Messages {
         }
         let (tx, rx) = mpsc::channel(8);
         tx.send(NormalizedEvent::Display(DisplayEvent::TextDelta {
+            mid: None,
+            part: None,
             message_id: broca_protocol::MessageId(format!("m{}", step.0)),
             tool_call_id: None,
             delta: "answer".into(),
@@ -1119,6 +1138,7 @@ async fn excluded_case(kind: &str) {
                     .into(),
                 )]
                 .into(),
+                ..Default::default()
             })
         }
         "not_sent" => {}
@@ -1189,6 +1209,7 @@ async fn excluded_unknown(interrupted: bool) {
 
 fn result_record(id: &str, text: &str) -> WalRecord {
     WalRecord::ToolResult {
+        finished_at_ms: None,
         tags: None,
         batch_id: BatchId("b".into()),
         result: Arc::new(ToolResult {
@@ -1217,6 +1238,7 @@ async fn seal_linearization_keeps_answered_slots_until_handover_and_orders_paral
         tool_call_id: "a".into(),
     };
     let model = WalRecord::ModelStepFinished {
+        written_at_ms: None,
         tags: None,
         step_id: StepId(1),
         assistant_message: Arc::new(AssistantMessage {
@@ -1241,7 +1263,7 @@ async fn seal_linearization_keeps_answered_slots_until_handover_and_orders_paral
     assert!(!seal.deposit_hook(second, result_record("a", "loop-must-not-write")));
     seal.record_hook_fallbacks(&writer).await.unwrap();
     assert_eq!(
-        *records.lock().unwrap(),
+        records_with_observed_result_times(&records),
         vec![
             model,
             result_record("z", "answered-z"),
@@ -1264,7 +1286,7 @@ async fn loop_wins_handover_and_seal_writes_no_second_terminal() {
     seal.seal_and_collect(std::time::Duration::ZERO).await;
     seal.record_hook_fallbacks(&writer).await.unwrap();
     assert_eq!(
-        *records.lock().unwrap(),
+        records_with_observed_result_times(&records),
         vec![result_record("a", "answered")]
     );
     let _ = writer.shutdown().await;
@@ -2324,7 +2346,7 @@ async fn lost_post_tool_handover_parks_before_batch_or_turn_markers() {
     assert!(records.lock().unwrap().is_empty());
     seal.record_hook_fallbacks(&writer).await.unwrap();
     assert_eq!(
-        *records.lock().unwrap(),
+        records_with_observed_result_times(&records),
         vec![result_record("c", "fallback")]
     );
     let _ = writer.shutdown().await;
@@ -2539,3 +2561,272 @@ async fn cut_step_shutdown_fallback_keeps_exact_rejection_counts() {
 
 #[path = "dispatch_cancel_tests.rs"]
 mod dispatch_cancel_tests;
+
+#[tokio::test]
+async fn post_hook_restream_counts_delta_less_stored_blocks() {
+    let message = AssistantMessage {
+        message_id: broca_protocol::MessageId("hooked".into()),
+        content: vec![
+            ContentBlock::RedactedReasoning {
+                data: "opaque".into(),
+                provider_format: None,
+            },
+            ContentBlock::Reasoning {
+                text: "thinking".into(),
+                signature: None,
+            },
+            ContentBlock::Text {
+                text: "answer".into(),
+            },
+        ],
+    };
+    let (out, mut events) = mpsc::channel(8);
+    restream_message(&message, &out).await;
+    assert_eq!(
+        events.try_recv().unwrap(),
+        OutputEvent::Display(DisplayEvent::DisplayReset)
+    );
+    let parts: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+        .filter_map(|e| match e {
+            OutputEvent::Display(e) => e.coordinates().map(|(_, part)| part),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(parts, vec![1, 2]);
+}
+
+/// Records the `late_results` declaration each batch's manifest carries for the tool's
+/// provider, and answers every call at once.
+struct DeclarationProbe {
+    seen: Mutex<Vec<Option<bool>>>,
+}
+
+#[async_trait::async_trait]
+impl ToolPlane for DeclarationProbe {
+    async fn batch_started(
+        &self,
+        _: &BatchCtx,
+        _: &[ToolCall],
+        manifest: &ToolManifest,
+    ) -> Result<(), ToolPlaneError> {
+        self.seen.lock().unwrap().push(
+            manifest
+                .provider_declarations("aft")
+                .and_then(|declarations| declarations.late_results),
+        );
+        Ok(())
+    }
+
+    async fn batch_finished(&self, _: &BatchCtx) -> Result<(), ToolPlaneError> {
+        Ok(())
+    }
+
+    async fn dispatch(&self, _: &BatchCtx, call: &ToolCall) -> DispatchResult {
+        DispatchResult::Completed(ToolResult {
+            tool_call_id: call.tool_call_id.clone(),
+            output: ToolOutput::Text { text: "ok".into() },
+            is_error: false,
+        })
+    }
+}
+
+/// A plan manifest whose provider froze the `late_results` capability, or froze nothing.
+fn declaring(late_results: bool) -> broca_wal::PlanManifest {
+    let mut manifest = frozen(Vec::new(), None, false);
+    if let broca_wal::FetchOutcome::Answered {
+        declarations_frozen,
+        ..
+    } = &mut manifest.fetches[0].outcome
+    {
+        *declarations_frozen = late_results.then_some(broca_wal::FrozenProviderDeclarations {
+            result_formats: None,
+            late_results: Some(true),
+        });
+    }
+    manifest
+}
+
+/// A batch routes by the provider declarations its session froze, never by whatever manifest a
+/// later admission offers: a fresh run reads the admitted manifest, and a resume reads the
+/// manifest its own `RunStarted` recorded, even when the resuming caller brings a different
+/// one.
+#[tokio::test]
+async fn a_batch_reads_provider_declarations_only_from_the_frozen_manifest() {
+    let control = RunControl {
+        manifest: Some(Arc::new(declaring(true))),
+        ..Default::default()
+    };
+    let (seed_writer, seed) = writer();
+    let (out, _rx) = mpsc::channel(128);
+    let fresh = DeclarationProbe {
+        seen: Mutex::new(Vec::new()),
+    };
+    run_body(
+        &mut request(),
+        crate::replay::replay(&[]).unwrap(),
+        None,
+        false,
+        false,
+        false,
+        &control,
+        &Messages {
+            requests: Arc::new(Mutex::new(Vec::new())),
+        },
+        &fresh,
+        &crate::AllowAll,
+        &seed_writer,
+        || Ok(false),
+        None,
+        &out,
+        None,
+    )
+    .await
+    .unwrap();
+    let _ = seed_writer.shutdown().await;
+    assert_eq!(*fresh.seen.lock().unwrap(), [Some(true)]);
+
+    // Resume from the durable model step, with a caller that offers a manifest declaring
+    // nothing: the resumed batch still routes by what the session froze.
+    let mut prefix = Vec::new();
+    for record in seed.lock().unwrap().iter() {
+        prefix.push(record.clone());
+        if matches!(record, WalRecord::ModelStepFinished { .. }) {
+            break;
+        }
+    }
+    let mut prior = crate::replay::replay(&prefix).unwrap();
+    prior.manifest = prefix.iter().find_map(|record| match record {
+        WalRecord::RunStarted {
+            manifest: Some(manifest),
+            ..
+        } => Some(Arc::new(manifest.as_ref().clone())),
+        _ => None,
+    });
+    let resumed = DeclarationProbe {
+        seen: Mutex::new(Vec::new()),
+    };
+    let (writer, _records) = writer();
+    run_body(
+        &mut request(),
+        prior,
+        None,
+        true,
+        false,
+        false,
+        &RunControl {
+            manifest: Some(Arc::new(declaring(false))),
+            ..Default::default()
+        },
+        &Messages {
+            requests: Arc::new(Mutex::new(Vec::new())),
+        },
+        &resumed,
+        &crate::AllowAll,
+        &writer,
+        || Ok(false),
+        None,
+        &out,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(*resumed.seen.lock().unwrap(), [Some(true)]);
+    let _ = writer.shutdown().await;
+}
+
+#[tokio::test]
+#[cfg(feature = "test-attachments")]
+async fn tool_reference_provenance_is_enforced_before_hook_payloads_are_stored() {
+    use broca_protocol::{MediaMarkerReason, ToolOutputPart};
+    let bind = BindIdentity::new("/project", "caller", "media-hooks");
+    let root = scratch("tool-reference-provenance");
+    let wal = crate::FileWalStore::new(root.join("wal"));
+    drop(wal.open(&bind).unwrap());
+    let (mut writer, records) = writer();
+    writer.bind_media_capture(&wal, &bind);
+    let capture = writer.media_capture().unwrap();
+    let own = capture
+        .capture(
+            &BatchId("r-b1".into()),
+            &ToolCallId("c".into()),
+            b"%PDF-1.7\nown\n%%EOF".to_vec(),
+            "application/pdf".into(),
+        )
+        .await
+        .unwrap();
+    let foreign = capture
+        .capture(
+            &BatchId("r-b1".into()),
+            &ToolCallId("other".into()),
+            b"%PDF-1.7\nforeign\n%%EOF".to_vec(),
+            "application/pdf".into(),
+        )
+        .await
+        .unwrap();
+    let mut altered = own.clone();
+    altered.mime = "image/png".into();
+    let supplied = [own.clone(), foreign.clone(), altered.clone()];
+    let plane = crate::StubToolPlane::new().with_tool("edit", move |_| {
+        crate::StubReply::Output(ToolOutput::Parts {
+            parts: supplied
+                .iter()
+                .cloned()
+                .map(|media| ToolOutputPart::Media { media })
+                .collect(),
+        })
+    });
+    let manifest = frozen(vec![vec![sub("post_tool", None, "refuse")]], None, false);
+    let plan = HookPlan::from_manifest(&manifest).unwrap();
+    let (hooks, seen) = scripted(|_, request| {
+        let text = &request.subject.blocks().unwrap()[0];
+        assert!(text.contains("reason=carrier]"));
+        assert_eq!(text.matches("reason=provenance]").count(), 2);
+        Reply::Answer(append("!"))
+    });
+    let runtime = runtime(&plan, &hooks, &bind, &writer);
+    batch(
+        vec![call("c")],
+        &plane,
+        &crate::AllowAll,
+        &writer,
+        &runtime,
+        None,
+    )
+    .await;
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    let original = {
+        let records = records.lock().unwrap();
+        records
+            .iter()
+            .find_map(|record| match record {
+                WalRecord::ToolResult {
+                    hooks: Some(hooks), ..
+                } => hooks.original.as_ref(),
+                _ => None,
+            })
+            .unwrap()
+            .clone()
+    };
+    let result: ToolResult = serde_json::from_value(original).unwrap();
+    assert_eq!(
+        result.output,
+        ToolOutput::Parts {
+            parts: vec![
+                ToolOutputPart::Media { media: own },
+                ToolOutputPart::Text {
+                    text: broca_protocol::content::media_not_shown_marker(
+                        &foreign,
+                        MediaMarkerReason::Provenance
+                    )
+                },
+                ToolOutputPart::Text {
+                    text: broca_protocol::content::media_not_shown_marker(
+                        &altered,
+                        MediaMarkerReason::Provenance
+                    )
+                },
+            ]
+        }
+    );
+    writer.shutdown().await.unwrap();
+}

@@ -19,7 +19,7 @@ broca-subc = { path = "../broca-subc" }
 # provider's `live` feature.
 broca-provider = { path = "../broca-provider", features = ["live"] }
 # Catalog model resolution: `--model <provider/model>` resolves the wire family +
-# base_url + auth kind from the vendored models.dev snapshot (the bundled catalog).
+# base_url + auth kind from Fusiform, with the shared last-known-good catalog as fallback.
 broca-catalog = { path = "../broca-catalog", features = ["live"] }
 # For the fusiform catalog poller. Reused rather than reimplemented: a second fetch path would
 # be a second place for the request shape, the LKG format, and the refusal rules to drift.
@@ -30,4 +30,5 @@ tokio.workspace = true
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
+broca-catalog = { path = "../broca-catalog", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }

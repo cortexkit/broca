@@ -7,8 +7,8 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
 use broca_provider::spec::{
-    Capabilities, CapabilityFlag, CostSchedule, CostTier, Limits, ModelSpec, Overlay, ProviderSpec,
-    ReasoningOptions, WireFamilyId,
+    Capabilities, CapabilityFlag, CostSchedule, CostTier, InputModalities, Limits, ModelSpec,
+    Overlay, ProviderSpec, ReasoningOptions, WireFamilyId,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 #[cfg(test)]
@@ -16,7 +16,13 @@ use serde_json::Map;
 use serde_json::Value;
 
 use crate::family::{resolve_provider_family, FamilyResolution};
-use crate::{Catalog, CatalogError, OVERLAY};
+#[cfg(any(test, feature = "test-support"))]
+use crate::Catalog;
+use crate::{CatalogError, OVERLAY};
+
+// Snapshot replacement bypasses refresh validation and must not be available to shipping code.
+#[cfg(all(feature = "test-support", not(debug_assertions)))]
+compile_error!("catalog test-support cannot be enabled in a release build");
 
 /// Catalog fields fetched from fusiform for accepting sends and maintaining prompt caches.
 /// Accepting a send freezes its run configuration before any record is written.
@@ -41,9 +47,12 @@ use crate::{Catalog, CatalogError, OVERLAY};
 pub const FUSIFORM_FACT_PREFIXES: &[&str] = &[
     "existence",
     "model.kind",
+    "model.name",
+    "provider.",
     "limit.context",
     "limit.output",
     "capability.attachment",
+    "capability.input_modalities",
     "capability.reasoning",
     "capability.reasoning_options",
     "capability.tool_call",
@@ -52,6 +61,12 @@ pub const FUSIFORM_FACT_PREFIXES: &[&str] = &[
     "rate.output",
     "rate.cache_read",
     "rate.cache_write",
+    "wire.npm",
+    "wire.api",
+    "wire.shape",
+    "route.reasoning_wire_ids",
+    "route.reasoning_default",
+    "successor",
 ];
 
 /// Prefix of a per-model input rate for one upstream mode, e.g. `rate.input.mode.fast`.
@@ -76,6 +91,8 @@ pub struct FusiformCatalogResponse {
     pub withheld: Vec<Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub uncertain: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wire_corrections: Vec<Value>,
 }
 
 /// Where the currently served in-memory document was obtained.
@@ -95,6 +112,7 @@ impl CatalogSource {
 }
 
 struct LoadedCatalog {
+    carries_routing_facts: bool,
     // Arc-wrapped so an equal-version refresh can republish the existing index with fresh
     // metadata instead of rebuilding ~6,300 models to produce the same answer.
     catalog: Arc<ServingCatalog>,
@@ -122,6 +140,10 @@ struct LoadedCatalog {
     /// version as the next poll and no kinds, and reusing its index would keep admitting a
     /// non-chat model to `session.send` until fusiform happened to mint a new version.
     carries_model_kinds: bool,
+    /// An equal-version poll can add modalities that an older prefix list did not request.
+    carries_input_modalities: bool,
+    /// A same-version poll can add names omitted by the previous prefix list.
+    carries_display_names: bool,
     /// Present rows this catalog left out or kept from the catalog it replaced, because their
     /// facts could not be used. Shared with an equal-version republish, which reuses the index
     /// these describe.
@@ -134,6 +156,28 @@ fn response_carries_model_kinds(response: &FusiformCatalogResponse) -> bool {
         .models
         .values()
         .any(|facts| facts.contains_key("model.kind"))
+}
+
+fn response_carries_input_modalities(response: &FusiformCatalogResponse) -> bool {
+    response
+        .models
+        .values()
+        .any(|facts| facts.contains_key("capability.input_modalities"))
+}
+
+fn response_carries_display_names(response: &FusiformCatalogResponse) -> bool {
+    response
+        .models
+        .values()
+        .any(|facts| facts.contains_key("model.name") || facts.contains_key("provider.name"))
+}
+
+fn response_carries_routing_facts(response: &FusiformCatalogResponse) -> bool {
+    response.models.values().any(|facts| {
+        facts
+            .keys()
+            .any(|key| key.starts_with("wire.") || key.starts_with("route."))
+    })
 }
 
 impl LoadedCatalog {
@@ -167,12 +211,12 @@ fn response_carries_output_limits(response: &FusiformCatalogResponse) -> bool {
 /// The bounded provider facts retained for admission. `raw` is always null, so cloning this spec
 /// for one lookup never copies another model or an ingestion-only catalog field.
 struct ServingProvider {
-    spec: ProviderSpec,
+    spec: Option<ProviderSpec>,
     models: BTreeMap<String, ServingModel>,
 }
 
-/// Construction also tracks pending providers so they remain valid overlay targets, then discards
-/// them before the immutable serving index is installed.
+/// Construction tracks whether a provider has an implemented renderer. Pending providers retain
+/// bounded model metadata, so an unsupported chat route cannot hide a stated non-chat kind.
 struct DraftServingProvider {
     spec: Option<ProviderSpec>,
     models: BTreeMap<String, ServingModel>,
@@ -195,6 +239,7 @@ struct ServingModel {
     /// served.
     output_limit: Option<u64>,
     attachment: CapabilityFlag,
+    input_modalities: InputModalities,
     reasoning: CapabilityFlag,
     tool_call: CapabilityFlag,
     /// `capability.structured_output`. Like the three flags above, fusiform omits it on rows
@@ -223,6 +268,7 @@ impl Default for ServingModel {
             context_limit: None,
             output_limit: None,
             attachment: CapabilityFlag::Absent,
+            input_modalities: InputModalities::default(),
             reasoning: CapabilityFlag::Absent,
             tool_call: CapabilityFlag::Absent,
             structured_output: CapabilityFlag::Absent,
@@ -235,6 +281,7 @@ impl Default for ServingModel {
 }
 
 impl ServingModel {
+    #[cfg(any(test, feature = "test-support"))]
     fn from_spec(
         model: &ModelSpec,
         model_family: WireFamilyId,
@@ -248,6 +295,7 @@ impl ServingModel {
             context_limit: model.limits.context,
             output_limit: model.limits.max_output,
             attachment: model.capabilities.attachment,
+            input_modalities: model.input_modalities,
             reasoning: model.capabilities.reasoning,
             tool_call: model.capabilities.tool_call,
             structured_output: model.capabilities.structured_output,
@@ -274,6 +322,7 @@ impl ServingModel {
                 interleaved: CapabilityFlag::Absent,
                 structured_output: self.structured_output,
             },
+            input_modalities: self.input_modalities,
             limits: Limits {
                 context: self.context_limit,
                 max_input: None,
@@ -290,6 +339,7 @@ impl ServingModel {
 }
 
 struct ServingCatalog {
+    routing: BTreeMap<String, crate::routing::RoutingFacts>,
     providers: BTreeMap<String, ServingProvider>,
     overlay_removed_models: BTreeMap<String, BTreeSet<String>>,
     withdrawn_models: BTreeMap<String, BTreeSet<String>>,
@@ -304,6 +354,9 @@ struct ServingCatalog {
 /// Absent is never zero: a fact the catalog does not state stays `None`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelBatchRow {
+    /// Human display facts only. Missing or blank names never fall back to identifiers.
+    pub model_name: Option<String>,
+    pub provider_name: Option<String>,
     /// `model.kind` as served (`decision`, `extraction`, `chat`, ...); `None` when the row
     /// states no kind.
     pub kind: Option<String>,
@@ -350,12 +403,22 @@ fn batch_rate_nanos(value: Option<&Value>) -> Option<i64> {
 
 fn batch_row_of(model: &ServingModel, facts: &BTreeMap<String, Value>) -> ModelBatchRow {
     ModelBatchRow {
+        model_name: display_name_fact(facts, "model.name"),
+        provider_name: display_name_fact(facts, "provider.name"),
         kind: model.kind.clone(),
         context_tokens: model.context_limit,
         attachment: model.attachment == CapabilityFlag::Known(true),
         input_rate_nanos: batch_rate_nanos(facts.get("rate.input")),
         output_rate_nanos: batch_rate_nanos(facts.get("rate.output")),
     }
+}
+
+fn display_name_fact(facts: &BTreeMap<String, Value>, key: &str) -> Option<String> {
+    facts
+        .get(key)?
+        .as_str()
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
 }
 
 /// What one assembly of fusiform's model map produced.
@@ -442,6 +505,75 @@ impl RowExclusion {
 pub struct CatalogSnapshot(Arc<LoadedCatalog>);
 
 impl CatalogSnapshot {
+    pub fn routing_facts(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Option<&crate::routing::RoutingFacts> {
+        self.0.catalog.routing.get(&format!("{provider}/{model}"))
+    }
+
+    /// Admission refuses an unknown endpoint or grammar rather than borrowing another model's.
+    pub fn resolve_route(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Result<(WireFamilyId, String), String> {
+        let (family, api) = self
+            .routing_facts(provider, model)
+            .ok_or_else(|| format!("catalog model '{provider}/{model}': missing routing facts"))?
+            .route()
+            .map_err(|reason| format!("catalog model '{provider}/{model}': {reason}"))?;
+        Ok((self.wire_family(provider, model).unwrap_or(family), api))
+    }
+
+    pub fn successor(&self, provider: &str, model: &str) -> Option<&str> {
+        self.routing_facts(provider, model)?.successor.as_deref()
+    }
+
+    /// Historical tier spellings are recognized only by a published backend id, not a suffix guess.
+    pub fn code_assist_route(
+        &self,
+        provider: &str,
+        model: &str,
+        level: Option<&str>,
+    ) -> Result<(String, String), String> {
+        if let Some(facts) = self.routing_facts(provider, model) {
+            if !self.contains_model(provider, model) {
+                return Err(format!("catalog model '{provider}/{model}': no served row"));
+            }
+            return facts
+                .tier(level)
+                .map(|wire| (model.to_owned(), wire))
+                .map_err(|reason| format!("catalog model '{provider}/{model}': {reason}"));
+        }
+        let prefix = format!("{provider}/");
+        let wire = model.strip_prefix("antigravity-").unwrap_or(model);
+        for (id, facts) in &self.0.catalog.routing {
+            if let Some(alias) = id
+                .strip_prefix(&prefix)
+                .filter(|alias| self.contains_model(provider, alias))
+            {
+                if facts
+                    .reasoning_wire_ids
+                    .as_ref()
+                    .is_some_and(|tiers| tiers.values().any(|id| id == wire))
+                {
+                    return Ok((
+                        alias.to_string(),
+                        level.map_or_else(
+                            || Ok(wire.to_string()),
+                            |level| facts.tier(Some(level)),
+                        )?,
+                    ));
+                }
+            }
+        }
+        Err(format!(
+            "catalog model '{provider}/{model}': {}",
+            crate::routing::MISSING_CODE_ASSIST_TIERS
+        ))
+    }
     pub fn resolved_at_ms(&self) -> i64 {
         self.0.resolved_at_ms
     }
@@ -470,7 +602,7 @@ impl CatalogSnapshot {
             .catalog
             .providers
             .get(provider_id)
-            .is_some_and(|provider| !provider.models.is_empty())
+            .is_some_and(|provider| provider.spec.is_some() && !provider.models.is_empty())
     }
 
     /// The model-batch facts of the row `<provider_id>/<model_id>`, whether or not the chat
@@ -624,6 +756,10 @@ impl ServingCatalog {
         let mut model_identities = BTreeSet::new();
         let mut excluded_rows = Vec::new();
         let mut batch_rows = BTreeMap::new();
+        let routing: BTreeMap<_, _> = models
+            .iter()
+            .map(|(id, facts)| (id.clone(), crate::routing::RoutingFacts::decode(facts)))
+            .collect();
 
         for (identity, facts) in models {
             let Some((provider_id, model_id)) = identity
@@ -652,10 +788,28 @@ impl ServingCatalog {
                         let provider_overlay = overlay.patch.get(&provider_id);
                         let overlay_family =
                             provider_overlay.and_then(RuntimeProviderOverlay::family);
-                        let family = match resolve_provider_family(&provider_id, overlay_family) {
-                            FamilyResolution::Supported { family, .. } => Some(family),
-                            FamilyResolution::Pending { .. } => None,
-                        };
+                        let legacy_family =
+                            match resolve_provider_family(&provider_id, overlay_family) {
+                                FamilyResolution::Supported { family, .. } => Some(family),
+                                FamilyResolution::Pending { .. } => None,
+                            };
+                        let family = routing[identity]
+                            .npm
+                            .as_ref()
+                            .and_then(|npm| {
+                                crate::family::wire_family(
+                                    &npm.value,
+                                    routing[identity]
+                                        .shape
+                                        .as_ref()
+                                        .map(|shape| shape.value.as_str()),
+                                )
+                            })
+                            .or_else(|| {
+                                crate::family::credential_persona_route(&provider_id, "oauth")
+                                    .map(|route| route.0)
+                            })
+                            .or(legacy_family);
                         RuntimeProviderOverlay::serving_provider(
                             provider_overlay,
                             &provider_id,
@@ -674,6 +828,23 @@ impl ServingCatalog {
                                 batch_rows.insert(identity.clone(), batch_row_of(&model, facts));
                                 if let Some(patch) = overlay.model_patch(&provider_id, &model_id) {
                                     patch.apply(&mut model);
+                                }
+                                if let Ok((family, api)) = routing[identity].route() {
+                                    model.wire_family = Some(family);
+                                    if let Some(override_family) = overlay
+                                        .model_patch(&provider_id, &model_id)
+                                        .and_then(|patch| match patch.wire_family {
+                                            Patch::Set(family) => family,
+                                            Patch::Missing => None,
+                                        })
+                                    {
+                                        model.wire_family = Some(override_family);
+                                    }
+                                    model.base_url = Some(api.clone());
+                                    if provider.spec.is_none() {
+                                        provider.spec =
+                                            Some(serving_provider_spec(&provider_id, family, api));
+                                    }
                                 }
                                 provider.models.insert(model_id.clone(), model);
                             }
@@ -748,6 +919,11 @@ impl ServingCatalog {
                 if provider.models.contains_key(model_id) {
                     continue;
                 }
+                // Renderer choices describe an existing row; they are not evidence that a
+                // missing or retired model exists in the upstream catalog.
+                if model_patch.is_renderer_pin_only() {
+                    continue;
+                }
                 let mut model = ServingModel::default();
                 model_patch.apply(&mut model);
                 provider.models.insert(model_id.clone(), model);
@@ -774,17 +950,15 @@ impl ServingCatalog {
             providers.insert(provider_id.clone(), provider);
         }
 
-        // Pending providers are represented during construction only so overlay target validation
-        // keeps the old semantics. They cannot serve and are not retained in the snapshot.
-        providers.retain(|_, provider| provider.spec.is_some());
-        overlay_removed_models.retain(|provider_id, _| providers.contains_key(provider_id));
+        // A missing renderer must not hide kind, limits or prices from admission. Keep the
+        // bounded metadata for pending providers, but never materialize a serving spec for them.
         let providers = providers
             .into_iter()
             .map(|(id, provider)| {
                 (
                     id,
                     ServingProvider {
-                        spec: provider.spec.expect("pending providers were removed"),
+                        spec: provider.spec,
                         models: provider.models,
                     },
                 )
@@ -793,6 +967,7 @@ impl ServingCatalog {
 
         Ok(AssembledCatalog {
             catalog: Self {
+                routing,
                 providers,
                 overlay_removed_models,
                 withdrawn_models,
@@ -803,8 +978,10 @@ impl ServingCatalog {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn from_catalog(catalog: &Catalog) -> Self {
         let mut providers = BTreeMap::new();
+        let mut routing = BTreeMap::new();
         for (provider_id, (provider_family, _)) in &catalog.resolved_family {
             let Some(entry) = catalog.providers.get(provider_id) else {
                 continue;
@@ -818,6 +995,19 @@ impl ServingCatalog {
             spec.raw = Value::Null;
             let mut models = BTreeMap::new();
             for model_id in model_entries.keys() {
+                if let Some(raw) = model_entries[model_id]
+                    .as_object()
+                    .filter(|raw| raw.contains_key("route.reasoning_wire_ids"))
+                {
+                    let facts = raw
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect();
+                    routing.insert(
+                        format!("{provider_id}/{model_id}"),
+                        crate::routing::RoutingFacts::decode(&facts),
+                    );
+                }
                 let Some((model_provider, model)) =
                     catalog.model_for_serving(provider_id, model_id)
                 else {
@@ -835,7 +1025,13 @@ impl ServingCatalog {
                     ),
                 );
             }
-            providers.insert(provider_id.clone(), ServingProvider { spec, models });
+            providers.insert(
+                provider_id.clone(),
+                ServingProvider {
+                    spec: Some(spec),
+                    models,
+                },
+            );
         }
 
         let mut overlay_removed_models = catalog.overlay_removed_models.clone();
@@ -848,6 +1044,7 @@ impl ServingCatalog {
                 .insert(model_id.clone());
         }
         Self {
+            routing,
             providers,
             overlay_removed_models,
             withdrawn_models,
@@ -867,12 +1064,15 @@ impl ServingCatalog {
     }
 
     fn contains_model(&self, provider_id: &str, model_id: &str) -> bool {
-        self.provider_and_model(provider_id, model_id).is_some()
+        self.provider_and_model(provider_id, model_id)
+            .is_some_and(|(provider, _)| provider.spec.is_some())
     }
 
     fn wire_family(&self, provider_id: &str, model_id: &str) -> Option<WireFamilyId> {
         let (provider, model) = self.provider_and_model(provider_id, model_id)?;
-        Some(model.wire_family.unwrap_or(provider.spec.wire_family))
+        model
+            .wire_family
+            .or_else(|| provider.spec.as_ref().map(|spec| spec.wire_family))
     }
 
     fn context_limit(&self, provider_id: &str, model_id: &str) -> Option<u64> {
@@ -891,11 +1091,12 @@ impl ServingCatalog {
         model_id: &str,
     ) -> Option<(ProviderSpec, ModelSpec)> {
         let (provider, model) = self.provider_and_model(provider_id, model_id)?;
-        let family = model.wire_family.unwrap_or(provider.spec.wire_family);
-        let mut provider_spec = if family == provider.spec.wire_family {
-            provider.spec.clone()
+        let spec = provider.spec.as_ref()?;
+        let family = model.wire_family.unwrap_or(spec.wire_family);
+        let mut provider_spec = if family == spec.wire_family {
+            spec.clone()
         } else {
-            serving_provider_spec(provider_id, family, provider.spec.base_url.clone())
+            serving_provider_spec(provider_id, family, spec.base_url.clone())
         };
         if let Some(base_url) = &model.base_url {
             provider_spec.base_url.clone_from(base_url);
@@ -910,10 +1111,11 @@ impl ServingCatalog {
         family: WireFamilyId,
     ) -> Option<(ProviderSpec, ModelSpec)> {
         let (provider, model) = self.provider_and_model(provider_id, model_id)?;
+        let spec = provider.spec.as_ref()?;
         let base_url = model
             .base_url
             .clone()
-            .unwrap_or_else(|| provider.spec.base_url.clone());
+            .unwrap_or_else(|| spec.base_url.clone());
         Some((
             serving_provider_spec(provider_id, family, base_url),
             model.to_spec(model_id),
@@ -933,7 +1135,7 @@ impl ServingCatalog {
     }
 }
 
-fn serving_provider_spec(
+pub(crate) fn serving_provider_spec(
     provider_id: &str,
     family: WireFamilyId,
     base_url: String,
@@ -982,6 +1184,8 @@ impl RuntimeOverlay {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuntimeProviderOverlay {
+    #[serde(default, rename = "_comment")]
+    _comment: Option<String>,
     #[serde(default, rename = "base_url_source")]
     _base_url_source: Option<String>,
     #[serde(default, rename = "wire_family_source")]
@@ -1032,6 +1236,8 @@ impl RuntimeProviderOverlay {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuntimeModelOverlay {
+    #[serde(default, rename = "_comment")]
+    _comment: Option<String>,
     #[serde(default, rename = "id")]
     _id: Option<String>,
     #[serde(default)]
@@ -1058,6 +1264,16 @@ struct RuntimeModelOverlay {
 }
 
 impl RuntimeModelOverlay {
+    fn is_renderer_pin_only(&self) -> bool {
+        matches!(self.name, Patch::Missing)
+            && matches!(self.cost, Patch::Missing)
+            && matches!(self.attachment, Patch::Missing)
+            && matches!(self.reasoning, Patch::Missing)
+            && matches!(self.tool_call, Patch::Missing)
+            && matches!(self.structured_output, Patch::Missing)
+            && matches!(self.limit, Patch::Missing)
+    }
+
     fn apply(&self, model: &mut ServingModel) {
         if let Patch::Set(name) = &self.name {
             model.display_name = name.clone().unwrap_or_default();
@@ -1174,12 +1390,16 @@ fn serving_model_from_facts(
     facts: &BTreeMap<String, Value>,
 ) -> Result<ServingModel, CatalogError> {
     Ok(ServingModel {
-        display_name: String::new(),
+        display_name: display_name_fact(facts, "model.name").unwrap_or_default(),
         base_url: None,
         cost: warm_cost_fact(facts),
         context_limit: context_fact(identity, facts)?,
         output_limit: output_fact(identity, facts)?,
         attachment: optional_capability_fact(identity, facts, "capability.attachment")?,
+        input_modalities: facts
+            .get("capability.input_modalities")
+            .map(InputModalities::from_value)
+            .unwrap_or_default(),
         reasoning: reasoning_fact(identity, facts)?,
         tool_call: optional_capability_fact(identity, facts, "capability.tool_call")?,
         structured_output: optional_capability_fact(
@@ -1646,6 +1866,9 @@ impl CatalogCache {
         response: FusiformCatalogResponse,
         poll_summary: Option<(usize, Instant)>,
     ) -> Result<(), CatalogRefreshError> {
+        for correction in &response.wire_corrections {
+            tracing::info!(target: "catalog", correction = %correction, "fusiform wire correction");
+        }
         let catalog_version = response.catalog_version;
         let resolved_at_ms = response.resolved_at_ms;
         let model_count = response.models.len();
@@ -1734,7 +1957,10 @@ impl CatalogCache {
             .clone()
     }
 
-    fn refresh_inner(&self, response: FusiformCatalogResponse) -> Result<(), CatalogRefreshError> {
+    fn refresh_inner(
+        &self,
+        mut response: FusiformCatalogResponse,
+    ) -> Result<(), CatalogRefreshError> {
         // WHEN THIS CAN ACTUALLY FIRE, per fusiform's serve predicates rather than observation:
         // `uncertain` needs an era with `boundary_at_ms > at`, and `withheld` needs a correction
         // window with `affected_until_ms >= at`. A boundary is stamped when the poll that detected
@@ -1787,6 +2013,24 @@ impl CatalogCache {
                 });
             }
             if response.catalog_version == current.catalog_version {
+                // Equal versions cannot withdraw a published name. Preserve those facts in
+                // the persisted response too, so a nameless poll cannot erase them on restart.
+                if current.carries_display_names {
+                    for (identity, facts) in &mut response.models {
+                        if let Some(row) = current.catalog.batch_rows.get(identity) {
+                            for (key, cached) in [
+                                ("model.name", &row.model_name),
+                                ("provider.name", &row.provider_name),
+                            ] {
+                                if display_name_fact(facts, key).is_none() {
+                                    if let Some(name) = cached {
+                                        facts.insert(key.into(), Value::String(name.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // Same version, so the facts cannot have changed and the existing index is
                 // still correct — but only if the response is COMPLETE. A truncated or
                 // degraded response can carry the version of the document it was truncated
@@ -1818,6 +2062,10 @@ impl CatalogCache {
                     || response_carries_mode_rates(&response) != current.carries_mode_rates
                     || response_carries_warm_rates(&response) != current.carries_warm_rates
                     || response_carries_model_kinds(&response) != current.carries_model_kinds
+                    || response_carries_input_modalities(&response)
+                        != current.carries_input_modalities
+                    || response_carries_routing_facts(&response) != current.carries_routing_facts
+                    || response_carries_display_names(&response) != current.carries_display_names
                 {
                     let rebuilt = Arc::new(loaded(
                         &response,
@@ -1837,6 +2085,7 @@ impl CatalogCache {
                     persist_lkg(path, &response)?;
                 }
                 let refreshed = Arc::new(LoadedCatalog {
+                    carries_routing_facts: current.carries_routing_facts,
                     catalog: Arc::clone(&current.catalog),
                     model_identities: Arc::clone(&current.model_identities),
                     resolved_at_ms: response.resolved_at_ms,
@@ -1846,6 +2095,8 @@ impl CatalogCache {
                     carries_mode_rates: current.carries_mode_rates,
                     carries_warm_rates: current.carries_warm_rates,
                     carries_model_kinds: current.carries_model_kinds,
+                    carries_input_modalities: current.carries_input_modalities,
+                    carries_display_names: current.carries_display_names,
                     excluded_rows: Arc::clone(&current.excluded_rows),
                 });
                 self.install(refreshed);
@@ -1904,6 +2155,7 @@ impl CatalogCache {
     /// Install a document without touching disk. This is intended for focused tests that prove the
     /// admission path remains independent from a concurrently slow or failed poll.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn install_for_test(
         &self,
         response: FusiformCatalogResponse,
@@ -1916,6 +2168,7 @@ impl CatalogCache {
 
     /// Install an already assembled catalog for tests which exercise legacy snapshot fixtures.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn install_parsed_for_test(
         &self,
         catalog: &Catalog,
@@ -1923,6 +2176,7 @@ impl CatalogCache {
         source: CatalogSource,
     ) {
         let next = Arc::new(LoadedCatalog {
+            carries_routing_facts: false,
             catalog: Arc::new(ServingCatalog::from_catalog(catalog)),
             model_identities: Arc::new(BTreeSet::new()),
             resolved_at_ms,
@@ -1933,6 +2187,8 @@ impl CatalogCache {
             carries_warm_rates: true,
             // The vendored snapshot serves no `model.kind`.
             carries_model_kinds: false,
+            carries_input_modalities: false,
+            carries_display_names: false,
             excluded_rows: Arc::from([]),
         });
         *self.current.write().expect("catalog cache lock poisoned") = Some(next);
@@ -1992,6 +2248,7 @@ fn loaded(
     }
     let assembled = ServingCatalog::from_fusiform(&response.models, previous)?;
     Ok(LoadedCatalog {
+        carries_routing_facts: response_carries_routing_facts(response),
         catalog: Arc::new(assembled.catalog),
         model_identities: Arc::new(assembled.model_identities),
         resolved_at_ms: response.resolved_at_ms,
@@ -2001,6 +2258,8 @@ fn loaded(
         carries_mode_rates: response_carries_mode_rates(response),
         carries_warm_rates: response_carries_warm_rates(response),
         carries_model_kinds: response_carries_model_kinds(response),
+        carries_input_modalities: response_carries_input_modalities(response),
+        carries_display_names: response_carries_display_names(response),
         excluded_rows: assembled.excluded_rows.into(),
     })
 }
@@ -2371,7 +2630,139 @@ mod tests {
             ]),
             withheld: Vec::new(),
             uncertain: Vec::new(),
+            wire_corrections: Vec::new(),
         }
+    }
+
+    #[test]
+    fn live_fusiform_input_modalities_reach_serving_models() {
+        let mut response = response(100);
+        let facts = response
+            .models
+            .get_mut("anthropic/claude-sonnet-4-5")
+            .unwrap();
+        facts.insert("capability.attachment".into(), serde_json::json!(false));
+        facts.insert(
+            "capability.input_modalities".into(),
+            serde_json::json!(["text", "image", "pdf", "future-modality"]),
+        );
+        // Apply the catalog.get prefix filter so a missing request cannot pass this test.
+        for facts in response.models.values_mut() {
+            facts.retain(|fact, _| {
+                FUSIFORM_FACT_PREFIXES
+                    .iter()
+                    .any(|prefix| fact.starts_with(prefix))
+            });
+        }
+        let cache = CatalogCache::empty();
+        cache.refresh(response).unwrap();
+        let snapshot = cache.snapshot().unwrap();
+        assert_eq!(snapshot.source(), CatalogSource::Fusiform);
+        let (_, model) = snapshot
+            .model_for_serving("anthropic", "claude-sonnet-4-5")
+            .unwrap();
+        assert_eq!(
+            model.input_modalities,
+            InputModalities {
+                text: Some(true),
+                image: Some(true),
+                pdf: Some(true),
+                audio: Some(false),
+                video: Some(false),
+            }
+        );
+        assert_eq!(model.capabilities.attachment, CapabilityFlag::Known(false));
+    }
+
+    #[test]
+    fn malformed_fusiform_input_modalities_still_serve_text() {
+        for value in [
+            None,
+            Some(Value::Null),
+            Some(serde_json::json!("image")),
+            Some(serde_json::json!(true)),
+            Some(serde_json::json!({"input": ["image"]})),
+            Some(serde_json::json!(["image", 42])),
+            Some(serde_json::json!([null])),
+        ] {
+            let cache = CatalogCache::empty();
+            let mut before = response(100);
+            before
+                .models
+                .get_mut("anthropic/claude-sonnet-4-5")
+                .unwrap()
+                .insert(
+                    "capability.input_modalities".into(),
+                    serde_json::json!(["text", "image", "pdf"]),
+                );
+            cache.refresh(before).unwrap();
+            let mut after = response(200);
+            after.catalog_version += 1;
+            let facts = after.models.get_mut("anthropic/claude-sonnet-4-5").unwrap();
+            facts.insert("capability.attachment".into(), serde_json::json!(true));
+            // A snapshot-shaped key is not a second source for a Fusiform row.
+            facts.insert(
+                "modalities".into(),
+                serde_json::json!({"input": ["image", "pdf"]}),
+            );
+            if let Some(value) = value.clone() {
+                facts.insert("capability.input_modalities".into(), value);
+            }
+            cache.refresh(after).unwrap();
+            let snapshot = cache.snapshot().unwrap();
+            let (provider, model) = snapshot
+                .model_for_serving("anthropic", "claude-sonnet-4-5")
+                .expect("unknown modalities must not exclude a text-serving row");
+            assert_eq!(
+                model.input_modalities,
+                InputModalities::default(),
+                "{value:?}"
+            );
+            assert_eq!(cache.health(200).unwrap().rows_excluded, 0);
+            resolve_frozen(
+                &provider,
+                &model,
+                4096,
+                renderer_version_for(provider.wire_family),
+            )
+            .expect("text configuration remains usable with unknown modalities");
+        }
+    }
+
+    #[test]
+    fn an_equal_version_poll_that_newly_carries_input_modalities_rebuilds_the_index() {
+        let cache = CatalogCache::empty();
+        cache.refresh(response(100)).unwrap();
+        let before = cache.snapshot().unwrap();
+        let mut after = response(200);
+        after
+            .models
+            .get_mut("anthropic/claude-sonnet-4-5")
+            .unwrap()
+            .insert(
+                "capability.input_modalities".into(),
+                serde_json::json!(["text", "image", "pdf"]),
+            );
+        cache.refresh(after.clone()).unwrap();
+        let snapshot = cache.snapshot().unwrap();
+        assert!(!snapshot.shares_index_with(&before));
+        assert_eq!(
+            snapshot
+                .model_for_serving("anthropic", "claude-sonnet-4-5")
+                .unwrap()
+                .1
+                .input_modalities
+                .pdf,
+            Some(true)
+        );
+        cache.refresh(after).unwrap();
+        assert!(cache.snapshot().unwrap().shares_index_with(&snapshot));
+        assert!(before
+            .model_for_serving("anthropic", "claude-sonnet-4-5")
+            .unwrap()
+            .1
+            .input_modalities
+            .is_unknown());
     }
 
     /// Fusiform's `capability.structured_output` maps like the other capability facts, except
@@ -2527,22 +2918,15 @@ mod tests {
         }
         assert_eq!(compared, 6_328, "the gate must compare every fixture row");
 
-        // This model is introduced by the provider overlay rather than fusiform, so it is not one
-        // of the 6,328 response rows above. It still serves and must retain the legacy answer.
-        let overlay_old = legacy.model_for_serving("xai", "grok-composer-2.5-fast");
-        let overlay_new = compact
-            .catalog
-            .model_for_serving("xai", "grok-composer-2.5-fast");
-        assert!(overlay_old.is_some(), "overlay-only oracle model is absent");
-        assert_eq!(
-            consumed_model_facts(&overlay_new),
-            consumed_model_facts(&overlay_old),
-            "consumed facts changed for the overlay-only model"
-        );
-        assert_eq!(
-            freeze(overlay_new),
-            freeze(overlay_old),
-            "frozen resolution changed for the overlay-only model"
+        assert!(legacy
+            .model_for_serving("xai", "grok-composer-2.5-fast")
+            .is_none());
+        assert!(
+            compact
+                .catalog
+                .model_for_serving("xai", "grok-composer-2.5-fast")
+                .is_none(),
+            "the overlay cannot reinstate a retired row"
         );
     }
 
@@ -2682,7 +3066,7 @@ mod tests {
         // a family.
         assert!(!snapshot.contains_model("typesafe", "jev-1.13.0"));
         let overlay: RuntimeOverlay = serde_json::from_str(
-            r#"{ "patch": { "typesafe": { "wire_family": "openai_chat" } } }"#,
+            r#"{ "patch": { "typesafe": { "wire_family": "openai_chat" }, "cloudflare-workers-ai": { "wire_family": "openai_chat" } } }"#,
         )
         .expect("test overlay parses");
         let models = curated_rows();
@@ -2702,9 +3086,16 @@ mod tests {
         assert_eq!(jev.capabilities.reasoning, CapabilityFlag::Unknown);
         assert_eq!(jev.capabilities.tool_call, CapabilityFlag::Absent);
         for model in ["@cf/cloudflare/clef", "@cf/cloudflare/clairic"] {
-            let (provider, row) = snapshot
+            assert!(
+                snapshot
+                    .model_for_serving("cloudflare-workers-ai", model)
+                    .is_none(),
+                "a row without routing facts has metadata but no chat route"
+            );
+            let (provider, row) = assembled
+                .catalog
                 .model_for_serving("cloudflare-workers-ai", model)
-                .unwrap_or_else(|| panic!("{model} is served"));
+                .unwrap_or_else(|| panic!("{model} has a test renderer"));
             assert_eq!(row.limits.context, Some(65_536), "{model}");
             assert_eq!(row.capabilities.attachment, CapabilityFlag::Known(true));
             assert_eq!(row.capabilities.reasoning, CapabilityFlag::Unknown);
@@ -3025,6 +3416,37 @@ mod tests {
     /// the same catalog version with the fact now present. Reusing the index there would serve
     /// no output limits until fusiform happened to mint a new version.
     #[test]
+    fn an_equal_version_poll_that_newly_carries_routing_facts_rebuilds_the_index() {
+        let cache = CatalogCache::empty();
+        let mut page = response(100);
+        cache.refresh(page.clone()).unwrap();
+        let before = cache.snapshot().unwrap();
+        let facts = page.models.get_mut("anthropic/claude-sonnet-4-5").unwrap();
+        facts.insert(
+            "wire.npm".into(),
+            serde_json::json!({"value":"@ai-sdk/anthropic", "from":"provider"}),
+        );
+        facts.insert(
+            "wire.api".into(),
+            serde_json::json!({"value":"https://served.example", "from":"curated"}),
+        );
+        page.resolved_at_ms += 1;
+        cache.refresh(page).unwrap();
+        let after = cache.snapshot().unwrap();
+        assert!(
+            !after.shares_index_with(&before),
+            "new routing prefixes require a new serving index"
+        );
+        assert_eq!(
+            after
+                .resolve_route("anthropic", "claude-sonnet-4-5")
+                .unwrap()
+                .1,
+            "https://served.example"
+        );
+    }
+
+    #[test]
     fn an_equal_version_poll_that_newly_carries_output_limits_rebuilds_the_index() {
         let cache = CatalogCache::empty();
         let first = response(100);
@@ -3081,26 +3503,44 @@ mod tests {
     }
 
     #[test]
-    fn compiled_overlay_only_model_retains_authored_warm_prices() {
+    fn synthetic_overlay_model_retains_authored_warm_prices() {
         let mut response = response(10);
         let facts = response.models["anthropic/claude-sonnet-4-5"].clone();
         response.models.insert("xai/fixture-base".into(), facts);
-        assert!(!response.models.contains_key("xai/grok-composer-2.5-fast"));
-        let cache = CatalogCache::empty();
-        cache.refresh(response).expect("shipped overlay must load");
-        let snapshot = cache.snapshot().unwrap();
-        let cost = snapshot
-            .warm_cost_schedule("xai", "grok-composer-2.5-fast")
+        let overlay: RuntimeOverlay = serde_json::from_value(serde_json::json!({"patch":{"xai":{
+            "wire_family":"openai_responses", "models":{"fixture-priced":{
+                "name":"Synthetic priced model", "cost":{"input":0.5,"output":2.5,"cache_read":0.2}
+            }}
+        }}}))
+        .unwrap();
+        let (catalog, _) =
+            ServingCatalog::from_fusiform_with_overlay(&response.models, overlay).unwrap();
+        let (_, model) = catalog.model_for_serving("xai", "fixture-priced").unwrap();
+        assert_eq!(model.cost.input, Some(0.5));
+        assert_eq!(model.cost.output, Some(2.5));
+        assert_eq!(model.cost.cache_read, Some(0.2));
+        assert_eq!(model.cost.cache_write, None);
+        assert_eq!(model.display_name, "Synthetic priced model");
+    }
+
+    #[test]
+    fn a_renderer_only_patch_cannot_invent_a_model_row() {
+        let mut page = response(10);
+        page.models.insert(
+            "openai/fixture-present".into(),
+            page.models["anthropic/claude-sonnet-4-5"].clone(),
+        );
+        let overlay: RuntimeOverlay =
+            serde_json::from_value(serde_json::json!({"patch":{"openai":{
+                "wire_family":"openai_responses", "models":{"gpt-4.1":{"wire_family":"openai_chat"}}
+            }}}))
             .unwrap();
-        assert_eq!(cost.input, Some(0.5));
-        assert_eq!(cost.output, Some(2.5));
-        assert_eq!(cost.cache_read, Some(0.2));
-        assert_eq!(cost.cache_write, None);
-        let (_, model) = snapshot
-            .model_for_serving("xai", "grok-composer-2.5-fast")
-            .unwrap();
-        assert_eq!(model.cost, cost);
-        assert_eq!(model.display_name, "Grok Composer 2.5 Fast");
+        let (catalog, _) =
+            ServingCatalog::from_fusiform_with_overlay(&page.models, overlay).unwrap();
+        assert!(
+            !catalog.contains_model("openai", "gpt-4.1"),
+            "a renderer pin is not evidence of model existence"
+        );
     }
 
     #[test]
@@ -3332,6 +3772,152 @@ mod tests {
         assert_eq!(schedule.input, Some(0.24));
     }
 
+    fn named_decision_response(version: i64) -> FusiformCatalogResponse {
+        let mut response = curated_response(version);
+        for (id, model, provider) in [
+            ("typesafe/jev-1.13.0", "Jev 1.13", "TypeSafe"),
+            (
+                "cloudflare-workers-ai/@cf/cloudflare/clef",
+                "Clef",
+                "Cloudflare Workers AI",
+            ),
+        ] {
+            let facts = response.models.get_mut(id).unwrap();
+            facts.insert("model.name".into(), serde_json::json!(model));
+            facts.insert("provider.name".into(), serde_json::json!(provider));
+        }
+        response
+    }
+
+    #[test]
+    fn requested_display_name_facts_reach_decision_rows_without_id_fallbacks() {
+        let mut response = named_decision_response(1);
+        for facts in response.models.values_mut() {
+            facts.retain(|key, _| {
+                FUSIFORM_FACT_PREFIXES
+                    .iter()
+                    .any(|prefix| key.starts_with(prefix))
+            });
+        }
+        let cache = CatalogCache::empty();
+        cache.refresh(response).unwrap();
+        let snapshot = cache.snapshot().unwrap();
+        let jev = snapshot.model_batch_row("typesafe/jev-1.13.0").unwrap();
+        assert_eq!(jev.model_name.as_deref(), Some("Jev 1.13"));
+        assert_eq!(jev.provider_name.as_deref(), Some("TypeSafe"));
+        let clef = snapshot
+            .model_batch_row("cloudflare-workers-ai/@cf/cloudflare/clef")
+            .unwrap();
+        assert_eq!(clef.model_name.as_deref(), Some("Clef"));
+        assert_eq!(clef.provider_name.as_deref(), Some("Cloudflare Workers AI"));
+        assert_eq!(
+            snapshot
+                .model_batch_row("flash-absent")
+                .map(|row| row.provider_name),
+            None
+        );
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!(""),
+            serde_json::json!(" "),
+            serde_json::json!(123),
+        ] {
+            let mut response = named_decision_response(2);
+            let facts = response.models.get_mut("typesafe/jev-1.13.0").unwrap();
+            facts.insert("model.name".into(), value.clone());
+            facts.insert("provider.name".into(), value);
+            let cache = CatalogCache::empty();
+            cache.refresh(response).unwrap();
+            let row = cache
+                .snapshot()
+                .unwrap()
+                .model_batch_row("typesafe/jev-1.13.0")
+                .unwrap();
+            assert_eq!(row.model_name, None);
+            assert_eq!(row.provider_name, None);
+        }
+    }
+
+    #[test]
+    fn same_version_names_rebuild_and_survive_nameless_polls_and_restart() {
+        let path = temp_lkg("decision-display-names");
+        let cache = CatalogCache::open(&path);
+        cache.refresh(curated_response(7)).unwrap();
+        let old = cache.snapshot().unwrap();
+        assert_eq!(
+            old.model_batch_row("typesafe/jev-1.13.0")
+                .unwrap()
+                .provider_name,
+            None
+        );
+        cache.refresh(named_decision_response(7)).unwrap();
+        let named = cache.snapshot().unwrap();
+        assert!(!old.shares_index_with(&named));
+        assert_eq!(
+            named
+                .model_batch_row("typesafe/jev-1.13.0")
+                .unwrap()
+                .provider_name
+                .as_deref(),
+            Some("TypeSafe")
+        );
+        let mut nameless = curated_response(7);
+        nameless
+            .models
+            .get_mut("typesafe/jev-1.13.0")
+            .unwrap()
+            .insert("limit.output".into(), serde_json::json!(10));
+        cache.refresh(nameless).unwrap();
+        drop(cache);
+        let reopened = CatalogCache::open(&path);
+        let jev = reopened
+            .snapshot()
+            .unwrap()
+            .model_batch_row("typesafe/jev-1.13.0")
+            .unwrap();
+        assert_eq!(jev.provider_name.as_deref(), Some("TypeSafe"));
+        assert_eq!(jev.model_name.as_deref(), Some("Jev 1.13"));
+        reopened.refresh(curated_response(8)).unwrap();
+        assert_eq!(
+            reopened
+                .snapshot()
+                .unwrap()
+                .model_batch_row("typesafe/jev-1.13.0")
+                .unwrap()
+                .provider_name,
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_provider_fact_is_ignored_without_excluding_a_served_row() {
+        let cache = CatalogCache::empty();
+        cache.refresh(named_decision_response(1)).unwrap();
+        let before = cache
+            .snapshot()
+            .unwrap()
+            .model_batch_row("typesafe/jev-1.13.0")
+            .unwrap();
+        let mut response = named_decision_response(2);
+        response
+            .models
+            .get_mut("typesafe/jev-1.13.0")
+            .unwrap()
+            .insert(
+                "provider.future_field".into(),
+                serde_json::json!({"unknown":[1,2,3]}),
+            );
+        cache.refresh(response).unwrap();
+        assert_eq!(cache.health(100).unwrap().rows_excluded, 0);
+        assert_eq!(
+            cache
+                .snapshot()
+                .unwrap()
+                .model_batch_row("typesafe/jev-1.13.0"),
+            Some(before)
+        );
+    }
+
     /// fusiform's served pages for its curated System One rows, vendored byte-for-byte from
     /// fusiform 69a15bb `crates/fusiform-module/fixtures/served-payloads.json` (cases "a curated
     /// decision model", "a curated extraction model" and "a provider served only through
@@ -3369,6 +3955,8 @@ mod tests {
         assert_eq!(
             jev,
             ModelBatchRow {
+                model_name: None,
+                provider_name: None,
                 kind: Some("decision".into()),
                 context_tokens: None,
                 attachment: false,
@@ -3412,6 +4000,7 @@ mod tests {
             models: curated_rows(),
             withheld: Vec::new(),
             uncertain: Vec::new(),
+            wire_corrections: Vec::new(),
         }
     }
 
@@ -3482,16 +4071,17 @@ mod tests {
             ("@cf/cloudflare/clef", "decision"),
             ("@cf/cloudflare/clairic", "extraction"),
         ] {
-            let (provider, model) = after
-                .model_for_serving("cloudflare-workers-ai", model_id)
+            let row = after
+                .model_batch_row(&format!("cloudflare-workers-ai/{model_id}"))
                 .unwrap_or_else(|| panic!("{model_id} resolves by its full catalog id"));
-            assert_eq!(model.id, model_id, "the model part keeps its slashes");
-            assert_eq!(provider.wire_family, WireFamilyId::OpenAiChat);
-            assert_eq!(model.limits.context, Some(65_536));
-            assert_eq!(model.capabilities.attachment, CapabilityFlag::Known(true));
-            // An omitted reasoning flag is unknown, like null; see `reasoning_fact`.
-            assert_eq!(model.capabilities.reasoning, CapabilityFlag::Unknown);
-            assert_eq!(model.capabilities.tool_call, CapabilityFlag::Absent);
+            assert!(
+                after
+                    .model_for_serving("cloudflare-workers-ai", model_id)
+                    .is_none(),
+                "routing facts are not stated for this non-chat row"
+            );
+            assert_eq!(row.context_tokens, Some(65_536));
+            assert!(row.attachment);
             assert_eq!(
                 after
                     .model_kind("cloudflare-workers-ai", model_id)
@@ -4397,6 +4987,7 @@ mod windows_acl_tests {
             models: BTreeMap::new(),
             withheld: vec![],
             uncertain: vec![],
+            wire_corrections: vec![],
         };
         let seen = std::rc::Rc::new(std::cell::Cell::new(0));
         let output = seen.clone();

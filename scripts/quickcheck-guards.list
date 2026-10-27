@@ -1,43 +1,24 @@
 # package|cargo-test-target|test-filter|features|source-file|test-function|reason
-# Scans Rust tests under crates/ for short real-time polling loops.
-broca-test-support|event_wait_guard|-|-|crates/broca-test-support/tests/event_wait_guard.rs|short_real_time_polls_are_classified|Rejects unclassified short real-time waits anywhere under crates/.
-# Inventories every ServeError::Open construction and its explicit error class.
-broca-module|it|open_failed_classes::|broca-module/test-clock|crates/broca-module/tests/it/open_failed_classes.rs|every_open_failed_site_chooses_a_class|Keeps the open-error classification inventory synchronized with serve.rs.
+# Pins the retry class each default ServeHandler refusal carries.
+broca-module|it|open_failed_classes::|broca-module/test-clock|crates/broca-module/tests/it/open_failed_classes.rs|default_refusals_carry_their_retry_class|Keeps the default refusals' error classes pinned when serve.rs changes.
 # Pins the sorted WAL feature names exposed by the daemon's read-only probe.
 broca-module-serve|it|wal_known_features::|broca-module-serve/test-clock|crates/broca-module-serve/tests/it/wal_known_features.rs|wal_known_features_prints_the_sorted_table_and_nothing_else|Protects the known-feature table used by placement tooling.
-# Guards admission against a redundant read of the persisted WAL history.
-broca-module-serve|admission_wal_read_budget|fresh_episode_admission_does_not_add_a_full_wal_read|broca-module-serve/test-clock|crates/broca-module-serve/tests/admission_wal_read_budget.rs|fresh_episode_admission_does_not_add_a_full_wal_read|Scans executor source to protect the admission read budget.
-# Restricts scope-stamp identity reads to the named identity adapters.
-broca-module-serve|it|scope_stamp_source::|broca-module-serve/test-clock|crates/broca-module-serve/tests/it/scope_stamp_source.rs|broca_reads_stamp_identity_only_in_scope_adapters|Scans workspace sources for scope-stamp reads outside approved adapters.
+# Admission read-budget and credential-source regressions run in ck-broca's bin tests above.
 # Prevents shipped Rust sources from reading the launch nonce directly.
 broca-module-serve|launch_nonce|no_shipped_code_reads_a_launch_nonce_variable_directly|broca-module-serve/test-clock|crates/broca-module-serve/tests/launch_nonce.rs|no_shipped_code_reads_a_launch_nonce_variable_directly|Keeps production launch-nonce reads behind the shared accessor.
-# Ensures daemon executable environment reads use the shared resolver.
-broca-test-support|subc_bin_guard|real_daemon_binary_environment_reads_use_shared_resolver|-|crates/broca-test-support/tests/subc_bin_guard.rs|real_daemon_binary_environment_reads_use_shared_resolver|Finds direct daemon-binary environment reads across workspace sources.
 # Verifies every discovered broca child process pins an isolated state root.
-broca-module-serve|it|state_root_isolation::every_broca_spawn_site_pins_its_state_root|broca-module-serve/test-clock|crates/broca-module-serve/tests/it/state_root_isolation.rs|every_broca_spawn_site_pins_its_state_root|Scans all test sources for broca spawns that could reach operator state.
+broca-module-serve|it|state_root_isolation::every_broca_spawn_site_pins_its_state_root|broca-module-serve/test-clock|crates/broca-module-serve/tests/it/state_root_isolation.rs|every_broca_spawn_site_pins_its_state_root|Boots a child through each test command builder and checks it writes only beneath the selected state root.
 # Ensures only the shared state-root resolver reads the state-root environment variable.
 broca-module-serve|it|state_root_isolation::only_the_shared_resolver_names_the_state_root|broca-module-serve/test-clock|crates/broca-module-serve/tests/it/state_root_isolation.rs|only_the_shared_resolver_names_the_state_root|Checks production environment reads remain behind the shared state-root resolver.
-# Proves the state-root isolation scanner rejects an unpinned planted spawn.
-broca-module-serve|it|state_root_isolation::the_isolation_checker_flags_an_unpinned_spawn|broca-module-serve/test-clock|crates/broca-module-serve/tests/it/state_root_isolation.rs|the_isolation_checker_flags_an_unpinned_spawn|Keeps the state-root source scanner's failure path observable.
 # Keeps production deferred-call record construction inside approved writer paths.
 broca-wal|it|compaction_source::|-|crates/broca-wal/tests/it/compaction_source.rs|no_production_path_writes_deferred_call_records|Scans production source for unauthorized deferred-call WAL writers.
 # Ensures retention writes stay in the core and actor implementation.
 broca-wal|it|retention_source::|-|crates/broca-wal/tests/it/retention_source.rs|retention_writes_are_limited_to_the_core_and_actor|Inventories production retention writers across crate sources.
-# Guards shipped log levels against sites below the default operator visibility.
-broca-module-serve|it|log_levels_are_deliberate::|broca-module-serve/test-clock|crates/broca-module-serve/tests/it/log_levels_are_deliberate.rs|no_operator_log_site_sits_below_the_unconfigured_default|Checks the non-vacuous log-level census across shipped sources.
-# Prevents the removed whole-array transform route from returning to workspace code.
-broca-module-serve|it|transform_route_removed::|broca-module-serve/test-clock|crates/broca-module-serve/tests/it/transform_route_removed.rs|no_code_names_the_removed_transform_route|Scans source, scripts, and workflow files for removed route names.
-# Keeps test fixtures referenced by provider integration-test sources.
-broca-provider|it|fixture_coverage::|broca-provider/live,broca-provider/test-harness|crates/broca-provider/tests/it/fixture_coverage.rs|every_fixture_is_read_by_some_test|Inventories provider fixtures without starting a provider or daemon.
 # Pins the embedded served-payload fixture's wire shape.
 broca-catalog|it|fusiform_wire_fixture::|broca-catalog/live|crates/broca-catalog/tests/it/fusiform_wire_fixture.rs|the_served_shape_carries_the_facts_broca_consumes|Checks local catalog payload fixture data without network access.
-# Pins catalog endpoint values and their origin in embedded snapshot and overlay data.
-broca-catalog|it|base_url_pins::|broca-catalog/live|crates/broca-catalog/tests/it/base_url_pins.rs|every_overlay_base_url_pin_declares_its_source_and_is_nonempty|Checks catalog snapshot and overlay data from local fixtures only.
-# Pins the source and family for generated wire-family overlay entries.
-broca-catalog|it|wire_family_pins::|broca-catalog/live|crates/broca-catalog/tests/it/wire_family_pins.rs|every_overlay_wire_family_pin_declares_its_source|Keeps catalog family pins explicit rather than silently inherited.
-# Checks test rigs use development-linked binaries rather than shipped names.
-broca-test-support|ckdev_guard|-|-|crates/broca-test-support/tests/ckdev_guard.rs|test_code_never_spawns_ck_binaries_under_production_names|Checks test rig launches use development-linked binaries rather than shipped names.
-# Checks long-lived test rigs use owned output files instead of runner stdio.
-broca-test-support|rig_stdio_guard|-|-|crates/broca-test-support/tests/rig_stdio_guard.rs|rig_children_use_owned_stdio_logs|Scans rig test sources for child processes that retain test-runner output handles.
+# Checks row endpoints and refusal of withheld routing facts.
+broca-catalog|it|base_url_pins::|broca-catalog/live|crates/broca-catalog/tests/it/base_url_pins.rs|served_apis_freeze_to_equivalent_full_request_urls|Checks served full URLs under SDK/renderer conventions and named missing-fact refusals.
+# Checks authored renderer exceptions rather than copied provider inventories.
+broca-catalog|it|wire_family_pins::|broca-catalog/live|crates/broca-catalog/tests/it/wire_family_pins.rs|overlay_cannot_restore_local_model_format_tables|Prevents a local model-format table from reappearing.
 # Checks fixture cases for rig-test filtering without compiling workspace test binaries.
 python|scripts/test-portable-test-selection.py|PortableRigSelectionTests.test_exact_rig_test_exclusion_keeps_guard_test_selected|-|scripts/test-portable-test-selection.py|test_exact_rig_test_exclusion_keeps_guard_test_selected|Exercises the rig-selection filter's fixture-backed selection check; the full inventory remains in the workspace gate.

@@ -222,6 +222,7 @@ mod tests {
 
     fn ctx() -> BatchCtx {
         BatchCtx {
+            media_capture: None,
             batch_id: BatchId("b1".into()),
             bind: BindIdentity {
                 project_root: "/tmp/x".into(),

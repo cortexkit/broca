@@ -183,6 +183,7 @@ fn scripts() -> Vec<Vec<NormalizedEvent>> {
 
 fn request(run: &str, dir: &std::path::Path) -> RunRequest {
     RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -650,7 +651,7 @@ async fn renderer_drift_resume_seals_and_next_invocation_opens_a_new_episode() {
         .iter()
         .filter_map(|event| match event {
             OutputEvent::Control(control) => Some(control),
-            OutputEvent::Display(_) => None,
+            OutputEvent::Display(_) | OutputEvent::DisplayContext { .. } => None,
         })
         .collect();
     assert!(matches!(

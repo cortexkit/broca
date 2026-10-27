@@ -4,10 +4,10 @@ use super::{
     fold_lineage_id, metadata_file_id, validate_contiguous_sequence, WalByteAnchor, WalError,
 };
 use crate::framing::{self, DecodeStep, FrameError};
+use crate::fs_ops::File;
 use serde::{de::Error as _, Deserialize};
 use serde_json::value::RawValue;
 use std::{
-    fs::File,
     io::{Read, Seek, SeekFrom},
     path::Path,
 };

@@ -158,7 +158,7 @@ pub fn cc_version_suffix_for_transcript(messages: &[Message], version: &str) -> 
     let single = std::slice::from_ref(first_user);
     let id_map = crate::tool_id_alias::ToolIdMap::build(single, &id_grammar());
     let name_map = crate::tool_name_alias::ToolNameMap::build(&[], single);
-    let wire = convert_message(first_user, false, &id_map, &name_map);
+    let wire = convert_message(first_user, false, &id_map, &name_map, None);
     Some(persona_rules::cc_version_suffix(
         &persona_rules::first_user_message_text(std::slice::from_ref(&wire)),
         version,
@@ -320,6 +320,33 @@ pub struct AnthropicMessages;
 impl WireFamily for AnthropicMessages {
     fn shape(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
         build_request_body(frozen, opts)
+    }
+
+    fn shape_with_media(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        media: &[crate::media_render::InlineMedia<'_>],
+    ) -> Value {
+        let media = crate::media_render::MediaRender {
+            frozen,
+            payloads: media,
+        };
+        build_request_body_with_media(frozen, opts, frozen.media.as_ref().map(|_| &media))
+    }
+
+    fn render_with_media(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        media: &[crate::media_render::InlineMedia<'_>],
+    ) -> Vec<u8> {
+        let body = self.shape_with_media(frozen, opts, media);
+        if persona(frozen).is_some() {
+            persona_bytes(&body)
+        } else {
+            broca_protocol::canonical_json_bytes(&body)
+        }
     }
 
     /// A persona run's bytes are the persona's key order with the `cch` signature written in;
@@ -495,6 +522,14 @@ impl StreamNormalizer for AnthropicStreamNormalizer {
 /// Build the Anthropic Messages request body from the frozen config + this step's
 /// `CallOptions`. A pure function of its inputs.
 fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
+    build_request_body_with_media(frozen, opts, None)
+}
+
+fn build_request_body_with_media(
+    frozen: &FrozenRenderConfig,
+    opts: &CallOptions,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+) -> Value {
     // A run with structured output adds its submit tool or schema instructions here; a run
     // without renders from `opts` unchanged.
     let prepared = crate::structured_output::prepare(frozen, opts);
@@ -561,7 +596,7 @@ fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value 
                 opts.target_model.as_ref(),
             );
             (
-                convert_message(m, positional && echo_safe, &id_map, &name_map),
+                convert_message(m, positional && echo_safe, &id_map, &name_map, media),
                 m.cache_prefix_blocks,
                 prompt_index,
             )
@@ -959,6 +994,7 @@ fn convert_message(
     keep_thinking: bool,
     id_map: &crate::tool_id_alias::ToolIdMap,
     name_map: &crate::tool_name_alias::ToolNameMap,
+    media: Option<&crate::media_render::MediaRender<'_>>,
 ) -> Value {
     match m.role {
         Role::Tool => {
@@ -969,7 +1005,7 @@ fn convert_message(
                     ContentBlock::ToolResult(tr) => Some(json!({
                         "type": "tool_result",
                         "tool_use_id": id_map.wire_id(&tr.tool_call_id.0),
-                        "content": tool_output_text(&tr.output),
+                        "content": tool_output_content(&tr.output, media),
                         "is_error": tr.is_error,
                     })),
                     _ => None,
@@ -978,13 +1014,13 @@ fn convert_message(
             json!({ "role": "user", "content": content })
         }
         Role::User => {
-            json!({ "role": "user", "content": convert_user_content(&m.content, id_map, name_map) })
+            json!({ "role": "user", "content": convert_user_content(&m.content, id_map, name_map, media) })
         }
         Role::Assistant => {
-            json!({ "role": "assistant", "content": convert_content(&m.content, keep_thinking, id_map, name_map) })
+            json!({ "role": "assistant", "content": convert_content(&m.content, keep_thinking, id_map, name_map, None) })
         }
         Role::System => {
-            json!({ "role": "user", "content": convert_content(&m.content, false, id_map, name_map) })
+            json!({ "role": "user", "content": convert_content(&m.content, false, id_map, name_map, None) })
         }
     }
 }
@@ -993,6 +1029,7 @@ fn convert_user_content(
     blocks: &[ContentBlock],
     id_map: &crate::tool_id_alias::ToolIdMap,
     name_map: &crate::tool_name_alias::ToolNameMap,
+    media: Option<&crate::media_render::MediaRender<'_>>,
 ) -> Vec<Value> {
     let mut content = Vec::new();
     for block in blocks {
@@ -1000,7 +1037,7 @@ fn convert_user_content(
             ContentBlock::ToolResult(tr) => content.push(json!({
                 "type": "tool_result",
                 "tool_use_id": id_map.wire_id(&tr.tool_call_id.0),
-                "content": tool_output_text(&tr.output),
+                "content": tool_output_content(&tr.output, media),
                 "is_error": tr.is_error,
             })),
             _ => content.extend(convert_content(
@@ -1008,6 +1045,7 @@ fn convert_user_content(
                 false,
                 id_map,
                 name_map,
+                media,
             )),
         }
     }
@@ -1019,12 +1057,14 @@ fn convert_content(
     keep_thinking: bool,
     id_map: &crate::tool_id_alias::ToolIdMap,
     name_map: &crate::tool_name_alias::ToolNameMap,
+    media: Option<&crate::media_render::MediaRender<'_>>,
 ) -> Vec<Value> {
     use crate::reasoning::{decide_reasoning, ReasoningDecision, SerializerProfile};
     blocks
         .iter()
         .enumerate()
         .filter_map(|(idx, b)| match b {
+            ContentBlock::Media(reference) => Some(media_block(reference, media, false)),
             // Drop an empty text part (Anthropic rejects `text:""`). Defensive against
             // foreign input; the owned normalizers never produce empty text.
             ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. }
@@ -1087,11 +1127,63 @@ fn convert_content(
 
 fn tool_output_text(out: &ToolOutput) -> String {
     match out {
+        ToolOutput::Parts { parts } => broca_protocol::content::media_parts_text(
+            parts,
+            broca_protocol::MediaMarkerReason::Carrier,
+        ),
         ToolOutput::Text { text } => text.clone(),
         ToolOutput::Json { value } => value.to_string(),
         ToolOutput::Denied { reason } => format!("denied: {reason}"),
         ToolOutput::Error { message } => message.clone(),
     }
+}
+
+fn tool_output_content(
+    out: &ToolOutput,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+) -> Value {
+    if let (ToolOutput::Parts { parts }, Some(media)) = (out, media) {
+        return Value::Array(
+            parts
+                .iter()
+                .filter_map(|part| match part {
+                    broca_protocol::ToolOutputPart::Text { text } if text.is_empty() => None,
+                    broca_protocol::ToolOutputPart::Text { text } => {
+                        Some(json!({"type":"text", "text":text}))
+                    }
+                    broca_protocol::ToolOutputPart::Media { media: reference } => {
+                        Some(media_block(reference, Some(media), true))
+                    }
+                })
+                .collect(),
+        );
+    }
+    Value::String(tool_output_text(out))
+}
+
+fn media_block(
+    reference: &broca_protocol::MediaRef,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+    tool: bool,
+) -> Value {
+    use broca_protocol::{MediaKind, MediaMarkerReason};
+    let payload = media
+        .ok_or(MediaMarkerReason::Carrier)
+        .and_then(|media| media.native(reference, tool));
+    let reason = match payload {
+        Ok(base64) => {
+            let kind = match reference.kind {
+                MediaKind::Image => "image",
+                MediaKind::Document => "document",
+                MediaKind::Audio | MediaKind::Video => {
+                    return json!({"type":"text", "text":broca_protocol::content::media_not_shown_marker(reference, MediaMarkerReason::Carrier)})
+                }
+            };
+            return json!({"type":kind, "source":{"type":"base64", "media_type":reference.mime, "data":base64}});
+        }
+        Err(reason) => reason,
+    };
+    json!({"type":"text", "text":broca_protocol::content::media_not_shown_marker(reference, reason)})
 }
 
 #[cfg(test)]
@@ -1263,7 +1355,7 @@ mod tests {
                     message.origin.as_ref(),
                     opts.target_model.as_ref(),
                 );
-                convert_message(message, positional && echo_safe, &id_map, &name_map)
+                convert_message(message, positional && echo_safe, &id_map, &name_map, None)
             })
             .collect()
     }

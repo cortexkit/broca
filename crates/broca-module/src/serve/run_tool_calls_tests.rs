@@ -124,6 +124,7 @@ impl ClosedSession {
             .collect();
         self.append(WalRecord::StepStarted { step_id });
         self.append(WalRecord::ModelStepFinished {
+            written_at_ms: None,
             step_id,
             assistant_message: Arc::new(AssistantMessage {
                 message_id: MessageId("assistant-1".into()),
@@ -149,6 +150,7 @@ impl ClosedSession {
         for (index, (id, args)) in calls.iter().enumerate() {
             let tool_call_id = ToolCallId(id.clone());
             self.append(WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 batch_id: batch_id.clone(),
                 tool_call_id: tool_call_id.clone(),
                 tool_name: Some("write_file".into()),
@@ -161,6 +163,7 @@ impl ClosedSession {
             });
             if let Some(results) = results {
                 self.append(WalRecord::ToolResult {
+                    finished_at_ms: None,
                     batch_id: batch_id.clone(),
                     result: Arc::new(ToolResult {
                         tool_call_id,
@@ -186,6 +189,7 @@ impl ClosedSession {
 
     fn steer(&mut self, text: &str) {
         self.append(WalRecord::Steered {
+            written_at_ms: None,
             tags: None,
             retention: None,
             ts_ms: None,
@@ -240,6 +244,7 @@ impl ClosedSession {
         let step_id = StepId(1);
         let batch_id = BatchId("batch-duplicate-id".into());
         self.append(WalRecord::ModelStepFinished {
+            written_at_ms: None,
             step_id,
             assistant_message: Arc::new(AssistantMessage {
                 message_id: MessageId("assistant-duplicate-id".into()),
@@ -259,6 +264,7 @@ impl ClosedSession {
             planned_calls: vec![call_id.clone(), call_id.clone()],
         });
         self.append(WalRecord::ToolDispatchIntent {
+            dispatched_at_ms: None,
             batch_id: batch_id.clone(),
             tool_call_id: call_id.clone(),
             tool_name: Some("write_file".into()),
@@ -270,6 +276,7 @@ impl ClosedSession {
             call_key: None,
         });
         self.append(WalRecord::ToolResult {
+            finished_at_ms: None,
             batch_id: batch_id.clone(),
             result: Arc::new(ToolResult {
                 tool_call_id: call_id.clone(),
@@ -286,6 +293,7 @@ impl ClosedSession {
             tags: None,
         });
         self.append(WalRecord::ToolResult {
+            finished_at_ms: None,
             batch_id: batch_id.clone(),
             result: Arc::new(ToolResult {
                 tool_call_id: call_id,
@@ -633,6 +641,7 @@ async fn run_tool_calls_ordinals_match_session_read_across_a_materialized_prefix
 async fn run_tool_calls_returns_empty_for_a_run_without_tool_calls() {
     let mut session = ClosedSession::new("empty");
     session.append(WalRecord::ModelStepFinished {
+        written_at_ms: None,
         step_id: StepId(1),
         assistant_message: Arc::new(AssistantMessage {
             message_id: MessageId("assistant-1".into()),
@@ -758,6 +767,7 @@ async fn completed_directives_match_all_published_vectors_and_old_run_bytes() {
             .iter()
             .any(|block| matches!(block, ContentBlock::ToolCall(_)));
         session.append(WalRecord::ModelStepFinished {
+            written_at_ms: None,
             step_id: StepId(1),
             assistant_message: Arc::new(AssistantMessage {
                 message_id: MessageId("final".into()),
@@ -779,6 +789,7 @@ async fn completed_directives_match_all_published_vectors_and_old_run_bytes() {
                 planned_calls: vec![ToolCallId("ignored".into())],
             });
             session.append(WalRecord::ToolResult {
+                finished_at_ms: None,
                 batch_id: batch_id.clone(),
                 result: Arc::new(ToolResult {
                     tool_call_id: ToolCallId("ignored".into()),

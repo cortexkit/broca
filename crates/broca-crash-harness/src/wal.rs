@@ -184,6 +184,10 @@ impl ObservedWalStore {
 // test in tests/it/observed_wal_fidelity.rs compares these impls with FileWalStore's and
 // FileWal's, so a new production override cannot be missed here silently.
 impl WalStore for ObservedWalStore {
+    fn uploads(&self) -> Option<broca_core::media_uploads::Uploads> {
+        WalStore::uploads(&self.inner)
+    }
+
     fn read_records_tail_bounded(
         &self,
         session: &BindIdentity,
@@ -216,6 +220,30 @@ impl WalStore for ObservedWalStore {
             retention,
             session_class,
         )?))
+    }
+
+    fn open_writer(
+        &self,
+        session: &BindIdentity,
+        retention: Option<u64>,
+        session_class: Option<&str>,
+        lease: Box<dyn broca_core::LeaseHandle>,
+    ) -> Result<(Box<dyn Wal + Send>, Box<dyn broca_core::LeaseHandle>), WalError> {
+        let (wal, lease) =
+            WalStore::open_writer(&self.inner, session, retention, session_class, lease)?;
+        Ok((self.observe(wal), lease))
+    }
+
+    fn open_owned_writer(
+        &self,
+        session: &BindIdentity,
+        retention: Option<u64>,
+        session_class: Option<&str>,
+        lease: Box<dyn broca_core::LeaseHandle>,
+    ) -> Result<(Box<dyn Wal + Send>, Box<dyn broca_core::LeaseHandle>), WalError> {
+        let (wal, lease) =
+            WalStore::open_owned_writer(&self.inner, session, retention, session_class, lease)?;
+        Ok((self.observe(wal), lease))
     }
 
     fn check_move(&self, session: &BindIdentity, write: bool) -> Result<(), WalError> {

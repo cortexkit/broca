@@ -199,6 +199,8 @@ impl PartialEq for TagSlot {
     }
 }
 
+impl Eq for TagSlot {}
+
 impl TagSlot {
     pub fn new(tags: Option<Arc<PartTags>>) -> Self {
         Self {
@@ -370,6 +372,8 @@ pub fn part_kind(role: Role, block: &ContentBlock, clean: bool) -> Option<PartKi
         }
     };
     Some(match block {
+        // Runner tags currently assign no number to a standalone media block.
+        ContentBlock::Media(_) => return None,
         ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => match role {
             Role::System => PartKind::TurnSystem,
             Role::Assistant => text_kind(&exposed_model_text(clean, text), PartKind::AssistantText),
@@ -390,8 +394,28 @@ pub fn part_kind(role: Role, block: &ContentBlock, clean: bool) -> Option<PartKi
                 text_kind(message, PartKind::ToolResultText)
             }
             ToolOutput::Json { .. } => return None,
+            ToolOutput::Parts { parts } => parts_numbering(parts).0,
         },
     })
+}
+
+// Map storage once for the shared contract's classification and placement rules. Numbering
+// and rendering must see the same blocks, including empty text and every media reference.
+fn parts_numbering(parts: &[crate::ToolOutputPart]) -> (PartKind, Option<usize>) {
+    use cortexkit_role_llm_runner::tags::{
+        numbered_block_index, tool_result_kind, ToolResultBlock,
+    };
+    let blocks: Vec<_> = parts
+        .iter()
+        .map(|part| match part {
+            crate::ToolOutputPart::Text { text } => ToolResultBlock::Text(text),
+            crate::ToolOutputPart::Media { media } => match media.kind {
+                crate::MediaKind::Image => ToolResultBlock::Image,
+                _ => ToolResultBlock::Media,
+            },
+        })
+        .collect();
+    (tool_result_kind(&blocks), numbered_block_index(&blocks))
 }
 
 /// The model's text as every exposure shows it: cleaned of tag notation when `clean`, else as
@@ -530,6 +554,29 @@ fn render_computed(message: &mut Message, tags: &PartTags, computed: ComputedTag
                             cortexkit_role_llm_runner::tags::render_counted_text(number, message);
                     }
                     ToolOutput::Json { .. } => {}
+                    ToolOutput::Parts { parts } => {
+                        let (kind, index) = parts_numbering(parts);
+                        if let Some(index) = index {
+                            if let crate::ToolOutputPart::Text { text } = &mut parts[index] {
+                                *text = cortexkit_role_llm_runner::tags::render_counted_text(
+                                    number, text,
+                                );
+                            }
+                        } else {
+                            let label = match kind {
+                                PartKind::ToolResultImageOnly => {
+                                    Some(cortexkit_role_llm_runner::tags::image_label(number))
+                                }
+                                PartKind::ToolResultMediaOnly => {
+                                    Some(cortexkit_role_llm_runner::tags::media_label(number))
+                                }
+                                _ => None,
+                            };
+                            if let Some(text) = label {
+                                parts.insert(0, crate::ToolOutputPart::Text { text });
+                            }
+                        }
+                    }
                 }
             }
             _ => {}

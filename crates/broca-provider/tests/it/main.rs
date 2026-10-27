@@ -47,22 +47,24 @@ mod claude_oauth_wire_vectors;
 mod conformance_report_is_not_vacuous;
 mod empty_assistant_turn_content;
 mod empty_text_drop;
-mod fixture_coverage;
 mod frozen_config_excludes_raw;
 mod frozen_config_resume;
 #[cfg(feature = "live")]
 mod gemini_e2e;
+mod gemini_media_render;
 mod gemini_merged_text_regression;
 mod gemini_render_golden;
 mod gemini_thought_parts;
 mod google_codeassist_render_golden;
-mod live_consent_gate;
+mod media_profile_frozen;
 #[cfg(feature = "live")]
 mod mixed_family_concurrency_e2e;
+mod native_media_render;
 mod normalize_fixture;
 #[cfg(feature = "live")]
 mod openai_chat_e2e;
 mod openai_chat_golden;
+mod openai_media_render;
 mod openai_responses_chatgpt_render_golden;
 #[cfg(feature = "live")]
 mod openai_responses_e2e;
@@ -91,12 +93,3 @@ mod usage_presence;
 mod chatgpt_effort_updates;
 mod compaction_thinking;
 mod hooks_render_golden;
-
-#[cfg(not(feature = "live"))]
-#[test]
-fn live_transport_suites_need_their_feature_enabled() {
-    eprintln!(
-        "SKIP live transport suites: compiled without the live feature; re-run with \
-         `-F broca-provider/live` to exercise the family e2e and aimock guard suites."
-    );
-}

@@ -12,7 +12,9 @@
 //!   its first request repeats the old bytes and its new records are stamped like the old ones.
 //!
 //! The fixture is frozen. Regenerating it with a later build would write the later rules and
-//! prove nothing; `BROCA_PIN_V1_GENERATE=1` exists only to show how it was made.
+//! prove nothing. The ignored `generate_stored_ledger_fixture` test documents how it was made
+//! in the stored-ledger build that introduced the fixture (`11463387`), not an update procedure
+//! for later builds.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -42,10 +44,6 @@ fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/runner_tags_v1")
         .join(name)
-}
-
-fn generating() -> bool {
-    std::env::var_os("BROCA_PIN_V1_GENERATE").is_some()
 }
 
 /// Answers by the number of assistant turns the request already holds, so a resumed run asks
@@ -204,6 +202,7 @@ impl SteerOnce {
         let writer = self.writer.lock().unwrap().clone().expect("writer set");
         let input = vec![Message::new(Role::User, vec![text("also check the docs")])];
         let record = WalRecord::Steered {
+            written_at_ms: None,
             tags: None,
             retention: None,
             ts_ms: None,
@@ -389,34 +388,37 @@ fn load_fixture_records(name: &str) -> Vec<FramedRecord> {
 }
 
 #[tokio::test]
+#[ignore = "writes the historical oracle; invoke explicitly on the stored-ledger build only"]
+async fn generate_stored_ledger_fixture() {
+    let store = FileWalStore::new(scratch("generate"));
+    let reference = run(&store, true).await;
+    let dir = fixture("");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(
+        store.wal_path(&request().session),
+        fixture("steer_anthropic.wal"),
+    )
+    .unwrap();
+    let sent: Vec<String> = reference.calls.iter().map(request_text).collect();
+    let records = &reference.records;
+    let cut = cut_at(records);
+    let resumed = run(&store_with(&records[..cut], "generate-resume"), false).await;
+    let expected = json!({
+        "sent": sent,
+        "transcript": transcript(records),
+        "wal_tags": wal_tags(records),
+        "resumed_sent": resumed.calls.iter().map(request_text).collect::<Vec<_>>(),
+        "resumed_wal_tags": wal_tags(&resumed.records),
+    });
+    std::fs::write(
+        fixture("expected.json"),
+        serde_json::to_string_pretty(&expected).unwrap() + "\n",
+    )
+    .unwrap();
+}
+
+#[tokio::test]
 async fn a_session_written_under_the_stored_ledger_keeps_its_exact_bytes() {
-    if generating() {
-        let store = FileWalStore::new(scratch("generate"));
-        let reference = run(&store, true).await;
-        let dir = fixture("");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::copy(
-            store.wal_path(&request().session),
-            fixture("steer_anthropic.wal"),
-        )
-        .unwrap();
-        let sent: Vec<String> = reference.calls.iter().map(request_text).collect();
-        let records = &reference.records;
-        let cut = cut_at(records);
-        let resumed = run(&store_with(&records[..cut], "generate-resume"), false).await;
-        let expected = json!({
-            "sent": sent,
-            "transcript": transcript(records),
-            "wal_tags": wal_tags(records),
-            "resumed_sent": resumed.calls.iter().map(request_text).collect::<Vec<_>>(),
-            "resumed_wal_tags": wal_tags(&resumed.records),
-        });
-        std::fs::write(
-            fixture("expected.json"),
-            serde_json::to_string_pretty(&expected).unwrap() + "\n",
-        )
-        .unwrap();
-    }
     let expected: Value =
         serde_json::from_str(&std::fs::read_to_string(fixture("expected.json")).unwrap()).unwrap();
     let records = load_fixture_records("exact-bytes");
@@ -518,6 +520,7 @@ async fn a_resumed_stored_ledger_run_renders_a_steer_delivery_live_as_its_rebuil
     let records = load_fixture_records("steer-delivery");
     let cut = cut_at(&records);
     let send = broca_core::delivery_order::OrderedSend {
+        admitted_at_ms: None,
         submission_id: SubmissionId("send-in-order".into()),
         order: broca_protocol::DeliveryOrder {
             modes: vec![broca_protocol::DeliveryMode::Steer],

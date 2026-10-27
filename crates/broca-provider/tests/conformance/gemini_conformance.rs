@@ -105,6 +105,7 @@ fn gemini_spec() -> (ProviderSpec, ModelSpec) {
         limits: Limits::default(),
         cost: CostSchedule::default(),
         reasoning_options: Default::default(),
+        input_modalities: Default::default(),
         release_date: None,
         status: None,
         overlay: Overlay::default(),
@@ -212,6 +213,7 @@ fn gemini_normalizer_assembles_text_and_tool_call() {
             NormalizedEvent::Display(DisplayEvent::ToolInputDelta {
                 tool_call_id,
                 delta,
+                ..
             }) => Some((&tool_call_id.0, delta.as_str())),
             _ => None,
         })

@@ -34,12 +34,24 @@ const MANAGEMENT_OPERATIONS: &[&str] = &[
     "run.tool_calls",
     "session.baseline",
     "session.warm",
-    "cap.install",
-    "spend.delta",
     "vault.audit",
     "session.subscribe",
     // Served only on routes opened for the classifier role, and counted like the others.
     "classify.run",
+    // Served only on tool-provider routes for the sessionless model tools.
+    "tool.catalog",
+    "late_results",
+    "late_results.ack",
+    // Staged media uploads, served before any send references them.
+    "session.upload_begin",
+    "session.upload_append",
+    "session.upload_commit",
+    "session.upload_status",
+    "session.history",
+    "session.output_refs",
+    "session.output_ref_read",
+    "permissions.list",
+    "permissions.revoke",
 ];
 
 #[derive(Clone, Debug)]
@@ -330,7 +342,14 @@ async fn health_check_stream_chunks_session_reads_and_actor_opens_start_at_zero_
     assert_eq!(request_log.target, "requests");
     assert_eq!(request_log.level, tracing::Level::DEBUG);
     assert_eq!(request_log.operation, "run.cancel");
-    assert_eq!(request_log.session, "operation-counters");
+    assert_eq!(
+        request_log.session,
+        broca_core::session_addr(&BindIdentity::new(
+            dir.join("proj"),
+            "runner",
+            "operation-counters"
+        ))
+    );
     assert!(!request_log.actor_opened);
 
     let after = health_metrics(&mut client_reader, &mut client_writer, 5).await;

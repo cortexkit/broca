@@ -225,10 +225,10 @@ impl Rig {
         .unwrap();
         let mut file = self.wal.open(&self.key).unwrap();
         let records = vec![
-            WalRecord::RunStarted { tags: None, session_class: None, retention: None, hooks: None, title: None, on_restart: on_restart.then_some(broca_protocol::request::OnRestart::Resume), keep_warm: None, marker_order_version: None, manifest: None, scope: Some(scope.clone()), send_id: None, request_identity_digest: None, project_id: None, principal: None, ts_ms: None, run_id: RunId("r".into()), session: self.key.clone(), config: Box::new(config), input: req.input.into(), origin: broca_wal::RunOrigin::Fresh, submission_id: None },
-            WalRecord::ModelStepFinished { tags: None, hooks: None, step_id: StepId(1), assistant_message: broca_protocol::AssistantMessage { message_id: broca_protocol::MessageId("m".into()), content: vec![broca_protocol::ContentBlock::ToolCall(ToolCall { thought_signature: None, tool_call_id: ToolCallId("c".into()), tool_name: "edit".into(), input: serde_json::json!({}) })] }.into(), usage: Default::default(), finish_reason: Some(broca_protocol::FinishReason::ToolCalls), retries_used: 0, service_tier_used: None, speed_used: None },
+            WalRecord::RunStarted { written_at_ms: None, tags: None, session_class: None, retention: None, hooks: None, title: None, on_restart: on_restart.then_some(broca_protocol::request::OnRestart::Resume), keep_warm: None, marker_order_version: None, manifest: None, scope: Some(scope.clone()), send_id: None, request_identity_digest: None, project_id: None, principal: None, ts_ms: None, run_id: RunId("r".into()), session: self.key.clone(), config: Box::new(config), input: req.input.into(), origin: broca_wal::RunOrigin::Fresh, submission_id: None },
+            WalRecord::ModelStepFinished { written_at_ms: None, tags: None, hooks: None, step_id: StepId(1), assistant_message: broca_protocol::AssistantMessage { message_id: broca_protocol::MessageId("m".into()), content: vec![broca_protocol::ContentBlock::ToolCall(ToolCall { thought_signature: None, tool_call_id: ToolCallId("c".into()), tool_name: "edit".into(), input: serde_json::json!({}) })] }.into(), usage: Default::default(), finish_reason: Some(broca_protocol::FinishReason::ToolCalls), retries_used: 0, service_tier_used: None, speed_used: None },
             WalRecord::ToolBatchStarted { batch_id: broca_protocol::BatchId("b".into()), step_id: StepId(1), planned_calls: vec![ToolCallId("c".into())] },
-            WalRecord::ToolCallDeferred { batch_id: broca_protocol::BatchId("b".into()), call_id: ToolCallId("c".into()), executor: broca_wal::DeferredExecutor::Broca, module: None, tool: "edit".into(), schema_pin: None, args_jcs: "{}".into(), args_hash: "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a".into(), scope, ask: serde_json::from_value(serde_json::json!({"prompt":"Allow?","expires_at_ms":expiry,"on_expiry":"deny","material_damage":false,"late_execution":"notify_only"})).unwrap() },
+            WalRecord::ToolCallDeferred { deferred_at_ms: None, batch_id: broca_protocol::BatchId("b".into()), call_id: ToolCallId("c".into()), executor: broca_wal::DeferredExecutor::Broca, module: None, tool: "edit".into(), schema_pin: None, args_jcs: "{}".into(), args_hash: "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a".into(), scope, ask: serde_json::from_value(serde_json::json!({"prompt":"Allow?","expires_at_ms":expiry,"on_expiry":"deny","material_damage":false,"late_execution":"notify_only"})).unwrap() },
         ];
         for record in records {
             file.append(1, &record, true).unwrap();
@@ -246,6 +246,7 @@ impl Rig {
         );
         if approved {
             self.append(WalRecord::ApprovalRecorded {
+                closed_at_ms: None,
                 tags: None,
                 call_key: key.clone(),
                 call_id: ToolCallId("c".into()),
@@ -300,6 +301,7 @@ impl Rig {
     }
     fn closed_result(key: &str, writer: bool) -> WalRecord {
         WalRecord::ToolResult {
+            finished_at_ms: None,
             tags: None,
             hooks: None,
             batch_id: broca_protocol::BatchId("b".into()),
@@ -776,6 +778,7 @@ async fn projected_approval_metadata_matches_wal_session_read() {
         if let Some(decision) = decision {
             let result = broca_core::not_dispatched_result(&ToolCallId("c".into()));
             rig.append(WalRecord::ApprovalRecorded {
+                closed_at_ms: None,
                 tags: None,
                 call_key: key.clone(),
                 call_id: ToolCallId("c".into()),
@@ -951,6 +954,7 @@ async fn dispatched_refused_declined_and_approved_closed_calls_send_no_withdrawa
         let mut result = Rig::closed_result(&key, false);
         if kind == "declined" {
             rig.append(WalRecord::ApprovalRecorded {
+                closed_at_ms: None,
                 tags: None,
                 call_key: key.clone(),
                 call_id: ToolCallId("c".into()),
@@ -964,6 +968,7 @@ async fn dispatched_refused_declined_and_approved_closed_calls_send_no_withdrawa
         } else {
             if kind == "dispatched" {
                 rig.append(WalRecord::ToolDispatchIntent {
+                    dispatched_at_ms: None,
                     batch_id: broca_protocol::BatchId("b".into()),
                     tool_call_id: ToolCallId("c".into()),
                     tool_name: Some("edit".into()),
@@ -1617,6 +1622,7 @@ async fn missing_origin_is_expired_without_blocking_other_owed_calls() {
     file.append(
         1,
         &WalRecord::ToolResult {
+            finished_at_ms: None,
             tags: None,
             batch_id: broca_protocol::BatchId("b".into()),
             result: broca_core::not_dispatched_result(&ToolCallId("bad".into())).into(),
@@ -1747,6 +1753,7 @@ fn seed_late_entries(rig: &Rig) -> Vec<String> {
         file.append(
             1,
             &WalRecord::ApprovalRecorded {
+                closed_at_ms: None,
                 tags: None,
                 call_key: key.clone(),
                 call_id: ToolCallId("c".into()),
@@ -2052,6 +2059,7 @@ async fn durable_approval_cache_matches_seed_and_ignores_stale_markers() {
         1
     );
     rig.append(WalRecord::ApprovalRecorded {
+        closed_at_ms: None,
         tags: None,
         call_key: key.clone(),
         call_id: ToolCallId("c".into()),
@@ -2096,6 +2104,49 @@ async fn durable_approval_cache_matches_seed_and_ignores_stale_markers() {
     live.wait_covered(u64::MAX).await;
     assert!(live.awaiting(&RunId("r".into()), 6).is_none());
     assert_eq!(live.prepared(&RunId("r".into()), 6), None);
+}
+
+#[tokio::test]
+async fn cached_auth_selection_keeps_admission_identity_without_wal_reads() {
+    let rig = Rig::new(false);
+    rig.seed(true, false, false, false);
+    let mut frames = rig.frames();
+    let admission: broca_wal::AuthSelection = serde_json::from_value(serde_json::json!({
+        "credential_id": "apikey:cline-pass", "resolved_credential_id": "apikey:alias"
+    }))
+    .unwrap();
+    let WalRecord::RunStarted { config, .. } = &mut frames[0].record else {
+        panic!("the seed must begin with the run admission");
+    };
+    config.auth_selection = Some(admission.clone());
+    let live = crate::approval_state::ApprovalState::default();
+    for frame in &frames {
+        live.observe(frame.seq, frame.fence, None, &frame.record);
+    }
+    let head = frames.last().unwrap().seq;
+    let run = RunId("r".into());
+    assert_eq!(live.auth_selection(&run, head), Some(admission.clone()));
+    assert_eq!(live.auth_selection(&run, head + 1), None);
+    assert_eq!(live.auth_selection(&RunId("another".into()), head), None);
+    let mut refrozen = admission.clone();
+    refrozen.credential_id = "apikey:replacement".into();
+    live.observe(
+        head + 1,
+        1,
+        None,
+        &WalRecord::RunAuthRefrozen {
+            ts_ms: None,
+            auth_selection: refrozen,
+        },
+    );
+    assert_eq!(live.auth_selection(&run, head + 1), Some(admission.clone()));
+    let seeded = crate::approval_state::ApprovalState::default();
+    seeded.seed(None, head, Some(run.clone()), &frames, None, true);
+    assert_eq!(seeded.auth_selection(&run, head), Some(admission));
+    seeded.seed(None, head, Some(run.clone()), &frames[1..], None, true);
+    assert_eq!(seeded.auth_selection(&run, head), None);
+    live.healthy.store(false, Ordering::Release);
+    assert_eq!(live.auth_selection(&run, head + 1), None);
 }
 
 #[tokio::test]
@@ -2302,6 +2353,7 @@ fn approval_cache_tool_update_work_is_independent_of_prior_runs() {
         1,
         None,
         &WalRecord::ToolDispatchIntent {
+            dispatched_at_ms: None,
             batch_id: broca_protocol::BatchId("b".into()),
             tool_call_id: ToolCallId("c".into()),
             tool_name: Some("edit".into()),

@@ -11,6 +11,7 @@ use std::{
 
 fn ctx() -> BatchCtx {
     BatchCtx {
+        media_capture: None,
         batch_id: BatchId("b".into()),
         bind: BindIdentity::new("/p", "test", "s"),
         run_id: RunId("r".into()),
@@ -566,6 +567,7 @@ async fn close_out_adopted_id_survives_projection_without_reopening_call() {
     let seq = writer.record(prepared.clone()).into_result().unwrap();
     let key = crate::context::call_key(writer.lineage_id().unwrap(), seq);
     writer.record(WalRecord::ToolResult {
+        finished_at_ms: None,
         tags: None,
         batch_id: ctx().batch_id,
         result: std::sync::Arc::new(crate::resume::not_dispatched_result(

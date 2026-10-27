@@ -272,6 +272,8 @@ pub fn responses_warm_body(base: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Read only usage from the bounded Responses answer; generated content is discarded.
 /// Both streaming terminal envelopes and non-streaming responses carry the same usage shape.
+/// Only the live transport sends warms, so this and the two items below exist only with it.
+#[cfg(any(feature = "live", test))]
 pub(crate) fn responses_response_usage(body: &[u8]) -> broca_protocol::Usage {
     let response = serde_json::from_slice::<Value>(body).ok().or_else(|| {
         let text = std::str::from_utf8(body).ok()?;
@@ -314,11 +316,13 @@ pub(crate) fn responses_response_usage(body: &[u8]) -> broca_protocol::Usage {
 }
 
 /// The response headers a warm keeps: Anthropic's unified rate-limit report.
+#[cfg(any(feature = "live", test))]
 pub(crate) const RATELIMIT_HEADER_PREFIX: &str =
     cortexkit_anthropic_policy::RATELIMIT_UNIFIED_HEADER_PREFIX;
 
 /// The usage a non-streaming Anthropic Messages response reports, each count absent when the
 /// response carries none.
+#[cfg(any(feature = "live", test))]
 pub(crate) fn anthropic_response_usage(body: &[u8]) -> broca_protocol::Usage {
     let usage = serde_json::from_slice::<Value>(body)
         .ok()

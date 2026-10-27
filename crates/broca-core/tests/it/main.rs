@@ -6,8 +6,9 @@
 //! macOS, is assessed by the code-signing check the first time it runs, so per-file binaries made
 //! the suite slow to build and slow to start.
 //!
-//! `input_allocation` keeps a binary of its own: it installs a counting `#[global_allocator]`, which
-//! would count every other test's allocations too, and a binary can have only one.
+//! `input_allocation` and `capture_allocation` keep their own binaries: their global allocators
+//! measure different scopes (retained size versus temporary allocation calls), and a binary
+//! can install only one allocator.
 
 mod append_only_render;
 mod cancel_watchdog;

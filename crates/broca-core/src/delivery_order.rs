@@ -115,6 +115,10 @@ pub fn append_to_result(result: &mut ToolResult, text: &str) {
         ToolOutput::Text { text: output } => output.push_str(text),
         ToolOutput::Error { message } => message.push_str(text),
         ToolOutput::Json { .. } | ToolOutput::Denied { .. } => {}
+        // The Rendering contract keeps multipart results in source order, including appended text.
+        ToolOutput::Parts { parts } => {
+            parts.push(broca_protocol::ToolOutputPart::Text { text: text.into() })
+        }
     }
 }
 
@@ -142,6 +146,7 @@ pub fn apply_to_prompt(prompt: &mut [Message], tool_call_id: &ToolCallId, text: 
 /// One queued ordered send, as the running turn sees it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrderedSend {
+    pub admitted_at_ms: Option<u64>,
     pub submission_id: SubmissionId,
     pub order: DeliveryOrder,
     /// The principal that sent it (a plan-named sender, or else the principal that queued it);
@@ -165,6 +170,7 @@ impl OrderedSend {
             None => pending.request.input.clone(),
         };
         Some(Self {
+            admitted_at_ms: pending.admitted_at_ms,
             submission_id: pending.submission_id.clone(),
             order,
             principal: pending
@@ -197,6 +203,7 @@ pub fn ended(submission_id: &SubmissionId, reason: SendEndReason) -> WalRecord {
 /// The record of a `steer` delivery of `send` into `run_id`.
 pub fn steered(send: &OrderedSend, run_id: &RunId) -> WalRecord {
     WalRecord::SendDelivered {
+        written_at_ms: send.admitted_at_ms,
         tags: None,
         submission_id: send.submission_id.clone(),
         run_id: run_id.clone(),
@@ -215,6 +222,7 @@ pub fn with_tool_result(
     text: String,
 ) -> WalRecord {
     WalRecord::SendDelivered {
+        written_at_ms: send.admitted_at_ms,
         tags: None,
         submission_id: send.submission_id.clone(),
         run_id: run_id.clone(),

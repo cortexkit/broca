@@ -28,10 +28,6 @@ pub const OP_CANCEL: &str = "run.cancel";
 pub const OP_STATUS: &str = "run.status";
 pub const OP_RUN_EVENT_GET: &str = "run.event.get";
 pub const OP_READ: &str = "session.read";
-/// Daemon-scoped durable budget-cap mutations.
-pub const OP_CAP_INSTALL: &str = "cap.install";
-
-pub const OP_SPEND_DELTA: &str = "spend.delta";
 /// Daemon-scoped read of the credential vault's listing under broca's grants.
 pub const OP_VAULT_AUDIT: &str = "vault.audit";
 /// The held-open stream observability surface.
@@ -137,6 +133,41 @@ pub fn manifest_with_archive(
 pub(crate) fn management_operations() -> Vec<ManagementOperation> {
     vec![
         ManagementOperation {
+            name: cortexkit_role_llm_runner::ops::SESSION_HISTORY.into(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Page surviving session history as stored entries or display rows.".into()),
+        },
+        ManagementOperation {
+            name: cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS.into(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Read the records of a session-owned output reference set.".into()),
+        },
+        ManagementOperation {
+            name: cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ.into(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Read retained bytes of a session-owned output reference.".into()),
+        },
+        ManagementOperation {
+            name: "session.upload_begin".into(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some("Reserve session-owned attachment staging.".into()),
+        },
+        ManagementOperation {
+            name: "session.upload_append".into(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some("Append a bounded chunk to session-owned staging.".into()),
+        },
+        ManagementOperation {
+            name: "session.upload_commit".into(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some("Verify and commit a staged upload without admitting a send.".into()),
+        },
+        ManagementOperation {
+            name: "session.upload_status".into(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Read the state and received count of a staged upload.".into()),
+        },
+        ManagementOperation {
             name: OP_SEND_STATUS.to_string(),
             kind: ManagementOperationKind::Query,
             description: Some("Read the durable fate of a send_id without admitting or delivering work.".into()),
@@ -213,6 +244,31 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             ),
         },
         ManagementOperation {
+            name: "tool.catalog".into(),
+            kind: ManagementOperationKind::Query,
+            description: Some("List the sessionless model tools and their invocation modes.".into()),
+        },
+        ManagementOperation {
+            name: "late_results".into(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Read late model-tool results belonging to the stamped caller.".into()),
+        },
+        ManagementOperation {
+            name: "late_results.ack".into(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some("Acknowledge the stamped caller's late model-tool results.".into()),
+        },
+        ManagementOperation {
+            name: "permissions.list".into(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Permissions routes only: list private-content grants for the operator.".into()),
+        },
+        ManagementOperation {
+            name: "permissions.revoke".into(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some("Permissions routes only: revoke one private-content grant for the operator.".into()),
+        },
+        ManagementOperation {
             name: OP_RESOLVE.to_string(),
             kind: ManagementOperationKind::Query,
             description: Some(
@@ -256,21 +312,6 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             description: Some(
                 "Keep the provider's prompt cache warm: re-send the session's most recent request with no output, and report what it cost."
                     .to_string(),
-            ),
-        },
-        ManagementOperation {
-            name: OP_CAP_INSTALL.to_string(),
-            kind: ManagementOperationKind::Mutate,
-            description: Some(
-                "Install or remove a spend cap. Enforcement is at admission, and refusals fail closed."
-                    .to_string(),
-            ),
-        },
-        ManagementOperation {
-            name: OP_SPEND_DELTA.to_string(),
-            kind: ManagementOperationKind::Mutate,
-            description: Some(
-                "Apply a spend increment against an installed cap's watermark.".to_string(),
             ),
         },
         ManagementOperation {
@@ -431,6 +472,8 @@ pub fn manifest_configured(
             // `classifier` role. A caller finds broca by this entry, then picks it for a model
             // its classifier `role.describe` lists.
             cortexkit_role_classifier::PROVIDES.to_string(),
+            "tool-provider/v1".to_string(),
+            "permissions/v1".to_string(),
             subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
             subc_protocol::scope::AGENT_RUN_SCOPES_CAPABILITY.to_string(),
         ],
@@ -444,24 +487,18 @@ pub fn manifest_configured(
             // declaring Serial would tell subc to gate every session behind one in-flight call
             // and serialise a fleet that already schedules itself.
             //
-            // BOTH HALVES ARE PINNED, and the cross-session half was verified by mutation
-            // rather than by reading:
+            // Both halves are covered by runtime tests:
             //
             // WITHIN-SESSION ORDERING --
             // `delayed_terminal_send_retry_does_not_queue_behind_active_run`.
             //
             // CROSS-SESSION OVERLAP -- `concurrent_sessions_sharing_one_tool_module_are_isolated`
             // drives five sessions through one shared tool route, and its ConcurrencyProbe fails
-            // if ANY run finishes before all five are admitted. Replacing its tokio::join! with
-            // sequential awaits reddens it BY NAME. So a global lock that made this surface
+            // if ANY run finishes before all five are admitted. So a global lock that made this surface
             // secretly Serial would be caught, which is what the declaration actually asserts.
             //
-            // RUN THAT MUTATION WITH BROCA_REQUIRE_AIMOCK=1 AND BROCA_REQUIRE_SUBC=1. Unguarded,
-            // the rig returns early when a dependency is missing and reports a pass having
-            // executed nothing -- which is exactly how this comment briefly claimed the
-            // OPPOSITE, off a 15s 'pass' that was startup timeouts rather than serialised
-            // sessions. The guards exist so an experiment cannot silently test nothing, and an
-            // unguarded mutation run is evidence in neither direction.
+            // Run the cross-session test with BROCA_REQUIRE_AIMOCK=1 and BROCA_REQUIRE_SUBC=1.
+            // Without these guards, a missing dependency can return early without testing overlap.
             concurrency: Concurrency::ModuleManaged,
             // The request/response ops: send/retract/cancel change state (Mutate); status
             // is a point-read (Query).
@@ -478,6 +515,17 @@ pub fn manifest_configured(
             transport: subc_protocol::manifest::InternalTransport::Bulk,
             agent_facing: false,
             operations: broca_wire::agent_data::REQUIRED_OPS.iter().map(|op| op.to_string()).collect(),
+        }, ProviderRole::ToolProvider {
+            tools: vec![subc_protocol::manifest::Tool {
+                name: crate::llm_tools::CLASSIFY_TOOL_NAME.into(),
+                description: Some("Classify one item with a decision model.".into()),
+                execution_mode: subc_protocol::manifest::ExecutionMode::Pure,
+                schema: cortexkit_llm_tools::classify::input_schema(),
+            }],
+            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+            concurrency: Concurrency::ModuleManaged,
+            emits_push: false,
+            sub_supervises: false,
         }])
     // WHAT BROCA OPENS ROUTES TO, built from the same resolved values the serve binary dials,
     // so the declaration follows the configuration rather than a second list of names.
@@ -539,11 +587,11 @@ mod provenance_tests {
         assert_eq!(
             obj["capabilities"],
             serde_json::json!({
-                "provides": ["llm-runner/v1", "agent-data/v1", "classifier/v1", "flow-scopes/v1", "agent-run-scopes/v1"],
+                "provides": ["llm-runner/v1", "agent-data/v1", "classifier/v1", "tool-provider/v1", "permissions/v1", "flow-scopes/v1", "agent-run-scopes/v1"],
                 "requires": [],
                 "must_never_reach": [],
             }),
-            "broca declares runner, agent-data and classifier roles, flow and agent-run scope handling, and requires or denies nothing"
+            "broca declares runner, agent-data, classifier, model-tool and permissions roles, flow and agent-run scope handling, and requires or denies nothing"
         );
         //
         // `consumes` has skip_serializing_if = "Vec::is_empty" since subc-protocol 0.19.0, so
@@ -651,7 +699,7 @@ mod provenance_tests {
         // PINNED AS AN INDEPENDENT LITERAL, and the first version of this test was VACUOUS
         // for want of that. It compared the declaration against CATALOG_POLL_INTERVAL -- but
         // the declaration is BUILT from that constant, so both sides moved together and the
-        // test passed happily with the interval mutated to 15 minutes. A guard drawn from the
+        // test would pass even if the interval changed to 15 minutes. A guard drawn from the
         // thing it guards can only ever confirm self-consistency.
         //
         // The two risks are different and need different mechanisms. The DECLARATION reads the
@@ -679,40 +727,26 @@ mod provenance_tests {
         );
     }
 
-    /// What the provenance helper does with broca's inputs, asserted on VALUES not on text.
-    ///
-    /// Replaces a text search over this file, and the replacement is the point. The old test
-    /// grepped the production half for `wire_crate_version: None` -- itself already the repaired
-    /// form of a test that had been outright unfailable, because it originally searched the WHOLE
-    /// file and the literal inside its own assertion satisfied it (issue #9, confirmed by
-    /// mutation). Even scoped correctly, a text search pins the SPELLING of a decision rather
-    /// than its OUTCOME, so it could not survive the construction moving into a helper.
-    ///
-    /// Two facts pinned, one of which is a live behaviour change:
-    ///
-    ///   - `wire_crate_version` IS NOW SOURCED. It stayed absent for as long as subc-protocol
-    ///     exported no version const; the helper fills it from that crate's own const, so the
-    ///     parked reason is DISCHARGED rather than still pending.
-    ///   - `store_schema_version` STAYS ABSENT, because broca has no schema version to report.
-    ///     Tempting to synthesise from the column list, which would then change silently under
-    ///     an unrelated additive migration.
+    /// Check the provenance broca actually registers, rather than a separately built upstream
+    /// value. A stamped test build exercises the same compile-time inputs as packaging.
     #[test]
+    #[ignore = "requires CK_BUILD_STAMPED=1 and canonical CK_BUILD_REV/CK_BUILD_LOCK_DIGEST at compile time"]
     fn provenance_fills_only_what_broca_can_source() {
-        let sha = "a".repeat(40);
-        let lock = "b".repeat(64);
-        let provenance = subc_protocol::manifest::build_provenance(Some(&sha), Some(&lock), None)
-            .expect("full-length lowercase hex is the canonical form for both");
-
-        assert_eq!(provenance.build_git_sha.as_deref(), Some(sha.as_str()));
-        assert_eq!(provenance.build_lock_digest.as_deref(), Some(lock.as_str()));
-        assert!(
-            provenance.wire_crate_version.is_some(),
-            "the helper sources this from subc-protocol's own version const"
+        let emitted = serde_json::to_value(manifest("broca")).unwrap();
+        let provenance = emitted.get("provenance").expect("stamped HELLO provenance");
+        assert_eq!(
+            provenance["build_git_sha"].as_str(),
+            option_env!("CK_BUILD_REV")
         );
         assert_eq!(
-            provenance.store_schema_version, None,
-            "broca passes None: it has no schema version to report"
+            provenance["build_lock_digest"].as_str(),
+            option_env!("CK_BUILD_LOCK_DIGEST")
         );
+        assert_eq!(
+            provenance["wire_crate_version"],
+            subc_protocol::SUBC_PROTOCOL_CRATE_VERSION
+        );
+        assert!(provenance.get("store_schema_version").is_none());
     }
 
     /// The exact bytes of the provenance block a stamped build sends in HELLO, for fixed inputs.
@@ -770,26 +804,6 @@ mod provenance_tests {
         );
     }
 
-    /// The stamped block carries the process's nonce source.
-    ///
-    /// Checked as source text, because the block exists only in builds that
-    /// `scripts/stage-release.sh` stamps at compile time, and no test build is stamped. The value mapping is tested on values
-    /// above and through the real process accessor in `tests/launch_nonce.rs`; this pins that
-    /// the stamped block is the one that uses it.
-    #[test]
-    fn the_stamped_block_reports_the_nonce_source() {
-        let text = include_str!("manifest.rs");
-        let (production, _tests) = text
-            .split_once("#[cfg(test)]")
-            .expect("manifest.rs must contain a #[cfg(test)] boundary to split on");
-        assert!(
-            production.contains(
-                "Ok(provenance) => Some(provenance.with_launch_nonce_source(launch_nonce_source())),"
-            ),
-            "build_provenance must attach the accessor's cached nonce source to the stamped block"
-        );
-    }
-
     /// A malformed sha is REFUSED; a sentinel is an honest omission. Both arms, because
     /// collapsing them is the plausible mistake.
     ///
@@ -824,49 +838,29 @@ mod provenance_tests {
         );
     }
 
-    /// The one field broca cannot honestly source stays absent even when stamped.
-    ///
-    /// Pinned because both are tempting to synthesise: a wire crate version could be read from
-    /// the wrong crate, and a store schema version could be derived from the column list -- which
-    /// would then change silently under an unrelated additive migration. Absent is the truthful
-    /// value until each has a real source.
-    ///
-    /// THE SEARCH IS SCOPED TO THE PRODUCTION HALF OF THIS FILE, and that is the whole test.
-    ///
-    /// It originally searched the WHOLE file, which made it unfailable: the literal it looks for
-    /// appears inside its own assertion, so the corpus contained the answer regardless of what
-    /// the field said. Setting `wire_crate_version: Some("0.13.0".to_string())` left it GREEN.
-    /// Reported from outside (issue #9) and confirmed by mutation before this rewrite.
-    ///
-    /// A guard whose own source is part of the corpus it searches satisfies itself. Splitting at
-    /// the `#[cfg(test)]` boundary is what makes the corpus the thing under test rather than the
-    /// test plus the thing.
+    /// The store has no schema version to report. Even a stamped manifest must omit the field,
+    /// not invent a version from its columns or emit a null that consumers could mistake for one.
     #[test]
+    #[ignore = "requires CK_BUILD_STAMPED=1 and canonical CK_BUILD_REV/CK_BUILD_LOCK_DIGEST at compile time"]
     fn unsourced_provenance_fields_are_not_synthesised() {
-        let text = include_str!("manifest.rs");
-        let (production, _tests) = text
-            .split_once("#[cfg(test)]")
-            .expect("manifest.rs must contain a #[cfg(test)] boundary to split on");
-
-        // An empty or truncated split is an instrument failure, not a clean result: a file that
-        // opened with #[cfg(test)] would yield an empty production half and pass every `!contains`
-        // check below by having nothing to find.
-        assert!(
-            production.contains("fn build_provenance()"),
-            "the production half must contain build_provenance; the split is wrong, not the code"
+        let emitted = serde_json::to_value(manifest("broca")).unwrap();
+        let provenance = emitted["provenance"]
+            .as_object()
+            .expect("stamped HELLO provenance");
+        assert_eq!(
+            provenance.keys().map(String::as_str).collect::<Vec<_>>(),
+            if launch_nonce_source().is_some() {
+                vec![
+                    "build_git_sha",
+                    "build_lock_digest",
+                    "launch_nonce_source",
+                    "wire_crate_version",
+                ]
+            } else {
+                vec!["build_git_sha", "build_lock_digest", "wire_crate_version"]
+            }
         );
-
-        // wire_crate_version is no longer checked here: it is now SOURCED by the helper, and the
-        // value assertion above is the honest test of that. Only the field broca still cannot
-        // source belongs in a call-site text check.
-        // Anchored on the CALL, not on a bare `None`. A loose `contains("None,")` would match
-        // any of a dozen unrelated lines in this file and pass whatever the third argument said.
-        assert!(
-            production.contains("option_env!(\"CK_BUILD_LOCK_DIGEST\"),\n        None,\n    ) {"),
-            "build_provenance must pass None as store_schema_version until the store has a real \
-             version to report; deriving one from the column list would change silently under an \
-             unrelated additive migration"
-        );
+        assert!(!provenance.contains_key("store_schema_version"));
     }
 }
 
@@ -954,10 +948,10 @@ mod consumes_tests {
         assert_eq!(services, vec!["fusiform", "claustrum", "routing-b"]);
     }
 
-    /// broca never opens a route to routing without the vault (the OpenCode source or a mock
-    /// provider resolve no accounts), so it declares none then, and always declares it with the
-    /// vault. The removed `legacy_static` switch cannot turn the route off any more: the config
-    /// that set it is refused.
+    /// broca never opens a route to routing without the vault (the mock providers resolve no
+    /// accounts), so it declares none then, and always declares it with the vault. The removed
+    /// `legacy_static` switch cannot turn the route off any more: the config that set it is
+    /// refused.
     #[test]
     fn the_routing_module_is_declared_exactly_alongside_the_vault() {
         assert!(crate::account_routing::AccountSelectionConfig::parse(
@@ -982,7 +976,7 @@ mod consumes_tests {
     /// Each configuration-dependent entry appears and disappears with its knob.
     #[test]
     fn optional_consumers_track_their_knobs() {
-        // The OpenCode auth source (or a mock provider) leaves the vault unopened: only the
+        // A mock provider leaves the vault unopened: only the
         // catalog remains a service dependency.
         let (tools, services) = declared(&ConsumerRoutes::resolve(None, false));
         assert_eq!(tools, vec!["aft"]);

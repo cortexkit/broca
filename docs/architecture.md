@@ -115,9 +115,12 @@ supervisor can respawn it.
   projections, not competing authorities.
 - **At-most-once side effects.** Persist tool intent before dispatch. An intent
   without a result is indeterminate on resume, not permission to resend.
-- **Freeze when accepting a run.** Inputs that shape rendered bytes are frozen into
-  `RunStarted`. Resume uses the frozen values; incompatible renderer or catalog
-  drift is refused rather than silently changing an admitted request.
+- **Freeze at admission.** Inputs that shape rendered bytes are frozen into
+  `RunStarted`. Resume renders from that complete recorded configuration, not a new
+  catalog resolution, so changed or withdrawn catalog facts do not refuse an admitted
+  run. The current family's independent compatibility table must still reproduce the
+  recorded renderer version; unsupported versions or unverifiable bundles refuse
+  continuation rather than silently rendering today's bytes as an older version.
 - **Canonical storage, aliases at rendering.** Store caller tool IDs and names;
   provider-specific aliases exist only in the rendered request.
 - **Absent is not zero.** Unknown measurements remain absent.

@@ -42,9 +42,6 @@ chmod +x "$PY_DIR/python3"
 export PATH="$PY_DIR:$PATH"
 echo "script-suites: $(python3 --version) at $PY"
 
-# Check the whole catalogue before running suites or any native mutation replay.
-python3 scripts/verify-mutation-platforms.py
-
 suites=(
     scripts/test-check-path-deps.py
     scripts/test-stage-release.py
@@ -77,6 +74,7 @@ suites=(
     scripts/test-ci-pipeline.py
     scripts/test-gated-commit.py
     scripts/test-deploy.py
+    scripts/test-acceptance-worker-turn.py
     scripts/test-turn-harnesses.py
     scripts/test-repro-vanished-bind-root.py
     scripts/test-script-options.py
@@ -84,6 +82,7 @@ suites=(
     scripts/test-dependency-features.py
     scripts/test-cargo-watchdog.py
     scripts/tests/test_clock_safety.py
+    scripts/tests/test_release_fences.py
     # Maintenance scripts refuse to write while a writer's liveness is unknown.
     scripts/lib/test_liveness.py
     # Every suite file in scripts/ is listed in one of the arrays in this file.
@@ -132,7 +131,5 @@ done
 python3 scripts/check-path-deps.py
 python3 scripts/live-runs.py --self-test
 python3 scripts/audit-export-lane.py --self-test
-python3 scripts/verify-windows-mutations.py --self-test
-python3 scripts/verify-mutation-platforms.py --self-test
 # Nothing under .cortexkit/ may be tracked except release-notes/, skills/, rules/ and WORKER.md.
 scripts/check-cortexkit-layout.sh

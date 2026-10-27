@@ -113,6 +113,7 @@ fn queued_title(request: &RunRequest, index: usize, bytes: usize) -> [WalRecord;
     let submission_id = broca_protocol::SubmissionId(format!("noise-{index}"));
     [
         WalRecord::Queued {
+            written_at_ms: None,
             retention: None,
             ts_ms: None,
             keep_warm: None,
@@ -439,6 +440,7 @@ fn scripts() -> Vec<Vec<NormalizedEvent>> {
 
 fn request(dir: &std::path::Path) -> RunRequest {
     RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -1951,4 +1953,1193 @@ async fn paused_budgeted_run_projects_once_at_pause() {
         .any(|record| matches!(record.record, broca_wal::WalRecord::RunPaused { .. })));
 
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The provider of the store's frozen render config.
+struct HistoryProvider {
+    /// Episodes whose render inputs the run loop handed to a provider call.
+    rendered: Mutex<Vec<Arc<broca_protocol::request::RenderHistory>>>,
+}
+
+#[async_trait]
+impl Provider for HistoryProvider {
+    fn render_config_blob(&self) -> serde_json::Value {
+        json!({ "render_config": "history" })
+    }
+    fn renderer_version(&self) -> u32 {
+        1
+    }
+    async fn step(
+        &self,
+        _step_id: StepId,
+        opts: &broca_protocol::CallOptions,
+    ) -> mpsc::Receiver<NormalizedEvent> {
+        self.rendered
+            .lock()
+            .unwrap()
+            .push(opts.render_episodes.clone());
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(NormalizedEvent::Control(
+                    ProviderControl::AssistantMessage {
+                        message: AssistantMessage {
+                            message_id: MessageId("continued".into()),
+                            content: vec![ContentBlock::Text {
+                                text: "continued".into(),
+                            }],
+                        },
+                    },
+                ))
+                .await;
+            let _ = tx
+                .send(NormalizedEvent::Control(ProviderControl::Finished {
+                    usage: Usage::default(),
+                    finish_reason: FinishReason::Stop,
+                    retries_used: 0,
+                }))
+                .await;
+        });
+        rx
+    }
+}
+
+/// Drive one run over `dir` and return the render history its first provider call received.
+async fn run_history(
+    dir: &std::path::Path,
+    store: Arc<SqliteStore>,
+) -> Arc<broca_protocol::request::RenderHistory> {
+    let provider = HistoryProvider {
+        rendered: Mutex::new(Vec::new()),
+    };
+    let lease = FileLeaseStore::new(dir.join("lease"));
+    let wal = FileWalStore::new(dir.join("wal"));
+    let (tx, mut rx) = mpsc::channel(64);
+    let collector = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let summary = run_loop_with_store(
+        request(dir),
+        &provider,
+        &StubToolPlane::new(),
+        &lease,
+        &AllowAll,
+        &wal,
+        Some(store as Arc<dyn broca_core::SessionStore>),
+        &tx,
+    )
+    .await;
+    drop(tx);
+    collector.await.unwrap();
+    let rendered = provider.rendered.lock().unwrap();
+    assert!(
+        !rendered.is_empty(),
+        "the run made no provider call: {summary:?}"
+    );
+    rendered[0].clone()
+}
+
+#[tokio::test]
+async fn projected_episode_render_inputs_equal_a_full_wal_replay() {
+    let base = broca_test_support::scratch_root()
+        .join(format!("broca-episode-projection-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let dir = base.join("session");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let store = Arc::new(SqliteStore::open(dir.join("store.db")).unwrap());
+    let rendered = run_history(&dir, store.clone()).await;
+    let frames = wal_frames(&dir);
+    let history = replay(
+        &frames
+            .iter()
+            .map(|frame| frame.record.clone())
+            .collect::<Vec<_>>(),
+    )
+    .expect("the run's history replays");
+    let expected: Vec<broca_protocol::request::EpisodeRenderInput> =
+        broca_core::replay::projected_episode_metadata(&history)
+            .into_iter()
+            .map(|episode| broca_protocol::request::EpisodeRenderInput {
+                prompt_start: usize::try_from(episode.start().expect("a start")).unwrap(),
+                first_user: episode
+                    .first_user()
+                    .expect("a known first user")
+                    .map(|value| value as usize),
+                frozen_config: episode.render_config().cloned().unwrap_or_default(),
+            })
+            .collect();
+    assert_eq!(expected.len(), 1, "the fixture opened one episode");
+    assert_eq!(
+        rendered.episodes, expected,
+        "the run's episode inputs equal what a full WAL replay derives"
+    );
+
+    // The store's own projection holds the same values, so a later resume can read them.
+    let session = session_of(&dir);
+    let projected = MaterializedStore::read_episode_projection(store.as_ref(), &session)
+        .expect("read episode projection")
+        .expect("the live store keeps its episodes");
+    assert_eq!(projected.len(), 1);
+    assert_eq!(projected[0].start(), Some(expected[0].prompt_start as u64));
+    assert_eq!(
+        projected[0].first_user(),
+        Some(expected[0].first_user.map(|value| value as u64))
+    );
+    assert_eq!(
+        projected[0].render_config(),
+        Some(&expected[0].frozen_config)
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+fn session_of(dir: &std::path::Path) -> BindIdentity {
+    request(dir).session
+}
+
+// ---------------------------------------------------------------------------------------------
+// Resume under an applied compaction view: only the view's held set is read back.
+// ---------------------------------------------------------------------------------------------
+
+use broca_core::compaction_provider::{
+    lineage::MessageRef,
+    notice::ViewReady,
+    setup::{SetupAnswer, SetupRequest},
+    view::{CompactionView, ViewGetAnswer, ViewGetRequest, ViewRange},
+};
+
+/// What a held-view session's provider recorded: each request's canonical bytes, its message
+/// ordinals and its episode render inputs, by run id and step.
+type HeldSent = Arc<Mutex<std::collections::BTreeMap<(String, u64), Vec<u8>>>>;
+
+/// A provider whose frozen render config asks for ChatGPT effort updates, at a per-episode
+/// effort, and that records every request it is sent.
+struct HeldModel {
+    effort: &'static str,
+    effort_updates: bool,
+    scripts: HashMap<String, Vec<Vec<NormalizedEvent>>>,
+    sent: HeldSent,
+    /// Called as each request is sent, before it is recorded.
+    probe: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[async_trait]
+impl Provider for HeldModel {
+    async fn step(
+        &self,
+        step_id: StepId,
+        opts: &broca_protocol::CallOptions,
+    ) -> mpsc::Receiver<NormalizedEvent> {
+        if let Some(probe) = &self.probe {
+            probe();
+        }
+        let run = opts
+            .step_context
+            .as_ref()
+            .map(|context| context.run_id.clone())
+            .unwrap_or_default();
+        let mut bytes = broca_core::render::canonical_request_bytes(opts);
+        // Ordinals and episode render inputs are not canonical content, but a renderer reads
+        // them (ChatGPT effort placement, structured output), so they must match too.
+        bytes.extend(
+            format!(
+                "\n{:?}\n{:?}",
+                opts.prompt.iter().map(|m| m.ordinal).collect::<Vec<_>>(),
+                opts.render_episodes
+            )
+            .into_bytes(),
+        );
+        self.sent
+            .lock()
+            .unwrap()
+            .insert((run.clone(), step_id.0), bytes);
+        let script = self
+            .scripts
+            .get(&run)
+            .and_then(|steps| steps.get((step_id.0 - 1) as usize))
+            .cloned()
+            .unwrap_or_default();
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            for event in script {
+                let _ = tx.send(event).await;
+            }
+        });
+        rx
+    }
+
+    fn render_config_blob(&self) -> serde_json::Value {
+        json!({"chatgpt_effort_updates": self.effort_updates, "effort": self.effort})
+    }
+}
+
+fn read_turn(mid: &str, id: &str, path: &str) -> Vec<NormalizedEvent> {
+    let mut events = tool_turn(mid, id, path);
+    if let NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) = &mut events[0]
+    {
+        if let ContentBlock::ToolCall(call) = &mut message.content[0] {
+            call.tool_name = "read".into();
+        }
+    }
+    events
+}
+
+/// The provider's views: version 2 replaces `[1, 5)` (the system message and the first read turn) and keeps ordinal 0 once five model steps
+/// are durable; version 3, once eight are, keeps only the second episode and replaces the
+/// rest through the newest message, so the active episode holds nothing.
+struct HeldViews {
+    wal: FileWalStore,
+    session: BindIdentity,
+    lineage: Mutex<String>,
+}
+
+impl HeldViews {
+    fn replay(&self) -> broca_core::ReplayState {
+        let records: Vec<WalRecord> = self
+            .wal
+            .read_records(&self.session)
+            .unwrap()
+            .into_iter()
+            .map(|frame| frame.record)
+            .collect();
+        replay(&records).unwrap()
+    }
+
+    fn version(&self) -> Option<u64> {
+        let records = self.wal.read_records(&self.session).unwrap();
+        let steps = records
+            .iter()
+            .filter(|frame| matches!(frame.record, WalRecord::ModelStepFinished { .. }))
+            .count();
+        match steps {
+            0..=4 => None,
+            5..=7 => Some(2),
+            _ => Some(3),
+        }
+    }
+
+    fn candidate(&self, session: &str, version: u64) -> CompactionView {
+        let summary = |text: &str| {
+            serde_json::to_string(&vec![Message::new(
+                Role::User,
+                vec![ContentBlock::Text { text: text.into() }],
+            )])
+            .unwrap()
+        };
+        let lineage = self.lineage.lock().unwrap().clone();
+        if version == 2 {
+            return CompactionView::new(
+                session,
+                2,
+                lineage,
+                MessageRef {
+                    ordinal: 4,
+                    mid: "m4".into(),
+                },
+                vec![
+                    ViewRange::keep(0, 1),
+                    ViewRange::replace(1, 5, summary("early")),
+                ],
+            );
+        }
+        let state = self.replay();
+        let starts: Vec<u64> = state
+            .render_episodes
+            .unwrap()
+            .iter()
+            .map(|episode| episode.prompt_start as u64)
+            .collect();
+        let covered = state.extent - 1;
+        CompactionView::new(
+            session,
+            3,
+            lineage,
+            MessageRef {
+                ordinal: covered,
+                mid: format!("m{covered}"),
+            },
+            vec![
+                ViewRange::keep(0, 1),
+                ViewRange::replace(1, starts[1], summary("first episode")),
+                ViewRange::keep(starts[1], starts[2]),
+                ViewRange::replace(starts[2], covered + 1, summary("third episode")),
+            ],
+        )
+    }
+}
+
+impl broca_core::compaction::CompactionViews for HeldViews {
+    fn newest_ready(&self, session: &str, lineage: &str, after: Option<u64>) -> Option<ViewReady> {
+        *self.lineage.lock().unwrap() = lineage.into();
+        let version = self.version()?;
+        (after.is_none_or(|after| version > after))
+            .then(|| ViewReady::for_view(&self.candidate(session, version)))
+    }
+}
+
+#[async_trait]
+impl broca_core::compaction::CompactionPlane for HeldViews {
+    async fn setup(
+        &self,
+        _: &str,
+        _: &BindIdentity,
+        request: SetupRequest,
+    ) -> Result<SetupAnswer, broca_core::compaction::CompactionUnavailable> {
+        if let Some(lineage) = &request.lineage_id {
+            *self.lineage.lock().unwrap() = lineage.clone();
+        }
+        Ok(serde_json::from_value(json!({
+            "answer": "ready",
+            "request_id": request.request_id,
+            "initial": {"compaction_id": "c", "version": 1, "range": {"from": 0, "to": 0},
+                        "replacement": []}
+        }))
+        .unwrap())
+    }
+
+    async fn view_get(
+        &self,
+        _: &str,
+        _: &BindIdentity,
+        request: ViewGetRequest,
+    ) -> Result<ViewGetAnswer, broca_core::compaction::CompactionUnavailable> {
+        Ok(ViewGetAnswer::view(
+            self.candidate(&request.session_ref, request.view_version),
+        ))
+    }
+}
+
+fn held_manifest() -> Arc<broca_wal::PlanManifest> {
+    Arc::new(broca_wal::PlanManifest {
+        plan: broca_wal::OpaqueJson::from_json_text(
+            json!({"compaction_item":{"provider":"provider","preset":"head","params":{}},
+                   "composition":{},"render_tags":true})
+            .to_string(),
+        )
+        .unwrap(),
+        plan_identity: "id".into(),
+        composition_digest: "digest".into(),
+        tools: Arc::new(vec![]),
+        system_text: String::new(),
+        system_digest: String::new(),
+        join_version: 1,
+        role_versions: Default::default(),
+        fetches: vec![],
+        declarations: vec![],
+    })
+}
+
+/// One episode of the held-view session.
+struct HeldEpisodeSpec {
+    run_id: &'static str,
+    effort: &'static str,
+    effort_updates: bool,
+    input: Vec<Message>,
+    budget: Option<BudgetConfig>,
+    steps: Vec<Vec<NormalizedEvent>>,
+}
+
+fn text_message(role: Role, text: &str) -> Message {
+    Message::new(role, vec![ContentBlock::Text { text: text.into() }])
+}
+
+/// Three episodes. The first repeats one read three times, so its guidance fires after the
+/// first view's cut. The second is where view 2 applies. The third has a budget nudge firing
+/// after the cut, and view 3 covers its newest message before it repeats its read once more.
+/// `padding` adds that many already-answered exchanges to the first episode's input: discarded
+/// history that only makes the session longer.
+fn held_episodes(padding: usize, effort_updates: bool) -> Vec<HeldEpisodeSpec> {
+    // The system message sits inside the first view's replaced range: a resume must still hold
+    // it, since every request renders it.
+    let mut first_input = vec![
+        text_message(Role::User, "some context"),
+        text_message(Role::System, "be brief"),
+    ];
+    for index in 0..padding {
+        first_input.push(text_message(Role::User, &format!("old question {index}")));
+        first_input.push(text_message(
+            Role::Assistant,
+            &format!("old answer {index}"),
+        ));
+    }
+    first_input.push(text_message(Role::User, "read x until it changes"));
+    vec![
+        HeldEpisodeSpec {
+            run_id: "e1",
+            effort: "low",
+            effort_updates,
+            input: first_input,
+            budget: None,
+            steps: vec![
+                read_turn("a1", "x1", "x"),
+                read_turn("a2", "x2", "x"),
+                read_turn("a3", "x3", "x"),
+                text_turn("a4", "x never changes"),
+            ],
+        },
+        HeldEpisodeSpec {
+            run_id: "e2",
+            effort: "high",
+            effort_updates,
+            input: vec![text_message(Role::User, "now read y")],
+            budget: None,
+            steps: vec![read_turn("b1", "y1", "y"), text_turn("b2", "y read")],
+        },
+        HeldEpisodeSpec {
+            run_id: "e3",
+            effort: "high",
+            effort_updates,
+            input: vec![text_message(Role::User, "read z again and again")],
+            budget: Some(
+                serde_json::from_value(
+                    json!({"nudges":[{"at_tool_calls":2,"text":"budget reminder"}]}),
+                )
+                .unwrap(),
+            ),
+            steps: vec![
+                read_turn("c1", "z1", "z"),
+                read_turn("c2", "z2", "z"),
+                read_turn("c3", "z3", "z"),
+                text_turn("c4", "z read"),
+            ],
+        },
+    ]
+}
+
+fn held_request(dir: &std::path::Path, episode: &HeldEpisodeSpec) -> RunRequest {
+    let mut request = request(dir);
+    request.run_id = RunId(episode.run_id.into());
+    request.input = episode.input.clone();
+    request.tools = vec![Tool {
+        name: "read".into(),
+        description: "read".into(),
+        input_schema: json!({"type": "object"}),
+        module: None,
+        execution_mode: ExecutionMode::Parallel,
+        reply: None,
+    }];
+    request.policy_allowed = ["read".to_string()].into_iter().collect();
+    request.stop_when = vec![StopCondition::StepCount { n: 20 }];
+    request.budget = episode.budget.clone();
+    request
+}
+
+fn held_control(dir: &std::path::Path) -> broca_core::RunControl {
+    let views = Arc::new(HeldViews {
+        wal: FileWalStore::new(dir.join("wal")),
+        session: request(dir).session,
+        lineage: Mutex::new(String::new()),
+    });
+    broca_core::RunControl {
+        manifest: Some(held_manifest()),
+        compaction_plane: Some(views.clone()),
+        compaction_views: Some(views),
+        ..Default::default()
+    }
+}
+
+fn held_plane() -> StubToolPlane {
+    StubToolPlane::new().with_tool("read", |_| {
+        StubReply::Output(ToolOutput::Text {
+            text: "same".into(),
+        })
+    })
+}
+
+/// Run `episodes` in order on the session in `dir`, the first one as a fresh run or a resume
+/// and every later one as an appended episode, recording their requests in `sent`.
+async fn run_held_episodes(
+    dir: &std::path::Path,
+    episodes: &[HeldEpisodeSpec],
+    store: Option<Arc<dyn broca_core::SessionStore>>,
+    sent: &HeldSent,
+) {
+    for episode in episodes {
+        let model = HeldModel {
+            effort: episode.effort,
+            effort_updates: episode.effort_updates,
+            scripts: [(episode.run_id.to_string(), episode.steps.clone())]
+                .into_iter()
+                .collect(),
+            sent: sent.clone(),
+            probe: None,
+        };
+        let (tx, mut rx) = mpsc::channel(512);
+        let collector = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        broca_core::run_loop_with_control(
+            held_request(dir, episode),
+            &model,
+            &held_plane(),
+            &FileLeaseStore::new(dir.join("lease")),
+            &AllowAll,
+            &FileWalStore::new(dir.join("wal")),
+            store.clone(),
+            held_control(dir),
+            &tx,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("episode {} failed: {error}", episode.run_id));
+        drop(tx);
+        collector.await.unwrap();
+    }
+}
+
+/// Counts what a resume reads from the store, forwarding everything to SQLite.
+#[derive(Default)]
+struct StoreReads {
+    held_reads: AtomicUsize,
+    held_rows: AtomicUsize,
+    page_rows: AtomicUsize,
+    whole_prefix_reads: AtomicUsize,
+}
+
+struct CountedStore {
+    inner: Arc<SqliteStore>,
+    reads: Arc<StoreReads>,
+}
+
+impl MaterializedStore for CountedStore {
+    fn read_retained_head(
+        &self,
+        session: &BindIdentity,
+        lineage_id: &str,
+    ) -> Result<Option<broca_core::head::RetainedHeadCheckpoint>, String> {
+        MaterializedStore::read_retained_head(self.inner.as_ref(), session, lineage_id)
+    }
+    fn checkpoint_retained_head(
+        &self,
+        session: &BindIdentity,
+        checkpoint: &broca_core::head::RetainedHeadCheckpoint,
+    ) -> Result<(), String> {
+        MaterializedStore::checkpoint_retained_head(self.inner.as_ref(), session, checkpoint)
+    }
+    fn tag_location(
+        &self,
+        session: &BindIdentity,
+        tag: u64,
+    ) -> Result<Option<broca_core::TagLocation>, String> {
+        MaterializedStore::tag_location(self.inner.as_ref(), session, tag)
+    }
+    fn materialized_message_count(&self, session: &BindIdentity) -> Result<Option<u64>, String> {
+        MaterializedStore::materialized_message_count(self.inner.as_ref(), session)
+    }
+    fn read_page_with_attribution(
+        &self,
+        session: &BindIdentity,
+        from: Option<u64>,
+        limit: u64,
+        view: broca_core::ReadView,
+    ) -> Result<StorePageSnapshot, broca_core::StorePageReadError> {
+        let page = MaterializedStore::read_page_with_attribution(
+            self.inner.as_ref(),
+            session,
+            from,
+            limit,
+            view,
+        )?;
+        self.reads
+            .page_rows
+            .fetch_add(page.rows.len(), Ordering::SeqCst);
+        Ok(page)
+    }
+    fn read_page_with_watermark(
+        &self,
+        session: &BindIdentity,
+        from: Option<u64>,
+        limit: u64,
+        view: broca_core::ReadView,
+    ) -> Result<StorePageSnapshot, String> {
+        let page = MaterializedStore::read_page_with_watermark(
+            self.inner.as_ref(),
+            session,
+            from,
+            limit,
+            view,
+        )?;
+        self.reads
+            .page_rows
+            .fetch_add(page.rows.len(), Ordering::SeqCst);
+        Ok(page)
+    }
+    fn read_prefix_with_watermark(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<broca_core::StorePrefix, String> {
+        self.reads.whole_prefix_reads.fetch_add(1, Ordering::SeqCst);
+        MaterializedStore::read_prefix_with_watermark(self.inner.as_ref(), session)
+    }
+    fn read_held_prefix(
+        &self,
+        session: &BindIdentity,
+        held: &broca_core::HeldRowsRequest,
+    ) -> Result<Option<broca_core::HeldPrefix>, String> {
+        let prefix = MaterializedStore::read_held_prefix(self.inner.as_ref(), session, held)?;
+        if let Some(prefix) = &prefix {
+            self.reads.held_reads.fetch_add(1, Ordering::SeqCst);
+            self.reads
+                .held_rows
+                .fetch_add(prefix.rows.len(), Ordering::SeqCst);
+        }
+        Ok(prefix)
+    }
+    fn read_episode_projection(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<Vec<broca_core::context::EpisodeRenderProjection>>, String> {
+        MaterializedStore::read_episode_projection(self.inner.as_ref(), session)
+    }
+    fn read_admission_snapshot(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<broca_core::AdmissionStoreSnapshot>, String> {
+        MaterializedStore::read_admission_snapshot(self.inner.as_ref(), session)
+    }
+    fn reproject_if_lineage_mismatch(
+        &self,
+        session: &BindIdentity,
+        stale_lineage_id: Option<&str>,
+        complete_wal: &broca_wal::WalRangeRead,
+    ) -> Result<(), String> {
+        MaterializedStore::reproject_if_lineage_mismatch(
+            self.inner.as_ref(),
+            session,
+            stale_lineage_id,
+            complete_wal,
+        )
+    }
+}
+
+impl Persister for CountedStore {
+    fn projection_seed(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<broca_core::ProjectionSeed>, String> {
+        Persister::projection_seed(self.inner.as_ref(), session)
+    }
+    fn project(
+        &self,
+        session: &BindIdentity,
+        records: &[broca_wal::FramedRecord],
+    ) -> Result<u64, String> {
+        Persister::project(self.inner.as_ref(), session, records)
+    }
+    fn project_retention_metadata(
+        &self,
+        session: &BindIdentity,
+        metadata: &broca_core::projection_plan::RetainedWithdrawalProjection,
+    ) -> Result<(), String> {
+        Persister::project_retention_metadata(self.inner.as_ref(), session, metadata)
+    }
+    fn project_range(
+        &self,
+        session: &BindIdentity,
+        range: &broca_wal::WalRangeRead,
+    ) -> Result<u64, String> {
+        Persister::project_range(self.inner.as_ref(), session, range)
+    }
+    fn persist_wal_anchor(
+        &self,
+        session: &BindIdentity,
+        anchor: Option<&broca_wal::WalByteAnchor>,
+    ) -> Result<(), String> {
+        Persister::persist_wal_anchor(self.inner.as_ref(), session, anchor)
+    }
+}
+
+/// Where two requests first differ, with some context from each.
+fn first_difference(actual: &[u8], expected: &[u8]) -> String {
+    let at = actual
+        .iter()
+        .zip(expected)
+        .position(|(a, b)| a != b)
+        .unwrap_or(actual.len().min(expected.len()));
+    let window = |bytes: &[u8]| {
+        String::from_utf8_lossy(&bytes[at.saturating_sub(200)..(at + 300).min(bytes.len())])
+            .into_owned()
+    };
+    format!(
+        "at byte {at}:\n  resumed: {}\n  clean:   {}",
+        window(actual),
+        window(expected)
+    )
+}
+
+/// Project the durable records of the session in `dir` into `store`, with the WAL's identity.
+fn project_durable(dir: &std::path::Path, store: &SqliteStore) {
+    let session = request(dir).session;
+    let range = FileWalStore::new(dir.join("wal"))
+        .read_records_range(&session, 0, None, None)
+        .unwrap();
+    Persister::project_range(store, &session, &range).expect("project the durable records");
+}
+
+/// The episode a WAL cut is in and whether it already ended: the run that resumes it, or the
+/// first one still to run.
+fn resume_from(frames: &[broca_wal::FramedRecord], episodes: &[HeldEpisodeSpec]) -> usize {
+    let records: Vec<WalRecord> = frames.iter().map(|frame| frame.record.clone()).collect();
+    let state = replay(&records).unwrap();
+    state.run_id.map_or(0, |run| {
+        episodes
+            .iter()
+            .position(|episode| episode.run_id == run.0)
+            .unwrap()
+    })
+}
+
+/// A crash at every durable record of a session with applied views, resumed from the store
+/// projected at that cut: every request the resumed session sends is byte-identical to the
+/// uninterrupted run's, whether the store holds the cut or the WAL tail does. Covered: a keep
+/// range at ordinal 0 plus the suffix; repetition guidance of an episode that straddles the
+/// first view's cut, firing after it; ChatGPT effort updates (a changed effort per episode);
+/// a budget nudge firing after the cut; a newer view recorded past the store watermark; a cut
+/// whose coverage end is at or past the store prefix; and an active episode the newest view
+/// holds nothing of, which then repeats its read again.
+#[tokio::test]
+async fn held_view_resume_is_byte_identical_at_every_crash_cut() {
+    let base =
+        broca_test_support::scratch_root().join(format!("broca-held-cut-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let episodes = held_episodes(0, true);
+
+    let ref_dir = base.join("ref");
+    std::fs::create_dir_all(&ref_dir).unwrap();
+    let ref_sent = HeldSent::default();
+    // The reference holds the whole transcript at every admission: no store, so every episode
+    // starts from a full WAL replay.
+    run_held_episodes(&ref_dir, &episodes, None, &ref_sent).await;
+    let ref_sent = ref_sent.lock().unwrap().clone();
+    let frames = wal_frames(&ref_dir);
+    let records: Vec<WalRecord> = frames.iter().map(|frame| frame.record.clone()).collect();
+    let applied: Vec<u64> = records
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::CompactionViewApplied {
+                view_version,
+                choice: broca_wal::CompactionViewChoice::Applied,
+                ..
+            } => Some(*view_version),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(applied, vec![2, 3], "both views applied in the clean run");
+    assert!(
+        records
+            .iter()
+            .any(|record| matches!(record, WalRecord::BudgetFired { .. })),
+        "the budget nudge fired"
+    );
+    let clean = replay(&records).unwrap();
+    assert!(
+        clean
+            .prompt
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter(|block| matches!(block, ContentBlock::ToolResult(_)))
+            .count()
+            >= 7,
+        "every read returned"
+    );
+
+    let mut held_resumes = 0;
+    let mut views_past_watermark = 0;
+    let mut coverage_past_prefix_cuts = 0;
+    for keep in 1..frames.len() {
+        let dir = base.join(format!("cut-{keep}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_wal_frames(&dir, &frames[..keep]);
+        let sqlite = Arc::new(SqliteStore::open(dir.join("store.db")).unwrap());
+        project_durable(&dir, &sqlite);
+        let watermark = sqlite
+            .read_admission_snapshot(&request(&dir).session)
+            .unwrap()
+            .map_or(0, |admission| admission.watermark_seq);
+        let prefix_len = sqlite
+            .materialized_message_count(&request(&dir).session)
+            .unwrap()
+            .unwrap_or(0);
+        let cut_state = replay(
+            &frames[..keep]
+                .iter()
+                .map(|frame| frame.record.clone())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let view_past_watermark = frames[..keep].iter().any(|frame| {
+            frame.seq > watermark && matches!(frame.record, WalRecord::CompactionViewApplied { .. })
+        });
+        let coverage_past_prefix = cut_state
+            .compaction
+            .state()
+            .and_then(|state| state.view.as_ref())
+            .is_some_and(|applied| applied.view.covers_through.ordinal + 1 >= prefix_len);
+        let reads = Arc::new(StoreReads::default());
+        let store = Arc::new(CountedStore {
+            inner: sqlite,
+            reads: reads.clone(),
+        });
+        let sent = HeldSent::default();
+        let from = resume_from(&frames[..keep], &episodes);
+        // A cut that leaves a tool call's outcome unknown seals its episode Interrupted, and
+        // the history every later episode renders then differs from the clean run's.
+        let cut_records: Vec<WalRecord> = frames[..keep]
+            .iter()
+            .map(|frame| frame.record.clone())
+            .collect();
+        let sealed = matches!(
+            replay(&cut_records).unwrap().resolution,
+            ReplayResolution::Interrupted { .. }
+        );
+        let to = if sealed { from + 1 } else { episodes.len() };
+        run_held_episodes(&dir, &episodes[from..to], Some(store), &sent).await;
+        let held = reads.held_reads.load(Ordering::SeqCst);
+        held_resumes += held;
+        if held > 0 && prefix_len > 0 {
+            views_past_watermark += usize::from(view_past_watermark);
+            coverage_past_prefix_cuts += usize::from(coverage_past_prefix);
+        }
+        for (step, bytes) in sent.lock().unwrap().iter() {
+            let expected = ref_sent.get(step).expect("the clean run sent this request");
+            assert!(
+                bytes == expected,
+                "cut@{keep}/{}: resumed request {step:?} differs from the clean run:\n{}",
+                frames.len(),
+                first_difference(bytes, expected)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert!(
+        held_resumes > 10,
+        "only {held_resumes} resumes read the held set"
+    );
+    assert!(
+        views_past_watermark > 0 && coverage_past_prefix_cuts > 0,
+        "held resumes with a view past the watermark: {views_past_watermark}, \
+         with coverage at or past the prefix: {coverage_past_prefix_cuts}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// What one held resume read before its first request.
+#[derive(Debug, PartialEq)]
+struct HeldResumeReads {
+    /// Store rows the held read returned.
+    held_rows: usize,
+    /// Store rows the repetition-guidance fold paged through.
+    page_rows: usize,
+    /// Store rows the resume would read under the held-set rule: the held rows below the
+    /// prefix (plus its last row), and the guidance episodes' model-step rows below it.
+    expected_rows: (usize, usize),
+    whole_prefix_reads: usize,
+    /// WAL sequences decoded, relative to the store watermark.
+    decoded: Vec<u64>,
+    /// How many records the WAL holds past the watermark.
+    tail: u64,
+}
+
+/// Resume the third episode of the held-view session (with `padding` discarded exchanges) at
+/// its last model step, from a store projected up to there, and report what it read.
+async fn held_resume_reads(padding: usize, effort_updates: bool, gap: bool) -> HeldResumeReads {
+    use broca_core::{
+        load_prior_wal_snapshot, run_loop_on_writer_admitted_with_prior_snapshot, StartMode,
+        WalHandle,
+    };
+    let base = broca_test_support::scratch_root().join(format!(
+        "broca-held-reads-{}-{padding}-{effort_updates}-{gap}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    let episodes = held_episodes(padding, effort_updates);
+    let clean_dir = base.join("clean");
+    std::fs::create_dir_all(&clean_dir).unwrap();
+    let clean_sent = HeldSent::default();
+    run_held_episodes(
+        &clean_dir,
+        &episodes,
+        Some(Arc::new(
+            SqliteStore::open(clean_dir.join("store.db")).unwrap(),
+        )),
+        &clean_sent,
+    )
+    .await;
+    let frames = wal_frames(&clean_dir);
+    let cut = frames
+        .iter()
+        .rposition(|frame| matches!(frame.record, WalRecord::StepStarted { .. }))
+        .unwrap();
+    let clean_records: Vec<WalRecord> = frames.iter().map(|f| f.record.clone()).collect();
+    let clean = replay(&clean_records).unwrap();
+
+    let dir = base.join("resume");
+    std::fs::create_dir_all(&dir).unwrap();
+    let session = request(&dir).session;
+    write_wal_frames(&dir, &frames[..cut]);
+    let sqlite = Arc::new(SqliteStore::open(dir.join("store.db")).unwrap());
+    project_durable(&dir, &sqlite);
+    let prefix_len = sqlite
+        .materialized_message_count(&session)
+        .unwrap()
+        .unwrap();
+    let watermark = sqlite
+        .read_admission_snapshot(&session)
+        .unwrap()
+        .unwrap()
+        .watermark_seq;
+    assert!(watermark > 0 && prefix_len > 0, "the store holds a prefix");
+    if gap {
+        // Lose a held row (the second episode's first message, which the newest view keeps).
+        let second = clean.render_episodes.as_ref().unwrap()[1].prompt_start as i64;
+        let session_key = format!(
+            "{}\u{1f}{}\u{1f}{}",
+            session.project_root.display(),
+            session.harness,
+            session.session
+        );
+        let deleted = rusqlite::Connection::open(dir.join("store.db"))
+            .unwrap()
+            .execute(
+                "DELETE FROM message WHERE session=?1 AND ord=?2",
+                rusqlite::params![session_key, second],
+            )
+            .unwrap();
+        assert_eq!(deleted, 1);
+    }
+
+    // The rows the held-set rule names, from the uninterrupted run's own replay.
+    let view = clean
+        .compaction
+        .state()
+        .and_then(|state| state.view.clone())
+        .expect("an applied view")
+        .view;
+    let holds = |ordinal: u64| {
+        ordinal > view.covers_through.ordinal
+            || view.ranges.iter().any(|range| {
+                matches!(range, ViewRange::Keep { from, to, .. } if *from <= ordinal && ordinal < *to)
+            })
+            || clean.prompt[ordinal as usize].role == Role::System
+    };
+    let held_rows = (0..prefix_len).filter(|ordinal| holds(*ordinal)).count()
+        + usize::from(!holds(prefix_len - 1));
+    let starts: Vec<u64> = clean
+        .render_episodes
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|episode| episode.prompt_start as u64)
+        .collect();
+    let step_rows = clean
+        .episode_step_spans
+        .as_ref()
+        .unwrap()
+        .iter()
+        .filter(|span| {
+            // A guidance episode: the newest one, or one holding a message.
+            let episode = starts.partition_point(|start| *start <= span.start as u64) - 1;
+            let end = starts.get(episode + 1).copied().unwrap_or(u64::MAX);
+            episode + 1 == starts.len() || (starts[episode]..end).any(holds)
+        })
+        .map(|span| (span.start as u64..(span.end as u64).min(prefix_len)).count())
+        .sum::<usize>();
+
+    let encoded = frames[..cut]
+        .iter()
+        .map(|frame| serde_json::to_vec(&(frame.fence, &frame.record)).unwrap())
+        .collect();
+    let inner = FileWalStore::new(dir.join("wal"));
+    let lineage_id = inner
+        .read_records_range(&session, 0, None, None)
+        .unwrap()
+        .lineage_id;
+    let wal = Arc::new(DecodingWalStore {
+        inner,
+        lineage_id,
+        encoded,
+        decoded: AtomicUsize::new(0),
+        decoded_sequences: Mutex::new(Vec::new()),
+    });
+    let head = frames[cut - 1].seq;
+    let snapshot =
+        load_prior_wal_snapshot(wal.as_ref(), &session, head, Some(sqlite.as_ref())).unwrap();
+    assert_eq!(snapshot.base_watermark, watermark);
+    let reads = Arc::new(StoreReads::default());
+    let store = Arc::new(CountedStore {
+        inner: sqlite,
+        reads: reads.clone(),
+    });
+    let at_first_request = Arc::new(Mutex::new(None));
+    let probe = {
+        let at_first_request = at_first_request.clone();
+        let reads = reads.clone();
+        let wal = wal.clone();
+        Arc::new(move || {
+            at_first_request.lock().unwrap().get_or_insert_with(|| {
+                (
+                    reads.held_rows.load(Ordering::SeqCst),
+                    reads.page_rows.load(Ordering::SeqCst),
+                    reads.whole_prefix_reads.load(Ordering::SeqCst),
+                    wal.decoded_sequences.lock().unwrap().clone(),
+                )
+            });
+        })
+    };
+    let third = &episodes[2];
+    let sent = HeldSent::default();
+    let model = HeldModel {
+        effort: third.effort,
+        effort_updates,
+        scripts: [(third.run_id.to_string(), third.steps.clone())]
+            .into_iter()
+            .collect(),
+        sent: sent.clone(),
+        probe: Some(probe),
+    };
+    let writer = WalHandle::spawn(wal.open(&session).unwrap(), 1).unwrap();
+    let (out, _events) = mpsc::channel(1000);
+    run_loop_on_writer_admitted_with_prior_snapshot(
+        held_request(&dir, third),
+        &writer,
+        StartMode::FreshOrResume,
+        &model,
+        &held_plane(),
+        &AllowAll,
+        wal.as_ref(),
+        Some(store as Arc<dyn broca_core::SessionStore>),
+        held_control(&dir),
+        &out,
+        None,
+        Some(&snapshot),
+    )
+    .await
+    .unwrap();
+    writer.shutdown().await.unwrap();
+    let clean_sent = clean_sent.lock().unwrap();
+    let resumed = sent.lock().unwrap();
+    assert!(!resumed.is_empty(), "the resume sent its request");
+    for (step, bytes) in resumed.iter() {
+        assert_eq!(
+            Some(bytes),
+            clean_sent.get(step),
+            "resumed request {step:?}"
+        );
+    }
+    // The resume record reports the whole transcript it reconstructed, not the held part.
+    let resumed_frames = wal_frames(&dir);
+    let replayed = resumed_frames[cut..]
+        .iter()
+        .find_map(|frame| match &frame.record {
+            WalRecord::ResumeStarted { replayed, .. } => Some(replayed.messages),
+            _ => None,
+        })
+        .expect("the resume recorded itself");
+    let at_cut: Vec<WalRecord> = frames[..cut].iter().map(|f| f.record.clone()).collect();
+    assert_eq!(replayed, replay(&at_cut).unwrap().prompt.len() as u64);
+    let (held, pages, whole_prefix_reads, decoded) =
+        at_first_request.lock().unwrap().take().unwrap();
+    let _ = std::fs::remove_dir_all(&base);
+    HeldResumeReads {
+        held_rows: held,
+        page_rows: pages,
+        expected_rows: (held_rows, step_rows),
+        whole_prefix_reads,
+        decoded: decoded
+            .into_iter()
+            .map(|seq| seq.saturating_sub(watermark))
+            .collect(),
+        tail: head - watermark,
+    }
+}
+
+/// A resume at a nonzero watermark under an applied view never replays the whole WAL, decodes
+/// exactly the records past the watermark, and reads from the store only the held rows and the
+/// guidance episodes' model-step rows: the same counts however long the discarded history is.
+/// Run on a ChatGPT effort-update session and on one without effort updates, both with
+/// repetition guidance in an earlier episode.
+#[tokio::test]
+async fn held_view_resume_reads_only_the_held_set_and_the_wal_tail() {
+    for effort_updates in [true, false] {
+        let short = held_resume_reads(8, effort_updates, false).await;
+        let long = held_resume_reads(400, effort_updates, false).await;
+        for reads in [&short, &long] {
+            assert_eq!(reads.whole_prefix_reads, 0, "{reads:?}");
+            assert_eq!(
+                (reads.held_rows, reads.page_rows),
+                reads.expected_rows,
+                "{reads:?}"
+            );
+            assert_eq!(
+                reads.decoded,
+                (1..=reads.tail).collect::<Vec<_>>(),
+                "decoded exactly the WAL records past the watermark, once: {reads:?}"
+            );
+        }
+        assert_eq!(
+            short, long,
+            "resume reads must not grow with discarded history"
+        );
+    }
+}
+
+/// A held row missing from the store is read from the WAL instead: the resume decodes the
+/// whole WAL, never renders a gap, and sends the clean run's bytes (asserted while resuming).
+#[tokio::test]
+async fn a_held_row_missing_from_the_store_is_read_from_the_wal() {
+    let reads = held_resume_reads(8, true, true).await;
+    assert_eq!(
+        reads.held_rows, 0,
+        "the store's held read failed: {reads:?}"
+    );
+    assert!(
+        reads.decoded.contains(&0),
+        "the resume decoded records the store had materialized: {reads:?}"
+    );
+}
+
+/// A store whose episode projection was never computed (written before it existed) reads as
+/// absent, and the next projection replays the WAL once and stores every episode.
+#[tokio::test]
+async fn an_absent_episode_projection_is_filled_by_the_next_projection() {
+    let dir = broca_test_support::scratch_root()
+        .join(format!("broca-held-refill-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let episodes = held_episodes(0, false);
+    let sqlite = Arc::new(SqliteStore::open(dir.join("store.db")).unwrap());
+    let sent = HeldSent::default();
+    run_held_episodes(&dir, &episodes[..1], Some(sqlite.clone()), &sent).await;
+    let session = request(&dir).session;
+    let session_key = format!(
+        "{}\u{1f}{}\u{1f}{}",
+        session.project_root.display(),
+        session.harness,
+        session.session
+    );
+    rusqlite::Connection::open(dir.join("store.db"))
+        .unwrap()
+        .execute(
+            "UPDATE meta SET episode_metadata_json=NULL WHERE session=?1",
+            [&session_key],
+        )
+        .unwrap();
+    assert_eq!(
+        MaterializedStore::read_episode_projection(sqlite.as_ref(), &session).unwrap(),
+        None
+    );
+    run_held_episodes(&dir, &episodes[1..2], Some(sqlite.clone()), &sent).await;
+    let projected = MaterializedStore::read_episode_projection(sqlite.as_ref(), &session)
+        .unwrap()
+        .expect("the projection refilled the episodes");
+    let records: Vec<WalRecord> = wal_frames(&dir).into_iter().map(|f| f.record).collect();
+    let watermark = sqlite
+        .read_admission_snapshot(&session)
+        .unwrap()
+        .unwrap()
+        .watermark_seq;
+    let materialized: Vec<WalRecord> = records[..watermark as usize].to_vec();
+    assert_eq!(
+        projected,
+        broca_core::replay::projected_episode_metadata(&replay(&materialized).unwrap())
+    );
+    assert_eq!(projected.len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
 }

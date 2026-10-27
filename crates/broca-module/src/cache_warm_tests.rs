@@ -815,6 +815,7 @@ impl Fixture {
         });
         let records = [
             WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -861,6 +862,7 @@ impl Fixture {
                 served_account_ref: None,
             },
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(1),
@@ -1005,7 +1007,10 @@ async fn a_warm_after_the_run_re_sends_its_last_request_and_records_it() {
         async {
             loop {
                 facts = fixture.export.read_page(None, 10).unwrap().facts;
-                if facts.iter().any(|fact| fact.segment.warm) {
+                if facts
+                    .iter()
+                    .any(|fact| fact.segment.as_session().unwrap().warm)
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1014,10 +1019,27 @@ async fn a_warm_after_the_run_re_sends_its_last_request_and_records_it() {
         || format!("WAL records={}", fixture.records().len()),
     )
     .await;
-    let warm_facts: Vec<_> = facts.iter().filter(|fact| fact.segment.warm).collect();
+    let warm_facts: Vec<_> = facts
+        .iter()
+        .filter(|fact| fact.segment.as_session().unwrap().warm)
+        .collect();
     assert_eq!(warm_facts.len(), 1, "{facts:?}");
-    assert_eq!(warm_facts[0].segment.usage.cached_input_tokens, Some(4000));
-    assert_eq!(facts.iter().filter(|fact| !fact.segment.warm).count(), 1);
+    assert_eq!(
+        warm_facts[0]
+            .segment
+            .as_session()
+            .unwrap()
+            .usage
+            .cached_input_tokens,
+        Some(4000)
+    );
+    assert_eq!(
+        facts
+            .iter()
+            .filter(|fact| !fact.segment.as_session().unwrap().warm)
+            .count(),
+        1
+    );
 }
 
 /// A provider that reports no usage leaves every count absent, on the reply and on the record.
@@ -1887,7 +1909,10 @@ async fn a_warm_finishing_after_the_next_run_started_is_still_recorded() {
                     .unwrap()
                     .facts
                     .iter()
-                    .filter(|fact| fact.segment.warm && fact.segment.run_id.0 == "r1")
+                    .filter(|fact| {
+                        fact.segment.as_session().unwrap().warm
+                            && fact.segment.as_session().unwrap().run_id.0 == "r1"
+                    })
                     .count();
                 if warm_facts == 1 {
                     break;
@@ -2124,7 +2149,10 @@ async fn automatic_keep_warm_records_trigger_and_refreshes() {
         .unwrap()
         .facts
         .into_iter()
-        .filter(|fact| fact.segment.warm && fact.segment.run_id.0 == "held-auto")
+        .filter(|fact| {
+            fact.segment.as_session().unwrap().warm
+                && fact.segment.as_session().unwrap().run_id.0 == "held-auto"
+        })
         .count();
     assert!(
         warm_facts >= 4,

@@ -22,7 +22,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::fanout::{Delivery, FromCursor};
 use crate::registry::{LineageKey, OpenError};
-use broca_core::{CapInstallRequest, CapMutation, SpendDeltaRequest};
 
 /// Shared refusal spelling for wire adapters of this management surface.
 pub use cortexkit_role_llm_runner::errors::PRE_USER_UNAVAILABLE;
@@ -45,7 +44,7 @@ pub struct SessionReadRequest {
     pub lineage_id: Option<String>,
     /// The page's byte cap; `None` is the default cap.
     pub max_bytes: Option<u64>,
-    /// `descriptors` serves large payloads as refs and every entry's content identities.
+    /// `blocks` exposes stored media; `descriptors` serves payload refs and content identities.
     pub media: cortexkit_role_llm_runner::read::MediaMode,
 }
 
@@ -409,6 +408,7 @@ fn session_read_response(
             .messages
             .into_iter()
             .map(|message| SessionReadMessage {
+                written_at: message.written_at,
                 delivered_as: message
                     .run
                     .as_ref()
@@ -1204,12 +1204,23 @@ fn next_run_tool_calls_cursor(
     .map(Some)
 }
 
+fn frozen_auth_selection(state: &broca_core::ReconciledRunState) -> Option<String> {
+    // Reuse the admission selection already decoded for lifecycle resolution. Current
+    // routing and the vault's resolved alias are not the credential key the run froze.
+    state
+        .auth_selection
+        .as_ref()
+        .map(|selection| selection.credential_id.clone())
+        .filter(|credential_id| !credential_id.is_empty())
+}
+
 fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStatusResponse {
     use broca_core::RunIndexState as State;
 
     let Some(state) = state else {
         return RunStatusResponse::Unknown;
     };
+    let auth_selection = frozen_auth_selection(&state);
     let final_step_finish_reason = state.final_step_finish_reason;
     let undelivered_steers = state.undelivered_steers;
     let indeterminate_tool_calls = state.indeterminate_tool_calls;
@@ -1228,9 +1239,10 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             .to_string()
     });
     match state.state {
-        // A runner-owned wait (llm-runner 0.5.2 §6) is whatever carries a deadline: the context
-        // ceiling's wait for a view, else a rewrite ride's reported wait. `reason` only names it.
+        // Deadline waits and provider-held calls are independent runner-owned waits.
+        // Consumers recognize them from their fields, never from the informational reason.
         State::Active => RunStatusResponse::Active {
+            auth_selection,
             reason: match (state.ceiling_deadline_ms, state.ride_wait_deadline_ms) {
                 (Some(_), _) => Some("context_ceiling_wait".into()),
                 (None, Some(_)) => {
@@ -1243,11 +1255,19 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             step: state.live_step,
             title,
             awaiting_approval: None,
+            held_calls: state.held_calls,
         },
         State::Paused => RunStatusResponse::Paused {
+            auth_selection,
             pause_reason: state
                 .pause_reason
-                .filter(|reason| *reason == broca_protocol::PauseReason::Restart)
+                .filter(|reason| {
+                    matches!(
+                        reason,
+                        broca_protocol::PauseReason::Restart
+                            | broca_protocol::PauseReason::ToolHeld
+                    )
+                })
                 .map(Into::into),
             usage,
             retries_used,
@@ -1274,8 +1294,10 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
                         }),
                 }),
             title,
+            held_calls: state.held_calls,
         },
         State::Interrupted => RunStatusResponse::Interrupted {
+            auth_selection,
             reason: None,
             error,
             final_step_finish_reason,
@@ -1287,6 +1309,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             structured_output: structured_output.clone(),
         },
         State::Completed => RunStatusResponse::Completed {
+            auth_selection,
             directives: None,
             final_step_finish_reason,
             undelivered_steers,
@@ -1296,6 +1319,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             structured_output: structured_output.clone(),
         },
         State::MaxSteps => RunStatusResponse::MaxSteps {
+            auth_selection,
             final_step_finish_reason,
             undelivered_steers,
             usage,
@@ -1304,6 +1328,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             structured_output: structured_output.clone(),
         },
         State::BudgetExhausted => RunStatusResponse::BudgetExhausted {
+            auth_selection,
             detail: state
                 .budget_detail
                 .expect("budget terminal retains its durable detail"),
@@ -1315,6 +1340,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             structured_output: structured_output.clone(),
         },
         State::ContextCeiling => RunStatusResponse::ContextCeiling {
+            auth_selection,
             context_ceiling: state
                 .context_ceiling
                 .expect("ceiling terminal retains its durable detail"),
@@ -1326,6 +1352,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             structured_output: structured_output.clone(),
         },
         State::Cancelled => RunStatusResponse::Cancelled {
+            auth_selection,
             final_step_finish_reason,
             undelivered_steers,
             usage,
@@ -1334,6 +1361,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             structured_output: structured_output.clone(),
         },
         State::Error => RunStatusResponse::Error {
+            auth_selection,
             final_step_finish_reason,
             undelivered_steers,
             usage,
@@ -1343,6 +1371,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             structured_output: structured_output.clone(),
         },
         State::TransformUnavailable => RunStatusResponse::TransformUnavailable {
+            auth_selection,
             final_step_finish_reason,
             undelivered_steers,
             usage,
@@ -1357,6 +1386,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
 /// failures describe lease or store problems; `SendIdReuse` is a typed request rejection.
 #[derive(Debug, Clone)]
 pub enum ServeError {
+    Upload(broca_core::media_uploads::UploadError),
     ContextCeiling(broca_protocol::ContextCeilingDetail),
     UnknownSend,
     SessionMoving {
@@ -1427,15 +1457,6 @@ pub enum ServeError {
     /// which may anchor the run's tag numbers at a checkpoint. Refused `transient`, writing
     /// nothing, so no reader sees a number that changes once the answer is durable.
     TagsAwaitSetup,
-    /// A durable cap receiver needs a fresh baseline before it can continue.
-    BaselineRequired,
-    /// The daemon's cap table was not configured.
-    CapUnavailable(String),
-    /// Admission was denied by a durable budget cap.
-    BudgetDenied {
-        cap_id: String,
-        reason: String,
-    },
     /// An import was rejected by lineage/content admission.
     Import(String),
     /// A deterministic import identity was reused with different bytes.
@@ -1517,6 +1538,7 @@ impl From<OpenError> for ServeError {
 impl std::fmt::Display for ServeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Upload(error) => error.fmt(f),
             ServeError::UnknownSend => write!(f, "send_id is not recorded for this caller"),
             ServeError::SessionMoving { cut_id } => write!(f, "session is moving under cut {cut_id}"),
             ServeError::SessionMoved { holder } => write!(f, "session moved to {holder}"),
@@ -1554,11 +1576,6 @@ impl std::fmt::Display for ServeError {
             ServeError::TagsAwaitSetup => f.write_str(
                 "the running run's tag numbers wait for its compaction Setup answer; retry shortly",
             ),
-            ServeError::BaselineRequired => f.write_str("baseline_required"),
-            ServeError::CapUnavailable(s) => write!(f, "cap table unavailable: {s}"),
-            ServeError::BudgetDenied { cap_id, reason } => {
-                write!(f, "budget_denied: cap '{cap_id}' ({reason})")
-            }
             ServeError::ContextCeiling(detail) => write!(f, "context_ceiling: estimated request size {} in window {} ({})", detail.size, detail.window, detail.cause),
             ServeError::Import(s) => write!(f, "import rejected: {s}"),
             ServeError::ImportIdReuse => write!(f, "import_id was reused with different content"),
@@ -1609,6 +1626,19 @@ impl std::error::Error for ServeError {}
 /// real outcome or a typed `ServeError`.
 #[async_trait]
 pub trait ServeHandler: Send + Sync {
+    async fn upload(
+        &self,
+        _session: &LineageKey,
+        _principal: Option<&broca_protocol::BindPrincipal>,
+        _scope: &broca_protocol::SendScope,
+        _method: &str,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, ServeError> {
+        Err(ServeError::InvalidParams {
+            field: "upload_id".into(),
+            message: "uploads unavailable".into(),
+        })
+    }
     fn backup_classes(&self) -> Vec<String> {
         vec!["head".into()]
     }
@@ -1670,20 +1700,6 @@ pub trait ServeHandler: Send + Sync {
         Err(ServeError::UnknownSend)
     }
 
-    /// Install or remove one daemon-scoped durable cap.
-    async fn cap_install(&self, _req: CapInstallRequest) -> Result<CapMutation, ServeError> {
-        Err(ServeError::CapUnavailable(
-            "cap table is not configured".into(),
-        ))
-    }
-
-    /// Apply one already-priced daemon-scoped spend delta.
-    async fn spend_delta(&self, _req: SpendDeltaRequest) -> Result<CapMutation, ServeError> {
-        Err(ServeError::CapUnavailable(
-            "cap table is not configured".into(),
-        ))
-    }
-
     /// The adoption check a stamped `route.bind` gets before it is acknowledged: `Ok(Some)` when
     /// the bound session was recorded without a scope and its history refuses the stamp. Only
     /// adoption is decided here; every other scope rule is decided on each send, since an
@@ -1726,6 +1742,55 @@ pub trait ServeHandler: Send + Sync {
     /// `session.read` — read a durable transcript page without opening a lineage actor or
     /// acquiring the session lease.
     async fn read(&self, req: SessionReadRequest) -> Result<SessionReadResponse, ServeError>;
+
+    /// The plan manifest the session froze at admission. `None` for a session admitted without a
+    /// plan, and from a handler that cannot read the session's history.
+    async fn frozen_manifest(
+        &self,
+        _session: &LineageKey,
+    ) -> Result<Option<std::sync::Arc<broca_wal::PlanManifest>>, ServeError> {
+        Ok(None)
+    }
+
+    /// Every durable record of the session's current lineage, oldest first, read under the
+    /// expiry check of run `run_id`. `None` from a handler that keeps no log reader. On-demand
+    /// history uses it for send metadata; output references use it to find a past compaction view.
+    async fn session_log(
+        &self,
+        _session: &LineageKey,
+        _run_id: &str,
+    ) -> Result<Option<Vec<broca_wal::WalRecord>>, ServeError> {
+        Ok(None)
+    }
+
+    /// `session.output_refs` (llm-runner §9.13): one page of an output-reference set, derived
+    /// from the session log on every read (see [`crate::output_refs`]).
+    async fn output_refs(
+        &self,
+        session: &LineageKey,
+        request: &cortexkit_role_llm_runner::output_refs::ListRequest,
+    ) -> Result<
+        Result<cortexkit_role_llm_runner::output_refs::Page, crate::output_refs::OutputRefRefusal>,
+        ServeError,
+    > {
+        crate::output_refs::list(self, session, request).await
+    }
+
+    /// `session.output_ref_read` (llm-runner §9.13): a byte range of one output reference's
+    /// content, derived from the session log on every read (see [`crate::output_refs`]).
+    async fn output_ref_read(
+        &self,
+        session: &LineageKey,
+        request: &cortexkit_role_llm_runner::output_refs::ReadRequest,
+    ) -> Result<
+        Result<
+            cortexkit_role_llm_runner::output_refs::ReadReply,
+            crate::output_refs::OutputRefRefusal,
+        >,
+        ServeError,
+    > {
+        crate::output_refs::read(self, session, request).await
+    }
 
     /// Where the session's materialized transcript holds the part tagged `tag`, from the
     /// store's tag index (see [`broca_core::TagLocation`]). `None` when this handler keeps no
@@ -1878,6 +1943,15 @@ pub trait ServeHandler: Send + Sync {
             "session.head is unsupported".into(),
             Some(broca_protocol::ErrorClass::Permanent),
         ))
+    }
+
+    async fn head_for(
+        &self,
+        session: &LineageKey,
+        _principal: Option<&broca_protocol::BindPrincipal>,
+        _scope: &broca_protocol::SendScope,
+    ) -> Result<broca_wire::HeadResponse, ServeError> {
+        self.head(session).await
     }
 
     /// `session.warm` — re-send the session's most recent model request shaped to generate
@@ -2127,6 +2201,39 @@ impl ServeHandler for crate::LineageRegistry {
             .map_err(ServeError::from)
     }
 
+    async fn frozen_manifest(
+        &self,
+        session: &LineageKey,
+    ) -> Result<Option<std::sync::Arc<broca_wal::PlanManifest>>, ServeError> {
+        Ok(self
+            .session_ownership_for_bind(session)
+            .await
+            .and_then(|ownership| ownership.first_episode)
+            .and_then(|first| first.manifest))
+    }
+
+    async fn session_log(
+        &self,
+        session: &LineageKey,
+        run_id: &str,
+    ) -> Result<Option<Vec<broca_wal::WalRecord>>, ServeError> {
+        let range = self
+            .read_run_tool_calls_range(session, run_id, 0, None, None)
+            .await?;
+        match range.records() {
+            broca_wal::WalRangeRecords::Complete(records) => Ok(Some(
+                records.iter().map(|framed| framed.record.clone()).collect(),
+            )),
+            broca_wal::WalRangeRecords::Absent => Ok(Some(Vec::new())),
+            broca_wal::WalRangeRecords::Partial(_) | broca_wal::WalRangeRecords::Unknown(_) => {
+                Err(ServeError::Open(
+                    "the session log could not be read completely".into(),
+                    Some(broca_protocol::ErrorClass::Transient),
+                ))
+            }
+        }
+    }
+
     async fn read_model(
         &self,
         req: SessionReadRequest,
@@ -2199,8 +2306,40 @@ impl ServeHandler for crate::LineageRegistry {
             .map_err(ServeError::ScopeRefused)
     }
 
-    async fn send(&self, req: SendRequest) -> Result<SendResponse, ServeError> {
+    async fn upload(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, ServeError> {
+        crate::uploads::upload(self, session, principal, scope, method, params).await
+    }
+
+    async fn send(&self, mut req: SendRequest) -> Result<SendResponse, ServeError> {
         use crate::actor::SendOutcome;
+        if !req.request.content.is_empty() && !self.session_written(&req.session)? {
+            let mut request = (*req.request).clone();
+            crate::person_media::stage(self.upload_store().as_ref(), &req.session, &mut request)
+                .map_err(media_preflight_error)?;
+            let profile = self
+                .media_profile(&request)
+                .await
+                .map_err(media_preflight_error)?;
+            let model = format!(
+                "{}/{}",
+                request.model.provider_module_id, request.model.model_id
+            );
+            crate::person_media::check(profile.as_deref(), &model, &request.input)
+                .map_err(media_preflight_error)?;
+            if let Some(held) = &mut request.staged_uploads {
+                std::sync::Arc::make_mut(held).profile = profile
+                    .as_ref()
+                    .map(|profile| serde_json::to_value(profile).expect("media profile JSON"));
+            }
+            req.request.staged_uploads = request.staged_uploads;
+        }
         // Opening an actor creates the lineage header. A fresh run scope has no frozen
         // history to consult, so reject a wrong carrier or tools before creating any WAL.
         // Existing sessions still use the actor's authoritative frozen-ownership check.
@@ -2371,9 +2510,6 @@ impl ServeHandler for crate::LineageRegistry {
                 Err(ServeError::WalNewerWriter { missing, reason })
             }
             SendOutcome::Transient(e) => Err(ServeError::Transient(e)),
-            SendOutcome::BudgetDenied { cap_id, reason } => {
-                Err(ServeError::BudgetDenied { cap_id, reason })
-            }
             SendOutcome::AccountSelectionRefused(refusal) => {
                 Err(ServeError::AccountSelectionRefused(refusal))
             }
@@ -2599,28 +2735,13 @@ impl ServeHandler for crate::LineageRegistry {
         }
     }
 
-    async fn cap_install(&self, req: CapInstallRequest) -> Result<CapMutation, ServeError> {
-        self.install_cap(req).await.map_err(|error| match error {
-            broca_core::CapStoreError::BaselineRequired => ServeError::BaselineRequired,
-            broca_core::CapStoreError::Storage(message)
-            | broca_core::CapStoreError::Invalid(message) => ServeError::CapUnavailable(message),
-        })
-    }
-
-    async fn spend_delta(&self, req: SpendDeltaRequest) -> Result<CapMutation, ServeError> {
-        self.apply_spend_delta(req)
-            .await
-            .map_err(|error| match error {
-                broca_core::CapStoreError::BaselineRequired => ServeError::BaselineRequired,
-                broca_core::CapStoreError::Storage(message)
-                | broca_core::CapStoreError::Invalid(message) => {
-                    ServeError::CapUnavailable(message)
-                }
-            })
-    }
-
     async fn import(&self, req: SessionImportRequest) -> Result<SessionImportResponse, ServeError> {
         use crate::actor::ImportOutcome;
+        // Refused before the session is routed or opened, so a transcript naming media inline
+        // writes nothing: a person names media only through upload references.
+        if let Err((field, message)) = broca_wire::check_supplied_media(&req.messages) {
+            return Err(ServeError::InvalidParams { field, message });
+        }
         let request = broca_core::ImportRequest {
             project_id: req.project_id,
             principal: req.principal,
@@ -2645,6 +2766,12 @@ impl ServeHandler for crate::LineageRegistry {
             ImportOutcome::Reopen => unreachable!("registry retry consumes Reopen"),
             ImportOutcome::Error(broca_core::ImportError::ImportIdReuse) => {
                 Err(ServeError::ImportIdReuse)
+            }
+            ImportOutcome::Error(broca_core::ImportError::SuppliedMedia(found)) => {
+                Err(ServeError::InvalidParams {
+                    field: found.path(),
+                    message: found.to_string(),
+                })
             }
             ImportOutcome::Error(error) => Err(ServeError::Import(error.to_string())),
         }
@@ -2815,6 +2942,11 @@ impl ServeHandler for crate::LineageRegistry {
         }
         self.attribute_tool_calls(&req.session, &mut response, &dispatches, prompt_len)
             .await?;
+        if req.media == cortexkit_role_llm_runner::read::MediaMode::Blocks {
+            for entry in &mut response.messages {
+                entry.show_media_blocks();
+            }
+        }
         if req.media == cortexkit_role_llm_runner::read::MediaMode::Descriptors {
             for entry in &mut response.messages {
                 // Only structure that is not payload can outgrow the per-message budget.
@@ -2840,10 +2972,22 @@ impl ServeHandler for crate::LineageRegistry {
     }
 
     async fn head(&self, session: &LineageKey) -> Result<broca_wire::HeadResponse, ServeError> {
+        self.head_for(session, None, &broca_protocol::SendScope::default())
+            .await
+    }
+
+    async fn head_for(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+    ) -> Result<broca_wire::HeadResponse, ServeError> {
         // The newest page of one message: the store's last row and the WAL past its watermark,
         // so the cost follows what is not yet materialized, never the session's length.
         let crate::registry::RouteReadPage {
             page,
+            head_facts,
+            head_facts_complete,
             newest_record_ms,
             retention_activity_ms,
             last_title,
@@ -2856,6 +3000,12 @@ impl ServeHandler for crate::LineageRegistry {
         let Some(lineage_id) = page.lineage_id else {
             return Ok(broca_wire::HeadResponse::default());
         };
+        if !head_facts_complete {
+            return Err(crate::registry::OpenError::Open(
+                "session.head cannot attest metadata from an incomplete WAL suffix".into(),
+            )
+            .into());
+        }
         // Retained sessions report expiry activity; maintenance must not move that clock.
         // Otherwise use the live WAL file's own write time, a stat; else
         // (its WAL was folded into an archive) the newest timestamped record of the read's
@@ -2883,7 +3033,12 @@ impl ServeHandler for crate::LineageRegistry {
         } else {
             None
         };
+        let sender = head_facts.sender(principal, scope, broca_wire::DELIVERY_MODES);
         Ok(broca_wire::HeadResponse {
+            model: head_facts.model,
+            usage: head_facts.usage.filter(|usage| usage.consistent()),
+            sender,
+            incarnation: lineage_id.incarnation(),
             lineage_id: Some(lineage_id.to_string()),
             last_ordinal: page.prompt_len.checked_sub(1),
             first_ordinal: Some(0),
@@ -2946,6 +3101,7 @@ impl ServeHandler for crate::LineageRegistry {
         let (state, mut records) = self
             .route_run_state_with_wal(session, run_id.clone())
             .await?;
+        let auth_selection = state.as_ref().and_then(frozen_auth_selection);
         let mut detail = state.as_ref().and_then(|state| state.budget_detail.clone());
         let mut context_ceiling = state
             .as_ref()
@@ -3031,6 +3187,7 @@ impl ServeHandler for crate::LineageRegistry {
             None
         };
         let response = broca_wire::RunResultResponse {
+            auth_selection,
             directives,
             usage,
             detail,
@@ -3448,6 +3605,94 @@ impl ServeHandler for crate::LineageRegistry {
 }
 
 #[cfg(test)]
+mod held_status_tests {
+    use super::*;
+
+    fn state(index: broca_core::RunIndexState) -> broca_core::ReconciledRunState {
+        broca_core::ReconciledRunState {
+            state: index,
+            held_calls: Vec::new(),
+            budget_detail: None,
+            context_ceiling: None,
+            ceiling_deadline_ms: None,
+            ride_wait_deadline_ms: None,
+            structured_output: None,
+            live_step: None,
+            undelivered_steers: None,
+            final_step_finish_reason: None,
+            indeterminate_tool_calls: None,
+            usage: None,
+            run_usage: Default::default(),
+            retries_used: 0,
+            error: None,
+            pause_reason: None,
+            auth_selection: None,
+            title: None,
+        }
+    }
+
+    #[test]
+    fn active_and_paused_status_omit_empty_held_calls() {
+        for index in [
+            broca_core::RunIndexState::Active,
+            broca_core::RunIndexState::Paused,
+        ] {
+            let wire = serde_json::to_value(run_status_response(Some(state(index)))).unwrap();
+            assert!(
+                wire.get("held_calls").is_none(),
+                "empty held_calls must be omitted, not null or []: {wire}"
+            );
+            let decoded: cortexkit_role_llm_runner::run::RunStatus =
+                serde_json::from_value(wire).unwrap();
+            assert!(!decoded.is_held_wait());
+            assert!(decoded.held_calls().is_empty());
+        }
+    }
+
+    #[test]
+    fn active_and_paused_status_map_open_provider_held_calls() {
+        let expected = serde_json::json!([{
+            "call_key": "lineage:4", "tool": "ask", "provider": "tools",
+            "reason": "running", "held_at_ms": 42
+        }]);
+        for index in [
+            broca_core::RunIndexState::Active,
+            broca_core::RunIndexState::Paused,
+        ] {
+            let mut reconciled = state(index.clone());
+            reconciled.pause_reason = (index == broca_core::RunIndexState::Paused)
+                .then_some(broca_protocol::PauseReason::ToolHeld);
+            reconciled
+                .held_calls
+                .push(cortexkit_role_llm_runner::run::HeldCall::new(
+                    "lineage:4",
+                    "ask",
+                    "tools",
+                    "running",
+                    42,
+                ));
+            let wire = serde_json::to_value(run_status_response(Some(reconciled))).unwrap();
+            assert_eq!(
+                wire["held_calls"], expected,
+                "open held calls must be reported on live and paused runs"
+            );
+            assert!(wire.get("deadline_ms").is_none());
+            if index == broca_core::RunIndexState::Paused {
+                assert_eq!(wire["pause_reason"], "tool_held");
+                assert_eq!(wire["reason"], "tool_held");
+            }
+            let decoded: cortexkit_role_llm_runner::run::RunStatus =
+                serde_json::from_value(wire).unwrap();
+            assert!(decoded.is_held_wait());
+            assert_eq!(decoded.held_calls()[0].tool(), "ask");
+            assert!(!cortexkit_role_tool_provider::result::is_person_wait(
+                decoded.held_calls()[0].reason()
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
 mod paused_auth_tests {
     use super::run_status_response;
 
@@ -3470,6 +3715,7 @@ mod paused_auth_tests {
                 broca_protocol::PauseReason::AuthRequired,
             ] {
                 let state = broca_core::ReconciledRunState {
+                    held_calls: Vec::new(),
                     run_usage: Default::default(),
                     budget_detail: None,
                     context_ceiling: None,
@@ -3502,6 +3748,7 @@ mod paused_auth_tests {
                     ride_wait_deadline_ms: None,
                 };
                 let value = serde_json::to_value(run_status_response(Some(state.clone()))).unwrap();
+                assert_eq!(value["auth_selection"], "requested-key");
                 assert_eq!(value["auth"]["path"], wire);
                 assert_eq!(value["auth"]["credential_id"], "resolved-key");
                 assert_eq!(
@@ -3519,9 +3766,19 @@ mod paused_auth_tests {
                     value["auth"],
                     serde_json::json!({"credential_id": "requested-key"})
                 );
+                legacy
+                    .auth_selection
+                    .as_mut()
+                    .unwrap()
+                    .credential_id
+                    .clear();
+                let value =
+                    serde_json::to_value(run_status_response(Some(legacy.clone()))).unwrap();
+                assert!(value.get("auth_selection").is_none());
                 legacy.auth_selection = None;
                 let value = serde_json::to_value(run_status_response(Some(legacy))).unwrap();
                 assert!(value.get("auth").is_none());
+                assert!(value.get("auth_selection").is_none());
             }
         }
     }
@@ -3536,6 +3793,7 @@ mod context_ceiling_tests {
     use super::*;
     fn reconciled(state: broca_core::RunIndexState) -> broca_core::ReconciledRunState {
         broca_core::ReconciledRunState {
+            held_calls: Vec::new(),
             state,
             context_ceiling: None,
             ceiling_deadline_ms: None,
@@ -3599,5 +3857,230 @@ mod context_ceiling_tests {
         let status: cortexkit_role_llm_runner::run::RunStatus =
             serde_json::from_value(wire).unwrap();
         assert_eq!(status.runner_wait_until(), Some(234_567));
+    }
+}
+
+fn media_preflight_error(error: broca_core::RunError) -> ServeError {
+    match error {
+        broca_core::RunError::MediaUnsupported(message) => ServeError::DeliveryRefused {
+            code: "media_unsupported",
+            message,
+        },
+        broca_core::RunError::Transient(message) => ServeError::Transient(message),
+        error => ServeError::InvalidParams {
+            field: "content".into(),
+            message: error.to_string(),
+        },
+    }
+}
+
+/// Offset-based head for overhaul roots only (not yet serving production).
+///
+/// Today's `head_for` serves the newest page of one message through the store and the
+/// WAL past its watermark. The offset index serves the same head from the session row
+/// and the newest message row's byte range: the head decodes only those frames, never
+/// the whole log. A Setup in the tail renumbers indexed tags, so the caller advances
+/// the index before serving when [`head_tail_needs_index_up`] is true. Production offset reads
+/// wire `broca.db` into `head_for`; this helper already pins the decode bound the head
+/// must keep.
+///
+/// The head's byte range is the newest message row's `[lo_off, hi_off)`: one frame for a
+/// single-message turn, the turn's span for a tool turn whose two messages share it.
+/// With frame-decode counting on, serving the head decodes only that range.
+#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
+pub(crate) fn head_byte_range_for_offsets(
+    newest: Option<&crate::registry::OffsetPageRow>,
+) -> Option<(u64, u64)> {
+    newest.map(|row| (row.lo_off, row.hi_off))
+}
+
+/// Whether a head whose tail holds a durable Setup may be served from the current index.
+///
+/// Delegates to the replay crate's detector so head, page and tail checks cannot drift
+/// apart. A durable Setup before its index commit (durable tail, stale index) forces a
+/// catch-up: recovery replays the Setup into the index before the head is served.
+#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
+pub(crate) fn head_tail_needs_index_up(tail: &[broca_wal::FramedRecord]) -> bool {
+    broca_core::replay::tail_contains_compaction_setup(tail)
+}
+
+/// Offset head decode-bounding and Setup catch-up tests.
+///
+/// Pins that the head decodes only its own row range and that a Setup in the tail
+/// forces an index catch-up before serving, including the crash-cut where the Setup is
+/// durable but its index commit has not happened.
+#[cfg(test)]
+mod offset_head_tests {
+    use std::cell::Cell;
+    use std::sync::Arc;
+
+    use broca_protocol::{
+        caller::RunFinishReason,
+        content::{AssistantMessage, ContentBlock, Message, Role},
+        request::ModelHandle,
+        BindIdentity, MessageId, RunId, StepId, Usage,
+    };
+    use broca_wal::{
+        CompactionMessageKind, FramedRecord, RunConfig, RunOrigin, SetupTagCheckpoint, WalRecord,
+    };
+
+    use super::{head_byte_range_for_offsets, head_tail_needs_index_up};
+    use crate::registry::{decode_frames_at_offsets, OffsetPageRow};
+
+    fn user(text: &str) -> Message {
+        Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }])
+    }
+
+    fn run_started() -> WalRecord {
+        WalRecord::RunStarted {
+            written_at_ms: None,
+            tags: None,
+            session_class: None,
+            retention: None,
+            hooks: None,
+            title: None,
+            on_restart: None,
+            keep_warm: None,
+            marker_order_version: None,
+            manifest: None,
+            scope: None,
+            send_id: None,
+            request_identity_digest: None,
+            project_id: None,
+            principal: None,
+            ts_ms: None,
+            run_id: RunId("r1".into()),
+            session: BindIdentity::new("/tmp/project", "runner", "session"),
+            config: Box::new(RunConfig {
+                turn_directives_v1: None,
+                render_tags: false,
+                computed_tags: None,
+                model: ModelHandle::new("stub", "m"),
+                tools: vec![].into(),
+                tool_choice: Default::default(),
+                generation: Default::default(),
+                response_format: Default::default(),
+                provider_options: serde_json::Value::Null,
+                cache_tiers: serde_json::Value::Null,
+                context_epoch: 0,
+                renderer_version: 1,
+                frozen_render_config: serde_json::Value::Null,
+                auth_selection: None,
+                tools_were_omitted: false,
+                budget: None,
+                context_limit: None,
+                work_class: None,
+                variant: None,
+                service_tier: None,
+                stop_when: Vec::new(),
+                context_management: None,
+            }),
+            input: vec![user("task")].into(),
+            origin: RunOrigin::Fresh,
+            submission_id: None,
+        }
+    }
+
+    fn text_step() -> WalRecord {
+        WalRecord::ModelStepFinished {
+            written_at_ms: None,
+            tags: None,
+            hooks: None,
+            step_id: StepId(1),
+            assistant_message: Arc::new(AssistantMessage {
+                message_id: MessageId("m1".into()),
+                content: vec![ContentBlock::Text {
+                    text: "answer".into(),
+                }],
+            }),
+            usage: Usage::default(),
+            finish_reason: None,
+            retries_used: 0,
+            service_tier_used: None,
+            speed_used: None,
+        }
+    }
+
+    fn run_finished() -> WalRecord {
+        WalRecord::RunFinished {
+            interrupt_reason: None,
+            ts_ms: None,
+            reason: RunFinishReason::Completed,
+            usage: Usage::default(),
+            error: None,
+            retries_used: 0,
+        }
+    }
+
+    fn encode_log(records: &[WalRecord]) -> (Vec<u8>, Vec<(u64, u64)>) {
+        let mut bytes = Vec::new();
+        let mut offsets = Vec::new();
+        for (i, record) in records.iter().enumerate() {
+            let start = bytes.len() as u64;
+            bytes.extend(broca_wal::framing::encode(i as u64 + 1, 1, record).expect("encode"));
+            offsets.push((start, bytes.len() as u64));
+        }
+        (bytes, offsets)
+    }
+
+    #[test]
+    fn head_decodes_only_its_range_and_catches_setup_in_tail() {
+        let records = vec![
+            run_started(),
+            WalRecord::StepStarted { step_id: StepId(1) },
+            text_step(),
+            run_finished(),
+        ];
+        let (bytes, offsets) = encode_log(&records);
+        // The head is the newest message's row: here the single answer frame.
+        let newest = OffsetPageRow {
+            ord: 1,
+            lo_off: offsets[2].0,
+            hi_off: offsets[2].1,
+        };
+        let range = head_byte_range_for_offsets(Some(&newest)).expect("head range");
+        assert_eq!(range, (offsets[2].0, offsets[2].1));
+        assert!(head_byte_range_for_offsets(None).is_none());
+        // With counting on, the head decodes one frame, not the whole log.
+        let counter = Cell::new(0u64);
+        let head = decode_frames_at_offsets(&bytes, &[range], Some(&counter)).expect("head decode");
+        assert_eq!(head.len(), 1);
+        assert_eq!(counter.get(), 1);
+        assert!(counter.get() < records.len() as u64);
+        assert!(matches!(
+            head[0].record,
+            WalRecord::ModelStepFinished { .. }
+        ));
+        // No Setup in this tail: no catch-up.
+        let tail: Vec<FramedRecord> = head;
+        assert!(!head_tail_needs_index_up(&tail));
+        // A durable Setup in the tail forces a catch-up before the head is served.
+        // Crash-cut: these Setup bytes are durable while its index commit has not happened;
+        // the reader sees the Setup past the indexed end and advances the index first.
+        let mut with_setup = tail.clone();
+        with_setup.push(FramedRecord {
+            seq: with_setup.len() as u64 + 10,
+            fence: 1,
+            record: WalRecord::CompactionMessage {
+                provider: "test".into(),
+                kind: CompactionMessageKind::Setup,
+                compaction_id: "cmp-1".into(),
+                version: 1,
+                range: broca_wal::CompactionRange { from: 0, to: 0 },
+                replacement: Arc::new(Vec::new()),
+                sha256: "0".repeat(64),
+                request_id: None,
+                cursor: None,
+                call_when: None,
+                stability: None,
+                ceiling: None,
+                tag_checkpoint: Some(SetupTagCheckpoint {
+                    tag_checkpoint: 3,
+                    cut: "m1".into(),
+                }),
+                ride_wait_ms: None,
+            },
+        });
+        assert!(head_tail_needs_index_up(&with_setup));
     }
 }

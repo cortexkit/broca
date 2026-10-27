@@ -1,0 +1,9 @@
+data: {"type":"response.created","response":{"id":"response"}}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":""},{"type":"refusal","refusal":""}]}}
+
+data: {"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"answer"}
+
+data: {"type":"response.completed","response":{"id":"response","status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}
+
+: end of synthetic stream

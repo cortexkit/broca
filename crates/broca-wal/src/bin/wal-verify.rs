@@ -1,6 +1,10 @@
 // A `src/bin/` target is its OWN crate root and does NOT inherit the sibling lib/main
 // attribute, so this must be stated per binary or the guarantee silently does not apply here.
 #![forbid(unsafe_code)]
+// This operator verifier is outside the WAL write/recovery path and power-loss
+// proofs: its own I/O only lists/reads logs and writes its verification report.
+// Durability work delegated to the library remains covered by the library's lint.
+#![allow(clippy::disallowed_methods)]
 
 //! Replay every WAL file under a directory and compare the result against a baseline.
 //!

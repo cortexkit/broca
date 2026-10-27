@@ -33,7 +33,6 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
 
 use crate::stall::{self, Phase};
 use broca_diagnostics::{Receiver as EgressReceiver, Sender as EgressSender};
@@ -42,7 +41,7 @@ use broca_module::serve::{
 };
 use broca_module::{Delivery, LineageRegistry};
 use broca_protocol::BindIdentity as BrocaBindIdentity;
-use broca_wire::{encode_subscribe_control, encode_subscribe_display};
+use broca_wire::{encode_live_subscribe_control, encode_live_subscribe_display};
 use subc_protocol::session::{
     ModuleControlCommand, ModuleControlRequest, ModuleControlResponse,
     MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -58,14 +57,13 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::manifest::{
-    OP_BASELINE, OP_CANCEL, OP_CAP_INSTALL, OP_HEAD, OP_IMPORT, OP_READ, OP_RESOLVE, OP_RETRACT,
-    OP_ROLE_DESCRIBE, OP_RUN_EVENT_GET, OP_RUN_RESULT, OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS,
-    OP_SPEND_DELTA, OP_STATUS, OP_SUBSCRIBE, OP_VAULT_AUDIT, OP_WARM,
+    OP_BASELINE, OP_CANCEL, OP_HEAD, OP_IMPORT, OP_READ, OP_RESOLVE, OP_RETRACT, OP_ROLE_DESCRIBE,
+    OP_RUN_EVENT_GET, OP_RUN_RESULT, OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS, OP_STATUS,
+    OP_SUBSCRIBE, OP_VAULT_AUDIT, OP_WARM,
 };
 use crate::wire::{
-    CancelParams, CapInstallParams, CapMutationResult, FromWireExt, ImportParams, ImportResult,
-    RetractParams, RouteRequest, SendParams, SendParamsExt, SendResult, SpendDeltaParams,
-    StatusParams, SubscribeParams,
+    CancelParams, FromWireExt, ImportParams, ImportResult, RetractParams, RouteRequest, SendParams,
+    SendParamsExt, SendResult, StatusParams, SubscribeParams,
 };
 
 const HELLO_CORR: u64 = 1;
@@ -120,24 +118,89 @@ fn management_operation_counts() -> serde_json::Value {
     )
 }
 
-async fn log_served_request<F: std::future::Future>(
-    operation: String,
-    session: String,
-    future: F,
-) -> F::Output {
-    let started = Instant::now();
-    let (output, actor_opened) = broca_module::registry::with_request_actor_opened(future).await;
-    emit_request_log(
-        &operation,
-        &session,
-        actor_opened,
-        started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
-    );
-    output
+tokio::task_local! {
+    // Successful calls need no owned outcome string, including high-rate run.status polls.
+    static REQUEST_OUTCOME: std::cell::RefCell<Option<String>>;
 }
 
-fn emit_request_log(operation: &str, session: &str, actor_opened: bool, elapsed_us: u64) {
-    tracing::debug!(target: "requests", operation, session, actor_opened, elapsed_us, "served management request");
+fn record_request_outcome(outcome: &str) {
+    let _ = REQUEST_OUTCOME.try_with(|slot| *slot.borrow_mut() = Some(outcome.to_owned()));
+}
+
+fn caller_module(bind: &BindObservation) -> Option<&str> {
+    match bind.principal.as_ref() {
+        Some(broca_protocol::BindPrincipal::Reserved { module_id }) => Some(module_id),
+        _ => None,
+    }
+}
+
+fn request_operation(body: &[u8]) -> String {
+    #[derive(serde::Deserialize)]
+    struct Operation {
+        method: String,
+    }
+    serde_json::from_slice::<Operation>(body)
+        .map(|operation| operation.method)
+        .unwrap_or_else(|_| "<invalid>".into())
+}
+
+async fn log_served_request<F: std::future::Future>(
+    operation: &str,
+    session: &BrocaBindIdentity,
+    caller_module_id: Option<&str>,
+    phase: &str,
+    future: F,
+) -> F::Output {
+    let started = tokio::time::Instant::now();
+    REQUEST_OUTCOME
+        .scope(std::cell::RefCell::new(None), async {
+            let (output, actor_opened) =
+                broca_module::registry::with_request_actor_opened(catch_panic(future)).await;
+            if output.is_err()
+                && !TERMINAL_SENT
+                    .try_with(|sent| sent.load(Ordering::SeqCst))
+                    .unwrap_or(false)
+            {
+                // reply_on_panic sends the wire code "transient" when no reply was claimed.
+                record_request_outcome("transient");
+            }
+            let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            // Compute the session-address hash only when a line will be emitted; log the hash rather than the raw session path or request body.
+            if elapsed_us > 2_000_000
+                || tracing::enabled!(target: "requests", tracing::Level::DEBUG)
+            {
+                REQUEST_OUTCOME.with(|outcome| {
+                    emit_request_log(
+                        operation,
+                        &broca_core::session_addr(session),
+                        caller_module_id,
+                        outcome.borrow().as_deref().unwrap_or("ok"),
+                        phase,
+                        actor_opened,
+                        elapsed_us,
+                    );
+                });
+            }
+            output.unwrap_or_else(|()| std::panic::resume_unwind(Box::new(())))
+        })
+        .await
+}
+
+fn emit_request_log(
+    operation: &str,
+    session: &str,
+    caller_module_id: Option<&str>,
+    outcome: &str,
+    phase: &str,
+    actor_opened: bool,
+    elapsed_us: u64,
+) {
+    let elapsed_ms = elapsed_us / 1000;
+    if elapsed_us > 2_000_000 {
+        tracing::warn!(target: "requests", operation, session, caller_module_id, outcome, phase, actor_opened, elapsed_us, elapsed_ms, "served management request");
+    } else {
+        tracing::debug!(target: "requests", operation, session, caller_module_id, outcome, phase, actor_opened, elapsed_us, elapsed_ms, "served management request");
+    }
 }
 
 // Keep the first keys seen rather than evicting them: this bounds log volume even if a peer
@@ -440,9 +503,9 @@ fn to_broca_identity(id: &SubcBindIdentity) -> BrocaBindIdentity {
 #[derive(Debug, Clone, Default, PartialEq)]
 struct BindObservation {
     agent_data: bool,
-    /// The route was opened declaring the `classifier/v1` role: it serves only that role's
-    /// ops (System One), holds no session, and reads no session history.
-    classifier: bool,
+    /// Only llm-runner routes address a session. Other roles serve their own operations
+    /// without opening a session or reading its history.
+    role: RouteRole,
     /// The producer's registered project id, as the client supplied it (unattested).
     project_id: Option<String>,
     /// The daemon-stamped principal, converted without change. `None` when the bind carried
@@ -451,13 +514,14 @@ struct BindObservation {
     /// The daemon's scope stamp on the bind, or why there is none. Every send over the route
     /// carries it to admission, which decides the owner check and the scope to freeze.
     scope: broca_protocol::SendScope,
+    reads_held_reply: bool,
 }
 
 /// Preserve the scope identity, including the agent and run identifiers of an agent-run scope
 /// and its opener. The scoped bind establishes that the daemon allowed
 /// this opener to use the scope, either as its owner or as another module allowed to open
 /// routes under it. `owner_authorized` describes the scope owner's authority, not the opener's;
-/// broca grants no permission based on that flag or on agent delegation attributes.
+/// that flag alone grants no permission, nor do agent delegation attributes.
 fn to_bind_scope(
     stamp: &subc_protocol::scope::ScopeStamp,
     principal: Option<&subc_protocol::Principal>,
@@ -483,6 +547,23 @@ fn to_bind_scope(
             agent_id,
             run_id,
         },
+        kind: match stamp.kind {
+            subc_protocol::scope::ScopeKind::Head => broca_protocol::ScopeKind::Head,
+            subc_protocol::scope::ScopeKind::Worker => broca_protocol::ScopeKind::Worker,
+            subc_protocol::scope::ScopeKind::Ephemeral => broca_protocol::ScopeKind::Ephemeral,
+        },
+        parent: stamp.parent.as_ref().map(|parent| {
+            Box::new(broca_protocol::ScopeParent {
+                owner: to_bind_principal(&parent.owner),
+                scope_ref: parent.scope_ref.clone(),
+                scope_epoch: parent.scope_epoch,
+            })
+        }),
+        parent_state: stamp.parent_state.map(|state| match state {
+            subc_protocol::scope::ParentState::Linked => broca_protocol::ParentState::Linked,
+            subc_protocol::scope::ParentState::Pending => broca_protocol::ParentState::Pending,
+            subc_protocol::scope::ParentState::Ended => broca_protocol::ParentState::Ended,
+        }),
         owner_authorized: stamp.owner_authorized,
     }
 }
@@ -522,6 +603,7 @@ struct Routes {
     agent_data: Option<Arc<crate::agent_data::AgentDataService>>,
     /// System One, when this build serves it; a classifier bind is refused without it.
     system_one: Option<Arc<crate::system_one::SystemOne>>,
+    llm_tools: Option<Arc<crate::llm_tools::LlmTools>>,
     // The bind observations (project id, principal) stay beside the session key rather than
     // inside it: BindIdentity also keys the actor registry, so folding them in would give one
     // session WAL a separate actor per distinct observation, all writing the same file.
@@ -543,6 +625,7 @@ impl Routes {
         Self {
             agent_data: None,
             system_one: None,
+            llm_tools: None,
             by_channel: std::collections::HashMap::new(),
             pending_binds: std::collections::HashMap::new(),
             bind_tasks: JoinSet::new(),
@@ -905,6 +988,49 @@ where
 /// `classifier/v1` role, reached by routes that declare it.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_connection_with_services<R, W, H>(
+    read_half: R,
+    write_half: W,
+    module_id: &str,
+    handler: Arc<H>,
+    health_registry: Arc<LineageRegistry>,
+    vault_gauge: Arc<VaultGauge>,
+    catalog_cache: Option<Arc<broca_catalog::CatalogCache>>,
+    archive: crate::wal_archive::WalArchiveConfig,
+    consumer_routes: crate::consumer_routes::ConsumerRoutes,
+    vault_auditor: Option<Arc<dyn crate::vault_audit::VaultAuditor>>,
+    daemon_capabilities: Option<Vec<String>>,
+    scope_describer: Option<Arc<broca_subc::ModuleScopeDescriber>>,
+    agent_data: Option<Arc<crate::agent_data::AgentDataService>>,
+    system_one: Option<Arc<crate::system_one::SystemOne>>,
+) -> Result<ServeEnd, ServeIoError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+    H: ServeHandler + 'static,
+{
+    serve_connection_with_llm_tools(
+        read_half,
+        write_half,
+        module_id,
+        handler,
+        health_registry,
+        vault_gauge,
+        catalog_cache,
+        archive,
+        consumer_routes,
+        vault_auditor,
+        daemon_capabilities,
+        scope_describer,
+        agent_data,
+        system_one,
+        None,
+    )
+    .await
+}
+
+/// Add the sessionless model-tool service without changing existing classifier callers.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_connection_with_llm_tools<R, W, H>(
     mut read_half: R,
     write_half: W,
     module_id: &str,
@@ -919,6 +1045,7 @@ pub async fn serve_connection_with_services<R, W, H>(
     scope_describer: Option<Arc<broca_subc::ModuleScopeDescriber>>,
     agent_data: Option<Arc<crate::agent_data::AgentDataService>>,
     system_one: Option<Arc<crate::system_one::SystemOne>>,
+    llm_tools: Option<Arc<crate::llm_tools::LlmTools>>,
 ) -> Result<ServeEnd, ServeIoError>
 where
     R: AsyncRead + Unpin,
@@ -954,6 +1081,7 @@ where
             scope_describer.as_deref(),
             agent_data,
             system_one,
+            llm_tools,
         ),
     );
     let mut writer_finished = false;
@@ -1009,6 +1137,7 @@ async fn run_frame_loop<R, H>(
     scope_describer: Option<&broca_subc::ModuleScopeDescriber>,
     agent_data: Option<Arc<crate::agent_data::AgentDataService>>,
     system_one: Option<Arc<crate::system_one::SystemOne>>,
+    llm_tools: Option<Arc<crate::llm_tools::LlmTools>>,
 ) -> Result<ServeEnd, ServeIoError>
 where
     R: AsyncRead + Unpin,
@@ -1032,6 +1161,7 @@ where
     let mut routes = Routes::new(daemon_scopes);
     routes.agent_data = agent_data;
     routes.system_one = system_one;
+    routes.llm_tools = llm_tools;
     let request_slots = Arc::new(Semaphore::new(MAX_INFLIGHT_ROUTE_REQUESTS));
     let mut request_tasks = JoinSet::new();
 
@@ -1335,9 +1465,11 @@ where
                 }));
                 return Ok(true);
             }
-            if bind.classifier {
+            if bind.role == RouteRole::Classifier {
                 spawn_classifier_request(
                     frame.body,
+                    bind.clone(),
+                    session,
                     routes.system_one.clone(),
                     writer,
                     request_tasks,
@@ -1345,17 +1477,96 @@ where
                 );
                 return Ok(true);
             }
+            if matches!(bind.role, RouteRole::ToolProvider | RouteRole::Permissions) {
+                let service = routes.llm_tools.clone();
+                let writer = writer.clone();
+                request_tasks.spawn(reply_on_panic(
+                    writer.clone(),
+                    (ver, channel, epoch, corr),
+                    async move {
+                        let operation = request_operation(&frame.body);
+                        let caller = caller_module(&bind).map(str::to_owned);
+                        log_served_request(
+                            &operation,
+                            &session,
+                            caller.as_deref(),
+                            "reply",
+                            async move {
+                                let answer = match service {
+                                    Some(service) => tokio::spawn(async move {
+                                        if bind.role == RouteRole::Permissions {
+                                            service
+                                                .permissions()
+                                                .answer(&frame.body, bind.principal.as_ref())
+                                                .await
+                                        } else {
+                                            service
+                                                .answer_with_capabilities(
+                                                    &frame.body,
+                                                    bind.principal.as_ref(),
+                                                    &bind.scope,
+                                                    bind.reads_held_reply,
+                                                )
+                                                .await
+                                        }
+                                    })
+                                    .await
+                                    .unwrap_or_else(|_| {
+                                        Err(crate::system_one::refusal_body(
+                                            &crate::system_one::internal_refusal(
+                                                "model tool request failed",
+                                            ),
+                                        ))
+                                    }),
+                                    None => {
+                                        Err(serde_json::to_vec(&subc_protocol::ErrorBody::new(
+                                            "unknown_method",
+                                            "model tools are not configured",
+                                        ))
+                                        .expect("error encodes"))
+                                    }
+                                };
+                                match answer {
+                                    Ok(body) => {
+                                        send_response_bytes(
+                                            &writer,
+                                            ver,
+                                            channel,
+                                            epoch,
+                                            corr,
+                                            body.get().as_bytes().to_vec(),
+                                        )
+                                        .await
+                                    }
+                                    Err(body) => {
+                                        send_error_bytes(&writer, ver, channel, epoch, corr, body)
+                                            .await
+                                    }
+                                }
+                            },
+                        )
+                        .await
+                    },
+                ));
+                return Ok(true);
+            }
             let req: RouteRequest = match serde_json::from_slice(&frame.body) {
                 Ok(r) => r,
                 Err(e) => {
-                    send_error(
-                        writer,
-                        ver,
-                        channel,
-                        epoch,
-                        corr,
-                        "invalid_request",
-                        &format!("request body not decodable: {e}"),
+                    log_served_request(
+                        "<invalid>",
+                        &session,
+                        caller_module(&bind),
+                        "reply",
+                        send_error(
+                            writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            "invalid_request",
+                            &format!("request body not decodable: {e}"),
+                        ),
                     )
                     .await?;
                     return Ok(true);
@@ -1380,13 +1591,19 @@ where
                     bind.principal.as_ref(),
                     &bind.scope,
                 ) {
-                    send_serve_error(
-                        writer,
-                        ver,
-                        channel,
-                        epoch,
-                        corr,
-                        &ServeError::ScopeRefused(refusal),
+                    log_served_request(
+                        &req.method,
+                        &session,
+                        caller_module(&bind),
+                        "reply",
+                        send_serve_error(
+                            writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            &ServeError::ScopeRefused(refusal),
+                        ),
                     )
                     .await?;
                     return Ok(true);
@@ -1487,11 +1704,16 @@ async fn handle_control_request(
             scope,
             target,
             role_versions,
+            consumer_capabilities,
             ..
         } => {
             stall::method_context(1);
-            let classifier = match bind_role(role_versions.as_ref(), routes.system_one.is_some()) {
-                Ok(classifier) => classifier,
+            let role = match bind_target_role(
+                &target,
+                role_versions.as_ref(),
+                routes.system_one.is_some(),
+            ) {
+                Ok(role) => role,
                 Err(message) => {
                     return send_error(
                         writer,
@@ -1512,15 +1734,22 @@ async fn handle_control_request(
             let bind = BindObservation {
                 agent_data: matches!(&target, subc_protocol::RouteTarget::InternalService { service_id, .. }
                     if service_id == broca_wire::agent_data::SERVICE_ID),
-                classifier: classifier
-                    && matches!(target, subc_protocol::RouteTarget::ManagementSurface { .. }),
+                role: if matches!(target, subc_protocol::RouteTarget::ManagementSurface { .. })
+                    || (matches!(target, subc_protocol::RouteTarget::ToolProvider { .. })
+                        && role == RouteRole::ToolProvider)
+                {
+                    role
+                } else {
+                    RouteRole::LlmRunner
+                },
                 project_id: identity.project_id.clone(),
                 principal: principal.as_ref().map(to_bind_principal),
                 scope: bind_send_scope(scope.as_ref(), routes.daemon_scopes, principal.as_ref()),
+                reads_held_reply: cortexkit_role_tool_provider::consumer_reads_held_reply_v1(
+                    consumer_capabilities.as_deref(),
+                ),
             };
-            if !bind.agent_data
-                && !matches!(target, subc_protocol::RouteTarget::ManagementSurface { .. })
-            {
+            if !serves_bind_target(&target, bind.role, routes.llm_tools.is_some()) {
                 return send_error(
                     writer,
                     frame.header.ver,
@@ -1533,8 +1762,8 @@ async fn handle_control_request(
                 .await;
             }
             let identity = to_broca_identity(&identity);
-            // A classifier route names no session, so its identity keys nothing.
-            if let Err(error) = if bind.agent_data || bind.classifier {
+            // Sessionless roles use the stamped caller and scope, not a session identity.
+            if let Err(error) = if bind.agent_data || bind.role.is_sessionless() {
                 Ok(())
             } else {
                 identity.validate_keyable()
@@ -1569,7 +1798,7 @@ async fn handle_control_request(
             // Keep the bind unacknowledged until its history authorizes the stamp. The read
             // runs off ingress so a slow WAL/store cannot hide health probes or GOODBYE.
             if !completed.bind.agent_data
-                && !completed.bind.classifier
+                && !completed.bind.role.is_sessionless()
                 && matches!(&completed.bind.scope, broca_protocol::SendScope::Stamped(_))
             {
                 let registry = health_registry.clone();
@@ -1768,6 +1997,7 @@ async fn handle_control_request(
                     // fleet totals; consumers derive rates by diffing two readings from one launch.
                     // Always emit zero so a quiet process cannot be confused with an unwired counter.
                     "stream_chunks": broca_provider::sse::stream_chunks(),
+                    "display_index_resets": broca_provider::display_index_resets(),
                     // Entries providers listed in input_transformations: for Anthropic, signed
                     // thinking blocks dropped because an earlier part of the conversation changed
                     // between requests. Zero is healthy only over measured attempts; anything
@@ -1813,6 +2043,7 @@ async fn handle_control_request(
             // needs, which are never routed. Null in a process with no vault credential source,
             // which asks routing nothing.
             "account_selection": crate::account_routing::published_metrics(),
+            "system_one": routes.system_one.as_ref().map(|service| service.health()),
                 });
             if let Some(Ok(catalog)) = catalog_health {
                 // Staleness is ordinary operation: expose its age and provenance while leaving
@@ -2079,12 +2310,23 @@ fn prepare_route_request(
     }
 }
 
-fn subscribe_from(params: &serde_json::Value) -> Result<SubscribeFrom, (Option<String>, String)> {
+fn subscribe_from(
+    params: &serde_json::Value,
+) -> Result<
+    (
+        SubscribeFrom,
+        Option<cortexkit_role_llm_runner::display::Limits>,
+    ),
+    (Option<String>, String),
+> {
     let params: SubscribeParams = decode_params(params)?;
-    match params.from {
-        None => Ok(SubscribeFrom::Live),
-        Some(w) => w.to_subscribe_from().map_err(|e| (Some("from".into()), e)),
-    }
+    let from = match params.from {
+        None => SubscribeFrom::Live,
+        Some(w) => w
+            .to_subscribe_from()
+            .map_err(|e| (Some("from".into()), e))?,
+    };
+    Ok((from, params.limits))
 }
 
 /// Dispatch `vault.audit` without acquiring an actor lease or touching the bound session.
@@ -2109,6 +2351,7 @@ async fn spawn_vault_audit_request<H: ServeHandler + 'static>(
     let writer = writer.clone();
     let conn_cancel = conn_cancel.clone();
     request_tasks.spawn(reply_on_panic(writer.clone(), (ver, channel, epoch, corr), async move {
+        log_served_request(OP_VAULT_AUDIT, &session, caller_module(&bind), "reply", async {
         let _permit = request_slots
             .acquire_owned()
             .await
@@ -2121,8 +2364,6 @@ async fn spawn_vault_audit_request<H: ServeHandler + 'static>(
             return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
         }
         count_management_operation(OP_VAULT_AUDIT);
-        let log_context = tracing::enabled!(target: "requests", tracing::Level::DEBUG)
-            .then(|| (req.method.clone(), session.session.clone()));
         let request = async move {
             tokio::select! {
                 _ = conn_cancel.cancelled() => Ok(()),
@@ -2155,10 +2396,8 @@ async fn spawn_vault_audit_request<H: ServeHandler + 'static>(
                 } => result,
             }
         };
-        match log_context {
-            Some((operation, session)) => log_served_request(operation, session, request).await,
-            None => request.await,
-        }
+        request.await
+        }).await
     }));
     Ok(())
 }
@@ -2190,6 +2429,17 @@ where
         matches!(&prepared, PreparedRouteRequest::Request(req) if req.method == OP_ROLE_DESCRIBE);
 
     request_tasks.spawn(reply_on_panic(writer.clone(), (ver, channel, epoch, corr), async move {
+        let method = match &prepared {
+            PreparedRouteRequest::Request(req) => req.method.as_str(),
+            PreparedRouteRequest::Subscribe { .. } => OP_SUBSCRIBE,
+        };
+        let operation = if method == OP_STATUS {
+            std::borrow::Cow::Borrowed(OP_STATUS)
+        } else {
+            std::borrow::Cow::Owned(method.to_owned())
+        };
+        let phase = if method == OP_SUBSCRIBE { "open" } else { "reply" };
+        log_served_request(&operation, &session, caller_module(&bind), phase, async {
         // Authorization can read durable history, and permits can be held by slow calls.
         // Neither wait belongs on the frame reader: it must still answer PING and GOODBYE.
         let _turn = dispatch_ticket.wait().await;
@@ -2206,23 +2456,21 @@ where
             return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
         }
         let write = matches!(method, OP_SEND | OP_WARM | OP_IMPORT | OP_CANCEL | OP_RETRACT);
-        let session_read = matches!(method, OP_READ | OP_RESOLVE | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE);
+        let write = write || matches!(method, "session.upload_begin" | "session.upload_append" | "session.upload_commit");
+        let session_read = matches!(method, OP_READ | OP_RESOLVE | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_HISTORY | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ);
         if write || session_read {
             if let Err(error) = handler.check_migration(&session, write).await {
                 return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
             }
         }
         count_management_operation(method);
-        let log_context = (method != OP_SUBSCRIBE
-            && tracing::enabled!(target: "requests", tracing::Level::DEBUG))
-            .then(|| (method.to_owned(), session.session.clone()));
         if describe {
             trace_describe("task_started", channel, epoch, corr);
         }
         // The connection keeps reading while requests run, but actor-bound work for one session
         // takes its turn in wire-arrival order. Separate sessions use separate lanes and remain
         // concurrent; replies may still arrive out of order because correlation ids disambiguate them.
-        let request = async move {
+        let request = async {
             match prepared {
                 PreparedRouteRequest::Request(req) => {
                     if describe {
@@ -2230,29 +2478,16 @@ where
                     }
                     tokio::select! {
                         _ = conn_cancel.cancelled() => Ok(()),
-                        result = execute_route_request(req, &writer, ver, channel, epoch, corr, session, bind, &handler) => result,
+                        result = execute_route_request(req, &writer, ver, channel, epoch, corr, &session, &bind, &handler) => result,
                     }
                 }
                 PreparedRouteRequest::Subscribe { params, slot } => {
-                    let from = match subscribe_from(&params) {
+                    let (from, limits) = match subscribe_from(&params) {
                         Ok(from) => from,
                         Err((field, message)) => {
-                            let refusal = send_invalid_params(
+                            return send_invalid_params(
                                 &writer, ver, channel, epoch, corr, field, &message,
-                            );
-                            return if tracing::enabled!(
-                                target: "requests",
-                                tracing::Level::DEBUG
-                            ) {
-                                log_served_request(
-                                    OP_SUBSCRIBE.to_string(),
-                                    session.session.clone(),
-                                    refusal,
-                                )
-                                .await
-                            } else {
-                                refusal.await
-                            };
+                            ).await;
                         }
                     };
                     // Only an authorized, well-formed replacement may stop the previous stream.
@@ -2266,19 +2501,19 @@ where
                             channel,
                             epoch,
                             corr,
-                            session,
+                            session.clone(),
                             from,
+                            limits,
                             handler,
                             cancel.clone(),
+                            caller_module(&bind).map(str::to_owned),
                         ) => result,
                     }
                 }
             }
         };
-        match log_context {
-            Some((operation, session)) => log_served_request(operation, session, request).await,
-            None => request.await,
-        }
+        request.await
+        }).await
     }));
     Ok(())
 }
@@ -2310,8 +2545,8 @@ async fn execute_route_request<H>(
     channel: u16,
     epoch: u32,
     corr: u64,
-    session: BrocaBindIdentity,
-    bind: BindObservation,
+    session: &BrocaBindIdentity,
+    bind: &BindObservation,
     handler: &Arc<H>,
 ) -> Result<(), ServeIoError>
 where
@@ -2333,79 +2568,21 @@ where
         }
     }
     match req.method.as_str() {
-        OP_CAP_INSTALL => {
-            let params: CapInstallParams = match serde_json::from_value(req.params) {
-                Ok(params) => params,
-                Err(error) => {
-                    return send_error(
-                        writer,
-                        ver,
-                        channel,
-                        epoch,
-                        corr,
-                        "invalid_params",
-                        &error.to_string(),
-                    )
-                    .await;
-                }
-            };
-            match handler.cap_install(params.into_core()).await {
-                Ok(broca_core::CapMutation::Applied(watermark)) => {
-                    let response = CapMutationResult {
-                        applied_watermark: watermark,
-                    };
-                    send_json_response(writer, ver, channel, epoch, corr, &response).await
-                }
-                Ok(broca_core::CapMutation::BaselineRequired) => {
-                    send_error(
-                        writer,
-                        ver,
-                        channel,
-                        epoch,
-                        corr,
-                        "baseline_required",
-                        "baseline_required",
-                    )
-                    .await
-                }
-                Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
-            }
-        }
-        OP_SPEND_DELTA => {
-            let params: SpendDeltaParams = match serde_json::from_value(req.params) {
-                Ok(params) => params,
-                Err(error) => {
-                    return send_error(
-                        writer,
-                        ver,
-                        channel,
-                        epoch,
-                        corr,
-                        "invalid_params",
-                        &error.to_string(),
-                    )
-                    .await;
-                }
-            };
-            match handler.spend_delta(params.into_core()).await {
-                Ok(broca_core::CapMutation::Applied(watermark)) => {
-                    let response = CapMutationResult {
-                        applied_watermark: watermark,
-                    };
-                    send_json_response(writer, ver, channel, epoch, corr, &response).await
-                }
-                Ok(broca_core::CapMutation::BaselineRequired) => {
-                    send_error(
-                        writer,
-                        ver,
-                        channel,
-                        epoch,
-                        corr,
-                        "baseline_required",
-                        "baseline_required",
-                    )
-                    .await
-                }
+        "session.upload_begin"
+        | "session.upload_append"
+        | "session.upload_commit"
+        | "session.upload_status" => {
+            match handler
+                .upload(
+                    session,
+                    bind.principal.as_ref(),
+                    &bind.scope,
+                    &req.method,
+                    req.params,
+                )
+                .await
+            {
+                Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
                 Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
             }
         }
@@ -2429,9 +2606,9 @@ where
                         .await
                     }
                 };
-            let run_id = run_id_for_send(&session, Some(&params.send_id));
+            let run_id = run_id_for_send(session, Some(&params.send_id));
             match handler
-                .send_status(&session, run_id, &params.send_id, bind.principal.as_ref())
+                .send_status(session, run_id, &params.send_id, bind.principal.as_ref())
                 .await
             {
                 Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
@@ -2452,6 +2629,18 @@ where
                     corr,
                     "unsupported_seed_from",
                     "seed_from is reserved for lineage forks and is not supported in v1",
+                )
+                .await;
+            }
+            if let Err(message) = broca_wire::check_upload_references(&req.params) {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some("content".into()),
+                    &message,
                 )
                 .await;
             }
@@ -2697,7 +2886,7 @@ where
             } else {
                 inherit_frozen
             };
-            if let Some(detail) = execute_class_root_refusal(&session).await {
+            if let Some(detail) = execute_class_root_refusal(session).await {
                 return send_error(
                     writer,
                     ver,
@@ -2714,7 +2903,7 @@ where
             // refusal here is answered before anything is written to the session's WAL. The
             // session's actor checks the plan again against the session's history as it admits
             // the send, in case an episode was written in between.
-            if !handler.hook_plane_available() && handler.frozen_plan_requires_hooks(&session).await
+            if !handler.hook_plane_available() && handler.frozen_plan_requires_hooks(session).await
             {
                 return send_serve_error(
                     writer,
@@ -2729,7 +2918,7 @@ where
                 .await;
             }
             if !matches!(&bind.scope, broca_protocol::SendScope::Stamped(_))
-                && handler.frozen_plan_requires_approval(&session).await
+                && handler.frozen_plan_requires_approval(session).await
             {
                 return send_error_body(writer, ver, channel, epoch, corr, approve_scope_error())
                     .await;
@@ -2743,7 +2932,7 @@ where
                     };
                     match admit_send_plan(
                         handler.as_ref(),
-                        &session,
+                        session,
                         &req.params,
                         plan,
                         scope,
@@ -2772,22 +2961,22 @@ where
                     }
                 }
             };
-            let run_id = run_id_for_send(&session, params.send_id.as_deref());
+            let run_id = run_id_for_send(session, params.send_id.as_deref());
             let own_run_id = run_id.clone();
             let bound_session = session.clone();
-            let mut send_req = match params.into_send_request(session, run_id) {
+            let mut send_req = match params.into_send_request(session.clone(), run_id) {
                 Ok(request) => request,
                 Err(broca_core::RunError::Config(message)) => {
                     return send_error(writer, ver, channel, epoch, corr, "config", &message).await;
                 }
                 Err(error) => unreachable!("send parameter validation returned {error}"),
             };
-            send_req.request.project_id = bind.project_id;
+            send_req.request.project_id = bind.project_id.clone();
             send_req.request.inherit_frozen = inherit_frozen;
             send_req.stop_sequences_named =
                 req.params.pointer("/generation/stop_sequences").is_some();
-            send_req.request.principal = bind.principal;
-            send_req.request.scope = bind.scope;
+            send_req.request.principal = bind.principal.clone();
+            send_req.request.scope = bind.scope.clone();
             send_req.plan = plan;
             let refusal_session_ref = send_req.session.session.clone();
             let refusal_send_id = send_req.send_id.clone();
@@ -2876,7 +3065,7 @@ where
                     .await
                 }
             };
-            if let Some(detail) = execute_class_root_refusal(&session).await {
+            if let Some(detail) = execute_class_root_refusal(session).await {
                 return send_error(
                     writer,
                     ver,
@@ -2888,11 +3077,11 @@ where
                 )
                 .await;
             }
-            let run_id = run_id_for_import(&session, &params.import_id);
+            let run_id = run_id_for_import(session, &params.import_id);
             let import_req = SessionImportRequest {
-                project_id: bind.project_id,
-                principal: bind.principal,
-                session,
+                project_id: bind.project_id.clone(),
+                principal: bind.principal.clone(),
+                session: session.clone(),
                 run_id,
                 messages: params.messages,
                 source_ref: params.origin.source_ref,
@@ -2922,7 +3111,7 @@ where
                 }
             };
             let sid = broca_protocol::SubmissionId(params.submission_id);
-            match handler.retract(&session, sid).await {
+            match handler.retract(session, sid).await {
                 Ok(resp) => send_json_response(writer, ver, channel, epoch, corr, &resp).await,
                 Err(e) => send_serve_error(writer, ver, channel, epoch, corr, &e).await,
             }
@@ -2976,7 +3165,7 @@ where
                 }
             };
             match handler
-                .cancel_at(&session, broca_protocol::RunId(params.run_id), at)
+                .cancel_at(session, broca_protocol::RunId(params.run_id), at)
                 .await
             {
                 Ok(resp) => send_json_response(writer, ver, channel, epoch, corr, &resp).await,
@@ -3006,13 +3195,13 @@ where
                 }
             };
             match params.run_id {
-                None => match handler.status(&session).await {
+                None => match handler.status(session).await {
                     Ok(resp) => send_json_response(writer, ver, channel, epoch, corr, &resp).await,
                     Err(e) => send_serve_error(writer, ver, channel, epoch, corr, &e).await,
                 },
                 Some(run_id) => {
                     match handler
-                        .run_status_reply(&session, broca_protocol::RunId(run_id))
+                        .run_status_reply(session, broca_protocol::RunId(run_id))
                         .await
                     {
                         Ok(resp) => {
@@ -3048,11 +3237,41 @@ where
                 )
                 .await;
             }
-            match handler.run_event_get(&session, &params.event_key).await {
+            match handler.run_event_get(session, &params.event_key).await {
                 Ok(response) => {
                     send_json_response(writer, ver, channel, epoch, corr, &response).await
                 }
                 Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
+            }
+        }
+        cortexkit_role_llm_runner::ops::SESSION_HISTORY => {
+            let request = match decode_params::<cortexkit_role_llm_runner::history::HistoryRequest>(
+                &req.params,
+            ) {
+                Ok(request) => request,
+                Err((field, message)) => {
+                    return send_invalid_params(writer, ver, channel, epoch, corr, field, &message)
+                        .await
+                }
+            };
+            match broca_module::history::read(handler.as_ref(), session, &request).await {
+                Ok(page) => send_json_response(writer, ver, channel, epoch, corr, &page).await,
+                Err(broca_module::history::HistoryError::Serve(error)) => {
+                    send_serve_error(writer, ver, channel, epoch, corr, &error).await
+                }
+                Err(broca_module::history::HistoryError::Unrepresentable { ordinal, field }) => {
+                    let body = serde_json::json!({
+                        "code":"history_unrepresentable", "class":"permanent",
+                        "message":format!("session.history cannot represent message {ordinal}: no retained {field}; use session.read for raw recovery"),
+                        "detail":{"ordinal":ordinal,"field":field},
+                    });
+                    let bytes = serde_json::to_vec(&body)
+                        .map_err(|error| ServeIoError(error.to_string()))?;
+                    send_error_bytes(writer, ver, channel, epoch, corr, bytes).await
+                }
+                Err(broca_module::history::HistoryError::Refused { code, message }) => {
+                    send_error(writer, ver, channel, epoch, corr, code, &message).await
+                }
             }
         }
         OP_READ => {
@@ -3131,7 +3350,7 @@ where
             }
             let read_req = SessionReadRequest {
                 late_after: params.late_after,
-                session,
+                session: session.clone(),
                 from_ordinal: params.from_ordinal,
                 limit: params.limit,
                 include_tools: params.include_tools,
@@ -3202,7 +3421,7 @@ where
                 )
                 .await;
             }
-            match handler.resolve(&session, &params).await {
+            match handler.resolve(session, &params).await {
                 Ok(Ok(reply)) => {
                     send_json_response(writer, ver, channel, epoch, corr, &reply).await
                 }
@@ -3229,7 +3448,10 @@ where
                 return send_invalid_params(writer, ver, channel, epoch, corr, field, &message)
                     .await;
             }
-            match handler.head(&session).await {
+            match handler
+                .head_for(session, bind.principal.as_ref(), &bind.scope)
+                .await
+            {
                 Ok(head) => send_json_response(writer, ver, channel, epoch, corr, &head).await,
                 Err(e) => send_serve_error(writer, ver, channel, epoch, corr, &e).await,
             }
@@ -3256,7 +3478,7 @@ where
                     }
                 };
             match handler
-                .run_result(&session, broca_protocol::RunId(params.run_id))
+                .run_result(session, broca_protocol::RunId(params.run_id))
                 .await
             {
                 Ok(result) => send_json_response(writer, ver, channel, epoch, corr, &result).await,
@@ -3295,7 +3517,7 @@ where
                 )
                 .await;
             }
-            match handler.run_tool_calls(&session, request).await {
+            match handler.run_tool_calls(session, request).await {
                 Ok(page) => send_json_response(writer, ver, channel, epoch, corr, &page).await,
                 Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
             }
@@ -3307,7 +3529,7 @@ where
                     .await;
             }
             match handler
-                .baseline(&session, bind.principal.as_ref(), &bind.scope)
+                .baseline(session, bind.principal.as_ref(), &bind.scope)
                 .await
             {
                 Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
@@ -3322,9 +3544,63 @@ where
                         .await;
                 }
             };
-            match handler.warm(&session, params.lineage_id).await {
+            match handler.warm(session, params.lineage_id).await {
                 Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
                 Err(e) => send_serve_error(writer, ver, channel, epoch, corr, &e).await,
+            }
+        }
+        cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS => {
+            type Request = cortexkit_role_llm_runner::output_refs::ListRequest;
+            let request: Request = match serde_json::from_value(req.params.clone()) {
+                Ok(request) => request,
+                Err(error) => {
+                    let field = broca_wire::failing_field::<Request>(&req.params, &error);
+                    return send_invalid_params(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        field,
+                        &error.to_string(),
+                    )
+                    .await;
+                }
+            };
+            match handler.output_refs(session, &request).await {
+                Ok(Ok(page)) => send_json_response(writer, ver, channel, epoch, corr, &page).await,
+                Ok(Err(refusal)) => {
+                    send_output_ref_refusal(writer, ver, channel, epoch, corr, refusal).await
+                }
+                Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
+            }
+        }
+        cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ => {
+            type Request = cortexkit_role_llm_runner::output_refs::ReadRequest;
+            let request: Request = match serde_json::from_value(req.params.clone()) {
+                Ok(request) => request,
+                Err(error) => {
+                    let field = broca_wire::failing_field::<Request>(&req.params, &error);
+                    return send_invalid_params(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        field,
+                        &error.to_string(),
+                    )
+                    .await;
+                }
+            };
+            match handler.output_ref_read(session, &request).await {
+                Ok(Ok(reply)) => {
+                    send_json_response(writer, ver, channel, epoch, corr, &reply).await
+                }
+                Ok(Err(refusal)) => {
+                    send_output_ref_refusal(writer, ver, channel, epoch, corr, refusal).await
+                }
+                Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
             }
         }
         OP_SUBSCRIBE => unreachable!("prepare_route_request handles session.subscribe"),
@@ -3357,8 +3633,10 @@ async fn start_subscribe_stream<H>(
     corr: u64,
     session: BrocaBindIdentity,
     from: SubscribeFrom,
+    limits: Option<cortexkit_role_llm_runner::display::Limits>,
     handler: Arc<H>,
     cancel: CancellationToken,
+    caller_module_id: Option<String>,
 ) -> Result<(), ServeIoError>
 where
     H: ServeHandler + 'static,
@@ -3367,12 +3645,7 @@ where
     // egress backpressures the FORWARD task here (not the coordinator's fanout, which has
     // its own per-subscriber backpressure + detach-on-lag).
     let (sink, mut deliveries) = mpsc::channel::<Delivery>(EGRESS_BUFFER);
-    let subscribe = handler.subscribe(&session, from, sink);
-    let subscribe_result = if tracing::enabled!(target: "requests", tracing::Level::DEBUG) {
-        log_served_request(OP_SUBSCRIBE.to_string(), session.session.clone(), subscribe).await
-    } else {
-        subscribe.await
-    };
+    let subscribe_result = handler.subscribe(&session, from, sink).await;
     if let Err(e) = subscribe_result {
         return send_serve_error(&writer, ver, channel, epoch, corr, &e).await;
     }
@@ -3391,127 +3664,156 @@ where
     // tore the subscriber down); a failed egress send (client gone); or `cancel` (this
     // route's GOODBYE, or the connection teardown). `cancel` is what prevents a parked task
     // from holding the egress open forever and hanging the connection on teardown.
-    tokio::spawn(async move {
-        loop {
-            let delivery = tokio::select! {
-                _ = cancel.cancelled() => break,
-                d = deliveries.recv() => match d {
-                    Some(d) => d,
-                    None => break, // the coordinator's subscriber task ended (sink closed)
-                },
-            };
-            if let Delivery::Expired { expired_at_ms } = &delivery {
-                let _ = send_serve_error(
-                    &writer,
+    use tracing::instrument::WithSubscriber;
+    tokio::spawn(
+        async move {
+            log_served_request(
+            OP_SUBSCRIBE,
+            &session,
+            caller_module_id.as_deref(),
+            "close",
+            async {
+                let mut next_seq = cortexkit_role_llm_runner::live::FIRST_SEQ;
+                loop {
+                    let delivery = tokio::select! {
+                        _ = cancel.cancelled() => { record_request_outcome("cancelled"); break },
+                        d = deliveries.recv() => match d {
+                            Some(d) => d,
+                            None => break, // the coordinator's subscriber task ended (sink closed)
+                        },
+                    };
+                    if let Delivery::Expired { expired_at_ms } = &delivery {
+                        let error = ServeError::Expired {
+                            expired_at_ms: *expired_at_ms,
+                        };
+                        let body =
+                            ErrorBody::new(broca_module::retention::EXPIRED, error.to_string())
+                                .with_detail(
+                                    serde_json::to_value(
+                                        broca_module::retention::ExpiredDetail::new(*expired_at_ms),
+                                    )
+                                    .expect("expiry details serialize"),
+                                );
+                        let _ = send_subscribe_error_body(
+                            &writer,
+                            (ver, channel, epoch, corr),
+                            next_seq,
+                            body,
+                        )
+                        .await;
+                        return;
+                    }
+                    if let Delivery::Error(message) = &delivery {
+                        // A replay failure is a typed stream terminal, not an empty successful stream.
+                        // `Error` is already terminal in the existing subc vocabulary, so do not append
+                        // a clean `StreamEnd` that could overwrite its meaning for a client.
+                        let _ = send_subscribe_error_body(
+                            &writer,
+                            (ver, channel, epoch, corr),
+                            next_seq,
+                            ErrorBody::new("subscribe_replay_failed", message),
+                        )
+                        .await;
+                        return;
+                    }
+                    let delivery = limit_live_arguments(delivery, limits.as_ref());
+                    let (priority, body) = match encode_delivery(&delivery, next_seq) {
+                        EncodedDelivery::Data(priority, body) => (priority, body),
+                        // A Detached marker: end the stream cleanly; the client resubscribes.
+                        EncodedDelivery::Detached => break,
+                        EncodedDelivery::Unencodable(error) => {
+                            let _ = send_undeliverable_unit(
+                                &writer,
+                                (ver, channel, epoch, corr),
+                                &delivery,
+                                next_seq,
+                                "unencodable",
+                                format!("subscribe unit could not be encoded: {error}"),
+                                None,
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                    // Subscribe frames share SUBC_MAX_FRAME_BYTES with unary replies. An oversized frame
+                    // could invalidate sibling requests on this one module connection, and a clean
+                    // StreamEnd here would send the client back to the same cursor forever.
+                    let frame_bytes = body.len().saturating_add(subc_protocol::HEADER_LEN);
+                    if frame_bytes > broca_wire::SUBC_MAX_FRAME_BYTES as usize {
+                        let _ = send_undeliverable_unit(
+                            &writer,
+                            (ver, channel, epoch, corr),
+                            &delivery,
+                            next_seq,
+                            "too_large",
+                            "subscribe unit exceeds the transport frame limit".into(),
+                            Some(frame_bytes),
+                        )
+                        .await;
+                        return;
+                    }
+                    let frame = match Frame::build_with_version(
+                        ver,
+                        FrameType::StreamData,
+                        Flags::new(false, priority, false),
+                        channel,
+                        epoch,
+                        corr,
+                        body,
+                    ) {
+                        Ok(f) => f,
+                        Err(error) => {
+                            let _ = send_undeliverable_unit(
+                                &writer,
+                                (ver, channel, epoch, corr),
+                                &delivery,
+                                next_seq,
+                                "unencodable",
+                                format!("subscribe frame could not be built: {error}"),
+                                None,
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        res = writer.send(frame) => {
+                            if res.is_err() {
+                                return; // egress closed → client gone; stop (the sink drop tears down the sub)
+                            }
+                        }
+                    }
+                    next_seq = next_seq
+                        .checked_add(1)
+                        .expect("subscription sequence exhausted");
+                }
+                // Terminal: emit StreamEnd (LAST flag) to release the held credit + close the
+                // stream. Best-effort — on egress close this just no-ops.
+                if let Ok(end) = Frame::build_with_version(
                     ver,
+                    FrameType::StreamEnd,
+                    Flags::new(false, Priority::Interactive, true),
                     channel,
                     epoch,
                     corr,
-                    &ServeError::Expired {
-                        expired_at_ms: *expired_at_ms,
-                    },
-                )
-                .await;
-                return;
-            }
-            if let Delivery::Error(message) = &delivery {
-                // A replay failure is a typed stream terminal, not an empty successful stream.
-                // `Error` is already terminal in the existing subc vocabulary, so do not append
-                // a clean `StreamEnd` that could overwrite its meaning for a client.
-                let _ = send_error(
-                    &writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    "subscribe_replay_failed",
-                    message,
-                )
-                .await;
-                return;
-            }
-            let (priority, body) = match encode_delivery(&delivery) {
-                EncodedDelivery::Data(priority, body) => (priority, body),
-                // A Detached marker: end the stream cleanly; the client resubscribes.
-                EncodedDelivery::Detached => break,
-                EncodedDelivery::Unencodable(error) => {
-                    let _ = send_undeliverable_unit(
-                        &writer,
-                        (ver, channel, epoch, corr),
-                        &delivery,
-                        "unencodable",
-                        format!("subscribe unit could not be encoded: {error}"),
-                        None,
-                    )
-                    .await;
-                    return;
-                }
-            };
-            // The same transport bound unary replies honour. An oversized frame on the wire
-            // could invalidate sibling requests on this one module connection, and a clean
-            // StreamEnd here would send the client back to the same cursor forever.
-            let frame_bytes = body.len().saturating_add(subc_protocol::HEADER_LEN);
-            if frame_bytes > broca_wire::SUBC_MAX_FRAME_BYTES as usize {
-                let _ = send_undeliverable_unit(
-                    &writer,
-                    (ver, channel, epoch, corr),
-                    &delivery,
-                    "too_large",
-                    "subscribe unit exceeds the transport frame limit".into(),
-                    Some(frame_bytes),
-                )
-                .await;
-                return;
-            }
-            let frame = match Frame::build_with_version(
-                ver,
-                FrameType::StreamData,
-                Flags::new(false, priority, false),
-                channel,
-                epoch,
-                corr,
-                body,
-            ) {
-                Ok(f) => f,
-                Err(error) => {
-                    let _ = send_undeliverable_unit(
-                        &writer,
-                        (ver, channel, epoch, corr),
-                        &delivery,
-                        "unencodable",
-                        format!("subscribe frame could not be built: {error}"),
-                        None,
-                    )
-                    .await;
-                    return;
-                }
-            };
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                res = writer.send(frame) => {
-                    if res.is_err() {
-                        return; // egress closed → client gone; stop (the sink drop tears down the sub)
+                    serde_json::to_vec(&SubscribeEndMetadata {
+                        seq: next_seq,
+                        event: cortexkit_role_llm_runner::live::LiveEvent::DisplayReset,
+                    })
+                    .expect("subscription end metadata serializes"),
+                ) {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {}
+                        _ = writer.send(end) => {}
                     }
                 }
-            }
+            },
+        )
+        .await
         }
-        // Terminal: emit StreamEnd (LAST flag) to release the held credit + close the
-        // stream. Best-effort — on egress close this just no-ops.
-        if let Ok(end) = Frame::build_with_version(
-            ver,
-            FrameType::StreamEnd,
-            Flags::new(false, Priority::Interactive, true),
-            channel,
-            epoch,
-            corr,
-            Vec::new(),
-        ) {
-            tokio::select! {
-                _ = cancel.cancelled() => {}
-                _ = writer.send(end) => {}
-            }
-        }
-    });
+        .with_current_subscriber(),
+    );
     Ok(())
 }
 
@@ -3527,18 +3829,50 @@ enum EncodedDelivery {
     Unencodable(serde_json::Error),
 }
 
-fn encode_delivery(delivery: &Delivery) -> EncodedDelivery {
+fn limit_live_arguments(
+    delivery: Delivery,
+    limits: Option<&cortexkit_role_llm_runner::display::Limits>,
+) -> Delivery {
+    if let (Delivery::Control(frame), Some(limits)) = (&delivery, limits) {
+        if let cortexkit_role_llm_runner::live::LiveEvent::ToolStarted(event) = &frame.2 {
+            let arguments: serde_json::Value =
+                serde_json::from_str(&event.arguments).expect("projected arguments are JSON");
+            let limited = cortexkit_role_llm_runner::live::ToolStarted::new(
+                &event.mid,
+                &event.tool_call_id,
+                &event.name,
+                &arguments,
+                Some(limits),
+                event.started_at,
+            );
+            return Delivery::Control(Arc::new((
+                frame.0,
+                frame.1.clone(),
+                cortexkit_role_llm_runner::live::LiveEvent::ToolStarted(limited),
+            )));
+        }
+    }
+    delivery
+}
+
+fn encode_delivery(delivery: &Delivery, seq: u64) -> EncodedDelivery {
     let (priority, encoded) = match delivery {
         Delivery::Control(event) => {
-            let (cursor, unit) = event.as_ref();
+            let (cursor, unit, live_event) = event.as_ref();
             (
                 Priority::Interactive,
-                encode_subscribe_control(cursor.wal_seq, cursor.sub_index, unit),
+                encode_live_subscribe_control(
+                    cursor.wal_seq,
+                    cursor.sub_index,
+                    unit,
+                    seq,
+                    live_event,
+                ),
             )
         }
         Delivery::Display(event) => (
             Priority::Background,
-            encode_subscribe_display(event.as_ref()),
+            encode_live_subscribe_display(event.as_ref(), seq),
         ),
         Delivery::Expired { .. } | Delivery::Error(_) | Delivery::Detached => {
             return EncodedDelivery::Detached
@@ -3560,13 +3894,14 @@ async fn send_undeliverable_unit(
     writer: &EgressSender<Frame>,
     (ver, channel, epoch, corr): (u8, u16, u32, u64),
     delivery: &Delivery,
+    seq: u64,
     reason: &str,
     message: String,
     frame_bytes: Option<usize>,
 ) -> Result<(), ServeIoError> {
     let cursor = match delivery {
         Delivery::Control(event) => {
-            let (cursor, _) = event.as_ref();
+            let (cursor, ..) = event.as_ref();
             serde_json::json!({"wal_seq": cursor.wal_seq, "sub_index": cursor.sub_index})
         }
         _ => serde_json::Value::Null,
@@ -3582,7 +3917,36 @@ async fn send_undeliverable_unit(
         "ending subscribe stream on an undeliverable unit: {message}"
     );
     let body = ErrorBody::new(SUBSCRIBE_UNIT_UNDELIVERABLE, message).with_detail(detail);
-    send_error_body(writer, ver, channel, epoch, corr, body).await
+    send_subscribe_error_body(writer, (ver, channel, epoch, corr), seq, body).await
+}
+
+#[derive(serde::Serialize)]
+struct SubscribeEndMetadata {
+    seq: u64,
+    event: cortexkit_role_llm_runner::live::LiveEvent,
+}
+
+async fn send_subscribe_error_body(
+    writer: &EgressSender<Frame>,
+    (ver, channel, epoch, corr): (u8, u16, u32, u64),
+    seq: u64,
+    body: ErrorBody,
+) -> Result<(), ServeIoError> {
+    record_request_outcome(&body.code);
+    #[derive(serde::Serialize)]
+    struct LiveErrorBody {
+        #[serde(flatten)]
+        body: ErrorBody,
+        seq: u64,
+        event: cortexkit_role_llm_runner::live::LiveEvent,
+    }
+    let body = serde_json::to_vec(&LiveErrorBody {
+        body,
+        seq,
+        event: cortexkit_role_llm_runner::live::LiveEvent::DisplayReset,
+    })
+    .map_err(|error| ServeIoError(error.to_string()))?;
+    send_error_bytes(writer, ver, channel, epoch, corr, body).await
 }
 
 async fn send_hello(
@@ -3685,8 +4049,45 @@ async fn send_json_response<T: serde::Serialize>(
     send(writer, frame).await
 }
 
+async fn send_response_bytes(
+    writer: &EgressSender<Frame>,
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    body: Vec<u8>,
+) -> Result<(), ServeIoError> {
+    let frame_bytes = body.len().saturating_add(subc_protocol::HEADER_LEN);
+    if frame_bytes > broca_wire::SUBC_MAX_FRAME_BYTES as usize {
+        // No bytes from this reply have reached the wire, so a small correlated Error
+        // can fail this call without invalidating any sibling request on the connection.
+        return send_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "response_too_large",
+            "response exceeds the transport frame limit",
+        )
+        .await;
+    }
+    let frame = Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        body,
+    )
+    .map_err(|e| ServeIoError(e.to_string()))?;
+    send(writer, frame).await
+}
+
 fn refused_send_code(error: &ServeError) -> String {
     match error {
+        ServeError::Upload(error) => error.code.into(),
         ServeError::ContextCeiling(_) => cortexkit_role_llm_runner::errors::CONTEXT_CEILING.into(),
         ServeError::UnknownSend => cortexkit_role_llm_runner::errors::UNKNOWN_SEND.into(),
         ServeError::SessionMoving { .. } => "session_moving".into(),
@@ -3711,9 +4112,6 @@ fn refused_send_code(error: &ServeError) -> String {
         }
         ServeError::SendIdReuse { .. } => "send_id_reuse".into(),
         ServeError::Transient(_) | ServeError::TagsAwaitSetup => "transient".into(),
-        ServeError::BaselineRequired => "baseline_required".into(),
-        ServeError::CapUnavailable(_) => "cap_unavailable".into(),
-        ServeError::BudgetDenied { .. } => "budget_denied".into(),
         ServeError::Import(_) => "import_rejected".into(),
         ServeError::ImportIdReuse => "import_id_reuse".into(),
         ServeError::ImportBusy => "import_busy".into(),
@@ -3808,6 +4206,23 @@ async fn send_serve_error(
         return send_error_bytes(writer, ver, channel, epoch, corr, body).await;
     }
     let code = match err {
+        ServeError::Upload(error) => {
+            let mut detail = serde_json::json!({});
+            if let Some(field) = error.field {
+                detail["field"] = field.into();
+            }
+            if let Some(received) = error.received {
+                detail["received"] = received.into();
+            }
+            if matches!(
+                error.code,
+                "upload_staging_full" | "upload_session_full" | "upload_store_failed"
+            ) {
+                detail["class"] = "transient".into();
+            }
+            let body = ErrorBody::new(error.code, error.to_string()).with_detail(detail);
+            return send_error_body(writer, ver, channel, epoch, corr, body).await;
+        }
         ServeError::ReplyTooLarge(_) => unreachable!("reply_too_large returned above"),
         ServeError::SessionMoving { cut_id } => {
             let body = ErrorBody::new("session_moving", err.to_string())
@@ -3880,9 +4295,6 @@ async fn send_serve_error(
         }
         ServeError::SendIdReuse { .. } => "send_id_reuse",
         ServeError::Transient(_) | ServeError::TagsAwaitSetup => "transient",
-        ServeError::BaselineRequired => "baseline_required",
-        ServeError::CapUnavailable(_) => "cap_unavailable",
-        ServeError::BudgetDenied { .. } => "budget_denied",
         ServeError::ContextCeiling(detail) => {
             let body = ErrorBody::new(
                 cortexkit_role_llm_runner::errors::CONTEXT_CEILING,
@@ -4038,15 +4450,25 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
     scope: Option<&broca_protocol::SessionScope>,
     model: Option<&crate::wire::ModelParams>,
 ) -> Result<broca_module::actor::SendPlan, SendPlanRefusal> {
+    // A plan item's `output_refs` member is refused unless the admitter can freeze sessions
+    // that opt into output references (llm-runner §9.13: a runner without the group refuses it).
+    let output_refs = if handler
+        .plan_admitter()
+        .is_some_and(|admitter| admitter.admits_output_refs())
+    {
+        broca_fetch_plan::OutputRefsSupport::Supported
+    } else {
+        broca_fetch_plan::OutputRefsSupport::Unsupported
+    };
     if let Some(params) = params.as_object() {
-        broca_fetch_plan::check_send_members(params)?;
+        broca_fetch_plan::check_send_members_with(params, output_refs)?;
     }
     let support = if handler.compaction_supported() {
         broca_fetch_plan::CompactionSupport::Supported
     } else {
         broca_fetch_plan::CompactionSupport::Unsupported
     };
-    let parsed = broca_fetch_plan::parse_plan(plan, support)?;
+    let parsed = broca_fetch_plan::parse_plan_with(plan, support, output_refs)?;
     // Filing an approval question and executing its tool call must use the scope
     // identity supplied by the daemon on the inbound route, never a caller's payload.
     // Check before fetching providers or opening an actor, so refusal writes no WAL.
@@ -4067,7 +4489,7 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
         && parsed
             .tool_items
             .iter()
-            .any(|item| item.preset == broca_fetch_plan::CONFINED_TOOL_PRESET)
+            .any(|item| item.preset.as_deref() == Some(broca_fetch_plan::CONFINED_TOOL_PRESET))
     {
         return Err(SendPlanRefusal::WorkerPresetRequiresScope);
     }
@@ -4145,35 +4567,112 @@ fn send_field_of(differing: &str) -> Option<&'static str> {
     })
 }
 
-/// The bind refusal for a route whose declared roles this build cannot answer as one role: a
-/// `classifier` version it does not serve, or `classifier` beside `llm-runner` (a route has
-/// one `role.describe`, so it cannot be both).
+/// The bind refusal for an unsupported role version or multiple supported roles on one route.
+/// Each route has only one operation namespace, including one `role.describe`.
 pub const ROLE_VERSIONS_UNSUPPORTED: &str = "role_versions_unsupported";
 
-/// Which role a bind's `role_versions` asks this route to serve: `Ok(true)` for
-/// `classifier/v1`, `Ok(false)` for llm-runner (no classifier declared), or the refusal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum RouteRole {
+    #[default]
+    LlmRunner,
+    Classifier,
+    ToolProvider,
+    Permissions,
+}
+
+/// Adding model tools admits only the matching tool-provider role, not arbitrary new route
+/// targets. Internal agent-data and management routes retain their existing target rules.
+fn serves_bind_target(target: &subc_protocol::RouteTarget, role: RouteRole, tools: bool) -> bool {
+    match target {
+        subc_protocol::RouteTarget::ManagementSurface { .. } => true,
+        subc_protocol::RouteTarget::InternalService { service_id, .. } => {
+            service_id == broca_wire::agent_data::SERVICE_ID
+        }
+        subc_protocol::RouteTarget::ToolProvider { .. } => role == RouteRole::ToolProvider && tools,
+    }
+}
+
+impl RouteRole {
+    fn is_sessionless(self) -> bool {
+        self != Self::LlmRunner
+    }
+}
+
+/// Tool-provider targets identify their role without a declaration. A declaration may pin
+/// that role's version, but cannot switch the target to another operation namespace.
+fn bind_target_role(
+    target: &subc_protocol::RouteTarget,
+    role_versions: Option<&std::collections::BTreeMap<String, String>>,
+    serves_classifier: bool,
+) -> Result<RouteRole, String> {
+    if !matches!(target, subc_protocol::RouteTarget::ToolProvider { .. }) {
+        return bind_role(role_versions, serves_classifier);
+    }
+    if let Some(roles) = role_versions {
+        if let Some(other) = roles.keys().find(|role| role.as_str() != "tool-provider") {
+            return Err(format!(
+                "a route serves one role; the tool-provider target conflicts with declared role {other}"
+            ));
+        }
+    }
+    bind_role(role_versions, serves_classifier)?;
+    Ok(RouteRole::ToolProvider)
+}
+
+/// Select a supported role, retaining llm-runner for legacy or unrelated declarations.
 fn bind_role(
     role_versions: Option<&std::collections::BTreeMap<String, String>>,
     serves_classifier: bool,
-) -> Result<bool, String> {
-    let (role, version) = broca_subc::CLASSIFIER_ROLE_VERSIONS;
-    let Some(declared) = role_versions.and_then(|roles| roles.get(role)) else {
-        return Ok(false);
+) -> Result<RouteRole, String> {
+    let Some(roles) = role_versions else {
+        return Ok(RouteRole::LlmRunner);
     };
+    let supported = [
+        ("classifier", "v1", RouteRole::Classifier),
+        ("llm-runner", "v1", RouteRole::LlmRunner),
+        ("tool-provider", "v1", RouteRole::ToolProvider),
+        ("permissions", "v1", RouteRole::Permissions),
+    ];
+    let mut declared_roles = supported
+        .into_iter()
+        .filter(|(role, _, _)| roles.contains_key(*role));
+    let Some((role, version, selected)) = declared_roles.next() else {
+        return Ok(RouteRole::LlmRunner);
+    };
+    let declared = &roles[role];
     if declared != version {
         return Err(format!(
             "this build serves {role} {version} only; the route declares {role} {declared}"
         ));
     }
-    if role_versions.is_some_and(|roles| roles.contains_key("llm-runner")) {
+    if let Some((other, _, _)) = declared_roles.next() {
         return Err(format!(
-            "a route serves one role; this one declares both {role} and llm-runner"
+            "a route serves one role; this one declares both {role} and {other}"
         ));
     }
-    if !serves_classifier {
+    if selected == RouteRole::Classifier && !serves_classifier {
         return Err(format!("this build does not serve {role} {version}"));
     }
-    Ok(true)
+    Ok(selected)
+}
+
+#[cfg(test)]
+mod role_selection_tests {
+    use super::{bind_role, RouteRole};
+
+    #[test]
+    fn each_supported_role_selects_its_own_dispatch() {
+        assert_eq!(bind_role(None, true), Ok(RouteRole::LlmRunner));
+        for (name, expected) in [
+            ("llm-runner", RouteRole::LlmRunner),
+            ("classifier", RouteRole::Classifier),
+            ("tool-provider", RouteRole::ToolProvider),
+            ("permissions", RouteRole::Permissions),
+        ] {
+            let roles = [(name.into(), "v1".into())].into_iter().collect();
+            assert_eq!(bind_role(Some(&roles), true), Ok(expected), "{name}");
+        }
+    }
 }
 
 /// Answer one request on a classifier route, on tasks of its own: never the frame loop, and
@@ -4183,6 +4682,8 @@ fn bind_role(
 /// (which would end the connection).
 fn spawn_classifier_request(
     body: Vec<u8>,
+    bind: BindObservation,
+    session: BrocaBindIdentity,
     service: Option<Arc<crate::system_one::SystemOne>>,
     writer: &EgressSender<Frame>,
     request_tasks: &mut JoinSet<Result<(), ServeIoError>>,
@@ -4190,34 +4691,56 @@ fn spawn_classifier_request(
 ) {
     let writer = writer.clone();
     request_tasks.spawn(async move {
-        let answered = match service {
-            Some(service) => tokio::spawn(async move { service.answer(&body).await }).await,
-            None => Ok(Err(serde_json::to_vec(&subc_protocol::ErrorBody::new(
-                "unknown_method",
-                "this build serves no classifier/v1 role",
-            ))
-            .unwrap_or_default())),
-        };
-        match answered {
-            Ok(Ok(result)) => send_json_response(&writer, ver, channel, epoch, corr, &result).await,
-            Ok(Err(body)) => send_error_bytes(&writer, ver, channel, epoch, corr, body).await,
-            Err(error) => {
-                tracing::error!(target: "system_one", %error,
+        let operation = request_operation(&body);
+        let caller = caller_module(&bind).map(str::to_owned);
+        log_served_request(
+            &operation,
+            &session,
+            caller.as_deref(),
+            "reply",
+            async move {
+                let answered = match service {
+                    Some(service) => {
+                        tokio::spawn(async move {
+                            service
+                                .answer(&body, bind.principal.as_ref(), &bind.scope)
+                                .await
+                        })
+                        .await
+                    }
+                    None => Ok(Err(serde_json::to_vec(&subc_protocol::ErrorBody::new(
+                        "unknown_method",
+                        "this build serves no classifier/v1 role",
+                    ))
+                    .unwrap_or_default())),
+                };
+                match answered {
+                    Ok(Ok(result)) => {
+                        send_json_response(&writer, ver, channel, epoch, corr, &result).await
+                    }
+                    Ok(Err(body)) => {
+                        send_error_bytes(&writer, ver, channel, epoch, corr, body).await
+                    }
+                    Err(error) => {
+                        tracing::error!(target: "system_one", %error,
                     "answering a classifier request failed; it is answered internal_error");
-                let refusal = crate::system_one::internal_refusal(
-                    "serving this request failed inside broca; send it again",
-                );
-                send_error_bytes(
-                    &writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    crate::system_one::refusal_body(&refusal),
-                )
-                .await
-            }
-        }
+                        let refusal = crate::system_one::internal_refusal(
+                            "serving this request failed inside broca; send it again",
+                        );
+                        send_error_bytes(
+                            &writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            crate::system_one::refusal_body(&refusal),
+                        )
+                        .await
+                    }
+                }
+            },
+        )
+        .await
     });
 }
 
@@ -4275,6 +4798,56 @@ fn delivery_list_refusal(
         )
         .with_detail(serde_json::json!({"delivery":modes})),
     )
+}
+
+/// An output-reference refusal (llm-runner §9.13) under its error code.
+async fn send_output_ref_refusal(
+    writer: &EgressSender<Frame>,
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    refusal: broca_module::output_refs::OutputRefRefusal,
+) -> Result<(), ServeIoError> {
+    use broca_module::output_refs::OutputRefRefusal;
+    match refusal {
+        OutputRefRefusal::UnknownRef(message) => {
+            send_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                cortexkit_role_llm_runner::errors::UNKNOWN_REF,
+                &message,
+            )
+            .await
+        }
+        OutputRefRefusal::InvalidParams { field, message } => {
+            send_invalid_params(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                Some(field.into()),
+                &message,
+            )
+            .await
+        }
+        OutputRefRefusal::ReplyTooLarge(message) => {
+            send_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                cortexkit_role_llm_runner::errors::REPLY_TOO_LARGE,
+                &message,
+            )
+            .await
+        }
+    }
 }
 
 async fn send_error(
@@ -4492,6 +5065,9 @@ async fn send_error_bytes(
         ))
         .map_err(|error| ServeIoError(error.to_string()))?;
     }
+    if let Ok(error) = serde_json::from_slice::<ErrorBody>(&body) {
+        record_request_outcome(&error.code);
+    }
     let frame = Frame::build_with_version(
         ver,
         FrameType::Error,
@@ -4513,10 +5089,10 @@ async fn send(writer: &EgressSender<Frame>, frame: Frame) -> Result<(), ServeIoE
     if matches!(frame.header.ty, FrameType::Response | FrameType::Error) {
         mark_terminal_sent();
     }
-    writer
-        .send(frame)
-        .await
-        .map_err(|_| ServeIoError("egress channel closed".into()))
+    writer.send(frame).await.map_err(|_| {
+        record_request_outcome("egress_closed");
+        ServeIoError("egress channel closed".into())
+    })
 }
 
 // Codes are deliberately a closed diagnostic vocabulary, never hashes or copies of
@@ -4534,8 +5110,8 @@ fn method_code(method: &str) -> u8 {
         OP_IMPORT => 11,
         OP_HEAD => 12,
         OP_BASELINE => 13,
-        OP_CAP_INSTALL => 14,
-        OP_SPEND_DELTA => 15,
+        // 14 and 15 named the removed spend-cap operations (`cap.install`, `spend.delta`).
+        // They are not reused, so a code in an older stall report keeps its meaning.
         OP_RUN_RESULT => 16,
         OP_WARM => 17,
         OP_RESOLVE => 18,
@@ -4670,6 +5246,42 @@ impl std::error::Error for ServeIoError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_bind_target_does_not_widen_management_or_internal_service_admission() {
+        use subc_protocol::RouteTarget;
+        let module_id = "broca".to_owned();
+        let management = RouteTarget::ManagementSurface {
+            module_id: module_id.clone(),
+        };
+        let tools = RouteTarget::ToolProvider {
+            module_id: module_id.clone(),
+        };
+        let agent_data = RouteTarget::InternalService {
+            module_id: module_id.clone(),
+            service_id: broca_wire::agent_data::SERVICE_ID.into(),
+        };
+        let unrelated = RouteTarget::InternalService {
+            module_id,
+            service_id: "unrelated-service".into(),
+        };
+        for role in [
+            RouteRole::LlmRunner,
+            RouteRole::Classifier,
+            RouteRole::ToolProvider,
+            RouteRole::Permissions,
+        ] {
+            for enabled in [false, true] {
+                assert!(serves_bind_target(&management, role, enabled));
+                assert!(serves_bind_target(&agent_data, role, enabled));
+                assert!(!serves_bind_target(&unrelated, role, enabled));
+                assert_eq!(
+                    serves_bind_target(&tools, role, enabled),
+                    role == RouteRole::ToolProvider && enabled
+                );
+            }
+        }
+    }
     use broca_module::serve::{
         CancelResponse, RetractResponse, RunStatusResponse, SendRequest, SendResponse,
         SessionReadResponse, StatusResponse,
@@ -4735,7 +5347,15 @@ mod tests {
             .with(tracing_subscriber::EnvFilter::new(filter))
             .with(RequestLogCapture(events.clone()));
         tracing::subscriber::with_default(subscriber, || {
-            emit_request_log("session.read", "bind-session-id", true, 17);
+            emit_request_log(
+                "session.read",
+                "bind-session-id",
+                None,
+                "ok",
+                "reply",
+                true,
+                17,
+            );
         });
         let captured = events.lock().unwrap().clone();
         captured
@@ -4786,6 +5406,173 @@ mod tests {
         assert_eq!(log.fields["class"], "permanent");
         assert_eq!(log.fields["message"], "session.send refused");
         assert!(!format!("{:?}", log.fields).contains("private prompt and argument content"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn management_request_logs_refusal_code() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("requests=debug"))
+            .with(RequestLogCapture(events.clone()));
+        let (writer, mut replies) = broca_diagnostics::channel(4, Default::default());
+        log_served_request(
+            "session.head",
+            &BrocaBindIdentity::new("/private/project", "runner", "session-ref-7"),
+            Some("phone-reader"),
+            "reply",
+            send_error(&writer, 1, 1, 1, 1, "session_expired", "private content"),
+        )
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+        assert_eq!(replies.recv().await.unwrap().header.ty, FrameType::Error);
+        let logs = events.lock().unwrap();
+        assert_eq!(logs.len(), 1, "{logs:?}");
+        assert_eq!(logs[0].fields["outcome"], "session_expired");
+        assert_eq!(logs[0].fields["caller_module_id"], "phone-reader");
+        assert!(!format!("{logs:?}").contains("/private/project"));
+        assert!(!format!("{logs:?}").contains("private content"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_management_request_warns_at_default_level() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("info"))
+            .with(RequestLogCapture(events.clone()));
+        log_served_request(
+            "session.read",
+            &BrocaBindIdentity::new("/private/project", "runner", "session-ref-7"),
+            None,
+            "reply",
+            async {
+                tokio::time::advance(std::time::Duration::from_millis(2001)).await;
+            },
+        )
+        .with_subscriber(subscriber)
+        .await;
+        let logs = events.lock().unwrap();
+        assert_eq!(logs.len(), 1, "{logs:?}");
+        assert_eq!(logs[0].level, tracing::Level::WARN);
+        assert_eq!(logs[0].fields["elapsed_ms"], "2001");
+    }
+
+    #[tokio::test]
+    async fn panicked_management_request_logs_the_wire_refusal_code() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+        async fn panicking_handler() -> Result<(), ServeIoError> {
+            panic!("private handler state");
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("requests=debug"))
+            .with(RequestLogCapture(events.clone()));
+        let (writer, mut frames) = broca_diagnostics::channel(4, Arc::default());
+        let session = BrocaBindIdentity::new("/private/project", "runner", "panic");
+        reply_on_panic(
+            writer,
+            (1, 1, 1, 1),
+            log_served_request(OP_HEAD, &session, None, "reply", panicking_handler()),
+        )
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+        let frame = frames.recv().await.unwrap();
+        assert_eq!(frame.header.ty, FrameType::Error);
+        let refusal: ErrorBody = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(refusal.code, "transient");
+        let events = events.lock().unwrap();
+        let logs: Vec<_> = events
+            .iter()
+            .filter(|event| event.target == "requests")
+            .collect();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].fields["outcome"], refusal.code);
+        assert!(!format!("{logs:?}").contains("private handler state"));
+    }
+
+    #[test]
+    fn management_request_at_two_seconds_remains_debug() {
+        use tracing_subscriber::prelude::*;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("requests=debug"))
+            .with(RequestLogCapture(events.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            emit_request_log("run.status", "hash", None, "ok", "reply", false, 2_000_000);
+        });
+        let logs = events.lock().unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].level, tracing::Level::DEBUG);
+        assert_eq!(logs[0].fields["outcome"], "ok");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn subscription_logs_open_and_close_not_frames() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("requests=debug"))
+            .with(RequestLogCapture(events.clone()));
+        let (sink_tx, mut sink_rx) = mpsc::channel(1);
+        let handler = Arc::new(MockSubscribeHandler {
+            sink_tx,
+            refuse_session: std::sync::atomic::AtomicBool::new(false),
+            model_reply_too_large: None,
+        });
+        let (writer, mut frames) = broca_diagnostics::channel(8, Arc::default());
+        let identity = BrocaBindIdentity::new("/private/project", "runner", "subscribe");
+        let cancel = CancellationToken::new();
+        log_served_request(
+            OP_SUBSCRIBE,
+            &identity,
+            Some("reader"),
+            "open",
+            start_subscribe_stream(
+                writer,
+                1,
+                1,
+                1,
+                1,
+                identity.clone(),
+                SubscribeFrom::Start,
+                None,
+                handler,
+                cancel.clone(),
+                Some("reader".into()),
+            ),
+        )
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+        let sink = sink_rx.recv().await.unwrap();
+        for _ in 0..2 {
+            sink.send(Delivery::Display(Arc::new(
+                broca_protocol::DisplayEvent::DisplayReset,
+            )))
+            .await
+            .unwrap();
+            assert_eq!(
+                frames.recv().await.unwrap().header.ty,
+                FrameType::StreamData
+            );
+        }
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), sink.closed())
+            .await
+            .unwrap();
+        let logs = events.lock().unwrap();
+        assert_eq!(logs.len(), 2, "{logs:?}");
+        assert_eq!(logs[0].fields["phase"], "open");
+        assert_eq!(logs[1].fields["phase"], "close");
+        assert_eq!(logs[1].fields["outcome"], "cancelled");
+        assert_eq!(logs[0].fields["session"], logs[1].fields["session"]);
     }
 
     #[test]
@@ -5039,6 +5826,7 @@ mod tests {
             lineage_id: None,
             messages: vec![
                 SessionReadMessage {
+                    written_at: None,
                     delivered_as: None,
                     run: None,
                     ordinal: 0,
@@ -5056,6 +5844,7 @@ mod tests {
                     part_digests: None,
                 },
                 SessionReadMessage {
+                    written_at: None,
                     delivered_as: None,
                     run: None,
                     ordinal: 1,
@@ -5219,6 +6008,7 @@ mod tests {
                 sub_index: 1,
             },
             unit,
+            cortexkit_role_llm_runner::live::LiveEvent::DisplayReset,
         ))))
         .await
         .unwrap();
@@ -5430,6 +6220,7 @@ mod tests {
             version: None,
         };
         let run_result = broca_wire::RunResultResponse {
+            auth_selection: None,
             directives: None,
             context_ceiling: None,
             usage: Default::default(),
@@ -5502,8 +6293,8 @@ mod tests {
             7,
             3,
             11,
-            BrocaBindIdentity::new("/tmp/vector-project", "runner", "session"),
-            BindObservation::default(),
+            &BrocaBindIdentity::new("/tmp/vector-project", "runner", "session"),
+            &BindObservation::default(),
             &handler,
         )
         .await
@@ -5704,6 +6495,7 @@ mod tests {
             let end = (from + 2).min(self.messages.len());
             let messages = (from..end)
                 .map(|ordinal| broca_wire::SessionReadMessage {
+                    written_at: None,
                     delivered_as: None,
                     ordinal: ordinal as u64,
                     mid: format!("m{ordinal}"),
@@ -5960,6 +6752,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscribe_transport_terminals_keep_stream_sequence_and_event() {
+        for terminal in [
+            Delivery::Detached,
+            Delivery::Error("broken replay".into()),
+            Delivery::Expired {
+                expired_at_ms: 1234,
+            },
+        ] {
+            let detached = matches!(terminal, Delivery::Detached);
+            let (sink_tx, mut sink_rx) = mpsc::channel(1);
+            let handler = Arc::new(MockSubscribeHandler {
+                sink_tx,
+                refuse_session: std::sync::atomic::AtomicBool::new(false),
+                model_reply_too_large: None,
+            });
+            let (writer, mut written) = broca_diagnostics::channel::<Frame>(8, Arc::default());
+            start_subscribe_stream(
+                writer,
+                1,
+                1,
+                1,
+                1,
+                BrocaBindIdentity::new("/tmp/project-a", "runner", "terminal-sequence"),
+                SubscribeFrom::Start,
+                None,
+                handler,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+            let sink = sink_rx.recv().await.unwrap();
+            sink.send(Delivery::Display(Arc::new(
+                broca_protocol::DisplayEvent::DisplayReset,
+            )))
+            .await
+            .unwrap();
+            sink.send(terminal).await.unwrap();
+            let first = tokio::time::timeout(std::time::Duration::from_secs(2), written.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let end = tokio::time::timeout(std::time::Duration::from_secs(2), written.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(first.header.ty, FrameType::StreamData);
+            assert_eq!(
+                end.header.ty,
+                if detached {
+                    FrameType::StreamEnd
+                } else {
+                    FrameType::Error
+                }
+            );
+            for (frame, seq) in [(first, 1_u64), (end, 2)] {
+                let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+                assert_eq!(body["seq"], seq);
+                assert_eq!(body["event"]["type"], "display_reset");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_subscribe_forward_task_cancel_while_blocked() {
         use broca_protocol::display::DisplayEvent;
         use std::time::Duration;
@@ -5985,8 +6841,10 @@ mod tests {
             1, // corr
             session,
             SubscribeFrom::Start,
+            None,
             handler,
             cancel.clone(),
+            None,
         )
         .await;
         assert!(start_res.is_ok());
@@ -6455,6 +7313,7 @@ mod tests {
     async fn refused_replacement_goodbye_preserves_published_route_and_stream() {
         let session = BrocaBindIdentity::new("/tmp/project-a", "runner", "published");
         let record = broca_wal::WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -6886,10 +7745,11 @@ mod tests {
                 identity: BrocaBindIdentity::new("/tmp/project-a", "runner", "late-bind"),
                 bind: BindObservation {
                     agent_data: false,
-                    classifier: false,
+                    role: RouteRole::LlmRunner,
                     project_id: None,
                     principal: None,
                     scope: broca_protocol::SendScope::Unstamped,
+                    reads_held_reply: false,
                 },
                 cancel,
                 refusal: Ok(None),
@@ -7014,6 +7874,44 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_tool_response_is_call_local() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (writer, mut written) =
+                broca_diagnostics::channel::<Frame>(EGRESS_BUFFER, Arc::default());
+            let large = serde_json::to_vec(&serde_json::json!({
+                "answers":{"q":{"type":"noul","noul":0.5,"provider_extra":{"text":"x".repeat(broca_wire::SUBC_MAX_FRAME_BYTES as usize)}}},
+                "usage":{"input_tokens":0},"cost_usd":0,
+            })).unwrap();
+            let result: cortexkit_llm_tools::classify::Result = serde_json::from_slice(&large).unwrap();
+            cortexkit_llm_tools::classify::validate_result(&result).unwrap();
+            send_response_bytes(
+                &writer,
+                PROTOCOL_VERSION,
+                1,
+                1,
+                1,
+                large,
+            )
+            .await
+            .unwrap();
+            send_response_bytes(&writer, PROTOCOL_VERSION, 1, 1, 2, b"{}".to_vec())
+                .await
+                .unwrap();
+            let refused = next_written(&mut written).await;
+            assert_eq!(refused.header.ty, FrameType::Error);
+            assert_eq!(refused.header.corr, 1);
+            let error: serde_json::Value = serde_json::from_slice(&refused.body).unwrap();
+            assert_eq!(error["code"], "response_too_large");
+            let sibling = next_written(&mut written).await;
+            assert_eq!(sibling.header.ty, FrameType::Response);
+            assert_eq!(sibling.header.corr, 2);
+            assert_eq!(sibling.body, b"{}");
+        })
+        .await
+        .expect("the tool reply writer did not finish within its bound");
     }
 
     #[test]
@@ -7147,6 +8045,7 @@ mod tests {
                 CancellationToken::new(),
                 crate::wal_archive::WalArchiveConfig::default(),
                 &crate::consumer_routes::ConsumerRoutes::default(),
+                None,
                 None,
                 None,
                 None,
@@ -7342,6 +8241,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -7514,6 +8414,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -7669,6 +8570,7 @@ mod tests {
                 Some(loop_describer.as_ref()),
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -7771,6 +8673,7 @@ mod tests {
                 CancellationToken::new(),
                 crate::wal_archive::WalArchiveConfig::default(),
                 &consumer_routes,
+                None,
                 None,
                 None,
                 None,
@@ -7920,6 +8823,7 @@ mod tests {
                 CancellationToken::new(),
                 crate::wal_archive::WalArchiveConfig::default(),
                 &consumer_routes,
+                None,
                 None,
                 None,
                 None,
@@ -8128,6 +9032,46 @@ mod open_failed_wire_classes {
 #[cfg(test)]
 mod agent_run_writer_tests {
     use super::*;
+
+    #[test]
+    fn basal_program_bind_preserves_attested_parent_identity_and_state() {
+        use broca_protocol::{ParentState, ScopeKind};
+        for (wire_state, state) in [
+            ("linked", ParentState::Linked),
+            ("pending", ParentState::Pending),
+            ("ended", ParentState::Ended),
+        ] {
+            let stamp: subc_protocol::scope::ScopeStamp =
+                serde_json::from_value(serde_json::json!({
+                    "owner": {"kind":"reserved", "module_id":"prefrontal-core"},
+                    "ref":"program-scope", "scope_epoch":7, "kind":"ephemeral",
+                    "owner_authorized": true,
+                    "attributes": {"agent_id":"program-agent", "run_id":"program-run"},
+                    "parent": {
+                        "owner":{"kind":"reserved", "module_id":"different-parent-owner"},
+                        "ref":"head-scope", "scope_epoch":3
+                    },
+                    "parent_state":wire_state
+                }))
+                .unwrap();
+            let basal = subc_protocol::Principal::Reserved {
+                module_id: "basal".into(),
+            };
+            let bind = to_bind_scope(&stamp, Some(&basal));
+            assert_eq!(bind.kind, ScopeKind::Ephemeral);
+            assert_eq!(bind.parent_state, Some(state));
+            assert!(bind.owner_authorized);
+            assert_eq!(bind.scope.agent_id.as_deref(), Some("program-agent"));
+            assert_eq!(bind.scope.run_id.as_deref(), Some("program-run"));
+            let parent = bind.parent.unwrap();
+            assert_eq!(
+                parent.owner.as_owner_string(),
+                "reserved:different-parent-owner"
+            );
+            assert_eq!(parent.scope_ref, "head-scope");
+            assert_eq!(parent.scope_epoch, 3);
+        }
+    }
 
     #[test]
     fn run_scope_deadline_does_not_change_frozen_scope_bytes() {

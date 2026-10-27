@@ -83,6 +83,22 @@ pub struct MoveObservation {
 /// because they have no local bytes that the incoming cut could overwrite.
 #[async_trait::async_trait]
 pub trait MoveDriver: Send + Sync {
+    /// Media needs a transport carrying objects as well as WAL bytes. Until the
+    /// bridge supplies that transport, refuse before any cut intent or freeze.
+    fn prepare_media(
+        &self,
+        session: &BindIdentity,
+        digests: &BTreeSet<String>,
+    ) -> Result<(), ErrorBody> {
+        if digests.is_empty() {
+            return Ok(());
+        }
+        Err(refusal(
+            "incompatible_version",
+            "session media cannot move through the WAL-only transport",
+            serde_json::json!({"session": session.session, "required": ["media-content/v1"]}),
+        ))
+    }
     async fn plan(&self, cut_id: &str, refs: &Refs, op: Op) -> Result<MovePlans, ErrorBody>;
     async fn cover(&self, reference: &str) -> Result<u64, ErrorBody>;
     async fn export(&self, reference: &str, frozen: &[u8]) -> Result<(), ErrorBody>;
@@ -507,18 +523,31 @@ impl CutArtifacts for FileCutArtifacts {
             .iter()
             .filter_map(|r| plans.iter().find(|p| r["ref"] == p.reference).cloned())
             .collect();
+        // Prepare, release and abort publish or remove the source's move markers. For
+        // those, an idle actor whose writer owns its tenure closes that writer and hands
+        // the still-held session lease to this guard before any marker changes. Every
+        // other operation only reads, and inspection never takes a tenure.
+        let mode = if matches!(op, Op::Prepare | Op::Release | Op::Abort) {
+            crate::registry::CutLockMode::Mutate
+        } else {
+            crate::registry::CutLockMode::Inspect
+        };
         let sessions = self
             .registry
-            .lock_move_sessions(
+            .lock_move_sessions_with_mode(
                 &plans.iter().map(|p| p.session.clone()).collect::<Vec<_>>(),
                 false,
+                mode,
             )
             .await
             .map_err(unavailable)?;
         let mut busy = sessions.busy.iter().find_map(|(_, reason)| reason.clone());
-        let open_actor = plans
-            .iter()
-            .any(|p| self.registry.slot_state(&p.session).is_some());
+        // A retired actor's slot stays `Closing` until the guard releases it, but it no
+        // longer serves the session: the guard holds its lease instead.
+        let actor_open = |session: &BindIdentity| {
+            self.registry.slot_state(session).is_some() && !sessions.holds_tenure(session)
+        };
+        let open_actor = plans.iter().any(|p| actor_open(&p.session));
         let mut leases = Vec::new();
         let mut observations = Vec::new();
         for plan in &plans {
@@ -538,8 +567,11 @@ impl CutArtifacts for FileCutArtifacts {
                     .map_err(unavailable)?
                     .or_else(|| moving.map(|f| f.cut_id)),
                 moved_holder: moved.map(|m| m.holder),
-                open_actor: self.registry.slot_state(&plan.session).is_some(),
+                open_actor: actor_open(&plan.session),
             };
+            // A session whose lease this guard already holds (handed over by its closed
+            // actor) must not be acquired again; one with an open actor keeps its lease
+            // with that actor while it is paused.
             if self.registry.slot_state(&plan.session).is_none() {
                 match self
                     .leases
@@ -673,6 +705,10 @@ impl CutArtifacts for FileCutArtifacts {
                 }
             }
             if op == Op::Prepare {
+                let digests =
+                    broca_core::media_store::session_media_digests(&self.state_root, &plan.session)
+                        .map_err(unavailable)?;
+                self.driver.prepare_media(&plan.session, &digests)?;
                 if !live.try_exists().map_err(unavailable)? && plan.local_archive.is_none() {
                     return Err(refusal(
                         "unknown_ref",
@@ -1069,3 +1105,48 @@ impl CutArtifacts for FileCutArtifacts {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod provider_held_tests {
+    use super::*;
+    use broca_core::WalStore;
+    use broca_protocol::{PauseReason, RunId};
+    use broca_wal::WalRecord;
+
+    #[test]
+    fn tool_held_session_is_run_active_for_move() {
+        let root = broca_test_support::scratch_root().join("move-tool-held");
+        let store = FileWalStore::new(root.join("wal"));
+        let session = BindIdentity::new("/project", "broca", "held");
+        let mut writer = store.open(&session).unwrap();
+        writer
+            .append(
+                1,
+                &crate::move_install::tests::started(&session, "run"),
+                true,
+            )
+            .unwrap();
+        writer
+            .append(
+                1,
+                &WalRecord::RunPaused {
+                    run_id: RunId("run".into()),
+                    reason: PauseReason::ToolHeld,
+                    error: None,
+                    ts_ms: Some(1),
+                },
+                true,
+            )
+            .unwrap();
+        drop(writer);
+        let range = broca_wal::read_records_range(
+            store.wal_path(&session),
+            broca_wal::DEFAULT_MAX_READ_BYTES,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(source_busy_reason(&range).unwrap(), Some("run_active"));
+    }
+}

@@ -19,13 +19,13 @@ pub mod refusal;
 mod compaction_tests;
 
 pub use admit::{
-    admit, baseline_facts, join_system_texts, Admitted, BaselineFacts, DescribeAnswer, FetchError,
-    Fetcher, PlanAdmitter, ADMISSION_DEADLINE, CATALOG_OP, DECLARE_OP, JOIN_SEPARATOR,
+    admit, baseline_facts, compose, join_system_texts, Admitted, BaselineFacts, DescribeAnswer,
+    FetchError, Fetcher, PlanAdmitter, ADMISSION_DEADLINE, CATALOG_OP, DECLARE_OP, JOIN_SEPARATOR,
     JOIN_VERSION,
 };
 pub use plan::{
-    check_later_plan, check_send_members, names_confined_preset, parse_plan, plan_identity,
-    plan_senders, CompactionSupport, Plan, PlanSender, PlanTemplate, SlotType,
-    CONFINED_TOOL_PRESET, SENDERS_MEMBER,
+    check_later_plan, check_send_members, check_send_members_with, names_confined_preset,
+    parse_plan, parse_plan_with, plan_identity, plan_senders, CompactionSupport, OutputRefsSupport,
+    Plan, PlanSender, PlanTemplate, SlotType, CONFINED_TOOL_PRESET, SENDERS_MEMBER,
 };
 pub use refusal::{Refusal, Unanswered};

@@ -3,6 +3,7 @@
 //! fetched with `view.get` at the first step boundary, recorded, rendered, and reported in
 //! advance notices.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -32,6 +33,25 @@ use crate::{
 
 const PROVIDER: &str = "compactor";
 const APPLIED_HEAD: &str = "durable compacted head";
+
+#[tokio::test]
+async fn compaction_requests_match_the_pre_windowing_bytes() {
+    let mut requests = Vec::new();
+    for scenario in [SCENARIO, SIGNED_SCENARIO] {
+        let handle = RunnerHandle::new(scenario).await;
+        requests.push(
+            handle
+                .reference
+                .sent
+                .values()
+                .map(|bytes| String::from_utf8(bytes.clone()).expect("canonical request JSON"))
+                .collect::<Vec<_>>(),
+        );
+    }
+    let expected: Vec<Vec<String>> =
+        serde_json::from_str(include_str!("fixtures/compaction_request_bytes.json")).unwrap();
+    assert_eq!(requests, expected);
+}
 
 fn request() -> RunRequest {
     let submission = serde_json::from_value(json!({
@@ -79,6 +99,61 @@ fn with_compaction(mut control: RunControl, provider: Arc<ScriptedCompaction>) -
     control.compaction_plane = Some(provider.clone());
     control.compaction_views = Some(provider);
     control
+}
+
+/// Bind the signed scenario's announcements to durable progress, including on restart. The
+/// runner also queries newer versions before applying a fetched view, so a version filter
+/// alone cannot show whether the run has reached the next view's publication point.
+pub(crate) fn schedule_views(control: &mut RunControl, request: &RunRequest, state_root: &Path) {
+    if request.session != signed_request().session {
+        return;
+    }
+    if let Some(source) = control.compaction_views.take() {
+        control.compaction_views = Some(Arc::new(SignedAnnouncements {
+            source,
+            wal: wal_path(state_root, &request.session),
+        }));
+    }
+}
+
+struct SignedAnnouncements {
+    source: Arc<dyn CompactionViews>,
+    wal: PathBuf,
+}
+
+impl CompactionViews for SignedAnnouncements {
+    fn newest_ready(
+        &self,
+        session_ref: &str,
+        lineage_id: &str,
+        after: Option<u64>,
+    ) -> Option<ViewReady> {
+        let records = LogImage::read(&self.wal).records();
+        let applied_first = records.iter().any(|record| {
+            matches!(
+                record,
+                WalRecord::CompactionViewApplied {
+                    view_version: 2,
+                    ..
+                }
+            )
+        });
+        let tool_result = records.iter().any(|record| {
+            matches!(record, WalRecord::ToolResult { result, .. } if result.tool_call_id.0 == "edit-1")
+        });
+        // The second view edits the tool result. It cannot be published while the first view
+        // is being fetched, or before the tool result exists. Reading the WAL rather than
+        // counting queries preserves that publication order across every crash cut.
+        let first = self.source.newest_ready(session_ref, lineage_id, None)?;
+        let ready = if applied_first && tool_result {
+            ViewReady::for_view(&second_view(session_ref, lineage_id))
+        } else {
+            first
+        };
+        after
+            .is_none_or(|version| ready.view_version > version)
+            .then_some(ready)
+    }
 }
 
 fn assistant(id: &str, content: Vec<ContentBlock>, finish: FinishReason) -> Vec<NormalizedEvent> {
@@ -295,7 +370,7 @@ struct ScriptedCompaction {
     /// Announce an older view (version 1, "stale summary") at every boundary, even after
     /// version 2 applied.
     stale: bool,
-    /// Follow `SIGNED_SCENARIO`'s two-view schedule instead.
+    /// Serve the signed scenario's second view once its WAL-backed schedule announces it.
     signed: bool,
     lineage: Mutex<Option<String>>,
 }
@@ -443,13 +518,7 @@ impl CompactionViews for ScriptedCompaction {
         if self.ceiling.is_some() {
             return None;
         }
-        let version = if self.signed {
-            match after {
-                None | Some(0..=1) => 2,
-                Some(2) => 3,
-                Some(_) => return None,
-            }
-        } else if self.stale {
+        let version = if self.stale {
             1
         } else if after.is_none_or(|applied| applied < 2) {
             2

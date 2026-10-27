@@ -343,6 +343,8 @@ async fn imports_reads_and_continues_on_real_module_rig() {
             auth: None,
             one_shot: None,
             context_management: None,
+            session_class: None,
+            plan: None,
         })
         .await
         .unwrap()

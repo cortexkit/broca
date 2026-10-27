@@ -147,6 +147,12 @@ mod tests {
             assert_eq!(prompt[..3], raw[..3]);
             let suffix = "\n\nTool repetition guidance: read has now failed 2 times with identical arguments. Read the error and change the arguments or the approach; repeating this call unchanged will fail the same way.";
             let expected = match output {
+                ToolOutput::Parts { mut parts } => {
+                    parts.push(broca_protocol::ToolOutputPart::Text {
+                        text: suffix.into(),
+                    });
+                    ToolOutput::Parts { parts }
+                }
                 ToolOutput::Text { text } => ToolOutput::Text {
                     text: text + suffix,
                 },

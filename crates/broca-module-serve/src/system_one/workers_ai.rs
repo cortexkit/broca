@@ -188,6 +188,8 @@ impl ClassifierProvider for WorkersAi {
             Ok(secret) => secret,
             Err(message) => return ProviderReply::Credential(message),
         };
+        let auth_selection = secret.as_ref().and_then(|s| s.auth_selection.clone());
+        let account_ref = secret.as_ref().and_then(|s| s.account_id.clone());
         let (token, account_id) = match secret {
             Some(secret) => match secret.account_id {
                 Some(account_id) => (Some(secret.token), account_id),
@@ -235,7 +237,16 @@ impl ClassifierProvider for WorkersAi {
             } else {
                 "the request failed in transport".to_owned()
             }),
-            Ok(Ok((status, retry_after_ms, body))) => reply_from(status, retry_after_ms, &body),
+            Ok(Ok((status, retry_after_ms, body))) => {
+                match reply_from(status, retry_after_ms, &body) {
+                    ProviderReply::Answered(body) => ProviderReply::AttributedAnswer {
+                        body,
+                        auth_selection,
+                        account_ref,
+                    },
+                    reply => reply,
+                }
+            }
         }
     }
 }

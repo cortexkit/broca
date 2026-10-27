@@ -11,19 +11,6 @@
 //!     opaque blob to REBUILD the provider, resume → blob-equality passes →
 //!     byte-identical. This is the "resume any session" flow a tool would use.
 
-// A file-level `cfg` DELETES this file when the feature is off, and a deleted file reports
-// "running 0 tests ... test result: ok" -- indistinguishable at a glance from a suite that
-// ran and passed, and impossible to instrument because no code survives to carry a notice.
-// Gating a module instead leaves this shell compiled, so the absence can announce itself.
-#[cfg(not(feature = "live"))]
-#[test]
-fn this_suite_needs_its_feature_enabled() {
-    eprintln!(
-        "SKIP frozen_config_resume: compiled without its feature, so none of its cases exist. \
-         This reports `ok` -- re-run with `-F broca-provider/live` to execute them."
-    );
-}
-
 #[cfg(feature = "live")]
 mod gated {
 
@@ -138,6 +125,7 @@ mod gated {
 
     fn request(dir: &std::path::Path) -> RunRequest {
         RunRequest {
+            input_written_at_ms: None,
             directives: None,
             session_class: None,
             retention: None,
@@ -299,6 +287,7 @@ mod gated {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,

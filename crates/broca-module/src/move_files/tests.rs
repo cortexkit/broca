@@ -1,4 +1,7 @@
 use super::*;
+
+#[path = "websocket_tests.rs"]
+mod websocket;
 use crate::cut_state::CutStore;
 use crate::registry::{ActorHandle, LineageKey, LineageOpener, OpenError, RegistryHandle};
 use broca_core::WalStore;
@@ -458,6 +461,54 @@ async fn missing_sealed_digest_stages_nothing_and_stores_no_intent() {
     assert!(error.message.contains("sealed digest"));
     assert!(!rig.root.join("wal-staging").exists());
     assert!(!rig.store.path(CUT).exists());
+}
+
+#[tokio::test]
+async fn media_move_prepare_refuses_by_feature_before_writing_any_cut_artifact() {
+    let rig = Rig::new("media-prepare", true);
+    let session = &rig.driver.plans[1].session;
+    let bytes = b"%PDF-1.7\nmove fixture\n%%EOF";
+    let reference = broca_core::media_validation::validate_media(bytes, "application/pdf").unwrap();
+    let media = broca_core::media_store::MediaStore::open(
+        &rig.root,
+        broca_core::media_store::MediaStoreClass::NonDurable,
+    )
+    .unwrap();
+    media
+        .session(session)
+        .unwrap()
+        .register_and_append(&reference, bytes, || Ok(()))
+        .unwrap();
+    let error = rig.op(Op::Prepare).await.unwrap_err();
+    assert_eq!(error.code.as_str(), "incompatible_version");
+    assert_eq!(
+        serde_json::to_value(&error).unwrap()["detail"]["required"],
+        json!(["media-content/v1"])
+    );
+    assert!(!rig.store.path(CUT).exists());
+    assert!(!rig.root.join("wal-staging").exists());
+    for plan in &rig.driver.plans {
+        let path = rig.wal.wal_path(&plan.session);
+        assert!(!path.with_extension("moving").exists());
+        assert_eq!(std::fs::read(path).unwrap(), plan.bytes);
+    }
+    assert_eq!(media.read_verified(&reference).unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn no_media_move_keeps_wal_bytes_and_cut_digest_unchanged() {
+    let rig = Rig::new("no-media-byte-identity", true);
+    assert_eq!(rig.op(Op::Prepare).await.unwrap(), json!({"enforced":true}));
+    assert_eq!(rig.op(Op::Export).await.unwrap(), json!({"enforced":true}));
+    for plan in &rig.driver.plans {
+        let bytes = std::fs::read(rig.wal.wal_path(&plan.session)).unwrap();
+        assert_eq!(bytes, plan.bytes);
+        assert_eq!(bytes.len() as u64, plan.end_offset);
+        assert_eq!(migration::digest(&bytes), plan.digest);
+    }
+    assert!(!rig.root.join("media").exists());
+    assert!(!rig.root.join("media-durable").exists());
+    assert!(!rig.root.join("media-ephemeral").exists());
 }
 
 #[tokio::test]

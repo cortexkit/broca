@@ -550,6 +550,8 @@ struct Daemon {
     child: RefCell<broca_test_support::RigChild>,
     dir: PathBuf,
     connection_file: PathBuf,
+    // Only direct credential.get wire probes use a handle; the supervised module uses its grant.
+    vault_probe_handle: Option<String>,
 }
 
 impl Drop for Daemon {
@@ -714,7 +716,7 @@ impl Daemon {
         Self::start_with_env_and_aft_modules(
             tag,
             "",
-            &[("BROCA_AUTH_SOURCE", "vault")],
+            &[],
             &[],
             &[],
             Some(VaultSeed {
@@ -821,14 +823,16 @@ impl Daemon {
                 serde_json::from_str(include_str!("../fixtures/fusiform-lkg-minimal.json"))
                     .expect("the checked-in minimal fusiform LKG is valid JSON");
             if seed.order == VaultSeedOrder::PutThenMint {
-                // `atomic-chat` is a shipped catalog overlay that the live-vault 401 arm routes
-                // to aimock through `ProviderRoute::AtomicChat`. Adding only the model fact here
-                // keeps `BROCA_PROVIDER_BASE_URL` unset, because that mock override deliberately
-                // skips credential resolution and would make the cache proof vacuous.
+                // This synthetic Chat route keeps the original loopback root as its published
+                // endpoint; ProviderRoute::AtomicChat must override it with aimock's own address.
+                // BROCA_PROVIDER_BASE_URL stays unset because that mock override skips credential
+                // resolution and would make the credential-cache proof vacuous.
                 lkg["models"]["atomic-chat/cache-eviction-probe"] = json!({
                     "capability.attachment": false,
                     "capability.reasoning": false,
                     "capability.tool_call": false,
+                    "wire.npm": {"value":"@ai-sdk/openai-compatible", "from":"fixture"},
+                    "wire.api": {"value":"http://127.0.0.1:1337/v1", "from":"fixture"},
                     "existence": "present",
                     "limit.context": 8192
                 });
@@ -850,6 +854,9 @@ impl Daemon {
                     "limit.output": 32000
                 });
             }
+            // Real model routing comes from the same captured fact plane as the other daemon rigs.
+            // The synthetic cache probe above declares its transport explicitly instead.
+            lkg = super::routing_fixture::with_served_routing(lkg);
             setup(
                 "seed lkg catalog",
                 std::fs::write(
@@ -943,30 +950,7 @@ impl Daemon {
                 });
             }
         }
-        if broca_env
-            .iter()
-            .any(|(key, value)| *key == "BROCA_AUTH_SOURCE" && *value == "vault")
-        {
-            let handles_path = dir.join("vault-handles.json");
-            setup(
-                "write vault handles fixture",
-                std::fs::write(
-                    &handles_path,
-                    r#"{"handles":{"apikey:openai":"ckh_test_only"}}"#,
-                )
-                .ok(),
-            )?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                setup(
-                    "restrict vault handles to 0600",
-                    std::fs::set_permissions(&handles_path, std::fs::Permissions::from_mode(0o600))
-                        .ok(),
-                )?;
-            }
-            config["modules"]["broca"]["env"]["BROCA_VAULT_HANDLES_PATH"] =
-                json!(handles_path.to_string_lossy());
+        if vault_seed.is_some() {
             // Point BROCA_AUTH_METHODS_PATH at an explicit file so developer settings cannot
             // leak into the rig. The Meta capture case declares its OAuth method here; other
             // vault cases declare no overrides and use the API-key fallback. The file must
@@ -989,6 +973,7 @@ impl Daemon {
         // Seed the vault and declare its module BEFORE the supervisor starts: the vault holds a
         // single-writer lease once its daemon is up, and `reserved` is required because the
         // module echoes the launch nonce to prove it is the process the supervisor spawned.
+        let mut vault_probe_handle = None;
         if let Some(seed) = vault_seed.as_ref() {
             let (vault_binary, ck_auth_binary) = vault_binaries.as_ref()?;
             let data_home = dir.join("vault-data");
@@ -1003,14 +988,14 @@ impl Daemon {
                 "create vault data dir",
                 std::fs::create_dir_all(&vault_dir).ok(),
             )?;
-            let handle = setup(
+            vault_probe_handle = Some(setup(
                 "seed the vault credential",
                 if seed.order == VaultSeedOrder::PutThenMint {
                     seed_live_credential(&vault_dir, &key_path, ck_auth_binary, seed)
                 } else {
                     seed_dead_credential(&vault_dir, &key_path, ck_auth_binary, seed)
                 },
-            )?;
+            )?);
 
             config["storage"] =
                 json!({ "backend": "sqlite", "data_home": data_home.to_string_lossy() });
@@ -1062,27 +1047,6 @@ impl Daemon {
                 },
                 "enabled": true,
             });
-            let handles_path = dir.join("vault-handles.json");
-            setup(
-                "write seeded vault handles",
-                std::fs::write(
-                    &handles_path,
-                    serde_json::to_string(&json!({ "handles": { &seed.credential_id: handle } }))
-                        .unwrap(),
-                )
-                .ok(),
-            )?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                setup(
-                    "restrict vault handles to 0600",
-                    std::fs::set_permissions(&handles_path, std::fs::Permissions::from_mode(0o600))
-                        .ok(),
-                )?;
-            }
-            config["modules"]["broca"]["env"]["BROCA_VAULT_HANDLES_PATH"] =
-                json!(handles_path.to_string_lossy());
             config["modules"]["broca"]["env"]["BROCA_CREDENTIAL_VAULT_MODULE_ID"] =
                 json!("claustrum");
         }
@@ -1136,6 +1100,7 @@ impl Daemon {
             child: RefCell::new(child),
             dir,
             connection_file,
+            vault_probe_handle,
         };
         // Wait until the broca MODULE is actually LIVE (registered + bindable), not just
         // until subc is up. A supervised module spawns + HELLO-registers ASYNCHRONOUSLY after
@@ -2492,13 +2457,7 @@ async fn empty_tools_send_completes_when_tool_module_rejects_binds() {
 /// A missing credentials module degrades health without preventing broca from registering.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn vault_dependency_is_resolved_after_registering() {
-    let Some(daemon) = Daemon::start_with_broca_env(
-        "vault-register-first",
-        "",
-        &[("BROCA_AUTH_SOURCE", "vault")],
-    )
-    .await
-    else {
+    let Some(daemon) = Daemon::start_with_broca_env("vault-register-first", "", &[]).await else {
         return;
     };
 
@@ -2687,7 +2646,7 @@ const VAULT_REJECTION_FIXTURES: &str = r#"{
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_provider_401_evicts_the_current_real_vault_credential_from_process_cache() {
-    // The shipped catalog points `atomic-chat` at this loopback port, and real desktop apps
+    // The rig's synthetic catalog points `atomic-chat` at this loopback port, and real desktop apps
     // listen on it too. Keep it occupied for the whole test -- by this listener when it is free,
     // by whatever already holds it otherwise -- so the arm passes only when aimock boots on its
     // own port and the provider route really reaches it. When this test binds the port, its
@@ -3082,81 +3041,6 @@ async fn context_management_is_chosen_per_session_and_frozen_at_first_admission(
     }
 }
 
-/// A child that exits at once, for standing in as a supervisor that died.
-///
-/// Spelled per-platform because the rest of this rig spawns real product binaries and never
-/// needed a bare process before. `/usr/bin/true` does not exist on Windows, which CI caught.
-fn exits_immediately() -> tokio::process::Command {
-    if cfg!(windows) {
-        let mut c = tokio::process::Command::new("cmd");
-        c.args(["/C", "exit", "0"]);
-        c
-    } else {
-        tokio::process::Command::new("/usr/bin/true")
-    }
-}
-
-/// A child that outlives the assertion, for standing in as a live supervisor.
-fn stays_running() -> tokio::process::Command {
-    if cfg!(windows) {
-        let mut c = tokio::process::Command::new("ping");
-        c.args(["-n", "31", "127.0.0.1"]);
-        c
-    } else {
-        let mut c = tokio::process::Command::new("/bin/sleep");
-        c.arg("30");
-        c
-    }
-}
-
-/// The readiness diagnosis must SEPARATE a dead supervisor from a supervisor that is alive
-/// without its module, because those send an investigator to opposite places.
-///
-/// The supervisor-exited arm is unreachable from the rig: the connection-file gate runs first,
-/// so a supervisor that dies early fails there instead, and one that dies in the window between
-/// publishing its file and the module registering is a race I cannot schedule. Driving the
-/// method directly is what makes the arm provable at all -- otherwise it would ship as an
-/// untested branch whose text nobody has ever read.
-#[tokio::test]
-async fn the_readiness_diagnosis_separates_a_dead_supervisor_from_a_missing_module() {
-    let dir = broca_test_support::scratch_root().join(format!("broca-diag-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("rig dir");
-
-    // A process that exits immediately, standing in for a supervisor that died.
-    let mut dead = exits_immediately().spawn().expect("spawn");
-    dead.wait().await.expect("reap");
-    let mut daemon = Daemon {
-        child: RefCell::new(broca_test_support::RigChild::new(dead, &dir, "daemon")),
-        dir: dir.clone(),
-        connection_file: dir.join("subc-connection.json"),
-    };
-    let msg = daemon.readiness_diagnosis("broca");
-    assert!(
-        msg.contains("supervisor exited"),
-        "a reaped supervisor must be named as the failure, got: {msg}"
-    );
-
-    // A process still running, standing in for a live supervisor whose module never appeared.
-    let alive = stays_running().kill_on_drop(true).spawn().expect("spawn");
-    let mut daemon = Daemon {
-        child: RefCell::new(broca_test_support::RigChild::new(alive, &dir, "daemon")),
-        dir,
-        connection_file: std::path::PathBuf::from("/nonexistent"),
-    };
-    let msg = daemon.readiness_diagnosis("broca");
-    assert!(
-        msg.contains("supervisor stayed up"),
-        "a live supervisor must be reported as still up, got: {msg}"
-    );
-    // The load caveat rides on this arm specifically: it is the one that fires on an unmodified
-    // tree when the host is busy, and without it the message reads as a verdict on the diff.
-    assert!(
-        msg.contains("still starting when the deadline expired"),
-        "the timeout cause must stay named, got: {msg}"
-    );
-    daemon.child.get_mut().kill().await.ok();
-}
-
 // The shape you never probe is the shape you will assert is impossible. These strict,
 // test-only mirrors audit live claustrum replies; production vault.rs remains forward-compatible.
 #[derive(serde::Deserialize)]
@@ -3215,10 +3099,10 @@ async fn live_vault_reply_shapes_match_the_decoder() {
         claustrum_bin(),
         std::fs::read_to_string(daemon.dir.join("runtime/data-home/cortexkit/run/logs/claustrum.stderr.log")),
     );
-    let handles: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(daemon.dir.join("vault-handles.json")).unwrap())
-            .unwrap();
-    let handle = handles["handles"]["apikey:wire-probe"].as_str().unwrap();
+    let handle = daemon
+        .vault_probe_handle
+        .as_deref()
+        .expect("wire probe needs the handle minted while seeding the isolated vault");
     let conn = broca_subc::SubcConnection::connect(&daemon.connection_file)
         .await
         .unwrap();

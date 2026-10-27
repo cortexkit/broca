@@ -811,6 +811,10 @@ mod tests {
             .filter_map(|block| match block {
                 ContentBlock::ToolResult(result) => {
                     let text = match &result.output {
+                        ToolOutput::Parts { parts } => broca_protocol::content::media_parts_text(
+                            parts,
+                            broca_protocol::MediaMarkerReason::NotRequested,
+                        ),
                         ToolOutput::Text { text } => text.clone(),
                         ToolOutput::Error { message } => message.clone(),
                         ToolOutput::Json { value } => value.to_string(),

@@ -1,127 +1,146 @@
-use broca_protocol::ErrorClass;
+use async_trait::async_trait;
+use broca_module::registry::OpenError;
+use broca_module::serve::{
+    CancelResponse, RetractResponse, SendRequest, SendResponse, SessionReadRequest, StatusResponse,
+    SubscribeFrom,
+};
+use broca_module::{Delivery, ServeError, ServeHandler};
+use broca_protocol::{BindIdentity, ErrorClass, RunId, SubmissionId};
+use tokio::sync::mpsc;
 
-/// Keep the production construction inventory closed: every added site must choose a class.
-#[test]
-fn every_open_failed_site_chooses_a_class() {
-    let source = include_str!("../../src/serve.rs");
-    let marker = ["ServeError::", "Open("].concat();
-    let sites = [
-        ("final_message_of: missing RunStarted", "None"),
-        ("final_message_of: replay failed", "None"),
-        ("final_message_of: missing assistant", "None"),
-        (
-            "run_tool_call_records: incomplete WAL range",
-            "Some(broca_protocol::ErrorClass::Transient)",
-        ),
-        (
-            "indexed_run_tool_calls: stored result size encoding",
-            "None",
-        ),
-        (
-            "run_tool_calls_cursor_authentication: entropy unavailable",
-            "Some(broca_protocol::ErrorClass::Transient)",
-        ),
-        (
-            "run_tool_calls_cursor_authentication: cursor encoding",
-            "None",
-        ),
-        ("run_tool_calls_cursor_token: cursor encoding", "None"),
-        ("From<OpenError>: erased cause", "None"),
-        ("From<OpenError>: typed cause", "Some(class)"),
+/// A serve handler that implements only the required methods, so every other method answers
+/// with the trait's default refusal. Its required methods are never reached by these tests.
+struct DefaultsOnly;
+
+#[async_trait]
+impl ServeHandler for DefaultsOnly {
+    async fn send(&self, _: SendRequest) -> Result<SendResponse, ServeError> {
+        unreachable!("not exercised")
+    }
+    async fn retract(
+        &self,
+        _: &BindIdentity,
+        _: SubmissionId,
+    ) -> Result<RetractResponse, ServeError> {
+        unreachable!("not exercised")
+    }
+    async fn subscribe(
+        &self,
+        _: &BindIdentity,
+        _: SubscribeFrom,
+        _: mpsc::Sender<Delivery>,
+    ) -> Result<(), ServeError> {
+        unreachable!("not exercised")
+    }
+    async fn read(
+        &self,
+        _: SessionReadRequest,
+    ) -> Result<broca_wire::SessionReadResponse, ServeError> {
+        unreachable!("not exercised")
+    }
+    async fn cancel(&self, _: &BindIdentity, _: RunId) -> Result<CancelResponse, ServeError> {
+        unreachable!("not exercised")
+    }
+    async fn status(&self, _: &BindIdentity) -> Result<StatusResponse, ServeError> {
+        unreachable!("not exercised")
+    }
+    async fn run_status(
+        &self,
+        _: &BindIdentity,
+        _: RunId,
+    ) -> Result<broca_wire::RunStatusResponse, ServeError> {
+        unreachable!("not exercised")
+    }
+}
+
+/// The class an `Open` refusal carries, or a panic naming what was returned instead.
+fn open_class<T: std::fmt::Debug>(site: &str, result: Result<T, ServeError>) -> Option<ErrorClass> {
+    match result {
+        Err(ServeError::Open(_, class)) => class,
+        other => panic!("{site}: expected an Open refusal, got {other:?}"),
+    }
+}
+
+/// A serve implementation without a capability refuses it with a class a caller can act on:
+/// a missing method is Permanent (a retry reaches the same implementation), while a send that
+/// cannot tell whether the session was written is Transient (the classifier may answer later).
+#[tokio::test]
+async fn default_refusals_carry_their_retry_class() {
+    let handler = DefaultsOnly;
+    let session = BindIdentity::new(std::path::PathBuf::from("/tmp/project"), "runner", "s");
+    let run = || RunId("r".into());
+    let permanent = Some(ErrorClass::Permanent);
+    let cases = [
         (
             "cancel_at: boundary runtime not installed",
-            "Some(broca_protocol::ErrorClass::Permanent)",
+            open_class(
+                "cancel_at",
+                handler
+                    .cancel_at(
+                        &session,
+                        run(),
+                        broca_wal::record::RunCancelAt::StepBoundary,
+                    )
+                    .await,
+            ),
+            permanent,
         ),
         (
             "head: unsupported",
-            "Some(broca_protocol::ErrorClass::Permanent)",
+            open_class("head", handler.head(&session).await),
+            permanent,
         ),
         (
             "warm: unsupported",
-            "Some(broca_protocol::ErrorClass::Permanent)",
+            open_class("warm", handler.warm(&session, None).await),
+            permanent,
         ),
         (
             "run_result: unsupported",
-            "Some(broca_protocol::ErrorClass::Permanent)",
+            open_class("run_result", handler.run_result(&session, run()).await),
+            permanent,
         ),
         (
             "run_tool_calls: unsupported",
-            "Some(broca_protocol::ErrorClass::Permanent)",
+            open_class(
+                "run_tool_calls",
+                handler
+                    .run_tool_calls(
+                        &session,
+                        cortexkit_role_llm_runner::tool_calls::ToolCallsRequest::new("r"),
+                    )
+                    .await,
+            ),
+            permanent,
         ),
         (
             "baseline: unsupported",
-            "Some(broca_protocol::ErrorClass::Permanent)",
+            open_class(
+                "baseline",
+                handler.baseline(&session, None, &Default::default()).await,
+            ),
+            permanent,
         ),
         (
             "session_written: classifier unsupported",
-            "Some(broca_protocol::ErrorClass::Transient)",
+            open_class("session_written", handler.session_written(&session)),
+            Some(ErrorClass::Transient),
         ),
-        (
-            "model_read: invalid source",
-            "Some(broca_protocol::ErrorClass::Permanent)",
-        ),
-        ("send: erased cause", "None"),
-        ("send: typed admission", "Some(class)"),
-        ("send_status: durable send has no carrying run", "None"),
-        // A stamped bind whose history no source could read is refused, and may succeed on retry.
-        (
-            "bind_adoption_refusal: history unreadable",
-            "Some(broca_protocol::ErrorClass::Transient)",
-        ),
-        ("retract: erased cause", "None"),
-        ("subscribe: erased cause", "None"),
-        (
-            "read: incomplete late continuation",
-            "Some(broca_protocol::ErrorClass::Transient)",
-        ),
-        ("warm: erased cause", "None"),
-        ("run_tool_calls: response encoding", "None"),
-        (
-            "session_written: WAL presence unknown",
-            "Some(broca_protocol::ErrorClass::Transient)",
-        ),
-        // Cancellation can fail while reading the cut JSON that freezes a session.
-        // The actor passes text here, not the I/O kind needed to prove retryability.
-        ("cancel: erased move-authority cause", "None"),
     ];
-    let mut expressions = Vec::new();
-    for tail in source.split(&marker).skip(1) {
-        let mut depth = 1;
-        let mut end = None;
-        for (i, ch) in tail.char_indices() {
-            match ch {
-                '(' => depth += 1,
-                ')' => depth -= 1,
-                _ => {}
-            }
-            if depth == 0 {
-                end = Some(i);
-                break;
-            }
-        }
-        let expression: String = tail[..end.expect("balanced Open expression")]
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        // Display matches the variant rather than constructing it.
-        if expression == "s,_" {
-            continue;
-        }
-        expressions.push(expression);
+    for (site, actual, expected) in cases {
+        assert_eq!(actual, expected, "{site}");
     }
-    assert_eq!(
-        expressions.len(),
-        sites.len(),
-        "an Open construction was added or removed; update its classification decision"
+}
+
+/// An open failure with only a text cause has no class to give a caller; a typed cause keeps
+/// its class (see `typed_open_errors_preserve_all_shared_classes`).
+#[test]
+fn an_erased_open_error_carries_no_class() {
+    let error = ServeError::from(OpenError::Open("lost cause".into()));
+    assert!(
+        matches!(&error, ServeError::Open(reason, None) if reason == "lost cause"),
+        "{error:?}"
     );
-    for ((site, class), expression) in sites.iter().zip(expressions) {
-        assert!(
-            expression
-                .trim_end_matches(',')
-                .ends_with(&format!(",{class}")),
-            "{site}: expected {class}, found {expression}"
-        );
-    }
 }
 
 #[test]

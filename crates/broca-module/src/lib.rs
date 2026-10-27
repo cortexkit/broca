@@ -10,15 +10,23 @@
 
 pub mod actor;
 pub mod cache;
+mod compaction_watch;
 pub mod executor;
 pub mod fanout;
+pub mod held_slots;
+pub mod history;
+pub mod late_results_puller;
+pub mod late_results_store;
 pub mod opener;
+pub mod output_refs;
+pub mod person_media;
 pub mod registry;
 pub mod retention;
 pub mod retention_withdrawals;
 mod send_fate;
 pub mod serve;
 pub mod session_class;
+mod uploads;
 
 pub use cache::{CacheDeclaration, CacheDeclarer};
 pub use executor::{RunExecutor, RunJob, RunKind, SealedRun, WarmBase, WarmError, WarmJob};

@@ -38,6 +38,133 @@ const SCOPE_EPOCH: u64 = 7;
 /// out with corr `SCOPE_SYNC_CORR_BASE + n`, and its reply is recorded under that corr.
 const SCOPE_SYNC_CORR_BASE: u64 = 1_000_000;
 
+#[derive(Default)]
+struct AcceptanceCatalog {
+    fetched: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl subc_client_rs::ModuleHandler for AcceptanceCatalog {
+    async fn handle(
+        &self,
+        _ctx: subc_client_rs::RequestCtx,
+        body: Vec<u8>,
+    ) -> subc_client_rs::HandlerOutcome {
+        use sha2::{Digest, Sha256};
+        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(request["name"], "tool.catalog");
+        assert_eq!(request["arguments"]["preset"], "reader");
+        let composition = &request["arguments"]["composition"];
+        let schema = serde_json::json!({"type": "object"});
+        let mut answer = serde_json::json!({
+            "generation": "1",
+            "catalog_digest": format!("{:x}", Sha256::digest(b"acceptance-catalog")),
+            "capabilities": {"late_results": true},
+            "tools": [{
+                "name": "read", "description": "Read a file",
+                "input_schema": schema,
+                "schema_digest": cortexkit_role_tool_provider::catalog::schema_digest(&schema).unwrap(),
+                "semantics": 1, "capabilities": ["code.read/v1"],
+                "result_format": "content/v1"
+            }]
+        });
+        // A provider release between preflight and admission must recompose the plan, not
+        // rotate models or bypass the WAL feature checks.
+        if self.fetched.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            answer["catalog_digest"] = serde_json::json!(format!(
+                "{:x}",
+                Sha256::digest(b"acceptance-catalog-updated")
+            ));
+            answer["tools"].as_array_mut().unwrap().push(serde_json::json!({
+                "name": "search", "description": "Search files", "input_schema": schema,
+                "schema_digest": cortexkit_role_tool_provider::catalog::schema_digest(&schema).unwrap(),
+                "semantics": 1, "capabilities": ["code.search/v1"], "result_format": "content/v1"
+            }));
+        }
+        if !composition.is_null() {
+            answer["composition_digest"] = serde_json::json!(
+                cortexkit_role_tool_provider::catalog::composition_digest(composition).unwrap()
+            );
+        }
+        subc_client_rs::HandlerOutcome::Response(serde_json::to_vec(&answer).unwrap())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_admission_acceptance_reads_real_run_started_gates() {
+    use subc_protocol::manifest::{Concurrency, ExecutionMode, IdentityScope, ProviderRole, Tool};
+    let model = ScopeModel::start().await;
+    let Some(rig) = Rig::start_configured(None, None, Some(&model.url)).await else {
+        return;
+    };
+    let manifest =
+        subc_protocol::manifest::ModuleManifest::builder("aft", env!("CARGO_PKG_VERSION"))
+            .provides(vec![ProviderRole::ToolProvider {
+                tools: vec![Tool {
+                    name: "read".into(),
+                    description: Some("Read a file".into()),
+                    execution_mode: ExecutionMode::Pure,
+                    schema: serde_json::json!({"type": "object"}),
+                }],
+                identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+                concurrency: Concurrency::ModuleManaged,
+                emits_push: false,
+                sub_supervises: false,
+            }])
+            .build();
+    let (_, serve) = subc_client_rs::serve_with_handle(
+        &rig.connection_file,
+        manifest,
+        AcceptanceCatalog::default(),
+    )
+    .await
+    .expect("register declaring AFT catalog on private daemon");
+    let serving = tokio::spawn(serve);
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let output = Command::new("python3")
+        .arg(root.join("scripts/acceptance-worker-turn.py"))
+        .arg("--session-bin")
+        .arg(env!("CARGO_BIN_EXE_broca-session"))
+        .arg("--subc")
+        .arg(&rig.connection_file)
+        .arg("--state-root")
+        .arg(&rig.state_root)
+        .arg("--project-root")
+        .arg(&rig.dir)
+        .args(["--model", "mock/mock-model", "--timeout", "30"])
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .await
+        .unwrap();
+    serving.abort();
+    println!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success() {
+        for path in walk(&rig.dir) {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                for line in text
+                    .lines()
+                    .filter(|line| line.contains("panicked") || line.contains("precomputed"))
+                    .take(4)
+                {
+                    println!("{}: {line}", path.display());
+                }
+            }
+        }
+    }
+    assert!(
+        output.status.success(),
+        "worker admission acceptance failed"
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("recomposing once"));
+}
+
 fn sibling_bin(name: &str, env_key: &str) -> PathBuf {
     broca_test_support::subc_bin(name, env_key)
 }
@@ -501,6 +628,48 @@ fn admitted_sends(path: &Path) -> (usize, usize) {
     )
 }
 
+/// The `requires` list of every frame in a WAL's bytes that carries a `run_started` record,
+/// in file order: `Some(names)` for a gated frame, `None` for an ordinary one that any reader
+/// would accept. Walks the frame headers (`[len u32 LE][ver u8][seq][fence][digest]`) so a
+/// payload is read whole, not matched by a byte prefix that depends on every other feature.
+fn run_started_frame_requires(wal: &[u8]) -> Vec<Option<Vec<String>>> {
+    use broca_wal::framing::{FRAMING_VERSION as ORDINARY, GATED_FRAMING_VERSION as GATED};
+    let header = broca_wal::framing::HEADER_LEN;
+    let mut found = Vec::new();
+    let mut rest = wal;
+    while rest.len() >= header {
+        let len = u32::from_le_bytes(rest[0..4].try_into().unwrap()) as usize;
+        let ver = rest[4];
+        let Some(payload) = rest.get(header..header + len) else {
+            break; // a torn tail: the record was never durable
+        };
+        let parsed = || serde_json::from_slice::<serde_json::Value>(payload).ok();
+        match ver {
+            ORDINARY => {
+                if parsed().is_some_and(|record| record["type"] == "run_started") {
+                    found.push(None);
+                }
+            }
+            GATED => {
+                if let Some(envelope) =
+                    parsed().filter(|envelope| envelope["record"]["type"] == "run_started")
+                {
+                    let requires = envelope["requires"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|name| name.as_str().map(str::to_owned))
+                        .collect();
+                    found.push(Some(requires));
+                }
+            }
+            _ => {}
+        }
+        rest = &rest[header + len..];
+    }
+    found
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_real_daemons_stamp_freezes_the_scope_and_refuses_another_identity() {
     let Some(rig) = Rig::start().await else {
@@ -556,21 +725,27 @@ async fn the_real_daemons_stamp_freezes_the_scope_and_refuses_another_identity()
         )],
         "broca froze exactly the (owner, ref, scope_epoch) the daemon stamped"
     );
-    // The session is tagged too, so its RunStarted also requires runner tags.
-    let gated = br#"{"requires":["runner-tags/v2","scope/v1"],"record":{"type":"run_started""#;
+    // The scoped RunStarted must sit in a gated frame whose `requires` names scope/v1, so a
+    // reader that predates scopes refuses the WAL instead of reading the episode as unscoped.
+    // The frame also names whatever other features the record uses (runner tags, message
+    // times, ...); those may grow with later records and are not what this test guards.
+    let run_started = run_started_frame_requires(&wal);
     assert_eq!(
-        wal.windows(gated.len())
-            .filter(|window| *window == gated)
-            .count(),
+        run_started.len(),
         1,
-        "the scoped RunStarted is a gated frame requiring scope/v1"
+        "exactly one RunStarted frame: {run_started:?}"
     );
-    assert_eq!(
-        std::fs::read_to_string(rig.state_root.join(broca_wal::FEATURE_FLOOR_FILENAME))
-            .ok()
-            .as_deref(),
-        Some("runner-tags/v2\nscope/v1\n"),
-        "the feature floor lists scope/v1"
+    assert!(
+        run_started[0]
+            .as_ref()
+            .is_some_and(|requires| requires.iter().any(|name| name == "scope/v1")),
+        "the scoped RunStarted is a gated frame requiring scope/v1: {run_started:?}"
+    );
+    let floor = std::fs::read_to_string(rig.state_root.join(broca_wal::FEATURE_FLOOR_FILENAME))
+        .unwrap_or_default();
+    assert!(
+        floor.lines().any(|name| name == "scope/v1"),
+        "the feature floor lists scope/v1: {floor:?}"
     );
 
     // A second identity, admitted by the daemon as a listed carrier of the same scope, is not
