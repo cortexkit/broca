@@ -276,6 +276,9 @@ async fn image_reference_refusals_are_fixed_class_and_write_nothing() {
             "image_unavailable",
             "permanent",
         ),
+        // A reply the daemon could not deliver for its size is refused as an oversized inline
+        // image is, not as a missing handle.
+        (ImageResolveError::TooLarge, "invalid_params", "permanent"),
     ] {
         let rig = rig(true);
         rig.source

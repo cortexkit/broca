@@ -161,6 +161,18 @@ impl SystemOne {
                                 ResolveFailure::Unavailable.refusal(&field)
                             }
                             broca_subc::ImageResolveError::InvalidReply => invalid_reply(&field),
+                            // An inline image this large gets invalid_params, so a resolved one
+                            // does too: the handle is valid, but the picture is too big to send.
+                            broca_subc::ImageResolveError::TooLarge => {
+                                tracing::warn!(
+                                    target: "system_one",
+                                    "image.resolve reply was too large for the daemon to deliver"
+                                );
+                                Refusal::invalid_params(
+                                    &field,
+                                    "the resolved image is larger than an image reference can carry",
+                                )
+                            }
                         })?;
                     let bytes = STANDARD
                         .decode(&reply.bytes)
