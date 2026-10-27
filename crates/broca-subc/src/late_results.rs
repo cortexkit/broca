@@ -223,7 +223,7 @@ pub fn late_entry_tool_result(
     use cortexkit_role_tool_provider::late_results::EntryKind;
     let error = |message: String| broca_protocol::ToolResult {
         tool_call_id: tool_call_id.clone(),
-        output: broca_protocol::ToolOutput::Error { message },
+        output: broca_protocol::ToolOutput::error(message),
         is_error: true,
     };
     match entry.kind() {

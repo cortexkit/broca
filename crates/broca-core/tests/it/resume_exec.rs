@@ -903,7 +903,7 @@ async fn check_named_tool_result_ceiling(
     }
     let is_error = matches!(&output, ToolOutput::Error { .. });
     let tool_plane = StubToolPlane::new().with_tool(tool_name, move |_| match &output {
-        ToolOutput::Error { message } => StubReply::ExecError(message.clone()),
+        ToolOutput::Error { message, .. } => StubReply::ExecError(message.clone()),
         _ => StubReply::Output(output.clone()),
     });
     let mut req = request("r", &dir);
@@ -1010,14 +1010,7 @@ async fn tool_result_ceiling_serializes_large_json_as_text() {
 #[tokio::test]
 async fn tool_result_ceiling_caps_error_and_preserves_is_error() {
     let message = "failure".repeat(160_000);
-    check_tool_result_ceiling(
-        "error",
-        ToolOutput::Error {
-            message: message.clone(),
-        },
-        message,
-    )
-    .await;
+    check_tool_result_ceiling("error", ToolOutput::error(message.clone()), message).await;
 }
 
 #[tokio::test]

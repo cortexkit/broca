@@ -254,7 +254,7 @@ async fn await_conflict(mode: &'static str) {
         .batch(&crate::AllowAll, vec![call("c")], Some(resume), false)
         .await;
     assert!(
-        matches!(&result.results[0].output, ToolOutput::Error { message } if message.contains("consent_conflicting_decisions")),
+        matches!(&result.results[0].output, ToolOutput::Error { message, .. } if message.contains("consent_conflicting_decisions")),
         "a filed await approval must check every settlement before intake"
     );
     assert_eq!(
@@ -405,7 +405,7 @@ async fn live_old_approval_proves_recorded_duplicate_withdrawal_before_adoption(
         .batch(&crate::AllowAll, vec![call("held")], Some(resume), false)
         .await;
     assert!(
-        matches!(&result.results[0].output, ToolOutput::Error { message } if message.contains("consent_conflicting_decisions")),
+        matches!(&result.results[0].output, ToolOutput::Error { message, .. } if message.contains("consent_conflicting_decisions")),
         "live adoption must prove the recorded duplicate did not answer oppositely"
     );
     assert!(cards.withdrew.load(Ordering::SeqCst));
@@ -661,7 +661,7 @@ async fn live_feed_budget_preserves_prefix_until_later_conflict() {
         .batch(&crate::AllowAll, vec![call("held")], Some(resume), false)
         .await;
     assert!(
-        matches!(&result.results[0].output, ToolOutput::Error { message } if message.contains("consent_conflicting_decisions"))
+        matches!(&result.results[0].output, ToolOutput::Error { message, .. } if message.contains("consent_conflicting_decisions"))
     );
     assert_eq!(
         *feed.positions.lock().unwrap(),

@@ -306,7 +306,7 @@ fn render_native(message: &Value) -> Result<Vec<Value>, String> {
                     broca_protocol::ToolOutput::Text { text } => text,
                     broca_protocol::ToolOutput::Json { value } => value.to_string(),
                     broca_protocol::ToolOutput::Denied { reason } => format!("denied: {reason}"),
-                    broca_protocol::ToolOutput::Error { message } => message,
+                    broca_protocol::ToolOutput::Error { message, .. } => message,
                 };
                 Ok(json!({"role":"tool","tool_call_id":b["tool_call_id"],"content":text}))
             })

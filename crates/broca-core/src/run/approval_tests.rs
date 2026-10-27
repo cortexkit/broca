@@ -1363,7 +1363,7 @@ async fn absent_elicitation_adapter_closes_before_prepared_and_installed_plane_p
         } else {
             assert!(result.results[0].is_error);
             assert!(
-                matches!(&result.results[0].output, ToolOutput::Error { message } if message.starts_with("pre_tool_unavailable:"))
+                matches!(&result.results[0].output, ToolOutput::Error { message, .. } if message.starts_with("pre_tool_unavailable:"))
             );
             assert!(rig.tools.sent.lock().unwrap().is_empty());
             assert!(rig.questions.keys.lock().unwrap().is_empty());
@@ -1951,7 +1951,7 @@ async fn late_validation_and_plane_outcomes_are_terminal_and_never_retried() {
             usize::from(mode != "deny")
         );
         if mode == "deny" {
-            assert!(rig.frames().iter().any(|frame|matches!(&frame.record,WalRecord::LateResult{result,..} if matches!(&result.output,ToolOutput::Error{message} if message.starts_with("pre_tool_denied:")))));
+            assert!(rig.frames().iter().any(|frame|matches!(&frame.record,WalRecord::LateResult{result,..} if matches!(&result.output,ToolOutput::Error{message, ..} if message.starts_with("pre_tool_denied:")))));
         }
         let outcomes: Vec<_> = rig
             .frames()

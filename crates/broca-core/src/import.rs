@@ -678,9 +678,7 @@ fn flush_pending(
             *synthesized += 1;
             ContentBlock::ToolResult(ToolResult {
                 tool_call_id,
-                output: ToolOutput::Error {
-                    message: "tool not run: interrupted before dispatch".into(),
-                },
+                output: ToolOutput::error("tool not run: interrupted before dispatch"),
                 is_error: true,
             })
         })
@@ -830,7 +828,7 @@ mod tests {
             .filter_map(|block| match block {
                 ContentBlock::ToolResult(ToolResult {
                     tool_call_id,
-                    output: ToolOutput::Error { message },
+                    output: ToolOutput::Error { message, .. },
                     is_error: true,
                 }) if message == "tool not run: interrupted before dispatch" => {
                     Some(tool_call_id.0.clone())
@@ -965,16 +963,12 @@ mod tests {
                 vec![
                     ContentBlock::ToolResult(ToolResult {
                         tool_call_id: ToolCallId("a".into()),
-                        output: ToolOutput::Error {
-                            message: "tool not run: interrupted before dispatch".into(),
-                        },
+                        output: ToolOutput::error("tool not run: interrupted before dispatch"),
                         is_error: true,
                     }),
                     ContentBlock::ToolResult(ToolResult {
                         tool_call_id: ToolCallId("d".into()),
-                        output: ToolOutput::Error {
-                            message: "tool not run: interrupted before dispatch".into(),
-                        },
+                        output: ToolOutput::error("tool not run: interrupted before dispatch"),
                         is_error: true,
                     }),
                 ],

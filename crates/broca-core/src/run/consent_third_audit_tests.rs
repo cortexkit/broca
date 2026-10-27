@@ -179,7 +179,7 @@ async fn late_approving_get_rechecks_opposing_settlement_before_authorization() 
         "a late get must not authorize over an opposing owner-feed settlement"
     );
     assert!(!rig.frames().iter().any(|frame| matches!(&frame.record, WalRecord::LateApprovalRecorded { call_key, decision: broca_wal::LateDecision::Approved, .. } if call_key == &key)));
-    assert!(rig.frames().iter().any(|frame| matches!(&frame.record, WalRecord::LateResult { call_key, outcome: broca_wal::LateOutcome::NotSent, result } if call_key == &key && matches!(&result.output, ToolOutput::Error { message } if message.contains("consent_conflicting_decisions")))));
+    assert!(rig.frames().iter().any(|frame| matches!(&frame.record, WalRecord::LateResult { call_key, outcome: broca_wal::LateOutcome::NotSent, result } if call_key == &key && matches!(&result.output, ToolOutput::Error { message, .. } if message.contains("consent_conflicting_decisions")))));
     rig.finish().await;
 }
 
@@ -304,7 +304,7 @@ async fn live_expired_older_approval_proves_recorded_duplicate_before_adoption()
         "an older late approval cannot replace the still-answerable recorded duplicate"
     );
     assert!(!rig.frames().iter().any(|frame| matches!(&frame.record, WalRecord::LateApprovalRecorded { call_key, decision: broca_wal::LateDecision::Approved, .. } if call_key == &key)));
-    assert!(rig.frames().iter().any(|frame| matches!(&frame.record, WalRecord::LateResult { call_key, outcome: broca_wal::LateOutcome::NotSent, result } if call_key == &key && matches!(&result.output, ToolOutput::Error { message } if message.contains("consent_conflicting_decisions")))));
+    assert!(rig.frames().iter().any(|frame| matches!(&frame.record, WalRecord::LateResult { call_key, outcome: broca_wal::LateOutcome::NotSent, result } if call_key == &key && matches!(&result.output, ToolOutput::Error { message, .. } if message.contains("consent_conflicting_decisions")))));
     let mut history = approval_gate::History::new(&rig.writer, rig.frames()).unwrap();
     assert_eq!(
         history.projection.calls[&key].elicitation_id.as_deref(),

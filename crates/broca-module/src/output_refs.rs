@@ -258,7 +258,7 @@ fn stored_output(output: &ToolOutput) -> (String, Option<String>, Vec<u8>) {
     let text = |bytes: &str| ("text".to_owned(), None, bytes.as_bytes().to_vec());
     match output {
         ToolOutput::Text { text: body } => text(body),
-        ToolOutput::Error { message } => text(message),
+        ToolOutput::Error { message, .. } => text(message),
         ToolOutput::Denied { reason } => text(reason),
         ToolOutput::Json { value } => (
             "text".to_owned(),

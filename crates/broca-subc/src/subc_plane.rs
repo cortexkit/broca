@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use broca_core::{
-    tool_plane::{BatchCtx, DispatchResult, ToolPlane, ToolPlaneError},
+    tool_plane::{BatchCtx, DispatchResult, ToolOpenGuard, ToolPlane, ToolPlaneError},
     ToolManifest,
 };
 use broca_protocol::{
@@ -46,29 +46,28 @@ use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::connection::{
-    retry_route_open, retry_route_open_with_scope_hold, route_failure_is_known_dead, ConnError,
-    GateTarget, ModuleGate, RouteHandle, RouteOpenError, RouteOpenRetry, ScopeHold, SubcConnection,
-    ROUTE_OPEN_RETRY_DEADLINE, ROUTE_OPEN_RETRY_INTERVAL, ROUTE_OPEN_RETRY_MAX_INTERVAL,
+    is_module_availability_refusal, retry_route_open, retry_route_open_with_scope_hold,
+    route_failure_is_known_dead, ConnError, GateTarget, ModuleGate, RouteHandle, RouteOpenError,
+    RouteOpenRetry, ScopeHold, SubcConnection, ROUTE_OPEN_RETRY_DEADLINE,
+    ROUTE_OPEN_RETRY_INTERVAL, ROUTE_OPEN_RETRY_MAX_INTERVAL,
 };
 use crate::scope_describe::{DescribedScope, ScopeDescriber};
 use crate::tool_deadline::tool_reply_deadline;
 
-/// How long a dispatch that was refused `module_reloading` waits for the module to come back.
+/// How long a TOOL-call dispatch route open keeps retrying a module-availability
+/// refusal (`target_unavailable`, `module_reloading`, `module_warming`, `module_timeout`)
+/// before the call is refused as module-unavailable: 90 s from the open, through the
+/// same per-target gate every other waiter shares, so all waiting calls ride out one
+/// short provider-module restart together instead of each failing the turn after 3 s.
 ///
-/// THE DEFAULT 3s DOES NOT COVER A RESTART, and I shipped a fix that assumed it did. Measured
-/// from the daemon's own logs: 16 AFT module_reloading episodes, 13 of them longer than 3s,
-/// clustered at 15-30s -- which is the module's 30s drain window. With the 3s patience the
-/// retry mostly ended in `NotSent`, so the model still got an error, just three seconds later.
-///
-/// 45s covers the 30s drain plus a respawn and warm-up, and stays well inside the 120s
-/// default execution deadline a tool call runs under (some calls get longer; see `tool_deadline`). A restart that takes longer still surfaces as
-/// `NotSent` -- a bounded wait, not an unbounded one, is the point. Session close still aborts
-/// the wait immediately.
-const RELOAD_REOPEN_PATIENCE: RouteOpenPatience = RouteOpenPatience {
-    deadline: Duration::from_secs(45),
-    // Backs off to 2s rather than polling every 100ms: at the flat interval a 45s wait is
-    // ~450 route.open calls per waiting dispatch, the storm the default path's cap exists to
-    // prevent.
+/// Tool dispatch only: vault, catalog, transform and routing opens keep the 3 s default
+/// patience. The wait still ends at once on run cancel/stop or the call's own reply
+/// budget, whichever comes first (see [`ToolOpenGuard`]).
+const TOOL_DISPATCH_PATIENCE: RouteOpenPatience = RouteOpenPatience {
+    deadline: Duration::from_secs(90),
+    // Backs off to 2s rather than polling every 100ms: at the flat interval a 90s wait is
+    // hundreds of route.open calls per waiting dispatch, the storm the default path's cap
+    // exists to prevent. While the module is down the gate does the waiting anyway.
     max_interval: Duration::from_secs(2),
 };
 
@@ -1355,6 +1354,7 @@ impl SubcToolPlane {
         closed: RouteHandle,
         composed_under: Option<ScopeStamp>,
         patience: RouteOpenPatience,
+        guard: &ToolOpenGuard,
         fence_key: FenceKey,
         key: Option<broca_core::tool_plane::DispatchKey<'_>>,
     ) -> DispatchResult {
@@ -1387,11 +1387,12 @@ impl SubcToolPlane {
                 Some(scope),
                 module_id,
                 &lifecycle,
-                None,
+                guard.deadline,
+                guard,
                 patience,
             )
             .await
-            .map_err(RouteEnsureError::into_plane)
+            .map_err(|error| map_tool_open_refusal(error, module_id))
         {
             Ok(route) => route,
             Err(error @ ToolPlaneError::ScopeRefused { .. }) => {
@@ -1401,6 +1402,14 @@ impl SubcToolPlane {
                 };
                 self.latch_gone(ctx, &code);
                 return drained(&code);
+            }
+            Err(ToolPlaneError::ModuleUnavailable {
+                module,
+                code,
+                detail,
+            }) => {
+                return self
+                    .module_unavailable_result(ctx, call, &module, &code, &detail, &fence_key);
             }
             Err(error) => {
                 return DispatchResult::NotSent {
@@ -1601,9 +1610,7 @@ impl SubcToolPlane {
                 // (`a_provider_scope_not_synced_refusal_is_recorded_and_never_resent`) pins this.
                 let result = ToolResult {
                     tool_call_id: call.tool_call_id.clone(),
-                    output: ToolOutput::Error {
-                        message: format!("tool/route rejected: {msg}"),
-                    },
+                    output: ToolOutput::error(format!("tool/route rejected: {msg}")),
                     is_error: true,
                 };
                 self.fence
@@ -1784,12 +1791,17 @@ impl SubcToolPlane {
     }
 
     /// Ensure a route + its flow-control semaphore exist for `bind`; return the
-    /// route channel and a shared semaphore handle.
+    /// route channel and a shared semaphore handle. This is the tool-dispatch open: a
+    /// module-availability refusal is retried for [`TOOL_DISPATCH_PATIENCE`], and one that
+    /// outlasts it becomes [`ToolPlaneError::ModuleUnavailable`] (proven undelivered).
+    /// `guard` ends the wait early on run cancel/stop, and `guard.deadline` caps it at the
+    /// step deadline that comes earlier.
     async fn ensure_route(
         &self,
         bind: &BindIdentity,
         scope: Option<&SessionScope>,
         module_id: &str,
+        guard: &ToolOpenGuard,
     ) -> Result<(RouteHandle, Arc<Semaphore>), ToolPlaneError> {
         let lifecycle = self.capture_session_lifecycle_token(bind);
         self.ensure_route_for_lifecycle_inner(
@@ -1797,17 +1809,19 @@ impl SubcToolPlane {
             scope,
             module_id,
             &lifecycle,
-            None,
-            DEFAULT_ROUTE_OPEN_PATIENCE,
+            guard.deadline,
+            guard,
+            TOOL_DISPATCH_PATIENCE,
         )
         .await
-        .map_err(RouteEnsureError::into_plane)
+        .map_err(|error| map_tool_open_refusal(error, module_id))
     }
 
     /// Open a route to `module_id` for `bind`, under `scope` when the run was admitted under
     /// one. This is the only place a tool route is opened, so it is where a scoped run's route
     /// is guaranteed to carry its scope: a scoped open that cannot carry it is refused, never
     /// sent unscoped.
+    #[allow(clippy::too_many_arguments)]
     async fn route_open_for_lifecycle(
         &self,
         bind: &BindIdentity,
@@ -1815,6 +1829,7 @@ impl SubcToolPlane {
         module_id: &str,
         lifecycle: &CancellationToken,
         retry_deadline: Option<Instant>,
+        guard: &ToolOpenGuard,
         patience: RouteOpenPatience,
     ) -> Result<(RouteHandle, Option<ScopeStamp>), RouteEnsureError> {
         // One computed deadline keeps the caller budget authoritative while retaining a short
@@ -1832,13 +1847,19 @@ impl SubcToolPlane {
             max_interval: patience.max_interval,
         };
         let gate_for = || self.conn.module_gate(module_id);
+        // Run cancel/stop ends the wait at once too, not just the session close: link the
+        // session lifecycle to the run's guard, and report which side fired.
+        let wait = WaitCancel::link(lifecycle, guard);
+        let cancel = wait.token();
         let cancelled = || {
-            RouteEnsureError::Plane(ToolPlaneError::Unavailable(
-                "session closed during route open".into(),
-            ))
+            RouteEnsureError::Plane(ToolPlaneError::Unavailable(if guard.interrupted() {
+                "run cancelled or stopped during route open".into()
+            } else {
+                "session closed during route open".into()
+            }))
         };
         let Some(scope) = scope else {
-            return retry_route_open(retry(), Some(lifecycle), gate_for, || {
+            return retry_route_open(retry(), Some(cancel), gate_for, || {
                 self.conn
                     .route_open_dispatch(module_id, bind, None, self.held_reply_declared())
             })
@@ -1894,7 +1915,7 @@ impl SubcToolPlane {
             let handle = retry_route_open_with_scope_hold(
                 retry(),
                 Some(hold),
-                Some(lifecycle),
+                Some(cancel),
                 gate_for,
                 || {
                     self.conn.route_open_dispatch(
@@ -1954,6 +1975,7 @@ impl SubcToolPlane {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn ensure_route_for_lifecycle_inner(
         &self,
         bind: &BindIdentity,
@@ -1961,6 +1983,7 @@ impl SubcToolPlane {
         module_id: &str,
         lifecycle: &CancellationToken,
         retry_deadline: Option<Instant>,
+        guard: &ToolOpenGuard,
         patience: RouteOpenPatience,
     ) -> Result<(RouteHandle, Arc<Semaphore>), RouteEnsureError> {
         let key = Self::route_key(bind, scope, module_id);
@@ -1994,7 +2017,15 @@ impl SubcToolPlane {
             .await
             .map_err(RouteEnsureError::Plane)?;
         let (handle, stamp) = self
-            .route_open_for_lifecycle(bind, scope, module_id, lifecycle, retry_deadline, patience)
+            .route_open_for_lifecycle(
+                bind,
+                scope,
+                module_id,
+                lifecycle,
+                retry_deadline,
+                guard,
+                patience,
+            )
             .await?;
         let sem = Arc::new(Semaphore::new(window));
         let cached = {
@@ -2042,6 +2073,7 @@ impl SubcToolPlane {
             module_id,
             lifecycle,
             retry_deadline,
+            &ToolOpenGuard::default(),
             DEFAULT_ROUTE_OPEN_PATIENCE,
         )
         .await
@@ -2194,6 +2226,7 @@ impl SubcToolPlane {
         ctx: &BatchCtx,
         calls: &[ToolCall],
         manifest: &ToolManifest,
+        guard: &ToolOpenGuard,
     ) -> Result<(), ToolPlaneError> {
         if ctx.scope.is_some() {
             // No call of this batch is in flight yet (its intents are written after this
@@ -2246,12 +2279,11 @@ impl SubcToolPlane {
             .unwrap()
             .insert(Self::batch_route_key(ctx), resolved);
 
-        let route_results = join_all(
-            modules
-                .iter()
-                .map(|module_id| self.ensure_route(&ctx.bind, ctx.scope.as_ref(), module_id)),
-        )
-        .await;
+        let route_results =
+            join_all(modules.iter().map(|module_id| {
+                self.ensure_route(&ctx.bind, ctx.scope.as_ref(), module_id, guard)
+            }))
+            .await;
         // join_all retains input order. Check every result in the same BTreeSet order as the
         // former serial loop so completion timing cannot change which module error is returned.
         let mut handles = HashMap::new();
@@ -2296,11 +2328,38 @@ impl SubcToolPlane {
         }
     }
 
+    /// A terminal result for a call proven undelivered because its module stayed down for
+    /// the whole tool-dispatch patience. The message stays the stable unavailable string
+    /// while the module, the daemon's code and its detail ride in sibling fields, so the
+    /// model can retry rather than give up. Fenced like any other Completed result, so a
+    /// repeated id returns it without re-sending.
+    fn module_unavailable_result(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        module_id: &str,
+        code: &str,
+        detail: &str,
+        fence_key: &FenceKey,
+    ) -> DispatchResult {
+        let result = ToolResult {
+            tool_call_id: call.tool_call_id.clone(),
+            output: ToolOutput::module_unavailable(module_id, code, detail),
+            is_error: true,
+        };
+        self.fence
+            .lock()
+            .unwrap()
+            .insert(&ctx.batch_id, fence_key.clone(), result.clone());
+        DispatchResult::Completed(result)
+    }
+
     async fn dispatch_inner(
         &self,
         ctx: &BatchCtx,
         call: &ToolCall,
         key: Option<broca_core::tool_plane::DispatchKey<'_>>,
+        guard: &ToolOpenGuard,
     ) -> DispatchResult {
         // Fence: a repeated (session, tool_call_id) returns the prior result (at-most-once).
         // Keyed by session so the same provider id minted by two sessions can't false-dedup.
@@ -2337,6 +2396,12 @@ impl SubcToolPlane {
         };
         let scope = ctx.scope.as_ref();
         let route_key = Self::route_key(&ctx.bind, scope, &module_id);
+        // The route-open wait must not eat the call's own execution budget: cap it at the
+        // call's reply deadline (the step deadline that comes earlier), alongside the
+        // tool-dispatch patience and the run cancel/stop the guard already carries.
+        let reply_deadline = self.reply_deadline(ctx, &module_id, call);
+        let mut guard = guard.clone();
+        guard.cap(Instant::now() + reply_deadline);
 
         // For a scoped call: the stamp of the route its batch started with, which the call was
         // composed under. `None` for an unscoped call.
@@ -2368,7 +2433,8 @@ impl SubcToolPlane {
                             &module_id,
                             handle,
                             Some(stamp),
-                            DEFAULT_ROUTE_OPEN_PATIENCE,
+                            TOOL_DISPATCH_PATIENCE,
+                            &guard,
                             fence_key,
                             key,
                         )
@@ -2379,9 +2445,22 @@ impl SubcToolPlane {
         }
 
         // route.open / semaphore failures are BEFORE any tool send → NotSent (the
-        // call never left the process; safe to (re-)dispatch).
-        let (route_handle, sem) = match self.ensure_route(&ctx.bind, scope, &module_id).await {
+        // call never left the process; safe to (re-)dispatch). A module that stays down
+        // for the whole tool-dispatch patience instead ends the call with the attributed
+        // unavailable result (still never sent).
+        let (route_handle, sem) = match self
+            .ensure_route(&ctx.bind, scope, &module_id, &guard)
+            .await
+        {
             Ok(rs) => rs,
+            Err(ToolPlaneError::ModuleUnavailable {
+                module,
+                code,
+                detail,
+            }) => {
+                return self
+                    .module_unavailable_result(ctx, call, &module, &code, &detail, &fence_key);
+            }
             Err(e) => {
                 self.latch_open_refusal(ctx, &e);
                 return DispatchResult::NotSent {
@@ -2443,10 +2522,7 @@ impl SubcToolPlane {
         //    restart. The protocol guarantees this rejection happens before the request is
         //    sent to the tool, so re-dispatching cannot execute it twice. Without this
         //    retry, an ordinary tool-module restart returns a `tool/route rejected` error to
-        //    the model. Re-opening waits for the drain with RELOAD_REOPEN_PATIENCE rather
-        //    than the default 3s: that
-        //    default ends most real restarts in NotSent, returning the same error three
-        //    seconds later;
+        //    the model. Re-opening waits out the drain with the tool-dispatch patience;
         //  - provider route_not_bound / route_reclaimed refusals share the stale-route retry;
         //    outcome_unknown_root_reclaimed instead interrupts and evicts without a retry;
         //  - any other typed Error frame (Rejected) is a DEFINITE negative response — a
@@ -2457,7 +2533,6 @@ impl SubcToolPlane {
         //
         // That last case is why the reply deadline is sized per call rather than fixed: a
         // deadline shorter than the work turns a healthy call into an ambiguous one.
-        let reply_deadline = self.reply_deadline(ctx, &module_id, call);
         let first = match self
             .send_call(ctx, &module_id, &route_handle, call, reply_deadline, key)
             .await
@@ -2473,11 +2548,6 @@ impl SubcToolPlane {
         // decides, and so does whether a fresh route would carry the same epoch and agent as
         // the route the call was composed under (see `resend_or_drain`).
         if (route_is_known_stale || endpoint_is_reloading) && scope.is_some() {
-            let patience = if endpoint_is_reloading {
-                RELOAD_REOPEN_PATIENCE
-            } else {
-                DEFAULT_ROUTE_OPEN_PATIENCE
-            };
             return self
                 .resend_or_drain(
                     ctx,
@@ -2485,7 +2555,8 @@ impl SubcToolPlane {
                     &module_id,
                     route_handle,
                     composed_under,
-                    patience,
+                    TOOL_DISPATCH_PATIENCE,
+                    &guard,
                     fence_key,
                     key,
                 )
@@ -2509,13 +2580,33 @@ impl SubcToolPlane {
                     scope,
                     &module_id,
                     &lifecycle,
-                    None,
-                    RELOAD_REOPEN_PATIENCE,
+                    guard.deadline,
+                    &guard,
+                    TOOL_DISPATCH_PATIENCE,
                 )
                 .await
-                .map_err(RouteEnsureError::into_plane)
+                .map_err(|error| map_tool_open_refusal(error, &module_id))
             } else {
-                self.ensure_route(&ctx.bind, scope, &module_id).await
+                self.ensure_route(&ctx.bind, scope, &module_id, &guard)
+                    .await
+            };
+            // A module that stays down for the whole tool-dispatch patience ends the call
+            // with the attributed unavailable result, proven never sent, not a reopen error.
+            let reopened = match reopened {
+                Err(ToolPlaneError::ModuleUnavailable {
+                    module,
+                    code,
+                    detail,
+                }) => {
+                    return self
+                        .module_unavailable_result(ctx, call, &module, &code, &detail, &fence_key);
+                }
+                reopened => reopened.map_err(|error| {
+                    self.latch_open_refusal(ctx, &error);
+                    DispatchResult::NotSent {
+                        reason: format!("route re-open after stale handle failed: {error}"),
+                    }
+                }),
             };
             match reopened {
                 Ok((fresh_handle, fresh_sem)) => {
@@ -2538,11 +2629,8 @@ impl SubcToolPlane {
                         SendAttempt::Reply(reply) => reply,
                     }
                 }
-                Err(e) => {
-                    self.latch_open_refusal(ctx, &e);
-                    return DispatchResult::NotSent {
-                        reason: format!("route re-open after stale handle failed: {e}"),
-                    };
+                Err(reason) => {
+                    return reason;
                 }
             }
         } else {
@@ -2607,7 +2695,8 @@ impl SubcToolPlane {
                     signals: signals.clone(),
                 },
             );
-        self.dispatch_inner(ctx, call, Some(key)).await
+        self.dispatch_inner(ctx, call, Some(key), &ToolOpenGuard::from(signals))
+            .await
     }
 
     async fn recheck_approval_scope_inner(
@@ -2722,13 +2811,24 @@ impl ToolPlane for SubcToolPlane {
         calls: &[ToolCall],
         manifest: &ToolManifest,
     ) -> Result<(), ToolPlaneError> {
-        self.batch_started_inner(ctx, calls, manifest).await
+        self.batch_started_inner(ctx, calls, manifest, &ToolOpenGuard::default())
+            .await
+    }
+    async fn batch_started_guarded(
+        &self,
+        ctx: &BatchCtx,
+        calls: &[ToolCall],
+        manifest: &ToolManifest,
+        guard: &ToolOpenGuard,
+    ) -> Result<(), ToolPlaneError> {
+        self.batch_started_inner(ctx, calls, manifest, guard).await
     }
     fn dispatch_target(&self, ctx: &BatchCtx, id: &ToolCallId) -> Option<String> {
         self.dispatch_target_inner(ctx, id)
     }
     async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
-        self.dispatch_inner(ctx, call, None).await
+        self.dispatch_inner(ctx, call, None, &ToolOpenGuard::default())
+            .await
     }
     async fn dispatch_keyed(
         &self,
@@ -2736,7 +2836,17 @@ impl ToolPlane for SubcToolPlane {
         call: &ToolCall,
         key: broca_core::tool_plane::DispatchKey<'_>,
     ) -> DispatchResult {
-        self.dispatch_inner(ctx, call, Some(key)).await
+        self.dispatch_inner(ctx, call, Some(key), &ToolOpenGuard::default())
+            .await
+    }
+    async fn dispatch_guarded(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        key: Option<broca_core::tool_plane::DispatchKey<'_>>,
+        guard: &ToolOpenGuard,
+    ) -> DispatchResult {
+        self.dispatch_inner(ctx, call, key, guard).await
     }
     async fn dispatch_approved(
         &self,
@@ -2955,7 +3065,7 @@ fn catalog_entry_has_tool(entry: &CatalogEntry, tool_name: &str) -> bool {
 fn route_failure_result(call: &ToolCall, message: String) -> ToolResult {
     ToolResult {
         tool_call_id: call.tool_call_id.clone(),
-        output: ToolOutput::Error { message },
+        output: ToolOutput::error(message),
         is_error: true,
     }
 }
@@ -3016,6 +3126,70 @@ fn scoped_open_refusal(
 /// inside a successful CallToolResult (`isError: true`) instead.
 fn conn_to_plane(e: ConnError) -> ToolPlaneError {
     ToolPlaneError::Unavailable(e.to_string())
+}
+
+/// Map a tool-dispatch route-open failure to the plane error the loop reports. A refusal
+/// the daemon attributed to the module (`target_unavailable`, `module_reloading`,
+/// `module_warming`, `module_timeout`) that outlasted the tool-dispatch patience becomes
+/// [`ToolPlaneError::ModuleUnavailable`]: proven undelivered, carrying the module, the
+/// daemon's code and its detail. Everything else keeps today's mapping.
+fn map_tool_open_refusal(error: RouteEnsureError, module_id: &str) -> ToolPlaneError {
+    match error {
+        RouteEnsureError::Connection(ConnError::Rejected(message))
+            if is_module_availability_refusal(message.code()) =>
+        {
+            ToolPlaneError::ModuleUnavailable {
+                module: module_id.to_owned(),
+                code: message.code().to_owned(),
+                detail: message.detail().to_owned(),
+            }
+        }
+        error => error.into_plane(),
+    }
+}
+
+/// Links the session lifecycle to the run's early-exit guard for one route-open wait: the
+/// returned token fires when the session closes OR the run is cancelled/stopped. The
+/// watcher task is aborted when the link drops (when the open finishes), so no task
+/// outlives the wait it paces.
+struct WaitCancel {
+    token: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl WaitCancel {
+    fn link(lifecycle: &CancellationToken, guard: &ToolOpenGuard) -> Self {
+        let token = CancellationToken::new();
+        let linked = token.clone();
+        let lifecycle = lifecycle.clone();
+        let cancel = guard.cancel_token();
+        let stop = guard.stop_token();
+        let task = tokio::spawn(async move {
+            async fn wait(token: Option<CancellationToken>) {
+                match token {
+                    Some(token) => token.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            }
+            tokio::select! {
+                _ = lifecycle.cancelled() => {}
+                _ = wait(cancel) => {}
+                _ = wait(stop) => {}
+            }
+            linked.cancel();
+        });
+        Self { token, task }
+    }
+
+    fn token(&self) -> &CancellationToken {
+        &self.token
+    }
+}
+
+impl Drop for WaitCancel {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 /// The warm-bind retry delay for `attempt` (1-based): 250ms doubling to a 5s cap.
@@ -3091,15 +3265,13 @@ fn map_text_call_tool_result(
     {
         return ToolResult {
             tool_call_id: id.clone(),
-            output: ToolOutput::Error {
-                message: malformed_tool_reply_message(raw),
-            },
+            output: ToolOutput::error(malformed_tool_reply_message(raw)),
             is_error: true,
         };
     }
 
     let output = if is_error {
-        ToolOutput::Error { message: text }
+        ToolOutput::error(text)
     } else if content.is_none_or(Vec::is_empty) {
         match raw.get("structuredContent") {
             Some(value) => ToolOutput::Json {
@@ -3278,6 +3450,10 @@ mod tests {
         dispatched_presets: Mutex<Vec<Option<String>>>,
         dispatched_deadlines: Mutex<Vec<Duration>>,
         dispatched_arguments: Mutex<Vec<serde_json::Value>>,
+        /// Real per-module availability gates, installed by tests that prove waiting
+        /// calls share one probe while the module is down. Modules without an
+        /// installed gate open ungated, as before.
+        gates: Mutex<HashMap<String, Arc<ModuleGate>>>,
     }
 
     impl ScriptedToolPlaneConnection {
@@ -3315,6 +3491,7 @@ mod tests {
                 dispatched_presets: Mutex::new(Vec::new()),
                 dispatched_deadlines: Mutex::new(Vec::new()),
                 dispatched_arguments: Mutex::new(Vec::new()),
+                gates: Mutex::new(HashMap::new()),
             })
         }
 
@@ -3335,6 +3512,26 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(module_id.to_string(), scripts.into());
+        }
+
+        /// Install a real per-module availability gate (as the live connection returns),
+        /// so the test proves waiting calls share one probe while the module is down.
+        /// `jitter` paces the probes: zero for exact attempt counts, a fixed small wait
+        /// for waits a cancel must cut.
+        fn install_real_gate_with_jitter(
+            &self,
+            module_id: &str,
+            jitter: impl Fn(Duration) -> Duration + Send + Sync + 'static,
+        ) {
+            self.gates.lock().unwrap().insert(
+                module_id.to_string(),
+                Arc::new(ModuleGate::with_jitter(jitter, CancellationToken::new())),
+            );
+        }
+
+        /// Install a real gate with no probe jitter, so the attempt count is exact.
+        fn install_real_gate(&self, module_id: &str) {
+            self.install_real_gate_with_jitter(module_id, |_| Duration::ZERO);
         }
 
         fn gate_route_open(&self, module_id: &str) -> RouteOpenGate {
@@ -3495,6 +3692,10 @@ mod tests {
         fn route_is_open(&self, route: &RouteHandle) -> bool {
             !self.closed.lock().unwrap().contains(&route.channel)
         }
+
+        fn module_gate(&self, module_id: &str) -> Option<Arc<ModuleGate>> {
+            self.gates.lock().unwrap().get(module_id).cloned()
+        }
     }
 
     #[tokio::test]
@@ -3570,7 +3771,10 @@ mod tests {
         );
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         let ctx = batch_ctx("approved-stale-before-push");
-        let (route, _) = plane.ensure_route(&ctx.bind, None, "aft").await.unwrap();
+        let (route, _) = plane
+            .ensure_route(&ctx.bind, None, "aft", &ToolOpenGuard::default())
+            .await
+            .unwrap();
         *conn.approved_setup_error.lock().unwrap() = Some(ConnError::StaleRouteHandle(route));
         let result = plane
             .dispatch_approved(&ctx, &call("edit"), "{}", "call-key", &Default::default())
@@ -3631,7 +3835,10 @@ mod tests {
             let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
             let ctx = batch_ctx("approved-permit");
             let call = call("edit");
-            let (_, sem) = plane.ensure_route(&ctx.bind, None, "aft").await.unwrap();
+            let (_, sem) = plane
+                .ensure_route(&ctx.bind, None, "aft", &ToolOpenGuard::default())
+                .await
+                .unwrap();
             let permit = sem.clone().acquire_owned().await.unwrap();
             let token = CancellationToken::new();
             let signals = broca_core::tool_plane::DispatchSignals::new(
@@ -3815,6 +4022,7 @@ mod tests {
                     "aft",
                     &lifecycle,
                     None,
+                    &ToolOpenGuard::default(),
                     DEFAULT_ROUTE_OPEN_PATIENCE,
                 )
                 .await
@@ -3850,6 +4058,7 @@ mod tests {
                     "aft",
                     &lifecycle,
                     None,
+                    &ToolOpenGuard::default(),
                     DEFAULT_ROUTE_OPEN_PATIENCE,
                 )
                 .await
@@ -3969,6 +4178,7 @@ mod tests {
                 "aft",
                 &lifecycle,
                 None,
+                &ToolOpenGuard::default(),
                 DEFAULT_ROUTE_OPEN_PATIENCE,
             )
             .await
@@ -4001,6 +4211,7 @@ mod tests {
                 "aft",
                 &lifecycle,
                 None,
+                &ToolOpenGuard::default(),
                 DEFAULT_ROUTE_OPEN_PATIENCE,
             )
             .await
@@ -4030,6 +4241,7 @@ mod tests {
                 "aft",
                 &lifecycle,
                 None,
+                &ToolOpenGuard::default(),
                 DEFAULT_ROUTE_OPEN_PATIENCE,
             )
             .await
@@ -4426,7 +4638,7 @@ mod tests {
             })
             .unwrap_or_default();
         let output = if is_error {
-            ToolOutput::Error { message: text }
+            ToolOutput::error(text)
         } else {
             ToolOutput::Text { text }
         };
@@ -4522,11 +4734,9 @@ mod tests {
         assert!(result.is_error);
         assert_eq!(
             result.output,
-            ToolOutput::Error {
-                message:
-                    "[non-text tool content omitted: type=audio mimeType=audio/wav data≈6 bytes]"
-                        .into()
-            }
+            ToolOutput::error(
+                "[non-text tool content omitted: type=audio mimeType=audio/wav data≈6 bytes]"
+            )
         );
     }
 
@@ -4538,7 +4748,7 @@ mod tests {
 
         let result = uncaptured_result(&ToolCallId("t1".into()), &raw);
         assert!(result.is_error);
-        let ToolOutput::Error { message } = result.output else {
+        let ToolOutput::Error { message, .. } = result.output else {
             panic!("expected an error output, got {:?}", result.output);
         };
         assert!(
@@ -4585,7 +4795,7 @@ mod tests {
 
         let result = uncaptured_result(&ToolCallId("t1".into()), &raw);
         assert!(result.is_error);
-        let ToolOutput::Error { message } = result.output else {
+        let ToolOutput::Error { message, .. } = result.output else {
             panic!("expected an error output");
         };
         let quoted = message.split_once("raw reply: ").unwrap().1;
@@ -4607,7 +4817,7 @@ mod tests {
         });
         let r = uncaptured_result(&ToolCallId("t1".into()), &raw);
         assert!(r.is_error);
-        assert!(matches!(r.output, ToolOutput::Error { message } if message == "boom"));
+        assert!(matches!(r.output, ToolOutput::Error { message, .. } if message == "boom"));
     }
 
     fn result(text: &str) -> ToolResult {
@@ -4763,7 +4973,7 @@ mod tests {
             "routing failures are model-visible tool errors"
         );
         assert!(
-            matches!(result.output, ToolOutput::Error { message } if message.contains(tool_name)),
+            matches!(result.output, ToolOutput::Error { message, .. } if message.contains(tool_name)),
             "routing failure message should name the unresolved tool"
         );
     }
@@ -5268,7 +5478,7 @@ mod tests {
             "the re-open must have outlasted the default patience to prove anything: {waited:?}"
         );
         assert!(
-            waited < RELOAD_REOPEN_PATIENCE.deadline,
+            waited < TOOL_DISPATCH_PATIENCE.deadline,
             "and still be bounded: {waited:?}"
         );
     }
@@ -5308,6 +5518,204 @@ mod tests {
             "a definite answer must be delivered, never re-sent"
         );
         assert!(conn.closed_routes.lock().unwrap().is_empty());
+    }
+
+    /// A tool-call batch waits out a 25 s provider-module restart instead of failing the turn.
+    ///
+    /// The route open is refused `target_unavailable` for 25 s of paused time, then the
+    /// module accepts: the batch opens, the call completes, and exactly one tool call went
+    /// out. Against the 3 s budget this batch start fails; the 90 s tool-dispatch patience
+    /// rides it out through the same per-target gate every waiter shares.
+    #[tokio::test(start_paused = true)]
+    async fn tool_dispatch_waits_out_a_25s_module_restart() {
+        let catalog = vec![catalog_entry("aft", &["read"])];
+        let conn = ScriptedToolPlaneConnection::new(
+            vec![catalog.clone(), catalog.clone(), catalog],
+            vec![successful_tool_reply("served after restart")],
+        );
+        // 25 refusals, each taking a second to arrive: a 25 s outage.
+        let mut sequence = (0..25)
+            .map(|_| RouteOpenScript {
+                delay: Duration::from_secs(1),
+                ..RouteOpenScript::rejected("target_unavailable — module_id 'aft' is unavailable")
+            })
+            .collect::<Vec<_>>();
+        sequence.push(RouteOpenScript::default());
+        conn.script_route_open_sequence("aft", sequence);
+        conn.install_real_gate("aft");
+        let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+        let ctx = batch_ctx("batch-restart-25s");
+        let tool_call = call("read");
+        let started = Instant::now();
+        plane
+            .batch_started(
+                &ctx,
+                std::slice::from_ref(&tool_call),
+                &ToolManifest::from_tools(vec![request_tool("read", Some("aft"))]),
+            )
+            .await
+            .expect("the 90 s patience must ride out a 25 s restart");
+        assert_completed_success(plane.dispatch(&ctx, &tool_call).await);
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_secs(25),
+            "the batch must have outlasted the old 3 s budget to prove anything: {waited:?}"
+        );
+        assert_eq!(
+            conn.tool_calls.load(Ordering::SeqCst),
+            1,
+            "exactly one send after the outage: nothing was sent while the module was down"
+        );
+        assert!(
+            conn.route_open_calls.load(Ordering::SeqCst) >= 10,
+            "the open kept retrying through the outage"
+        );
+    }
+
+    /// A module down past the 90 s tool-dispatch patience ends the batch as
+    /// module-unavailable: proven undelivered, naming the module, the daemon's code and its
+    /// detail. Nothing is ever sent.
+    #[tokio::test(start_paused = true)]
+    async fn tool_dispatch_past_90s_reports_module_unavailable() {
+        let catalog = vec![catalog_entry("aft", &["read"])];
+        let conn = ScriptedToolPlaneConnection::new(
+            vec![catalog.clone(), catalog.clone(), catalog],
+            vec![],
+        );
+        // The module never comes back: every open is refused, each taking 5 s to arrive.
+        conn.script_route_open_sequence(
+            "aft",
+            vec![RouteOpenScript {
+                delay: Duration::from_secs(5),
+                ..RouteOpenScript::rejected("target_unavailable — module_id 'aft' is unavailable")
+            }],
+        );
+        conn.install_real_gate("aft");
+        let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+        let ctx = batch_ctx("batch-restart-forever");
+        let tool_call = call("read");
+        let started = Instant::now();
+        let error = plane
+            .batch_started(
+                &ctx,
+                std::slice::from_ref(&tool_call),
+                &ToolManifest::from_tools(vec![request_tool("read", Some("aft"))]),
+            )
+            .await
+            .expect_err("a module down past the patience must fail the batch");
+        let waited = started.elapsed();
+        assert!(
+            waited >= TOOL_DISPATCH_PATIENCE.deadline,
+            "the batch must have waited out the whole patience: {waited:?}"
+        );
+        match error {
+            ToolPlaneError::ModuleUnavailable {
+                module,
+                code,
+                detail,
+            } => {
+                assert_eq!(module, "aft");
+                assert_eq!(code, "target_unavailable");
+                assert!(!detail.is_empty(), "the daemon's detail is kept");
+            }
+            other => panic!("expected the attributed outage, got {other:?}"),
+        }
+        assert_eq!(
+            conn.tool_calls.load(Ordering::SeqCst),
+            0,
+            "nothing was sent"
+        );
+        let opens = conn.route_open_calls.load(Ordering::SeqCst);
+        assert!(
+            opens >= 10,
+            "the open kept retrying instead of giving up at once: {opens}"
+        );
+        assert!(
+            opens < 40,
+            "the gate paces probes while the module is down, one per tick: {opens}"
+        );
+    }
+
+    /// Run cancel ends a module-outage wait at once instead of holding the patience.
+    #[tokio::test(start_paused = true)]
+    async fn cancel_mid_wait_ends_promptly() {
+        let catalog = vec![catalog_entry("aft", &["read"])];
+        let conn = ScriptedToolPlaneConnection::new(
+            vec![catalog.clone(), catalog.clone(), catalog],
+            vec![],
+        );
+        // Instant refusals: the wait is all backoff and gate pacing, which cancel must cut.
+        // The probes are 50 ms apart (not zero), so the wait parks where cancel observes it
+        // instead of spinning through an always-due probe.
+        conn.script_route_open_sequence(
+            "aft",
+            vec![RouteOpenScript::rejected(
+                "target_unavailable — module_id 'aft' is unavailable",
+            )],
+        );
+        conn.install_real_gate_with_jitter("aft", |_| Duration::from_millis(50));
+        let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+        let ctx = batch_ctx("batch-cancel-mid-wait");
+        let tool_call = call("read");
+        let manifest = ToolManifest::from_tools(vec![request_tool("read", Some("aft"))]);
+        let cancel = CancellationToken::new();
+        let guard = ToolOpenGuard::new(Some(&cancel), None);
+        let started = Instant::now();
+        let task = tokio::spawn(async move {
+            plane
+                .batch_started_guarded(&ctx, std::slice::from_ref(&tool_call), &manifest, &guard)
+                .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        cancel.cancel();
+        let result = task.await.expect("the wait must end on cancel");
+        let waited = started.elapsed();
+        assert!(
+            matches!(result, Err(ToolPlaneError::Unavailable(_))),
+            "a cancelled wait is an unsent failure, never a success: {result:?}"
+        );
+        assert!(
+            waited < TOOL_DISPATCH_PATIENCE.deadline,
+            "cancel must end the wait at once, not at the patience: {waited:?}"
+        );
+        assert_eq!(
+            conn.tool_calls.load(Ordering::SeqCst),
+            0,
+            "nothing was sent"
+        );
+    }
+
+    /// A call already in flight when the route drops is indeterminate and never retried:
+    /// the request may have run, so the run stops for review instead of re-sending.
+    #[tokio::test]
+    async fn in_flight_call_when_route_drops_is_indeterminate() {
+        let catalog = vec![catalog_entry("aft", &["read"])];
+        let conn = ScriptedToolPlaneConnection::new(
+            vec![catalog.clone(), catalog.clone(), catalog],
+            vec![Err(ConnError::Transport("route gone (GOODBYE)".into()))],
+        );
+        *conn.close_during_call.lock().unwrap() = true;
+        let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+        let ctx = batch_ctx("batch-route-drop-in-flight");
+        let tool_call = call("read");
+        plane
+            .batch_started(
+                &ctx,
+                std::slice::from_ref(&tool_call),
+                &ToolManifest::from_tools(vec![request_tool("read", Some("aft"))]),
+            )
+            .await
+            .unwrap();
+        match plane.dispatch(&ctx, &tool_call).await {
+            DispatchResult::SentButOutcomeUnknown { .. } => {}
+            other => panic!("a sent call with no result is indeterminate, got {other:?}"),
+        }
+        assert_eq!(
+            conn.tool_calls.load(Ordering::SeqCst),
+            1,
+            "the sent call is never re-sent"
+        );
     }
 
     #[tokio::test]
@@ -6007,7 +6415,12 @@ mod tests {
                 } else {
                     plane.forget_route(&scoped, "aft", original);
                     plane
-                        .ensure_route(&scoped.bind, scoped.scope.as_ref(), "aft")
+                        .ensure_route(
+                            &scoped.bind,
+                            scoped.scope.as_ref(),
+                            "aft",
+                            &ToolOpenGuard::default(),
+                        )
                         .await
                         .unwrap();
                 }
@@ -6885,7 +7298,7 @@ mod tests {
             match plane.dispatch(&scoped, &read).await {
                 DispatchResult::Completed(result) => {
                     assert!(result.is_error);
-                    let ToolOutput::Error { message } = &result.output else {
+                    let ToolOutput::Error { message, .. } = &result.output else {
                         panic!("expected an error result, got {result:?}");
                     };
                     assert!(message.contains("scope_not_synced"), "{message}");
@@ -7298,8 +7711,11 @@ mod module_gate_tests {
             deadline: Duration::from_secs(30),
             max_interval: ROUTE_OPEN_RETRY_MAX_INTERVAL,
         };
+        let guard = ToolOpenGuard::default();
         let results = join_all(binds.iter().map(|bind| {
-            plane.ensure_route_for_lifecycle_inner(bind, None, "aft", &lifecycle, None, patience)
+            plane.ensure_route_for_lifecycle_inner(
+                bind, None, "aft", &lifecycle, None, &guard, patience,
+            )
         }))
         .await;
         let attempts = conn.attempts.lock().unwrap().clone();

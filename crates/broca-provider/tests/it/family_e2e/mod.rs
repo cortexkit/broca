@@ -260,7 +260,7 @@ impl RunOutcome {
                 OutputEvent::Control(ControlUnit::ToolResult { result }) => {
                     Some(match &result.output {
                         ToolOutput::Text { text } => text.clone(),
-                        ToolOutput::Error { message } => message.clone(),
+                        ToolOutput::Error { message, .. } => message.clone(),
                         _ => String::new(),
                     })
                 }

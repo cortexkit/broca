@@ -71,9 +71,7 @@ pub(crate) fn records(session: &BindIdentity) -> Vec<FramedRecord> {
                 closing_result: Some(
                     ToolResult {
                         tool_call_id: ToolCallId(id.into()),
-                        output: ToolOutput::Error {
-                            message: text.into(),
-                        },
+                        output: ToolOutput::error(text),
                         is_error: true,
                     }
                     .into(),
@@ -323,9 +321,7 @@ pub fn deferred_projection_matches_replay_golden<
             result: ToolResult {
                 tool_call_id: ToolCallId("expired".into()),
                 is_error: true,
-                output: ToolOutput::Error {
-                    message: "pre_tool_unavailable".into(),
-                },
+                output: ToolOutput::error("pre_tool_unavailable"),
             }
             .into(),
         },

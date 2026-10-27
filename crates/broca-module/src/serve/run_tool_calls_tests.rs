@@ -297,9 +297,7 @@ impl ClosedSession {
             batch_id: batch_id.clone(),
             result: Arc::new(ToolResult {
                 tool_call_id: call_id,
-                output: ToolOutput::Error {
-                    message: "duplicate tool_call_id from provider".into(),
-                },
+                output: ToolOutput::error("duplicate tool_call_id from provider"),
                 is_error: true,
             }),
             outcome: DispatchOutcome::Completed,

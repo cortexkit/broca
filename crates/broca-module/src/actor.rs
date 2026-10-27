@@ -9665,9 +9665,9 @@ mod tests {
                         if sequential {
                             assert_eq!(
                                 successor.0.output,
-                                broca_protocol::ToolOutput::Error {
-                                    message: broca_core::resume::NOT_DISPATCHED_TEXT.into()
-                                }
+                                broca_protocol::ToolOutput::error(
+                                    broca_core::resume::NOT_DISPATCHED_TEXT
+                                )
                             );
                         }
                         let prior = broca_core::replay(&raw).unwrap();

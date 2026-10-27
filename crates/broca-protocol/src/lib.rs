@@ -65,7 +65,8 @@ pub use canonical::canonical_json_bytes;
 pub use content::{
     AssistantMessage, ContentBlock, EncryptedReasoningFormat, FinishReason, MediaKind,
     MediaMarkerReason, MediaRef, Message, Role, TextProviderFormat, TextProviderState, ToolCall,
-    ToolOutput, ToolOutputPart, ToolResult,
+    ToolOutput, ToolOutputPart, ToolResult, TOOL_PLANE_UNAVAILABLE_MESSAGE,
+    TOOL_PLANE_UNAVAILABLE_RETRY,
 };
 pub use cortexkit_role_llm_runner::errors::ContextCeilingDetail;
 pub use cortexkit_role_llm_runner::run::BudgetExhaustedDetail;

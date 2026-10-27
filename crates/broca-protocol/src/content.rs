@@ -450,8 +450,25 @@ pub enum ToolOutput {
         reason: String,
     },
     /// Tool execution error, fed back as conversation data so the model can adapt.
+    ///
+    /// `message` is the stable, matchable account of the failure: exact-equality checks on it
+    /// (for example the tool-plane-unavailable match) keep working. A failure the plane can
+    /// attribute to a module outage additionally carries `module`/`code`/`detail`, with
+    /// `nothing_sent` set, so the model (and any log reader) sees WHAT was down and that a
+    /// retry is safe — without changing `message`. The extra fields are skipped on the wire
+    /// when absent, so results that never had them serialize exactly as before.
     Error {
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        module: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nothing_sent: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry: Option<String>,
     },
 }
 
@@ -461,6 +478,86 @@ pub enum ToolOutput {
 pub enum ToolOutputPart {
     Text { text: String },
     Media { media: MediaRef },
+}
+
+/// The error text for a tool result the plane never sent: the string a caller matches on
+/// with exact equality to detect an unavailable tool plane.
+///
+/// Kept as a single constant (rather than a literal at each construction site) so the
+/// plane-built result and the run-built no-dispatch result cannot drift apart.
+pub const TOOL_PLANE_UNAVAILABLE_MESSAGE: &str = "tool plane unavailable";
+
+/// Guidance appended (in renderings, not in `message`) to a result the plane never sent
+/// because its module was restarting or unavailable.
+pub const TOOL_PLANE_UNAVAILABLE_RETRY: &str =
+    "the module is restarting or unavailable; retry the call in a minute";
+
+impl ToolOutput {
+    /// A plain error result with no module attribution, as every existing site built it.
+    pub fn error(message: impl Into<String>) -> Self {
+        ToolOutput::Error {
+            message: message.into(),
+            module: None,
+            code: None,
+            detail: None,
+            nothing_sent: None,
+            retry: None,
+        }
+    }
+
+    /// An error result for a call refused because its module was restarting or
+    /// unavailable, proven undelivered: `message` stays exactly
+    /// [`TOOL_PLANE_UNAVAILABLE_MESSAGE`] (callers match on it), while the module, the
+    /// daemon's refusal code and detail, and the retry guidance ride in sibling fields so
+    /// the model — and any reader of the serialized result — sees what was down and that
+    /// nothing was sent.
+    pub fn module_unavailable(
+        module: impl Into<String>,
+        code: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        let detail = detail.into();
+        ToolOutput::Error {
+            message: TOOL_PLANE_UNAVAILABLE_MESSAGE.to_owned(),
+            module: Some(module.into()),
+            code: Some(code.into()),
+            detail: (!detail.is_empty()).then_some(detail),
+            nothing_sent: Some(true),
+            retry: Some(TOOL_PLANE_UNAVAILABLE_RETRY.to_owned()),
+        }
+    }
+
+    /// The text the model reads for an error result's fields: the message, plus any
+    /// module-outage attribution on its own lines. A plain error renders as its message
+    /// alone, exactly as before; only an attributed outage result grows the extra lines.
+    /// Kept as one associated function (rather than a method matching `self`) so every
+    /// provider family's encoder renders these fields byte-identically.
+    pub fn error_model_text(
+        message: &str,
+        module: Option<&str>,
+        code: Option<&str>,
+        detail: Option<&str>,
+        nothing_sent: Option<bool>,
+        retry: Option<&str>,
+    ) -> String {
+        let mut text = message.to_owned();
+        if let Some(module) = module {
+            text.push_str(&format!("\nmodule: {module}"));
+        }
+        if let Some(code) = code {
+            text.push_str(&format!("\ncode: {code}"));
+        }
+        if let Some(detail) = detail {
+            text.push_str(&format!("\ndetail: {detail}"));
+        }
+        if nothing_sent == Some(true) {
+            text.push_str("\nnothing was sent");
+        }
+        if let Some(retry) = retry {
+            text.push_str(&format!("\nretry: {retry}"));
+        }
+        text
+    }
 }
 
 /// Text-only rendering in source order, also used by readers that did not request media.
@@ -585,6 +682,59 @@ pub fn is_image_only_placeholder(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The model-facing text for a module outage names the module, the code and the
+    /// guidance lines after the stable message; a plain error renders as its message
+    /// alone, exactly as before.
+    #[test]
+    fn module_outage_error_model_text_shows_attribution() {
+        use super::{ToolOutput, TOOL_PLANE_UNAVAILABLE_MESSAGE};
+        let text = ToolOutput::error_model_text(
+            TOOL_PLANE_UNAVAILABLE_MESSAGE,
+            Some("aft"),
+            Some("target_unavailable"),
+            Some("supervised_not_registered"),
+            Some(true),
+            Some(super::TOOL_PLANE_UNAVAILABLE_RETRY),
+        );
+        assert!(text.starts_with("tool plane unavailable\n"), "{text}");
+        for line in [
+            "module: aft",
+            "code: target_unavailable",
+            "detail: supervised_not_registered",
+            "nothing was sent",
+            super::TOOL_PLANE_UNAVAILABLE_RETRY,
+        ] {
+            assert!(text.contains(line), "{text}");
+        }
+        assert_eq!(
+            ToolOutput::error_model_text("boom", None, None, None, None, None),
+            "boom"
+        );
+        // The constructor and the renderer agree field for field.
+        let built = ToolOutput::module_unavailable("aft", "target_unavailable", "d");
+        let ToolOutput::Error {
+            message,
+            module,
+            code,
+            detail,
+            nothing_sent,
+            retry,
+        } = &built
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            ToolOutput::error_model_text(
+                message,
+                module.as_deref(),
+                code.as_deref(),
+                detail.as_deref(),
+                *nothing_sent,
+                retry.as_deref(),
+            ),
+            text.replace("supervised_not_registered", "d")
+        );
+    }
     #[test]
     fn image_only_placeholders_are_recognised_and_mixed_content_is_not() {
         use super::{is_image_only_placeholder, non_text_tool_content_placeholder};

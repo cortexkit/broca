@@ -573,9 +573,7 @@ async fn undeclared_held_reply_is_a_protocol_refusal_not_a_final_answer() {
     let result = completed(plane.dispatch(&ctx, &call).await);
     assert_eq!(
         result.output,
-        ToolOutput::Error {
-            message: "malformed provider-held reply: prerequisites not met".into()
-        }
+        ToolOutput::error("malformed provider-held reply: prerequisites not met")
     );
     assert!(result.is_error);
     assert_eq!(rig.waits.load(Ordering::SeqCst), 0);

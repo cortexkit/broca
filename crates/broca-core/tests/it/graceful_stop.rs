@@ -334,7 +334,7 @@ fn tool_results(records: &[WalRecord]) -> Vec<(String, DispatchOutcome, String)>
             } => {
                 let text = match &result.output {
                     ToolOutput::Text { text } => text.clone(),
-                    ToolOutput::Error { message } => message.clone(),
+                    ToolOutput::Error { message, .. } => message.clone(),
                     other => format!("{other:?}"),
                 };
                 Some((result.tool_call_id.0.clone(), *outcome, text))

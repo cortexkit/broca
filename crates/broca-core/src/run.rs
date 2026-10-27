@@ -45,7 +45,7 @@ use crate::{
     lease::{lease_key_for, LeaseError, LeaseStore},
     provider::Provider,
     replay::{replay, PendingTurn, ReplayResolution, ReplayState},
-    tool_plane::{BatchCtx, DispatchResult, ToolPlane, ToolPlaneError},
+    tool_plane::{BatchCtx, DispatchResult, ToolOpenGuard, ToolPlane, ToolPlaneError},
     tool_repetition::{result_bytes, RepetitionFold, RepetitionObserver},
     wal_writer::{session_addr, WalHandle, WalStore, WalWriteError},
 };
@@ -5516,9 +5516,7 @@ where
                         "stopped provider attempt after runaway tool argument whitespace");
                     rejected_tool_calls.push(ToolResult {
                         tool_call_id: cut.tool_call_id.clone(),
-                        output: ToolOutput::Error {
-                            message: cut.error_text(),
-                        },
+                        output: ToolOutput::error(cut.error_text()),
                         is_error: true,
                     });
                 }
@@ -7036,7 +7034,7 @@ fn append_repetition_guidance(result: &mut ToolResult, guidance: &str) {
         }
         ToolOutput::Text { text } => text.push_str(&suffix),
         ToolOutput::Denied { reason } => reason.push_str(&suffix),
-        ToolOutput::Error { message } => message.push_str(&suffix),
+        ToolOutput::Error { message, .. } => message.push_str(&suffix),
         ToolOutput::Json { value } => {
             // Structured outputs have no metadata slot. Preserve their JSON text before the note;
             // this copy is provider-facing only, while the durable result remains structured.
@@ -7990,8 +7988,15 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
     // never sent to the tool plane.
     enum BatchRefusal {
         /// The tool plane is unavailable or refused the route: each call gets a durable
-        /// `tool_no_dispatch`.
-        Unavailable(String),
+        /// `tool_no_dispatch`. `detail` is the stable matchable message; a refusal the
+        /// plane attributed to a module outage additionally names the module, the daemon's
+        /// code and its detail.
+        Unavailable {
+            detail: String,
+            module: Option<String>,
+            code: Option<String>,
+            refusal_detail: Option<String>,
+        },
         /// With nothing in flight, the tool plane found the run's scope or its parent gone:
         /// each call gets a `route_drained` result naming the reason, and the run stops
         /// Interrupted after this batch.
@@ -8008,16 +8013,38 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
     let batch_refusal = if stop_is_requested(stop) || cancelled_before_batch {
         Some(BatchRefusal::Stopped)
     } else {
-        match tool_plane.batch_started(&ctx, &calls, manifest).await {
+        match tool_plane
+            .batch_started_guarded(&ctx, &calls, manifest, &ToolOpenGuard::new(cancel, stop))
+            .await
+        {
             Ok(()) => None,
             // An ordinary tool-plane failure keeps the exact detail text it always had: sessions
             // already on disk hold it as their durable no-dispatch reason.
-            Err(ToolPlaneError::Unavailable(_)) => {
-                Some(BatchRefusal::Unavailable("tool plane unavailable".into()))
-            }
-            Err(error @ ToolPlaneError::ScopeRefused { .. }) => {
-                Some(BatchRefusal::Unavailable(error.to_string()))
-            }
+            Err(ToolPlaneError::Unavailable(_)) => Some(BatchRefusal::Unavailable {
+                detail: broca_protocol::TOOL_PLANE_UNAVAILABLE_MESSAGE.into(),
+                module: None,
+                code: None,
+                refusal_detail: None,
+            }),
+            // A module that stayed down for the whole tool-dispatch patience: nothing was
+            // sent, and the no-dispatch reason carries the attribution next to the stable
+            // message.
+            Err(ToolPlaneError::ModuleUnavailable {
+                module,
+                code,
+                detail,
+            }) => Some(BatchRefusal::Unavailable {
+                detail: broca_protocol::TOOL_PLANE_UNAVAILABLE_MESSAGE.into(),
+                module: Some(module),
+                code: Some(code),
+                refusal_detail: (!detail.is_empty()).then_some(detail),
+            }),
+            Err(error @ ToolPlaneError::ScopeRefused { .. }) => Some(BatchRefusal::Unavailable {
+                detail: error.to_string(),
+                module: None,
+                code: None,
+                refusal_detail: None,
+            }),
             Err(ToolPlaneError::ScopeDrained { reason }) => {
                 Some(BatchRefusal::ScopeDrained(reason))
             }
@@ -8070,11 +8097,19 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
         }
         match &batch_refusal {
             None => {}
-            Some(BatchRefusal::Unavailable(detail)) => {
+            Some(BatchRefusal::Unavailable {
+                detail,
+                module,
+                code,
+                refusal_detail,
+            }) => {
                 plan.push(CallPlan::NoDispatch {
                     tool_call_id: call.tool_call_id.clone(),
                     reason: NoDispatchReason::Unavailable {
                         detail: detail.clone(),
+                        module: module.clone(),
+                        code: code.clone(),
+                        refusal_detail: refusal_detail.clone(),
                     },
                     hooks: None,
                 });
@@ -8662,7 +8697,26 @@ fn cap_tool_result(result: &mut ToolResult, run_id: &RunId, tool_name: &str, hea
             return;
         }
         ToolOutput::Text { text } => text.as_str(),
-        ToolOutput::Error { message } => message.as_str(),
+        ToolOutput::Error {
+            message,
+            module,
+            code,
+            detail,
+            nothing_sent,
+            retry,
+        } => {
+            // Measure (and cap below) the text the model actually reads, including any
+            // module-outage attribution.
+            serialized = ToolOutput::error_model_text(
+                message,
+                module.as_deref(),
+                code.as_deref(),
+                detail.as_deref(),
+                *nothing_sent,
+                retry.as_deref(),
+            );
+            &serialized
+        }
         ToolOutput::Denied { reason } => {
             serialized = format!("denied: {reason}");
             &serialized
@@ -9057,6 +9111,17 @@ impl<T: ToolPlane> ToolPlane for ProviderHeldPlane<'_, T> {
     ) -> Result<(), ToolPlaneError> {
         self.inner.batch_started(ctx, calls, manifest).await
     }
+    async fn batch_started_guarded(
+        &self,
+        ctx: &BatchCtx,
+        calls: &[ToolCall],
+        manifest: &ToolManifest,
+        guard: &crate::tool_plane::ToolOpenGuard,
+    ) -> Result<(), ToolPlaneError> {
+        self.inner
+            .batch_started_guarded(ctx, calls, manifest, guard)
+            .await
+    }
     async fn batch_finished(&self, ctx: &BatchCtx) -> Result<(), ToolPlaneError> {
         self.inner.batch_finished(ctx).await
     }
@@ -9072,6 +9137,22 @@ impl<T: ToolPlane> ToolPlane for ProviderHeldPlane<'_, T> {
     }
     async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
         self.inner.dispatch(ctx, call).await
+    }
+    async fn dispatch_guarded(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        key: Option<crate::tool_plane::DispatchKey<'_>>,
+        guard: &crate::tool_plane::ToolOpenGuard,
+    ) -> DispatchResult {
+        // Route through the keyed/unkeyed entry points (not the inner plane's guarded
+        // one) so resumed-held calls and the held-recorder injection keep working; the
+        // inner plane's own patience still applies to the opens below.
+        let _ = guard;
+        match key {
+            Some(key) => self.dispatch_keyed(ctx, call, key).await,
+            None => self.dispatch(ctx, call).await,
+        }
     }
     async fn dispatch_keyed(
         &self,
@@ -9227,21 +9308,27 @@ async fn resolve<T: ToolPlane>(
                         )
                         .await
                 }
-                None => match key.as_deref() {
-                    Some(call_key) => {
-                        tool_plane
-                            .dispatch_keyed(
-                                ctx,
-                                &call,
-                                crate::tool_plane::DispatchKey {
-                                    call_key,
-                                    held_recorder: None,
-                                },
-                            )
-                            .await
+                None => {
+                    // The route-open wait ends early on run cancel/stop; the plane caps it
+                    // at the call's own reply budget.
+                    let guard = ToolOpenGuard::new(cancel, stop);
+                    match key.as_deref() {
+                        Some(call_key) => {
+                            tool_plane
+                                .dispatch_guarded(
+                                    ctx,
+                                    &call,
+                                    Some(crate::tool_plane::DispatchKey {
+                                        call_key,
+                                        held_recorder: None,
+                                    }),
+                                    &guard,
+                                )
+                                .await
+                        }
+                        None => tool_plane.dispatch_guarded(ctx, &call, None, &guard).await,
                     }
-                    None => tool_plane.dispatch(ctx, &call).await,
-                },
+                }
             };
             match result {
                 DispatchResult::Completed(mut result) => {
@@ -9251,7 +9338,7 @@ async fn resolve<T: ToolPlane>(
                         .map(|capture| capture.captured_for(&ctx.batch_id, &result.tool_call_id))
                         .unwrap_or_default();
                     crate::tool_media::enforce_provenance(&mut result, &captured);
-                    let malformed_held = matches!(&result.output, ToolOutput::Error { message } if message.starts_with("malformed provider-held reply:"));
+                    let malformed_held = matches!(&result.output, ToolOutput::Error { message, .. } if message.starts_with("malformed provider-held reply:"));
                     let mut resolution =
                         CallResolution::plain(result, Some(DispatchOutcome::Completed));
                     if malformed_held {
@@ -9316,11 +9403,9 @@ async fn resolve<T: ToolPlane>(
 fn route_drained_result(id: &ToolCallId, reason: &str) -> ToolResult {
     ToolResult {
         tool_call_id: id.clone(),
-        output: ToolOutput::Error {
-            message: format!(
-                "route_drained: the tool was not run because its route was closed ({reason})"
-            ),
-        },
+        output: ToolOutput::error(format!(
+            "route_drained: the tool was not run because its route was closed ({reason})"
+        )),
         is_error: true,
     }
 }
@@ -9328,9 +9413,7 @@ fn route_drained_result(id: &ToolCallId, reason: &str) -> ToolResult {
 fn error_result(call: &ToolCall, message: &str) -> ToolResult {
     ToolResult {
         tool_call_id: call.tool_call_id.clone(),
-        output: ToolOutput::Error {
-            message: message.to_owned(),
-        },
+        output: ToolOutput::error(message),
         is_error: true,
     }
 }
@@ -9341,9 +9424,9 @@ fn error_result(call: &ToolCall, message: &str) -> ToolResult {
 fn unknown_result(call: &ToolCall, reason: &str) -> ToolResult {
     ToolResult {
         tool_call_id: call.tool_call_id.clone(),
-        output: ToolOutput::Error {
-            message: format!("tool outcome unknown (interrupted for review): {reason}"),
-        },
+        output: ToolOutput::error(format!(
+            "tool outcome unknown (interrupted for review): {reason}"
+        )),
         is_error: true,
     }
 }
@@ -9353,9 +9436,7 @@ fn unknown_result(call: &ToolCall, reason: &str) -> ToolResult {
 fn interrupted_result(id: &ToolCallId) -> ToolResult {
     ToolResult {
         tool_call_id: id.clone(),
-        output: ToolOutput::Error {
-            message: "tool not run: batch interrupted".into(),
-        },
+        output: ToolOutput::error("tool not run: batch interrupted"),
         is_error: true,
     }
 }
@@ -9770,7 +9851,7 @@ fn hard_stop_result(call: &ToolCall, outcome: DispatchOutcome) -> ToolResult {
     };
     ToolResult {
         tool_call_id: call.tool_call_id.clone(),
-        output: ToolOutput::Error { message },
+        output: ToolOutput::error(message),
         is_error: true,
     }
 }
@@ -10639,9 +10720,9 @@ mod tests {
         };
         let manifest = ToolManifest::from_tools(vec![serde_json::from_value(serde_json::json!({"name":"tool","description":"","input_schema":{},"execution_mode":"parallel"})).unwrap()]);
         let plane = crate::StubToolPlane::new().with_tool("tool", |_| {
-            crate::StubReply::Output(ToolOutput::Error {
-                message: "malformed provider-held reply: prerequisites not met".into(),
-            })
+            crate::StubReply::Output(ToolOutput::error(
+                "malformed provider-held reply: prerequisites not met",
+            ))
         });
         let (out, _events) = mpsc::channel(64);
         let outcome = dispatch_batch(
@@ -11209,7 +11290,7 @@ mod tests {
                 let terminals: Vec<_> = raw.iter().filter_map(|record| match record { WalRecord::ToolResult { result, outcome, .. } if result.tool_call_id.0 == id => Some((result, outcome)), _ => None }).collect();
                 assert_eq!(terminals.len(), 1, "close-out must include the unsent successor");
                 assert_eq!(*terminals[0].1, DispatchOutcome::Interrupted);
-                assert_eq!(terminals[0].0.output, ToolOutput::Error { message: expected.into() });
+                assert_eq!(terminals[0].0.output, ToolOutput::error(expected));
             }
             let prior = crate::replay(&raw).unwrap();
             assert!(prior.open_tool_batch.is_none());
@@ -13295,6 +13376,7 @@ mod approval_gate {
                     ToolPlaneError::ScopeDrained { reason } => reason,
                     ToolPlaneError::ScopeRefused { code, .. } => code,
                     ToolPlaneError::Unavailable(reason) => reason,
+                    ToolPlaneError::ModuleUnavailable { module, .. } => module,
                 };
                 let mut result = CallResolution::plain(
                     route_drained_result(&call.tool_call_id, &reason),
@@ -13659,7 +13741,14 @@ mod approval_gate {
         let announced =
             !is_cancelled(control) && !stop_is_requested(control.stop_requested.as_ref());
         let start = if announced {
-            plane.batch_started(&ctx, &calls, &routed_manifest).await
+            plane
+                .batch_started_guarded(
+                    &ctx,
+                    &calls,
+                    &routed_manifest,
+                    &ToolOpenGuard::new(control.cancel.as_ref(), control.stop_requested.as_ref()),
+                )
+                .await
         } else {
             Err(ToolPlaneError::Unavailable(
                 "batch stopped before route open".into(),
@@ -13708,8 +13797,23 @@ mod approval_gate {
             } else if let Err(error) = &start {
                 Slot::Ready(Some(CallPlan::NoDispatch {
                     tool_call_id: call.tool_call_id,
-                    reason: NoDispatchReason::Unavailable {
-                        detail: error.to_string(),
+                    reason: match error {
+                        ToolPlaneError::ModuleUnavailable {
+                            module,
+                            code,
+                            detail,
+                        } => NoDispatchReason::Unavailable {
+                            detail: broca_protocol::TOOL_PLANE_UNAVAILABLE_MESSAGE.into(),
+                            module: Some(module.clone()),
+                            code: Some(code.clone()),
+                            refusal_detail: (!detail.is_empty()).then_some(detail.clone()),
+                        },
+                        error => NoDispatchReason::Unavailable {
+                            detail: error.to_string(),
+                            module: None,
+                            code: None,
+                            refusal_detail: None,
+                        },
                     },
                     hooks: None,
                 }))
@@ -15273,7 +15377,7 @@ mod approval_gate {
             if let Some(mut result) = validation {
                 // LateResult has no reason field, so retain the hook refusal code
                 // in its provider-valid error result rather than losing it at the boundary.
-                if let (Some("pre_tool_denied"), ToolOutput::Error { message }) = (
+                if let (Some("pre_tool_denied"), ToolOutput::Error { message, .. }) = (
                     result.reason.as_deref(),
                     &mut Arc::make_mut(&mut result.result).output,
                 ) {
@@ -15345,7 +15449,12 @@ mod approval_gate {
             };
         }
         if let Err(error) = plane
-            .batch_started(ctx, std::slice::from_ref(call), manifest)
+            .batch_started_guarded(
+                ctx,
+                std::slice::from_ref(call),
+                manifest,
+                &ToolOpenGuard::new(control.cancel.as_ref(), control.stop_requested.as_ref()),
+            )
             .await
         {
             return DispatchResult::NotSent {

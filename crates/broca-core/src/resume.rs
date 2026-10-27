@@ -44,9 +44,7 @@ pub const NOT_DISPATCHED_TEXT: &str =
 pub fn outcome_unknown_result(tool_call_id: &ToolCallId) -> ToolResult {
     ToolResult {
         tool_call_id: tool_call_id.clone(),
-        output: ToolOutput::Error {
-            message: OUTCOME_UNKNOWN_TEXT.into(),
-        },
+        output: ToolOutput::error(OUTCOME_UNKNOWN_TEXT),
         is_error: true,
     }
 }
@@ -58,9 +56,7 @@ pub fn outcome_unknown_result(tool_call_id: &ToolCallId) -> ToolResult {
 pub fn not_dispatched_result(tool_call_id: &ToolCallId) -> ToolResult {
     ToolResult {
         tool_call_id: tool_call_id.clone(),
-        output: ToolOutput::Error {
-            message: NOT_DISPATCHED_TEXT.into(),
-        },
+        output: ToolOutput::error(NOT_DISPATCHED_TEXT),
         is_error: true,
     }
 }
@@ -90,9 +86,9 @@ pub fn provider_held_close_result(
     (
         ToolResult {
             tool_call_id: tool_call_id.clone(),
-            output: ToolOutput::Error {
-                message: format!("{code}: the run was {text} while the provider held the call"),
-            },
+            output: ToolOutput::error(format!(
+                "{code}: the run was {text} while the provider held the call"
+            )),
             is_error: true,
         },
         outcome,
@@ -682,7 +678,7 @@ mod tests {
                             };
                             assert_eq!(code.as_deref(), Some(expected_code));
                             assert_eq!(*outcome, DispatchOutcome::Interrupted);
-                            assert_eq!(result.output, ToolOutput::Error { message: format!("{expected_code}: the run was {} while the provider held the call", if cancel { "cancelled" } else { "interrupted" }) });
+                            assert_eq!(result.output, ToolOutput::error(format!("{expected_code}: the run was {} while the provider held the call", if cancel { "cancelled" } else { "interrupted" })));
                         }
                     }
                     let repaired = replay(&cut_records).unwrap();

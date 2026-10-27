@@ -674,9 +674,7 @@ fn convert_tool_result(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let output = if is_error {
-        ToolOutput::Error {
-            message: tool_result_text(&blocks),
-        }
+        ToolOutput::error(tool_result_text(&blocks))
     } else if let [block] = blocks.as_slice() {
         match (
             block.get("type").and_then(Value::as_str),

@@ -584,8 +584,24 @@ fn convert_tool_output(output: &ToolOutput) -> Vec<Value> {
         ToolOutput::Text { text } => vec![json!({ "text": text })],
         ToolOutput::Json { value } => vec![json!({ "json": value })],
         ToolOutput::Denied { reason } => vec![json!({ "text": format!("denied: {reason}") })],
-        ToolOutput::Error { message } if message.is_empty() => vec![json!({ "json": message })],
-        ToolOutput::Error { message } => vec![json!({ "text": message })],
+        ToolOutput::Error { message, .. } if message.is_empty() => {
+            vec![json!({ "json": message })]
+        }
+        ToolOutput::Error {
+            message,
+            module,
+            code,
+            detail,
+            nothing_sent,
+            retry,
+        } => vec![json!({ "text": ToolOutput::error_model_text(
+            message,
+            module.as_deref(),
+            code.as_deref(),
+            detail.as_deref(),
+            *nothing_sent,
+            retry.as_deref(),
+        ) })],
     }
 }
 
@@ -1756,7 +1772,8 @@ mod tests {
             ToolOutput::Text { text } => vec![json!({ "text": text })],
             ToolOutput::Json { value } => vec![json!({ "json": value })],
             ToolOutput::Denied { reason } => vec![json!({ "text": format!("denied: {reason}") })],
-            ToolOutput::Error { message } => vec![json!({ "text": message })],
+            // Legacy contrast renderer: keeps the old message-only bytes on purpose.
+            ToolOutput::Error { message, .. } => vec![json!({ "text": message })],
         }
     }
 
@@ -1809,12 +1826,7 @@ mod tests {
 
     #[test]
     fn empty_error_tool_result_uses_json_string_and_keeps_error_status() {
-        let body = tool_result_request(
-            ToolOutput::Error {
-                message: String::new(),
-            },
-            true,
-        );
+        let body = tool_result_request(ToolOutput::error(String::new()), true);
         let tool_result = &body["messages"][1]["content"][0]["toolResult"];
 
         assert_eq!(tool_result["content"], json!([{ "json": "" }]));
@@ -1833,9 +1845,7 @@ mod tests {
             ToolOutput::Denied {
                 reason: "policy".into(),
             },
-            ToolOutput::Error {
-                message: "failed".into(),
-            },
+            ToolOutput::error("failed"),
         ] {
             assert_eq!(
                 serde_json::to_vec(&convert_tool_output(&output)).unwrap(),

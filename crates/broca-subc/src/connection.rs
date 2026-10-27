@@ -154,6 +154,11 @@ impl RejectedMessage {
     pub(crate) fn code(&self) -> &str {
         self.code.as_deref().unwrap_or("")
     }
+
+    /// The daemon's detail for a structured refusal (the message after the code).
+    pub(crate) fn detail(&self) -> &str {
+        &self.message
+    }
 }
 
 impl From<String> for RejectedMessage {
@@ -3321,7 +3326,7 @@ async fn cancelled_or_never(cancel: Option<&CancellationToken>) {
 /// restarting, or not answering), as opposed to anything about the route asked for. These are
 /// the refusals that are the same for every caller of that module, so one caller's refusal is
 /// news for all of them; see [`ModuleGate`].
-fn is_module_availability_refusal(code: &str) -> bool {
+pub(crate) fn is_module_availability_refusal(code: &str) -> bool {
     use subc_protocol::error_codes::{
         MODULE_RELOADING, MODULE_TIMEOUT, MODULE_WARMING, TARGET_UNAVAILABLE,
     };
@@ -3387,6 +3392,10 @@ pub(crate) struct ModuleGate {
     /// released at once (see [`GateAdmission::Retired`]) instead of sleeping on a gate nothing
     /// will probe any more.
     retired: CancellationToken,
+    /// The tool-provider module this gate paces, when it paces tool routes. Only a gate
+    /// with a label logs its outages: one line when the target starts refusing, one when it
+    /// recovers, whatever route kinds the other gates pace.
+    tool_module: Option<String>,
 }
 
 struct GateState {
@@ -3403,6 +3412,9 @@ struct GateClosed {
     /// cannot wait for the next probe is given this: the gate's latest evidence that the module
     /// was unavailable.
     refusal: RejectedMessage,
+    /// When the outage started (the close transition), so recovery can report how long the
+    /// target was down.
+    since: time::Instant,
     /// When the next probe may go through.
     next_probe_at: time::Instant,
     /// The envelope the wait after the next failed probe is drawn from.
@@ -3487,7 +3499,16 @@ impl ModuleGate {
             state,
             jitter: Box::new(jitter),
             retired,
+            tool_module: None,
         }
+    }
+
+    /// Label this gate with the tool-provider module it paces, so its outages are logged
+    /// once per outage (see [`ModuleGate::observe`]). Non-tool gates stay unlabeled and
+    /// silent.
+    pub(crate) fn with_tool_module(mut self, module: &str) -> Self {
+        self.tool_module = Some(module.to_owned());
+        self
     }
 
     /// Whether the gate is closed and still pacing opens (a retired gate paces nothing).
@@ -3600,11 +3621,14 @@ impl ModuleGate {
     }
 
     /// Learn from one open's outcome. `epoch` is the gate period the open was admitted in, and
-    /// `probe` its probe turn if it was one.
+    /// `probe` its probe turn if it was one. A tool gate logs its outage transitions once per
+    /// outage: when the gate closes (module and code) and when it reopens (module and how
+    /// long the target was down). Every other observation only paces probes, silently.
     fn observe(&self, outcome: &ConnResult<RouteHandle>, epoch: u64, probe: Option<u64>) {
         let now = time::Instant::now();
         let jitter = |envelope: Duration| (self.jitter)(envelope).min(envelope);
         let evidence = module_evidence(outcome);
+        let tool_module = self.tool_module.clone();
         self.state.send_if_modified(|state| {
             let Some(closed) = state.closed.as_mut() else {
                 // Open gate: only an availability refusal from an open admitted in THIS open
@@ -3617,8 +3641,16 @@ impl ModuleGate {
                     return false;
                 }
                 state.epoch += 1;
+                if let Some(module) = &tool_module {
+                    tracing::info!(
+                        module = %module,
+                        code = refusal.code(),
+                        "tool route target started refusing route opens"
+                    );
+                }
                 state.closed = Some(GateClosed {
                     refusal: refusal.clone(),
+                    since: now,
                     next_probe_at: now + jitter(ROUTE_OPEN_RETRY_INTERVAL),
                     envelope: (ROUTE_OPEN_RETRY_INTERVAL * 2).min(ROUTE_OPEN_RETRY_MAX_INTERVAL),
                     probe: None,
@@ -3629,7 +3661,15 @@ impl ModuleGate {
             match evidence {
                 ModuleEvidence::Answered => {
                     state.epoch += 1;
+                    let since = closed.since;
                     state.closed = None;
+                    if let Some(module) = &tool_module {
+                        tracing::info!(
+                            module = %module,
+                            down_secs = now.saturating_duration_since(since).as_secs(),
+                            "tool route target reachable again"
+                        );
+                    }
                 }
                 ModuleEvidence::Unavailable(refusal) => {
                     closed.refusal = refusal.clone();
@@ -3703,7 +3743,13 @@ impl ModuleGates {
         Arc::clone(
             gates
                 .entry((generation, target.clone()))
-                .or_insert_with(|| Arc::new(ModuleGate::new(retired))),
+                .or_insert_with(|| {
+                    let gate = ModuleGate::new(retired);
+                    match target {
+                        GateTarget::ToolProvider(module) => Arc::new(gate.with_tool_module(module)),
+                        _ => Arc::new(gate),
+                    }
+                }),
         )
     }
 }
@@ -7158,6 +7204,38 @@ mod module_gate_tests {
         let retry = RouteOpenRetry::default_patience();
         assert_eq!(retry.budget, Duration::from_secs(3));
         assert_eq!(retry.max_interval, Duration::from_secs(5));
+    }
+
+    /// The default patience still gives up after 3 s on a module-availability refusal: the
+    /// 90 s wait is a tool-dispatch policy, and every other route kind (vault, catalog,
+    /// transform, routing, approval rechecks) keeps this bound.
+    #[tokio::test(start_paused = true)]
+    async fn the_default_patience_gives_up_after_three_seconds_on_module_refusals() {
+        let start = time::Instant::now();
+        let calls = AtomicUsize::new(0);
+        let result = retry_route_open(RouteOpenRetry::default_patience(), None, no_gate, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(refused("module_warming")) }
+        })
+        .await;
+        assert!(
+            matches!(result, Err(RouteOpenError::Conn(ConnError::Rejected(_)))),
+            "the last refusal is returned unchanged: {result:?}"
+        );
+        let waited = start.elapsed();
+        assert!(
+            waited >= ROUTE_OPEN_RETRY_DEADLINE,
+            "the open retries for the whole default budget: {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(30),
+            "and gives up long before any tool-dispatch patience: {waited:?}"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) < 100,
+            "a handful of attempts, not a storm: {}",
+            calls.load(Ordering::SeqCst)
+        );
     }
 
     /// Full jitter stays inside its envelope and actually varies: a wait never exceeds the

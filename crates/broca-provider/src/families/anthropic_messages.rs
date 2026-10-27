@@ -1134,7 +1134,21 @@ fn tool_output_text(out: &ToolOutput) -> String {
         ToolOutput::Text { text } => text.clone(),
         ToolOutput::Json { value } => value.to_string(),
         ToolOutput::Denied { reason } => format!("denied: {reason}"),
-        ToolOutput::Error { message } => message.clone(),
+        ToolOutput::Error {
+            message,
+            module,
+            code,
+            detail,
+            nothing_sent,
+            retry,
+        } => ToolOutput::error_model_text(
+            message,
+            module.as_deref(),
+            code.as_deref(),
+            detail.as_deref(),
+            *nothing_sent,
+            retry.as_deref(),
+        ),
     }
 }
 
@@ -1193,6 +1207,27 @@ mod tests {
     use super::*;
     use crate::families::{anthropic_apikey_frozen_config, anthropic_frozen_config};
     use broca_protocol::{content::ToolOutput, ToolCallId};
+
+    /// An attributed module-outage error reaches the model with the module, the code
+    /// and the retry guidance; a plain error renders as its message alone.
+    #[test]
+    fn attributed_outage_error_renders_attribution_for_the_model() {
+        let text = tool_output_text(&ToolOutput::module_unavailable(
+            "aft",
+            "target_unavailable",
+            "supervised_not_registered",
+        ));
+        assert!(text.starts_with("tool plane unavailable\n"), "{text}");
+        for line in [
+            "module: aft",
+            "code: target_unavailable",
+            "detail: supervised_not_registered",
+            "nothing was sent",
+        ] {
+            assert!(text.contains(line), "{text}");
+        }
+        assert_eq!(tool_output_text(&ToolOutput::error("boom")), "boom");
+    }
 
     fn persona_frozen() -> FrozenRenderConfig {
         let mut frozen = anthropic_frozen_config("claude-opus-4-8");

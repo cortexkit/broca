@@ -389,7 +389,7 @@ pub fn part_kind(role: Role, block: &ContentBlock, clean: bool) -> Option<PartKi
                 PartKind::ToolResultImageOnly
             }
             ToolOutput::Text { text: message }
-            | ToolOutput::Error { message }
+            | ToolOutput::Error { message, .. }
             | ToolOutput::Denied { reason: message } => {
                 text_kind(message, PartKind::ToolResultText)
             }
@@ -548,7 +548,7 @@ fn render_computed(message: &mut Message, tags: &PartTags, computed: ComputedTag
                         *text = cortexkit_role_llm_runner::tags::image_label(number);
                     }
                     ToolOutput::Text { text: message }
-                    | ToolOutput::Error { message }
+                    | ToolOutput::Error { message, .. }
                     | ToolOutput::Denied { reason: message } => {
                         *message =
                             cortexkit_role_llm_runner::tags::render_counted_text(number, message);
@@ -896,9 +896,7 @@ mod tests {
                 }),
                 ContentBlock::ToolResult(ToolResult {
                     tool_call_id: ToolCallId("e".into()),
-                    output: ToolOutput::Error {
-                        message: "failed".into(),
-                    },
+                    output: ToolOutput::error("failed"),
                     is_error: true,
                 }),
             ],

@@ -130,9 +130,7 @@ mod tests {
     fn restores_exact_failure_guidance_for_every_output_shape() {
         for output in [
             ToolOutput::Text { text: "raw".into() },
-            ToolOutput::Error {
-                message: "raw".into(),
-            },
+            ToolOutput::error("raw"),
             ToolOutput::Denied {
                 reason: "raw".into(),
             },
@@ -156,8 +154,20 @@ mod tests {
                 ToolOutput::Text { text } => ToolOutput::Text {
                     text: text + suffix,
                 },
-                ToolOutput::Error { message } => ToolOutput::Error {
+                ToolOutput::Error {
+                    message,
+                    module,
+                    code,
+                    detail,
+                    nothing_sent,
+                    retry,
+                } => ToolOutput::Error {
                     message: message + suffix,
+                    module,
+                    code,
+                    detail,
+                    nothing_sent,
+                    retry,
                 },
                 ToolOutput::Denied { reason } => ToolOutput::Denied {
                     reason: reason + suffix,
@@ -184,9 +194,7 @@ mod tests {
             prompt.extend(turn(
                 &format!("{n}"),
                 json!({"n": n}),
-                ToolOutput::Error {
-                    message: "raw".into(),
-                },
+                ToolOutput::error("raw"),
                 true,
             ));
         }
@@ -195,7 +203,7 @@ mod tests {
             let ContentBlock::ToolResult(result) = &prompt[index].content[0] else {
                 panic!()
             };
-            assert_eq!(result.output, ToolOutput::Error { message: format!("raw\n\nTool repetition guidance: read has failed {count} times in a row. Something about this tool or its target is not working right now; try a different route to the same goal.") });
+            assert_eq!(result.output, ToolOutput::error(format!("raw\n\nTool repetition guidance: read has failed {count} times in a row. Something about this tool or its target is not working right now; try a different route to the same goal.")));
         }
     }
 
@@ -318,7 +326,7 @@ mod replay_tests {
         let ContentBlock::ToolResult(result) = &mut expected.prompt[3].content[0] else {
             panic!()
         };
-        result.output = ToolOutput::Error { message: "raw\n\nTool repetition guidance: read has now failed 2 times with identical arguments. Read the error and change the arguments or the approach; repeating this call unchanged will fail the same way.".into() };
+        result.output = ToolOutput::error("raw\n\nTool repetition guidance: read has now failed 2 times with identical arguments. Read the error and change the arguments or the approach; repeating this call unchanged will fail the same way.");
         assert_eq!(opts.prompt, expected.prompt);
         assert_eq!(
             actual,
@@ -326,7 +334,7 @@ mod replay_tests {
                 .unwrap()
                 .render(&frozen, &expected)
         );
-        assert_eq!(records.iter().filter(|r| matches!(r, WalRecord::ToolResult { result, .. } if result.output == ToolOutput::Error { message: "raw".into() })).count(), 3);
+        assert_eq!(records.iter().filter(|r| matches!(r, WalRecord::ToolResult { result, .. } if result.output == ToolOutput::error("raw"))).count(), 3);
     }
 }
 

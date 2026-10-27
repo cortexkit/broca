@@ -129,6 +129,17 @@ pub enum ToolPlaneError {
     /// The plane could not reach the executor after its bounded transport retry
     /// (subc unreachable / route gone / timeout).
     Unavailable(String),
+    /// A tool route's open kept being refused with a module-availability code
+    /// (`target_unavailable`, `module_reloading`, `module_warming`, `module_timeout`)
+    /// for the whole tool-dispatch patience, so the module is restarting or down.
+    /// Proven undelivered: nothing was sent. The loop reports it with the stable
+    /// `tool plane unavailable` message plus this attribution, so the model can retry
+    /// rather than give up.
+    ModuleUnavailable {
+        module: String,
+        code: String,
+        detail: String,
+    },
     /// A scoped run's route could not be opened for a reason to do with its scope, named by
     /// `code`: `scope_unsupported` (the daemon does not admit scoped routes),
     /// `scope_unverifiable` (the scope's state could not be confirmed), or a refusal the daemon
@@ -159,6 +170,14 @@ impl std::fmt::Display for ToolPlaneError {
             ToolPlaneError::ScopeDrained { reason } => write!(
                 f,
                 "route_drained: the session's scope route was closed ({reason}); nothing was sent"
+            ),
+            ToolPlaneError::ModuleUnavailable {
+                module,
+                code,
+                detail,
+            } => write!(
+                f,
+                "tool plane unavailable (module '{module}' is restarting or unavailable; nothing was sent): {code} {detail}"
             ),
         }
     }
@@ -220,6 +239,78 @@ impl DispatchSignals {
             cancel: cancel.cloned(),
             stop: stop.cloned(),
         }
+    }
+    pub fn interrupted(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            || self
+                .stop
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+    }
+    pub async fn cancelled(&self) {
+        async fn wait(token: Option<&tokio_util::sync::CancellationToken>) {
+            match token {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending().await,
+            }
+        }
+        tokio::select! {
+            _ = wait(self.cancel.as_ref()) => {}
+            _ = wait(self.stop.as_ref()) => {}
+        }
+    }
+}
+
+impl From<&DispatchSignals> for ToolOpenGuard {
+    /// The approved path already carries run signals to its send boundary; the same tokens
+    /// bound its route-open wait.
+    fn from(signals: &DispatchSignals) -> Self {
+        Self {
+            cancel: signals.cancel.clone(),
+            stop: signals.stop.clone(),
+            deadline: None,
+        }
+    }
+}
+
+/// What ends a tool-dispatch route-open wait early: the run's cancel and stop/shutdown
+/// tokens. The wait also ends at the step deadline that comes earlier, which the plane
+/// derives from the call's own reply budget. Carried separately from [`DispatchSignals`]
+/// (which guards the physical send) so planes whose opens never wait keep ignoring it.
+/// Clones observe the same tokens while the wait is pending.
+#[derive(Clone, Default)]
+pub struct ToolOpenGuard {
+    cancel: Option<tokio_util::sync::CancellationToken>,
+    stop: Option<tokio_util::sync::CancellationToken>,
+    /// Waste no more of the step on the open than this instant, when set: the caller’s own
+    /// deadline (the plane fills in the call’s reply budget) ends the wait early.
+    pub deadline: Option<tokio::time::Instant>,
+}
+impl ToolOpenGuard {
+    pub fn new(
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+        stop: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Self {
+        Self {
+            cancel: cancel.cloned(),
+            stop: stop.cloned(),
+            deadline: None,
+        }
+    }
+    /// Cap the wait at `at`, when sooner than the deadline already set.
+    pub fn cap(&mut self, at: tokio::time::Instant) {
+        self.deadline = Some(match self.deadline {
+            Some(current) => current.min(at),
+            None => at,
+        });
+    }
+    pub fn cancel_token(&self) -> Option<tokio_util::sync::CancellationToken> {
+        self.cancel.clone()
+    }
+    pub fn stop_token(&self) -> Option<tokio_util::sync::CancellationToken> {
+        self.stop.clone()
     }
     pub fn interrupted(&self) -> bool {
         self.cancel
@@ -343,6 +434,37 @@ pub trait ToolPlane: Send + Sync {
 
     /// Close a batch — modelling `tool_batch_finished{batch_id}`.
     async fn batch_finished(&self, ctx: &BatchCtx) -> Result<(), ToolPlaneError>;
+
+    /// batch_started with an early-exit guard for the route-open wait: run cancel or
+    /// stop/shutdown ends the wait at once instead of holding the tool-dispatch
+    /// patience. Planes whose opens never wait keep the default, which ignores the guard.
+    async fn batch_started_guarded(
+        &self,
+        ctx: &BatchCtx,
+        calls: &[ToolCall],
+        manifest: &ToolManifest,
+        guard: &ToolOpenGuard,
+    ) -> Result<(), ToolPlaneError> {
+        let _ = guard;
+        self.batch_started(ctx, calls, manifest).await
+    }
+
+    /// dispatch/dispatch_keyed with the same early-exit guard for the route-open wait.
+    /// `key` selects the keyed form, as dispatch_keyed does. Planes whose dispatch
+    /// never waits keep the default.
+    async fn dispatch_guarded(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        key: Option<DispatchKey<'_>>,
+        guard: &ToolOpenGuard,
+    ) -> DispatchResult {
+        let _ = guard;
+        match key {
+            Some(key) => self.dispatch_keyed(ctx, call, key).await,
+            None => self.dispatch(ctx, call).await,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

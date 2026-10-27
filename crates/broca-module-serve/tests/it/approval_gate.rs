@@ -864,7 +864,7 @@ fn closed(rig: &Rig, records: &[WalRecord], decision: DeferredDecision, refusal:
     let result = answers[0].1.as_ref().expect("closing result");
     assert!(result.is_error);
     assert!(
-        matches!(&result.output, broca_protocol::ToolOutput::Error {message} if message.starts_with(refusal))
+        matches!(&result.output, broca_protocol::ToolOutput::Error { message, .. } if message.starts_with(refusal))
     );
     assert_eq!(
         count(records, |record| matches!(
