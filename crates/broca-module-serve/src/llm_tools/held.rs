@@ -194,16 +194,15 @@ impl HeldCalls {
     ) -> Answer {
         let principal = principal
             .ok_or_else(|| {
-                refusal(
+                late_refusal(
                     "scope_required",
                     "late results require a daemon-stamped caller principal",
-                    Spend::Nothing,
                 )
             })?
             .as_owner_string();
         let request: ReadRequest = serde_json::from_value(arguments.clone()).map_err(invalid)?;
         let since = request.since.as_ref().map_or(0, |cursor| cursor.seq);
-        let head = self.store.late_head(&principal).map_err(internal)?;
+        let head = self.store.late_head(&principal).map_err(late_internal)?;
         if let Some(cursor) = &request.since {
             self.check_cursor(cursor, head, &principal)?;
         }
@@ -211,7 +210,7 @@ impl HeldCalls {
         let mut rows = self
             .store
             .late_results(&principal, since, limit + 1, now_ms)
-            .map_err(internal)?;
+            .map_err(late_internal)?;
         let more = rows.len() > limit as usize;
         rows.truncate(limit as usize);
         let seq = rows.last().map_or(head, |entry| entry.seq);
@@ -219,7 +218,7 @@ impl HeldCalls {
             .iter()
             .map(|entry| late_entry(&entry.call))
             .collect::<Result<Vec<_>, _>>()?;
-        raw(
+        late_raw(
             json!({"entries":entries, "cursor":{"provider_incarnation":self.caller_incarnation(&principal),"seq":seq},"more":more}),
         )
     }
@@ -227,28 +226,27 @@ impl HeldCalls {
     pub fn acknowledge(&self, arguments: &Value, principal: Option<&BindPrincipal>) -> Answer {
         let principal = principal
             .ok_or_else(|| {
-                refusal(
+                late_refusal(
                     "scope_required",
                     "late-result acknowledgements require a daemon-stamped caller principal",
-                    Spend::Nothing,
                 )
             })?
             .as_owner_string();
         let request: AckRequest = serde_json::from_value(arguments.clone()).map_err(invalid)?;
         self.check_cursor(
             &request.through,
-            self.store.late_head(&principal).map_err(internal)?,
+            self.store.late_head(&principal).map_err(late_internal)?,
             &principal,
         )?;
         self.store
             .acknowledge(&principal, request.through.seq)
-            .map_err(internal)?;
-        raw(json!({}))
+            .map_err(late_internal)?;
+        late_raw(json!({}))
     }
 
     fn check_cursor(&self, cursor: &Cursor, head: u64, principal: &str) -> Result<(), Vec<u8>> {
         if cursor.provider_incarnation != self.caller_incarnation(principal) || cursor.seq > head {
-            return Err(refusal("cursor_incarnation_changed", "late-results cursor is not from this caller's provider incarnation or is past its entries", Spend::Nothing));
+            return Err(late_refusal("cursor_incarnation_changed", "late-results cursor is not from this caller's provider incarnation or is past its entries"));
         }
         Ok(())
     }
@@ -271,13 +269,10 @@ pub fn not_started(consent: &str) -> String {
 }
 
 fn late_entry(row: &HeldCall) -> Result<Value, Vec<u8>> {
-    let result = row.final_result.as_ref().ok_or_else(|| {
-        refusal(
-            "internal",
-            "late result has no stored final outcome",
-            Spend::Unknown,
-        )
-    })?;
+    let result = row
+        .final_result
+        .as_ref()
+        .ok_or_else(|| late_refusal("internal", "late result has no stored final outcome"))?;
     let mut entry = json!({
         "kind":if result.kind == FinalKind::Result {"result"} else {"not_started"},
         "owner":row.scope.owner, "ref":row.scope.scope_ref, "scope_epoch":row.scope.scope_epoch,
@@ -285,7 +280,7 @@ fn late_entry(row: &HeldCall) -> Result<Value, Vec<u8>> {
         "event_id":format!("llm.classify:{}:{}",row.batch_id,row.admitted_at_ms),
         "settled_at":result.settled_at_ms, "reduced":false,
     });
-    let body: Value = serde_json::from_str(&result.body).map_err(lost)?;
+    let body: Value = serde_json::from_str(&result.body).map_err(late_internal)?;
     if result.kind == FinalKind::Result {
         entry["result"] = if body.get("content").is_some() {
             body
@@ -318,15 +313,27 @@ fn raw(value: Value) -> Answer {
     serde_json::value::to_raw_value(&value).map_err(internal)
 }
 
+/// A late-results reply. Its encoding failure carries no spend member, like every refusal of
+/// `late_results` and `late_results.ack`.
+fn late_raw(value: Value) -> Answer {
+    serde_json::value::to_raw_value(&value).map_err(late_internal)
+}
+
+/// A refusal of a model tool call, with the spend it states.
 fn refusal(code: &str, message: &str, spend: Spend) -> Vec<u8> {
     crate::system_one::refusal_body(&spend.mark(super::admission::refusal(code, message)))
 }
 
+/// A refusal of `late_results` or `late_results.ack`. These operations answer no model call,
+/// so their refusals carry no spend member: their bodies stay the ones readers already decode.
+fn late_refusal(code: &str, message: &str) -> Vec<u8> {
+    crate::system_one::refusal_body(&super::admission::refusal(code, message))
+}
+
 fn invalid(error: impl std::fmt::Display) -> Vec<u8> {
-    refusal(
+    late_refusal(
         "invalid_params",
         &format!("invalid late-results arguments: {error}"),
-        Spend::Nothing,
     )
 }
 
@@ -334,6 +341,14 @@ fn invalid(error: impl std::fmt::Display) -> Vec<u8> {
 fn internal(error: impl std::fmt::Display) -> Vec<u8> {
     crate::system_one::refusal_body(&Spend::Nothing.mark(crate::system_one::internal_refusal(
         &format!("held-call store: {error}"),
+    )))
+}
+
+/// A held-call store failure answering `late_results` or `late_results.ack`, without a spend
+/// member.
+fn late_internal(error: impl std::fmt::Display) -> Vec<u8> {
+    crate::system_one::refusal_body(&crate::system_one::internal_refusal(&format!(
+        "held-call store: {error}"
     )))
 }
 

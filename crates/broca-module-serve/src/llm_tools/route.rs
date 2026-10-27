@@ -334,8 +334,10 @@ impl LlmTools {
         let call: ToolCallRequest = serde_json::from_slice(body)
             .map_err(|e| unspent(Refusal::invalid_params("request", e.to_string())))?;
         match call.name.as_str() {
+            // Refusals of model tool calls, an unknown tool name included, state spend; the
+            // provider's own operations (`role.describe`, `tool.catalog`, late results) do not.
             "role.describe" => raw(
-                Spend::Nothing,
+                None,
                 json!({
                     "majors": [{"version":"tool-provider/v1", "ops":["role.describe", "tool.catalog", "late_results", "late_results.ack"], "stability":"alpha"}],
                     "implementation_version": env!("CARGO_PKG_VERSION"),
@@ -452,12 +454,12 @@ impl LlmTools {
         let digest = hash(&answer);
         if request.digest_only == Some(true) {
             return raw(
-                Spend::Nothing,
+                None,
                 json!({"generation":generation,"catalog_digest":digest}),
             );
         }
         answer["catalog_digest"] = json!(digest);
-        raw(Spend::Nothing, answer)
+        raw(None, answer)
     }
 
     fn input_schema(&self) -> Value {
@@ -866,9 +868,10 @@ fn has_final_outcome(stored: &StoredBatch) -> bool {
         })
 }
 
-/// Encode a model-tool refusal with its spend mark. `None` is for a refusal an earlier step
-/// already marked (a refusal `execute_tool` returns, or an item error that carries its stored
-/// mark); every other caller states the spend.
+/// Encode a refusal with its spend mark. `None` is for a refusal an earlier step already
+/// marked (a refusal `execute_tool` returns, or an item error that carries its stored mark)
+/// and for refusals of the provider's own operations, which answer no model call; every model
+/// tool call's other refusals state the spend.
 fn error(refusal: Refusal, spend: Option<Spend>) -> Vec<u8> {
     let refusal = match spend {
         Some(spend) => spend.mark(refusal),
@@ -884,7 +887,7 @@ fn unspent(refusal: Refusal) -> Vec<u8> {
 
 fn catalog_error(field: &str, message: String) -> Vec<u8> {
     let mut body = subc_protocol::ErrorBody::new("invalid_request", message);
-    body.detail = Some(json!({"field":field, "no_spend":true}));
+    body.detail = Some(json!({"field":field}));
     serde_json::to_vec(&body).expect("catalog refusal encodes")
 }
 
@@ -903,17 +906,19 @@ fn as_tool_result(body: Box<RawValue>) -> Answer {
         return Ok(body);
     }
     raw(
-        Spend::Unknown,
+        Some(Spend::Unknown),
         json!({"content":[{"type":"text","text":body.get()}],"structuredContent":value}),
     )
 }
 
-/// Encode a reply. `lost` is the spend a failure to encode it states.
-fn raw(lost: Spend, value: Value) -> Answer {
+/// Encode a reply. `lost` is the spend a failure to encode it states: `None` for the
+/// provider's own operations (`role.describe`, `tool.catalog`), which answer no model call and
+/// keep their refusal bodies free of spend members.
+fn raw(lost: Option<Spend>, value: Value) -> Answer {
     serde_json::value::to_raw_value(&value).map_err(|_| {
         error(
             crate::system_one::internal_refusal("model tool reply cannot encode"),
-            Some(lost),
+            lost,
         )
     })
 }

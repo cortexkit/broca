@@ -436,15 +436,6 @@ async fn refusals_before_dispatch_spend_nothing() {
     cases.push(("cost_exceeded", rig.refuse("k3", too_cheap).await));
     let undecodable = rig.tools.answer(b"{", Some(&principal()), &stamped()).await;
     cases.push(("invalid_params", body(undecodable)));
-    let late = rig
-        .tools
-        .answer(
-            &serde_json::to_vec(&json!({"name": "late_results", "arguments": {}})).unwrap(),
-            None,
-            &stamped(),
-        )
-        .await;
-    cases.push(("scope_required", body(late)));
     for (code, refusal) in &cases {
         assert_eq!(refusal["code"], *code, "{refusal}");
         assert_eq!(spend(refusal), RefusalSpend::NoSpend, "{refusal}");
@@ -457,17 +448,40 @@ async fn refusals_before_dispatch_spend_nothing() {
     let unknown = body(unknown);
     assert_eq!(unknown["code"], "unknown_method");
     assert_eq!(unknown["detail"]["no_spend"], true, "{unknown}");
+    assert_eq!(rig.provider.calls.load(Ordering::SeqCst), 0);
+}
+
+/// `tool.catalog` and `late_results` answer no model call, so their refusals carry no spend
+/// member. Core's plan fetch and other readers decode these bodies, so each must stay byte for
+/// byte the body broca answered before model tools marked refusals.
+#[tokio::test]
+async fn provider_operation_refusals_keep_their_bodies_without_spend() {
+    let rig = Rig::new(|| ProviderReply::Answered(ANSWER.to_vec()));
     let catalog = rig
         .send(
             json!({"name": "tool.catalog", "arguments": {"preset": "invented"}}),
             &stamped(),
         )
-        .await;
-    let catalog = body(catalog);
-    assert_eq!(catalog["code"], "invalid_request");
-    assert_eq!(catalog["detail"]["no_spend"], true, "{catalog}");
-    assert_eq!(rig.provider.calls.load(Ordering::SeqCst), 0);
+        .await
+        .expect_err("a catalog preset is refused");
+    assert_eq!(String::from_utf8(catalog).unwrap(), CATALOG_PRESET_REFUSAL,);
+    let late = rig
+        .tools
+        .answer(
+            &serde_json::to_vec(&json!({"name": "late_results", "arguments": {}})).unwrap(),
+            None,
+            &stamped(),
+        )
+        .await
+        .expect_err("late results need a caller principal");
+    assert_eq!(
+        String::from_utf8(late).unwrap(),
+        LATE_RESULTS_UNSCOPED_REFUSAL
+    );
 }
+
+const CATALOG_PRESET_REFUSAL: &str = r#"{"code":"invalid_request","message":"model tools have no catalog presets","detail":{"field":"preset"}}"#;
+const LATE_RESULTS_UNSCOPED_REFUSAL: &str = r#"{"code":"scope_required","message":"late results require a daemon-stamped caller principal","detail":{"class":"permanent"}}"#;
 
 /// Private-content admission ends a call before dispatch, so its refusal spends nothing.
 #[tokio::test]

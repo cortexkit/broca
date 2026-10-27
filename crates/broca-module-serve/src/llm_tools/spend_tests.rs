@@ -190,8 +190,9 @@ fn item_errors_keep_their_mark_and_unmarked_ones_keep_their_bytes() {
 /// spend: the file, a piece of the line, how many lines carry it, and the spend it states.
 /// Refusals built as a `Refusal` cannot reach a caller unmarked: the route's `error` takes the
 /// spend, and `SystemOne::execute_tool` marks every refusal it returns by whether a provider
-/// request was sent. The permissions route is an operator-only operation, not a model tool,
-/// so it is not listed.
+/// request was sent. Refusals of the provider's own operations (`tool.catalog`, `late_results`
+/// and `late_results.ack`) answer no model call and are listed as carrying no member. The
+/// permissions route is an operator-only operation, not a model tool, so it is not listed.
 const SITES: &[(&str, &str, usize, &str)] = &[
     (
         "route.rs",
@@ -221,13 +222,13 @@ const SITES: &[(&str, &str, usize, &str)] = &[
         "route.rs",
         "ErrorBody::new(\"invalid_request\"",
         1,
-        "no spend: literal no_spend",
+        "no member: a tool.catalog refusal answers no model call",
     ),
     (
         "route.rs",
         "to_vec(&body).expect(\"catalog refusal encodes\")",
         1,
-        "no spend: the same catalog body",
+        "no member: the same tool.catalog body",
     ),
     (
         "route.rs",
@@ -272,6 +273,18 @@ const SITES: &[(&str, &str, usize, &str)] = &[
         "refusal_body(&Spend::Unknown.mark(",
         1,
         "unknown: a held result that was lost",
+    ),
+    (
+        "held.rs",
+        "refusal_body(&super::admission::refusal(code, message))",
+        1,
+        "no member: a late_results refusal answers no model call",
+    ),
+    (
+        "held.rs",
+        "refusal_body(&crate::system_one::internal_refusal(&format!(",
+        1,
+        "no member: a late_results store failure answers no model call",
     ),
     (
         "private_content.rs",
