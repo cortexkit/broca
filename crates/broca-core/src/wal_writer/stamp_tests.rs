@@ -18,13 +18,27 @@ struct Root {
 
 impl Root {
     fn new(name: &str, overhaul: bool) -> Self {
+        Self::with_wal_dir(name, overhaul, true)
+    }
+
+    /// A root whose `wal/` directory does not exist yet, as an overhaul root's is not when its
+    /// first log is opened: the state root is marked (and may hold other files) before any log
+    /// creates the directory its logs live in.
+    fn without_wal_dir(name: &str, overhaul: bool) -> Self {
+        Self::with_wal_dir(name, overhaul, false)
+    }
+
+    fn with_wal_dir(name: &str, overhaul: bool, create_wal_dir: bool) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let state_root = broca_test_support::scratch_root().join(format!(
             "wal-stamp-{}-{name}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(state_root.join("wal")).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        if create_wal_dir {
+            std::fs::create_dir_all(state_root.join("wal")).unwrap();
+        }
         if overhaul {
             std::fs::write(
                 state_root.join(crate::state_format::MARKER_FILENAME),
@@ -252,6 +266,23 @@ async fn overhaul_root_frames_carry_a_writer_stamp() {
 }
 
 #[tokio::test]
+async fn a_marked_root_without_its_wal_directory_still_writes_version_4() {
+    // The state root is marked before its `wal/` directory exists, so the first log open is also
+    // the call that creates `wal/`. That creation says nothing about the root's format: the
+    // marker, not the directory, decides it.
+    let root = Root::without_wal_dir("fresh-overhaul", true);
+    assert!(!root.state_root.join("wal").exists());
+    let handle = root.handle(7);
+    handle.record(record(1)).into_result().unwrap();
+    handle.shutdown().await.expect("shutdown");
+
+    let landed = frames(&root);
+    assert_eq!(landed.len(), 1);
+    assert_eq!(landed[0].requires, ["frame-stamps/v1"]);
+    assert!(landed[0].metadata.appended_ms > 0);
+}
+
+#[tokio::test]
 async fn a_legacy_root_keeps_the_frames_it_wrote_before() {
     let root = Root::new("legacy", false);
     let handle = root.handle(7);
@@ -296,8 +327,12 @@ async fn appended_ms_monotonic_per_process() {
     handle.shutdown().await.expect("shutdown");
 }
 
-/// A writer WAL that reports, for each frame, the monotonic reading its own writer thread had
-/// just taken. Comparing that with the frame's `appended_ms` shows where the stamp came from.
+/// A writer WAL that records, for each frame, the wall-clock time its own writer thread read when
+/// it was handed the frame.
+///
+/// The stamp and the reading come from the same clock, the same thread and the same moment: the
+/// shortest wait between them is under a millisecond, so two separate readings could differ by
+/// more than the gap they are meant to bound.
 struct StampedWal {
     inner: Box<dyn Wal + Send>,
     readings: std::sync::Arc<Mutex<Vec<WriterReading>>>,
@@ -309,6 +344,8 @@ struct WriterReading {
 }
 
 impl StampedWal {
+    /// Both readings below happen after the writer thread computes a frame's header, so the
+    /// stamp is at or after the wall-clock value they both sample.
     fn note(&self) {
         let wall_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -382,9 +419,10 @@ impl Wal for StampedWal {
 #[tokio::test]
 async fn appended_ms_taken_on_writer_thread() {
     let root = Root::new("writer-thread", true);
-    // Each frame records the writer thread's monotonic reading taken when it assembled the
-    // frame's header. A handle stamps `appended_ms` from the same place, so it is at or after
-    // that reading; one sampled while the record was enqueued, before the writer ran, is not.
+    // Each frame records the wall-clock time the writer thread read when it handed the frame to
+    // the WAL, which is after it computed the frame's header. A handle stamps `appended_ms` in
+    // that header, so the stamp bounds that reading from below; one sampled while the record was
+    // enqueued, before the writer thread ran, does not.
     let readings = std::sync::Arc::new(Mutex::new(Vec::new()));
     let record_readings = readings.clone();
     let handle = WalHandle::spawn(

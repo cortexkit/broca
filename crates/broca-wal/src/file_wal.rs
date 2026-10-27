@@ -574,10 +574,10 @@ static ROOT_MARKERS: OnceLock<std::sync::Mutex<Vec<RootMarker>>> = OnceLock::new
 /// first time this process asks about that root.
 ///
 /// A missing or unreadable marker means a legacy root: reading one as overhaul would put frames
-/// on disk that its readers cannot open. An open that had to create the root's directories does
-/// not read a marker, because a root created just now cannot have been marked and a missing
-/// marker means legacy anyway.
-fn overhaul_root_cached(wal_path: &Path, created_root: bool) -> (PathBuf, bool) {
+/// on disk that its readers cannot open. Creating a directory on the way to the log says nothing
+/// about the root's format, so the marker is read even then: a state root is marked before its
+/// logs exist, and often before its `wal/` directory does.
+fn overhaul_root_cached(wal_path: &Path) -> (PathBuf, bool) {
     let root = wal_path
         .parent()
         .and_then(Path::parent)
@@ -589,28 +589,23 @@ fn overhaul_root_cached(wal_path: &Path, created_root: bool) -> (PathBuf, bool) 
     if let Some(known) = markers.iter().find(|marker| marker.root == root) {
         return (root, known.overhaul);
     }
-    let overhaul = if created_root {
-        false
-    } else {
-        match File::open(root.join(crate::state_format::MARKER_FILENAME)) {
-            Ok(mut file) => {
-                let mut marker = Vec::new();
-                match file.read_to_end(&mut marker) {
-                    Ok(_) => {
-                        marker == crate::state_format::OVERHAUL_MARKER
-                            || marker == b"broca-state/2\n"
-                    }
-                    Err(error) => {
-                        report_unreadable_marker(&root, &error);
-                        false
-                    }
+    let overhaul = match File::open(root.join(crate::state_format::MARKER_FILENAME)) {
+        Ok(mut file) => {
+            let mut marker = Vec::new();
+            match file.read_to_end(&mut marker) {
+                Ok(_) => {
+                    marker == crate::state_format::OVERHAUL_MARKER || marker == b"broca-state/2\n"
+                }
+                Err(error) => {
+                    report_unreadable_marker(&root, &error);
+                    false
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => {
-                report_unreadable_marker(&root, &error);
-                false
-            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            report_unreadable_marker(&root, &error);
+            false
         }
     };
     markers.push(RootMarker {
@@ -927,8 +922,7 @@ impl FileWal {
             ),
             Err(e) => return Err(WalError::Io(e)),
         };
-        let (state_root, overhaul_root) =
-            overhaul_root_cached(&path, !newly_created_dirs.is_empty());
+        let (state_root, overhaul_root) = overhaul_root_cached(&path);
         let mut lineage_id = recovered_lineage_id;
         // Creation is the identity boundary. Legacy files deliberately remain unidentified on
         // open and receive their first metadata frame only when append performs the next write.
