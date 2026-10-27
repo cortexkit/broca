@@ -160,6 +160,26 @@ impl Wal for ObservedWal {
         }
         result
     }
+    fn append_v4(
+        &mut self,
+        fence: u64,
+        record: &WalRecord,
+        sync: bool,
+        prepared: broca_wal::PreparedV4Frame,
+        appended_ms: u64,
+    ) -> Result<u64, WalError> {
+        let result = self
+            .inner
+            .append_v4(fence, record, sync, prepared, appended_ms);
+        self.note_retention(record);
+        if sync && result.is_ok() {
+            self.durable();
+        }
+        result
+    }
+    fn wal_config(&self) -> broca_wal::WalConfig {
+        self.inner.wal_config()
+    }
 
     fn sync(&self) -> Result<(), WalError> {
         self.inner.sync()?;

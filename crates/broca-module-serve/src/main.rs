@@ -187,6 +187,11 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     state_format
         .check_request_dumps(|key| std::env::var_os(key))
         .map_err(ServeIoError)?;
+    // THE ONE DECISION OF THE LOG FRAME FORMAT, taken here and handed to the WAL store below:
+    // version 4 frames on a `broca-state/2` root, today's frames everywhere else. A marker that
+    // cannot be read, or an overhaul root whose `wal/` is a symbolic link or resolves outside the
+    // root, refuses boot instead.
+    let wal_config = state_format::wal_config(&state_root, state_format).map_err(ServeIoError)?;
     let _stall_watchdog = broca_module_serve::stall::start(&state_root)?;
     // An optional provider base_url override (the mock/openai-compatible path; e.g. aimock).
     // When unset, the run's model id is resolved through the catalog.
@@ -307,8 +312,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .flatten();
     let lease_store = Arc::new(FileLeaseStore::new(state_root.join("leases")));
     let bus_hints = Arc::new(broca_module_serve::bus_events::Hints::default());
-    let mut wal_store =
-        FileWalStore::new(state_root.join("wal")).with_backup_classes(backup_classes.0);
+    let mut wal_store = FileWalStore::with_config(state_root.join("wal"), wal_config)
+        .with_backup_classes(backup_classes.0);
     if bus_event_config.enabled {
         wal_store = wal_store.with_durable_observer(bus_hints.observer());
     }

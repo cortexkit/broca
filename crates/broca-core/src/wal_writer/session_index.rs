@@ -168,6 +168,21 @@ impl Wal for AdmissionWal {
         let _projection_admission = self.before_append(record)?;
         self.wal.append_preencoded(fence, record, sync, frame)
     }
+    fn append_v4(
+        &mut self,
+        fence: u64,
+        record: &WalRecord,
+        sync: bool,
+        prepared: broca_wal::PreparedV4Frame,
+        appended_ms: u64,
+    ) -> Result<u64, WalError> {
+        let _projection_admission = self.before_append(record)?;
+        self.wal
+            .append_v4(fence, record, sync, prepared, appended_ms)
+    }
+    fn wal_config(&self) -> broca_wal::WalConfig {
+        self.wal.wal_config()
+    }
     fn sync(&self) -> Result<(), WalError> {
         self.wal.sync()
     }

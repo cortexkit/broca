@@ -184,6 +184,10 @@ impl ObservedWalStore {
 // test in tests/it/observed_wal_fidelity.rs compares these impls with FileWalStore's and
 // FileWal's, so a new production override cannot be missed here silently.
 impl WalStore for ObservedWalStore {
+    fn wal_config(&self) -> broca_wal::WalConfig {
+        WalStore::wal_config(&self.inner)
+    }
+
     fn uploads(&self) -> Option<broca_core::media_uploads::Uploads> {
         WalStore::uploads(&self.inner)
     }
@@ -410,6 +414,27 @@ impl Wal for ObservedWal {
             self.synced.lock().unwrap().insert(seq);
         }
         Ok(seq)
+    }
+
+    fn append_v4(
+        &mut self,
+        fence: u64,
+        record: &WalRecord,
+        sync: bool,
+        prepared: broca_wal::PreparedV4Frame,
+        appended_ms: u64,
+    ) -> Result<u64, WalError> {
+        let seq = self
+            .inner
+            .append_v4(fence, record, sync, prepared, appended_ms)?;
+        if sync {
+            self.synced.lock().unwrap().insert(seq);
+        }
+        Ok(seq)
+    }
+
+    fn wal_config(&self) -> broca_wal::WalConfig {
+        self.inner.wal_config()
     }
 
     fn append_budget(&self) -> Option<(u64, u64, u64)> {

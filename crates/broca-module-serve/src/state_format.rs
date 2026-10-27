@@ -381,6 +381,24 @@ pub(crate) fn prepare(root: &Path, overhaul_opt_in: bool) -> Result<StateFormat,
     prepare_with(&RealFs, root, overhaul_opt_in, BUILD_PHASE)
 }
 
+/// The log frame format every WAL store of this process is built with, decided once here from
+/// the root [`prepare`] just decided. The WAL's own classifier reads the marker again and also
+/// refuses an overhaul root whose `wal/` is a symbolic link or resolves outside the root; boot
+/// stops on any refusal, and on a classification that disagrees with `format`.
+pub(crate) fn wal_config(root: &Path, format: StateFormat) -> Result<broca_wal::WalConfig, String> {
+    let config = broca_wal::classify_state_root(root)
+        .map_err(|error| format!("refusing to serve: {error}. See {RUNBOOK}."))?;
+    if config.is_overhaul() != (format == StateFormat::Overhaul) {
+        return Err(format!(
+            "refusing to serve: the state root {} was decided as {format:?} but its log format \
+             reads as {:?}; it changed during startup. See {RUNBOOK}.",
+            root.display(),
+            config.format
+        ));
+    }
+    Ok(config)
+}
+
 /// Today's background work that deletes or exports state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BackgroundTask {
@@ -1212,6 +1230,57 @@ mod tests {
         ] {
             assert!(seen.contains(&expected), "never produced {expected:?}");
         }
+    }
+
+    #[test]
+    fn the_wal_config_follows_the_decided_format() {
+        let scratch = Scratch::new("wal-config");
+        let root = scratch.root();
+        // A new root without the opt-in runs today's format, and its logs are legacy.
+        let format = prepare_with(&RealFs, &root, false, CutPhase::BeforeCut).unwrap();
+        assert_eq!(
+            wal_config(&root, format).unwrap(),
+            broca_wal::WalConfig::LEGACY
+        );
+        // With the opt-in it becomes an overhaul root, and its logs are version 4.
+        let format = prepare_with(&RealFs, &root, true, CutPhase::BeforeCut).unwrap();
+        assert_eq!(format, StateFormat::Overhaul);
+        assert_eq!(
+            wal_config(&root, format).unwrap(),
+            broca_wal::WalConfig::OVERHAUL
+        );
+        // A decision the marker no longer matches refuses rather than pick one.
+        let error = wal_config(&root, StateFormat::Legacy).unwrap_err();
+        assert!(error.contains(RUNBOOK), "{error}");
+    }
+
+    #[test]
+    fn boot_refuses_an_unreadable_marker() {
+        // A directory where the marker belongs cannot be read as a file, whoever runs the test.
+        let scratch = Scratch::new("wal-config-unreadable");
+        let root = scratch.root();
+        std::fs::create_dir_all(root.join(MARKER_FILE)).unwrap();
+        for format in [StateFormat::Legacy, StateFormat::Overhaul] {
+            let error = wal_config(&root, format).unwrap_err();
+            assert!(error.contains(MARKER_FILE), "{error}");
+            assert!(error.contains(RUNBOOK), "{error}");
+        }
+        // The marker rules refuse the same root before the WAL classifier is asked.
+        assert!(prepare_with(&RealFs, &root, false, CutPhase::BeforeCut).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn boot_refuses_an_overhaul_root_whose_wal_is_a_symlink() {
+        let scratch = Scratch::new("wal-config-symlink");
+        let root = scratch.root();
+        let format = prepare_with(&RealFs, &root, true, CutPhase::BeforeCut).unwrap();
+        assert_eq!(format, StateFormat::Overhaul);
+        let elsewhere = scratch.0.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join("wal")).unwrap();
+        let error = wal_config(&root, format).unwrap_err();
+        assert!(error.contains("symbolic link"), "{error}");
     }
 
     /// The shim can fail the test above: renaming the marker before syncing it leaves a state
