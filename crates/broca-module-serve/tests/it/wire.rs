@@ -6754,13 +6754,29 @@ async fn reader_release_refuses_first_time_activation_fence_without_any_sidecar(
 
 #[tokio::test]
 async fn pending_release_fence_outranks_a_tombstone_for_mutations_but_not_reads() {
-    let mut route = PreparedWalRoute::start("pending-release-wire", |_| {}).await;
-    let reference =
+    // A cut recorded before the v2 switch names the session by its folder-based v1
+    // reference; a newer one by its v2 reference. Both must fence the session the same way.
+    for version in ["v1", "v2"] {
+        pending_release_fence_outranks_a_tombstone_under(version).await;
+    }
+}
+
+async fn pending_release_fence_outranks_a_tombstone_under(version: &str) {
+    let mut route =
+        PreparedWalRoute::start(&format!("pending-release-wire-{version}"), |_| {}).await;
+    let reference = if version == "v1" {
+        broca_core::wal_writer::legacy_session_ref(
+            "runner",
+            &route.dir.join("proj").to_string_lossy(),
+            "s1",
+        )
+    } else {
         cortexkit_role_llm_runner::session_ref(&cortexkit_role_llm_runner::SessionIdentity {
             runner: "broca",
             harness: "runner",
             session: "s1",
-        });
+        })
+    };
     broca_wal::migration::atomic_json(&route.dir, &route.dir.join("agent-data/cuts/cut-a.json"),&serde_json::json!({"step":"exported","refs":[{"ref_kind":"broca-session","ref":reference}],"intent":{"op":"release","request":{}}})).unwrap();
     broca_wal::migration::atomic_json(
         &route.dir,
@@ -6782,10 +6798,11 @@ async fn pending_release_fence_outranks_a_tombstone_for_mutations_but_not_reads(
     .into_iter()
     .enumerate()
     {
-        let body = route.expect_error(i as u64 + 2, request).await;
+        let body = route.expect_error(i as u64 + 2, request.clone()).await;
         assert_eq!(
             String::from_utf8(body).unwrap(),
-            r#"{"code":"session_moving","message":"session is moving under cut cut-a","detail":{"cutId":"cut-a"}}"#
+            r#"{"code":"session_moving","message":"session is moving under cut cut-a","detail":{"cutId":"cut-a"}}"#,
+            "{version}: {request}"
         );
     }
     let body = route.expect_error(6, read_request()).await;

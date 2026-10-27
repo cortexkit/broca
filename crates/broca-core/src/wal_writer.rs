@@ -485,16 +485,19 @@ impl FileWalStore {
     }
 
     pub fn check_move(&self, session: &BindIdentity, write: bool) -> Result<(), WalError> {
-        broca_wal::migration::guard(
+        // A cut file may name the session by its folder-based v1 reference (recorded before
+        // the v2 switch) or by its v2 reference. Check both in one pass, so a pending release
+        // under either reference outranks a moved tombstone for writes.
+        let legacy = legacy_session_ref(
+            &session.harness,
+            &session.project_root.to_string_lossy(),
+            &session.session,
+        );
+        broca_wal::migration::guard_refs(
             &self.wal_path(session),
-            &legacy_session_ref(
-                &session.harness,
-                &session.project_root.to_string_lossy(),
-                &session.session,
-            ),
+            &[&legacy, &agent_session_ref(session)],
             write,
-        )?;
-        broca_wal::migration::guard(&self.wal_path(session), &agent_session_ref(session), write)
+        )
     }
 
     fn check_authorization_move(&self, session: &BindIdentity) -> Result<(), WalError> {
@@ -996,11 +999,14 @@ impl FileWalStore {
                 self.session_index.clone(),
                 (
                     path,
-                    legacy_session_ref(
-                        &session.harness,
-                        &session.project_root.to_string_lossy(),
-                        &session.session,
-                    ),
+                    [
+                        legacy_session_ref(
+                            &session.harness,
+                            &session.project_root.to_string_lossy(),
+                            &session.session,
+                        ),
+                        agent_session_ref(session),
+                    ],
                 ),
             )
             .with_placement(
