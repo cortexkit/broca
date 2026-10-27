@@ -115,6 +115,7 @@ impl ToolPlaneConnection for Rig {
         _: Duration,
         _: Option<&str>,
         key: Option<&str>,
+        _schema_pin: Option<&str>,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
         self.sent
             .lock()
@@ -129,6 +130,7 @@ impl ToolPlaneConnection for Rig {
         _: Duration,
         _: Option<&str>,
         args: &ApprovedArgs,
+        _schema_pin: Option<&str>,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
         self.sent
             .lock()
@@ -213,6 +215,7 @@ fn manifest_declaring(opt_in: bool, late_results: bool) -> ToolManifest {
             )])
         }),
         late_results: late_results.then_some(true),
+        schema_pins: None,
     };
     let plan = PlanManifest {
         declarations: Vec::new(),
@@ -677,6 +680,7 @@ async fn staged_plain_key_reaches_the_real_guarded_wire_envelope() {
         Duration::from_secs(2),
         Some("preset"),
         Some("lineage:1"),
+        None,
     );
     tokio::pin!(dispatch);
     let request = tokio::select! {
@@ -802,4 +806,82 @@ async fn negotiated_media_dispatch_captures_with_nullable_error_code() {
     );
     assert_eq!(completed(plane.dispatch(&ctx, &call).await), result);
     assert_eq!(rig.sent.lock().unwrap().len(), 1);
+}
+
+/// The batch's frozen plan with the catalog schema pins a later build freezes at admission,
+/// and no other declaration.
+fn manifest_pinning(
+    schema_pins: Option<std::collections::BTreeMap<String, broca_wal::DispatchSchemaPin>>,
+) -> ToolManifest {
+    let plan = PlanManifest {
+        declarations: Vec::new(),
+        plan: OpaqueJson::from_json_text(
+            json!({"tool_items":[{"provider":"provider"}]}).to_string(),
+        )
+        .unwrap(),
+        plan_identity: String::new(),
+        composition_digest: String::new(),
+        fetches: vec![ProviderFetch {
+            provider: "provider".into(),
+            outcome: FetchOutcome::Answered {
+                catalog_digest: "digest".into(),
+                tools: Vec::new().into(),
+                text: None,
+                result_ops: None,
+                reply: None,
+                declarations_frozen: schema_pins.map(|schema_pins| FrozenProviderDeclarations {
+                    schema_pins: Some(schema_pins),
+                    ..Default::default()
+                }),
+                reference_slots: None,
+            },
+        }],
+        tools: Vec::new().into(),
+        system_text: String::new(),
+        system_digest: String::new(),
+        join_version: 1,
+        role_versions: Default::default(),
+    };
+    ToolManifest::from_tools(vec![serde_json::from_value(json!({"name":"tool","description":"","input_schema":{},"module":"provider","execution_mode":"parallel"})).unwrap()])
+        .with_plan_manifest(&plan)
+        .unwrap()
+}
+
+/// A run admitted by a build that freezes catalog schema pins, resumed here, dispatches each
+/// call under the pin its plan recorded for that tool, never one from a later catalog. A plan
+/// without pins, which is every plan this build admits itself, leaves the pin unknown.
+#[tokio::test]
+async fn a_resumed_batch_dispatches_under_the_schema_pin_its_plan_recorded() {
+    let pin = broca_wal::DispatchSchemaPin {
+        schema_digest: "634bdb1fe768fce0974f9c89e6f15f889470a8288277c6433e4711ab6a5b9335".into(),
+        semantics: 7,
+    };
+    let call = call("call");
+    for (pins, expected) in [
+        (
+            Some(std::collections::BTreeMap::from([(
+                "tool".to_owned(),
+                pin.clone(),
+            )])),
+            Some(pin.clone()),
+        ),
+        (None, None),
+    ] {
+        let rig = Rig::new(true, true, false, false);
+        let plane = rig.plane(false);
+        let ctx = ctx();
+        plane
+            .batch_started(&ctx, std::slice::from_ref(&call), &manifest_pinning(pins))
+            .await
+            .unwrap();
+        assert_eq!(
+            plane.dispatch_schema_pin(&ctx, &call.tool_call_id, &call.tool_name),
+            expected
+        );
+        // A pin belongs to the tool it was recorded for.
+        assert_eq!(
+            plane.dispatch_schema_pin(&ctx, &call.tool_call_id, "another_tool"),
+            None
+        );
+    }
 }

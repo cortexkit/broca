@@ -306,9 +306,15 @@ re-authentication. May appear more than once, and after provider calls.
 | `ts_ms` | u64 | absent. Wall-clock ms when the refreeze was recorded. |
 | `auth_selection` | `AuthSelection` | required |
 
-`AuthSelection` (also `RunConfig.auth_selection`): `credential_id` (required, the
-`<method>:<provider>[:<account>]` routing key); absent-when-unset `account_ref`,
-`resolved_credential_id`, and `vault_request`. `vault_request` is
+`AuthSelection` (also `RunConfig.auth_selection`): `credential_id` (required); absent-when-unset
+`account_ref`, `resolved_credential_id`, `vault_request`, `account_decision`, and
+`auth_method`. Without `auth_method`, `credential_id` is the `<method>:<provider>[:<account>]`
+broca key, and method, provider and account parse out of it. With `auth_method` (a string such
+as `oauth`, `chatgpt`, `apikey`, `antigravity`, frozen from the vault's metadata when routing
+chose the credential), `credential_id` is the vault's own credential id, an opaque record name:
+resume reads it verbatim and takes the method from `auth_method`, and nothing parses the id.
+A `run_started` or `run_auth_refrozen` whose selection carries `auth_method` is
+**must-understand, feature `auth-selection-method/v1`** (a `ver = 3` frame). `vault_request` is
 `{min_ttl_ms: i64|null (always written), force_refresh: bool (absent on get_scoped),
 op: "get"|"get_scoped"|<unknown string> (absent on older records, meaning "get")}`.
 `account_ref` is empty by construction for `apikey` and `antigravity` credentials, so key
@@ -472,7 +478,8 @@ the whole WAL instead of skipping it.
 | `question_withdrawal_acknowledged` | none; informational | How the withdrawal of a held call's question ended. An older build skips it and computes the same session. |
 
 Several records documented above also become must-understand when they carry certain fields
-(for example `run_started` with a scope, a plan manifest or retention, and `run_paused` with
+(for example `run_started` with a scope, a plan manifest or retention, `run_started` and
+`run_auth_refrozen` whose `auth_selection` carries `auth_method`, and `run_paused` with
 reason `restart`). `WalRecord::required_features` in the same file lists every case.
 
 #### Unknown record types

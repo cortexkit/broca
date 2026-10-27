@@ -253,6 +253,22 @@ pub fn select_credential_id(
     resolve_credential_id(provider, pinned, account, config, fallback)
 }
 
+/// How a run's frozen credential selection authenticates, and for which provider, without
+/// re-deriving anything the selection froze. A selection frozen with its `auth_method` (a
+/// credential routing chose, named by the vault's opaque id) takes the method from that field
+/// and the provider from the run, since it was offered for exactly that provider; its id is
+/// never parsed. An older selection holds a broca key, which names both. `None` for a method
+/// token this build does not know or a key that does not parse.
+pub fn frozen_selection_credential(
+    selection: &broca_wal::AuthSelection,
+    run_provider: &str,
+) -> Option<(AuthMethod, String)> {
+    match &selection.auth_method {
+        Some(token) => AuthMethod::from_token(token).map(|method| (method, run_provider.into())),
+        None => CredentialId::parse(&selection.credential_id).map(|id| (id.method, id.provider)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -530,6 +530,7 @@ fn export_records_with_account(
     let mut start = run_started(0, &run_id.0, session, "hi", ModelHandle::new("stub", "m"));
     if let WalRecord::RunStarted { config, .. } = &mut start.record {
         config.auth_selection = Some(AuthSelection {
+            auth_method: None,
             credential_id: "chatgpt:openai".into(),
             account_ref: account_ref.map(str::to_string),
             resolved_credential_id: None,

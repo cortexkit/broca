@@ -2642,6 +2642,7 @@ fn declaring(late_results: bool) -> broca_wal::PlanManifest {
         *declarations_frozen = late_results.then_some(broca_wal::FrozenProviderDeclarations {
             result_formats: None,
             late_results: Some(true),
+            schema_pins: None,
         });
     }
     manifest

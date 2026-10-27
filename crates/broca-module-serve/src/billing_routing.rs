@@ -595,6 +595,7 @@ mod tests {
                         renderer_version: 1,
                         frozen_render_config: Value::Null,
                         auth_selection: Some(broca_core::AuthSelection {
+                            auth_method: None,
                             credential_id: credential_id.into(),
                             account_ref: None,
                             resolved_credential_id: None,

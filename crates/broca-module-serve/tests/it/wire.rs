@@ -348,6 +348,7 @@ impl RunExecutor for ReauthCoreExec {
             config.renderer_version = provider.renderer_version();
             config.frozen_render_config = provider.render_config_blob();
             config.auth_selection = Some(broca_core::AuthSelection {
+                auth_method: None,
                 credential_id: "chatgpt:openai".into(),
                 account_ref: None,
                 resolved_credential_id: None,
@@ -409,6 +410,7 @@ impl RunExecutor for ReauthCoreExec {
             config.renderer_version = provider.renderer_version();
             config.frozen_render_config = provider.render_config_blob();
             config.auth_selection = Some(broca_core::AuthSelection {
+                auth_method: None,
                 credential_id: "chatgpt:openai".into(),
                 account_ref: None,
                 resolved_credential_id: None,
@@ -469,6 +471,7 @@ impl RunExecutor for ReauthCoreExec {
         let mut control = job.control;
         control.pause_for_auth_at_start = pause;
         control.auth_selection = Some(broca_core::AuthSelection {
+            auth_method: None,
             credential_id: "chatgpt:openai".into(),
             account_ref: None,
             resolved_credential_id: None,

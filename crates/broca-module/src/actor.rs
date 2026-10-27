@@ -13563,6 +13563,7 @@ mod steer_auth_conflict_tests {
     fn frozen(credential_id: Option<&str>) -> broca_wal::RunConfig {
         let mut config = super::tests::min_config();
         config.auth_selection = credential_id.map(|id| broca_wal::AuthSelection {
+            auth_method: None,
             credential_id: id.into(),
             account_ref: None,
             resolved_credential_id: None,

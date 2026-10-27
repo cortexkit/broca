@@ -181,6 +181,10 @@ pub const MEDIA_CONTENT_FEATURE: &str = "media-content/v1";
 /// requires it unless a provider declared something.
 pub const PROVIDER_DECLARATIONS_FEATURE: &str = "provider-declarations/v1";
 
+/// Catalog schema identities frozen in a plan. Readers that drop the map could
+/// dispatch a resumed run without its admitted tool definition's schema pin.
+pub const TOOL_SCHEMA_PINS_FEATURE: &str = "tool-schema-pins/v1";
+
 /// The feature names this build understands in a gated frame's `requires` list.
 ///
 /// THIS IS THE ONLY TABLE. Every reader path (replay, the anchored range read behind
@@ -197,6 +201,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     TURN_DIRECTIVES_FEATURE,
     AGENT_RUN_SCOPE_FEATURE,
     ARCHIVE_INDEX_V2_FEATURE,
+    AUTH_SELECTION_METHOD_FEATURE,
     CHATGPT_CODEX_WIRE_FEATURE,
     CLIENT_MESSAGE_ID_FEATURE,
     COMPACTION_RIDE_WAIT_FEATURE,
@@ -216,6 +221,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     PLAN_REFERENCE_SLOTS_FEATURE,
     PROVIDER_DECLARATIONS_FEATURE,
     PROVIDER_FALLBACK_BLOCK_FEATURE,
+    TOOL_SCHEMA_PINS_FEATURE,
     PROVIDER_HELD_FEATURE,
     PROVIDER_TEXT_STATE_FEATURE,
     REFUSAL_FALLBACK_FEATURE,
@@ -335,6 +341,12 @@ pub const SESSION_CLASS_FEATURE: &str = "session-class/v1";
 
 /// Ignoring a session input cap would authorize paid model steps the caller forbade.
 pub const INPUT_TOKEN_CAP_FEATURE: &str = "input-token-cap/v1";
+
+/// A `RunStarted` or `RunAuthRefrozen` whose credential selection names its auth method
+/// (`AuthSelection::auth_method`). Its `credential_id` is then the vault's opaque credential
+/// id; a reader without this feature would parse that id for a method and resume on the wrong
+/// credential or wire family, so it must refuse the log instead.
+pub const AUTH_SELECTION_METHOD_FEATURE: &str = "auth-selection-method/v1";
 
 /// A run frozen with structured output renders its schema into every request and ends when the
 /// model calls `submit_result`. A reader that skipped the frozen settings would resume the run
@@ -903,6 +915,9 @@ mod provider_held_tests;
 mod fallback_tests;
 
 #[cfg(test)]
+mod reader_release_tests;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn message_times_require_an_understanding_reader() {
@@ -1269,6 +1284,7 @@ mod tests {
                 TURN_DIRECTIVES_FEATURE,
                 AGENT_RUN_SCOPE_FEATURE,
                 ARCHIVE_INDEX_V2_FEATURE,
+                AUTH_SELECTION_METHOD_FEATURE,
                 CHATGPT_CODEX_WIRE_FEATURE,
                 CLIENT_MESSAGE_ID_FEATURE,
                 COMPACTION_RIDE_WAIT_FEATURE,
@@ -1288,6 +1304,7 @@ mod tests {
                 PLAN_REFERENCE_SLOTS_FEATURE,
                 PROVIDER_DECLARATIONS_FEATURE,
                 PROVIDER_FALLBACK_BLOCK_FEATURE,
+                TOOL_SCHEMA_PINS_FEATURE,
                 PROVIDER_HELD_FEATURE,
                 PROVIDER_TEXT_STATE_FEATURE,
                 REFUSAL_FALLBACK_FEATURE,
@@ -1320,6 +1337,7 @@ mod tests {
         assert_eq!(PLAN_MANIFEST_FEATURE, "plan-manifest/v1");
         assert_eq!(PLAN_REFERENCE_SLOTS_FEATURE, "plan-reference-slots/v1");
         assert_eq!(PROVIDER_DECLARATIONS_FEATURE, "provider-declarations/v1");
+        assert_eq!(TOOL_SCHEMA_PINS_FEATURE, "tool-schema-pins/v1");
         assert_eq!(PROVIDER_TEXT_STATE_FEATURE, "provider-text-state/v1");
         assert_eq!(
             PROVIDER_FALLBACK_BLOCK_FEATURE,
@@ -1337,6 +1355,7 @@ mod tests {
             "google-rpc-error-details/v1"
         );
         assert_eq!(INPUT_TOKEN_CAP_FEATURE, "input-token-cap/v1");
+        assert_eq!(AUTH_SELECTION_METHOD_FEATURE, "auth-selection-method/v1");
         assert_eq!(STEER_QUEUE_FEATURE, "steer-queue/v1");
         assert_eq!(STEP_TRANSFORMS_FEATURE, "step-transforms/v1");
         assert_eq!(STRUCTURED_OUTPUT_FEATURE, "structured-output/v1");
@@ -1350,6 +1369,54 @@ mod tests {
     /// paragraph break requires its own feature, so an older reader refuses the WAL by that
     /// name instead of resuming the run without the break. A frozen structured output without
     /// the flag, or with it false, requires nothing new.
+    #[test]
+    fn auth_selection_method_is_must_understand_on_both_selection_records() {
+        use crate::record::WalRecord;
+        // The method is the selection's last key, so every older key keeps its place.
+        const PINNED: &[&str] = &[
+            r#"{"type":"run_started","run_id":"r","session":{"project_root":"/tmp/project","harness":"runner","session":"session"},"config":{"model":{"provider_module_id":"anthropic","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1,"auth_selection":{"credential_id":"work-claude","account_ref":"acct-1","account_decision":{"path":"routed","admission_id":"r","decision_id":"acd-1"},"auth_method":"oauth"}},"input":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"origin":{"kind":"fresh"}}"#,
+            r#"{"type":"run_auth_refrozen","ts_ms":5,"auth_selection":{"credential_id":"work-claude","account_ref":"acct-1","auth_method":"oauth"}}"#,
+        ];
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != AUTH_SELECTION_METHOD_FEATURE)
+            .collect();
+        for pinned in PINNED {
+            let record: WalRecord = serde_json::from_str(pinned).unwrap();
+            assert_eq!(serde_json::to_string(&record).unwrap(), *pinned);
+            assert_eq!(record.required_features(), &[AUTH_SELECTION_METHOD_FEATURE]);
+            let bytes = encode(1, 1, &record).unwrap();
+            assert_eq!(bytes[4], GATED_FRAMING_VERSION);
+            match decode_next(&bytes) {
+                DecodeStep::Record { framed, .. } => assert_eq!(framed.record, record),
+                _ => panic!("this build reads a selection with a method"),
+            }
+            // A build without the feature refuses the log by the feature's name rather than
+            // resume it by parsing the opaque credential id.
+            assert!(
+                matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [AUTH_SELECTION_METHOD_FEATURE])
+            );
+
+            // The same record without the method needs no feature at all.
+            let mut without = record.clone();
+            match &mut without {
+                WalRecord::RunStarted { config, .. } => {
+                    config.auth_selection.as_mut().unwrap().auth_method = None
+                }
+                WalRecord::RunAuthRefrozen { auth_selection, .. } => {
+                    auth_selection.auth_method = None
+                }
+                _ => unreachable!(),
+            }
+            assert!(without.required_features().is_empty());
+            assert!(matches!(
+                decode_next_with(&encode(1, 1, &without).unwrap(), &older),
+                DecodeStep::Record { .. }
+            ));
+        }
+    }
+
     #[test]
     fn structured_output_paragraph_break_is_must_understand() {
         // Serialized from the protocol type, so renaming its field cannot leave this gate
