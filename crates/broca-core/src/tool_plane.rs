@@ -229,6 +229,9 @@ pub enum DispatchResult {
 pub struct DispatchSignals {
     cancel: Option<tokio_util::sync::CancellationToken>,
     stop: Option<tokio_util::sync::CancellationToken>,
+    /// The run's absolute step deadline, carried so the route-open wait in front of the send
+    /// ends with it (see [`ToolOpenGuard`]). It never makes an enqueued call count as unsent.
+    deadline: Option<tokio::time::Instant>,
 }
 impl DispatchSignals {
     pub fn new(
@@ -238,6 +241,7 @@ impl DispatchSignals {
         Self {
             cancel: cancel.cloned(),
             stop: stop.cloned(),
+            deadline: None,
         }
     }
     pub fn interrupted(&self) -> bool {
@@ -265,27 +269,30 @@ impl DispatchSignals {
 
 impl From<&DispatchSignals> for ToolOpenGuard {
     /// The approved path already carries run signals to its send boundary; the same tokens
-    /// bound its route-open wait.
+    /// and the same absolute deadline bound its route-open wait.
     fn from(signals: &DispatchSignals) -> Self {
         Self {
             cancel: signals.cancel.clone(),
             stop: signals.stop.clone(),
-            deadline: None,
+            deadline: signals.deadline,
         }
     }
 }
 
 /// What ends a tool-dispatch route-open wait early: the run's cancel and stop/shutdown
-/// tokens. The wait also ends at the step deadline that comes earlier, which the plane
-/// derives from the call's own reply budget. Carried separately from [`DispatchSignals`]
-/// (which guards the physical send) so planes whose opens never wait keep ignoring it.
-/// Clones observe the same tokens while the wait is pending.
+/// tokens, and the run's absolute step deadline when it has one. A batch builds one guard
+/// and hands the same guard to its batch start and to every call, so every route-open wait
+/// of the batch (first open and every re-open) ends at the same instant. Carried separately
+/// from [`DispatchSignals`] (which guards the physical send) so planes whose opens never
+/// wait keep ignoring it; [`ToolOpenGuard::signals`] gives the matching send guard. Clones
+/// observe the same tokens while the wait is pending.
 #[derive(Clone, Default)]
 pub struct ToolOpenGuard {
     cancel: Option<tokio_util::sync::CancellationToken>,
     stop: Option<tokio_util::sync::CancellationToken>,
-    /// Waste no more of the step on the open than this instant, when set: the caller’s own
-    /// deadline (the plane fills in the call’s reply budget) ends the wait early.
+    /// The run's step deadline, as an absolute instant: no route-open wait of the batch, and
+    /// no open attempt in flight, outlasts it. `None` when the run has none, which leaves the
+    /// plane's own patience as the only bound.
     pub deadline: Option<tokio::time::Instant>,
 }
 impl ToolOpenGuard {
@@ -299,12 +306,19 @@ impl ToolOpenGuard {
             deadline: None,
         }
     }
-    /// Cap the wait at `at`, when sooner than the deadline already set.
-    pub fn cap(&mut self, at: tokio::time::Instant) {
-        self.deadline = Some(match self.deadline {
-            Some(current) => current.min(at),
-            None => at,
-        });
+    /// The same guard ending at the absolute `deadline` (the run's step deadline).
+    pub fn with_deadline(mut self, deadline: Option<tokio::time::Instant>) -> Self {
+        self.deadline = deadline;
+        self
+    }
+    /// The send-boundary signals matching this guard: the same tokens and deadline, for
+    /// the physical enqueue that follows the open.
+    pub fn signals(&self) -> DispatchSignals {
+        DispatchSignals {
+            cancel: self.cancel.clone(),
+            stop: self.stop.clone(),
+            deadline: self.deadline,
+        }
     }
     pub fn cancel_token(&self) -> Option<tokio_util::sync::CancellationToken> {
         self.cancel.clone()

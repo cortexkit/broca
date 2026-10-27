@@ -1067,14 +1067,20 @@ pub fn no_dispatch_result(tool_call_id: &ToolCallId, reason: &NoDispatchReason) 
             code,
             refusal_detail,
         } => match module {
-            Some(module) => ToolOutput::Error {
-                message: detail.clone(),
-                module: Some(module.clone()),
-                code: code.clone(),
-                detail: refusal_detail.clone(),
-                nothing_sent: Some(true),
-                retry: Some(broca_protocol::TOOL_PLANE_UNAVAILABLE_RETRY.to_owned()),
-            },
+            // Built by the one constructor that checks every member against the runner
+            // contract (and omits one that does not fit), so a daemon value out of contract
+            // never reaches a history page. The message stays the stable detail recorded.
+            Some(module) => {
+                let mut output = ToolOutput::module_unavailable(
+                    module.as_str(),
+                    code.clone().unwrap_or_default(),
+                    refusal_detail.clone().unwrap_or_default(),
+                );
+                if let ToolOutput::Error { message, .. } = &mut output {
+                    message.clone_from(detail);
+                }
+                output
+            }
             None => ToolOutput::error(detail),
         },
     };

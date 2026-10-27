@@ -139,6 +139,8 @@ pub struct RejectedMessage {
     code: Option<String>,
     message: String,
     text: String,
+    /// The Error body's optional structured `detail`, when the daemon sent one.
+    detail: Option<serde_json::Value>,
 }
 
 impl RejectedMessage {
@@ -148,16 +150,27 @@ impl RejectedMessage {
             code: Some(code),
             message,
             text,
+            detail: None,
         }
+    }
+
+    fn with_detail(mut self, detail: Option<serde_json::Value>) -> Self {
+        self.detail = detail.filter(|detail| !detail.is_null());
+        self
     }
 
     pub(crate) fn code(&self) -> &str {
         self.code.as_deref().unwrap_or("")
     }
 
-    /// The daemon's detail for a structured refusal (the message after the code).
-    pub(crate) fn detail(&self) -> &str {
-        &self.message
+    /// The daemon's detail for this refusal: its structured `detail` when it sent one (a
+    /// string as given, anything else as compact JSON), otherwise the message after the code.
+    pub(crate) fn detail(&self) -> String {
+        match &self.detail {
+            Some(serde_json::Value::String(detail)) => detail.clone(),
+            Some(detail) => detail.to_string(),
+            None => self.message.clone(),
+        }
     }
 }
 
@@ -167,6 +180,7 @@ impl From<String> for RejectedMessage {
             code: None,
             message: text.clone(),
             text,
+            detail: None,
         }
     }
 }
@@ -3036,7 +3050,9 @@ fn reverse_request_refusal(request: &Frame) -> Result<Frame, subc_protocol::Fram
 
 pub(crate) fn decode_error_body(body: &[u8]) -> RejectedMessage {
     match serde_json::from_slice::<subc_protocol::ErrorBody>(body) {
-        Ok(error) => RejectedMessage::structured(error.code, error.message),
+        Ok(error) => {
+            RejectedMessage::structured(error.code, error.message).with_detail(error.detail)
+        }
         Err(_) => String::from_utf8_lossy(body).into_owned().into(),
     }
 }
@@ -3213,13 +3229,83 @@ where
     Fut: std::future::Future<Output = ConnResult<RouteHandle>>,
     G: Fn() -> Option<Arc<ModuleGate>>,
 {
-    retry_route_open_jittered(retry, scope_hold, cancel, gate_for, &full_jitter, attempt).await
+    retry_route_open_jittered(
+        retry,
+        None,
+        scope_hold,
+        cancel,
+        gate_for,
+        &full_jitter,
+        attempt,
+    )
+    .await
+}
+
+/// How a tool-call route open waits out a module outage, instead of the fixed
+/// [`RouteOpenRetry`] budget measured from the start of the open:
+/// - the `patience` clock starts at the first temporary refusal this open meets (or on
+///   arriving at the module's closed gate, the gate's evidence of the same outage), so a
+///   slow first answer does not eat into it;
+/// - `deadline`, when set, is an absolute end for the whole open: no wait and no attempt
+///   outlives it, whatever is left of the patience;
+/// - an attempt in flight is raced against cancellation and that end, and abandoned when
+///   either comes first. Abandoning is safe because the attempt has not produced a route
+///   anyone can send on: a route.open answered after its caller left is closed by the
+///   reader (late route-open cleanup), and the gate hands an abandoned probe turn on.
+///
+/// At the end the last availability refusal is returned unchanged, so the caller can report
+/// it as proven undelivered; an end reached before any refusal is a transport failure that
+/// sent nothing.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OutageWait {
+    /// How long to keep retrying after the first temporary refusal.
+    pub patience: Duration,
+    /// The upper bound for the doubling backoff envelope between attempts.
+    pub max_interval: Duration,
+    /// The absolute end of the whole open (the run's step deadline), when there is one.
+    pub deadline: Option<time::Instant>,
+}
+
+/// [`retry_route_open_with_scope_hold`] under an [`OutageWait`] rather than a fixed budget:
+/// the tool-call dispatch open, which waits out a short provider-module restart.
+pub(crate) async fn retry_route_open_waiting_out_outage<F, Fut, G>(
+    outage: OutageWait,
+    scope_hold: Option<ScopeHold>,
+    cancel: Option<&CancellationToken>,
+    gate_for: G,
+    attempt: F,
+) -> Result<RouteHandle, RouteOpenError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ConnResult<RouteHandle>>,
+    G: Fn() -> Option<Arc<ModuleGate>>,
+{
+    retry_route_open_jittered(
+        RouteOpenRetry::within(outage.patience, outage.max_interval),
+        Some(outage),
+        scope_hold,
+        cancel,
+        gate_for,
+        &full_jitter,
+        attempt,
+    )
+    .await
+}
+
+/// Sleep until `at`, or forever when there is no `at`.
+async fn sleep_until_or_never(at: Option<time::Instant>) {
+    match at {
+        Some(at) => time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// The retry loop itself, drawing each backoff wait with `jitter` ([`full_jitter`] outside
-/// tests, so that a test can make the schedule exact).
+/// tests, so that a test can make the schedule exact). With `outage`, `retry.budget` is the
+/// outage patience and is measured as [`OutageWait`] describes.
 async fn retry_route_open_jittered<F, Fut, G>(
     retry: RouteOpenRetry,
+    outage: Option<OutageWait>,
     scope_hold: Option<ScopeHold>,
     cancel: Option<&CancellationToken>,
     gate_for: G,
@@ -3232,7 +3318,21 @@ where
     G: Fn() -> Option<Arc<ModuleGate>>,
 {
     use subc_protocol::error_codes::{SCOPE_CHANGED, SCOPE_NOT_SYNCED};
-    let retry_deadline = time::Instant::now() + retry.budget;
+    // Without an outage wait the budget runs from now. With one, only the absolute end bounds
+    // the open until its first temporary refusal starts the patience clock.
+    let mut retry_deadline = match outage {
+        None => Some(time::Instant::now() + retry.budget),
+        Some(wait) => wait.deadline,
+    };
+    let mut patience_started = outage.is_none();
+    let start_patience = |deadline: &mut Option<time::Instant>| {
+        if let Some(wait) = outage {
+            let end = time::Instant::now() + wait.patience;
+            *deadline = Some(wait.deadline.map_or(end, |run_end| run_end.min(end)));
+        }
+    };
+    // The last temporary refusal seen, returned if the outage wait ends mid-attempt.
+    let mut last_refusal: Option<RejectedMessage> = None;
     let mut envelope = ROUTE_OPEN_RETRY_INTERVAL.min(retry.max_interval);
     let mut scope_interval =
         ROUTE_OPEN_RETRY_INTERVAL.min(scope_hold.map_or(retry.max_interval, |h| h.max_interval));
@@ -3243,7 +3343,13 @@ where
             let Some(current) = gate.clone() else {
                 break None;
             };
-            match current.admit(Some(retry_deadline), cancel).await {
+            // A closed gate is the module's outage, already seen by another open: the outage
+            // patience runs from here.
+            if !patience_started && current.is_closed() {
+                start_patience(&mut retry_deadline);
+                patience_started = true;
+            }
+            match current.admit(retry_deadline, cancel).await {
                 GateAdmission::Admitted(ticket) => break Some(ticket),
                 GateAdmission::Refused(refusal) => {
                     return Err(RouteOpenError::Conn(ConnError::Rejected(refusal)))
@@ -3258,10 +3364,33 @@ where
                 }
             }
         };
-        // Deliberately not wrapped in a timeout against `retry_deadline`: an attempt that
-        // started before the deadline runs to its own reply deadline, because the daemon may
-        // still be relaying its bind and abandoning it would report a successful open as failed.
-        let outcome = attempt().await;
+        let outcome = match outage {
+            // Deliberately not wrapped in a timeout against `retry_deadline`: an attempt that
+            // started before the deadline runs to its own reply deadline, because the daemon
+            // may still be relaying its bind and abandoning it would report a successful open
+            // as failed.
+            None => attempt().await,
+            // A tool call's open must not outlive its run's cancel or the end of its wait: a
+            // route that opens after either would carry a send nobody may make any more. The
+            // cancel check comes first, so an open never starts once the run has stopped.
+            Some(_) => {
+                tokio::select! {
+                    biased;
+                    _ = cancelled_or_never(cancel) => return Err(RouteOpenError::Cancelled),
+                    _ = sleep_until_or_never(retry_deadline) => {
+                        return Err(RouteOpenError::Conn(match last_refusal.take() {
+                            Some(refusal) => ConnError::Rejected(refusal),
+                            None => ConnError::Transport(
+                                "route.open did not finish before the run's deadline; nothing \
+                                 was sent"
+                                    .into(),
+                            ),
+                        }));
+                    }
+                    outcome = attempt() => outcome,
+                }
+            }
+        };
         if let Some(ticket) = ticket {
             ticket.report(&outcome);
         }
@@ -3272,10 +3401,22 @@ where
             {
                 let code = message.code();
                 let held = scope_hold.filter(|_| matches!(code, SCOPE_NOT_SYNCED | SCOPE_CHANGED));
-                let deadline = held.map_or(retry_deadline, |hold| hold.deadline);
+                if held.is_none() && !patience_started {
+                    start_patience(&mut retry_deadline);
+                    patience_started = true;
+                }
+                let deadline = match held {
+                    Some(hold) => hold.deadline,
+                    None => {
+                        retry_deadline.expect("the budget or the outage patience is running by now")
+                    }
+                };
                 let remaining = deadline.saturating_duration_since(time::Instant::now());
                 if remaining.is_zero() {
                     return Err(RouteOpenError::Conn(ConnError::Rejected(message)));
+                }
+                if outage.is_some() && held.is_none() {
+                    last_refusal = Some(message.clone());
                 }
                 let changed = code == SCOPE_CHANGED;
                 let at_once = held.is_some() && changed && !previous_was_scope_changed;
@@ -7258,6 +7399,7 @@ mod module_gate_tests {
         let started_at = Mutex::new(Vec::new());
         let result = retry_route_open_jittered(
             patient(Duration::from_secs(30)),
+            None,
             None,
             None,
             no_gate,

@@ -488,9 +488,46 @@ pub enum ToolOutputPart {
 pub const TOOL_PLANE_UNAVAILABLE_MESSAGE: &str = "tool plane unavailable";
 
 /// Guidance appended (in renderings, not in `message`) to a result the plane never sent
-/// because its module was restarting or unavailable.
+/// because its module was restarting or unavailable. The runner contract limits `retry` to
+/// one line of at most [`MODULE_UNAVAILABLE_RETRY_MAX_BYTES`].
 pub const TOOL_PLANE_UNAVAILABLE_RETRY: &str =
     "the module is restarting or unavailable; retry the call in a minute";
+
+/// The most bytes the runner contract allows in a module-outage error's `detail`.
+pub const MODULE_UNAVAILABLE_DETAIL_MAX_BYTES: usize = 1024;
+
+/// The most bytes the runner contract allows in a module-outage error's `retry`.
+pub const MODULE_UNAVAILABLE_RETRY_MAX_BYTES: usize = 256;
+
+/// Whether `module` is a module id the runner contract accepts in an error's `module`: 1 to
+/// 255 bytes of UTF-8 with no control character (spaces and non-ASCII are allowed).
+fn is_contract_module_id(module: &str) -> bool {
+    (1..=255).contains(&module.len()) && !module.chars().any(char::is_control)
+}
+
+/// Whether `code` is an error code the runner contract accepts: `^[a-z][a-z0-9_]{0,63}$`.
+fn is_contract_error_code(code: &str) -> bool {
+    let mut bytes = code.bytes();
+    bytes.next().is_some_and(|first| first.is_ascii_lowercase())
+        && code.len() <= 64
+        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+/// Bound a daemon refusal detail to what the runner contract allows in a module-outage
+/// error's `detail`: one line of at most [`MODULE_UNAVAILABLE_DETAIL_MAX_BYTES`] bytes.
+/// Every line break (CR, LF or CRLF) becomes one space, and an over-long detail is cut at
+/// the last char boundary that fits, so the result is always valid UTF-8.
+pub fn bound_module_unavailable_detail(detail: &str) -> String {
+    let mut line = detail.replace("\r\n", " ").replace(['\r', '\n'], " ");
+    if line.len() > MODULE_UNAVAILABLE_DETAIL_MAX_BYTES {
+        let mut end = MODULE_UNAVAILABLE_DETAIL_MAX_BYTES;
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        line.truncate(end);
+    }
+    line
+}
 
 impl ToolOutput {
     /// A plain error result with no module attribution, as every existing site built it.
@@ -510,17 +547,27 @@ impl ToolOutput {
     /// [`TOOL_PLANE_UNAVAILABLE_MESSAGE`] (callers match on it), while the module, the
     /// daemon's refusal code and detail, and the retry guidance ride in sibling fields so
     /// the model — and any reader of the serialized result — sees what was down and that
-    /// nothing was sent.
+    /// nothing was sent. The detail is bounded to one line of at most 1 KiB (see
+    /// [`bound_module_unavailable_detail`]).
+    ///
+    /// Strict readers of the runner contract refuse a whole history page that holds one
+    /// invalid member, and the module id and code come from the daemon, so each is checked
+    /// here, where every such result is built, and left out when it does not fit: `module`
+    /// must be 1 to 255 bytes with no control character, `code` must match
+    /// `^[a-z][a-z0-9_]{0,63}$`, and no member is ever present but empty. The result stays a
+    /// valid attributed error with fewer fields, and `message` never changes.
     pub fn module_unavailable(
         module: impl Into<String>,
         code: impl Into<String>,
         detail: impl Into<String>,
     ) -> Self {
-        let detail = detail.into();
+        let module = Some(module.into()).filter(|module| is_contract_module_id(module));
+        let code = Some(code.into()).filter(|code| is_contract_error_code(code));
+        let detail = bound_module_unavailable_detail(&detail.into());
         ToolOutput::Error {
             message: TOOL_PLANE_UNAVAILABLE_MESSAGE.to_owned(),
-            module: Some(module.into()),
-            code: Some(code.into()),
+            module,
+            code,
             detail: (!detail.is_empty()).then_some(detail),
             nothing_sent: Some(true),
             retry: Some(TOOL_PLANE_UNAVAILABLE_RETRY.to_owned()),
@@ -733,6 +780,153 @@ mod tests {
                 retry.as_deref(),
             ),
             text.replace("supervised_not_registered", "d")
+        );
+    }
+
+    /// The runner contract caps `retry` at one line of 256 bytes; the constant the plane
+    /// sends must stay inside it.
+    #[test]
+    fn module_unavailable_retry_is_one_short_line() {
+        use super::{MODULE_UNAVAILABLE_RETRY_MAX_BYTES, TOOL_PLANE_UNAVAILABLE_RETRY};
+        assert!(TOOL_PLANE_UNAVAILABLE_RETRY.len() <= MODULE_UNAVAILABLE_RETRY_MAX_BYTES);
+        assert!(!TOOL_PLANE_UNAVAILABLE_RETRY.contains(['\n', '\r']));
+        let super::ToolOutput::Error {
+            retry,
+            nothing_sent,
+            ..
+        } = super::ToolOutput::module_unavailable("aft", "target_unavailable", "d")
+        else {
+            unreachable!()
+        };
+        assert_eq!(retry.as_deref(), Some(TOOL_PLANE_UNAVAILABLE_RETRY));
+        assert_eq!(nothing_sent, Some(true));
+    }
+
+    /// A daemon detail that spans lines and runs past 1 KiB is stored as one line cut to
+    /// 1024 bytes on a char boundary: every line break becomes a space, and a multi-byte
+    /// char straddling the limit is dropped whole rather than split.
+    #[test]
+    fn module_unavailable_detail_is_one_line_of_at_most_1_kib() {
+        use super::{bound_module_unavailable_detail, MODULE_UNAVAILABLE_DETAIL_MAX_BYTES};
+        // 1021 ASCII bytes once the CRLF collapses to one space, then a 4-byte char that
+        // would end at byte 1025.
+        let mut raw = String::from("first line\nsecond\r\nthird\rfourth ");
+        while raw.len() < 1022 {
+            raw.push('x');
+        }
+        raw.push('🦀');
+        raw.push_str("\ntail that must be cut");
+        let bounded = bound_module_unavailable_detail(&raw);
+        assert!(
+            bounded.len() <= MODULE_UNAVAILABLE_DETAIL_MAX_BYTES,
+            "{}",
+            bounded.len()
+        );
+        assert_eq!(bounded.len(), 1021, "the straddling char is dropped whole");
+        assert!(!bounded.contains(['\n', '\r']), "{bounded}");
+        assert!(
+            bounded.starts_with("first line second third fourth "),
+            "{bounded}"
+        );
+        assert!(!bounded.contains('🦀'));
+        // The constructor applies the same bound to what it stores.
+        let super::ToolOutput::Error { detail, .. } =
+            super::ToolOutput::module_unavailable("aft", "target_unavailable", raw)
+        else {
+            unreachable!()
+        };
+        assert_eq!(detail.as_deref(), Some(bounded.as_str()));
+        // A short single-line detail is kept exactly as given.
+        assert_eq!(
+            bound_module_unavailable_detail("supervised_not_registered"),
+            "supervised_not_registered"
+        );
+    }
+
+    /// The members of an attributed outage error, for the contract-shape tests below.
+    fn outage_members(
+        module: &str,
+        code: &str,
+        detail: &str,
+    ) -> (String, Option<String>, Option<String>, Option<String>) {
+        let super::ToolOutput::Error {
+            message,
+            module,
+            code,
+            detail,
+            nothing_sent,
+            retry,
+        } = super::ToolOutput::module_unavailable(module, code, detail)
+        else {
+            unreachable!()
+        };
+        // Whatever is left out, the result stays an attributed outage.
+        assert_eq!(nothing_sent, Some(true));
+        assert_eq!(retry.as_deref(), Some(super::TOOL_PLANE_UNAVAILABLE_RETRY));
+        (message, module, code, detail)
+    }
+
+    /// A code outside `^[a-z][a-z0-9_]{0,63}$` is left out rather than emitted; the message
+    /// and the other members are unchanged.
+    #[test]
+    fn an_out_of_grammar_code_is_omitted() {
+        for bad in [
+            "Target_unavailable",
+            "9lives",
+            "target-unavailable",
+            "",
+            "a b",
+        ] {
+            let (message, module, code, detail) = outage_members("aft", bad, "d");
+            assert_eq!(message, super::TOOL_PLANE_UNAVAILABLE_MESSAGE);
+            assert_eq!(code, None, "{bad:?} must be omitted");
+            assert_eq!(module.as_deref(), Some("aft"));
+            assert_eq!(detail.as_deref(), Some("d"));
+        }
+        let too_long = format!("a{}", "b".repeat(64));
+        assert_eq!(outage_members("aft", &too_long, "d").2, None);
+        let longest = format!("a{}", "b".repeat(63));
+        assert_eq!(outage_members("aft", &longest, "d").2, Some(longest));
+        assert_eq!(
+            outage_members("aft", "module_timeout2", "d").2.as_deref(),
+            Some("module_timeout2")
+        );
+    }
+
+    /// An empty detail is never emitted as an empty member, and nor is one that bounds to
+    /// nothing.
+    #[test]
+    fn an_empty_detail_is_omitted() {
+        let (message, module, code, detail) = outage_members("aft", "target_unavailable", "");
+        assert_eq!(message, super::TOOL_PLANE_UNAVAILABLE_MESSAGE);
+        assert_eq!(detail, None);
+        assert_eq!(module.as_deref(), Some("aft"));
+        assert_eq!(code.as_deref(), Some("target_unavailable"));
+    }
+
+    /// A module id over 255 bytes, one with a control character, and an empty one are left
+    /// out; the rest of the result is unchanged.
+    #[test]
+    fn an_out_of_contract_module_is_omitted() {
+        let long = "m".repeat(300);
+        for bad in [long.as_str(), "aft\u{7}", "af\nt", ""] {
+            let (message, module, code, detail) = outage_members(bad, "target_unavailable", "d");
+            assert_eq!(message, super::TOOL_PLANE_UNAVAILABLE_MESSAGE);
+            assert_eq!(module, None, "{bad:?} must be omitted");
+            assert_eq!(code.as_deref(), Some("target_unavailable"));
+            assert_eq!(detail.as_deref(), Some("d"));
+        }
+        let longest = "m".repeat(255);
+        assert_eq!(outage_members(&longest, "x", "d").1, Some(longest));
+    }
+
+    /// A module id with a space and non-ASCII characters fits the contract and is kept.
+    #[test]
+    fn a_non_ascii_module_with_a_space_is_kept() {
+        let id = "mödule äft";
+        assert_eq!(
+            outage_members(id, "target_unavailable", "d").1.as_deref(),
+            Some(id)
         );
     }
     #[test]

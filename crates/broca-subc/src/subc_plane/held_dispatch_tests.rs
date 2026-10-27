@@ -115,6 +115,7 @@ impl ToolPlaneConnection for Rig {
         _: Duration,
         _: Option<&str>,
         key: Option<&str>,
+        _: &broca_core::tool_plane::DispatchSignals,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
         self.sent
             .lock()
@@ -668,6 +669,7 @@ async fn negotiated_final_content_uses_only_the_frozen_opt_in() {
 async fn staged_plain_key_reaches_the_real_guarded_wire_envelope() {
     let (conn, route, mut server) = SubcConnection::in_process_for_test(7, 1);
     let call = call("call");
+    let signals = broca_core::tool_plane::DispatchSignals::default();
     let dispatch = ToolPlaneConnection::tool_call_staged(
         &conn,
         &route,
@@ -675,6 +677,7 @@ async fn staged_plain_key_reaches_the_real_guarded_wire_envelope() {
         Duration::from_secs(2),
         Some("preset"),
         Some("lineage:1"),
+        &signals,
     );
     tokio::pin!(dispatch);
     let request = tokio::select! {

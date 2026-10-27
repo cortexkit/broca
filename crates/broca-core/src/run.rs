@@ -8014,7 +8014,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
         Some(BatchRefusal::Stopped)
     } else {
         match tool_plane
-            .batch_started_guarded(&ctx, &calls, manifest, &ToolOpenGuard::new(cancel, stop))
+            .batch_started_guarded(&ctx, &calls, manifest, &tool_open_guard(cancel, stop))
             .await
         {
             Ok(()) => None,
@@ -9145,14 +9145,36 @@ impl<T: ToolPlane> ToolPlane for ProviderHeldPlane<'_, T> {
         key: Option<crate::tool_plane::DispatchKey<'_>>,
         guard: &crate::tool_plane::ToolOpenGuard,
     ) -> DispatchResult {
-        // Route through the keyed/unkeyed entry points (not the inner plane's guarded
-        // one) so resumed-held calls and the held-recorder injection keep working; the
-        // inner plane's own patience still applies to the opens below.
-        let _ = guard;
-        match key {
-            Some(key) => self.dispatch_keyed(ctx, call, key).await,
-            None => self.dispatch(ctx, call).await,
+        // Forward the guard to the inner plane's guarded entry point, so run cancel, stop and
+        // the step deadline end its route-open waits. A keyed call keeps what
+        // `dispatch_keyed` adds: a call resumed while provider-held rejoins its waiting slot
+        // instead of being dispatched again, and every other keyed call carries this batch's
+        // held-reply recorder.
+        let Some(key) = key else {
+            return self.inner.dispatch_guarded(ctx, call, None, guard).await;
+        };
+        if let Some(held) = self
+            .held
+            .resumed
+            .iter()
+            .find(|held| held.tool_call_id == call.tool_call_id)
+        {
+            return match self.lifecycle {
+                Some(lifecycle) => lifecycle.wait(ctx, call, &held.reply()).await,
+                None => std::future::pending().await,
+            };
         }
+        self.inner
+            .dispatch_guarded(
+                ctx,
+                call,
+                Some(crate::tool_plane::DispatchKey {
+                    call_key: key.call_key,
+                    held_recorder: Some(self),
+                }),
+                guard,
+            )
+            .await
     }
     async fn dispatch_keyed(
         &self,
@@ -9304,14 +9326,14 @@ async fn resolve<T: ToolPlane>(
                                 call_key: key.as_deref().expect("approved call has Prepared key"),
                                 held_recorder: None,
                             },
-                            &crate::tool_plane::DispatchSignals::new(cancel, stop),
+                            &tool_open_guard(cancel, stop).signals(),
                         )
                         .await
                 }
                 None => {
-                    // The route-open wait ends early on run cancel/stop; the plane caps it
-                    // at the call's own reply budget.
-                    let guard = ToolOpenGuard::new(cancel, stop);
+                    // The route-open wait ends early on run cancel/stop, and at the run's
+                    // step deadline (see `tool_open_guard`).
+                    let guard = tool_open_guard(cancel, stop);
                     match key.as_deref() {
                         Some(call_key) => {
                             tool_plane
@@ -9396,6 +9418,22 @@ async fn resolve<T: ToolPlane>(
             }
         }
     }
+}
+
+/// The route-open guard for a batch's tool calls: the run's cancel and stop tokens, and the
+/// run's step deadline. Every batch entry point builds its guard here, so the batch start, each
+/// call and each re-open all end at the same instant.
+///
+/// A run has no step deadline for tool dispatch today: the provider watchdog
+/// (`RunControl::provider_call_timeout`) bounds only the model stream, and a call's reply
+/// deadline is that call's execution budget, not time left in the step. So the deadline is
+/// `None`, and the plane's own tool-dispatch patience is the only bound on a route-open wait
+/// besides cancel and stop.
+fn tool_open_guard(
+    cancel: Option<&CancellationToken>,
+    stop: Option<&CancellationToken>,
+) -> ToolOpenGuard {
+    ToolOpenGuard::new(cancel, stop).with_deadline(None)
 }
 
 /// The `route_drained` result for a call a scope drain stopped before it was sent. The text
@@ -13746,7 +13784,7 @@ mod approval_gate {
                     &ctx,
                     &calls,
                     &routed_manifest,
-                    &ToolOpenGuard::new(control.cancel.as_ref(), control.stop_requested.as_ref()),
+                    &tool_open_guard(control.cancel.as_ref(), control.stop_requested.as_ref()),
                 )
                 .await
         } else {
@@ -15453,7 +15491,7 @@ mod approval_gate {
                 ctx,
                 std::slice::from_ref(call),
                 manifest,
-                &ToolOpenGuard::new(control.cancel.as_ref(), control.stop_requested.as_ref()),
+                &tool_open_guard(control.cancel.as_ref(), control.stop_requested.as_ref()),
             )
             .await
         {
@@ -15487,10 +15525,8 @@ mod approval_gate {
                 call,
                 args_jcs,
                 key,
-                &crate::tool_plane::DispatchSignals::new(
-                    control.cancel.as_ref(),
-                    control.stop_requested.as_ref(),
-                ),
+                &tool_open_guard(control.cancel.as_ref(), control.stop_requested.as_ref())
+                    .signals(),
             )
             .await;
         if let DispatchResult::Completed(result) = &mut outcome {
