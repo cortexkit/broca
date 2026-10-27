@@ -5,6 +5,7 @@
 #[serde(default, deny_unknown_fields)]
 pub struct LlmToolsConfig {
     pub advertise_tags: bool,
+    pub image_references: bool,
     pub private_content_providers: Vec<String>,
 }
 
@@ -12,6 +13,7 @@ impl Default for LlmToolsConfig {
     fn default() -> Self {
         Self {
             advertise_tags: false,
+            image_references: false,
             private_content_providers: vec!["anthropic".into(), "anthropic-platform".into()],
         }
     }
@@ -44,6 +46,7 @@ impl LlmToolsConfig {
         #[serde(default, deny_unknown_fields)]
         struct Tags {
             advertise_tags: bool,
+            image_references: bool,
         }
         #[derive(serde::Deserialize)]
         struct File {
@@ -58,6 +61,7 @@ impl LlmToolsConfig {
             .map_err(|error| format!("parse model-tool config {}: {error}", path.display()))?;
         let config = Self {
             advertise_tags: file.llm_tools.advertise_tags,
+            image_references: file.llm_tools.image_references,
             private_content_providers: file
                 .private_content_providers
                 .unwrap_or_else(|| Self::default().private_content_providers),

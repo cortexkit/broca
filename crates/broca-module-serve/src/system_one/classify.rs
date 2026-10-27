@@ -24,8 +24,8 @@ use cortexkit_role_classifier::{
     provider::{item_code_for_status, workers_ai_item_code},
     reply::Usage,
     request::{
-        check_catalog_row, check_request, check_request_bytes, parse_request, CatalogRow,
-        ClassifyRequest, CLASSIFIER_KIND,
+        check_catalog_row, check_request_bytes, parse_request, CatalogRow, ClassifyRequest,
+        CLASSIFIER_KIND,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -52,7 +52,7 @@ pub(crate) fn is_classifier_row(row: &ModelBatchRow) -> bool {
 
 /// The catalog row as the role's check reads it: fusiform's `decision` is the role's
 /// `classifier`; any other stated kind is passed on as stated, so a refusal names it.
-fn catalog_row(row: Option<&ModelBatchRow>) -> CatalogRow<'_> {
+pub(super) fn catalog_row(row: Option<&ModelBatchRow>) -> CatalogRow<'_> {
     match row {
         None => CatalogRow::Absent,
         Some(row) => match row.kind.as_deref() {
@@ -513,7 +513,7 @@ pub(crate) async fn run(
     scope: &broca_store::system_one::BatchScope,
     admitted_at_ms: Option<i64>,
 ) -> Result<Box<RawValue>, Refusal> {
-    run_inner(service, params, scope, admitted_at_ms, None).await
+    run_inner(service, params, scope, admitted_at_ms, None, None).await
 }
 
 pub(super) fn admit_tool(
@@ -539,7 +539,7 @@ pub(super) fn admit_tool(
         let pin = service
             .pin(&request.model)
             .ok_or_else(|| Refusal::model_unavailable(&request.model))?;
-        check_request(&request, &service.model_entry(pin, &row))?;
+        service.check_images_request(&request, &service.model_entry(pin, &row))?;
         use broca_core::ChargeBasisResolver;
         FrozenRow {
             input_rate_nanos: row.input_rate_nanos,
@@ -596,6 +596,7 @@ pub(super) async fn run_inner(
     scope: &broca_store::system_one::BatchScope,
     admitted_at_ms: Option<i64>,
     tool: Option<(&str, &ToolAdmission)>,
+    images: Option<&super::images::PreparedImages>,
 ) -> Result<Box<RawValue>, Refusal> {
     let flush = Arc::clone(service);
     tokio::task::spawn_blocking(move || flush.flush_facts())
@@ -641,7 +642,20 @@ pub(super) async fn run_inner(
     }
     let entry = service.model_entry(&pin, &row);
     if tool.is_none() {
-        check_request(&request, &entry)?;
+        service.check_images_request(&request, &entry)?;
+    }
+    for (i, item) in request.items.iter().enumerate() {
+        if let Some(j) = item
+            .images
+            .iter()
+            .flatten()
+            .position(|image| image.reference().is_some())
+        {
+            if images.is_none_or(|prepared| prepared.0.len() != request.items.len()) {
+                return Err(cortexkit_model_batch::image::ResolveFailure::Unavailable
+                    .refusal(format!("items[{i}].images[{j}]")));
+            }
+        }
     }
 
     let identity =
@@ -696,6 +710,7 @@ pub(super) async fn run_inner(
         sent_ceiling,
         admitted_at_ms,
         tool.map(|(_, admission)| admission.frozen_row.as_str()),
+        images,
     )
     .await;
     hold.release().await;
@@ -722,6 +737,7 @@ async fn serve_claimed(
     sent_ceiling: Option<u64>,
     admitted_at_ms: Option<i64>,
     tool_frozen: Option<&str>,
+    prepared: Option<&super::images::PreparedImages>,
 ) -> Result<Box<RawValue>, Refusal> {
     let is_tool = tool_frozen.is_some();
     let live_frozen = if let Some(frozen) = tool_frozen {
@@ -889,11 +905,18 @@ async fn serve_claimed(
                 continue;
             }
         }
-        let images = raw.items[index]
-            .images
-            .filter(|images| images.get().trim() != "null")
-            .map_or(String::new(), |images| {
-                format!(",\"images\":{}", images.get())
+        let replacement = prepared
+            .and_then(|images| images.0.get(index))
+            .and_then(Option::as_deref);
+        let images = replacement
+            .map(|images| format!(",\"images\":{images}"))
+            .unwrap_or_else(|| {
+                raw.items[index]
+                    .images
+                    .filter(|images| images.get().trim() != "null")
+                    .map_or(String::new(), |images| {
+                        format!(",\"images\":{}", images.get())
+                    })
             });
         let body = format!(
             "{{\"model\":{},\"state\":{},\"questions\":{questions}{images}}}",

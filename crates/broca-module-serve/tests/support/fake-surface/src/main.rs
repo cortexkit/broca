@@ -4,7 +4,7 @@
 //! (`flow.private_content_providers`) before it may call a provider, so a test needs both to
 //! answer. `fake-aft-stub` declares only the tool-provider role, so the daemon refuses a
 //! `route.open` aimed at its management surface before any operation is dispatched. This binary
-//! is a module that does declare a management surface, and serves those two operations.
+//! is a module that declares a management surface, including screenshot resolution.
 //!
 //! Configuration, from the environment and the command line:
 //!
@@ -32,7 +32,7 @@ use subc_protocol::manifest::{
 use subc_protocol::{ErrorBody, Flags, Frame, FrameType, ModuleHelloBody, Priority, PROTOCOL_VERSION};
 use subc_transport::{authenticate_client, read_frame, write_frame};
 
-const SURFACED_OPS: [&str; 2] = ["private_content.query", "flow.private_content_providers"];
+const SURFACED_OPS: [&str; 3] = ["private_content.query", "flow.private_content_providers", "image.resolve"];
 
 fn main() {
     if let Some(()) = relaunch() {
@@ -246,6 +246,11 @@ async fn serve() -> Result<(), String> {
             &requests,
             &format!("{} {}\n", method, request["params"]),
         )?;
+        // Leave the image request unanswered to exercise the caller's source timeout.
+        // Other operations remain available while the image source is down.
+        if method == "image.resolve" && fixtures.with_extension("down").exists() {
+            continue;
+        }
         let (ty, body) = match answer(&fixtures, &method, &request["params"]) {
             Ok(result) => (FrameType::Response, result),
             Err(refused) => (FrameType::Error, refused),
@@ -358,6 +363,10 @@ fn answer(fixtures: &PathBuf, method: &str, params: &serde_json::Value) -> Resul
         {
             continue;
         }
+        if fixture["match"]["handle"].as_str()
+            .is_some_and(|handle| params["handle"].as_str() != Some(handle)) {
+            continue;
+        }
         let raw = fixture["stdout"].as_str().unwrap_or_default();
         let value: serde_json::Value = match serde_json::from_str(raw) {
             Ok(value) => value,
@@ -365,7 +374,7 @@ fn answer(fixtures: &PathBuf, method: &str, params: &serde_json::Value) -> Resul
         };
         // Cerebellum sends both answers and refusals as bare response bodies. Preserve the
         // fixture bytes so the rig cannot hide a client that expects a result envelope.
-        if method == "private_content.query" {
+        if matches!(method, "private_content.query" | "image.resolve") {
             return Ok(raw.as_bytes().to_vec());
         }
         // Basal refuses with an error frame, while its successful fixture includes result.
@@ -383,6 +392,9 @@ fn answer(fixtures: &PathBuf, method: &str, params: &serde_json::Value) -> Resul
             "private_content": marked, "sources": []
         }))
         .unwrap_or_default());
+    }
+    if method == "image.resolve" {
+        return Ok(br#"{"outcome":"image_unavailable"}"#.to_vec());
     }
     Err(refused(
         "unknown_method",
@@ -402,6 +414,23 @@ fn append(path: &PathBuf, line: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_resolution_fixtures_are_scoped_by_handle_and_answer_bare() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("target/scratch/image-fixtures-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("fixtures.json");
+        let body = r#"{"mime":"image/png","sha256":"digest","bytes":"YWJj"}"#;
+        std::fs::write(&path, serde_json::json!([{
+            "match":{"method":"image.resolve","scope_ref":"run","handle":"ih123"},"stdout":body
+        }]).to_string()).unwrap();
+        assert_eq!(answer(&path, "image.resolve", &serde_json::json!({"handle":"ih123","scope_ref":"run"})).unwrap(), body.as_bytes());
+        for params in [serde_json::json!({"handle":"foreign","scope_ref":"run"}), serde_json::json!({"handle":"ih123","scope_ref":"foreign"})] {
+            assert_eq!(answer(&path, "image.resolve", &params).unwrap(), br#"{"outcome":"image_unavailable"}"#);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn private_content_rejects_unknown_params_with_a_normal_refusal_body() {

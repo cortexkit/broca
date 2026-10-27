@@ -1145,7 +1145,16 @@ where
     R: AsyncRead + Unpin,
     H: ServeHandler + 'static,
 {
-    send_hello(&writer, module_id, archive, consumer_routes).await?;
+    send_hello(
+        &writer,
+        module_id,
+        archive,
+        consumer_routes,
+        system_one
+            .as_ref()
+            .is_some_and(|system| system.image_references()),
+    )
+    .await?;
     let ack = {
         let _phase = stall::enter(Phase::AwaitFrame).await;
         expect_hello_ack(read_half).await?
@@ -3954,9 +3963,23 @@ async fn send_hello(
     module_id: &str,
     archive: crate::wal_archive::WalArchiveConfig,
     consumer_routes: &crate::consumer_routes::ConsumerRoutes,
+    image_references: bool,
 ) -> Result<(), ServeIoError> {
+    let mut manifest = crate::manifest::manifest_configured(module_id, archive, consumer_routes);
+    if image_references {
+        for role in &mut manifest.provides {
+            if let subc_protocol::manifest::ProviderRole::ToolProvider { tools, .. } = role {
+                for tool in tools {
+                    if tool.name == crate::llm_tools::CLASSIFY_TOOL_NAME {
+                        tool.schema =
+                            cortexkit_llm_tools::classify::input_schema_with_image_references();
+                    }
+                }
+            }
+        }
+    }
     let body = serde_json::to_vec(&ModuleHelloBody {
-        manifest: crate::manifest::manifest_configured(module_id, archive, consumer_routes),
+        manifest,
         protocol_ver: PROTOCOL_VERSION,
         control_ops: Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
         launch_nonce: hello_launch_nonce()?,

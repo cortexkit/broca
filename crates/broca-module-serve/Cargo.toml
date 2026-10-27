@@ -64,6 +64,7 @@ cortexkit-bus-trait.workspace = true
 cortexkit-bus-nats.workspace = true
 async-nats = { version = "0.50", default-features = false, features = ["ring"] }
 base64 = "0.22"
+zeroize = "=1.9.0"
 # The executor reads a run's terminal WAL record (its auth-error status) to report a
 # wire-auth failure back to the vault — so the WAL record types are a runtime dep, not
 # just the dev-only wire-test dep below.

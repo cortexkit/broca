@@ -822,6 +822,7 @@ fn direct_tools_with_private_content(
         Arc::new(system),
         broca_module_serve::config::LlmToolsConfig {
             advertise_tags: true,
+            image_references: false,
             private_content_providers,
         },
         asks,
@@ -1227,6 +1228,7 @@ fn tools_with_catalog(
         Arc::new(system),
         broca_module_serve::config::LlmToolsConfig {
             advertise_tags: false,
+            image_references: false,
             private_content_providers: if allow {
                 vec!["typesafe".into()]
             } else {
@@ -1435,6 +1437,7 @@ async fn memory_unmeasured_cost_is_a_stored_permanent_failure_without_an_answer(
         Arc::new(system),
         broca_module_serve::config::LlmToolsConfig {
             advertise_tags: true,
+            image_references: false,
             private_content_providers: vec!["typesafe".into()],
         },
         Arc::new(broca_module_serve::llm_tools::NoPrivateContent),
@@ -1511,6 +1514,7 @@ async fn memory_in_process_single_flight_waiters_receive_the_same_answer() {
         Arc::new(system),
         broca_module_serve::config::LlmToolsConfig {
             advertise_tags: true,
+            image_references: false,
             private_content_providers: vec!["typesafe".into()],
         },
         Arc::new(broca_module_serve::llm_tools::NoPrivateContent),
@@ -2212,6 +2216,7 @@ async fn memory_nonfinal_transient_outcome_resumes_under_its_frozen_admission() 
         Arc::new(system),
         broca_module_serve::config::LlmToolsConfig {
             advertise_tags: true,
+            image_references: false,
             private_content_providers: vec!["typesafe".into()],
         },
         Arc::new(broca_module_serve::llm_tools::NoPrivateContent),
@@ -2280,6 +2285,7 @@ async fn memory_question_order_and_raw_json_survive_the_tool_adapter() {
         Arc::new(system),
         broca_module_serve::config::LlmToolsConfig {
             advertise_tags: true,
+            image_references: false,
             private_content_providers: vec!["typesafe".into()],
         },
         Arc::new(broca_module_serve::llm_tools::NoPrivateContent),

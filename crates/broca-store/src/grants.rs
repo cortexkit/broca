@@ -1,7 +1,10 @@
 //! Consent authority and held tool calls. This database is not rebuilt from the session WAL:
 //! losing a grant asks again, while losing a held request would lose the caller's work.
 
-use std::{path::Path, sync::Mutex};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex, Weak},
+};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -170,7 +173,11 @@ pub struct LateDelivery {
 
 pub struct GrantsStore {
     conn: Mutex<Connection>,
+    terminal_listeners: Mutex<Vec<Weak<HeldCallTerminal>>>,
 }
+
+/// In-memory cleanup runs synchronously after a held call's terminal transaction commits.
+pub type HeldCallTerminal = dyn Fn(&str, i64) + Send + Sync;
 
 fn encode(value: &impl Serialize) -> Result<String> {
     serde_json::to_string(value).map_err(|e| GrantsError(e.to_string()))
@@ -237,6 +244,7 @@ impl GrantsStore {
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
+            terminal_listeners: Mutex::new(Vec::new()),
         })
     }
 
@@ -245,6 +253,41 @@ impl GrantsStore {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let result = action(&tx)?;
         tx.commit()?;
+        Ok(result)
+    }
+
+    /// The caller owns the listener; dropping it unregisters cleanup without keeping its
+    /// in-memory state alive across a new service instance on the same database.
+    pub fn on_held_call_terminal(&self, listener: &Arc<HeldCallTerminal>) {
+        self.terminal_listeners
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(Arc::downgrade(listener));
+    }
+
+    fn terminal_write<T>(
+        &self,
+        action: impl FnOnce(&Transaction<'_>, &mut Vec<(String, i64)>) -> Result<T>,
+    ) -> Result<T> {
+        let mut terminal = Vec::new();
+        let result = self.write(|tx| action(tx, &mut terminal))?;
+        if !terminal.is_empty() {
+            let mut listeners = self
+                .terminal_listeners
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let active = listeners
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>();
+            listeners.retain(|listener| listener.strong_count() > 0);
+            drop(listeners);
+            for (key, admitted_at) in terminal {
+                for listener in &active {
+                    listener(&key, admitted_at);
+                }
+            }
+        }
         Ok(result)
     }
 
@@ -264,7 +307,7 @@ impl GrantsStore {
         request: HoldRequest,
         card: Option<&Card>,
     ) -> Result<HoldAdmission> {
-        self.write(|tx| {
+        self.terminal_write(|tx, terminal| {
             if let Some(card) = card {
                 if card.dedup_key != request.dedup_key
                     || card.scope != request.scope
@@ -303,10 +346,20 @@ impl GrantsStore {
                 "DELETE FROM late_results WHERE batch_id=?1",
                 [&request.batch_id],
             )?;
+            let replaced: Option<i64> = tx
+                .query_row(
+                    "SELECT admitted_at_ms FROM held_calls WHERE batch_id=?1",
+                    [&request.batch_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
             tx.execute(
                 "DELETE FROM held_calls WHERE batch_id=?1",
                 [&request.batch_id],
             )?;
+            if let Some(admitted_at) = replaced {
+                terminal.push((request.batch_id.clone(), admitted_at));
+            }
             let row = HeldCall {
                 batch_id: request.batch_id,
                 scope: request.scope,
@@ -408,7 +461,7 @@ impl GrantsStore {
 
     /// A requester refusal means there is no card to wait on and mints no run denial.
     pub fn refuse_card(&self, dedup_key: &str, body: &str, now_ms: i64) -> Result<()> {
-        self.write(|tx| {
+        self.terminal_write(|tx, terminal| {
             let Some(card) = read_card(tx, dedup_key)? else {
                 return Ok(());
             };
@@ -422,7 +475,15 @@ impl GrantsStore {
                 .query_map([dedup_key], |r| r.get::<_, String>(0))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             for row in rows {
-                finalize(tx, decode(&row)?, FinalKind::NotStarted, body, true, now_ms)?;
+                finalize(
+                    tx,
+                    decode(&row)?,
+                    FinalKind::NotStarted,
+                    body,
+                    true,
+                    now_ms,
+                    terminal,
+                )?;
             }
             tx.execute("DELETE FROM cards WHERE dedup_key=?1", [dedup_key])?;
             Ok(())
@@ -503,6 +564,17 @@ impl GrantsStore {
         now_ms: i64,
     ) -> Result<()> {
         self.apply_answers(scope, None, &[answer], now_ms)
+    }
+
+    /// Commit a correlated group of decisions before acknowledging a feed page that also
+    /// contains terminal card records. A failed terminal cleanup must leave that page readable.
+    pub fn apply_answer_batch(
+        &self,
+        scope: &ScopeIdentity,
+        answers: &[CardAnswer],
+        now_ms: i64,
+    ) -> Result<()> {
+        self.apply_answers(scope, None, answers, now_ms)
     }
 
     fn apply_answers(
@@ -599,38 +671,38 @@ impl GrantsStore {
         is_error: bool,
         now_ms: i64,
     ) -> Result<bool> {
-        self.write(|tx| {
+        self.terminal_write(|tx, terminal| {
             let Some(row) = read_call(tx, batch_id, now_ms)? else {
                 return Ok(false);
             };
             if row.state != HeldState::Authorized {
                 return Ok(false);
             }
-            finalize(tx, row, FinalKind::Result, body, is_error, now_ms)
+            finalize(tx, row, FinalKind::Result, body, is_error, now_ms, terminal)
         })
     }
 
     pub fn finish_unstarted(&self, batch_id: &str, body: &str, now_ms: i64) -> Result<bool> {
-        self.write(|tx| {
+        self.terminal_write(|tx, terminal| {
             let Some(row) = read_call(tx, batch_id, now_ms)? else {
                 return Ok(false);
             };
             if !matches!(row.state, HeldState::Filing | HeldState::Held) {
                 return Ok(false);
             }
-            finalize(tx, row, FinalKind::NotStarted, body, true, now_ms)
+            finalize(tx, row, FinalKind::NotStarted, body, true, now_ms, terminal)
         })
     }
 
     pub fn expire_held(&self, batch_id: &str, body: &str, now_ms: i64) -> Result<bool> {
-        self.write(|tx| {
+        self.terminal_write(|tx, terminal| {
             let Some(row) = read_call(tx, batch_id, now_ms)? else {
                 return Ok(false);
             };
             if row.state != HeldState::Held || now_ms < row.deadline_at_ms {
                 return Ok(false);
             }
-            finalize(tx, row, FinalKind::NotStarted, body, true, now_ms)
+            finalize(tx, row, FinalKind::NotStarted, body, true, now_ms, terminal)
         })
     }
 
@@ -687,8 +759,17 @@ impl GrantsStore {
     }
 
     pub fn sweep(&self, now_ms: i64) -> Result<usize> {
-        self.write(|tx| {
+        self.terminal_write(|tx, terminal| {
             tx.execute("DELETE FROM late_results WHERE expires_at_ms<=?1", [now_ms])?;
+            terminal.extend(
+                tx.prepare(
+                    "SELECT batch_id,admitted_at_ms FROM held_calls WHERE admitted_at_ms<=?1",
+                )?
+                .query_map([now_ms.saturating_sub(RETENTION_MS)], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+            );
             Ok(tx.execute(
                 "DELETE FROM held_calls WHERE admitted_at_ms<=?1",
                 [now_ms.saturating_sub(RETENTION_MS)],
@@ -740,6 +821,7 @@ fn finalize(
     body: &str,
     is_error: bool,
     now_ms: i64,
+    terminal: &mut Vec<(String, i64)>,
 ) -> Result<bool> {
     row.state = HeldState::Final;
     row.request = None;
@@ -760,5 +842,47 @@ fn finalize(
     )?;
     let seq = tx.last_insert_rowid();
     tx.execute("INSERT INTO late_cursors VALUES (?1,?2) ON CONFLICT(principal) DO UPDATE SET seq=excluded.seq", params![row.principal, seq])?;
+    terminal.push((row.batch_id, row.admitted_at_ms));
     Ok(true)
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn held_call_terminal_listeners_run_after_commit_without_holding_store_locks() {
+        let store = Arc::new(GrantsStore::open_in_memory().unwrap());
+        let weak = Arc::downgrade(&store);
+        let observed = Arc::new(AtomicUsize::new(0));
+        let count = observed.clone();
+        let listener: Arc<HeldCallTerminal> = Arc::new(move |key, admitted_at| {
+            assert_eq!((key, admitted_at), ("call", 1000));
+            assert!(weak.upgrade().unwrap().lookup(key, 1000).unwrap().is_none());
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        store.on_held_call_terminal(&listener);
+        let failed: Result<()> = store.terminal_write(|_, terminal| {
+            terminal.push(("call".into(), 1000));
+            Err(GrantsError("rollback".into()))
+        });
+        assert!(failed.is_err());
+        assert_eq!(observed.load(Ordering::SeqCst), 0);
+        store
+            .terminal_write(|_, terminal| {
+                terminal.push(("call".into(), 1000));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+        drop(listener);
+        store
+            .terminal_write(|_, terminal| {
+                terminal.push(("call".into(), 1000));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+    }
 }

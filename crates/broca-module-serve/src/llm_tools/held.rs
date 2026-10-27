@@ -13,6 +13,8 @@ type Answer = Result<Box<RawValue>, Vec<u8>>;
 pub struct HeldCalls {
     pub store: Arc<GrantsStore>,
     incarnation: String,
+    pub(super) images: Arc<super::held_images::HeldImages>,
+    _on_terminal: Arc<broca_store::grants::HeldCallTerminal>,
 }
 
 #[derive(Deserialize)]
@@ -37,7 +39,29 @@ struct AckRequest {
 
 impl HeldCalls {
     pub fn new(store: Arc<GrantsStore>, incarnation: String) -> Self {
-        Self { store, incarnation }
+        Self::with_image_limit(store, incarnation, super::held_images::HELD_IMAGE_MAX_BYTES)
+    }
+
+    pub(super) fn with_image_limit(
+        store: Arc<GrantsStore>,
+        incarnation: String,
+        limit: usize,
+    ) -> Self {
+        let images = Arc::new(super::held_images::HeldImages::new(limit));
+        let weak = Arc::downgrade(&images);
+        let on_terminal: Arc<broca_store::grants::HeldCallTerminal> =
+            Arc::new(move |key, admitted_at| {
+                if let Some(images) = weak.upgrade() {
+                    images.remove(key, admitted_at);
+                }
+            });
+        store.on_held_call_terminal(&on_terminal);
+        Self {
+            store,
+            incarnation,
+            images,
+            _on_terminal: on_terminal,
+        }
     }
 
     pub(super) fn replay(
@@ -134,6 +158,27 @@ impl HeldCalls {
                 }
             }
         })
+    }
+
+    pub(super) async fn sweep_image_entries(
+        &self,
+        consent: &super::consent::Consent,
+        now: i64,
+    ) -> Result<(), broca_store::grants::GrantsError> {
+        for (key, admitted_at, scope) in self.images.entries() {
+            let row = self.store.lookup(&key, now)?;
+            let gone = row.is_none_or(|row| {
+                row.state == HeldState::Final || row.admitted_at_ms != admitted_at
+            });
+            let ended = !gone
+                && scope.flow_id.is_none()
+                && scope.run_id.is_some()
+                && consent.image_run_live(&scope).await == super::consent::RunLiveness::Ended;
+            if gone || ended {
+                self.images.remove(&key, admitted_at);
+            }
+        }
+        Ok(())
     }
 
     pub fn read(
