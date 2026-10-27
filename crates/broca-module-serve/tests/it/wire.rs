@@ -128,6 +128,7 @@ fn chatgpt_test_options<'a>(account_id: Option<&'a str>) -> ResolveOptions<'a> {
         media: false,
         media_profile: None,
         claude_code_persona: None,
+        anthropic_server_side_fallback: false,
         auth_method: Some(broca_catalog::live::AuthMethod::Chatgpt),
         family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
         project_id: None,

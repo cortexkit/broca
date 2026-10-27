@@ -144,6 +144,108 @@ impl StateFormatConfig {
     }
 }
 
+/// The `anthropic_fallbacks` key of `broca.jsonc`: the operator switches for the two layers of
+/// content-filter fallback on Anthropic OAuth runs. Both are off unless an operator turns them
+/// on, so a build carrying the code sends the requests it always did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AnthropicFallbackSwitches {
+    /// `anthropic_fallbacks.server_side`: ask Anthropic to hand a content-filter refusal to
+    /// another model itself (`fallbacks: "default"` on an OAuth request for a model whose
+    /// catalog row supports it).
+    pub server_side: bool,
+}
+
+impl AnthropicFallbackSwitches {
+    pub fn load_default() -> Result<Self, String> {
+        use crate::config_home::ConfigHome;
+        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
+        {
+            ConfigHome::Resolved { path, .. } => Self::load(&path),
+            ConfigHome::Unresolvable => Ok(Self::default()),
+        }
+    }
+
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Self::parse(&text).map_err(|error| format!("{}: {error}", path.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(format!(
+                "read anthropic_fallbacks from {}: {error}",
+                path.display()
+            )),
+        }
+    }
+
+    /// Parse the switches out of a whole `broca.jsonc`. The key is strict about its shape: an
+    /// unknown member or a non-boolean value refuses boot rather than being read as off, because
+    /// an operator who wrote the key meant to change behaviour and a silent "off" would hide the
+    /// typo until a refusal surprised them in production.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Switches {
+            #[serde(default)]
+            server_side: bool,
+        }
+        #[derive(serde::Deserialize)]
+        struct File {
+            #[serde(default)]
+            anthropic_fallbacks: Option<Switches>,
+        }
+        let text = crate::cache_routing::strip_trailing_commas(
+            &crate::cache_routing::strip_jsonc_comments(text),
+        );
+        let file: File = serde_json::from_str(&text)
+            .map_err(|error| format!("parse anthropic_fallbacks: {error}"))?;
+        Ok(match file.anthropic_fallbacks {
+            None => Self::default(),
+            Some(switches) => Self {
+                server_side: switches.server_side,
+            },
+        })
+    }
+}
+
+#[cfg(test)]
+mod anthropic_fallback_switch_tests {
+    use super::AnthropicFallbackSwitches;
+
+    #[test]
+    fn absent_key_leaves_both_layers_off() {
+        for text in ["{}", "{ \"cache\": {} }", "// only a comment\n{}"] {
+            assert_eq!(
+                AnthropicFallbackSwitches::parse(text).unwrap(),
+                AnthropicFallbackSwitches::default(),
+                "{text}"
+            );
+        }
+        assert!(!AnthropicFallbackSwitches::default().server_side);
+    }
+
+    #[test]
+    fn the_server_side_switch_opts_in() {
+        let switches = AnthropicFallbackSwitches::parse(
+            "{\n  // staging\n  \"anthropic_fallbacks\": { \"server_side\": true },\n}",
+        )
+        .unwrap();
+        assert!(switches.server_side);
+    }
+
+    #[test]
+    fn a_misspelt_or_wrongly_typed_switch_refuses() {
+        for text in [
+            "{\"anthropic_fallbacks\": {\"server_sides\": true}}",
+            "{\"anthropic_fallbacks\": {\"server_side\": \"true\"}}",
+            "{\"anthropic_fallbacks\": true}",
+        ] {
+            assert!(
+                AnthropicFallbackSwitches::parse(text).is_err(),
+                "{text} must not be read as a switch"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod state_format_config_tests {
     use super::StateFormatConfig;

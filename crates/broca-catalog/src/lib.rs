@@ -28,6 +28,8 @@ pub mod merge;
 pub mod routing;
 pub mod runtime;
 
+#[cfg(test)]
+pub(crate) use runtime::test_catalog_lock;
 pub use runtime::{
     catalog, global_catalog_cache, install_global_catalog_cache, CatalogCache, CatalogHealth,
     CatalogRefreshError, CatalogSnapshot, CatalogSource, CatalogUnavailable,
@@ -792,9 +794,10 @@ fn map_model(model_id: &str, entry: &Value, raw_policy: RawPolicy) -> ModelSpec 
             .get("reasoning_options")
             .and_then(ReasoningOptions::from_value)
             .unwrap_or_default(),
-        // The vendored models.dev snapshot states no server-side fallback; the fact is served by
-        // fusiform alone.
-        server_side_fallback: None,
+        // The snapshot spelling of fusiform's `capability.server_side_fallback`. The vendored
+        // copy states none, but a test catalog can, so both read paths agree. A value that is
+        // not a boolean reads as unstated, like the fusiform reader's.
+        server_side_fallback: entry.get("server_side_fallback").and_then(Value::as_bool),
         release_date: entry
             .get("release_date")
             .and_then(Value::as_str)

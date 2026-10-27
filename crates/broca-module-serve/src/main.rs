@@ -442,6 +442,11 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let cache_table =
         broca_module_serve::CacheTtlTable::load_default_path().map_err(ServeIoError)?;
     executor_impl = executor_impl.with_cache_table(cache_table);
+    // The operator switches for content-filter fallback. A malformed section refuses boot by
+    // name, like the sections above; both layers stay off without one.
+    let anthropic_fallbacks = broca_module_serve::config::AnthropicFallbackSwitches::load_default()
+        .map_err(ServeIoError)?;
+    executor_impl = executor_impl.with_anthropic_fallbacks(anthropic_fallbacks);
     let charge_basis_table = Arc::new(ChargeBasisTable::load_default_path().map_err(ServeIoError)?);
     if let Some(notice) = charge_basis_table.ignored_version_notice() {
         tracing::warn!(target: "billing", "{notice}");
@@ -2761,6 +2766,9 @@ mod executor {
         /// `broca_module_serve::claude_code_identity`). `None` admits Anthropic OAuth episodes
         /// without a persona, in the shape they had before it existed.
         claude_code_install_id: Option<String>,
+        /// The operator switches for content-filter fallback on Anthropic OAuth runs. Both are
+        /// off unless configured, so a build carrying the code sends today's requests.
+        anthropic_fallbacks: broca_module_serve::config::AnthropicFallbackSwitches,
         /// Each session's pinned `cc_version` suffix once computed in this process (`None` when
         /// its WAL could not be read), so the WAL is read for it at most once per session.
         cc_suffix_memo: Arc<std::sync::Mutex<std::collections::HashMap<String, Option<String>>>>,
@@ -2816,6 +2824,7 @@ mod executor {
                 cache_table: CacheTtlTable::shipped_defaults(),
                 routing: None,
                 claude_code_install_id: None,
+                anthropic_fallbacks: Default::default(),
                 cc_suffix_memo: Default::default(),
                 cc_suffix_wal_bytes: Default::default(),
                 cc_prompt_memo: Default::default(),
@@ -2951,6 +2960,15 @@ mod executor {
         /// Install the id the Claude Code persona's device id derives from.
         pub fn with_claude_code_install_id(mut self, install_id: Option<String>) -> Self {
             self.claude_code_install_id = install_id;
+            self
+        }
+
+        /// Install the operator switches for Anthropic content-filter fallback.
+        pub fn with_anthropic_fallbacks(
+            mut self,
+            switches: broca_module_serve::config::AnthropicFallbackSwitches,
+        ) -> Self {
+            self.anthropic_fallbacks = switches;
             self
         }
 
@@ -4016,6 +4034,8 @@ mod executor {
                     .as_ref()
                     .map(|refresh| refresh.refresher.clone()),
                 structured_output: job.req.structured_output.as_ref().filter(|_| fresh_episode),
+                // Off unless an operator turned it on; a resume keeps its recorded value.
+                anthropic_server_side_fallback: self.anthropic_fallbacks.server_side,
             };
             let chatgpt_wire = broca_module_serve::chatgpt_identity::for_episode(
                 family_override.filter(|_| fresh_episode),
@@ -4864,6 +4884,7 @@ mod executor {
                     media: false,
                     media_profile: None,
                     claude_code_persona: None,
+                    anthropic_server_side_fallback: false,
                     auth_method: method,
                     family_override,
                     project_id: None,
@@ -4892,6 +4913,7 @@ mod executor {
                 media: false,
                 media_profile: None,
                 claude_code_persona: None,
+                anthropic_server_side_fallback: false,
                 auth_method: Some(AuthMethod::Chatgpt),
                 family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
                 project_id: None,

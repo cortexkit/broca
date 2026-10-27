@@ -145,6 +145,11 @@ pub struct ResolveOptions<'a> {
     /// without a persona, the shape OAuth runs had before it existed. A resume passes the
     /// recorded persona through `EpisodeRenderConfig` instead.
     pub claude_code_persona: Option<&'a ClaudeCodePersona>,
+    /// The operator switch for Layer 1, Anthropic's server-side fallback: when true, an OAuth
+    /// episode whose catalog row states `capability.server_side_fallback` asks the runtime to
+    /// hand a content-filter refusal to another model itself. Default false: no request changes
+    /// until an operator turns it on, and a resume keeps whatever its bundle recorded.
+    pub anthropic_server_side_fallback: bool,
 }
 
 /// The Claude Code persona an episode renders with, as the code starting it knows it.
@@ -461,7 +466,7 @@ pub fn resolve_chatgpt_pause_episode_with_client(
 pub fn provider_for_recorded_config(
     provider_id: &str,
     model_id: &str,
-    frozen: FrozenRenderConfig,
+    mut frozen: FrozenRenderConfig,
     auth: &AuthMode,
     auth_method: Option<AuthMethod>,
     frozen_account_ref: Option<&str>,
@@ -482,6 +487,10 @@ pub fn provider_for_recorded_config(
         clock: Some(clock),
         ..Default::default()
     };
+    // A recorded config is restored as it was, minus the one render choice whose scope is the
+    // auth method: a non-OAuth run renders no `fallbacks`, exactly as it did when it was
+    // admitted, even if its recorded config carries the flag.
+    apply_server_side_fallback_auth_scope(provider_id, auth_method, &mut frozen);
     let resolved_auth = resolve_family_auth(auth, &frozen, &auth_kind, provider_id, &opts)?;
     live_provider_with_clock_and_refresher(
         Some(http_client),
@@ -595,6 +604,23 @@ pub struct EpisodeRenderConfig<'a> {
     /// absence is kept, so an OAuth episode admitted before the persona existed resumes with
     /// its old bytes rather than being re-admitted into the new shape.
     pub claude_code_persona: EpisodePersona<'a>,
+    /// The server-side fallback opt-in: `Fresh` for a new episode, which decides it from the
+    /// catalog row and the operator switch; `Recorded` for a resume, which keeps exactly what
+    /// its frozen config recorded even if the fact or the switch changed since.
+    pub server_side_fallback: EpisodeFallback,
+}
+
+/// The server-side fallback opt-in an episode renders with, as the code starting it knows it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EpisodeFallback {
+    /// A new episode: it asks the runtime for server-side fallback when its catalog row states
+    /// the capability and the operator switch is on.
+    #[default]
+    Fresh,
+    /// A resumed episode: exactly what its frozen render config recorded. `true` keeps a run
+    /// that opted in opted in even if the fact or the switch has since changed, and `false`
+    /// keeps one that did not opted out.
+    Recorded(bool),
 }
 
 /// The output cap used when a send sets none and the catalog cannot supply a usable one.
@@ -704,6 +730,12 @@ impl EpisodeRenderConfig<'_> {
         if let Some(recorded) = self.provider_text_state {
             config.provider_text_state = recorded;
         }
+        // The server-side fallback opt-in is NOT applied here. When the caller supplied a
+        // recorded bundle, `config` already holds the recorded flag, and re-applying it would
+        // turn a switched-off admission into an opted-in one. It is decided by
+        // `apply_server_side_fallback` and scoped to the credential method by
+        // `apply_server_side_fallback_auth_scope`, both of which know the provider and the
+        // method.
         config
     }
 }
@@ -779,6 +811,11 @@ fn resolve_provider_inner(
         // The provider represents today's code. Core must ask the family's independent
         // compatibility table before comparing a blob restamped to the recorded version.
         frozen.renderer_version = renderer_version_for(family);
+        // The resumed episode's auth method decides the same method-scoped render choices a
+        // fresh admission applies, so an api-key episode that recorded the opt-in still sends no
+        // `fallbacks`.
+        apply_auth_method_quirks(provider_id, opts.auth_method, &mut frozen);
+        apply_server_side_fallback_auth_scope(provider_id, opts.auth_method, &mut frozen);
         let auth_kind =
             provider_route_auth_kind(provider_id, family, &crate::default_auth_kind(family));
         let (handle, auth_desc, auth_method, refresher) =
@@ -944,6 +981,7 @@ fn resolve_provider_inner(
         provider_text_state: episode_render.provider_text_state,
         structured_output: episode_render.structured_output,
         claude_code_persona: episode_render.claude_code_persona,
+        server_side_fallback: episode_render.server_side_fallback,
     };
     if catalog.is_withdrawn(provider_id, model_id) {
         let advice = catalog
@@ -1236,6 +1274,14 @@ fn resolve_provider_inner(
         episode_render.claude_code_persona,
         opts.claude_code_persona,
     );
+    apply_server_side_fallback(
+        &mut frozen,
+        provider_id,
+        auth_method,
+        episode_render.server_side_fallback,
+        opts.anthropic_server_side_fallback,
+        catalog.server_side_fallback(provider_id, model_id),
+    );
     if provider_id == "opencode-go" && family == WireFamilyId::OpenAiChat {
         // Pi serves these Qwen ids through Chat Completions despite their Anthropic models.dev
         // metadata and uses the Qwen thinking switch; the frozen flag preserves resumed bytes.
@@ -1312,6 +1358,62 @@ fn apply_claude_code_persona(
         _ if !identity_lead => None,
         EpisodePersona::Fresh => fresh.cloned(),
         EpisodePersona::Recorded(recorded) => recorded.cloned(),
+    };
+}
+
+/// Whether a config is the shape Anthropic's server-side fallback belongs to: the Claude
+/// subscription (OAuth) identity-lead request to the `anthropic` provider. The capability is a
+/// property of that route, and the catalog states the fact per provider/model row, which both
+/// auth methods share, so the auth method has to gate it as well.
+fn is_anthropic_oauth_shape(
+    provider_id: &str,
+    auth_method: Option<AuthMethod>,
+    frozen: &FrozenRenderConfig,
+) -> bool {
+    provider_id == "anthropic"
+        && auth_method == Some(AuthMethod::Oauth)
+        && frozen.family_id == WireFamilyId::AnthropicMessages
+        && matches!(
+            frozen.system_prompt,
+            SystemPromptPolicy::RequiredIdentityLead { .. }
+        )
+}
+
+/// Clears a recorded opt-in on a config that is not the shape the capability belongs to. A
+/// resume never re-decides the flag, so a config restored as recorded would otherwise render
+/// `fallbacks` for a credential method that cannot use it: the catalog states the fact on a row
+/// both auth methods share, so the method has to gate the render as well as the decision.
+fn apply_server_side_fallback_auth_scope(
+    provider_id: &str,
+    auth_method: Option<AuthMethod>,
+    frozen: &mut FrozenRenderConfig,
+) {
+    if !is_anthropic_oauth_shape(provider_id, auth_method, frozen) {
+        frozen.server_side_fallback = false;
+    }
+}
+
+/// Freeze the episode's server-side fallback opt-in into its render config.
+///
+/// The opt-in asks Anthropic to hand a content-filter refusal to another model itself, which
+/// only the Claude subscription (OAuth) route implements, so it needs the OAuth identity-lead
+/// shape on the `anthropic` provider as well as the model's own catalog fact. It is decided once
+/// here; a resume restores what it recorded, so a fact or switch that changed since admission
+/// cannot move an in-flight run's bytes.
+fn apply_server_side_fallback(
+    frozen: &mut FrozenRenderConfig,
+    provider_id: &str,
+    auth_method: Option<AuthMethod>,
+    episode: EpisodeFallback,
+    switch_on: bool,
+    fact: Option<bool>,
+) {
+    let eligible = is_anthropic_oauth_shape(provider_id, auth_method, frozen)
+        && fact == Some(true)
+        && switch_on;
+    frozen.server_side_fallback = match episode {
+        EpisodeFallback::Fresh => eligible,
+        EpisodeFallback::Recorded(recorded) => recorded,
     };
 }
 
@@ -1669,6 +1771,8 @@ fn apply_auth_method_quirks(
     method: Option<AuthMethod>,
     frozen: &mut FrozenRenderConfig,
 ) {
+    // The same quirks apply to a plain `anthropic` api-key request and to OpenCode Go's
+    // Anthropic wire shape, which its SDK reaches with an api-key header.
     if (provider == "anthropic" && method == Some(AuthMethod::ApiKey))
         || (provider == "opencode-go" && frozen.family_id == WireFamilyId::AnthropicMessages)
     {
@@ -2159,6 +2263,175 @@ mod tests {
         let frozen = serde_json::from_value(resolved.provider.render_config_blob())
             .expect("resolved provider exposes its frozen config");
         (resolved, frozen)
+    }
+
+    /// Install a test catalog whose `anthropic` rows differ only in
+    /// `capability.server_side_fallback`. The vendored snapshot states no such fact, so a test
+    /// for the opt-in has to publish one; `None` leaves the row without the fact.
+    ///
+    /// The cache and the gate are shared with other tests in this process, so this must be the
+    /// only catalog an opt-in test loads (see `with_test_catalog`).
+    fn catalog_stating_server_side_fallback(models: &[(&str, Option<bool>)]) -> crate::Catalog {
+        let mut document: serde_json::Value =
+            serde_json::from_str(include_str!("../data/models.dev.json"))
+                .expect("bundled snapshot is JSON");
+        for (model, fact) in models {
+            let row = document["anthropic"]["models"]
+                .get_mut(*model)
+                .unwrap_or_else(|| panic!("the snapshot lists anthropic/{model}"));
+            match fact {
+                Some(value) => row["server_side_fallback"] = serde_json::json!(value),
+                None => {
+                    row.as_object_mut().unwrap().remove("server_side_fallback");
+                }
+            }
+        }
+        crate::Catalog::from_json_str(&document.to_string(), "{}")
+            .expect("the snapshot is well formed")
+    }
+
+    /// Run `body` with `catalog` installed. The catalog cache and the gate lock are shared with
+    /// every test in this process, so the gate is what keeps this test's catalog from replacing
+    /// another test's while it resolves.
+    fn with_test_catalog<R>(catalog: &crate::Catalog, body: impl FnOnce() -> R) -> R {
+        let gate = crate::test_catalog_lock();
+        let _held = gate.lock().unwrap_or_else(|poison| poison.into_inner());
+        let cache = std::sync::Arc::new(crate::CatalogCache::empty());
+        cache.install_parsed_for_test(catalog, 0, crate::CatalogSource::Fusiform);
+        crate::install_global_catalog_cache(cache);
+        body()
+    }
+
+    /// Resolve one Anthropic episode of `model` and return its frozen config and step-one body.
+    /// A caller that passes a recorded config gets the resume path's behaviour, and one that
+    /// passes none gets a new admission's.
+    fn resolve_anthropic_episode(
+        model: &str,
+        method: AuthMethod,
+        switch_on: bool,
+        render: EpisodeRenderConfig<'_>,
+    ) -> (FrozenRenderConfig, serde_json::Value) {
+        let resolved = resolve_catalog_episode_with_client(
+            model,
+            Some(2048),
+            &AuthMode::Secret("test-secret".to_string()),
+            &ResolveOptions {
+                auth_method: Some(method),
+                anthropic_server_side_fallback: switch_on,
+                ..ResolveOptions::default()
+            },
+            broca_provider::build_provider_http_client(),
+            render,
+        )
+        .unwrap_or_else(|error| panic!("resolve {model} as {method:?}: {error}"));
+        let frozen: FrozenRenderConfig =
+            serde_json::from_value(resolved.provider.render_config_blob())
+                .expect("resolved provider exposes its frozen config");
+        let body = serde_json::from_slice(&resolved.provider.render_request(&anthropic_options()))
+            .expect("step-one body is JSON");
+        (frozen, body)
+    }
+
+    /// The opt-in is set for exactly one shape: an OAuth (identity-lead) run of an `anthropic`
+    /// model whose catalog row states the capability, with the operator switch on. Every other
+    /// combination leaves it unset and the request bytes unchanged — the default-off switch is
+    /// what keeps a build carrying this code from sending a new field.
+    #[test]
+    fn server_side_fallback_is_frozen_only_for_capable_oauth_episodes() {
+        use EpisodeFallback::Fresh;
+        let catalog = catalog_stating_server_side_fallback(&[
+            ("claude-fable-5-1", Some(true)),
+            ("claude-haiku-4-5", Some(false)),
+            ("claude-sonnet-4-5", None),
+        ]);
+        with_test_catalog(&catalog, || {
+            let fresh = || EpisodeRenderConfig {
+                server_side_fallback: Fresh,
+                ..EpisodeRenderConfig::default()
+            };
+            let (frozen, body) = resolve_anthropic_episode(
+                "anthropic/claude-fable-5-1",
+                AuthMethod::Oauth,
+                true,
+                fresh(),
+            );
+            assert!(frozen.server_side_fallback);
+            assert_eq!(body["fallbacks"], "default");
+
+            // The control: the same episode with the switch off renders exactly the bytes it
+            // did before the field existed, and records no flag.
+            let (off, off_body) = resolve_anthropic_episode(
+                "anthropic/claude-fable-5-1",
+                AuthMethod::Oauth,
+                false,
+                fresh(),
+            );
+            assert!(!off.server_side_fallback);
+            assert!(serde_json::to_value(&off)
+                .unwrap()
+                .get("server_side_fallback")
+                .is_none());
+            assert!(off_body.get("fallbacks").is_none());
+            // The bytes are the switch's own: `fallbacks` is the only member that differs.
+            let mut expected = body.clone();
+            expected.as_object_mut().unwrap().remove("fallbacks");
+            assert_eq!(off_body, expected);
+
+            // A model the catalog says cannot, and one it says nothing about, both stay off.
+            for model in ["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-4-5"] {
+                let (frozen, body) =
+                    resolve_anthropic_episode(model, AuthMethod::Oauth, true, fresh());
+                assert!(!frozen.server_side_fallback, "{model}");
+                assert!(body.get("fallbacks").is_none(), "{model}");
+            }
+
+            // An api-key episode never opts in, even when it resumes an OAuth episode's recorded
+            // config: the fact the episode was admitted on belongs to a row both auth methods
+            // share, and the subscription route is the one that implements the handoff.
+            let (api_key_recorded, api_key_recorded_body) = resolve_anthropic_episode(
+                "anthropic/claude-fable-5-1",
+                AuthMethod::ApiKey,
+                true,
+                EpisodeRenderConfig {
+                    recorded_config: Some(&frozen),
+                    ..EpisodeRenderConfig::default()
+                },
+            );
+            assert!(
+                !api_key_recorded_body
+                    .as_object()
+                    .unwrap()
+                    .contains_key("fallbacks"),
+                "an api-key episode must send no fallbacks whatever it recorded: {api_key_recorded_body}"
+            );
+            assert!(!api_key_recorded.server_side_fallback);
+
+            // A resume keeps exactly what its episode recorded, whatever the fact and the
+            // switch say now: a recorded opt-in stays on with the switch off, and a recorded
+            // absence stays off with it on.
+            let (kept_on, kept_on_body) = resolve_anthropic_episode(
+                "anthropic/claude-fable-5-1",
+                AuthMethod::Oauth,
+                false,
+                EpisodeRenderConfig {
+                    recorded_config: Some(&frozen),
+                    ..EpisodeRenderConfig::default()
+                },
+            );
+            assert!(kept_on.server_side_fallback);
+            assert_eq!(kept_on_body["fallbacks"], "default");
+            let (kept_off, kept_off_body) = resolve_anthropic_episode(
+                "anthropic/claude-fable-5-1",
+                AuthMethod::Oauth,
+                true,
+                EpisodeRenderConfig {
+                    recorded_config: Some(&off),
+                    ..EpisodeRenderConfig::default()
+                },
+            );
+            assert!(!kept_off.server_side_fallback);
+            assert!(kept_off_body.get("fallbacks").is_none());
+        });
     }
 
     fn anthropic_endpoint(
