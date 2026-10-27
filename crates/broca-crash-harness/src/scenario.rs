@@ -382,11 +382,11 @@ mod lease_tests {
     use std::io::{self, Read, Seek, SeekFrom, Write};
     use std::process::{Child, Command, Stdio};
     use std::sync::atomic::AtomicBool;
-    use std::time::{Duration, Instant};
 
     use broca_core::lease::WalLeaseDomain;
     use broca_core::{FileWalStore, LeaseError, WalHandle};
     use broca_protocol::BindIdentity;
+    use broca_test_support::wait_until_sync;
     use broca_wal::fs_ops::{with_fs_ops, FileOps, FsOps, OpenOptions, ReadDir, RealFs};
     use broca_wal::{FramedRecord, Wal, WalError, WalLineageId, WalRecord};
 
@@ -458,9 +458,14 @@ mod lease_tests {
                 if target == phase {
                     fs::write(marker, phase).unwrap();
                     if matches!(phase, "released" | "takeover-live") {
-                        while !marker.with_extension("resume").exists() {
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
+                        let resume = marker.with_extension("resume");
+                        wait_until_sync(&format!("lease {phase} resume marker"), || {
+                            if resume.exists() {
+                                Ok(())
+                            } else {
+                                Err(format!("missing resume marker {}", resume.display()))
+                            }
+                        });
                         return;
                     }
                     loop {
@@ -677,20 +682,25 @@ mod lease_tests {
         }
 
         fn at(&mut self, marker: &Path) {
-            let deadline = Instant::now() + Duration::from_secs(20);
-            while !marker.exists() {
-                assert!(
-                    self.0.try_wait().unwrap().is_none(),
-                    "child exited before {}",
-                    marker.display()
-                );
-                assert!(
-                    Instant::now() < deadline,
-                    "child never reached {}",
-                    marker.display()
-                );
-                std::thread::sleep(Duration::from_millis(5));
-            }
+            let child = self.0.id();
+            wait_until_sync(
+                &format!("lease child {child} marker {}", marker.display()),
+                || match self
+                    .0
+                    .try_wait()
+                    .map_err(|error| format!("cannot observe lease child {child}: {error}"))?
+                {
+                    Some(status) => Err(format!(
+                        "lease child {child} exited with {status} before marker {}",
+                        marker.display()
+                    )),
+                    None if marker.exists() => Ok(()),
+                    None => Err(format!(
+                        "lease child {child} is still running; missing marker {}",
+                        marker.display()
+                    )),
+                },
+            );
         }
 
         fn kill(&mut self) {
@@ -699,15 +709,14 @@ mod lease_tests {
             assert_eq!(self.0.wait().unwrap().signal(), Some(9));
         }
 
-        fn success(&mut self, timeout: Duration) {
-            let deadline = Instant::now() + timeout;
-            let status = loop {
-                if let Some(status) = self.0.try_wait().unwrap() {
-                    break status;
-                }
-                assert!(Instant::now() < deadline, "lease subprocess did not finish");
-                std::thread::sleep(Duration::from_millis(5));
-            };
+        fn success(&mut self, description: &str) {
+            let child = self.0.id();
+            let status = wait_until_sync(description, || {
+                self.0
+                    .try_wait()
+                    .map_err(|error| format!("cannot observe lease child {child}: {error}"))?
+                    .ok_or_else(|| format!("lease child {child} is still running"))
+            });
             let mut output = String::new();
             if let Some(mut stdout) = self.0.stdout.take() {
                 stdout.read_to_string(&mut output).unwrap();
@@ -734,7 +743,11 @@ mod lease_tests {
                 .spawn()
                 .unwrap(),
         );
-        process.success(Duration::from_secs(if held { 20 } else { 60 }));
+        process.success(if held {
+            "lease contender reports Held"
+        } else {
+            "lease successor acquires, appends and closes"
+        });
     }
 
     #[test]
@@ -867,7 +880,7 @@ mod lease_tests {
         successor.at(&root.0.join("successor-paused"));
         let before = fs::read(store.wal_path(&session)).unwrap();
         fs::write(root.0.join("paused.resume"), b"resume").unwrap();
-        old.success(Duration::from_secs(20));
+        old.success("released lease predecessor exits after resuming");
         assert_eq!(
             fs::read(store.wal_path(&session)).unwrap(),
             before,
@@ -875,7 +888,7 @@ mod lease_tests {
         );
         probe(&root.0, true);
         fs::write(root.0.join("successor-paused.resume"), b"resume").unwrap();
-        successor.success(Duration::from_secs(20));
+        successor.success("lease successor closes after resuming");
         assert_eq!(fs::read(store.wal_path(&session)).unwrap(), before);
     }
 
