@@ -1700,6 +1700,140 @@ async fn a_warm_whose_rebuilt_request_differs_is_refused_and_sends_nothing() {
     assert!(warm_records(&fixture.records()).is_empty());
 }
 
+const REFUSING_SOURCE: &str = "claude-opus-5-5";
+const REFUSAL_FALLBACK: &str = "claude-opus-4-8";
+
+/// A warmable config for [`REFUSING_SOURCE`] that froze [`REFUSAL_FALLBACK`] as its refusal
+/// fallback, and that fallback's own config. The fallback's output cap differs from the
+/// source's, so the two models' requests differ in more than the model name.
+fn source_with_refusal_fallback(url: &str) -> (FrozenRenderConfig, FrozenRenderConfig) {
+    let mut fallback = warmable(url);
+    fallback.wire_model_id = REFUSAL_FALLBACK.into();
+    fallback.max_output_tokens = 1_000;
+    let mut source = warmable(url);
+    source.wire_model_id = REFUSING_SOURCE.into();
+    source.max_output_tokens = 2_000;
+    source.refusal_fallback = Some(Box::new(broca_provider::wire::RefusalFallbackConfig {
+        model: broca_protocol::request::ModelHandle::new("anthropic", REFUSAL_FALLBACK),
+        context_limit: Some(200_000),
+        frozen: fallback.clone(),
+    }));
+    (source, fallback)
+}
+
+/// The WAL's rebuilt request for one step, with `digest` as the digest its step recorded.
+fn recorded_request(
+    opts: broca_protocol::CallOptions,
+    digest: String,
+    route: Option<broca_wal::StepRoute>,
+) -> broca_core::RecordedRequest {
+    broca_core::RecordedRequest {
+        run_id: RunId("r1".into()),
+        step_id: StepId(1),
+        config: min_config(),
+        opts,
+        request_body_sha256: digest,
+        route,
+    }
+}
+
+fn hello_options() -> broca_protocol::CallOptions {
+    broca_protocol::CallOptions::new(vec![Message::new(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "hello".into(),
+        }],
+    )])
+}
+
+/// A recorded step the refusal-fallback model answered is warmed as that model's request: the
+/// warm provider, built from the source episode's config, renders the fallback's bytes, they
+/// match the digest the step recorded, and the warm goes to the fallback model. The expected
+/// bytes come from the Anthropic renderer applied to the fallback's own config, not from the
+/// provider under test.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_warm_of_a_recorded_fallback_step_renders_and_sends_the_fallback_request() {
+    use broca_provider::wire::WireFamily;
+    let server = Server::start(vec![Reply::WarmOrText]).await;
+    let (source, fallback) = source_with_refusal_fallback(&server.url);
+    let opts = hello_options();
+    let fallback_base = AnthropicMessages.render(&fallback, &opts);
+    let source_base = AnthropicMessages.render(&source, &opts);
+    assert_ne!(
+        sha256_hex(&fallback_base),
+        sha256_hex(&source_base),
+        "the two routes render different bytes, so the digest check tells them apart"
+    );
+    let recorded = recorded_request(
+        opts,
+        sha256_hex(&fallback_base),
+        Some(broca_wal::StepRoute {
+            model: broca_protocol::request::ModelHandle::new("anthropic", REFUSAL_FALLBACK),
+            reason: broca_wal::StepRouteReason::Refusal,
+        }),
+    );
+    // A fresh provider starts on the source route, as an executor's warm provider does.
+    let provider = provider_for(source);
+
+    let sent = crate::executor::send_warm(
+        &provider,
+        crate::executor::WarmBase::Recorded(Box::new(recorded)),
+    )
+    .await
+    .expect("the fallback step's rebuilt request matches its recorded digest");
+
+    let bodies = server.bodies();
+    assert_eq!(bodies.len(), 1, "exactly one warm was sent");
+    assert_eq!(bodies[0], expected_warm_body(&fallback_base));
+    let body: serde_json::Value = serde_json::from_slice(&bodies[0]).unwrap();
+    assert_eq!(body["model"], REFUSAL_FALLBACK);
+    assert_eq!(sent.warm_body_sha256, sha256_hex(&bodies[0]));
+}
+
+/// A recorded step the episode's own model answered is warmed exactly as before the fallback
+/// existed: the source's bytes, sent to the source model. That holds for a fresh provider and
+/// for one an earlier fallback step or warm left on the fallback route.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_warm_of_a_recorded_source_step_is_unchanged_by_the_refusal_fallback() {
+    use broca_provider::wire::WireFamily;
+    for left_on_fallback in [false, true] {
+        let server = Server::start(vec![Reply::WarmOrText]).await;
+        let (source, _) = source_with_refusal_fallback(&server.url);
+        let opts = hello_options();
+        let source_base = AnthropicMessages.render(&source, &opts);
+        let recorded = recorded_request(opts, sha256_hex(&source_base), None);
+        let provider = provider_for(source);
+        if left_on_fallback {
+            broca_core::Provider::set_step_route(
+                &provider,
+                broca_core::refusal_fallback::StepRoute::Fallback,
+            );
+        }
+
+        crate::executor::send_warm(
+            &provider,
+            crate::executor::WarmBase::Recorded(Box::new(recorded)),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("left_on_fallback={left_on_fallback}: the source warm failed: {error:?}")
+        });
+
+        let bodies = server.bodies();
+        assert_eq!(bodies.len(), 1, "left_on_fallback={left_on_fallback}");
+        assert_eq!(
+            bodies[0],
+            expected_warm_body(&source_base),
+            "left_on_fallback={left_on_fallback}"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&bodies[0]).unwrap();
+        assert_eq!(
+            body["model"], REFUSING_SOURCE,
+            "left_on_fallback={left_on_fallback}"
+        );
+    }
+}
+
 /// A warm the provider refuses is reported with the provider's error and recorded nowhere.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_warm_the_provider_refuses_is_reported_and_not_recorded() {
