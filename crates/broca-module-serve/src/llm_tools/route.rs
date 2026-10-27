@@ -134,6 +134,9 @@ impl LlmTools {
     }
 
     fn watch_consent(self: &Arc<Self>, key: String) {
+        if self.consent_stop.is_cancelled() {
+            return;
+        }
         if !self
             .consent_workers
             .lock()
@@ -150,6 +153,9 @@ impl LlmTools {
                 };
                 loop {
                     let now = service.system.tool_now();
+                    if let Err(error) = service.held.sweep_image_entries(consent, now).await {
+                        tracing::warn!(%error, "held-call image cleanup will be retried");
+                    }
                     if let Err(error) = consent.resume_granted(now).await {
                         tracing::warn!(%error, "held-call grant reconciliation failed");
                     }
@@ -189,6 +195,10 @@ impl LlmTools {
                     } else {
                         match consent.wait_once(&key, now).await {
                             Ok(false) => {
+                                let _ = service
+                                    .held
+                                    .sweep_image_entries(consent, service.system.tool_now())
+                                    .await;
                                 if let Err(error) =
                                     consent.resume_granted(service.system.tool_now()).await
                                 {
@@ -468,11 +478,38 @@ impl LlmTools {
         if let Some(receiver) = running {
             return await_flight(receiver).await;
         }
-        let images = self
-            .system
-            .prepare_images(&admission.params, scope, stored.as_ref())
-            .await
-            .map_err(error)?;
+        let kept = match held.as_ref() {
+            Some(row) => self
+                .held
+                .images
+                .get(row, scope, &admission)
+                .map_err(error)?,
+            None => None,
+        };
+        let image_scope = match &kept {
+            Some(kept) => SendScope::Stamped(kept.stamp.clone()),
+            // Restarted holds have no attested parent metadata in memory. Never guess it
+            // from the durable row or substitute the stamp on a later retry.
+            None if held.is_some() => SendScope::Internal,
+            None => scope.clone(),
+        };
+        let images = match kept.and_then(|kept| kept.images) {
+            Some(images) => images,
+            None => match self
+                .system
+                .prepare_images(&admission.params, &image_scope, stored.as_ref())
+                .await
+            {
+                Ok(images) => Arc::new(images),
+                Err(refusal) => {
+                    let answer = Err(error(refusal));
+                    if held.is_some() {
+                        self.persist_held_answer(&admission.batch_id, &answer)?;
+                    }
+                    return answer;
+                }
+            },
+        };
         let pricing = if let Some(row) = &held {
             serde_json::from_value(json!({"frozen_row":row.frozen_row})).map_err(|_| {
                 error(crate::system_one::internal_refusal(
@@ -547,7 +584,7 @@ impl LlmTools {
                     .map_err(consent_error)?;
                     let frozen = serde_json::to_value(&pricing).map_err(consent_error)?;
                     let row = consent
-                        .file(
+                        .file_with_admission(
                             HoldRequest {
                                 batch_id: admission.batch_id.clone(),
                                 scope: identity,
@@ -565,6 +602,15 @@ impl LlmTools {
                             },
                             body,
                             now,
+                            |row| {
+                                self.held.images.retain(
+                                    self.held.store.clone(),
+                                    row,
+                                    bind,
+                                    images.clone(),
+                                    now,
+                                )
+                            },
                         )
                         .await
                         .map_err(consent_error)?;

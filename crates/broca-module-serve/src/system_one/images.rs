@@ -15,6 +15,7 @@ use cortexkit_role_classifier::{
     },
 };
 use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 use super::SystemOne;
 
@@ -44,6 +45,22 @@ impl ImageResolver for broca_subc::PrivateContentClient {
 /// Provider-only replacements. The original request and its identity retain handles.
 #[derive(Default)]
 pub(crate) struct PreparedImages(pub Vec<Option<String>>);
+
+impl PreparedImages {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.0.iter().flatten().fold(0usize, |total, image| {
+            total.saturating_add(image.capacity())
+        })
+    }
+}
+
+impl Drop for PreparedImages {
+    fn drop(&mut self) {
+        for image in self.0.iter_mut().flatten() {
+            image.zeroize();
+        }
+    }
+}
 
 impl SystemOne {
     pub fn with_image_resolver(mut self, resolver: Arc<dyn ImageResolver>) -> Self {

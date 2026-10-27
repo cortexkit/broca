@@ -26,6 +26,7 @@
 mod classify;
 mod images;
 pub use images::ImageResolver;
+pub(crate) use images::PreparedImages;
 pub mod credential;
 pub mod typesafe;
 pub mod workers_ai;
@@ -464,7 +465,7 @@ impl SystemOne {
         args_digest: String,
         admission: ToolAdmission,
         admitted_at_ms: Option<i64>,
-        images: images::PreparedImages,
+        images: Arc<images::PreparedImages>,
     ) -> Result<Box<RawValue>, Refusal> {
         self.sweep()
             .await
@@ -906,7 +907,7 @@ mod tool_admission_tests {
                 "digest".into(),
                 admission,
                 Some(1000),
-                images::PreparedImages::default(),
+                Arc::new(images::PreparedImages::default()),
             )
             .await
             .unwrap();

@@ -4,6 +4,9 @@
 mod admission;
 pub mod consent;
 pub mod held;
+mod held_images;
+#[cfg(test)]
+mod held_images_tests;
 pub mod permissions;
 mod private_content;
 mod route;

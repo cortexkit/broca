@@ -133,6 +133,9 @@ pub struct Consent {
 }
 
 impl Consent {
+    pub(super) async fn image_run_live(&self, scope: &SessionScope) -> RunLiveness {
+        self.io.run_live(scope).await
+    }
     pub fn new(store: Arc<GrantsStore>, io: Arc<dyn ConsentIo>) -> Self {
         Self {
             store,
@@ -245,6 +248,16 @@ impl Consent {
         body: Value,
         now: i64,
     ) -> Result<HeldCall, GrantsError> {
+        self.file_with_admission(request, body, now, |_| {}).await
+    }
+
+    pub(super) async fn file_with_admission(
+        &self,
+        request: HoldRequest,
+        body: Value,
+        now: i64,
+        admitted: impl FnOnce(&HeldCall) + Send,
+    ) -> Result<HeldCall, GrantsError> {
         let lock = self.key_lock(&request.dedup_key);
         let filing_guard = lock.lock().await;
         let recovering = self
@@ -270,6 +283,9 @@ impl Consent {
                 return Err(GrantsError("held call argument reuse".into()))
             }
         };
+        // Install process-local resources only for the first persisted admission, before
+        // filing yields to the consent transport. Replays never replace the first snapshot.
+        admitted(&row);
         let current = self
             .store
             .card(&card.dedup_key)?
@@ -351,16 +367,18 @@ impl Consent {
         let _feed_guard = feed.lock().await;
         let lock = self.key_lock(key);
         let _guard = lock.lock().await;
-        let Some(card) = self.store.card(key)? else {
+        if self.store.card(key)?.is_none() {
             return Ok(());
-        };
+        }
         if !self.reading_open(key, (self.clock)())? {
             return Ok(());
         }
         if !self.scan(&scope, key, now).await? {
             return Ok(());
         }
-        let card = self.store.card(key)?.unwrap_or(card);
+        let Some(card) = self.store.card(key)? else {
+            return Ok(());
+        };
         if card.state == CardState::Filing {
             self.send(&card, &scope, now, true).await?;
             // The returned id is durable, but the second lookup is still owed across a crash
@@ -431,6 +449,7 @@ impl Consent {
             }
             let mut answers = Vec::new();
             let mut duplicates = Vec::new();
+            let mut terminal = Vec::new();
             for record in records {
                 let key = record.fields["requester_ref"]
                     .as_str()
@@ -445,6 +464,13 @@ impl Consent {
                 if !answer_in_window {
                     continue;
                 }
+                if matches!(
+                    record.state,
+                    ConsentState::Withdrawn | ConsentState::Expired
+                ) {
+                    terminal.push((key.to_owned(), record));
+                    continue;
+                }
                 if let Some(answer) = self.answer(&card, scope, &record).await {
                     if let Some(id) = &card.card_id {
                         if id != &record.elicitation_id {
@@ -455,12 +481,8 @@ impl Consent {
                 }
             }
             let decided_at = (self.clock)();
-            self.store.apply_answer_page(
-                &identity,
-                &page.cursor.to_string(),
-                &answers,
-                decided_at,
-            )?;
+            self.store
+                .apply_answer_batch(&identity, &answers, decided_at)?;
             for answer in &answers {
                 if let Some(card) = self.store.card(&answer.dedup_key)? {
                     if card.card_id.as_deref() != Some(&answer.card_id) {
@@ -469,6 +491,15 @@ impl Consent {
                     self.settle_calls(&card, decided_at)?;
                 }
             }
+            // An explicit decision, including one for an older id adopted during recovery,
+            // takes precedence over a replacement card's expiry on the same feed page.
+            for (key, record) in terminal {
+                if let Some(card) = self.store.card(&key)? {
+                    self.finish_terminal_card(&card, &record, decided_at)?;
+                }
+            }
+            self.store
+                .apply_answer_page(&identity, &page.cursor.to_string(), &[], decided_at)?;
             for id in duplicates {
                 self.io.withdraw(scope, &id).await;
             }
@@ -505,6 +536,29 @@ impl Consent {
             decision,
             run_live,
         })
+    }
+
+    fn finish_terminal_card(
+        &self,
+        card: &Card,
+        record: &ConsentRecord,
+        now: i64,
+    ) -> Result<bool, GrantsError> {
+        let reason = match record.state {
+            ConsentState::Withdrawn => "withdrawn",
+            ConsentState::Expired => "expired",
+            _ => return Ok(false),
+        };
+        // A terminal record for a replaced card must not settle calls waiting on its
+        // replacement. Answered cards keep their committed decision as well.
+        if card.card_id.as_deref() != Some(&record.elicitation_id)
+            || matches!(card.state, CardState::Allowed | CardState::Denied)
+        {
+            return Ok(false);
+        }
+        self.store
+            .refuse_card(&card.dedup_key, &not_started(reason), now)?;
+        Ok(true)
     }
 
     /// Ordinary answer intake uses await, never the recovery feed. A replaced id cannot
@@ -555,6 +609,9 @@ impl Consent {
         if current.card_id != card.card_id {
             self.io.withdraw(&scope, id).await;
             return Ok(true);
+        }
+        if self.finish_terminal_card(&current, &record, (self.clock)())? {
+            return Ok(false);
         }
         if let Some(answer) = self.answer(&current, &scope, &record).await {
             self.store
