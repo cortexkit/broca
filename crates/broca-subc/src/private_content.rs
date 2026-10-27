@@ -169,6 +169,11 @@ pub enum ImageResolveError {
     Unavailable,
     SourceUnavailable,
     InvalidReply,
+    /// The daemon refused to deliver Cerebellum's reply because it was larger than a
+    /// module-to-client frame may be (`MAX_DELIVERED_FRAME_LEN`, 4 MiB with the header). The
+    /// reply carries the image as base64, so the image itself is at least about 3 MiB: this is
+    /// a property of the image, not a missing or expired handle.
+    TooLarge,
 }
 
 impl PrivateContentClient {
@@ -206,6 +211,9 @@ impl PrivateContentClient {
         let _ = self.conn.route_close(&route).await;
         match reply {
             Ok(Ok(Ok(bytes))) => decode_image(&bytes),
+            Ok(Ok(Err(error))) if error.code == subc_protocol::error_codes::FRAME_TOO_LARGE => {
+                Err(ImageResolveError::TooLarge)
+            }
             Ok(Ok(Err(_))) => Err(ImageResolveError::Unavailable),
             _ => Err(ImageResolveError::SourceUnavailable),
         }
@@ -411,7 +419,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn image_resolve_refusal_timeout_and_invalid_shape_are_distinct() {
-        for case in ["refused", "outcome", "invalid", "timeout", "route"] {
+        for case in [
+            "refused",
+            "outcome",
+            "invalid",
+            "too_large",
+            "timeout",
+            "route",
+        ] {
             let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
             let client = PrivateContentClient::new(
                 Arc::new(conn),
@@ -442,6 +457,10 @@ mod tests {
                     "invalid" => {
                         assert!(module.reply(&request, br#"{"bytes":"YWJj"}"#.to_vec()));
                     }
+                    // What the daemon sends in place of a reply too large to deliver.
+                    "too_large" => {
+                        assert!(module.refuse(&request, "frame_too_large"));
+                    }
                     "timeout" => tokio::time::advance(QUERY_TIMEOUT + Duration::from_secs(1)).await,
                     _ => unreachable!(),
                 }
@@ -449,6 +468,7 @@ mod tests {
             let expected = match case {
                 "refused" | "outcome" => ImageResolveError::Unavailable,
                 "invalid" => ImageResolveError::InvalidReply,
+                "too_large" => ImageResolveError::TooLarge,
                 _ => ImageResolveError::SourceUnavailable,
             };
             assert!(matches!(reply, Err(error) if error == expected), "{case}");
