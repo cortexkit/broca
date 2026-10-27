@@ -2131,6 +2131,7 @@ mod tests {
                 WalRecord::RunAuthRefrozen {
                     ts_ms: Some(10),
                     auth_selection: AuthSelection {
+                        auth_method: None,
                         credential_id: "chatgpt:openai".into(),
                         account_ref: Some("first-account".into()),
                         resolved_credential_id: None,
@@ -2144,6 +2145,7 @@ mod tests {
                 WalRecord::RunAuthRefrozen {
                     ts_ms: Some(20),
                     auth_selection: AuthSelection {
+                        auth_method: None,
                         credential_id: "chatgpt:openai".into(),
                         account_ref: Some("second-account".into()),
                         resolved_credential_id: None,
@@ -2163,6 +2165,7 @@ mod tests {
         )
         .expect("replay accepts independent auth refreezes");
         let expected = AuthSelection {
+            auth_method: None,
             credential_id: "chatgpt:openai".into(),
             account_ref: Some("second-account".into()),
             resolved_credential_id: None,

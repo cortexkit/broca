@@ -955,6 +955,80 @@ async fn a_key_is_read_by_grant_as_its_alias_or_itself_and_records_get_scoped() 
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// A RESUME KEEPS ITS FROZEN SELECTION, AND NOTHING RE-DERIVES IT.
+///
+/// A selection frozen with its `auth_method` names the vault's own credential id: the resume
+/// reads exactly that id, with no parse and no `vault.credential_ids` alias lookup, and takes
+/// the method from the frozen field. Here the ids would parse to another method (`apikey:...`)
+/// or not at all (`work-claude`), and an alias exists for one of them; none of that matters.
+/// A selection without the field is a broca key and resumes exactly as before: mapped through
+/// its alias, method from the key. A frozen method this build does not know refuses the
+/// resume rather than guess.
+#[tokio::test]
+async fn a_resume_reads_its_frozen_selection_verbatim_or_as_a_broca_key() {
+    let root = fresh_vault_root("frozen-method-resume");
+    let daemon = CapturingVaultDaemon::start(&root).await;
+    let executor = executor_with_vault_addressing(
+        &root,
+        &daemon,
+        Duration::from_secs(2),
+        broca_module_serve::VaultCredentialIds::from_pairs([
+            ("oauth:anthropic:work", "vault-alias-id"),
+            ("apikey:openai:x", "aliased-key"),
+        ]),
+        supervised_broca_identity(),
+    )
+    .await;
+    let resume = |frozen: &'static str, method: Option<&'static str>| {
+        let executor = &executor;
+        async move {
+            executor
+                .decide_auth_with_account(
+                    "anthropic",
+                    Some(frozen),
+                    method,
+                    false,
+                    None,
+                    None,
+                    &AccountChoice::NotApplicable,
+                    None,
+                )
+                .await
+        }
+    };
+    for (frozen, method, read, expected) in [
+        ("work-claude", Some("oauth"), "work-claude", AuthMethod::Oauth),
+        ("apikey:openai:x", Some("oauth"), "apikey:openai:x", AuthMethod::Oauth),
+        ("oauth:anthropic:work", Some("oauth"), "oauth:anthropic:work", AuthMethod::Oauth),
+        ("oauth:anthropic:work", None, "vault-alias-id", AuthMethod::Oauth),
+    ] {
+        let before = daemon.requests().len();
+        let resolved = resume(frozen, method).await.unwrap_or_else(|error| {
+            daemon.assert_healthy();
+            panic!("{frozen} resumes: {error:?}")
+        });
+        let requests = daemon.requests();
+        assert_eq!(requests.len(), before + 1, "{frozen}: one read");
+        assert_eq!(requests[before].1["credential_id"], read, "{frozen}");
+        assert_eq!(resolved.method, Some(expected), "{frozen}");
+        let selection = resolved.selection.expect("a resume keeps its selection");
+        assert_eq!(selection.credential_id, frozen, "the frozen id is kept verbatim");
+        assert_eq!(selection.auth_method.as_deref(), method, "{frozen}");
+    }
+    let before = daemon.requests().len();
+    match resume("work-claude", Some("some-future-method")).await {
+        Err(RunError::Config(message)) => {
+            assert!(message.contains("some-future-method"), "{message}")
+        }
+        _ => panic!("an unknown frozen method must refuse the resume"),
+    }
+    assert_eq!(daemon.requests().len(), before, "nothing is read for it");
+    daemon.assert_healthy();
+    drop(executor);
+    drop(daemon);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// A SCOPED NOT_FOUND IS FINAL: it is never retried any other way. The refusal keeps
 /// not_found's class (a configuration failure of admission) and says what it can mean: it
 /// names the id asked for and the principal, both causes, and `ck auth events`.
@@ -1063,12 +1137,29 @@ async fn a_wire_auth_failure_is_reported_by_credential_id_on_the_exact_wire_shap
     .await;
     let vault = executor.vault.as_ref().expect("the vault auth source is wired");
 
-    report_wire_auth_failure(vault, "apikey:synthetic", 401, 5)
+    let key = |credential_id: &str| broca_core::AuthSelection {
+        credential_id: credential_id.into(),
+        account_ref: None,
+        resolved_credential_id: None,
+        vault_request: None,
+        account_decision: None,
+        auth_method: None,
+    };
+    report_wire_auth_failure(vault, &key("apikey:synthetic"), 401, 5)
         .await
         .expect("the aliased report is accepted");
-    report_wire_auth_failure(vault, "oauth:anthropic", 401, 6)
+    report_wire_auth_failure(vault, &key("oauth:anthropic"), 401, 6)
         .await
         .expect("the unaliased report is accepted");
+    // A selection frozen with its method names the vault's own id: reported verbatim, never
+    // through the alias its spelling happens to match.
+    let routed = broca_core::AuthSelection {
+        auth_method: Some("oauth".into()),
+        ..key("apikey:synthetic")
+    };
+    report_wire_auth_failure(vault, &routed, 401, 7)
+        .await
+        .expect("the verbatim report is accepted");
     daemon.assert_healthy();
 
     assert_eq!(
@@ -1090,6 +1181,15 @@ async fn a_wire_auth_failure_is_reported_by_credential_id_on_the_exact_wire_shap
                     "provider_status": 401,
                     "reporter_source": "direct",
                     "record_version": 6
+                })
+            ),
+            (
+                "credential.report_auth_failure".to_string(),
+                serde_json::json!({
+                    "credential_id": "apikey:synthetic",
+                    "provider_status": 401,
+                    "reporter_source": "direct",
+                    "record_version": 7
                 })
             ),
         ]
@@ -1584,7 +1684,7 @@ async fn routed_chatgpt_reads_the_second_credential_and_freezes_the_decision() {
     }).await;
     let executor = executor_with_capturing_vault(&root, &daemon).await;
     let choice = routed_chatgpt_choice().await;
-    let resolved = executor.decide_auth_with_account("openai", None, true, Some(AuthMethod::Chatgpt), None, &choice, None).await.unwrap();
+    let resolved = executor.decide_auth_with_account("openai", None, None, true, Some(AuthMethod::Chatgpt), None, &choice, None).await.unwrap();
     let selection = resolved.selection.unwrap();
     assert_eq!(selection.credential_id, "chatgpt:openai:second");
     assert_eq!(selection.account_ref.as_deref(), Some("chatgpt-b"));
@@ -1606,7 +1706,7 @@ async fn routed_chatgpt_refuses_a_different_vault_account_identity() {
     }).await;
     let executor = executor_with_capturing_vault(&root, &daemon).await;
     let choice = routed_chatgpt_choice().await;
-    match executor.decide_auth_with_account("openai", None, true, Some(AuthMethod::Chatgpt), None, &choice, None).await {
+    match executor.decide_auth_with_account("openai", None, None, true, Some(AuthMethod::Chatgpt), None, &choice, None).await {
         Err(RunError::Config(message)) => assert!(message.starts_with("account_identity_mismatch:"), "{message}"),
         _ => panic!("a token for another account must refuse admission"),
     }
@@ -1623,7 +1723,7 @@ async fn account_mismatch_does_not_populate_lkg() {
     let mut executor = executor_with_capturing_vault(&root, &daemon).await;
     let choice = routed_chatgpt_choice().await;
     let credential_id = "chatgpt:openai:second";
-    match executor.decide_auth_with_account("openai", None, true, Some(AuthMethod::Chatgpt), None, &choice, None).await {
+    match executor.decide_auth_with_account("openai", None, None, true, Some(AuthMethod::Chatgpt), None, &choice, None).await {
         Err(RunError::Config(message)) => assert!(message.starts_with("account_identity_mismatch:"), "{message}"),
         _ => panic!("a token for another account must refuse admission"),
     }
@@ -1642,7 +1742,7 @@ async fn account_mismatch_does_not_populate_lkg() {
         .unwrap_or_else(|_| panic!("outage fixture must own its vault"));
     Arc::get_mut(executor.vault.as_mut().unwrap()).unwrap().client = outage_vault.client;
 
-    assert!(matches!(executor.decide_auth_with_account("openai", None, true,
+    assert!(matches!(executor.decide_auth_with_account("openai", None, None, true,
         Some(AuthMethod::Chatgpt), None, &choice, None).await,
         Err(RunError::Config(message)) if message.starts_with("credential not configured or unusable:")),
         "a routed admission must not serve the mismatched token during an outage");

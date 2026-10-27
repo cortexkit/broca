@@ -1084,6 +1084,7 @@ async fn a_sealed_run_reports_its_interrupted_terminal_once() {
     let client = Arc::new(client(&routing));
     let lineage = lineage();
     let selection = |decision: Option<AccountDecision>| broca_core::AuthSelection {
+        auth_method: None,
         credential_id: "oauth:anthropic".into(),
         account_ref: None,
         resolved_credential_id: None,

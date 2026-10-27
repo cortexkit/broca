@@ -98,6 +98,7 @@ async fn run_refusal(host: &str, status: u16, body: &'static str) -> RefusalRun 
     };
     let control = RunControl {
         auth_selection: Some(AuthSelection {
+            auth_method: None,
             credential_id: FROZEN_CREDENTIAL.into(),
             account_ref: None,
             resolved_credential_id: None,

@@ -3721,6 +3721,7 @@ mod paused_auth_tests {
                     error: None,
                     pause_reason: Some(reason),
                     auth_selection: Some(broca_wal::AuthSelection {
+                        auth_method: None,
                         credential_id: "requested-key".into(),
                         resolved_credential_id: Some("resolved-key".into()),
                         account_ref: Some("7b66addd-0000-4000-8000-000000000001".into()),

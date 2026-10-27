@@ -675,6 +675,7 @@ async fn auth_selection_is_frozen_on_run_config_and_not_a_render_input() {
     let provider = CapturingProvider::new(vec![text_reply("m1", "answer")]);
     let control = RunControl {
         auth_selection: Some(AuthSelection {
+            auth_method: None,
             credential_id: "oauth:anthropic".into(),
             account_ref: None,
             resolved_credential_id: None,
@@ -747,6 +748,7 @@ async fn account_ref_freezes_on_run_config_and_stamps_the_export_segment() {
     let plane = StubToolPlane::new();
     let control = RunControl {
         auth_selection: Some(AuthSelection {
+            auth_method: None,
             credential_id: "chatgpt:openai".into(),
             account_ref: Some("acct-uuid-777".into()),
             resolved_credential_id: Some("chatgpt:openai:actual-secret".into()),
@@ -899,6 +901,7 @@ async fn pause_for_auth_at_start_admits_then_pauses_then_continues() {
             affordable_max_tokens: None,
         }),
         auth_selection: Some(AuthSelection {
+            auth_method: None,
             credential_id: "chatgpt:openai".into(),
             account_ref: None,
             resolved_credential_id: None,
@@ -962,6 +965,7 @@ async fn pause_for_auth_at_start_admits_then_pauses_then_continues() {
     // Continue after re-auth: same run_id, byte-identical to the no-pause reference.
     let resumed = CapturingProvider::new(vec![text_reply("m1", "the answer")]);
     let resolved_selection = AuthSelection {
+        auth_method: None,
         credential_id: "chatgpt:openai".into(),
         account_ref: Some("resolved-account".into()),
         resolved_credential_id: Some("chatgpt:openai:reauthenticated".into()),
@@ -1057,6 +1061,7 @@ async fn auth_resume_with_the_same_selection_is_silent_and_keeps_one_segment() {
     let wal = FileWalStore::new(dir.join("wal"));
     let plane = StubToolPlane::new();
     let selection = AuthSelection {
+        auth_method: None,
         credential_id: "chatgpt:openai".into(),
         account_ref: Some("same-account".into()),
         resolved_credential_id: None,
@@ -1344,6 +1349,7 @@ async fn auth_resume_refreezes_use_run_clock() {
         RunControl {
             clock: Some(clock),
             auth_selection: Some(AuthSelection {
+                auth_method: None,
                 credential_id: "provider:key".into(),
                 account_ref: Some("account".into()),
                 resolved_credential_id: None,
@@ -1716,6 +1722,7 @@ async fn resolved_credential_witness_survives_resume_despite_new_resolution() {
     let lease = FileLeaseStore::new(dir.join("lease"));
     let wal = FileWalStore::new(dir.join("wal"));
     let frozen = AuthSelection {
+        auth_method: None,
         credential_id: "apikey:kimi-code-plan-global".into(),
         account_ref: None,
         resolved_credential_id: Some("apikey:kimi-for-coding".into()),

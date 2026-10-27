@@ -62,12 +62,16 @@ pub struct FrozenProviderDeclarations {
     /// answered yes. Absent means the provider cannot settle a call after its reply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub late_results: Option<bool>,
+    /// Actual tool.catalog identities frozen at admission. Old manifests and
+    /// non-plan tools carry none; a later catalog must not fill the missing facts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_pins: Option<BTreeMap<String, super::DispatchSchemaPin>>,
 }
 
 impl FrozenProviderDeclarations {
     /// Whether nothing was declared, so the declaration writes no bytes at all.
     pub fn is_empty(&self) -> bool {
-        self.result_formats.is_none() && self.late_results.is_none()
+        self.result_formats.is_none() && self.late_results.is_none() && self.schema_pins.is_none()
     }
 }
 
@@ -425,6 +429,7 @@ mod tests {
         *declarations_frozen = Some(FrozenProviderDeclarations {
             result_formats: None,
             late_results: Some(true),
+            schema_pins: None,
         });
         let bytes = serde_json::to_string(&record).unwrap();
         assert!(bytes.contains(
@@ -735,6 +740,7 @@ mod tests {
                         FrozenResultFormat("content/v1".into()),
                     )])),
                     late_results: Some(true),
+                    schema_pins: None,
                 }),
                 reference_slots: None,
             },
@@ -783,6 +789,7 @@ mod tests {
                 *declarations_frozen = Some(FrozenProviderDeclarations {
                     result_formats: None,
                     late_results: Some(true),
+                    schema_pins: None,
                 });
             }
         }
@@ -798,5 +805,50 @@ mod tests {
         assert!(!fixture
             .required_features()
             .contains(&PROVIDER_DECLARATIONS_FEATURE));
+    }
+
+    #[test]
+    fn frozen_tool_schema_pins_require_a_reader_feature_and_round_trip() {
+        use crate::framing::{decode_next, encode, DecodeStep, TOOL_SCHEMA_PINS_FEATURE};
+        let fixture: WalRecord = serde_json::from_str(FIXTURE.trim_end()).unwrap();
+        assert!(!fixture
+            .required_features()
+            .contains(&TOOL_SCHEMA_PINS_FEATURE));
+        let mut pinned = fixture;
+        let WalRecord::RunStarted {
+            manifest: Some(manifest),
+            ..
+        } = &mut pinned
+        else {
+            panic!("fixture manifest")
+        };
+        for fetch in &mut manifest.fetches {
+            if let FetchOutcome::Answered {
+                declarations_frozen,
+                ..
+            } = &mut fetch.outcome
+            {
+                *declarations_frozen = Some(FrozenProviderDeclarations {
+                    schema_pins: Some(
+                        [(
+                            "work".into(),
+                            super::super::DispatchSchemaPin {
+                                schema_digest: "0".repeat(64),
+                                semantics: 7,
+                            },
+                        )]
+                        .into(),
+                    ),
+                    ..Default::default()
+                });
+            }
+        }
+        assert!(pinned
+            .required_features()
+            .contains(&TOOL_SCHEMA_PINS_FEATURE));
+        match decode_next(&encode(1, 1, &pinned).unwrap()) {
+            DecodeStep::Record { framed, .. } => assert_eq!(framed.record, pinned),
+            _ => panic!("the pin-writing build must read its own feature"),
+        }
     }
 }
