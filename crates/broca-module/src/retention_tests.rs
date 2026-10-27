@@ -2232,6 +2232,87 @@ async fn send_waits_for_in_progress_deletion_to_complete_before_opening_fresh_li
     assert!(registry.stop_and_seal().await);
 }
 
+/// The opener waits on a held lease only while `expired` reports expiry. A deletion that
+/// writes its tombstone and removes the WAL while `expired` is between reading the tombstones
+/// and finding the WAL gone must still be reported, or a racing send refuses with LeaseHeld.
+#[test]
+fn expiry_check_overlapping_a_completing_deletion_still_reports_expiry() {
+    type Deletion = Box<dyn FnOnce() + Send>;
+    struct DeleteOnLiveLookup {
+        store: Arc<SqliteStore>,
+        during: Mutex<Option<Deletion>>,
+    }
+    impl RetentionIndex for DeleteOnLiveLookup {
+        fn live(&self, key: &BindIdentity) -> Result<Option<RetentionLineageRow>, String> {
+            let deletion = self.during.lock().unwrap().take();
+            if let Some(deletion) = deletion {
+                deletion();
+            }
+            RetentionIndex::live(self.store.as_ref(), key)
+        }
+        fn lineage(&self, id: &str) -> Result<Option<RetentionLineageRow>, String> {
+            RetentionIndex::lineage(self.store.as_ref(), id)
+        }
+        fn runs(&self, id: &str) -> Result<Vec<RetentionRunRow>, String> {
+            RetentionIndex::runs(self.store.as_ref(), id)
+        }
+        fn candidates(&self, now: u64) -> Result<Vec<RetentionLineageRow>, String> {
+            RetentionIndex::candidates(self.store.as_ref(), now)
+        }
+        fn run(&self, id: &str) -> Result<Option<RunRetention>, String> {
+            RetentionIndex::run(self.store.as_ref(), id)
+        }
+        fn upsert(
+            &self,
+            row: &RetentionLineageRow,
+            runs: &[RetentionRunRow],
+        ) -> Result<(), String> {
+            RetentionIndex::upsert(self.store.as_ref(), row, runs)
+        }
+    }
+    let rig = Rig::new();
+    let old = rig.seed(1, 100, Some(200));
+    rig.service.rederive(&rig.key).unwrap();
+    let index = Arc::new(DeleteOnLiveLookup {
+        store: rig.store.clone(),
+        during: Mutex::new(None),
+    });
+    let checker = RetentionService::new(
+        rig.service.wal.clone(),
+        index.clone(),
+        rig.leases.clone(),
+        rig.store.clone(),
+        Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1)),
+    )
+    .unwrap();
+    // The checker has already resolved the live WAL and read the (still empty) tombstone
+    // directory when it consults the index; the whole deletion runs at that point.
+    *index.during.lock().unwrap() = Some(Box::new({
+        let deleter = rig.service.clone();
+        let key = rig.key.clone();
+        let old = old.clone();
+        move || {
+            let _lease = deleter.lease(&key).unwrap();
+            assert_eq!(deleter.delete_expired(&key, 1200).unwrap(), Some(old));
+        }
+    }));
+    let verdict = checker.expired(&rig.key, None).unwrap();
+    assert!(
+        index.during.lock().unwrap().is_none(),
+        "the deletion ran inside the expiry check"
+    );
+    assert!(!rig.service.wal.ephemeral_wal_path(&rig.key).exists());
+    let stone = rig
+        .service
+        .tombstones(&rig.key)
+        .unwrap()
+        .into_iter()
+        .find(|stone| stone.lineage_id == old)
+        .unwrap();
+    assert!(stone.completed_at_ms.is_some());
+    assert_eq!(verdict, Some(stone.expired_at_ms));
+}
+
 struct QuotaRefusalExecutor {
     config: broca_wal::RunConfig,
     observed: tokio::sync::mpsc::Sender<broca_core::keep_warm_wait::WarmTick>,
