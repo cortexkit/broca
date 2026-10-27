@@ -3464,9 +3464,10 @@ where
     // between boundaries estimates the next one.
     let mut notice_request_bytes = 0usize;
     let mut compaction_history = prior.compaction_history.clone();
-    // The output cap this run recorded for a step it may now resume; kept current below from
-    // the run and step records this run writes, exactly as replay folds them.
+    // What the output reservation estimates the next request from; kept current below from
+    // the attempt and step records this run writes, exactly as replay folds them.
     let mut output_history = prior.output_reservation.clone();
+    output_history.seed_from_compaction(&compaction_history);
     let compaction_item = frozen_hooks
         .map(|manifest| crate::compaction::item(manifest))
         .transpose()
@@ -4388,7 +4389,7 @@ where
         // synced, reclaim the vector when no observer retained the record; otherwise the mutable
         // prompt takes its own copy only after the record is durable.
         let episode_input = Arc::new(episode_input);
-        output_history.start_run();
+        output_history.start_run(&cfg.model);
         let (run_started_seq, input_tags) = writer.record_tagged(WalRecord::RunStarted {
             written_at_ms: req
                 .input_written_at_ms
@@ -5390,9 +5391,79 @@ where
                     .map_or(0, |history| history.retained_base_len()),
             );
         }
+        // Keep the step's output reservation inside the context limit: lower its cap when the
+        // estimated input plus the frozen cap would pass the limit, or end the run
+        // `context_overflow` without sending when not even the provider's floor fits.
+        //
         // A cap this step already recorded is what an earlier attempt of it sent, so a resume
-        // renders it again.
-        if let Some(cap) = output_history.recorded_for(step_id) {
+        // renders it again even when it cannot estimate the request itself.
+        let recorded_cap = output_history.recorded_for(step_id);
+        let mut fresh_clamp = None;
+        if let (Some(limits), Some(context_limit)) = (provider.output_limits(), context_limit) {
+            // The estimate costs a render of the whole request, so it is made only when a
+            // measured earlier step on this model makes one possible. A compaction boundary
+            // already rendered the request it sends.
+            let estimate = output_history
+                .has_measurement(&cfg.model)
+                .then(|| {
+                    let bytes = match &model_opts {
+                        Some(_) => notice_request_bytes,
+                        None => provider.render_request(&opts).len(),
+                    };
+                    output_history.estimate(bytes, &cfg.model)
+                })
+                .flatten();
+            match estimate.map(|estimate| {
+                (
+                    estimate,
+                    crate::output_reservation::decide(limits, context_limit, estimate),
+                )
+            }) {
+                Some((
+                    estimate,
+                    crate::output_reservation::Reservation::Overflow { available, floor },
+                )) => {
+                    let error =
+                        output_reservation_overflow(estimate, available, floor, context_limit);
+                    let _ = send(
+                        out,
+                        OutputEvent::Control(ControlUnit::Error {
+                            error: error.clone().into(),
+                        }),
+                    )
+                    .await;
+                    terminal_error = Some(error);
+                    break RunFinishReason::Error;
+                }
+                Some((
+                    estimate,
+                    crate::output_reservation::Reservation::Clamped { max_output_tokens },
+                )) => fresh_clamp = Some((max_output_tokens, estimate, context_limit)),
+                Some((_, crate::output_reservation::Reservation::Unchanged)) | None => {}
+            }
+        }
+        // Only a request that now needs less than the recorded cap lowers it further.
+        let step_cap = match (recorded_cap, fresh_clamp) {
+            (Some(recorded), Some((fresh, ..))) => Some(recorded.min(fresh)),
+            (Some(recorded), None) => Some(recorded),
+            (None, Some((fresh, ..))) => Some(fresh),
+            (None, None) => None,
+        };
+        if let Some(cap) = step_cap {
+            if recorded_cap != Some(cap) {
+                let (_, estimated_input_tokens, context_limit) =
+                    fresh_clamp.expect("a cap below the recorded one comes from a fresh clamp");
+                writer.record(WalRecord::OutputReservationClamped {
+                    step_id,
+                    max_output_tokens: cap,
+                    estimated_input_tokens,
+                    context_limit,
+                });
+                // Durable before the request is sent, so a resume and any rebuild of this
+                // step's request render the cap the provider saw.
+                writer.sync().await?;
+                output_history.note_recorded(step_id, cap);
+            }
             let sent = match model_opts.as_mut() {
                 Some(model_opts) => Arc::make_mut(model_opts),
                 None => mutable_call_options(&mut opts),
@@ -5420,7 +5491,11 @@ where
         let session = &req.session;
         let attempt_run_id = &resolved_run_id;
         let completed_attempt_time = std::sync::Mutex::new(None);
+        // The body length of this step's latest attempt, for the output reservation's next
+        // estimate (replay reads it from the same `ModelAttemptFinished` records).
+        let last_attempt_bytes = std::sync::Mutex::new(None);
         let record_attempt = |attempt: broca_protocol::ModelAttempt| -> AttemptFuture<'_> {
+            *last_attempt_bytes.lock().unwrap() = Some(attempt.request_body_len);
             if matches!(
                 attempt.outcome,
                 broca_protocol::AttemptOutcome::Complete
@@ -5544,7 +5619,10 @@ where
                 total_usage += usage;
                 input_budget.observe(usage);
                 input_budget.limit = writer.input_token_limit().or(input_budget.limit);
-                output_history.note_step();
+                if let Some(bytes) = last_attempt_bytes.lock().unwrap().take() {
+                    output_history.note_attempt(bytes);
+                }
+                output_history.note_step(usage);
                 if let Some(bytes) = sent_bytes {
                     compaction_history.previous_native_usage = Some(usage);
                     compaction_history.previous_provider_code = None;
@@ -7326,6 +7404,40 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
         false,
     ))
 }
+
+/// The `context_overflow` refusal of a request whose estimated input leaves less room for output
+/// than the provider's floor. Nothing was sent; compacting the conversation is what helps.
+fn output_reservation_overflow(
+    estimate: u64,
+    available: u64,
+    floor: u32,
+    context_limit: u64,
+) -> ProviderError {
+    ProviderError {
+        provider_details: None,
+        provider_subcode: None,
+        refusal: None,
+        class: ErrorClass::ContextOverflow,
+        message: format!(
+            "request not sent: its estimated {estimate} input tokens leave {available} tokens of \
+             the {context_limit}-token context limit for output (after a safety margin of {} \
+             tokens), below the minimum output reservation of {floor} tokens",
+            crate::output_reservation::margin(context_limit)
+        ),
+        status: None,
+        retry_after_secs: None,
+        provider_code: Some(OUTPUT_RESERVATION_OVERFLOW_CODE.into()),
+        resets_at_ms: None,
+        resets_at_source: None,
+        limit_window: None,
+        account_ref: None,
+        credential_id: None,
+        affordable_max_tokens: None,
+    }
+}
+
+/// The `provider_code` of [`output_reservation_overflow`].
+pub const OUTPUT_RESERVATION_OVERFLOW_CODE: &str = "output_reservation_exceeds_context";
 
 /// Return the durable request only when no blocking renderer can still hold its snapshot.
 /// This intentionally uses `Arc::get_mut`, never `Arc::make_mut`: copying a multi-megabyte
