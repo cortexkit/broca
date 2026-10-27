@@ -106,7 +106,6 @@ enum Stub {
 
 struct Rig {
     _daemon: broca_test_support::RigChild,
-    restarted: Mutex<Vec<broca_test_support::RigChild>>,
     root: PathBuf,
     state: PathBuf,
     provider: Arc<Provider>,
@@ -250,7 +249,6 @@ impl Rig {
         .unwrap();
         let rig = Self {
             _daemon: broca_test_support::RigChild::new(child, &root, "daemon"),
-            restarted: Mutex::new(Vec::new()),
             root,
             state,
             provider: provider_state,
@@ -333,76 +331,35 @@ impl Rig {
         std::fs::write(path, config.to_string()).unwrap();
     }
 
-    /// Start broca again over the same state, with a module id of its own, and open a fresh
-    /// route to it.
+    /// Restart the daemon's broca over the same state and open a fresh route to the new
+    /// process. Only one broca may serve a state root at a time, so the running one is killed
+    /// first, and the daemon starts it again with the config as it is now.
     async fn restart(&self) -> Route {
-        let config = self.root.join("config/cortexkit/broca.jsonc");
-        let settings: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
-        let child = broca_test_support::tokio_rig_command(
-            broca_test_support::ckdev_binary(
-                Path::new(env!("CARGO_BIN_EXE_ck-broca")),
-                broca_test_support::scratch_root(),
-            ),
-            &self.root,
-            "restarted",
-        )
-        .unwrap()
-        .arg("--subc")
-        .arg(self.root.join("runtime/subc-connection.json"))
-        .env("SUBC_MODULE_ID", "broca-restarted")
-        .env_remove("SUBC_LAUNCH_NONCE")
-        .env_remove("SUBC_LAUNCH_NONCE_FD")
-        .env("BROCA_STATE_ROOT", &self.state)
-        .env("BROCA_CONFIG_PATH", config)
-        .env(
-            "BROCA_PROVIDER_BASE_URL",
-            settings["providers"]["typesafe"]["base_url"]
-                .as_str()
-                .unwrap(),
-        )
-        .env("XDG_CONFIG_HOME", self.root.join("config"))
-        .env("XDG_RUNTIME_DIR", self.root.join("runtime"))
-        .env("XDG_DATA_HOME", self.root.join("data"))
-        .env("HOME", self.root.join("home"))
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            let lock = spawn_lock(&self.root).unwrap();
-            lock.lock().unwrap();
-            record_process(&self.root, "restarted", child.id().unwrap());
-        }
-        self.restarted
-            .lock()
+        let roster = self.root.join("data/cortexkit/run/live-children.json");
+        let record: Value = serde_json::from_slice(&std::fs::read(&roster).unwrap()).unwrap();
+        let pid = record["children"]
+            .as_array()
             .unwrap()
-            .push(broca_test_support::RigChild::new(
-                child,
-                &self.root,
-                "restarted",
-            ));
-        // A freshly started broca registers with the daemon a moment after spawn.
-        let connection = Arc::new(
-            SubcConnection::connect_with_consumer_identity(
-                &self.root.join("runtime/subc-connection.json"),
-                Some(subc_control::ConsumerIdentity {
-                    module_id: "owner".into(),
-                    launch_nonce: std::fs::read_to_string(self.root.join("owner.nonce"))
-                        .unwrap()
-                        .trim()
-                        .into(),
-                }),
-            )
-            .await
-            .unwrap(),
-        );
-        let identity = broca_protocol::BindIdentity::new(
-            self.root.join("project").canonicalize().unwrap(),
-            "test",
-            "restart-probe",
-        );
-        served_route(&connection, "broca-restarted", &identity, None).await;
-        self.open_to("broca-restarted", "run", false).await
+            .iter()
+            .find(|child| child["module_id"] == "broca")
+            .and_then(|child| child["pid"].as_u64())
+            .map(|pid| u32::try_from(pid).unwrap())
+            .expect("the rig daemon supervises a live broca");
+        subc_os::Process::open(pid)
+            .unwrap()
+            .expect("the daemon's broca is live")
+            .signal(subc_os::Signal::Kill)
+            .unwrap();
+        // Gone means the daemon has reaped it, so a route opened next cannot reach the old
+        // process.
+        broca_test_support::wait_until("the old broca reaped", || async {
+            match subc_os::Process::open(pid) {
+                Ok(None) => Ok(()),
+                _ => Err(format!("broca {pid} still exists")),
+            }
+        })
+        .await;
+        self.open_to("broca", "run", false).await
     }
 
     /// How many `private_content.query` requests reached cerebellum.

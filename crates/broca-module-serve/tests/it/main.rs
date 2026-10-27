@@ -72,6 +72,7 @@ mod send_tool_reply_real_daemon;
 mod session_client;
 mod single_turn_module_e2e;
 mod state_root_isolation;
+mod state_root_lock;
 mod step_transforms;
 mod structured_output;
 mod wal_known_features;

@@ -39,7 +39,16 @@ paths rather than begin an empty history (`crates/broca-module-serve/src/state_r
   catalog/fusiform-lkg.json last-known-good model catalog
   logs/                     daily log files
   request-dumps/            debug request dumps
+  broca.lock                held by the one ck-broca serving this root   (below)
 ```
+
+Only one `ck-broca` process may serve a state root. At boot, before it touches anything else
+in the root, it takes an exclusive OS advisory lock on `broca.lock` (`flock` on Unix,
+`LockFileEx` on Windows) and holds it until it exits; the kernel releases it however the
+process dies. A second process finding the lock held logs one ERROR naming the root and exits
+non-zero at once, without writing to the root. The file holds no data and never marks a root
+as holding state. The command-line tools (store-maintenance, wal-fold, broca-session) do not
+take it (`crates/broca-module-serve/src/state_root_lock.rs`).
 
 The WAL is the source of truth. Everything in `run-index.db` is derived from it, although
 not all of it can be regenerated (section 4 says which parts cannot).

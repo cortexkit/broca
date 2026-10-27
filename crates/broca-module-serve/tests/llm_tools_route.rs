@@ -360,42 +360,6 @@ impl Rig {
     fn calls(&self) -> usize {
         *self.provider.calls.lock().unwrap()
     }
-
-    // Only the Unix cross-process claim test starts a second daemon.
-    #[cfg(unix)]
-    fn spawn_peer(&self, id: &str) -> broca_test_support::RigChild {
-        let config = self.root.join("config/cortexkit/broca.jsonc");
-        let settings: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
-        let child = broca_test_support::tokio_rig_command(
-            broca_test_support::ckdev_binary(
-                Path::new(env!("CARGO_BIN_EXE_ck-broca")),
-                broca_test_support::scratch_root(),
-            ),
-            &self.root,
-            &format!("peer-{id}"),
-        )
-        .unwrap()
-        .arg("--subc")
-        .arg(self.root.join("runtime/subc-connection.json"))
-        .env("SUBC_MODULE_ID", id)
-        .env_remove("SUBC_LAUNCH_NONCE")
-        .env_remove("SUBC_LAUNCH_NONCE_FD")
-        .env("BROCA_STATE_ROOT", &self.state)
-        .env("BROCA_CONFIG_PATH", config)
-        .env(
-            "BROCA_PROVIDER_BASE_URL",
-            settings["providers"]["typesafe"]["base_url"]
-                .as_str()
-                .unwrap(),
-        )
-        .env("XDG_CONFIG_HOME", self.root.join("config"))
-        .env("XDG_DATA_HOME", self.root.join("data"))
-        .env("HOME", self.root.join("home"))
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-        broca_test_support::RigChild::new(child, &self.root, &format!("peer-{id}"))
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -641,64 +605,66 @@ async fn published_classify_request_vectors_use_the_real_serve_path() {
     assert_eq!(rig.calls(), 3);
 }
 
-#[cfg(unix)]
+/// A batch another process holds is refused as transient and writes nothing; once that owner is
+/// gone, recovery frees the batch and the call runs.
+///
+/// The other owner is this test process, not a second broca: only one broca may serve a state
+/// root. The test claims the batch in the rig's `system-one.db` through the same store API a
+/// broca uses, under an owner identity of its own, so it holds that owner's lifetime lock
+/// exactly as a peer process would. Closing its store releases the lock the way the owner
+/// process exiting would.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn another_process_claim_returns_transient_without_writes() {
     let Some(rig) = Rig::start("cross-process", true, true, Some(42_000_000), 0, false).await
     else {
         return;
     };
-    let owner_process = rig.spawn_peer("broca-owner-process");
-    let first = Arc::new(rig.open_to("broca-owner-process", true, false).await);
-    rig.provider
-        .blocked
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    let executing = {
-        let first = first.clone();
-        tokio::spawn(async move { first.call(args(), Some("cross-process")).await })
-    };
-    broca_test_support::wait_until("first process provider dispatch", || async {
-        if rig.calls() == 1 {
-            Ok(())
-        } else {
-            Err("not dispatched".to_string())
-        }
-    })
-    .await;
+    let route = rig.open(true, false).await;
+    let (batch_id, recorded) = recorded_batch("cross-process").await;
+    let other_owner = broca_store::SystemOneStore::open(rig.state.join("system-one.db")).unwrap();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    assert_eq!(
+        other_owner
+            .claim(&broca_store::system_one::BatchClaim {
+                role: broca_module_serve::system_one::LLM_CLASSIFY_STORE_ROLE,
+                batch_id: &batch_id,
+                model: &recorded.model,
+                identity: &recorded.identity,
+                body_digest: &recorded.args_digest,
+                frozen_row: &recorded.frozen_row,
+                scope: recorded
+                    .scope
+                    .as_ref()
+                    .expect("a tool batch records its scope"),
+                ceiling_nanos: recorded.ceiling_nanos,
+                owner: "another-process-launch",
+                now_ms,
+            })
+            .unwrap(),
+        broca_store::system_one::Claimed::Fresh
+    );
     let before = artifacts(&rig);
-    let _later_process = rig.spawn_peer("broca-later-process");
-    let second = rig.open_to("broca-later-process", true, false).await;
-    let error = second
-        .call(args(), Some("cross-process"))
-        .await
-        .unwrap_err();
+    let error = route.call(args(), Some("cross-process")).await.unwrap_err();
     assert_eq!(error["code"], "batch_in_progress");
     assert_eq!(error["detail"]["class"], "transient");
     assert_eq!(error["detail"]["retry_after_ms"], 1000);
     assert_eq!(artifacts(&rig), before);
-    executing.abort();
-    // The claim belongs to the peer broca the first route reached, not the daemon's own module.
-    sigkill(owner_process.id().expect("the owner peer is running"));
+    assert_eq!(rig.calls(), 0);
+    // The claim still holds while its owner lives.
     let recovery = broca_store::SystemOneStore::open(rig.state.join("system-one.db")).unwrap();
-    broca_test_support::wait_until("dead owner lifetime lock release", || async {
-        match recovery.release_abandoned().unwrap() {
-            1 => Ok(()),
-            0 => Err("owner has not exited yet".to_string()),
-            count => panic!("unexpected abandoned claim count {count}"),
-        }
-    })
-    .await;
     assert_eq!(recovery.release_abandoned().unwrap(), 0);
-    rig.provider
-        .blocked
-        .store(false, std::sync::atomic::Ordering::SeqCst);
-    rig.provider.hold.notify_waiters();
-    let answer = second.call(args(), Some("cross-process")).await.unwrap();
+    drop(other_owner);
+    assert_eq!(recovery.release_abandoned().unwrap(), 1);
+    assert_eq!(recovery.release_abandoned().unwrap(), 0);
+    let answer = route.call(args(), Some("cross-process")).await.unwrap();
     assert_eq!(
-        second.call(args(), Some("cross-process")).await.unwrap(),
+        route.call(args(), Some("cross-process")).await.unwrap(),
         answer
     );
-    assert_eq!(rig.calls(), 2);
+    assert_eq!(rig.calls(), 1);
     assert_eq!(
         rows(&rig.state.join("system-one.db"), "item_outcome").len(),
         1
@@ -707,6 +673,44 @@ async fn another_process_claim_returns_transient_without_writes() {
         rows(&rig.state.join("run-index.db"), "export_facts").len(),
         1
     );
+}
+
+/// The batch id and record a broca admits for `args()` sent under `key` by the rig's `owner`
+/// caller in its `run` scope. The same llm.classify admission runs in this process against a
+/// scratch in-memory store, and the record is found there under the id the admission derives.
+async fn recorded_batch(key: &str) -> (String, broca_store::system_one::StoredBatch) {
+    use sha2::{Digest, Sha256};
+    let store = Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap());
+    let tools = direct_tools(
+        Arc::new(std::sync::atomic::AtomicI64::new(1000)),
+        Arc::new(CountedProvider::default()),
+        store.clone(),
+        Arc::new(broca_store::SqliteStore::open_in_memory().unwrap()),
+    );
+    tools
+        .answer(
+            &direct_body(args(), Some(key)),
+            Some(&owner()),
+            &stamped(1, "owner"),
+        )
+        .await
+        .unwrap();
+    let batch_id = format!(
+        "{:x}",
+        Sha256::digest(
+            json!({"call_key":key,"owner":"reserved:owner","principal":"reserved:owner","scope_epoch":1,"scope_ref":"run"})
+                .to_string()
+                .as_bytes()
+        )
+    );
+    let recorded = store
+        .lookup(
+            broca_module_serve::system_one::LLM_CLASSIFY_STORE_ROLE,
+            &batch_id,
+        )
+        .unwrap()
+        .expect("the admission recorded its batch under the derived id");
+    (batch_id, recorded)
 }
 
 #[cfg(unix)]
