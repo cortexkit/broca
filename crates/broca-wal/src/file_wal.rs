@@ -9,7 +9,6 @@ use std::{
     cell::{Cell, RefCell},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::OnceLock,
 };
 
 use crate::fs_ops::{self, File, OpenOptions};
@@ -18,9 +17,11 @@ use crate::writer_tenure::{OwnedWalTenure, TenureError};
 
 use crate::{
     framing::{
-        decode_next, encode, encode_lineage, DecodeStep, FrameError, FramedRecord, WalLineageId,
+        decode_next, encode, encode_lineage, DecodeStep, FrameError, FramedRecord, PreparedV4Frame,
+        WalLineageId,
     },
     record::WalRecord,
+    state_format::{StateRootError, WalConfig, WalFormat},
 };
 
 use broca_protocol::BindIdentity;
@@ -29,6 +30,10 @@ pub const DEFAULT_MAX_READ_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[path = "human_prompt_count.rs"]
 mod human_prompt_count;
+
+#[cfg(test)]
+#[path = "file_wal_v4_tests.rs"]
+mod v4_tests;
 pub use human_prompt_count::{
     count_human_prompts_in_bytes, read_human_prompt_count, HumanPromptCount,
 };
@@ -284,6 +289,16 @@ pub enum WalError {
         requires: Vec<String>,
         reason: String,
     },
+    /// The state root's log format could not be decided, or a store refuses to write on it
+    /// (see [`StateRootError`]). Nothing was opened or written.
+    StateRoot(StateRootError),
+    /// A frame of the `offered` format was handed to a log of the `log` format: an overhaul log
+    /// writes only the version 4 frames it stamps itself, and a legacy log never writes them.
+    /// Nothing was written.
+    FrameFormat {
+        log: WalFormat,
+        offered: WalFormat,
+    },
 }
 
 impl WalError {
@@ -301,7 +316,9 @@ impl WalError {
             | Self::ForeignWrite { .. }
             | Self::ConflictingLineageIds { .. }
             | Self::Entropy(_)
-            | Self::FeatureFloor { .. }) => Err(other),
+            | Self::FeatureFloor { .. }
+            | Self::StateRoot(_)
+            | Self::FrameFormat { .. }) => Err(other),
         }
     }
 }
@@ -363,7 +380,22 @@ impl std::fmt::Display for WalError {
                 ),
                 requires.join(", ")
             ),
+            WalError::StateRoot(error) => error.fmt(f),
+            WalError::FrameFormat { log, offered } => write!(
+                f,
+                "wal append refused: a {} log does not write {} frames",
+                format_name(*log),
+                format_name(*offered)
+            ),
         }
+    }
+}
+
+/// How a refusal names a frame format.
+fn format_name(format: WalFormat) -> &'static str {
+    match format {
+        WalFormat::Legacy => "legacy",
+        WalFormat::Overhaul => "version 4 (broca-state/2)",
     }
 }
 
@@ -431,18 +463,31 @@ pub trait Wal {
         None
     }
 
-    /// The state root this log lives in, beside its `wal/` directory. A writer raises that
-    /// root's feature floor before the first version 4 frame, whose header names
-    /// `frame-stamps/v1`.
-    fn state_root_path(&self) -> Option<PathBuf> {
-        None
+    /// The frame format this log writes, as the store that opened it was configured at boot.
+    /// A writer handle reads it once, at spawn, to choose how it hands records over: an
+    /// overhaul log takes them through [`Wal::append_v4`] only. The default is legacy.
+    fn wal_config(&self) -> WalConfig {
+        WalConfig::LEGACY
     }
 
-    /// True when the log lives on a state root marked `broca-state/2`. Its writer appends
-    /// version 4 frames, whose headers carry `appended_ms` and `writer_id`; every other root
-    /// keeps the frames its current readers already understand.
-    fn on_overhaul_root(&self) -> bool {
-        false
+    /// Append `record` as the version 4 frame `prepared` (built from that same record), stamped
+    /// with `appended_ms`, which the caller samples on the thread that calls this, immediately
+    /// before the call. The log fills in the sequence, fence and its own `writer_id`, and raises
+    /// the feature floor over every name the frame lists before writing it.
+    ///
+    /// Only an overhaul log writes version 4 frames; the default refuses, as a legacy log does.
+    fn append_v4(
+        &mut self,
+        _fence: u64,
+        _record: &WalRecord,
+        _sync: bool,
+        _prepared: PreparedV4Frame,
+        _appended_ms: u64,
+    ) -> Result<u64, WalError> {
+        Err(WalError::FrameFormat {
+            log: WalFormat::Legacy,
+            offered: WalFormat::Overhaul,
+        })
     }
 
     fn recovery_byte_cap(&self) -> Option<u64> {
@@ -488,9 +533,6 @@ struct SyncProbe {
 
 pub struct FileWal {
     path: PathBuf,
-    /// The state root holding this log: `path`'s parent's parent. A version 4 frame names
-    /// `frame-stamps/v1`, and that root's floor must list it before such a frame is written.
-    state_root: PathBuf,
     file: File,
     next_seq: u64,
     /// The file size this writer last left the file at (the byte offset after its last
@@ -513,9 +555,12 @@ pub struct FileWal {
     /// upward. The first directory-sync pass drains this list after syncing every directory
     /// whose direct child was newly created.
     newly_created_dirs: RefCell<Vec<PathBuf>>,
-    /// True on a `broca-state/2` root, where appends are version 4 frames. A root does not
-    /// change format under a live writer.
-    overhaul_root: bool,
+    /// The frame format this log writes, set by the store that opened it from the boot
+    /// decision. Legacy unless [`FileWal::with_wal_config`] says otherwise.
+    config: WalConfig,
+    /// Minted when the log is configured as an overhaul log: the random 128-bit id stamped in
+    /// every version 4 frame this open appends, so a frame names the writer that wrote it.
+    writer_id: Option<[u8; 16]>,
     lineage_id: Option<WalLineageId>,
     /// The machine's WAL feature floor (see [`crate::floor`]). A record that requires any WAL
     /// feature is appended only after this file lists it; with no floor configured such a
@@ -558,69 +603,19 @@ fn mint_lineage_id() -> Result<WalLineageId, WalError> {
     Ok(WalLineageId::from_bytes(bytes))
 }
 
-/// One state root's format marker, read the first time this process opens a log inside it.
-struct RootMarker {
-    /// The root path, as given by the logged path's grandparent.
-    root: PathBuf,
-    overhaul: bool,
-}
-
-/// The markers this process has already read, one entry per state root. A root that exists keeps
-/// its format, so the file is read once and the answer reused. Each entry is the root's path and
-/// answer only, never an open handle on the root, so nothing outlives the directory it named.
-static ROOT_MARKERS: OnceLock<std::sync::Mutex<Vec<RootMarker>>> = OnceLock::new();
-
-/// Report whether the state root holding `wal_path` is an overhaul root, reading its marker the
-/// first time this process asks about that root.
-///
-/// A missing or unreadable marker means a legacy root: reading one as overhaul would put frames
-/// on disk that its readers cannot open. Creating a directory on the way to the log says nothing
-/// about the root's format, so the marker is read even then: a state root is marked before its
-/// logs exist, and often before its `wal/` directory does.
-fn overhaul_root_cached(wal_path: &Path) -> (PathBuf, bool) {
-    let root = wal_path
-        .parent()
-        .and_then(Path::parent)
-        .map_or_else(PathBuf::new, Path::to_path_buf);
-    let markers = ROOT_MARKERS.get_or_init(Default::default);
-    let mut markers = markers
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(known) = markers.iter().find(|marker| marker.root == root) {
-        return (root, known.overhaul);
-    }
-    let overhaul = match File::open(root.join(crate::state_format::MARKER_FILENAME)) {
-        Ok(mut file) => {
-            let mut marker = Vec::new();
-            match file.read_to_end(&mut marker) {
-                Ok(_) => {
-                    marker == crate::state_format::OVERHAUL_MARKER || marker == b"broca-state/2\n"
-                }
-                Err(error) => {
-                    report_unreadable_marker(&root, &error);
-                    false
-                }
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => {
-            report_unreadable_marker(&root, &error);
-            false
-        }
-    };
-    markers.push(RootMarker {
-        root: root.clone(),
-        overhaul,
-    });
-    (root, overhaul)
-}
-
-fn report_unreadable_marker(root: &Path, error: &std::io::Error) {
-    tracing::warn!(
-        target: "wal",
-        "cannot read the state-format marker in {}: {error}; keeping legacy frames",
-        root.display()
-    );
+/// Where an append's bytes come from.
+enum FrameSource {
+    /// Encode the record here, in this log's format.
+    Encode,
+    /// A legacy frame the writer handle encoded to measure its budget. Only a legacy log takes
+    /// it, after checking it is exactly the frame its sequence, fence and record require.
+    Legacy(Vec<u8>),
+    /// A version 4 payload the writer handle prepared, and the `appended_ms` its writer thread
+    /// sampled. Only an overhaul log takes it, and stamps the header itself.
+    V4 {
+        prepared: PreparedV4Frame,
+        appended_ms: u64,
+    },
 }
 
 struct ManifestAppend {
@@ -922,7 +917,6 @@ impl FileWal {
             ),
             Err(e) => return Err(WalError::Io(e)),
         };
-        let (state_root, overhaul_root) = overhaul_root_cached(&path);
         let mut lineage_id = recovered_lineage_id;
         // Creation is the identity boundary. Legacy files deliberately remain unidentified on
         // open and receive their first metadata frame only when append performs the next write.
@@ -949,13 +943,13 @@ impl FileWal {
         };
         Ok(Self {
             path,
-            state_root,
             file,
             next_seq,
             last_write_end,
             dir_needs_sync: Cell::new(true),
             newly_created_dirs: RefCell::new(newly_created_dirs),
-            overhaul_root,
+            config: WalConfig::LEGACY,
+            writer_id: None,
             lineage_id,
             recovery_cap: DEFAULT_MAX_READ_BYTES,
             append_budget: DEFAULT_MAX_READ_BYTES,
@@ -973,6 +967,22 @@ impl FileWal {
     pub fn with_feature_floor(mut self, floor: impl Into<PathBuf>) -> Self {
         self.feature_floor = Some(floor.into());
         self
+    }
+
+    /// Write this log in `config`'s format, as decided once at boot for its state root. An
+    /// overhaul log mints its random `writer_id` here, so each open stamps its own; it then writes
+    /// only version 4 frames it stamps itself and refuses caller-encoded bytes.
+    pub fn with_wal_config(mut self, config: WalConfig) -> Result<Self, WalError> {
+        self.writer_id = match config.format {
+            WalFormat::Legacy => None,
+            WalFormat::Overhaul => {
+                let mut id = [0u8; 16];
+                getrandom::fill(&mut id).map_err(WalError::Entropy)?;
+                Some(id)
+            }
+        };
+        self.config = config;
+        Ok(self)
     }
 
     /// The first barrier syncs the file, its parent, and parents of directories
@@ -1047,12 +1057,35 @@ impl FileWal {
         self
     }
 
+    /// Assemble the version 4 frame `prepared` at `seq`, with this open's `writer_id`, and hand
+    /// back the names it requires.
+    fn stamp_v4(
+        &self,
+        seq: u64,
+        fence: u64,
+        prepared: PreparedV4Frame,
+        appended_ms: u64,
+    ) -> Result<(Vec<u8>, std::borrow::Cow<'static, [&'static str]>), WalError> {
+        let writer_id = self
+            .writer_id
+            .expect("an overhaul log mints its writer id when it is configured");
+        let frame = prepared
+            .stamp(crate::framing::v4::Metadata {
+                seq,
+                fence,
+                appended_ms,
+                writer_id,
+            })
+            .map_err(WalError::Frame)?;
+        Ok((frame, prepared.requires().to_vec().into()))
+    }
+
     fn append_frame(
         &mut self,
         fence: u64,
         record: &WalRecord,
         sync: bool,
-        frame: Option<Vec<u8>>,
+        source: FrameSource,
     ) -> Result<u64, WalError> {
         // One validation phase per tenure: the open-time guard cleared the
         // fenced path and reference under the held tenure, so owned appends
@@ -1114,11 +1147,48 @@ impl FileWal {
             self.append_budget = self.recovery_cap;
         }
         let seq = self.next_seq;
-        let preencoded = frame.is_some();
-        let record_bytes = match frame {
-            Some(frame) => frame,
-            None => encode(seq, fence, record).map_err(WalError::Frame)?,
-        };
+        let preencoded = matches!(source, FrameSource::Legacy(_));
+        // The bytes this append writes, and every name the machine's feature floor must list
+        // before they exist. A legacy log writes exactly what it always has. An overhaul log
+        // writes only version 4 frames it stamps here, from a payload the shared codec built:
+        // caller-encoded bytes are refused, and nothing falls back to the legacy encoding.
+        let (record_bytes, requires): (Vec<u8>, std::borrow::Cow<'static, [&'static str]>) =
+            match (self.config.format, source) {
+                (WalFormat::Legacy, FrameSource::Encode) => (
+                    encode(seq, fence, record).map_err(WalError::Frame)?,
+                    record.required_features().into(),
+                ),
+                (WalFormat::Legacy, FrameSource::Legacy(frame)) => {
+                    (frame, record.required_features().into())
+                }
+                // A direct append, one that did not come through a writer handle, is stamped
+                // with the time it reaches this log.
+                (WalFormat::Overhaul, FrameSource::Encode) => self.stamp_v4(
+                    seq,
+                    fence,
+                    PreparedV4Frame::prepare(record).map_err(WalError::Frame)?,
+                    crate::framing::appended_ms_now(),
+                )?,
+                (
+                    WalFormat::Overhaul,
+                    FrameSource::V4 {
+                        prepared,
+                        appended_ms,
+                    },
+                ) => self.stamp_v4(seq, fence, prepared, appended_ms)?,
+                (log @ WalFormat::Overhaul, FrameSource::Legacy(_)) => {
+                    return Err(WalError::FrameFormat {
+                        log,
+                        offered: WalFormat::Legacy,
+                    })
+                }
+                (log @ WalFormat::Legacy, FrameSource::V4 { .. }) => {
+                    return Err(WalError::FrameFormat {
+                        log,
+                        offered: WalFormat::Overhaul,
+                    })
+                }
+            };
         let overhead = crate::framing::LINEAGE_FRAME_LEN as u64
             * if self.lineage_id.is_none() && current > 0 {
                 2
@@ -1140,18 +1210,17 @@ impl FileWal {
                 file_size: required,
             });
         }
-        // A version 4 writer stamps its header and writes here directly, so it has nothing to
-        // validate against the legacy bytes; every other pre-encoded frame is checked to be
-        // exactly the one its sequence, fence and record require.
-        if preencoded && !self.overhaul_root {
+        // A legacy pre-encoded frame is checked to be exactly the one its sequence, fence and
+        // record require. A version 4 frame was stamped above from the codec's own payload.
+        if preencoded {
             crate::framing::validate_preencoded(&record_bytes, seq, fence, record)
                 .map_err(WalError::Frame)?;
         }
         // Raise the floor BEFORE the frame exists, and refuse the append if it cannot be
         // raised. Placement reads the floor to decide which builds may run on this machine;
         // a gated frame written first would be data it does not know about if the process
-        // died before the floor caught up.
-        let requires = record.required_features();
+        // died before the floor caught up. Every version 4 frame names `frame-stamps/v1`, so
+        // on an overhaul log this runs before every append.
         if !requires.is_empty() {
             let refuse = |path: Option<PathBuf>, reason: String| WalError::FeatureFloor {
                 path,
@@ -1161,7 +1230,7 @@ impl FileWal {
             let Some(floor) = self.feature_floor.clone() else {
                 return Err(refuse(None, "no feature floor is configured".into()));
             };
-            crate::floor::raise_floor(&floor, requires)
+            crate::floor::raise_floor(&floor, &requires)
                 .map_err(|error| refuse(Some(floor), error.to_string()))?;
         }
         let (lineage_id, minted_for_legacy) = match self.lineage_id {
@@ -1203,7 +1272,7 @@ impl FileWal {
 
 impl Wal for FileWal {
     fn append(&mut self, fence: u64, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
-        self.append_frame(fence, record, sync, None)
+        self.append_frame(fence, record, sync, FrameSource::Encode)
     }
 
     fn append_preencoded(
@@ -1213,15 +1282,30 @@ impl Wal for FileWal {
         sync: bool,
         frame: Vec<u8>,
     ) -> Result<u64, WalError> {
-        self.append_frame(fence, record, sync, Some(frame))
+        self.append_frame(fence, record, sync, FrameSource::Legacy(frame))
     }
 
-    fn on_overhaul_root(&self) -> bool {
-        self.overhaul_root
+    fn append_v4(
+        &mut self,
+        fence: u64,
+        record: &WalRecord,
+        sync: bool,
+        prepared: PreparedV4Frame,
+        appended_ms: u64,
+    ) -> Result<u64, WalError> {
+        self.append_frame(
+            fence,
+            record,
+            sync,
+            FrameSource::V4 {
+                prepared,
+                appended_ms,
+            },
+        )
     }
 
-    fn state_root_path(&self) -> Option<PathBuf> {
-        Some(self.state_root.clone())
+    fn wal_config(&self) -> WalConfig {
+        self.config
     }
 
     fn append_budget(&self) -> Option<(u64, u64, u64)> {
@@ -1458,7 +1542,8 @@ impl OwnedWriterWal {
     /// Append a record at the next seq, stamped with the tenure's epoch.
     pub fn append(&mut self, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
         let fence = self.epoch();
-        self.wal.append_frame(fence, record, sync, None)
+        self.wal
+            .append_frame(fence, record, sync, FrameSource::Encode)
     }
 
     /// Append a frame encoded by the single writer's enqueue path, stamped
@@ -1470,7 +1555,8 @@ impl OwnedWriterWal {
         frame: Vec<u8>,
     ) -> Result<u64, WalError> {
         let fence = self.epoch();
-        self.wal.append_frame(fence, record, sync, Some(frame))
+        self.wal
+            .append_frame(fence, record, sync, FrameSource::Legacy(frame))
     }
 
     /// Move an unstarted log before its first record fixes its placement.

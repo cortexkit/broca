@@ -25,6 +25,7 @@ pub use file_wal::{
     WalError, WalRangeRead, WalRangeRecords, WalTailRead, DEFAULT_MAX_READ_BYTES,
 };
 pub use floor::{raise_floor, read_floor, FEATURE_FLOOR_FILENAME};
+pub use framing::PreparedV4Frame;
 #[cfg(any(test, feature = "test-known-feature"))]
 pub use framing::{forget_feature_for_test, ForgottenFeature};
 pub use framing::{
@@ -54,6 +55,7 @@ pub use record::{
     ACCOUNT_DECISION_PINNED, ACCOUNT_DECISION_ROUTED, ACCOUNT_DECISION_SINGLE_CANDIDATE,
     ACCOUNT_DECISION_UNREACHABLE, ACCOUNT_DECISION_UNSUPPORTED, MAX_REPLACEMENT_BYTES,
 };
+pub use state_format::{classify_state_root, StateRootError, WalConfig, WalFormat};
 // `PauseReason` is shared caller/WAL vocabulary; it lives in `broca-protocol` (like
 // `RunFinishReason`) and is re-exported here so existing `broca_wal::PauseReason` paths
 // keep resolving.

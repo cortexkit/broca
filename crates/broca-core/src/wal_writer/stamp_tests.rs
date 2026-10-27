@@ -1,5 +1,6 @@
-//! Version 4 writer stamps: the header's `appended_ms` and `writer_id` fields, which only an
-//! overhaul root (`broca-state/2`) writes.
+//! Version 4 writer stamps: the header's `appended_ms` and `writer_id` fields, which only a store
+//! configured at boot for an overhaul root (`broca-state/2`) writes, and the legacy-only store
+//! that refuses to write on such a root.
 //!
 //! Reading the stored bytes back through `FileWal::open` truncates a torn tail before it returns,
 //! so a frame cut inside its header that reads back as absent is the crash-cut contract: recovery
@@ -28,26 +29,36 @@ impl Root {
         Self::with_wal_dir(name, overhaul, false)
     }
 
-    fn with_wal_dir(name: &str, overhaul: bool, create_wal_dir: bool) -> Self {
+    fn scratch(name: &str) -> PathBuf {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let state_root = broca_test_support::scratch_root().join(format!(
             "wal-stamp-{}-{name}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
+        let _ = std::fs::remove_dir_all(&state_root);
         std::fs::create_dir_all(&state_root).unwrap();
+        state_root
+    }
+
+    /// The store is built the way the daemon builds it: from the boot classification of the
+    /// state root, so an overhaul root gets [`FileWalStore::with_config`].
+    fn with_wal_dir(name: &str, overhaul: bool, create_wal_dir: bool) -> Self {
+        let state_root = Self::scratch(name);
         if create_wal_dir {
             std::fs::create_dir_all(state_root.join("wal")).unwrap();
         }
         if overhaul {
             std::fs::write(
-                state_root.join(crate::state_format::MARKER_FILENAME),
+                state_root.join(broca_wal::state_format::MARKER_FILENAME),
                 b"broca-state/2\n",
             )
             .unwrap();
         }
+        let config = broca_wal::classify_state_root(&state_root).expect("classify the root");
+        assert_eq!(config.is_overhaul(), overhaul);
         Self {
-            wal_store: FileWalStore::new(state_root.join("wal")),
+            wal_store: FileWalStore::with_config(state_root.join("wal"), config),
             session: BindIdentity::new("/stamp-test", "runner", name),
             state_root,
         }
@@ -160,27 +171,27 @@ fn gate_deadline() -> std::time::Duration {
     std::time::Duration::from_secs(20)
 }
 
-/// A writer WAL that holds the writer thread in its first `append`, so a test can see everything
-/// enqueue finished before the writer ran.
+/// A writer WAL that holds the writer thread in its first version 4 append, so a test can act
+/// while the writer is parked there. It reports when the writer reached the gate, and on which
+/// thread.
 struct GatedWal {
     inner: Box<dyn Wal + Send>,
-    gate: Mutex<std::sync::mpsc::Receiver<()>>,
+    reached: std::sync::mpsc::Sender<std::thread::ThreadId>,
+    gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
 impl GatedWal {
     fn pass_gate(&self) {
-        // Only the first append waits: the gate receiver is consumed once and later calls find
-        // nothing left to receive.
-        let Ok(gate) = self.gate.try_lock() else {
-            return;
-        };
-        let _ = gate.recv_timeout(gate_deadline());
+        let _ = self.reached.send(std::thread::current().id());
+        // Only the first append waits: the gate receiver is taken once.
+        if let Some(gate) = self.gate.lock().unwrap().take() {
+            let _ = gate.recv_timeout(gate_deadline());
+        }
     }
 }
 
 impl Wal for GatedWal {
     fn append(&mut self, fence: u64, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
-        self.pass_gate();
         self.inner.append(fence, record, sync)
     }
 
@@ -191,16 +202,24 @@ impl Wal for GatedWal {
         sync: bool,
         frame: Vec<u8>,
     ) -> Result<u64, WalError> {
-        self.pass_gate();
         self.inner.append_preencoded(fence, record, sync, frame)
     }
 
-    fn on_overhaul_root(&self) -> bool {
-        self.inner.on_overhaul_root()
+    fn append_v4(
+        &mut self,
+        fence: u64,
+        record: &WalRecord,
+        sync: bool,
+        prepared: broca_wal::PreparedV4Frame,
+        appended_ms: u64,
+    ) -> Result<u64, WalError> {
+        self.pass_gate();
+        self.inner
+            .append_v4(fence, record, sync, prepared, appended_ms)
     }
 
-    fn state_root_path(&self) -> Option<PathBuf> {
-        self.inner.state_root_path()
+    fn wal_config(&self) -> broca_wal::WalConfig {
+        self.inner.wal_config()
     }
 
     fn append_budget(&self) -> Option<(u64, u64, u64)> {
@@ -239,6 +258,7 @@ impl Wal for GatedWal {
 #[tokio::test]
 async fn overhaul_root_frames_carry_a_writer_stamp() {
     let root = Root::new("stamped", true);
+    assert!(root.wal_store.wal_config().is_overhaul());
     let handle = root.handle(7);
     handle.record(record(1)).into_result().unwrap();
     handle.record(record(2)).into_result().unwrap();
@@ -260,16 +280,28 @@ async fn overhaul_root_frames_carry_a_writer_stamp() {
         landed[0].metadata.writer_id, landed[1].metadata.writer_id,
         "one writer stamps its id on every frame it appends"
     );
+    assert_eq!(
+        broca_wal::read_floor(&root.floor_path()).unwrap(),
+        std::collections::BTreeSet::from(["frame-stamps/v1".to_owned()]),
+        "the floor lists what the frames require"
+    );
     // The writer's own reader accepts what it wrote.
     let read = read_log(&root);
     assert_eq!(read.len(), 2);
+
+    // A later open is a new writer, with an id of its own.
+    let handle = root.handle(8);
+    handle.record(record(3)).into_result().unwrap();
+    handle.shutdown().await.expect("shutdown");
+    let landed = frames(&root);
+    assert_eq!(landed.len(), 3);
+    assert_ne!(landed[2].metadata.writer_id, landed[0].metadata.writer_id);
 }
 
 #[tokio::test]
 async fn a_marked_root_without_its_wal_directory_still_writes_version_4() {
     // The state root is marked before its `wal/` directory exists, so the first log open is also
-    // the call that creates `wal/`. That creation says nothing about the root's format: the
-    // marker, not the directory, decides it.
+    // the call that creates `wal/`. The boot classification, not the directory, decides it.
     let root = Root::without_wal_dir("fresh-overhaul", true);
     assert!(!root.state_root.join("wal").exists());
     let handle = root.handle(7);
@@ -285,21 +317,185 @@ async fn a_marked_root_without_its_wal_directory_still_writes_version_4() {
 #[tokio::test]
 async fn a_legacy_root_keeps_the_frames_it_wrote_before() {
     let root = Root::new("legacy", false);
+    assert!(!root.wal_store.wal_config().is_overhaul());
     let handle = root.handle(7);
     handle.record(record(1)).into_result().unwrap();
     handle.shutdown().await.expect("shutdown");
 
     let bytes = stored(&root);
-    assert_ne!(
-        bytes[FIRST_FRAME + 4],
-        broca_wal::framing::V4_FRAMING_VERSION,
-        "a root without the overhaul marker keeps its legacy frame version"
+    let legacy = broca_wal::framing::encode(1, 7, &record(1)).unwrap();
+    assert_eq!(
+        bytes[FIRST_FRAME..FIRST_FRAME + legacy.len()],
+        legacy,
+        "a root without the overhaul marker writes the legacy frame byte for byte"
     );
     assert!(
         !root.floor_path().exists(),
         "a legacy frame names no new feature, so nothing is raised at the floor"
     );
     assert_eq!(read_log(&root).len(), 1);
+}
+
+#[test]
+fn the_default_store_refuses_to_write_on_a_marked_root() {
+    // `FileWalStore::new` writes only legacy frames, so on a root marked `broca-state/2`, or one
+    // whose marker cannot be read, every writable open refuses by name and creates nothing.
+    for marker in ["overhaul", "unreadable", "unknown"] {
+        let state_root = Root::scratch("default-store");
+        let marker_path = state_root.join(broca_wal::state_format::MARKER_FILENAME);
+        match marker {
+            "overhaul" => std::fs::write(&marker_path, b"broca-state/2\n").unwrap(),
+            "unreadable" => std::fs::create_dir(&marker_path).unwrap(),
+            _ => std::fs::write(&marker_path, b"broca-state/3\n").unwrap(),
+        }
+        let store = FileWalStore::new(state_root.join("wal"));
+        assert!(!store.wal_config().is_overhaul());
+        let session = BindIdentity::new("/stamp-test", "runner", "default-store");
+        for open in [
+            store.open(&session).map(drop),
+            store.open_with_class(&session, None, None).map(drop),
+            store.open_with_class(&session, Some(60), None).map(drop),
+        ] {
+            let error = open.expect_err(marker);
+            assert!(
+                matches!(
+                    error,
+                    WalError::StateRoot(broca_wal::StateRootError::OverhaulRootNeedsConfig { .. })
+                ),
+                "{marker}: {error:?}"
+            );
+            assert!(error.to_string().contains("wal store refused"), "{error}");
+        }
+        assert!(
+            !state_root.join("wal").exists(),
+            "{marker}: a refused open creates nothing"
+        );
+        let _ = std::fs::remove_dir_all(&state_root);
+    }
+    // The same store on an unmarked root writes as it always has.
+    let state_root = Root::scratch("default-store-legacy");
+    let store = FileWalStore::new(state_root.join("wal"));
+    let session = BindIdentity::new("/stamp-test", "runner", "default-store");
+    let mut wal = store.open(&session).expect("an unmarked root is legacy");
+    wal.append(1, &record(1), true).unwrap();
+    let _ = std::fs::remove_dir_all(&state_root);
+}
+
+#[tokio::test]
+async fn appended_ms_is_sampled_on_the_writer_thread_when_it_writes() {
+    let root = Root::new("writer-thread", true);
+    // The stamp clock returns whatever the test sets, and records the thread that read it.
+    let now = Arc::new(AtomicU64::new(1_000));
+    let readers = Arc::new(Mutex::new(Vec::new()));
+    let clock = {
+        let now = now.clone();
+        let readers = readers.clone();
+        StampClock::from_fn(move || {
+            readers.lock().unwrap().push(std::thread::current().id());
+            now.load(Ordering::SeqCst)
+        })
+    };
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+    let handle = WalHandle::spawn_with_stamp_clock(
+        Box::new(GatedWal {
+            inner: root.open(),
+            reached: reached_tx,
+            gate: Mutex::new(Some(gate_rx)),
+        }),
+        3,
+        clock,
+    )
+    .expect("spawn the writer");
+
+    // The writer takes the first record, reads the clock (1000) and parks at the gate.
+    handle.record(record(1)).into_result().unwrap();
+    let writer_thread = reached_rx
+        .recv_timeout(gate_deadline())
+        .expect("the writer reaches the gate");
+    assert_ne!(writer_thread, std::thread::current().id());
+    // The second record is enqueued while the writer is parked, and only then does the clock
+    // move. Sampling at enqueue would stamp it 1000; the writer samples 2000 when it gets there.
+    handle.record(record(2)).into_result().unwrap();
+    assert_eq!(
+        readers.lock().unwrap().len(),
+        1,
+        "enqueueing a record does not read the stamp clock"
+    );
+    now.store(2_000, Ordering::SeqCst);
+    gate_tx.send(()).unwrap();
+    handle.sync().await.expect("sync past the gate");
+
+    let landed = frames(&root);
+    assert_eq!(landed.len(), 2);
+    assert_eq!(landed[0].metadata.appended_ms, 1_000);
+    assert_eq!(
+        landed[1].metadata.appended_ms, 2_000,
+        "the second frame carries the value read when the writer wrote it"
+    );
+    let readers = readers.lock().unwrap().clone();
+    assert_eq!(readers, [writer_thread, writer_thread]);
+    handle.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn the_frame_is_prepared_at_enqueue_and_the_floor_raised_before_it_is_written() {
+    let root = Root::new("prepared", true);
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+    let handle = WalHandle::spawn(
+        Box::new(GatedWal {
+            inner: root.open(),
+            reached: reached_tx,
+            gate: Mutex::new(Some(gate_rx)),
+        }),
+        3,
+    )
+    .expect("spawn the writer");
+    // An encode error surfaces at enqueue, on the caller's thread, because that is where the
+    // version 4 payload is serialized. It is returned, never swallowed, and the writer fails
+    // closed: nothing later can claim durability past the missing record.
+    let refused = handle.record(WalRecord::Unknown).into_result();
+    assert!(refused.is_err(), "{refused:?}");
+    let _ = handle.record(record(1));
+    drop(gate_tx);
+    assert!(
+        handle.sync().await.is_err(),
+        "a refused encode poisons the writer, so no barrier can succeed after it"
+    );
+    assert!(
+        reached_rx.try_recv().is_err(),
+        "no record reached the log after the refusal"
+    );
+    assert_eq!(stored(&root).len(), FIRST_FRAME, "nothing was written");
+    let _ = handle.shutdown().await;
+
+    let root = Root::new("prepared-floor", true);
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+    let handle = WalHandle::spawn(
+        Box::new(GatedWal {
+            inner: root.open(),
+            reached: reached_tx,
+            gate: Mutex::new(Some(gate_rx)),
+        }),
+        3,
+    )
+    .expect("spawn the writer");
+    handle.record(record(1)).into_result().unwrap();
+    reached_rx
+        .recv_timeout(gate_deadline())
+        .expect("the writer reaches the gate");
+    // Parked before the log: no frame, so no floor yet either.
+    assert_eq!(stored(&root).len(), FIRST_FRAME);
+    gate_tx.send(()).unwrap();
+    handle.sync().await.expect("sync past the gate");
+    assert_eq!(frames(&root).len(), 1);
+    assert_eq!(
+        broca_wal::read_floor(&root.floor_path()).unwrap(),
+        std::collections::BTreeSet::from(["frame-stamps/v1".to_owned()]),
+    );
+    handle.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]
@@ -311,11 +507,8 @@ async fn appended_ms_monotonic_per_process() {
         handle.sync().await.unwrap();
         let stamped = frames(&root);
         assert_eq!(stamped.len() as u64, n);
-        // This writer's frames. Sibling tests in the same binary stamp their own, and the
-        // process-wide floor is shared, so only one writer's sequence says anything here.
-        let writer_id = stamped[0].metadata.writer_id;
         let mut last = 0;
-        for header in stamped.iter().filter(|h| h.metadata.writer_id == writer_id) {
+        for header in &stamped {
             assert!(
                 header.metadata.appended_ms >= last,
                 "appended_ms went backwards: {} after {last}",
@@ -324,162 +517,6 @@ async fn appended_ms_monotonic_per_process() {
             last = header.metadata.appended_ms;
         }
     }
-    handle.shutdown().await.expect("shutdown");
-}
-
-/// A writer WAL that records, for each frame, the wall-clock time its own writer thread read when
-/// it was handed the frame.
-///
-/// The stamp and the reading come from the same clock, the same thread and the same moment: the
-/// shortest wait between them is under a millisecond, so two separate readings could differ by
-/// more than the gap they are meant to bound.
-struct StampedWal {
-    inner: Box<dyn Wal + Send>,
-    readings: std::sync::Arc<Mutex<Vec<WriterReading>>>,
-}
-
-/// The wall-clock time the writer thread read just before it handed a frame to the WAL.
-struct WriterReading {
-    wall_ms: u128,
-}
-
-impl StampedWal {
-    /// Both readings below happen after the writer thread computes a frame's header, so the
-    /// stamp is at or after the wall-clock value they both sample.
-    fn note(&self) {
-        let wall_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-        self.readings
-            .lock()
-            .unwrap()
-            .push(WriterReading { wall_ms });
-    }
-}
-
-impl Wal for StampedWal {
-    fn append(&mut self, fence: u64, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
-        self.note();
-        self.inner.append(fence, record, sync)
-    }
-
-    fn append_preencoded(
-        &mut self,
-        fence: u64,
-        record: &WalRecord,
-        sync: bool,
-        frame: Vec<u8>,
-    ) -> Result<u64, WalError> {
-        self.note();
-        self.inner.append_preencoded(fence, record, sync, frame)
-    }
-
-    fn on_overhaul_root(&self) -> bool {
-        self.inner.on_overhaul_root()
-    }
-
-    fn state_root_path(&self) -> Option<PathBuf> {
-        self.inner.state_root_path()
-    }
-
-    fn append_budget(&self) -> Option<(u64, u64, u64)> {
-        self.inner.append_budget()
-    }
-
-    fn recovery_byte_cap(&self) -> Option<u64> {
-        self.inner.recovery_byte_cap()
-    }
-
-    fn append_budget_scope(&self) -> broca_wal::size_limit::SizeScope {
-        self.inner.append_budget_scope()
-    }
-
-    fn sync(&self) -> Result<(), WalError> {
-        self.inner.sync()
-    }
-
-    fn replay(&self) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
-        self.inner.replay()
-    }
-
-    fn tail_after_seq(&self, after_seq: u64) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
-        self.inner.tail_after_seq(after_seq)
-    }
-
-    fn last_seq(&self) -> u64 {
-        self.inner.last_seq()
-    }
-
-    fn lineage_id(&self) -> Option<broca_wal::WalLineageId> {
-        self.inner.lineage_id()
-    }
-}
-
-#[tokio::test]
-async fn appended_ms_taken_on_writer_thread() {
-    let root = Root::new("writer-thread", true);
-    // Each frame records the wall-clock time the writer thread read when it handed the frame to
-    // the WAL, which is after it computed the frame's header. A handle stamps `appended_ms` in
-    // that header, so the stamp bounds that reading from below; one sampled while the record was
-    // enqueued, before the writer thread ran, does not.
-    let readings = std::sync::Arc::new(Mutex::new(Vec::new()));
-    let record_readings = readings.clone();
-    let handle = WalHandle::spawn(
-        Box::new(StampedWal {
-            inner: root.open(),
-            readings: record_readings,
-        }),
-        3,
-    )
-    .expect("spawn the writer");
-    handle.record(record(1)).into_result().unwrap();
-    handle.sync().await.expect("sync");
-    handle.record(record(2)).into_result().unwrap();
-    handle.sync().await.expect("sync");
-    let landed = frames(&root);
-    assert_eq!(landed.len(), 2);
-    {
-        let readings = readings.lock().unwrap();
-        assert_eq!(readings.len(), 2);
-        for (header, reading) in landed.iter().zip(readings.iter()) {
-            assert!(
-                header.metadata.appended_ms as u128 >= reading.wall_ms,
-                "appended_ms {} predates the writer thread's own reading at {}: it was taken \
-                 before the writer ran",
-                header.metadata.appended_ms,
-                reading.wall_ms
-            );
-        }
-    }
-    handle.shutdown().await.expect("shutdown");
-}
-
-#[tokio::test]
-async fn preencoded_frame_hash_off_thread() {
-    let root = Root::new("hash-off-thread", true);
-    let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
-    let handle = WalHandle::spawn(
-        Box::new(GatedWal {
-            inner: root.open(),
-            gate: Mutex::new(gate_rx),
-        }),
-        3,
-    )
-    .expect("spawn the writer");
-    // The writer is parked in its first append, and enqueue has already returned. Everything
-    // enqueue settles off the writer thread is settled now: the feature floor names what every
-    // version 4 frame requires, while the log still holds no frame.
-    handle.record(record(1)).into_result().unwrap();
-    assert_eq!(
-        broca_wal::read_floor(&root.floor_path()).unwrap(),
-        std::collections::BTreeSet::from(["frame-stamps/v1".to_owned()]),
-        "enqueue settles the frame's feature names before the writer thread runs"
-    );
-    assert_eq!(stored(&root).len(), FIRST_FRAME);
-    gate_tx.send(()).unwrap();
-    handle.sync().await.expect("sync past the gate");
-    assert_eq!(frames(&root).len(), 1);
     handle.shutdown().await.expect("shutdown");
 }
 
@@ -494,15 +531,11 @@ async fn crash_cut_inside_a_version_4_header_is_a_torn_tail() {
     assert_eq!(frames(&root).len(), 2);
 
     // A crash mid-write leaves the first frame and its trailing identity frame whole, and cuts
-    // the second frame's header partway. (A reader without this header treats the bytes after
-    // the first frame as a torn tail, so the cut must come after them.)
+    // the second frame's header partway, past the legacy header length recovery first reads.
     let second_start = second_frame_start(&complete);
     let second = broca_wal::framing::v4::decode_header(&complete[second_start..])
         .unwrap()
         .expect("the second frame has a header");
-    // A version 4 header is 83 bytes before its requirements array. The cut is past the legacy
-    // header length recovery first reads, so what survives is a partially written version 4
-    // header rather than an empty read.
     let cut = second_start + 64;
     assert!(cut < second_start + second.frame_len());
     std::fs::write(root.log_path(), &complete[..cut]).unwrap();
@@ -513,9 +546,6 @@ async fn crash_cut_inside_a_version_4_header_is_a_torn_tail() {
         1,
         "recovery discards the header that was cut short"
     );
-    // Recovery may discard the torn bytes; what it may not do is keep the first frame while
-    // failing to read it. A log that reopened at sequence 1 and holds no later frame is a log
-    // that ends at its last complete frame.
     assert_eq!(frames(&root).len(), 1, "only the complete frame survives");
     // Appending after recovery continues from the surviving frame.
     let handle = WalHandle::spawn(recovered, 5).expect("spawn on the recovered log");
@@ -526,28 +556,4 @@ async fn crash_cut_inside_a_version_4_header_is_a_torn_tail() {
     assert_eq!(landed.len(), 3);
     assert_eq!(landed[1].metadata.seq, 2);
     assert_eq!(landed[2].metadata.seq, 3);
-}
-
-#[tokio::test]
-async fn power_loss_cut_inside_a_version_4_header_is_a_torn_tail() {
-    let root = Root::new("power-loss", true);
-    let handle = root.handle(5);
-    handle.record(record(1)).into_result().unwrap();
-    handle.record(record(2)).into_result().unwrap();
-    handle.shutdown().await.expect("shutdown");
-    let complete = stored(&root);
-
-    // A power loss that reached the disk partway through the second frame's header.
-    let cut = second_frame_start(&complete) + 64;
-    assert!(cut < complete.len());
-    std::fs::write(root.log_path(), &complete[..cut]).unwrap();
-
-    let recovered = root.open();
-    assert_eq!(
-        recovered.last_seq(),
-        1,
-        "only the frame that reached the disk in full survives"
-    );
-    assert_eq!(frames(&root).len(), 1);
-    assert_eq!(read_log(&root).len(), 1);
 }

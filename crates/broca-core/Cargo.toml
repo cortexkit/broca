@@ -35,8 +35,6 @@ async-trait.workspace = true
 futures.workspace = true
 # The prefix/cache hash over the deterministic provider-rendered request bytes (C7).
 sha2.workspace = true
-# The random 128-bit id minted at each writer open and stamped in version 4 frame headers.
-getrandom = "0.3"
 
 [dev-dependencies]
 broca-owner-only = { workspace = true, features = ["test-support"] }

@@ -160,6 +160,26 @@ impl Wal for ObservedWal {
         }
         result
     }
+    fn append_v4(
+        &mut self,
+        fence: u64,
+        record: &WalRecord,
+        sync: bool,
+        prepared: broca_wal::PreparedV4Frame,
+        appended_ms: u64,
+    ) -> Result<u64, WalError> {
+        let result = self
+            .inner
+            .append_v4(fence, record, sync, prepared, appended_ms);
+        self.note_retention(record);
+        if sync && result.is_ok() {
+            self.durable();
+        }
+        result
+    }
+    fn wal_config(&self) -> broca_wal::WalConfig {
+        self.inner.wal_config()
+    }
 
     fn sync(&self) -> Result<(), WalError> {
         self.inner.sync()?;
@@ -177,12 +197,6 @@ impl Wal for ObservedWal {
     }
     fn lineage_id(&self) -> Option<broca_wal::WalLineageId> {
         self.inner.lineage_id()
-    }
-    fn on_overhaul_root(&self) -> bool {
-        self.inner.on_overhaul_root()
-    }
-    fn state_root_path(&self) -> Option<std::path::PathBuf> {
-        self.inner.state_root_path()
     }
     fn append_budget(&self) -> Option<(u64, u64, u64)> {
         self.inner.append_budget()
