@@ -611,3 +611,197 @@ async fn owned_open_keeps_lease_until_wal_is_closed() {
     reopened.shutdown().await.expect("shutdown");
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// Opens a [`FinalSyncWal`] so a test can observe exactly when the writer's WAL drops.
+struct FinalSyncStore {
+    syncs: Arc<AtomicUsize>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl WalStore for FinalSyncStore {
+    fn open(&self, _: &BindIdentity) -> Result<Box<dyn Wal + Send>, WalError> {
+        Ok(Box::new(FinalSyncWal {
+            seq: 0,
+            syncs: self.syncs.clone(),
+            dropped: self.dropped.clone(),
+            panic_on_final: false,
+        }))
+    }
+    fn read_records(&self, _: &BindIdentity) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
+        Ok(vec![])
+    }
+}
+
+#[tokio::test]
+async fn shutdown_into_tenure_closes_the_wal_before_returning_the_held_lease() {
+    use crate::{lease_key_for, LeaseStore};
+    for final_sync_fails in [false, true] {
+        let root = broca_test_support::scratch_root().join(format!(
+            "broca-close-into-tenure-{final_sync_fails}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let lease_dir = root.join("leases");
+        let domain = crate::lease::WalLeaseDomain::new(lease_dir.clone());
+        let session = BindIdentity::new(root.join("project"), "h", "s");
+        let key = lease_key_for(&session);
+        // FinalSyncWal fails its third sync: recovery proof, one explicit barrier, then
+        // the shutdown barrier. Starting the count high keeps every sync successful.
+        let syncs = Arc::new(AtomicUsize::new(if final_sync_fails { 0 } else { 100 }));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let store = Arc::new(FinalSyncStore {
+            syncs: syncs.clone(),
+            dropped: dropped.clone(),
+        });
+        let tenure = domain.acquire(&session).expect("acquire caller tenure");
+        let epoch = tenure.epoch();
+        let handle = WalHandle::open_and_spawn_owned(store, session.clone(), tenure, None)
+            .await
+            .expect("owned open");
+        handle.record(WalRecord::Unknown).into_result().unwrap();
+        handle.sync().await.unwrap();
+        handle.record(WalRecord::Unknown).into_result().unwrap();
+
+        let (result, closed) = handle.shutdown_into_tenure().await;
+        assert_eq!(result.is_err(), final_sync_fails, "{result:?}");
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "the WAL descriptor is gone before the tenure is handed back"
+        );
+        let closed = closed.expect("an owned writer hands back its tenure even on sync failure");
+        assert_eq!(closed.epoch(), epoch);
+        assert_eq!(closed.key(), &key);
+        assert!(
+            matches!(
+                crate::FileLeaseStore::new(&lease_dir).acquire(&key),
+                Err(crate::LeaseError::Held { .. })
+            ),
+            "the handed-back tenure still holds the session lease"
+        );
+        drop(closed);
+        drop(
+            crate::FileLeaseStore::new(&lease_dir)
+                .acquire(&key)
+                .expect("dropping the closed tenure releases the lease"),
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn shutdown_into_tenure_of_a_standalone_writer_hands_back_nothing() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let writer = WalHandle::spawn(
+        Box::new(FinalSyncWal {
+            seq: 0,
+            syncs: Arc::new(AtomicUsize::new(100)),
+            dropped: dropped.clone(),
+            panic_on_final: false,
+        }),
+        1,
+    )
+    .unwrap();
+    let (result, closed) = writer.shutdown_into_tenure().await;
+    result.unwrap();
+    assert!(
+        closed.is_none(),
+        "a lease-free writer has no tenure to hand over"
+    );
+    assert!(dropped.load(Ordering::Acquire));
+}
+
+/// Records, in order, when a writer's WAL and its lease are dropped.
+type DropLog = Arc<Mutex<Vec<&'static str>>>;
+
+struct OrderWal {
+    log: DropLog,
+    panic_in_preparation: bool,
+}
+
+impl Drop for OrderWal {
+    fn drop(&mut self) {
+        self.log.lock().unwrap().push("wal");
+    }
+}
+
+impl Wal for OrderWal {
+    fn append(&mut self, _: u64, _: &WalRecord, _: bool) -> Result<u64, WalError> {
+        Ok(1)
+    }
+    fn sync(&self) -> Result<(), WalError> {
+        Ok(())
+    }
+    fn replay(&self) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
+        Ok(vec![])
+    }
+    fn tail_after_seq(&self, _: u64) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
+        Ok(vec![])
+    }
+    fn last_seq(&self) -> u64 {
+        0
+    }
+    fn append_budget(&self) -> Option<(u64, u64, u64)> {
+        // Read while the writer handle is prepared, after recovery is proven and before
+        // the writer thread exists.
+        if self.panic_in_preparation {
+            panic!("injected panic while preparing the writer handle");
+        }
+        None
+    }
+}
+
+#[derive(Debug)]
+struct OrderLease {
+    key: cortexkit_lease::LeaseKey,
+    log: DropLog,
+}
+
+impl LeaseHandle for OrderLease {
+    fn epoch(&self) -> u64 {
+        1
+    }
+    fn key(&self) -> &cortexkit_lease::LeaseKey {
+        &self.key
+    }
+}
+
+impl Drop for OrderLease {
+    fn drop(&mut self) {
+        self.log.lock().unwrap().push("lease");
+    }
+}
+
+fn order_parts(panic_in_preparation: bool) -> (DropLog, Box<OrderWal>, Box<OrderLease>) {
+    let log = DropLog::default();
+    let wal = Box::new(OrderWal {
+        log: log.clone(),
+        panic_in_preparation,
+    });
+    let lease = Box::new(OrderLease {
+        key: cortexkit_lease::LeaseKey::new("broca", "wal", "order-test"),
+        log: log.clone(),
+    });
+    (log, wal, lease)
+}
+
+#[test]
+fn writer_preparation_panic_closes_the_wal_before_the_lease() {
+    let (log, wal, lease) = order_parts(true);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        WalHandle::spawn_with_lease(wal, lease)
+    }));
+    assert!(outcome.is_err(), "the injected preparation panic must fire");
+    assert_eq!(*log.lock().unwrap(), vec!["wal", "lease"]);
+}
+
+#[test]
+fn writer_thread_spawn_failure_closes_the_wal_before_the_lease() {
+    let (log, wal, lease) = order_parts(false);
+    FAIL_NEXT_WRITER_SPAWN.with(|fail| fail.set(true));
+    let error = match WalHandle::spawn_with_lease(wal, lease) {
+        Ok(_) => panic!("the injected spawn failure must refuse the writer"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("spawn failed"), "{error}");
+    assert_eq!(*log.lock().unwrap(), vec!["wal", "lease"]);
+}

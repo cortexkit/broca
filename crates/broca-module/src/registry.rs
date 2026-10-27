@@ -587,9 +587,63 @@ impl std::fmt::Display for ShutdownReport {
 }
 
 pub struct MoveSessionGuard {
+    /// Actors retired by a mutating cut: each closed its writer, handed over the
+    /// still-held session lease (absent if the writer could not close cleanly), and left
+    /// its registry slot `Closing` under a close token this guard now owns. Dropping the
+    /// guard releases each lease and then commits each slot closed, all before the cut
+    /// gates release, so the next cut lock or opener finds the slot already absent
+    /// instead of racing the retired actor's exit.
+    retired: Vec<RetiredActor>,
     gates: Vec<tokio::sync::OwnedMutexGuard<()>>,
     actors: Vec<tokio::sync::oneshot::Sender<()>>,
     pub busy: Vec<(LineageKey, Option<String>)>,
+}
+
+/// One actor generation a mutating cut retired; see [`MoveSessionGuard`].
+struct RetiredActor {
+    key: LineageKey,
+    tenure: Option<broca_core::wal_writer::ClosedWriterTenure>,
+    close: CloseToken,
+}
+
+impl Drop for MoveSessionGuard {
+    fn drop(&mut self) {
+        // Release the lease before the slot turns absent, and turn the slot absent
+        // before the gates (dropped with the fields below) let anyone else in.
+        for retired in self.retired.drain(..) {
+            drop(retired.tenure);
+            retired.close.commit();
+        }
+    }
+}
+
+impl MoveSessionGuard {
+    /// Whether this guard holds the session lease handed over by `key`'s closed actor.
+    pub fn holds_tenure(&self, key: &LineageKey) -> bool {
+        self.retired
+            .iter()
+            .any(|retired| &retired.key == key && retired.tenure.is_some())
+    }
+
+    /// How many closed actors handed their session lease to this guard.
+    pub fn handed_tenures(&self) -> usize {
+        self.retired
+            .iter()
+            .filter(|retired| retired.tenure.is_some())
+            .count()
+    }
+}
+
+/// How a move holds an open session actor while it works on that session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CutLockMode {
+    /// The move only reads. Open actors pause and later resume with their writer.
+    Inspect,
+    /// The move may publish or remove move markers for the session. An idle actor that
+    /// owns its tenure through its writer closes that writer and hands the still-held
+    /// lease to the guard; the guard commits its slot closed when released. Other actors
+    /// pause as for `Inspect`; a busy actor refuses without changing its writer.
+    Mutate,
 }
 
 struct Inner {
@@ -1039,10 +1093,23 @@ impl LineageRegistry {
 
     /// Prevent opening absent actors and pause existing actors, in contract ref
     /// order. The returned guard remains held through the durable cut completion.
+    /// This is the inspection mode: no actor closes and the guard takes no tenure.
     pub async fn lock_move_sessions(
         &self,
         sessions: &[LineageKey],
         reject_open: bool,
+    ) -> Result<MoveSessionGuard, OpenError> {
+        self.lock_move_sessions_with_mode(sessions, reject_open, CutLockMode::Inspect)
+            .await
+    }
+
+    /// Like [`Self::lock_move_sessions`], choosing how open actors are held. In
+    /// [`CutLockMode::Mutate`] the guard may receive closed actors' session leases.
+    pub async fn lock_move_sessions_with_mode(
+        &self,
+        sessions: &[LineageKey],
+        reject_open: bool,
+        mode: CutLockMode,
     ) -> Result<MoveSessionGuard, OpenError> {
         let mut sorted = sessions.to_vec();
         sorted.sort_by_key(|key| {
@@ -1064,6 +1131,7 @@ impl LineageRegistry {
             )
         });
         let mut guard = MoveSessionGuard {
+            retired: Vec::new(),
             gates: Vec::new(),
             actors: Vec::new(),
             busy: Vec::new(),
@@ -1101,14 +1169,27 @@ impl LineageRegistry {
                 }
                 let (reply, wait) = tokio::sync::oneshot::channel();
                 handle
-                    .send(crate::actor::LineageCmd::CutLock { reply })
+                    .send(crate::actor::LineageCmd::CutLock { reply, mode })
                     .await
                     .map_err(|_| OpenError::Open("actor closed during cut lock".into()))?;
-                let (busy, release) = wait
+                let crate::actor::CutLockReply {
+                    busy,
+                    release,
+                    retired,
+                } = wait
                     .await
                     .map_err(|_| OpenError::Open("actor closed during cut lock".into()))?;
                 guard.busy.push((key.clone(), busy));
                 guard.actors.push(release);
+                if let Some(crate::actor::RetiredForCut { tenure, close }) = retired {
+                    // Only a mutating cut may retire an actor or take its session lease.
+                    debug_assert_eq!(mode, CutLockMode::Mutate);
+                    guard.retired.push(RetiredActor {
+                        key: key.clone(),
+                        tenure,
+                        close,
+                    });
+                }
             }
             self.inner.opener.retire_idle_session_transport(&key);
         }
