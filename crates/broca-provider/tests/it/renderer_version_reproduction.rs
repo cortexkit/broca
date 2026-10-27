@@ -203,6 +203,12 @@ fn every_reproducible_declaration_renders_its_pinned_old_bytes() {
         ))
         .expect("OpenAI Chat v4 pins are JSON"),
     );
+    // Anthropic v3's server-side fallback opt-in is a flag a config frozen at v2 does not carry,
+    // so these v2 pins keep their bytes; they are also the v2 proof for the declaration above.
+    pins.extend(
+        serde_json::from_str::<Vec<Value>>(include_str!("../fixtures/pre_native_media.json"))
+            .expect("Anthropic v2 pins are JSON"),
+    );
     let legacy_opts = legacy_call_options();
     let chat_v4_opts = openai_chat_v4_call_options();
     let mut proven = BTreeSet::new();
@@ -527,4 +533,60 @@ mod live {
         assert!(rebuilt.reproduces_renderer_version(7));
         assert!(rebuilt.reproduces_renderer_version(8));
     }
+}
+
+/// An Anthropic config that does not opt in freezes v2, the version every Anthropic run froze
+/// before the opt-in existed. Its frozen blob is byte-for-byte a v2 blob: compare it with the
+/// pinned v2 config the reproducibility proof above already holds, with the model id set aside.
+/// This is the rollback guarantee — a build rolled back past v3 resumes such a run, because
+/// neither the recorded version nor the recorded config moved.
+#[test]
+fn an_anthropic_config_without_the_opt_in_freezes_v2_exactly_as_before() {
+    let frozen = broca_provider::families::anthropic_frozen_config("claude-opus-5-5");
+    assert_eq!(frozen.renderer_version, 2);
+    assert!(!frozen.server_side_fallback);
+    let blob = serde_json::to_value(&frozen).unwrap();
+    assert!(blob.get("server_side_fallback").is_none(), "{blob}");
+
+    let pin = serde_json::from_str::<Vec<Value>>(include_str!("../fixtures/pre_native_media.json"))
+        .unwrap()
+        .into_iter()
+        .find(|case| {
+            case["frozen"]["family_id"] == "anthropic_messages"
+                && case["frozen"]["renderer_version"] == 2
+                && case["frozen"]["system_prompt"]["mode"] == "instructions_field"
+        })
+        .expect("the fixture holds an Anthropic v2 config");
+    let expected = pin["frozen"].as_object().unwrap();
+    let ours = blob.as_object().unwrap();
+    // The fixture's config is a different shape on purpose (no identity lead), so this compares
+    // the field SET: the same keys, with no new one added and none dropped.
+    let mut their_keys: Vec<&String> = expected.keys().collect();
+    let mut our_keys: Vec<&String> = ours.keys().collect();
+    their_keys.sort();
+    our_keys.sort();
+    assert_eq!(our_keys, their_keys);
+    assert_eq!(blob["renderer_version"], 2);
+}
+
+/// A config that opts in freezes v3, the version whose bytes it renders.
+#[test]
+fn an_anthropic_config_with_the_opt_in_freezes_v3() {
+    let mut frozen = broca_provider::families::anthropic_frozen_config("claude-opus-5-5");
+    frozen.server_side_fallback = true;
+    frozen.renderer_version = broca_provider::families::anthropic_renderer_version(true);
+    assert_eq!(frozen.renderer_version, 3);
+    let body: Value =
+        serde_json::from_slice(&AnthropicMessages.render(&frozen, &legacy_call_options())).unwrap();
+    assert_eq!(body["fallbacks"], "default");
+    // Both versions a recorded Anthropic run can name are accepted on resume: the current one
+    // and the reproducible v2 predecessor.
+    assert!(reproduces_renderer_version(
+        WireFamilyId::AnthropicMessages,
+        frozen.renderer_version
+    ));
+    assert!(reproduces_renderer_version(
+        WireFamilyId::AnthropicMessages,
+        2
+    ));
 }

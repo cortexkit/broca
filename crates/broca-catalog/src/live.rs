@@ -808,14 +808,20 @@ fn resolve_provider_inner(
         let mut frozen = recorded.clone();
         frozen.opencode_go_session_id = episode_render.opencode_go_session_id.map(str::to_owned);
         let family = frozen.family_id;
-        // The provider represents today's code. Core must ask the family's independent
-        // compatibility table before comparing a blob restamped to the recorded version.
-        frozen.renderer_version = renderer_version_for(family);
         // The resumed episode's auth method decides the same method-scoped render choices a
         // fresh admission applies, so an api-key episode that recorded the opt-in still sends no
         // `fallbacks`.
         apply_auth_method_quirks(provider_id, opts.auth_method, &mut frozen);
         apply_server_side_fallback_auth_scope(provider_id, opts.auth_method, &mut frozen);
+        // The provider represents today's code. Core must ask the family's independent
+        // compatibility table before comparing a blob restamped to the recorded version. On
+        // Anthropic the version follows the opt-in as recorded, so a run that never opted in
+        // keeps the v2 identity (and version) it was admitted with.
+        frozen.renderer_version = if family == WireFamilyId::AnthropicMessages {
+            broca_provider::families::anthropic_renderer_version(frozen.server_side_fallback)
+        } else {
+            renderer_version_for(family)
+        };
         let auth_kind =
             provider_route_auth_kind(provider_id, family, &crate::default_auth_kind(family));
         let (handle, auth_desc, auth_method, refresher) =
@@ -1236,6 +1242,23 @@ fn resolve_provider_inner(
     let auth_kind = provider_route_auth_kind(provider_id, family, &provider_spec.auth_kind);
     let (handle, auth_desc, auth_method) =
         resolve_auth(auth, &auth_kind, provider_id, opts.auth_method)?;
+    // The server-side fallback opt-in is decided BEFORE the render version, because the version
+    // records whether this config can render the opt-in's bytes at all: a config that does not
+    // opt in keeps freezing v2, so a later rollback still resumes it. Only an Anthropic config
+    // can opt in, so every other family's version is untouched.
+    let server_side_fallback = decide_server_side_fallback(
+        provider_id,
+        auth_method,
+        family,
+        &frozen.system_prompt,
+        episode_render.server_side_fallback,
+        opts.anthropic_server_side_fallback,
+        catalog.server_side_fallback(provider_id, model_id),
+    );
+    if family == WireFamilyId::AnthropicMessages {
+        frozen.renderer_version =
+            broca_provider::families::anthropic_renderer_version(server_side_fallback);
+    }
     apply_auth_method_quirks(provider_id, auth_method, &mut frozen);
     frozen.max_output_tokens = max_tokens;
     if family == WireFamilyId::GoogleCodeAssist {
@@ -1274,14 +1297,8 @@ fn resolve_provider_inner(
         episode_render.claude_code_persona,
         opts.claude_code_persona,
     );
-    apply_server_side_fallback(
-        &mut frozen,
-        provider_id,
-        auth_method,
-        episode_render.server_side_fallback,
-        opts.anthropic_server_side_fallback,
-        catalog.server_side_fallback(provider_id, model_id),
-    );
+    // Decided above, before the render version, so the two can never disagree.
+    frozen.server_side_fallback = server_side_fallback;
     if provider_id == "opencode-go" && family == WireFamilyId::OpenAiChat {
         // Pi serves these Qwen ids through Chat Completions despite their Anthropic models.dev
         // metadata and uses the Qwen thinking switch; the frozen flag preserves resumed bytes.
@@ -1370,13 +1387,12 @@ fn is_anthropic_oauth_shape(
     auth_method: Option<AuthMethod>,
     frozen: &FrozenRenderConfig,
 ) -> bool {
-    provider_id == "anthropic"
-        && auth_method == Some(AuthMethod::Oauth)
-        && frozen.family_id == WireFamilyId::AnthropicMessages
-        && matches!(
-            frozen.system_prompt,
-            SystemPromptPolicy::RequiredIdentityLead { .. }
-        )
+    is_anthropic_oauth_shape_of(
+        provider_id,
+        auth_method,
+        frozen.family_id,
+        &frozen.system_prompt,
+    )
 }
 
 /// Clears a recorded opt-in on a config that is not the shape the capability belongs to. A
@@ -1393,28 +1409,50 @@ fn apply_server_side_fallback_auth_scope(
     }
 }
 
-/// Freeze the episode's server-side fallback opt-in into its render config.
+/// Whether these two properties make a config the shape the opt-in belongs to. The caller
+/// supplies them from a config, or from the resolve's own inputs before a config exists.
+fn is_anthropic_oauth_shape_of(
+    provider_id: &str,
+    auth_method: Option<AuthMethod>,
+    family: WireFamilyId,
+    system_prompt: &SystemPromptPolicy,
+) -> bool {
+    provider_id == "anthropic"
+        && auth_method == Some(AuthMethod::Oauth)
+        && family == WireFamilyId::AnthropicMessages
+        && matches!(
+            system_prompt,
+            SystemPromptPolicy::RequiredIdentityLead { .. }
+        )
+}
+
+/// Decide the episode's server-side fallback opt-in.
 ///
 /// The opt-in asks Anthropic to hand a content-filter refusal to another model itself, which
 /// only the Claude subscription (OAuth) route implements, so it needs the OAuth identity-lead
-/// shape on the `anthropic` provider as well as the model's own catalog fact. It is decided once
-/// here; a resume restores what it recorded, so a fact or switch that changed since admission
-/// cannot move an in-flight run's bytes.
-fn apply_server_side_fallback(
-    frozen: &mut FrozenRenderConfig,
+/// shape on the `anthropic` provider as well as the model's own catalog fact. A fresh episode
+/// decides it from those; a resume keeps what it recorded, so a fact or switch that changed
+/// since admission cannot move an in-flight run's bytes.
+///
+/// It is a decision separate from writing the flag, because the render version is recorded from
+/// the same answer ([`broca_provider::families::anthropic_renderer_version`]) and must be frozen
+/// before any quirk runs.
+fn decide_server_side_fallback(
     provider_id: &str,
     auth_method: Option<AuthMethod>,
+    family: WireFamilyId,
+    system_prompt: &SystemPromptPolicy,
     episode: EpisodeFallback,
     switch_on: bool,
     fact: Option<bool>,
-) {
-    let eligible = is_anthropic_oauth_shape(provider_id, auth_method, frozen)
+) -> bool {
+    let eligible = is_anthropic_oauth_shape_of(provider_id, auth_method, family, system_prompt)
         && fact == Some(true)
         && switch_on;
-    frozen.server_side_fallback = match episode {
+    match episode {
         EpisodeFallback::Fresh => eligible,
         EpisodeFallback::Recorded(recorded) => recorded,
-    };
+    }
 }
 
 /// Freeze the episode's structured-output decision into its render config. A resume applies
@@ -2357,6 +2395,11 @@ mod tests {
             );
             assert!(frozen.server_side_fallback);
             assert_eq!(body["fallbacks"], "default");
+            // The opt-in freezes the version whose bytes it renders.
+            assert_eq!(
+                frozen.renderer_version,
+                broca_provider::families::anthropic_renderer_version(true)
+            );
 
             // The control: the same episode with the switch off renders exactly the bytes it
             // did before the field existed, and records no flag.
@@ -2367,6 +2410,9 @@ mod tests {
                 fresh(),
             );
             assert!(!off.server_side_fallback);
+            // And the switch being off means the episode records v2, so a build rolled back past
+            // v3 resumes it: nothing about this run moved.
+            assert_eq!(off.renderer_version, 2);
             assert!(serde_json::to_value(&off)
                 .unwrap()
                 .get("server_side_fallback")

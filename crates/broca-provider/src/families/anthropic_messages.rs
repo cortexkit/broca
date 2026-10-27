@@ -731,7 +731,9 @@ fn build_request_body_with_media(
     }
     // A run admitted with server-side fallback asks the runtime to hand a content-filter
     // refusal to another model itself. The persona then appends the fallback beta and places
-    // the key after `speed`; a config without the flag renders neither.
+    // the key after `speed`; a config without the flag renders neither. Admission freezes the
+    // flag and the version together (see `families::anthropic_renderer_version`), so a recorded
+    // config never pairs an opt-in with a version that does not describe these bytes.
     if frozen.server_side_fallback {
         body["fallbacks"] = Value::String("default".to_string());
     }

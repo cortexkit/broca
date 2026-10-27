@@ -113,8 +113,10 @@ fn anthropic_oauth_without_the_opt_in_drops_the_handoff() {
 
 #[test]
 fn anthropic_with_the_opt_in_echoes_the_handoff_at_its_position() {
+    // The opt-in and its render version are frozen together; a config opts in at v3.
     let mut frozen = anthropic_frozen_config("claude-opus-5-5");
     frozen.server_side_fallback = true;
+    frozen.renderer_version = broca_provider::families::anthropic_renderer_version(true);
     let body: serde_json::Value =
         serde_json::from_slice(&AnthropicMessages.render(&frozen, &prompt(true))).unwrap();
     let message = &body["messages"][1];

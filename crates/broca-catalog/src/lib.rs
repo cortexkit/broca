@@ -2219,7 +2219,16 @@ mod tests {
                 &provider_spec,
                 &model_spec,
                 2048,
-                renderer_version_for(family),
+                // This fixture does not opt in to server-side fallback, so the free version is
+                // the one admission would record for it: v2 on Anthropic, the current version
+                // elsewhere. `resolve_frozen` takes the version as an input rather than
+                // deriving it, so the opt-in rule has to be applied here.
+                match family {
+                    WireFamilyId::AnthropicMessages => {
+                        broca_provider::families::anthropic_renderer_version(false)
+                    }
+                    _ => renderer_version_for(family),
+                },
             )
             .expect("synthetic catalog fixtures publish known capability flags");
             if family == WireFamilyId::GoogleCodeAssist {

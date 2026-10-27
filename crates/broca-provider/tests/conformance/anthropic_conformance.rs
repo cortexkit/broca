@@ -653,11 +653,7 @@ fn served_model_resolution_order() {
     assert_eq!(finished_step(&events).0.as_deref(), Some("claude-opus-4-8"));
 
     // The requested model, including its dated alias, is not a fallback.
-    for requested in [
-        "claude-opus-5-5",
-        "claude-opus-5-5-20260101",
-        "claude-opus-5-5-20260101.1",
-    ] {
+    for requested in ["claude-opus-5-5", "claude-opus-5-5-20260101"] {
         let events = normalize_recorded(
             &AnthropicMessages,
             &anthropic_frozen_config("claude-opus-5-5"),

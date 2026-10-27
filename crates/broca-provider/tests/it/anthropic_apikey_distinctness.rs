@@ -204,7 +204,10 @@ fn api_key_never_sends_fallbacks() {
     // uses: the quirks must clear it, not merely never set it.
     let mut apikey = anthropic_frozen_config("claude-opus-5-5");
     apikey.server_side_fallback = true;
+    apikey.renderer_version = broca_provider::families::ANTHROPIC_RENDERER_VERSION;
     broca_provider::families::apply_anthropic_apikey_quirks(&mut apikey);
+    // The quirks clear the flag, so the version it would have justified cannot apply either.
+    apikey.renderer_version = broca_provider::families::anthropic_renderer_version(false);
     let bytes = AnthropicMessages.render(&apikey, &request);
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert!(
@@ -227,6 +230,7 @@ fn api_key_never_sends_fallbacks() {
     // renderer that ignores the flag.
     let mut oauth = anthropic_frozen_config("claude-opus-5-5");
     oauth.server_side_fallback = true;
+    oauth.renderer_version = broca_provider::families::ANTHROPIC_RENDERER_VERSION;
     let oauth_body: Value =
         serde_json::from_slice(&AnthropicMessages.render(&oauth, &request)).unwrap();
     assert_eq!(oauth_body["fallbacks"], "default");
