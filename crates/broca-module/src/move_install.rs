@@ -228,22 +228,28 @@ pub fn verify_received(
                 .or_insert_with(|| session.clone());
         }
     }
-    let session = triples
-        .into_values()
-        .find(|session| {
-            broca_wire::agent_data::session_ref(
-                &session.harness,
-                &session.project_root.to_string_lossy(),
-                &session.session,
-            ) == reference
-        })
-        .ok_or_else(|| {
-            refusal(
-                "invalid_request",
-                format!("no WAL RunStarted triple matches ref {reference}"),
-                json!({"ref":reference}),
-            )
-        })?;
+    let mut matching = triples.into_values().filter(|session| {
+        broca_wire::agent_data::matches_session_ref(
+            reference,
+            &session.harness,
+            &session.project_root.to_string_lossy(),
+            &session.session,
+        )
+    });
+    let session = matching.next().ok_or_else(|| {
+        refusal(
+            "invalid_request",
+            format!("no WAL RunStarted triple matches ref {reference}"),
+            json!({"ref":reference}),
+        )
+    })?;
+    if matching.next().is_some() {
+        return Err(refusal(
+            "session_ref_ambiguous",
+            "multiple WAL bind triples match the session reference",
+            json!({"ref": reference}),
+        ));
+    }
     // Renaming a WAL to another bind identity preserves historical RunStarted
     // records. Until a run starts under the new harness/project/session triple,
     // no record can prove its current shared ref. Refuse that gap instead of

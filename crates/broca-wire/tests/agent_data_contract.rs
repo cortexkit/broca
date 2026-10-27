@@ -20,21 +20,54 @@ fn session_ref_fixture_bytes_are_pinned() {
 }
 
 #[test]
-fn session_reference_matches_shared_vectors() {
+fn legacy_session_reference_matches_shared_vectors() {
     let file: Value = serde_json::from_str(SESSION_REFS).unwrap();
     let cases = file["cases"].as_array().unwrap();
     assert_eq!(cases.len(), 4);
     for case in cases {
         let bind = &case["bind"];
-        let reference = agent_data::session_reference(
-            bind["harness"].as_str().unwrap(),
-            bind["project_root"].as_str().unwrap(),
-            bind["session"].as_str().unwrap(),
+        let reference = agent_data::refs::Ref::new(
+            "broca-session",
+            broca_core::wal_writer::legacy_session_ref(
+                bind["harness"].as_str().unwrap(),
+                bind["project_root"].as_str().unwrap(),
+                bind["session"].as_str().unwrap(),
+            ),
         );
         assert_eq!(reference.ref_kind, "broca-session", "{}", case["name"]);
         assert_eq!(reference.r#ref, case["session_ref"], "{}", case["name"]);
         assert!(agent_data::refs::is_session_ref(&reference.r#ref));
     }
+}
+
+#[test]
+fn session_reference_v2_uses_bare_runner_and_ignores_folder() {
+    for root in [
+        "/synthetic/project",
+        "/synthetic/project/",
+        "/synthetic/other",
+    ] {
+        let reference = agent_data::session_reference("runner", root, "s1");
+        assert_eq!(reference.r#ref, "701a6e2266b2d8d3740373257146e954");
+        assert!(agent_data::matches_session_ref(
+            &reference.r#ref,
+            "runner",
+            root,
+            "s1"
+        ));
+    }
+    assert!(agent_data::matches_session_ref(
+        "fb99bd3a001d05d029c607bd048ed5a1",
+        "runner",
+        "/tmp/project",
+        "s1"
+    ));
+    assert!(!agent_data::matches_session_ref(
+        "fb99bd3a001d05d029c607bd048ed5a1",
+        "runner",
+        "/synthetic/other",
+        "s1"
+    ));
 }
 
 #[test]

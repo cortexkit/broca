@@ -391,16 +391,6 @@ pub fn parse_plan_with(
     let object = plan.as_object().ok_or_else(|| Refusal::invalid("plan"))?;
     let tool_items = items(object, "tool_items", true)?;
     let system_text_items = items(object, "system_text_items", true)?;
-    // tool-provider 0.10.4 has no default system-text selector: its nested item requires
-    // `preset`. Refuse the missing name rather than sending an unrepresentable request.
-    if let Some(index) = system_text_items
-        .iter()
-        .position(|item| item.preset.is_none())
-    {
-        return Err(Refusal::invalid(format!(
-            "plan.system_text_items[{index}].preset"
-        )));
-    }
     if let Some((index, _)) = system_text_items
         .iter()
         .enumerate()

@@ -1115,20 +1115,24 @@ impl Rig {
     }
 
     /// A `session.send` to the fresh session `name` that must be refused before anything is
-    /// written: its error body parsed and as the exact bytes the serve path sent. Fails when
-    /// any WAL file appears or changes while the send is answered.
+    /// durable: its error body parsed and as the exact bytes the serve path sent. Every log that
+    /// existed before the send must keep its exact bytes. A log the send created may hold only
+    /// its opening lineage frame (the same "writes nothing" rule as `wire.rs`, shared through
+    /// [`super::wire::holds_no_durable_records`]); any record in it, or any other new file, fails.
     async fn refused_send(&self, name: &str, send_id: &str) -> (Value, Vec<u8>) {
-        let wal_files = || -> Vec<(std::path::PathBuf, u64)> {
-            let mut files: Vec<_> = std::fs::read_dir(self.state_root.join("wal"))
+        let wal_files = || -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+            std::fs::read_dir(self.state_root.join("wal"))
                 .map(|entries| {
                     entries
                         .flatten()
-                        .filter_map(|entry| Some((entry.path(), entry.metadata().ok()?.len())))
+                        .filter_map(|entry| {
+                            let path = entry.path();
+                            let bytes = std::fs::read(&path).ok()?;
+                            Some((path, bytes))
+                        })
                         .collect()
                 })
-                .unwrap_or_default();
-            files.sort();
-            files
+                .unwrap_or_default()
         };
         let conn = SubcConnection::connect(&self.connection_file)
             .await
@@ -1161,7 +1165,32 @@ impl Rig {
         let bytes = reply.expect_err("the send is refused");
         // Long enough for a run that had been admitted to write its RunStarted.
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(wal_files(), before, "a refused send writes nothing");
+        let after = wal_files();
+        for (path, bytes) in &before {
+            assert!(
+                after.get(path) == Some(bytes),
+                "a refused send leaves a log that existed before it byte for byte unchanged: {}",
+                path.display()
+            );
+        }
+        for path in after.keys().filter(|path| !before.contains_key(*path)) {
+            assert!(
+                path.extension().is_some_and(|extension| extension == "wal"),
+                "a refused send creates no file other than a session log: {}",
+                path.display()
+            );
+            // A refused first send may leave the log it opened holding only the lineage frame,
+            // which is framing rather than a record: broca has always done this, and it is what
+            // `wire.rs` already counts as writing nothing. A record of any kind is durable.
+            assert!(
+                super::wire::holds_no_durable_records(broca_wal::replay_file(
+                    path,
+                    broca_wal::DEFAULT_MAX_READ_BYTES,
+                )),
+                "a log created by a refused send holds no record beyond its lineage frame: {}",
+                path.display()
+            );
+        }
         assert!(
             self.frames(name)
                 .iter()

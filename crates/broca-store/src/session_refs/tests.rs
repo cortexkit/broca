@@ -53,7 +53,7 @@ fn backfill_maps_every_distinct_run_index_triple_once() {
     );
     for session in &sessions {
         let (address,root,harness,name): (String,String,String,String) = conn.query_row(
-            "SELECT address,project_root,harness,session FROM agent_data_session_ref WHERE session_ref=?1", [agent_session_ref(session)],
+            "SELECT address,project_root,harness,session FROM agent_data_session_ref WHERE session_ref=?1", [broca_core::wal_writer::legacy_session_ref(&session.harness, &session.project_root.to_string_lossy(), &session.session)],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
         assert_eq!(address, session_addr(session));
         assert_eq!(BindIdentity::new(root, harness, name), *session);
@@ -1003,4 +1003,69 @@ fn projection_repair_observes_other_process_writers() {
     assert!(status.success());
     assert!(!repair.finish().unwrap());
     assert!(broca_core::session_projection_incomplete(&root).unwrap());
+}
+
+#[test]
+fn session_ref_v2_startup_rekey_is_idempotent_and_keeps_v1() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let session = BindIdentity::new("/synthetic/project", "runner", "ref-migration");
+    let v1 = broca_core::wal_writer::legacy_session_ref(
+        &session.harness,
+        &session.project_root.to_string_lossy(),
+        &session.session,
+    );
+    let v2 = agent_session_ref(&session);
+    let address = session_addr(&session);
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agent_data_session_ref VALUES(?1,?2,?3,?4,?5)",
+            params![v1, address, "/synthetic/project", "runner", "ref-migration"],
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+        let changes = conn.total_changes();
+        init_schema(&conn).unwrap();
+        assert_eq!(
+            conn.total_changes(),
+            changes,
+            "repeated startup must not rewrite aliases"
+        );
+    }
+    let found = store
+        .session_refs([v1.as_str(), v2.as_str()].into_iter())
+        .unwrap();
+    assert_eq!(found.sessions[&v1], (address.clone(), session.clone()));
+    assert_eq!(found.sessions[&v2], (address, session));
+}
+
+#[test]
+fn session_ref_v2_ambiguous_roots_refuse_but_v1_stays_exact() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let first = BindIdentity::new("/synthetic/one", "runner", "shared");
+    let second = BindIdentity::new("/synthetic/two", "runner", "shared");
+    for session in [&first, &second] {
+        store
+            .record_session(&session_addr(session), session)
+            .unwrap();
+        let v1 = broca_core::wal_writer::legacy_session_ref(
+            &session.harness,
+            &session.project_root.to_string_lossy(),
+            &session.session,
+        );
+        assert_eq!(
+            store
+                .session_refs([v1.as_str()].into_iter())
+                .unwrap()
+                .sessions[&v1]
+                .1,
+            *session
+        );
+    }
+    assert_ne!(session_addr(&first), session_addr(&second));
+    let v2 = agent_session_ref(&first);
+    assert!(matches!(
+        store.session_refs([v2.as_str()].into_iter()),
+        Err(StoreError::InconsistentSnapshot("session_ref_ambiguous"))
+    ));
 }

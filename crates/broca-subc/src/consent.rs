@@ -711,6 +711,7 @@ mod tests {
             build_lock_digest: None,
             capability_requirements: vec![],
             machine_id: None,
+            config_path: None,
         };
         assert!(module.reply(&request, serde_json::to_vec(&reply).unwrap()));
     }
