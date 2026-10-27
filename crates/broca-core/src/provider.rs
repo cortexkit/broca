@@ -195,6 +195,16 @@ pub trait Provider: Send + Sync {
         false
     }
 
+    /// The output-token cap this provider's requests carry and the smallest cap it may be
+    /// lowered to, when the run's frozen config controls a cap the request sends. The run loop
+    /// lowers a step's cap (through `StepContext::max_output_tokens`) when the estimated input
+    /// plus the cap would pass the run's context limit. `None`, the default, means the request
+    /// carries no cap the loop can lower (an in-process provider, or a backend whose body omits
+    /// the field), so no step's cap is ever changed.
+    fn output_limits(&self) -> Option<crate::output_reservation::OutputLimits> {
+        None
+    }
+
     /// Re-send `base`, an exact request body this provider rendered earlier, shaped so the
     /// provider generates nothing and only reads (and so keeps) the cached prefix. One attempt,
     /// never retried. The default cannot warm and sends nothing.
@@ -294,6 +304,10 @@ impl Provider for Box<dyn Provider> {
 
     fn render_request(&self, opts: &CallOptions) -> Vec<u8> {
         (**self).render_request(opts)
+    }
+
+    fn output_limits(&self) -> Option<crate::output_reservation::OutputLimits> {
+        (**self).output_limits()
     }
 
     fn renderer_version(&self) -> u32 {

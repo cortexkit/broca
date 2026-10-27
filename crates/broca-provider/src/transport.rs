@@ -949,6 +949,10 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
             .render(&self.effective_frozen().for_step(opts), opts)
     }
 
+    fn output_limits(&self) -> Option<broca_core::output_reservation::OutputLimits> {
+        self.frozen.output_limits()
+    }
+
     fn renderer_version(&self) -> u32 {
         self.frozen.renderer_version
     }
