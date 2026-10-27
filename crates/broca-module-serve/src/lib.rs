@@ -40,6 +40,7 @@ pub mod opencode_go_identity;
 pub mod provider_overrides;
 pub mod refusal_fallback_config;
 pub mod run_routing;
+mod scope_workdir;
 pub mod send_audit;
 pub mod serve;
 pub mod session_class;

@@ -3054,7 +3054,8 @@ pub struct AccountDecision {
     /// re-serializes to its stored bytes.
     pub path: String,
     /// The id broca asked routing about this run under, and names it by in its account reports
-    /// to routing. Absent when broca reports nothing for the run (the `legacy_static` path).
+    /// to routing. Absent when broca reports nothing for the run (the `legacy_static` path older
+    /// builds wrote).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_id: Option<String>,
     /// Routing's id for the decision that chose the account, when routing chose it.
@@ -3099,7 +3100,8 @@ pub const ACCOUNT_DECISION_ROUTED: &str = "routed";
 /// Routing answered that account selection is switched off; the static pick was used.
 pub const ACCOUNT_DECISION_DISABLED: &str = "disabled";
 /// Routing gave no answer in time (route refused, timeout, malformed reply); the static pick
-/// was used.
+/// was used. Written only by builds that admitted such a send: a send routing cannot answer
+/// is now refused before anything is written. Kept so those older runs still read and resume.
 pub const ACCOUNT_DECISION_UNREACHABLE: &str = "unreachable";
 /// Routing does not select accounts for this provider; the static pick was used.
 pub const ACCOUNT_DECISION_UNSUPPORTED: &str = "unsupported";
@@ -3107,8 +3109,9 @@ pub const ACCOUNT_DECISION_UNSUPPORTED: &str = "unsupported";
 pub const ACCOUNT_DECISION_PINNED: &str = "pinned";
 /// The provider had at most one candidate account, so there was nothing to ask.
 pub const ACCOUNT_DECISION_SINGLE_CANDIDATE: &str = "single_candidate";
-/// The operator's `account_selection.legacy_static` setting in `broca.jsonc`, an emergency
-/// switch, bypassed routing entirely.
+/// The operator's former `account_selection.legacy_static` setting in `broca.jsonc`, an
+/// emergency switch, bypassed routing entirely. The setting no longer exists, so this path is
+/// no longer written; it is kept so runs recorded under it still read and resume.
 pub const ACCOUNT_DECISION_LEGACY_STATIC: &str = "legacy_static";
 /// broca had no vault listing to ask routing with in time; the static pick was used.
 pub const ACCOUNT_DECISION_CANDIDATES_UNKNOWN: &str = "candidates_unknown";

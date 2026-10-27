@@ -118,7 +118,7 @@ pub struct ReplayState {
     pub run_finals: std::collections::BTreeMap<u64, RunAttribution>,
     pub compaction: crate::compaction::CompactionCheckpoint,
     pub compaction_history: crate::compaction::CompactionHistory,
-    /// The output cap the current run recorded for a step, which a resume of that step renders.
+    /// The measured step and recorded output cap the run loop's output reservation reads.
     pub output_reservation: crate::output_reservation::OutputReservationHistory,
     /// The lowest sequence number this lineage's next compaction notice may take: 1, or, for a
     /// lineage at an address whose earlier lineages retention deleted, the number their

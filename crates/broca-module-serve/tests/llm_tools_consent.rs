@@ -1373,3 +1373,273 @@ async fn startup_resumes_a_held_call_whose_card_and_grant_committed_before_autho
     assert_eq!(provider.0.load(Ordering::SeqCst), 1);
     stop.cancel();
 }
+
+/// A cerebellum stand-in whose answer each step of a test sets: `None` is no answer.
+#[derive(Default)]
+struct Answering(Mutex<Option<broca_subc::PrivateContent>>);
+impl Answering {
+    fn set(&self, answer: Option<broca_subc::PrivateContent>) {
+        *self.0.lock().unwrap() = answer;
+    }
+}
+#[async_trait::async_trait]
+impl Asks for Answering {
+    async fn marked(&self, _: &str, _: Option<&str>) -> Option<broca_subc::PrivateContent> {
+        self.0.lock().unwrap().clone()
+    }
+    async fn flow_providers(
+        &self,
+        _: &str,
+    ) -> Result<broca_subc::FlowPolicy, broca_subc::FlowProvidersError> {
+        unreachable!("run only")
+    }
+}
+
+/// A catalog whose provider display name can be withdrawn, which is what leaves a card with
+/// nothing to name and ends the consent step `consent_unavailable`.
+struct NamedCatalog(AtomicBool);
+impl BatchCatalog for NamedCatalog {
+    fn row(&self, model: &str) -> Option<broca_catalog::ModelBatchRow> {
+        let mut row = Catalog {
+            provider_name: Some("TypeSafe".into()),
+        }
+        .row(model)?;
+        if !self.0.load(Ordering::SeqCst) {
+            row.provider_name = None;
+        }
+        Some(row)
+    }
+}
+
+fn marked_by(sources: Vec<broca_subc::SourceKind>) -> Option<broca_subc::PrivateContent> {
+    Some(broca_subc::PrivateContent {
+        marked: true,
+        sources,
+    })
+}
+
+/// Settle a card for `scope_ref` the way an answer would, minting a grant (or a deny) for the
+/// test agent and `typesafe`. The card is never filed, so no held call waits on it.
+fn decide(store: &GrantsStore, scope_ref: &str, card_id: &str, decision: Decision) {
+    let mut card_scope = identity();
+    card_scope.scope_ref = scope_ref.into();
+    let dedup_key = format!("decided-{card_id}");
+    store
+        .put_card(&Card {
+            dedup_key: dedup_key.clone(),
+            scope: card_scope.clone(),
+            agent_id: scope().agent_id.unwrap(),
+            provider: "typesafe".into(),
+            content: "decided elsewhere".into(),
+            card_id: Some(card_id.into()),
+            state: CardState::Pending,
+        })
+        .unwrap();
+    store
+        .apply_answer(
+            &card_scope,
+            CardAnswer {
+                dedup_key,
+                card_id: card_id.into(),
+                decision,
+                run_live: false,
+            },
+            1000,
+        )
+        .unwrap();
+}
+
+/// Every private-content verdict and every consent outcome a run can reach moves its own
+/// `health.check` counter and no other, and the first call each standing grant releases is
+/// logged once, naming the grant and never the call's content.
+#[tokio::test]
+async fn consent_health_counts_each_verdict_and_outcome_and_logs_each_grant_once() {
+    let store = Arc::new(GrantsStore::open_in_memory().unwrap());
+    let io = Arc::new(FakeIo::default());
+    let consent = coordinator(store.clone(), io.clone(), Arc::new(AtomicI64::new(1000)));
+    let provider = Arc::new(Provider::default());
+    let catalog = Arc::new(NamedCatalog(AtomicBool::new(true)));
+    let system = SystemOne::new(
+        Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap()),
+        "consent-health",
+        catalog.clone(),
+        vec![ModelPin::jev(provider.clone())],
+        Config::default(),
+        Arc::default(),
+    )
+    .with_store_role(LLM_CLASSIFY_STORE_ROLE)
+    .with_clock(Arc::new(|| 1000));
+    let cerebellum = Arc::new(Answering::default());
+    let stop = tokio_util::sync::CancellationToken::new();
+    let tools = Arc::new(
+        LlmTools::new(Arc::new(system), Default::default(), cerebellum.clone())
+            .with_held(Arc::new(HeldCalls::new(
+                store.clone(),
+                "consent-health".into(),
+            )))
+            .with_consent(consent, stop.clone()),
+    );
+    let principal = BindPrincipal::Reserved {
+        module_id: "caller".into(),
+    };
+    let logs = broca_test_support::LogCapture::new();
+    let call = |scope_ref: &str, key: &str, reads_held_reply: bool| {
+        let mut session = scope();
+        session.scope_ref = scope_ref.into();
+        let stamp = SendScope::Stamped(BindScope {
+            scope: session,
+            owner_authorized: true,
+            kind: broca_protocol::ScopeKind::Head,
+            parent: None,
+            parent_state: None,
+        });
+        let request =
+            json!({"name":"llm_classify","arguments":args("typesafe/jev-1.13.0"),"call_key":key});
+        let tools = tools.clone();
+        let principal = principal.clone();
+        logs.scope_future(async move {
+            match tools
+                .answer_with_capabilities(
+                    request.to_string().as_bytes(),
+                    Some(&principal),
+                    &stamp,
+                    reads_held_reply,
+                )
+                .await
+            {
+                Ok(reply) => Ok(serde_json::from_str::<Value>(reply.get()).unwrap()),
+                Err(body) => Err(serde_json::from_slice::<Value>(&body).unwrap()),
+            }
+        })
+    };
+    let health = || tools.consent_health();
+    let zero = json!({
+        "verdicts": {"not_asked": 0, "unmarked": 0, "marked": 0, "unreachable": 0},
+        "marked_outcomes": {
+            "released_by_grant": 0, "card_filed": 0, "denied_by_standing_deny": 0,
+            "refused_consent_required": 0, "refused_private_content_unknown": 0,
+            "refused_private_content_unreachable": 0, "refused_by_flow_policy": 0,
+            "consent_unavailable": 0,
+        },
+    });
+    assert_eq!(health(), zero);
+    let mut expected = zero.clone();
+
+    // Unmarked: the call reaches its provider and no consent outcome moves.
+    cerebellum.set(Some(broca_subc::PrivateContent::unmarked()));
+    assert!(call("run", "unmarked", true).await.is_ok());
+    assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+    expected["verdicts"]["unmarked"] = json!(1);
+    assert_eq!(health(), expected);
+
+    // No answer: counted apart from a marked scope, and refused for want of a source.
+    cerebellum.set(None);
+    let refused = call("run", "unreachable", true).await.unwrap_err();
+    assert_eq!(refused["detail"]["consent"], "private_content_unreachable");
+    expected["verdicts"]["unreachable"] = json!(1);
+    expected["marked_outcomes"]["refused_private_content_unreachable"] = json!(1);
+    assert_eq!(health(), expected);
+
+    // Marked with no source a card can name.
+    cerebellum.set(marked_by(vec![broca_subc::SourceKind::Other(
+        "future_source".into(),
+    )]));
+    let refused = call("unknown-run", "unknown", true).await.unwrap_err();
+    assert_eq!(refused["detail"]["consent"], "private_content_unknown");
+    expected["verdicts"]["marked"] = json!(1);
+    expected["marked_outcomes"]["refused_private_content_unknown"] = json!(1);
+    assert_eq!(health(), expected);
+
+    // Marked, and the caller cannot read a held reply.
+    cerebellum.set(marked_by(vec![broca_subc::SourceKind::PersonBrowser]));
+    let refused = call("run", "no-hold", false).await.unwrap_err();
+    assert_eq!(refused["detail"]["consent"], "consent_required");
+    expected["verdicts"]["marked"] = json!(2);
+    expected["marked_outcomes"]["refused_consent_required"] = json!(1);
+    assert_eq!(health(), expected);
+
+    // Marked, and the card has no provider name to show.
+    catalog.0.store(false, Ordering::SeqCst);
+    let refused = call("run", "unnamed", true).await.unwrap_err();
+    assert_eq!(refused["detail"]["consent"], "consent_unavailable");
+    catalog.0.store(true, Ordering::SeqCst);
+    expected["verdicts"]["marked"] = json!(3);
+    expected["marked_outcomes"]["consent_unavailable"] = json!(1);
+    assert_eq!(health(), expected);
+
+    // Marked, and held behind a card.
+    let held = call("run", "card", true).await.unwrap();
+    assert_eq!(held["held"]["reason"], "consent");
+    assert_eq!(io.requests.lock().unwrap().len(), 1);
+    expected["verdicts"]["marked"] = json!(4);
+    expected["marked_outcomes"]["card_filed"] = json!(1);
+    assert_eq!(health(), expected);
+
+    // Marked, and the person already denied this provider for this run.
+    decide(&store, "denied-run", "deny-card", Decision::Deny);
+    let refused = call("denied-run", "denied", true).await.unwrap_err();
+    assert_eq!(refused["detail"]["consent"], "denied");
+    expected["verdicts"]["marked"] = json!(5);
+    expected["marked_outcomes"]["denied_by_standing_deny"] = json!(1);
+    assert_eq!(health(), expected);
+
+    // Marked, and a standing 24-hour grant releases the call without a card. Two calls under
+    // one grant log one line; a second grant logs its own.
+    let releases = || {
+        logs.events()
+            .into_iter()
+            .filter(|event| {
+                event.target == "llm_tools.consent"
+                    && event.level == tracing::Level::INFO
+                    && event.message()
+                        == "a standing grant released a private-content call without a consent card"
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(releases().is_empty());
+    decide(&store, "another-run", "grant-a", Decision::Allow24h);
+    assert!(call("run", "grant-a-1", true).await.is_ok());
+    assert!(call("run", "grant-a-2", true).await.is_ok());
+    assert_eq!(provider.0.load(Ordering::SeqCst), 3);
+    expected["verdicts"]["marked"] = json!(7);
+    expected["marked_outcomes"]["released_by_grant"] = json!(2);
+    assert_eq!(health(), expected);
+    let logged = releases();
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    let line = &logged[0];
+    assert_eq!(line.fields["grant_id"], "grant-a");
+    assert_eq!(line.fields["agent_id"], "agent-id-must-not-be-displayed");
+    assert_eq!(line.fields["provider"], "typesafe");
+    assert_eq!(line.fields["kind"], "24_hours");
+    assert_eq!(
+        line.fields["expires_at_ms"],
+        (1000 + 24 * 60 * 60 * 1000).to_string()
+    );
+    assert_eq!(line.fields["scope_ref"], "run");
+    // Nothing from the call itself: not the question, the item or the model's answer.
+    for value in line.fields.values() {
+        for content in ["Is this likely?", "private text", "noul"] {
+            assert!(!value.contains(content), "{value}");
+        }
+    }
+
+    assert!(store.revoke("grant-a").unwrap());
+    decide(&store, "another-run", "grant-b", Decision::Allow24h);
+    assert!(call("run", "grant-b-1", true).await.is_ok());
+    expected["verdicts"]["marked"] = json!(8);
+    expected["marked_outcomes"]["released_by_grant"] = json!(3);
+    assert_eq!(health(), expected);
+    let logged = releases();
+    assert_eq!(logged.len(), 2, "{logged:?}");
+    assert_eq!(logged[1].fields["grant_id"], "grant-b");
+
+    // Every call the check found marked or could not check ended in exactly one outcome.
+    let outcomes: u64 = expected["marked_outcomes"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|count| count.as_u64().unwrap())
+        .sum();
+    assert_eq!(outcomes, 8 + 1);
+    stop.cancel();
+}

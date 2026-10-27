@@ -120,6 +120,10 @@ impl Provider for LiveAnthropicProvider {
         self.inner.render_request(opts)
     }
 
+    fn output_limits(&self) -> Option<broca_core::output_reservation::OutputLimits> {
+        self.inner.output_limits()
+    }
+
     fn renderer_version(&self) -> u32 {
         self.inner.renderer_version()
     }

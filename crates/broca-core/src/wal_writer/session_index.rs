@@ -79,7 +79,10 @@ pub(super) struct AdmissionWal {
     state_root: PathBuf,
     index: Arc<Mutex<Option<Arc<dyn SessionRefIndex>>>>,
     placement: Option<(PathBuf, PathBuf, PathBuf, Vec<String>)>,
-    legacy_fence: (PathBuf, String),
+    /// The session's WAL path, whose `.moved`/`.moving` marker files and pending cut files
+    /// are checked before every append, with the session's v1 and v2 references: a pending
+    /// cut that names either reference refuses the append.
+    legacy_fence: (PathBuf, [String; 2]),
 }
 
 impl AdmissionWal {
@@ -88,7 +91,7 @@ impl AdmissionWal {
         address: String,
         state_root: PathBuf,
         index: Arc<Mutex<Option<Arc<dyn SessionRefIndex>>>>,
-        legacy_fence: (PathBuf, String),
+        legacy_fence: (PathBuf, [String; 2]),
     ) -> Self {
         Self {
             wal,
@@ -115,7 +118,8 @@ impl AdmissionWal {
         &mut self,
         record: &WalRecord,
     ) -> Result<Option<ProjectionAdmission>, WalError> {
-        broca_wal::migration::guard(&self.legacy_fence.0, &self.legacy_fence.1, true)?;
+        let [legacy, current] = &self.legacy_fence.1;
+        broca_wal::migration::guard_refs(&self.legacy_fence.0, &[legacy, current], true)?;
         let mut admission = None;
         if let WalRecord::RunStarted {
             session,

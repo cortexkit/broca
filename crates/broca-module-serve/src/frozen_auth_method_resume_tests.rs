@@ -91,13 +91,16 @@ async fn a_run_started_with_a_frozen_auth_method_resumes_on_its_vault_id_verbati
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// NOTHING THIS BUILD ADMITS FREEZES AN AUTH METHOD.
+/// ONLY A ROUTED ADMISSION FREEZES AN AUTH METHOD.
 ///
-/// A fresh admission, whether resolved from configuration or routed to an account, freezes a
-/// broca key with no `auth_method`, so the `RunStarted` it writes needs no reader feature and
-/// any older build can still read and resume it.
+/// A fresh admission resolved from configuration freezes a broca key with no `auth_method`, so
+/// the `RunStarted` it writes needs no reader feature and any older build can still read and
+/// resume it. A fresh admission routed to an account freezes the vault's own credential id with
+/// the method the vault's metadata named, so its `RunStarted` requires
+/// `auth-selection-method/v1`: a build that cannot read the method must refuse the log rather
+/// than parse the opaque id.
 #[tokio::test]
-async fn a_fresh_admission_freezes_no_auth_method_and_requires_no_feature() {
+async fn only_a_routed_admission_freezes_its_auth_method_and_requires_the_feature() {
     let root = fresh_vault_root("fresh-no-auth-method");
     let daemon = CapturingVaultDaemon::start_expiring(
         &root,
@@ -134,9 +137,7 @@ async fn a_fresh_admission_freezes_no_auth_method_and_requires_no_feature() {
         )
         .await
         .unwrap();
-    for resolved in [configured, routed] {
-        let selection = resolved.selection.expect("a fresh run freezes its selection");
-        assert_eq!(selection.auth_method, None, "{}", selection.credential_id);
+    let run_started = |selection: broca_wal::AuthSelection| {
         let mut record: broca_wal::WalRecord = serde_json::from_str(
             r#"{"type":"run_started","run_id":"r","session":{"project_root":"/tmp/project","harness":"runner","session":"session"},"config":{"model":{"provider_module_id":"anthropic","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"origin":{"kind":"fresh"}}"#,
         )
@@ -145,11 +146,25 @@ async fn a_fresh_admission_freezes_no_auth_method_and_requires_no_feature() {
             unreachable!()
         };
         config.auth_selection = Some(selection);
-        assert!(record.required_features().is_empty());
-        assert!(!serde_json::to_string(&record)
-            .unwrap()
-            .contains("auth_method"));
-    }
+        record
+    };
+
+    let selection = configured.selection.expect("a fresh run freezes its selection");
+    assert_eq!(selection.auth_method, None, "{}", selection.credential_id);
+    let record = run_started(selection);
+    assert!(record.required_features().is_empty());
+    assert!(!serde_json::to_string(&record)
+        .unwrap()
+        .contains("auth_method"));
+
+    let selection = routed.selection.expect("a routed run freezes its selection");
+    assert_eq!(selection.credential_id, "chatgpt:openai:second");
+    assert_eq!(selection.auth_method.as_deref(), Some("chatgpt"));
+    let record = run_started(selection);
+    assert_eq!(
+        record.required_features(),
+        &[broca_wal::framing::AUTH_SELECTION_METHOD_FEATURE]
+    );
     daemon.assert_healthy();
     drop(executor);
     drop(daemon);

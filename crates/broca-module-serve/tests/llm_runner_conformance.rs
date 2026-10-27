@@ -2190,6 +2190,9 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::Compaction,
             Capability::ModelView,
             Capability::ClientMessageId,
+            // role.describe declares system_text_default (tool-provider 0.12), and the
+            // adapter implements both of its hooks, so the kit runs those cases.
+            Capability::SystemTextDefault,
         ]
         .into_iter()
         .collect();
@@ -3233,7 +3236,10 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         .join(format!("broca-llm-conformance-{}", std::process::id()));
     broca_test_support::remove_rig_dir(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
-    let subject = BrocaSubject::new(&scratch).await;
+    #[cfg_attr(not(feature = "test-clock"), allow(unused_mut))]
+    let mut subject = BrocaSubject::new(&scratch).await;
+    #[cfg(feature = "test-clock")]
+    attach_notice_bus(&mut subject, &scratch).await;
     let work_dir = scratch.join("suite");
     std::fs::create_dir_all(&work_dir).unwrap();
     let report = run_suite(&subject, &work_dir)
@@ -3433,6 +3439,19 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
     broca_test_support::remove_rig_dir(&scratch);
 }
 
+/// Attach one private NATS bus to every daemon the kit starts, as production runs with a bus.
+/// The kit reads compaction advance notices captured at the bus, never rebuilt from the WAL,
+/// so without a bus its notice cases could only fail. A missing `nats-server` therefore fails
+/// the suite here, naming the cause, instead of failing those cases with a misleading reason.
+#[cfg(feature = "test-clock")]
+async fn attach_notice_bus(subject: &mut BrocaSubject, root: &Path) {
+    let bus = bus::BusRig::new(root).await.expect(
+        "the llm-runner conformance suite needs a private NATS bus (nats-server, through \
+         cortexkit-bus-testkit) to capture the compaction advance notices the kit checks",
+    );
+    subject.bus = Some(Arc::new(bus));
+}
+
 /// Sandboxed runs can exercise every non-kill case without claiming crash conformance.
 fn skip_crash_kills() -> bool {
     std::env::var("BROCA_CONFORMANCE_SKIP_CRASH_KILLS").as_deref() == Ok("1")
@@ -3506,6 +3525,8 @@ async fn kit_compaction_cases_without_process_kills() {
     let root = broca_test_support::scratch_root().join("kit-compaction-without-kills");
     std::fs::create_dir_all(&root).unwrap();
     let mut subject = BrocaSubject::new(&root).await;
+    #[cfg(feature = "test-clock")]
+    attach_notice_bus(&mut subject, &root).await;
     let advertised = subject.capabilities();
     subject.process_kills_disabled = true;
     assert_eq!(

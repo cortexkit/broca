@@ -99,6 +99,19 @@ fn the_fallback_route_renders_the_fallback_models_request_and_nothing_else_moves
 }
 
 #[test]
+fn output_limits_follow_the_model_selected_for_the_step() {
+    let (source, fallback) = source_with_fallback(None);
+    let provider = LiveProvider::new(AnthropicMessages, source.clone(), AuthHandle::None);
+    assert_eq!(provider.output_limits().unwrap().max, 2_000);
+    provider.set_step_route(StepRoute::Fallback);
+    assert_eq!(provider.output_limits(), fallback.output_limits());
+    assert_eq!(provider.output_limits().unwrap().max, 1_000);
+    assert_eq!(provider.output_limits().unwrap().floor, 1_000);
+    provider.set_step_route(StepRoute::Source);
+    assert_eq!(provider.output_limits(), source.output_limits());
+}
+
+#[test]
 fn a_provider_without_a_fallback_ignores_the_route() {
     let source = anthropic_oauth(SOURCE, 2_000, None);
     let provider = LiveProvider::new(AnthropicMessages, source.clone(), AuthHandle::None);

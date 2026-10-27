@@ -316,6 +316,63 @@ impl FrozenRenderConfig {
             _ => std::borrow::Cow::Borrowed(self),
         }
     }
+
+    /// The output cap this config's requests carry and the smallest cap a step may lower it to,
+    /// or `None` when the rendered body does not carry `max_output_tokens` as its cap, so lowering
+    /// it would change nothing:
+    ///
+    /// - the ChatGPT codex backend omits the field (the backend rejects it);
+    /// - an Antigravity tier model renders its tier ceiling unless the caller set a cap and the
+    ///   renderer is version 7 or later;
+    /// - Bedrock before renderer version 3 renders the caller's cap without bounding it.
+    ///
+    /// Anthropic requires `max_tokens` above the thinking budget, so with thinking enabled the
+    /// floor is one token above the budget the request sends.
+    pub fn output_limits(&self) -> Option<broca_core::output_reservation::OutputLimits> {
+        let renders_cap = match self.family_id {
+            WireFamilyId::OpenAiResponsesChatgpt => false,
+            WireFamilyId::GoogleCodeAssist => {
+                crate::families::google_codeassist::renders_frozen_output_cap(self)
+            }
+            WireFamilyId::BedrockConverse => {
+                self.renderer_version >= 3 || self.caller_max_output_tokens.is_none()
+            }
+            WireFamilyId::OpenAiChat
+            | WireFamilyId::OpenAiResponses
+            | WireFamilyId::AnthropicMessages
+            | WireFamilyId::Gemini => true,
+        };
+        if !renders_cap {
+            return None;
+        }
+        let variant_budget = match &self.variant {
+            Some(crate::variant::FrozenVariant {
+                request: crate::variant::VariantRequest::Anthropic { thinking, .. },
+                ..
+            }) => Some(
+                thinking
+                    .as_ref()
+                    .and_then(|thinking| thinking.get("budget_tokens"))
+                    .and_then(Value::as_u64)
+                    .and_then(|budget| u32::try_from(budget).ok())
+                    .unwrap_or(0),
+            ),
+            _ => None,
+        };
+        let thinking_budget = variant_budget.unwrap_or(match self.reasoning {
+            ReasoningPolicy::AnthropicInterleaved { budget_tokens, .. } => budget_tokens,
+            _ => 0,
+        });
+        let required = if thinking_budget > 0 {
+            thinking_budget.saturating_add(1)
+        } else {
+            0
+        };
+        Some(broca_core::output_reservation::OutputLimits::new(
+            self.max_output_tokens,
+            required,
+        ))
+    }
 }
 
 /// Conversation identity and episode-local request numbering for the Antigravity envelope.
@@ -1124,5 +1181,39 @@ mod output_cap_tests {
                 "{family_id:?}: {body}"
             );
         }
+    }
+
+    #[test]
+    fn output_limits_follow_what_each_family_renders() {
+        // The ChatGPT codex backend omits the field, so there is nothing to lower.
+        assert_eq!(
+            frozen_config_for_family(WireFamilyId::OpenAiResponsesChatgpt, "m").output_limits(),
+            None
+        );
+        // An Antigravity tier model without a caller cap renders its tier ceiling.
+        let tier = frozen_config_for_family(WireFamilyId::GoogleCodeAssist, "gemini-3-flash-agent");
+        assert_eq!(tier.output_limits(), None);
+        let mut capped = tier.clone();
+        capped.caller_max_output_tokens = Some(10_000);
+        assert!(capped.output_limits().is_some());
+
+        let responses = frozen_config_for_family(WireFamilyId::OpenAiResponses, "m");
+        let limits = responses.output_limits().unwrap();
+        assert_eq!(limits.max, responses.max_output_tokens);
+        assert_eq!(
+            limits.floor,
+            broca_core::output_reservation::MIN_USEFUL_OUTPUT_TOKENS.min(limits.max)
+        );
+
+        // Anthropic needs `max_tokens` above the thinking budget.
+        let mut anthropic = frozen_config_for_family(WireFamilyId::AnthropicMessages, "m");
+        anthropic.max_output_tokens = 64_000;
+        anthropic.reasoning = ReasoningPolicy::AnthropicInterleaved {
+            budget_tokens: 31_999,
+            last_turn_only: true,
+            echo_scope: crate::policy::ThinkingEchoScope::AllAssistantMessages,
+            cross_model: crate::policy::CrossModelThinking::AnyAnthropicModel,
+        };
+        assert_eq!(anthropic.output_limits().unwrap().floor, 32_000);
     }
 }
