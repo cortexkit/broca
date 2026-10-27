@@ -10,7 +10,7 @@ use broca_module_serve::{
     llm_tools::{
         consent::{Consent, ConsentIo},
         held::HeldCalls,
-        Asks, LlmTools,
+        Asks, ConsumerFormat, LlmTools,
     },
     system_one::{
         BatchCatalog, ClassifierProvider, Config, ModelPin, ProviderReply, SystemOne,
@@ -1084,6 +1084,153 @@ async fn real_tool_path_captures_card_golden_and_ordinary_or_keyless_route_never
     assert_eq!(provider.0.load(Ordering::SeqCst), 1);
     assert_eq!(io.requests.lock().unwrap().len(), 1);
     assert_eq!(io.feeds.load(Ordering::SeqCst), 0);
+    stop.cancel();
+}
+
+#[test]
+fn either_reply_format_name_lets_a_consumer_hold_calls() {
+    let caps = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+    for (declared, result_format, held_reply) in [
+        (
+            caps(&["tool-result/v1", "held-reply/v1"]),
+            Some("tool-result/v1"),
+            true,
+        ),
+        (
+            caps(&["content/v1", "held-reply/v1"]),
+            Some("content/v1"),
+            true,
+        ),
+        (caps(&["tool-result/v1"]), Some("tool-result/v1"), false),
+        (caps(&["held-reply/v1"]), None, false),
+        (caps(&[]), None, false),
+    ] {
+        assert_eq!(
+            ConsumerFormat::from_capabilities(Some(&declared)),
+            ConsumerFormat {
+                result_format,
+                held_reply
+            },
+            "{declared:?}"
+        );
+    }
+    assert_eq!(
+        ConsumerFormat::from_capabilities(None),
+        ConsumerFormat::default()
+    );
+}
+
+/// A consumer built against tool-provider 0.13 declares the reply format as `tool-result/v1`.
+/// It must get the same held call and consent card as a `content/v1` consumer, the catalog in
+/// its own name, and answers as tool results whose `structuredContent` is the tool result.
+#[tokio::test]
+async fn a_tool_result_v1_consumer_is_held_for_consent_and_gets_structured_answers() {
+    let store = Arc::new(GrantsStore::open_in_memory().unwrap());
+    let io = Arc::new(FakeIo::default());
+    let consent = coordinator(store.clone(), io.clone(), Arc::new(AtomicI64::new(1000)));
+    let provider = Arc::new(Provider::default());
+    let system = SystemOne::new(
+        Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap()),
+        "tool-result-consumer",
+        Arc::new(Catalog {
+            provider_name: Some("TypeSafe".into()),
+        }),
+        vec![ModelPin::jev(provider.clone())],
+        Config::default(),
+        Arc::default(),
+    )
+    .with_store_role(LLM_CLASSIFY_STORE_ROLE)
+    .with_clock(Arc::new(|| 1000));
+    let stop = tokio_util::sync::CancellationToken::new();
+    let tools = Arc::new(
+        LlmTools::new(Arc::new(system), Default::default(), Arc::new(Marked))
+            .with_held(Arc::new(HeldCalls::new(
+                store.clone(),
+                "tool-result-consumer".into(),
+            )))
+            .with_consent(consent.clone(), stop.clone()),
+    );
+    let principal = BindPrincipal::Reserved {
+        module_id: "caller".into(),
+    };
+    let stamp = SendScope::Stamped(BindScope {
+        scope: scope(),
+        owner_authorized: true,
+        kind: broca_protocol::ScopeKind::Head,
+        parent: None,
+        parent_state: None,
+    });
+    let declared = vec!["tool-result/v1".to_owned(), "held-reply/v1".to_owned()];
+    let consumer = ConsumerFormat::from_capabilities(Some(&declared));
+
+    let catalog = |consumer| {
+        let tools = tools.clone();
+        let stamp = stamp.clone();
+        async move {
+            let body = json!({"name":"tool.catalog","arguments":{"params":{}}}).to_string();
+            let reply = tools
+                .answer_for_consumer(body.as_bytes(), None, &stamp, consumer)
+                .await
+                .unwrap();
+            serde_json::from_str::<Value>(reply.get()).unwrap()["tools"][0]["result_format"].clone()
+        }
+    };
+    assert_eq!(catalog(consumer).await, "tool-result/v1");
+    assert_eq!(catalog(ConsumerFormat::default()).await, "content/v1");
+
+    let request = json!({"name":"llm_classify","arguments":args("typesafe/jev-1.13.0"),"call_key":"raw:tool-result"});
+    let held = tools
+        .answer_for_consumer(
+            request.to_string().as_bytes(),
+            Some(&principal),
+            &stamp,
+            consumer,
+        )
+        .await
+        .unwrap();
+    let held: Value = serde_json::from_str(held.get()).unwrap();
+    assert_eq!(held["held"]["reason"], "consent");
+    assert!(held.get("structuredContent").is_none());
+    let captured = io.requests.lock().unwrap()[0].clone();
+    assert_eq!(provider.0.load(Ordering::SeqCst), 0);
+
+    io.live.store(true, Ordering::SeqCst);
+    io.answers.lock().unwrap().push_back(record(
+        "card-1",
+        captured["dedup_key"].as_str().unwrap(),
+        "allow_run",
+    ));
+    io.answered.notify_one();
+    broca_test_support::wait_until("authorized tool outcome", || async {
+        let rows = store
+            .card_calls(captured["dedup_key"].as_str().unwrap(), 1000)
+            .unwrap();
+        if rows[0].state == HeldState::Final {
+            Ok(())
+        } else {
+            Err("consent has not released the provider".to_owned())
+        }
+    })
+    .await;
+    let answer = tools
+        .answer_for_consumer(
+            request.to_string().as_bytes(),
+            Some(&principal),
+            &stamp,
+            consumer,
+        )
+        .await
+        .unwrap();
+    let answer: Value = serde_json::from_str(answer.get()).unwrap();
+    let structured = &answer["structuredContent"];
+    assert_eq!(structured["answers"]["q"]["noul"], 0.5);
+    assert!(structured["cost_usd"].is_number());
+    assert_eq!(
+        serde_json::from_str::<Value>(answer["content"][0]["text"].as_str().unwrap()).unwrap(),
+        *structured
+    );
+    assert!(answer.get("held").is_none());
+    assert_eq!(provider.0.load(Ordering::SeqCst), 1);
     stop.cancel();
 }
 
