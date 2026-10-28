@@ -13,6 +13,7 @@ pub mod compaction_provider;
 
 pub mod account_report;
 pub mod admission;
+pub mod attempt_id;
 pub mod billing;
 mod budget_kernel;
 pub mod cache_warm;

@@ -3136,6 +3136,9 @@ fn replay_seeded_with_compaction<'a>(
             // same contract, so replay skips it exactly as it skips `Unknown`. The step's retry
             // count still comes from `ModelStepFinished.retries_used`.
             WalRecord::ModelAttemptFinished { .. } => {}
+            WalRecord::AttemptReserved { .. }
+            | WalRecord::AttemptReleased { .. }
+            | WalRecord::AttemptCorrected { .. } => {}
             // A refused step contributes nothing to the prompt: its content was never stored,
             // and the same step id commits the fallback model's answer. Its usage was billed, so
             // it counts toward the episode's totals, and it records the schedule it armed.

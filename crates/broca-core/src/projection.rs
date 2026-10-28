@@ -979,6 +979,9 @@ fn project_control_record<S: ControlProjectionSink>(
         // Provider attempt evidence is known to this build but carries no session semantics:
         // it is skipped exactly like `Unknown`, so the control stream is identical without it.
         WalRecord::ModelAttemptFinished { .. } => {}
+        WalRecord::AttemptReserved { .. }
+        | WalRecord::AttemptReleased { .. }
+        | WalRecord::AttemptCorrected { .. } => {}
         // A refused step is re-sent under the same step id and its refused content is never
         // stored, so a subscriber replaying the WAL sees only the step's `StepStarted` and the
         // answer that committed it.

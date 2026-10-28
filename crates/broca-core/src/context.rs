@@ -2699,6 +2699,9 @@ mod catch_up_tests {
             seq: 11,
             fence: 1,
             record: WalRecord::CacheWarmed {
+                attempt_id: None,
+                reservation: None,
+                envelope: None,
                 trigger: None,
                 run_id: RunId("r1".into()),
                 step_id: broca_protocol::StepId(1),

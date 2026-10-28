@@ -2071,6 +2071,9 @@ mod tests {
             frame(
                 seq,
                 WalRecord::ModelAttemptFinished {
+                    attempt_id: None,
+                    reservation: None,
+                    envelope: None,
                     content_progress: Default::default(),
                     step_id: StepId(step),
                     attempt: 0,
@@ -2117,6 +2120,9 @@ mod tests {
         frame(
             seq,
             WalRecord::CacheWarmed {
+                attempt_id: None,
+                reservation: None,
+                envelope: None,
                 trigger: None,
                 run_id: RunId(run_id.into()),
                 step_id: StepId(2),

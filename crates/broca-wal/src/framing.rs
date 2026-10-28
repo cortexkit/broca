@@ -202,6 +202,7 @@ pub const TOOL_SCHEMA_PINS_FEATURE: &str = "tool-schema-pins/v1";
 /// as [`DecodeStep::NewerWriter`]. `ck-broca --wal-known-features` prints this list so
 /// placement tooling can refuse to install a build that cannot read what is already on disk.
 pub const KNOWN_FEATURES: &[&str] = &[
+    BILL_ATTEMPTS_FEATURE,
     crate::head_proof::VISIBILITY_LATE_FEATURE,
     "writer-id/v1",
     INTERRUPT_REASON_FEATURE,
@@ -250,6 +251,9 @@ pub const KNOWN_FEATURES: &[&str] = &[
     TOOL_TIMES_FEATURE,
     MESSAGE_TIMES_FEATURE,
 ];
+
+/// Physical-send reservation and settlement evidence for billing readers.
+pub const BILL_ATTEMPTS_FEATURE: &str = "bill-attempts/v1";
 
 /// A plan manifest that froze a provider's catalog reference slots (`FetchOutcome::Answered`'s
 /// `reference_slots`): the arguments output references are read from (llm-runner §9.13). A
@@ -1420,6 +1424,7 @@ mod tests {
         assert_eq!(
             KNOWN_FEATURES,
             &[
+                BILL_ATTEMPTS_FEATURE,
                 crate::head_proof::VISIBILITY_LATE_FEATURE,
                 "writer-id/v1",
                 INTERRUPT_REASON_FEATURE,
@@ -1470,6 +1475,7 @@ mod tests {
             ]
         );
         assert_eq!(TOOL_REPLY_FEATURE, "tool-reply/v1");
+        assert_eq!(BILL_ATTEMPTS_FEATURE, "bill-attempts/v1");
         assert_eq!(MESSAGE_TIMES_FEATURE, "message-times/v1");
         assert_eq!(OUTPUT_RESERVATION_FEATURE, "output-reservation/v1");
         assert_eq!(RUNNER_TAGS_FEATURE, "runner-tags/v1");

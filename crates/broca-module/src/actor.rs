@@ -6201,6 +6201,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
             sent.ratelimit_headers.iter().cloned().collect(),
         );
         writer.record(WalRecord::CacheWarmed {
+            attempt_id: None,
+            reservation: None,
+            envelope: None,
             trigger: None,
             run_id: run_id.clone(),
             step_id,

@@ -225,6 +225,9 @@ impl KeepWarmDriver for AutomaticWarmer {
             sent.ratelimit_headers.iter().cloned().collect(),
         );
         self.writer.record(WalRecord::CacheWarmed {
+            attempt_id: None,
+            reservation: None,
+            envelope: None,
             trigger: Some("keep_warm".into()),
             run_id: run_id.clone(),
             step_id,

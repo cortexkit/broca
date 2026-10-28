@@ -493,6 +493,9 @@ fn repairable_import_prefix(
             // Provider attempt evidence is informational too, so it neither makes nor breaks a
             // repairable import prefix.
             WalRecord::ModelAttemptFinished { .. } => {}
+            WalRecord::AttemptReserved { .. }
+            | WalRecord::AttemptReleased { .. }
+            | WalRecord::AttemptCorrected { .. } => {}
             _ => return Ok(None),
         }
     }
