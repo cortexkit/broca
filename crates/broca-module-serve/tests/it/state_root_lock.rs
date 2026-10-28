@@ -115,6 +115,10 @@ impl Drop for Reap {
 }
 
 /// Every entry under `root` with its length, modification time and, for files, its bytes.
+///
+/// The lock file's bytes are not read: this test holds its lock, and Windows refuses to read
+/// a byte range another handle has locked. Its length and modification time are still
+/// compared, which shows a second broca did not rewrite it.
 fn tree(root: &Path) -> BTreeMap<PathBuf, (u64, std::time::SystemTime, Option<Vec<u8>>)> {
     let mut out = BTreeMap::new();
     let mut pending = vec![root.to_path_buf()];
@@ -124,6 +128,8 @@ fn tree(root: &Path) -> BTreeMap<PathBuf, (u64, std::time::SystemTime, Option<Ve
             let metadata = std::fs::symlink_metadata(&path).expect("stat an entry");
             let bytes = if metadata.is_dir() {
                 pending.push(path.clone());
+                None
+            } else if path == root.join(LOCK_FILE) {
                 None
             } else {
                 Some(std::fs::read(&path).expect("read a file"))

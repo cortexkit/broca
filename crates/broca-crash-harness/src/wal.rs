@@ -304,6 +304,13 @@ impl WalStore for ObservedWalStore {
         WalStore::read_records(&self.inner, session)
     }
 
+    fn read_records_with_lineage(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<(Vec<FramedRecord>, Option<WalLineageId>), WalError> {
+        WalStore::read_records_with_lineage(&self.inner, session)
+    }
+
     fn read_records_range(
         &self,
         session: &BindIdentity,

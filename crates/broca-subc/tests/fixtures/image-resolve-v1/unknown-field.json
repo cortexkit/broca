@@ -1,0 +1,26 @@
+{
+  "case": "unknown-field",
+  "contract": "image-resolve-v1",
+  "handle": "ih0123456789abcdef0123456789abcdef",
+  "principal": "reserved:broca",
+  "reply": {
+    "body_length": 116,
+    "body_utf8": "{\"context\":null,\"detail\":{\"field\":\"owner\",\"reason_code\":\"unknown_field\"},\"outcome\":\"invalid_request\",\"session\":null}",
+    "channel": 9,
+    "corr": 12,
+    "epoch": 1,
+    "flags": 2,
+    "type": "Response",
+    "wire_hex": "740000000201020900010000000c000000000000007b22636f6e74657874223a6e756c6c2c2264657461696c223a7b226669656c64223a226f776e6572222c22726561736f6e5f636f6465223a22756e6b6e6f776e5f6669656c64227d2c226f7574636f6d65223a22696e76616c69645f72657175657374222c2273657373696f6e223a6e756c6c7d"
+  },
+  "request": {
+    "body_length": 134,
+    "body_utf8": "{\"method\":\"image.resolve\",\"params\":{\"handle\":\"ih0123456789abcdef0123456789abcdef\",\"owner\":\"reserved:broca\",\"scope_ref\":\"vector-head\"}}",
+    "channel": 9,
+    "corr": 12,
+    "epoch": 1,
+    "type": "Request",
+    "wire_hex": "860000000200020900010000000c000000000000007b226d6574686f64223a22696d6167652e7265736f6c7665222c22706172616d73223a7b2268616e646c65223a2269683031323334353637383961626364656630313233343536373839616263646566222c226f776e6572223a2272657365727665643a62726f6361222c2273636f70655f726566223a22766563746f722d68656164227d7d"
+  },
+  "state": "an unexpected parameter is refused, naming it"
+}

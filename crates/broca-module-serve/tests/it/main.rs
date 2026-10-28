@@ -66,6 +66,7 @@ mod renderer_version_resume_real_daemon;
 mod reply_deadline_real_daemon;
 mod retention_consent_wire;
 mod scope_carrier;
+mod scope_workdir;
 mod seal_line_is_filterable_e2e;
 mod send_delivery;
 mod send_tool_reply_real_daemon;

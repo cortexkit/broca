@@ -472,6 +472,7 @@ the whole WAL instead of skipping it.
 | `input_token_budget_exhausted` | must-understand, `input-token-cap/v1` | The input-token budget ran out; written in the terminal barrier with any never-dispatched tool results. |
 | `context_ceiling_wait` | must-understand, `context-ceiling/v1` | A step's bounded wait at the context ceiling. |
 | `context_ceiling_decided` | must-understand, `context-ceiling/v1` | The durable decision of a ceiling check, before any model I/O: permit the step, or seal the run without sending. |
+| `output_reservation_clamped` | must-understand, `output-reservation/v1` | A step's output-token cap, lowered before any model I/O so the estimated input plus the cap stays inside the run's context limit. Written only for a lowered step; a resume and every rebuild of the step's request (cache warm, cache dump) render the recorded cap. |
 | `structured_output_downgraded` | must-understand, `structured-output-downgrade/v1` | The provider refused the strict schema's grammar; from this barrier on the run renders non-strict, including after a crash. |
 | `structured_output_result` | must-understand, `structured-output/v1` | The run's structured output and its validation, written in the same commit as `run_finished` and never recomputed on read. |
 | `run_cancel_requested` | must-understand, `run-cancel-at/v1` | An accepted cancellation, synced before it is acknowledged. It does not seal the episode; recovery still repairs the open tool batch. |

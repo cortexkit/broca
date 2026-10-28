@@ -22,6 +22,13 @@
 //! a model on provider [`FALLBACK_PROVIDER`]: the fallback runs on the same account and the same
 //! wire family as the model that refused, so only the model id changes.
 //!
+//! The mapping alone sends nothing anywhere: the operator switch `anthropic_fallbacks.refusal` in
+//! the same file must also be `true` (it defaults to `false`; see
+//! [`crate::config::AnthropicFallbackSwitches`], which holds this switch beside the server-side
+//! one). Only then is a fresh episode whose model has a mapping offered its fallback at
+//! admission, and whether it is actually frozen still depends on the episode (Anthropic OAuth,
+//! and the rest of the rules in `broca_catalog::live`).
+//!
 //! Every entry is validated at load time. A defective entry refuses boot by name rather than
 //! being dropped, because a mapping an operator wrote and broca ignored would only be noticed
 //! when a refusal happened and nothing switched.
@@ -61,11 +68,20 @@ pub struct FallbackTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefusalFallbackConfig {
     mappings: BTreeMap<String, String>,
+    /// The operator switch `anthropic_refusal_fallback`. Off, no episode is offered a
+    /// fallback whatever the mappings say.
+    enabled: bool,
 }
+
+/// The `broca.jsonc` key that switches the client-side refusal fallback on. It lives in the
+/// `anthropic_fallbacks` block, beside the server-side switch, so both layers of the same
+/// feature are turned on in one place.
+pub const SWITCH_KEY: &str = "anthropic_fallbacks.refusal";
 
 impl Default for RefusalFallbackConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             mappings: DEFAULT_MAPPINGS
                 .iter()
                 .map(|(source, fallback)| ((*source).to_string(), (*fallback).to_string()))
@@ -95,14 +111,39 @@ impl RefusalFallbackConfig {
                 ));
             }
         }
-        Ok(Self { mappings })
+        Ok(Self {
+            mappings,
+            enabled: false,
+        })
     }
 
     /// A config with no mappings: every refusal commits as it does with no fallback at all.
     pub fn disabled() -> Self {
         Self {
             mappings: BTreeMap::new(),
+            enabled: false,
         }
+    }
+
+    /// The same mappings with the operator switch set to `enabled`.
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Whether the operator switched the fallback on.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// The fallback model id a FRESH episode of `provider/model` is offered at admission:
+    /// `Some` only when the switch is on, `provider` is [`FALLBACK_PROVIDER`] and the mapping
+    /// names `model`. A resumed episode keeps what it froze and is never offered one.
+    pub fn offer_for(&self, provider: &str, model: &str) -> Option<&str> {
+        if !self.enabled || provider != FALLBACK_PROVIDER {
+            return None;
+        }
+        self.mappings.get(model).map(String::as_str)
     }
 
     /// Load from the config-home `broca.jsonc`, through the same ladder as its other sections.
@@ -135,14 +176,20 @@ impl RefusalFallbackConfig {
         );
         let object: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(&stripped).map_err(|error| error.to_string())?;
+        // The switch is read by `AnthropicFallbackSwitches`, which owns the block and refuses a
+        // misspelt member. A section parser only needs its value, and a file it cannot read here
+        // has already failed that loader at boot.
+        let enabled = crate::config::AnthropicFallbackSwitches::parse(&stripped)
+            .map_err(|error| format!("{SWITCH_KEY}: {error}"))?
+            .refusal;
         let Some(section) = object.get("refusal_fallback") else {
-            return Ok(Self::default());
+            return Ok(Self::default().with_enabled(enabled));
         };
         let entries: BTreeMap<String, String> =
             serde_json::from_value(section.clone()).map_err(|error| {
                 format!("refusal_fallback must map model ids to model ids: {error}")
             })?;
-        Self::new(entries)
+        Ok(Self::new(entries)?.with_enabled(enabled))
     }
 
     /// The model a refused step on `source` is re-sent to, or `None` when `source` has no
@@ -339,6 +386,40 @@ mod tests {
                 .any(|notice| notice.contains("claude-opus-4-8")),
             "the fallback model is served: {notices:?}"
         );
+    }
+
+    #[test]
+    fn the_switch_is_off_by_default_and_gates_every_offer() {
+        let default = RefusalFallbackConfig::parse("{}").unwrap();
+        assert!(!default.is_enabled());
+        assert_eq!(default.offer_for("anthropic", "claude-opus-5-5"), None);
+        let on = RefusalFallbackConfig::parse(
+            r#"{"anthropic_fallbacks": {"refusal": true}}"#,
+        )
+        .unwrap();
+        assert!(on.is_enabled());
+        assert_eq!(
+            on.offer_for("anthropic", "claude-opus-5-5"),
+            Some("claude-opus-4-8")
+        );
+        assert_eq!(on.offer_for("anthropic", "claude-haiku-5-5"), None);
+        assert_eq!(on.offer_for("anthropic-platform", "claude-opus-5-5"), None);
+        // The server-side switch alone offers no client-side fallback: the two are separate.
+        let other_switch = RefusalFallbackConfig::parse(
+            r#"{"anthropic_fallbacks": {"server_side": true}}"#,
+        )
+        .unwrap();
+        assert!(!other_switch.is_enabled());
+        assert_eq!(other_switch.offer_for("anthropic", "claude-opus-5-5"), None);
+        let off = RefusalFallbackConfig::parse(
+            r#"{"anthropic_fallbacks": {"refusal": false}, "refusal_fallback": {"claude-opus-5": "claude-opus-4-8"}}"#,
+        )
+        .unwrap();
+        assert_eq!(off.offer_for("anthropic", "claude-opus-5"), None);
+        let error =
+            RefusalFallbackConfig::parse(r#"{"anthropic_fallbacks": {"refusal": "yes"}}"#)
+                .unwrap_err();
+        assert!(error.contains(SWITCH_KEY), "{error}");
     }
 
     #[test]

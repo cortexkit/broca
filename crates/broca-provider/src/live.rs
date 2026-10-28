@@ -51,6 +51,18 @@ impl Provider for LiveAnthropicProvider {
     fn downgrade_structured_output(&self) {
         self.inner.downgrade_structured_output();
     }
+
+    fn refusal_fallback_model(&self) -> Option<broca_protocol::request::ModelHandle> {
+        self.inner.refusal_fallback_model()
+    }
+
+    fn refusal_fallback_context_limit(&self) -> Option<u64> {
+        self.inner.refusal_fallback_context_limit()
+    }
+
+    fn set_step_route(&self, route: broca_core::refusal_fallback::StepRoute) {
+        self.inner.set_step_route(route);
+    }
     async fn step_with_runtime(
         &self,
         step_id: StepId,
@@ -106,6 +118,10 @@ impl Provider for LiveAnthropicProvider {
 
     fn render_request(&self, opts: &CallOptions) -> Vec<u8> {
         self.inner.render_request(opts)
+    }
+
+    fn output_limits(&self) -> Option<broca_core::output_reservation::OutputLimits> {
+        self.inner.output_limits()
     }
 
     fn renderer_version(&self) -> u32 {

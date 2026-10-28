@@ -43,6 +43,7 @@ pub(crate) fn legacy_call_options() -> CallOptions {
         account_ref: None,
         run_id: "legacy".into(),
         step_index: 2,
+        max_output_tokens: None,
     });
     opts
 }

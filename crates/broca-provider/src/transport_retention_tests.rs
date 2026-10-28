@@ -22,6 +22,7 @@ fn options(ephemeral_session: bool) -> CallOptions {
         account_ref: None,
         run_id: "retention-diagnostic-test".into(),
         step_index: 1,
+        max_output_tokens: None,
     });
     opts
 }
@@ -194,6 +195,8 @@ async fn retention_https_calls_private_diagnostics_on_every_retry() {
             seal: None,
             step_id: StepId(1),
             cache_ttl_ms: None,
+            first_attempt: 0,
+            route: broca_core::refusal_fallback::StepRoute::Source,
         },
         &clock,
         None,

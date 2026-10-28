@@ -38,6 +38,10 @@ pub struct SentRequest {
     pub sha256: String,
     /// When the transport started sending it, in milliseconds since the Unix epoch.
     pub sent_at_ms: u64,
+    /// The model the transport sent it to: the episode's own model, or the refusal-fallback
+    /// model while a refusal round routes steps there. A warm of these bytes must be shaped and
+    /// addressed for the same model, or it would refresh a cache the run is not using.
+    pub route: crate::refusal_fallback::StepRoute,
 }
 
 impl SentRequest {
@@ -54,6 +58,7 @@ impl std::fmt::Debug for SentRequest {
             .field("body", &format_args!("<{} bytes>", self.bytes().len()))
             .field("sha256", &self.sha256)
             .field("sent_at_ms", &self.sent_at_ms)
+            .field("route", &self.route)
             .finish()
     }
 }
@@ -568,6 +573,11 @@ pub fn last_recorded_request(
             account_ref: None,
             run_id: run_id.0.clone(),
             step_index: step_id.0,
+            // A cap the step lowered to fit its context limit is part of the bytes it sent.
+            max_output_tokens: crate::output_reservation::recorded_cap(
+                &records[..attempt_at],
+                *step_id,
+            ),
         }),
         target_model: Some(
             route

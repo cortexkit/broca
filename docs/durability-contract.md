@@ -224,6 +224,22 @@ The wait uses Setup's `wait_ms` (at most 300,000 ms), including the ceiling ride
 After the bound a request still at the ceiling is refused even if inside the window; a request
 over the window is never sent. The terminal carries no provider error or model backoff signal.
 
+A lowered output cap requires **`output-reservation/v1`**. `output_reservation_clamped`
+records a step's output-token cap when it is lower than the run's frozen cap, synced before
+model I/O. A resume of the step renders the recorded cap again, and a cache warm or cache dump
+rebuilds the step with it, so the rebuilt bytes match the recorded digest. A build without the
+feature refuses the WAL instead of resuming the step with the frozen cap, which would be a
+different request from the one recorded.
+
+A step whose estimated input plus the frozen output cap would pass the run's context limit is
+sent with a lower cap, recorded first as `output_reservation_clamped`. The estimate is the
+previous step's measured input plus the request's growth in rendered bytes since, at two bytes
+per token, and a margin of 1,024 tokens or 1/256 of the window is kept free. A resume lowers a
+recorded cap further only if the request now needs less, and records the lower cap first. When
+not even the provider's minimum output reservation fits (4,096 tokens, the caller's smaller
+explicit cap, or one token above an Anthropic thinking budget), the run ends `error` with class
+`context_overflow` and provider code `output_reservation_exceeds_context` without sending.
+
 Send admission checks the durable estimate plus the incoming native messages without calling
 the provider. An already accepted queued head blocked by the ceiling remains pending; holding
 it writes no record. A durable view's updated notice or an effective window change wakes the

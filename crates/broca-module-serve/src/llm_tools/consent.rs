@@ -8,7 +8,7 @@ use std::{
 
 use broca_protocol::{BindIdentity, SessionScope};
 use broca_store::grants::{
-    Card, CardAnswer, CardState, Decision, GrantKind, GrantsError, GrantsStore, HeldCall,
+    Card, CardAnswer, CardState, Decision, Grant, GrantKind, GrantsError, GrantsStore, HeldCall,
     HeldState, HoldAdmission, HoldRequest, ScopeIdentity,
 };
 use broca_subc::{
@@ -186,12 +186,23 @@ impl Consent {
         provider: &str,
         now: i64,
     ) -> Result<bool, GrantsError> {
+        Ok(self.releasing_grant(scope, provider, now).await?.is_some())
+    }
+
+    /// The live grant that lets this scope call `provider` now, if any: the same decision as
+    /// [`Self::granted`], naming the grant so the route can report which one released a call.
+    pub async fn releasing_grant(
+        &self,
+        scope: &SessionScope,
+        provider: &str,
+        now: i64,
+    ) -> Result<Option<Grant>, GrantsError> {
         let Some(agent) = scope.agent_id.as_deref() else {
-            return Ok(false);
+            return Ok(None);
         };
         let identity = identity(scope);
         if self.store.denied(agent, &identity, provider)? {
-            return Ok(false);
+            return Ok(None);
         }
         for grant in self.store.grants()? {
             if grant.holder != agent || grant.provider != provider {
@@ -199,18 +210,18 @@ impl Consent {
             }
             match grant.kind {
                 GrantKind::Hours24 if grant.expires_at_ms.is_some_and(|expiry| now < expiry) => {
-                    return Ok(true)
+                    return Ok(Some(grant))
                 }
                 GrantKind::Run
                     if grant.scope.as_ref() == Some(&identity)
                         && self.io.run_live(scope).await == RunLiveness::Live =>
                 {
-                    return Ok(true)
+                    return Ok(Some(grant))
                 }
                 _ => (),
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// A grant can settle while another card's waiter is asleep, or just before a process

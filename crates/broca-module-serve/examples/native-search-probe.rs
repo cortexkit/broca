@@ -651,6 +651,7 @@ async fn run(args: Args) -> Result<(), String> {
                         account_ref: None,
                         run_id: "native-search-probe".into(),
                         step_index: 1,
+                        max_output_tokens: None,
                     });
                     opts.target_model = Some(model);
                     family.render(&frozen, &opts)

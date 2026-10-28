@@ -27,14 +27,14 @@ struct Cerebellum {
     replies: Mutex<HashMap<String, ImageReply>>,
     calls: Mutex<Vec<(String, String, Option<String>)>>,
 }
-type ImageReply = Result<(String, Vec<u8>, bool), ImageResolveError>;
+type ImageReply = Result<(String, Vec<u8>), ImageResolveError>;
 
 impl Cerebellum {
-    fn image(&self, handle: &str, mime: &str, bytes: Vec<u8>, corrupt: bool) {
+    fn image(&self, handle: &str, mime: &str, bytes: Vec<u8>) {
         self.replies
             .lock()
             .unwrap()
-            .insert(handle.into(), Ok((mime.into(), bytes, corrupt)));
+            .insert(handle.into(), Ok((mime.into(), bytes)));
     }
 }
 
@@ -50,21 +50,18 @@ impl ImageResolver for Cerebellum {
             .lock()
             .unwrap()
             .push((handle.into(), scope.into(), parent.map(str::to_owned)));
-        let (mime, bytes, corrupt) = self
+        let (content_type, bytes) = self
             .replies
             .lock()
             .unwrap()
             .get(handle)
             .cloned()
             .unwrap_or(Err(ImageResolveError::Unavailable))?;
+        // The test fake stands in for the wire decoder, which checks length and digest before
+        // this boundary: bytes here are already verified, as `ResolvedImage` carries no digest.
         Ok(ResolvedImage {
-            mime,
-            sha256: if corrupt {
-                "0".repeat(64)
-            } else {
-                format!("{:x}", Sha256::digest(&bytes))
-            },
-            bytes: STANDARD.encode(bytes),
+            content_type,
+            bytes,
         })
     }
 }
@@ -122,7 +119,7 @@ struct Rig {
 
 fn rig(enabled: bool) -> Rig {
     let source = Arc::new(Cerebellum::default());
-    source.image(HANDLE, "image/png", STANDARD.decode(PIXEL).unwrap(), false);
+    source.image(HANDLE, "image/png", STANDARD.decode(PIXEL).unwrap());
     let provider = Arc::new(Provider::default());
     let store = Arc::new(SystemOneStore::open_in_memory().unwrap());
     let export = Arc::new(SqliteStore::open_in_memory().unwrap());
@@ -304,24 +301,6 @@ async fn image_reference_refusals_are_fixed_class_and_write_nothing() {
 }
 
 #[tokio::test]
-async fn image_reference_integrity_mismatch_is_permanent_and_writes_nothing() {
-    let rig = rig(true);
-    rig.source
-        .image(HANDLE, "image/png", STANDARD.decode(PIXEL).unwrap(), true);
-    let refusal = tool(
-        &rig,
-        arguments(CLEF, json!([{"handle":HANDLE}])),
-        &scope(false),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(refusal["code"], "image_unavailable");
-    assert_eq!(refusal["detail"]["class"], "permanent");
-    assert_eq!(refusal["detail"]["field"], "items[0].images[0]");
-    assert_nothing_written(&rig);
-}
-
-#[tokio::test]
 async fn image_reference_scope_and_attachment_admission_precede_resolution() {
     let rig = rig(true);
     assert_eq!(
@@ -435,7 +414,7 @@ async fn image_reference_resolved_bytes_get_inline_size_type_count_and_pixel_che
         ("image/png", vec![0; 3 * 1024 * 1024], 3),
     ] {
         let rig = rig(true);
-        rig.source.image(HANDLE, mime, bytes, false);
+        rig.source.image(HANDLE, mime, bytes);
         let refusal = tool(
             &rig,
             arguments(CLEF, json!(vec![json!({"handle":HANDLE}); count])),
@@ -448,8 +427,7 @@ async fn image_reference_resolved_bytes_get_inline_size_type_count_and_pixel_che
     }
     let rig = rig(true);
     let inline = json!([{"content_type":"image/png","base64":STANDARD.encode(&too_many_pixels)}]);
-    rig.source
-        .image(HANDLE, "image/png", too_many_pixels, false);
+    rig.source.image(HANDLE, "image/png", too_many_pixels);
     for images in [json!([{"handle":HANDLE}]), inline] {
         let refusal = tool(&rig, arguments(CLEF, images), &scope(false))
             .await

@@ -7,9 +7,12 @@ use cortexkit_role_llm_runner_conformance::ScriptedTurn;
 pub(super) const PROVIDER: &str = "anthropic";
 pub(super) const MODEL: &str = "conformance-output-refs";
 
+/// The context window is 1M tokens because `output_refs_snapshot_budget` stores a 1 MiB tool
+/// result and the following request must fit the window. With a smaller one, broca correctly
+/// ends the run as context_overflow before sending, as a provider would refuse that request.
 pub(super) fn catalog_row() -> Value {
     json!({"capability.attachment":false,"capability.reasoning":true,
-        "capability.tool_call":true,"existence":"present","limit.context":128000,
+        "capability.tool_call":true,"existence":"present","limit.context":1000000,
         "wire.npm":{"value":"@ai-sdk/anthropic","from":"fixture"},
         "wire.api":{"value":"https://conformance.invalid/v1","from":"fixture"}})
 }

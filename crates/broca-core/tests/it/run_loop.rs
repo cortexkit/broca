@@ -5643,3 +5643,669 @@ async fn an_ambiguous_tool_without_a_planned_stop_has_no_interrupt_provenance() 
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+// ───────────────────────── client-side refusal fallback ─────────────────────────
+
+const FALLBACK_MODEL: &str = "claude-opus-4-8";
+
+fn fallback_handle() -> ModelHandle {
+    ModelHandle::new("anthropic", FALLBACK_MODEL)
+}
+
+/// A step the model refused: some text and a terminal `content_filter`.
+fn refusal_step(text: &str) -> Vec<NormalizedEvent> {
+    let mut step = text_step_with_usage(text, usage(10, 3));
+    for event in &mut step {
+        match event {
+            NormalizedEvent::Control(ProviderControl::StepFinished { finish_reason, .. })
+            | NormalizedEvent::Control(ProviderControl::Finished { finish_reason, .. }) => {
+                *finish_reason = FinishReason::ContentFilter
+            }
+            _ => {}
+        }
+    }
+    step
+}
+
+/// A step that completed a tool call and was then refused.
+fn tool_refusal_step(id: &str) -> Vec<NormalizedEvent> {
+    let mut step = tool_step(&[(id, "edit", json!({"path": id}))]);
+    for event in &mut step {
+        match event {
+            NormalizedEvent::Control(ProviderControl::StepFinished { finish_reason, .. })
+            | NormalizedEvent::Control(ProviderControl::Finished { finish_reason, .. }) => {
+                *finish_reason = FinishReason::ContentFilter
+            }
+            _ => {}
+        }
+    }
+    step
+}
+
+fn fallback_provider(scripts: Vec<Vec<NormalizedEvent>>) -> StubProvider {
+    StubProvider::new(scripts).with_refusal_fallback(fallback_handle(), Some(1_000_000))
+}
+
+/// Mark a step as served by Anthropic's own server-side fallback: the provider reported a wire
+/// model other than the one asked for, which is what the normalizer turns into `served_model`.
+fn served_by_server_side_fallback(mut step: Vec<NormalizedEvent>, served_model: &str) -> Vec<NormalizedEvent> {
+    for event in &mut step {
+        if let NormalizedEvent::Control(ProviderControl::StepFinished { served_model: served, .. }) = event {
+            *served = Some(served_model.to_string());
+        }
+    }
+    step
+}
+
+/// An in-memory WAL that remembers how many records the last sync covered.
+#[derive(Clone, Default)]
+struct SyncTrackingWalStore {
+    records: Arc<Mutex<Vec<FramedRecord>>>,
+    synced_through: Arc<AtomicUsize>,
+}
+
+struct SyncTrackingWal {
+    store: SyncTrackingWalStore,
+    next_seq: u64,
+}
+
+impl broca_core::WalStore for SyncTrackingWalStore {
+    fn open(&self, _session: &BindIdentity) -> Result<Box<dyn Wal + Send>, WalError> {
+        let next_seq = self.records.lock().unwrap().len() as u64 + 1;
+        Ok(Box::new(SyncTrackingWal {
+            store: self.clone(),
+            next_seq,
+        }))
+    }
+
+    fn read_records(&self, _session: &BindIdentity) -> Result<Vec<FramedRecord>, WalError> {
+        Ok(self.records.lock().unwrap().clone())
+    }
+}
+
+impl Wal for SyncTrackingWal {
+    fn append(&mut self, fence: u64, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
+        let seq = self.next_seq;
+        self.store.records.lock().unwrap().push(FramedRecord {
+            seq,
+            fence,
+            record: record.clone(),
+        });
+        self.next_seq += 1;
+        if sync {
+            self.sync()?;
+        }
+        Ok(seq)
+    }
+
+    fn sync(&self) -> Result<(), WalError> {
+        let len = self.store.records.lock().unwrap().len();
+        self.store.synced_through.store(len, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn replay(&self) -> Result<Vec<FramedRecord>, WalError> {
+        Ok(self.store.records.lock().unwrap().clone())
+    }
+
+    fn tail_after_seq(&self, after_seq: u64) -> Result<Vec<FramedRecord>, WalError> {
+        Ok(self
+            .store
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|record| record.seq > after_seq)
+            .cloned()
+            .collect())
+    }
+
+    fn last_seq(&self) -> u64 {
+        self.next_seq.saturating_sub(1)
+    }
+}
+
+/// The scripted stub, also noting at each call which records the WAL had made durable.
+struct DurabilityProbe {
+    inner: StubProvider,
+    wal: SyncTrackingWalStore,
+    /// Per call: the durable records' types at the moment the request went out.
+    durable_at_call: Mutex<Vec<Vec<WalRecord>>>,
+}
+
+#[async_trait::async_trait]
+impl broca_core::Provider for DurabilityProbe {
+    fn refusal_fallback_model(&self) -> Option<ModelHandle> {
+        self.inner.refusal_fallback_model()
+    }
+
+    fn refusal_fallback_context_limit(&self) -> Option<u64> {
+        self.inner.refusal_fallback_context_limit()
+    }
+
+    fn set_step_route(&self, route: broca_core::refusal_fallback::StepRoute) {
+        self.inner.set_step_route(route);
+    }
+
+    async fn step(
+        &self,
+        step_id: StepId,
+        opts: &broca_protocol::CallOptions,
+    ) -> mpsc::Receiver<NormalizedEvent> {
+        let synced = self.wal.synced_through.load(Ordering::SeqCst);
+        let durable = self.wal.records.lock().unwrap()[..synced]
+            .iter()
+            .map(|frame| frame.record.clone())
+            .collect();
+        self.durable_at_call.lock().unwrap().push(durable);
+        self.inner.step(step_id, opts).await
+    }
+}
+
+fn wal_records(store: &SyncTrackingWalStore) -> Vec<WalRecord> {
+    store
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|frame| frame.record.clone())
+        .collect()
+}
+
+async fn drive_fallback<P: broca_core::Provider, T: broca_core::ToolPlane>(
+    request: RunRequest,
+    provider: &P,
+    plane: &T,
+    wal: &SyncTrackingWalStore,
+    tag: &str,
+) -> (broca_core::RunSummary, Vec<OutputEvent>) {
+    let (store, dir) = tmp_lease_store(tag);
+    let (tx, mut rx) = mpsc::channel(8192);
+    let collector = tokio::spawn(async move {
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
+    });
+    let summary = run_loop(request, provider, plane, &store, &AllowAll, wal, &tx)
+        .await
+        .expect("run");
+    drop(tx);
+    let events = collector.await.unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+    (summary, events)
+}
+
+fn refused_records(records: &[WalRecord]) -> Vec<&WalRecord> {
+    records
+        .iter()
+        .filter(|record| matches!(record, WalRecord::ModelStepRefused { .. }))
+        .collect()
+}
+
+fn step_fallbacks(
+    records: &[WalRecord],
+) -> Vec<(StepId, broca_wal::StepFallback, Option<FinishReason>)> {
+    records
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::ModelStepFinished {
+                step_id,
+                fallback,
+                finish_reason,
+                ..
+            } => Some((*step_id, (**fallback).clone(), *finish_reason)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn phase(fallback: &broca_wal::StepFallback) -> Option<broca_wal::RefusalFallbackPhase> {
+    fallback
+        .refusal_fallback
+        .as_ref()
+        .map(|schedule| schedule.phase)
+}
+
+/// A plain refusal on the source model re-sends the same step to the fallback model, after a
+/// synced `ModelStepRefused` and one display reset, and commits the fallback's answer as that
+/// step: one `StepFinished`, the fallback's finish reason, and the refused content nowhere.
+#[tokio::test]
+async fn refusal_resends_step_on_fallback() {
+    let wal = SyncTrackingWalStore::default();
+    let provider = DurabilityProbe {
+        inner: fallback_provider(vec![
+            refusal_step("I can't help"),
+            text_step("fallback answer"),
+        ]),
+        wal: wal.clone(),
+        durable_at_call: Mutex::default(),
+    };
+    let plane = StubToolPlane::new();
+    let (summary, events) = drive_fallback(
+        req("refusal-resend", vec![], vec![]),
+        &provider,
+        &plane,
+        &wal,
+        "rf1",
+    )
+    .await;
+
+    assert_eq!(summary.reason, RunFinishReason::Completed);
+    assert_eq!(summary.steps, 1);
+    assert_eq!(
+        provider.inner.routes(),
+        [
+            broca_core::refusal_fallback::StepRoute::Source,
+            broca_core::refusal_fallback::StepRoute::Fallback
+        ]
+    );
+    let calls = provider.inner.calls();
+    assert_eq!(calls[1].target_model, Some(fallback_handle()));
+    // Synced before the re-send: the second request saw the refusal durable.
+    let durable = provider.durable_at_call.lock().unwrap().clone();
+    assert!(refused_records(&durable[0]).is_empty());
+    assert_eq!(
+        refused_records(&durable[1]).len(),
+        1,
+        "barrier before the re-send"
+    );
+
+    let records = wal_records(&wal);
+    let refused = refused_records(&records);
+    assert_eq!(refused.len(), 1);
+    let WalRecord::ModelStepRefused {
+        step_id: refused_step,
+        usage: refused_usage,
+        discarded_blocks,
+        schedule,
+        ..
+    } = refused[0]
+    else {
+        unreachable!()
+    };
+    assert_eq!(*refused_usage, usage(10, 3));
+    assert_eq!(*discarded_blocks, 1);
+    assert_eq!(
+        schedule.phase,
+        broca_wal::RefusalFallbackPhase::Fallback { remaining: 10 }
+    );
+    let steps = step_fallbacks(&records);
+    assert_eq!(steps.len(), 1);
+    let (step_id, fallback, finish) = &steps[0];
+    assert_eq!(
+        step_id, refused_step,
+        "the refused step id commits the answer"
+    );
+    assert_eq!(
+        *finish,
+        Some(FinishReason::Stop),
+        "the fallback's finish reason"
+    );
+    assert_eq!(
+        fallback.route,
+        Some(broca_wal::StepRoute {
+            model: fallback_handle(),
+            reason: broca_wal::StepRouteReason::Refusal,
+        })
+    );
+    assert_eq!(
+        phase(fallback),
+        Some(broca_wal::RefusalFallbackPhase::Fallback { remaining: 9 })
+    );
+    let refused_at = records
+        .iter()
+        .position(|record| matches!(record, WalRecord::ModelStepRefused { .. }))
+        .unwrap();
+    let finished_at = records
+        .iter()
+        .position(|record| matches!(record, WalRecord::ModelStepFinished { .. }))
+        .unwrap();
+    assert!(refused_at < finished_at);
+
+    // One display reset, after the refused deltas and before the fallback's.
+    let resets: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| matches!(event, OutputEvent::Display(DisplayEvent::DisplayReset)))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(resets.len(), 1);
+    let delta_at = |text: &str| {
+        events
+            .iter()
+            .position(|event| {
+                matches!(event, OutputEvent::Display(DisplayEvent::TextDelta { delta, .. }) if delta == text)
+            })
+            .unwrap()
+    };
+    assert!(delta_at("I can't help") < resets[0] && resets[0] < delta_at("fallback answer"));
+    let step_finished = control_units(&events)
+        .into_iter()
+        .filter(|unit| matches!(unit, ControlUnit::StepFinished { .. }))
+        .count();
+    assert_eq!(step_finished, 1);
+
+    // Both calls were billed; replay agrees with the live totals and never sees the refusal.
+    assert_eq!(summary.usage.input_tokens, Some(20));
+    assert_eq!(summary.usage.output_tokens, Some(8));
+    let replayed = replay(&records).expect("replay");
+    assert_eq!(replayed.usage, summary.usage);
+    let answer = replayed
+        .prompt
+        .iter()
+        .find(|message| message.role == Role::Assistant)
+        .expect("the answer");
+    assert_eq!(answer.origin, Some(fallback_handle()));
+    assert!(!format!("{:?}", replayed.prompt).contains("I can't help"));
+    assert_eq!(
+        replayed.refusal_fallback.map(|schedule| schedule.phase),
+        Some(broca_wal::RefusalFallbackPhase::Fallback { remaining: 9 })
+    );
+}
+
+/// A refusal that comes after a completed tool call commits as a tool step: the call is
+/// dispatched exactly once, the schedule is armed, and the next step goes to the fallback.
+#[tokio::test]
+async fn refusal_after_tool_use_dispatches_once_and_arms_schedule() {
+    let wal = SyncTrackingWalStore::default();
+    let provider = fallback_provider(vec![tool_refusal_step("t1"), text_step("done")]);
+    let plane = StubToolPlane::new().with_canned_text("edit", "edited");
+    let (summary, _) = drive_fallback(
+        req(
+            "refusal-tool",
+            vec![tool("edit", ExecutionMode::Parallel)],
+            vec![],
+        ),
+        &provider,
+        &plane,
+        &wal,
+        "rf2",
+    )
+    .await;
+    assert_eq!(summary.reason, RunFinishReason::Completed);
+    let dispatched = plane
+        .log()
+        .into_iter()
+        .filter(|event| matches!(event, StubEvent::Dispatched(id) if id.0 == "t1"))
+        .count();
+    assert_eq!(
+        dispatched, 1,
+        "the completed tool call is dispatched exactly once"
+    );
+    assert_eq!(
+        provider.routes(),
+        [
+            broca_core::refusal_fallback::StepRoute::Source,
+            broca_core::refusal_fallback::StepRoute::Fallback
+        ]
+    );
+    let records = wal_records(&wal);
+    assert!(refused_records(&records).is_empty(), "nothing is re-sent");
+    let steps = step_fallbacks(&records);
+    assert_eq!(steps.len(), 2);
+    let (_, first, first_finish) = &steps[0];
+    assert_eq!(*first_finish, Some(FinishReason::ToolCalls));
+    assert!(first.refusal_after_tool_use);
+    assert_eq!(first.route, None);
+    assert_eq!(
+        phase(first),
+        Some(broca_wal::RefusalFallbackPhase::Fallback { remaining: 10 })
+    );
+    let (_, second, _) = &steps[1];
+    assert_eq!(
+        second.route,
+        Some(broca_wal::StepRoute {
+            model: fallback_handle(),
+            reason: broca_wal::StepRouteReason::Schedule,
+        })
+    );
+    assert_eq!(
+        phase(second),
+        Some(broca_wal::RefusalFallbackPhase::Fallback { remaining: 9 })
+    );
+}
+
+/// Rounds of 10, 20 and 40 fallback responses, each returning to the source; ten clean source
+/// responses make the next refusal start at 10 again.
+#[tokio::test]
+async fn fallback_schedule_doubles_and_returns() {
+    use broca_core::refusal_fallback::StepRoute::{Fallback, Source};
+    let mut scripts = Vec::new();
+    let mut expected = Vec::new();
+    let mut next_id = 0;
+    let mut tool_call = |scripts: &mut Vec<Vec<NormalizedEvent>>| {
+        next_id += 1;
+        let id = format!("c{next_id}");
+        scripts.push(tool_step(&[(id.as_str(), "edit", json!({"path": id}))]));
+    };
+    for round in [10, 20, 40] {
+        scripts.push(refusal_step("no"));
+        expected.push(Source);
+        for _ in 0..round {
+            tool_call(&mut scripts);
+            expected.push(Fallback);
+        }
+    }
+    for _ in 0..10 {
+        tool_call(&mut scripts);
+        expected.push(Source);
+    }
+    scripts.push(refusal_step("no"));
+    expected.push(Source);
+    for _ in 0..10 {
+        tool_call(&mut scripts);
+        expected.push(Fallback);
+    }
+    scripts.push(text_step("back on the source"));
+    expected.push(Source);
+
+    let wal = SyncTrackingWalStore::default();
+    let provider = fallback_provider(scripts);
+    let plane = StubToolPlane::new().with_canned_text("edit", "edited");
+    let (summary, _) = drive_fallback(
+        req(
+            "refusal-schedule",
+            vec![tool("edit", ExecutionMode::Parallel)],
+            vec![StopCondition::StepCount { n: 500 }],
+        ),
+        &provider,
+        &plane,
+        &wal,
+        "rf3",
+    )
+    .await;
+    assert_eq!(summary.reason, RunFinishReason::Completed);
+    assert_eq!(provider.routes(), expected);
+    let records = wal_records(&wal);
+    let rounds: Vec<u32> = refused_records(&records)
+        .into_iter()
+        .map(|record| match record {
+            WalRecord::ModelStepRefused { schedule, .. } => match schedule.phase {
+                broca_wal::RefusalFallbackPhase::Fallback { remaining } => remaining,
+                broca_wal::RefusalFallbackPhase::Probe { .. } => 0,
+            },
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(rounds, [10, 20, 40, 10]);
+    let replayed = replay(&records).expect("replay");
+    assert_eq!(
+        replayed.refusal_fallback.map(|schedule| schedule.phase),
+        Some(broca_wal::RefusalFallbackPhase::Probe { clean: 1 })
+    );
+}
+
+/// A source reply Anthropic's own server-side fallback served is not a clean reply from the
+/// source: the service did not answer, it handed the request on. It must therefore break the
+/// client-side schedule's streak of clean source responses instead of advancing it. Both layers
+/// are on here, since that is the only shape in which they can interact.
+///
+/// One refusal starts a full round (10 fallback steps), then the source is probed once and the
+/// handoff serves that reply. The probe therefore records 0; a reply counted as clean would
+/// record 1.
+#[tokio::test]
+async fn server_side_fallback_reply_does_not_count_toward_the_clean_streak() {
+    use broca_core::refusal_fallback::StepRoute::{Fallback, Source};
+    let mut scripts = vec![refusal_step("no")];
+    let mut expected = vec![Source];
+    for _ in 0..broca_core::refusal_fallback::ROUND_STEPS {
+        scripts.push(tool_step(&[("c1", "edit", json!({"path": "1"}))]));
+        expected.push(Fallback);
+    }
+    // The probe: Anthropic itself hands this reply to another model.
+    scripts.push(served_by_server_side_fallback(
+        text_step("handed on"),
+        "claude-opus-4-8",
+    ));
+    expected.push(Source);
+
+    let wal = SyncTrackingWalStore::default();
+    let provider = fallback_provider(scripts);
+    let plane = StubToolPlane::new().with_canned_text("edit", "edited");
+    let (summary, _) = drive_fallback(
+        req(
+            "refusal-server-side",
+            vec![tool("edit", ExecutionMode::Parallel)],
+            vec![],
+        ),
+        &provider,
+        &plane,
+        &wal,
+        "rf3b",
+    )
+    .await;
+    assert_eq!(summary.reason, RunFinishReason::Completed);
+    assert_eq!(provider.routes(), expected);
+
+    let records = wal_records(&wal);
+    let served: Vec<Option<String>> = step_fallbacks(&records)
+        .into_iter()
+        .map(|(_, fallback, _)| fallback.served_model.clone())
+        .collect();
+    // The probe reply is the run's last step, so it is recorded and says what served it; no
+    // other step in this run was handed off.
+    assert_eq!(
+        served.last(),
+        Some(&Some("claude-opus-4-8".to_string())),
+        "the handed-off probe reply names the model that produced it: {served:?}"
+    );
+    assert!(
+        served[..served.len() - 1].iter().all(Option::is_none),
+        "nothing else in this run was handed off: {served:?}"
+    );
+    let replayed = replay(&records).expect("replay");
+    assert_eq!(
+        replayed.refusal_fallback.map(|schedule| schedule.phase),
+        Some(broca_wal::RefusalFallbackPhase::Probe { clean: 0 }),
+        "the handoff broke the streak instead of counting as a clean source reply"
+    );
+}
+
+/// A refusal from the fallback model passes through: it commits as `content_filter`, with no
+/// second re-send and the schedule unchanged.
+#[tokio::test]
+async fn fallback_refusal_passes_through() {
+    let wal = SyncTrackingWalStore::default();
+    let provider = fallback_provider(vec![refusal_step("no"), refusal_step("still no")]);
+    let plane = StubToolPlane::new();
+    let (summary, _) = drive_fallback(
+        req("refusal-chain", vec![], vec![]),
+        &provider,
+        &plane,
+        &wal,
+        "rf4",
+    )
+    .await;
+    assert_eq!(summary.reason, RunFinishReason::Completed);
+    assert_eq!(provider.calls().len(), 2, "no second re-send");
+    let records = wal_records(&wal);
+    assert_eq!(refused_records(&records).len(), 1);
+    let steps = step_fallbacks(&records);
+    assert_eq!(steps.len(), 1);
+    let (_, fallback, finish) = &steps[0];
+    assert_eq!(*finish, Some(FinishReason::ContentFilter));
+    assert_eq!(
+        fallback.route.as_ref().map(|route| route.reason),
+        Some(broca_wal::StepRouteReason::Refusal)
+    );
+    assert_eq!(
+        phase(fallback),
+        Some(broca_wal::RefusalFallbackPhase::Fallback { remaining: 10 }),
+        "a fallback refusal does not count toward the round"
+    );
+}
+
+/// The model-step records of a run, as bytes (wall-clock times aside), and the record types in
+/// order: what an ineligible run must leave exactly as it did before the fallback existed.
+fn step_bytes(records: &[WalRecord]) -> (Vec<String>, Vec<String>) {
+    let kinds = records
+        .iter()
+        .map(|record| serde_json::to_value(record).unwrap()["type"].to_string())
+        .collect();
+    let steps = records
+        .iter()
+        .filter(|record| matches!(record, WalRecord::ModelStepFinished { .. }))
+        .map(|record| {
+            // Wall-clock times differ from run to run; every other byte must not.
+            let mut value = serde_json::to_value(record).unwrap();
+            value.as_object_mut().unwrap().remove("written_at_ms");
+            serde_json::to_string(&value).unwrap()
+        })
+        .collect();
+    (kinds, steps)
+}
+
+/// A run without a frozen fallback, and one whose prompt already fills the fallback model's
+/// window, commit a refusal exactly as a run did before the fallback existed.
+#[tokio::test]
+async fn ineligible_refusal_commits_as_today() {
+    let scripts = || vec![tool_step(&[("t1", "edit", json!({}))]), refusal_step("no")];
+    let request = || {
+        req(
+            "refusal-ineligible",
+            vec![tool("edit", ExecutionMode::Parallel)],
+            vec![],
+        )
+    };
+    let plane = StubToolPlane::new().with_canned_text("edit", "edited");
+
+    let plain_wal = SyncTrackingWalStore::default();
+    let plain = StubProvider::new(scripts());
+    let (plain_summary, plain_events) =
+        drive_fallback(request(), &plain, &plane, &plain_wal, "rf5a").await;
+    let plain_records = wal_records(&plain_wal);
+
+    // The first step's prompt (10 input tokens) already fills this fallback's window.
+    let guarded_wal = SyncTrackingWalStore::default();
+    let guarded = StubProvider::new(scripts()).with_refusal_fallback(fallback_handle(), Some(10));
+    let (guarded_summary, guarded_events) =
+        drive_fallback(request(), &guarded, &plane, &guarded_wal, "rf5b").await;
+    let guarded_records = wal_records(&guarded_wal);
+
+    for (summary, records, provider) in [
+        (&plain_summary, &plain_records, &plain),
+        (&guarded_summary, &guarded_records, &guarded),
+    ] {
+        assert_eq!(summary.reason, RunFinishReason::Completed);
+        assert_eq!(
+            summary.final_step_finish_reason,
+            Some(FinishReason::ContentFilter)
+        );
+        assert_eq!(provider.calls().len(), 2);
+        assert!(refused_records(records).is_empty());
+        for (_, fallback, _) in step_fallbacks(records) {
+            assert_eq!(fallback, broca_wal::StepFallback::default());
+        }
+    }
+    assert_eq!(step_bytes(&plain_records), step_bytes(&guarded_records));
+    let resets = |events: &[OutputEvent]| {
+        events
+            .iter()
+            .filter(|event| matches!(event, OutputEvent::Display(DisplayEvent::DisplayReset)))
+            .count()
+    };
+    assert_eq!(resets(&plain_events), 0);
+    assert_eq!(resets(&guarded_events), 0);
+}

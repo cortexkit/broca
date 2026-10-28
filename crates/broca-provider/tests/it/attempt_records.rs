@@ -666,13 +666,26 @@ mod gated {
             .filter(|r| !matches!(r, WalRecord::ModelAttemptFinished { .. }))
             .collect();
         let all: Vec<WalRecord> = framed.iter().map(|f| f.record.clone()).collect();
-        let with_state = replay(&all).unwrap();
+        let mut with_state = replay(&all).unwrap();
         let without_state = replay(&stripped).unwrap();
         assert_eq!(
             serde_json::to_vec(&with_state.prompt).unwrap(),
             serde_json::to_vec(&without_state.prompt).unwrap(),
             "reconstructed prompt bytes"
         );
+        // The output reservation is the one reader of attempt records: it takes each attempt's
+        // rendered body length as the measurement its next estimate scales from. Only the replay
+        // with them has it; everything else must match.
+        let model = all
+            .iter()
+            .find_map(|r| match r {
+                WalRecord::RunStarted { config, .. } => Some(config.model.clone()),
+                _ => None,
+            })
+            .expect("the run's RunStarted");
+        assert!(with_state.output_reservation.has_measurement(&model));
+        assert!(!without_state.output_reservation.has_measurement(&model));
+        with_state.output_reservation = without_state.output_reservation.clone();
         assert_eq!(format!("{with_state:?}"), format!("{without_state:?}"));
         let units = |frames: &[FramedRecord]| -> Vec<_> {
             project_control(frames)

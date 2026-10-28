@@ -153,8 +153,13 @@ pub enum ProviderReply {
         code: Option<u64>,
         retry_after_ms: Option<u64>,
     },
-    /// No reply: the connection failed or the attempt ran out of time.
+    /// No reply: the attempt ran out of time, or the connection failed in a way that may
+    /// have come after the request was sent, so the provider may have billed it.
     Transport(String),
+    /// No reply because no connection was ever made (name lookup, a refused connect, TLS
+    /// setup): nothing reached the provider. Answered exactly as [`Self::Transport`]; only the
+    /// model tools' refusal spend tells the two apart.
+    Unconnected(String),
     /// The credential could not be read, so nothing was sent.
     Credential(String),
 }
@@ -484,22 +489,36 @@ impl SystemOne {
         admitted_at_ms: Option<i64>,
         images: Arc<images::PreparedImages>,
     ) -> Result<Box<RawValue>, Refusal> {
-        self.sweep()
+        // Every refusal of a model tool states its spend. One that no step marked is marked
+        // here by whether a provider attempt was ever started: before the first one nothing was
+        // spent; after it the provider may have billed a call nothing measured.
+        let mut dispatched = false;
+        let answer = async {
+            self.sweep()
+                .await
+                .map_err(|_| internal_refusal("batch retention is unavailable"))?;
+            let gauge = self.in_flight.clone();
+            gauge.fetch_add(1, Ordering::Relaxed);
+            let _lowered = GaugeGuard(gauge);
+            let _slot = self.call_slots.clone().acquire_owned().await;
+            classify::run_inner(
+                &self,
+                &params,
+                &scope,
+                admitted_at_ms,
+                Some((&args_digest, &admission)),
+                Some(&images),
+                &mut dispatched,
+            )
             .await
-            .map_err(|_| internal_refusal("batch retention is unavailable"))?;
-        let gauge = self.in_flight.clone();
-        gauge.fetch_add(1, Ordering::Relaxed);
-        let _lowered = GaugeGuard(gauge);
-        let _slot = self.call_slots.clone().acquire_owned().await;
-        classify::run_inner(
-            &self,
-            &params,
-            &scope,
-            admitted_at_ms,
-            Some((&args_digest, &admission)),
-            Some(&images),
-        )
-        .await
+        }
+        .await;
+        let spend = if dispatched {
+            crate::llm_tools::spend::Spend::Unknown
+        } else {
+            crate::llm_tools::spend::Spend::Nothing
+        };
+        answer.map_err(|refusal| spend.mark_undeclared(refusal))
     }
 
     /// The batch recorded under this service's role for `batch_id`, with its outcomes; `None`
@@ -761,6 +780,7 @@ impl SystemOne {
                     admitted_at_ms,
                     None,
                     Some(&images),
+                    &mut false,
                 )
                 .await
             }

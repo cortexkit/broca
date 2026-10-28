@@ -23,6 +23,22 @@ use tokio::time::Instant;
 
 use crate::{connection::SubcConnection, role_route::RoleRoute};
 
+// The bound route supplies the full session identity. Accept its historical
+// handle, but address the provider using the current folder-independent handle.
+fn current_reference(bind: &BindIdentity, supplied: &str) -> Result<String, CompactionUnavailable> {
+    let current = broca_core::wal_writer::agent_session_ref(bind);
+    let legacy = broca_core::wal_writer::legacy_session_ref(
+        &bind.harness,
+        &bind.project_root.to_string_lossy(),
+        &bind.session,
+    );
+    if supplied == current || supplied == legacy {
+        Ok(current)
+    } else {
+        Err(CompactionUnavailable)
+    }
+}
+
 /// Routes are isolated by caller session and provider. Discovery, queueing and the RPC all
 /// consume the call's budget; failed calls invalidate the route before another request uses it.
 pub struct SubcCompactionPlane {
@@ -157,11 +173,9 @@ impl CompactionPlane for SubcCompactionPlane {
         &self,
         provider: &str,
         bind: &BindIdentity,
-        request: ViewGetRequest,
+        mut request: ViewGetRequest,
     ) -> Result<ViewGetAnswer, CompactionUnavailable> {
-        if request.session_ref != broca_core::wal_writer::agent_session_ref(bind) {
-            return Err(CompactionUnavailable);
-        }
+        request.session_ref = current_reference(bind, &request.session_ref)?;
         self.route
             .call(
                 provider,
@@ -181,11 +195,9 @@ impl CompactionPlane for SubcCompactionPlane {
         &self,
         provider: &str,
         bind: &BindIdentity,
-        request: RideRequest,
+        mut request: RideRequest,
     ) -> Result<RideAnswer, CompactionUnavailable> {
-        if request.session_ref != broca_core::wal_writer::agent_session_ref(bind) {
-            return Err(CompactionUnavailable);
-        }
+        request.session_ref = current_reference(bind, &request.session_ref)?;
         let ride_deadline = Instant::now() + Duration::from_millis(request.deadline_ms);
         self.route
             .call(
@@ -235,5 +247,23 @@ mod describe_refusal_tests {
             assert!(!describe_refusal_may_clear(code), "{code}");
             assert!(!describe_refusal_is_routing(code), "{code}");
         }
+    }
+}
+
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+
+    #[test]
+    fn compaction_reference_accepts_v1_and_v2_but_forwards_v2() {
+        let bind = BindIdentity::new("/tmp/project", "runner", "s1");
+        let v2 = "701a6e2266b2d8d3740373257146e954";
+        assert_eq!(current_reference(&bind, v2).unwrap(), v2);
+        assert_eq!(
+            current_reference(&bind, "fb99bd3a001d05d029c607bd048ed5a1").unwrap(),
+            v2
+        );
+        assert!(current_reference(&bind, "58710a071e777b22bf1b3734b691ef7d").is_err());
+        assert!(current_reference(&bind, "unrelated").is_err());
     }
 }

@@ -2160,6 +2160,7 @@ mod tests {
                 account_ref: None,
                 run_id: "fixed-run".into(),
                 step_index: 1,
+                max_output_tokens: None,
             });
             opts
         };

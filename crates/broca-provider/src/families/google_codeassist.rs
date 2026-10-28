@@ -265,6 +265,15 @@ fn apply_antigravity_generation_defaults(body: &mut Value, frozen: &FrozenRender
     }
 }
 
+/// Whether the request body's `maxOutputTokens` is `frozen.max_output_tokens` (or bounded by
+/// it), so a step that lowers that value lowers the cap sent. An Antigravity tier model without
+/// a caller cap renders its tier ceiling instead, and before renderer version 7 a caller cap is
+/// bounded only by the tier ceiling.
+pub(crate) fn renders_frozen_output_cap(frozen: &FrozenRenderConfig) -> bool {
+    antigravity_max_output_tokens(&frozen.wire_model_id).is_none()
+        || (frozen.caller_max_output_tokens.is_some() && frozen.renderer_version >= 7)
+}
+
 fn antigravity_max_output_tokens(wire_model_id: &str) -> Option<u32> {
     match wire_model_id {
         "gemini-3.5-flash-low"
@@ -520,6 +529,7 @@ mod tests {
             account_ref: None,
             run_id: run_id.to_string(),
             step_index: idx,
+            max_output_tokens: None,
         }
     }
 

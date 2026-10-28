@@ -145,14 +145,25 @@ impl StateFormatConfig {
 }
 
 /// The `anthropic_fallbacks` key of `broca.jsonc`: the operator switches for content-filter
-/// fallback on Anthropic OAuth runs. `server_side` is the only switch today, and it is off unless
-/// an operator turns it on, so a build carrying the code sends the requests it always did.
+/// fallback on Anthropic OAuth runs.
+///
+/// ```jsonc
+/// {"anthropic_fallbacks": {"server_side": true, "refusal": true}}
+/// ```
+///
+/// Both are off unless an operator turns them on, so a build carrying the code sends the
+/// requests it always did. `server_side` lets Anthropic hand a refusal to another model itself;
+/// `refusal` lets broca re-send a refused step to the model its `refusal_fallback` mapping
+/// names.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AnthropicFallbackSwitches {
     /// `anthropic_fallbacks.server_side`: ask Anthropic to hand a content-filter refusal to
     /// another model itself (`fallbacks: "default"` on an OAuth request for a model whose
     /// catalog row supports it).
     pub server_side: bool,
+    /// `anthropic_fallbacks.refusal`: allow a refused step to be re-sent to the model the
+    /// `refusal_fallback` section maps it to.
+    pub refusal: bool,
 }
 
 impl AnthropicFallbackSwitches {
@@ -186,6 +197,8 @@ impl AnthropicFallbackSwitches {
         struct Switches {
             #[serde(default)]
             server_side: bool,
+            #[serde(default)]
+            refusal: bool,
         }
         #[derive(serde::Deserialize)]
         struct File {
@@ -201,6 +214,7 @@ impl AnthropicFallbackSwitches {
             None => Self::default(),
             Some(switches) => Self {
                 server_side: switches.server_side,
+                refusal: switches.refusal,
             },
         })
     }
@@ -219,16 +233,31 @@ mod anthropic_fallback_switch_tests {
                 "{text}"
             );
         }
-        assert!(!AnthropicFallbackSwitches::default().server_side);
+        let off = AnthropicFallbackSwitches::default();
+        assert!(!off.server_side);
+        assert!(!off.refusal);
     }
 
     #[test]
-    fn the_server_side_switch_opts_in() {
-        let switches = AnthropicFallbackSwitches::parse(
+    fn each_switch_opts_in_its_own_layer() {
+        let server_side = AnthropicFallbackSwitches::parse(
             "{\n  // staging\n  \"anthropic_fallbacks\": { \"server_side\": true },\n}",
         )
         .unwrap();
-        assert!(switches.server_side);
+        assert!(server_side.server_side);
+        assert!(!server_side.refusal, "the other switch stays off");
+
+        let refusal =
+            AnthropicFallbackSwitches::parse("{\"anthropic_fallbacks\": {\"refusal\": true}}")
+                .unwrap();
+        assert!(refusal.refusal);
+        assert!(!refusal.server_side, "the other switch stays off");
+
+        let both = AnthropicFallbackSwitches::parse(
+            "{\"anthropic_fallbacks\": {\"server_side\": true, \"refusal\": true}}",
+        )
+        .unwrap();
+        assert!(both.server_side && both.refusal);
     }
 
     #[test]
@@ -236,6 +265,8 @@ mod anthropic_fallback_switch_tests {
         for text in [
             "{\"anthropic_fallbacks\": {\"server_sides\": true}}",
             "{\"anthropic_fallbacks\": {\"server_side\": \"true\"}}",
+            "{\"anthropic_fallbacks\": {\"refusals\": true}}",
+            "{\"anthropic_fallbacks\": {\"refusal\": 1}}",
             "{\"anthropic_fallbacks\": true}",
         ] {
             assert!(
@@ -243,6 +274,19 @@ mod anthropic_fallback_switch_tests {
                 "{text} must not be read as a switch"
             );
         }
+    }
+
+    #[test]
+    fn other_root_keys_are_ignored() {
+        // This loader owns one block; the file's other sections, including the retired root
+        // boolean the refusal mapping used to read, belong to other loaders. A file carrying
+        // them still reads both switches as off rather than failing here.
+        let switches = AnthropicFallbackSwitches::parse(
+            "{\"anthropic_refusal_fallback\": true, \"refusal_fallback\": {\"a\": \"b\"}}",
+        )
+        .unwrap();
+        assert!(!switches.server_side);
+        assert!(!switches.refusal);
     }
 }
 

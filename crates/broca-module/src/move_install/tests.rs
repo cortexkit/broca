@@ -253,7 +253,7 @@ fn mixed_run_started_triples_resolve_by_ref_not_record_position() {
     let bytes = std::fs::read(store.wal_path(&a)).unwrap();
     let digest = broca_wal::migration::digest(&bytes);
     for session in [&a, &b] {
-        let reference = broca_wire::agent_data::session_ref(
+        let reference = broca_core::wal_writer::legacy_session_ref(
             &session.harness,
             &session.project_root.to_string_lossy(),
             &session.session,
@@ -262,6 +262,14 @@ fn mixed_run_started_triples_resolve_by_ref_not_record_position() {
         assert_eq!(&resolved, session);
         assert_eq!(store.wal_path(&resolved), store.wal_path(session));
     }
+    let v2 = broca_wire::agent_data::session_ref("runner", "/before", "s");
+    assert_eq!(
+        verify_received(&v2, &bytes, bytes.len() as u64, &digest)
+            .unwrap_err()
+            .code
+            .as_str(),
+        "session_ref_ambiguous"
+    );
     let error = verify_received("unknown-ref", &bytes, bytes.len() as u64, &digest).unwrap_err();
     assert_eq!(error.code.as_str(), "invalid_request");
     assert!(error.message.contains("unknown-ref"));
@@ -280,7 +288,7 @@ fn rekey_without_a_run_for_the_new_triple_is_refused_without_cross_module_lookup
     std::fs::rename(store.wal_path(&old), store.wal_path(&current)).unwrap();
     let bytes = std::fs::read(store.wal_path(&current)).unwrap();
     let digest = broca_wal::migration::digest(&bytes);
-    let reference = broca_wire::agent_data::session_ref("runner", "/after", "s");
+    let reference = broca_core::wal_writer::legacy_session_ref("runner", "/after", "s");
     let error = verify_received(&reference, &bytes, bytes.len() as u64, &digest).unwrap_err();
     assert_eq!(error.code.as_str(), "invalid_request");
     assert!(error.message.contains(&reference));

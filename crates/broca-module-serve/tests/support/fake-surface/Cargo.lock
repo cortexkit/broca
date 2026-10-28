@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -73,6 +79,7 @@ dependencies = [
 name = "fake-surface"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "libc",
  "serde_json",
  "subc-protocol",
@@ -171,9 +178,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.5"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags",
  "errno",
@@ -248,9 +255,9 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.19"
+version = "0.1.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d21902a3af5bb8a3fc6c79a3faf550e021d57d130352e95fec6808969957b6c0"
+checksum = "e504e90bb5822ca25b96695af6fb0bf0b1f5fda953a2779be44e51003ac955a2"
 dependencies = [
  "libc",
  "rustix",

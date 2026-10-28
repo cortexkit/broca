@@ -115,6 +115,7 @@ fn options(prompt: Vec<Message>) -> CallOptions {
         account_ref: None,
         run_id: "run-tags".into(),
         step_index: 2,
+        max_output_tokens: None,
     });
     options.tools = Arc::new(vec![Tool {
         name: "lookup".into(),

@@ -415,7 +415,10 @@ impl WireFamily for AnthropicMessages {
                 .with_max_output_tokens(frozen.max_output_tokens)
                 // A response naming another model is reported as served by a server-side
                 // fallback; the requested id is the only thing that makes it "another".
-                .with_requested_model(frozen.wire_model_id.clone()),
+                .with_requested_model(frozen.wire_model_id.clone())
+                // Only an episode that froze a refusal fallback commits a refusal after a
+                // tool call as a tool step; every other episode assembles it as before.
+                .with_refusal_tool_use_trim(frozen.refusal_fallback.is_some()),
         })
     }
 
@@ -1362,6 +1365,7 @@ mod tests {
             account_ref: None,
             run_id: "run-1".into(),
             step_index: 1,
+            max_output_tokens: None,
         });
         opts
     }
