@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import pathlib
 import sys
@@ -36,8 +37,8 @@ def chooser_selects_accounts(selection: dict) -> bool:
     raise CannotCompare("a recent auth selection has an unknown authentication method")
 
 
-def recent_credentials(state_root: pathlib.Path, now_ms: int, days: int = 7) -> tuple[set[str], set[str], int]:
-    """Return recent chooser-selected ids, skipped ids, and decoded-log count.
+def recent_credentials(state_root: pathlib.Path, now_ms: int, days: int = 7) -> tuple[set[str], set[str], int, int]:
+    """Return recent chooser-selected ids, skipped ids, read count, and vanish count.
 
     Include refreezes and recent activity in older runs.
 
@@ -49,17 +50,34 @@ def recent_credentials(state_root: pathlib.Path, now_ms: int, days: int = 7) -> 
     credentials: set[str] = set()
     skipped: set[str] = set()
     logs_read = 0
+    logs_vanished = 0
     cutoff = now_ms - days * 24 * 60 * 60 * 1000
     # Logs fold into archives only after 14 idle days, so an archive cannot contain
     # activity from the seven-day deploy window.
     for wal in logical_wals(state_root / "wal", include_archives=False):
         # A live WAL is append-only: without a modification since the cutoff it
         # cannot contain a record written during the deploy window.
-        if wal.stat().st_mtime_ns < cutoff * 1_000_000:
-            continue
+        try:
+            if wal.stat().st_mtime_ns < cutoff * 1_000_000:
+                continue
+            frames = read_records(wal)
+        except FileNotFoundError as error:
+            if error.errno != errno.ENOENT:
+                raise
+            # Retention can remove a listed session before its stat or read.
+            # Confirm that the entry is gone; an existing entry or another error
+            # is not evidence of retention and must still refuse the comparison.
+            try:
+                wal.lstat()
+            except FileNotFoundError as recheck:
+                if recheck.errno != errno.ENOENT:
+                    raise
+                logs_vanished += 1
+                continue
+            raise
         logs_read += 1
         selection = None
-        for frame in read_records(wal):
+        for frame in frames:
             record = frame.record
             kind = record["type"]
             if kind == "run_started":
@@ -92,7 +110,17 @@ def recent_credentials(state_root: pathlib.Path, now_ms: int, days: int = 7) -> 
                 skipped.add(credential)
     if not credentials and not skipped:
         raise CannotCompare(f"no credentials recorded in broca runs in the last {days} days")
-    return credentials, skipped - credentials, logs_read
+    return credentials, skipped - credentials, logs_read, logs_vanished
+
+
+def os_error_detail(error: OSError) -> str:
+    # OS error text is not needed: class, errno and quoted paths identify the
+    # failed operation without echoing arbitrary exception text into deploy logs.
+    path = json.dumps(str(error.filename)) if error.filename is not None else "(unavailable)"
+    detail = f"{type(error).__name__}: errno={error.errno}, path={path}"
+    if error.filename2 is not None:
+        detail += f", path2={json.dumps(str(error.filename2))}"
+    return detail
 
 
 def compare(credentials: set[str], listing: object) -> list[str]:
@@ -141,7 +169,7 @@ def main() -> int:
         parser.error("--days must be positive")
     started = time.monotonic()
     try:
-        credentials, skipped, logs_read = recent_credentials(args.state_root or default_state_root(), int(time.time() * 1000), args.days)
+        credentials, skipped, logs_read, logs_vanished = recent_credentials(args.state_root or default_state_root(), int(time.time() * 1000), args.days)
         listing = json.loads(args.vault_listing.read_text())
         missing = compare(credentials, listing)
     except CannotCompare as error:
@@ -150,14 +178,20 @@ def main() -> int:
     except ArchiveRefusal as error:
         message = str(error)
         cause = error.__cause__
-        while cause is not None and not isinstance(cause, (json.JSONDecodeError, UnicodeDecodeError)):
+        while cause is not None:
+            if isinstance(cause, (json.JSONDecodeError, UnicodeDecodeError)):
+                message = message.replace(str(cause), "[parser detail withheld]")
+            elif isinstance(cause, OSError):
+                detail = os_error_detail(cause)
+                message = message.replace(str(cause), detail) if str(cause) in message else f"{message}; {detail}"
             cause = cause.__cause__
-        if cause is not None:
-            message = message.replace(str(cause), "[parser detail withheld]")
         reason = f"{type(error).__name__}: {message}"
         print(f"credential-metadata: cannot compare: {reason}", file=sys.stderr)
         return 2
-    except (OSError, ValueError, StateRootError) as error:
+    except OSError as error:
+        print(f"credential-metadata: cannot compare: {os_error_detail(error)}", file=sys.stderr)
+        return 2
+    except (ValueError, StateRootError) as error:
         # JSON parser messages can include input text; expose only the error class.
         print(f"credential-metadata: cannot compare: invalid or unreadable input ({type(error).__name__})", file=sys.stderr)
         return 2
@@ -168,6 +202,7 @@ def main() -> int:
         return 1
     print(f"credential-metadata: PASS; {len(credentials)} recently used credentials selected by the chooser "
           f"have provider_ids and auth_method; read {logs_read} logs in {time.monotonic() - started:.2f}s; "
+          f"{logs_vanished} logs vanished during the scan; "
           f"skipped as not chooser-selected: {', '.join(sorted(skipped)) if skipped else '(none)'}")
     return 0
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import errno
 import importlib.util
 import io
 import json
@@ -174,12 +175,12 @@ class MetadataDeployGate(unittest.TestCase):
         refreeze["auth_selection"]["credential_id"] = "apikey:cline-pass"
         self.write_records([self.start("oauth:anthropic:old", self.now - GATE.WEEK_MS - 1, method=None),
                             refreeze])
-        self.assertEqual(GATE.recent_credentials(self.root, self.now), (set(), {"apikey:cline-pass"}, 1))
+        self.assertEqual(GATE.recent_credentials(self.root, self.now), (set(), {"apikey:cline-pass"}, 1, 0))
 
     def test_a_credential_seen_in_scope_is_not_reported_as_skipped(self):
         self.write_records([self.start("apikey:provider-module", resolved="shared", method=None)], "module.wal")
         self.write_records([self.start("opaque-subscription", resolved="shared")])
-        self.assertEqual(GATE.recent_credentials(self.root, self.now), ({"shared"}, set(), 2))
+        self.assertEqual(GATE.recent_credentials(self.root, self.now), ({"shared"}, set(), 2, 0))
 
     def test_refuse_names_each_used_credential_and_missing_field(self):
         self.write_records([self.start("oauth:anthropic:private"), self.start("no-method"),
@@ -244,19 +245,19 @@ class MetadataDeployGate(unittest.TestCase):
         self.assertNotIn("ts_ms", records[3])
         self.assertEqual(records[4]["written_at_ms"], self.now)
         self.assertEqual(records[5]["ts_ms"], self.now)
-        self.assertEqual(GATE.recent_credentials(self.root, self.now), ({"long-running", "refrozen"}, set(), 1))
+        self.assertEqual(GATE.recent_credentials(self.root, self.now), ({"long-running", "refrozen"}, set(), 1, 0))
 
     def test_recent_ts_ms_activity_counts_a_legacy_untimed_selection(self):
         self.write_records([self.start("oauth:anthropic:legacy", timestamp=None, resolved="legacy", method=None),
                             self.timed(self.attempt_template)])
-        self.assertEqual(GATE.recent_credentials(self.root, self.now), ({"legacy"}, set(), 1))
+        self.assertEqual(GATE.recent_credentials(self.root, self.now), ({"legacy"}, set(), 1, 0))
 
     def test_untimed_refreeze_waits_for_later_activity_without_refusing(self):
         refreeze = copy.deepcopy(self.refreeze_template)
         refreeze["auth_selection"]["credential_id"] = "oauth:anthropic:refrozen-legacy"
         self.write_records([self.start("oauth:anthropic:legacy", timestamp=None, method=None), refreeze,
                             self.timed(self.attempt_template)])
-        self.assertEqual(GATE.recent_credentials(self.root, self.now), ({"oauth:anthropic:refrozen-legacy"}, set(), 1))
+        self.assertEqual(GATE.recent_credentials(self.root, self.now), ({"oauth:anthropic:refrozen-legacy"}, set(), 1, 0))
 
     def test_untimed_records_alone_are_not_evidence_of_recency(self):
         self.write_records([self.start("oauth:anthropic:untimed", timestamp=None, method=None),
@@ -270,7 +271,7 @@ class MetadataDeployGate(unittest.TestCase):
         self.write_records([self.start("oauth:anthropic:ended", timestamp=None, resolved="ended", method=None),
                             self.timed(self.finish_template),
                             self.timed(self.attempt_template)])
-        self.assertEqual(GATE.recent_credentials(self.root, self.now), ({"ended"}, set(), 1))
+        self.assertEqual(GATE.recent_credentials(self.root, self.now), ({"ended"}, set(), 1, 0))
 
     def test_old_live_logs_and_archives_are_not_read(self):
         old = self.write_records([self.start("old-unused", self.now - GATE.WEEK_MS - 1)], "old.wal")
@@ -293,6 +294,112 @@ class MetadataDeployGate(unittest.TestCase):
             status, output = self.run_gate([{"id": "recent", "provider_ids": ["anthropic"], "auth_method": "oauth"}])
         self.assertEqual(status, 0, output)
         self.assertIn("read 2 logs in 0.25s", output)
+
+    def test_retention_deletion_before_stat_or_read_is_skipped_and_counted(self):
+        discover = GATE.logical_wals
+        reader = GATE.read_records
+        for phase in ("stat", "read"):
+            with self.subTest(phase=phase):
+                vanished = self.write_records([self.start("deleted")], "deleted.wal")
+                survivor = self.write_records([self.start("survivor")], "survivor.wal")
+
+                def list_then_delete(*args, **kwargs):
+                    paths = discover(*args, **kwargs)
+                    if phase == "stat":
+                        vanished.unlink()
+                    return paths
+
+                def delete_then_read(path):
+                    if phase == "read" and path == vanished:
+                        vanished.unlink()
+                    return reader(path)
+
+                with mock.patch.object(GATE, "logical_wals", side_effect=list_then_delete), \
+                     mock.patch.object(GATE, "read_records", side_effect=delete_then_read) as read:
+                    status, output = self.run_gate([
+                        {"id": "survivor", "provider_ids": ["anthropic"], "auth_method": "oauth"},
+                    ])
+                self.assertEqual(status, 0, output)
+                self.assertFalse(vanished.exists())
+                read.assert_any_call(survivor)
+                self.assertIn("read 1 logs", output)
+                self.assertIn("1 logs vanished during the scan", output)
+
+    def test_a_missing_file_error_for_a_present_log_fails_closed_with_its_path(self):
+        path = self.write_records([self.start("recent")])
+        error = FileNotFoundError(errno.ENOENT, "token-DO-NOT-LOG", str(path))
+        with mock.patch.object(GATE, "read_records", side_effect=error):
+            status, output = self.run_gate([{"id": "recent"}])
+        self.assertTrue(path.exists())
+        self.assertEqual(status, 2, output)
+        self.assertIn(f"FileNotFoundError: errno={errno.ENOENT}, path={json.dumps(str(path))}", output)
+        self.assertNotIn("PASS", output)
+
+    def test_an_error_rechecking_a_missing_log_still_fails_closed(self):
+        path = self.write_records([self.start("recent")])
+        reader = GATE.read_records
+        lstat = pathlib.Path.lstat
+
+        def delete_then_read(wal):
+            path.unlink()
+            return reader(wal)
+
+        def denied_recheck(wal, *args, **kwargs):
+            if wal == path:
+                raise PermissionError(errno.EACCES, "token-DO-NOT-LOG", str(wal))
+            return lstat(wal, *args, **kwargs)
+
+        with mock.patch.object(GATE, "read_records", side_effect=delete_then_read), \
+             mock.patch.object(pathlib.Path, "lstat", new=denied_recheck):
+            status, output = self.run_gate([{"id": "recent"}])
+        self.assertEqual(status, 2, output)
+        self.assertIn(f"PermissionError: errno={errno.EACCES}, path={json.dumps(str(path))}", output)
+
+    def test_a_dangling_log_entry_is_not_a_confirmed_vanish(self):
+        path = self.write_records([self.start("recent")])
+        discover = GATE.logical_wals
+
+        def replace_after_listing(*args, **kwargs):
+            paths = discover(*args, **kwargs)
+            path.unlink()
+            path.symlink_to(path.with_suffix(".missing"))
+            return paths
+
+        with mock.patch.object(GATE, "logical_wals", side_effect=replace_after_listing):
+            status, output = self.run_gate([{"id": "recent"}])
+        self.assertTrue(path.is_symlink())
+        self.assertEqual(status, 2, output)
+        self.assertIn(f"FileNotFoundError: errno={errno.ENOENT}, path={json.dumps(str(path))}", output)
+
+    def test_if_every_log_vanishes_the_comparison_is_still_empty(self):
+        path = self.write_records([self.start("recent")])
+        discover = GATE.logical_wals
+
+        def list_then_delete(*args, **kwargs):
+            paths = discover(*args, **kwargs)
+            path.unlink()
+            return paths
+
+        with mock.patch.object(GATE, "logical_wals", side_effect=list_then_delete):
+            status, output = self.run_gate([{"id": "recent"}])
+        self.assertEqual(status, 2, output)
+        self.assertIn("no credentials recorded", output)
+        self.assertNotIn("PASS", output)
+
+    def test_archive_refusal_names_os_error_paths_without_os_error_text(self):
+        source = self.root / 'source"quoted'
+        destination = self.root / "destination"
+        for embedded in (True, False):
+            with self.subTest(embedded=embedded):
+                error = OSError(errno.EXDEV, "token-DO-NOT-LOG", str(source), None, str(destination))
+                refusal = GATE.ArchiveRefusal(f"cannot enumerate WAL population: {error}" if embedded
+                                             else "cannot enumerate WAL population")
+                refusal.__cause__ = error
+                with mock.patch.object(GATE, "logical_wals", side_effect=refusal):
+                    status, output = self.run_gate([{"id": "recent"}])
+                self.assertEqual(status, 2, output)
+                self.assertIn(f"OSError: errno={errno.EXDEV}, path={json.dumps(str(source))}", output)
+                self.assertIn(f"path2={json.dumps(str(destination))}", output)
 
     def test_archive_refusal_prints_its_class_and_reason(self):
         self.write_records([self.start("recent")])
