@@ -5239,6 +5239,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     SendOutcome::RetainedSessionTooLarge { max_bytes }
                 }
                 broca_core::WalWriteError::Failed(error) => SendOutcome::Error(error),
+                broca_core::WalWriteError::ProofPathUnavailable => {
+                    SendOutcome::Error(broca_core::WalWriteError::ProofPathUnavailable.to_string())
+                }
             };
         }
         if let Err(error) = writer.sync().await {
@@ -5874,6 +5877,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
                                 } => RetractOutcome::RetainedSessionTooLarge { max_bytes },
                                 broca_core::WalWriteError::Failed(error) => {
                                     RetractOutcome::Error(error)
+                                }
+                                broca_core::WalWriteError::ProofPathUnavailable => {
+                                    RetractOutcome::Error(
+                                        broca_core::WalWriteError::ProofPathUnavailable.to_string(),
+                                    )
                                 }
                             }
                         }

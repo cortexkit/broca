@@ -143,6 +143,13 @@ pub enum WalRecord {
     WriterClosed {
         writer_id: [u8; 16],
     },
+
+    /// A recently stamped publication boundary protects an older synced batch
+    /// from being exposed without advancing the log's last recorded write.
+    VisibilityLate {
+        through_seq: u64,
+        oldest_appended_ms: u64,
+    },
     /// Episode boundary open — ONE ATOMIC record: the run_id, session, the
     /// AUTHORITATIVE request config, AND the user input, all in a single framed
     /// record. Atomic-by-construction so a torn crash leaves EITHER nothing OR a
@@ -1360,6 +1367,7 @@ impl WalRecord {
             WalRecord::Unknown
                 | WalRecord::WriterOpened { .. }
                 | WalRecord::WriterClosed { .. }
+                | WalRecord::VisibilityLate { .. }
                 | WalRecord::ModelAttemptFinished { .. }
                 | WalRecord::ResumeStarted { .. }
                 | WalRecord::CacheWarmed { .. }
@@ -1385,6 +1393,9 @@ impl WalRecord {
     /// on its own, so no caller can write a must-understand value into a frame an older build
     /// would read without checking.
     pub fn required_features(&self) -> &'static [&'static str] {
+        if matches!(self, Self::VisibilityLate { .. }) {
+            return &[crate::head_proof::VISIBILITY_LATE_FEATURE];
+        }
         if matches!(self, Self::WriterOpened { .. } | Self::WriterClosed { .. }) {
             return &["writer-id/v1"];
         }
@@ -1833,6 +1844,7 @@ impl WalRecord {
             | Self::SendEnded { .. }
             | Self::WriterOpened { .. }
             | Self::WriterClosed { .. }
+            | Self::VisibilityLate { .. }
             | Self::Unknown => false,
         }
     }

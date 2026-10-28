@@ -1050,7 +1050,9 @@ impl FileWalStore {
                             !self.config.is_overhaul()
                                 || !matches!(
                                     frame.record,
-                                    WalRecord::WriterOpened { .. } | WalRecord::WriterClosed { .. }
+                                    WalRecord::WriterOpened { .. }
+                                        | WalRecord::WriterClosed { .. }
+                                        | WalRecord::VisibilityLate { .. }
                                 )
                         })
                 })
@@ -2059,6 +2061,7 @@ impl AppendBudget {
 #[derive(Debug, Clone)]
 pub enum WalWriteError {
     Failed(String),
+    ProofPathUnavailable,
     RetainedSessionTooLarge { max_bytes: u64 },
     SessionTooLarge { max_bytes: u64 },
 }
@@ -2067,6 +2070,10 @@ impl std::fmt::Display for WalWriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Failed(detail) => write!(f, "wal write failure: {detail}"),
+            Self::ProofPathUnavailable => write!(
+                f,
+                "visibility-late/v1: overhaul WAL has no file path for its durable-head proof"
+            ),
             Self::SessionTooLarge { max_bytes } => {
                 write!(
                     f,
@@ -2416,12 +2423,13 @@ pub struct WalHandle {
     /// A panic while it is held leaves the reserved-versus-enqueued state unknown, so
     /// `lock_enqueue` fails the writer closed (a sticky writer poison) before recovering the
     /// guard: no later append can reach the WAL, and later calls get errors, not panics.
-    enqueue_lock: Mutex<()>,
+    enqueue_lock: Arc<Mutex<()>>,
     /// The next seq this handle will assign. HOISTED from the WAL (writer-task-owned)
     /// to the handle (caller-side) so `record` can assign + RETURN a record's final
     /// monotonic seq SYNCHRONOUSLY — a fan-out ring entry then carries its final durable
     /// cursor at publish, with no backpatch. Seeded from the WAL's durable head at spawn.
-    next_seq: AtomicU64,
+    next_seq: Arc<AtomicU64>,
+    publication_bytes: Arc<AtomicU64>,
     /// Last sequence made durable by a successful writer fsync. Read-only paths clone this
     /// gauge so they can bound visible WAL records without borrowing the writer or taking its
     /// lease.
@@ -2867,6 +2875,21 @@ impl WalHandle {
                     .into(),
             ));
         }
+        let publisher = if v4 {
+            let path = wal.log_path().ok_or(WalWriteError::ProofPathUnavailable)?;
+            let lineage = wal.lineage_id().ok_or_else(|| {
+                WalWriteError::Failed(
+                    "visibility-late/v1: overhaul WAL has no lineage for its durable-head proof"
+                        .into(),
+                )
+            })?;
+            Some(broca_wal::head_proof::Publisher::new(
+                path.to_path_buf(),
+                lineage,
+            ))
+        } else {
+            None
+        };
         // Lifecycle records do not start a conversation. A warmed writer-only log still needs
         // the same first-send placement, retention and runner-tag state as an empty log.
         let unstarted = last_seq == 0
@@ -2878,13 +2901,22 @@ impl WalHandle {
                     .all(|frame| {
                         matches!(
                             frame.record,
-                            WalRecord::WriterOpened { .. } | WalRecord::WriterClosed { .. }
+                            WalRecord::WriterOpened { .. }
+                                | WalRecord::WriterClosed { .. }
+                                | WalRecord::VisibilityLate { .. }
                         )
                     }));
         let last_seq = last_seq + u64::from(v4);
         // Seq is 1-based; the first record of an empty WAL is seq 1, so the next seq
         // after a durable head of `last_seq` is `last_seq + 1`.
-        let next_seq = AtomicU64::new(last_seq + 1);
+        let next_seq = Arc::new(AtomicU64::new(last_seq + 1));
+        let enqueue_lock = Arc::new(Mutex::new(()));
+        let publication_bytes = Arc::new(AtomicU64::new(0));
+        let writer_sequence = (
+            next_seq.clone(),
+            enqueue_lock.clone(),
+            publication_bytes.clone(),
+        );
         let durable_head = Arc::new(AtomicU64::new(last_seq));
         let writer_durable_head = Arc::clone(&durable_head);
         let poisoned = Arc::new(Mutex::new(None));
@@ -2922,13 +2954,32 @@ impl WalHandle {
                 .wal
                 .as_mut()
                 .expect("writer owner holds its WAL during startup");
+            let mut publication = Publication {
+                publisher,
+                sequence: Some(writer_sequence),
+                deferred: Default::default(),
+                fence,
+                clock: clock.clone(),
+                observed: observer.is_some(),
+            };
             let writer = if let Some(context) = context {
                 let address = context.address.clone();
                 match context.open(&mut **wal, fence, || clock.now_ms()) {
                     Ok((writer, seq, record)) => {
+                        let mut pending = vec![(seq, Box::new(record))];
+                        let opened = publication.sync(&mut **wal, &rx, &mut pending);
+                        if let Err(error) = opened {
+                            let _ = ready_tx.send(Err(WalWriteError::Failed(error)));
+                            let (wal, lease) = owner.into_parts();
+                            drop(wal);
+                            return lease;
+                        }
+                        writer_durable_head.store(wal.last_seq(), Ordering::Release);
                         if let Some(obs) = &observer {
-                            obs.observe(seq, fence, &record, wal.lineage_id());
-                            obs.observe_tap(seq, fence, wal.lineage_id(), &record);
+                            for (seq, record) in pending {
+                                obs.observe(seq, fence, &record, wal.lineage_id());
+                                obs.observe_tap(seq, fence, wal.lineage_id(), &record);
+                            }
                         }
                         Some(writer)
                     }
@@ -2958,6 +3009,7 @@ impl WalHandle {
                 writer_lineage_id,
                 clock,
                 writer,
+                publication,
             );
             lease
         };
@@ -3001,6 +3053,9 @@ impl WalHandle {
                 }
             }
         };
+        // Startup markers are already included in the budget returned by the WAL.
+        // Only later publication markers need this separate enqueue-side charge.
+        publication_bytes.store(0, Ordering::SeqCst);
         Ok(WalHandle {
             display_placement: Mutex::new(unstarted.then(Default::default)),
             input_token_limit: AtomicU64::new(0),
@@ -3011,8 +3066,9 @@ impl WalHandle {
             append_budget,
             v4,
             tx,
-            enqueue_lock: Mutex::new(()),
+            enqueue_lock,
             next_seq,
+            publication_bytes,
             durable_head,
             poisoned,
             lineage_id,
@@ -3364,6 +3420,7 @@ impl WalHandle {
                         budget.reserve
                     };
                 if end
+                    .saturating_add(self.publication_bytes.load(Ordering::SeqCst))
                     .saturating_add(reserve)
                     .saturating_add(budget.writer_close_reserve)
                     > budget.max_bytes
@@ -3772,9 +3829,125 @@ impl Drop for WalHandle {
     }
 }
 
-// The writer thread's whole mutable state arrives as owned parameters: the WAL, the fence, the
-// command queue, the observer, the shared poison and durability gauges, the lineage gauge and
-// the clock version 4 frames are stamped from.
+type WriterSequence = (Arc<AtomicU64>, Arc<Mutex<()>>, Arc<AtomicU64>);
+
+struct Publication {
+    publisher: Option<broca_wal::head_proof::Publisher>,
+    sequence: Option<WriterSequence>,
+    deferred: std::collections::VecDeque<WalCommand>,
+    fence: u64,
+    clock: StampClock,
+    observed: bool,
+}
+
+impl Publication {
+    fn sync(
+        &mut self,
+        wal: &mut dyn Wal,
+        rx: &std_mpsc::Receiver<WalCommand>,
+        pending: &mut Vec<(u64, Box<WalRecord>)>,
+    ) -> Result<(), String> {
+        let Some(publisher) = &mut self.publisher else {
+            return wal.sync().map_err(|error| error.to_string());
+        };
+        loop {
+            publisher.sync(wal).map_err(|error| error.to_string())?;
+            let now = self.clock.now_ms();
+            let Some((through_seq, oldest_appended_ms)) = publisher.late(now) else {
+                if publisher.publish(now).map_err(|error| error.to_string())? {
+                    return Ok(());
+                }
+                continue;
+            };
+            let record = WalRecord::VisibilityLate {
+                through_seq,
+                oldest_appended_ms,
+            };
+            let prepared =
+                broca_wal::PreparedV4Frame::prepare(&record).map_err(|error| error.to_string())?;
+            let (next, enqueue, bytes) = self
+                .sequence
+                .as_ref()
+                .expect("overhaul publication has a sequence allocator");
+            // Reserve through the same lock as user appends. Requests already queued
+            // keep their promised sequences; none can race into the marker's slot.
+            let marker_seq = {
+                let _guard = enqueue
+                    .lock()
+                    .map_err(|_| "visibility-late/v1: poisoned enqueue lock")?;
+                bytes.fetch_add(
+                    prepared.frame_len() as u64
+                        + wal.append_budget().map_or(0, |(_, _, overhead)| overhead),
+                    Ordering::SeqCst,
+                );
+                next.fetch_add(1, Ordering::SeqCst)
+            };
+            while wal.last_seq() < marker_seq - 1 {
+                let command = rx
+                    .recv()
+                    .map_err(|_| "visibility-late/v1: missing queued append before marker")?;
+                match command {
+                    command @ (WalCommand::Append { .. } | WalCommand::AppendV4 { .. }) => {
+                        let (seq, record) = append_command(wal, self.fence, &self.clock, command)?;
+                        if self.observed {
+                            pending.push((seq, record));
+                        }
+                    }
+                    command => self.deferred.push_back(command),
+                }
+            }
+            let seq = wal
+                .append_v4(self.fence, &record, false, prepared, self.clock.now_ms())
+                .map_err(|error| error.to_string())?;
+            if seq != marker_seq {
+                return Err("visibility-late/v1: marker sequence drift".into());
+            }
+            if self.observed {
+                pending.push((seq, Box::new(record)));
+            }
+            // A second slow sync can age the marker too. Repeat, never publish
+            // the late batch on the strength of a sync alone.
+            crate::durability_counters::record_fsync(
+                crate::durability_counters::FsyncCause::Barrier,
+                self.fence,
+            );
+        }
+    }
+}
+
+fn append_command(
+    wal: &mut dyn Wal,
+    fence: u64,
+    clock: &StampClock,
+    command: WalCommand,
+) -> Result<(u64, Box<WalRecord>), String> {
+    let (seq, record, result) = match command {
+        WalCommand::Append { seq, record, frame } => {
+            let result = match frame {
+                Some(frame) => wal.append_preencoded(fence, &record, false, frame),
+                None => wal.append(fence, &record, false),
+            };
+            (seq, record, result)
+        }
+        WalCommand::AppendV4 {
+            seq,
+            record,
+            prepared,
+        } => {
+            let result = wal.append_v4(fence, &record, false, prepared, clock.now_ms());
+            (seq, record, result)
+        }
+        _ => unreachable!("append_command accepts only append commands"),
+    };
+    match result {
+        Ok(assigned) if assigned == seq => Ok((seq, record)),
+        Ok(assigned) => Err(format!(
+            "wal seq drift: handle assigned {seq}, wal assigned {assigned}"
+        )),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn writer_loop(
@@ -3797,6 +3970,14 @@ fn writer_loop(
         lineage_id,
         stamp_clock,
         None,
+        Publication {
+            publisher: None,
+            sequence: None,
+            deferred: Default::default(),
+            fence,
+            clock: StampClock::wall(),
+            observed: false,
+        },
     );
 }
 
@@ -3811,19 +3992,16 @@ fn writer_loop_with_identity(
     lineage_id: Arc<Mutex<Option<broca_wal::WalLineageId>>>,
     stamp_clock: StampClock,
     writer: Option<open_writers::OpenWriter>,
+    mut publication: Publication,
 ) {
     let mut writer = writer;
     use crate::durability_counters::{
         deadline_ms_for, monotonic_now_ms_for, record_fsync, FsyncCause,
     };
 
-    // The seq of the last record APPENDED (coalesced, maybe not yet fsynced) and the
-    // last record made DURABLE by a successful fsync. A control-stream cursor may only
-    // advance to `last_fsynced_seq` — `last_appended_seq` includes records past the
-    // fsync barrier that a crash would lose. Both start at the WAL's current durable
-    // head (records already on disk from a prior process), so a resume's first barrier
-    // reports a seq that accounts for the pre-existing prefix.
-    let mut last_appended_seq = wal.last_seq();
+    // A control-stream cursor advances only after sync and publication. The WAL's
+    // last_seq can include coalesced appends that a crash would lose. Startup has
+    // already proved and published the recovered prefix behind writer_opened.
     let mut last_fsynced_seq = wal.last_seq();
     let mut dirty = false;
     // The sync deadline: the monotonic instant (in ms) by which dirty data must be
@@ -3853,7 +4031,9 @@ fn writer_loop_with_identity(
         // dirty writer wakes at its deadline even when nothing arrives. A dirty
         // writer with no deadline is poisoned (its sync already failed), so it
         // idles like a clean one until close.
-        let wait = if dirty {
+        let wait = if let Some(command) = publication.deferred.pop_front() {
+            Wait::Command(command)
+        } else if dirty {
             let now = monotonic_now_ms_for(fence);
             if deadline_at_ms.is_some_and(|deadline| now >= deadline) {
                 let poison = current_poison(&poisoned);
@@ -3861,9 +4041,12 @@ fn writer_loop_with_identity(
                     // Every fsync is counted by the path that issued it, for health.
                     record_fsync(FsyncCause::Deadline, fence);
                 }
-                match sync_result(&*wal, &poison) {
+                match poison.map_or_else(
+                    || publication.sync(&mut *wal, &rx, &mut pending_observed),
+                    Err,
+                ) {
                     Ok(()) => {
-                        last_fsynced_seq = last_appended_seq;
+                        last_fsynced_seq = wal.last_seq();
                         durable_head.store(last_fsynced_seq, Ordering::Release);
                         dirty = false;
                         deadline_at_ms = None;
@@ -3932,9 +4115,12 @@ fn writer_loop_with_identity(
                     // Every fsync is counted by the path that issued it, for health.
                     record_fsync(FsyncCause::Disconnect, fence);
                 }
-                match sync_result(&*wal, &poison) {
+                match poison.map_or_else(
+                    || publication.sync(&mut *wal, &rx, &mut pending_observed),
+                    Err,
+                ) {
                     Ok(()) => {
-                        last_fsynced_seq = last_appended_seq;
+                        last_fsynced_seq = wal.last_seq();
                         durable_head.store(last_fsynced_seq, Ordering::Release);
                         if let Some(obs) = &observer {
                             for (seq, record) in pending_observed.drain(..) {
@@ -3956,6 +4142,7 @@ fn writer_loop_with_identity(
                     &stamp_clock,
                     observer.as_ref(),
                     &durable_head,
+                    publication.publisher.as_mut(),
                 ) {
                     set_poison(&poisoned, error);
                 }
@@ -3978,38 +4165,9 @@ fn writer_loop_with_identity(
             }
             command @ (WalCommand::Append { .. } | WalCommand::AppendV4 { .. }) => {
                 if current_poison(&poisoned).is_none() {
-                    let (seq, record, result) = match command {
-                        WalCommand::Append { seq, record, frame } => {
-                            let result = match frame {
-                                Some(frame) => wal.append_preencoded(fence, &record, false, frame),
-                                None => wal.append(fence, &record, false),
-                            };
-                            (seq, record, result)
-                        }
-                        WalCommand::AppendV4 {
-                            seq,
-                            record,
-                            prepared,
-                        } => {
-                            // A version 4 frame's `appended_ms` is this thread's sample, taken
-                            // immediately before the log stamps and writes it; the payload was
-                            // serialized and digested on the enqueueing thread.
-                            let appended_ms = stamp_clock.now_ms();
-                            let result =
-                                wal.append_v4(fence, &record, false, prepared, appended_ms);
-                            (seq, record, result)
-                        }
-                        _ => unreachable!("matched as an append above"),
-                    };
-                    match result {
-                        // The WAL self-assigns the seq deterministically; it MUST equal
-                        // the seq the handle assigned (both start at the durable head + 1
-                        // and increment by 1 per FIFO append). A mismatch means the
-                        // handle's counter and the WAL drifted — a bug, not a runtime
-                        // condition — so poison rather than write a wrong-cursor record.
-                        Ok(assigned) if assigned == seq => {
+                    match append_command(&mut *wal, fence, &stamp_clock, command) {
+                        Ok((assigned, record)) => {
                             let became_dirty = !dirty;
-                            last_appended_seq = assigned;
                             dirty = true;
                             if became_dirty {
                                 // The deadline starts when the writer goes dirty and
@@ -4028,13 +4186,7 @@ fn writer_loop_with_identity(
                                 pending_observed.push((assigned, record));
                             }
                         }
-                        Ok(assigned) => set_poison(
-                            &poisoned,
-                            format!(
-                                "wal seq drift: handle assigned {seq}, wal assigned {assigned}"
-                            ),
-                        ),
-                        Err(e) => set_poison(&poisoned, e.to_string()),
+                        Err(error) => set_poison(&poisoned, error),
                     }
                 }
             }
@@ -4048,24 +4200,29 @@ fn writer_loop_with_identity(
                     if poison.is_none() {
                         record_fsync(FsyncCause::Barrier, fence);
                     }
-                    sync_result(&*wal, &poison).map(|()| {
-                        last_fsynced_seq = last_appended_seq;
-                        durable_head.store(last_fsynced_seq, Ordering::Release);
-                        dirty = false;
-                        deadline_at_ms = None;
-                        if let Some(obs) = &observer {
-                            if has_tap {
-                                for (seq, record) in &pending_observed {
-                                    obs.observe(*seq, fence, record, wal.lineage_id());
-                                }
-                            } else {
-                                for (seq, record) in pending_observed.drain(..) {
-                                    obs.observe(seq, fence, &record, wal.lineage_id());
+                    poison
+                        .map_or_else(
+                            || publication.sync(&mut *wal, &rx, &mut pending_observed),
+                            Err,
+                        )
+                        .map(|()| {
+                            last_fsynced_seq = wal.last_seq();
+                            durable_head.store(last_fsynced_seq, Ordering::Release);
+                            dirty = false;
+                            deadline_at_ms = None;
+                            if let Some(obs) = &observer {
+                                if has_tap {
+                                    for (seq, record) in &pending_observed {
+                                        obs.observe(*seq, fence, record, wal.lineage_id());
+                                    }
+                                } else {
+                                    for (seq, record) in pending_observed.drain(..) {
+                                        obs.observe(seq, fence, &record, wal.lineage_id());
+                                    }
                                 }
                             }
-                        }
-                        last_fsynced_seq
-                    })
+                            last_fsynced_seq
+                        })
                 } else {
                     poison.map_or(Ok(last_fsynced_seq), Err)
                 };
@@ -4092,12 +4249,15 @@ fn writer_loop_with_identity(
                     if poison.is_none() {
                         record_fsync(FsyncCause::Shutdown, fence);
                     }
-                    sync_result(&*wal, &poison)
+                    poison.map_or_else(
+                        || publication.sync(&mut *wal, &rx, &mut pending_observed),
+                        Err,
+                    )
                 } else {
                     poison.map_or(Ok(()), Err)
                 };
                 if result.is_ok() && dirty {
-                    durable_head.store(last_appended_seq, Ordering::Release);
+                    durable_head.store(wal.last_seq(), Ordering::Release);
                     if let Some(obs) = &observer {
                         for (seq, record) in pending_observed.drain(..) {
                             obs.observe(seq, fence, &record, wal.lineage_id());
@@ -4115,6 +4275,7 @@ fn writer_loop_with_identity(
                         &stamp_clock,
                         observer.as_ref(),
                         &durable_head,
+                        publication.publisher.as_mut(),
                     )
                 });
                 let result = result.map_err(|error| {
@@ -4144,15 +4305,28 @@ fn close_writer_identity(
     clock: &StampClock,
     observer: Option<&RecordObserver>,
     durable_head: &AtomicU64,
+    publisher: Option<&mut broca_wal::head_proof::Publisher>,
 ) -> Result<(), String> {
     if let Some(writer) = writer {
         let (seq, record) = writer
             .close(wal, fence, clock.now_ms())
             .map_err(|error| format!("writer-id/v1: cannot close writer: {error}"))?;
-        durable_head.store(seq, Ordering::Release);
-        if let Some(obs) = observer {
-            obs.observe(seq, fence, &record, wal.lineage_id());
-            obs.observe_tap(seq, fence, wal.lineage_id(), &record);
+        let published = if let Some(publisher) = publisher {
+            publisher.sync(wal).map_err(|error| error.to_string())?;
+            // Closing forbids further appends. If its sync was late, leave the
+            // close unpublished for the next writer_opened rather than append again.
+            publisher
+                .publish(clock.now_ms())
+                .map_err(|error| error.to_string())?
+        } else {
+            true
+        };
+        if published {
+            durable_head.store(seq, Ordering::Release);
+            if let Some(obs) = observer {
+                obs.observe(seq, fence, &record, wal.lineage_id());
+                obs.observe_tap(seq, fence, wal.lineage_id(), &record);
+            }
         }
         if let Err(error) = writer.unlink() {
             tracing::warn!(%error, "writer-id/v1: durable writer close succeeded but marker unlink failed; reclaim will remove the marker");
@@ -4180,13 +4354,6 @@ fn set_poison(poisoned: &Mutex<Option<String>>, error: String) {
 /// while holding the guard and cannot poison this lock. See `set_poison` for why that matters.
 fn current_poison(poisoned: &Mutex<Option<String>>) -> Option<String> {
     poisoned.lock().unwrap().clone()
-}
-
-fn sync_result(wal: &(dyn Wal + Send), poisoned: &Option<String>) -> Result<(), String> {
-    if let Some(e) = poisoned {
-        return Err(e.clone());
-    }
-    wal.sync().map_err(|e: WalError| e.to_string())
 }
 
 #[cfg(test)]
@@ -5206,3 +5373,415 @@ mod tool_times_tests;
 
 #[cfg(test)]
 mod writer_id_tests;
+
+#[cfg(test)]
+mod head_proof_tests {
+    use super::*;
+    use broca_wal::head_proof::{sidecar_path, HeadProof, PublishedLog};
+
+    struct Root(PathBuf);
+    impl Root {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = broca_test_support::scratch_root().join(format!(
+                "head-proof-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn store(&self) -> FileWalStore {
+            FileWalStore::with_config(self.0.join("wal"), broca_wal::WalConfig::OVERHAUL)
+        }
+    }
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct StalledWal {
+        inner: Box<dyn Wal + Send>,
+        now: Arc<AtomicU64>,
+        stalls: Arc<AtomicU64>,
+        gate: Option<(std_mpsc::Sender<()>, Mutex<std_mpsc::Receiver<()>>)>,
+        path_access: PathAccess,
+    }
+    enum PathAccess {
+        Forward,
+        Missing,
+        Forbidden,
+    }
+    impl Wal for StalledWal {
+        fn log_path(&self) -> Option<&Path> {
+            match self.path_access {
+                PathAccess::Forward => self.inner.log_path(),
+                PathAccess::Missing => None,
+                PathAccess::Forbidden => panic!("legacy writer must never request a proof path"),
+            }
+        }
+        fn wal_config(&self) -> broca_wal::WalConfig {
+            self.inner.wal_config()
+        }
+        fn writer_id(&self) -> Option<[u8; 16]> {
+            self.inner.writer_id()
+        }
+        fn writer_close_reserve(&self) -> u64 {
+            self.inner.writer_close_reserve()
+        }
+        fn append_budget(&self) -> Option<(u64, u64, u64)> {
+            self.inner.append_budget()
+        }
+        fn append(&mut self, fence: u64, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
+            self.inner.append(fence, record, sync)
+        }
+        fn append_v4(
+            &mut self,
+            fence: u64,
+            record: &WalRecord,
+            sync: bool,
+            prepared: broca_wal::PreparedV4Frame,
+            at: u64,
+        ) -> Result<u64, WalError> {
+            self.inner.append_v4(fence, record, sync, prepared, at)
+        }
+        fn sync(&self) -> Result<(), WalError> {
+            self.inner.sync()?;
+            let stalls = self.stalls.load(Ordering::SeqCst);
+            if stalls > 0 {
+                self.stalls.store(stalls - 1, Ordering::SeqCst);
+                self.now.fetch_add(70_000, Ordering::SeqCst);
+                if let Some((entered, release)) = &self.gate {
+                    entered.send(()).unwrap();
+                    release.lock().unwrap().recv().unwrap();
+                }
+            }
+            Ok(())
+        }
+        fn replay(&self) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
+            self.inner.replay()
+        }
+        fn tail_after_seq(&self, seq: u64) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
+            self.inner.tail_after_seq(seq)
+        }
+        fn last_seq(&self) -> u64 {
+            self.inner.last_seq()
+        }
+        fn lineage_id(&self) -> Option<broca_wal::WalLineageId> {
+            self.inner.lineage_id()
+        }
+    }
+
+    fn ordinary() -> WalRecord {
+        WalRecord::TurnFinished {
+            step_id: broca_protocol::StepId(1),
+        }
+    }
+
+    #[test]
+    fn pathless_overhaul_open_refuses_before_spawning_or_writing() {
+        let root = Root::new();
+        let store = root.store();
+        let session = BindIdentity::new("/proof", "runner", "pathless");
+        let inner = store.open(&session).unwrap();
+        let path = store.wal_path(&session);
+        let before = std::fs::read(&path).unwrap();
+        let wal = StalledWal {
+            inner,
+            now: Arc::new(AtomicU64::new(1000)),
+            stalls: Arc::new(AtomicU64::new(0)),
+            gate: None,
+            path_access: PathAccess::Missing,
+        };
+        let result = WalHandle::spawn_proven_with_clock(
+            Box::new(wal),
+            0,
+            1,
+            None,
+            None,
+            (
+                StampClock::wall(),
+                Some(open_writers::WriterContext {
+                    root: root.0.clone(),
+                    address: session_addr(&session),
+                }),
+            ),
+        );
+        assert!(matches!(result, Err(WalWriteError::ProofPathUnavailable)));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!root.0.join("open-writers").exists());
+        assert!(!sidecar_path(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn legacy_writer_never_requests_a_proof_path() {
+        let root = Root::new();
+        let store = FileWalStore::new(root.0.join("wal"));
+        let session = BindIdentity::new("/proof", "runner", "legacy-pathless");
+        let wal = StalledWal {
+            inner: store.open(&session).unwrap(),
+            now: Arc::new(AtomicU64::new(1000)),
+            stalls: Arc::new(AtomicU64::new(0)),
+            gate: None,
+            path_access: PathAccess::Forbidden,
+        };
+        let reads = Arc::new(AtomicU64::new(0));
+        let clock = {
+            let reads = reads.clone();
+            StampClock::from_fn(move || {
+                reads.fetch_add(1, Ordering::SeqCst);
+                1000
+            })
+        };
+        let handle =
+            WalHandle::spawn_proven_with_clock(Box::new(wal), 0, 1, None, None, (clock, None))
+                .unwrap();
+        handle.record(ordinary()).into_result().unwrap();
+        handle.sync().await.unwrap();
+        handle.shutdown().await.unwrap();
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "legacy append, sync and close do not sample the stamp clock"
+        );
+        assert!(!sidecar_path(&store.wal_path(&session)).exists());
+        assert!(!root.0.join("open-writers").exists());
+    }
+
+    fn timed_handle(
+        root: &Root,
+        session: &BindIdentity,
+        now: Arc<AtomicU64>,
+        stalls: Arc<AtomicU64>,
+    ) -> WalHandle {
+        let wal = StalledWal {
+            inner: root.store().open(session).unwrap(),
+            now: now.clone(),
+            stalls,
+            gate: None,
+            path_access: PathAccess::Forward,
+        };
+        let clock = StampClock::from_fn(move || now.load(Ordering::SeqCst));
+        WalHandle::spawn_proven_with_clock(
+            Box::new(wal),
+            0,
+            1,
+            None,
+            None,
+            (
+                clock,
+                Some(open_writers::WriterContext {
+                    root: root.0.clone(),
+                    address: session_addr(session),
+                }),
+            ),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn late_marker_is_rechecked_after_another_stalled_sync() {
+        let root = Root::new();
+        let session = BindIdentity::new("/proof", "runner", "repeated-stall");
+        let now = Arc::new(AtomicU64::new(1000));
+        let stalls = Arc::new(AtomicU64::new(0));
+        let handle = timed_handle(&root, &session, now.clone(), stalls.clone());
+        handle.record(ordinary()).into_result().unwrap();
+        stalls.store(2, Ordering::SeqCst);
+        assert_eq!(handle.sync().await.unwrap(), 4);
+        let records = root.store().read_records(&session).unwrap();
+        assert!(matches!(
+            records[2].record,
+            WalRecord::VisibilityLate { through_seq: 2, .. }
+        ));
+        assert!(matches!(
+            records[3].record,
+            WalRecord::VisibilityLate { through_seq: 3, .. }
+        ));
+        let proof = HeadProof::decode(
+            &std::fs::read(sidecar_path(&root.store().wal_path(&session))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(proof.durable_seq, 4);
+        assert_eq!(proof.appended_ms, 141_000);
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_close_is_left_for_the_next_writer_opened() {
+        let root = Root::new();
+        let session = BindIdentity::new("/proof", "runner", "late-close");
+        let now = Arc::new(AtomicU64::new(1000));
+        let stalls = Arc::new(AtomicU64::new(0));
+        let handle = timed_handle(&root, &session, now, stalls.clone());
+        let head = handle.durable_head();
+        stalls.store(1, Ordering::SeqCst);
+        handle.shutdown().await.unwrap();
+        let path = root.store().wal_path(&session);
+        let proof = HeadProof::decode(&std::fs::read(sidecar_path(&path)).unwrap()).unwrap();
+        assert_eq!(proof.durable_seq, 1);
+        assert_eq!(head.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            root.store()
+                .read_records(&session)
+                .unwrap()
+                .last()
+                .unwrap()
+                .record,
+            WalRecord::WriterClosed { .. }
+        ));
+        let store = root.store();
+        let next =
+            WalHandle::spawn_in_store(store.open(&session).unwrap(), &store, &session, 2, None)
+                .unwrap();
+        assert_eq!(
+            HeadProof::decode(&std::fs::read(sidecar_path(&path)).unwrap())
+                .unwrap()
+                .durable_seq,
+            3
+        );
+        next.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_batch_published_behind_marker() {
+        let root = Root::new();
+        let store = root.store();
+        let session = BindIdentity::new("/proof", "runner", "session");
+        let path = store.wal_path(&session);
+        let now = Arc::new(AtomicU64::new(1000));
+        let stalls = Arc::new(AtomicU64::new(0));
+        let (entered_tx, entered_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let wal = StalledWal {
+            inner: store.open(&session).unwrap(),
+            now: now.clone(),
+            stalls: stalls.clone(),
+            gate: Some((entered_tx, Mutex::new(release_rx))),
+            path_access: PathAccess::Forward,
+        };
+        let clock = {
+            let now = now.clone();
+            StampClock::from_fn(move || now.load(Ordering::SeqCst))
+        };
+        let handle = WalHandle::spawn_proven_with_clock(
+            Box::new(wal),
+            0,
+            1,
+            None,
+            None,
+            (
+                clock,
+                Some(open_writers::WriterContext {
+                    root: root.0.clone(),
+                    address: session_addr(&session),
+                }),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            HeadProof::decode(&std::fs::read(sidecar_path(&path)).unwrap())
+                .unwrap()
+                .durable_seq,
+            1
+        );
+        assert_eq!(handle.record(ordinary()).into_result().unwrap(), 2);
+        stalls.store(1, Ordering::SeqCst);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        handle.tx.send(WalCommand::Sync(ack_tx)).unwrap();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(
+            HeadProof::decode(&std::fs::read(sidecar_path(&path)).unwrap())
+                .unwrap()
+                .durable_seq,
+            1
+        );
+        // An append and another barrier queued during the stalled sync must keep
+        // their reserved sequences when publication inserts its late marker.
+        assert_eq!(handle.record(ordinary()).into_result().unwrap(), 3);
+        let (later_tx, later_rx) = oneshot::channel();
+        handle.tx.send(WalCommand::Sync(later_tx)).unwrap();
+        release_tx.send(()).unwrap();
+        assert_eq!(ack_rx.await.unwrap().unwrap(), 4);
+        assert_eq!(later_rx.await.unwrap().unwrap(), 4);
+        let bytes = std::fs::read(&path).unwrap();
+        let sidecar = std::fs::read(sidecar_path(&path)).unwrap();
+        let published = PublishedLog::open(&bytes, &sidecar).unwrap();
+        assert_eq!(published.head().durable_seq, 4);
+        assert_eq!(published.head().appended_ms, 71_000);
+        let records = store.read_records(&session).unwrap();
+        assert!(matches!(
+            records.last().unwrap().record,
+            WalRecord::VisibilityLate {
+                through_seq: 2,
+                oldest_appended_ms: 1000
+            }
+        ));
+        assert_eq!(handle.record(ordinary()).into_result().unwrap(), 5);
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_publishes_behind_writer_opened() {
+        let root = Root::new();
+        let store = root.store();
+        let session = BindIdentity::new("/proof", "runner", "recovery");
+        let mut wal = store.open(&session).unwrap();
+        wal.append_v4(
+            1,
+            &ordinary(),
+            false,
+            broca_wal::PreparedV4Frame::prepare(&ordinary()).unwrap(),
+            1,
+        )
+        .unwrap();
+        drop(wal);
+        let path = store.wal_path(&session);
+        assert!(!sidecar_path(&path).exists());
+        let handle =
+            WalHandle::spawn_in_store(store.open(&session).unwrap(), &store, &session, 2, None)
+                .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let sidecar = std::fs::read(sidecar_path(&path)).unwrap();
+        let published = PublishedLog::open(&bytes, &sidecar).unwrap();
+        assert_eq!(published.head().durable_seq, 2);
+        assert!(published.head().appended_ms > 1);
+        assert!(matches!(
+            store.read_records(&session).unwrap().last().unwrap().record,
+            WalRecord::WriterOpened {
+                recovered_through_seq: 1,
+                ..
+            }
+        ));
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn proof_and_log_path_follow_first_send_relocation() {
+        let root = Root::new();
+        let store = root.store();
+        let session = BindIdentity::new("/proof", "runner", "placement");
+        let source = store.wal_path(&session);
+        let handle =
+            WalHandle::spawn_in_store(store.open(&session).unwrap(), &store, &session, 1, None)
+                .unwrap();
+        handle.shutdown().await.unwrap();
+        assert!(sidecar_path(&source).exists());
+        let destination = root.0.join("wal-ephemeral/placed.wal");
+        let mut wal = FileWal::open(&source)
+            .unwrap()
+            .with_wal_config(broca_wal::WalConfig::OVERHAUL)
+            .unwrap();
+        assert_eq!(wal.log_path(), Some(source.as_path()));
+        wal.relocate_unstarted(&destination).unwrap();
+        assert_eq!(wal.log_path(), Some(destination.as_path()));
+        assert!(!source.exists());
+        assert!(!sidecar_path(&source).exists());
+        let bytes = std::fs::read(&destination).unwrap();
+        let sidecar = std::fs::read(sidecar_path(&destination)).unwrap();
+        assert!(PublishedLog::open(&bytes, &sidecar).is_some());
+    }
+}

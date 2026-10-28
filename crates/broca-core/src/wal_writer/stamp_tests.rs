@@ -205,6 +205,9 @@ impl GatedWal {
 }
 
 impl Wal for GatedWal {
+    fn log_path(&self) -> Option<&Path> {
+        self.inner.log_path()
+    }
     fn writer_close_reserve(&self) -> u64 {
         self.inner.writer_close_reserve()
     }
@@ -452,7 +455,7 @@ async fn appended_ms_is_sampled_on_the_writer_thread_when_it_writes() {
     handle.record(record(2)).into_result().unwrap();
     assert_eq!(
         readers.lock().unwrap().len(),
-        2,
+        3,
         "enqueueing a record does not read the stamp clock"
     );
     now.store(2_000, Ordering::SeqCst);
@@ -467,7 +470,9 @@ async fn appended_ms_is_sampled_on_the_writer_thread_when_it_writes() {
         "the second frame carries the value read when the writer wrote it"
     );
     let readers = readers.lock().unwrap().clone();
-    assert_eq!(readers, [writer_thread, writer_thread, writer_thread]);
+    // Proof publication checks freshness after both startup sync and this barrier.
+    // Those two reads, like the three frame stamps, belong to the writer thread.
+    assert_eq!(readers, [writer_thread; 5]);
     handle.shutdown().await.expect("shutdown");
 }
 

@@ -9,6 +9,7 @@
 pub mod error;
 pub mod features;
 pub mod frame;
+pub mod proof;
 
 pub use error::{Error, HeaderCorruption};
 

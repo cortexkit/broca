@@ -1,7 +1,7 @@
 //! Power-loss cuts through the production writer-id/v1 lifecycle and FileWal recovery.
 
 #[path = "../../broca-core/src/open_writers.rs"]
-mod actual_open_writers;
+pub(super) mod actual_open_writers;
 
 #[cfg(feature = "writer-id-faults")]
 mod faults;

@@ -136,7 +136,9 @@ impl AdmissionWal {
                 self.wal.replay()?.iter().all(|frame| {
                     matches!(
                         frame.record,
-                        WalRecord::WriterOpened { .. } | WalRecord::WriterClosed { .. }
+                        WalRecord::WriterOpened { .. }
+                            | WalRecord::WriterClosed { .. }
+                            | WalRecord::VisibilityLate { .. }
                     )
                 })
             } else {
@@ -164,6 +166,9 @@ impl AdmissionWal {
 }
 
 impl Wal for AdmissionWal {
+    fn log_path(&self) -> Option<&std::path::Path> {
+        self.wal.log_path()
+    }
     fn writer_close_reserve(&self) -> u64 {
         self.wal.writer_close_reserve()
     }

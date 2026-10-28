@@ -954,6 +954,9 @@ impl From<WalWriteError> for RunError {
     fn from(e: WalWriteError) -> Self {
         match e {
             WalWriteError::Failed(detail) => RunError::Wal(detail),
+            WalWriteError::ProofPathUnavailable => {
+                RunError::Wal(WalWriteError::ProofPathUnavailable.to_string())
+            }
             WalWriteError::SessionTooLarge { max_bytes } => RunError::SessionTooLarge { max_bytes },
             WalWriteError::RetainedSessionTooLarge { max_bytes } => {
                 RunError::RetainedSessionTooLarge { max_bytes }

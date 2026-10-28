@@ -476,6 +476,7 @@ fn repairable_import_prefix(
             // `WalRecord`, so it neither makes nor breaks a repairable import prefix.
             WalRecord::WriterOpened { .. }
             | WalRecord::WriterClosed { .. }
+            | WalRecord::VisibilityLate { .. }
             | WalRecord::Unknown => {}
             // This reader release decodes compaction records but does not act on them yet.
             WalRecord::CompactionRequest { .. }

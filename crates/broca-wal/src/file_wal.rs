@@ -438,6 +438,10 @@ fn closed_error() -> WalError {
 
 /// The append-only WAL log. The loop depends on the trait, not the impl.
 pub trait Wal {
+    /// Current file location, including first-send relocation; absent for memory logs.
+    fn log_path(&self) -> Option<&Path> {
+        None
+    }
     /// Append a record at the next seq, stamping it with the lease-tenure `fence`. The fence is
     /// forensic metadata only; single-writer safety comes from the lease's OS lock and this
     /// implementation's file-integrity check. If `sync`, fsync before returning (a barrier
@@ -686,7 +690,9 @@ impl FileWal {
             && self.replay()?.iter().all(|frame| {
                 matches!(
                     frame.record,
-                    WalRecord::WriterOpened { .. } | WalRecord::WriterClosed { .. }
+                    WalRecord::WriterOpened { .. }
+                        | WalRecord::WriterClosed { .. }
+                        | WalRecord::VisibilityLate { .. }
                 )
             }))
     }
@@ -731,7 +737,14 @@ impl FileWal {
         crate::migration::durable_dir(parent.parent().unwrap_or(parent), parent)
             .map_err(WalError::Io)?;
         fs_ops::rename(&self.path, destination).map_err(WalError::Io)?;
+        let source_head = crate::head_proof::sidecar_path(&self.path);
         self.path = destination.to_path_buf();
+        // The proof covers an already synced prefix. Move it before syncing the
+        // destination directory, so placement never leaves a proof at the old path.
+        if fs_ops::try_exists(&source_head).map_err(WalError::Io)? {
+            fs_ops::rename(&source_head, crate::head_proof::sidecar_path(destination))
+                .map_err(WalError::Io)?;
+        }
         self.dir_needs_sync.set(true);
         self.sync()?;
         self.refresh_owned_cache();
@@ -1317,6 +1330,9 @@ impl FileWal {
 }
 
 impl Wal for FileWal {
+    fn log_path(&self) -> Option<&Path> {
+        Some(&self.path)
+    }
     fn writer_close_reserve(&self) -> u64 {
         self.writer_close_reserve
     }
