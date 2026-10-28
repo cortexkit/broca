@@ -197,6 +197,17 @@ async fn a_fallback_step_sends_the_fallback_request_and_continues_the_attempt_or
     provider.set_step_route(StepRoute::Fallback);
     let opts = Arc::new(options());
     let expected_body = provider.render_request(&opts);
+    let progress = Arc::new(std::sync::Mutex::new(Some(
+        broca_protocol::provider::InFlightStep {
+            step_id: StepId(4),
+            started_at_ms: 0,
+            attempt: 0,
+            attempt_started_at_ms: 0,
+            last_content_at_ms: None,
+            max_content_gap_ms: None,
+            max_content_gap_ended_at_ms: None,
+        },
+    )));
 
     let mut rx = provider
         .step_with_runtime(
@@ -206,7 +217,7 @@ async fn a_fallback_step_sends_the_fallback_request_and_continues_the_attempt_or
                 cancel: CancellationToken::new(),
                 deadline: None,
                 seal: None,
-                progress: None,
+                progress: Some(Arc::clone(&progress)),
                 // Three attempts of this step were recorded before the re-send.
                 first_attempt: 3,
             },
@@ -262,6 +273,11 @@ async fn a_fallback_step_sends_the_fallback_request_and_continues_the_attempt_or
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].attempt, 3);
     assert_eq!(attempts[0].outcome, AttemptOutcome::Complete);
+    assert_eq!(
+        progress.lock().unwrap().as_ref().unwrap().attempt,
+        3,
+        "live status uses the same step-scoped ordinal as durable attempt evidence"
+    );
 }
 
 /// `options()` carrying a step whose output cap the run recorded lowered to `cap`.

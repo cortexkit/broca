@@ -60,9 +60,14 @@ fn anthropic_prefix() -> Vec<u8> {
 enum Reply {
     /// A 200 promising more than `prefix`, writing `prefix`, then holding the connection open
     /// until the client drops it.
-    Stall { prefix: Vec<u8> },
+    Stall {
+        prefix: Vec<u8>,
+    },
     /// A 503 asking for a long retry delay, so the transport sits between attempts.
     RetryLater,
+    Complete {
+        body: Vec<u8>,
+    },
 }
 
 struct Server {
@@ -135,6 +140,13 @@ async fn read_request_body(socket: &mut TcpStream) -> Vec<u8> {
 
 async fn write_reply(socket: &mut TcpStream, reply: Reply) {
     match reply {
+        Reply::Complete { body } => {
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n", body.len());
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(&body).await.unwrap();
+            socket.flush().await.unwrap();
+            return;
+        }
         Reply::Stall { prefix } => {
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
@@ -414,6 +426,214 @@ async fn the_seal_records_the_attempt_in_flight_before_the_interrupted_terminal(
                 .any(|(_, outcome)| outcome == &AttemptOutcome::Cancelled),
         "a seal must never read as a caller's cancel: {records:#?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sealed_refusal_resend_continues_in_a_new_episode_without_reusing_attempt_identity() {
+    let complete = |reason: &str| {
+        let mut bytes = anthropic_prefix();
+        bytes.extend_from_slice(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\nevent: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{reason}\"}},\"usage\":{{\"output_tokens\":1}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n").as_bytes());
+        bytes
+    };
+    let server = Server::start(vec![
+        Reply::Complete {
+            body: complete("refusal"),
+        },
+        Reply::Stall {
+            prefix: anthropic_prefix(),
+        },
+        Reply::Complete {
+            body: complete("end_turn"),
+        },
+    ])
+    .await;
+    let mut frozen = anthropic_frozen_config("claude-opus-5-5");
+    frozen.base_url = Some(server.url.clone());
+    let mut fallback = anthropic_frozen_config("claude-opus-4-8");
+    fallback.base_url = Some(server.url.clone());
+    frozen.refusal_fallback = Some(Box::new(broca_provider::wire::RefusalFallbackConfig {
+        model: broca_protocol::ModelHandle::new("anthropic", "claude-opus-4-8"),
+        context_limit: None,
+        frozen: fallback,
+    }));
+    let initial = frozen.clone();
+    let f = Fixture::new(move || {
+        Box::new(LiveProvider::new(
+            AnthropicMessages,
+            initial,
+            AuthHandle::Bearer("test".into()),
+        ))
+    });
+    let mut request = text_req(&f.key, "sealed-run");
+    request.model = broca_protocol::ModelHandle::new("anthropic", "claude-opus-5-5");
+    assert!(matches!(
+        f.registry
+            .route_send(&f.key, request.clone(), RunKind::FreshOrResume)
+            .await
+            .unwrap(),
+        SendOutcome::Active { .. }
+    ));
+    broca_test_support::wait_for(
+        "refusal resend reaches the fallback HTTP request",
+        async {
+            while server.request_bodies().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        },
+        || format!("records={:?}", f.records()),
+    )
+    .await;
+    f.seal().await;
+    let sealed = f.records();
+    let store = FileWalStore::new(f.root.join("wal"));
+    let lineage = {
+        use broca_wal::Wal;
+        broca_wal::FileWal::open(store.wal_path(&f.key))
+            .unwrap()
+            .lineage_id()
+            .unwrap()
+    };
+    let sealed_ids: Vec<_> = store
+        .read_records(&f.key)
+        .unwrap()
+        .into_iter()
+        .filter(|frame| matches!(frame.record, WalRecord::ModelAttemptFinished { .. }))
+        .map(|frame| format!("{lineage}:{}", frame.seq))
+        .collect();
+    assert_eq!(
+        attempt_outcomes(&sealed),
+        [
+            (0, AttemptOutcome::Complete),
+            (1, AttemptOutcome::SealedInFlight)
+        ]
+    );
+    let before = broca_core::replay(&sealed)
+        .unwrap()
+        .refusal_fallback
+        .unwrap();
+    assert_eq!(
+        before.phase,
+        broca_wal::RefusalFallbackPhase::Fallback { remaining: 10 }
+    );
+    let provider = LiveProvider::new(AnthropicMessages, frozen, AuthHandle::Bearer("test".into()));
+    let (out, mut events) = mpsc::channel(256);
+    let collector = tokio::spawn(async move { while events.recv().await.is_some() {} });
+    let result = broca_core::run_loop(
+        request.clone(),
+        &provider,
+        &StubToolPlane::new(),
+        &FileLeaseStore::new(f.root.join("leases")),
+        &AllowAll,
+        &FileWalStore::new(f.root.join("wal")),
+        &out,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result.reason,
+        RunFinishReason::Interrupted,
+        "a sealed run is terminal, so an idempotent resend does not reopen it"
+    );
+    assert_eq!(server.request_bodies().len(), 2);
+    request.run_id = broca_protocol::RunId("after-seal".into());
+    let result = broca_core::run_loop_append_episode(
+        request,
+        &provider,
+        &StubToolPlane::new(),
+        &FileLeaseStore::new(f.root.join("leases")),
+        &AllowAll,
+        &FileWalStore::new(f.root.join("wal")),
+        None,
+        &out,
+    )
+    .await
+    .unwrap();
+    drop(out);
+    collector.await.unwrap();
+    assert_eq!(result.reason, RunFinishReason::Completed);
+    let records = f.records();
+    assert_eq!(
+        attempt_outcomes(&records),
+        [
+            (0, AttemptOutcome::Complete),
+            (1, AttemptOutcome::SealedInFlight),
+            (0, AttemptOutcome::Complete)
+        ]
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record, WalRecord::ModelStepRefused { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record, WalRecord::RunStarted { .. }))
+            .count(),
+        2
+    );
+    let mut run = String::new();
+    let mut identities = Vec::new();
+    for record in &records {
+        match record {
+            WalRecord::RunStarted { run_id, .. } => run.clone_from(&run_id.0),
+            WalRecord::ModelAttemptFinished {
+                step_id, attempt, ..
+            } => identities.push((run.clone(), *step_id, *attempt)),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        identities,
+        [
+            ("sealed-run".into(), StepId(1), 0),
+            ("sealed-run".into(), StepId(1), 1),
+            ("after-seal".into(), StepId(1), 0)
+        ]
+    );
+    let frames = store.read_records(&f.key).unwrap();
+    let resumed_lineage = {
+        use broca_wal::Wal;
+        broca_wal::FileWal::open(store.wal_path(&f.key))
+            .unwrap()
+            .lineage_id()
+            .unwrap()
+    };
+    assert_eq!(resumed_lineage, lineage);
+    let ids: Vec<_> = frames
+        .iter()
+        .filter(|frame| matches!(frame.record, WalRecord::ModelAttemptFinished { .. }))
+        .map(|frame| format!("{resumed_lineage}:{}", frame.seq))
+        .collect();
+    assert_eq!(&ids[..2], sealed_ids.as_slice());
+    assert_eq!(
+        ids.iter().collect::<std::collections::HashSet<_>>().len(),
+        3
+    );
+    assert!(frames.windows(2).all(|pair| pair[1].seq == pair[0].seq + 1));
+    let after = broca_core::replay(&records)
+        .unwrap()
+        .refusal_fallback
+        .unwrap();
+    assert_eq!(
+        after.phase,
+        broca_wal::RefusalFallbackPhase::Fallback { remaining: 9 }
+    );
+    assert_eq!(after.re_refusals, before.re_refusals);
+    let sent = server.request_bodies();
+    assert_eq!(sent.len(), 3);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&sent[0]).unwrap()["model"],
+        "claude-opus-5-5"
+    );
+    for bytes in &sent[1..] {
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(bytes).unwrap()["model"],
+            "claude-opus-4-8"
+        );
+    }
 }
 
 /// With no attempt in flight (the transport is waiting out a retry delay after a recorded

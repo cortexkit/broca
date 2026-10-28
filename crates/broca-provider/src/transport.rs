@@ -2080,7 +2080,7 @@ fn spawn_transport_task<F: WireFamily + 'static>(
             }
         };
 
-        let mut attempt = 0;
+        let mut attempt = first_attempt;
         let normalizer_factory = || {
             if let Some(progress) = &progress {
                 if let Some(step) = progress.lock().unwrap().as_mut() {

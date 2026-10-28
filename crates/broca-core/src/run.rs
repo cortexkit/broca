@@ -3144,7 +3144,6 @@ where
     } else {
         Default::default()
     };
-    // The last committed step's usage, for the fallback's context guard.
     if !is_resume && req.retention.is_some() && writer.is_retention_lineage() == Some(false) {
         return Err(RunError::Config(
             "retention disagrees with the lineage's frozen policy".into(),
@@ -3187,6 +3186,29 @@ where
             None => Vec::new(),
         }),
     };
+    let mut resumed_attempts = std::collections::HashMap::<StepId, u32>::new();
+    if is_resume && !append_episode {
+        // Step ids restart for each episode. Continue after the largest durable
+        // ordinal of this episode, including attempts of an uncommitted resend.
+        for frame in approval_frames.iter() {
+            match &frame.record {
+                WalRecord::RunStarted { .. } => resumed_attempts.clear(),
+                WalRecord::ModelAttemptFinished {
+                    step_id, attempt, ..
+                } => {
+                    let next = attempt.checked_add(1).ok_or_else(|| {
+                        RunError::Config(format!(
+                            "model attempt ordinal exhausted for step {}",
+                            step_id.0
+                        ))
+                    })?;
+                    let known = resumed_attempts.entry(*step_id).or_default();
+                    *known = (*known).max(next);
+                }
+                _ => {}
+            }
+        }
+    }
     if is_resume && !append_episode {
         let mut held =
             crate::resume::closing_held_replies(approval_frames.iter().map(|frame| &frame.record));
@@ -5564,9 +5586,9 @@ where
         let session = &req.session;
         let attempt_run_id = &resolved_run_id;
         let completed_attempt_time = std::sync::Mutex::new(None);
-        // Attempts this step has recorded, so a re-send after a refusal numbers its attempts
-        // after them.
-        let step_attempts = std::sync::atomic::AtomicU32::new(0);
+        // Both a live resend and a resumed one continue after durable attempt evidence.
+        let next_attempt = resumed_attempts.remove(&step_id).unwrap_or(0);
+        let step_attempts = std::sync::atomic::AtomicU32::new(next_attempt);
         // How many `thinking_dropped` input transformations the step's completed attempt
         // reported, when it reported its transformations at all.
         let thinking_dropped = std::sync::Mutex::new(None::<usize>);
@@ -5574,7 +5596,10 @@ where
         // estimate (replay reads it from the same `ModelAttemptFinished` records).
         let last_attempt_bytes = std::sync::Mutex::new(None);
         let record_attempt = |attempt: broca_protocol::ModelAttempt| -> AttemptFuture<'_> {
-            step_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            step_attempts.fetch_max(
+                attempt.attempt.saturating_add(1),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             *last_attempt_bytes.lock().unwrap() = Some(attempt.request_body_len);
             if matches!(
                 attempt.outcome,
@@ -5661,7 +5686,7 @@ where
             provider.set_step_route(step_route);
         }
         let mut refusal_prior_retries = 0u32;
-        let mut first_attempt = 0u32;
+        let mut first_attempt = next_attempt;
         let step = loop {
             // A fallback step tells the renderer which model it is rendering for, as the
             // recorded request a cache warm rebuilds does.
@@ -8080,7 +8105,7 @@ async fn run_step_watched<P: Provider>(
         *progress.lock().unwrap() = Some(broca_protocol::provider::InFlightStep {
             step_id,
             started_at_ms: now,
-            attempt: 0,
+            attempt: first_attempt,
             attempt_started_at_ms: now,
             last_content_at_ms: None,
             max_content_gap_ms: None,

@@ -473,7 +473,7 @@ pub fn resolve_chatgpt_pause_episode_with_client(
 pub fn provider_for_recorded_config(
     provider_id: &str,
     model_id: &str,
-    mut frozen: FrozenRenderConfig,
+    frozen: FrozenRenderConfig,
     auth: &AuthMode,
     auth_method: Option<AuthMethod>,
     frozen_account_ref: Option<&str>,
@@ -494,11 +494,8 @@ pub fn provider_for_recorded_config(
         clock: Some(clock),
         ..Default::default()
     };
-    // A recorded config is restored as it was, minus the one render choice whose scope is the
-    // auth method: a non-OAuth run renders no `fallbacks`, exactly as it did when it was
-    // admitted, even if its recorded config carries the flag.
-    apply_server_side_fallback_auth_scope(provider_id, auth_method, &mut frozen);
     let resolved_auth = resolve_family_auth(auth, &frozen, &auth_kind, provider_id, &opts)?;
+    validate_recorded_fallback_auth(provider_id, resolved_auth.auth_method, &frozen)?;
     live_provider_with_clock_and_refresher(
         Some(http_client),
         frozen,
@@ -815,20 +812,6 @@ fn resolve_provider_inner(
         let mut frozen = recorded.clone();
         frozen.opencode_go_session_id = episode_render.opencode_go_session_id.map(str::to_owned);
         let family = frozen.family_id;
-        // The resumed episode's auth method decides the same method-scoped render choices a
-        // fresh admission applies, so an api-key episode that recorded the opt-in still sends no
-        // `fallbacks`.
-        apply_auth_method_quirks(provider_id, opts.auth_method, &mut frozen);
-        apply_server_side_fallback_auth_scope(provider_id, opts.auth_method, &mut frozen);
-        // The provider represents today's code. Core must ask the family's independent
-        // compatibility table before comparing a blob restamped to the recorded version. On
-        // Anthropic the version follows the opt-in as recorded, so a run that never opted in
-        // keeps the v2 identity (and version) it was admitted with.
-        frozen.renderer_version = if family == WireFamilyId::AnthropicMessages {
-            broca_provider::families::anthropic_renderer_version(frozen.server_side_fallback)
-        } else {
-            renderer_version_for(family)
-        };
         let auth_kind =
             provider_route_auth_kind(provider_id, family, &crate::default_auth_kind(family));
         let (handle, auth_desc, auth_method, refresher) =
@@ -848,6 +831,17 @@ fn resolve_provider_inner(
                     resolved.refresher,
                 )
             };
+        // Frozen fallback choices are not re-derived on resume. A credential that cannot
+        // honor them refuses before core can refreeze the episode or send a changed body.
+        validate_recorded_fallback_auth(provider_id, auth_method, &frozen)?;
+        apply_auth_method_quirks(provider_id, opts.auth_method, &mut frozen);
+        // The provider represents today's code. Core checks the family's compatibility table
+        // before comparing a blob restamped to the recorded version.
+        frozen.renderer_version = if family == WireFamilyId::AnthropicMessages {
+            broca_provider::families::anthropic_renderer_version(frozen.server_side_fallback)
+        } else {
+            renderer_version_for(family)
+        };
         let base_url = frozen
             .base_url
             .clone()
@@ -1422,18 +1416,19 @@ fn is_anthropic_oauth_shape(
     )
 }
 
-/// Clears a recorded opt-in on a config that is not the shape the capability belongs to. A
-/// resume never re-decides the flag, so a config restored as recorded would otherwise render
-/// `fallbacks` for a credential method that cannot use it: the catalog states the fact on a row
-/// both auth methods share, so the method has to gate the render as well as the decision.
-fn apply_server_side_fallback_auth_scope(
+/// Recorded OAuth-only fallback choices cannot be silently removed to fit a new credential.
+/// Refuse by name instead, leaving the original episode reproducible with OAuth credentials.
+fn validate_recorded_fallback_auth(
     provider_id: &str,
     auth_method: Option<AuthMethod>,
-    frozen: &mut FrozenRenderConfig,
-) {
-    if !is_anthropic_oauth_shape(provider_id, auth_method, frozen) {
-        frozen.server_side_fallback = false;
+    frozen: &FrozenRenderConfig,
+) -> Result<(), String> {
+    if (frozen.server_side_fallback || frozen.refusal_fallback.is_some())
+        && !is_anthropic_oauth_shape(provider_id, auth_method, frozen)
+    {
+        return Err("frozen_fallback_auth_mismatch: recorded Anthropic fallback settings require OAuth credentials; resume with OAuth rather than changing the frozen request for an API key".into());
     }
+    Ok(())
 }
 
 /// Whether these two properties make a config the shape the opt-in belongs to. The caller
@@ -2624,26 +2619,26 @@ mod tests {
                 assert!(body.get("fallbacks").is_none(), "{model}");
             }
 
-            // An api-key episode never opts in, even when it resumes an OAuth episode's recorded
-            // config: the fact the episode was admitted on belongs to a row both auth methods
-            // share, and the subscription route is the one that implements the handoff.
-            let (api_key_recorded, api_key_recorded_body) = resolve_anthropic_episode(
+            // An API-key credential cannot honor the recorded OAuth opt-in. Refusing keeps
+            // the frozen episode intact instead of quietly changing its request on resume.
+            let error = resolve_catalog_episode_with_client(
                 "anthropic/claude-fable-5-1",
-                AuthMethod::ApiKey,
-                true,
+                Some(2048),
+                &AuthMode::Secret("test-secret".into()),
+                &ResolveOptions {
+                    auth_method: Some(AuthMethod::ApiKey),
+                    anthropic_server_side_fallback: true,
+                    ..Default::default()
+                },
+                broca_provider::build_provider_http_client(),
                 EpisodeRenderConfig {
                     recorded_config: Some(&frozen),
                     ..EpisodeRenderConfig::default()
                 },
-            );
-            assert!(
-                !api_key_recorded_body
-                    .as_object()
-                    .unwrap()
-                    .contains_key("fallbacks"),
-                "an api-key episode must send no fallbacks whatever it recorded: {api_key_recorded_body}"
-            );
-            assert!(!api_key_recorded.server_side_fallback);
+            )
+            .err()
+            .expect("a frozen OAuth opt-in cannot resume with an API key");
+            assert!(error.to_string().contains("frozen_fallback_auth_mismatch"));
 
             // A resume keeps exactly what its episode recorded, whatever the fact and the
             // switch say now: a recorded opt-in stays on with the switch off, and a recorded

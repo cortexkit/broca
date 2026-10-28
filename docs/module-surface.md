@@ -1232,6 +1232,11 @@ subsequent non-content records increment them. A byte class never observed stays
 This telemetry and the attempt log's `last_content_ms` do **not** change the existing idle or
 content deadlines, retry policy, or rate-floor policy.
 
+Provider-attempt ordinals are scoped to the episode's step. A refusal resend and a
+resume of an unfinished step continue after that step's largest durable attempt ordinal;
+live `step.attempt` uses the same offset. These ordinals are not stable global IDs.
+Accounting event IDs use `lineage_id:wal_seq`, and timestamps are not join keys.
+
 ## 15. session.read consistency + pagination
 
 `session.read` cuts each page from one atomic materialized-store snapshot plus its exact
@@ -1301,6 +1306,12 @@ as terminal/no-op, so a "resumable terminal" would seal the run). Replay gains a
 resume **continues the SAME run_id from the last durable boundary**; no new episode starts
 until the pause is resolved or cancelled. The error detail is persisted for `run.status`.
 (Auto pause→refresh→continue is deferred; the lineage is preserved + manually resumable.)
+
+Recorded Anthropic fallback settings are frozen on resume, even if the current switches
+are off. If the resolved credential method is not OAuth, restoring an episode that froze
+either fallback produces a permanent configuration refusal naming
+`frozen_fallback_auth_mismatch`, before any provider request or render-config refreeze.
+Resume with OAuth credentials rather than silently dropping the frozen opt-in for an API key.
 
 ## 17b. The metering lane: direct read-only storage
 
