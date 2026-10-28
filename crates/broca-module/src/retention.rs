@@ -392,6 +392,45 @@ type EvictCaches = dyn Fn(&BindIdentity) + Send + Sync;
 
 type AcquireLease = dyn Fn(&BindIdentity) -> Result<Box<dyn LeaseHandle>, String> + Send + Sync;
 
+/// Preserve the one retryable placement state without reclassifying existing
+/// retention failures whose string-based contracts remain unchanged.
+#[derive(Debug)]
+pub(crate) enum RetentionReadError {
+    RelocationIncomplete { reason: String },
+    Other(String),
+}
+
+impl RetentionReadError {
+    fn from_wal(error: broca_wal::WalError) -> Self {
+        match error {
+            error @ broca_wal::WalError::RelocationIncomplete { .. } => {
+                Self::RelocationIncomplete {
+                    reason: error.to_string(),
+                }
+            }
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+impl From<String> for RetentionReadError {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+impl From<&str> for RetentionReadError {
+    fn from(error: &str) -> Self {
+        Self::Other(error.into())
+    }
+}
+impl std::fmt::Display for RetentionReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RelocationIncomplete { reason } => f.write_str(reason),
+            Self::Other(error) => f.write_str(error),
+        }
+    }
+}
+
 /// Shared by actors and the registry. Content mutations require the caller's session lease;
 /// expiry reads may refresh the content-free retention summary, but never run state.
 pub struct RetentionService {
@@ -399,6 +438,7 @@ pub struct RetentionService {
         std::sync::OnceLock<Arc<dyn crate::retention_withdrawals::RetentionWithdrawalAdapter>>,
     pub(crate) withdrawal_wake: tokio::sync::Notify,
     unreadable: Mutex<std::collections::HashSet<String>>,
+    relocation_incomplete: std::sync::atomic::AtomicU64,
     enrollment: Mutex<Enrollment>,
     deletion_recovery: Mutex<(bool, std::collections::HashSet<BindIdentity>)>,
     archived_expiry: Mutex<ArchivedExpiry>,
@@ -547,6 +587,7 @@ impl RetentionService {
             withdrawal_wake: tokio::sync::Notify::new(),
             evict: std::sync::OnceLock::new(),
             unreadable: Mutex::new(std::collections::HashSet::new()),
+            relocation_incomplete: std::sync::atomic::AtomicU64::new(0),
             enrollment: Mutex::default(),
             deletion_recovery: Mutex::default(),
             archived_expiry: Mutex::default(),
@@ -663,6 +704,25 @@ impl RetentionService {
         self.unreadable.lock().unwrap().len()
     }
 
+    /// Number of retention attempts deferred for an interrupted overhaul placement.
+    pub fn relocation_incomplete_skips(&self) -> u64 {
+        self.relocation_incomplete
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn live_path_for_retention(
+        &self,
+        key: &BindIdentity,
+    ) -> Result<Option<PathBuf>, RetentionReadError> {
+        self.wal.resolve_live_path(key).map_err(|error| {
+            if matches!(error, broca_wal::WalError::RelocationIncomplete { .. }) {
+                self.relocation_incomplete.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(target: "retention", session = %broca_core::session_addr(key), "retention deferred: wal_relocation_incomplete; an owned open must finish placement");
+            }
+            RetentionReadError::from_wal(error)
+        })
+    }
+
     fn current_indexed(
         &self,
         key: &BindIdentity,
@@ -744,6 +804,14 @@ impl RetentionService {
         self.expired_head(key, run, None)
     }
 
+    pub(crate) fn expired_typed(
+        &self,
+        key: &BindIdentity,
+        run: Option<&str>,
+    ) -> Result<Option<u64>, RetentionReadError> {
+        self.expired_head_with_meta(key, run, None, None)
+    }
+
     pub(crate) fn expired_head(
         &self,
         key: &BindIdentity,
@@ -751,6 +819,7 @@ impl RetentionService {
         head: Option<u64>,
     ) -> Result<Option<u64>, String> {
         self.expired_head_with_meta(key, run, head, None)
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn expired_head_with_meta(
@@ -759,7 +828,13 @@ impl RetentionService {
         run: Option<&str>,
         head: Option<u64>,
         meta: Option<&broca_core::AdmissionStoreSnapshot>,
-    ) -> Result<Option<u64>, String> {
+    ) -> Result<Option<u64>, RetentionReadError> {
+        let overhaul_path = self
+            .wal
+            .wal_config()
+            .is_overhaul()
+            .then(|| self.live_path_for_retention(key))
+            .transpose()?;
         let run_meta = run.map(|run| self.index.run(run)).transpose()?.flatten();
         if let Some(meta) = &run_meta {
             if meta.expired_at_ms.is_some() {
@@ -776,7 +851,10 @@ impl RetentionService {
             }
         }
         self.wal.check_move(key, false).map_err(|e| e.to_string())?;
-        let path = self.wal.resolve_live_path(key).map_err(|e| e.to_string())?;
+        let path = match overhaul_path {
+            Some(path) => path,
+            None => self.live_path_for_retention(key)?,
+        };
         // Deletion may move the resolved path aside before it is opened. Let the
         // ordinary range reader resolve absence/tombstones instead of failing the read.
         let file = path
@@ -806,20 +884,17 @@ impl RetentionService {
                 cache.identity = identity.clone();
             }
             if let Some(facts) = cache.lineages.get(key) {
-                if self
-                    .wal
-                    .resolve_live_path(key)
-                    .map_err(|e| e.to_string())?
-                    .is_none()
-                {
-                    return self.expired_archived(key, run, &stones, facts);
+                if self.live_path_for_retention(key)?.is_none() {
+                    return self
+                        .expired_archived(key, run, &stones, facts)
+                        .map_err(Into::into);
                 }
                 cache.lineages.remove(key);
             }
             let archived = self
                 .wal
                 .read_archived_for_expiry(key)
-                .map_err(|e| e.to_string())?;
+                .map_err(RetentionReadError::from_wal)?;
             if let Some((read, wal_bytes)) = archived {
                 // Archive indexes identify addresses, not lineages. Parse the member's WAL
                 // records once to extract its lineage and policy, without caching records.
@@ -843,11 +918,7 @@ impl RetentionService {
                     let verdict = self.expired_archived(key, run, &stones, &facts)?;
                     if identity.is_some()
                         && self.wal.archive_identity().map_err(|e| e.to_string())? == identity
-                        && self
-                            .wal
-                            .resolve_live_path(key)
-                            .map_err(|e| e.to_string())?
-                            .is_none()
+                        && self.live_path_for_retention(key)?.is_none()
                     {
                         // Bound memory even when a client probes arbitrarily many sessions.
                         if cache.lineages.len() >= 16_384 {
@@ -861,7 +932,9 @@ impl RetentionService {
             }
         }
         if head.is_none() && archived_read.is_none() {
-            self.wal.flush_for_read(key).map_err(|e| e.to_string())?;
+            self.wal
+                .flush_for_read(key)
+                .map_err(RetentionReadError::from_wal)?;
         }
         if let Some(file) = &file {
             let bytes = file.metadata().map_err(|e| e.to_string())?.len();
@@ -900,7 +973,7 @@ impl RetentionService {
             None => self
                 .wal
                 .read_records_range(key, 0, head, None)
-                .map_err(|e| e.to_string())?,
+                .map_err(RetentionReadError::from_wal)?,
         };
         if matches!(read.records(), broca_wal::WalRangeRecords::Complete(_)) {
             if let Some(stone) = stones.iter().find(|s| {
@@ -955,7 +1028,7 @@ impl RetentionService {
         if self
             .wal
             .lineage_exists(key, meta)
-            .map_err(|e| e.to_string())?
+            .map_err(RetentionReadError::from_wal)?
         {
             return Ok(None);
         }
@@ -1385,6 +1458,21 @@ impl RetentionService {
         key: &BindIdentity,
         now_ms: u64,
     ) -> Result<Option<String>, String> {
+        self.delete_expired_typed(key, now_ms)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn delete_expired_typed(
+        &self,
+        key: &BindIdentity,
+        now_ms: u64,
+    ) -> Result<Option<String>, RetentionReadError> {
+        let overhaul_path = self
+            .wal
+            .wal_config()
+            .is_overhaul()
+            .then(|| self.live_path_for_retention(key))
+            .transpose()?;
         self.wal.check_move(key, true).map_err(|e| e.to_string())?;
         for stone in self
             .tombstones(key)?
@@ -1393,7 +1481,11 @@ impl RetentionService {
         {
             self.complete(key, stone, now_ms)?;
         }
-        let Some(path) = self.wal.resolve_live_path(key).map_err(|e| e.to_string())? else {
+        let path = match overhaul_path {
+            Some(path) => path,
+            None => self.live_path_for_retention(key)?,
+        };
+        let Some(path) = path else {
             return Ok(None);
         };
         let read = self.read_path(&path);
@@ -1699,6 +1791,10 @@ impl RetentionService {
         let mut completed = Vec::new();
         for key in keys {
             let result = (|| {
+                if self.wal.wal_config().is_overhaul() {
+                    self.live_path_for_retention(&key)
+                        .map_err(|error| error.to_string())?;
+                }
                 let stones = self.tombstones(&key)?;
                 if stones.iter().all(|s| s.completed_at_ms.is_some()) {
                     for stone in stones {

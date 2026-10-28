@@ -224,10 +224,41 @@ pub enum OpenError {
 }
 
 impl OpenError {
+    pub(crate) fn from_wal_open(error: broca_core::WalOpenError) -> Self {
+        match error {
+            broca_core::WalOpenError::RelocationIncomplete { reason } => Self::Classified {
+                reason,
+                class: broca_protocol::ErrorClass::Transient,
+            },
+            broca_core::WalOpenError::SessionMoving { cut_id } => Self::SessionMoving { cut_id },
+            broca_core::WalOpenError::SessionMoved { holder } => Self::SessionMoved { holder },
+            broca_core::WalOpenError::NewerWriter { missing, error } => Self::NewerWriter {
+                missing,
+                reason: error.to_string(),
+            },
+            // Opaque write/open failures do not establish retryability.
+            broca_core::WalOpenError::Failed(error) => Self::Open(error.to_string()),
+        }
+    }
+    pub(crate) fn from_retention(error: crate::retention::RetentionReadError) -> Self {
+        match error {
+            crate::retention::RetentionReadError::RelocationIncomplete { reason } => {
+                Self::Classified {
+                    reason,
+                    class: broca_protocol::ErrorClass::Transient,
+                }
+            }
+            crate::retention::RetentionReadError::Other(reason) => Self::Open(reason),
+        }
+    }
     /// Classify a WAL read failure, keeping a newer-writer refusal typed. `reason` is the full
     /// text to report, already including the failure's own rendering.
     pub(crate) fn from_wal_read(reason: String, error: &broca_wal::WalError) -> Self {
         match error {
+            broca_wal::WalError::RelocationIncomplete { .. } => Self::Classified {
+                reason,
+                class: broca_protocol::ErrorClass::Transient,
+            },
             broca_wal::WalError::SessionMoving { cut_id } => Self::SessionMoving {
                 cut_id: cut_id.clone(),
             },
@@ -238,7 +269,7 @@ impl OpenError {
                 missing: missing.clone(),
                 reason,
             },
-            // Only temporary OS errors establish that the same read may succeed on retry.
+            // For generic I/O failures, only these temporary OS kinds establish retryability.
             broca_wal::WalError::Io(error)
                 if matches!(
                     error.kind(),
@@ -255,6 +286,38 @@ impl OpenError {
             // Corruption, replay/shape errors and opaque failures are not presumed retryable.
             _ => OpenError::Open(reason),
         }
+    }
+}
+
+#[cfg(test)]
+mod relocation_error_tests {
+    use super::*;
+
+    #[test]
+    fn relocation_incomplete_keeps_its_class_across_read_and_actor_open() {
+        let error = broca_wal::WalError::RelocationIncomplete {
+            paths: vec!["wal/a.wal".into(), "wal-ephemeral/a.wal".into()],
+            cause: None,
+        };
+        let reason = error.to_string();
+        for mapped in [
+            OpenError::from_wal_read(reason.clone(), &error),
+            OpenError::from_wal_open(broca_core::WalOpenError::RelocationIncomplete {
+                reason: reason.clone(),
+            }),
+        ] {
+            assert!(
+                matches!(mapped, OpenError::Classified { reason: actual, class: broca_protocol::ErrorClass::Transient } if actual == reason)
+            );
+        }
+        let failure = broca_core::WalWriteError::Failed("unchanged failure".into());
+        let expected = failure.to_string();
+        assert!(
+            matches!(OpenError::from_wal_open(broca_core::WalOpenError::Failed(failure)), OpenError::Open(actual) if actual == expected)
+        );
+        assert!(
+            matches!(OpenError::from_retention(crate::retention::RetentionReadError::Other("unchanged retention error".into())), OpenError::Open(actual) if actual == "unchanged retention error")
+        );
     }
 }
 
@@ -6148,13 +6211,7 @@ impl LineageRegistry {
             if let Some(probe) = probe {
                 probe();
             }
-            let meta = if run.is_none()
-                && service
-                    .wal
-                    .resolve_live_path(&key)
-                    .map_err(|e| e.to_string())?
-                    .is_none()
-            {
+            let meta = if run.is_none() && service.live_path_for_retention(&key)?.is_none() {
                 store
                     .as_ref()
                     .map(|store| store.read_admission_snapshot(&key))
@@ -6167,7 +6224,7 @@ impl LineageRegistry {
         })
         .await
         .map_err(|e| OpenError::Open(e.to_string()))?
-        .map_err(OpenError::Open)?;
+        .map_err(OpenError::from_retention)?;
         if let Some(expired_at_ms) = expired {
             return Err(OpenError::Expired { expired_at_ms });
         }

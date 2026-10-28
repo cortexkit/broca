@@ -485,6 +485,32 @@ fn retention_deletion_drops_media_manifest_after_wal_unlink_and_leaves_collectio
     );
 }
 impl Rig {
+    #[cfg(unix)]
+    fn overhaul() -> Self {
+        let mut rig = Self::new();
+        fs::write(
+            rig.root.join(broca_wal::state_format::MARKER_FILENAME),
+            b"broca-state/2\n",
+        )
+        .unwrap();
+        let wal = Arc::new(FileWalStore::with_config(
+            rig.root.join("wal"),
+            broca_wal::WalConfig::OVERHAUL,
+        ));
+        let resolver = Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1));
+        rig.service = Arc::new(
+            RetentionService::new(
+                wal,
+                rig.store.clone(),
+                rig.leases.clone(),
+                rig.store.clone(),
+                resolver,
+            )
+            .unwrap(),
+        );
+        rig
+    }
+
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = broca_test_support::scratch_root().join(format!(
@@ -558,6 +584,91 @@ impl Rig {
         registry.set_retention_service(self.service.clone());
         registry
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn relocation_incomplete_preflight_never_expires_or_completes_deletion() {
+    let rig = Rig::overhaul();
+    let wal = rig
+        .service
+        .wal
+        .open_with_retention(&rig.key, Some(60))
+        .unwrap();
+    let id = wal.lineage_id().unwrap().to_string();
+    drop(wal);
+    let source = rig.service.wal.ephemeral_wal_path(&rig.key);
+    let alias = rig.service.wal.wal_path(&rig.key);
+    fs::create_dir_all(alias.parent().unwrap()).unwrap();
+    fs::hard_link(&source, &alias).unwrap();
+    rig.service.remember_session(&rig.key).unwrap();
+    rig.service
+        .write_tombstone(
+            &rig.key,
+            &Tombstone {
+                lineage_id: id.clone(),
+                expired_at_ms: 1,
+                seq: 1,
+                completed_at_ms: None,
+                next_tag: None,
+                next_notice_seq: None,
+            },
+        )
+        .unwrap();
+    rig.service
+        .index
+        .deletion_pending(&id, &rig.key, true)
+        .unwrap();
+    let before_bytes = fs::read(&source).unwrap();
+    let before_stones = serde_json::to_value(rig.service.tombstones(&rig.key).unwrap()).unwrap();
+    let before_outbox = rig.store.pending_retention_withdrawals().unwrap().len();
+    let registry = rig.registry(None);
+    let error = registry.check_expired(&rig.key, None).await.unwrap_err();
+    assert!(
+        matches!(&error, crate::registry::OpenError::Classified { class: broca_protocol::ErrorClass::Transient, reason } if reason.contains("wal_relocation_incomplete"))
+    );
+    assert!(matches!(
+        rig.service.delete_expired_typed(&rig.key, u64::MAX),
+        Err(RetentionReadError::RelocationIncomplete { .. })
+    ));
+    assert!(rig.service.resume_deletions(u64::MAX).unwrap().is_empty());
+    assert!(
+        rig.service.resume_deletions(u64::MAX).unwrap().is_empty(),
+        "the next pass retries the deferred key"
+    );
+    assert_eq!(rig.service.relocation_incomplete_skips(), 4);
+    assert_eq!(fs::read(&source).unwrap(), before_bytes);
+    assert_eq!(fs::read(&alias).unwrap(), before_bytes);
+    assert_eq!(
+        serde_json::to_value(rig.service.tombstones(&rig.key).unwrap()).unwrap(),
+        before_stones
+    );
+    assert_eq!(
+        rig.store.pending_retention_withdrawals().unwrap().len(),
+        before_outbox
+    );
+    assert!(!rig.service.deleting(&rig.key, &id).exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn legacy_same_inode_conflicts_keep_the_existing_retention_error_class() {
+    let rig = Rig::new();
+    rig.seed(1, 1000, Some(1000));
+    let source = rig.service.wal.ephemeral_wal_path(&rig.key);
+    let alias = rig.service.wal.wal_path(&rig.key);
+    fs::create_dir_all(alias.parent().unwrap()).unwrap();
+    fs::hard_link(&source, &alias).unwrap();
+    let error = rig
+        .registry(None)
+        .check_expired(&rig.key, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, crate::registry::OpenError::Open(reason) if reason.starts_with("wal io: conflicting live WALs:") && !reason.contains("wal_relocation_incomplete"))
+    );
+    assert_eq!(rig.service.relocation_incomplete_skips(), 0);
+    assert!(source.exists() && alias.exists());
 }
 impl Drop for Rig {
     fn drop(&mut self) {

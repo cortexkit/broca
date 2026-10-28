@@ -51,7 +51,7 @@ fn record_lifecycle(close: bool) -> (Scratch, Arc<RecordingFs>, [u8; 16]) {
     let writer_id = with_fs_ops(fs.clone(), || {
         let mut wal = open(&root.0);
         let id = wal.writer_id().unwrap();
-        let (writer, seq, _) = WriterContext {
+        let (writer, seq, _, _) = WriterContext {
             root: root.0.clone(),
             address: "addr".into(),
         }
@@ -65,7 +65,7 @@ fn record_lifecycle(close: bool) -> (Scratch, Arc<RecordingFs>, [u8; 16]) {
             let prepared = broca_wal::PreparedV4Frame::prepare(&record).unwrap();
             wal.append_v4(1, &record, false, prepared, 2).unwrap();
             wal.sync().unwrap();
-            writer.close(&mut wal, 1, 3).unwrap();
+            let (_, _, _) = writer.close(&mut wal, 1, 3).unwrap();
             writer.unlink().unwrap();
         }
         id

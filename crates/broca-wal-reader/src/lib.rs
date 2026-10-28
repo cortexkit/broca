@@ -3,6 +3,12 @@
 //! This codec neither interprets content nor acquires leases. A caller must stop
 //! reading a log on a header error or a newer-writer refusal. Only a verified
 //! header makes it safe to advance past a damaged payload.
+//!
+//! Durability is a claim by the trusted writer/filesystem, not an authenticated
+//! property of a CRC or digest. Raw `open_log` and `frame` access do not enforce
+//! published bounds. Billing readers should use [`proof::PublishedLog`], treat
+//! unavailable proofs as unavailable rather than EOF, and fully consume its
+//! bounded iterator (including unreadable evidence) before advancing progress.
 
 #![forbid(unsafe_code)]
 

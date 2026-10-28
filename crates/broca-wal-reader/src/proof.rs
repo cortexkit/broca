@@ -1,4 +1,12 @@
-//! Published heads are hints bound to a verified frame, never bare sequence watermarks.
+//! Published heads bind a trusted writer's durability claim to a bounded frame prefix.
+//!
+//! CRCs and frame identities detect corruption and bind content; they do not
+//! authenticate fsync or defend against an actor forging both log and sidecar.
+//! Trust the writer and filesystem. The raw codec and file APIs remain public
+//! escape hatches: callers choose this view to enforce the published boundary.
+//! A missing/torn proof is unavailable, not EOF. Billing progress additionally
+//! requires fully consuming the bounded iterator, handling feature refusals and
+//! persisting every PayloadCorrupt item as unreadable evidence before advancing.
 
 use sha2::{Digest, Sha256};
 
@@ -54,56 +62,123 @@ impl HeadProof {
     }
 }
 
-/// A complete, contiguous prefix whose final frame matches the sidecar's identity.
-/// No stored sequence or byte offset alone can construct this view.
+/// Why a CRC-valid durability claim cannot describe the supplied prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProofError {
+    /// A proof belongs to another lineage or final frame, including an orphan at relocation.
+    MismatchedProof,
+    /// A covered header cannot be trusted, so its bytes cannot safely be skipped.
+    Header { offset: usize, source: Error },
+    /// A covered frame is missing, incomplete, noncontiguous or has invalid lineage metadata.
+    CorruptPrefix { offset: usize, reason: &'static str },
+}
+
+impl std::fmt::Display for ProofError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MismatchedProof => write!(
+                f,
+                "durable-head proof does not match this log's lineage or final frame"
+            ),
+            Self::Header { offset, source } => {
+                write!(f, "covered WAL header at byte {offset}: {source}")
+            }
+            Self::CorruptPrefix { offset, reason } => {
+                write!(f, "covered WAL prefix at byte {offset}: {reason}")
+            }
+        }
+    }
+}
+impl std::error::Error for ProofError {}
+
+/// A contiguous prefix whose final verified header matches the sidecar's identity.
+/// Payload integrity is reported by iteration so damaged bytes can be retained as
+/// unreadable evidence. No bare stored sequence or offset can construct this view.
 pub struct PublishedLog<'a> {
     proof: HeadProof,
     frames: &'a [u8],
 }
 
 impl<'a> PublishedLog<'a> {
-    pub fn open(log: &'a [u8], sidecar: &[u8]) -> Option<Self> {
-        let proof = HeadProof::decode(sidecar)?;
-        let end = usize::try_from(proof.durable_end).ok()?;
-        let prefix = log.get(..end)?;
-        if lineage(prefix)? != proof.lineage_id {
-            return None;
+    /// `Ok(None)` means the proof is absent, torn or fails its own checksum.
+    /// Errors instead identify a mismatched claim or corruption in its covered
+    /// prefix. Payload corruption is yielded as evidence by `frames`, not hidden.
+    pub fn open(log: &'a [u8], sidecar: &[u8]) -> Result<Option<Self>, ProofError> {
+        let Some(proof) = HeadProof::decode(sidecar) else {
+            return Ok(None);
+        };
+        let end = usize::try_from(proof.durable_end).map_err(|_| ProofError::CorruptPrefix {
+            offset: log.len(),
+            reason: "published end cannot be represented",
+        })?;
+        let prefix = log.get(..end).ok_or(ProofError::CorruptPrefix {
+            offset: log.len(),
+            reason: "published prefix is truncated",
+        })?;
+        let first_lineage = lineage(prefix).ok_or(ProofError::CorruptPrefix {
+            offset: 0,
+            reason: "missing or corrupt lineage metadata",
+        })?;
+        if first_lineage != proof.lineage_id {
+            return Err(ProofError::MismatchedProof);
         }
-        let frames = prefix.get(LINEAGE_LEN..)?;
+        let frames = prefix.get(LINEAGE_LEN..).ok_or(ProofError::CorruptPrefix {
+            offset: 0,
+            reason: "incomplete lineage metadata",
+        })?;
         let mut tail = frames;
         let mut seq = 0u64;
         let mut newest = None;
         let mut ended_on_record = false;
         while !tail.is_empty() {
+            let offset = end - tail.len();
             if tail.get(4) == Some(&2) {
-                if lineage(tail)? != proof.lineage_id {
-                    return None;
+                if lineage(tail) != Some(proof.lineage_id) {
+                    return Err(ProofError::CorruptPrefix {
+                        offset,
+                        reason: "corrupt or conflicting lineage metadata",
+                    });
                 }
-                tail = tail.get(LINEAGE_LEN..)?;
+                tail = &tail[LINEAGE_LEN..];
                 ended_on_record = false;
                 continue;
             }
-            let header = frame::decode_header(tail).ok()??;
-            if header.metadata.seq != seq.checked_add(1)? || !frame::digest_verifies(tail) {
-                return None;
+            let header = frame::decode_header(tail)
+                .map_err(|source| ProofError::Header { offset, source })?
+                .ok_or(ProofError::CorruptPrefix {
+                    offset,
+                    reason: "incomplete published header",
+                })?;
+            if Some(header.metadata.seq) != seq.checked_add(1) {
+                return Err(ProofError::CorruptPrefix {
+                    offset,
+                    reason: "noncontiguous record sequence",
+                });
             }
-            tail = tail.get(header.frame_len()..)?;
+            tail = tail
+                .get(header.frame_len()..)
+                .ok_or(ProofError::CorruptPrefix {
+                    offset,
+                    reason: "incomplete published frame",
+                })?;
             seq = header.metadata.seq;
             newest = Some(header);
             ended_on_record = true;
         }
-        let header = newest?;
+        let header = newest.ok_or(ProofError::MismatchedProof)?;
         if !ended_on_record
             || seq != proof.durable_seq
             || header.identity != proof.frame_identity
             || header.metadata.writer_id != proof.writer_id
             || header.metadata.appended_ms != proof.appended_ms
         {
-            return None;
+            return Err(ProofError::MismatchedProof);
         }
-        Some(Self { proof, frames })
+        Ok(Some(Self { proof, frames }))
     }
 
+    /// The bound, not a billing-consumption receipt. Feature compatibility and
+    /// payload integrity are established only while fully consuming `frames`.
     pub fn head(&self) -> &HeadProof {
         &self.proof
     }
@@ -118,6 +193,7 @@ impl<'a> PublishedLog<'a> {
     }
 }
 
+#[must_use = "consume the complete bounded iterator before advancing billing progress"]
 pub struct PublishedFrames<'a, 'k> {
     tail: &'a [u8],
     known: &'k [&'k str],
@@ -228,19 +304,21 @@ mod tests {
             )
             .unwrap(),
         );
-        let published = PublishedLog::open(&log, &proof.encode()).unwrap();
+        let published = PublishedLog::open(&log, &proof.encode()).unwrap().unwrap();
         let frames: Vec<_> = published.frames(&["visibility-late/v1"]).collect();
         assert_eq!(frames.len(), 1);
         assert!(
             matches!(&frames[0], Ok(frame::DecodeStep::Frame(f)) if f.header.metadata.seq == 1)
         );
         for length in 0..PROOF_LEN {
-            assert!(PublishedLog::open(&log, &proof.encode()[..length]).is_none());
+            assert!(PublishedLog::open(&log, &proof.encode()[..length])
+                .unwrap()
+                .is_none());
         }
         for at in 0..PROOF_LEN {
             let mut torn = proof.encode();
             torn[at] ^= 1;
-            assert!(PublishedLog::open(&log, &torn).is_none());
+            assert!(PublishedLog::open(&log, &torn).unwrap().is_none());
         }
     }
 
@@ -258,11 +336,17 @@ mod tests {
                 5 => changed.appended_ms += 1,
                 _ => unreachable!(),
             }
-            assert!(PublishedLog::open(&log, &changed.encode()).is_none());
+            assert!(PublishedLog::open(&log, &changed.encode()).is_err());
         }
         let mut corrupt = log.clone();
         *corrupt.last_mut().unwrap() ^= 1;
-        assert!(PublishedLog::open(&corrupt, &proof.encode()).is_none());
+        let bounded = PublishedLog::open(&corrupt, &proof.encode())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            bounded.frames(&["visibility-late/v1"]).next(),
+            Some(Ok(frame::DecodeStep::PayloadCorrupt { .. }))
+        ));
         let mut gapped = log;
         let frame = frame::encode(
             frame::Metadata {
@@ -284,7 +368,7 @@ mod tests {
             appended_ms: 3000,
             ..proof
         };
-        assert!(PublishedLog::open(&gapped, &changed.encode()).is_none());
+        assert!(PublishedLog::open(&gapped, &changed.encode()).is_err());
     }
 
     #[test]
@@ -316,6 +400,7 @@ mod tests {
         assert_eq!(
             PublishedLog::open(&log, &proof.encode())
                 .unwrap()
+                .unwrap()
                 .frames(&["visibility-late/v1"])
                 .count(),
             2
@@ -326,7 +411,7 @@ mod tests {
             ..proof.clone()
         };
         assert!(
-            PublishedLog::open(&log, &past_record.encode()).is_none(),
+            PublishedLog::open(&log, &past_record.encode()).is_err(),
             "proof end must name a record, not metadata"
         );
         log[between + 53] ^= 1;
@@ -335,8 +420,96 @@ mod tests {
         hash.update(&log[between + 53..between + LINEAGE_LEN]);
         log[between + 21..between + 53].copy_from_slice(&hash.finalize());
         assert!(
-            PublishedLog::open(&log, &proof.encode()).is_none(),
+            PublishedLog::open(&log, &proof.encode()).is_err(),
             "even an intact conflicting lineage is refused"
         );
+    }
+
+    #[test]
+    fn unavailable_proof_is_distinct_from_covered_header_corruption() {
+        let (mut log, proof) = fixture();
+        assert!(PublishedLog::open(&log, &[]).unwrap().is_none());
+        log[LINEAGE_LEN + 5] ^= 1;
+        assert!(matches!(
+            PublishedLog::open(&log, &proof.encode()),
+            Err(ProofError::Header {
+                offset: LINEAGE_LEN,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unreadable_payload_evidence_is_bounded_and_iteration_continues() {
+        let (mut log, proof) = fixture();
+        let damaged_start = LINEAGE_LEN;
+        *log.last_mut().unwrap() ^= 1;
+        let damaged = log[damaged_start..].to_vec();
+        let second = frame::encode(
+            frame::Metadata {
+                seq: 2,
+                fence: 9,
+                appended_ms: 2000,
+                writer_id: [3; 16],
+            },
+            &[],
+            b"{}",
+        )
+        .unwrap();
+        let header = frame::decode_header(&second).unwrap().unwrap();
+        log.extend_from_slice(&second);
+        let proof = HeadProof {
+            durable_seq: 2,
+            durable_end: log.len() as u64,
+            frame_identity: header.identity,
+            appended_ms: 2000,
+            ..proof
+        };
+        log.extend_from_slice(&second);
+        let bounded = PublishedLog::open(&log, &proof.encode()).unwrap().unwrap();
+        let mut frames = bounded.frames(&["visibility-late/v1"]);
+        assert!(
+            matches!(frames.next(), Some(Ok(frame::DecodeStep::PayloadCorrupt { raw_frame, header, .. })) if raw_frame == damaged && header.metadata.seq == 1)
+        );
+        assert!(
+            matches!(frames.next(), Some(Ok(frame::DecodeStep::Frame(f))) if f.header.metadata.seq == 2)
+        );
+        assert!(
+            frames.next().is_none(),
+            "unpublished duplicate bytes remain outside the iterator"
+        );
+    }
+
+    #[test]
+    fn a_head_is_not_a_billing_consumption_receipt() {
+        let (mut log, proof) = fixture();
+        let second = frame::encode(
+            frame::Metadata {
+                seq: 2,
+                fence: 9,
+                appended_ms: 2000,
+                writer_id: [3; 16],
+            },
+            &["bill-new/v1"],
+            b"{}",
+        )
+        .unwrap();
+        let header = frame::decode_header(&second).unwrap().unwrap();
+        log.extend_from_slice(&second);
+        let proof = HeadProof {
+            durable_seq: 2,
+            durable_end: log.len() as u64,
+            frame_identity: header.identity,
+            appended_ms: 2000,
+            ..proof
+        };
+        let bounded = PublishedLog::open(&log, &proof.encode()).unwrap().unwrap();
+        assert_eq!(bounded.head().durable_seq, 2);
+        let mut frames = bounded.frames(&["visibility-late/v1"]);
+        assert!(frames.next().unwrap().is_ok());
+        assert!(
+            matches!(frames.next(), Some(Err(Error::NewerWriter { features })) if features == ["bill-new/v1"])
+        );
+        assert!(frames.next().is_none());
     }
 }

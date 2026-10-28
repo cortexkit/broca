@@ -432,6 +432,20 @@ fn state_root_of(root: &Path) -> PathBuf {
     }
 }
 
+#[cfg(unix)]
+fn same_wal_file(left: &Path, right: &Path) -> Result<bool, WalError> {
+    use std::os::unix::fs::MetadataExt;
+    let left = broca_wal::fs_ops::metadata(left).map_err(WalError::Io)?;
+    let right = broca_wal::fs_ops::metadata(right).map_err(WalError::Io)?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(not(unix))]
+fn same_wal_file(_left: &Path, _right: &Path) -> Result<bool, WalError> {
+    // Never guess file identity on platforms without a safe device/inode pair.
+    Ok(false)
+}
+
 impl FileWalStore {
     /// Count human prompts when an older episode has no recorded count, bounded by this
     /// store's byte limit and admission's durable head sequence. An earlier count includes
@@ -836,10 +850,19 @@ impl FileWalStore {
 
     fn resolve_live_address(&self, address: &str) -> Result<Option<PathBuf>, WalError> {
         let mut live: Option<PathBuf> = None;
+        let mut aliases = Vec::new();
         for root in [&self.root, &self.ephemeral_root(), &self.durable_root()] {
             let path = root.join(format!("{address}.wal"));
             if broca_wal::wal_file_exists(&path)? {
                 if let Some(prior) = live {
+                    if self.config.is_overhaul() && same_wal_file(&prior, &path)? {
+                        if aliases.is_empty() {
+                            aliases.push(prior.clone());
+                        }
+                        aliases.push(path);
+                        live = Some(prior);
+                        continue;
+                    }
                     return Err(WalError::Io(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
@@ -851,6 +874,12 @@ impl FileWalStore {
                 }
                 live = Some(path);
             }
+        }
+        if !aliases.is_empty() {
+            return Err(WalError::RelocationIncomplete {
+                paths: aliases,
+                cause: None,
+            });
         }
         Ok(live)
     }
@@ -984,6 +1013,15 @@ impl FileWalStore {
             return Err(WalError::StateRoot(refusal.clone()));
         }
         self.check_move(session, true)?;
+        if self.config.is_overhaul() {
+            if let extraction::RestoreAuthority::OwnedTenure { lease, .. } = &authority {
+                if lease.key() != &crate::lease::lease_key_for(session) {
+                    return Err(WalError::Io(io::Error::new(io::ErrorKind::PermissionDenied,
+                        "wal_relocation_incomplete: placement repair requires this session's owned tenure")));
+                }
+                self.finish_linked_placement(session, retention, session_class)?;
+            }
+        }
         let lookup = self.archived_member(session)?;
         let path = if let Some(member) = lookup.member {
             let path = if lookup.durable {
@@ -1101,6 +1139,93 @@ impl FileWalStore {
             }),
             retained,
         ))
+    }
+
+    /// Only an owned open may finish a cut link/unlink placement. Discovery
+    /// cannot choose a direction while another writer may still be relocating.
+    fn finish_linked_placement(
+        &self,
+        session: &BindIdentity,
+        retention: Option<u64>,
+        session_class: Option<&str>,
+    ) -> Result<(), WalError> {
+        let paths = [
+            self.wal_path(session),
+            self.ephemeral_wal_path(session),
+            self.durable_wal_path(session),
+        ];
+        let mut live = Vec::new();
+        for path in &paths {
+            if broca_wal::wal_file_exists(path)? {
+                live.push(path);
+            }
+        }
+        if live.len() < 2 {
+            return Ok(());
+        }
+        for path in &live[1..] {
+            if !same_wal_file(live[0], path)? {
+                return Err(WalError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "conflicting live WALs: {} and {}",
+                        live[0].display(),
+                        path.display()
+                    ),
+                )));
+            }
+        }
+        let records = broca_wal::replay_file(live[0], self.max_read_bytes)?;
+        if records.iter().any(|frame| {
+            !matches!(
+                frame.record,
+                WalRecord::WriterOpened { .. }
+                    | WalRecord::WriterClosed { .. }
+                    | WalRecord::VisibilityLate { .. }
+            )
+        }) {
+            return Err(WalError::Io(io::Error::new(io::ErrorKind::InvalidData,
+                "wal_relocation_incomplete: a started session cannot have a pending first-send placement")));
+        }
+        let destination = if retention.is_some() {
+            &paths[1]
+        } else if session_class
+            .is_some_and(|class| self.backup_classes.iter().any(|value| value == class))
+        {
+            &paths[2]
+        } else {
+            &paths[0]
+        };
+        let parent = destination.parent().expect("store WAL paths have a parent");
+        let incomplete_paths = live
+            .iter()
+            .map(|path| path.as_path().to_path_buf())
+            .collect();
+        let repair = || -> io::Result<()> {
+            if !live.contains(&destination) {
+                broca_wal::migration::durable_dir(parent.parent().unwrap_or(parent), parent)?;
+                broca_wal::fs_ops::hard_link(live[0], destination)?;
+            }
+            broca_wal::fs_ops::sync_dir(parent)?;
+            for source in live {
+                if source == destination {
+                    continue;
+                }
+                match broca_wal::fs_ops::remove_file(source) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                broca_wal::fs_ops::sync_dir(
+                    source.parent().expect("store WAL paths have a parent"),
+                )?;
+            }
+            Ok(())
+        };
+        repair().map_err(|error| WalError::RelocationIncomplete {
+            paths: incomplete_paths,
+            cause: Some(error.to_string()),
+        })
     }
 
     /// Resolve only after live absence: a live WAL is authoritative even when an archive
@@ -2093,13 +2218,16 @@ impl std::error::Error for WalWriteError {}
 
 /// Why a session WAL could not be opened, recovered and proven for writing.
 ///
-/// A WAL that a newer build wrote is kept apart from every other failure so the caller can
-/// refuse it by name. Its bytes are intact and nothing changes between retries; only a build
-/// that knows the missing features can open it. Every other cause keeps the plain
-/// [`WalWriteError`] it always had. Both variants render exactly the text a plain
-/// [`WalWriteError`] would, so a message or log line built from this error reads as before.
+/// Newer-writer refusals and interrupted placement stay typed: a caller can
+/// distinguish a missing capability from namespace work a session-owned open
+/// must finish. Other recovery/proof failures retain their [`WalWriteError`]
+/// display text; `SessionMoving` and `SessionMoved` keep their existing
+/// `session_moving` and `session_moved` display forms.
 #[derive(Debug, Clone)]
 pub enum WalOpenError {
+    RelocationIncomplete {
+        reason: String,
+    },
     SessionMoving {
         cut_id: String,
     },
@@ -2119,6 +2247,9 @@ impl WalOpenError {
     fn from_wal(error: WalError) -> Self {
         let text = WalWriteError::Failed(error.to_string());
         match error {
+            error @ WalError::RelocationIncomplete { .. } => Self::RelocationIncomplete {
+                reason: error.to_string(),
+            },
             WalError::SessionMoving { cut_id } => Self::SessionMoving { cut_id },
             WalError::SessionMoved { holder } => Self::SessionMoved { holder },
             WalError::NewerWriter { missing, .. } => WalOpenError::NewerWriter {
@@ -2133,6 +2264,7 @@ impl WalOpenError {
 impl std::fmt::Display for WalOpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            WalOpenError::RelocationIncomplete { reason } => f.write_str(reason),
             WalOpenError::SessionMoving { cut_id } => {
                 write!(f, "session_moving {{cutId: {cut_id}}}")
             }
@@ -2185,7 +2317,7 @@ impl StampClock {
         Self(Arc::new(broca_wal::framing::appended_ms_now))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-clock"))]
     pub(crate) fn from_fn(clock: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
         Self(Arc::new(clock))
     }
@@ -2587,6 +2719,28 @@ impl WalHandle {
         lease: Option<Box<dyn LeaseHandle>>,
         fs: Arc<dyn broca_wal::fs_ops::FsOps>,
     ) -> Result<WalHandle, WalWriteError> {
+        Self::spawn_in_store_with_fs_and_clock_for_test(
+            wal,
+            store,
+            session,
+            fence,
+            lease,
+            fs,
+            broca_wal::framing::appended_ms_now,
+        )
+    }
+
+    /// Drive the real writer with deterministic stamp time and filesystem stalls.
+    #[cfg(feature = "test-clock")]
+    pub fn spawn_in_store_with_fs_and_clock_for_test<W: WalStore>(
+        wal: Box<dyn Wal + Send>,
+        store: &W,
+        session: &BindIdentity,
+        fence: u64,
+        lease: Option<Box<dyn LeaseHandle>>,
+        fs: Arc<dyn broca_wal::fs_ops::FsOps>,
+        clock: impl Fn() -> u64 + Send + Sync + 'static,
+    ) -> Result<WalHandle, WalWriteError> {
         struct Restore(Option<Arc<dyn broca_wal::fs_ops::FsOps>>);
         impl Drop for Restore {
             fn drop(&mut self) {
@@ -2596,7 +2750,25 @@ impl WalHandle {
             }
         }
         let _restore = Restore(WRITER_FS_FOR_TEST.with(|slot| slot.replace(Some(fs))));
-        Self::spawn_in_store(wal, store, session, fence, lease)
+        if !wal.wal_config().is_overhaul() {
+            return Self::spawn_in_store(wal, store, session, fence, lease);
+        }
+        let fence = lease.as_ref().map_or(fence, |lease| lease.epoch());
+        let (wal, seq) = Self::prove_recovery(wal)?;
+        let context = store
+            .writer_marker_root()
+            .map(|root| open_writers::WriterContext {
+                root,
+                address: session_addr(session),
+            });
+        Self::spawn_proven_with_clock(
+            wal,
+            seq,
+            fence,
+            None,
+            lease,
+            (StampClock::from_fn(clock), context),
+        )
     }
 
     /// Open and prove a session WAL away from the async runtime, then start its writer thread.
@@ -2875,21 +3047,9 @@ impl WalHandle {
                     .into(),
             ));
         }
-        let publisher = if v4 {
-            let path = wal.log_path().ok_or(WalWriteError::ProofPathUnavailable)?;
-            let lineage = wal.lineage_id().ok_or_else(|| {
-                WalWriteError::Failed(
-                    "visibility-late/v1: overhaul WAL has no lineage for its durable-head proof"
-                        .into(),
-                )
-            })?;
-            Some(broca_wal::head_proof::Publisher::new(
-                path.to_path_buf(),
-                lineage,
-            ))
-        } else {
-            None
-        };
+        if v4 && wal.log_path().is_none() {
+            return Err(WalWriteError::ProofPathUnavailable);
+        }
         // Lifecycle records do not start a conversation. A warmed writer-only log still needs
         // the same first-send placement, retention and runner-tag state as an empty log.
         let unstarted = last_seq == 0
@@ -2955,7 +3115,7 @@ impl WalHandle {
                 .as_mut()
                 .expect("writer owner holds its WAL during startup");
             let mut publication = Publication {
-                publisher,
+                publisher: None,
                 sequence: Some(writer_sequence),
                 deferred: Default::default(),
                 fence,
@@ -2965,9 +3125,14 @@ impl WalHandle {
             let writer = if let Some(context) = context {
                 let address = context.address.clone();
                 match context.open(&mut **wal, fence, || clock.now_ms()) {
-                    Ok((writer, seq, record)) => {
+                    Ok((writer, seq, record, synced)) => {
                         let mut pending = vec![(seq, Box::new(record))];
-                        let opened = publication.sync(&mut **wal, &rx, &mut pending);
+                        let opened = broca_wal::head_proof::Publisher::from_synced(synced)
+                            .map_err(|error| error.to_string())
+                            .and_then(|publisher| {
+                                publication.publisher = Some(publisher);
+                                publication.publish_synced(&mut **wal, &rx, &mut pending)
+                            });
                         if let Err(error) = opened {
                             let _ = ready_tx.send(Err(WalWriteError::Failed(error)));
                             let (wal, lease) = owner.into_parts();
@@ -2975,6 +3140,7 @@ impl WalHandle {
                             return lease;
                         }
                         writer_durable_head.store(wal.last_seq(), Ordering::Release);
+                        *writer_lineage_id.lock().unwrap() = wal.lineage_id();
                         if let Some(obs) = &observer {
                             for (seq, record) in pending {
                                 obs.observe(seq, fence, &record, wal.lineage_id());
@@ -3850,14 +4016,30 @@ impl Publication {
         let Some(publisher) = &mut self.publisher else {
             return wal.sync().map_err(|error| error.to_string());
         };
+        publisher.sync(wal).map_err(|error| error.to_string())?;
+        self.publish_synced(wal, rx, pending)
+    }
+
+    fn publish_synced(
+        &mut self,
+        wal: &mut dyn Wal,
+        rx: &std_mpsc::Receiver<WalCommand>,
+        pending: &mut Vec<(u64, Box<WalRecord>)>,
+    ) -> Result<(), String> {
+        let publisher = self
+            .publisher
+            .as_mut()
+            .expect("only overhaul writers publish proofs");
         loop {
-            publisher.sync(wal).map_err(|error| error.to_string())?;
-            let now = self.clock.now_ms();
-            let Some((through_seq, oldest_appended_ms)) = publisher.late(now) else {
-                if publisher.publish(now).map_err(|error| error.to_string())? {
-                    return Ok(());
-                }
-                continue;
+            let (through_seq, oldest_appended_ms) = match publisher
+                .publish(|| self.clock.now_ms())
+                .map_err(|error| error.to_string())?
+            {
+                broca_wal::head_proof::PublicationStatus::Published => return Ok(()),
+                broca_wal::head_proof::PublicationStatus::Late {
+                    through_seq,
+                    oldest_appended_ms,
+                } => (through_seq, oldest_appended_ms),
             };
             let record = WalRecord::VisibilityLate {
                 through_seq,
@@ -3911,6 +4093,7 @@ impl Publication {
                 crate::durability_counters::FsyncCause::Barrier,
                 self.fence,
             );
+            publisher.sync(wal).map_err(|error| error.to_string())?;
         }
     }
 }
@@ -4308,17 +4491,21 @@ fn close_writer_identity(
     publisher: Option<&mut broca_wal::head_proof::Publisher>,
 ) -> Result<(), String> {
     if let Some(writer) = writer {
-        let (seq, record) = writer
+        let (seq, record, synced) = writer
             .close(wal, fence, clock.now_ms())
             .map_err(|error| format!("writer-id/v1: cannot close writer: {error}"))?;
         let published = if let Some(publisher) = publisher {
-            publisher.sync(wal).map_err(|error| error.to_string())?;
-            // Closing forbids further appends. If its sync was late, leave the
-            // close unpublished for the next writer_opened rather than append again.
             publisher
-                .publish(clock.now_ms())
-                .map_err(|error| error.to_string())?
+                .scan_synced(synced)
+                .map_err(|error| error.to_string())?;
+            // A durable close forbids further appends. Retain its marker on any
+            // late exposure so reclaim or the next opener publishes a successor.
+            match publisher.publish(|| clock.now_ms()).map_err(|error| error.to_string())? {
+                broca_wal::head_proof::PublicationStatus::Published => true,
+                broca_wal::head_proof::PublicationStatus::Late { .. } => return Err("visibility-late/v1: late_close_publication; retained open-writer marker requires a successor".into()),
+            }
         } else {
+            let _ = synced;
             true
         };
         if published {
@@ -5444,7 +5631,11 @@ mod head_proof_tests {
             prepared: broca_wal::PreparedV4Frame,
             at: u64,
         ) -> Result<u64, WalError> {
-            self.inner.append_v4(fence, record, sync, prepared, at)
+            let seq = self.inner.append_v4(fence, record, false, prepared, at)?;
+            if sync {
+                self.sync()?;
+            }
+            Ok(seq)
         }
         fn sync(&self) -> Result<(), WalError> {
             self.inner.sync()?;
@@ -5617,7 +5808,14 @@ mod head_proof_tests {
         let handle = timed_handle(&root, &session, now, stalls.clone());
         let head = handle.durable_head();
         stalls.store(1, Ordering::SeqCst);
-        handle.shutdown().await.unwrap();
+        let error = handle.shutdown().await.unwrap_err();
+        assert!(error.to_string().contains("late_close_publication"));
+        assert_eq!(
+            std::fs::read_dir(root.0.join("open-writers"))
+                .unwrap()
+                .count(),
+            1
+        );
         let path = root.store().wal_path(&session);
         let proof = HeadProof::decode(&std::fs::read(sidecar_path(&path)).unwrap()).unwrap();
         assert_eq!(proof.durable_seq, 1);
@@ -5709,7 +5907,7 @@ mod head_proof_tests {
         assert_eq!(later_rx.await.unwrap().unwrap(), 4);
         let bytes = std::fs::read(&path).unwrap();
         let sidecar = std::fs::read(sidecar_path(&path)).unwrap();
-        let published = PublishedLog::open(&bytes, &sidecar).unwrap();
+        let published = PublishedLog::open(&bytes, &sidecar).unwrap().unwrap();
         assert_eq!(published.head().durable_seq, 4);
         assert_eq!(published.head().appended_ms, 71_000);
         let records = store.read_records(&session).unwrap();
@@ -5746,7 +5944,7 @@ mod head_proof_tests {
                 .unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let sidecar = std::fs::read(sidecar_path(&path)).unwrap();
-        let published = PublishedLog::open(&bytes, &sidecar).unwrap();
+        let published = PublishedLog::open(&bytes, &sidecar).unwrap().unwrap();
         assert_eq!(published.head().durable_seq, 2);
         assert!(published.head().appended_ms > 1);
         assert!(matches!(
@@ -5782,6 +5980,6 @@ mod head_proof_tests {
         assert!(!sidecar_path(&source).exists());
         let bytes = std::fs::read(&destination).unwrap();
         let sidecar = std::fs::read(sidecar_path(&destination)).unwrap();
-        assert!(PublishedLog::open(&bytes, &sidecar).is_some());
+        assert!(PublishedLog::open(&bytes, &sidecar).unwrap().is_some());
     }
 }

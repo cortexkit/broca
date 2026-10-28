@@ -357,10 +357,10 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
                     }
                     let deleting = if let Some(service) = registry.retention_service() {
                         let session = key.clone();
-                        tokio::task::spawn_blocking(move || service.expired(&session, None))
+                        tokio::task::spawn_blocking(move || service.expired_typed(&session, None))
                             .await
                             .map_err(|error| OpenError::Open(error.to_string()))?
-                            .map_err(OpenError::Open)?
+                            .map_err(OpenError::from_retention)?
                             .is_some()
                     } else {
                         false
@@ -406,6 +406,24 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
         // Moving the lease into recovery prevents cancellation from releasing it while
         // deletion or admission validation still touches this address.
         let authority = tokio::task::spawn_blocking(move || {
+            if wal.wal_config().is_overhaul() {
+                if let Some(service) = &service {
+                    if let Err(
+                        error @ crate::retention::RetentionReadError::RelocationIncomplete {
+                            ..
+                        },
+                    ) = service.live_path_for_retention(&session)
+                    {
+                        // Retention must not act on an unfinished placement. The
+                        // owned writer open verifies it is unstarted and repairs
+                        // it under this tenure before exposing any session state.
+                        return match &authority {
+                            OpenAuthority::Tenure(_) => Ok(authority),
+                            OpenAuthority::Lease(_) => Err(OpenError::from_retention(error)),
+                        };
+                    }
+                }
+            }
             if status && service.is_some() {
                 let meta = store
                     .as_ref()
@@ -432,8 +450,9 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
                 };
                 if retained || wal.wal_present(&session) == Some(false) {
                     if let Some(service) = &service {
-                        if let Some(expired_at_ms) =
-                            service.expired(&session, None).map_err(OpenError::Open)?
+                        if let Some(expired_at_ms) = service
+                            .expired_typed(&session, None)
+                            .map_err(OpenError::from_retention)?
                         {
                             return Err(OpenError::Expired { expired_at_ms });
                         }
@@ -445,8 +464,8 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
                 }
             } else if let Some(service) = service {
                 service
-                    .delete_expired(&session, service.clock.now_ms())
-                    .map_err(OpenError::Open)?;
+                    .delete_expired_typed(&session, service.clock.now_ms())
+                    .map_err(OpenError::from_retention)?;
             } else if retention.is_some() {
                 return Err(OpenError::Open(
                     "retention service is not configured".into(),
@@ -493,19 +512,7 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
         //    returns no handle, and the registry cannot publish an Open slot. An owned tenure is
         //    consumed by the open and kept by the writer task; a bare lease comes back for the
         //    actor to hold.
-        let map_open_error = |error: broca_core::WalOpenError| match error {
-            broca_core::WalOpenError::SessionMoving { cut_id } => {
-                OpenError::SessionMoving { cut_id }
-            }
-            broca_core::WalOpenError::SessionMoved { holder } => OpenError::SessionMoved { holder },
-            broca_core::WalOpenError::NewerWriter { missing, error } => OpenError::NewerWriter {
-                missing,
-                reason: error.to_string(),
-            },
-            // WalWriteError erases I/O and recovery/proof causes; corruption cannot be
-            // retried away, so do not classify this opaque write/open failure as transient.
-            broca_core::WalOpenError::Failed(error) => OpenError::Open(error.to_string()),
-        };
+        let map_open_error = OpenError::from_wal_open;
         let (writer, lease) = match authority {
             OpenAuthority::Lease(lease) => {
                 let (writer, lease) = WalHandle::open_and_spawn_observed_with_class(
