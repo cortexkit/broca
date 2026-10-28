@@ -188,19 +188,41 @@ fn path_of(choice: &AccountChoice) -> &str {
 // ---- admission ------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn account_selection_disabled_is_a_permanent_refusal_without_fallback() {
-    let routing = FakeRouting::refusing(SELECTION_DISABLED, json!({ "code": SELECTION_DISABLED }));
+async fn account_selection_disabled_keeps_the_static_credential() {
+    let routing = FakeRouting::refusing(
+        SELECTION_DISABLED,
+        json!({ "code": SELECTION_DISABLED, "decision_id": "acd-disabled" }),
+    );
     let client = client(&routing);
-    let ChoiceRefusal::Refused(refusal) =
-        choose(&client, "oauth:anthropic", false, Some(two_accounts()))
-            .await
-            .unwrap_err()
+    let (choice, events) = broca_test_support::capture_logs(choose(
+        &client,
+        "oauth:anthropic",
+        false,
+        Some(two_accounts()),
+    ))
+    .await;
+    let AccountChoice::Static(decision) =
+        choice.expect("the operator off-switch keeps the static account fallback")
     else {
-        panic!("routing answered a refusal")
+        panic!("selection off must retain the static credential")
     };
-    assert_eq!(refusal.routing_code, SELECTION_DISABLED);
-    assert_eq!(refusal.class, ErrorClass::Permanent);
+    assert_eq!(decision.path, broca_wal::ACCOUNT_DECISION_DISABLED);
+    assert_eq!(decision.admission_id.as_deref(), Some("run-1"));
+    assert_eq!(decision.decision_id.as_deref(), Some("acd-disabled"));
     assert_eq!(routing.methods(), vec![ACCOUNT_FOR_OP]);
+    assert_eq!(client.counters.get("disabled"), 1);
+    assert_eq!(client.counters.get("refused"), 0);
+    let event = events
+        .iter()
+        .find(|event| {
+            event.fields.get("routing_code").map(String::as_str) == Some(SELECTION_DISABLED)
+        })
+        .expect("the static fallback log preserves routing's code");
+    assert_eq!(event.target, "routing");
+    assert_eq!(
+        event.fields.get("decision_id").map(String::as_str),
+        Some("acd-disabled")
+    );
 }
 
 /// Routing being down refuses the send, typed and transient, instead of admitting it on an
@@ -678,18 +700,21 @@ async fn two_admissions_of_the_same_send_send_the_same_admission_id() {
 }
 
 #[tokio::test]
-async fn an_undeclared_unsupported_code_is_a_transient_refusal_not_a_fallback() {
-    let routing = FakeRouting::refusing("account_selection_unsupported", json!({}));
-    let client = client(&routing);
-    let ChoiceRefusal::Refused(refusal) =
-        choose(&client, "oauth:anthropic", false, Some(two_accounts()))
-            .await
-            .unwrap_err()
-    else {
-        panic!("routing answered a refusal")
-    };
-    assert_eq!(refusal.routing_code, "account_selection_unsupported");
-    assert_eq!(refusal.class, ErrorClass::Transient);
+async fn undeclared_disabled_and_unsupported_codes_are_refusals_not_fallbacks() {
+    for code in ["disabled", "unsupported", "account_selection_unsupported"] {
+        let routing = FakeRouting::refusing(code, json!({}));
+        let client = client(&routing);
+        let ChoiceRefusal::Refused(refusal) =
+            choose(&client, "oauth:anthropic", false, Some(two_accounts()))
+                .await
+                .unwrap_err()
+        else {
+            panic!("routing answered a refusal")
+        };
+        assert_eq!(refusal.routing_code, code);
+        assert_eq!(refusal.class, ErrorClass::Transient);
+        assert_eq!(client.counters.get("disabled"), 0);
+    }
 }
 
 #[tokio::test]
@@ -904,11 +929,24 @@ fn published_and_deployed_refusal_classes_are_mapped_by_name() {
         "unknown_decision",
         "admission_conflict",
         "unscoped_caller",
-        "account_selection_disabled",
+        "account_not_authorized",
     ] {
         assert_eq!(classify_refusal(code), ErrorClass::Permanent, "{code}");
     }
-    assert_eq!(classify_refusal("account_not_authorized"), ErrorClass::Auth);
+    assert_eq!(classify_refusal(AUTH_REQUIRED), ErrorClass::Auth);
+    let outcome = classify_account_for_reply(Err(serde_json::to_vec(&json!({
+        "code": SELECTION_DISABLED,
+        "message": "account selection is switched off",
+        "detail": { "decision_id": "acd-off" },
+    }))
+    .unwrap()));
+    assert_eq!(outcome.kind(), SELECTION_DISABLED);
+    assert_eq!(
+        outcome,
+        AccountForOutcome::SelectionDisabled {
+            decision_id: Some("acd-off".into())
+        }
+    );
 }
 
 fn assert_hold_timing(detail: Value, reset: Option<u64>, wait: Option<u64>) {
@@ -1008,13 +1046,10 @@ async fn account_selection_unavailable_is_refused_transient_not_a_fallback() {
 }
 
 #[tokio::test]
-async fn account_not_authorized_is_refused_auth_required() {
+async fn account_not_authorized_is_refused_permanent_with_its_code_and_detail() {
     assert_eq!(
         refusal_for("account_not_authorized").await,
-        AccountSelectionRefusal {
-            class: ErrorClass::Auth,
-            ..transient("account_not_authorized")
-        }
+        permanent("account_not_authorized")
     );
 }
 

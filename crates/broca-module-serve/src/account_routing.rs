@@ -391,6 +391,8 @@ pub enum AccountForOutcome {
     },
     /// `auth_required`: every remaining candidate needs a fresh login.
     AuthRequired { decision_id: Option<String> },
+    /// Only `account_selection_disabled` enables the configured static credential fallback.
+    SelectionDisabled { decision_id: Option<String> },
     /// Any refusal broca passes on to the caller.
     Refused(AccountSelectionRefusal),
     /// Routing did not return a decision before the admission budget expired.
@@ -405,6 +407,7 @@ impl AccountForOutcome {
         match self {
             AccountForOutcome::Chosen { .. } => "chosen",
             AccountForOutcome::AuthRequired { .. } => "auth_required",
+            AccountForOutcome::SelectionDisabled { .. } => SELECTION_DISABLED,
             AccountForOutcome::Refused(refusal) => &refusal.routing_code,
             AccountForOutcome::NoDecisionWithinBudget => "no_decision_within_budget",
             AccountForOutcome::Unreachable(_) => "unreachable",
@@ -413,7 +416,8 @@ impl AccountForOutcome {
 }
 
 /// Known refusal classes are pinned by name; a new routing code is a transient refusal, not
-/// evidence of a failed transport. Auth-required is handled earlier by the login pause path.
+/// evidence of a failed transport. Login pauses and the module off-switch are handled before
+/// refusal classification.
 pub fn classify_refusal(code: &str) -> ErrorClass {
     match code {
         "account_hold"
@@ -425,9 +429,12 @@ pub fn classify_refusal(code: &str) -> ErrorClass {
         | "pin_generation_conflict"
         | "store_error"
         | "internal_error" => ErrorClass::Transient,
-        AUTH_REQUIRED | ACCOUNT_NOT_AUTHORIZED => ErrorClass::Auth,
-        "admission_conflict" | "invalid_request" | "unknown_decision" | "unscoped_caller"
-        | SELECTION_DISABLED => ErrorClass::Permanent,
+        AUTH_REQUIRED => ErrorClass::Auth,
+        "admission_conflict"
+        | "invalid_request"
+        | "unknown_decision"
+        | "unscoped_caller"
+        | ACCOUNT_NOT_AUTHORIZED => ErrorClass::Permanent,
         _ => ErrorClass::Transient,
     }
 }
@@ -480,6 +487,7 @@ pub fn classify_account_for_reply(reply: Result<Vec<u8>, Vec<u8>>) -> AccountFor
             let decision_id = detail["decision_id"].as_str().map(str::to_string);
             match error.code.as_str() {
                 AUTH_REQUIRED => AccountForOutcome::AuthRequired { decision_id },
+                SELECTION_DISABLED => AccountForOutcome::SelectionDisabled { decision_id },
                 code => {
                     let resets_at_ms = if code == "account_hold" {
                         detail["until_ms"].as_u64()
@@ -1052,6 +1060,24 @@ where
             client.counters.bump("auth_required");
             Ok(AccountChoice::AuthRequired(decision(
                 broca_wal::ACCOUNT_DECISION_AUTH_REQUIRED,
+                Some(admission),
+                decision_id,
+            )))
+        }
+        AccountForOutcome::SelectionDisabled { decision_id } => {
+            client.counters.bump("disabled");
+            tracing::info!(
+                target: "routing",
+                session = %broca_core::session_addr(inputs.session),
+                send_id = inputs.send_id.unwrap_or("<none>"),
+                provider = %provider,
+                auth_method = method.as_token(),
+                routing_code = SELECTION_DISABLED,
+                decision_id = decision_id.as_deref().unwrap_or("<none>"),
+                "routing account selection is switched off; using the static credential"
+            );
+            Ok(AccountChoice::Static(decision(
+                broca_wal::ACCOUNT_DECISION_DISABLED,
                 Some(admission),
                 decision_id,
             )))

@@ -2143,11 +2143,6 @@ async fn routing_refusals_keep_their_code_and_pool_limits_are_account_limits() {
             "transient",
         ),
         (
-            "account_selection_disabled",
-            "account_selection_refused",
-            "permanent",
-        ),
-        (
             "account_pool_reserve_limited",
             "account_limit_exhausted",
             "transient",
@@ -2162,11 +2157,6 @@ async fn routing_refusals_keep_their_code_and_pool_limits_are_account_limits() {
             "account_quota_unknown",
             "account_limit_exhausted",
             "transient",
-        ),
-        (
-            "account_not_authorized",
-            "account_selection_refused",
-            "auth_required",
         ),
         (
             "route_state_unavailable",
@@ -2190,6 +2180,82 @@ async fn routing_refusals_keep_their_code_and_pool_limits_are_account_limits() {
         assert!(!error.to_string().contains("unreachable"));
         assert!(!error.to_string().contains("could not be reached"));
     }
+    let root = rig.root.clone();
+    drop(rig);
+    broca_test_support::remove_rig_dir(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_selection_disabled_admits_the_send_on_the_static_credential() {
+    let Some(rig) = Rig::start().await else {
+        return;
+    };
+    rig.routing.set(RoutingMode::Refuse {
+        code: "account_selection_disabled",
+        retry_after_s: None,
+    });
+    let client = rig.client("selection-disabled").await;
+    let run_id = send(&client, "send-selection-disabled", None).await;
+    let frames = rig.finished("selection-disabled").await;
+    let chosen = selection(&frames);
+    assert_eq!(chosen["credential_id"], "oauth:anthropic");
+    assert_eq!(
+        chosen["account_decision"],
+        json!({
+            "conversation_key": session_affinity(&frames),
+            "conversation_key_source": "session",
+            "path": "disabled",
+            "admission_id": run_id,
+            "decision_id": "acd-refused",
+        })
+    );
+    assert_eq!(rig.routing.account_for_count(&run_id), 1);
+    assert_eq!(
+        rig.vault.scoped_reads().last().map(String::as_str),
+        Some("oauth:anthropic")
+    );
+    assert_eq!(
+        rig.upstream
+            .authorized_as
+            .lock()
+            .unwrap()
+            .last()
+            .map(String::as_str),
+        Some("oauth:anthropic"),
+        "the admitted send uses the static account's token"
+    );
+    let root = rig.root.clone();
+    drop(rig);
+    broca_test_support::remove_rig_dir(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_not_authorized_refuses_permanently_without_pausing_or_writing() {
+    let Some(rig) = Rig::start().await else {
+        return;
+    };
+    rig.routing.set(RoutingMode::Refuse {
+        code: "account_not_authorized",
+        retry_after_s: Some(1260),
+    });
+    let (error, _) = rig
+        .refused_send("not-authorized", "send-not-authorized")
+        .await;
+    assert_eq!(error["code"], "account_selection_refused");
+    assert_eq!(error["detail"]["class"], "permanent");
+    assert_eq!(error["detail"]["routing_code"], "account_not_authorized");
+    assert_eq!(
+        error["detail"]["routing_detail"],
+        json!({
+            "code": "account_not_authorized",
+            "retry_after_s": 1260,
+            "decision_id": "acd-refused",
+            "exclusions": [],
+        })
+    );
+    assert!(rig.frames("not-authorized").is_empty());
+    assert!(rig.vault.scoped_reads().is_empty());
+    assert!(rig.upstream.authorized_as.lock().unwrap().is_empty());
     let root = rig.root.clone();
     drop(rig);
     broca_test_support::remove_rig_dir(root);

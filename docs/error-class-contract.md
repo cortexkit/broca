@@ -180,9 +180,10 @@ broca specifics:
   `account_hold`, `account_pool_exhausted`, `account_pool_reserve_limited`,
   `account_quota_unknown`, `no_eligible_account`, `account_selection_unavailable`,
   `pin_generation_conflict`, `store_error` and `internal_error`, with `retry_after_secs` set
-  from routing's wait when it gave one; `auth_required` for `account_not_authorized`, and
-  `permanent` for `admission_conflict`, `invalid_request`, `unknown_decision`,
-  `unscoped_caller` and `account_selection_disabled`. Unknown refusal codes remain verbatim and transient,
+  from routing's wait when it gave one; `permanent` for `admission_conflict`, `invalid_request`,
+  `unknown_decision`, `unscoped_caller` and `account_not_authorized`. An authorization refusal
+  means operator policy excludes the request's credentials; logging in cannot fix it.
+  Unknown refusal codes remain verbatim and transient,
   never `routing_unavailable`. Pool exhaustion, reserve limits, account holds and unknown quota use `account_limit_exhausted`
   instead of `account_selection_refused`, so callers wait or reroute rather than hot-retrying.
   Routing's `reset_at_ms` is carried as `resets_at_ms`; when no wait was supplied it also yields a
@@ -190,7 +191,12 @@ broca specifics:
   milliseconds), then legacy `retry_after_s` (seconds); legacy `reset_at` is retained only
   in the original detail and is never parsed. A hold with neither timing field stays untimed.
   `auth_required` retains the admit-and-pause-for-login path, with its routing code in the
-  paused run's `auth.routing_code`. Callers branch on structured fields,
+  paused run's `auth.routing_code`. `account_selection_disabled` is the routing operator's
+  module-wide off-switch: that answer admits the send on the configured static credential,
+  records an account decision with path `disabled`, and logs the literal routing code
+  `account_selection_disabled`. It is not an account or provider refusal. The undeclared aliases
+  `disabled` and `unsupported` do not enable this fallback.
+  Callers branch on structured fields,
   never on the message. The bodies are pinned by
   `crates/broca-wire/tests/golden/account_selection_refused.*.json`.
 

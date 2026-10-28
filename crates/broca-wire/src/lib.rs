@@ -3685,8 +3685,9 @@ pub struct AccountSelectionRefusedDetail {
     pub routing_code: String,
     /// `transient` when retrying the same send later may be admitted (an account hold, an
     /// exhausted or reserve-limited pool, unknown quota, a stale roster), `permanent` when it
-    /// cannot without someone acting first (a request routing rejected as malformed or
-    /// conflicting), and `auth_required` when the account is not authorized.
+    /// cannot without someone acting first (a malformed or conflicting request, or an operator
+    /// policy exclusion). Routing's `auth_required` answer admits a run to pause for login
+    /// instead of returning this refusal.
     pub class: broca_protocol::OpenErrorClass,
     /// The preferred wait in seconds, from routing's deadline or its `retry_after_s`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
