@@ -146,6 +146,8 @@ fn attempt_progress_fields_roundtrip_without_a_reader_feature() {
 /// The wire tag of each record kind. Exhaustive on purpose: see the module comment.
 fn tag_of(record: &WalRecord) -> &'static str {
     match record {
+        WalRecord::WriterOpened { .. } => "writer_opened",
+        WalRecord::WriterClosed { .. } => "writer_closed",
         WalRecord::RunStarted { .. } => "run_started",
         WalRecord::ModelStepFinished { .. } => "model_step_finished",
         WalRecord::ModelStepRefused { .. } => "model_step_refused",
@@ -202,6 +204,21 @@ fn tag_of(record: &WalRecord) -> &'static str {
 
 /// Every record kind this build writes, each with its optional fields both present and absent
 /// where it has any. `Unknown` is absent because it can never be written.
+const WRITER_ID_PINNED: &[&str] = &[
+    r#"{"type":"writer_opened","writer_id":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"recovered_through_seq":0,"cause":"new"}"#,
+    r#"{"type":"writer_opened","writer_id":[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],"previous_writer_id":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"recovered_through_seq":5,"cause":"reopen"}"#,
+    r#"{"type":"writer_closed","writer_id":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]}"#,
+];
+
+#[test]
+fn writer_id_records_keep_their_bytes_and_require_writer_id() {
+    for bytes in WRITER_ID_PINNED {
+        let record: WalRecord = serde_json::from_str(bytes).unwrap();
+        assert_eq!(record.required_features(), ["writer-id/v1"]);
+        assert_eq!(serde_json::to_string(&record).unwrap(), *bytes);
+    }
+}
+
 const PINNED: &[&str] = &[
     r#"{"type":"run_started","run_id":"run-7","session":{"project_root":"/tmp/project","harness":"runner","session":"session"},"project_id":"pj-a","principal":{"kind":"direct"},"ts_ms":1790000000000,"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"origin":{"kind":"fresh"},"submission_id":"sub-run-7"}"#,
     r#"{"type":"run_started","run_id":"run-7","session":{"project_root":"/tmp/project","harness":"runner","session":"session"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"origin":{"kind":"fresh"}}"#,
@@ -715,6 +732,7 @@ fn the_pinned_bytes_cover_every_record_kind() {
         .chain(RIDE_WAIT_PINNED.iter().copied())
         .chain(FALLBACK_PINNED.iter().map(|(bytes, _)| *bytes))
         .chain(OUTPUT_RESERVATION_PINNED.iter().copied())
+        .chain(WRITER_ID_PINNED.iter().copied())
         .map(|bytes| tag_of(&serde_json::from_str::<WalRecord>(bytes).unwrap()))
         .collect();
     // The tag of every arm of the exhaustive `tag_of` except `WalRecord::Unknown`, the
@@ -722,6 +740,8 @@ fn the_pinned_bytes_cover_every_record_kind() {
     // compiling; whoever adds its arm must add its tag here too, and this assertion then fails
     // until `PINNED` holds bytes for it.
     let every_kind = [
+        "writer_opened",
+        "writer_closed",
         "run_started",
         "model_step_finished",
         "model_step_refused",

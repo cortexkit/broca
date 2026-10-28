@@ -132,7 +132,17 @@ impl AdmissionWal {
             admission =
                 record_candidate(index.as_deref(), &self.state_root, &self.address, session)
                     .map_err(|error| WalError::Io(std::io::Error::other(error)))?;
-            if self.wal.last_seq() == 0 {
+            let unstarted = if self.wal.wal_config().is_overhaul() {
+                self.wal.replay()?.iter().all(|frame| {
+                    matches!(
+                        frame.record,
+                        WalRecord::WriterOpened { .. } | WalRecord::WriterClosed { .. }
+                    )
+                })
+            } else {
+                self.wal.last_seq() == 0
+            };
+            if unstarted {
                 if let Some((ordinary, ephemeral, durable, classes)) = &self.placement {
                     let path = if retention.is_some() {
                         ephemeral
@@ -154,6 +164,9 @@ impl AdmissionWal {
 }
 
 impl Wal for AdmissionWal {
+    fn writer_id(&self) -> Option<[u8; 16]> {
+        self.wal.writer_id()
+    }
     fn append(&mut self, fence: u64, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
         let _projection_admission = self.before_append(record)?;
         self.wal.append(fence, record, sync)

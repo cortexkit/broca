@@ -470,6 +470,11 @@ pub trait Wal {
         WalConfig::LEGACY
     }
 
+    /// The random identity minted by this overhaul WAL open; never supplied by a caller.
+    fn writer_id(&self) -> Option<[u8; 16]> {
+        None
+    }
+
     /// Append `record` as the version 4 frame `prepared` (built from that same record), stamped
     /// with `appended_ms`, which the caller samples on the thread that calls this, immediately
     /// before the call. The log fills in the sequence, fence and its own `writer_id`, and raises
@@ -685,7 +690,14 @@ impl FileWal {
         if self.path == destination {
             return Ok(());
         }
-        if self.next_seq != 1 {
+        let only_writer_records = self.config.is_overhaul()
+            && self.replay()?.iter().all(|frame| {
+                matches!(
+                    frame.record,
+                    WalRecord::WriterOpened { .. } | WalRecord::WriterClosed { .. }
+                )
+            });
+        if self.next_seq != 1 && !only_writer_records {
             return Err(WalError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "cannot relocate a started session WAL",
@@ -1271,6 +1283,9 @@ impl FileWal {
 }
 
 impl Wal for FileWal {
+    fn writer_id(&self) -> Option<[u8; 16]> {
+        self.writer_id
+    }
     fn append(&mut self, fence: u64, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
         self.append_frame(fence, record, sync, FrameSource::Encode)
     }

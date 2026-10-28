@@ -3017,7 +3017,9 @@ fn replay_seeded_with_compaction<'a>(
             // A record type written by a newer build. By the contract on `WalRecord`, such a
             // record is informational only, so it contributes nothing to the prompt or the
             // episode state: replay is identical to the same WAL without it.
-            WalRecord::Unknown => {}
+            WalRecord::WriterOpened { .. }
+            | WalRecord::WriterClosed { .. }
+            | WalRecord::Unknown => {}
             // Compaction is folded separately above; the transcript remains append-only.
             WalRecord::CompactionRequest { .. }
             | WalRecord::CompactionMessage { .. }
@@ -4127,6 +4129,78 @@ pub(crate) mod projection_boundary_tests {
             seq,
             fence: 1,
             record,
+        }
+    }
+
+    #[test]
+    fn writer_records_alone_create_no_projection_episode_or_boundary() {
+        let records = [
+            framed(
+                1,
+                WalRecord::WriterOpened {
+                    writer_id: [1; 16],
+                    previous_writer_id: None,
+                    recovered_through_seq: 0,
+                    cause: "new".into(),
+                },
+            ),
+            framed(2, WalRecord::WriterClosed { writer_id: [1; 16] }),
+        ];
+        let mut state = crate::projection_plan::ProjectionBoundaryState::default();
+        let empty = serde_json::to_value(&state).unwrap();
+        for frame in &records {
+            assert!(state.observe(frame).is_empty());
+        }
+        assert_eq!(serde_json::to_value(&state).unwrap(), empty);
+        assert_eq!(latest_projection_boundary(&records, 0), None);
+    }
+
+    #[test]
+    fn writer_records_anywhere_preserve_projection_boundaries_and_episode_indexes() {
+        let records = vec![
+            run_started(10, "one"),
+            no_tool_step(20, 1),
+            run_finished(30),
+            run_started(40, "two"),
+            turn_finished(50, 1),
+            run_finished(60),
+        ];
+        let facts = |records: &[FramedRecord]| {
+            let mut state = crate::projection_plan::ProjectionBoundaryState::default();
+            let facts: Vec<_> = records
+                .iter()
+                .flat_map(|frame| state.observe(frame))
+                .collect();
+            (
+                serde_json::to_value(facts).unwrap(),
+                serde_json::to_value(state).unwrap(),
+            )
+        };
+        for position in 0..=records.len() {
+            let seq = position as u64 * 10 + 1;
+            let mut with_writers = records.clone();
+            with_writers.splice(
+                position..position,
+                [
+                    framed(
+                        seq,
+                        WalRecord::WriterOpened {
+                            writer_id: [1; 16],
+                            previous_writer_id: None,
+                            recovered_through_seq: seq - 1,
+                            cause: "new".into(),
+                        },
+                    ),
+                    framed(seq + 1, WalRecord::WriterClosed { writer_id: [1; 16] }),
+                ],
+            );
+            assert_eq!(facts(&with_writers), facts(&records));
+            for watermark in 0..=62 {
+                assert_eq!(
+                    latest_projection_boundary(&with_writers, watermark),
+                    latest_projection_boundary(&records, watermark)
+                );
+            }
         }
     }
 

@@ -202,6 +202,7 @@ pub const TOOL_SCHEMA_PINS_FEATURE: &str = "tool-schema-pins/v1";
 /// as [`DecodeStep::NewerWriter`]. `ck-broca --wal-known-features` prints this list so
 /// placement tooling can refuse to install a build that cannot read what is already on disk.
 pub const KNOWN_FEATURES: &[&str] = &[
+    "writer-id/v1",
     INTERRUPT_REASON_FEATURE,
     TURN_DIRECTIVES_FEATURE,
     AGENT_RUN_SCOPE_FEATURE,
@@ -1418,6 +1419,7 @@ mod tests {
         assert_eq!(
             KNOWN_FEATURES,
             &[
+                "writer-id/v1",
                 INTERRUPT_REASON_FEATURE,
                 TURN_DIRECTIVES_FEATURE,
                 AGENT_RUN_SCOPE_FEATURE,

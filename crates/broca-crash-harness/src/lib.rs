@@ -44,8 +44,11 @@
 
 pub mod invariants;
 pub mod power_loss;
+
 pub mod scenario;
 pub mod wal;
+#[cfg(all(test, unix))]
+mod writer_id_tests;
 
 #[cfg(test)]
 mod compaction;

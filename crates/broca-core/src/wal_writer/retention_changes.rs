@@ -137,6 +137,9 @@ impl ObservedWal {
 }
 
 impl Wal for ObservedWal {
+    fn writer_id(&self) -> Option<[u8; 16]> {
+        self.inner.writer_id()
+    }
     fn append(&mut self, fence: u64, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
         let result = self.inner.append(fence, record, sync);
         self.note_retention(record);
