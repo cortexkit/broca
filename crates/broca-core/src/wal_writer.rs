@@ -2682,15 +2682,30 @@ impl WalHandle {
                 identity: check_session.clone(),
                 cause: None,
             });
-        let mut handle = Self::spawn_proven_with_clock(
-            wal,
-            last_seq,
-            fence,
-            observer,
-            None,
-            (StampClock::wall(), context),
-        )
-        .map_err(WalOpenError::Failed)?;
+        let owner = WriterOwner {
+            wal: Some(wal),
+            lease: Some(lease),
+        };
+        let (mut handle, lease) = spawn_blocking(JobKind::WalWriter, move || {
+            let (wal, lease) = owner.into_parts();
+            let handle = Self::spawn_proven_with_clock(
+                wal,
+                last_seq,
+                fence,
+                observer,
+                None,
+                (StampClock::wall(), context),
+            )
+            .map_err(WalOpenError::Failed)?;
+            // On cancellation, tuple drop joins the handle before releasing its lease.
+            Ok::<_, WalOpenError>((handle, lease.expect("guarded open retains its lease")))
+        })
+        .await
+        .map_err(|error| {
+            WalOpenError::Failed(WalWriteError::Failed(format!(
+                "WAL startup task failed: {error}"
+            )))
+        })??;
         handle.bind_media_capture(check_store.as_ref(), &check_session);
         handle.move_check = Some(Arc::new(move || {
             check_store.check_move(&check_session, true)
@@ -2877,16 +2892,6 @@ impl WalHandle {
                 "WAL open/recovery task failed: {error}"
             )))
         })??;
-        let mut opened = opened;
-        let wal = opened
-            .wal
-            .take()
-            .expect("owned open holds its WAL until handoff");
-        let lease = opened
-            .lease
-            .take()
-            .expect("owned open holds its tenure until handoff");
-        let (last_seq, fence) = (opened.last_seq, opened.fence);
         // The writer task owns the lease until the WAL is closed: dropping the
         // handle without shutdown still joins through the task, and shutdown
         // joins before the task drops the lease. No separate lease is returned.
@@ -2898,21 +2903,46 @@ impl WalHandle {
                 identity: check_session.clone(),
                 cause: startup.cause,
             });
-        let spawn = || {
-            Self::spawn_proven_with_clock(
-                wal,
-                last_seq,
-                fence,
-                observer,
-                Some(lease),
-                (StampClock::wall(), context),
-            )
-            .map_err(WalOpenError::Failed)
-        };
-        #[cfg(feature = "test-clock")]
-        let mut handle = with_writer_fs(startup.fs, spawn)?;
-        #[cfg(not(feature = "test-clock"))]
-        let mut handle = spawn()?;
+        // Writer startup replays the log and waits for the marker/open barrier's
+        // ready acknowledgement. Neither operation may block an async runtime worker.
+        // Keep OpenedOwned intact until this blocking job runs, including on cancellation.
+        let mut handle = spawn_blocking(JobKind::WalWriter, move || {
+            let mut opened = opened;
+            let wal = opened
+                .wal
+                .take()
+                .expect("owned open holds its WAL until handoff");
+            let lease = opened
+                .lease
+                .take()
+                .expect("owned open holds its tenure until handoff");
+            let (last_seq, fence) = (opened.last_seq, opened.fence);
+            let spawn = || {
+                Self::spawn_proven_with_clock(
+                    wal,
+                    last_seq,
+                    fence,
+                    observer,
+                    Some(lease),
+                    (StampClock::wall(), context),
+                )
+                .map_err(WalOpenError::Failed)
+            };
+            #[cfg(feature = "test-clock")]
+            {
+                with_writer_fs(startup.fs, spawn)
+            }
+            #[cfg(not(feature = "test-clock"))]
+            {
+                spawn()
+            }
+        })
+        .await
+        .map_err(|error| {
+            WalOpenError::Failed(WalWriteError::Failed(format!(
+                "WAL startup task failed: {error}"
+            )))
+        })??;
         handle.bind_media_capture(check_store.as_ref(), &check_session);
         handle.move_check = Some(Arc::new(move || {
             check_store.check_move(&check_session, true)
@@ -4260,11 +4290,85 @@ fn close_writer_identity(
             obs.observe(seq, fence, &record, wal.lineage_id());
             obs.observe_tap(seq, fence, wal.lineage_id(), &record);
         }
-        if let Err(error) = writer.unlink() {
-            tracing::warn!(%error, "writer-id/v1: durable writer close succeeded but marker unlink failed; reclaim will remove the marker");
+        match writer.unlink() {
+            Ok((marker, identity)) => unlink_settled_predecessors(&marker, &identity),
+            Err(error) => {
+                tracing::warn!(%error, "writer-id/v1: durable writer close succeeded but marker unlink failed; reclaim will remove the marker")
+            }
         }
     }
     Ok(())
+}
+
+fn unlink_settled_predecessors(marker: &Path, identity: &BindIdentity) {
+    use broca_wal::fs_ops;
+    use std::io::Read;
+
+    // This writer has published a newer WriterOpened and WriterClosed. Remove only
+    // verified predecessor markers while its session lease is still held. A close
+    // whose publication fails never reaches this cleanup.
+    let Some(directory) = marker.parent() else {
+        return;
+    };
+    let address = session_addr(identity);
+    let entries = match fs_ops::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(target: "writer_reclaim", path = %directory.display(), %error, "closed writer could not scan predecessor markers");
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(target: "writer_reclaim", path = %directory.display(), %error, "closed writer could not read a predecessor marker entry");
+                continue;
+            }
+        };
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some((found_address, writer)) = name.split_once('.') else {
+            continue;
+        };
+        if found_address != address
+            || writer.len() != 32
+            || !writer
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            continue;
+        }
+        let remove = || -> Result<(), String> {
+            if !entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_file()
+            {
+                return Err("writer marker is not a regular file".into());
+            }
+            let mut bytes = Vec::new();
+            fs_ops::File::open(&path)
+                .map_err(|error| error.to_string())?
+                .take(64 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| error.to_string())?;
+            if bytes.len() > 64 * 1024 {
+                return Err("writer marker exceeds the size limit".into());
+            }
+            if decode_writer_marker(&bytes)? != *identity {
+                return Err("writer marker identity does not match the closed session".into());
+            }
+            fs_ops::remove_file(&path).map_err(|error| error.to_string())
+        };
+        if let Err(error) = remove() {
+            // Retain any marker whose validation or removal fails. A later
+            // lease-gated reclaim pass must retry the remaining marker.
+            tracing::warn!(target: "writer_reclaim", path = %path.display(), %error, "closed writer retained predecessor marker");
+        }
+    }
 }
 
 /// Records the first fatal writer error, which every later append and barrier then reports.

@@ -41,6 +41,7 @@ pub(crate) struct WriterContext {
 pub(crate) struct OpenWriter {
     marker: PathBuf,
     writer_id: [u8; 16],
+    identity: BindIdentity,
 }
 
 impl WriterContext {
@@ -63,9 +64,10 @@ impl WriterContext {
         let id: String = writer_id.iter().map(|byte| format!("{byte:02x}")).collect();
         let marker = directory.join(format!("{}.{id}", self.address));
         let temporary = marker.with_extension(format!("{id}.tmp"));
+        let identity = self.identity;
         let bytes = serde_json::to_vec(&serde_json::json!({
             "version": 1,
-            "identity": self.identity,
+            "identity": &identity,
         }))
         .map_err(|error| WalError::Io(std::io::Error::other(error)))?;
         let mut options = fs_ops::OpenOptions::new();
@@ -102,7 +104,15 @@ impl WriterContext {
                 .into(),
         };
         let seq = append_barrier(wal, fence, &opened, now())?;
-        Ok((OpenWriter { marker, writer_id }, seq, opened))
+        Ok((
+            OpenWriter {
+                marker,
+                writer_id,
+                identity,
+            },
+            seq,
+            opened,
+        ))
     }
 }
 
@@ -120,11 +130,11 @@ impl OpenWriter {
         Ok((seq, record))
     }
 
-    pub(crate) fn unlink(self) -> Result<(), WalError> {
+    pub(crate) fn unlink(self) -> Result<(PathBuf, BindIdentity), WalError> {
         // No directory sync is needed after unlink. A resurrected marker is conservative:
         // the durable WriterClosed still proves that this writer cannot append again.
         fs_ops::remove_file(&self.marker).map_err(WalError::Io)?;
-        Ok(())
+        Ok((self.marker, self.identity))
     }
 }
 

@@ -316,14 +316,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         wal_store = wal_store.with_durable_observer(bus_hints.observer());
     }
     let wal_store = Arc::new(wal_store);
-    // Writer reclamation is format-specific maintenance, not legacy retention work.
-    // Its first background pass runs without waiting for a send to reopen a dead writer.
-    let _writer_reclaim = match state_format {
-        state_format::StateFormat::Overhaul => {
-            broca_module::actor::writer_reclaim::spawn(wal_store.clone())
-        }
-        state_format::StateFormat::Legacy => None,
-    };
+    // The state-root lock is already held, and no session writer has started yet.
+    broca_module::actor::writer_reclaim::reap_temporary_markers_at_boot(wal_store.clone())
+        .await
+        .map_err(ServeIoError)?;
     let crash_orphan_wal = wal_store.clone();
 
     // The provider-held runtime: the slots a held call waits in, and the intake that pulls each
@@ -700,10 +696,11 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let compaction_inbox = executor_impl.compaction_inbox();
     let executor = Arc::new(executor_impl.with_clock(retention.clock.clone()));
     let move_wal = wal_store.clone();
-    let mut opener_builder = DefaultOpener::new(lease_store, wal_store, executor)
-        .with_run_index(run_index.clone())
-        .with_materialized_store(run_index.clone())
-        .with_charge_basis_resolver(charge_basis_table.clone());
+    let mut opener_builder =
+        opener_for_state_root(lease_store, wal_store, executor, state_format, &state_root)?
+            .with_run_index(run_index.clone())
+            .with_materialized_store(run_index.clone())
+            .with_charge_basis_resolver(charge_basis_table.clone());
     // Each finished run's usage-export fact. An overhaul root exports nothing.
     if state_format.runs(BackgroundTask::UsageExport) {
         opener_builder = opener_builder.with_export_index(run_index.clone());
@@ -940,6 +937,18 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
                 sweep.open_failed,
             );
         })
+    };
+
+    // Reclaim must not change WAL mtimes before orphan discovery, or open a
+    // second successor while the boot sealer is recovering that session.
+    let _writer_reclaim = match state_format {
+        state_format::StateFormat::Overhaul => {
+            broca_module::actor::writer_reclaim::spawn_after_boot(
+                crash_orphan_wal.clone(),
+                async move { _crash_orphan_seal.await.map_err(|error| error.to_string()) },
+            )
+        }
+        state_format::StateFormat::Legacy => None,
     };
 
     // Late results reach a run through its session's actor, so delivery waits for the registry.
@@ -1204,6 +1213,86 @@ mod runtime_shutdown_tests {
         release_unrelated.send(()).unwrap();
         process.join().unwrap();
         result.expect("an unrelated blocking job delayed runtime exit");
+    }
+}
+
+/// Select the writer-lease ownership policy for the state format.
+fn opener_for_state_root(
+    leases: Arc<FileLeaseStore>,
+    wal: Arc<FileWalStore>,
+    executor: Arc<dyn broca_module::executor::RunExecutor>,
+    format: state_format::StateFormat,
+    root: &Path,
+) -> Result<DefaultOpener<FileLeaseStore, FileWalStore>, ServeIoError> {
+    match format {
+        state_format::StateFormat::Legacy => Ok(DefaultOpener::new(leases, wal, executor)),
+        state_format::StateFormat::Overhaul => {
+            // Record the actual lease root before attaching its owned domain. The
+            // writer, not the actor, must retain authority if an extra Arc survives.
+            DefaultOpener::with_file_leases(root.join("leases"), wal, executor)
+                .with_lease_domain(broca_core::lease::WalLeaseDomain::new(root.join("leases")))
+                .map_err(|error| ServeIoError(error.to_string()))
+        }
+    }
+}
+
+#[cfg(test)]
+mod overhaul_opener_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn overhaul_startup_uses_a_root_aware_owned_writer_domain() {
+        struct NeverExecutes;
+        #[async_trait::async_trait]
+        impl broca_module::executor::RunExecutor for NeverExecutes {
+            async fn execute(
+                &self,
+                _: broca_module::executor::RunJob,
+                _: tokio::sync::mpsc::Sender<broca_core::OutputEvent>,
+            ) -> Result<broca_core::RunSummary, broca_core::RunError> {
+                panic!("idle startup must not execute a run");
+            }
+        }
+        let root = broca_test_support::scratch_root()
+            .join(format!("overhaul-owned-opener-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let wal = Arc::new(FileWalStore::with_config(
+            root.join("wal"),
+            broca_wal::WalConfig::OVERHAUL,
+        ));
+        let opener = opener_for_state_root(
+            Arc::new(FileLeaseStore::new(root.join("leases"))),
+            wal.clone(),
+            Arc::new(NeverExecutes),
+            state_format::StateFormat::Overhaul,
+            &root,
+        )
+        .unwrap()
+        .with_idle_ttl(Duration::from_secs(3600));
+        let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal, None);
+        let session = broca_protocol::BindIdentity::new("/overhaul-opener", "runner", "session");
+        registry.actor_for(&session).await.unwrap();
+        let guard = registry
+            .lock_move_sessions_with_mode(
+                std::slice::from_ref(&session),
+                false,
+                broca_module::registry::CutLockMode::Mutate,
+            )
+            .await
+            .unwrap();
+        assert!(
+            guard.holds_tenure(&session),
+            "the actor must hand over a writer-owned tenure, never the guarded fallback"
+        );
+        let domain = broca_core::lease::WalLeaseDomain::new(root.join("leases"));
+        assert!(matches!(
+            domain.acquire(&session),
+            Err(broca_core::LeaseError::Held { .. })
+        ));
+        drop(guard);
+        drop(domain.acquire(&session).unwrap());
+        assert!(registry.stop_and_seal().await);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 
