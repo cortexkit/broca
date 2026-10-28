@@ -1392,6 +1392,7 @@ async fn provider_attempt_records_change_nothing_replay_reads() {
         // The output reservation is the one reader of attempt records: it takes an attempt's
         // rendered body length as the measurement its next estimate scales from. It is asserted
         // on its own below; everything else replay reads must not change.
+        let reservation = state.output_reservation.clone();
         state.output_reservation = plain_state.output_reservation.clone();
         assert_eq!(
             format!("{state:?}"),
@@ -1405,6 +1406,15 @@ async fn provider_attempt_records_change_nothing_replay_reads() {
             "{label}"
         );
         checkpoint.at_seq = plain_checkpoint.at_seq;
+        // The checkpoint carries the reservation fold replay builds from the same log, so a
+        // resume from it clamps as a full replay would. That fold is the one part allowed to
+        // differ from the plain log's checkpoint.
+        assert_eq!(
+            format!("{:?}", checkpoint.output_reservation),
+            format!("{:?}", Some(&reservation)),
+            "{label}: the checkpoint's reservation fold is replay's"
+        );
+        checkpoint.output_reservation = plain_checkpoint.output_reservation.clone();
         assert_eq!(
             format!("{checkpoint:?}"),
             format!("{plain_checkpoint:?}"),
