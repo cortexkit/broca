@@ -1242,6 +1242,504 @@ pub fn decode_admission_checkpoint(encoded: &str) -> Option<AdmissionCheckpointV
     serde_json::from_value(envelope.checkpoint).ok()
 }
 
+/// An authenticated source frame in an admission seed. The hash covers the complete encoded
+/// frame, not its JSON payload, so moved, truncated and replaced sources all force full replay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdmissionSource {
+    seq: u64,
+    off: u64,
+    end: u64,
+    identity: Vec<u8>,
+}
+
+impl AdmissionSource {
+    fn read(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        boundary: &AdmissionSource,
+    ) -> Result<FramedRecord, crate::replay::SeedFallback> {
+        use sha2::Digest;
+        let bad = || crate::replay::SeedFallback {
+            reason: "admission source identity mismatch",
+        };
+        if self.seq == 0 || self.seq > boundary.seq || self.end > boundary.end {
+            return Err(bad());
+        }
+        let len = self
+            .end
+            .checked_sub(self.off)
+            .filter(|len| *len > 0)
+            .ok_or_else(bad)?;
+        let bytes = read_at(self.off, len).map_err(|_| bad())?;
+        if bytes.len() as u64 != len || sha2::Sha256::digest(&bytes).as_slice() != self.identity {
+            return Err(bad());
+        }
+        match broca_wal::framing::decode_next(&bytes) {
+            broca_wal::framing::DecodeStep::Record { framed, consumed }
+                if consumed == bytes.len() && framed.seq == self.seq =>
+            {
+                Ok(*framed)
+            }
+            _ => Err(bad()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AdmissionEpisodeSeed {
+    start: AdmissionSource,
+    run_id: RunId,
+    refreezes: Vec<AdmissionSource>,
+    structured_output_downgraded: bool,
+    provider_call_started: bool,
+    disposition: EpisodeDisposition,
+    pause_reason: Option<broca_protocol::PauseReason>,
+    cancel_at: Option<broca_wal::record::RunCancelAt>,
+    usage: Option<Usage>,
+    retries_used: u32,
+    budget_replay_state: Option<BudgetReplayStateV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AdmissionQueueSeed {
+    source: AdmissionSource,
+    submission_id: SubmissionId,
+    order_source: Option<AdmissionSource>,
+}
+
+/// Content-free admission continuation for the offset index. Sources and scalars must be
+/// committed in the same index transaction as the qualified projection boundary.
+///
+/// `scalars` is deliberately private: it has no episode, queue payload, manifest or frozen
+/// render config and is not a usable v1 checkpoint until hydration completes. Compaction
+/// payloads currently require full replay rather than storing a second copy in this seed.
+/// Materialized-store readers continue to use `load_prior_wal_snapshot`; this seed is for
+/// the offset-index admission path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdmissionSeed {
+    version: u32,
+    boundary: AdmissionSource,
+    lineage_id: Option<String>,
+    qualified: bool,
+    scalars: AdmissionCheckpointV1,
+    first_run: Option<AdmissionSource>,
+    episode: Option<AdmissionEpisodeSeed>,
+    queued: Vec<AdmissionQueueSeed>,
+    staged: Option<AdmissionSource>,
+    ordinal_base: u64,
+    tag_high: u64,
+    tag_rules: Option<(bool, bool)>,
+}
+
+impl AdmissionSeed {
+    /// Capture a complete prefix ending at the index's committed projection boundary.
+    /// Index writers supply actual positioned frames, never offsets inferred from re-encoding.
+    pub fn capture(
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        boundary: &crate::replay::SeedBoundary,
+        prefix: &[crate::replay::PositionedFrame],
+    ) -> Result<Self, crate::replay::SeedFallback> {
+        use sha2::Digest;
+        let bad = || crate::replay::SeedFallback {
+            reason: "incomplete admission prefix",
+        };
+        if prefix.first().map(|p| p.framed.seq) != Some(1)
+            || prefix.last().map(|p| (p.framed.seq, p.off))
+                != Some((boundary.seq, boundary.frame_off))
+            || prefix
+                .windows(2)
+                .any(|p| p[0].framed.seq + 1 != p[1].framed.seq)
+        {
+            return Err(bad());
+        }
+        let frames: Vec<_> = prefix.iter().map(|p| p.framed.clone()).collect();
+        let mut scalars = AdmissionCheckpointV1::from_frames(&frames).map_err(|_| bad())?;
+        let replay =
+            crate::replay::replay(&frames.iter().map(|p| p.record.clone()).collect::<Vec<_>>())
+                .map_err(|_| bad())?;
+        if !matches!(
+            scalars.compaction,
+            Some(crate::compaction::CompactionCheckpoint::None)
+        ) || !replay.pending_steers.is_empty()
+            || replay.open_tool_turn.is_some()
+            || frames.iter().any(|p| matches!(&p.record, WalRecord::RunStarted { manifest: Some(manifest), .. } if crate::compaction::has_compaction(manifest)))
+        {
+            return Err(crate::replay::SeedFallback {
+                reason: "admission prefix needs full replay",
+            });
+        }
+        let source = |i: usize| -> Result<AdmissionSource, crate::replay::SeedFallback> {
+            let off = prefix[i].off;
+            let limit = prefix.get(i + 1).map_or(boundary.frame_end, |p| p.off);
+            let bytes = read_at(off, limit.checked_sub(off).ok_or_else(bad)?).map_err(|_| bad())?;
+            // FileWal metadata follows each record. A source identifies only its own
+            // frame, not the lineage bytes before the next positioned record.
+            let consumed = match broca_wal::framing::decode_next(&bytes) {
+                broca_wal::framing::DecodeStep::Record { framed, consumed }
+                    if *framed == prefix[i].framed =>
+                {
+                    consumed
+                }
+                _ => return Err(bad()),
+            };
+            let end = off.checked_add(consumed as u64).ok_or_else(bad)?;
+            let source = AdmissionSource {
+                seq: prefix[i].framed.seq,
+                off,
+                end,
+                identity: sha2::Sha256::digest(&bytes[..consumed]).to_vec(),
+            };
+            if source.read(
+                read_at,
+                &AdmissionSource {
+                    seq: boundary.seq,
+                    off: boundary.frame_off,
+                    end: boundary.frame_end,
+                    identity: boundary.frame_identity.clone(),
+                },
+            )? != prefix[i].framed
+            {
+                return Err(bad());
+            }
+            Ok(source)
+        };
+        let first = frames
+            .iter()
+            .position(|p| matches!(p.record, WalRecord::RunStarted { .. }));
+        let last = frames
+            .iter()
+            .rposition(|p| matches!(p.record, WalRecord::RunStarted { .. }));
+        let episode = match (last, scalars.last_episode.take()) {
+            (Some(i), Some(episode)) => Some(AdmissionEpisodeSeed {
+                start: source(i)?,
+                run_id: episode.run_id.clone(),
+                refreezes: ((i + 1)..frames.len())
+                    .filter(|j| {
+                        matches!(
+                            frames[*j].record,
+                            WalRecord::RunConfigRefrozen { .. } | WalRecord::RunAuthRefrozen { .. }
+                        )
+                    })
+                    .map(source)
+                    .collect::<Result<_, _>>()?,
+                // This is an effective-state flag, like the pause disposition, not a sequence
+                // used to synthesize a record. A later render refreeze replaces an earlier downgrade.
+                structured_output_downgraded: frames[i + 1..].iter().fold(
+                    false,
+                    |downgraded, p| match &p.record {
+                        WalRecord::RunConfigRefrozen { .. } => false,
+                        WalRecord::StructuredOutputDowngraded { run_id }
+                            if run_id == &episode.run_id =>
+                        {
+                            true
+                        }
+                        _ => downgraded,
+                    },
+                ),
+                provider_call_started: episode.provider_call_started,
+                disposition: episode.disposition,
+                pause_reason: episode.pause_reason,
+                cancel_at: episode.cancel_at,
+                usage: episode.usage,
+                retries_used: episode.retries_used,
+                budget_replay_state: episode.budget_replay_state,
+            }),
+            (None, None) => None,
+            _ => return Err(bad()),
+        };
+        let queued = scalars.pending_fifo.iter().map(|pending| {
+            let i = frames.iter().rposition(|p| matches!(&p.record, WalRecord::Queued { submission_id, .. } if submission_id == &pending.submission_id)).ok_or_else(bad)?;
+            let order_source = if pending.order.is_some() {
+                Some(source(frames[..i].iter().rposition(|p| matches!(&p.record, WalRecord::DeliveryOrdered { submission_id, .. } if submission_id == &pending.submission_id)).ok_or_else(bad)?)?)
+            } else { None };
+            Ok(AdmissionQueueSeed { source: source(i)?, submission_id: pending.submission_id.clone(), order_source })
+        }).collect::<Result<_, crate::replay::SeedFallback>>()?;
+        scalars.pending_fifo = Arc::new(Vec::new());
+        let staged = scalars.pending_order.take().map(|staged| {
+            source(frames.iter().rposition(|p| matches!(&p.record, WalRecord::DeliveryOrdered { submission_id, .. } if submission_id == &staged.submission_id)).ok_or_else(bad)?)
+        }).transpose()?;
+        if let Some(ownership) = &mut scalars.ownership {
+            if let Some(first) = &mut ownership.first_episode {
+                first.manifest = None;
+            }
+        }
+        if let Some(effort) = &mut scalars.effort_history {
+            effort.first_config = serde_json::Value::Null;
+        }
+        let tag_seed = crate::tags::TagSeed::from_prefix(&replay.prompt);
+        Ok(Self {
+            version: 1,
+            boundary: AdmissionSource {
+                seq: boundary.seq,
+                off: boundary.frame_off,
+                end: boundary.frame_end,
+                identity: boundary.frame_identity.clone(),
+            },
+            lineage_id: boundary.lineage_id.clone(),
+            qualified: boundary.qualified,
+            scalars,
+            first_run: first.map(source).transpose()?,
+            episode,
+            queued,
+            staged,
+            ordinal_base: replay.extent,
+            tag_high: tag_seed.high,
+            tag_rules: tag_seed.rules.map(|r| (r.render, r.clean)),
+        })
+    }
+
+    fn episode(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    ) -> Result<Option<LastEpisodeV1>, crate::replay::SeedFallback> {
+        let Some(seed) = &self.episode else {
+            return Ok(None);
+        };
+        let bad = || crate::replay::SeedFallback {
+            reason: "invalid admission episode sources",
+        };
+        let start = seed.start.read(read_at, &self.boundary)?;
+        if !matches!(&start.record, WalRecord::RunStarted { run_id, .. } if run_id == &seed.run_id)
+        {
+            return Err(bad());
+        }
+        let mut checkpoint = AdmissionCheckpointV1::empty();
+        checkpoint
+            .fold_record(start.seq, &start.record)
+            .map_err(|_| bad())?;
+        let mut refs = seed
+            .refreezes
+            .iter()
+            .map(|source| {
+                let frame = source.read(read_at, &self.boundary)?;
+                if source.seq <= start.seq
+                    || !matches!(
+                        frame.record,
+                        WalRecord::RunConfigRefrozen { .. } | WalRecord::RunAuthRefrozen { .. }
+                    )
+                {
+                    return Err(bad());
+                }
+                Ok(frame)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        refs.sort_by_key(|frame| frame.seq);
+        if refs.windows(2).any(|p| p[0].seq == p[1].seq) {
+            return Err(bad());
+        }
+        checkpoint.fold_frames(&refs).map_err(|_| bad())?;
+        let mut episode = checkpoint.last_episode.ok_or_else(bad)?;
+        if seed.structured_output_downgraded {
+            broca_protocol::structured_output::FrozenStructuredOutput::downgrade_render_config(
+                &mut episode.config.frozen_render_config,
+            );
+        }
+        // Replay may reset the budget when the tail opens another episode. Validate the stored
+        // episode's budget before that reset can hide an unsupported or incomplete seed.
+        match (&episode.config.budget, &seed.budget_replay_state) {
+            (Some(config), Some(state)) if state.is_valid_for(config) => {}
+            (None, None) => {}
+            _ => return Err(bad()),
+        }
+        episode.provider_call_started = seed.provider_call_started;
+        episode.disposition = seed.disposition;
+        episode.pause_reason = seed.pause_reason;
+        episode.cancel_at = seed.cancel_at;
+        episode.usage = seed.usage;
+        episode.retries_used = seed.retries_used;
+        episode.budget_replay_state = seed.budget_replay_state.clone();
+        Ok(Some(episode))
+    }
+
+    fn validate(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        tail: &[crate::replay::PositionedFrame],
+        safe_head: u64,
+        episode: Option<&LastEpisodeV1>,
+    ) -> Result<(), crate::replay::SeedFallback> {
+        if self.version != 1
+            || self.scalars.at_seq != self.boundary.seq
+            || tail.last().map_or(self.boundary.seq, |p| p.framed.seq) != safe_head
+            || self.episode.is_none()
+            || self.first_run.is_none()
+            || !self.scalars.ownership_complete()
+            || self.scalars.head.is_none()
+            || self.scalars.has_deferred_calls.is_none()
+            || self.scalars.output_reservation.is_none()
+            || crate::replay::tail_contains_compaction_setup(&tail.iter().map(|p| p.framed.clone()).collect::<Vec<_>>())
+            || tail.iter().any(|p| matches!(&p.framed.record, WalRecord::RunStarted { manifest: Some(manifest), .. } if crate::compaction::has_compaction(manifest)))
+        {
+            return Err(crate::replay::SeedFallback {
+                reason: "admission seed incomplete or head mismatch",
+            });
+        }
+        crate::replay::replay_seeded_at_validated_boundary(
+            read_at,
+            &crate::replay::SeedBoundary {
+                lineage_id: self.lineage_id.clone(),
+                seq: self.boundary.seq,
+                frame_off: self.boundary.off,
+                frame_end: self.boundary.end,
+                frame_identity: self.boundary.identity.clone(),
+                qualified: self.qualified,
+            },
+            tail,
+            episode.map(|e| e.config.model.clone()),
+            episode.map(|e| e.run_id.clone()),
+            episode.and_then(|e| e.config.budget.clone()),
+            episode.and_then(|e| e.budget_replay_state.clone()),
+            self.ordinal_base,
+            true,
+            crate::tags::TagSeed {
+                high: self.tag_high,
+                rules: self
+                    .tag_rules
+                    .map(|(render, clean)| broca_protocol::tags::ComputedRules { render, clean }),
+            },
+            Vec::new(),
+        )?;
+        Ok(())
+    }
+
+    /// Hydrate an admission checkpoint only after authenticating its boundary and contiguous tail.
+    /// A caller must discard every partial result and fully replay on any `SeedFallback`.
+    pub fn hydrate_with_base(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        tail: &[crate::replay::PositionedFrame],
+        safe_head: u64,
+    ) -> Result<(AdmissionCheckpointV1, AdmissionCheckpointV1), crate::replay::SeedFallback> {
+        let episode = self.episode(read_at)?;
+        self.validate(read_at, tail, safe_head, episode.as_ref())?;
+        let bad = || crate::replay::SeedFallback {
+            reason: "incomplete admission scalars",
+        };
+        if self.scalars.last_episode.is_some()
+            || !self.scalars.pending_fifo.is_empty()
+            || self.scalars.pending_order.is_some()
+            || self.first_run.is_some()
+                != self
+                    .scalars
+                    .ownership
+                    .as_ref()
+                    .is_some_and(|o| o.first_episode.is_some())
+            || self
+                .scalars
+                .effort_history
+                .as_ref()
+                .is_none_or(|e| !e.first_config.is_null())
+            || !self.scalars.ownership_complete()
+            || !matches!(
+                self.scalars.compaction,
+                Some(crate::compaction::CompactionCheckpoint::None)
+            )
+        {
+            return Err(bad());
+        }
+        let mut checkpoint = self.scalars.clone();
+        checkpoint.last_episode = episode;
+        if let Some(source) = &self.first_run {
+            let first = source.read(read_at, &self.boundary)?;
+            let WalRecord::RunStarted {
+                run_id,
+                config,
+                manifest,
+                ..
+            } = first.record
+            else {
+                return Err(bad());
+            };
+            let ownership = checkpoint
+                .ownership
+                .as_mut()
+                .and_then(|o| o.first_episode.as_mut())
+                .ok_or_else(bad)?;
+            if ownership.run_id != run_id {
+                return Err(bad());
+            }
+            ownership.manifest = manifest.as_deref().cloned().map(Arc::new);
+            checkpoint
+                .effort_history
+                .as_mut()
+                .ok_or_else(bad)?
+                .first_config = config.frozen_render_config.clone();
+        }
+        let pending = self.queued.iter().map(|seed| {
+            let frame = seed.source.read(read_at, &self.boundary)?;
+            if !matches!(&frame.record, WalRecord::Queued { submission_id, .. } if submission_id == &seed.submission_id) { return Err(bad()); }
+            let mut one = AdmissionCheckpointV1::empty();
+            if let Some(source) = &seed.order_source {
+                let order = source.read(read_at, &self.boundary)?;
+                if order.seq >= frame.seq || !matches!(&order.record, WalRecord::DeliveryOrdered { submission_id, .. } if submission_id == &seed.submission_id) { return Err(bad()); }
+                one.fold_record(order.seq, &order.record).map_err(|_| bad())?;
+            }
+            one.fold_record(frame.seq, &frame.record).map_err(|_| bad())?;
+            Arc::unwrap_or_clone(one.pending_fifo).pop().ok_or_else(bad)
+        }).collect::<Result<Vec<_>, _>>()?;
+        checkpoint.pending_fifo = Arc::new(pending);
+        if let Some(source) = &self.staged {
+            let frame = source.read(read_at, &self.boundary)?;
+            let WalRecord::DeliveryOrdered {
+                submission_id,
+                order,
+                sent_by,
+            } = frame.record
+            else {
+                return Err(bad());
+            };
+            checkpoint.pending_order = Some(StagedOrder {
+                submission_id,
+                order,
+                sent_by,
+            });
+        }
+        let base = checkpoint.clone();
+        checkpoint
+            .fold_frames(&tail.iter().map(|p| p.framed.clone()).collect::<Vec<_>>())
+            .map_err(|_| bad())?;
+        if !checkpoint.compaction_boundary_complete() {
+            return Err(bad());
+        }
+        Ok((base, checkpoint))
+    }
+
+    /// Return the complete admission view through `safe_head`, discarding the prefix view.
+    pub fn hydrate(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        tail: &[crate::replay::PositionedFrame],
+        safe_head: u64,
+    ) -> Result<AdmissionCheckpointV1, crate::replay::SeedFallback> {
+        self.hydrate_with_base(read_at, tail, safe_head)
+            .map(|(_, head)| head)
+    }
+
+    /// Rebuild only the paused episode's request sources. A no-tool boundary plus its
+    /// `RunStarted` costs two source-frame reads (the lineage header and EOF probe carry no
+    /// request content), plus one read for each inline refreeze. Ownership and queued requests
+    /// are irrelevant to cancellation and are not decoded here.
+    pub fn paused_episode(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        tail: &[crate::replay::PositionedFrame],
+        safe_head: u64,
+    ) -> Result<Option<LastEpisodeV1>, crate::replay::SeedFallback> {
+        let episode = self.episode(read_at)?;
+        self.validate(read_at, tail, safe_head, episode.as_ref())?;
+        let mut checkpoint = AdmissionCheckpointV1::empty();
+        checkpoint.last_episode = episode;
+        checkpoint
+            .fold_frames(&tail.iter().map(|p| p.framed.clone()).collect::<Vec<_>>())
+            .map_err(|_| crate::replay::SeedFallback {
+                reason: "paused admission tail refused",
+            })?;
+        Ok(checkpoint
+            .last_episode
+            .filter(|e| e.disposition == EpisodeDisposition::Paused))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use broca_protocol::{
@@ -1570,6 +2068,806 @@ mod tests {
                 last_reason: RunFinishReason::Completed
             }
         );
+    }
+
+    fn offset_log(records: &[FramedRecord]) -> (Vec<u8>, Vec<crate::replay::PositionedFrame>) {
+        let mut bytes = Vec::new();
+        let positioned = records
+            .iter()
+            .map(|frame| {
+                let off = bytes.len() as u64;
+                bytes.extend(
+                    broca_wal::framing::encode(frame.seq, frame.fence, &frame.record).unwrap(),
+                );
+                crate::replay::PositionedFrame {
+                    off,
+                    framed: frame.clone(),
+                }
+            })
+            .collect();
+        (bytes, positioned)
+    }
+
+    fn offset_reader(bytes: &[u8]) -> impl Fn(u64, u64) -> std::io::Result<Vec<u8>> + '_ {
+        move |off, len| {
+            let off = (off as usize).min(bytes.len());
+            Ok(bytes[off..off.saturating_add(len as usize).min(bytes.len())].to_vec())
+        }
+    }
+
+    fn offset_boundary(
+        bytes: &[u8],
+        frames: &[crate::replay::PositionedFrame],
+        cut: usize,
+    ) -> crate::replay::SeedBoundary {
+        use sha2::Digest;
+        let off = frames[cut - 1].off;
+        let end = frames.get(cut).map_or(bytes.len() as u64, |p| p.off);
+        crate::replay::SeedBoundary {
+            lineage_id: None,
+            seq: frames[cut - 1].framed.seq,
+            frame_off: off,
+            frame_end: end,
+            frame_identity: sha2::Sha256::digest(&bytes[off as usize..end as usize]).to_vec(),
+            qualified: true,
+        }
+    }
+
+    fn offset_step(seq: u64) -> FramedRecord {
+        frame(
+            seq,
+            WalRecord::ModelStepFinished {
+                fallback: Default::default(),
+                written_at_ms: None,
+                tags: None,
+                hooks: None,
+                step_id: StepId(1),
+                assistant_message: Arc::new(AssistantMessage {
+                    message_id: MessageId(format!("m{seq}")),
+                    content: vec![ContentBlock::Text {
+                        text: "private assistant text".into(),
+                    }],
+                }),
+                usage: Usage::default(),
+                finish_reason: None,
+                retries_used: 2,
+                service_tier_used: None,
+                speed_used: None,
+            },
+        )
+    }
+
+    fn offset_corpus() -> Vec<FramedRecord> {
+        let mut first = started(1, "r1", None);
+        if let WalRecord::RunStarted { input, .. } = &mut first.record {
+            *input = vec![message("private first input")].into();
+        }
+        if let WalRecord::RunStarted { config, .. } = &mut first.record {
+            config.budget = Some(BudgetConfig {
+                max_input_tokens: None,
+                nudges: vec![],
+                finalize_at_tool_calls: 12,
+                finalize_text: "private finalize text".into(),
+            });
+        }
+        let mut second = started(11, "r2", None);
+        if let WalRecord::RunStarted { input, .. } = &mut second.record {
+            *input = vec![message("private second input")].into();
+        }
+        if let WalRecord::RunStarted {
+            request_identity_digest,
+            config,
+            ..
+        } = &mut second.record
+        {
+            *request_identity_digest = Some("request-digest".into());
+            config.tools_were_omitted = true;
+        }
+        vec![
+            first,
+            frame(
+                2,
+                WalRecord::RunConfigRefrozen {
+                    renderer_version: 2,
+                    ts_ms: None,
+                    frozen_render_config: serde_json::json!({"wire": "private refrozen setup"}),
+                },
+            ),
+            frame(
+                3,
+                WalRecord::RunAuthRefrozen {
+                    ts_ms: None,
+                    auth_selection: AuthSelection {
+                        credential_id: "apikey:stub".into(),
+                        account_ref: None,
+                        resolved_credential_id: None,
+                        vault_request: None,
+                        account_decision: None,
+                        auth_method: None,
+                    },
+                },
+            ),
+            offset_step(4),
+            frame(
+                5,
+                WalRecord::DeliveryOrdered {
+                    submission_id: SubmissionId("q".into()),
+                    order: broca_protocol::DeliveryOrder {
+                        modes: vec![broca_protocol::request::DeliveryMode::IdleStart],
+                        dedupe_key: None,
+                        expires_at_ms: None,
+                        template: None,
+                    },
+                    sent_by: None,
+                },
+            ),
+            frame(
+                6,
+                WalRecord::Queued {
+                    submission_id: SubmissionId("q".into()),
+                    request: Box::new(request("private queued input")),
+                    request_identity_digest: None,
+                    principal: None,
+                    send_id: None,
+                    title: None,
+                    delivery: Some(Delivery::Queue),
+                    retention: None,
+                    conversation_key: None,
+                    hooks: None,
+                    keep_warm: None,
+                    written_at_ms: None,
+                    ts_ms: None,
+                },
+            ),
+            frame(
+                7,
+                WalRecord::RunPaused {
+                    run_id: RunId("r1".into()),
+                    ts_ms: None,
+                    reason: PauseReason::AuthRequired,
+                    error: None,
+                },
+            ),
+            frame(
+                8,
+                WalRecord::RunCancelRequested {
+                    run_id: RunId("r1".into()),
+                    at: broca_wal::record::RunCancelAt::Now,
+                },
+            ),
+            frame(
+                9,
+                WalRecord::Retracted {
+                    submission_id: SubmissionId("q".into()),
+                    failure: None,
+                },
+            ),
+            frame(
+                10,
+                WalRecord::RunFinished {
+                    interrupt_reason: None,
+                    reason: RunFinishReason::Cancelled,
+                    usage: Usage::default(),
+                    retries_used: 2,
+                    ts_ms: None,
+                    error: None,
+                },
+            ),
+            second,
+            offset_step(12),
+            frame(
+                13,
+                WalRecord::RunPaused {
+                    run_id: RunId("r2".into()),
+                    ts_ms: None,
+                    reason: PauseReason::AuthRequired,
+                    error: None,
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn offset_admission_equals_full_fold_at_every_publication_and_index_cut() {
+        let records = offset_corpus();
+        let (bytes, positioned) = offset_log(&records);
+        let mut matched = 0;
+        for boundary_cut in [4, 12] {
+            let boundary = offset_boundary(&bytes, &positioned, boundary_cut);
+            let seed = AdmissionSeed::capture(
+                &offset_reader(&bytes),
+                &boundary,
+                &positioned[..boundary_cut],
+            )
+            .unwrap();
+            let serialized = serde_json::to_string(&seed).unwrap();
+            for secret in [
+                "private first input",
+                "private second input",
+                "private assistant text",
+                "private refrozen setup",
+                "private queued input",
+                "private finalize text",
+                "second tool",
+                "\"opaque\"",
+            ] {
+                assert!(
+                    !serialized.contains(secret),
+                    "content leaked into seed: {secret}"
+                );
+            }
+            let seed: AdmissionSeed = serde_json::from_str(&serialized).unwrap();
+            for end in boundary_cut..=records.len() {
+                let end_off = positioned.get(end).map_or(bytes.len(), |p| p.off as usize);
+                let read_at = offset_reader(&bytes[..end_off]);
+                let snapshot = crate::run::load_prior_wal_snapshot_from_seed(
+                    &read_at,
+                    &seed,
+                    &positioned[boundary_cut..end],
+                    end as u64,
+                    || panic!("valid boundary must not fall back at {boundary_cut}/{end}"),
+                )
+                .unwrap();
+                assert_eq!(
+                    snapshot.checkpoint_at_head,
+                    AdmissionCheckpointV1::from_frames(&records[..end]).unwrap(),
+                    "boundary={boundary_cut}, published={end}"
+                );
+                assert_eq!(snapshot.base_watermark, boundary.seq);
+                matched += 1;
+            }
+        }
+        assert_eq!(matched, 12);
+    }
+
+    #[test]
+    fn offset_admission_real_filewal_hydrates_without_full_read() {
+        use crate::replay::{PositionedFrame, SeedBoundary};
+        use crate::WalStore;
+        use broca_wal::framing::{decode_next, DecodeStep};
+        use sha2::Digest;
+        use std::io::{Read, Seek, SeekFrom};
+
+        let root = broca_test_support::scratch_root()
+            .join(format!("real-admission-seed-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
+        let records = offset_corpus();
+        let key = match &records[0].record {
+            WalRecord::RunStarted { session, .. } => session.clone(),
+            _ => unreachable!(),
+        };
+        let store =
+            crate::FileWalStore::with_config(root.join("wal"), broca_wal::WalConfig::OVERHAUL);
+        let mut wal = store.open(&key).unwrap();
+        for framed in &records {
+            wal.append(framed.fence, &framed.record, true).unwrap();
+        }
+        drop(wal);
+        let path = store.wal_path(&key);
+        let bytes = std::fs::read(&path).unwrap();
+        let mut positioned = Vec::new();
+        let mut off = 0usize;
+        let mut lineage_id = None;
+        let mut boundary_end = 0;
+        // The first episode's answer is qualified by its durable terminal in this log;
+        // the later episode remains paused.
+        let cut = 4;
+        while off < bytes.len() {
+            match decode_next(&bytes[off..]) {
+                DecodeStep::Record { framed, consumed } => {
+                    if framed.seq == cut as u64 {
+                        boundary_end = (off + consumed) as u64;
+                    }
+                    positioned.push(PositionedFrame {
+                        off: off as u64,
+                        framed: *framed,
+                    });
+                    off += consumed;
+                }
+                DecodeStep::Lineage {
+                    lineage_id: found,
+                    consumed,
+                } => {
+                    lineage_id = Some(found.to_string());
+                    off += consumed;
+                }
+                _ => panic!("the real admission log must decode at byte {off}"),
+            }
+        }
+        let boundary = SeedBoundary {
+            lineage_id,
+            seq: positioned[cut - 1].framed.seq,
+            frame_off: positioned[cut - 1].off,
+            frame_end: boundary_end,
+            frame_identity: sha2::Sha256::digest(
+                &bytes[positioned[cut - 1].off as usize..boundary_end as usize],
+            )
+            .to_vec(),
+            qualified: true,
+        };
+        let read_at = |off, len| {
+            let mut file = std::fs::File::open(&path)?;
+            file.seek(SeekFrom::Start(off))?;
+            let mut bytes = Vec::new();
+            file.take(len).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        };
+        let seed = AdmissionSeed::capture(&read_at, &boundary, &positioned[..cut])
+            .expect("a multi-record FileWal admission seed must capture exact source frames");
+        assert_eq!(
+            positioned[cut].off - boundary.frame_end,
+            broca_wal::framing::LINEAGE_FRAME_LEN as u64
+        );
+        let full_reads = std::cell::Cell::new(0);
+        let snapshot = crate::run::load_prior_wal_snapshot_from_seed(
+            &read_at,
+            &seed,
+            &positioned[cut..],
+            13,
+            || {
+                full_reads.set(full_reads.get() + 1);
+                panic!("a valid real FileWal admission seed must not read the full log")
+            },
+        )
+        .unwrap();
+        assert_eq!(full_reads.get(), 0);
+        assert_eq!(snapshot.base_watermark, 4);
+        assert_eq!(
+            snapshot.checkpoint_at_head,
+            AdmissionCheckpointV1::from_frames(&records).unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn offset_admission_boundary_and_locator_mismatches_fully_repair() {
+        let records = offset_corpus();
+        let (bytes, positioned) = offset_log(&records);
+        let boundary = offset_boundary(&bytes, &positioned, 4);
+        let seed =
+            AdmissionSeed::capture(&offset_reader(&bytes), &boundary, &positioned[..4]).unwrap();
+        let expected = AdmissionCheckpointV1::from_frames(&records).unwrap();
+        for case in 0..9 {
+            let mut seed = seed.clone();
+            let mut tail = positioned[4..].to_vec();
+            match case {
+                0 => seed.boundary.identity[0] ^= 1,
+                1 => seed.qualified = false,
+                2 => seed.episode.as_mut().unwrap().start.identity[0] ^= 1,
+                3 => seed.lineage_id = Some("different lineage".into()),
+                4 => {
+                    tail.remove(0);
+                }
+                5 => seed.version += 1,
+                6 => seed.episode.as_mut().unwrap().refreezes[0].end += 1,
+                7 => {
+                    seed.episode
+                        .as_mut()
+                        .unwrap()
+                        .budget_replay_state
+                        .as_mut()
+                        .unwrap()
+                        .version += 1
+                }
+                8 => seed.episode = None,
+                _ => unreachable!(),
+            }
+            let repairs = std::cell::Cell::new(0);
+            let snapshot = crate::run::load_prior_wal_snapshot_from_seed(
+                &offset_reader(&bytes),
+                &seed,
+                &tail,
+                records.len() as u64,
+                || {
+                    repairs.set(repairs.get() + 1);
+                    Ok(records.clone())
+                },
+            )
+            .unwrap();
+            assert_eq!(repairs.get(), 1, "case {case} must repair");
+            assert_eq!(snapshot.base_watermark, 0);
+            assert_eq!(snapshot.checkpoint_at_head, expected);
+        }
+    }
+
+    #[test]
+    fn offset_admission_hydrates_queued_payloads_and_staged_order_from_sources() {
+        let corpus = offset_corpus();
+        let mut records = corpus[..5].to_vec();
+        records.push(offset_step(6));
+        records.push(corpus[5].clone());
+        records.push(offset_step(8));
+        records.push(corpus[6].clone());
+        for (i, frame) in records.iter_mut().enumerate() {
+            frame.seq = i as u64 + 1;
+        }
+        let (bytes, positioned) = offset_log(&records);
+        for cut in [6, 8] {
+            let boundary = offset_boundary(&bytes, &positioned, cut);
+            let seed =
+                AdmissionSeed::capture(&offset_reader(&bytes), &boundary, &positioned[..cut])
+                    .unwrap();
+            assert!(!serde_json::to_string(&seed)
+                .unwrap()
+                .contains("private queued input"));
+            for end in cut..=records.len() {
+                let end_off = positioned.get(end).map_or(bytes.len(), |p| p.off as usize);
+                let actual = seed
+                    .hydrate(
+                        &offset_reader(&bytes[..end_off]),
+                        &positioned[cut..end],
+                        end as u64,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    actual,
+                    AdmissionCheckpointV1::from_frames(&records[..end]).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn offset_admission_index_ahead_of_restored_log_falls_back_to_full_prefix() {
+        let records = offset_corpus();
+        let (bytes, positioned) = offset_log(&records);
+        let boundary = offset_boundary(&bytes, &positioned, 12);
+        let seed =
+            AdmissionSeed::capture(&offset_reader(&bytes), &boundary, &positioned[..12]).unwrap();
+        let restored = &bytes[..positioned[7].off as usize];
+        let repaired = crate::run::load_prior_wal_snapshot_from_seed(
+            &offset_reader(restored),
+            &seed,
+            &[],
+            7,
+            || Ok(records[..7].to_vec()),
+        )
+        .unwrap();
+        assert_eq!(repaired.base_watermark, 0);
+        assert_eq!(
+            repaired.checkpoint_at_head,
+            AdmissionCheckpointV1::from_frames(&records[..7]).unwrap()
+        );
+    }
+
+    #[test]
+    fn offset_admission_preserves_paused_state_with_ambiguous_tool_tail() {
+        let corpus = offset_corpus();
+        let mut records = corpus[..4].to_vec();
+        let mut tool_step = offset_step(5);
+        let call_id = ToolCallId("ambiguous".into());
+        if let WalRecord::ModelStepFinished {
+            step_id,
+            assistant_message,
+            ..
+        } = &mut tool_step.record
+        {
+            *step_id = StepId(2);
+            Arc::make_mut(assistant_message).content = vec![ContentBlock::ToolCall(ToolCall {
+                thought_signature: None,
+                tool_call_id: call_id.clone(),
+                tool_name: "first".into(),
+                input: serde_json::Value::Null,
+            })];
+        }
+        records.push(tool_step);
+        let batch_id = broca_protocol::BatchId("b2".into());
+        records.push(frame(
+            6,
+            WalRecord::ToolBatchStarted {
+                batch_id: batch_id.clone(),
+                step_id: StepId(2),
+                planned_calls: vec![call_id.clone()],
+            },
+        ));
+        records.push(frame(
+            7,
+            WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
+                hooks: None,
+                batch_id,
+                tool_call_id: call_id,
+                tool_name: Some("first".into()),
+                args: Arc::new(serde_json::Value::Null),
+                module_id: None,
+                schema_pin: None,
+                approval_digest: None,
+                call_key: None,
+            },
+        ));
+        records.push(frame(8, corpus[6].record.clone()));
+        let (bytes, positioned) = offset_log(&records);
+        let boundary = offset_boundary(&bytes, &positioned, 4);
+        let seed =
+            AdmissionSeed::capture(&offset_reader(&bytes), &boundary, &positioned[..4]).unwrap();
+        let actual = seed
+            .hydrate(&offset_reader(&bytes), &positioned[4..], 8)
+            .unwrap();
+        let full = AdmissionCheckpointV1::from_frames(&records).unwrap();
+        assert_eq!(actual, full);
+        assert_eq!(
+            actual.last_episode.as_ref().unwrap().disposition,
+            EpisodeDisposition::Paused
+        );
+        assert_eq!(
+            seed.paused_episode(&offset_reader(&bytes), &positioned[4..], 8)
+                .unwrap(),
+            full.last_episode
+        );
+        assert!(matches!(
+            crate::replay::replay(&records.iter().map(|p| p.record.clone()).collect::<Vec<_>>())
+                .unwrap()
+                .resolution,
+            crate::ReplayResolution::Interrupted { .. }
+        ));
+    }
+
+    #[test]
+    fn offset_admission_downgrade_state_respects_refreeze_order_and_run_identity() {
+        use broca_protocol::structured_output::{FrozenStructuredOutput, Mode, SchemaDelivery};
+        let render = serde_json::json!({"structured_output": FrozenStructuredOutput {
+            mode: Mode::FinalText, name: "result".into(), schema_jcs: "{}".into(), enforcement: "enforced".into(),
+            reason: None, profile: None, delivery: SchemaDelivery::Strict, instructions_paragraph_break: false,
+        }});
+        for (before_refreeze, after_run, expected_delivery) in [
+            (true, None, SchemaDelivery::Strict),
+            (false, Some("r1"), SchemaDelivery::Unconstrained),
+            (false, Some("another-run"), SchemaDelivery::Strict),
+        ] {
+            let mut start = started(1, "r1", None);
+            if let WalRecord::RunStarted { config, .. } = &mut start.record {
+                config.frozen_render_config = render.clone();
+            }
+            let mut records = vec![start];
+            if before_refreeze {
+                records.push(frame(
+                    0,
+                    WalRecord::StructuredOutputDowngraded {
+                        run_id: RunId("r1".into()),
+                    },
+                ));
+            }
+            records.push(frame(
+                0,
+                WalRecord::RunConfigRefrozen {
+                    renderer_version: 2,
+                    ts_ms: None,
+                    frozen_render_config: render.clone(),
+                },
+            ));
+            if let Some(run) = after_run {
+                records.push(frame(
+                    0,
+                    WalRecord::StructuredOutputDowngraded {
+                        run_id: RunId(run.into()),
+                    },
+                ));
+            }
+            records.push(offset_step(0));
+            let cut = records.len();
+            records.push(frame(
+                0,
+                WalRecord::RunPaused {
+                    run_id: RunId("r1".into()),
+                    ts_ms: None,
+                    reason: PauseReason::AuthRequired,
+                    error: None,
+                },
+            ));
+            for (i, frame) in records.iter_mut().enumerate() {
+                frame.seq = i as u64 + 1;
+            }
+            let (bytes, positioned) = offset_log(&records);
+            let boundary = offset_boundary(&bytes, &positioned, cut);
+            if after_run == Some("another-run") {
+                // Admission ignores unrelated downgrade metadata, but canonical replay refuses
+                // its run identity. A seed must not turn that refusal into a usable checkpoint.
+                assert!(AdmissionSeed::capture(
+                    &offset_reader(&bytes),
+                    &boundary,
+                    &positioned[..cut]
+                )
+                .is_err());
+                continue;
+            }
+            let seed =
+                AdmissionSeed::capture(&offset_reader(&bytes), &boundary, &positioned[..cut])
+                    .unwrap();
+            let actual = seed
+                .hydrate(
+                    &offset_reader(&bytes),
+                    &positioned[cut..],
+                    records.len() as u64,
+                )
+                .unwrap();
+            assert_eq!(
+                actual,
+                AdmissionCheckpointV1::from_frames(&records).unwrap()
+            );
+            let config = actual.last_episode.unwrap().config;
+            assert_eq!(
+                FrozenStructuredOutput::from_frozen_render_config(Some(
+                    &config.frozen_render_config
+                ))
+                .unwrap()
+                .delivery,
+                expected_delivery
+            );
+        }
+    }
+
+    #[test]
+    fn offset_admission_compaction_manifest_before_setup_requires_full_replay() {
+        let mut records = offset_corpus()[..4].to_vec();
+        if let WalRecord::RunStarted { manifest, .. } = &mut records[0].record {
+            *manifest = Some(Box::new(broca_wal::PlanManifest {
+                plan: broca_wal::OpaqueJson::from_json_text(serde_json::json!({"compaction_item": {"provider":"provider", "preset":"head", "params":{}}, "composition":{}}).to_string()).unwrap(),
+                plan_identity: "plan".into(), composition_digest: "digest".into(), tools: Arc::new(vec![]), system_text: String::new(), system_digest: String::new(), join_version: 1, role_versions: Default::default(), fetches: vec![], declarations: vec![],
+            }));
+        }
+        let (bytes, positioned) = offset_log(&records);
+        let boundary = offset_boundary(&bytes, &positioned, 4);
+        assert_eq!(
+            AdmissionSeed::capture(&offset_reader(&bytes), &boundary, &positioned)
+                .unwrap_err()
+                .reason,
+            "admission prefix needs full replay"
+        );
+    }
+
+    #[test]
+    fn offset_admission_setup_in_tail_forces_full_repair() {
+        let mut records = offset_corpus()[..4].to_vec();
+        records.push(frame(
+            5,
+            WalRecord::CompactionMessage {
+                provider: "test".into(),
+                kind: broca_wal::CompactionMessageKind::Setup,
+                compaction_id: "setup".into(),
+                version: 1,
+                range: broca_wal::CompactionRange { from: 0, to: 0 },
+                replacement: Arc::new(vec![]),
+                sha256: "0".repeat(64),
+                request_id: None,
+                cursor: None,
+                call_when: None,
+                stability: None,
+                ceiling: None,
+                tag_checkpoint: None,
+                ride_wait_ms: None,
+            },
+        ));
+        let (bytes, positioned) = offset_log(&records);
+        let boundary = offset_boundary(&bytes, &positioned, 4);
+        let seed =
+            AdmissionSeed::capture(&offset_reader(&bytes), &boundary, &positioned[..4]).unwrap();
+        let repairs = std::cell::Cell::new(0);
+        let repaired = crate::run::load_prior_wal_snapshot_from_seed(
+            &offset_reader(&bytes),
+            &seed,
+            &positioned[4..],
+            5,
+            || {
+                repairs.set(repairs.get() + 1);
+                Ok(records.clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(repairs.get(), 1);
+        assert_eq!(
+            repaired.checkpoint_at_head,
+            AdmissionCheckpointV1::from_frames(&records).unwrap()
+        );
+    }
+
+    #[test]
+    fn offset_admission_paused_request_has_exact_source_read_budget() {
+        let records = offset_corpus();
+        let (bytes, positioned) = offset_log(&records);
+        for (cut, end, expected_reads) in [(4, 7, 4), (12, 13, 2)] {
+            let boundary = offset_boundary(&bytes, &positioned, cut);
+            let seed =
+                AdmissionSeed::capture(&offset_reader(&bytes), &boundary, &positioned[..cut])
+                    .unwrap();
+            let end_off = positioned.get(end).map_or(bytes.len(), |p| p.off as usize);
+            let reads = std::cell::Cell::new(0);
+            let read_at = |off, len| {
+                let data = offset_reader(&bytes[..end_off])(off, len)?;
+                if matches!(broca_wal::framing::decode_next(&data), broca_wal::framing::DecodeStep::Record { consumed, .. } if consumed == data.len())
+                {
+                    reads.set(reads.get() + 1);
+                }
+                Ok(data)
+            };
+            let episode = seed
+                .paused_episode(&read_at, &positioned[cut..end], end as u64)
+                .unwrap()
+                .unwrap();
+            let full = AdmissionCheckpointV1::from_frames(&records[..end])
+                .unwrap()
+                .last_episode
+                .unwrap();
+            assert_eq!(
+                serde_json::to_vec(&episode).unwrap(),
+                serde_json::to_vec(&full).unwrap()
+            );
+            assert_eq!(
+                reads.get(),
+                expected_reads,
+                "two base source frames plus one per refreeze"
+            );
+        }
+    }
+
+    #[test]
+    fn offset_admission_crash_cut_after_wal_barrier_before_seed_commit() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let dir = std::path::Path::new("target/scratch").join(format!(
+            "admission-cut-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wal_path = dir.join("session.wal");
+        let index_path = dir.join("admission-seed.json");
+        let records = offset_corpus();
+        let (bytes, positioned) = offset_log(&records);
+        let boundary = offset_boundary(&bytes, &positioned, 4);
+        let seed =
+            AdmissionSeed::capture(&offset_reader(&bytes), &boundary, &positioned[..4]).unwrap();
+        // Persist the old committed seed, then publish each later WAL prefix without committing
+        // a replacement seed. Reopening must reconcile the durable tail, not lose its pause.
+        std::fs::write(&index_path, serde_json::to_vec(&seed).unwrap()).unwrap();
+        for end in 4..=records.len() {
+            let end_off = positioned.get(end).map_or(bytes.len(), |p| p.off as usize);
+            let mut wal = std::fs::File::create(&wal_path).unwrap();
+            wal.write_all(&bytes[..end_off]).unwrap();
+            wal.sync_all().unwrap();
+            drop(wal);
+            let seed: AdmissionSeed =
+                serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
+            let read_at = |off, len| {
+                let mut file = std::fs::File::open(&wal_path)?;
+                file.seek(SeekFrom::Start(off))?;
+                let mut data = Vec::new();
+                file.take(len).read_to_end(&mut data)?;
+                Ok(data)
+            };
+            let snapshot = crate::run::load_prior_wal_snapshot_from_seed(
+                &read_at,
+                &seed,
+                &positioned[4..end],
+                end as u64,
+                || panic!("lagging seed must reconcile the synced WAL"),
+            )
+            .unwrap();
+            let full = AdmissionCheckpointV1::from_frames(&records[..end]).unwrap();
+            assert_eq!(snapshot.checkpoint_at_head, full);
+            assert_eq!(
+                serde_json::to_vec(&snapshot.checkpoint_at_head.last_episode).unwrap(),
+                serde_json::to_vec(&full.last_episode).unwrap()
+            );
+            if full
+                .last_episode
+                .as_ref()
+                .is_some_and(|e| e.disposition == EpisodeDisposition::Paused)
+            {
+                assert_eq!(
+                    serde_json::to_vec(
+                        &seed
+                            .paused_episode(&read_at, &positioned[4..end], end as u64)
+                            .unwrap()
+                    )
+                    .unwrap(),
+                    serde_json::to_vec(&full.last_episode).unwrap()
+                );
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

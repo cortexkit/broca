@@ -6488,6 +6488,52 @@ impl<W: WalStore + 'static> LineageActor<W> {
         Ok(())
     }
 
+    /// Offset-store counterpart of the legacy paused finalizer's request reconstruction.
+    /// The broca.db admission path will supply a consistent seed and positioned tail before
+    /// handing the request to the existing pre-cancelled executor. No production caller uses
+    /// this seam until the offset store replaces the legacy admission checkpoint.
+    #[allow(dead_code, reason = "wired by the broca.db admission path")]
+    fn paused_cancel_request_from_seed(
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        seed: &broca_core::admission::AdmissionSeed,
+        tail: &[broca_core::replay::PositionedFrame],
+        safe_head: u64,
+        run_id: &RunId,
+        full_read: impl FnOnce() -> Result<Vec<broca_wal::FramedRecord>, String>,
+    ) -> Result<Option<(SubmissionRequest, Option<String>)>, String> {
+        let episode = match seed.paused_episode(read_at, tail, safe_head) {
+            Ok(Some(episode)) => Some(episode),
+            // A non-paused summary is not enough to decline a requested paused cancellation.
+            // Repair from the durable prefix before deciding that there is no paused request.
+            Ok(None) | Err(_) => {
+                let frames = full_read()?;
+                if frames.last().map_or(0, |frame| frame.seq) != safe_head {
+                    return Err(format!(
+                        "paused cancellation repair did not reach durable head {safe_head}"
+                    ));
+                }
+                broca_core::replay::replay(
+                    &frames.iter().map(|p| p.record.clone()).collect::<Vec<_>>(),
+                )
+                .map_err(|error| error.to_string())?;
+                broca_core::AdmissionCheckpointV1::from_frames(&frames)
+                    .map_err(|error| error.to_string())?
+                    .last_episode
+            }
+        };
+        Ok(episode
+            .filter(|episode| {
+                episode.run_id == *run_id && episode.disposition == EpisodeDisposition::Paused
+            })
+            .map(|episode| {
+                let mut request = submission_from_episode(&episode);
+                if episode.config.tools_were_omitted {
+                    request.tools = None;
+                }
+                (request, episode.request_identity_digest)
+            }))
+    }
+
     async fn start_paused_cancel_finalizer(
         &mut self,
         run_id: &RunId,
@@ -9251,6 +9297,318 @@ mod tests {
                 .any(|frame| matches!(frame.record, WalRecord::RunFinished { .. })));
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn offset_admission_paused_cancel_rebuilds_request_bytes_and_repairs_bad_seed() {
+        use broca_core::replay::{PositionedFrame, SeedBoundary};
+        use broca_wal::framing::{decode_next, DecodeStep};
+        use sha2::Digest;
+        let key = BindIdentity::new("/offset-admission", "h", "s");
+        for (config_refreeze, auth_refreezes) in
+            [(false, 0), (true, 0), (false, 1), (true, 1), (true, 2)]
+        {
+            let mut records = held_close_seed(&key, false)[..2].to_vec();
+            if let WalRecord::RunStarted { config, .. } = &mut records[0] {
+                config.tools_were_omitted = true;
+            }
+            if let WalRecord::ModelStepFinished {
+                assistant_message, ..
+            } = &mut records[1]
+            {
+                Arc::make_mut(assistant_message).content =
+                    vec![broca_protocol::ContentBlock::Text {
+                        text: "answer before auth pause".into(),
+                    }];
+            }
+            if config_refreeze {
+                records.insert(1, WalRecord::RunConfigRefrozen { renderer_version: 2, ts_ms: None, frozen_render_config: serde_json::json!({"wire": "refrozen cancellation setup"}) });
+            }
+            for auth in 0..auth_refreezes {
+                records.insert(
+                    1,
+                    WalRecord::RunAuthRefrozen {
+                        ts_ms: None,
+                        auth_selection: broca_wal::AuthSelection {
+                            credential_id: format!("apikey:stub:refrozen{auth}"),
+                            account_ref: None,
+                            resolved_credential_id: None,
+                            vault_request: None,
+                            account_decision: None,
+                            auth_method: None,
+                        },
+                    },
+                );
+            }
+            let boundary_cut = records.len();
+            records.push(WalRecord::RunPaused {
+                run_id: RunId("held".into()),
+                ts_ms: None,
+                reason: broca_protocol::PauseReason::AuthRequired,
+                error: None,
+            });
+            let mut bytes = Vec::new();
+            let positioned: Vec<_> = records
+                .iter()
+                .enumerate()
+                .map(|(i, record)| {
+                    let seq = i as u64 + 1;
+                    let off = bytes.len() as u64;
+                    bytes.extend(broca_wal::framing::encode(seq, 1, record).unwrap());
+                    PositionedFrame {
+                        off,
+                        framed: broca_wal::FramedRecord {
+                            seq,
+                            fence: 1,
+                            record: record.clone(),
+                        },
+                    }
+                })
+                .collect();
+            let boundary = SeedBoundary {
+                lineage_id: None,
+                seq: boundary_cut as u64,
+                frame_off: positioned[boundary_cut - 1].off,
+                frame_end: positioned[boundary_cut].off,
+                frame_identity: sha2::Sha256::digest(
+                    &bytes[positioned[boundary_cut - 1].off as usize
+                        ..positioned[boundary_cut].off as usize],
+                )
+                .to_vec(),
+                qualified: true,
+            };
+            let read_raw = |off: u64, len: u64| {
+                let off = (off as usize).min(bytes.len());
+                Ok(bytes[off..off.saturating_add(len as usize).min(bytes.len())].to_vec())
+            };
+            let seed = broca_core::admission::AdmissionSeed::capture(
+                &read_raw,
+                &boundary,
+                &positioned[..boundary_cut],
+            )
+            .unwrap();
+            let reads = std::cell::Cell::new(0);
+            let read_at = |off, len| {
+                let data = read_raw(off, len)?;
+                if matches!(decode_next(&data), DecodeStep::Record { consumed, .. } if consumed == data.len())
+                {
+                    reads.set(reads.get() + 1);
+                }
+                Ok(data)
+            };
+            // The seed is still the pre-pause commit: the durable pause belongs to the tail.
+            // Reopening with that old seed must produce the legacy finalizer's exact request.
+            let frames: Vec<_> = positioned.iter().map(|p| p.framed.clone()).collect();
+            let full = broca_core::AdmissionCheckpointV1::from_frames(&frames)
+                .unwrap()
+                .last_episode
+                .unwrap();
+            let mut expected_request = submission_from_episode(&full);
+            expected_request.tools = None;
+            let expected = (expected_request, full.request_identity_digest.clone());
+            let actual = LineageActor::<FileWalStore>::paused_cancel_request_from_seed(
+                &read_at,
+                &seed,
+                &positioned[boundary_cut..],
+                frames.len() as u64,
+                &RunId("held".into()),
+                || panic!("valid paused seed must not replay the session"),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+            assert!(actual.0.tools.is_none());
+            assert!(actual.1.is_some());
+            assert_eq!(
+                reads.get(),
+                2 + u32::from(config_refreeze) + auth_refreezes,
+                "two base source frames plus each inline refreeze"
+            );
+
+            let mut bad = serde_json::to_value(&seed).unwrap();
+            bad["qualified"] = serde_json::json!(false);
+            let bad = serde_json::from_value(bad).unwrap();
+            let repairs = std::cell::Cell::new(0);
+            let repaired = LineageActor::<FileWalStore>::paused_cancel_request_from_seed(
+                &read_at,
+                &bad,
+                &positioned[boundary_cut..],
+                frames.len() as u64,
+                &RunId("held".into()),
+                || {
+                    repairs.set(repairs.get() + 1);
+                    Ok(frames.clone())
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(repairs.get(), 1);
+            assert_eq!(
+                serde_json::to_vec(&repaired).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn offset_paused_cancel_real_filewal_reads_two_sources_without_full_read() {
+        use broca_core::replay::{PositionedFrame, SeedBoundary};
+        use broca_wal::framing::{decode_next, DecodeStep};
+        use sha2::Digest;
+        use std::io::{Read, Seek, SeekFrom};
+
+        let root = broca_test_support::scratch_root()
+            .join(format!("real-paused-cancel-seed-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
+        let key = BindIdentity::new("/offset-admission", "h", "real-paused");
+        let mut records = held_close_seed(&key, false)[..5].to_vec();
+        if let WalRecord::RunStarted { config, .. } = &mut records[0] {
+            config.tools_were_omitted = true;
+        }
+        let (batch_id, step_id, calls) = match &records[2] {
+            WalRecord::ToolBatchStarted {
+                batch_id,
+                step_id,
+                planned_calls,
+            } => (batch_id.clone(), *step_id, planned_calls.clone()),
+            _ => unreachable!(),
+        };
+        for tool_call_id in calls {
+            records.push(WalRecord::ToolResult {
+                finished_at_ms: None,
+                batch_id: batch_id.clone(),
+                result: Arc::new(broca_protocol::content::ToolResult {
+                    tool_call_id,
+                    output: broca_protocol::content::ToolOutput::Text {
+                        text: "finished".into(),
+                    },
+                    is_error: false,
+                }),
+                outcome: broca_wal::record::DispatchOutcome::Completed,
+                hooks: None,
+                reason: None,
+                withdraw_elicitation: None,
+                provider_held: None,
+                tags: None,
+            });
+        }
+        records.push(WalRecord::ToolBatchFinished { batch_id });
+        // A committed tool turn qualifies immediately, so the paused run has a valid cut
+        // without depending on a future terminal to qualify a no-tool answer.
+        records.push(WalRecord::TurnFinished { step_id });
+        let cut = records.len();
+        records.push(WalRecord::RunPaused {
+            run_id: RunId("held".into()),
+            ts_ms: None,
+            reason: broca_protocol::PauseReason::AuthRequired,
+            error: None,
+        });
+        let store = FileWalStore::with_config(root.join("wal"), broca_wal::WalConfig::OVERHAUL);
+        let mut wal = store.open(&key).unwrap();
+        for record in &records {
+            wal.append(1, record, true).unwrap();
+        }
+        drop(wal);
+        let path = store.wal_path(&key);
+        let bytes = std::fs::read(&path).unwrap();
+        let mut positioned = Vec::new();
+        let mut off = 0usize;
+        let mut lineage_id = None;
+        let mut boundary_end = 0;
+        while off < bytes.len() {
+            match decode_next(&bytes[off..]) {
+                DecodeStep::Record { framed, consumed } => {
+                    if framed.seq == cut as u64 {
+                        boundary_end = (off + consumed) as u64;
+                    }
+                    positioned.push(PositionedFrame {
+                        off: off as u64,
+                        framed: *framed,
+                    });
+                    off += consumed;
+                }
+                DecodeStep::Lineage {
+                    lineage_id: found,
+                    consumed,
+                } => {
+                    lineage_id = Some(found.to_string());
+                    off += consumed;
+                }
+                _ => panic!("the real paused log must decode at byte {off}"),
+            }
+        }
+        let boundary = SeedBoundary {
+            lineage_id,
+            seq: cut as u64,
+            frame_off: positioned[cut - 1].off,
+            frame_end: boundary_end,
+            frame_identity: sha2::Sha256::digest(
+                &bytes[positioned[cut - 1].off as usize..boundary_end as usize],
+            )
+            .to_vec(),
+            qualified: true,
+        };
+        let read_raw = |off, len| {
+            let mut file = std::fs::File::open(&path)?;
+            file.seek(SeekFrom::Start(off))?;
+            let mut bytes = Vec::new();
+            file.take(len).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        };
+        let seed =
+            broca_core::admission::AdmissionSeed::capture(&read_raw, &boundary, &positioned[..cut])
+                .expect("a multi-record FileWal paused seed must capture exact source frames");
+        let source_reads = std::cell::Cell::new(0);
+        let full_reads = std::cell::Cell::new(0);
+        let read_at = |off, len| {
+            let bytes = read_raw(off, len)?;
+            if matches!(decode_next(&bytes),DecodeStep::Record { consumed, .. } if consumed==bytes.len())
+            {
+                source_reads.set(source_reads.get() + 1);
+            }
+            Ok(bytes)
+        };
+        let actual = LineageActor::<FileWalStore>::paused_cancel_request_from_seed(
+            &read_at,
+            &seed,
+            &positioned[cut..],
+            positioned.last().unwrap().framed.seq,
+            &RunId("held".into()),
+            || {
+                full_reads.set(full_reads.get() + 1);
+                panic!("a valid real FileWal paused seed must not replay the full log")
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let frames: Vec<_> = positioned.iter().map(|p| p.framed.clone()).collect();
+        let episode = broca_core::AdmissionCheckpointV1::from_frames(&frames)
+            .unwrap()
+            .last_episode
+            .unwrap();
+        let mut request = submission_from_episode(&episode);
+        request.tools = None;
+        assert_eq!(
+            serde_json::to_vec(&actual).unwrap(),
+            serde_json::to_vec(&(request, episode.request_identity_digest)).unwrap()
+        );
+        assert!(actual.0.tools.is_none());
+        assert!(actual.1.is_some());
+        assert_eq!(full_reads.get(), 0);
+        assert_eq!(
+            source_reads.get(),
+            2,
+            "one RunStarted source and the boundary TurnFinished source"
+        );
+        assert_eq!(
+            positioned[cut].off - boundary.frame_end,
+            broca_wal::framing::LINEAGE_FRAME_LEN as u64
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn held_close_seed(key: &BindIdentity, sequential: bool) -> Vec<WalRecord> {

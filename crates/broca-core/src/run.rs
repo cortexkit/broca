@@ -467,6 +467,46 @@ where
     })
 }
 
+/// Staged offset-index admission loader. The store supplies one committed seed/boundary snapshot,
+/// a positioned durable tail and a full-read repair callback; legacy materialized-store readers
+/// continue to use `load_prior_wal_snapshot` until the offset store is wired into admission.
+pub fn load_prior_wal_snapshot_from_seed(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    seed: &crate::admission::AdmissionSeed,
+    tail: &[crate::replay::PositionedFrame],
+    safe_head: u64,
+    full_read: impl FnOnce() -> Result<Vec<broca_wal::FramedRecord>, String>,
+) -> Result<PriorWalSnapshot, String> {
+    if let Ok((mut base, head)) = seed.hydrate_with_base(read_at, tail, safe_head) {
+        let watermark = base.at_seq;
+        base.pending_fifo = Arc::new(Vec::new());
+        return Ok(PriorWalSnapshot {
+            base_watermark: watermark,
+            head_seq: safe_head,
+            tail: Arc::new(tail.iter().map(|p| p.framed.clone()).collect()),
+            checkpoint_at_base: Some(base),
+            checkpoint_at_head: head,
+        });
+    }
+    let frames = full_read()?;
+    if frames.last().map_or(0, |frame| frame.seq) != safe_head {
+        return Err(format!(
+            "full admission repair did not reach durable head {safe_head}"
+        ));
+    }
+    crate::replay::replay(&frames.iter().map(|p| p.record.clone()).collect::<Vec<_>>())
+        .map_err(|error| error.to_string())?;
+    let checkpoint_at_head =
+        crate::AdmissionCheckpointV1::from_frames(&frames).map_err(|error| error.to_string())?;
+    Ok(PriorWalSnapshot {
+        base_watermark: 0,
+        head_seq: safe_head,
+        tail: Arc::new(frames),
+        checkpoint_at_base: None,
+        checkpoint_at_head,
+    })
+}
+
 /// Check that a bounded admission tail starts from complete budget state and contains the caller
 /// text recorded with each durable budget firing. The post-tail checkpoint has already folded these
 /// records, so an invalid firing clears its replay state before this check can pass.
