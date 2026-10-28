@@ -27,6 +27,555 @@ use broca_wal::{DispatchOutcome, ResumeRedo, ResumeReplayed, WalRecord, Withdraw
 
 use crate::replay::{OpenCallState, ReplayResolution, ReplayState};
 
+/// One transient offset-index read, bounded by the writer's durable head. The adapter loads
+/// messages and frozen episode inputs from their WAL locators, not database content copies.
+/// Boundary, projection scalars, message rows and tail must describe the same index snapshot.
+/// This value is deliberately not serializable: both the message prefix and the projection's
+/// admission checkpoint contain hydrated request/config content. Persist locators and scalars,
+/// not this snapshot.
+#[derive(Clone)]
+pub struct OffsetResumeSnapshot {
+    pub boundary: crate::replay::SeedBoundary,
+    pub projection: crate::replay::ProjectionSeed,
+    pub prefix: Vec<broca_protocol::Message>,
+    pub tail: Vec<crate::replay::PositionedFrame>,
+}
+
+pub struct OffsetResumeState {
+    pub prior: ReplayState,
+    pub snapshot: crate::run::PriorWalSnapshot,
+    pub placement: crate::placement::Placement,
+}
+
+/// Opt-in reader seam for overhaul roots. The offset store must explicitly supply this reader
+/// to the run entry point; ordinary run entry points never select it.
+pub trait OffsetResumeReader: Send + Sync {
+    /// Hydrate the requested message rows and episode metadata using checked WAL locators.
+    /// Implementations must verify source sequences/identities and bound reads to `safe_head`.
+    fn snapshot(&self, safe_head: u64)
+        -> Result<OffsetResumeSnapshot, crate::replay::SeedFallback>;
+    fn read_at(&self, offset: u64, len: u64) -> std::io::Result<Vec<u8>>;
+    /// Report whether reconstruction accepted the validated seed or fell back to the complete WAL.
+    fn reconstructed(&self, _fallback: Option<crate::replay::SeedFallback>) {}
+}
+
+/// Validate snapshot consistency and the boundary before using continuation state. Unsupported
+/// compaction/deferred-history shapes return a fallback so the caller reads the complete WAL
+/// rather than producing an incomplete prompt.
+pub fn reconstruct_from_offsets(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    snapshot: OffsetResumeSnapshot,
+    safe_head: u64,
+) -> Result<OffsetResumeState, crate::replay::SeedFallback> {
+    use crate::replay::{
+        replay_projection_tail, replay_seeded_at_validated_boundary, SeedFallback,
+    };
+    let bad = |reason| SeedFallback { reason };
+    let seed = snapshot.projection;
+    if seed.watermark_seq != snapshot.boundary.seq
+        || seed.admission_checkpoint.at_seq != seed.watermark_seq
+        || seed.prefix_len != snapshot.prefix.len() as u64
+        || snapshot
+            .prefix
+            .iter()
+            .enumerate()
+            .any(|(ord, m)| m.ordinal != Some(ord as u64))
+        || snapshot
+            .tail
+            .last()
+            .map_or(seed.watermark_seq, |p| p.framed.seq)
+            != safe_head
+        || snapshot
+            .tail
+            .iter()
+            .filter(|p| matches!(p.framed.record, WalRecord::RunStarted { .. }))
+            .count()
+            > 1
+    {
+        return Err(bad("offset resume snapshot does not reach durable head"));
+    }
+    if !seed.admission_checkpoint.ownership_complete()
+        || seed.admission_checkpoint.has_deferred_calls != Some(false)
+        || seed.admission_checkpoint.input_budget.is_none()
+        || seed.admission_checkpoint.output_reservation.is_none()
+        || !matches!(
+            seed.admission_checkpoint.compaction,
+            Some(crate::compaction::CompactionCheckpoint::None)
+        )
+        || crate::replay::tail_contains_compaction_setup(
+            &snapshot
+                .tail
+                .iter()
+                .map(|p| p.framed.clone())
+                .collect::<Vec<_>>(),
+        )
+        || !crate::replay::budget_replay_seed_is_valid(&seed)
+        // A refreeze can replace an earlier episode's render input. This composer does not
+        // replace previously projected inputs after a refreeze, so it requires the complete WAL.
+        || snapshot.tail.iter().any(|p| matches!(p.framed.record,
+            WalRecord::RunConfigRefrozen { .. } | WalRecord::RunAuthRefrozen { .. }))
+    {
+        return Err(bad("offset resume prefix needs full replay"));
+    }
+    let episode = seed.admission_checkpoint.last_episode.as_ref();
+    let mut state = replay_seeded_at_validated_boundary(
+        read_at,
+        &snapshot.boundary,
+        &snapshot.tail,
+        seed.trailing_origin.clone(),
+        episode.map(|e| e.run_id.clone()),
+        episode.and_then(|e| e.config.budget.clone()),
+        episode.and_then(|e| e.budget_replay_state.clone()),
+        seed.prefix_len,
+        seed.prefix_len != 0,
+        seed.tag_seed,
+        Vec::new(),
+    )?;
+    let frames: Vec<_> = snapshot.tail.into_iter().map(|p| p.framed).collect();
+    let mut placement = crate::projection::ControlProjectionState::from_projection_seed(&seed)
+        .ok_or_else(|| bad("offset resume placement seed is incomplete"))?
+        .placement()
+        .clone();
+    for frame in &frames {
+        placement
+            .observe(&frame.record)
+            .map_err(|_| bad("offset resume placement tail is invalid"))?;
+    }
+    // Projection composition retains the existing counter/reset and episode-coordinate rules.
+    // Only the checked WAL tail is folded; the hydrated request-message prefix is reused.
+    let delta = replay_projection_tail(&seed, &frames)
+        .map_err(|_| bad("offset resume projection composition failed"))?;
+    let checkpoint = delta.admission_checkpoint;
+    if !matches!(
+        checkpoint.compaction,
+        Some(crate::compaction::CompactionCheckpoint::None)
+    ) {
+        return Err(bad("offset resume compaction needs full replay"));
+    }
+    let episodes = delta
+        .episodes
+        .ok_or_else(|| bad("offset resume has no episode coordinates"))?;
+    if episodes.first().and_then(|e| e.start()) != Some(0)
+        || episodes.iter().enumerate().any(|(i, e)| {
+            let end = episodes
+                .get(i + 1)
+                .and_then(|e| e.start())
+                .unwrap_or(state.extent);
+            e.start().is_none_or(|start| {
+                start > end
+                    || end > state.extent
+                    || e.first_user()
+                        .flatten()
+                        .is_some_and(|ord| ord < start || ord >= end)
+                    || e.first_step()
+                        .flatten()
+                        .is_some_and(|ord| ord < start || ord >= end)
+            })
+        })
+    {
+        return Err(bad(
+            "offset resume episode coordinates are outside the prompt",
+        ));
+    }
+    state.render_episodes = crate::run::episode_render_inputs(&episodes)
+        .map_err(|_| bad("offset resume episode coordinates overflow"))?;
+    if state.render_episodes.is_none() {
+        return Err(bad("offset resume episode coordinates are incomplete"));
+    }
+    state.episode_step_spans = Some(
+        episodes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                e.first_step().flatten().map(|start| {
+                    let end = episodes
+                        .get(i + 1)
+                        .and_then(|e| e.start())
+                        .unwrap_or(state.extent);
+                    start as usize..end as usize
+                })
+            })
+            .collect(),
+    );
+    let mut prefix = snapshot.prefix;
+    if let Some(to) = delta.truncate_prefix_to {
+        prefix.truncate(to as usize);
+    }
+    prefix.reserve(state.prompt.len() + 256);
+    prefix.append(&mut state.prompt);
+    if prefix.len() as u64 != state.extent {
+        return Err(bad("offset resume prompt extent is inconsistent"));
+    }
+    state.prompt = prefix;
+    state.message_runs = vec![None; state.prompt.len()];
+    state.completed_steps = delta.completed_steps;
+    state.usage = delta.usage;
+    state.retries_used = delta.retries_used;
+    state.last_step_usage = delta.last_step_usage;
+    state.last_step_finish_reason = delta.last_step_finish_reason;
+    state.provider_call_started |= state.completed_steps != 0;
+    let current = checkpoint.last_episode.as_ref();
+    state.run_config = current.map(|e| e.config.clone());
+    state.run_id = current.map(|e| e.run_id.clone());
+    state.on_restart = current.and_then(|e| e.on_restart);
+    state.keep_warm = current.and_then(|e| e.keep_warm);
+    state.cancel_at = current.and_then(|e| e.cancel_at);
+    state.marker_order_version = current.and_then(|e| e.marker_order_version);
+    state.input_budget = checkpoint
+        .input_budget
+        .clone()
+        .ok_or_else(|| bad("offset resume input budget is incomplete"))?;
+    state.output_reservation = checkpoint
+        .output_reservation
+        .clone()
+        .ok_or_else(|| bad("offset resume output reservation is incomplete"))?;
+    state.manifest = checkpoint
+        .ownership
+        .as_ref()
+        .and_then(|o| o.first_episode.as_ref())
+        .and_then(|e| e.manifest.clone());
+    Ok(OffsetResumeState {
+        prior: state,
+        snapshot: crate::run::PriorWalSnapshot {
+            base_watermark: seed.watermark_seq,
+            head_seq: safe_head,
+            checkpoint_at_base: Some(seed.admission_checkpoint),
+            checkpoint_at_head: checkpoint,
+            tail: Arc::new(frames),
+        },
+        placement,
+    })
+}
+
+#[cfg(test)]
+mod offset_resume_tests {
+    use super::*;
+    use crate::replay::{PositionedFrame, ProjectionSeed, SeedBoundary};
+    use broca_protocol::{
+        caller::RunFinishReason, content::AssistantMessage, ContentBlock, Message, Role, StepId,
+        Usage,
+    };
+    use broca_wal::{framing, FramedRecord};
+    use sha2::{Digest, Sha256};
+
+    fn start(run: &str) -> WalRecord {
+        let mut record = crate::replay::projection_boundary_tests::run_started(1, run).record;
+        if let WalRecord::RunStarted { input, .. } = &mut record {
+            *input = vec![Message::new(
+                Role::User,
+                vec![ContentBlock::Text { text: run.into() }],
+            )]
+            .into();
+        }
+        record
+    }
+
+    fn step(id: u64) -> WalRecord {
+        WalRecord::ModelStepFinished {
+            fallback: Default::default(),
+            written_at_ms: None,
+            hooks: None,
+            service_tier_used: None,
+            speed_used: None,
+            step_id: StepId(id),
+            assistant_message: Arc::new(AssistantMessage {
+                message_id: broca_protocol::MessageId(format!("m{id}")),
+                content: vec![ContentBlock::Text {
+                    text: format!("answer {id}"),
+                }],
+            }),
+            usage: Usage {
+                input_tokens: Some(20),
+                output_tokens: Some(id),
+                ..Usage::default()
+            },
+            finish_reason: Some(broca_protocol::FinishReason::Stop),
+            retries_used: 0,
+            tags: None,
+        }
+    }
+
+    fn finish() -> WalRecord {
+        WalRecord::RunFinished {
+            interrupt_reason: None,
+            ts_ms: None,
+            reason: RunFinishReason::Completed,
+            usage: Usage::default(),
+            error: None,
+            retries_used: 0,
+        }
+    }
+
+    fn corpus() -> Vec<WalRecord> {
+        vec![
+            start("old"),
+            WalRecord::StepStarted { step_id: StepId(1) },
+            step(1),
+            finish(),
+            start("current"),
+            WalRecord::StepStarted { step_id: StepId(1) },
+            step(1),
+            finish(),
+        ]
+    }
+
+    fn encode(records: &[WalRecord]) -> (Vec<u8>, Vec<PositionedFrame>, Vec<u64>) {
+        let mut bytes = Vec::new();
+        let mut positions = Vec::new();
+        let mut ends = Vec::new();
+        for (i, record) in records.iter().enumerate() {
+            let frame = FramedRecord {
+                seq: i as u64 + 1,
+                fence: 1,
+                record: record.clone(),
+            };
+            positions.push(PositionedFrame {
+                off: bytes.len() as u64,
+                framed: frame.clone(),
+            });
+            bytes.extend(framing::encode(frame.seq, frame.fence, &frame.record).unwrap());
+            ends.push(bytes.len() as u64);
+        }
+        (bytes, positions, ends)
+    }
+
+    fn reader(bytes: &[u8]) -> impl Fn(u64, u64) -> std::io::Result<Vec<u8>> + '_ {
+        move |off, len| {
+            let start = (off as usize).min(bytes.len());
+            Ok(bytes[start..(start.saturating_add(len as usize)).min(bytes.len())].to_vec())
+        }
+    }
+
+    fn snapshot(
+        bytes: &[u8],
+        positions: &[PositionedFrame],
+        ends: &[u64],
+        boundary: usize,
+    ) -> OffsetResumeSnapshot {
+        let frames: Vec<_> = positions[..=boundary]
+            .iter()
+            .map(|p| p.framed.clone())
+            .collect();
+        let prior =
+            crate::replay::replay(&frames.iter().map(|f| f.record.clone()).collect::<Vec<_>>())
+                .unwrap();
+        let delta =
+            crate::replay::replay_projection_tail(&ProjectionSeed::empty(), &frames).unwrap();
+        let mut projection = ProjectionSeed::empty();
+        projection.watermark_seq = frames.last().unwrap().seq;
+        projection.prefix_len = prior.extent;
+        projection.completed_steps = prior.completed_steps;
+        projection.usage = prior.usage;
+        projection.retries_used = prior.retries_used;
+        projection.last_step_usage = prior.last_step_usage;
+        projection.last_step_finish_reason = prior.last_step_finish_reason;
+        projection.last_run_id = prior.run_id;
+        projection.trailing_origin = prior.prompt.iter().rev().find_map(|m| m.origin.clone());
+        projection.tag_seed = crate::tags::TagSeed::from_prefix(&prior.prompt);
+        projection.admission_checkpoint = delta.admission_checkpoint;
+        projection.projection_episodes = delta.episodes;
+        projection.open_episode_span = delta.open_episode_span;
+        OffsetResumeSnapshot {
+            boundary: SeedBoundary {
+                lineage_id: None,
+                seq: positions[boundary].framed.seq,
+                frame_off: positions[boundary].off,
+                frame_end: ends[boundary],
+                frame_identity: Sha256::digest(
+                    &bytes[positions[boundary].off as usize..ends[boundary] as usize],
+                )
+                .to_vec(),
+                qualified: true,
+            },
+            projection,
+            prefix: prior.prompt,
+            tail: positions[boundary + 1..].to_vec(),
+        }
+    }
+
+    fn assert_continuation(actual: &ReplayState, expected: &ReplayState) {
+        assert_eq!(actual.prompt, expected.prompt);
+        assert_eq!(actual.run_config, expected.run_config);
+        assert_eq!(actual.run_id, expected.run_id);
+        assert_eq!(actual.completed_steps, expected.completed_steps);
+        assert_eq!(actual.usage, expected.usage);
+        assert_eq!(actual.retries_used, expected.retries_used);
+        assert_eq!(actual.last_step_usage, expected.last_step_usage);
+        assert_eq!(
+            actual.last_step_finish_reason,
+            expected.last_step_finish_reason
+        );
+        assert_eq!(actual.resolution, expected.resolution);
+        assert_eq!(actual.render_episodes, expected.render_episodes);
+        assert_eq!(actual.episode_step_spans, expected.episode_step_spans);
+        assert_eq!(actual.open_tool_batch, expected.open_tool_batch);
+        assert_eq!(actual.tool_call_count, expected.tool_call_count);
+        assert_eq!(actual.pending_steers, expected.pending_steers);
+        assert_eq!(actual.input_budget, expected.input_budget);
+        assert_eq!(actual.output_reservation, expected.output_reservation);
+        assert_eq!(
+            resume_started_record(actual, 8, planned_redo(actual)),
+            resume_started_record(expected, 8, planned_redo(expected))
+        );
+    }
+
+    #[test]
+    fn offset_resume_matches_complete_continuation_at_every_cut() {
+        let records = corpus();
+        for cut in 4..=records.len() {
+            let (bytes, positions, ends) = encode(&records[..cut]);
+            let loaded = reconstruct_from_offsets(
+                &reader(&bytes),
+                snapshot(&bytes, &positions, &ends, 2),
+                cut as u64,
+            )
+            .unwrap();
+            let expected = crate::replay::replay(&records[..cut]).unwrap();
+            assert_continuation(&loaded.prior, &expected);
+            assert_eq!(loaded.snapshot.head_seq, cut as u64);
+        }
+    }
+
+    #[test]
+    fn offset_resume_preserves_open_tool_turn_and_redo_at_every_cut() {
+        let mut records = corpus()[..4].to_vec();
+        records.extend(crate::replay::deferred_tests::batch(&["a", "b"]));
+        records.push(crate::replay::deferred_tests::terminal("b", None));
+        records.push(crate::replay::deferred_tests::terminal("a", None));
+        records.extend(crate::replay::deferred_tests::finished());
+        for cut in 5..=records.len() {
+            let (bytes, positions, ends) = encode(&records[..cut]);
+            let loaded = reconstruct_from_offsets(
+                &reader(&bytes),
+                snapshot(&bytes, &positions, &ends, 2),
+                cut as u64,
+            )
+            .unwrap();
+            let expected = crate::replay::replay(&records[..cut]).unwrap();
+            assert_continuation(&loaded.prior, &expected);
+        }
+    }
+
+    #[test]
+    fn offset_resume_rejects_invalid_boundary_and_incomplete_snapshot() {
+        let records = corpus();
+        let (bytes, positions, ends) = encode(&records);
+        for case in 0..8 {
+            let mut candidate = snapshot(&bytes, &positions, &ends, 2);
+            match case {
+                0 => candidate.boundary.frame_identity[0] ^= 1,
+                1 => candidate.boundary.qualified = false,
+                2 => candidate.tail[0].off += 1,
+                3 => candidate.tail[0].framed.seq += 1,
+                4 => candidate.projection.admission_checkpoint.has_deferred_calls = Some(true),
+                5 => {
+                    candidate.prefix.pop();
+                }
+                6 => candidate.tail.pop().map(|_| ()).unwrap(),
+                _ => {
+                    candidate.projection.projection_episodes.as_mut().unwrap()[0].first_step =
+                        Some(Some(10000))
+                }
+            }
+            assert!(
+                reconstruct_from_offsets(&reader(&bytes), candidate, 8).is_err(),
+                "case {case}"
+            );
+        }
+        let candidate = snapshot(&bytes, &positions, &ends, 2);
+        assert!(
+            reconstruct_from_offsets(&reader(&bytes[..ends[1] as usize]), candidate, 8).is_err()
+        );
+    }
+
+    #[test]
+    fn offset_resume_decodes_only_the_boundary_and_single_episode_tail() {
+        let mut records = corpus();
+        let mut history = Vec::new();
+        for _ in 0..1000 {
+            history.extend(records[..4].iter().cloned());
+        }
+        history.append(&mut records);
+        let (bytes, positions, ends) = encode(&history);
+        let boundary = positions.len() - 6;
+        let candidate = snapshot(&bytes, &positions, &ends, boundary);
+        let decoded = std::cell::Cell::new(0);
+        let tail = crate::projection::decode_positioned_frames(
+            &reader(&bytes),
+            ends[boundary],
+            bytes.len() as u64,
+            Some(&decoded),
+        )
+        .unwrap();
+        assert_eq!(tail.len(), 5);
+        let checked_reads = std::cell::RefCell::new(Vec::new());
+        let boundary_range = (
+            candidate.boundary.frame_off,
+            candidate.boundary.frame_end - candidate.boundary.frame_off,
+        );
+        let read_at = |off, len| {
+            checked_reads.borrow_mut().push((off, len));
+            reader(&bytes)(off, len)
+        };
+        reconstruct_from_offsets(
+            &read_at,
+            OffsetResumeSnapshot { tail, ..candidate },
+            positions.len() as u64,
+        )
+        .unwrap();
+        assert_eq!(decoded.get(), 5);
+        assert_eq!(
+            *checked_reads.borrow(),
+            vec![boundary_range, (0, framing::LINEAGE_FRAME_LEN as u64)],
+            "read only the boundary and lineage header, never the history range"
+        );
+    }
+
+    #[test]
+    #[ignore = "explicit resume-cost measurement at the campaign's two history sizes"]
+    fn offset_resume_cost_at_1k_and_150k_messages() {
+        for n in [1_000, 150_000] {
+            let mut records = corpus();
+            if let WalRecord::RunStarted { input, .. } = &mut records[0] {
+                *input = (0..n - 2)
+                    .map(|i| {
+                        Message::new(
+                            Role::User,
+                            vec![ContentBlock::Text {
+                                text: format!("history {i}"),
+                            }],
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .into();
+            }
+            let (bytes, positions, ends) = encode(&records[..6]);
+            let mut candidate = snapshot(&bytes, &positions, &ends, 2);
+            let start = std::time::Instant::now();
+            // Include request-source decoding, not just concatenation of an already hydrated
+            // vector. This fixture's history inputs share a single RunStarted source frame.
+            let broca_wal::framing::DecodeStep::Record { framed, .. } =
+                framing::decode_next(&bytes[..ends[0] as usize])
+            else {
+                panic!("history source decodes")
+            };
+            let WalRecord::RunStarted { input, .. } = framed.record else {
+                panic!("history source is RunStarted")
+            };
+            let mut prefix = input.to_vec();
+            for (ord, message) in prefix.iter_mut().enumerate() {
+                message.ordinal = Some(ord as u64);
+            }
+            prefix.push(candidate.prefix.last().unwrap().clone());
+            candidate.prefix = prefix;
+            let loaded = reconstruct_from_offsets(&reader(&bytes), candidate, 6).unwrap();
+            let elapsed = start.elapsed();
+            assert_eq!(loaded.prior.prompt.len(), n);
+            eprintln!("offset resume {n} messages: {:.2} ms (request-source decode + composition; index construction excluded; historical baseline {:.2} ms)", elapsed.as_secs_f64() * 1000.0, if n == 1000 { 5.24 } else { 384.58 });
+        }
+    }
+}
+
 /// The text of the result a resume writes for an indeterminate call. It says plainly that no
 /// result was recorded, because that is all the runner knows: the call may have run.
 pub const OUTCOME_UNKNOWN_TEXT: &str = "outcome_unknown: this tool call was sent, but no result \

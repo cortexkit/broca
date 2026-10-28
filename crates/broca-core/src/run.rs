@@ -1568,6 +1568,113 @@ where
         out,
         on_admitted,
         prior_snapshot,
+        None,
+    )
+    .await
+}
+
+/// Opt-in overhaul resume seam. The reader supplies one offset-index snapshot; reconstruction
+/// validates the boundary before using the seed and falls back to a complete WAL read if
+/// snapshot loading or validation fails.
+/// Legacy entry points never install this reader.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_loop_from_offsets<P, T, L, A, W>(
+    req: RunRequest,
+    mode: StartMode,
+    provider: &P,
+    tool_plane: &T,
+    lease_store: &L,
+    approval: &A,
+    wal_store: &W,
+    control: RunControl,
+    out: &mpsc::Sender<OutputEvent>,
+    on_admitted: Option<tokio::sync::oneshot::Sender<Result<RunId, RunError>>>,
+    offsets: &dyn crate::resume::OffsetResumeReader,
+) -> Result<RunSummary, RunError>
+where
+    P: Provider,
+    T: ToolPlane,
+    L: LeaseStore,
+    A: ApprovalPolicy,
+    W: WalStore,
+{
+    if !wal_store.wal_config().is_overhaul() {
+        return Err(RunError::Wal(
+            "offset resume requires a broca-state/2 root".into(),
+        ));
+    }
+    let lease = lease_store
+        .acquire(&lease_key_for(&req.session))
+        .map_err(|e| match e {
+            LeaseError::Held { .. } => RunError::LeaseHeld(req.session.session.clone()),
+            other => RunError::Lease(other.to_string()),
+        })?;
+    let wal = wal_store.open(&req.session).map_err(RunError::from)?;
+    let mut writer =
+        WalHandle::spawn_in_store(wal, wal_store, &req.session, lease.epoch(), Some(lease))
+            .map_err(|e| RunError::Wal(e.to_string()))?;
+    writer.bind_media_capture(wal_store, &req.session);
+    let result = run_loop_on_writer_from_offsets(
+        req,
+        &writer,
+        mode,
+        provider,
+        tool_plane,
+        approval,
+        wal_store,
+        control,
+        out,
+        on_admitted,
+        offsets,
+    )
+    .await;
+    writer.shutdown().await.map_err(RunError::from)?;
+    result
+}
+
+/// Coordinator-owned-writer variant of [`run_loop_from_offsets`]. The caller retains the
+/// writer lifecycle and lease; terminal durability is identical to the legacy writer entry.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_loop_on_writer_from_offsets<P, T, A, W>(
+    mut req: RunRequest,
+    writer: &WalHandle,
+    mode: StartMode,
+    provider: &P,
+    tool_plane: &T,
+    approval: &A,
+    wal_store: &W,
+    control: RunControl,
+    out: &mpsc::Sender<OutputEvent>,
+    on_admitted: Option<tokio::sync::oneshot::Sender<Result<RunId, RunError>>>,
+    offsets: &dyn crate::resume::OffsetResumeReader,
+) -> Result<RunSummary, RunError>
+where
+    P: Provider,
+    T: ToolPlane,
+    A: ApprovalPolicy,
+    W: WalStore,
+{
+    if !wal_store.wal_config().is_overhaul() {
+        return Err(RunError::Wal(
+            "offset resume requires a broca-state/2 root".into(),
+        ));
+    }
+    let (append_episode, auth_resolved) = mode.flags();
+    run_on_writer(
+        &mut req,
+        writer,
+        append_episode,
+        auth_resolved,
+        provider,
+        tool_plane,
+        approval,
+        wal_store,
+        None,
+        &control,
+        out,
+        on_admitted,
+        None,
+        Some(offsets),
     )
     .await
 }
@@ -1591,6 +1698,7 @@ async fn run_on_writer<P, T, A, W>(
     out: &mpsc::Sender<OutputEvent>,
     on_admitted: Option<tokio::sync::oneshot::Sender<Result<RunId, RunError>>>,
     prior_snapshot: Option<&PriorWalSnapshot>,
+    offsets: Option<&dyn crate::resume::OffsetResumeReader>,
 ) -> Result<RunSummary, RunError>
 where
     P: Provider,
@@ -1647,6 +1755,7 @@ where
         wal_store,
         store.clone(),
         prior_snapshot,
+        offsets,
     )
     .await;
     let (mut prior, is_resume, mut append_episode, last_input, approval_frames) = match reconstruct
@@ -1764,39 +1873,74 @@ async fn reconstruct_prior<W>(
     wal_store: &W,
     store: Option<Arc<dyn SessionStore>>,
     prior_snapshot: Option<&PriorWalSnapshot>,
+    offsets: Option<&dyn crate::resume::OffsetResumeReader>,
 ) -> Result<ReconstructedPrior, RunError>
 where
     W: WalStore,
 {
     require_agent_run_scope_writer(req.scope.as_ref())?;
-    let snapshot = match prior_snapshot {
-        Some(snapshot) if prior_snapshot_matches_writer_head(writer, snapshot) => snapshot.clone(),
-        Some(_) => {
-            // A reserved append can make a snapshot stale before the writer task has flushed it.
-            // The barrier makes the retry's head authoritative before the loader tries the store
-            // checkpoint and its WAL suffix once more.
-            let safe_head = writer
-                .sync()
-                .await
-                .map_err(|error| RunError::Wal(error.to_string()))?;
-            let retried =
-                load_prior_wal_snapshot(wal_store, &req.session, safe_head, store.as_deref())
-                    .map_err(RunError::Wal)?;
-            if prior_snapshot_matches_writer_head(writer, &retried) {
-                retried
-            } else {
+    let mut offset_prior = None;
+    let snapshot = if let Some(offsets) = offsets {
+        let safe_head = writer
+            .sync()
+            .await
+            .map_err(|e| RunError::Wal(e.to_string()))?;
+        let loaded = offsets.snapshot(safe_head).and_then(|snapshot| {
+            if writer.lineage_id().map(|id| id.to_string()) != snapshot.boundary.lineage_id {
+                return Err(crate::replay::SeedFallback {
+                    reason: "offset resume writer lineage mismatch",
+                });
+            }
+            crate::resume::reconstruct_from_offsets(
+                &|off, len| offsets.read_at(off, len),
+                snapshot,
+                safe_head,
+            )
+        });
+        match loaded {
+            Ok(loaded) => {
+                offsets.reconstructed(None);
+                writer.seed_display_placement(safe_head, loaded.placement);
+                offset_prior = Some(loaded.prior);
+                loaded.snapshot
+            }
+            Err(reason) => {
+                offsets.reconstructed(Some(reason));
                 complete_snapshot(wal_store, &req.session)?
             }
         }
-        None if store.is_some() => {
-            let safe_head = writer
-                .sync()
-                .await
-                .map_err(|error| RunError::Wal(error.to_string()))?;
-            load_prior_wal_snapshot(wal_store, &req.session, safe_head, store.as_deref())
-                .map_err(RunError::Wal)?
+    } else {
+        match prior_snapshot {
+            Some(snapshot) if prior_snapshot_matches_writer_head(writer, snapshot) => {
+                snapshot.clone()
+            }
+            Some(_) => {
+                // A reserved append can make a snapshot stale before the writer task has flushed it.
+                // The barrier makes the retry's head authoritative before the loader tries the store
+                // checkpoint and its WAL suffix once more.
+                let safe_head = writer
+                    .sync()
+                    .await
+                    .map_err(|error| RunError::Wal(error.to_string()))?;
+                let retried =
+                    load_prior_wal_snapshot(wal_store, &req.session, safe_head, store.as_deref())
+                        .map_err(RunError::Wal)?;
+                if prior_snapshot_matches_writer_head(writer, &retried) {
+                    retried
+                } else {
+                    complete_snapshot(wal_store, &req.session)?
+                }
+            }
+            None if store.is_some() => {
+                let safe_head = writer
+                    .sync()
+                    .await
+                    .map_err(|error| RunError::Wal(error.to_string()))?;
+                load_prior_wal_snapshot(wal_store, &req.session, safe_head, store.as_deref())
+                    .map_err(RunError::Wal)?
+            }
+            None => complete_snapshot(wal_store, &req.session)?,
         }
-        None => complete_snapshot(wal_store, &req.session)?,
     };
 
     require_agent_run_scope_writer(
@@ -1822,7 +1966,9 @@ where
         other => other,
     };
     writer.seed_lineage_tags(lineage_tags);
-    seed_display_placement(writer, &snapshot, wal_store, store.as_deref(), &req.session);
+    if offset_prior.is_none() {
+        seed_display_placement(writer, &snapshot, wal_store, store.as_deref(), &req.session);
+    }
     let episode = snapshot.checkpoint_at_head.last_episode.as_ref();
     let is_resume = episode.is_some();
     let last_input = episode.map(|episode| episode.input.clone());
@@ -1900,6 +2046,7 @@ where
     }
 
     let mut prior = match store {
+        _ if offset_prior.is_some() => offset_prior.take().expect("checked offset prior"),
         _ if held_prior.is_some() => held_prior.take().expect("checked held prior"),
         _ if held_needs_replay => {
             replay_complete_snapshot_or_wal(&snapshot, wal_store, &req.session)?
@@ -2118,7 +2265,7 @@ async fn store_episode_render_history(
 /// The render inputs of an episode projection read from the store, or `Ok(None)` when one of
 /// its values was never computed or the episodes are out of order, so the caller replays the
 /// WAL instead.
-fn episode_render_inputs(
+pub(crate) fn episode_render_inputs(
     stored: &[crate::context::EpisodeRenderProjection],
 ) -> Result<Option<Vec<broca_protocol::request::EpisodeRenderInput>>, String> {
     if stored.is_empty()
@@ -2246,6 +2393,7 @@ where
         &control,
         out,
         None, // the per-run wrapper has no coordinator awaiting admission
+        None,
         None,
     ))
     .await;
