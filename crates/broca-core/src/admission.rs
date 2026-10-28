@@ -1034,6 +1034,7 @@ impl AdmissionCheckpointV1 {
             // `WalRecord`, so it changes no admission state (only `at_seq` advances past it).
             WalRecord::WriterOpened { .. }
             | WalRecord::WriterClosed { .. }
+            | WalRecord::VisibilityLate { .. }
             | WalRecord::Unknown => {}
             // Compaction state is folded below; it does not change admission's episode counters.
             WalRecord::CompactionRequest { .. }

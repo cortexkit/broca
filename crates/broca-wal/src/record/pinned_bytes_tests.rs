@@ -148,6 +148,7 @@ fn tag_of(record: &WalRecord) -> &'static str {
     match record {
         WalRecord::WriterOpened { .. } => "writer_opened",
         WalRecord::WriterClosed { .. } => "writer_closed",
+        WalRecord::VisibilityLate { .. } => "visibility_late",
         WalRecord::RunStarted { .. } => "run_started",
         WalRecord::ModelStepFinished { .. } => "model_step_finished",
         WalRecord::ModelStepRefused { .. } => "model_step_refused",

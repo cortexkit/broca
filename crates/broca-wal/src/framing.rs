@@ -64,7 +64,7 @@ impl WalLineageId {
         Self(bytes)
     }
 
-    fn as_bytes(self) -> [u8; 16] {
+    pub(crate) fn as_bytes(self) -> [u8; 16] {
         self.0
     }
 }
@@ -202,6 +202,7 @@ pub const TOOL_SCHEMA_PINS_FEATURE: &str = "tool-schema-pins/v1";
 /// as [`DecodeStep::NewerWriter`]. `ck-broca --wal-known-features` prints this list so
 /// placement tooling can refuse to install a build that cannot read what is already on disk.
 pub const KNOWN_FEATURES: &[&str] = &[
+    crate::head_proof::VISIBILITY_LATE_FEATURE,
     "writer-id/v1",
     INTERRUPT_REASON_FEATURE,
     TURN_DIRECTIVES_FEATURE,
@@ -1419,6 +1420,7 @@ mod tests {
         assert_eq!(
             KNOWN_FEATURES,
             &[
+                crate::head_proof::VISIBILITY_LATE_FEATURE,
                 "writer-id/v1",
                 INTERRUPT_REASON_FEATURE,
                 TURN_DIRECTIVES_FEATURE,

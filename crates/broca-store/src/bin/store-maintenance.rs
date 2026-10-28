@@ -869,6 +869,10 @@ fn private_mode(_state_root: &std::path::Path, _dry_run: bool) -> ExitCode {
 }
 
 fn wal_fold(root: &std::path::Path, args: &[String]) -> ExitCode {
+    if let Err(error) = broca_core::wal_fold::ensure_legacy_root(root) {
+        eprintln!("store-maintenance: wal-fold refused: {error}");
+        return ExitCode::from(2);
+    }
     let mut options = broca_core::wal_fold::FoldOptions::default();
     let mut args = args.iter();
     while let Some(arg) = args.next() {

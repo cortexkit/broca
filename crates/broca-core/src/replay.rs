@@ -3019,6 +3019,7 @@ fn replay_seeded_with_compaction<'a>(
             // episode state: replay is identical to the same WAL without it.
             WalRecord::WriterOpened { .. }
             | WalRecord::WriterClosed { .. }
+            | WalRecord::VisibilityLate { .. }
             | WalRecord::Unknown => {}
             // Compaction is folded separately above; the transcript remains append-only.
             WalRecord::CompactionRequest { .. }
@@ -4202,6 +4203,58 @@ pub(crate) mod projection_boundary_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn visibility_late_preserves_projection_boundaries_and_episode_indexes() {
+        let records = vec![
+            run_started(10, "one"),
+            no_tool_step(20, 1),
+            run_finished(30),
+            run_started(40, "two"),
+            turn_finished(50, 1),
+            run_finished(60),
+        ];
+        let facts = |records: &[FramedRecord]| {
+            let mut state = crate::projection_plan::ProjectionBoundaryState::default();
+            let facts: Vec<_> = records
+                .iter()
+                .flat_map(|frame| state.observe(frame))
+                .collect();
+            (
+                serde_json::to_value(facts).unwrap(),
+                serde_json::to_value(state).unwrap(),
+            )
+        };
+        for position in 0..=records.len() {
+            let mut with_marker = records.clone();
+            with_marker.insert(
+                position,
+                framed(
+                    position as u64 * 10 + 1,
+                    WalRecord::VisibilityLate {
+                        through_seq: position as u64 * 10,
+                        oldest_appended_ms: 1,
+                    },
+                ),
+            );
+            assert_eq!(facts(&with_marker), facts(&records));
+            for watermark in 0..=62 {
+                assert_eq!(
+                    latest_projection_boundary(&with_marker, watermark),
+                    latest_projection_boundary(&records, watermark)
+                );
+            }
+        }
+        let marker_only = [framed(
+            1,
+            WalRecord::VisibilityLate {
+                through_seq: 0,
+                oldest_appended_ms: 1,
+            },
+        )];
+        assert_eq!(facts(&marker_only), facts(&[]));
+        assert_eq!(latest_projection_boundary(&marker_only, 0), None);
     }
 
     fn turn_finished(seq: u64, step_id: u64) -> FramedRecord {

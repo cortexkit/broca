@@ -1025,6 +1025,10 @@ impl From<WalWriteError> for RunError {
     fn from(e: WalWriteError) -> Self {
         match e {
             WalWriteError::Failed(detail) => RunError::Wal(detail),
+            WalWriteError::RelocationIncomplete { reason } => RunError::Transient(reason),
+            WalWriteError::ProofPathUnavailable => {
+                RunError::Wal(WalWriteError::ProofPathUnavailable.to_string())
+            }
             WalWriteError::SessionTooLarge { max_bytes } => RunError::SessionTooLarge { max_bytes },
             WalWriteError::RetainedSessionTooLarge { max_bytes } => {
                 RunError::RetainedSessionTooLarge { max_bytes }
@@ -1038,6 +1042,9 @@ impl From<broca_wal::WalError> for RunError {
     /// failure, corruption included, stays [`RunError::Wal`] with its text, exactly as before.
     fn from(error: broca_wal::WalError) -> Self {
         match error {
+            error @ broca_wal::WalError::RelocationIncomplete { .. } => {
+                RunError::Transient(error.to_string())
+            }
             broca_wal::WalError::NewerWriter { missing, .. } => RunError::NewerWriter { missing },
             other => RunError::Wal(other.to_string()),
         }

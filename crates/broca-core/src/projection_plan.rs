@@ -695,7 +695,9 @@ impl ProjectionBoundaryState {
     pub fn observe(&mut self, frame: &FramedRecord) -> Vec<ProjectionBoundaryFact> {
         if matches!(
             frame.record,
-            WalRecord::WriterOpened { .. } | WalRecord::WriterClosed { .. }
+            WalRecord::WriterOpened { .. }
+                | WalRecord::WriterClosed { .. }
+                | WalRecord::VisibilityLate { .. }
         ) {
             return Vec::new();
         }

@@ -1077,3 +1077,47 @@ fn media_sweep_reclaims_uploads_only_in_write_mode_and_fails_closed() {
         assert!(root.join("media-uploads/objects").join(id).exists());
     }
 }
+
+#[test]
+fn wal_fold_cli_refuses_overhaul_before_any_maintenance_work() {
+    let root = state_root("overhaul-fold-refusal");
+    let marker = root.join(broca_wal::state_format::MARKER_FILENAME);
+    std::fs::write(&marker, b"broca-state/2\n").unwrap();
+    let before: std::collections::BTreeSet<_> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    for args in [
+        vec![],
+        vec!["--write"],
+        vec!["--resume", "sealed", "--write"],
+        vec!["--unfold", "--write"],
+        vec!["--abandon"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_store-maintenance"))
+            .arg("wal-fold")
+            .arg(&root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "overhaul folding must be refused, not reported as an empty successful pass"
+        );
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("overhaul") && error.contains("broca-state/2"),
+            "{error}"
+        );
+        let after: std::collections::BTreeSet<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            after, before,
+            "refusal must precede opening a database, lease, archive or journal"
+        );
+        assert_eq!(std::fs::read(&marker).unwrap(), b"broca-state/2\n");
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
