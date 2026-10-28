@@ -2,7 +2,8 @@
 
 Broca serves this read-only management query for head routes and authorized flow
 routes. The operation catalog declares it a query; the manifest's
-`flow_operations` contains exactly `diagnostics.findings`. A flow's identity comes
+`flow_operations` includes `diagnostics.findings` alongside the existing
+flow-callable management operations. A flow's identity comes
 from the daemon's route stamp, never from request parameters.
 
 Head routes must be stamped as `head`, have no agent-run or flow id, and be
@@ -14,12 +15,15 @@ unverified principals cannot borrow flow admission. An authorized flow stamp
 may also carry owner agent/run attributes; its flow id still selects flow
 admission rather than owner-agent identity.
 Existing channel/epoch checks reject stale route generations.
-On a flow-scoped management route every other operation, including
-`health.check`, `session.send`, classifier and permissions management operations,
-returns `flow_scope_not_supported` naming the operation before any session or
-diagnostic evidence read. Flow management binds therefore skip session-history
-adoption checks. Actual tool-provider routes retain their existing scoped model
-tool admission; a management role declaration cannot bypass the management gate.
+Existing management flow callers retain their original per-operation and
+session/resource authorization, including Basal's flow-stamp requirement on
+sends and the classifier management route. Adding diagnosis does not widen or
+narrow another operation. Actual tool-provider routes also retain their existing
+scoped model-tool admission. `flow_operations` is derived from the existing
+namespace scope/caller gates over the declared catalog, not a second hand-kept
+list. Stateful role, session and owner checks remain in their original positions;
+discovery is not a resource grant. For example, `permissions.list` and
+`permissions.revoke` still admit only Direct or reserved `cingulate`, not Basal.
 
 ```json
 {"method":"diagnostics.findings","params":{"window_ms":21600000}}

@@ -35,6 +35,7 @@ pub mod context_management;
 pub mod held_runtime;
 pub mod keep_warm_quota;
 pub mod llm_tools;
+pub mod management_admission;
 pub mod manifest;
 pub mod opencode_go_identity;
 pub mod provider_overrides;

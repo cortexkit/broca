@@ -330,6 +330,19 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
     ]
 }
 
+pub(crate) fn registered_management_operation(method: &str) -> bool {
+    static NAMES: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            management_operations()
+                .into_iter()
+                .map(|op| op.name)
+                .collect()
+        })
+        .contains(method)
+}
+
 pub(crate) fn observability_surfaces() -> Vec<ObservabilitySurface> {
     vec![ObservabilitySurface {
         name: OP_SUBSCRIBE.to_string(),
@@ -489,7 +502,7 @@ pub fn manifest_configured(
         requires: Vec::new(),
         must_never_reach: Vec::new(),
     }))
-    .flow_operations(Some(vec![broca_wire::diagnostics::OP.into()]))
+    .flow_operations(Some(crate::management_admission::flow_operations()))
     .provides(vec![ProviderRole::ManagementSurface {
             // Concurrent ACROSS sessions, FIFO WITHIN one: the registry fans requests out to
             // per-session lineage actors, and each actor processes its own commands in order

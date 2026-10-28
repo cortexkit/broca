@@ -1316,30 +1316,6 @@ where
     (frame, reader)
 }
 
-fn management_flow_refusal(body: &[u8], bind: &BindObservation) -> Option<ErrorBody> {
-    if !bind.management
-        || !matches!(&bind.scope, broca_protocol::SendScope::Stamped(stamp) if stamp.scope.flow_id.is_some())
-    {
-        return None;
-    }
-    #[derive(serde::Deserialize)]
-    struct Operation<'a> {
-        method: Option<&'a str>,
-        name: Option<&'a str>,
-    }
-    let request = serde_json::from_slice::<Operation<'_>>(body).ok();
-    let operation = request
-        .as_ref()
-        .and_then(|op| op.method.or(op.name))
-        .unwrap_or("<invalid>");
-    if request.is_some_and(|op| op.method == Some(crate::diagnostics::OP)) {
-        return None;
-    }
-    Some(ErrorBody::new("flow_scope_not_supported", format!(
-        "{operation} is not served on a flow-scoped management route; flows may call diagnostics.findings"
-    )).with_detail(serde_json::json!({"op":operation,"allowed_ops":[crate::diagnostics::OP]})))
-}
-
 /// Returns Ok(false) to stop the loop, which it does only for a channel-0 GOODBYE; the frame
 /// loop reports that stop as `ServeEnd::Goodbye`.
 #[allow(clippy::too_many_arguments)]
@@ -1465,16 +1441,19 @@ where
             let Some((_, session, bind)) = routes.by_channel.get(&channel).cloned() else {
                 unreachable!("route binding disappeared after the channel/epoch guard")
             };
-            if let Some(error) = management_flow_refusal(&frame.body, &bind) {
-                send_error_body(writer, ver, channel, epoch, corr, error).await?;
-                return Ok(true);
-            }
             if bind.management && request_operation(&frame.body) == crate::diagnostics::OP {
                 count_management_operation(crate::diagnostics::OP);
-                if let Err(error) = crate::diagnostics::admit(bind.principal.as_ref(), &bind.scope)
-                {
-                    send_error_body(writer, ver, channel, epoch, corr, error).await?;
-                    return Ok(true);
+                match crate::management_admission::admit(
+                    crate::diagnostics::OP,
+                    bind.principal.as_ref(),
+                    &bind.scope,
+                ) {
+                    Ok(crate::management_admission::Admission::Diagnostics) => {}
+                    Err(crate::management_admission::Refusal::Diagnostics(error)) => {
+                        send_error_body(writer, ver, channel, epoch, corr, error).await?;
+                        return Ok(true);
+                    }
+                    _ => unreachable!("diagnostics scope admission returned a different operation"),
                 }
                 let req: RouteRequest = match serde_json::from_slice(&frame.body) {
                     Ok(req) => req,
@@ -1933,13 +1912,10 @@ async fn handle_control_request(
                 cancel,
                 refusal: Ok(None),
             };
-            // Session-bearing routes authorize their stamp against history off ingress.
-            // Flow management serves only process-wide diagnostics, so its bind must not
-            // inspect a session's history merely to admit or refuse a process-level query.
+            // Keep the bind unacknowledged until its history authorizes the stamp. The read
+            // runs off ingress so a slow WAL/store cannot hide health probes or GOODBYE.
             if !completed.bind.agent_data
                 && !completed.bind.role.is_sessionless()
-                && !matches!(&completed.bind.scope, broca_protocol::SendScope::Stamped(stamp)
-                    if completed.bind.management && stamp.scope.flow_id.is_some())
                 && matches!(&completed.bind.scope, broca_protocol::SendScope::Stamped(_))
             {
                 let registry = health_registry.clone();
@@ -7388,153 +7364,6 @@ mod tests {
         held_bind_registry_with_records(vec![])
     }
 
-    #[tokio::test]
-    async fn diagnostics_flow_management_gate_refuses_reads_and_writes_before_sources() {
-        struct NoSessionReads(std::sync::atomic::AtomicU64);
-        impl broca_core::WalStore for NoSessionReads {
-            fn open(
-                &self,
-                _: &BrocaBindIdentity,
-            ) -> Result<Box<dyn broca_wal::Wal + Send>, broca_wal::WalError> {
-                self.0.fetch_add(1, Ordering::Relaxed);
-                panic!("flow management must not open a session")
-            }
-            fn read_records(
-                &self,
-                _: &BrocaBindIdentity,
-            ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
-                self.0.fetch_add(1, Ordering::Relaxed);
-                panic!("flow management must not read session history")
-            }
-        }
-        let source = Arc::new(NoSessionReads(std::sync::atomic::AtomicU64::new(0)));
-        let registry = Arc::new(LineageRegistry::new_with_reader(
-            Arc::new(RefusingOpener),
-            source.clone(),
-            None,
-        ));
-        let mut ingress = BindIngress::new(registry);
-        let owner = subc_protocol::Principal::Reserved {
-            module_id: "agent".into(),
-        };
-        let mut stamp = subc_protocol::scope::ScopeStamp::new(
-            owner.clone(),
-            "flow",
-            1,
-            subc_protocol::scope::ScopeKind::Head,
-        )
-        .with_owner_authorized(true);
-        stamp.attributes.flow_id = Some("diagnostic-flow".into());
-        let bind = ModuleControlRequest::RouteBind {
-            route_channel: 7,
-            epoch: 1,
-            target: subc_protocol::RouteTarget::ManagementSurface {
-                module_id: "broca".into(),
-            },
-            identity: SubcBindIdentity::new("/project", "test", "flow"),
-            principal: Some(owner),
-            scope: Some(stamp),
-            role_versions: None,
-            consumer_capabilities: None,
-            admission_facts: None,
-            call_mode: None,
-        };
-        ingress
-            .frame(
-                Frame::build(
-                    FrameType::Request,
-                    control_flags(),
-                    0,
-                    0,
-                    1,
-                    serde_json::to_vec(&bind).unwrap(),
-                )
-                .unwrap(),
-            )
-            .await;
-        let ack = next_written(&mut ingress.written).await;
-        assert_eq!(ack.header.ty, FrameType::Response);
-        assert_eq!(source.0.load(Ordering::Relaxed), 0);
-        for (i, method) in [
-            "health.check",
-            "session.send",
-            "classify.run",
-            "permissions.list",
-            "session.subscribe",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            ingress.routes.by_channel.get_mut(&7).unwrap().2.role = match method {
-                "classify.run" => RouteRole::Classifier,
-                "permissions.list" => RouteRole::Permissions,
-                _ => RouteRole::LlmRunner,
-            };
-            ingress
-                .frame(
-                    Frame::build(
-                        FrameType::Request,
-                        control_flags(),
-                        7,
-                        1,
-                        i as u64 + 2,
-                        serde_json::to_vec(&serde_json::json!({"method":method,"params":{}}))
-                            .unwrap(),
-                    )
-                    .unwrap(),
-                )
-                .await;
-            let reply = next_written(&mut ingress.written).await;
-            let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
-            assert_eq!(reply.header.ty, FrameType::Error);
-            assert_eq!(body["code"], "flow_scope_not_supported");
-            assert_eq!(body["detail"]["op"], method);
-            assert!(ingress.requests.is_empty());
-            assert_eq!(source.0.load(Ordering::Relaxed), 0);
-        }
-        let root = broca_test_support::scratch_root()
-            .join(format!("flow-diagnostics-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        let _store = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
-        crate::diagnostics::install(root);
-        ingress
-            .frame(
-                Frame::build(
-                    FrameType::Request,
-                    control_flags(),
-                    7,
-                    1,
-                    100,
-                    serde_json::to_vec(
-                        &serde_json::json!({"method":crate::diagnostics::OP,"params":{}}),
-                    )
-                    .unwrap(),
-                )
-                .unwrap(),
-            )
-            .await;
-        let reply = next_written(&mut ingress.written).await;
-        let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
-        assert_eq!(reply.header.ty, FrameType::Response, "{body}");
-        assert!(body["result"]["findings"].is_array());
-        assert_eq!(source.0.load(Ordering::Relaxed), 0);
-        let mut tool_bind = ingress.routes.by_channel[&7].2.clone();
-        tool_bind.management = false;
-        tool_bind.role = RouteRole::ToolProvider;
-        let mut management_alias = tool_bind.clone();
-        management_alias.management = true;
-        let refusal = management_flow_refusal(
-            br#"{"name":"llm_classify","arguments":{}}"#,
-            &management_alias,
-        )
-        .unwrap();
-        assert_eq!(refusal.detail.unwrap()["op"], "llm_classify");
-        assert!(
-            management_flow_refusal(br#"{"name":"llm_classify","arguments":{}}"#, &tool_bind)
-                .is_none()
-        );
-    }
-
     fn held_bind_registry_with_records(
         records: Vec<broca_wal::FramedRecord>,
     ) -> (BindIngress, Arc<HeldBindRead>, ReleaseBindRead) {
@@ -9668,3 +9497,7 @@ mod delivery_list_tests {
 #[cfg(test)]
 #[path = "serve_classifier_tests.rs"]
 mod classifier_route_tests;
+
+#[cfg(test)]
+#[path = "serve_flow_compat_tests.rs"]
+mod flow_management_compat_tests;
