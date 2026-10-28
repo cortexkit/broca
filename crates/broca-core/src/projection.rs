@@ -980,6 +980,7 @@ fn project_control_record<S: ControlProjectionSink>(
         // it is skipped exactly like `Unknown`, so the control stream is identical without it.
         WalRecord::ModelAttemptFinished { .. } => {}
         WalRecord::AttemptReserved { .. }
+        | WalRecord::AttemptFinished { .. }
         | WalRecord::AttemptReleased { .. }
         | WalRecord::AttemptCorrected { .. } => {}
         // A refused step is re-sent under the same step id and its refused content is never

@@ -1,6 +1,6 @@
 //! Billing identities are independent of log position and retry counters, including after restore.
 
-use broca_wal::record::AttemptId;
+use broca_wal::record::{AttemptId, CorrectionId};
 
 /// Mint all 128 bits from the OS random source before building a reservation.
 /// Entropy failures propagate to the caller: there is no counter or timestamp fallback.
@@ -10,18 +10,43 @@ pub fn mint_attempt_id() -> Result<AttemptId, getrandom::Error> {
     Ok(AttemptId::from_bytes(bytes))
 }
 
+/// Mint an independent identity for one complete replacement of an attempt's evidence.
+/// Multiple corrections of the same attempt must not share their deduplication key.
+pub fn mint_correction_id() -> Result<CorrectionId, getrandom::Error> {
+    let mut bytes = [0; 16];
+    getrandom::fill(&mut bytes)?;
+    Ok(CorrectionId::from_bytes(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use broca_protocol::{RunId, StepId};
     use broca_wal::record::{
-        AttemptCredential, AttemptReservation, AttemptRun, AttemptSession, WalRecord,
+        AttemptCredential, AttemptEnvelope, AttemptReservation, AttemptRun, AttemptSession,
+        WalRecord,
     };
     use std::collections::BTreeSet;
 
     #[test]
-    fn attempt_ids_do_not_repeat_across_restore_and_send_id_retry() {
-        let reservation = AttemptReservation {
+    fn correction_ids_are_distinct_for_repeated_corrections_of_one_attempt() {
+        let attempt = mint_attempt_id().unwrap();
+        let mut corrections = BTreeSet::new();
+        for _ in 0..64 {
+            let correction = mint_correction_id().unwrap();
+            assert_ne!(correction.as_str(), attempt.as_str());
+            assert_eq!(correction.as_str().len(), 32);
+            assert!(correction
+                .as_str()
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+            assert!(corrections.insert(correction));
+        }
+        assert_eq!(corrections.len(), 64);
+    }
+
+    fn reservation() -> AttemptReservation {
+        AttemptReservation {
             run_id: RunId("repeated-send-id".into()),
             step_id: StepId(1),
             attempt: 0,
@@ -32,6 +57,7 @@ mod tests {
             endpoint_host: "example.com".into(),
             model_sent: "model".into(),
             credential: AttemptCredential {
+                credential_ref: None,
                 account_ref: None,
                 auth_selection: None,
                 auth_method: None,
@@ -47,7 +73,35 @@ mod tests {
             request_body_bytes: 10,
             compressed: false,
             input_tokens_estimate: None,
+        }
+    }
+
+    #[test]
+    fn recovery_terminal_does_not_change_output_reservation_measurements() {
+        let record = WalRecord::AttemptFinished {
+            attempt_id: mint_attempt_id().unwrap(),
+            reservation: Box::new(reservation()),
+            envelope: Box::new(AttemptEnvelope::default()),
         };
+        let model = serde_json::from_value(serde_json::json!({
+            "provider_module_id":"provider", "model_id":"model"
+        }))
+        .unwrap();
+        let mut history = crate::output_reservation::OutputReservationHistory::default();
+        history.start_run(&model);
+        let before = history.clone();
+        history.fold(&record);
+        assert_eq!(history, before);
+        assert_eq!(history.estimate(1000, &model), None);
+        history.note_attempt(500);
+        let before = history.clone();
+        history.fold(&record);
+        assert_eq!(history, before);
+    }
+
+    #[test]
+    fn attempt_ids_do_not_repeat_across_restore_and_send_id_retry() {
+        let reservation = reservation();
         let original_id = mint_attempt_id().unwrap();
         let mut branch = vec![WalRecord::AttemptReserved {
             attempt_id: original_id.clone(),

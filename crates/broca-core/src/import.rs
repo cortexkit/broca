@@ -494,6 +494,7 @@ fn repairable_import_prefix(
             // repairable import prefix.
             WalRecord::ModelAttemptFinished { .. } => {}
             WalRecord::AttemptReserved { .. }
+            | WalRecord::AttemptFinished { .. }
             | WalRecord::AttemptReleased { .. }
             | WalRecord::AttemptCorrected { .. } => {}
             _ => return Ok(None),

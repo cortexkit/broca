@@ -3137,6 +3137,7 @@ fn replay_seeded_with_compaction<'a>(
             // count still comes from `ModelStepFinished.retries_used`.
             WalRecord::ModelAttemptFinished { .. } => {}
             WalRecord::AttemptReserved { .. }
+            | WalRecord::AttemptFinished { .. }
             | WalRecord::AttemptReleased { .. }
             | WalRecord::AttemptCorrected { .. } => {}
             // A refused step contributes nothing to the prompt: its content was never stored,

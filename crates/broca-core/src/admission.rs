@@ -1051,6 +1051,7 @@ impl AdmissionCheckpointV1 {
             // Provider attempt evidence is informational only, skipped exactly like `Unknown`.
             WalRecord::ModelAttemptFinished { .. } => {}
             WalRecord::AttemptReserved { .. }
+            | WalRecord::AttemptFinished { .. }
             | WalRecord::AttemptReleased { .. }
             | WalRecord::AttemptCorrected { .. } => {}
             // A refused step neither opens, pauses nor ends an episode: its re-send commits
