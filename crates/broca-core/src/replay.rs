@@ -1979,8 +1979,8 @@ pub struct SeedBoundary {
 
 /// A decoded tail frame positioned in the log, as a bounded tail read returns it.
 ///
-/// The validator requires byte contiguity: the first frame starts exactly where the
-/// boundary frame ends, so no record between them can silently vanish from the replay.
+/// The validator requires byte contiguity: only the writer's verified trailing lineage
+/// metadata may precede the first record, so no record between them can silently vanish.
 /// Later frames must continue the sequence gaplessly; the wiring reads them in order
 /// from the durable log, so their offsets chain by construction and only the first is
 /// checked.
@@ -2010,7 +2010,8 @@ pub struct SeedFallback {
 /// steer the tail would then lose. So this entry point takes the boundary's stored
 /// identity, reads exactly that frame and the log's header frame through `read_at`,
 /// and compares the sequence, the frame hash and the log lineage before replaying
-/// anything. Only those two ranges are ever read: the cost stays flat while the log
+/// anything. Apart from the writer's fixed-size trailing lineage metadata, only those
+/// two ranges are read: the cost stays flat while the log
 /// grows, which is what sparse resume needs on a 150k-message session. Any
 /// mismatch — a missing, torn, moved, different-lineage or different-hash frame, an
 /// unqualified boundary, a tail that is not contiguous with the boundary, or a frame
@@ -2021,8 +2022,9 @@ pub struct SeedFallback {
 /// `read_at(offset, len)` reads up to `len` bytes at `offset`, returning fewer at or
 /// past the log's end and an error only on a real I/O failure (which also falls back,
 /// letting the full-replay path report it). `tail` holds the positioned frames after
-/// the boundary: the first must continue its sequence and start where it ends, with no
-/// gaps after that; an empty tail is valid only at the log's durable end. `held_steers`
+/// the boundary: the first must continue its sequence and follow its frame or its
+/// verified trailing lineage metadata, with no sequence gaps after that; an empty tail
+/// is valid only at the log's durable end. `held_steers`
 /// carries the inputs the tail seed still holds at the cut, and `ordinal_base` the
 /// prefix length those rows cover; all three come from the same index snapshot as the
 /// boundary. A Setup in the tail still needs its own index catch-up first: see
@@ -2055,11 +2057,7 @@ pub fn replay_seeded_at_validated_boundary(
                 reason: "tail not contiguous with boundary",
             });
         }
-        if first.off != boundary.frame_end {
-            return Err(SeedFallback {
-                reason: "tail byte offset mismatch",
-            });
-        }
+        validate_boundary_lineage_gap(read_at, boundary, first.off)?;
         let mut seq = first.framed.seq;
         for positioned in rest {
             seq += 1;
@@ -2169,6 +2167,71 @@ pub fn replay_seeded_at_validated_boundary(
     .map_err(|_| SeedFallback {
         reason: "tail replay refused the seeded records",
     })
+}
+
+/// `FileWal::append_frame` in broca-wal/src/file_wal.rs writes one trailing lineage
+/// frame after each record. Its optional prefix precedes the record introducing a
+/// lineage, so it cannot add a second frame after an indexed boundary.
+const MAX_BOUNDARY_LINEAGE_FRAMES: u64 = 1;
+
+fn validate_boundary_lineage_gap(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    boundary: &SeedBoundary,
+    first_off: u64,
+) -> Result<(), SeedFallback> {
+    let gap = first_off
+        .checked_sub(boundary.frame_end)
+        .ok_or(SeedFallback {
+            reason: "tail byte offset mismatch",
+        })?;
+    if gap == 0 {
+        return Ok(());
+    }
+    let frame_len = broca_wal::framing::LINEAGE_FRAME_LEN as u64;
+    if gap > frame_len * MAX_BOUNDARY_LINEAGE_FRAMES {
+        return Err(SeedFallback {
+            reason: "too many frames in boundary lineage gap",
+        });
+    }
+    // A nonzero gap must be exactly one lineage frame, never a shifted record offset.
+    if gap != frame_len {
+        return Err(SeedFallback {
+            reason: "tail byte offset mismatch",
+        });
+    }
+    let bytes = read_at(boundary.frame_end, gap).map_err(|_| SeedFallback {
+        reason: "lineage gap unreadable",
+    })?;
+    if bytes.len() as u64 != gap {
+        return Err(SeedFallback {
+            reason: "short lineage gap read",
+        });
+    }
+    match broca_wal::framing::decode_next(&bytes) {
+        broca_wal::framing::DecodeStep::Lineage {
+            lineage_id,
+            consumed,
+        } if consumed == bytes.len()
+            && boundary.lineage_id.as_deref() == Some(lineage_id.to_string().as_str()) =>
+        {
+            Ok(())
+        }
+        broca_wal::framing::DecodeStep::Lineage { .. } => Err(SeedFallback {
+            reason: "boundary lineage gap mismatch",
+        }),
+        broca_wal::framing::DecodeStep::Record { .. } => Err(SeedFallback {
+            reason: "record in boundary lineage gap",
+        }),
+        broca_wal::framing::DecodeStep::TornTail => Err(SeedFallback {
+            reason: "torn boundary lineage gap",
+        }),
+        broca_wal::framing::DecodeStep::Corrupt(_) => Err(SeedFallback {
+            reason: "corrupt boundary lineage gap",
+        }),
+        broca_wal::framing::DecodeStep::NewerWriter { .. } => Err(SeedFallback {
+            reason: "newer frame in boundary lineage gap",
+        }),
+    }
 }
 
 /// Whether `off` is the log's durable end: a one-byte probe past it reads short.
@@ -6741,5 +6804,171 @@ mod offset_tail_tests {
         )
         .expect("empty tail at the durable end seeds");
         assert!(tail_state.prompt.is_empty());
+    }
+
+    struct RealBoundaryLog {
+        root: std::path::PathBuf,
+        path: std::path::PathBuf,
+        bytes: Vec<u8>,
+        records: Vec<WalRecord>,
+        boundary: SeedBoundary,
+        tail: Vec<PositionedFrame>,
+    }
+
+    impl RealBoundaryLog {
+        fn new(name: &str) -> Self {
+            use crate::WalStore;
+            let root = broca_test_support::scratch_root()
+                .join(format!("boundary-lineage-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
+            let store =
+                crate::FileWalStore::with_config(root.join("wal"), broca_wal::WalConfig::OVERHAUL);
+            let bind = BindIdentity::new("/tmp/project", "runner", "session");
+            let records = vec![
+                run_started("r1", vec![user("task")]),
+                step_started(1),
+                text_step(1, "answer"),
+                run_finished(RunFinishReason::Completed),
+            ];
+            let mut wal = store.open(&bind).unwrap();
+            for record in &records {
+                wal.append(1, record, true).unwrap();
+            }
+            drop(wal);
+            let path = store.wal_path(&bind);
+            let bytes = std::fs::read(&path).unwrap();
+            let scanned = scan_frames(&bytes);
+            let mut boundary = seed_boundary_for(&bytes, &scanned, 3, true);
+            boundary.lineage_id =
+                super::log_lineage_id(&bytes[..broca_wal::framing::LINEAGE_FRAME_LEN]);
+            let tail = positioned_tail(&scanned, 3);
+            Self {
+                root,
+                path,
+                bytes,
+                records,
+                boundary,
+                tail,
+            }
+        }
+
+        fn validate(
+            &self,
+            tail: &[PositionedFrame],
+        ) -> Result<super::ReplayState, super::SeedFallback> {
+            use std::io::{Read, Seek, SeekFrom};
+            let read_at = |off, len| {
+                let mut file = std::fs::File::open(&self.path)?;
+                file.seek(SeekFrom::Start(off))?;
+                let mut bytes = Vec::new();
+                file.take(len).read_to_end(&mut bytes)?;
+                Ok(bytes)
+            };
+            let (origin, run_id, ordinal_base, held) = seeds_at_cut(&self.records, 3);
+            replay_seeded_at_validated_boundary(
+                &read_at,
+                &self.boundary,
+                tail,
+                origin,
+                run_id,
+                None,
+                None,
+                ordinal_base,
+                false,
+                Default::default(),
+                held,
+            )
+        }
+
+        fn replace_gap(&self, replacement: &[u8]) -> Vec<PositionedFrame> {
+            let lo = self.boundary.frame_end as usize;
+            let hi = self.tail[0].off as usize;
+            let mut bytes = self.bytes[..lo].to_vec();
+            bytes.extend_from_slice(replacement);
+            bytes.extend_from_slice(&self.bytes[hi..]);
+            std::fs::write(&self.path, &bytes).unwrap();
+            scan_frames(&bytes)
+                .into_iter()
+                .filter(|(_, _, f)| f.seq > self.boundary.seq)
+                .map(|(off, _, framed)| PositionedFrame { off, framed })
+                .collect()
+        }
+    }
+
+    impl Drop for RealBoundaryLog {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn real_overhaul_boundary_accepts_its_trailing_lineage_frame() {
+        let log = RealBoundaryLog::new("accepted");
+        assert_eq!(
+            log.tail[0].off - log.boundary.frame_end,
+            broca_wal::framing::LINEAGE_FRAME_LEN as u64
+        );
+        let tail = log
+            .validate(&log.tail)
+            .expect("the writer's trailing lineage metadata is a valid gap");
+        assert!(tail.run_finished_durable);
+        assert_eq!(tail.extent, replay(&log.records).unwrap().extent);
+    }
+
+    #[test]
+    fn real_overhaul_boundary_refuses_foreign_lineage_in_gap() {
+        let log = RealBoundaryLog::new("foreign");
+        let foreign = RealBoundaryLog::new("foreign-source");
+        let tail = log.replace_gap(&foreign.bytes[..broca_wal::framing::LINEAGE_FRAME_LEN]);
+        assert_eq!(
+            log.validate(&tail).unwrap_err().reason,
+            "boundary lineage gap mismatch"
+        );
+    }
+
+    #[test]
+    fn real_overhaul_boundary_refuses_truncated_gap_frame() {
+        let log = RealBoundaryLog::new("truncated");
+        std::fs::write(&log.path, &log.bytes[..log.tail[0].off as usize - 1]).unwrap();
+        assert_eq!(
+            log.validate(&log.tail).unwrap_err().reason,
+            "short lineage gap read"
+        );
+    }
+
+    #[test]
+    fn real_overhaul_boundary_refuses_record_inside_gap() {
+        let log = RealBoundaryLog::new("record");
+        let scanned = scan_frames(&log.bytes);
+        let (lo, hi, _) = &scanned[1];
+        let tail = log.replace_gap(&log.bytes[*lo as usize..*hi as usize]);
+        assert_eq!(
+            log.validate(&tail).unwrap_err().reason,
+            "too many frames in boundary lineage gap"
+        );
+    }
+
+    #[test]
+    fn real_overhaul_boundary_refuses_extra_lineage_frame() {
+        let log = RealBoundaryLog::new("extra");
+        let lineage = &log.bytes[..broca_wal::framing::LINEAGE_FRAME_LEN];
+        let tail = log.replace_gap(&[lineage, lineage].concat());
+        assert_eq!(
+            log.validate(&tail).unwrap_err().reason,
+            "too many frames in boundary lineage gap"
+        );
+    }
+
+    #[test]
+    fn real_overhaul_boundary_refuses_corrupt_gap_checksum() {
+        let log = RealBoundaryLog::new("checksum");
+        let mut bytes = log.bytes.clone();
+        bytes[log.boundary.frame_end as usize + broca_wal::framing::LINEAGE_FRAME_LEN - 1] ^= 1;
+        std::fs::write(&log.path, bytes).unwrap();
+        assert_eq!(
+            log.validate(&log.tail).unwrap_err().reason,
+            "corrupt boundary lineage gap"
+        );
     }
 }
