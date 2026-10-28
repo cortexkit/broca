@@ -72,7 +72,12 @@ impl InputTokenBudget {
                         .and_then(|budget| budget.max_input_tokens),
                 )?;
             }
-            WalRecord::ModelStepFinished { usage, .. } => self.observe(*usage),
+            // A refused call's input was sent and billed, so it is spent like any step's.
+            WalRecord::ModelStepFinished { .. } | WalRecord::ModelStepRefused { .. } => {
+                if let Some(usage) = crate::refusal_fallback::total_step_usage(record) {
+                    self.observe(usage);
+                }
+            }
             _ => {}
         }
         Ok(())

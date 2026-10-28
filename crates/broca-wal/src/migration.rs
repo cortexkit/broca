@@ -8,9 +8,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 mod fence_index;
+use crate::fs_ops as fs;
 pub use fence_index::rebuild as rebuild_fence_index;
 use std::{
-    fs, io,
+    io,
     io::Write,
     path::{Path, PathBuf},
 };
@@ -57,7 +58,12 @@ impl From<MoveRefusal> for crate::WalError {
 }
 
 pub fn guard(wal: &Path, session_ref: &str, write: bool) -> Result<(), crate::WalError> {
-    check(wal, session_ref, write)
+    guard_refs(wal, &[session_ref], write)
+}
+
+/// [`guard`] for a session named by several references; see [`check_refs`].
+pub fn guard_refs(wal: &Path, session_refs: &[&str], write: bool) -> Result<(), crate::WalError> {
+    check_refs(wal, session_refs, write)
         .map_err(crate::WalError::Io)?
         .map_err(Into::into)
 }
@@ -66,11 +72,14 @@ pub fn guard(wal: &Path, session_ref: &str, write: bool) -> Result<(), crate::Wa
 /// directory itself, and a failure must propagate.
 #[cfg(unix)]
 pub fn sync_dir(path: &Path) -> io::Result<()> {
-    let directory = fs::File::open(path)?;
     #[cfg(any(test, feature = "test-io-trace"))]
-    let directory =
-        io_trace::SyncFile::new(&directory, io_trace::Event::DirectorySync(path.to_owned()));
-    directory.sync_all()
+    {
+        io_trace::sync_dir(path)
+    }
+    #[cfg(not(any(test, feature = "test-io-trace")))]
+    {
+        fs::sync_dir(path)
+    }
 }
 
 /// Non-Unix builds currently perform no directory sync. `File::open` cannot open
@@ -93,7 +102,7 @@ fn sync_file(file: &fs::File) -> io::Result<()> {
 /// The state root must already exist. No directory above it is created or synced.
 /// Directory barriers are implemented only on Unix; see `sync_dir`.
 pub fn durable_dir(state_root: &Path, path: &Path) -> io::Result<()> {
-    let root = state_root.canonicalize().map_err(|error| {
+    let root = fs::canonicalize(state_root).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!(
@@ -102,7 +111,7 @@ pub fn durable_dir(state_root: &Path, path: &Path) -> io::Result<()> {
             ),
         )
     })?;
-    if !root.is_dir() {
+    if !fs::is_dir(&root) {
         return Err(invalid(format!(
             "move state root {} is not a directory",
             state_root.display()
@@ -111,7 +120,7 @@ pub fn durable_dir(state_root: &Path, path: &Path) -> io::Result<()> {
     let mut target = std::path::absolute(path)?;
     let mut missing = Vec::new();
     loop {
-        match target.canonicalize() {
+        match fs::canonicalize(&target) {
             Ok(existing) => {
                 target = existing;
                 break;
@@ -151,9 +160,10 @@ pub fn durable_dir(state_root: &Path, path: &Path) -> io::Result<()> {
     let mut directory = root.clone();
     for part in relative.components() {
         directory.push(part);
-        match broca_owner_only::create_dir(&directory) {
+        match fs::create_dir(&directory) {
             Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && directory.is_dir() => {}
+            Err(error)
+                if error.kind() == io::ErrorKind::AlreadyExists && fs::is_dir(&directory) => {}
             Err(error) => return Err(error),
         }
     }
@@ -206,13 +216,14 @@ fn publish_json_bytes(
 ) -> io::Result<()> {
     let publication = fence_index::before(state_root, path, bytes)?;
     let temp = path.with_extension("json.tmp");
-    let mut file = broca_owner_only::OpenOptions::new()
+    let mut file = fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .open(&temp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
+    publication_ready(path)?;
     fs::rename(&temp, path)?;
     sync_dir(parent)?;
     if let Some(publication) = publication {
@@ -248,16 +259,12 @@ fn existing_freeze(
     path: &Path,
     wanted: &Freeze,
 ) -> io::Result<Option<Result<Freeze, MoveRefusal>>> {
-    let file = match broca_owner_only::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-    {
+    let mut file = match fs::OpenOptions::new().read(true).write(true).open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    let owner: Freeze = serde_json::from_reader(&file).map_err(invalid)?;
+    let owner: Freeze = serde_json::from_reader(&mut file).map_err(invalid)?;
     if owner.cut_id != wanted.cut_id {
         return Ok(Some(Err(MoveRefusal::Moving {
             cut_id: owner.cut_id,
@@ -281,7 +288,7 @@ fn freeze_temp(path: &Path) -> io::Result<(fs::File, FreezeTemp)> {
     loop {
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let temp = path.with_extension(format!("moving.{}.{id}.tmp", std::process::id()));
-        match broca_owner_only::OpenOptions::new()
+        match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temp)
@@ -471,6 +478,18 @@ pub fn cut_fence(wal_root: &Path, session_ref: &str) -> io::Result<Option<String
 }
 
 pub fn check(wal: &Path, session_ref: &str, write: bool) -> io::Result<Result<(), MoveRefusal>> {
+    check_refs(wal, &[session_ref], write)
+}
+
+/// [`check`] for a session that cut files may name by more than one reference (the
+/// folder-based v1 reference and the runner-identity v2 one). A write is fenced by a pending
+/// cut naming any of them before the moved tombstone is consulted, so the precedence of a
+/// pending release over a tombstone does not depend on which reference the cut recorded.
+pub fn check_refs(
+    wal: &Path,
+    session_refs: &[&str],
+    write: bool,
+) -> io::Result<Result<(), MoveRefusal>> {
     if wal
         .components()
         .any(|part| part.as_os_str() == "wal-staging")
@@ -489,8 +508,10 @@ pub fn check(wal: &Path, session_ref: &str, write: bool) -> io::Result<Result<()
         .and_then(|parent| Some(parent.parent()?.join("wal").join(wal.file_name()?)));
     let wal = canonical.as_deref().unwrap_or(wal);
     if write {
-        if let Some(cut_id) = cut_fence(wal.parent().unwrap_or(Path::new(".")), session_ref)? {
-            return Ok(Err(MoveRefusal::Moving { cut_id }));
+        for session_ref in session_refs {
+            if let Some(cut_id) = cut_fence(wal.parent().unwrap_or(Path::new(".")), session_ref)? {
+                return Ok(Err(MoveRefusal::Moving { cut_id }));
+            }
         }
     }
     if let Some(moved) = read_json::<Moved>(&wal.with_extension("moved"))? {
@@ -536,7 +557,7 @@ pub fn stage(state_root: &Path, path: &Path, bytes: &[u8], digest: &str) -> io::
     let parent = path.parent().ok_or_else(|| invalid("staging path"))?;
     durable_dir(state_root, parent)?;
     let temp = path.with_extension("wal.tmp");
-    let mut file = broca_owner_only::OpenOptions::new()
+    let mut file = fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)

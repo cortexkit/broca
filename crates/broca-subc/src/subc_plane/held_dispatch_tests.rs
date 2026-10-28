@@ -10,6 +10,9 @@ use broca_wal::{
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+#[path = "tests/dropped_media_tests.rs"]
+mod dropped_media_tests;
+
 struct Rig {
     identity: bool,
     declared_route: bool,
@@ -24,6 +27,7 @@ struct Rig {
     release_registration: tokio::sync::Notify,
     /// Whether each tool route this rig opened was asked to declare the held-reply capabilities.
     opened_declaring: Mutex<Vec<bool>>,
+    opened_result: Mutex<Vec<bool>>,
 }
 
 impl Rig {
@@ -42,6 +46,7 @@ impl Rig {
             block_registration: AtomicBool::new(false),
             registering: tokio::sync::Notify::new(),
             opened_declaring: Mutex::new(Vec::new()),
+            opened_result: Mutex::new(Vec::new()),
             release_registration: tokio::sync::Notify::new(),
         })
     }
@@ -81,10 +86,13 @@ impl ToolPlaneConnection for Rig {
         _: &str,
         _: &BindIdentity,
         _: Option<&ScopeSelector>,
+        tool_result_v1: bool,
         installed: bool,
     ) -> Result<RouteHandle, ConnError> {
         self.opened_declaring.lock().unwrap().push(installed);
+        self.opened_result.lock().unwrap().push(tool_result_v1);
         let mut route = RouteHandle::synthetic(7);
+        route.reads_tool_result = (tool_result_v1 || installed) && self.declared_route;
         route.reads_held_reply = installed && self.declared_route;
         Ok(route)
     }
@@ -108,6 +116,7 @@ impl ToolPlaneConnection for Rig {
     ) -> Result<serde_json::Value, ConnError> {
         panic!("dispatch must retain send certainty through the staged seam")
     }
+    #[allow(clippy::too_many_arguments)]
     async fn tool_call_staged(
         &self,
         _: &RouteHandle,
@@ -115,6 +124,8 @@ impl ToolPlaneConnection for Rig {
         _: Duration,
         _: Option<&str>,
         key: Option<&str>,
+        _schema_pin: Option<&str>,
+        _: &broca_core::tool_plane::DispatchSignals,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
         self.sent
             .lock()
@@ -129,6 +140,7 @@ impl ToolPlaneConnection for Rig {
         _: Duration,
         _: Option<&str>,
         args: &ApprovedArgs,
+        _schema_pin: Option<&str>,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
         self.sent
             .lock()
@@ -205,16 +217,22 @@ fn call(id: &str) -> ToolCall {
 /// The batch's frozen plan as the run freezes it: a module in the plan, the tool it offers,
 /// and whatever declarations the provider answered at admission.
 fn manifest_declaring(opt_in: bool, late_results: bool) -> ToolManifest {
+    manifest_format(opt_in.then_some("content/v1"), late_results)
+}
+
+fn manifest_format(format: Option<&str>, late_results: bool) -> ToolManifest {
     let declarations = FrozenProviderDeclarations {
-        result_formats: opt_in.then(|| {
+        result_formats: format.map(|format| {
             std::collections::BTreeMap::from([(
                 "tool".to_owned(),
-                FrozenResultFormat("content/v1".to_owned()),
+                FrozenResultFormat(format.to_owned()),
             )])
         }),
         late_results: late_results.then_some(true),
+        schema_pins: None,
     };
     let plan = PlanManifest {
+        rich_ui: None,
         declarations: Vec::new(),
         plan: OpaqueJson::from_json_text(
             json!({"tool_items":[{"provider":"provider"}]}).to_string(),
@@ -573,9 +591,7 @@ async fn undeclared_held_reply_is_a_protocol_refusal_not_a_final_answer() {
     let result = completed(plane.dispatch(&ctx, &call).await);
     assert_eq!(
         result.output,
-        ToolOutput::Error {
-            message: "malformed provider-held reply: prerequisites not met".into()
-        }
+        ToolOutput::error("malformed provider-held reply: prerequisites not met")
     );
     assert!(result.is_error);
     assert_eq!(rig.waits.load(Ordering::SeqCst), 0);
@@ -621,9 +637,11 @@ async fn held_record_sync_failure_cannot_join_a_waiting_slot() {
 #[tokio::test]
 async fn negotiated_final_content_uses_only_the_frozen_opt_in() {
     // A live catalog that no longer lists the opt-in cannot change how this batch reads a
-    // reply: the session froze the tool's format when it was admitted.
+    // reply: the session froze the tool's format when it was admitted. A missing errorCode
+    // distinguishes strict negotiated validation from legacy decoding even though valid text
+    // now has the same stored shape on both paths.
     let rig = Rig::new(true, true, true, true);
-    *rig.reply.lock().unwrap() = json!({"content":[{"type":"text","text":"model text"}],"structuredContent":{"private":"program data"}});
+    *rig.reply.lock().unwrap() = json!({"content":[{"type":"text","text":"model text"}],"isError":true,"structuredContent":{"private":"program data"}});
     let plane = rig.plane(true);
     let ctx = ctx();
     let call = call("call");
@@ -636,14 +654,11 @@ async fn negotiated_final_content_uses_only_the_frozen_opt_in() {
         .await
         .unwrap();
     let result = completed(plane.dispatch(&ctx, &call).await);
-    assert_eq!(
-        result.output,
-        ToolOutput::Parts {
-            parts: vec![broca_protocol::ToolOutputPart::Text {
-                text: "model text".into()
-            }]
-        }
-    );
+    assert!(result.is_error);
+    let ToolOutput::Error { message, .. } = result.output else {
+        panic!("invalid negotiated errors must be typed tool errors")
+    };
+    assert!(message.contains("errorCode"), "{message}");
     plane.batch_finished(&ctx).await.unwrap();
     let ctx = BatchCtx {
         batch_id: BatchId("next".into()),
@@ -658,18 +673,14 @@ async fn negotiated_final_content_uses_only_the_frozen_opt_in() {
         .await
         .unwrap();
     let result = completed(plane.dispatch(&ctx, &call).await);
-    assert_eq!(
-        result.output,
-        ToolOutput::Text {
-            text: "model text".into()
-        }
-    );
+    assert_eq!(result.output, ToolOutput::error("model text"));
 }
 
 #[tokio::test]
 async fn staged_plain_key_reaches_the_real_guarded_wire_envelope() {
     let (conn, route, mut server) = SubcConnection::in_process_for_test(7, 1);
     let call = call("call");
+    let signals = broca_core::tool_plane::DispatchSignals::default();
     let dispatch = ToolPlaneConnection::tool_call_staged(
         &conn,
         &route,
@@ -677,6 +688,8 @@ async fn staged_plain_key_reaches_the_real_guarded_wire_envelope() {
         Duration::from_secs(2),
         Some("preset"),
         Some("lineage:1"),
+        None,
+        &signals,
     );
     tokio::pin!(dispatch);
     let request = tokio::select! {
@@ -802,4 +815,83 @@ async fn negotiated_media_dispatch_captures_with_nullable_error_code() {
     );
     assert_eq!(completed(plane.dispatch(&ctx, &call).await), result);
     assert_eq!(rig.sent.lock().unwrap().len(), 1);
+}
+
+/// The batch's frozen plan with the catalog schema pins a later build freezes at admission,
+/// and no other declaration.
+fn manifest_pinning(
+    schema_pins: Option<std::collections::BTreeMap<String, broca_wal::DispatchSchemaPin>>,
+) -> ToolManifest {
+    let plan = PlanManifest {
+        rich_ui: None,
+        declarations: Vec::new(),
+        plan: OpaqueJson::from_json_text(
+            json!({"tool_items":[{"provider":"provider"}]}).to_string(),
+        )
+        .unwrap(),
+        plan_identity: String::new(),
+        composition_digest: String::new(),
+        fetches: vec![ProviderFetch {
+            provider: "provider".into(),
+            outcome: FetchOutcome::Answered {
+                catalog_digest: "digest".into(),
+                tools: Vec::new().into(),
+                text: None,
+                result_ops: None,
+                reply: None,
+                declarations_frozen: schema_pins.map(|schema_pins| FrozenProviderDeclarations {
+                    schema_pins: Some(schema_pins),
+                    ..Default::default()
+                }),
+                reference_slots: None,
+            },
+        }],
+        tools: Vec::new().into(),
+        system_text: String::new(),
+        system_digest: String::new(),
+        join_version: 1,
+        role_versions: Default::default(),
+    };
+    ToolManifest::from_tools(vec![serde_json::from_value(json!({"name":"tool","description":"","input_schema":{},"module":"provider","execution_mode":"parallel"})).unwrap()])
+        .with_plan_manifest(&plan)
+        .unwrap()
+}
+
+/// A run admitted by a build that freezes catalog schema pins, resumed here, dispatches each
+/// call under the pin its plan recorded for that tool, never one from a later catalog. A plan
+/// without pins, which is every plan this build admits itself, leaves the pin unknown.
+#[tokio::test]
+async fn a_resumed_batch_dispatches_under_the_schema_pin_its_plan_recorded() {
+    let pin = broca_wal::DispatchSchemaPin {
+        schema_digest: "634bdb1fe768fce0974f9c89e6f15f889470a8288277c6433e4711ab6a5b9335".into(),
+        semantics: 7,
+    };
+    let call = call("call");
+    for (pins, expected) in [
+        (
+            Some(std::collections::BTreeMap::from([(
+                "tool".to_owned(),
+                pin.clone(),
+            )])),
+            Some(pin.clone()),
+        ),
+        (None, None),
+    ] {
+        let rig = Rig::new(true, true, false, false);
+        let plane = rig.plane(false);
+        let ctx = ctx();
+        plane
+            .batch_started(&ctx, std::slice::from_ref(&call), &manifest_pinning(pins))
+            .await
+            .unwrap();
+        assert_eq!(
+            plane.dispatch_schema_pin(&ctx, &call.tool_call_id, &call.tool_name),
+            expected
+        );
+        // A pin belongs to the tool it was recorded for.
+        assert_eq!(
+            plane.dispatch_schema_pin(&ctx, &call.tool_call_id, "another_tool"),
+            None
+        );
+    }
 }

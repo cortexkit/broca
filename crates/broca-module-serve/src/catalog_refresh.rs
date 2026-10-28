@@ -148,6 +148,24 @@ impl CatalogPoller {
     }
 
     pub async fn poll(&self) -> Result<(), PollError> {
+        let result = self.poll_inner().await;
+        if let Err(error) = &result {
+            let code = match error {
+                PollError::Transport(_) => "catalog_transport",
+                PollError::Protocol(_) => "catalog_protocol",
+                PollError::Refused(_) => "catalog_refused",
+                PollError::Cache(_) => "catalog_cache_refused",
+            };
+            broca_module::diagnostics::CATALOG_REFUSALS.record(broca_module::diagnostics::Event {
+                at_ms: broca_module::diagnostics::now_ms(),
+                module: FUSIFORM_MODULE_ID.into(),
+                code: code.into(),
+            });
+        }
+        result
+    }
+
+    async fn poll_inner(&self) -> Result<(), PollError> {
         let poll_started = std::time::Instant::now();
         let (response, page_count) = self
             .read_catalog(MAX_CATALOG_PAGES, MAX_CATALOG_BYTES)

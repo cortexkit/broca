@@ -547,6 +547,8 @@ fn convert_content(
                 provider_format: None,
             } if echo_reasoning => Some(json!({"reasoningContent": {"redactedContent": data}})),
             ContentBlock::Reasoning { .. } | ContentBlock::RedactedReasoning { .. } => None,
+            // Anthropic's server-side fallback handoff means nothing to this family's API: dropped.
+            ContentBlock::ProviderFallback { .. } => None,
         })
         .collect()
 }
@@ -584,8 +586,24 @@ fn convert_tool_output(output: &ToolOutput) -> Vec<Value> {
         ToolOutput::Text { text } => vec![json!({ "text": text })],
         ToolOutput::Json { value } => vec![json!({ "json": value })],
         ToolOutput::Denied { reason } => vec![json!({ "text": format!("denied: {reason}") })],
-        ToolOutput::Error { message } if message.is_empty() => vec![json!({ "json": message })],
-        ToolOutput::Error { message } => vec![json!({ "text": message })],
+        ToolOutput::Error { message, .. } if message.is_empty() => {
+            vec![json!({ "json": message })]
+        }
+        ToolOutput::Error {
+            message,
+            module,
+            code,
+            detail,
+            nothing_sent,
+            retry,
+        } => vec![json!({ "text": ToolOutput::error_model_text(
+            message,
+            module.as_deref(),
+            code.as_deref(),
+            detail.as_deref(),
+            *nothing_sent,
+            retry.as_deref(),
+        ) })],
     }
 }
 
@@ -1416,6 +1434,9 @@ impl BedrockStreamNormalizer {
                 finish_reason: self.finish_reason,
                 service_tier_used: self.service_tier_used.clone(),
                 speed_used: None,
+                // No non-Anthropic family reports a server-side fallback or per-model usage.
+                served_model: None,
+                usage_iterations: None,
             }),
             NormalizedEvent::Control(ProviderControl::Finished {
                 usage: self.usage,
@@ -1756,7 +1777,8 @@ mod tests {
             ToolOutput::Text { text } => vec![json!({ "text": text })],
             ToolOutput::Json { value } => vec![json!({ "json": value })],
             ToolOutput::Denied { reason } => vec![json!({ "text": format!("denied: {reason}") })],
-            ToolOutput::Error { message } => vec![json!({ "text": message })],
+            // Legacy contrast renderer: keeps the old message-only bytes on purpose.
+            ToolOutput::Error { message, .. } => vec![json!({ "text": message })],
         }
     }
 
@@ -1809,12 +1831,7 @@ mod tests {
 
     #[test]
     fn empty_error_tool_result_uses_json_string_and_keeps_error_status() {
-        let body = tool_result_request(
-            ToolOutput::Error {
-                message: String::new(),
-            },
-            true,
-        );
+        let body = tool_result_request(ToolOutput::error(String::new()), true);
         let tool_result = &body["messages"][1]["content"][0]["toolResult"];
 
         assert_eq!(tool_result["content"], json!([{ "json": "" }]));
@@ -1833,9 +1850,7 @@ mod tests {
             ToolOutput::Denied {
                 reason: "policy".into(),
             },
-            ToolOutput::Error {
-                message: "failed".into(),
-            },
+            ToolOutput::error("failed"),
         ] {
             assert_eq!(
                 serde_json::to_vec(&convert_tool_output(&output)).unwrap(),
@@ -2083,6 +2098,57 @@ mod tests {
                 ("messageStart".to_owned(), (1, None)),
             ])
         );
+    }
+
+    /// A filtered stop ends the step as filtered, while a normal turn end still ends it
+    /// as a stop: both share the `messageStop` stop-reason mapping.
+    #[test]
+    fn guardrail_and_content_filtered_stop_reasons_finish_as_content_filter() {
+        fn step_finish_reason(stop_reason: &str) -> FinishReason {
+            let mut body = Vec::new();
+            body.extend(test_event_stream_message(
+                "messageStart",
+                br#"{"role":"assistant"}"#,
+            ));
+            body.extend(test_event_stream_message(
+                "contentBlockDelta",
+                br#"{"contentBlockIndex":0,"delta":{"text":"hi"}}"#,
+            ));
+            body.extend(test_event_stream_message(
+                "contentBlockStop",
+                br#"{"contentBlockIndex":0}"#,
+            ));
+            body.extend(test_event_stream_message(
+                "messageStop",
+                format!(r#"{{"stopReason":{stop_reason:?}}}"#).as_bytes(),
+            ));
+            body.extend(test_event_stream_message(
+                "metadata",
+                br#"{"usage":{"inputTokens":3,"outputTokens":1,"totalTokens":4}}"#,
+            ));
+            let mut normalizer = BedrockStreamNormalizer::new(StepId(1));
+            let mut events = normalizer.push(&body).expect("stream decodes");
+            events.extend(normalizer.finish().expect("stream ends cleanly"));
+            events
+                .iter()
+                .find_map(|event| match event {
+                    NormalizedEvent::Control(ProviderControl::StepFinished {
+                        finish_reason,
+                        ..
+                    }) => Some(*finish_reason),
+                    _ => None,
+                })
+                .expect("one StepFinished")
+        }
+
+        for stop_reason in ["guardrail_intervened", "content_filtered"] {
+            assert_eq!(
+                step_finish_reason(stop_reason),
+                FinishReason::ContentFilter,
+                "stopReason {stop_reason:?}"
+            );
+        }
+        assert_eq!(step_finish_reason("end_turn"), FinishReason::Stop);
     }
 }
 

@@ -40,6 +40,7 @@ pub(super) fn admit(
     scope: &SendScope,
     arguments: &RawValue,
     call_key: Option<&str>,
+    image_references: bool,
 ) -> Result<Admission, Refusal> {
     let stamp = match scope {
         SendScope::Stamped(bind) => Some(&bind.scope),
@@ -120,7 +121,12 @@ pub(super) fn admit(
     }
     let request: classify::Request = serde_json::from_str(arguments.get())
         .map_err(|e| Refusal::invalid_params("arguments", e.to_string()))?;
-    classify::validate_request(&request).map_err(|e| match e {
+    (if image_references {
+        classify::validate_request_with_image_references(&request)
+    } else {
+        classify::validate_request(&request)
+    })
+    .map_err(|e| match e {
         cortexkit_llm_tools::ValidationError::Role(refusal) => refusal,
         cortexkit_llm_tools::ValidationError::NegativeCost { field } => {
             Refusal::invalid_params(field, "cost must not be negative")

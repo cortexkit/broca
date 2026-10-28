@@ -159,11 +159,19 @@ impl Step {
 /// What the provider and tool plane of the rig do, shared with the test.
 #[derive(Default)]
 pub struct Script {
+    /// Optional real tool transport for serve-path tests; ordinary scripts keep their fake plane.
+    pub tool_plane: Mutex<Option<Arc<dyn broca_core::ToolPlane>>>,
+    /// A synthetic tool's catalog schema and semantics pin; absent for legacy direct tools.
+    pub schema_pin: Mutex<Option<broca_wal::DispatchSchemaPin>>,
     pub attempt_time: Mutex<Option<u64>>,
     pub hold_stream: Mutex<bool>,
     pub stream_gate: Notify,
     /// Model steps, consumed in order across every run. An exhausted script answers text.
     pub steps: Mutex<VecDeque<Step>>,
+    /// Family-normalized events take precedence over generated steps so wire fixtures retain
+    /// their provider metadata through the real run loop and WAL writer.
+    pub normalized_steps: Mutex<VecDeque<Vec<NormalizedEvent>>>,
+    pub refusal_fallback_model: Mutex<Option<broca_protocol::ModelHandle>>,
     /// The prompt each model step was called with, in call order.
     pub prompts: Mutex<Vec<Vec<Message>>>,
     /// The names of the tools each model step was offered, in call order.
@@ -246,6 +254,14 @@ impl ScriptedProvider {
 
 #[async_trait]
 impl Provider for ScriptedProvider {
+    fn refusal_fallback_model(&self) -> Option<broca_protocol::ModelHandle> {
+        self.0.refusal_fallback_model.lock().unwrap().clone()
+    }
+
+    fn refusal_fallback_context_limit(&self) -> Option<u64> {
+        self.refusal_fallback_model().map(|_| 1_000_000)
+    }
+
     fn render_config_blob(&self) -> serde_json::Value {
         match &self.1 {
             None => serde_json::json!({ "render_config": "stateless" }),
@@ -282,16 +298,23 @@ impl Provider for ScriptedProvider {
             self.0.entered.notify_one();
             gate.await;
         }
-        let step = self
+        let (tx, rx) = mpsc::channel(8);
+        let script = self.0.clone();
+        let mut events = self
             .0
-            .steps
+            .normalized_steps
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or(Step::Text("done"));
-        let (tx, rx) = mpsc::channel(8);
-        let script = self.0.clone();
-        let mut events = step.events();
+            .unwrap_or_else(|| {
+                self.0
+                    .steps
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(Step::Text("done"))
+                    .events()
+            });
         if let Some(at) = *self.0.attempt_time.lock().unwrap() {
             events.insert(0, NormalizedEvent::Control(ProviderControl::AttemptFinished {
                 attempt: serde_json::from_value(serde_json::json!({"attempt":0,"outcome":"complete","ts_ms":at,
@@ -336,18 +359,40 @@ struct ScriptedTools(Arc<Script>);
 impl ToolPlane for ScriptedTools {
     async fn batch_started(
         &self,
-        _ctx: &BatchCtx,
-        _calls: &[ToolCall],
-        _manifest: &ToolManifest,
+        ctx: &BatchCtx,
+        calls: &[ToolCall],
+        manifest: &ToolManifest,
     ) -> Result<(), ToolPlaneError> {
+        let real = self.0.tool_plane.lock().unwrap().clone();
+        if let Some(real) = real {
+            return real.batch_started(ctx, calls, manifest).await;
+        }
         Ok(())
     }
 
-    fn dispatch_target(&self, _ctx: &BatchCtx, _tool_call_id: &ToolCallId) -> Option<String> {
+    fn dispatch_target(&self, ctx: &BatchCtx, tool_call_id: &ToolCallId) -> Option<String> {
+        if let Some(real) = self.0.tool_plane.lock().unwrap().as_ref() {
+            return real.dispatch_target(ctx, tool_call_id);
+        }
         Some(WORK_MODULE.into())
     }
+    fn dispatch_schema_pin(
+        &self,
+        ctx: &BatchCtx,
+        id: &ToolCallId,
+        tool: &str,
+    ) -> Option<broca_wal::DispatchSchemaPin> {
+        if let Some(real) = self.0.tool_plane.lock().unwrap().as_ref() {
+            return real.dispatch_schema_pin(ctx, id, tool);
+        }
+        self.0.schema_pin.lock().unwrap().clone()
+    }
 
-    async fn dispatch(&self, _ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
+    async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
+        let real = self.0.tool_plane.lock().unwrap().clone();
+        if let Some(real) = real {
+            return real.dispatch(ctx, call).await;
+        }
         loop {
             let gate = self.0.tool_gate.notified();
             if !*self.0.hold_tool.lock().unwrap() {
@@ -385,7 +430,11 @@ impl ToolPlane for ScriptedTools {
         })
     }
 
-    async fn batch_finished(&self, _ctx: &BatchCtx) -> Result<(), ToolPlaneError> {
+    async fn batch_finished(&self, ctx: &BatchCtx) -> Result<(), ToolPlaneError> {
+        let real = self.0.tool_plane.lock().unwrap().clone();
+        if let Some(real) = real {
+            return real.batch_finished(ctx).await;
+        }
         *self.0.batch_finishes.lock().unwrap() += 1;
         Ok(())
     }
@@ -531,6 +580,7 @@ impl RunExecutor for CoreExec {
 }
 
 pub struct Rig {
+    pub store: Arc<broca_store::SqliteStore>,
     pub dir: PathBuf,
     reader: tokio::io::ReadHalf<tokio::io::DuplexStream>,
     writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
@@ -648,7 +698,7 @@ impl Rig {
         let registry = Arc::new(LineageRegistry::new_with_reader(
             opener,
             wal.clone(),
-            Some(store),
+            Some(store.clone()),
         ));
         let (client, server) = tokio::io::duplex(64 * 1024);
         let (mut reader, mut writer) = tokio::io::split(client);
@@ -690,6 +740,7 @@ impl Rig {
         let session = BindIdentity::new(dir.join("proj"), harness, "delivery");
         let wal_path = wal.wal_path(&session);
         let mut rig = Self {
+            store,
             dir,
             reader,
             writer,
@@ -743,6 +794,29 @@ impl Rig {
     ) -> Vec<Frame> {
         self.subscribe_collect_inner(channel, params, quiet, None::<fn()>, |_| true)
             .await
+    }
+
+    /// Subscribe on a route the test already bound with its caller and scope.
+    pub async fn subscribe_collect_bound(
+        &mut self,
+        channel: u16,
+        params: serde_json::Value,
+        quiet: Duration,
+    ) -> Vec<Frame> {
+        self.corr += 1;
+        let corr = self.corr;
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            1,
+            corr,
+            serde_json::to_vec(&serde_json::json!({"method":"session.subscribe","params":params}))
+                .unwrap(),
+        )
+        .unwrap();
+        write_frame(&mut self.writer, &frame).await.unwrap();
+        collect_subscription_frames_at(&mut self.reader, corr, quiet, None::<fn()>, |_| true).await
     }
 
     /// `subscribe_collect`, calling `on_attach` once the subscription's first frame arrives.

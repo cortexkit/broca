@@ -2129,6 +2129,7 @@ async fn reopened_actor_seals_indeterminate_run_before_draining_new_send() {
             step_id: broca_protocol::StepId(1),
         },
         broca_wal::WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -3783,6 +3784,7 @@ async fn stale_active_reconciles_to_terminal_from_wal() {
             submission_id: None,
         });
         writer.record(broca_wal::WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -4038,6 +4040,7 @@ fn seed_unsealed_run_with_queue(
             step_id: broca_protocol::StepId(1),
         },
         broca_wal::WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -4067,9 +4070,9 @@ fn seed_unsealed_run_with_queue(
                 batch_id: batch_id.clone(),
                 result: broca_protocol::ToolResult {
                     tool_call_id: call_id,
-                    output: broca_protocol::ToolOutput::Error {
-                        message: "tool not run: max steps reached before dispatch".into(),
-                    },
+                    output: broca_protocol::ToolOutput::error(
+                        "tool not run: max steps reached before dispatch",
+                    ),
                     is_error: true,
                 }
                 .into(),

@@ -864,7 +864,7 @@ fn closed(rig: &Rig, records: &[WalRecord], decision: DeferredDecision, refusal:
     let result = answers[0].1.as_ref().expect("closing result");
     assert!(result.is_error);
     assert!(
-        matches!(&result.output, broca_protocol::ToolOutput::Error {message} if message.starts_with(refusal))
+        matches!(&result.output, broca_protocol::ToolOutput::Error { message, .. } if message.starts_with(refusal))
     );
     assert_eq!(
         count(records, |record| matches!(
@@ -1546,4 +1546,27 @@ async fn real_cingulate_holds_and_withdraws_unanswered_call() {
         wait("real Cingulate withdrawal acknowledged", || rig.records().iter().any(|record| matches!(record,
             WalRecord::QuestionWithdrawalAcknowledged { answer: broca_wal::WithdrawalAnswer::Acknowledged, .. }))).await;
     }).await.expect("bounded placed Cingulate scenario");
+}
+
+#[tokio::test]
+async fn diagnostics_findings_uses_authenticated_head_owner_route() {
+    let Some(rig) = Rig::start("diagnostics-findings", false).await else {
+        return;
+    };
+    let conn = rig.owner().await;
+    let route = rig.route(&conn, true).await;
+    let reply = conn
+        .route_request(
+            &route,
+            serde_json::to_vec(&json!({
+                "method": "diagnostics.findings", "params": {}
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(reply["result"]["findings"].is_array(), "{reply}");
+    assert_eq!(reply["result"]["window_ms"], 21_600_000);
+    assert!(reply["result"]["generated_at_ms"].as_i64().unwrap() > 0);
+    assert!(serde_json::to_vec(&reply).unwrap().len() < 65_536);
 }

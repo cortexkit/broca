@@ -13,7 +13,7 @@ digest or treat opaque binding data as a daemon-issued authorization token.
 
 ## Frozen binding
 
-Each broca card with `kind: consent` carries one canonical JSON object in
+Each approval-plan card with `kind: consent` carries one canonical JSON object in
 `params.binding`:
 
 | Key | Value |
@@ -58,10 +58,30 @@ Upstream `scope`/`args_digest` fields describe consent content, not transport
 identity. `held-call-request.json` supplies `args_digest` equal to the argument hash,
 as well as the opaque binding. Tool and module are not top-level request keys.
 The `executor` wire field is dropped: broca executes its own approved calls.
-Broca generic cards have exactly approve/grant and deny/decline options. Any
+Broca approval-plan cards have exactly approve/grant and deny/decline options. Any
 approval plan declaring an extra option refuses `approval_options_unsupported`
 at admission, before any WAL write. Never silently drop extras when filing.
 Extra options need a defined generic-consent contract before broca supports them.
+
+### Private-content model-call cards
+
+`private-content-card.json` and `private-content-card-project.json` are local
+goldens for `llm_classify`, not approval-plan cards or upstream-served replies.
+They offer `allow_run` and `allow_24h` (effect `grant`) and `deny` (effect
+`decline`). Only the project fixture adds `allow_always`, also a grant, labeled
+"Always allow for the agent in this project". Every option has only `id`,
+`label` and `effect`; none carries danger-group metadata.
+Cingulate supplies the named subject from the filing route's daemon stamp;
+the card body carries no agent or project id. Both fixtures keep `scope` equal
+to the same provider-only object, default to deny, deny on expiry, and omit
+`expires_in_ms`. The original no-project golden is byte-identical to the
+tool-route fixture under `broca-module-serve/tests/fixtures/llm-tools/`.
+
+Broca offers and mints the always grant only when that scope stamp carries a
+project id. It freezes the id in the durable card and held-call records, never
+in the displayed body or the dedup key. Grant matching uses that attested id,
+not the bind's client-supplied project id or a path. The extra choice does not
+change approval-plan option validation or the pinned upstream corpora.
 
 ## Recovery with no recorded card id
 

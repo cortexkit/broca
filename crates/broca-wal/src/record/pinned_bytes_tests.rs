@@ -94,6 +94,30 @@ fn pre_cancel_at_boundaries_keep_their_bytes_and_frame_requirements() {
     }
 }
 
+/// Credential selections as every build up to now writes them, with every optional member
+/// present and with none. A selection that names how its credential authenticates is a later,
+/// gated addition; these shapes must keep their exact bytes and stay readable by any build, so
+/// they require no reader feature and keep the ungated frame version.
+#[test]
+fn auth_selections_without_a_frozen_method_keep_their_bytes_and_frame_requirements() {
+    use crate::framing::{encode, FRAMING_VERSION, HEADER_LEN};
+
+    for pinned in [
+        r#"{"type":"run_started","run_id":"r","session":{"project_root":"/tmp/project","harness":"runner","session":"session"},"config":{"model":{"provider_module_id":"anthropic","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1,"auth_selection":{"credential_id":"oauth:anthropic:work","account_ref":"acct-1","resolved_credential_id":"oauth:anthropic:work","vault_request":{"min_ttl_ms":600000,"op":"get_scoped"},"account_decision":{"conversation_key":"broca-session:abc","conversation_key_source":"session","path":"routed","admission_id":"r","decision_id":"acd-1"}}},"input":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"origin":{"kind":"fresh"}}"#,
+        r#"{"type":"run_started","run_id":"r","session":{"project_root":"/tmp/project","harness":"runner","session":"session"},"config":{"model":{"provider_module_id":"deepseek","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1,"auth_selection":{"credential_id":"apikey:deepseek"}},"input":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"origin":{"kind":"fresh"}}"#,
+        r#"{"type":"run_auth_refrozen","ts_ms":5,"auth_selection":{"credential_id":"oauth:anthropic:work","account_ref":"acct-1","resolved_credential_id":"oauth:anthropic:shared","vault_request":{"min_ttl_ms":600000,"op":"get_scoped"},"account_decision":{"path":"pinned","admission_id":"r"}}}"#,
+        r#"{"type":"run_auth_refrozen","auth_selection":{"credential_id":"oauth:anthropic:work"}}"#,
+    ] {
+        let record: WalRecord = serde_json::from_str(pinned).unwrap();
+        assert_ne!(record, WalRecord::Unknown);
+        assert_eq!(serde_json::to_string(&record).unwrap(), pinned);
+        assert!(record.required_features().is_empty(), "{pinned}");
+        let frame = encode(7, 3, &record).unwrap();
+        assert_eq!(frame[4], FRAMING_VERSION);
+        assert_eq!(&frame[HEADER_LEN..], pinned.as_bytes());
+    }
+}
+
 #[test]
 fn attempt_bytes_before_content_progress_stay_identical() {
     let pinned = include_str!("../../tests/fixtures/model_attempt_before_progress.json").trim_end();
@@ -122,8 +146,12 @@ fn attempt_progress_fields_roundtrip_without_a_reader_feature() {
 /// The wire tag of each record kind. Exhaustive on purpose: see the module comment.
 fn tag_of(record: &WalRecord) -> &'static str {
     match record {
+        WalRecord::WriterOpened { .. } => "writer_opened",
+        WalRecord::WriterClosed { .. } => "writer_closed",
+        WalRecord::VisibilityLate { .. } => "visibility_late",
         WalRecord::RunStarted { .. } => "run_started",
         WalRecord::ModelStepFinished { .. } => "model_step_finished",
+        WalRecord::ModelStepRefused { .. } => "model_step_refused",
         WalRecord::ModelAttemptFinished { .. } => "model_attempt_finished",
         WalRecord::StepStarted { .. } => "step_started",
         WalRecord::ToolBatchStarted { .. } => "tool_batch_started",
@@ -163,6 +191,7 @@ fn tag_of(record: &WalRecord) -> &'static str {
         WalRecord::InputTokenBudgetExhausted { .. } => "input_token_budget_exhausted",
         WalRecord::ContextCeilingWait { .. } => "context_ceiling_wait",
         WalRecord::ContextCeilingDecided { .. } => "context_ceiling_decided",
+        WalRecord::OutputReservationClamped { .. } => "output_reservation_clamped",
         WalRecord::CompactionRideWait { .. } => "compaction_ride_wait",
         WalRecord::CompactionRideWaitEnded { .. } => "compaction_ride_wait_ended",
         WalRecord::StructuredOutputResult { .. } => "structured_output_result",
@@ -176,6 +205,21 @@ fn tag_of(record: &WalRecord) -> &'static str {
 
 /// Every record kind this build writes, each with its optional fields both present and absent
 /// where it has any. `Unknown` is absent because it can never be written.
+const WRITER_ID_PINNED: &[&str] = &[
+    r#"{"type":"writer_opened","writer_id":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"recovered_through_seq":0,"cause":"new"}"#,
+    r#"{"type":"writer_opened","writer_id":[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],"previous_writer_id":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"recovered_through_seq":5,"cause":"reopen"}"#,
+    r#"{"type":"writer_closed","writer_id":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]}"#,
+];
+
+#[test]
+fn writer_id_records_keep_their_bytes_and_require_writer_id() {
+    for bytes in WRITER_ID_PINNED {
+        let record: WalRecord = serde_json::from_str(bytes).unwrap();
+        assert_eq!(record.required_features(), ["writer-id/v1"]);
+        assert_eq!(serde_json::to_string(&record).unwrap(), *bytes);
+    }
+}
+
 const PINNED: &[&str] = &[
     r#"{"type":"run_started","run_id":"run-7","session":{"project_root":"/tmp/project","harness":"runner","session":"session"},"project_id":"pj-a","principal":{"kind":"direct"},"ts_ms":1790000000000,"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"origin":{"kind":"fresh"},"submission_id":"sub-run-7"}"#,
     r#"{"type":"run_started","run_id":"run-7","session":{"project_root":"/tmp/project","harness":"runner","session":"session"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"origin":{"kind":"fresh"}}"#,
@@ -234,6 +278,36 @@ const PINNED: &[&str] = &[
     r#"{"type":"cache_warmed","run_id":"r","step_id":2,"request_body_sha256":"aa","warm_body_sha256":"bb","usage":{"input_tokens":3,"cached_input_tokens":4000,"cache_write_tokens":0},"served_account_ref":"acct-1","ratelimit_headers":{"anthropic-ratelimit-unified-5h-utilization":"0.2","anthropic-ratelimit-unified-status":"allowed"},"sent_at_ms":1790000000000,"ttl_ms":3600000,"expires_at_ms":1790003600000}"#,
     r#"{"type":"cache_warmed","run_id":"r","step_id":2,"request_body_sha256":"aa","warm_body_sha256":"bb","usage":{},"sent_at_ms":1790000000000}"#,
 ];
+
+const OUTPUT_RESERVATION_PINNED: &[&str] = &[
+    r#"{"type":"output_reservation_clamped","step_id":175,"max_output_tokens":124990,"estimated_input_tokens":919490,"context_limit":1048576}"#,
+];
+
+/// A lowered output cap is written in a gated frame requiring `output-reservation/v1`: a build
+/// that does not know the kind must refuse the WAL rather than resume the step with the frozen
+/// cap, which would be a different request from the one recorded.
+#[test]
+fn an_output_reservation_record_keeps_its_bytes_and_requires_its_feature() {
+    use crate::framing::{encode, GATED_FRAMING_VERSION, HEADER_LEN, OUTPUT_RESERVATION_FEATURE};
+    for pinned in OUTPUT_RESERVATION_PINNED {
+        let record: WalRecord = serde_json::from_str(pinned).unwrap();
+        assert!(matches!(
+            record,
+            WalRecord::OutputReservationClamped {
+                max_output_tokens: 124_990,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_string(&record).unwrap(), *pinned);
+        assert_eq!(record.required_features(), &[OUTPUT_RESERVATION_FEATURE]);
+        let frame = encode(7, 3, &record).unwrap();
+        assert_eq!(frame[4], GATED_FRAMING_VERSION);
+        assert_eq!(
+            &frame[HEADER_LEN..],
+            format!(r#"{{"requires":["output-reservation/v1"],"record":{pinned}}}"#).as_bytes()
+        );
+    }
+}
 
 const INPUT_CAP_PINNED: &[&str] = &[
     r#"{"type":"input_token_cap_frozen","limit":150}"#,
@@ -449,6 +523,82 @@ fn pre_compaction_records_keep_their_bytes_and_frame_requirements() {
     }
 }
 
+/// The content-filter fallback records and fields, each with its optional members present and
+/// absent: a refused step, and a step carrying the handoff part and each new step field. All
+/// optional members are absent by default, so the ordinary steps in `PINNED` keep their bytes.
+const FALLBACK_PINNED: &[(&str, &[&str])] = &[
+    (
+        r#"{"type":"model_step_refused","step_id":4,"usage":{"input_tokens":120,"cached_input_tokens":4000,"output_tokens":3},"served_model":"claude-opus-4-8","discarded_blocks":2,"schedule":{"source":{"provider_module_id":"anthropic","model_id":"claude-opus-5-5"},"fallback":{"provider_module_id":"anthropic","model_id":"claude-opus-4-8"},"phase":{"kind":"fallback","remaining":20},"re_refusals":1,"updated_at_ms":1790000000000},"ts_ms":1790000000000}"#,
+        &["refusal-fallback/v1"],
+    ),
+    (
+        r#"{"type":"model_step_refused","step_id":4,"usage":{},"discarded_blocks":0,"schedule":{"source":{"provider_module_id":"anthropic","model_id":"claude-opus-5-5"},"fallback":{"provider_module_id":"anthropic","model_id":"claude-opus-4-8"},"phase":{"kind":"probe","clean":3},"re_refusals":0}}"#,
+        &["refusal-fallback/v1"],
+    ),
+    (
+        r#"{"type":"model_step_finished","step_id":4,"assistant_message":{"message_id":"msg-4","content":[{"type":"text","text":"Let me"},{"type":"provider_fallback","from_model":"claude-opus-5-5","to_model":"claude-opus-4-8"},{"type":"text","text":" check."}]},"usage":{"input_tokens":3,"output_tokens":9},"finish_reason":"stop","retries_used":0,"served_model":"claude-opus-4-8","usage_iterations":[{"type":"message","model":"claude-opus-5-5","input_tokens":3,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":4000},{"type":"fallback_message","model":"claude-opus-4-8","output_tokens":9,"cache_creation":{"ephemeral_1h_input_tokens":0}}]}"#,
+        &["provider-fallback-block/v1"],
+    ),
+    (
+        r#"{"type":"model_step_finished","step_id":5,"assistant_message":{"message_id":"msg-5","content":[{"type":"tool_call","tool_call_id":"t1","tool_name":"edit","input":{"f":"a"}}]},"usage":{},"finish_reason":"tool_calls","retries_used":0,"refusal_fallback":{"source":{"provider_module_id":"anthropic","model_id":"claude-opus-5-5"},"fallback":{"provider_module_id":"anthropic","model_id":"claude-opus-4-8"},"phase":{"kind":"fallback","remaining":10},"re_refusals":0},"refusal_after_tool_use":true}"#,
+        &["refusal-fallback/v1"],
+    ),
+    (
+        r#"{"type":"model_step_finished","step_id":6,"assistant_message":{"message_id":"msg-6","content":[]},"usage":{},"retries_used":1,"route":{"model":{"provider_module_id":"anthropic","model_id":"claude-opus-4-8"},"reason":"schedule"},"refusal_fallback":{"source":{"provider_module_id":"anthropic","model_id":"claude-opus-5-5"},"fallback":{"provider_module_id":"anthropic","model_id":"claude-opus-4-8"},"phase":{"kind":"fallback","remaining":9},"re_refusals":0,"updated_at_ms":5}}"#,
+        &["refusal-fallback/v1"],
+    ),
+    (
+        r#"{"type":"model_step_finished","step_id":7,"assistant_message":{"message_id":"msg-7","content":[]},"usage":{},"retries_used":0,"served_model":"claude-opus-4-8","route":{"model":{"provider_module_id":"anthropic","model_id":"claude-opus-4-8"},"reason":"refusal"}}"#,
+        &["provider-fallback-block/v1", "refusal-fallback/v1"],
+    ),
+];
+
+/// Each fallback record keeps its bytes, requires exactly the features listed beside it, is
+/// written in a gated frame naming them, and reads back unchanged.
+#[test]
+fn fallback_records_keep_their_bytes_and_require_exactly_their_features() {
+    use crate::framing::{decode_next, encode, DecodeStep, GATED_FRAMING_VERSION, HEADER_LEN};
+    for (pinned, features) in FALLBACK_PINNED {
+        let record: WalRecord = serde_json::from_str(pinned).unwrap();
+        assert_ne!(record, WalRecord::Unknown);
+        assert_eq!(serde_json::to_string(&record).unwrap(), *pinned);
+        assert!(!record.is_informational(), "{pinned}");
+        assert_eq!(record.required_features(), *features, "{pinned}");
+        let frame = encode(7, 3, &record).unwrap();
+        assert_eq!(frame[4], GATED_FRAMING_VERSION, "{pinned}");
+        assert_eq!(
+            &frame[HEADER_LEN..],
+            format!(
+                r#"{{"requires":{},"record":{pinned}}}"#,
+                serde_json::to_string(features).unwrap()
+            )
+            .as_bytes()
+        );
+        match decode_next(&frame) {
+            DecodeStep::Record { framed, .. } => assert_eq!(framed.record, record, "{pinned}"),
+            _ => panic!("this build reads its own fallback frame: {pinned}"),
+        }
+    }
+}
+
+/// A step written before the fallback fields existed decodes with every one of them absent,
+/// and a step built with them absent writes exactly the old bytes.
+#[test]
+fn a_step_without_fallback_fields_reads_them_absent_and_writes_no_bytes_for_them() {
+    for pinned in PINNED
+        .iter()
+        .filter(|pinned| pinned.starts_with(r#"{"type":"model_step_finished""#))
+    {
+        let record: WalRecord = serde_json::from_str(pinned).unwrap();
+        let WalRecord::ModelStepFinished { fallback, .. } = &record else {
+            unreachable!()
+        };
+        assert_eq!(**fallback, StepFallback::default(), "{pinned}");
+        assert!(record.required_features().is_empty(), "{pinned}");
+        assert_eq!(serde_json::to_string(&record).unwrap(), *pinned);
+    }
+}
+
 #[test]
 fn every_record_kind_keeps_its_pinned_bytes() {
     for pinned in PINNED
@@ -581,6 +731,9 @@ fn the_pinned_bytes_cover_every_record_kind() {
         .chain(STRUCTURED_OUTPUT_PINNED.iter().copied())
         .chain(COMPACTION_VIEW_PINNED.iter().copied())
         .chain(RIDE_WAIT_PINNED.iter().copied())
+        .chain(FALLBACK_PINNED.iter().map(|(bytes, _)| *bytes))
+        .chain(OUTPUT_RESERVATION_PINNED.iter().copied())
+        .chain(WRITER_ID_PINNED.iter().copied())
         .map(|bytes| tag_of(&serde_json::from_str::<WalRecord>(bytes).unwrap()))
         .collect();
     // The tag of every arm of the exhaustive `tag_of` except `WalRecord::Unknown`, the
@@ -588,8 +741,11 @@ fn the_pinned_bytes_cover_every_record_kind() {
     // compiling; whoever adds its arm must add its tag here too, and this assertion then fails
     // until `PINNED` holds bytes for it.
     let every_kind = [
+        "writer_opened",
+        "writer_closed",
         "run_started",
         "model_step_finished",
+        "model_step_refused",
         "model_attempt_finished",
         "step_started",
         "tool_batch_started",
@@ -633,6 +789,7 @@ fn the_pinned_bytes_cover_every_record_kind() {
         "send_delivered",
         "compaction_ride_wait",
         "compaction_ride_wait_ended",
+        "output_reservation_clamped",
     ];
     assert_eq!(pinned, every_kind.into_iter().collect());
     assert_eq!(tag_of(&WalRecord::Unknown), "unknown");

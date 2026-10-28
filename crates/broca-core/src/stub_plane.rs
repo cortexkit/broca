@@ -181,7 +181,7 @@ impl ToolPlane for StubToolPlane {
             },
             StubReply::ExecError(message) => ToolResult {
                 tool_call_id: call.tool_call_id.clone(),
-                output: ToolOutput::Error { message },
+                output: ToolOutput::error(message),
                 is_error: true,
             },
             // The request never left → SAFE. Not cached (not a result).

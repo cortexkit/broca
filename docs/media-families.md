@@ -34,22 +34,34 @@ retries disabled. It never prints a credential, handle, request headers, respons
 body or provider error message. Unknown provider codes are `other_redacted`.
 
 ```sh
-# Default dry-run: 7 example families, at most 21 planned requests; sends nothing.
+# Default dry-run: 6 serving families, at most 18 planned requests; sends nothing.
 cargo run --locked -p broca-provider --features live --example media-live-check -- --dry-run
-# Copy/edit examples/media-live/plan.json under the provider crate first. Keep only
-# families serving real traffic and select one actual serving route per family.
+# The checked-in plan is crates/broca-provider/examples/media-live/plan.json.
+# Preview any operator edits before explicitly requesting live traffic.
 cargo run --locked -p broca-provider --features live --example media-live-check -- --dry-run --plan <plan.json>
-BROCA_LIVE_TESTS=1 cargo run --locked -p broca-provider --features live --example media-live-check -- --live --plan <plan.json>
+BROCA_LIVE_TESTS=1 cargo run --locked -p broca-provider --features live --example media-live-check -- --live --plan crates/broca-provider/examples/media-live/plan.json --subc "$HOME/.local/share/cortexkit/run/subc-connection.json"
 ```
 
-The example plan is a template, not catalog evidence or a current model list.
-Set the actual wire model, named dev-tools credential, provider `quirk` (for a
-compatible endpoint), and any `base_url`, `aws_region` or Code Assist `project_id`.
+The checked-in plan uses operator-confirmed serving models and vault credential
+names, not an automatically refreshed catalog snapshot: Anthropic Haiku 5.5,
+OpenAI GPT-6 Luna on Chat, Responses and ChatGPT, Gemini 3.8 Flash, and its
+Antigravity route. Recheck these selections when serving routes change. An
+operator override may set the wire model, named dev-tools credential, provider
+`quirk` (for a compatible endpoint), and any `base_url` or `aws_region`.
 An optional non-secret `frozen` object supplies a serving `FrozenRenderConfig`
 including provider-specific identity and quirks instead of family defaults. No
 token or capability handle belongs in the plan. Credentials are read by name only
 through the dev-tools handle map and subc, and only after `--live` and
 `BROCA_LIVE_TESTS=1`. `--subc` and `--timeout-secs` are optional.
+
+Bedrock is absent from the serving plan because the operator has no Bedrock
+credential; the summary records it as not live-checked with reason
+`no_credential`. Code Assist's account-project discovery is not part of this
+standalone probe. It still renders all three dry-run requests, but a live run
+without an explicit resolved `project_id` reports `skipped: project_id_required`
+before reading any credential or sending anything. The offline preview uses an
+empty project field only in its temporary render config; no account project ID
+is hard-coded or inferred, and the unresolved live config is unchanged.
 
 One route consumes all three request slots for its family; duplicate families
 are refused before credential access. Request 1 checks person PNG/PDF input where
@@ -243,7 +255,8 @@ https://platform.claude.com/docs/en/api/overview (request size limits)
 ## `bedrock_converse` (AWS Bedrock Converse)
 
 **Live check:** pending operator-run results; native image/PDF carriers are documented,
-not yet verified by this probe.
+not yet verified by this probe. The current serving plan omits Bedrock because
+there is no vault credential (`no_credential`); it is not live-checked.
 
 Sources: https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Message.html ·
 https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ContentBlock.html ·
@@ -540,7 +553,9 @@ https://github.com/googleapis/python-genai/blob/main/google/genai/types.py
 
 **Live check:** pending operator-run results for both generation profiles. All Code
 Assist production media gates remain unset; a PNG/PDF pass cannot enable untested
-audio/video carriers.
+audio/video carriers. Without a resolved project ID, the standalone probe reports
+`skipped: project_id_required` before credential access; its dry-run still renders
+the family's three planned requests.
 
 The Code Assist endpoint (`cloudcode-pa`) wraps a Gemini `generateContent` request in
 an envelope and has no public reference. The primary source is Google's own client,

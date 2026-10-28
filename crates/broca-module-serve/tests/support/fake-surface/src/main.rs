@@ -4,7 +4,8 @@
 //! (`flow.private_content_providers`) before it may call a provider, so a test needs both to
 //! answer. `fake-aft-stub` declares only the tool-provider role, so the daemon refuses a
 //! `route.open` aimed at its management surface before any operation is dispatched. This binary
-//! is a module that does declare a management surface, and serves those two operations.
+//! is a module that declares a management surface, including screenshot resolution and
+//! Cingulate card filing.
 //!
 //! Configuration, from the environment and the command line:
 //!
@@ -14,25 +15,31 @@
 //! - `SURFACE_FIXTURES`: a file holding one fixture or an array of them, each
 //!   `{"match": {"method", "scope_ref"?}, "stdout"}`. A request whose method matches (and whose
 //!   `scope_ref` equals the fixture's, when it names one) is answered with that fixture's
-//!   `stdout`, decoded as JSON and wrapped as `{"result": ...}`; a fixture whose `stdout`
-//!   decodes as an `ErrorBody` refuses the request with it instead. A `private_content.query`
+//!   `stdout` bytes after JSON validation. Basal `ErrorBody` fixtures use error frames;
+//!   Cerebellum's answers and outcome refusals use response frames. A `private_content.query`
 //!   with no matching fixture is answered marked, with no sources, when the file names a
-//!   `person_browser` fixture, and unmarked when it does not; any other unmatched operation is
+//!   recognized source kind, and unmarked when it does not; any other unmatched operation is
 //!   refused `unknown_method`.
 //! - `SURFACE_REQUESTS`: a file this process appends one line to per request, so a test can
 //!   count how often broca asked.
+//! - `SURFACE_SCOPES`: optional full scope set to sync on this module's own connection
+//!   after HELLO_ACK. The file need not exist at startup; this process waits up to 60 seconds
+//!   for it to appear.
 
 use std::io::Write;
 use std::path::PathBuf;
 
+use base64::{engine::general_purpose::STANDARD, Engine};
 use subc_protocol::manifest::{
-    Concurrency, IdentityScope, ManagementOperation, ManagementOperationKind, ModuleManifest,
-    ProviderRole,
+    CapabilityDeclarations, Concurrency, IdentityScope, ManagementOperation, ManagementOperationKind,
+    ModuleManifest, ProviderRole,
 };
 use subc_protocol::{ErrorBody, Flags, Frame, FrameType, ModuleHelloBody, Priority, PROTOCOL_VERSION};
 use subc_transport::{authenticate_client, read_frame, write_frame};
 
-const SURFACED_OPS: [&str; 2] = ["private_content.query", "flow.private_content_providers"];
+const SURFACED_OPS: [&str; 3] = ["private_content.query", "flow.private_content_providers", "image.resolve"];
+
+mod tool_result;
 
 fn main() {
     if let Some(()) = relaunch() {
@@ -163,6 +170,13 @@ fn stand_in_value(name: &str) -> String {
 
 async fn serve() -> Result<(), String> {
     let (module_id, nonce) = identity()?;
+    let mut tool_routes = tool_result::Routes::default();
+    // A flow caller must connect under Basal's daemon-issued identity, not the scope owner's.
+    // The rig uses the optional nonce file to open that additional consumer connection.
+    if std::env::args().any(|arg| arg.starts_with("--SURFACE_NONCE_PATH=")) {
+        std::fs::write(stand_in_value("SURFACE_NONCE_PATH"), &nonce)
+            .map_err(|error| format!("write the consumer nonce: {error}"))?;
+    }
     let fixtures = PathBuf::from(stand_in_value("SURFACE_FIXTURES"));
     let requests = PathBuf::from(stand_in_value("SURFACE_REQUESTS"));
     let info = subc_transport::read_for_client(env("SUBC_CONNECTION"))
@@ -197,6 +211,39 @@ async fn serve() -> Result<(), String> {
         &requests,
         &format!("hello-ack {:?} {}\n", ack.header.ty, String::from_utf8_lossy(&ack.body)),
     )?;
+    if std::env::args().any(|arg| arg.starts_with("--SURFACE_SCOPES=")) {
+        let path = PathBuf::from(stand_in_value("SURFACE_SCOPES"));
+        let scopes = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                match std::fs::read(&path) {
+                    Ok(bytes) => break serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .map_err(|error| format!("decode scope set: {error}")),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    Err(error) => break Err(format!("read scope set: {error}")),
+                }
+            }
+        }).await.map_err(|_| "the owner did not publish its scope set".to_owned())??;
+        // Keep optional registration fields intact; the daemon, not the stand-in's pinned
+        // protocol decoder, validates the owner's project and workdir attribution.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "op": "scope.sync", "generation": 1, "scopes": scopes
+        })).map_err(|error| error.to_string())?;
+        write(&mut stream, control(FrameType::Request, 2, body)).await?;
+        let reply = read_frame(&mut stream).await
+            .map_err(|error| format!("read scope.sync reply: {error}"))?
+            .ok_or("the daemon closed before scope.sync replied")?;
+        let body_json: serde_json::Value = serde_json::from_slice(&reply.body)
+            .map_err(|error| format!("decode scope.sync reply: {error}"))?;
+        append(&requests, &format!("{}\n", serde_json::json!({
+            "kind": if reply.header.ty == FrameType::Response { "scope_sync_response" } else { "error" },
+            "corr": reply.header.corr, "body_json": body_json
+        })))?;
+        if reply.header.ty != FrameType::Response || reply.header.corr != 2 {
+            return Err(format!("scope.sync was not accepted: {body_json}"));
+        }
+    }
     loop {
         let Some(frame) = read_frame(&mut stream)
             .await
@@ -211,9 +258,12 @@ async fn serve() -> Result<(), String> {
         if frame.header.channel == 0 && is_route_bind(&frame) {
             // A consumer opened a route to this surface: accept it and serve its channel.
             append(&requests, &format!("route.bind {}\n", String::from_utf8_lossy(&frame.body)))?;
+            if tool_result::enabled() {
+                tool_routes.bind(&frame)?;
+            }
             let accepted = serde_json::to_vec(&serde_json::json!({"op":"route.bind"}))
                 .unwrap_or_default();
-            write(&mut stream, reply_frame(&frame, FrameType::Response, accepted)).await?;
+            write(&mut stream, reply_frame(&frame, FrameType::Response, accepted, false)).await?;
             continue;
         }
         if frame.header.channel == 0 && frame.header.ty == FrameType::Request {
@@ -230,7 +280,7 @@ async fn serve() -> Result<(), String> {
                 "the stand-in surface serves no module control operation",
             );
             let body = serde_json::to_vec(&refused).unwrap_or_default();
-            write(&mut stream, reply_frame(&frame, FrameType::Error, body)).await?;
+            write(&mut stream, reply_frame(&frame, FrameType::Error, body, false)).await?;
             continue;
         }
         let request: serde_json::Value =
@@ -240,11 +290,22 @@ async fn serve() -> Result<(), String> {
             &requests,
             &format!("{} {}\n", method, request["params"]),
         )?;
-        let (ty, body) = match answer(&fixtures, &method, &request["params"]) {
-            Ok(result) => (FrameType::Response, result),
-            Err(refused) => (FrameType::Error, refused),
+        if tool_result::enabled() {
+            append(&requests, &format!("tool-result-request {request}\n"))?;
+            let body = tool_routes.answer(&frame, &request)?;
+            write(&mut stream, reply_frame(&frame, FrameType::Response, body, false)).await?;
+            continue;
+        }
+        // Leave the image request unanswered to exercise the caller's source timeout.
+        // Other operations remain available while the image source is down.
+        if method == "image.resolve" && fixtures.with_extension("down").exists() {
+            continue;
+        }
+        let (ty, body, binary) = match answer(&fixtures, &method, &request["params"]) {
+            Ok(result) => (FrameType::Response, result.body, result.binary),
+            Err(refused) => (FrameType::Error, refused, false),
         };
-        write(&mut stream, reply_frame(&frame, ty, body)).await?;
+        write(&mut stream, reply_frame(&frame, ty, body, binary)).await?;
     }
 }
 
@@ -266,10 +327,10 @@ fn control(ty: FrameType, corr: u64, body: Vec<u8>) -> Frame {
     .expect("a control frame fits the wire limit")
 }
 
-fn reply_frame(request: &Frame, ty: FrameType, body: Vec<u8>) -> Frame {
+fn reply_frame(request: &Frame, ty: FrameType, body: Vec<u8>, binary: bool) -> Frame {
     Frame::build(
         ty,
-        Flags::new(false, Priority::Interactive, false),
+        Flags::new(binary, Priority::Interactive, false),
         request.header.channel,
         request.header.epoch,
         request.header.corr,
@@ -285,7 +346,10 @@ async fn write(stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite +
 }
 
 fn manifest(module_id: &str) -> ModuleManifest {
-    let operations = SURFACED_OPS
+    if tool_result::enabled() {
+        return tool_result::manifest(module_id);
+    }
+    let mut operations: Vec<_> = SURFACED_OPS
         .iter()
         .map(|name| ManagementOperation {
             name: (*name).to_owned(),
@@ -293,6 +357,13 @@ fn manifest(module_id: &str) -> ModuleManifest {
             description: None,
         })
         .collect();
+    if module_id == "cingulate" {
+        operations.push(ManagementOperation {
+            name: "consent.request".into(),
+            kind: ManagementOperationKind::Mutate,
+            description: None,
+        });
+    }
     ModuleManifest::builder(module_id, env!("CARGO_PKG_VERSION")).provides(vec![
         ProviderRole::ManagementSurface {
             operations,
@@ -302,10 +373,41 @@ fn manifest(module_id: &str) -> ModuleManifest {
             concurrency: Concurrency::Serial,
         },
     ])
+    .capabilities((module_id == "cingulate").then(|| CapabilityDeclarations {
+        // Consent routes carry the run's scope. Advertise agent-run-scopes/v1, matching
+        // real Cingulate; this stand-in does not implement call-modes/v1.
+        provides: vec![
+            "consent-no-expiry/v1".into(),
+            subc_protocol::scope::AGENT_RUN_SCOPES_CAPABILITY.into(),
+        ],
+        requires: Vec::new(),
+        must_never_reach: Vec::new(),
+    }))
     .build()
 }
 
-fn answer(fixtures: &PathBuf, method: &str, params: &serde_json::Value) -> Result<Vec<u8>, Vec<u8>> {
+fn answer(fixtures: &PathBuf, method: &str, params: &serde_json::Value) -> Result<Surfaced, Vec<u8>> {
+    if method == "flow.private_content_providers"
+        && (params["flow_id"].as_str().is_none()
+            || params.as_object().is_none_or(|params| params.keys().any(|key| key != "flow_id")))
+    {
+        return Err(br#"{"code":"invalid_params","message":"params must contain only flow_id"}"#.to_vec());
+    }
+    if method == "private_content.query" {
+        if let Some(field) = params.as_object().and_then(|params| {
+            params
+                .keys()
+                .find(|key| !matches!(key.as_str(), "scope_ref" | "parent_scope_ref"))
+        }) {
+            return Ok(Surfaced::plain(
+                serde_json::to_vec(&serde_json::json!({
+                    "outcome": "invalid_request", "context": null, "session": null,
+                    "detail": {"field": field, "reason_code": "unknown_field"}
+                }))
+                .unwrap(),
+            ));
+        }
+    }
     let refused = |code: &str, message: String| {
         serde_json::to_vec(&ErrorBody::new(code, message)).unwrap_or_default()
     };
@@ -333,26 +435,50 @@ fn answer(fixtures: &PathBuf, method: &str, params: &serde_json::Value) -> Resul
         {
             continue;
         }
+        if fixture["match"]["handle"].as_str()
+            .is_some_and(|handle| params["handle"].as_str() != Some(handle)) {
+            continue;
+        }
         let raw = fixture["stdout"].as_str().unwrap_or_default();
+        // Cerebellum sends both answers and refusals as bare response bodies. Preserve the
+        // fixture bytes so the rig cannot hide a client that expects a result envelope.
+        // A resolve success is a binary body (`u32` big-endian head length, head JSON, image
+        // bytes): the fixture carries those exact body bytes base64-encoded, and the reply
+        // frame carries the binary flag. Every `image.resolve` fixture is a success; an
+        // unmatched handle gets the JSON refusal from the default below.
+        if method == "image.resolve" {
+            let body = STANDARD.decode(raw).map_err(|error| {
+                refused("internal_error", format!("bad fixture: {error}"))
+            })?;
+            return Ok(Surfaced { body, binary: true });
+        }
+        if method == "private_content.query" {
+            return Ok(Surfaced::plain(raw.as_bytes().to_vec()));
+        }
         let value: serde_json::Value = match serde_json::from_str(raw) {
             Ok(value) => value,
             Err(error) => return Err(refused("internal_error", format!("bad fixture: {error}"))),
         };
-        // A fixture that reads as an error is the module refusing the operation.
+        // Basal refuses with an error frame, while its successful fixture includes result.
         if value.get("code").is_some() {
-            return Err(serde_json::to_vec(&value).unwrap_or_default());
+            return Err(raw.as_bytes().to_vec());
         }
-        return Ok(serde_json::to_vec(&serde_json::json!({ "result": value })).unwrap_or_default());
+        return Ok(Surfaced::plain(raw.as_bytes().to_vec()));
     }
-    // A cerebellum stand-in answers a scope it has no fixture for. The file naming any
-    // `person_browser` fixture marks it as the whole file's answer, which is how a test says
-    // that this cerebellum keeps finding more private content.
+    // An unmatched private-content query returns marked=true if the fixture file names any
+    // recognized source. This lets a test model Cerebellum continuing to find private content.
     if method == "private_content.query" {
-        let marked = text.contains("person_browser");
-        return Ok(serde_json::to_vec(&serde_json::json!({
-            "result": {"private_content": marked, "sources": []}
-        }))
-        .unwrap_or_default());
+        let marked = ["person_browser", "desktop_app", "signed_in_site"]
+            .iter().any(|source| text.contains(source));
+        return Ok(Surfaced::plain(
+            serde_json::to_vec(&serde_json::json!({
+                "private_content": marked, "sources": []
+            }))
+            .unwrap_or_default(),
+        ));
+    }
+    if method == "image.resolve" {
+        return Ok(Surfaced::plain(br#"{"outcome":"image_unavailable"}"#.to_vec()));
     }
     Err(refused(
         "unknown_method",
@@ -360,6 +486,18 @@ fn answer(fixtures: &PathBuf, method: &str, params: &serde_json::Value) -> Resul
     ))
 }
 
+/// A fixture's answer: the reply body, and whether it is a binary body rather than JSON.
+#[derive(Debug)]
+struct Surfaced {
+    body: Vec<u8>,
+    binary: bool,
+}
+
+impl Surfaced {
+    fn plain(body: Vec<u8>) -> Self {
+        Self { body, binary: false }
+    }
+}
 fn append(path: &PathBuf, line: &str) -> Result<(), String> {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -368,4 +506,157 @@ fn append(path: &PathBuf, line: &str) -> Result<(), String> {
         .map_err(|error| format!("open the request log: {error}"))?;
     file.write_all(line.as_bytes())
         .map_err(|error| format!("write the request log: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cingulate_accepts_agent_run_scopes_like_the_real_provider() {
+        let manifest = super::manifest("cingulate");
+        assert!(manifest.capabilities.unwrap().provides.iter().any(|capability| {
+            capability == subc_protocol::scope::AGENT_RUN_SCOPES_CAPABILITY
+        }));
+    }
+
+    #[test]
+    fn cingulate_declares_card_filing_and_no_expiry_without_changing_other_surfaces() {
+        let manifest = super::manifest("cingulate");
+        assert_eq!(
+            manifest.capabilities.as_ref().unwrap().provides,
+            vec!["consent-no-expiry/v1", "agent-run-scopes/v1"]
+        );
+        assert!(manifest.provides.iter().any(|role| matches!(
+            role, super::ProviderRole::ManagementSurface { operations, .. }
+                if operations.iter().any(|op| op.name == "consent.request" && op.kind == super::ManagementOperationKind::Mutate)
+        )));
+        assert!(super::manifest("cerebellum").capabilities.is_none());
+    }
+
+    use super::*;
+
+    #[test]
+    fn image_resolution_fixtures_are_scoped_by_handle_and_answer_binary() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("target/scratch/image-fixtures-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("fixtures.json");
+        let image = b"abc";
+        // SHA-256 of `abc`, so the test needs no hash dependency for three fixture bytes.
+        let head = br#"{"content_type":"image/png","length":3,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}"#;
+        let mut body = (head.len() as u32).to_be_bytes().to_vec();
+        body.extend_from_slice(head);
+        body.extend_from_slice(image);
+        let stdout = STANDARD.encode(&body);
+        std::fs::write(&path, serde_json::json!([{
+            "match":{"method":"image.resolve","scope_ref":"run","handle":"ih123"},"stdout":stdout
+        }]).to_string()).unwrap();
+        let answered = answer(&path, "image.resolve", &serde_json::json!({"handle":"ih123","scope_ref":"run"})).unwrap();
+        assert!(answered.binary);
+        assert_eq!(answered.body, body);
+        for params in [serde_json::json!({"handle":"foreign","scope_ref":"run"}), serde_json::json!({"handle":"ih123","scope_ref":"foreign"})] {
+            let refused = answer(&path, "image.resolve", &params).unwrap();
+            assert!(!refused.binary);
+            assert_eq!(refused.body, br#"{"outcome":"image_unavailable"}"#);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_content_rejects_unknown_params_with_a_normal_refusal_body() {
+        let response = answer(
+            &PathBuf::new(),
+            "private_content.query",
+            &serde_json::json!({
+                "scope_ref": "run", "owner": {"kind": "reserved", "module_id": "broca"}
+            }),
+        )
+        .unwrap()
+        .body;
+        // Cerebellum fbcc6766, crates/cerebellum/tests/vectors/private-content-query-v1/unknown-field.json.
+        // Whole-file SHA-256 (provenance only, not body bytes):
+        // 7cc2ec06859a700a91c1e6a1a57643c66ab9af848debcf9b4beb6ecaa7aeb2bc.
+        assert_eq!(response, br#"{"context":null,"detail":{"field":"owner","reason_code":"unknown_field"},"outcome":"invalid_request","session":null}"#);
+    }
+
+    #[test]
+    fn private_content_default_answer_is_bare() {
+        let response = answer(
+            &PathBuf::new(),
+            "private_content.query",
+            &serde_json::json!({
+                "scope_ref": "run", "parent_scope_ref": "head"
+            }),
+        )
+        .unwrap()
+        .body;
+        // Cerebellum fbcc6766, crates/cerebellum/tests/vectors/private-content-query-v1/success-unmarked.json.
+        // Whole-file SHA-256 (provenance only, not body bytes):
+        // e860efcd7db12298f7af82758e8a72bc66b5e0ede81ada0c7fba40c1aa29acb2.
+        assert_eq!(response, br#"{"private_content":false,"sources":[]}"#);
+    }
+
+    #[test]
+    fn cerebellum_fixtures_preserve_pinned_reply_bytes() {
+        // Cerebellum fbcc6766. These reply bodies come from the following vectors; SHA-256s
+        // identify whole golden-file documents for provenance only, not the body bytes:
+        // crates/cerebellum/tests/vectors/private-content-query-v1/success-marked.json
+        // whole-file SHA-256 eb4c452cadd0b5d48e8855db366c599c3dcccb3408da1ea403fa5d8703032d1c
+        // crates/cerebellum/tests/vectors/private-content-query-v1/success-unmarked.json
+        // whole-file SHA-256 e860efcd7db12298f7af82758e8a72bc66b5e0ede81ada0c7fba40c1aa29acb2
+        // crates/cerebellum/tests/vectors/private-content-query-v1/unknown-field.json
+        // whole-file SHA-256 7cc2ec06859a700a91c1e6a1a57643c66ab9af848debcf9b4beb6ecaa7aeb2bc
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("target/scratch/cerebellum-fixtures-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let fixture = root.join("fixtures.json");
+        for body in [
+            r#"{"private_content":true,"sources":["signed_in_site"]}"#,
+            r#"{"private_content":false,"sources":[]}"#,
+            r#"{"context":null,"detail":{"field":"owner","reason_code":"unknown_field"},"outcome":"invalid_request","session":null}"#,
+        ] {
+            std::fs::write(&fixture, serde_json::json!([{
+                "match": {"method": "private_content.query", "scope_ref": "test-session"}, "stdout": body
+            }]).to_string()).unwrap();
+            let bytes = answer(&fixture, "private_content.query", &serde_json::json!({"scope_ref": "test-session"})).unwrap().body;
+            assert_eq!(bytes, body.as_bytes());
+            if body.contains("signed_in_site") {
+                let fallback = answer(&fixture, "private_content.query", &serde_json::json!({"scope_ref": "other-scope"})).unwrap().body;
+                assert_eq!(fallback, br#"{"private_content":true,"sources":[]}"#);
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn basal_rejects_unknown_params_in_an_error_frame() {
+        for params in [
+            serde_json::json!({"flow_id": "flow", "owner": {"kind": "reserved", "module_id": "broca"}}),
+            serde_json::json!({"flow_id": "flow", "future_field": true}),
+        ] {
+            let bytes = answer(&PathBuf::new(), "flow.private_content_providers", &params).unwrap_err();
+            let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(error, serde_json::json!({"code": "invalid_params", "message": "params must contain only flow_id"}));
+        }
+    }
+
+    #[test]
+    fn basal_fixtures_preserve_wrapped_successes_and_error_frames() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("target/scratch/basal-fixtures-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let fixture = root.join("fixtures.json");
+        for (body, refused) in [
+            (r#"{"result":{"flow_id":"flow","version":7,"code_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","providers":["typesafe","openai"]}}"#, false),
+            (r#"{"result":{"flow_id":"flow","version":7,"code_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","providers":[]}}"#, false),
+            (r#"{"code":"storage_unavailable","message":"storage is unavailable"}"#, true),
+        ] {
+            std::fs::write(&fixture, serde_json::json!([{
+                "match": {"method": "flow.private_content_providers"}, "stdout": body
+            }]).to_string()).unwrap();
+            let response = answer(&fixture, "flow.private_content_providers", &serde_json::json!({"flow_id": "flow"}));
+            let bytes = if refused { response.unwrap_err() } else { response.unwrap().body };
+            assert_eq!(bytes, body.as_bytes());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

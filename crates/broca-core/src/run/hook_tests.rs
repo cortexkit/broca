@@ -118,6 +118,7 @@ pub(super) fn frozen(
         plan["user_grants"] = json!([{"module":"p0","hook":"post_tool","tools":["edit"]}]);
     }
     broca_wal::PlanManifest {
+        rich_ui: None,
         plan: broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
         plan_identity: String::new(),
         composition_digest: String::new(),
@@ -662,7 +663,7 @@ async fn post_tool_cancel_applies_remaining_refuse_policy_without_calling_later_
         None,
     )
     .await;
-    let ToolOutput::Error { message } = &output.results[0].output else {
+    let ToolOutput::Error { message, .. } = &output.results[0].output else {
         panic!()
     };
     assert!(message.contains("p1"));
@@ -916,6 +917,75 @@ async fn post_assistant_record_control_next_prompt_and_display_all_use_final_mes
         assert_eq!(seen.lock().unwrap().len(), 2);
         let _ = writer.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn post_assistant_hook_never_sees_refused_message() {
+    let manifest = Arc::new(frozen(
+        vec![vec![sub("post_assistant", None, "pass")]],
+        None,
+        false,
+    ));
+    let (plane, seen) = scripted(|_, _| Reply::Answer(HookAnswer::Pass));
+    let control = RunControl {
+        manifest: Some(manifest),
+        hook_plane: Some(plane),
+        ..Default::default()
+    };
+    let answer = |text: &str, finish_reason| {
+        vec![
+            NormalizedEvent::Control(ProviderControl::AssistantMessage {
+                message: AssistantMessage {
+                    message_id: broca_protocol::MessageId(text.into()),
+                    content: vec![ContentBlock::Text { text: text.into() }],
+                },
+            }),
+            NormalizedEvent::Control(ProviderControl::Finished {
+                usage: Usage::default(),
+                finish_reason,
+                retries_used: 0,
+            }),
+        ]
+    };
+    let provider = crate::StubProvider::new(vec![
+        answer("refused content", FinishReason::ContentFilter),
+        answer("fallback answer", FinishReason::Stop),
+    ])
+    .with_refusal_fallback(
+        broca_protocol::request::ModelHandle::new("anthropic", "claude-opus-4-8"),
+        None,
+    );
+    let (writer, records) = writer();
+    let (out, _events) = mpsc::channel(128);
+    run_body(
+        &mut request(),
+        crate::replay::replay(&[]).unwrap(),
+        None,
+        false,
+        false,
+        false,
+        &control,
+        &provider,
+        &crate::StubToolPlane::new().with_canned_text("edit", "ok"),
+        &crate::AllowAll,
+        &writer,
+        || Ok(false),
+        None,
+        &out,
+        None,
+    )
+    .await
+    .unwrap();
+    // The hook ran once, on the fallback's answer; the refused message never reached it.
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].1.subject.blocks().unwrap(), ["fallback answer"]);
+    let records = records.lock().unwrap().clone();
+    assert!(records
+        .iter()
+        .any(|record| matches!(record, WalRecord::ModelStepRefused { .. })));
+    assert!(!format!("{records:?}").contains("refused content"));
+    let _ = writer.shutdown().await;
 }
 
 #[tokio::test]
@@ -1238,6 +1308,7 @@ async fn seal_linearization_keeps_answered_slots_until_handover_and_orders_paral
         tool_call_id: "a".into(),
     };
     let model = WalRecord::ModelStepFinished {
+        fallback: Default::default(),
         written_at_ms: None,
         tags: None,
         step_id: StepId(1),
@@ -1526,7 +1597,7 @@ async fn sealed_post_tool(
         for (result, reason) in &terminals {
             if let Some(provider) = expected_provider {
                 assert_eq!(reason.as_deref(), Some("post_tool_unavailable"));
-                let ToolOutput::Error { message } = &result.output else {
+                let ToolOutput::Error { message, .. } = &result.output else {
                     panic!("result must be withheld")
                 };
                 assert!(message.contains(provider));
@@ -2550,7 +2621,7 @@ async fn cut_step_shutdown_fallback_keeps_exact_rejection_counts() {
             1
         );
         assert!(records.iter().any(|r| matches!(r, WalRecord::ToolResult { result, .. } if matches!(&result.output,
-            ToolOutput::Error { message } if message.starts_with("tool_args_trailing_garbage:") && message.contains("json_bytes=9, whitespace_bytes=4097")))));
+            ToolOutput::Error { message, .. } if message.starts_with("tool_args_trailing_garbage:") && message.contains("json_bytes=9, whitespace_bytes=4097")))));
         assert!(!records
             .iter()
             .any(|r| matches!(r, WalRecord::ToolDispatchIntent { .. })));
@@ -2641,6 +2712,7 @@ fn declaring(late_results: bool) -> broca_wal::PlanManifest {
         *declarations_frozen = late_results.then_some(broca_wal::FrozenProviderDeclarations {
             result_formats: None,
             late_results: Some(true),
+            schema_pins: None,
         });
     }
     manifest

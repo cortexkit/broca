@@ -35,16 +35,22 @@ pub mod context_management;
 pub mod held_runtime;
 pub mod keep_warm_quota;
 pub mod llm_tools;
+pub mod management_admission;
 pub mod manifest;
 pub mod opencode_go_identity;
 pub mod provider_overrides;
+pub mod refusal_fallback_config;
 pub mod run_routing;
+mod scope_workdir;
 pub mod send_audit;
 pub mod serve;
 pub mod session_class;
+pub mod session_lookup;
 pub mod stall;
 pub mod state_root;
+pub mod state_root_lock;
 pub mod system_one;
+pub mod trajectory;
 pub mod transport_config;
 pub mod vault_audit;
 pub mod vault_config;
@@ -70,3 +76,4 @@ pub use vault_config::{
 };
 
 pub mod devtools;
+pub mod diagnostics;

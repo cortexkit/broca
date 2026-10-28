@@ -73,6 +73,7 @@ fn request() -> RunRequest {
 fn control() -> RunControl {
     let control = RunControl {
         manifest: Some(Arc::new(broca_wal::PlanManifest {
+            rich_ui: None,
             plan: OpaqueJson::from_json_text(
                 json!({"compaction_item":{"provider":PROVIDER,"preset":"summary","params":{}},"composition":{}})
                     .to_string(),

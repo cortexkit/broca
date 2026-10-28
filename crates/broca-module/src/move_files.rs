@@ -506,12 +506,12 @@ impl CutArtifacts for FileCutArtifacts {
             ));
         }
         for plan in &plans {
-            if broca_wire::agent_data::session_ref(
+            if !broca_wire::agent_data::matches_session_ref(
+                &plan.reference,
                 &plan.session.harness,
                 &plan.session.project_root.to_string_lossy(),
                 &plan.session.session,
-            ) != plan.reference
-            {
+            ) {
                 return Err(refusal(
                     "invalid_request",
                     "resolved session does not match its ref",
@@ -523,18 +523,31 @@ impl CutArtifacts for FileCutArtifacts {
             .iter()
             .filter_map(|r| plans.iter().find(|p| r["ref"] == p.reference).cloned())
             .collect();
+        // Prepare, release and abort publish or remove the source's move markers. For
+        // those, an idle actor whose writer owns its tenure closes that writer and hands
+        // the still-held session lease to this guard before any marker changes. Every
+        // other operation only reads, and inspection never takes a tenure.
+        let mode = if matches!(op, Op::Prepare | Op::Release | Op::Abort) {
+            crate::registry::CutLockMode::Mutate
+        } else {
+            crate::registry::CutLockMode::Inspect
+        };
         let sessions = self
             .registry
-            .lock_move_sessions(
+            .lock_move_sessions_with_mode(
                 &plans.iter().map(|p| p.session.clone()).collect::<Vec<_>>(),
                 false,
+                mode,
             )
             .await
             .map_err(unavailable)?;
         let mut busy = sessions.busy.iter().find_map(|(_, reason)| reason.clone());
-        let open_actor = plans
-            .iter()
-            .any(|p| self.registry.slot_state(&p.session).is_some());
+        // A retired actor's slot stays `Closing` until the guard releases it, but it no
+        // longer serves the session: the guard holds its lease instead.
+        let actor_open = |session: &BindIdentity| {
+            self.registry.slot_state(session).is_some() && !sessions.holds_tenure(session)
+        };
+        let open_actor = plans.iter().any(|p| actor_open(&p.session));
         let mut leases = Vec::new();
         let mut observations = Vec::new();
         for plan in &plans {
@@ -554,8 +567,11 @@ impl CutArtifacts for FileCutArtifacts {
                     .map_err(unavailable)?
                     .or_else(|| moving.map(|f| f.cut_id)),
                 moved_holder: moved.map(|m| m.holder),
-                open_actor: self.registry.slot_state(&plan.session).is_some(),
+                open_actor: actor_open(&plan.session),
             };
+            // A session whose lease this guard already holds (handed over by its closed
+            // actor) must not be acquired again; one with an open actor keeps its lease
+            // with that actor while it is paused.
             if self.registry.slot_state(&plan.session).is_none() {
                 match self
                     .leases
@@ -669,12 +685,26 @@ impl CutArtifacts for FileCutArtifacts {
                         "source snapshot does not match the frozen item",
                     ));
                 }
-                move_install::verify_received(
+                let recorded_session = move_install::verify_received(
                     &plan.reference,
                     &plan.bytes,
                     plan.end_offset,
                     &plan.digest,
                 )?;
+                if recorded_session.project_root.as_os_str()
+                    != plan.session.project_root.as_os_str()
+                    || recorded_session.harness != plan.session.harness
+                    || recorded_session.session != plan.session.session
+                {
+                    return Err(refusal(
+                        "invalid_request",
+                        format!(
+                            "source WAL does not record the carried bind triple for ref {}",
+                            plan.reference
+                        ),
+                        Value::Null,
+                    ));
+                }
                 if op == Op::Export {
                     let current = if live.try_exists().map_err(unavailable)? {
                         std::fs::read(&live).map_err(unavailable)?

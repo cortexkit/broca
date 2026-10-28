@@ -356,7 +356,14 @@ class KnownFeatureTableTests(unittest.TestCase):
         known = live_runs.wal_gate.KNOWN_FEATURES
         self.assertIn("dispatch-module/v1", known)
         source = live_runs.wal_gate.FRAMING_RS.read_text()
-        self.assertEqual(known, live_runs.wal_gate.broca_known_features(source))
+        self.assertEqual(
+            known,
+            live_runs.wal_gate.broca_known_features(
+                source, live_runs.wal_gate._broca_wal_module_source
+            ),
+        )
+        # An entry naming another module's constant resolves through that module's source.
+        self.assertIn("visibility-late/v1", known)
         # A WAL whose gated tool-call frame needs only that feature is read, not set aside.
         raw = frame(1, STARTED) + frame(2, {"type": "step_started"}, ["dispatch-module/v1"])
         self.assertEqual(self.state(raw), live_runs.OPEN)
@@ -374,6 +381,21 @@ class KnownFeatureTableTests(unittest.TestCase):
             parse(good.replace('pub const A_FEATURE: &str = "a/v1";', ""))
         with self.assertRaises(ValueError):
             parse('pub const KNOWN_FEATURES: &[&str] = &[\n];\n')
+        qualified = (
+            'pub const KNOWN_FEATURES: &[&str] = &[\n    A_FEATURE,\n    crate::other::B_FEATURE,\n];\n'
+            'pub const A_FEATURE: &str = "a/v1";\n'
+        )
+        modules = {"other": 'pub const B_FEATURE: &str = "b/v1";\n'}
+        self.assertEqual(
+            parse(qualified, lambda module: modules.get(module, "")),
+            frozenset({"a/v1", "b/v1"}),
+        )
+        # A qualified constant is read from its own module, never from framing.rs, and a
+        # module that doesn't define it fails loudly.
+        with self.assertRaises(ValueError):
+            parse(qualified + 'pub const B_FEATURE: &str = "b/v1";\n')
+        with self.assertRaises(ValueError):
+            parse(qualified, lambda module: "")
 
     state = LiveRunsGateTests.state
 

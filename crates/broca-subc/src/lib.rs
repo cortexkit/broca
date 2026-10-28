@@ -45,10 +45,13 @@ pub use consent::{
     AnswersPage, ConsentClient, ConsentError, ConsentRecord, ConsentState, FilingReply,
     ScopedConsentPlane, WithdrawalReply,
 };
-pub use flow_providers::{FlowPolicy, FlowProvidersClient, FlowProvidersError};
+pub use flow_providers::{
+    ApprovedFlowProviders, FlowPolicy, FlowProvidersClient, FlowProvidersError,
+};
 pub use hook_plane::SubcHookPlane;
 pub use late_results::{late_entry_tool_result, LateResultsError, LateResultsFeed};
 pub use plan_fetch::{SubcPlanAdmitter, SubcPlanFetcher};
+pub use private_content::{ImageResolveError, ResolvedImage};
 pub use private_content::{PrivateContent, PrivateContentClient, PrivateContentError, SourceKind};
 pub use scope_describe::{DescribedScope, ModuleScopeDescriber, ScopeDescriber};
 pub use session_door::{DoorCoverage, DoorRead, SessionDoorClient, SessionDoorError};

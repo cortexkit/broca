@@ -12,7 +12,7 @@
     "Display(ToolInputDelta { tool_call_id: ToolCallId(\"00000000-0000-4000-8000-000000000046\"), delta: \"{\\\"key\\\":\" })",
     "Display(ToolInputDelta { tool_call_id: ToolCallId(\"00000000-0000-4000-8000-000000000046\"), delta: \" \\\"build\\\"}\" })",
     "Control(AssistantMessage { message: AssistantMessage { message_id: MessageId(\"00000000-0000-4000-8000-000000000045\"), content: [Text { text: \"synthetic-001 synthetic-002 synthetic-003 synthetic-004 \" }, ToolCall(ToolCall { tool_call_id: ToolCallId(\"00000000-0000-4000-8000-000000000046\"), tool_name: \"read_record\", input: Object {\"key\": String(\"build\")}, thought_signature: None })] } })",
-    "Control(StepFinished { step_id: StepId(1), usage: Usage { input_tokens: Some(430), cached_input_tokens: Some(0), cache_write_tokens: Some(0), output_tokens: Some(58), reasoning_tokens: Some(0) }, finish_reason: ToolCalls, service_tier_used: Some(\"standard\"), speed_used: None })",
+    "Control(StepFinished { step_id: StepId(1), usage: Usage { input_tokens: Some(430), cached_input_tokens: Some(0), cache_write_tokens: Some(0), output_tokens: Some(58), reasoning_tokens: Some(0) }, finish_reason: ToolCalls, service_tier_used: Some(\"standard\"), speed_used: None, served_model: None, usage_iterations: None })",
     "Control(Finished { usage: Usage { input_tokens: Some(430), cached_input_tokens: Some(0), cache_write_tokens: Some(0), output_tokens: Some(58), reasoning_tokens: Some(0) }, finish_reason: ToolCalls, retries_used: 0 })",
     "Control(StreamStart { warnings: [] })",
     "Control(StepStarted { step_id: StepId(2) })",
@@ -23,7 +23,7 @@
     "Display(TextDelta { message_id: MessageId(\"00000000-0000-4000-8000-000000000047\"), tool_call_id: None, delta: \"synthetic-009 \" })",
     "Display(TextDelta { message_id: MessageId(\"00000000-0000-4000-8000-000000000047\"), tool_call_id: None, delta: \"synthetic-010 \" })",
     "Control(AssistantMessage { message: AssistantMessage { message_id: MessageId(\"00000000-0000-4000-8000-000000000047\"), content: [Text { text: \"synthetic-005 synthetic-006 synthetic-007 synthetic-008 synthetic-009 synthetic-010 \" }] } })",
-    "Control(StepFinished { step_id: StepId(2), usage: Usage { input_tokens: Some(509), cached_input_tokens: Some(0), cache_write_tokens: Some(0), output_tokens: Some(45), reasoning_tokens: Some(0) }, finish_reason: Stop, service_tier_used: Some(\"standard\"), speed_used: None })",
+    "Control(StepFinished { step_id: StepId(2), usage: Usage { input_tokens: Some(509), cached_input_tokens: Some(0), cache_write_tokens: Some(0), output_tokens: Some(45), reasoning_tokens: Some(0) }, finish_reason: Stop, service_tier_used: Some(\"standard\"), speed_used: None, served_model: None, usage_iterations: None })",
     "Control(Finished { usage: Usage { input_tokens: Some(509), cached_input_tokens: Some(0), cache_write_tokens: Some(0), output_tokens: Some(45), reasoning_tokens: Some(0) }, finish_reason: Stop, retries_used: 0 })"
   ],
   "note": "Synthetic response bytes and normalized events; preserves the original event order, field structure, usage shapes and chunk boundaries. No request or credentials.",

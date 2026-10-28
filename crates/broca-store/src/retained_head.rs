@@ -191,6 +191,7 @@ mod tests {
                 module_id: "owner".into(),
             });
             *manifest = Some(Box::new(broca_wal::PlanManifest {
+                rich_ui: None,
                 plan: broca_wal::OpaqueJson::from_json_text(serde_json::json!({"composition":{"secret":"SECRET_COMPOSITION"},
                     "senders":[{"module":"sender","templates":[{"id":"t","text":"SECRET_TEMPLATE","slots":{}}]}]}).to_string()).unwrap(),
                 plan_identity: "id".into(), composition_digest:"digest".into(), tools: Default::default(),

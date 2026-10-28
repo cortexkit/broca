@@ -474,7 +474,10 @@ fn repairable_import_prefix(
             } if dangling_seed => dangling_seed = false,
             // A record type from a newer build is informational by the contract on
             // `WalRecord`, so it neither makes nor breaks a repairable import prefix.
-            WalRecord::Unknown => {}
+            WalRecord::WriterOpened { .. }
+            | WalRecord::WriterClosed { .. }
+            | WalRecord::VisibilityLate { .. }
+            | WalRecord::Unknown => {}
             // This reader release decodes compaction records but does not act on them yet.
             WalRecord::CompactionRequest { .. }
             | WalRecord::CompactionMessage { .. }
@@ -483,6 +486,7 @@ fn repairable_import_prefix(
             | WalRecord::CompactionViewApplied { .. }
             | WalRecord::ContextCeilingWait { .. }
             | WalRecord::ContextCeilingDecided { .. }
+            | WalRecord::OutputReservationClamped { .. }
             | WalRecord::CompactionRideWait { .. }
             | WalRecord::CompactionRideWaitEnded { .. }
             | WalRecord::CompactionNotice { .. } => {}
@@ -678,9 +682,7 @@ fn flush_pending(
             *synthesized += 1;
             ContentBlock::ToolResult(ToolResult {
                 tool_call_id,
-                output: ToolOutput::Error {
-                    message: "tool not run: interrupted before dispatch".into(),
-                },
+                output: ToolOutput::error("tool not run: interrupted before dispatch"),
                 is_error: true,
             })
         })
@@ -830,7 +832,7 @@ mod tests {
             .filter_map(|block| match block {
                 ContentBlock::ToolResult(ToolResult {
                     tool_call_id,
-                    output: ToolOutput::Error { message },
+                    output: ToolOutput::Error { message, .. },
                     is_error: true,
                 }) if message == "tool not run: interrupted before dispatch" => {
                     Some(tool_call_id.0.clone())
@@ -965,16 +967,12 @@ mod tests {
                 vec![
                     ContentBlock::ToolResult(ToolResult {
                         tool_call_id: ToolCallId("a".into()),
-                        output: ToolOutput::Error {
-                            message: "tool not run: interrupted before dispatch".into(),
-                        },
+                        output: ToolOutput::error("tool not run: interrupted before dispatch"),
                         is_error: true,
                     }),
                     ContentBlock::ToolResult(ToolResult {
                         tool_call_id: ToolCallId("d".into()),
-                        output: ToolOutput::Error {
-                            message: "tool not run: interrupted before dispatch".into(),
-                        },
+                        output: ToolOutput::error("tool not run: interrupted before dispatch"),
                         is_error: true,
                     }),
                 ],

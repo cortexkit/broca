@@ -50,13 +50,13 @@ use sha2::{Digest, Sha256};
 struct Args {
     /// Path to the subc daemon's connection file (subc-connection.json).
     #[arg(long)]
-    subc: PathBuf,
+    subc: Option<PathBuf>,
     /// The broca module id to bind (the ManagementSurface).
     #[arg(long, default_value = "broca")]
     module_id: String,
     /// The session identity: project root, harness, session name.
-    #[arg(long)]
-    project_root: PathBuf,
+    #[arg(long, global = true)]
+    project_root: Option<PathBuf>,
     /// An OPAQUE key component: joined with U+001F into the WAL, lease, store and idempotency
     /// keys, validated only for that separator.
     ///
@@ -70,10 +70,13 @@ struct Args {
     /// v0.3.106 is addressed under `runner`, because harness is joined into the WAL filename.
     /// Passing `--harness runner` reopens it; the default now names a different lineage. 79
     /// such sessions exist (measured 2026-09-20), 3 of which were ever reopened.
-    #[arg(long, default_value = "broca")]
-    harness: String,
-    #[arg(long)]
+    #[arg(long, global = true)]
+    harness: Option<String>,
+    #[arg(long, global = true, default_value = "")]
     session: String,
+    /// State root for reading the session-ref inventory (read-only; never migrates the store).
+    #[arg(long, global = true)]
+    state_root: Option<PathBuf>,
     /// Emit one JSON object per line instead of greppable markers.
     #[arg(long)]
     json_events: bool,
@@ -89,6 +92,7 @@ struct Args {
 struct CacheDumpArgs {
     /// Bind session names to export. Repeat to select several sessions.
     #[arg(
+        id = "session",
         long = "session",
         required_unless_present = "since",
         conflicts_with = "since"
@@ -96,7 +100,7 @@ struct CacheDumpArgs {
     sessions: Vec<String>,
     /// Export only calls whose selected attempt ended at or after RFC3339 or epoch milliseconds.
     /// Earlier WAL history is replayed to reconstruct exact request bodies.
-    #[arg(long, required_unless_present = "sessions")]
+    #[arg(long, required_unless_present = "session")]
     since: Option<String>,
     #[arg(long)]
     out: PathBuf,
@@ -104,20 +108,127 @@ struct CacheDumpArgs {
     #[arg(long)]
     state_root: Option<PathBuf>,
     /// Address these sessions directly without consulting run-index.db.
-    #[arg(long, requires_all = ["sessions", "harness"], conflicts_with = "since")]
+    #[arg(long, requires_all = ["session", "harness"], conflicts_with = "since")]
     project_root: Option<PathBuf>,
-    #[arg(long, requires_all = ["sessions", "project_root"], conflicts_with = "since")]
+    #[arg(long, requires_all = ["session", "project_root"], conflicts_with = "since")]
     harness: Option<String>,
 }
 
 #[derive(Parser)]
 struct OfflineArgs {
+    /// Parse the daemon flag only to give the same refusal in either argument order.
+    #[arg(long, global = true, hide = true)]
+    subc: Option<PathBuf>,
     #[command(subcommand)]
     command: OfflineCommand,
 }
 #[derive(Subcommand)]
 enum OfflineCommand {
     CacheDump(CacheDumpArgs),
+    Trajectory(TrajectoryArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct TrajectoryArgs {
+    id: String,
+    #[arg(long)]
+    out: Option<PathBuf>,
+    #[arg(long)]
+    transcript: bool,
+    #[arg(long)]
+    state_root: Option<PathBuf>,
+    #[arg(long, requires = "harness")]
+    project_root: Option<PathBuf>,
+    #[arg(long, requires = "project_root")]
+    harness: Option<String>,
+}
+
+fn state_root(root: Option<&PathBuf>) -> Result<PathBuf, String> {
+    root.cloned().map(Ok).unwrap_or_else(|| {
+        broca_module_serve::state_root::resolve_state_root()
+            .map(|resolved| resolved.path)
+            .map_err(|_| "cannot resolve state root".into())
+    })
+}
+
+fn offline_daemon_refusal(name: &str) -> String {
+    format!(
+        "{name} must be invoked without daemon arguments; put the subcommand first and omit --subc"
+    )
+}
+
+fn subc_path(args: &Args) -> Result<&std::path::Path, String> {
+    args.subc
+        .as_deref()
+        .ok_or_else(|| "--subc is required for daemon commands".into())
+}
+
+fn trajectory(args: TrajectoryArgs) -> Result<i32, String> {
+    let root = state_root(args.state_root.as_ref())?;
+    let bind = match (args.project_root, args.harness) {
+        (Some(project), Some(harness)) => {
+            broca_protocol::BindIdentity::new(project, harness, &args.id)
+        }
+        (None, None) => broca_module_serve::session_lookup::lookup(&root, &args.id)?,
+        _ => return Err("--project-root and --harness must be provided together".into()),
+    };
+    let rows = broca_module_serve::trajectory::read(&root, &bind, args.transcript)?;
+    let mut output: Box<dyn Write> = match args.out {
+        Some(path) => {
+            let mut options = broca_owner_only::OpenOptions::new();
+            options.write(true).create_new(true);
+            Box::new(options.open(path).map_err(|_| {
+                "cannot create private trajectory output (existing files are never overwritten)"
+            })?)
+        }
+        None => Box::new(std::io::stdout().lock()),
+    };
+    for row in rows {
+        serde_json::to_writer(&mut output, &row).map_err(|_| "cannot write trajectory")?;
+        writeln!(output).map_err(|_| "cannot write trajectory")?;
+    }
+    output.flush().map_err(|_| "cannot flush trajectory")?;
+    Ok(0)
+}
+
+fn bind_identity(args: &Args) -> Result<broca_protocol::BindIdentity, String> {
+    let id = match &args.cmd {
+        Cmd::Read { id: Some(id), .. } => {
+            if !args.session.is_empty() {
+                return Err("read accepts either an id or --session, not both".into());
+            }
+            id.as_str()
+        }
+        _ => args.session.as_str(),
+    };
+    if id.is_empty() {
+        return Err("a session id or --session is required".into());
+    }
+    if let (Some(project), Some(harness)) = (&args.project_root, &args.harness) {
+        return Ok(broca_protocol::BindIdentity::new(project, harness, id));
+    }
+    if matches!(args.cmd, Cmd::Read { .. }) {
+        let bind =
+            broca_module_serve::session_lookup::lookup(&state_root(args.state_root.as_ref())?, id)?;
+        if args
+            .harness
+            .as_ref()
+            .is_some_and(|harness| *harness != bind.harness)
+        {
+            return Err(format!("session {id:?} does not match --harness"));
+        }
+        if let Some(project) = &args.project_root {
+            let project = std::fs::canonicalize(project).unwrap_or_else(|_| project.clone());
+            if project != bind.project_root {
+                return Err(format!("session {id:?} does not match --project-root; pass both --project-root and --harness for literal addressing"));
+            }
+        }
+        return Ok(bind);
+    }
+    if let Some(project) = &args.project_root {
+        return Ok(broca_protocol::BindIdentity::new(project, "broca", id));
+    }
+    Err("--project-root is required for this command".into())
 }
 
 fn cache_dump(args: CacheDumpArgs) -> Result<i32, String> {
@@ -186,6 +297,8 @@ enum Cmd {
     },
     /// Export digest-verified request bodies directly from live or archived WALs (no daemon).
     CacheDump(CacheDumpArgs),
+    /// Export run, model and tool events from a live or archived session WAL (no daemon).
+    Trajectory(TrajectoryArgs),
     /// Compose a tool-only fetch plan from live provider catalogs, without sending a turn.
     ComposePlan {
         /// JSON with tool_items and empty system_text_items/step_transform_items; omit
@@ -380,6 +493,8 @@ enum Cmd {
     /// `session.read`: one durable transcript page (lease-free; works on idle and
     /// active sessions). Prints per-message role/ordinal/summary plus page timing.
     Read {
+        /// Task id or full session name; omit when using --session.
+        id: Option<String>,
         /// First ordinal of the page (omit for the first page in the chosen direction).
         #[arg(long)]
         from_ordinal: Option<u64>,
@@ -550,13 +665,24 @@ fn content_import_id(messages: &[broca_protocol::Message]) -> Result<String, Str
 async fn main() {
     if std::env::args_os()
         .nth(1)
-        .is_some_and(|a| a == "cache-dump")
+        .is_some_and(|a| a == "cache-dump" || a == "trajectory")
     {
-        let OfflineCommand::CacheDump(args) = OfflineArgs::parse().command;
-        std::process::exit(match cache_dump(args) {
+        let args = OfflineArgs::parse();
+        let result = if args.subc.is_some() {
+            Err(offline_daemon_refusal(match &args.command {
+                OfflineCommand::CacheDump(_) => "cache-dump",
+                OfflineCommand::Trajectory(_) => "trajectory",
+            }))
+        } else {
+            match args.command {
+                OfflineCommand::CacheDump(args) => cache_dump(args),
+                OfflineCommand::Trajectory(args) => trajectory(args),
+            }
+        };
+        std::process::exit(match result {
             Ok(code) => code,
             Err(error) => {
-                eprintln!("cache-dump: {error}");
+                eprintln!("{error}");
                 1
             }
         });
@@ -593,6 +719,12 @@ fn validate_max_output_tokens(cmd: &Cmd) -> Result<(), String> {
 }
 
 async fn run(args: Args) -> Result<i32, String> {
+    match &args.cmd {
+        Cmd::CacheDump(_) => return Err(offline_daemon_refusal("cache-dump")),
+        Cmd::Trajectory(_) => return Err(offline_daemon_refusal("trajectory")),
+        _ => {}
+    }
+    subc_path(&args)?;
     validate_max_output_tokens(&args.cmd)?;
     let plan = match &args.cmd {
         Cmd::Run { admission, .. } | Cmd::Send { admission, .. } => load_plan(&admission.plan)?,
@@ -608,18 +740,17 @@ async fn run(args: Args) -> Result<i32, String> {
     if let Cmd::ComposePlan { items } = &args.cmd {
         return compose_plan(&args, items).await;
     }
-    let session =
-        broca_protocol::BindIdentity::new(&args.project_root, &args.harness, &args.session);
+    let session = bind_identity(&args)?;
     session
         .validate_keyable()
         .map_err(|error| format!("invalid bind identity: {error}"))?;
-    let conn = SubcConnection::connect(&args.subc)
+    let conn = SubcConnection::connect(subc_path(&args)?)
         .await
-        .map_err(|e| format!("connect subc ({}): {e}", args.subc.display()))?;
+        .map_err(|_| "cannot connect subc".to_string())?;
     let client = SessionClient::bind_with_timeout(
         conn,
         &args.module_id,
-        session,
+        session.clone(),
         std::time::Duration::from_millis(args.bind_timeout_ms),
     )
     .await
@@ -653,15 +784,15 @@ async fn run(args: Args) -> Result<i32, String> {
     // canonicalisation agrees -- only the daemon knows that. When they differ the typed form
     // is printed too, because a caller who typed a path and sees a different one needs to
     // know it is the same path and not a silently redirected bind.
-    let keyed_root =
-        std::fs::canonicalize(&args.project_root).unwrap_or_else(|_| args.project_root.clone());
-    let root_display = if keyed_root == args.project_root {
+    let keyed_root = std::fs::canonicalize(&session.project_root)
+        .unwrap_or_else(|_| session.project_root.clone());
+    let root_display = if keyed_root == session.project_root {
         keyed_root.display().to_string()
     } else {
         format!(
             "{} (as typed: {})",
             keyed_root.display(),
-            args.project_root.display()
+            session.project_root.display()
         )
     };
     let raw_output = matches!(
@@ -678,15 +809,15 @@ async fn run(args: Args) -> Result<i32, String> {
             &serde_json::json!({
                 "event": "bound",
                 "module": args.module_id,
-                "harness": args.harness,
+                "harness": session.harness,
                 "project_root": keyed_root.display().to_string(),
-                "project_root_as_typed": args.project_root.display().to_string(),
-                "session": args.session,
+                "project_root_as_typed": session.project_root.display().to_string(),
+                "session": session.session,
             }),
             || {
                 format!(
                     "BOUND module={} harness={} project_root={} session={}",
-                    args.module_id, args.harness, root_display, args.session
+                    args.module_id, session.harness, root_display, session.session
                 )
             },
         );
@@ -696,7 +827,9 @@ async fn run(args: Args) -> Result<i32, String> {
         Cmd::ComposePlan { .. } => {
             unreachable!("compose-plan is dispatched before the management-surface bind")
         }
-        Cmd::CacheDump(_) => Err("cache-dump must be invoked without daemon arguments".into()),
+        Cmd::CacheDump(_) | Cmd::Trajectory(_) => {
+            unreachable!("offline commands are refused before the management-surface bind")
+        }
         Cmd::Run {
             admission,
             prompt,
@@ -975,6 +1108,7 @@ async fn run(args: Args) -> Result<i32, String> {
             unreachable!("credential-audit is dispatched before the management-surface bind")
         }
         Cmd::Read {
+            id: _,
             from_ordinal,
             limit,
             include_tools,
@@ -1071,14 +1205,13 @@ async fn compose_plan(args: &Args, path: &std::path::Path) -> Result<i32, String
         std::fs::read(path).map_err(|error| format!("read --items {}: {error}", path.display()))?;
     let items = serde_json::from_slice(&bytes)
         .map_err(|error| format!("parse --items {}: {error}", path.display()))?;
-    let identity =
-        broca_protocol::BindIdentity::new(&args.project_root, &args.harness, &args.session);
+    let identity = bind_identity(args)?;
     identity
         .validate_keyable()
         .map_err(|error| format!("invalid bind identity: {error}"))?;
-    let conn = SubcConnection::connect(&args.subc)
+    let conn = SubcConnection::connect(subc_path(args)?)
         .await
-        .map_err(|error| format!("connect subc ({}): {error}", args.subc.display()))?;
+        .map_err(|_| "cannot connect subc".to_string())?;
     let fetcher = broca_subc::SubcPlanFetcher::new(std::sync::Arc::new(conn), identity, None);
     let result =
         broca_fetch_plan::compose(&items, &fetcher, broca_fetch_plan::ADMISSION_DEADLINE).await;
@@ -1236,14 +1369,13 @@ fn audit_events(answer: &Result<VaultAuditResponse, String>) -> Vec<(serde_json:
 /// Ask the daemon for `vault.audit`. A request that got no reply at all (no connection, no
 /// bind, a refused op) is an `Err`; the daemon's own `Unanswered` comes back as `Ok`.
 async fn request_vault_audit(args: &Args) -> Result<VaultAuditResponse, String> {
-    let session =
-        broca_protocol::BindIdentity::new(&args.project_root, &args.harness, &args.session);
+    let session = bind_identity(args)?;
     session
         .validate_keyable()
         .map_err(|error| format!("invalid bind identity: {error}"))?;
-    let conn = SubcConnection::connect(&args.subc)
+    let conn = SubcConnection::connect(subc_path(args)?)
         .await
-        .map_err(|error| format!("connect subc ({}): {error}", args.subc.display()))?;
+        .map_err(|_| "cannot connect subc".to_string())?;
     let client = SessionClient::bind_with_timeout(
         conn,
         &args.module_id,
@@ -1903,7 +2035,21 @@ fn emit_control_to(
         ControlUnit::ToolResult { result } => {
             let text = match &result.output {
                 broca_protocol::content::ToolOutput::Text { text } => text.clone(),
-                broca_protocol::content::ToolOutput::Error { message } => message.clone(),
+                broca_protocol::content::ToolOutput::Error {
+                    message,
+                    module,
+                    code,
+                    detail,
+                    nothing_sent,
+                    retry,
+                } => broca_protocol::content::ToolOutput::error_model_text(
+                    message,
+                    module.as_deref(),
+                    code.as_deref(),
+                    detail.as_deref(),
+                    *nothing_sent,
+                    retry.as_deref(),
+                ),
                 _ => String::new(),
             };
             emit_to(

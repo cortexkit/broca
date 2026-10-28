@@ -7,24 +7,33 @@
 
 use std::{
     cell::{Cell, RefCell},
-    fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
-use broca_owner_only::OpenOptions;
+use crate::fs_ops::{self, File, OpenOptions};
+
+use crate::writer_tenure::{OwnedWalTenure, TenureError};
 
 use crate::{
     framing::{
-        decode_next, encode, encode_lineage, DecodeStep, FrameError, FramedRecord, WalLineageId,
+        decode_next, encode, encode_lineage, DecodeStep, FrameError, FramedRecord, PreparedV4Frame,
+        WalLineageId,
     },
     record::WalRecord,
+    state_format::{StateRootError, WalConfig, WalFormat},
 };
+
+use broca_protocol::BindIdentity;
 
 pub const DEFAULT_MAX_READ_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[path = "human_prompt_count.rs"]
 mod human_prompt_count;
+
+#[cfg(test)]
+#[path = "file_wal_v4_tests.rs"]
+mod v4_tests;
 pub use human_prompt_count::{
     count_human_prompts_in_bytes, read_human_prompt_count, HumanPromptCount,
 };
@@ -33,6 +42,18 @@ pub use human_prompt_count::{
 thread_local! {
     static OPEN_STAGES: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
     static OPEN_READ_CAP: Cell<u64> = const { Cell::new(DEFAULT_MAX_READ_BYTES) };
+    /// Test-only unwind seam for the owned open path. When set, the owned
+    /// constructor panics after recovery, before returning the writer, so
+    /// `owned_open_failure_and_panic_release_only_after_close` can exercise
+    /// panic cleanup: the log must keep its verified prefix and a fresh
+    /// tenure must reopen it. Read with `take`, which also resets the flag,
+    /// so a caught panic never arms a later open.
+    static OWNED_OPEN_PANIC_AFTER_RECOVERY: Cell<bool> = const { Cell::new(false) };
+    /// Counts final barriers performed by the owned consuming close. The
+    /// settle itself is not observable in process (an fsync only matters
+    /// across a crash), so the close test asserts this counter instead of
+    /// trusting `sync_result` alone.
+    static OWNED_CLOSE_SETTLES: Cell<u64> = const { Cell::new(0) };
 }
 
 fn open_observed(_stage: &'static str) {
@@ -204,6 +225,12 @@ impl WalRangeRead {
 
 #[derive(Debug)]
 pub enum WalError {
+    /// An overhaul placement was interrupted between linking and unlinking.
+    /// Lease-free readers must retry; only the session's owned open may repair.
+    RelocationIncomplete {
+        paths: Vec<PathBuf>,
+        cause: Option<String>,
+    },
     SessionMoving {
         cut_id: String,
     },
@@ -268,6 +295,16 @@ pub enum WalError {
         requires: Vec<String>,
         reason: String,
     },
+    /// The state root's log format could not be decided, or a store refuses to write on it
+    /// (see [`StateRootError`]). Nothing was opened or written.
+    StateRoot(StateRootError),
+    /// A frame of the `offered` format was handed to a log of the `log` format: an overhaul log
+    /// writes only the version 4 frames it stamps itself, and a legacy log never writes them.
+    /// Nothing was written.
+    FrameFormat {
+        log: WalFormat,
+        offered: WalFormat,
+    },
 }
 
 impl WalError {
@@ -275,7 +312,8 @@ impl WalError {
         match self {
             Self::SessionMoving { cut_id } => Ok(crate::migration::MoveRefusal::Moving { cut_id }),
             Self::SessionMoved { holder } => Ok(crate::migration::MoveRefusal::Moved { holder }),
-            other @ (Self::Io(_)
+            other @ (Self::RelocationIncomplete { .. }
+            | Self::Io(_)
             | Self::Frame(_)
             | Self::TooLarge { .. }
             | Self::NonMonotonic { .. }
@@ -285,7 +323,9 @@ impl WalError {
             | Self::ForeignWrite { .. }
             | Self::ConflictingLineageIds { .. }
             | Self::Entropy(_)
-            | Self::FeatureFloor { .. }) => Err(other),
+            | Self::FeatureFloor { .. }
+            | Self::StateRoot(_)
+            | Self::FrameFormat { .. }) => Err(other),
         }
     }
 }
@@ -293,6 +333,21 @@ impl WalError {
 impl std::fmt::Display for WalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::RelocationIncomplete { paths, cause } => {
+                write!(
+                    f,
+                    "wal_relocation_incomplete: {}; the session's owned open must finish placement",
+                    paths
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(" and ")
+                )?;
+                if let Some(cause) = cause {
+                    write!(f, "; {cause}")?;
+                }
+                Ok(())
+            }
             Self::SessionMoving { cut_id } => write!(f, "session_moving {{cutId: {cut_id}}}"),
             Self::SessionMoved { holder } => write!(f, "session_moved {{holder: {holder}}}"),
             WalError::Io(e) => write!(f, "wal io: {e}"),
@@ -347,14 +402,68 @@ impl std::fmt::Display for WalError {
                 ),
                 requires.join(", ")
             ),
+            WalError::StateRoot(error) => error.fmt(f),
+            WalError::FrameFormat { log, offered } => write!(
+                f,
+                "wal append refused: a {} log does not write {} frames",
+                format_name(*log),
+                format_name(*offered)
+            ),
         }
+    }
+}
+
+/// How a refusal names a frame format.
+fn format_name(format: WalFormat) -> &'static str {
+    match format {
+        WalFormat::Legacy => "legacy",
+        WalFormat::Overhaul => "version 4 (broca-state/2)",
     }
 }
 
 impl std::error::Error for WalError {}
 
+/// How one `FileWal` validates the move fence around its mutations.
+///
+/// The standalone compatibility path re-checks the fence on every mutation.
+/// The owned path checks once, at open, while holding the tenure, and caches
+/// the clean verdict for exactly the validated path and session reference; a
+/// path or reference transition is a new validation phase. `Closed` is the
+/// terminal state left behind when the owned tenure is handed back: no append
+/// path runs in it.
+///
+/// The tenure stored here carries no release handle (minting and the real lock
+/// live outside this crate for now), but the ordering rule is already
+/// structural: the descriptor field below is declared before `access`, so
+/// drop and unwind close the writable handle before tenure teardown.
+enum AccessMode {
+    /// Standalone path: re-checks the move fence on every mutation and holds
+    /// no tenure to cache a verdict under.
+    GuardEveryMutation,
+    /// Tenure-backed writer: `fenced_path`/`fenced_ref` name the path and
+    /// session reference the open-time guard cleared under `tenure`.
+    OwnedTenure {
+        tenure: OwnedWalTenure,
+        fenced_path: PathBuf,
+        fenced_ref: String,
+    },
+    /// The tenure was handed back; the writer accepts no more mutations.
+    Closed,
+}
+
+fn closed_error() -> WalError {
+    WalError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "owned WAL writer is closed",
+    ))
+}
+
 /// The append-only WAL log. The loop depends on the trait, not the impl.
 pub trait Wal {
+    /// Current file location, including first-send relocation; absent for memory logs.
+    fn log_path(&self) -> Option<&Path> {
+        None
+    }
     /// Append a record at the next seq, stamping it with the lease-tenure `fence`. The fence is
     /// forensic metadata only; single-writer safety comes from the lease's OS lock and this
     /// implementation's file-integrity check. If `sync`, fsync before returning (a barrier
@@ -378,6 +487,43 @@ pub trait Wal {
     /// reserving terminal space so refusing a record never makes the log unreadable.
     fn append_budget(&self) -> Option<(u64, u64, u64)> {
         None
+    }
+
+    /// The frame format this log writes, as the store that opened it was configured at boot.
+    /// A writer handle reads it once, at spawn, to choose how it hands records over: an
+    /// overhaul log takes them through [`Wal::append_v4`] only. The default is legacy.
+    fn wal_config(&self) -> WalConfig {
+        WalConfig::LEGACY
+    }
+
+    /// The random identity minted by this overhaul WAL open; never supplied by a caller.
+    fn writer_id(&self) -> Option<[u8; 16]> {
+        None
+    }
+
+    /// Bytes held for this open writer's durable close, separate from the run terminal reserve.
+    fn writer_close_reserve(&self) -> u64 {
+        0
+    }
+
+    /// Append `record` as the version 4 frame `prepared` (built from that same record), stamped
+    /// with `appended_ms`, which the caller samples on the thread that calls this, immediately
+    /// before the call. The log fills in the sequence, fence and its own `writer_id`, and raises
+    /// the feature floor over every name the frame lists before writing it.
+    ///
+    /// Only an overhaul log writes version 4 frames; the default refuses, as a legacy log does.
+    fn append_v4(
+        &mut self,
+        _fence: u64,
+        _record: &WalRecord,
+        _sync: bool,
+        _prepared: PreparedV4Frame,
+        _appended_ms: u64,
+    ) -> Result<u64, WalError> {
+        Err(WalError::FrameFormat {
+            log: WalFormat::Legacy,
+            offered: WalFormat::Overhaul,
+        })
     }
 
     fn recovery_byte_cap(&self) -> Option<u64> {
@@ -445,6 +591,13 @@ pub struct FileWal {
     /// upward. The first directory-sync pass drains this list after syncing every directory
     /// whose direct child was newly created.
     newly_created_dirs: RefCell<Vec<PathBuf>>,
+    /// The frame format this log writes, set by the store that opened it from the boot
+    /// decision. Legacy unless [`FileWal::with_wal_config`] says otherwise.
+    config: WalConfig,
+    /// Minted when the log is configured as an overhaul log: the random 128-bit id stamped in
+    /// every version 4 frame this open appends, so a frame names the writer that wrote it.
+    writer_id: Option<[u8; 16]>,
+    writer_close_reserve: u64,
     lineage_id: Option<WalLineageId>,
     /// The machine's WAL feature floor (see [`crate::floor`]). A record that requires any WAL
     /// feature is appended only after this file lists it; with no floor configured such a
@@ -454,6 +607,10 @@ pub struct FileWal {
     budget_scope: crate::size_limit::SizeScope,
     feature_floor: Option<PathBuf>,
     session_ref: String,
+    /// Which move-fence discipline this handle follows. Declared after the
+    /// descriptor (`file`) so drop and unwind close the writable handle
+    /// before tenure teardown, even on the panic path out of open.
+    access: AccessMode,
     #[cfg(test)]
     sync_probe: Option<SyncProbe>,
 }
@@ -471,7 +628,7 @@ pub struct FileWal {
 /// directory fsync -- is the wrong place for a filesystem sweep. The repair verb lives in the
 /// store-maintenance binary where an operator can run it once.
 fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
-    broca_owner_only::create_dir_all(dir)
+    fs_ops::create_dir_all(dir)
 }
 
 fn mint_lineage_id() -> Result<WalLineageId, WalError> {
@@ -481,6 +638,21 @@ fn mint_lineage_id() -> Result<WalLineageId, WalError> {
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Ok(WalLineageId::from_bytes(bytes))
+}
+
+/// Where an append's bytes come from.
+enum FrameSource {
+    /// Encode the record here, in this log's format.
+    Encode,
+    /// A legacy frame the writer handle encoded to measure its budget. Only a legacy log takes
+    /// it, after checking it is exactly the frame its sequence, fence and record require.
+    Legacy(Vec<u8>),
+    /// A version 4 payload the writer handle prepared, and the `appended_ms` its writer thread
+    /// sampled. Only an overhaul log takes it, and stamps the header itself.
+    V4 {
+        prepared: PreparedV4Frame,
+        appended_ms: u64,
+    },
 }
 
 struct ManifestAppend {
@@ -532,13 +704,40 @@ fn append_manifest_line(entry: &ManifestAppend, lineage_id: WalLineageId) -> std
 }
 
 impl FileWal {
+    fn unstarted(&self) -> Result<bool, WalError> {
+        if self.next_seq == 1 {
+            return Ok(true);
+        }
+        Ok(self.config.is_overhaul()
+            && self.replay()?.iter().all(|frame| {
+                matches!(
+                    frame.record,
+                    WalRecord::WriterOpened { .. }
+                        | WalRecord::WriterClosed { .. }
+                        | WalRecord::VisibilityLate { .. }
+                )
+            }))
+    }
+
     /// A status/warm open can precede the first send. Move only an unstarted file,
     /// under its caller's session lease, before the first record fixes its placement.
+    ///
+    /// In the owned mode the destination's move sidecars are revalidated before
+    /// the rename: the cached open-time verdict covers the source path, never a
+    /// destination the guard has not cleared. The standalone path keeps its
+    /// existing behavior and re-checks on every later append instead.
     pub fn relocate_unstarted(&mut self, destination: &Path) -> Result<(), WalError> {
+        match &self.access {
+            AccessMode::Closed => return Err(closed_error()),
+            AccessMode::OwnedTenure { .. } => {
+                crate::migration::guard(destination, &self.session_ref, true)?;
+            }
+            AccessMode::GuardEveryMutation => {}
+        }
         if self.path == destination {
             return Ok(());
         }
-        if self.next_seq != 1 {
+        if !self.unstarted()? {
             return Err(WalError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "cannot relocate a started session WAL",
@@ -559,11 +758,79 @@ impl FileWal {
         let source_parent = self.path.parent().unwrap().to_path_buf();
         crate::migration::durable_dir(parent.parent().unwrap_or(parent), parent)
             .map_err(WalError::Io)?;
-        std::fs::rename(&self.path, destination).map_err(WalError::Io)?;
-        self.path = destination.to_path_buf();
+        if self.config.is_overhaul() {
+            // Make the destination name durable before removing the source.
+            // Cross-directory rename alone can lose both names after power loss.
+            fs_ops::hard_link(&self.path, destination).map_err(WalError::Io)?;
+            fs_ops::sync_dir(parent).map_err(WalError::Io)?;
+            fs_ops::remove_file(&self.path).map_err(WalError::Io)?;
+        } else {
+            fs_ops::rename(&self.path, destination).map_err(WalError::Io)?;
+        }
+        let source = std::mem::replace(&mut self.path, destination.to_path_buf());
+        if self.config.is_overhaul() {
+            // Log placement, the proof rename and directory barriers are not
+            // atomic. A cut can leave an orphan proof or both log names. Readers
+            // validate pairing; a missing/mismatched proof never authorizes EOF.
+            let source_head = crate::head_proof::sidecar_path(&source);
+            if fs_ops::try_exists(&source_head).map_err(WalError::Io)? {
+                fs_ops::rename(&source_head, crate::head_proof::sidecar_path(destination))
+                    .map_err(WalError::Io)?;
+            }
+        }
         self.dir_needs_sync.set(true);
         self.sync()?;
-        crate::migration::sync_dir(&source_parent).map_err(WalError::Io)
+        self.refresh_owned_cache();
+        crate::migration::sync_dir(&source_parent).map_err(|error| {
+            if self.config.is_overhaul() {
+                WalError::RelocationIncomplete {
+                    paths: vec![source, destination.to_path_buf()],
+                    cause: Some(format!(
+                        "source-directory barrier {}: {error}",
+                        source_parent.display()
+                    )),
+                }
+            } else {
+                WalError::Io(error)
+            }
+        })
+    }
+
+    /// Mark the current path and session reference as the verdict the owned
+    /// open-time guard cleared. A path or reference transition invalidates the
+    /// cache, and the next owned append revalidates before writing.
+    fn refresh_owned_cache(&mut self) {
+        if let AccessMode::OwnedTenure {
+            fenced_path,
+            fenced_ref,
+            ..
+        } = &mut self.access
+        {
+            fenced_path.clone_from(&self.path);
+            fenced_ref.clone_from(&self.session_ref);
+        }
+    }
+
+    /// Borrow the held tenure, if this handle runs in the owned mode.
+    fn owned_tenure(&self) -> Option<&OwnedWalTenure> {
+        match &self.access {
+            AccessMode::OwnedTenure { tenure, .. } => Some(tenure),
+            AccessMode::GuardEveryMutation | AccessMode::Closed => None,
+        }
+    }
+
+    /// Hand back the held tenure and leave the writer terminal: the mode
+    /// becomes `Closed`, so no append path runs after the handoff even if a
+    /// caller kept another handle to the same value (only the facade holds
+    /// owned handles, and closing it consumes the facade).
+    fn take_owned_tenure(&mut self) -> Option<OwnedWalTenure> {
+        match std::mem::replace(&mut self.access, AccessMode::Closed) {
+            AccessMode::OwnedTenure { tenure, .. } => Some(tenure),
+            previous => {
+                self.access = previous;
+                None
+            }
+        }
     }
     /// Open (creating if absent) the WAL at `path`, recovering `next_seq` from the
     /// last committed record. Creation writes a fresh lineage identity; an existing legacy file
@@ -577,7 +844,13 @@ impl FileWal {
     /// bricking an otherwise-recoverable session. A crash during an append followed by a
     /// resume-append is exactly the core recovery path, so this must be clean.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, WalError> {
-        Self::open_inner(path.into(), None, String::new(), None)
+        Self::open_inner(
+            path.into(),
+            None,
+            String::new(),
+            AccessMode::GuardEveryMutation,
+            None,
+        )
     }
 
     // Callers of this test seam are all `#[cfg(unix)]` (the directory-fsync probe tests), so on
@@ -585,7 +858,13 @@ impl FileWal {
     #[cfg(test)]
     #[cfg_attr(not(unix), allow(dead_code))]
     fn open_with_probe(path: impl Into<PathBuf>, sync_probe: SyncProbe) -> Result<Self, WalError> {
-        Self::open_inner(path.into(), None, String::new(), Some(sync_probe))
+        Self::open_inner(
+            path.into(),
+            None,
+            String::new(),
+            AccessMode::GuardEveryMutation,
+            Some(sync_probe),
+        )
     }
 
     /// Open a WAL and record its diagnostic address when this call creates the file.
@@ -625,6 +904,7 @@ impl FileWal {
                 identity: identity.into(),
             }),
             session_ref,
+            AccessMode::GuardEveryMutation,
             None,
         )
     }
@@ -633,17 +913,18 @@ impl FileWal {
         path: PathBuf,
         manifest: Option<ManifestAppend>,
         session_ref: String,
+        access: AccessMode,
         #[cfg(test)] sync_probe: Option<SyncProbe>,
         #[cfg(not(test))] _sync_probe: Option<()>,
     ) -> Result<Self, WalError> {
         crate::migration::guard(&path, &session_ref, true)?;
         #[cfg(windows)]
-        broca_owner_only::validate_if_exists(&path).map_err(WalError::Io)?;
+        fs_ops::validate_if_exists(&path).map_err(WalError::Io)?;
         let mut newly_created_dirs = Vec::new();
         if let Some(parent) = path.parent() {
             let mut candidate = parent;
             while !candidate.as_os_str().is_empty()
-                && !candidate.try_exists().map_err(WalError::Io)?
+                && !fs_ops::try_exists(candidate).map_err(WalError::Io)?
             {
                 newly_created_dirs.push(candidate.to_path_buf());
                 let Some(next) = candidate.parent() else {
@@ -693,7 +974,7 @@ impl FileWal {
         // write-data right SetEndOfFile needs → "Access is denied"); a plain write handle
         // has it. A clean cut (no torn bytes) makes valid_end == the file size, so this is
         // skipped then.
-        if let Ok(meta) = std::fs::metadata(&path) {
+        if let Ok(meta) = fs_ops::metadata(&path) {
             if meta.len() > valid_end {
                 open_observed("truncate");
                 let trunc = OpenOptions::new()
@@ -749,12 +1030,16 @@ impl FileWal {
             last_write_end,
             dir_needs_sync: Cell::new(true),
             newly_created_dirs: RefCell::new(newly_created_dirs),
+            config: WalConfig::LEGACY,
+            writer_id: None,
+            writer_close_reserve: 0,
             lineage_id,
             recovery_cap: DEFAULT_MAX_READ_BYTES,
             append_budget: DEFAULT_MAX_READ_BYTES,
             budget_scope: crate::size_limit::SizeScope::Session,
             feature_floor: None,
             session_ref,
+            access,
             #[cfg(test)]
             sync_probe,
         })
@@ -765,6 +1050,22 @@ impl FileWal {
     pub fn with_feature_floor(mut self, floor: impl Into<PathBuf>) -> Self {
         self.feature_floor = Some(floor.into());
         self
+    }
+
+    /// Write this log in `config`'s format, as decided once at boot for its state root. An
+    /// overhaul log mints its random `writer_id` here, so each open stamps its own; it then writes
+    /// only version 4 frames it stamps itself and refuses caller-encoded bytes.
+    pub fn with_wal_config(mut self, config: WalConfig) -> Result<Self, WalError> {
+        self.writer_id = match config.format {
+            WalFormat::Legacy => None,
+            WalFormat::Overhaul => {
+                let mut id = [0u8; 16];
+                getrandom::fill(&mut id).map_err(WalError::Entropy)?;
+                Some(id)
+            }
+        };
+        self.config = config;
+        Ok(self)
     }
 
     /// The first barrier syncs the file, its parent, and parents of directories
@@ -839,14 +1140,68 @@ impl FileWal {
         self
     }
 
+    /// Assemble the version 4 frame `prepared` at `seq`, with this open's `writer_id`, and hand
+    /// back the names it requires.
+    fn stamp_v4(
+        &self,
+        seq: u64,
+        fence: u64,
+        prepared: PreparedV4Frame,
+        appended_ms: u64,
+    ) -> Result<(Vec<u8>, std::borrow::Cow<'static, [&'static str]>), WalError> {
+        let writer_id = self
+            .writer_id
+            .expect("an overhaul log mints its writer id when it is configured");
+        let frame = prepared
+            .stamp(crate::framing::v4::Metadata {
+                seq,
+                fence,
+                appended_ms,
+                writer_id,
+            })
+            .map_err(WalError::Frame)?;
+        Ok((frame, prepared.requires().to_vec().into()))
+    }
+
     fn append_frame(
         &mut self,
         fence: u64,
         record: &WalRecord,
         sync: bool,
-        frame: Option<Vec<u8>>,
+        source: FrameSource,
     ) -> Result<u64, WalError> {
-        crate::migration::guard(&self.path, &self.session_ref, true)?;
+        // One validation phase per tenure: the open-time guard cleared the
+        // fenced path and reference under the held tenure, so owned appends
+        // skip the repeated migration probes while that verdict still covers
+        // this handle. A path or reference transition is a new phase and
+        // revalidates before writing. The standalone path has no tenure to
+        // cache under and re-checks on every mutation, as before.
+        enum Phase {
+            RefuseClosed,
+            Guard,
+            RefreshGuard,
+            Cached,
+        }
+        let phase = match &self.access {
+            AccessMode::Closed => Phase::RefuseClosed,
+            AccessMode::GuardEveryMutation => Phase::Guard,
+            AccessMode::OwnedTenure {
+                fenced_path,
+                fenced_ref,
+                ..
+            } if *fenced_path == self.path && *fenced_ref == self.session_ref => Phase::Cached,
+            AccessMode::OwnedTenure { .. } => Phase::RefreshGuard,
+        };
+        match phase {
+            Phase::RefuseClosed => return Err(closed_error()),
+            Phase::Guard | Phase::RefreshGuard => {
+                crate::migration::guard(&self.path, &self.session_ref, true)?;
+            }
+            Phase::Cached => {}
+        }
+        if matches!(phase, Phase::RefreshGuard) {
+            self.refresh_owned_cache();
+        }
         // Single-writer file-integrity check: the file must be exactly where THIS writer
         // last left it. If its size changed, a foreign writer appended (or truncated) it
         // since our last append (file size is per-inode, so a foreign handle's writes are
@@ -861,8 +1216,7 @@ impl FileWal {
                 found: current,
             });
         }
-        if self.next_seq == 1
-            && self.budget_scope == crate::size_limit::SizeScope::RetainedSession
+        if self.budget_scope == crate::size_limit::SizeScope::RetainedSession
             && matches!(
                 record,
                 WalRecord::RunStarted {
@@ -870,23 +1224,78 @@ impl FileWal {
                     ..
                 }
             )
+            && self.unstarted()?
         {
             self.budget_scope = crate::size_limit::SizeScope::Session;
             self.append_budget = self.recovery_cap;
         }
         let seq = self.next_seq;
-        let preencoded = frame.is_some();
-        let record_bytes = match frame {
-            Some(frame) => frame,
-            None => encode(seq, fence, record).map_err(WalError::Frame)?,
-        };
-        let overhead = crate::framing::LINEAGE_FRAME_LEN as u64
-            * if self.lineage_id.is_none() && current > 0 {
-                2
-            } else {
-                1
+        let preencoded = matches!(source, FrameSource::Legacy(_));
+        // The bytes this append writes, and every name the machine's feature floor must list
+        // before they exist. A legacy log writes exactly what it always has. An overhaul log
+        // writes only version 4 frames it stamps here, from a payload the shared codec built:
+        // caller-encoded bytes are refused, and nothing falls back to the legacy encoding.
+        let (record_bytes, requires): (Vec<u8>, std::borrow::Cow<'static, [&'static str]>) =
+            match (self.config.format, source) {
+                (WalFormat::Legacy, FrameSource::Encode) => (
+                    encode(seq, fence, record).map_err(WalError::Frame)?,
+                    record.required_features().into(),
+                ),
+                (WalFormat::Legacy, FrameSource::Legacy(frame)) => {
+                    (frame, record.required_features().into())
+                }
+                // A direct append, one that did not come through a writer handle, is stamped
+                // with the time it reaches this log.
+                (WalFormat::Overhaul, FrameSource::Encode) => self.stamp_v4(
+                    seq,
+                    fence,
+                    PreparedV4Frame::prepare(record).map_err(WalError::Frame)?,
+                    crate::framing::appended_ms_now(),
+                )?,
+                (
+                    WalFormat::Overhaul,
+                    FrameSource::V4 {
+                        prepared,
+                        appended_ms,
+                    },
+                ) => self.stamp_v4(seq, fence, prepared, appended_ms)?,
+                (log @ WalFormat::Overhaul, FrameSource::Legacy(_)) => {
+                    return Err(WalError::FrameFormat {
+                        log,
+                        offered: WalFormat::Legacy,
+                    })
+                }
+                (log @ WalFormat::Legacy, FrameSource::V4 { .. }) => {
+                    return Err(WalError::FrameFormat {
+                        log,
+                        offered: WalFormat::Overhaul,
+                    })
+                }
             };
-        let reserve = if matches!(record, WalRecord::RunFinished { .. }) {
+        let prefix_lineage =
+            self.lineage_id.is_none() && (current > 0 || self.config.is_overhaul());
+        let overhead =
+            crate::framing::LINEAGE_FRAME_LEN as u64 * if prefix_lineage { 2 } else { 1 };
+        let lifecycle = self.config.is_overhaul()
+            && matches!(
+                record,
+                WalRecord::WriterOpened { .. } | WalRecord::WriterClosed { .. }
+            );
+        let close_reserve = match record {
+            WalRecord::WriterOpened { writer_id, .. } if lifecycle => {
+                PreparedV4Frame::prepare(&WalRecord::WriterClosed {
+                    writer_id: *writer_id,
+                })
+                .map_err(WalError::Frame)?
+                .frame_len() as u64
+                    + crate::framing::LINEAGE_FRAME_LEN as u64
+            }
+            WalRecord::WriterClosed { .. } if lifecycle => 0,
+            _ => self.writer_close_reserve,
+        };
+        // Lifecycle barriers spend their own held bytes, not another run terminal's reserve.
+        // Every ordinary append, including RunFinished, must leave the outstanding close intact.
+        let reserve = if lifecycle || matches!(record, WalRecord::RunFinished { .. }) {
             0
         } else {
             crate::size_limit::reserve_bytes(overhead)
@@ -894,13 +1303,16 @@ impl FileWal {
         let required = current
             .saturating_add(record_bytes.len() as u64)
             .saturating_add(overhead)
-            .saturating_add(reserve);
+            .saturating_add(reserve)
+            .saturating_add(close_reserve);
         if required > self.append_budget {
             return Err(WalError::TooLarge {
                 max_bytes: self.append_budget,
                 file_size: required,
             });
         }
+        // A legacy pre-encoded frame is checked to be exactly the one its sequence, fence and
+        // record require. A version 4 frame was stamped above from the codec's own payload.
         if preencoded {
             crate::framing::validate_preencoded(&record_bytes, seq, fence, record)
                 .map_err(WalError::Frame)?;
@@ -908,8 +1320,8 @@ impl FileWal {
         // Raise the floor BEFORE the frame exists, and refuse the append if it cannot be
         // raised. Placement reads the floor to decide which builds may run on this machine;
         // a gated frame written first would be data it does not know about if the process
-        // died before the floor caught up.
-        let requires = record.required_features();
+        // died before the floor caught up. Every version 4 frame names `frame-stamps/v1`, so
+        // on an overhaul log this runs before every append.
         if !requires.is_empty() {
             let refuse = |path: Option<PathBuf>, reason: String| WalError::FeatureFloor {
                 path,
@@ -919,25 +1331,25 @@ impl FileWal {
             let Some(floor) = self.feature_floor.clone() else {
                 return Err(refuse(None, "no feature floor is configured".into()));
             };
-            crate::floor::raise_floor(&floor, requires)
+            crate::floor::raise_floor(&floor, &requires)
                 .map_err(|error| refuse(Some(floor), error.to_string()))?;
         }
-        let (lineage_id, minted_for_legacy) = match self.lineage_id {
-            Some(lineage_id) => (lineage_id, false),
+        let lineage_id = match self.lineage_id {
+            Some(lineage_id) => lineage_id,
             None => {
                 let minted = mint_lineage_id()?;
                 self.lineage_id = Some(minted);
-                (minted, true)
+                minted
             }
         };
         let lineage_bytes = encode_lineage(lineage_id);
-        let extra_metadata_len =
-            usize::from(minted_for_legacy && current > 0) * lineage_bytes.len();
+        let extra_metadata_len = usize::from(prefix_lineage) * lineage_bytes.len();
         let mut bytes =
             Vec::with_capacity(record_bytes.len() + lineage_bytes.len() + extra_metadata_len);
-        // A legacy WAL has records but no metadata. Put its newly-minted identity before the next
-        // record so even a torn record leaves a complete identity frame for the recovery open.
-        if minted_for_legacy && current > 0 {
+        // Overhaul publication needs lineage inside the first covered record's
+        // prefix, including recovery of an empty existing file. Legacy preserves
+        // its record-first layout for empty files and prefixes only nonempty ones.
+        if prefix_lineage {
             bytes.extend_from_slice(&lineage_bytes);
         }
         bytes.extend_from_slice(&record_bytes);
@@ -952,6 +1364,7 @@ impl FileWal {
             self.fsync()?;
         }
         self.next_seq = seq + 1;
+        self.writer_close_reserve = close_reserve;
         // Advance our high-water mark past the bytes we just wrote. Only OUR appends move
         // this, so "size unchanged since our last append" ⟺ no foreign write.
         self.last_write_end = current + bytes.len() as u64;
@@ -960,8 +1373,17 @@ impl FileWal {
 }
 
 impl Wal for FileWal {
+    fn log_path(&self) -> Option<&Path> {
+        Some(&self.path)
+    }
+    fn writer_close_reserve(&self) -> u64 {
+        self.writer_close_reserve
+    }
+    fn writer_id(&self) -> Option<[u8; 16]> {
+        self.writer_id
+    }
     fn append(&mut self, fence: u64, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
-        self.append_frame(fence, record, sync, None)
+        self.append_frame(fence, record, sync, FrameSource::Encode)
     }
 
     fn append_preencoded(
@@ -971,7 +1393,30 @@ impl Wal for FileWal {
         sync: bool,
         frame: Vec<u8>,
     ) -> Result<u64, WalError> {
-        self.append_frame(fence, record, sync, Some(frame))
+        self.append_frame(fence, record, sync, FrameSource::Legacy(frame))
+    }
+
+    fn append_v4(
+        &mut self,
+        fence: u64,
+        record: &WalRecord,
+        sync: bool,
+        prepared: PreparedV4Frame,
+        appended_ms: u64,
+    ) -> Result<u64, WalError> {
+        self.append_frame(
+            fence,
+            record,
+            sync,
+            FrameSource::V4 {
+                prepared,
+                appended_ms,
+            },
+        )
+    }
+
+    fn wal_config(&self) -> WalConfig {
+        self.config
     }
 
     fn append_budget(&self) -> Option<(u64, u64, u64)> {
@@ -979,7 +1424,9 @@ impl Wal for FileWal {
             self.append_budget,
             self.last_write_end,
             crate::framing::LINEAGE_FRAME_LEN as u64
-                * if self.lineage_id.is_none() && self.last_write_end > 0 {
+                * if self.lineage_id.is_none()
+                    && (self.last_write_end > 0 || self.config.is_overhaul())
+                {
                     2
                 } else {
                     1
@@ -1016,6 +1463,313 @@ impl Wal for FileWal {
 
     fn lineage_id(&self) -> Option<WalLineageId> {
         self.lineage_id
+    }
+}
+
+/// Why a tenure-backed writer open refused before mutating anything.
+#[derive(Debug)]
+pub enum OwnedOpenCause {
+    /// The tenure is bound to a different session than the requested one.
+    /// The check runs before any filesystem touch, so a wrong tenure changes
+    /// no bytes or directory entries.
+    Tenure(TenureError),
+    /// The one-time move fence or a recovery/creation step refused. The guard
+    /// runs before directory creation, torn-tail truncation, lineage
+    /// initialization and the first append, so a move-fence refusal creates
+    /// nothing; a later recovery or creation error can follow filesystem
+    /// changes (created directories, a truncated torn tail, written lineage).
+    Wal(WalError),
+}
+
+/// A refused tenure-backed open. The tenure is consumed on both paths: on
+/// failure the descriptor (if any) is closed before the tenure is released,
+/// and the caller opens again with a freshly acquired tenure.
+#[derive(Debug)]
+pub struct OwnedOpenError {
+    cause: OwnedOpenCause,
+}
+
+impl OwnedOpenError {
+    /// Which check refused the open.
+    pub fn cause(&self) -> &OwnedOpenCause {
+        &self.cause
+    }
+}
+
+impl std::fmt::Display for OwnedOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.cause {
+            OwnedOpenCause::Tenure(error) => write!(f, "owned WAL open refused: {error}"),
+            OwnedOpenCause::Wal(error) => write!(f, "owned WAL open refused: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for OwnedOpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.cause {
+            OwnedOpenCause::Tenure(error) => Some(error),
+            OwnedOpenCause::Wal(error) => Some(error),
+        }
+    }
+}
+
+/// The settled result of consuming an owned writer. The final barrier ran
+/// under the still-held tenure, and the tenure below is that same still-held
+/// owner, returned only after the writable descriptor is gone. Even when the
+/// final sync fails, no live writable handle survives alongside it.
+pub struct OwnedCloseOutcome {
+    /// The final barrier's outcome. A failure is reported, not retried: the
+    /// writer is disabled either way.
+    pub sync_result: Result<(), WalError>,
+    /// The tenure this writer held, handed back after teardown.
+    pub tenure: OwnedWalTenure,
+}
+
+/// A tenure-backed writable WAL: the only append path that may skip the
+/// per-append move fence.
+///
+/// The open-time guard cleared the log's path and session reference while
+/// holding `tenure`, and this facade keeps the descriptor and the tenure
+/// together until the consuming close hands the tenure back. Appends stamp
+/// the tenure's epoch as their forensic fence: unlike [`Wal::append`], there
+/// is no fence parameter, so a caller cannot supply an unrelated integer and
+/// mistake it for authority. Comparing the stamp never substitutes for
+/// holding this tenure.
+///
+/// Nothing mints tenures in production yet (the real lock acquisition lands
+/// with the store opener), so this path is test-only until then. Readers stay
+/// lease-free: use [`replay_file`] and the range readers instead of opening a
+/// writer to inspect a log.
+///
+/// ```compile_fail,E0061
+/// fn open_needs_a_tenure(
+///     path: std::path::PathBuf,
+///     session: &broca_protocol::BindIdentity,
+/// ) {
+///     let _wal = broca_wal::file_wal::OwnedWriterWal::open(
+///         path,
+///         session,
+///         "session-ref".to_string(),
+///     );
+/// }
+/// ```
+///
+/// ```compile_fail,E0061
+/// fn append_takes_no_caller_fence(
+///     wal: &mut broca_wal::file_wal::OwnedWriterWal,
+///     record: &broca_wal::WalRecord,
+/// ) {
+///     wal.append(7, record, true).unwrap();
+/// }
+/// ```
+pub struct OwnedWriterWal {
+    wal: FileWal,
+}
+
+impl OwnedWriterWal {
+    /// Open (creating if absent) the WAL at `path` for `session`, bound to
+    /// `tenure`, and recover it exactly like the standalone open.
+    ///
+    /// The tenure's session binding is checked before touching the
+    /// filesystem; the real-reference cut/moved/moving check runs once,
+    /// before any writable open, recovery truncation, lineage initialization
+    /// or append. `session_ref` must be the move-fence reference derived from
+    /// `session` (today `cortexkit_role_llm_runner::session_ref`, derived by
+    /// the store that owns the lease domain). Deriving it inside this crate
+    /// would need the role crate as a new dependency of `broca-wal`, so the
+    /// caller passes both: the tenure check binds the identity while the
+    /// guard uses the reference.
+    pub fn open(
+        path: impl Into<PathBuf>,
+        session: &BindIdentity,
+        session_ref: impl Into<String>,
+        tenure: OwnedWalTenure,
+    ) -> Result<Self, OwnedOpenError> {
+        Self::open_owned(path.into(), None, session, session_ref.into(), tenure)
+    }
+
+    /// Open with the diagnostic manifest this call records when it creates
+    /// the file. The manifest stays a best-effort sidecar: it is never
+    /// consulted while opening, exactly like the standalone variant.
+    pub fn open_with_manifest(
+        path: impl Into<PathBuf>,
+        manifest_path: impl Into<PathBuf>,
+        session_addr: impl Into<String>,
+        identity: impl Into<String>,
+        session: &BindIdentity,
+        session_ref: impl Into<String>,
+        tenure: OwnedWalTenure,
+    ) -> Result<Self, OwnedOpenError> {
+        Self::open_owned(
+            path.into(),
+            Some(ManifestAppend {
+                path: manifest_path.into(),
+                session_addr: session_addr.into(),
+                identity: identity.into(),
+            }),
+            session,
+            session_ref.into(),
+            tenure,
+        )
+    }
+
+    fn open_owned(
+        path: PathBuf,
+        manifest: Option<ManifestAppend>,
+        session: &BindIdentity,
+        session_ref: String,
+        tenure: OwnedWalTenure,
+    ) -> Result<Self, OwnedOpenError> {
+        // Bind before touching the filesystem: a wrong tenure refuses without
+        // creating directories or files, truncating a torn tail, or writing
+        // lineage. The tenure is consumed on both paths; on failure the
+        // half-built descriptor (if any) drops before the tenure is released.
+        if let Err(error) = tenure.require_session(session) {
+            return Err(OwnedOpenError {
+                cause: OwnedOpenCause::Tenure(error),
+            });
+        }
+        let fenced_path = path.clone();
+        let fenced_ref = session_ref.clone();
+        let access = AccessMode::OwnedTenure {
+            tenure,
+            fenced_path,
+            fenced_ref,
+        };
+        let wal =
+            FileWal::open_inner(path, manifest, session_ref, access, None).map_err(|error| {
+                OwnedOpenError {
+                    cause: OwnedOpenCause::Wal(error),
+                }
+            })?;
+        #[cfg(test)]
+        OWNED_OPEN_PANIC_AFTER_RECOVERY.with(|flag| {
+            if flag.take() {
+                panic!("owned open probe: panic after recovery, before returning the writer");
+            }
+        });
+        Ok(Self { wal })
+    }
+
+    /// Append a record at the next seq, stamped with the tenure's epoch.
+    pub fn append(&mut self, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
+        let fence = self.epoch();
+        self.wal
+            .append_frame(fence, record, sync, FrameSource::Encode)
+    }
+
+    /// Append a frame encoded by the single writer's enqueue path, stamped
+    /// with the tenure's epoch like [`Self::append`].
+    pub fn append_preencoded(
+        &mut self,
+        record: &WalRecord,
+        sync: bool,
+        frame: Vec<u8>,
+    ) -> Result<u64, WalError> {
+        let fence = self.epoch();
+        self.wal
+            .append_frame(fence, record, sync, FrameSource::Legacy(frame))
+    }
+
+    /// Move an unstarted log before its first record fixes its placement.
+    /// The destination's move sidecars are revalidated before the rename,
+    /// and the cached verdict follows the log to its new path.
+    pub fn relocate_unstarted(&mut self, destination: &Path) -> Result<(), WalError> {
+        self.wal.relocate_unstarted(destination)
+    }
+
+    /// Name the feature floor this writer raises before appending a gated record.
+    pub fn with_feature_floor(mut self, floor: impl Into<PathBuf>) -> Self {
+        self.wal = self.wal.with_feature_floor(floor);
+        self
+    }
+
+    /// Restrict the total byte ceiling without allowing it to exceed recovery's cap.
+    pub fn with_recovery_cap(mut self, max_bytes: u64) -> Self {
+        self.wal = self.wal.with_recovery_cap(max_bytes);
+        self
+    }
+
+    /// Apply a total byte ceiling and choose `retained_session_too_large`
+    /// for the writer's typed refusal terminal.
+    pub fn with_append_budget(mut self, max_bytes: u64) -> Self {
+        self.wal = self.wal.with_append_budget(max_bytes);
+        self
+    }
+
+    /// fsync queued writes without adding a record.
+    pub fn sync(&self) -> Result<(), WalError> {
+        self.wal.fsync()
+    }
+
+    /// Replay every committed record in order (torn tail discarded; non-tail
+    /// corruption is an error).
+    pub fn replay(&self) -> Result<Vec<FramedRecord>, WalError> {
+        self.wal.replay()
+    }
+
+    /// Records with `seq > after_seq`.
+    pub fn tail_after_seq(&self, after_seq: u64) -> Result<Vec<FramedRecord>, WalError> {
+        self.wal.tail_after_seq(after_seq)
+    }
+
+    /// The highest committed seq (0 if empty).
+    pub fn last_seq(&self) -> u64 {
+        self.wal.last_seq()
+    }
+
+    /// The durable lineage identity stored in this log, if it has one yet.
+    pub fn lineage_id(&self) -> Option<WalLineageId> {
+        self.wal.lineage_id()
+    }
+
+    /// The acquisition's epoch stamp: the value owned appends carry in their
+    /// frame fence field. Reading it is inspection only.
+    pub fn epoch(&self) -> u64 {
+        self.held_tenure().epoch()
+    }
+
+    /// The session this writer was opened for.
+    pub fn session(&self) -> &BindIdentity {
+        self.held_tenure().session()
+    }
+
+    /// The lease root the tenure was acquired under. Carried, not checked:
+    /// matching it against the store's configured domain is the store
+    /// opener's job when it adopts this facade.
+    pub fn lease_root(&self) -> &Path {
+        self.held_tenure().lease_root()
+    }
+
+    fn held_tenure(&self) -> &OwnedWalTenure {
+        self.wal
+            .owned_tenure()
+            .expect("an owned writer holds its tenure until the consuming close")
+    }
+
+    /// Settle queued work under the still-held tenure, disable the writer,
+    /// and hand back the held tenure. The explicit order is the guarantee:
+    /// the final barrier runs first, the mode flips to `Closed` (refusing any
+    /// later mutation), the descriptor drops, and only then does the tenure
+    /// move out. Dropping the facade without closing skips the final barrier,
+    /// so normal shutdown must call this; like everywhere else, nothing is
+    /// written or acknowledged from `Drop`.
+    pub fn close_into_tenure(self) -> OwnedCloseOutcome {
+        let mut wal = self.wal;
+        let sync_result = wal.fsync();
+        #[cfg(test)]
+        if sync_result.is_ok() {
+            OWNED_CLOSE_SETTLES.with(|count| count.set(count.get() + 1));
+        }
+        let tenure = wal
+            .take_owned_tenure()
+            .expect("an owned writer holds its tenure until the consuming close");
+        drop(wal);
+        OwnedCloseOutcome {
+            sync_result,
+            tenure,
+        }
     }
 }
 
@@ -1143,15 +1897,38 @@ fn scan_prefix<T>(
         let mut frame = header[..n].to_vec();
         if n == header.len() {
             let len = u32::from_le_bytes(header[..4].try_into().unwrap());
+            // A version 4 header is longer than the legacy one: its requirements array comes
+            // before the CRC and the payload. Read that array before sizing the frame from
+            // `len`, or the reader would assemble a frame short of its own header and never
+            // reach the payload, which a crash leaves unwritten, so recovery discards it.
+            let header_len = if header[4] == crate::framing::V4_FRAMING_VERSION {
+                match crate::framing::v4_header_len(&header) {
+                    Some(header_len) => header_len,
+                    None => return Ok(scan),
+                }
+            } else {
+                header.len()
+            };
+            if header_len > header.len() {
+                let extra = header_len - header.len();
+                let extra_budget = max_bytes.saturating_sub(offset + header.len() as u64);
+                let read = extra.min(usize::try_from(extra_budget).unwrap_or(usize::MAX));
+                let mut rest = vec![0u8; read];
+                let n = read_up_to(&mut file, &mut rest)?;
+                scan.bytes_read += n as u64;
+                rest.truncate(n);
+                frame.extend_from_slice(&rest);
+            }
             if len <= crate::framing::MAX_PAYLOAD_LEN {
-                let size = header.len() + len as usize;
+                let size = header_len + len as usize;
                 // The declared payload may be a torn tail's damaged length. Read
                 // only within budget; exceptional classification below probes one
                 // more byte to distinguish EOF from an actually oversized source.
                 let bounded_size = size.min(usize::try_from(available).unwrap_or(usize::MAX));
-                frame.resize(bounded_size, 0);
-                let n = read_up_to(&mut file, &mut frame[header.len()..])?;
-                frame.truncate(header.len() + n);
+                let already = frame.len();
+                frame.resize(bounded_size.max(already), 0);
+                let n = read_up_to(&mut file, &mut frame[already..])?;
+                frame.truncate(already + n);
                 scan.bytes_read += n as u64;
             }
         }
@@ -1241,7 +2018,7 @@ pub fn replay_file(path: impl AsRef<Path>, max_bytes: u64) -> Result<Vec<FramedR
 /// error is not evidence either way, and answering `false` for it would be the same defect
 /// this function exists to remove.
 pub fn wal_file_exists(path: impl AsRef<Path>) -> Result<bool, WalError> {
-    match std::fs::metadata(path.as_ref()) {
+    match fs_ops::metadata(path.as_ref()) {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(WalError::Io(e)),
@@ -1557,6 +2334,8 @@ pub fn read_verified_member_range(
     after_seq: u64,
     through_seq: Option<u64>,
 ) -> Result<WalRangeRead, WalError> {
+    #[cfg(any(test, feature = "test-io-trace"))]
+    crate::archive::expiry_io::decoded();
     let decoded = decode_bytes(bytes, 0, 1)?;
     select_decoded_range(
         decoded,
@@ -1911,7 +2690,7 @@ fn metadata_file_id(_metadata: &std::fs::Metadata) -> Option<u64> {
 /// provide one. Read-side durability caches use this only to invalidate a proof after the WAL is
 /// replaced; callers without an identity must take a fresh flush barrier instead.
 pub fn file_identity(path: impl AsRef<Path>) -> Result<Option<u64>, WalError> {
-    let metadata = match std::fs::metadata(path) {
+    let metadata = match fs_ops::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(WalError::Io(error)),
@@ -2292,6 +3071,355 @@ mod tests {
         assert!(open("0123456789abcdef0123456789abcdef").is_ok());
     }
 
+    fn tenure_identity(root: &str, harness: &str, session: &str) -> BindIdentity {
+        BindIdentity::new(root, harness, session)
+    }
+
+    fn tenure_domain() -> crate::writer_tenure::WalLeaseDomain {
+        crate::writer_tenure::WalLeaseDomain::new(PathBuf::from("/leases/test"))
+    }
+
+    /// Unwrap a tenure-backed open without requiring `Debug` on the writer.
+    fn unwrap_owned(result: Result<OwnedWriterWal, OwnedOpenError>) -> OwnedWriterWal {
+        match result {
+            Ok(wal) => wal,
+            Err(error) => panic!("owned open failed: {error:?}"),
+        }
+    }
+
+    /// Expect a tenure-backed open refusal without requiring `Debug` on the writer.
+    fn expect_owned_err(
+        result: Result<OwnedWriterWal, OwnedOpenError>,
+        context: &str,
+    ) -> OwnedOpenError {
+        match result {
+            Ok(_) => panic!("owned open unexpectedly succeeded: {context}"),
+            Err(error) => error,
+        }
+    }
+
+    /// Sorted `(relative path, byte length)` snapshot of every file under `dir`.
+    fn dir_snapshot(dir: &Path) -> Vec<(PathBuf, u64)> {
+        let mut files = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(current) = stack.pop() {
+            for entry in std::fs::read_dir(&current).unwrap() {
+                let entry = entry.unwrap();
+                let file_type = entry.file_type().unwrap();
+                if file_type.is_dir() {
+                    stack.push(entry.path());
+                } else {
+                    files.push((
+                        entry.path().strip_prefix(dir).unwrap().to_path_buf(),
+                        entry.metadata().unwrap().len(),
+                    ));
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn owned_open_rejects_missing_or_mismatched_tenure_before_mutation() {
+        let dir = tmp("owned-tenure-refusal");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.wal");
+        let _ = std::fs::remove_file(&path);
+        // Existing bytes must survive a refused open untouched.
+        let mut seed = FileWal::open(&path).unwrap();
+        seed.append(7, &run_started(0), true).unwrap();
+        drop(seed);
+        let before_bytes = std::fs::read(&path).unwrap();
+        let before_entries = dir_snapshot(&dir);
+        assert!(!before_bytes.is_empty());
+
+        let session_a = tenure_identity("/project", "runner", "session-a");
+        let session_b = tenure_identity("/project", "runner", "session-b");
+        let domain = tenure_domain();
+
+        // A tenure minted for another session refuses before any mutation:
+        // the check runs before directory creation, torn-tail truncation,
+        // lineage initialization and the first append.
+        let tenure_b = domain.mint_for_test(&session_b, 41).unwrap();
+        let error = expect_owned_err(
+            OwnedWriterWal::open(&path, &session_a, "ref-a".to_string(), tenure_b),
+            "a tenure for session-b must not open session-a",
+        );
+        assert!(
+            matches!(
+                error.cause(),
+                OwnedOpenCause::Tenure(TenureError::SessionMismatch { .. })
+            ),
+            "unexpected refusal: {:?}",
+            error.cause()
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before_bytes,
+            "a refused owned open must not rewrite bytes"
+        );
+        assert_eq!(
+            dir_snapshot(&dir),
+            before_entries,
+            "a refused owned open must not add directory entries"
+        );
+
+        // On an absent path the refused open creates nothing.
+        let absent = dir.join("absent.wal");
+        let tenure_b = domain.mint_for_test(&session_b, 42).unwrap();
+        assert!(OwnedWriterWal::open(&absent, &session_a, "ref-a".to_string(), tenure_b).is_err());
+        assert!(
+            !absent.exists(),
+            "a refused owned open must not create the WAL"
+        );
+        assert_eq!(dir_snapshot(&dir), before_entries);
+
+        // A moving session refuses the owned open before creating anything:
+        // omitting the tenure is not a bypass, it is a different,
+        // still-guarded constructor (see `standalone_append_still_checks_move_fence`).
+        let moving_dir = tmp("owned-tenure-moving");
+        std::fs::create_dir_all(&moving_dir).unwrap();
+        let moving_path = moving_dir.join("session.wal");
+        std::fs::write(
+            moving_path.with_extension("moving"),
+            br#"{"cutId":"cut","endOffset":0,"lineage_id":"id"}"#,
+        )
+        .unwrap();
+        let tenure_a = domain.mint_for_test(&session_a, 43).unwrap();
+        let error = expect_owned_err(
+            OwnedWriterWal::open(&moving_path, &session_a, "ref-a".to_string(), tenure_a),
+            "a moving session must refuse the owned open",
+        );
+        assert!(
+            matches!(
+                error.cause(),
+                OwnedOpenCause::Wal(WalError::SessionMoving { .. })
+            ),
+            "unexpected refusal: {:?}",
+            error.cause()
+        );
+        assert!(
+            !moving_path.exists(),
+            "a move-refused owned open must not create the WAL"
+        );
+
+        // The consumed tenures are gone, but a correctly bound tenure opens:
+        // nothing about the refusals poisoned the log.
+        let tenure_a = domain.mint_for_test(&session_a, 44).unwrap();
+        let wal = unwrap_owned(OwnedWriterWal::open(
+            &path,
+            &session_a,
+            "ref-a".to_string(),
+            tenure_a,
+        ));
+        assert_eq!(wal.epoch(), 44);
+        assert_eq!(wal.session(), &session_a);
+        assert_eq!(wal.last_seq(), 1);
+        let outcome = wal.close_into_tenure();
+        assert!(outcome.sync_result.is_ok());
+        assert_eq!(outcome.tenure.epoch(), 44);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn standalone_append_still_checks_move_fence() {
+        // The standalone compatibility path has no tenure to cache a verdict
+        // under, so its per-append move guard must stay exactly where it is:
+        // planting a freeze after open refuses the very next append.
+        let dir = tmp("standalone-guard");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.wal");
+        let _ = std::fs::remove_file(&path);
+        let mut wal = FileWal::open_with_manifest_and_session_ref(
+            &path,
+            dir.join("manifest"),
+            "address",
+            "identity",
+            "ref-1".to_string(),
+        )
+        .unwrap();
+        wal.append(1, &run_started(0), true).unwrap();
+        let clean_len = std::fs::metadata(&path).unwrap().len();
+        std::fs::write(
+            path.with_extension("moving"),
+            br#"{"cutId":"cut","endOffset":0,"lineage_id":"id"}"#,
+        )
+        .unwrap();
+        let error = wal
+            .append(1, &run_started(1), true)
+            .expect_err("a standalone append must re-check the move fence");
+        assert!(
+            matches!(error, WalError::SessionMoving { .. }),
+            "got {error:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            clean_len,
+            "a refused standalone append must not change bytes"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn owned_append_uses_the_open_time_move_verdict() {
+        // The owned-path fast path: the open-time guard ran under the held
+        // tenure, so later appends skip the repeated migration probes while
+        // that verdict still covers this path and reference. Only the
+        // consuming owned constructor selects this mode, which nothing mints
+        // in production yet, and the standalone path above keeps its
+        // per-append guard.
+        let dir = tmp("owned-cached-verdict");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.wal");
+        let _ = std::fs::remove_file(&path);
+        let session = tenure_identity("/project", "runner", "session-a");
+        let tenure = tenure_domain().mint_for_test(&session, 7).unwrap();
+        let mut wal = unwrap_owned(OwnedWriterWal::open(
+            &path,
+            &session,
+            "ref-1".to_string(),
+            tenure,
+        ));
+        wal.append(&run_started(0), true).unwrap();
+        // Freeze the session after open: the cached verdict still authorizes
+        // the tenure-backed append, while a standalone handle refuses.
+        std::fs::write(
+            path.with_extension("moving"),
+            br#"{"cutId":"cut","endOffset":0,"lineage_id":"id"}"#,
+        )
+        .unwrap();
+        wal.append(&run_started(1), true)
+            .expect("the open-time verdict covers the held tenure's appends");
+        assert_eq!(wal.last_seq(), 2);
+        let outcome = wal.close_into_tenure();
+        assert!(outcome.sync_result.is_ok());
+        assert_eq!(replay_file(&path, DEFAULT_MAX_READ_BYTES).unwrap().len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn owned_close_disables_wal_before_releasing_lease() {
+        // Normal shutdown settles under the lease, then disables the writer,
+        // then hands back the still-held tenure: the final barrier is the
+        // last filesystem effect, and the returned owner is the held one.
+        let dir = tmp("owned-close");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.wal");
+        let _ = std::fs::remove_file(&path);
+        let session = tenure_identity("/project", "runner", "session-a");
+        let domain = tenure_domain();
+        let tenure = domain.mint_for_test(&session, 41).unwrap();
+        let mut wal = unwrap_owned(OwnedWriterWal::open(
+            &path,
+            &session,
+            "ref-1".to_string(),
+            tenure,
+        ));
+        wal.append(&run_started(0), false).unwrap();
+        wal.append(&run_started(1), true).unwrap();
+        OWNED_CLOSE_SETTLES.with(|count| count.set(0));
+        let outcome = wal.close_into_tenure();
+        assert!(
+            outcome.sync_result.is_ok(),
+            "close settles queued appends under the lease"
+        );
+        assert_eq!(
+            OWNED_CLOSE_SETTLES.with(|count| count.get()),
+            1,
+            "the consuming close performs the final barrier exactly once"
+        );
+        assert_eq!(outcome.tenure.epoch(), 41);
+        assert_eq!(outcome.tenure.session(), &session);
+        assert_eq!(outcome.tenure.lease_root(), tenure_domain().lease_root());
+        // The close is consuming, so no handle survives that could append
+        // past the handoff; both records, including the unsynced one, are
+        // durable and readable.
+        let replayed = replay_file(&path, DEFAULT_MAX_READ_BYTES).unwrap();
+        assert_eq!(replayed.len(), 2);
+        assert_eq!(replayed[0].fence, 41);
+        assert_eq!(replayed[1].fence, 41);
+        // The tenure is released only now: a fresh tenure reopens the log
+        // where the closed writer left it.
+        let tenure = domain.mint_for_test(&session, 42).unwrap();
+        let wal = unwrap_owned(OwnedWriterWal::open(
+            &path,
+            &session,
+            "ref-1".to_string(),
+            tenure,
+        ));
+        assert_eq!(wal.last_seq(), 2);
+        let outcome = wal.close_into_tenure();
+        assert!(outcome.sync_result.is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn owned_open_failure_and_panic_release_only_after_close() {
+        let dir = tmp("owned-open-cleanup");
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = tenure_identity("/project", "runner", "session-a");
+        let domain = tenure_domain();
+
+        // An I/O failure during open leaves no writable handle behind: the
+        // half-built descriptor drops before tenure teardown, and a fresh
+        // tenure opens the real path cleanly.
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let tenure = domain.mint_for_test(&session, 7).unwrap();
+        let error = expect_owned_err(
+            OwnedWriterWal::open(
+                blocker.join("session.wal"),
+                &session,
+                "ref-1".to_string(),
+                tenure,
+            ),
+            "opening under a file must fail",
+        );
+        assert!(
+            matches!(error.cause(), OwnedOpenCause::Wal(_)),
+            "unexpected failure: {:?}",
+            error.cause()
+        );
+        let path = dir.join("session.wal");
+        let tenure = domain.mint_for_test(&session, 8).unwrap();
+        let mut wal = unwrap_owned(OwnedWriterWal::open(
+            &path,
+            &session,
+            "ref-1".to_string(),
+            tenure,
+        ));
+        wal.append(&run_started(0), true).unwrap();
+        wal.close_into_tenure();
+        let before_bytes = std::fs::read(&path).unwrap();
+
+        // A panic after recovery unwinds through the half-returned writer:
+        // field order drops the descriptor before tenure teardown, so the
+        // log keeps its verified prefix and a fresh tenure reopens it.
+        OWNED_OPEN_PANIC_AFTER_RECOVERY.with(|flag| flag.set(true));
+        let tenure = domain.mint_for_test(&session, 9).unwrap();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            OwnedWriterWal::open(&path, &session, "ref-1".to_string(), tenure)
+        }));
+        assert!(caught.is_err(), "the injected panic must unwind");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before_bytes,
+            "a panic during open must not change bytes"
+        );
+        let tenure = domain.mint_for_test(&session, 10).unwrap();
+        let wal = unwrap_owned(OwnedWriterWal::open(
+            &path,
+            &session,
+            "ref-1".to_string(),
+            tenure,
+        ));
+        assert_eq!(wal.last_seq(), 1);
+        let outcome = wal.close_into_tenure();
+        assert!(outcome.sync_result.is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn first_episode_discriminator_reads_only_its_bounded_prefix() {
         struct Count {
@@ -2319,6 +3447,7 @@ mod tests {
             wal.append(
                 1,
                 &WalRecord::ModelStepFinished {
+                    fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
                     hooks: None,
@@ -2445,6 +3574,7 @@ mod tests {
 
     fn run_started(n: u64) -> WalRecord {
         WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -2752,6 +3882,7 @@ mod tests {
     #[cfg(unix)]
     fn large_step(n: u64, text_bytes: usize) -> WalRecord {
         WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -3401,6 +4532,7 @@ mod tests {
             wal.append(
                 1,
                 &WalRecord::ModelStepFinished {
+                    fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
                     hooks: None,

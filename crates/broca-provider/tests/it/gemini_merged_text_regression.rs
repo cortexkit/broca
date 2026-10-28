@@ -51,6 +51,7 @@ fn request() -> CallOptions {
         account_ref: None,
         run_id: "run-merged-text-regression".into(),
         step_index: 7,
+        max_output_tokens: None,
     });
     opts
 }

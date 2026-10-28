@@ -13,10 +13,24 @@ pub(crate) fn insert(
     if session_addr(session) != address {
         return Ok(0);
     }
-    Ok(conn.execute(
+    let inserted = conn.execute(
         "INSERT OR IGNORE INTO agent_data_session_ref(session_ref,address,project_root,harness,session) VALUES(?1,?2,?3,?4,?5)",
-        params![agent_session_ref(session),address,session.project_root.to_string_lossy(),session.harness,session.session],
-    )?)
+        params![broca_core::wal_writer::legacy_session_ref(&session.harness, &session.project_root.to_string_lossy(), &session.session),address,session.project_root.to_string_lossy(),session.harness,session.session],
+    )?;
+    insert_v2(conn, address, session)?;
+    Ok(inserted)
+}
+
+pub(super) fn insert_v2(
+    conn: &Connection,
+    address: &str,
+    session: &BindIdentity,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO agent_data_session_ref_v2(session_ref,address) VALUES(?1,?2)",
+        params![agent_session_ref(session), address],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,13 +1,236 @@
 use super::*;
 use broca_core::{ExportIndex, MaterializedStore, RunIndex, RunIndexState};
 use broca_protocol::{RunFinishReason, RunId};
+use broca_wal::Wal;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const MARKER: &str = "RETENTION-MODULE-CONTENT-SENTINEL-59137";
 
-#[cfg(any(target_os = "linux", feature = "test-clock"))]
+fn archive_forever_sessions(rig: &Rig, count: usize) -> Vec<BindIdentity> {
+    let archive = rig.root.join("wal-archive/fold-1000.ark");
+    fs::create_dir_all(archive.parent().unwrap()).unwrap();
+    let mut writer = broca_wal::archive::ArchiveWriter::create(&archive)
+        .unwrap()
+        .without_feature_floor();
+    let mut keys = Vec::new();
+    for n in 0..count {
+        let key = BindIdentity::new(rig.root.join("project"), "runner", format!("archive-{n}"));
+        let mut wal = rig.service.wal.open(&key).unwrap();
+        wal.append(
+            1,
+            &started(&key, &format!("archive-run-{n}"), None, 100),
+            false,
+        )
+        .unwrap();
+        for _ in 0..4 {
+            wal.append(1, &large_expiry_step(), false).unwrap();
+        }
+        wal.append(1, &finished(200), true).unwrap();
+        drop(wal);
+        let path = rig.service.wal.wal_path(&key);
+        writer
+            .append(&broca_core::session_addr(&key), &fs::read(&path).unwrap())
+            .unwrap();
+        fs::remove_file(path).unwrap();
+        keys.push(key);
+    }
+    writer.seal().unwrap();
+    keys
+}
+
+#[cfg(unix)]
+#[test]
+fn archived_expiry_checks_bound_member_decodes() {
+    let rig = Rig::new();
+    let keys = archive_forever_sessions(&rig, 10);
+    let before = broca_wal::archive::expiry_io::counts();
+    let start = std::time::Instant::now();
+    for n in 0..1000 {
+        let key = &keys[n % keys.len()];
+        let run = (n % 2 == 0).then_some("archive-run-0");
+        assert_eq!(rig.service.expired(key, run).unwrap(), None);
+    }
+    let after = broca_wal::archive::expiry_io::counts();
+    let (opens, loads, decodes) = (after.0 - before.0, after.1 - before.1, after.2 - before.2);
+    eprintln!(
+        "archived expiry: 1000 checks, {} sessions, {:?}, {opens} archive opens, {loads} payload loads, {decodes} WAL member decodes",
+        keys.len(), start.elapsed()
+    );
+    assert!(decodes <= keys.len() as u64, "{decodes} member decodes");
+    // One open per session's member read, plus one per container the archive member index
+    // reads once to build itself (this rig seals a single container). The bound is what
+    // matters: opens track sessions and containers, never the 1,000 checks.
+    assert!(opens <= keys.len() as u64 + 1, "{opens} archive opens");
+}
+
+#[tokio::test]
+async fn archived_expiry_cache_keeps_tombstones_and_newer_lineages_authoritative() {
+    let rig = Rig::new();
+    let key = archive_forever_sessions(&rig, 1).pop().unwrap();
+    let registry = rig.registry(None);
+    let id = rig
+        .service
+        .wal
+        .read_records_range(&key, 0, None, None)
+        .unwrap()
+        .lineage_id
+        .unwrap()
+        .to_string();
+    for _ in 0..2 {
+        registry.check_expired(&key, None).await.unwrap();
+        registry
+            .check_expired(&key, Some("archive-run-0"))
+            .await
+            .unwrap();
+    }
+    let stone = Tombstone {
+        next_tag: None,
+        next_notice_seq: None,
+        lineage_id: id,
+        expired_at_ms: 1234,
+        seq: 2,
+        completed_at_ms: None,
+    };
+    rig.service.write_tombstone(&key, &stone).unwrap();
+    for run in [None, Some("archive-run-0")] {
+        assert!(matches!(
+            registry.check_expired(&key, run).await,
+            Err(crate::registry::OpenError::Expired {
+                expired_at_ms: 1234
+            })
+        ));
+    }
+
+    // A restored or newly written live lineage wins over a cached archived predecessor.
+    let path = rig.service.wal.ephemeral_wal_path(&key);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let now = rig.service.clock.now_ms();
+    let mut wal = broca_wal::FileWal::open(&path)
+        .unwrap()
+        .with_feature_floor(rig.service.wal.feature_floor_path());
+    wal.append(
+        1,
+        &started(&key, "newer", Some(RETAINED_SECONDS), now),
+        false,
+    )
+    .unwrap();
+    wal.append(1, &finished(now), true).unwrap();
+    drop(wal);
+    registry.check_expired(&key, None).await.unwrap();
+    registry.check_expired(&key, Some("newer")).await.unwrap();
+
+    // Publish that newer generation under the same container name, not just a new path.
+    let archive = rig.root.join("wal-archive/fold-1000.ark");
+    let old_archive = fs::read(&archive).unwrap();
+    let replacement = rig.root.join("fold-1000.ark");
+    let mut writer = broca_wal::archive::ArchiveWriter::create(&replacement)
+        .unwrap()
+        .without_feature_floor();
+    writer
+        .append(&broca_core::session_addr(&key), &fs::read(&path).unwrap())
+        .unwrap();
+    writer.seal().unwrap();
+    fs::rename(replacement, &archive).unwrap();
+    fs::remove_file(path).unwrap();
+    for _ in 0..2 {
+        registry.check_expired(&key, None).await.unwrap();
+        registry.check_expired(&key, Some("newer")).await.unwrap();
+    }
+
+    fs::write(&archive, old_archive).unwrap();
+    assert!(matches!(
+        registry.check_expired(&key, None).await,
+        Err(crate::registry::OpenError::Expired {
+            expired_at_ms: 1234
+        })
+    ));
+
+    fs::remove_file(rig.root.join("wal-archive/fold-1000.ark")).unwrap();
+    assert!(matches!(
+        registry.check_expired(&key, None).await,
+        Err(crate::registry::OpenError::Expired {
+            expired_at_ms: 1234
+        })
+    ));
+}
+
+#[cfg(feature = "test-clock")]
+#[test]
+fn archived_expiry_cache_rechecks_retention_rows_clock_and_run_membership() {
+    let rig = Rig::new();
+    let now = rig.service.clock.now_ms();
+    let id = rig.seed(RETAINED_SECONDS, now, Some(now));
+    rig.service.rederive(&rig.key).unwrap();
+    let path = rig.service.wal.ephemeral_wal_path(&rig.key);
+    let archive = rig.root.join("wal-archive/fold-1000.ark");
+    fs::create_dir_all(archive.parent().unwrap()).unwrap();
+    let mut writer = broca_wal::archive::ArchiveWriter::create(&archive)
+        .unwrap()
+        .without_feature_floor();
+    writer
+        .append(
+            &broca_core::session_addr(&rig.key),
+            &fs::read(&path).unwrap(),
+        )
+        .unwrap();
+    writer.seal().unwrap();
+    fs::remove_file(path).unwrap();
+    let before = broca_wal::archive::expiry_io::counts();
+    assert_eq!(rig.service.expired(&rig.key, None).unwrap(), None);
+    assert_eq!(rig.service.expired(&rig.key, Some("r1")).unwrap(), None);
+    let mut row = rig.store.lookup_retention_lineage(&id).unwrap().unwrap();
+    let deadline = row.expires_at_ms.unwrap();
+    fs::write(rig.root.join("test-clock"), br#"{"offset_ms":3600001}"#).unwrap();
+    rig.service.clock.refresh().unwrap();
+    assert_eq!(rig.service.expired(&rig.key, None).unwrap(), Some(deadline));
+    assert_eq!(
+        rig.service.expired(&rig.key, Some("r1")).unwrap(),
+        Some(deadline)
+    );
+    assert_eq!(
+        rig.service.expired(&rig.key, Some("unknown")).unwrap(),
+        None
+    );
+    row.expires_at_ms = None;
+    row.expired_at_ms = Some(deadline);
+    rig.store.upsert_retention_lineage(&row, &[]).unwrap();
+    assert_eq!(rig.service.expired(&rig.key, None).unwrap(), Some(deadline));
+    let after = broca_wal::archive::expiry_io::counts();
+    if cfg!(unix) {
+        assert_eq!(after.2 - before.2, 1);
+    }
+}
+
+#[test]
+fn archived_expiry_cache_invalidates_on_publication_conflict_and_corruption() {
+    let rig = Rig::new();
+    let key = archive_forever_sessions(&rig, 1).pop().unwrap();
+    let archive = rig.root.join("wal-archive/fold-1000.ark");
+    assert_eq!(rig.service.expired(&key, None).unwrap(), None);
+    assert_eq!(rig.service.expired(&key, None).unwrap(), None);
+    let newer = rig.root.join("wal-archive/fold-2000.ark");
+    fs::copy(&archive, &newer).unwrap();
+    assert_eq!(rig.service.expired(&key, None).unwrap(), None);
+    fs::create_dir_all(rig.root.join("wal-archive-durable")).unwrap();
+    let conflict = rig.root.join("wal-archive-durable/fold-3000.ark");
+    fs::copy(&archive, &conflict).unwrap();
+    assert!(rig
+        .service
+        .expired(&key, None)
+        .unwrap_err()
+        .contains("conflicting archived WALs"));
+    fs::remove_file(conflict).unwrap();
+    assert_eq!(rig.service.expired(&key, None).unwrap(), None);
+    let mut bytes = fs::read(&newer).unwrap();
+    // Keep the filename and length unchanged: metadata identity must catch in-place damage.
+    bytes[100] ^= 1;
+    fs::write(&newer, bytes).unwrap();
+    assert!(rig.service.expired(&key, None).is_err());
+}
+
 fn large_expiry_step() -> WalRecord {
     WalRecord::ModelStepFinished {
+        fallback: Default::default(),
         written_at_ms: None,
         tags: None,
         hooks: None,
@@ -156,6 +379,16 @@ fn retained_summary_does_not_include_records_past_durable_head() {
 fn missing_retention_summary_is_refreshed_without_rewriting_run_state() {
     let rig = Rig::new();
     let now = rig.service.clock.now_ms();
+    // Freeze the clock: the seed expires one second after `now`, and WAL setup on a
+    // slow runner can take longer than that between sampling `now` and checking expiry,
+    // which would report the seed as already expired. A fixed clock keeps the deadline
+    // in the future until the test moves it explicitly.
+    fs::write(
+        rig.root.join("test-clock"),
+        format!(r#"{{"now_ms":{now}}}"#),
+    )
+    .unwrap();
+    rig.service.clock.refresh().unwrap();
     rig.seed(1, now, Some(now));
     assert!(rig
         .store
@@ -262,6 +495,32 @@ fn retention_deletion_drops_media_manifest_after_wal_unlink_and_leaves_collectio
     );
 }
 impl Rig {
+    #[cfg(unix)]
+    fn overhaul() -> Self {
+        let mut rig = Self::new();
+        fs::write(
+            rig.root.join(broca_wal::state_format::MARKER_FILENAME),
+            b"broca-state/2\n",
+        )
+        .unwrap();
+        let wal = Arc::new(FileWalStore::with_config(
+            rig.root.join("wal"),
+            broca_wal::WalConfig::OVERHAUL,
+        ));
+        let resolver = Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1));
+        rig.service = Arc::new(
+            RetentionService::new(
+                wal,
+                rig.store.clone(),
+                rig.leases.clone(),
+                rig.store.clone(),
+                resolver,
+            )
+            .unwrap(),
+        );
+        rig
+    }
+
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = broca_test_support::scratch_root().join(format!(
@@ -318,15 +577,26 @@ impl Rig {
             wal: self.service.wal.clone(),
             store: self.store.clone(),
         });
-        let opener = Arc::new(
+        let opener = if self.service.wal.wal_config().is_overhaul() {
+            crate::opener::DefaultOpener::with_file_leases(
+                self.root.join("leases"),
+                self.service.wal.clone(),
+                executor,
+            )
+            .with_lease_domain(broca_core::lease::WalLeaseDomain::new(
+                self.root.join("leases"),
+            ))
+            .unwrap()
+        } else {
             crate::opener::DefaultOpener::new(
                 self.leases.clone(),
                 self.service.wal.clone(),
                 executor,
             )
-            .with_run_index(index.unwrap_or(self.store.clone()))
-            .with_materialized_store(self.store.clone()),
-        );
+        }
+        .with_run_index(index.unwrap_or(self.store.clone()))
+        .with_materialized_store(self.store.clone());
+        let opener = Arc::new(opener);
         let registry = crate::registry::LineageRegistry::new_with_reader(
             opener,
             self.service.wal.clone(),
@@ -336,9 +606,343 @@ impl Rig {
         registry
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn relocation_incomplete_preflight_never_expires_or_completes_deletion() {
+    let rig = Rig::overhaul();
+    let wal = rig
+        .service
+        .wal
+        .open_with_retention(&rig.key, Some(60))
+        .unwrap();
+    let id = wal.lineage_id().unwrap().to_string();
+    drop(wal);
+    let source = rig.service.wal.ephemeral_wal_path(&rig.key);
+    let alias = rig.service.wal.wal_path(&rig.key);
+    fs::create_dir_all(alias.parent().unwrap()).unwrap();
+    fs::hard_link(&source, &alias).unwrap();
+    rig.service.remember_session(&rig.key).unwrap();
+    rig.service
+        .write_tombstone(
+            &rig.key,
+            &Tombstone {
+                lineage_id: id.clone(),
+                expired_at_ms: 1,
+                seq: 1,
+                completed_at_ms: None,
+                next_tag: None,
+                next_notice_seq: None,
+            },
+        )
+        .unwrap();
+    rig.service
+        .index
+        .deletion_pending(&id, &rig.key, true)
+        .unwrap();
+    let before_bytes = fs::read(&source).unwrap();
+    let before_stones = serde_json::to_value(rig.service.tombstones(&rig.key).unwrap()).unwrap();
+    let before_outbox = rig.store.pending_retention_withdrawals().unwrap().len();
+    let registry = rig.registry(None);
+    let error = registry.check_expired(&rig.key, None).await.unwrap_err();
+    assert!(
+        matches!(&error, crate::registry::OpenError::Classified { class: broca_protocol::ErrorClass::Transient, reason } if reason.contains("wal_relocation_incomplete"))
+    );
+    assert_eq!(
+        rig.service
+            .delete_expired_typed(&rig.key, u64::MAX)
+            .unwrap(),
+        None
+    );
+    assert!(rig.service.resume_deletions(u64::MAX).unwrap().is_empty());
+    assert!(
+        rig.service.resume_deletions(u64::MAX).unwrap().is_empty(),
+        "the next pass retries the deferred key"
+    );
+    assert_eq!(rig.service.relocation_incomplete_skips(), 1);
+    assert_eq!(rig.service.overhaul_deferred_attempts(), 3);
+    assert_eq!(fs::read(&source).unwrap(), before_bytes);
+    assert_eq!(fs::read(&alias).unwrap(), before_bytes);
+    assert_eq!(
+        serde_json::to_value(rig.service.tombstones(&rig.key).unwrap()).unwrap(),
+        before_stones
+    );
+    assert_eq!(
+        rig.store.pending_retention_withdrawals().unwrap().len(),
+        before_outbox
+    );
+    assert!(!rig.service.deleting(&rig.key, &id).exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn legacy_same_inode_conflicts_keep_the_existing_retention_error_class() {
+    let rig = Rig::new();
+    rig.seed(1, 1000, Some(1000));
+    let source = rig.service.wal.ephemeral_wal_path(&rig.key);
+    let alias = rig.service.wal.wal_path(&rig.key);
+    fs::create_dir_all(alias.parent().unwrap()).unwrap();
+    fs::hard_link(&source, &alias).unwrap();
+    let error = rig
+        .registry(None)
+        .check_expired(&rig.key, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, crate::registry::OpenError::Open(reason) if reason.starts_with("wal io: conflicting live WALs:") && !reason.contains("wal_relocation_incomplete"))
+    );
+    assert_eq!(rig.service.relocation_incomplete_skips(), 0);
+    assert!(source.exists() && alias.exists());
+}
 impl Drop for Rig {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[cfg(all(unix, feature = "test-clock"))]
+#[tokio::test]
+async fn phase_one_overhaul_retention_defers_expiry_and_deletion() {
+    let rig = Rig::overhaul();
+    fs::write(rig.root.join("test-clock"), br#"{"now_ms":3000}"#).unwrap();
+    rig.service.clock.refresh().unwrap();
+    let writer = due_overhaul_writer(&rig, Arc::new(broca_wal::fs_ops::RealFs)).await;
+    writer.shutdown().await.unwrap();
+    let path = rig.service.wal.ephemeral_wal_path(&rig.key);
+    let before = fs::read(&path).unwrap();
+    let _lease = rig.service.lease(&rig.key).unwrap();
+    assert_eq!(
+        rig.service.delete_expired_typed(&rig.key, 3000).unwrap(),
+        None
+    );
+    assert_eq!(
+        rig.service.expired(&rig.key, None).unwrap(),
+        None,
+        "phase-one overhaul expiry is deferred even when the legacy deadline is due"
+    );
+    assert!(rig.service.resume_deletions(3000).unwrap().is_empty());
+    assert_eq!(rig.service.overhaul_deferred_attempts(), 3);
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(rig.service.tombstones(&rig.key).unwrap().is_empty());
+    assert!(rig
+        .store
+        .pending_retention_withdrawals()
+        .unwrap()
+        .is_empty());
+}
+
+#[cfg(all(unix, feature = "test-clock"))]
+async fn due_overhaul_writer(
+    rig: &Rig,
+    fs: Arc<dyn broca_wal::fs_ops::FsOps>,
+) -> broca_core::WalHandle {
+    let lease = rig.service.lease(&rig.key).unwrap();
+    let fence = lease.epoch();
+    let writer = broca_wal::fs_ops::with_fs_ops(fs.clone(), || {
+        let wal = rig
+            .service
+            .wal
+            .open_with_retention(&rig.key, Some(1))
+            .unwrap();
+        broca_core::WalHandle::spawn_in_store_with_fs_for_test(
+            wal,
+            rig.service.wal.as_ref(),
+            &rig.key,
+            fence,
+            Some(lease),
+            fs,
+        )
+        .unwrap()
+    });
+    writer
+        .record(started(&rig.key, "r1", Some(1), 1000))
+        .into_result()
+        .unwrap();
+    writer.record(finished(1000)).into_result().unwrap();
+    writer.sync().await.unwrap();
+    writer
+}
+
+#[cfg(all(unix, feature = "test-clock"))]
+mod overhaul_close_regressions {
+    use super::*;
+    use broca_wal::fs_ops::{FileOps, FsOps, OpenOptions, RealFs};
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    #[derive(Default)]
+    struct Faults {
+        head: AtomicBool,
+        close: AtomicBool,
+    }
+    struct FaultFs(Arc<Faults>);
+    struct FaultFile {
+        inner: Box<dyn FileOps>,
+        path: PathBuf,
+        faults: Arc<Faults>,
+    }
+    impl FsOps for FaultFs {
+        fn open(&self, path: &Path, options: &OpenOptions) -> io::Result<Box<dyn FileOps>> {
+            Ok(Box::new(FaultFile {
+                inner: RealFs.open(path, options)?,
+                path: path.to_path_buf(),
+                faults: self.0.clone(),
+            }))
+        }
+        fn metadata(&self, path: &Path) -> io::Result<fs::Metadata> {
+            RealFs.metadata(path)
+        }
+        fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+            RealFs.create_dir_all(path)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            RealFs.rename(from, to)
+        }
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            RealFs.remove_file(path)
+        }
+        fn sync_dir(&self, path: &Path) -> io::Result<()> {
+            RealFs.sync_dir(path)
+        }
+        fn create_dir(&self, path: &Path) -> io::Result<()> {
+            RealFs.create_dir(path)
+        }
+        fn hard_link(&self, from: &Path, to: &Path) -> io::Result<()> {
+            RealFs.hard_link(from, to)
+        }
+        fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+            RealFs.canonicalize(path)
+        }
+        fn read_dir(&self, path: &Path) -> io::Result<broca_wal::fs_ops::ReadDir> {
+            RealFs.read_dir(path)
+        }
+        fn validate_if_exists(&self, path: &Path) -> io::Result<()> {
+            RealFs.validate_if_exists(path)
+        }
+    }
+    impl Read for FaultFile {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.inner.read(bytes)
+        }
+    }
+    impl Seek for FaultFile {
+        fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(from)
+        }
+    }
+    impl Write for FaultFile {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.path.extension().is_some_and(|ext| ext == "head")
+                && self.faults.head.swap(false, Ordering::SeqCst)
+            {
+                return Err(io::Error::other("injected close-publication failure"));
+            }
+            if self.path.extension().is_some_and(|ext| ext == "wal")
+                && self.faults.close.load(Ordering::SeqCst)
+                && matches!(broca_wal::framing::decode_next(bytes), broca_wal::framing::DecodeStep::Record { framed, .. } if matches!(framed.record, WalRecord::WriterClosed { .. }))
+            {
+                self.faults.close.store(false, Ordering::SeqCst);
+                return Err(io::Error::other("injected interrupted close"));
+            }
+            self.inner.write(bytes)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+    impl FileOps for FaultFile {
+        fn metadata(&self) -> io::Result<fs::Metadata> {
+            self.inner.metadata()
+        }
+        fn set_len(&self, len: u64) -> io::Result<()> {
+            self.inner.set_len(len)
+        }
+        fn sync_all(&self) -> io::Result<()> {
+            self.inner.sync_all()
+        }
+        fn try_clone(&self) -> io::Result<Box<dyn FileOps>> {
+            Ok(Box::new(Self {
+                inner: self.inner.try_clone()?,
+                path: self.path.clone(),
+                faults: self.faults.clone(),
+            }))
+        }
+        fn lock(&self) -> io::Result<()> {
+            self.inner.lock()
+        }
+        fn unlock(&self) -> io::Result<()> {
+            self.inner.unlock()
+        }
+        fn try_lock(&self) -> Result<(), fs::TryLockError> {
+            self.inner.try_lock()
+        }
+        fn read_exact_at(&self, bytes: &mut [u8], offset: u64) -> io::Result<()> {
+            self.inner.read_exact_at(bytes, offset)
+        }
+    }
+
+    async fn next_send_reopens_due_history(publication_failure: bool) {
+        let rig = Rig::overhaul();
+        fs::write(rig.root.join("test-clock"), br#"{"now_ms":3000}"#).unwrap();
+        rig.service.clock.refresh().unwrap();
+        let faults = Arc::new(Faults::default());
+        let writer = due_overhaul_writer(&rig, Arc::new(FaultFs(faults.clone()))).await;
+        let lineage = writer.lineage_id().unwrap();
+        if publication_failure {
+            faults.head.store(true, Ordering::SeqCst);
+        } else {
+            faults.close.store(true, Ordering::SeqCst);
+        }
+        assert!(writer.shutdown().await.is_err());
+        let path = rig.service.wal.ephemeral_wal_path(&rig.key);
+        assert!(path.exists());
+        assert!(fs::read_dir(rig.root.join("open-writers"))
+            .unwrap()
+            .next()
+            .is_some());
+        let before = rig.service.wal.read_records(&rig.key).unwrap();
+        assert_eq!(
+            before
+                .iter()
+                .filter(|frame| matches!(frame.record, WalRecord::WriterClosed { .. }))
+                .count(),
+            usize::from(publication_failure)
+        );
+        let registry = rig.registry(None);
+        let mut next = request(&rig.key, "r2");
+        next.retention = Some(1);
+        let outcome = registry
+            .route_send(&rig.key, next, crate::executor::RunKind::FreshOrResume)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, crate::actor::SendOutcome::Active { .. }),
+            "{outcome:?}"
+        );
+        let observed = rig
+            .service
+            .wal
+            .read_records_range(&rig.key, 0, None, None)
+            .unwrap();
+        assert_eq!(
+            observed.lineage_id,
+            Some(lineage),
+            "the due retained log must not be deleted before its successor opens"
+        );
+        let records = rig.service.wal.read_records(&rig.key).unwrap();
+        assert!(records.iter().any(|frame| matches!(&frame.record, WalRecord::RunStarted { run_id, .. } if run_id.0 == "r1")));
+        assert!(records.iter().any(|frame| matches!(frame.record, WalRecord::WriterOpened { recovered_through_seq, previous_writer_id: Some(_), .. } if recovered_through_seq >= before.last().unwrap().seq)));
+        assert!(rig.service.tombstones(&rig.key).unwrap().is_empty());
+        assert!(rig.service.overhaul_deferred_attempts() > 0);
+        registry.stop_and_seal().await;
+    }
+
+    #[tokio::test]
+    async fn overdue_failed_close_publication_is_reopened_on_next_send() {
+        next_send_reopens_due_history(true).await;
+    }
+    #[tokio::test]
+    async fn overdue_interrupted_close_is_reopened_on_next_send() {
+        next_send_reopens_due_history(false).await;
     }
 }
 
@@ -1290,6 +1894,7 @@ async fn status_of_expired_large_session_refuses_in_the_status_opener() {
             wal.append(
                 1,
                 &WalRecord::ModelStepFinished {
+                    fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
                     hooks: None,
@@ -2013,6 +2618,87 @@ async fn send_waits_for_in_progress_deletion_to_complete_before_opening_fresh_li
     assert!(registry.stop_and_seal().await);
 }
 
+/// The opener waits on a held lease only while `expired` reports expiry. A deletion that
+/// writes its tombstone and removes the WAL while `expired` is between reading the tombstones
+/// and finding the WAL gone must still be reported, or a racing send refuses with LeaseHeld.
+#[test]
+fn expiry_check_overlapping_a_completing_deletion_still_reports_expiry() {
+    type Deletion = Box<dyn FnOnce() + Send>;
+    struct DeleteOnLiveLookup {
+        store: Arc<SqliteStore>,
+        during: Mutex<Option<Deletion>>,
+    }
+    impl RetentionIndex for DeleteOnLiveLookup {
+        fn live(&self, key: &BindIdentity) -> Result<Option<RetentionLineageRow>, String> {
+            let deletion = self.during.lock().unwrap().take();
+            if let Some(deletion) = deletion {
+                deletion();
+            }
+            RetentionIndex::live(self.store.as_ref(), key)
+        }
+        fn lineage(&self, id: &str) -> Result<Option<RetentionLineageRow>, String> {
+            RetentionIndex::lineage(self.store.as_ref(), id)
+        }
+        fn runs(&self, id: &str) -> Result<Vec<RetentionRunRow>, String> {
+            RetentionIndex::runs(self.store.as_ref(), id)
+        }
+        fn candidates(&self, now: u64) -> Result<Vec<RetentionLineageRow>, String> {
+            RetentionIndex::candidates(self.store.as_ref(), now)
+        }
+        fn run(&self, id: &str) -> Result<Option<RunRetention>, String> {
+            RetentionIndex::run(self.store.as_ref(), id)
+        }
+        fn upsert(
+            &self,
+            row: &RetentionLineageRow,
+            runs: &[RetentionRunRow],
+        ) -> Result<(), String> {
+            RetentionIndex::upsert(self.store.as_ref(), row, runs)
+        }
+    }
+    let rig = Rig::new();
+    let old = rig.seed(1, 100, Some(200));
+    rig.service.rederive(&rig.key).unwrap();
+    let index = Arc::new(DeleteOnLiveLookup {
+        store: rig.store.clone(),
+        during: Mutex::new(None),
+    });
+    let checker = RetentionService::new(
+        rig.service.wal.clone(),
+        index.clone(),
+        rig.leases.clone(),
+        rig.store.clone(),
+        Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1)),
+    )
+    .unwrap();
+    // The checker has already resolved the live WAL and read the (still empty) tombstone
+    // directory when it consults the index; the whole deletion runs at that point.
+    *index.during.lock().unwrap() = Some(Box::new({
+        let deleter = rig.service.clone();
+        let key = rig.key.clone();
+        let old = old.clone();
+        move || {
+            let _lease = deleter.lease(&key).unwrap();
+            assert_eq!(deleter.delete_expired(&key, 1200).unwrap(), Some(old));
+        }
+    }));
+    let verdict = checker.expired(&rig.key, None).unwrap();
+    assert!(
+        index.during.lock().unwrap().is_none(),
+        "the deletion ran inside the expiry check"
+    );
+    assert!(!rig.service.wal.ephemeral_wal_path(&rig.key).exists());
+    let stone = rig
+        .service
+        .tombstones(&rig.key)
+        .unwrap()
+        .into_iter()
+        .find(|stone| stone.lineage_id == old)
+        .unwrap();
+    assert!(stone.completed_at_ms.is_some());
+    assert_eq!(verdict, Some(stone.expired_at_ms));
+}
+
 struct QuotaRefusalExecutor {
     config: broca_wal::RunConfig,
     observed: tokio::sync::mpsc::Sender<broca_core::keep_warm_wait::WarmTick>,
@@ -2467,6 +3153,7 @@ fn seed_owed_question_with_scope_at(
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -3631,6 +4318,7 @@ async fn assert_tight_crash_recovery(open_batch: bool) {
         wal.append(
             1,
             &WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -4235,6 +4923,7 @@ async fn missing_materialized_history_is_not_known_empty_ownership() {
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -4298,6 +4987,7 @@ async fn zero_record_wal_does_not_hide_materialized_ownership_history() {
         wal.append(
             1,
             &WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -4368,6 +5058,7 @@ async fn append_repairs_inferred_prior_terminal_before_refusing_new_admission_at
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -4514,6 +5205,7 @@ async fn cold_forever_status_uses_bounded_wal_without_opening_actor() {
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,

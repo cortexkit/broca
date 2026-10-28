@@ -89,6 +89,7 @@ pub(crate) fn fixed_request() -> CallOptions {
         account_ref: None,
         run_id: "run-golden-0001".into(),
         step_index: 2,
+        max_output_tokens: None,
     });
     opts
 }
@@ -156,6 +157,7 @@ fn repeated_tool_call_id_request() -> CallOptions {
         account_ref: None,
         run_id: "run-collision-0001".into(),
         step_index: 3,
+        max_output_tokens: None,
     });
     opts
 }
@@ -192,6 +194,7 @@ fn google_codeassist_session_envelope_matches_golden() {
         account_ref: None,
         run_id: "run-1".into(),
         step_index: 1,
+        max_output_tokens: None,
     });
     assert_eq!(
         String::from_utf8(GoogleCodeAssist.render(&frozen, &opts)).unwrap(),

@@ -1,0 +1,12 @@
+[
+  {
+    "name": "text",
+    "legacy": {"content":[{"type":"text","text":"Read text: 12:00\n"}],"isError":false,"structuredContent":{"id":"read-text","success":true,"content":"12:00\n","text":"Read text: 12:00\n","complete":true,"truncated":false}},
+    "v1": {"content":[{"type":"text","text":"Read text: 12:00\n"}],"isError":false,"structuredContent":{"id":"read-text","success":true,"content":"12:00\n","text":"Read text: 12:00\n","complete":true,"truncated":false}}
+  },
+  {
+    "name": "error",
+    "legacy": {"content":[{"type":"text","text":"File not found: missing.txt"}],"isError":true,"structuredContent":{"id":"read-error","success":false,"code":"NOT_FOUND","text":"File not found: missing.txt","complete":true,"truncated":false}},
+    "v1": {"content":[{"type":"text","text":"File not found: missing.txt"}],"isError":true,"errorCode":"not_found","structuredContent":{"id":"read-error","success":false,"code":"NOT_FOUND","text":"File not found: missing.txt","complete":true,"truncated":false}}
+  }
+]

@@ -184,6 +184,13 @@ impl ObservedWalStore {
 // test in tests/it/observed_wal_fidelity.rs compares these impls with FileWalStore's and
 // FileWal's, so a new production override cannot be missed here silently.
 impl WalStore for ObservedWalStore {
+    fn writer_marker_root(&self) -> Option<PathBuf> {
+        WalStore::writer_marker_root(&self.inner)
+    }
+    fn wal_config(&self) -> broca_wal::WalConfig {
+        WalStore::wal_config(&self.inner)
+    }
+
     fn uploads(&self) -> Option<broca_core::media_uploads::Uploads> {
         WalStore::uploads(&self.inner)
     }
@@ -231,6 +238,18 @@ impl WalStore for ObservedWalStore {
     ) -> Result<(Box<dyn Wal + Send>, Box<dyn broca_core::LeaseHandle>), WalError> {
         let (wal, lease) =
             WalStore::open_writer(&self.inner, session, retention, session_class, lease)?;
+        Ok((self.observe(wal), lease))
+    }
+
+    fn open_owned_writer(
+        &self,
+        session: &BindIdentity,
+        retention: Option<u64>,
+        session_class: Option<&str>,
+        lease: Box<dyn broca_core::LeaseHandle>,
+    ) -> Result<(Box<dyn Wal + Send>, Box<dyn broca_core::LeaseHandle>), WalError> {
+        let (wal, lease) =
+            WalStore::open_owned_writer(&self.inner, session, retention, session_class, lease)?;
         Ok((self.observe(wal), lease))
     }
 
@@ -290,6 +309,13 @@ impl WalStore for ObservedWalStore {
 
     fn read_records(&self, session: &BindIdentity) -> Result<Vec<FramedRecord>, WalError> {
         WalStore::read_records(&self.inner, session)
+    }
+
+    fn read_records_with_lineage(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<(Vec<FramedRecord>, Option<WalLineageId>), WalError> {
+        WalStore::read_records_with_lineage(&self.inner, session)
     }
 
     fn read_records_range(
@@ -371,6 +397,15 @@ struct ObservedWal {
 // Like the store above, every method FileWal overrides is forwarded, so the writer sees the
 // same byte budget and takes the same pre-encoded append path as in production.
 impl Wal for ObservedWal {
+    fn log_path(&self) -> Option<&std::path::Path> {
+        self.inner.log_path()
+    }
+    fn writer_close_reserve(&self) -> u64 {
+        self.inner.writer_close_reserve()
+    }
+    fn writer_id(&self) -> Option<[u8; 16]> {
+        self.inner.writer_id()
+    }
     fn append(&mut self, fence: u64, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
         let seq = self.inner.append(fence, record, sync)?;
         if sync {
@@ -391,6 +426,27 @@ impl Wal for ObservedWal {
             self.synced.lock().unwrap().insert(seq);
         }
         Ok(seq)
+    }
+
+    fn append_v4(
+        &mut self,
+        fence: u64,
+        record: &WalRecord,
+        sync: bool,
+        prepared: broca_wal::PreparedV4Frame,
+        appended_ms: u64,
+    ) -> Result<u64, WalError> {
+        let seq = self
+            .inner
+            .append_v4(fence, record, sync, prepared, appended_ms)?;
+        if sync {
+            self.synced.lock().unwrap().insert(seq);
+        }
+        Ok(seq)
+    }
+
+    fn wal_config(&self) -> broca_wal::WalConfig {
+        self.inner.wal_config()
     }
 
     fn append_budget(&self) -> Option<(u64, u64, u64)> {

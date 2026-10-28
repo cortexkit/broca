@@ -1,8 +1,8 @@
 // Adapted from OpenAI Codex, revision a6baf8867cb4c9726213c0884a5c8b11f0cfd8bf (Apache-2.0).
 // Copyright 2025 OpenAI. See THIRD-PARTY-NOTICES.md and LICENSES/Apache-2.0.txt.
-// broca integrates run-local sockets with its shared Responses normalizer and HTTPS fallback.
+// broca integrates session-owned sockets with its shared Responses normalizer and HTTPS fallback.
 
-//! Run-local Responses sockets. The pump answers pings even between model steps; it never
+//! Responses sockets. The pump answers pings even between model steps and runs; it never
 //! decodes model output. Text records go through the same Responses normalizer as HTTPS.
 
 use super::*;
@@ -17,6 +17,11 @@ use tungstenite::{
     extensions::{compression::deflate::DeflateConfig, ExtensionsConfig},
     Message,
 };
+
+#[path = "transport_websocket_pool.rs"]
+mod pool;
+pub use pool::Connections;
+pub(super) use pool::Lease;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 // Codex's default stream budget is five retries after the initial request. Retain its
@@ -338,6 +343,26 @@ impl Default for Session {
 }
 
 impl Session {
+    fn retire_socket(&self) {
+        if let Some(socket) = self.state.lock().unwrap().socket.take() {
+            socket.shutdown.cancel();
+        }
+    }
+
+    fn take_completed_socket(&self) -> Option<Arc<Socket>> {
+        let mut state = self.state.lock().unwrap();
+        let socket = state.socket.take()?;
+        if state.force_https
+            || socket.closed.load(Ordering::Acquire)
+            || socket.shutdown.is_cancelled()
+            || socket.continuation.lock().unwrap().is_none()
+        {
+            socket.shutdown.cancel();
+            return None;
+        }
+        Some(socket)
+    }
+
     pub(super) fn set_policy(&self, policy: HttpsPolicy) {
         *self.policy.write().unwrap() = policy;
     }
@@ -443,9 +468,7 @@ impl Session {
             if let Some(socket) = &state.socket {
                 let age = now.saturating_duration_since(socket.established_at);
                 if !socket.closed.load(Ordering::Acquire)
-                    && socket.headers == request.headers
-                    && (!request.codex_wire || socket.auth_revision == request.auth_revision)
-                    && (!request.codex_wire || socket.url == request.url)
+                    && connection_identity_matches(socket, request)
                     && age < MAX_SOCKET_AGE
                 {
                     return Ok((Arc::clone(socket), true));
@@ -454,10 +477,7 @@ impl Session {
                     tracing::info!(target: "provider", transport = "websocket", socket_generation = socket.generation, socket_age_ms = age.as_millis() as u64, "Retiring Responses websocket before its connection lifetime limit");
                 }
                 socket.shutdown.cancel();
-                let auth_changed = socket.headers != request.headers
-                    || (request.codex_wire
-                        && (socket.auth_revision != request.auth_revision
-                            || socket.url != request.url));
+                let auth_changed = !connection_identity_matches(socket, request);
                 state.socket = None;
                 if auth_changed {
                     state.turn_state = None;
@@ -554,6 +574,8 @@ struct SendCommand {
 
 struct Socket {
     auth_revision: u64,
+    credential_id: Option<String>,
+    account_ref: Option<String>,
     url: String,
     continuation: Mutex<Option<crate::chatgpt_continuation::CompletedResponse>>,
     send: mpsc::Sender<SendCommand>,
@@ -567,6 +589,50 @@ struct Socket {
     established_at: Instant,
     last_completed_at: Mutex<Option<Instant>>,
     attempt_active: tokio::sync::watch::Sender<bool>,
+}
+
+impl Drop for Socket {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
+fn connection_identity_matches(socket: &Socket, request: &PreparedHttpRequest) -> bool {
+    if request.codex_wire
+        && (socket.auth_revision != request.auth_revision
+            || socket.url != request.url
+            || socket.credential_id != request.credential_id
+            || socket.account_ref != request.account_ref)
+    {
+        return false;
+    }
+    // Turn id/time also travel in every response.create. Stable identity inside the
+    // metadata header, and every other header, still fence the authenticated connection.
+    socket.headers.len() == request.headers.len()
+        && socket.headers.iter().zip(&request.headers).all(
+            |((saved_name, saved), (name, current))| {
+                saved_name == name
+                    && if request.codex_wire && name.eq_ignore_ascii_case("x-codex-turn-metadata") {
+                        stable_turn_metadata_matches(saved, current)
+                    } else {
+                        saved == current
+                    }
+            },
+        )
+}
+
+fn stable_turn_metadata_matches(saved: &str, current: &str) -> bool {
+    let stable = |text: &str| {
+        let mut value: Value = serde_json::from_str(text).ok()?;
+        let object = value.as_object_mut()?;
+        object.remove("turn_id");
+        object.remove("turn_started_at_unix_ms");
+        Some(value)
+    };
+    match (stable(saved), stable(current)) {
+        (Some(saved), Some(current)) => saved == current,
+        _ => saved == current,
+    }
 }
 
 struct AttemptActivity(tokio::sync::watch::Sender<bool>);
@@ -665,6 +731,8 @@ async fn connect(
     let (attempt_active, activity) = tokio::sync::watch::channel(false);
     let socket = Arc::new(Socket {
         auth_revision: request.auth_revision,
+        credential_id: request.credential_id.clone(),
+        account_ref: request.account_ref.clone(),
         url: request.url.clone(),
         continuation: Mutex::new(None),
         send,
@@ -837,6 +905,12 @@ pub(super) async fn drive(
     result.map_err(|mut failure| {
         if trace.transport.as_deref() != Some("websocket") {
             return failure;
+        }
+        if trace.socket_reused == Some(true)
+            && session.state.lock().unwrap().socket.as_ref()
+                .is_some_and(|socket| socket.closed.load(Ordering::Acquire))
+        {
+            tracing::info!(target: "provider", reason = "peer_closed_after_checkout", "Reused Responses websocket closed; leaving recovery to the accounted attempt loop");
         }
         // An upgrade refused for authentication is not a socket failure: the shared 401 path
         // re-reads the credential and tries the socket again, so it must not count toward the
@@ -1085,6 +1159,12 @@ async fn drive_socket(
         if let Ok(raw) = &record {
             if let Ok(value) = serde_json::from_slice(raw) {
                 session.observe_turn_state(&value);
+                if value["type"] == "error"
+                    && value.pointer("/error/code").and_then(Value::as_str)
+                        == Some("websocket_connection_limit_reached")
+                {
+                    client.chatgpt_connections.retire_idle_credential(request);
+                }
                 if value["type"] == "response.completed" {
                     *completed_id.lock().unwrap() =
                         value["response"]["id"].as_str().map(str::to_owned);
@@ -1829,6 +1909,8 @@ mod pump_tests {
         let (attempt_active, activity) = tokio::sync::watch::channel(false);
         let socket = Arc::new(Socket {
             auth_revision: 0,
+            credential_id: None,
+            account_ref: None,
             url: String::new(),
             continuation: Mutex::new(None),
             send,
@@ -2041,6 +2123,8 @@ async fn codex_failed_send_retires_socket_and_consumes_receipt() {
     let (attempt_active, _) = tokio::sync::watch::channel(false);
     let socket = Arc::new(Socket {
         auth_revision: 0,
+        credential_id: None,
+        account_ref: None,
         url: request.url.clone(),
         continuation: Mutex::new(Some(crate::chatgpt_continuation::CompletedResponse {
             request: logical,
@@ -2105,6 +2189,8 @@ async fn codex_completed_write_is_counted_when_cancelled_before_acknowledgement(
     let (attempt_active, _) = tokio::sync::watch::channel(false);
     let socket = Arc::new(Socket {
         auth_revision: 0,
+        credential_id: None,
+        account_ref: None,
         url: request.url.clone(),
         continuation: Mutex::new(Some(crate::chatgpt_continuation::CompletedResponse {
             request: logical,

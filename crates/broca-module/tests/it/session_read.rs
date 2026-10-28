@@ -492,6 +492,8 @@ fn tool_step() -> Vec<NormalizedEvent> {
             finish_reason: FinishReason::ToolCalls,
             service_tier_used: None,
             speed_used: None,
+            served_model: None,
+            usage_iterations: None,
         }),
         ctrl(ProviderControl::Finished {
             usage: usage(),
@@ -515,6 +517,8 @@ fn text_step(text: &str) -> Vec<NormalizedEvent> {
             finish_reason: FinishReason::Stop,
             service_tier_used: None,
             speed_used: None,
+            served_model: None,
+            usage_iterations: None,
         }),
         ctrl(ProviderControl::Finished {
             usage: usage(),
@@ -1725,6 +1729,7 @@ fn assistant_text(step: u64, text: &str) -> WalRecord {
 
 fn assistant_text_with_usage(step: u64, text: &str, step_usage: Usage) -> WalRecord {
     WalRecord::ModelStepFinished {
+        fallback: Default::default(),
         written_at_ms: None,
         tags: None,
         hooks: None,
@@ -1753,6 +1758,7 @@ fn read_request(
         from_ordinal,
         limit,
         include_tools: false,
+        include_rich_ui: false,
         after_mid: None,
         lineage_id: None,
         max_bytes: None,
@@ -2794,6 +2800,7 @@ fn dispatch_module_episode(key: &BindIdentity, run: &str, call: &str) -> Vec<Wal
     vec![
         started(key, run, &format!("{run} question")),
         WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -2962,6 +2969,7 @@ async fn read_falls_back_when_budget_config_is_only_in_materialized_prefix() {
             submission_id: None,
         },
         WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -3272,6 +3280,7 @@ async fn read_lineage_state_paused_and_active_with_open_dispatch() {
         &[
             started(&active, "run-active", "open"),
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -3404,6 +3413,7 @@ async fn read_falls_back_for_a_budget_firing_in_a_later_unprojected_episode() {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,

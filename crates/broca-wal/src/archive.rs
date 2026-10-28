@@ -5,11 +5,10 @@
 //! Removing the seal as well makes the file indistinguishable from a crashed fold, so it
 //! must remain unreadable. This module never repairs or publishes such a file.
 
-use broca_owner_only::OpenOptions;
+use crate::fs_ops::{File, OpenOptions};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
-    fs::File,
     io::{self, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
@@ -169,6 +168,7 @@ pub enum ContainerState {
 /// name, so the name must be the canonical `fold-<stamp>.ark`.
 pub struct ArchiveWriter {
     file: File,
+    path: PathBuf,
     stamp: u64,
     entries: Vec<MemberInfo>,
     failed: bool,
@@ -203,6 +203,7 @@ impl ArchiveWriter {
         options.write(true).create_new(true);
         Ok(Self {
             file: options.open(path)?,
+            path: path.to_owned(),
             stamp,
             entries: Vec::new(),
             failed: false,
@@ -333,7 +334,9 @@ impl ArchiveWriter {
         index.extend_from_slice(&index_len.to_le_bytes());
         index.extend_from_slice(&MAGIC.to_le_bytes());
         self.file.write_all(&index)?;
-        self.file.sync_all()
+        self.file.sync_all()?;
+        invalidate_member_index(self.path.parent().unwrap_or_else(|| Path::new("")));
+        Ok(())
     }
 }
 
@@ -415,6 +418,8 @@ impl ArchiveReader<File> {
     /// Any other name leaves a v2 index unverifiable, so it is read exactly as a v1 index is.
     pub fn open(path: impl AsRef<Path>, max_member_bytes: u64) -> io::Result<Self> {
         let path = path.as_ref();
+        #[cfg(any(test, feature = "test-io-trace"))]
+        expiry_io::opened();
         Ok(Self {
             source: BufReader::with_capacity(64 * 1024, File::open(path)?),
             max_member_bytes,
@@ -768,6 +773,8 @@ impl<R: Read + Seek> ArchiveReader<R> {
     }
 
     fn payload(&mut self, info: MemberInfo) -> io::Result<ArchiveMember> {
+        #[cfg(any(test, feature = "test-io-trace"))]
+        expiry_io::loaded();
         if info.payload_len > self.max_member_bytes {
             return Err(invalid("archive member exceeds per-member read limit"));
         }
@@ -839,6 +846,18 @@ pub fn read_newest_member(
     session_addr: &str,
     max_member_bytes: u64,
 ) -> io::Result<Option<ArchiveMember>> {
+    #[cfg(unix)]
+    if let Some(answer) = member_index::lookup(paths, session_addr, max_member_bytes)? {
+        return Ok(answer);
+    }
+    scan_newest_member(paths, session_addr, max_member_bytes)
+}
+
+fn scan_newest_member(
+    paths: &[PathBuf],
+    session_addr: &str,
+    max_member_bytes: u64,
+) -> io::Result<Option<ArchiveMember>> {
     let addr = address(session_addr)?;
     let mut ordered = paths
         .iter()
@@ -897,6 +916,49 @@ pub fn read_newest_member(
     Ok(None)
 }
 
+/// Warm the per-container fallback cache without replacing a directory-wide index with
+/// a single-container snapshot. The caller may warm independent containers concurrently.
+pub fn prewarm_container_membership(path: &Path, max_member_bytes: u64) -> io::Result<()> {
+    scan_newest_member(
+        std::slice::from_ref(&path.to_owned()),
+        "0000000000000000",
+        max_member_bytes,
+    )?;
+    Ok(())
+}
+
+/// Discard cached locations in an archive directory after a fold, removal or restore.
+/// External changes are also detected by comparing file identities on every lookup.
+pub fn invalidate_member_index(directory: &Path) {
+    #[cfg(unix)]
+    member_index::invalidate(directory);
+    #[cfg(not(unix))]
+    let _ = directory;
+}
+
+/// Mark a restored address uncertain without discarding other unchanged locations.
+/// Archive reads of this address use the scan until the directory index is rebuilt;
+/// ordinary store reads prefer the restored live log before consulting the archive.
+pub fn invalidate_restored_member(directory: &Path, session_addr: &str) {
+    #[cfg(unix)]
+    member_index::restored(directory, session_addr);
+    #[cfg(not(unix))]
+    let _ = (directory, session_addr);
+}
+
+#[cfg(unix)]
+mod member_index;
+
+/// Diagnostic (container count, address count, estimated allocation bytes) for a directory.
+#[cfg(all(
+    unix,
+    any(test, feature = "test-io-trace", feature = "test-known-feature")
+))]
+#[doc(hidden)]
+pub fn cached_member_index_stats(directory: &Path) -> Option<(usize, usize, usize)> {
+    member_index::stats(directory)
+}
+
 /// How the process-wide membership cache answered for one container, for tests and
 /// diagnostics in other crates. Not an API for deciding anything: lookups never need it.
 #[cfg(unix)]
@@ -927,6 +989,44 @@ pub fn cached_membership(path: &Path) -> Option<CachedMembership> {
 
 #[cfg(unix)]
 mod membership;
+
+/// Thread-local archive I/O accounting for synchronous expiry regression tests.
+#[cfg(any(test, feature = "test-io-trace"))]
+#[doc(hidden)]
+pub mod expiry_io {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNTS: Cell<(u64, u64, u64)> = const { Cell::new((0, 0, 0)) };
+    }
+
+    pub(super) fn opened() {
+        COUNTS.with(|counts| {
+            let (opens, loads, decodes) = counts.get();
+            counts.set((opens + 1, loads, decodes));
+        });
+    }
+
+    pub(super) fn loaded() {
+        COUNTS.with(|counts| {
+            let (opens, loads, decodes) = counts.get();
+            counts.set((opens, loads + 1, decodes));
+        });
+    }
+
+    pub(crate) fn decoded() {
+        COUNTS.with(|counts| {
+            let (opens, loads, decodes) = counts.get();
+            counts.set((opens, loads, decodes + 1));
+        });
+    }
+
+    /// Returns (archive open attempts, payload-load attempts, WAL-decode attempts).
+    /// Each count advances before the operation on the calling thread.
+    pub fn counts() -> (u64, u64, u64) {
+        COUNTS.with(Cell::get)
+    }
+}
 
 #[cfg(test)]
 mod tests;

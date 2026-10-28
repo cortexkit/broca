@@ -43,8 +43,14 @@
 //! ordinary test run.
 
 pub mod invariants;
+pub mod power_loss;
+
+#[cfg(all(test, unix))]
+mod proof_tests;
 pub mod scenario;
 pub mod wal;
+#[cfg(all(test, unix))]
+mod writer_id_tests;
 
 #[cfg(test)]
 mod compaction;

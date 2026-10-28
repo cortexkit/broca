@@ -289,7 +289,7 @@ fn tool_results(events: &[OutputEvent]) -> Vec<(bool, String)> {
                 result.is_error,
                 match &result.output {
                     ToolOutput::Text { text } => text.clone(),
-                    ToolOutput::Error { message } => message.clone(),
+                    ToolOutput::Error { message, .. } => message.clone(),
                     _ => String::new(),
                 },
             )),

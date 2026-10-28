@@ -411,6 +411,11 @@ impl FetchError {
 /// them.
 #[async_trait]
 pub trait Fetcher: Send + Sync {
+    /// A declaration from the provider's daemon catalog entry, never guessed from
+    /// a version or learned by forwarding a request an older provider cannot read.
+    async fn system_text_default_supported(&self, _provider: &str) -> Result<bool, FetchError> {
+        Ok(false)
+    }
     /// One `tool.catalog` call to `provider`.
     async fn catalog(&self, provider: &str, request: &CatalogRequest) -> Result<Value, FetchError>;
     /// One `transform.declare` call to `provider`.
@@ -472,10 +477,7 @@ pub fn catalog_request(
     let mut request = tool_catalog_request(tool_item).with_composition(plan.composition.clone());
     if let Some(item) = text_item {
         request = request.with_system_text(SystemTextItem {
-            preset: item
-                .preset
-                .clone()
-                .expect("system-text presets are checked before fetching"),
+            preset: item.preset.clone(),
             params: item.params.clone(),
         });
     }
@@ -862,9 +864,8 @@ fn freeze_reply(reply: &cortexkit_role_tool_provider::catalog::Reply) -> broca_w
     }
 }
 
-/// The provider declarations a fetched answer carries, frozen so a later step reads a reply by
-/// what the provider declared at admission. `None` when it declared nothing, which keeps the
-/// manifest bytes of every provider that never opted in or never serves late results.
+/// Freeze catalog identities and reply declarations at admission so dispatch and
+/// display never depend on a provider's later catalog.
 fn frozen_provider_declarations(
     answer: &cortexkit_role_tool_provider::catalog::CatalogAnswer,
 ) -> Option<FrozenProviderDeclarations> {
@@ -881,6 +882,21 @@ fn frozen_provider_declarations(
         })
         .collect();
     let declarations = FrozenProviderDeclarations {
+        schema_pins: (!answer.tools.is_empty()).then(|| {
+            answer
+                .tools
+                .iter()
+                .map(|tool| {
+                    (
+                        tool.name.clone(),
+                        broca_wal::DispatchSchemaPin {
+                            schema_digest: tool.schema_digest.clone(),
+                            semantics: tool.semantics,
+                        },
+                    )
+                })
+                .collect()
+        }),
         result_formats: (!result_formats.is_empty()).then_some(result_formats),
         late_results: answer
             .declares(cortexkit_role_tool_provider::catalog::session_capabilities::LATE_RESULTS)
@@ -1104,6 +1120,29 @@ pub async fn admit(
 ) -> Result<Admitted, Refusal> {
     let started = Instant::now();
     let deadline = started + deadline;
+    for item in plan
+        .system_text_items
+        .iter()
+        .filter(|item| item.preset.is_none())
+    {
+        let supported = within_deadline(deadline, || {
+            fetcher.system_text_default_supported(&item.provider)
+        })
+        .await
+        .map_err(|error| {
+            let missed = FetchMiss::from_error(error);
+            Refusal::FetchUnavailable {
+                provider: item.provider.clone(),
+                unanswered: missed.unanswered.clone(),
+                provider_detail: missed.provider_detail("catalog.list"),
+            }
+        })?;
+        if !supported {
+            return Err(Refusal::SystemTextPresetRequired {
+                provider: item.provider.clone(),
+            });
+        }
+    }
     let mut catalog_fetches: Vec<CatalogFetch<'_>> = Vec::new();
     for item in plan.tool_items.iter().chain(&plan.system_text_items) {
         if catalog_fetches.iter().all(|f| f.provider != item.provider) {
@@ -1291,6 +1330,7 @@ pub async fn admit(
                         outcomes.insert(provider, Ok(text));
                     } else if let Some(Ok(fetched)) = outcomes.get_mut(provider) {
                         fetched.text = text.text;
+                        fetched.answer.system_text = text.answer.system_text;
                     }
                 }
                 Err(missed) => {
@@ -1440,7 +1480,7 @@ pub async fn admit(
             Err(ItemRefusal::InvalidParams(detail)) => {
                 return Err(Refusal::InvalidParams {
                     detail: serde_json::to_value(detail).expect("JSON"),
-                })
+                });
             }
         }
     }
@@ -1488,6 +1528,28 @@ pub async fn admit(
         })
         .collect();
     let system_text = join_system_texts(texts);
+    let stamps: Vec<_> = plan
+        .system_text_items
+        .iter()
+        .filter_map(|item| {
+            let fetched = outcomes.get(item.provider.as_str())?.as_ref().ok()?;
+            let stamp = fetched.answer.system_text.as_ref()?.rich_ui.as_ref()?;
+            let stamp = broca_protocol::RichUiStamp::new(stamp.dialect(), stamp.catalog_digest())
+                .expect("the provider stamp was validated when decoding its answer");
+            Some((item.provider.as_str(), stamp))
+        })
+        .collect();
+    let rich_ui = cortexkit_role_llm_runner::rich_ui::plan_stamp(
+        stamps
+            .iter()
+            .map(|(provider, stamp)| (*provider, Some(stamp))),
+    )
+    .map_err(|conflict| Refusal::PlanStale {
+        differences: conflict.detail()["differences"]
+            .as_array()
+            .expect("conflict differences")
+            .clone(),
+    })?;
     let fetches = outcomes
         .iter()
         .map(|(provider, outcome)| ProviderFetch {
@@ -1554,6 +1616,7 @@ pub async fn admit(
     }
     Ok(Admitted {
         manifest: PlanManifest {
+            rich_ui,
             declarations: frozen_declarations,
             plan: OpaqueJson::from_json_text(plan.text.clone())
                 .expect("a plan serialized from a JSON value is JSON"),
@@ -1608,7 +1671,7 @@ fn check_default_item(
             Err(problem) => {
                 return Err(ItemRefusal::InvalidParams(InvalidSubscriptionDetail::new(
                     item, index, problem,
-                )))
+                )));
             }
         }
     }
@@ -1908,6 +1971,202 @@ mod tests {
             "tools": [],
             "system_text": system_text
         })
+    }
+
+    struct StampedFetcher(BTreeMap<String, Value>);
+
+    #[async_trait]
+    impl Fetcher for StampedFetcher {
+        async fn catalog(&self, provider: &str, _: &CatalogRequest) -> Result<Value, FetchError> {
+            Ok(self.0[provider].clone())
+        }
+        async fn declare(&self, _: &str, _: &DeclareRequest) -> Result<Value, FetchError> {
+            unreachable!("no transforms")
+        }
+        async fn describe_compaction(&self, _: &str) -> Result<DescribeAnswer, FetchError> {
+            unreachable!("no compaction")
+        }
+    }
+
+    #[tokio::test]
+    async fn rich_ui_stamp_freezes_only_the_teaching_answer_and_refuses_conflicts_in_plan_order() {
+        let mut value: Value = serde_json::from_str(&plan_for("z-teacher").text).unwrap();
+        value["system_text_items"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "provider":"a-teacher", "preset":"persona", "params":{}
+            }));
+        value["composition"]["providers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "provider":"a-teacher", "tools":[]
+            }));
+        value["composition"]["providers"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+        value["composition_digest"] = json!(
+            cortexkit_role_tool_provider::catalog::composition_digest(&value["composition"])
+                .unwrap()
+        );
+        let stamp = json!({"dialect":"1.0", "catalog_digest":"a".repeat(64)});
+        let other = json!({"dialect":"2.0", "catalog_digest":"b".repeat(64)});
+        value["rich_ui"] = other.clone();
+        let plan = parse_plan(&value, crate::plan::CompactionSupport::Unsupported).unwrap();
+        let text_digest = cortexkit_role_tool_provider::catalog::system_text_digest("teach");
+        let mut answer = catalog_answer(&plan, Some("teach"), &text_digest);
+        answer["system_text"]["rich_ui"] = stamp.clone();
+        let mut fetcher = StampedFetcher(BTreeMap::from([
+            ("z-teacher".into(), answer.clone()),
+            ("a-teacher".into(), answer),
+        ]));
+        let admitted = admit(
+            &plan,
+            &fetcher,
+            &broca_protocol::BindIdentity::new("/synthetic/stamps", "runner", "stamped"),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(admitted.manifest.rich_ui).unwrap(),
+            stamp
+        );
+        fetcher.0.get_mut("a-teacher").unwrap()["system_text"]["rich_ui"] = other.clone();
+        let refusal = admit(
+            &plan,
+            &fetcher,
+            &broca_protocol::BindIdentity::new("/synthetic/stamps", "runner", "conflict"),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refusal.code(), "plan_stale");
+        assert_eq!(
+            refusal.detail(),
+            json!({"differences":[
+                {"kind":"rich_ui", "provider":"z-teacher", "rich_ui":stamp},
+                {"kind":"rich_ui", "provider":"a-teacher", "rich_ui":other}
+            ]})
+        );
+        for answer in fetcher.0.values_mut() {
+            answer["system_text"]
+                .as_object_mut()
+                .unwrap()
+                .remove("rich_ui");
+        }
+        let unstamped = admit(
+            &plan,
+            &fetcher,
+            &broca_protocol::BindIdentity::new("/synthetic/stamps", "runner", "unstamped"),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(unstamped.manifest.rich_ui.is_none());
+        assert!(serde_json::to_value(unstamped.manifest)
+            .unwrap()
+            .get("rich_ui")
+            .is_none());
+    }
+
+    #[test]
+    fn catalog_schema_pin_is_frozen_instead_of_recomputed_from_a_later_catalog() {
+        let digest = "634bdb1fe768fce0974f9c89e6f15f889470a8288277c6433e4711ab6a5b9335";
+        let mut answer: cortexkit_role_tool_provider::catalog::CatalogAnswer = serde_json::from_value(json!({
+            "generation":"one", "catalog_digest":"one", "tools":[{
+                "name":"work", "input_schema":{"type":"object"}, "schema_digest":digest, "semantics":7, "capabilities":[]
+            }]
+        })).unwrap();
+        let frozen = frozen_provider_declarations(&answer).unwrap();
+        answer.tools[0].schema_digest = "0".repeat(64);
+        answer.tools[0].semantics = 99;
+        let round_trip: FrozenProviderDeclarations =
+            serde_json::from_slice(&serde_json::to_vec(&frozen).unwrap()).unwrap();
+        let pin = &round_trip.schema_pins.as_ref().unwrap()["work"];
+        assert_eq!(pin.schema_digest, digest);
+        assert_eq!(pin.semantics, 7);
+        assert_eq!(
+            cortexkit_role_tool_provider::call::SchemaPin::new(
+                "work",
+                &pin.schema_digest,
+                pin.semantics
+            )
+            .encode()
+            .unwrap(),
+            format!("tp1:work:{digest}:7")
+        );
+        assert!(FrozenProviderDeclarations::default().schema_pins.is_none());
+    }
+
+    struct DefaultTextFetcher {
+        supported: bool,
+        answer: Value,
+        requests: std::sync::Mutex<Vec<Value>>,
+    }
+
+    #[async_trait]
+    impl Fetcher for DefaultTextFetcher {
+        async fn system_text_default_supported(&self, _: &str) -> Result<bool, FetchError> {
+            Ok(self.supported)
+        }
+        async fn catalog(&self, _: &str, request: &CatalogRequest) -> Result<Value, FetchError> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(request).unwrap());
+            Ok(self.answer.clone())
+        }
+        async fn declare(&self, _: &str, _: &DeclareRequest) -> Result<Value, FetchError> {
+            unreachable!()
+        }
+        async fn describe_compaction(&self, _: &str) -> Result<DescribeAnswer, FetchError> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn presetless_system_text_is_catalog_gated_and_frozen() {
+        let composition =
+            json!({"providers":[{"provider":"persona","tools":[]}],"step_transform_items":[]});
+        let raw = json!({"tool_items":[],"system_text_items":[{"provider":"persona","params":{}}],"step_transform_items":[],
+            "composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(),"composition":composition});
+        let plan = crate::parse_plan(&raw, crate::CompactionSupport::Unsupported).unwrap();
+        let text = "frozen provider default";
+        let session =
+            broca_protocol::BindIdentity::new("/synthetic/default-text", "runner", "default-text");
+        for supported in [false, true] {
+            let mut fetcher = DefaultTextFetcher {
+                supported,
+                answer: catalog_answer(
+                    &plan,
+                    Some(text),
+                    &cortexkit_role_tool_provider::catalog::system_text_digest(text),
+                ),
+                requests: Default::default(),
+            };
+            let result = admit(&plan, &fetcher, &session, Duration::from_secs(1)).await;
+            if !supported {
+                let refusal = result.unwrap_err();
+                assert_eq!(refusal.code(), "system_text_preset_required");
+                assert_eq!(refusal.detail(), json!({"provider":"persona"}));
+                assert!(!refusal.retryable());
+                assert!(fetcher.requests.lock().unwrap().is_empty());
+            } else {
+                let admitted = result.unwrap();
+                let requests = fetcher.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                assert!(requests[0]["system_text"].get("preset").is_none());
+                assert_eq!(admitted.manifest.system_text, text);
+                fetcher.answer["system_text"]["text"] = json!("later catalog text");
+                let stored = serde_json::to_vec(&admitted.manifest).unwrap();
+                let restored: broca_wal::PlanManifest = serde_json::from_slice(&stored).unwrap();
+                assert_eq!(restored.system_text, text);
+                assert_eq!(requests.len(), 1);
+            }
+        }
     }
 
     async fn run_fetch(plan: &Plan, answer: Result<Value, FetchError>, session: &str) {

@@ -240,23 +240,10 @@ pub fn read_session_model_page(
     let lineage_id = snapshot.lineage_id.clone();
     if needs_full {
         let records = complete_read().map_err(ModelPageError::CompleteRead)?;
-        // Full replay owns the spans and raw native final values. Never derive guidance from
-        // page-local rows: a tail can start halfway through an episode's repeated calls.
-        let mut prior = crate::replay::replay(
-            records
-                .iter()
-                .map(|frame| frame.record.clone())
-                .collect::<Vec<_>>()
-                .as_slice(),
-        )?;
-        raw = std::mem::take(&mut prior.prompt);
-        for span in prior.episode_step_spans.unwrap_or_default() {
-            if span.end <= raw.len() {
-                crate::run::restore_repetition_guidance(&mut raw[span]);
-            }
-        }
+        let (full_raw, full_compaction) = full_replay_raw(&records)?;
+        raw = full_raw;
         if compaction.is_none() {
-            compaction = Some(prior.compaction);
+            compaction = Some(full_compaction);
         }
     } else {
         // Every displayed result is preceded by its episode's model-step history. Other
@@ -272,6 +259,236 @@ pub fn read_session_model_page(
         .and_then(CompactionCheckpoint::state)
         .and_then(|state| state.applied.as_ref());
     assemble(raw, applied, request, lineage_id, head)
+}
+
+/// Every message of the log, with each episode's repetition guidance restored, and the
+/// compaction state the whole log folds to.
+///
+/// Full replay supplies the episode spans used to restore repetition guidance. Never derive
+/// guidance from page-local rows: a tail can start halfway through an episode's repeated calls.
+fn full_replay_raw(
+    records: &[FramedRecord],
+) -> Result<(Vec<Message>, CompactionCheckpoint), crate::ReplayError> {
+    let mut prior = crate::replay::replay(
+        records
+            .iter()
+            .map(|frame| frame.record.clone())
+            .collect::<Vec<_>>()
+            .as_slice(),
+    )?;
+    let mut raw = std::mem::take(&mut prior.prompt);
+    for span in prior.episode_step_spans.unwrap_or_default() {
+        if span.end <= raw.len() {
+            crate::run::restore_repetition_guidance(&mut raw[span]);
+        }
+    }
+    Ok((raw, prior.compaction))
+}
+
+/// The model page a replay of the whole log renders.
+#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
+fn full_replay_model_page(
+    records: &[FramedRecord],
+    request: &ModelPageRequest,
+    lineage_id: Option<String>,
+    head: Option<crate::Cursor>,
+) -> Result<ModelPage, ModelPageError> {
+    let (raw, compaction) = full_replay_raw(records)?;
+    let applied = compaction.state().and_then(|state| state.applied.as_ref());
+    assemble(raw, applied, request, lineage_id, head)
+}
+
+/// What a model page read by episode takes from the offset index.
+///
+/// Every field comes from one index snapshot taken after the index caught up with the log: a
+/// compaction Setup in an unindexed tail renumbers tags that the rows below would still show
+/// with their old numbers.
+#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
+pub(crate) struct EpisodePageIndex<'a> {
+    /// Every `episode` row of the session, in episode order.
+    pub episodes: &'a [crate::projection::IndexedEpisode],
+    /// The transcript length (`head_ord`).
+    pub head_ord: u64,
+    /// The frames at the index's compaction offsets, in WAL order: the Setup and every later
+    /// compaction record. Only these decide the applied compaction a page renders, so the
+    /// page never replays the episodes they were written in.
+    pub compaction_frames: &'a [FramedRecord],
+    /// The `tag_base` of the message row at an ordinal, for messages numbered under the
+    /// computed tag rules. Rendered tag numbers come from these rows: a later Setup's tag
+    /// checkpoint renumbers every message from its cut, which may fall inside an earlier
+    /// episode whose replay never sees that Setup.
+    pub tag_base: &'a dyn Fn(u64) -> Option<u64>,
+    /// The session's last control cursor.
+    pub head: Option<crate::Cursor>,
+    pub lineage_id: Option<String>,
+}
+
+/// The frames a model page read by episode decodes for the episodes it shows.
+#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
+pub(crate) struct EpisodeFrames {
+    /// The committed projection boundary the replay seeds from (the last qualified one before
+    /// the first episode's `RunStarted`), or `None` when `frames` start at the log's first record.
+    pub seed: Option<crate::projection::EpisodeSeed>,
+    /// Every frame from that boundary, or the log's first record, through the end of the last
+    /// episode asked for.
+    pub frames: Vec<crate::replay::PositionedFrame>,
+}
+
+/// A model page and how it was served.
+#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
+#[derive(Debug)]
+pub(crate) struct EpisodeModelPage {
+    pub page: ModelPage,
+    /// Why the read replayed the whole log, or `None` when it was served by episode.
+    pub fallback: Option<&'static str>,
+}
+
+/// Read a model page by replaying only the episodes it shows.
+///
+/// The page window is fixed by the request, the transcript length and the applied compaction,
+/// exactly as [`read_session_model_page`] fixes it. `load` receives the range of `episodes` that
+/// window touches and returns their frames with the seed they start from; the replay is
+/// validated by [`crate::projection::replay_from_episode_start`]. Each shown episode is replayed
+/// from its `RunStarted`, because repetition guidance folds over the episode's whole model-step
+/// history even when the page starts partway into it (as it does when a later compaction hides
+/// the start of an earlier episode). Any failed check, an unreadable range, or a window the
+/// frames do not cover falls back to `complete_read` and a full replay, so the page is the same
+/// either way.
+#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
+pub(crate) fn read_session_model_page_by_episode(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    index: &EpisodePageIndex<'_>,
+    request: &ModelPageRequest,
+    load: impl FnOnce(std::ops::Range<usize>) -> Result<EpisodeFrames, String>,
+    complete_read: impl FnOnce() -> Result<Vec<FramedRecord>, String>,
+) -> Result<EpisodeModelPage, ModelPageError> {
+    if request.after_mid.is_some() {
+        return Err(ModelPageError::InvalidParams { field: "view" });
+    }
+    let mut compaction = CompactionCheckpoint::None;
+    for frame in index.compaction_frames {
+        compaction.fold(&frame.record);
+    }
+    let applied = compaction.state().and_then(|state| state.applied.as_ref());
+    match episode_page_messages(read_at, index, request, applied, load) {
+        Ok(raw) => Ok(EpisodeModelPage {
+            page: assemble(raw, applied, request, index.lineage_id.clone(), index.head)?,
+            fallback: None,
+        }),
+        Err(reason) => {
+            let records = complete_read().map_err(ModelPageError::CompleteRead)?;
+            Ok(EpisodeModelPage {
+                page: full_replay_model_page(
+                    &records,
+                    request,
+                    index.lineage_id.clone(),
+                    index.head,
+                )?,
+                fallback: Some(reason),
+            })
+        }
+    }
+}
+
+/// The messages of the page window, replayed from the episodes holding them.
+///
+/// The window is the one [`read_session_model_page`] proves sufficient: from the page's first
+/// visible ordinal through one message past a full page, so [`assemble`] can tell whether a
+/// next page exists. Messages hidden by the applied compaction never enter it.
+#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
+fn episode_page_messages(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    index: &EpisodePageIndex<'_>,
+    request: &ModelPageRequest,
+    applied: Option<&AppliedCompaction>,
+    load: impl FnOnce(std::ops::Range<usize>) -> Result<EpisodeFrames, String>,
+) -> Result<Vec<Message>, &'static str> {
+    let limit = request
+        .limit
+        .unwrap_or(SESSION_READ_DEFAULT_LIMIT)
+        .clamp(1, SESSION_READ_MAX_LIMIT);
+    let total_len = index.head_ord;
+    let hidden_through = applied.map_or(0, |applied| applied.range.to);
+    let needed = request
+        .from_ordinal
+        .unwrap_or_else(|| total_len.saturating_sub(limit))
+        .max(hidden_through);
+    let end = needed
+        .saturating_add(limit)
+        .saturating_add(1)
+        .min(total_len);
+    if needed >= end {
+        return Ok(Vec::new());
+    }
+    // The message at an ordinal belongs to the last episode whose input starts at or before it.
+    let first = index
+        .episodes
+        .iter()
+        .rposition(|episode| episode.first_ord <= needed)
+        .ok_or("no episode holds the page start")?;
+    let last = index
+        .episodes
+        .iter()
+        .rposition(|episode| episode.first_ord < end)
+        .filter(|last| *last >= first)
+        .ok_or("no episode holds the page end")?;
+    let EpisodeFrames { seed, frames } =
+        load(first..last + 1).map_err(|_| "episode frames unreadable")?;
+    let replayed = crate::projection::replay_from_episode_start(
+        read_at,
+        seed.as_ref(),
+        &index.episodes[first],
+        &frames,
+    )
+    .map_err(|fallback| fallback.reason)?;
+    let base = replayed.ordinal_base;
+    let mut raw = replayed.state.prompt;
+    if base.saturating_add(raw.len() as u64) < end {
+        return Err("page window not covered by the episodes read");
+    }
+    // Messages before the first shown episode came from the end of the episode before it,
+    // replayed only to reach the shown episode's start. Their guidance spans are partial and
+    // their messages are dropped below, so only the shown episodes' spans are restored.
+    let first_index = index.episodes[first]
+        .first_ord
+        .checked_sub(base)
+        .ok_or("episode starts before the seed boundary")? as usize;
+    for span in replayed.state.episode_step_spans.unwrap_or_default() {
+        if span.start >= first_index && span.end <= raw.len() {
+            crate::run::restore_repetition_guidance(&mut raw[span]);
+        }
+    }
+    let (from, to) = ((needed - base) as usize, (end - base) as usize);
+    let mut window: Vec<Message> = raw.drain(from..to).collect();
+    for (offset, message) in window.iter_mut().enumerate() {
+        let ordinal = needed + offset as u64;
+        message.ordinal = Some(ordinal);
+        renumber_from_row(message, (index.tag_base)(ordinal))?;
+    }
+    Ok(window)
+}
+
+/// Give a message numbered under the computed tag rules the numbers its index row holds.
+///
+/// Numbering a message is a pure function of its parts, its rules and the number it starts
+/// after, so renumbering from the row's base reproduces exactly what a replay of the whole log
+/// shows, including a renumbering by a Setup recorded after this message's episode. A message
+/// whose numbers the stored ledger assigned keeps them.
+#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
+fn renumber_from_row(message: &mut Message, tag_base: Option<u64>) -> Result<(), &'static str> {
+    let Some(computed) = message.part_tags().and_then(|tags| tags.computed) else {
+        return Ok(());
+    };
+    let mut high = tag_base.ok_or("message row has no tag base")?;
+    broca_protocol::tags::number_message(
+        message,
+        broca_protocol::tags::ComputedRules {
+            render: computed.render,
+            clean: computed.clean,
+        },
+        &mut high,
+    )
+    .map_err(|_| "tag numbering overflow")
 }
 
 fn assemble(
@@ -733,5 +950,657 @@ mod tests {
         );
         assert_eq!(under_cap.next_from_ordinal, Some(11));
         assert!(reply_bytes(&under_cap) < exact);
+    }
+}
+
+/// Model pages read by episode: each page equals a full replay's page at every cut of a corpus
+/// whose later compaction Setup hides the start of an earlier episode and renumbers its tags
+/// from a cut inside it, and decodes only the frames of the episodes the page shows.
+#[cfg(test)]
+mod episode_page_tests {
+    use std::cell::Cell;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use broca_protocol::{
+        caller::RunFinishReason,
+        content::{
+            AssistantMessage, ContentBlock, Message, Role, ToolCall, ToolOutput, ToolResult,
+        },
+        request::ModelHandle,
+        BatchId, BindIdentity, Delivery, MessageId, RunId, StepId, ToolCallId, Usage,
+    };
+    use broca_wal::{
+        CompactionMessageKind, ComputedTagRules, DispatchOutcome, FramedRecord, RunConfig,
+        RunOrigin, SetupTagCheckpoint, WalRecord,
+    };
+    use sha2::Digest;
+
+    use super::{
+        full_replay_model_page, read_session_model_page_by_episode, EpisodeFrames,
+        EpisodeModelPage, EpisodePageIndex, ModelPageRequest,
+    };
+    use crate::projection::{decode_positioned_frames, EpisodeSeed, IndexedEpisode};
+    use crate::projection_plan::{OffsetEpisode, OffsetSeed, OffsetSource};
+    use crate::replay::SeedBoundary;
+
+    fn user(text: &str) -> Message {
+        Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }])
+    }
+
+    /// A run under the computed tag rules, so every message carries numbers a later Setup's
+    /// tag checkpoint can renumber.
+    fn run_started(run_id: &str, input: Vec<Message>) -> WalRecord {
+        WalRecord::RunStarted {
+            written_at_ms: None,
+            tags: None,
+            session_class: None,
+            retention: None,
+            hooks: None,
+            title: None,
+            on_restart: None,
+            keep_warm: None,
+            marker_order_version: None,
+            manifest: None,
+            scope: None,
+            send_id: None,
+            request_identity_digest: None,
+            project_id: None,
+            principal: None,
+            ts_ms: None,
+            run_id: RunId(run_id.into()),
+            session: BindIdentity::new("/tmp/project", "runner", "session"),
+            config: Box::new(RunConfig {
+                turn_directives_v1: None,
+                render_tags: true,
+                computed_tags: Some(ComputedTagRules { checkpoint: 0 }),
+                model: ModelHandle::new("stub", "m"),
+                tools: vec![].into(),
+                tool_choice: Default::default(),
+                generation: Default::default(),
+                response_format: Default::default(),
+                provider_options: serde_json::Value::Null,
+                cache_tiers: serde_json::Value::Null,
+                context_epoch: 0,
+                renderer_version: 1,
+                frozen_render_config: serde_json::Value::Null,
+                auth_selection: None,
+                tools_were_omitted: false,
+                budget: None,
+                context_limit: None,
+                work_class: None,
+                variant: None,
+                service_tier: None,
+                stop_when: Vec::new(),
+                context_management: None,
+            }),
+            input: input.into(),
+            origin: RunOrigin::Fresh,
+            submission_id: None,
+        }
+    }
+
+    fn step_started(step: u64) -> WalRecord {
+        WalRecord::StepStarted {
+            step_id: StepId(step),
+        }
+    }
+
+    fn step(step: u64, content: Vec<ContentBlock>) -> WalRecord {
+        WalRecord::ModelStepFinished {
+            fallback: Default::default(),
+            written_at_ms: None,
+            tags: None,
+            hooks: None,
+            step_id: StepId(step),
+            assistant_message: Arc::new(AssistantMessage {
+                message_id: MessageId(format!("m{step}")),
+                content,
+            }),
+            usage: Usage::default(),
+            finish_reason: None,
+            retries_used: 0,
+            service_tier_used: None,
+            speed_used: None,
+        }
+    }
+
+    fn text(text: &str) -> ContentBlock {
+        ContentBlock::Text { text: text.into() }
+    }
+
+    fn call(id: &str, tool: &str, query: u64) -> ContentBlock {
+        ContentBlock::ToolCall(ToolCall {
+            tool_call_id: ToolCallId(id.into()),
+            tool_name: tool.into(),
+            input: serde_json::json!({ "q": query }),
+            thought_signature: None,
+        })
+    }
+
+    /// A committed tool turn after its model step: intents in plan order, results in
+    /// `arrival` order, each `(call id, is_error)`.
+    fn tool_turn(step: u64, batch: &str, arrival: &[(&str, bool)]) -> Vec<WalRecord> {
+        let batch_id = BatchId(batch.into());
+        let mut planned: Vec<&str> = arrival.iter().map(|(id, _)| *id).collect();
+        planned.sort_unstable();
+        let mut records = vec![WalRecord::ToolBatchStarted {
+            batch_id: batch_id.clone(),
+            step_id: StepId(step),
+            planned_calls: planned.iter().map(|id| ToolCallId((*id).into())).collect(),
+        }];
+        for id in &planned {
+            records.push(WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
+                hooks: None,
+                batch_id: batch_id.clone(),
+                tool_call_id: ToolCallId((*id).into()),
+                tool_name: None,
+                args: Arc::new(serde_json::json!({})),
+                module_id: None,
+                schema_pin: None,
+                approval_digest: None,
+                call_key: None,
+            });
+        }
+        for (id, is_error) in arrival {
+            records.push(WalRecord::ToolResult {
+                finished_at_ms: None,
+                tags: None,
+                hooks: None,
+                batch_id: batch_id.clone(),
+                result: Arc::new(ToolResult {
+                    tool_call_id: ToolCallId((*id).into()),
+                    output: ToolOutput::Text {
+                        text: if *is_error { "boom" } else { "ok" }.into(),
+                    },
+                    is_error: *is_error,
+                }),
+                outcome: DispatchOutcome::Completed,
+                reason: None,
+                withdraw_elicitation: None,
+                provider_held: None,
+            });
+        }
+        records.push(WalRecord::ToolBatchFinished { batch_id });
+        records.push(WalRecord::TurnFinished {
+            step_id: StepId(step),
+        });
+        records
+    }
+
+    fn run_finished() -> WalRecord {
+        WalRecord::RunFinished {
+            interrupt_reason: None,
+            ts_ms: None,
+            reason: RunFinishReason::Completed,
+            usage: Usage::default(),
+            error: None,
+            retries_used: 0,
+        }
+    }
+
+    /// The compaction Setup recorded in the third episode: it hides ordinals 0..2 behind a
+    /// replacement and renumbers tags from `m3`. Both cuts fall inside the first episode.
+    fn later_setup() -> WalRecord {
+        WalRecord::CompactionMessage {
+            provider: "test".into(),
+            kind: CompactionMessageKind::Setup,
+            compaction_id: "cmp-1".into(),
+            version: 1,
+            range: broca_wal::CompactionRange { from: 0, to: 2 },
+            replacement: Arc::new(vec![Message::new(Role::Assistant, vec![text("summary")])]),
+            sha256: "0".repeat(64),
+            request_id: None,
+            cursor: None,
+            call_when: None,
+            stability: None,
+            ceiling: None,
+            tag_checkpoint: Some(SetupTagCheckpoint {
+                tag_checkpoint: 50,
+                cut: "m3".into(),
+            }),
+            ride_wait_ms: None,
+        }
+    }
+
+    /// Four episodes. The first repeats a failing call across two tool turns (results of the
+    /// first turn arriving in reverse plan order), so its second turn's result carries
+    /// repetition guidance that only a fold from the episode's first step reproduces; it ends
+    /// with a text step and a steer placed at its close. The second is a non-attributable
+    /// import. The third records the Setup that hides the first episode's start and renumbers
+    /// its tags from inside it. The fourth follows the Setup.
+    fn corpus() -> Vec<WalRecord> {
+        let mut records = vec![
+            run_started("r1", vec![user("task")]),
+            step_started(1),
+            step(1, vec![call("a", "probe", 1), call("b", "other", 2)]),
+        ];
+        records.extend(tool_turn(1, "r1-b1", &[("b", false), ("a", true)]));
+        records.push(step_started(2));
+        records.push(step(2, vec![call("c", "probe", 1)]));
+        records.extend(tool_turn(2, "r1-b2", &[("c", true)]));
+        records.push(step_started(3));
+        records.push(step(3, vec![text("done")]));
+        records.push(WalRecord::Steered {
+            written_at_ms: None,
+            tags: None,
+            retention: None,
+            ts_ms: None,
+            title: None,
+            send_id: Some("steer-late".into()),
+            request_identity_digest: None,
+            delivery: Some(Delivery::Steer),
+            input: Arc::new(vec![user("late")]),
+            hooks: None,
+        });
+        records.push(run_finished());
+        let mut import = run_started("seed", vec![user("imported")]);
+        if let WalRecord::RunStarted { origin, .. } = &mut import {
+            *origin = RunOrigin::SeededFrom {
+                origin_kind: broca_wal::SeedOriginKind::Import,
+                source_ref: "fixture:import".into(),
+                origin_device_pseudonym: None,
+                base_seq: None,
+            };
+        }
+        records.push(import);
+        records.push(run_finished());
+        records.extend([
+            run_started("r3", vec![user("next")]),
+            step_started(1),
+            step(1, vec![text("answer")]),
+            later_setup(),
+            run_finished(),
+            run_started("r4", vec![user("after")]),
+            step_started(1),
+            step(1, vec![text("last")]),
+            run_finished(),
+        ]);
+        records
+    }
+
+    fn encode(records: &[WalRecord]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (index, record) in records.iter().enumerate() {
+            bytes.extend(broca_wal::framing::encode(index as u64 + 1, 1, record).unwrap());
+        }
+        bytes
+    }
+
+    fn reader(bytes: &[u8]) -> impl Fn(u64, u64) -> std::io::Result<Vec<u8>> + '_ {
+        move |off, len| {
+            let start = (off as usize).min(bytes.len());
+            let end = (off.saturating_add(len) as usize).min(bytes.len());
+            Ok(bytes[start..end].to_vec())
+        }
+    }
+
+    /// The offset index of a log, built by the same fold the indexer runs, with the rows,
+    /// episodes and boundaries the database would hold.
+    struct TestIndex {
+        episodes: Vec<IndexedEpisode>,
+        head_ord: u64,
+        rows: BTreeMap<u64, OffsetSource>,
+        boundaries: Vec<SeedBoundary>,
+        compaction_offsets: Vec<u64>,
+    }
+
+    fn index_log(bytes: &[u8]) -> TestIndex {
+        let mut seed = OffsetSeed::default();
+        let mut rows: BTreeMap<u64, OffsetSource> = BTreeMap::new();
+        let mut episodes: BTreeMap<u64, OffsetEpisode> = BTreeMap::new();
+        let mut boundaries: Vec<SeedBoundary> = Vec::new();
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let broca_wal::framing::DecodeStep::Record { framed, consumed } =
+                broca_wal::framing::decode_next(&bytes[off..])
+            else {
+                panic!("test log holds only records");
+            };
+            let end = off + consumed;
+            let delta = seed.observe(&framed, off as u64, end as u64).unwrap();
+            if let Some(to) = delta.truncate {
+                rows.retain(|ord, _| *ord < to);
+            }
+            rows.extend(delta.messages);
+            if let Some(closed) = delta.closed_episode {
+                episodes.insert(closed.n, closed);
+            }
+            if let Some(open) = &seed.episode {
+                episodes.insert(open.n, open.clone());
+            }
+            for fact in delta.boundaries {
+                if fact.terminal_seq.is_some() {
+                    boundaries
+                        .iter_mut()
+                        .find(|boundary| boundary.seq == fact.seq)
+                        .expect("a qualifier names an earlier candidate")
+                        .qualified = true;
+                } else {
+                    boundaries.push(SeedBoundary {
+                        lineage_id: None,
+                        seq: fact.seq,
+                        frame_off: off as u64,
+                        frame_end: end as u64,
+                        frame_identity: sha2::Sha256::digest(&bytes[off..end]).to_vec(),
+                        qualified: fact.qualified,
+                    });
+                }
+            }
+            // The database renumbers the rows from a Setup's cut exactly like this.
+            if let Some((cut, checkpoint)) = delta.reanchor {
+                if let Some(first) = rows.get(&cut) {
+                    let mut high = checkpoint.max(first.tag_base.unwrap_or(0));
+                    for row in rows.range_mut(cut..).map(|(_, row)| row) {
+                        if row.flags & 2 != 0 {
+                            row.tag_base = Some(high);
+                            high += row.tag_n;
+                            row.tag_high = high;
+                        } else {
+                            high = high.max(row.tag_high);
+                        }
+                    }
+                    seed.tag_high = high;
+                }
+            }
+            off = end;
+        }
+        TestIndex {
+            episodes: episodes
+                .into_values()
+                .map(|episode| IndexedEpisode {
+                    run_started_seq: episode.run_started_seq,
+                    run_started_off: episode.run_started_off,
+                    first_ord: episode.first_ord,
+                    end_ord: episode.end_ord,
+                })
+                .collect(),
+            head_ord: seed.head_ord(),
+            rows,
+            boundaries,
+            compaction_offsets: seed.admission.compaction.clone(),
+        }
+    }
+
+    /// The tail seed the index holds at the last qualified boundary before the episode's
+    /// `RunStarted`, taken from a replay of the log through that boundary.
+    fn seed_before(
+        index: &TestIndex,
+        records: &[WalRecord],
+        episode: &IndexedEpisode,
+    ) -> Option<EpisodeSeed> {
+        let start = episode.run_started_seq?;
+        let boundary = index
+            .boundaries
+            .iter()
+            .filter(|boundary| boundary.qualified && boundary.seq < start)
+            .max_by_key(|boundary| boundary.seq)?
+            .clone();
+        let prefix = crate::replay::replay(&records[..boundary.seq as usize]).unwrap();
+        Some(EpisodeSeed {
+            ordinal_base: prefix.prompt.len() as u64,
+            held_steers: prefix.pending_steers.clone(),
+            tag_seed: crate::tags::TagSeed::from_prefix(&prefix.prompt),
+            seed_origin: prefix
+                .run_config
+                .as_ref()
+                .map(|config| config.model.clone()),
+            seed_run_id: prefix.run_id.clone(),
+            seed_budget: prefix
+                .run_config
+                .as_ref()
+                .and_then(|config| config.budget.clone()),
+            boundary,
+        })
+    }
+
+    fn framed(records: &[WalRecord]) -> Vec<FramedRecord> {
+        records
+            .iter()
+            .enumerate()
+            .map(|(index, record)| FramedRecord {
+                seq: index as u64 + 1,
+                fence: 1,
+                record: record.clone(),
+            })
+            .collect()
+    }
+
+    /// Read one page by episode over the log `records`, with `index` (possibly altered by the
+    /// caller) standing in for the database, counting decoded frames into `decoded`.
+    fn page_by_episode(
+        records: &[WalRecord],
+        index: &TestIndex,
+        request: &ModelPageRequest,
+        decoded: &Cell<u64>,
+    ) -> (EpisodeModelPage, Option<std::ops::Range<usize>>) {
+        let bytes = encode(records);
+        let read_at = reader(&bytes);
+        let all = framed(records);
+        let compaction_frames: Vec<FramedRecord> = index
+            .compaction_offsets
+            .iter()
+            .map(|off| {
+                decode_positioned_frames(&read_at, *off, frame_end(&bytes, *off), None)
+                    .unwrap()
+                    .remove(0)
+                    .framed
+            })
+            .collect();
+        let tag_base = |ordinal: u64| {
+            index
+                .rows
+                .get(&ordinal)
+                .filter(|row| row.flags & 2 != 0)
+                .and_then(|row| row.tag_base)
+        };
+        let page_index = EpisodePageIndex {
+            episodes: &index.episodes,
+            head_ord: index.head_ord,
+            compaction_frames: &compaction_frames,
+            tag_base: &tag_base,
+            head: crate::last_control_cursor_through(&all, None),
+            lineage_id: None,
+        };
+        let loaded = Cell::new(None);
+        let page = read_session_model_page_by_episode(
+            &read_at,
+            &page_index,
+            request,
+            |episodes: std::ops::Range<usize>| {
+                loaded.set(Some(episodes.clone()));
+                let seed = seed_before(index, records, &index.episodes[episodes.start]);
+                let from = seed.as_ref().map_or(0, |seed| seed.boundary.frame_end);
+                let to = index
+                    .episodes
+                    .get(episodes.end)
+                    .and_then(|next| next.run_started_off)
+                    .unwrap_or(bytes.len() as u64);
+                Ok(EpisodeFrames {
+                    seed,
+                    frames: decode_positioned_frames(&read_at, from, to, Some(decoded))?,
+                })
+            },
+            || Ok(all.clone()),
+        )
+        .unwrap();
+        (page, loaded.take())
+    }
+
+    fn frame_end(bytes: &[u8], off: u64) -> u64 {
+        match broca_wal::framing::decode_next(&bytes[off as usize..]) {
+            broca_wal::framing::DecodeStep::Record { consumed, .. } => off + consumed as u64,
+            _ => panic!("offset names a record frame"),
+        }
+    }
+
+    fn full_page(records: &[WalRecord], request: &ModelPageRequest) -> super::ModelPage {
+        let all = framed(records);
+        full_replay_model_page(
+            &all,
+            request,
+            None,
+            crate::last_control_cursor_through(&all, None),
+        )
+        .unwrap()
+    }
+
+    fn requests(total: u64) -> Vec<ModelPageRequest> {
+        let mut requests = Vec::new();
+        for limit in [1, 2, 3, 5, 50] {
+            requests.push(ModelPageRequest {
+                limit: Some(limit),
+                ..Default::default()
+            });
+            for from in 0..=total + 1 {
+                requests.push(ModelPageRequest {
+                    from_ordinal: Some(from),
+                    limit: Some(limit),
+                    ..Default::default()
+                });
+            }
+        }
+        requests
+    }
+
+    #[test]
+    fn corpus_exercises_guidance_and_a_later_setup_renumbering_an_earlier_episode() {
+        // Pins what the equivalence test below depends on, so a corpus change cannot quietly
+        // stop exercising it.
+        let records = corpus();
+        let full = crate::replay::replay(&records).unwrap();
+        let index = index_log(&encode(&records));
+        assert_eq!(index.episodes.len(), 4);
+        assert_eq!(index.episodes[2].first_ord, 8, "the Setup's episode");
+        // Both Setup cuts fall inside the first episode.
+        assert!(index.episodes[0].first_ord < 2 && 3 < index.episodes[0].end_ord);
+        let base_of = |message: &Message| message.part_tags().and_then(|tags| tags.computed);
+        assert!(
+            base_of(&full.prompt[3]).is_some_and(|computed| computed.base >= 50),
+            "the Setup renumbers m3 after its checkpoint"
+        );
+        let page = full_page(
+            &records,
+            &ModelPageRequest {
+                from_ordinal: Some(0),
+                limit: Some(4),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            page.messages[0].message.role,
+            Role::Assistant,
+            "replacement"
+        );
+        assert_eq!(
+            page.messages[1].message.ordinal,
+            Some(2),
+            "page starts inside r1"
+        );
+        let guidance = serde_json::to_string(&page.messages[3].message).unwrap();
+        assert!(
+            guidance.contains("identical arguments"),
+            "m4 carries guidance folded from the hidden m1: {guidance}"
+        );
+    }
+
+    #[test]
+    fn model_page_by_episode_equals_full_replay_at_every_cut() {
+        let records = corpus();
+        let mut checked = 0;
+        for cut in 1..=records.len() {
+            let log = &records[..cut];
+            let index = index_log(&encode(log));
+            for request in requests(index.head_ord) {
+                let decoded = Cell::new(0);
+                let (by_episode, _) = page_by_episode(log, &index, &request, &decoded);
+                assert_eq!(
+                    by_episode.fallback, None,
+                    "cut {cut} request {request:?} fell back"
+                );
+                assert_eq!(
+                    by_episode.page,
+                    full_page(log, &request),
+                    "cut {cut} request {request:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 1000, "{checked} pages checked");
+    }
+
+    #[test]
+    fn a_page_decodes_only_the_frames_of_its_episodes() {
+        let records = corpus();
+        let bytes = encode(&records);
+        let index = index_log(&bytes);
+        // The last two messages belong to the fourth episode alone.
+        let request = ModelPageRequest {
+            limit: Some(2),
+            ..Default::default()
+        };
+        let decoded = Cell::new(0);
+        let (by_episode, loaded) = page_by_episode(&records, &index, &request, &decoded);
+        assert_eq!(by_episode.fallback, None);
+        assert_eq!(by_episode.page, full_page(&records, &request));
+        assert_eq!(loaded, Some(3..4));
+        // From the third episode's committed text step: the Setup, its terminal, then the
+        // fourth episode's four frames.
+        assert_eq!(decoded.get(), 6, "of {} frames", records.len());
+
+        // A page starting inside the first episode, behind the Setup, folds that episode from
+        // its start and decodes nothing past the episodes it shows.
+        let request = ModelPageRequest {
+            from_ordinal: Some(0),
+            limit: Some(3),
+            ..Default::default()
+        };
+        let decoded = Cell::new(0);
+        let (by_episode, loaded) = page_by_episode(&records, &index, &request, &decoded);
+        assert_eq!(by_episode.fallback, None);
+        assert_eq!(by_episode.page, full_page(&records, &request));
+        assert_eq!(loaded, Some(0..1));
+        let first_episode_frames = index.episodes[1].run_started_seq.unwrap() - 1;
+        assert_eq!(decoded.get(), first_episode_frames);
+    }
+
+    #[test]
+    fn stale_index_facts_fall_back_to_a_full_replay() {
+        let records = corpus();
+        let request = ModelPageRequest {
+            limit: Some(2),
+            ..Default::default()
+        };
+        let expected = full_page(&records, &request);
+
+        let mut shifted = index_log(&encode(&records));
+        shifted.episodes[3].first_ord -= 1;
+        let (page, _) = page_by_episode(&records, &shifted, &request, &Cell::new(0));
+        assert_eq!(page.fallback, Some("episode first ordinal mismatch"));
+        assert_eq!(page.page, expected);
+
+        let mut moved = index_log(&encode(&records));
+        moved.episodes[3].run_started_off = moved.episodes[3].run_started_off.map(|off| off + 1);
+        let (page, _) = page_by_episode(&records, &moved, &request, &Cell::new(0));
+        assert_eq!(page.fallback, Some("episode start not in the frames read"));
+        assert_eq!(page.page, expected);
+
+        let mut forged = index_log(&encode(&records));
+        for boundary in &mut forged.boundaries {
+            boundary.frame_identity[0] ^= 1;
+        }
+        let (page, _) = page_by_episode(&records, &forged, &request, &Cell::new(0));
+        assert_eq!(page.fallback, Some("boundary frame identity mismatch"));
+        assert_eq!(page.page, expected);
+
+        // Rows without tag bases cannot number the page.
+        let mut untagged = index_log(&encode(&records));
+        for row in untagged.rows.values_mut() {
+            row.tag_base = None;
+        }
+        let (page, _) = page_by_episode(&records, &untagged, &request, &Cell::new(0));
+        assert_eq!(page.fallback, Some("message row has no tag base"));
+        assert_eq!(page.page, expected);
     }
 }

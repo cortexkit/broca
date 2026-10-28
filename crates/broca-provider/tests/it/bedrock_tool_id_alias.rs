@@ -108,7 +108,9 @@ fn legacy_verbatim_ids(prompt: &[Message]) -> (String, String) {
                             "status": "success",
                         }
                     })),
-                    ContentBlock::Reasoning { .. } | ContentBlock::RedactedReasoning { .. } => None,
+                    ContentBlock::Reasoning { .. }
+                    | ContentBlock::RedactedReasoning { .. }
+                    | ContentBlock::ProviderFallback { .. } => None,
                 })
                 .collect::<Vec<_>>();
             json!({

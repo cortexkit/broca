@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use broca_core::{
-    tool_plane::{BatchCtx, DispatchResult, ToolPlane, ToolPlaneError},
+    tool_plane::{BatchCtx, DispatchResult, ToolOpenGuard, ToolPlane, ToolPlaneError},
     ToolManifest,
 };
 use broca_protocol::{
@@ -46,30 +46,31 @@ use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::connection::{
-    retry_route_open, retry_route_open_with_scope_hold, route_failure_is_known_dead, ConnError,
-    GateTarget, ModuleGate, RouteHandle, RouteOpenError, RouteOpenRetry, ScopeHold, SubcConnection,
+    is_module_availability_refusal, retry_route_open, retry_route_open_waiting_out_outage,
+    retry_route_open_with_scope_hold, route_failure_is_known_dead, ConnError, GateTarget,
+    ModuleGate, OutageWait, RouteHandle, RouteOpenError, RouteOpenRetry, ScopeHold, SubcConnection,
     ROUTE_OPEN_RETRY_DEADLINE, ROUTE_OPEN_RETRY_INTERVAL, ROUTE_OPEN_RETRY_MAX_INTERVAL,
 };
 use crate::scope_describe::{DescribedScope, ScopeDescriber};
 use crate::tool_deadline::tool_reply_deadline;
 
-/// How long a dispatch that was refused `module_reloading` waits for the module to come back.
+/// How long a TOOL-call dispatch route open keeps retrying a module-availability
+/// refusal (`target_unavailable`, `module_reloading`, `module_warming`, `module_timeout`)
+/// before the call is refused as module-unavailable: 90 s from the first refusal, through
+/// the same per-target gate every other waiter shares, so all waiting calls ride out one
+/// short provider-module restart together instead of each failing the turn after 3 s.
 ///
-/// THE DEFAULT 3s DOES NOT COVER A RESTART, and I shipped a fix that assumed it did. Measured
-/// from the daemon's own logs: 16 AFT module_reloading episodes, 13 of them longer than 3s,
-/// clustered at 15-30s -- which is the module's 30s drain window. With the 3s patience the
-/// retry mostly ended in `NotSent`, so the model still got an error, just three seconds later.
-///
-/// 45s covers the 30s drain plus a respawn and warm-up, and stays well inside the 120s
-/// default execution deadline a tool call runs under (some calls get longer; see `tool_deadline`). A restart that takes longer still surfaces as
-/// `NotSent` -- a bounded wait, not an unbounded one, is the point. Session close still aborts
-/// the wait immediately.
-const RELOAD_REOPEN_PATIENCE: RouteOpenPatience = RouteOpenPatience {
-    deadline: Duration::from_secs(45),
-    // Backs off to 2s rather than polling every 100ms: at the flat interval a 45s wait is
-    // ~450 route.open calls per waiting dispatch, the storm the default path's cap exists to
-    // prevent.
+/// Tool dispatch only: vault, catalog, transform and routing opens keep the 3 s default
+/// patience. The wait, an open attempt in flight included, still ends at once on run
+/// cancel/stop or at the run's step deadline when that comes first (see [`ToolOpenGuard`]
+/// and [`OutageWait`]).
+const TOOL_DISPATCH_PATIENCE: RouteOpenPatience = RouteOpenPatience {
+    deadline: Duration::from_secs(90),
+    // Backs off to 2s rather than polling every 100ms: at the flat interval a 90s wait is
+    // hundreds of route.open calls per waiting dispatch, the storm the default path's cap
+    // exists to prevent. While the module is down the gate does the waiting anyway.
     max_interval: Duration::from_secs(2),
+    waits_out_outage: true,
 };
 
 /// How long a scoped route open holds while the daemon answers `scope_not_synced` (the scope's
@@ -126,7 +127,7 @@ enum ScopeReading {
     /// The scope or its parent is gone; the reason names which ([`drain_ends_run`] holds).
     Gone(&'static str),
     /// The scope is live; this is the stamp a route opened now would carry.
-    Live(ScopeStamp),
+    Live(Box<ScopeStamp>),
     /// The owner has not synced since the daemon started: wait, as for `scope_not_synced` on
     /// open.
     NotSynced,
@@ -158,7 +159,7 @@ fn read_describe(opened_epoch: u64, answer: &DescribedScope) -> ScopeReading {
             } else if stamp.parent_state == Some(ParentState::Ended) {
                 ScopeReading::Gone(SCOPE_PARENT_ENDED)
             } else {
-                ScopeReading::Live(stamp.clone())
+                ScopeReading::Live(Box::new(stamp.clone()))
             }
         }
     }
@@ -186,11 +187,16 @@ fn same_agent(a: &ScopeStamp, b: &ScopeStamp) -> bool {
 struct RouteOpenPatience {
     deadline: Duration,
     max_interval: Duration,
+    /// Measure `deadline` from the first refusal and race attempts in flight against cancel
+    /// and the caller's deadline ([`OutageWait`]), as a tool-call dispatch open does. Every
+    /// other open keeps a fixed budget from its start.
+    waits_out_outage: bool,
 }
 
 const DEFAULT_ROUTE_OPEN_PATIENCE: RouteOpenPatience = RouteOpenPatience {
     deadline: ROUTE_OPEN_RETRY_DEADLINE,
     max_interval: ROUTE_OPEN_RETRY_MAX_INTERVAL,
+    waits_out_outage: false,
 };
 
 /// subc's per-route credit window for a declared concurrency class.
@@ -377,6 +383,7 @@ trait ToolPlaneConnection: Send + Sync {
         module_id: &str,
         identity: &BindIdentity,
         scope: Option<&ScopeSelector>,
+        _tool_result_v1: bool,
         _provider_held_installed: bool,
     ) -> Result<RouteHandle, ConnError> {
         self.route_open(module_id, identity, scope).await
@@ -409,12 +416,17 @@ trait ToolPlaneConnection: Send + Sync {
         _deadline: Duration,
         _preset: Option<&str>,
         _args: &ApprovedArgs,
+        _schema_pin: Option<&str>,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
         Err(crate::connection::ApprovedCallError::BeforePush(
             ConnError::Protocol("approved_dispatch_unavailable".into()).into(),
         ))
     }
 
+    /// An ordinary (not approved) call's send. `signals` are the run's cancel and stop: a
+    /// call they interrupted before its request is enqueued is never sent, and is reported
+    /// before-push (not sent).
+    #[allow(clippy::too_many_arguments)]
     async fn tool_call_staged(
         &self,
         route: &RouteHandle,
@@ -422,7 +434,19 @@ trait ToolPlaneConnection: Send + Sync {
         deadline: Duration,
         preset: Option<&str>,
         _call_key: Option<&str>,
+        schema_pin: Option<&str>,
+        signals: &broca_core::tool_plane::DispatchSignals,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
+        if signals.interrupted() {
+            return Err(crate::connection::ApprovedCallError::BeforePush(
+                crate::connection::ApprovedSetupError::Interrupted,
+            ));
+        }
+        if schema_pin.is_some() {
+            return Err(crate::connection::ApprovedCallError::BeforePush(
+                ConnError::Protocol("pinned_dispatch_unavailable".into()).into(),
+            ));
+        }
         self.tool_call(
             route,
             &call.tool_name,
@@ -460,11 +484,19 @@ impl ToolPlaneConnection for SubcConnection {
         module_id: &str,
         identity: &BindIdentity,
         scope: Option<&ScopeSelector>,
+        tool_result_v1: bool,
         provider_held_installed: bool,
     ) -> Result<RouteHandle, ConnError> {
-        self.route_open_dispatch_single_attempt(module_id, identity, scope, provider_held_installed)
-            .await
+        self.route_open_dispatch_single_attempt(
+            module_id,
+            identity,
+            scope,
+            tool_result_v1,
+            provider_held_installed,
+        )
+        .await
     }
+    #[allow(clippy::too_many_arguments)]
     async fn tool_call_staged(
         &self,
         route: &RouteHandle,
@@ -472,12 +504,17 @@ impl ToolPlaneConnection for SubcConnection {
         deadline: Duration,
         preset: Option<&str>,
         call_key: Option<&str>,
+        schema_pin: Option<&str>,
+        signals: &broca_core::tool_plane::DispatchSignals,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
         let args = serde_json::to_string(&call.input).map_err(|error| {
             crate::connection::ApprovedCallError::BeforePush(
                 ConnError::Protocol(error.to_string()).into(),
             )
         })?;
+        // The run's signals guard the enqueue itself: a cancel or stop observed before the
+        // request enters the writer queue leaves it unsent, and one after it never turns the
+        // enqueued request into an unsent one.
         self.tool_call_raw_guarded(
             route,
             &call.tool_name,
@@ -486,7 +523,8 @@ impl ToolPlaneConnection for SubcConnection {
             deadline,
             preset,
             call_key,
-            &broca_core::tool_plane::DispatchSignals::default(),
+            schema_pin,
+            signals,
         )
         .await
     }
@@ -513,6 +551,7 @@ impl ToolPlaneConnection for SubcConnection {
         deadline: Duration,
         preset: Option<&str>,
         args: &ApprovedArgs,
+        schema_pin: Option<&str>,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
         self.tool_call_raw_guarded(
             route,
@@ -522,6 +561,7 @@ impl ToolPlaneConnection for SubcConnection {
             deadline,
             preset,
             Some(&args.key),
+            schema_pin,
             &args.signals,
         )
         .await
@@ -631,7 +671,7 @@ pub struct SubcToolPlane {
     batch_presets: Mutex<HashMap<BatchRouteKey, ToolManifest>>,
     approved_args: Mutex<HashMap<BatchRouteKey, HashMap<ToolCallId, ApprovedArgs>>>,
     provider_held: Option<ProviderHeldSupport>,
-    /// Whether tool routes declare `content/v1` and `held-reply/v1`; see
+    /// Whether tool routes declare `held-reply/v1` alongside their result format; see
     /// [`Self::held_reply_declared`]. Settable only in debug builds.
     declares_held_reply: bool,
     /// The frozen tool manifest of each batch in progress. It is the only source of a
@@ -674,6 +714,11 @@ pub struct SubcToolPlane {
     /// Reads a scope's current state (`scope.describe`) over broca's module connection, once the
     /// serve loop has registered one; see [`Self::set_scope_describer`].
     describer: Mutex<Option<Arc<dyn ScopeDescriber>>>,
+    /// Calls re-opening a route after their first request was refused before it reached the
+    /// tool, by route key, each as the token that fires when that call has finished. A call
+    /// that was waiting for credit on the same route, and finds it replaced once it gets the
+    /// credit, sends only after these have finished: on a serial route, batch order holds.
+    resend_turns: Mutex<HashMap<RouteKey, Vec<CancellationToken>>>,
 }
 
 /// What the batch's frozen plan declared about one provider: whether it serves the `content/v1`
@@ -683,6 +728,7 @@ pub struct SubcToolPlane {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FrozenContract {
     pub content_v1: bool,
+    pub tool_result_v1: bool,
     pub late_results: bool,
 }
 
@@ -704,17 +750,16 @@ impl SubcToolPlane {
         self
     }
 
-    /// Debug builds only: declare `content/v1` and `held-reply/v1` on every tool-dispatch route,
-    /// so a provider may answer `held`. Release builds cannot declare them: a held call has no
-    /// cancel or stop close-out yet, so production keeps both capabilities undeclared and every
-    /// call's wire bytes exactly as they were before the held runtime was installed.
+    /// Debug builds only: declare `tool-result/v1` and `held-reply/v1` on every tool-dispatch route,
+    /// so a provider may answer `held`. Production negotiates result bodies independently,
+    /// but cannot declare held replies until held calls have cancel and stop close-out.
     #[cfg(debug_assertions)]
     pub fn declaring_held_reply_for_tests(mut self) -> Self {
         self.declares_held_reply = true;
         self
     }
 
-    /// Whether this plane's tool routes declare `held-reply/v1` (with `content/v1`). Only then
+    /// Whether this plane's tool routes declare `held-reply/v1` (with `tool-result/v1`). Only then
     /// does a plain call carry its key to a `late_results` provider, and only then is any call
     /// registered with the intake: without the declaration no provider may hold a call, so a key
     /// or a registration would change the wire and the store for nothing.
@@ -735,12 +780,13 @@ impl SubcToolPlane {
             content_v1: declarations
                 .and_then(|declarations| declarations.result_formats.as_ref())
                 .is_some_and(|formats| {
-                    formats.values().any(|format| {
-                        format.0
-                            == cortexkit_role_tool_provider::result::ResultFormat::ContentV1
-                                .as_str()
-                    })
+                    formats
+                        .values()
+                        .any(|format| matches!(format.0.as_str(), "content/v1" | "tool-result/v1"))
                 }),
+            tool_result_v1: declarations
+                .and_then(|declarations| declarations.result_formats.as_ref())
+                .is_some_and(|formats| formats.values().any(|format| format.0 == "tool-result/v1")),
         }
     }
 
@@ -755,10 +801,12 @@ impl SubcToolPlane {
             .and_then(|declarations| declarations.result_formats.as_ref())
             .and_then(|formats| formats.get(tool))
             .is_some_and(|format| {
-                format.0 == cortexkit_role_tool_provider::result::ResultFormat::ContentV1.as_str()
+                format.0 == "tool-result/v1"
+                    || (self.held_reply_declared() && format.0 == "content/v1")
             })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_call(
         &self,
         ctx: &BatchCtx,
@@ -767,6 +815,7 @@ impl SubcToolPlane {
         call: &ToolCall,
         deadline: Duration,
         key: Option<broca_core::tool_plane::DispatchKey<'_>>,
+        signals: &broca_core::tool_plane::DispatchSignals,
     ) -> SendAttempt {
         let args = self
             .approved_args
@@ -776,6 +825,17 @@ impl SubcToolPlane {
             .and_then(|calls| calls.get(&call.tool_call_id))
             .cloned();
         let preset = self.frozen_preset(ctx, module);
+        let schema_pin = self
+            .dispatch_schema_pin(ctx, &call.tool_call_id, &call.tool_name)
+            .and_then(|pin| {
+                cortexkit_role_tool_provider::call::SchemaPin::new(
+                    &call.tool_name,
+                    pin.schema_digest,
+                    pin.semantics,
+                )
+                .encode()
+                .ok()
+            });
         let late_results = self.frozen_contract(ctx, module).late_results;
         let plain_key = key.filter(|_| {
             self.held_reply_declared() && late_results && self.conn.consumer_module_id().is_some()
@@ -802,8 +862,9 @@ impl SubcToolPlane {
             };
         }
         if let Some(args) = args {
-            // This is after every route, permit and stale-route recovery wait.
-            // Only approved calls carry run signals; ordinary dispatch is unchanged.
+            // This is after every route, permit and stale-route recovery wait. An approved
+            // call stopped here keeps the existing `approved_dispatch_stopped_before_send`
+            // reason.
             if args.signals.interrupted() {
                 return SendAttempt::NotSent {
                     reason: "approved_dispatch_stopped_before_send".into(),
@@ -811,21 +872,48 @@ impl SubcToolPlane {
             }
             SendAttempt::approved_reply(
                 self.conn
-                    .tool_call_approved(route, call, deadline, preset.as_deref(), &args)
-                    .await,
-            )
-        } else {
-            SendAttempt::approved_reply(
-                self.conn
-                    .tool_call_staged(
+                    .tool_call_approved(
                         route,
                         call,
                         deadline,
                         preset.as_deref(),
-                        plain_key.map(|key| key.call_key),
+                        &args,
+                        schema_pin.as_deref(),
                     )
                     .await,
             )
+        } else {
+            // After every route-open, permit and stale-route wait: a run cancelled or stopped
+            // during any of them sends nothing. The enqueue below checks the same signals
+            // once more at the point the request is committed to the writer queue.
+            if signals.interrupted() {
+                return SendAttempt::NotSent {
+                    reason: "dispatch_stopped_before_send".into(),
+                };
+            }
+            let reply = self
+                .conn
+                .tool_call_staged(
+                    route,
+                    call,
+                    deadline,
+                    preset.as_deref(),
+                    plain_key.map(|key| key.call_key),
+                    schema_pin.as_deref(),
+                    signals,
+                )
+                .await;
+            if matches!(
+                reply,
+                Err(crate::connection::ApprovedCallError::BeforePush(
+                    crate::connection::ApprovedSetupError::Interrupted
+                ))
+            ) {
+                return SendAttempt::NotSent {
+                    reason: "dispatch_stopped_before_send".into(),
+                };
+            }
+            SendAttempt::approved_reply(reply)
         }
     }
 
@@ -857,6 +945,7 @@ impl SubcToolPlane {
             run_latches: Mutex::new(HashMap::new()),
             scope_sync_hold: SCOPE_SYNC_HOLD,
             describer: Mutex::new(None),
+            resend_turns: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1209,7 +1298,7 @@ impl SubcToolPlane {
     ///   returned and latched for the run.
     /// - The scope is live, or its state cannot be told: ordinary route loss. The closed routes
     ///   are forgotten, the batch re-opens, and that open checks the scope again.
-    async fn gone_since_last_batch(&self, ctx: &BatchCtx) -> Option<String> {
+    async fn gone_since_last_batch(&self, ctx: &BatchCtx, guard: &ToolOpenGuard) -> Option<String> {
         let scope = ctx.scope.as_ref()?;
         let session = Self::session_key(&ctx.bind);
         let key_scope = scope_key(Some(scope));
@@ -1231,8 +1320,14 @@ impl SubcToolPlane {
         for (module_id, handle) in &closed {
             self.forget_route(ctx, module_id, *handle);
         }
+        // Nothing of the batch is sent yet, so run cancel and stop end the hold as well as the
+        // session close; the batch's opens then see the interrupted run.
         let lifecycle = self.capture_session_lifecycle_token(&ctx.bind);
-        match self.read_scope(scope, &lifecycle, true).await {
+        let wait = WaitCancel::link(&lifecycle, guard);
+        match self
+            .read_scope(scope, wait.token(), guard.deadline, true)
+            .await
+        {
             ScopeReading::Gone(reason) => {
                 self.latch_gone(ctx, reason);
                 Some(reason.to_owned())
@@ -1286,11 +1381,17 @@ impl SubcToolPlane {
     /// against the epoch it was frozen at. With `hold`, an owner that has not synced since the
     /// daemon started is waited for, with backoff, inside [`SCOPE_SYNC_HOLD`], as a
     /// `scope_not_synced` open is; past the hold, or without `hold`, that is "can't tell".
-    /// A session close ends the wait at once.
+    /// The hold also ends at `until` when that comes first. `cancel` ends the wait between
+    /// describes at once (a describe already in flight finishes or reaches its own timeout
+    /// first): the caller passes the session close, linked with the run's cancel and stop when
+    /// the reading is for a call not yet sent, so a stopped run never sits out the hold. A hold
+    /// that ends early reads as "can't tell"; callers that hold a run guard check it to report
+    /// the call as stopped before send.
     async fn read_scope(
         &self,
         scope: &SessionScope,
-        lifecycle: &CancellationToken,
+        cancel: &CancellationToken,
+        until: Option<Instant>,
         hold: bool,
     ) -> ScopeReading {
         let Some(describer) = self.describer.lock().unwrap().clone() else {
@@ -1302,7 +1403,8 @@ impl SubcToolPlane {
             Ok(owner) => owner,
             Err(detail) => return ScopeReading::Unverifiable(detail),
         };
-        let deadline = Instant::now() + self.scope_sync_hold;
+        let hold_end = Instant::now() + self.scope_sync_hold;
+        let deadline = until.map_or(hold_end, |until| until.min(hold_end));
         let mut attempt = 0u32;
         loop {
             let reading = match describer.describe(&owner, &scope.scope_ref).await {
@@ -1324,8 +1426,8 @@ impl SubcToolPlane {
                 .min(SCOPE_SYNC_HOLD_MAX_INTERVAL)
                 .min(remaining);
             tokio::select! {
-                _ = lifecycle.cancelled() => {
-                    return ScopeReading::Unverifiable("the session closed during the hold".into());
+                _ = cancel.cancelled() => {
+                    return ScopeReading::Unverifiable("the wait ended during the hold".into());
                 }
                 _ = sleep(wait) => {}
             }
@@ -1346,6 +1448,9 @@ impl SubcToolPlane {
     ///   `scope_epoch` and the same agent as `composed_under`, the stamp of the route the call
     ///   was composed under. Otherwise `route_drained` as `scope_agent_changed`, or as the
     ///   refusal the re-open met.
+    ///
+    /// `earlier` are the calls re-opening on the same route that this call must not send
+    /// ahead of (see [`SubcToolPlane::begin_resend_turn`]); the send waits until they finish.
     #[allow(clippy::too_many_arguments)]
     async fn resend_or_drain(
         &self,
@@ -1355,8 +1460,10 @@ impl SubcToolPlane {
         closed: RouteHandle,
         composed_under: Option<ScopeStamp>,
         patience: RouteOpenPatience,
+        guard: &ToolOpenGuard,
         fence_key: FenceKey,
         key: Option<broca_core::tool_plane::DispatchKey<'_>>,
+        earlier: &[CancellationToken],
     ) -> DispatchResult {
         let Some(scope) = ctx.scope.as_ref() else {
             unreachable!("only a scoped call is resolved by describing its scope");
@@ -1368,10 +1475,20 @@ impl SubcToolPlane {
             sent: false,
         };
         let lifecycle = self.capture_session_lifecycle_token(&ctx.bind);
-        match self.read_scope(scope, &lifecycle, true).await {
+        // The call is not sent yet: run cancel and stop end the hold too, not only the session
+        // close, and a run they stopped reports the call as stopped before send.
+        let reading = {
+            let wait = WaitCancel::link(&lifecycle, guard);
+            self.read_scope(scope, wait.token(), guard.deadline, true)
+                .await
+        };
+        match reading {
             ScopeReading::Gone(reason) => {
                 self.latch_gone(ctx, reason);
                 return drained(reason);
+            }
+            ScopeReading::Unverifiable(_) | ScopeReading::NotSynced if guard.interrupted() => {
+                return self.stopped_before_send(ctx, call);
             }
             ScopeReading::Unverifiable(_) | ScopeReading::NotSynced => {
                 return drained(SCOPE_UNVERIFIABLE)
@@ -1382,18 +1499,22 @@ impl SubcToolPlane {
             return drained(SCOPE_UNVERIFIABLE);
         };
         let (fresh, sem) = match self
-            .ensure_route_for_lifecycle_inner(
+            .ensure_result_route_for_lifecycle_inner(
                 &ctx.bind,
                 Some(scope),
                 module_id,
                 &lifecycle,
-                None,
+                guard.deadline,
+                guard,
                 patience,
+                self.frozen_contract(ctx, module_id).tool_result_v1,
             )
             .await
-            .map_err(RouteEnsureError::into_plane)
+            .map_err(|error| map_tool_open_refusal(error, module_id))
         {
             Ok(route) => route,
+            // The run was cancelled or stopped during the re-open: never sent.
+            Err(_) if guard.interrupted() => return self.stopped_before_send(ctx, call),
             Err(error @ ToolPlaneError::ScopeRefused { .. }) => {
                 self.latch_open_refusal(ctx, &error);
                 let ToolPlaneError::ScopeRefused { code, .. } = error else {
@@ -1401,6 +1522,14 @@ impl SubcToolPlane {
                 };
                 self.latch_gone(ctx, &code);
                 return drained(&code);
+            }
+            Err(ToolPlaneError::ModuleUnavailable {
+                module,
+                code,
+                detail,
+            }) => {
+                return self
+                    .module_unavailable_result(ctx, call, &module, &code, &detail, &fence_key);
             }
             Err(error) => {
                 return DispatchResult::NotSent {
@@ -1416,6 +1545,12 @@ impl SubcToolPlane {
             self.forget_route(ctx, module_id, fresh);
             return drained(SCOPE_AGENT_CHANGED);
         }
+        if guard.interrupted() {
+            return self.stopped_before_send(ctx, call);
+        }
+        if !Self::wait_for_resend_turns(earlier, guard).await {
+            return self.stopped_before_send(ctx, call);
+        }
         let _permit = match sem.acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => {
@@ -1426,7 +1561,15 @@ impl SubcToolPlane {
         };
         let reply_deadline = self.reply_deadline(ctx, module_id, call);
         let outcome = match self
-            .send_call(ctx, module_id, &fresh, call, reply_deadline, key)
+            .send_call(
+                ctx,
+                module_id,
+                &fresh,
+                call,
+                reply_deadline,
+                key,
+                &guard.signals(),
+            )
             .await
         {
             SendAttempt::NotSent { reason } => return DispatchResult::NotSent { reason },
@@ -1467,19 +1610,23 @@ impl SubcToolPlane {
                 let content_v1 = self.frozen_tool_is_content_v1(ctx, module_id, &call.tool_name);
                 let late_results = self.frozen_contract(ctx, module_id).late_results;
                 let has_held = raw.get("held").is_some();
-                let decoded = (sent_on.reads_held_reply && content_v1)
-                    .then(|| {
-                        serde_json::from_value::<cortexkit_role_tool_provider::result::ToolResult>(
-                            raw.clone(),
-                        )
-                        .ok()
-                        .filter(|reply| {
-                            cortexkit_role_tool_provider::result::validate(reply).is_ok()
-                        })
+                let decoded = (sent_on.reads_tool_result && content_v1).then(|| {
+                    serde_json::from_value::<cortexkit_role_tool_provider::result::ToolResult>(
+                        raw.clone(),
+                    )
+                    .map_err(|error| error.to_string())
+                    .and_then(|reply| {
+                        cortexkit_role_tool_provider::result::validate(&reply)
+                            .map_err(|error| error.to_string())?;
+                        Ok(reply)
                     })
-                    .flatten();
+                });
                 if has_held {
-                    let held = decoded.as_ref().and_then(|reply| reply.held());
+                    let held = decoded
+                        .as_ref()
+                        .and_then(|reply| reply.as_ref().ok())
+                        .filter(|_| sent_on.reads_held_reply)
+                        .and_then(|reply| reply.held());
                     let eligible_key = key.filter(|key| {
                         self.registered_keys
                             .lock()
@@ -1541,16 +1688,25 @@ impl SubcToolPlane {
                         ),
                         Vec::new(),
                     )
-                } else if sent_on.reads_held_reply && content_v1 {
+                } else if sent_on.reads_tool_result && content_v1 {
                     let mut result = decoded
                         .as_ref()
+                        .expect("negotiated result was decoded")
+                        .as_ref()
+                        .map_err(Clone::clone)
                         .and_then(|reply| {
-                            crate::content_v1::map_content_v1_result(&call.tool_call_id, reply).ok()
+                            crate::content_v1::map_content_v1_result(&call.tool_call_id, reply)
+                                .map_err(|error| error.to_string())
                         })
-                        .unwrap_or_else(|| {
-                            route_failure_result(call, "malformed content/v1 tool reply".into())
+                        .unwrap_or_else(|reason| {
+                            route_failure_result(
+                                call,
+                                format!("malformed tool-result/v1 tool reply: {reason}"),
+                            )
                         });
-                    let captures = if ctx.media_capture.is_some() {
+                    let captures = if ctx.media_capture.is_some()
+                        && decoded.as_ref().is_some_and(Result::is_ok)
+                    {
                         tool_capture::content_v1_captures(&mut result, &raw)
                     } else {
                         Vec::new()
@@ -1592,6 +1748,23 @@ impl SubcToolPlane {
                     self.remove_batch_call_route(ctx, &call.tool_call_id);
                     let _ = self.invalidate_route_for_module(&ctx.bind, scope, module_id);
                 }
+                // `module_reloading` here answers the one re-send after a re-open: the module
+                // began draining again. The protocol refuses it before the request reaches the
+                // tool, so nothing was sent, and the call is reported exactly like a module that
+                // stayed down through the re-open wait. Not re-sent again: one re-send per call.
+                // The route is forgotten, not closed, for the reason the first refusal's is.
+                if msg.code() == subc_protocol::error_codes::MODULE_RELOADING {
+                    self.remove_batch_call_route(ctx, &call.tool_call_id);
+                    let _ = self.invalidate_route_for_module(&ctx.bind, scope, module_id);
+                    return self.module_unavailable_result(
+                        ctx,
+                        call,
+                        module_id,
+                        msg.code(),
+                        &broca_protocol::bound_module_unavailable_detail(&msg.detail()),
+                        &fence_key,
+                    );
+                }
                 // A provider that received the call and refuses it with `scope_not_synced` (Plexus
                 // does this on its bot-write legs until the owner has synced) lands here like any
                 // other refusal: recorded as this call's error result, and NOT re-sent. The
@@ -1601,9 +1774,7 @@ impl SubcToolPlane {
                 // (`a_provider_scope_not_synced_refusal_is_recorded_and_never_resent`) pins this.
                 let result = ToolResult {
                     tool_call_id: call.tool_call_id.clone(),
-                    output: ToolOutput::Error {
-                        message: format!("tool/route rejected: {msg}"),
-                    },
+                    output: ToolOutput::error(format!("tool/route rejected: {msg}")),
                     is_error: true,
                 };
                 self.fence
@@ -1674,7 +1845,7 @@ impl SubcToolPlane {
         let lifecycle = self.capture_session_lifecycle_token(&ctx.bind);
         // Do not wait for an unsynced owner here: the call's outcome is already decided, and
         // waiting would only delay reporting it.
-        let reason = match self.read_scope(scope, &lifecycle, false).await {
+        let reason = match self.read_scope(scope, &lifecycle, None, false).await {
             ScopeReading::Gone(reason) => {
                 self.latch_gone(ctx, reason);
                 reason
@@ -1758,6 +1929,51 @@ impl SubcToolPlane {
         route_matches(&routes, key, handle, sem)
     }
 
+    /// Record that a call on `key` is about to give its credit back and re-open, because its
+    /// first request was refused before it reached the tool. The turn ends when the returned
+    /// value is dropped: when that call has finished, sent or not.
+    fn begin_resend_turn(&self, key: &RouteKey) -> ResendTurn<'_> {
+        let done = CancellationToken::new();
+        let mut turns = self.resend_turns.lock().unwrap();
+        let entry = turns.entry(key.clone()).or_default();
+        entry.retain(|turn| !turn.is_cancelled());
+        entry.push(done.clone());
+        ResendTurn {
+            turns: &self.resend_turns,
+            key: key.clone(),
+            done,
+        }
+    }
+
+    /// The re-opening calls on `key` that have not finished yet.
+    fn resend_turns_in_progress(&self, key: &RouteKey) -> Vec<CancellationToken> {
+        self.resend_turns
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|turns| {
+                turns
+                    .iter()
+                    .filter(|turn| !turn.is_cancelled())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Wait until every call in `earlier` has finished. False when the run was cancelled or
+    /// stopped first.
+    async fn wait_for_resend_turns(earlier: &[CancellationToken], guard: &ToolOpenGuard) -> bool {
+        for turn in earlier {
+            tokio::select! {
+                biased;
+                () = guard.cancelled() => return false,
+                () = turn.cancelled() => {}
+            }
+        }
+        !guard.interrupted()
+    }
+
     /// Resolve the window for a SPECIFIC provider (`module_id`) from its catalog entry,
     /// cached per provider so a second route to the same provider doesn't re-fetch the
     /// catalog. Resolved per-route from that route's provider — NOT a single global memo
@@ -1784,12 +2000,17 @@ impl SubcToolPlane {
     }
 
     /// Ensure a route + its flow-control semaphore exist for `bind`; return the
-    /// route channel and a shared semaphore handle.
+    /// route channel and a shared semaphore handle. This is the tool-dispatch open: a
+    /// module-availability refusal is retried for [`TOOL_DISPATCH_PATIENCE`], and one that
+    /// outlasts it becomes [`ToolPlaneError::ModuleUnavailable`] (proven undelivered).
+    /// `guard` ends the wait early on run cancel/stop, and `guard.deadline` caps it at the
+    /// step deadline that comes earlier.
     async fn ensure_route(
         &self,
         bind: &BindIdentity,
         scope: Option<&SessionScope>,
         module_id: &str,
+        guard: &ToolOpenGuard,
     ) -> Result<(RouteHandle, Arc<Semaphore>), ToolPlaneError> {
         let lifecycle = self.capture_session_lifecycle_token(bind);
         self.ensure_route_for_lifecycle_inner(
@@ -1797,17 +2018,45 @@ impl SubcToolPlane {
             scope,
             module_id,
             &lifecycle,
-            None,
-            DEFAULT_ROUTE_OPEN_PATIENCE,
+            guard.deadline,
+            guard,
+            TOOL_DISPATCH_PATIENCE,
         )
         .await
-        .map_err(RouteEnsureError::into_plane)
+        .map_err(|error| map_tool_open_refusal(error, module_id))
+    }
+
+    async fn ensure_batch_route(
+        &self,
+        ctx: &BatchCtx,
+        module_id: &str,
+        guard: &ToolOpenGuard,
+    ) -> Result<(RouteHandle, Arc<Semaphore>), ToolPlaneError> {
+        if !self.frozen_contract(ctx, module_id).tool_result_v1 {
+            return self
+                .ensure_route(&ctx.bind, ctx.scope.as_ref(), module_id, guard)
+                .await;
+        }
+        let lifecycle = self.capture_session_lifecycle_token(&ctx.bind);
+        self.ensure_result_route_for_lifecycle_inner(
+            &ctx.bind,
+            ctx.scope.as_ref(),
+            module_id,
+            &lifecycle,
+            guard.deadline,
+            guard,
+            TOOL_DISPATCH_PATIENCE,
+            true,
+        )
+        .await
+        .map_err(|error| map_tool_open_refusal(error, module_id))
     }
 
     /// Open a route to `module_id` for `bind`, under `scope` when the run was admitted under
     /// one. This is the only place a tool route is opened, so it is where a scoped run's route
     /// is guaranteed to carry its scope: a scoped open that cannot carry it is refused, never
     /// sent unscoped.
+    #[allow(clippy::too_many_arguments)]
     async fn route_open_for_lifecycle(
         &self,
         bind: &BindIdentity,
@@ -1815,7 +2064,9 @@ impl SubcToolPlane {
         module_id: &str,
         lifecycle: &CancellationToken,
         retry_deadline: Option<Instant>,
+        guard: &ToolOpenGuard,
         patience: RouteOpenPatience,
+        tool_result_v1: bool,
     ) -> Result<(RouteHandle, Option<ScopeStamp>), RouteEnsureError> {
         // One computed deadline keeps the caller budget authoritative while retaining a short
         // per-iteration cap. Using either bound alone would either overshoot a short warm timeout
@@ -1831,18 +2082,48 @@ impl SubcToolPlane {
             budget: deadline.saturating_duration_since(Instant::now()),
             max_interval: patience.max_interval,
         };
+        // A tool-call dispatch open waits out an outage from its first refusal, ending at the
+        // caller's absolute deadline at the latest (`retry_deadline`: the run's step deadline).
+        let outage = patience.waits_out_outage.then_some(OutageWait {
+            patience: patience.deadline,
+            max_interval: patience.max_interval,
+            deadline: retry_deadline,
+        });
         let gate_for = || self.conn.module_gate(module_id);
+        // Run cancel/stop ends the wait at once too, not just the session close: link the
+        // session lifecycle to the run's guard, and report which side fired.
+        let wait = WaitCancel::link(lifecycle, guard);
+        let cancel = wait.token();
         let cancelled = || {
-            RouteEnsureError::Plane(ToolPlaneError::Unavailable(
-                "session closed during route open".into(),
-            ))
+            RouteEnsureError::Plane(ToolPlaneError::Unavailable(if guard.interrupted() {
+                "run cancelled or stopped during route open".into()
+            } else {
+                "session closed during route open".into()
+            }))
         };
         let Some(scope) = scope else {
-            return retry_route_open(retry(), Some(lifecycle), gate_for, || {
-                self.conn
-                    .route_open_dispatch(module_id, bind, None, self.held_reply_declared())
-            })
-            .await
+            let attempt = || {
+                self.conn.route_open_dispatch(
+                    module_id,
+                    bind,
+                    None,
+                    tool_result_v1,
+                    self.held_reply_declared(),
+                )
+            };
+            return match outage {
+                Some(outage) => {
+                    retry_route_open_waiting_out_outage(
+                        outage,
+                        None,
+                        Some(cancel),
+                        gate_for,
+                        attempt,
+                    )
+                    .await
+                }
+                None => retry_route_open(retry(), Some(cancel), gate_for, attempt).await,
+            }
             .map(|handle| (handle, None))
             .map_err(|error| match error {
                 RouteOpenError::Conn(error) => RouteEnsureError::Connection(error),
@@ -1852,7 +2133,9 @@ impl SubcToolPlane {
         let selector = self.scoped_selector(scope).await?;
         // The hold is bounded by the scope hold and by the caller's own deadline, whichever
         // comes first. Inside a run there is no caller deadline, so the hold alone bounds it; a
-        // session close ends it at once through `lifecycle`.
+        // session close, run cancel or stop ends it at once through the linked `cancel`. The
+        // same token ends the scope-sync waits of the describes that bracket the open; a
+        // describe already in flight finishes or times out first.
         let hold_cap = Instant::now() + self.scope_sync_hold;
         let hold = ScopeHold {
             deadline: retry_deadline.map_or(hold_cap, |caller| caller.min(hold_cap)),
@@ -1870,13 +2153,17 @@ impl SubcToolPlane {
         // pair that disagrees means the route may have been bound under either, so it is
         // closed and opened again.
         for _ in 0..MAX_STAMP_BRACKET_ATTEMPTS {
-            let before = match self.read_scope(scope, lifecycle, true).await {
+            let before = match self.read_scope(scope, cancel, guard.deadline, true).await {
                 ScopeReading::Live(stamp) => stamp,
                 ScopeReading::Gone(reason) => {
                     return Err(refused(
                         reason,
                         format!("scope.describe says the scope is gone ({reason})"),
                     ))
+                }
+                // The run was cancelled or stopped while the describe held: nothing is open yet.
+                ScopeReading::NotSynced | ScopeReading::Unverifiable(_) if guard.interrupted() => {
+                    return Err(cancelled())
                 }
                 ScopeReading::NotSynced => {
                     return Err(refused(
@@ -1891,31 +2178,53 @@ impl SubcToolPlane {
                     ))
                 }
             };
-            let handle = retry_route_open_with_scope_hold(
-                retry(),
-                Some(hold),
-                Some(lifecycle),
-                gate_for,
-                || {
-                    self.conn.route_open_dispatch(
-                        module_id,
-                        bind,
-                        Some(&selector),
-                        self.held_reply_declared(),
+            let attempt = || {
+                self.conn.route_open_dispatch(
+                    module_id,
+                    bind,
+                    Some(&selector),
+                    tool_result_v1,
+                    self.held_reply_declared(),
+                )
+            };
+            let opened = match outage {
+                Some(outage) => {
+                    retry_route_open_waiting_out_outage(
+                        outage,
+                        Some(hold),
+                        Some(cancel),
+                        gate_for,
+                        attempt,
                     )
-                },
-            )
-            .await
-            .map_err(|error| match error {
+                    .await
+                }
+                None => {
+                    retry_route_open_with_scope_hold(
+                        retry(),
+                        Some(hold),
+                        Some(cancel),
+                        gate_for,
+                        attempt,
+                    )
+                    .await
+                }
+            };
+            let handle = opened.map_err(|error| match error {
                 RouteOpenError::Conn(ConnError::Rejected(message)) => {
                     scoped_open_refusal(message, self.scope_sync_hold)
                 }
                 RouteOpenError::Conn(error) => RouteEnsureError::Connection(error),
                 RouteOpenError::Cancelled => cancelled(),
             })?;
-            match self.read_scope(scope, lifecycle, true).await {
+            match self.read_scope(scope, cancel, guard.deadline, true).await {
                 ScopeReading::Live(after) if may_resend_under(&before, &after) => {
-                    return Ok((handle, Some(after)));
+                    return Ok((handle, Some(*after)));
+                }
+                // The run was cancelled or stopped while the describe held: the route opened
+                // but carries nothing, so close it.
+                ScopeReading::NotSynced | ScopeReading::Unverifiable(_) if guard.interrupted() => {
+                    let _ = self.conn.route_close(&handle).await;
+                    return Err(cancelled());
                 }
                 ScopeReading::Live(_) => {
                     // The scope's stamp changed while the route was opening, so the route may
@@ -1954,6 +2263,7 @@ impl SubcToolPlane {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn ensure_route_for_lifecycle_inner(
         &self,
         bind: &BindIdentity,
@@ -1961,7 +2271,33 @@ impl SubcToolPlane {
         module_id: &str,
         lifecycle: &CancellationToken,
         retry_deadline: Option<Instant>,
+        guard: &ToolOpenGuard,
         patience: RouteOpenPatience,
+    ) -> Result<(RouteHandle, Arc<Semaphore>), RouteEnsureError> {
+        self.ensure_result_route_for_lifecycle_inner(
+            bind,
+            scope,
+            module_id,
+            lifecycle,
+            retry_deadline,
+            guard,
+            patience,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_result_route_for_lifecycle_inner(
+        &self,
+        bind: &BindIdentity,
+        scope: Option<&SessionScope>,
+        module_id: &str,
+        lifecycle: &CancellationToken,
+        retry_deadline: Option<Instant>,
+        guard: &ToolOpenGuard,
+        patience: RouteOpenPatience,
+        tool_result_v1: bool,
     ) -> Result<(RouteHandle, Arc<Semaphore>), RouteEnsureError> {
         let key = Self::route_key(bind, scope, module_id);
         if lifecycle.is_cancelled() {
@@ -1984,8 +2320,19 @@ impl SubcToolPlane {
         // the module is down, whatever route each waiter wants. When the module returns, each
         // waiting call makes one open of its own: a bounded burst, after which this cache keeps
         // one route per key as before.
-        if let Some(r) = self.routes.lock().unwrap().get(&key) {
-            return Ok((r.handle, Arc::clone(&r.sem)));
+        let obsolete = {
+            let mut routes = self.routes.lock().unwrap();
+            if let Some(r) = routes.get(&key) {
+                if r.handle.reads_tool_result == (tool_result_v1 || self.held_reply_declared()) {
+                    return Ok((r.handle, Arc::clone(&r.sem)));
+                }
+            }
+            routes.remove(&key)
+        };
+        // A warm bind may predate plan admission. Rebind before sending if the frozen
+        // catalog now selects a different result format; never infer it from reply shape.
+        if let Some(obsolete) = obsolete {
+            self.close_route_best_effort(obsolete.handle);
         }
         // Resolve the window from THIS route's provider at open time (per-provider, cached
         // per module_id) — not a single global memo.
@@ -1994,7 +2341,16 @@ impl SubcToolPlane {
             .await
             .map_err(RouteEnsureError::Plane)?;
         let (handle, stamp) = self
-            .route_open_for_lifecycle(bind, scope, module_id, lifecycle, retry_deadline, patience)
+            .route_open_for_lifecycle(
+                bind,
+                scope,
+                module_id,
+                lifecycle,
+                retry_deadline,
+                guard,
+                patience,
+                tool_result_v1,
+            )
             .await?;
         let sem = Arc::new(Semaphore::new(window));
         let cached = {
@@ -2042,6 +2398,7 @@ impl SubcToolPlane {
             module_id,
             lifecycle,
             retry_deadline,
+            &ToolOpenGuard::default(),
             DEFAULT_ROUTE_OPEN_PATIENCE,
         )
         .await
@@ -2194,6 +2551,7 @@ impl SubcToolPlane {
         ctx: &BatchCtx,
         calls: &[ToolCall],
         manifest: &ToolManifest,
+        guard: &ToolOpenGuard,
     ) -> Result<(), ToolPlaneError> {
         if ctx.scope.is_some() {
             // No call of this batch is in flight yet (its intents are written after this
@@ -2202,7 +2560,7 @@ impl SubcToolPlane {
             if let Some(latch) = self.run_latch(ctx) {
                 return Err(latch.into_plane_error());
             }
-            if let Some(reason) = self.gone_since_last_batch(ctx).await {
+            if let Some(reason) = self.gone_since_last_batch(ctx, guard).await {
                 return Err(ToolPlaneError::ScopeDrained { reason });
             }
         }
@@ -2249,7 +2607,7 @@ impl SubcToolPlane {
         let route_results = join_all(
             modules
                 .iter()
-                .map(|module_id| self.ensure_route(&ctx.bind, ctx.scope.as_ref(), module_id)),
+                .map(|module_id| self.ensure_batch_route(ctx, module_id, guard)),
         )
         .await;
         // join_all retains input order. Check every result in the same BTreeSet order as the
@@ -2296,11 +2654,57 @@ impl SubcToolPlane {
         }
     }
 
+    /// A terminal result for a call proven undelivered because its module stayed down for
+    /// the whole tool-dispatch patience. The message stays the stable unavailable string
+    /// while the module, the daemon's code and its detail ride in sibling fields, so the
+    /// model can retry rather than give up. Fenced like any other Completed result, so a
+    /// repeated id returns it without re-sending.
+    fn module_unavailable_result(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        module_id: &str,
+        code: &str,
+        detail: &str,
+        fence_key: &FenceKey,
+    ) -> DispatchResult {
+        let result = ToolResult {
+            tool_call_id: call.tool_call_id.clone(),
+            output: ToolOutput::module_unavailable(module_id, code, detail),
+            is_error: true,
+        };
+        self.fence
+            .lock()
+            .unwrap()
+            .insert(&ctx.batch_id, fence_key.clone(), result.clone());
+        DispatchResult::Completed(result)
+    }
+
+    /// The not-sent result for a call whose run was cancelled or stopped before its request
+    /// was enqueued. An approved call keeps the reason its records have always carried.
+    fn stopped_before_send(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
+        let approved = self
+            .approved_args
+            .lock()
+            .unwrap()
+            .get(&Self::batch_route_key(ctx))
+            .is_some_and(|calls| calls.contains_key(&call.tool_call_id));
+        DispatchResult::NotSent {
+            reason: if approved {
+                "approved_dispatch_stopped_before_send"
+            } else {
+                "dispatch_stopped_before_send"
+            }
+            .into(),
+        }
+    }
+
     async fn dispatch_inner(
         &self,
         ctx: &BatchCtx,
         call: &ToolCall,
         key: Option<broca_core::tool_plane::DispatchKey<'_>>,
+        guard: &ToolOpenGuard,
     ) -> DispatchResult {
         // Fence: a repeated (session, tool_call_id) returns the prior result (at-most-once).
         // Keyed by session so the same provider id minted by two sessions can't false-dedup.
@@ -2337,6 +2741,12 @@ impl SubcToolPlane {
         };
         let scope = ctx.scope.as_ref();
         let route_key = Self::route_key(&ctx.bind, scope, &module_id);
+        // The call's own execution budget once sent. It does not bound the route-open wait in
+        // front of the send: that ends at the guard's absolute deadline (the run's step
+        // deadline), the tool-dispatch patience, or run cancel/stop, whichever comes first.
+        let reply_deadline = self.reply_deadline(ctx, &module_id, call);
+        // The same run signals guard the physical enqueue after every open and permit wait.
+        let signals = guard.signals();
 
         // For a scoped call: the stamp of the route its batch started with, which the call was
         // composed under. `None` for an unscoped call.
@@ -2368,9 +2778,11 @@ impl SubcToolPlane {
                             &module_id,
                             handle,
                             Some(stamp),
-                            DEFAULT_ROUTE_OPEN_PATIENCE,
+                            TOOL_DISPATCH_PATIENCE,
+                            guard,
                             fence_key,
                             key,
+                            &[],
                         )
                         .await;
                 }
@@ -2379,9 +2791,21 @@ impl SubcToolPlane {
         }
 
         // route.open / semaphore failures are BEFORE any tool send → NotSent (the
-        // call never left the process; safe to (re-)dispatch).
-        let (route_handle, sem) = match self.ensure_route(&ctx.bind, scope, &module_id).await {
+        // call never left the process; safe to (re-)dispatch). A module that stays down
+        // for the whole tool-dispatch patience instead ends the call with the attributed
+        // unavailable result (still never sent).
+        let (route_handle, sem) = match self.ensure_batch_route(ctx, &module_id, guard).await {
             Ok(rs) => rs,
+            // The run was cancelled or stopped during the open: never sent.
+            Err(_) if guard.interrupted() => return self.stopped_before_send(ctx, call),
+            Err(ToolPlaneError::ModuleUnavailable {
+                module,
+                code,
+                detail,
+            }) => {
+                return self
+                    .module_unavailable_result(ctx, call, &module, &code, &detail, &fence_key);
+            }
             Err(e) => {
                 self.latch_open_refusal(ctx, &e);
                 return DispatchResult::NotSent {
@@ -2392,9 +2816,14 @@ impl SubcToolPlane {
         if scope.is_some() && composed_under.is_none() {
             composed_under = self.cached_stamp(&ctx.bind, scope, &module_id, route_handle);
         }
+        // The open may have waited out an outage; a run cancelled or stopped meanwhile sends
+        // nothing, and does not queue for flow-control credit either.
+        if guard.interrupted() {
+            return self.stopped_before_send(ctx, call);
+        }
         // Flow control: hold a route permit from send to terminal so concurrent
         // in-flight never exceeds the provider's window (Serial → serializes).
-        let _stale_permit = match Arc::clone(&sem).acquire_owned().await {
+        let first_permit = match Arc::clone(&sem).acquire_owned().await {
             Ok(p) => p,
             Err(_) => {
                 return DispatchResult::NotSent {
@@ -2404,13 +2833,35 @@ impl SubcToolPlane {
         };
 
         // Another task may have invalidated/re-opened the session route while this task was
-        // waiting for flow-control credit. This check runs strictly before the send, so it is
-        // safe to report NotSent: we only avoid a stale dispatch when the captured route is no
-        // longer the live cached route, and we never reclassify an already-sent request.
+        // waiting for flow-control credit. This check runs strictly before the send, so the
+        // call has sent nothing: it re-opens once, as its first send, rather than fail the
+        // turn. That is what a sibling meets when the call ahead of it on a serial route was
+        // refused for a module restart and gave its credit back to re-open.
         if !self.route_is_current(&route_key, route_handle, &sem) {
-            return DispatchResult::NotSent {
-                reason: "cached route changed before send".into(),
-            };
+            // The calls re-opening on this route now, which this call must not send ahead of.
+            let earlier = self.resend_turns_in_progress(&route_key);
+            drop(first_permit);
+            if scope.is_some() {
+                // A scoped call keeps the scope check of any re-open: a fresh route must carry
+                // the epoch and agent the call was composed under.
+                return self
+                    .resend_or_drain(
+                        ctx,
+                        call,
+                        &module_id,
+                        route_handle,
+                        composed_under,
+                        TOOL_DISPATCH_PATIENCE,
+                        guard,
+                        fence_key,
+                        key,
+                        &earlier,
+                    )
+                    .await;
+            }
+            return self
+                .send_on_replaced_route(ctx, call, &module_id, fence_key, key, guard, &earlier)
+                .await;
         }
         if scope.is_some() {
             let current = self.cached_stamp(&ctx.bind, scope, &module_id, route_handle);
@@ -2443,10 +2894,9 @@ impl SubcToolPlane {
         //    restart. The protocol guarantees this rejection happens before the request is
         //    sent to the tool, so re-dispatching cannot execute it twice. Without this
         //    retry, an ordinary tool-module restart returns a `tool/route rejected` error to
-        //    the model. Re-opening waits for the drain with RELOAD_REOPEN_PATIENCE rather
-        //    than the default 3s: that
-        //    default ends most real restarts in NotSent, returning the same error three
-        //    seconds later;
+        //    the model. Re-opening waits out the drain with the tool-dispatch patience; a
+        //    second `module_reloading` on the one re-send is reported as the module being
+        //    unavailable, still never sent (see `finish_dispatch`);
         //  - provider route_not_bound / route_reclaimed refusals share the stale-route retry;
         //    outcome_unknown_root_reclaimed instead interrupts and evicts without a retry;
         //  - any other typed Error frame (Rejected) is a DEFINITE negative response — a
@@ -2457,9 +2907,16 @@ impl SubcToolPlane {
         //
         // That last case is why the reply deadline is sized per call rather than fixed: a
         // deadline shorter than the work turns a healthy call into an ambiguous one.
-        let reply_deadline = self.reply_deadline(ctx, &module_id, call);
         let first = match self
-            .send_call(ctx, &module_id, &route_handle, call, reply_deadline, key)
+            .send_call(
+                ctx,
+                &module_id,
+                &route_handle,
+                call,
+                reply_deadline,
+                key,
+                &signals,
+            )
             .await
         {
             SendAttempt::NotSent { reason } => return DispatchResult::NotSent { reason },
@@ -2469,15 +2926,32 @@ impl SubcToolPlane {
             || matches!(&first, Err(ConnError::Rejected(msg)) if crate::connection::classify_tool_route_refusal(msg) == crate::connection::ToolRouteRefusal::Reopen);
         let endpoint_is_reloading = first.as_ref().err().and_then(ConnError::code)
             == Some(subc_protocol::error_codes::MODULE_RELOADING);
+        if !(route_is_known_stale || endpoint_is_reloading) {
+            return self
+                .finish_dispatch(
+                    ctx,
+                    call,
+                    &module_id,
+                    fence_key,
+                    route_handle,
+                    composed_under,
+                    first,
+                    key,
+                    first_permit,
+                )
+                .await;
+        }
+        // The first request was refused before it reached the tool, so it holds no window
+        // credit any more. Give the permit back before re-opening: the re-open may wait out a
+        // module restart, and on a serial route a sibling must not wait behind that. The
+        // sibling then re-opens alongside this call, but sends only after this call has
+        // finished (the resend turn), so a serial route keeps batch order.
+        let _resend_turn = self.begin_resend_turn(&route_key);
+        drop(first_permit);
         // A scoped call caught before send is never re-sent blindly. The scope's current state
         // decides, and so does whether a fresh route would carry the same epoch and agent as
         // the route the call was composed under (see `resend_or_drain`).
-        if (route_is_known_stale || endpoint_is_reloading) && scope.is_some() {
-            let patience = if endpoint_is_reloading {
-                RELOAD_REOPEN_PATIENCE
-            } else {
-                DEFAULT_ROUTE_OPEN_PATIENCE
-            };
+        if scope.is_some() {
             return self
                 .resend_or_drain(
                     ctx,
@@ -2485,79 +2959,181 @@ impl SubcToolPlane {
                     &module_id,
                     route_handle,
                     composed_under,
-                    patience,
+                    TOOL_DISPATCH_PATIENCE,
+                    guard,
                     fence_key,
                     key,
+                    &[],
                 )
                 .await;
         }
-        let mut sent_on = route_handle;
-        let outcome = if route_is_known_stale || endpoint_is_reloading {
-            self.remove_batch_call_route(ctx, &call.tool_call_id);
-            // FORGOTTEN, NOT CLOSED, in both cases. For module_reloading the daemon still holds
-            // the route, and closing it looks tidier -- but it is not safe. A sibling call in
-            // the same batch may still be in flight on it (the drain is waiting for exactly
-            // that call), and a GOODBYE would cut its reply off, turning a restart into an
-            // ambiguous outcome that stops the run. And eviction here is by key, so if a sibling
-            // already re-opened, this would close the FRESH route instead. The drain removes the
-            // old binding on its own; leaving it costs nothing but a dead entry until then.
-            let _ = self.invalidate_route_for_module(&ctx.bind, scope, &module_id);
-            let reopened = if endpoint_is_reloading {
-                let lifecycle = self.capture_session_lifecycle_token(&ctx.bind);
-                self.ensure_route_for_lifecycle_inner(
-                    &ctx.bind,
-                    scope,
-                    &module_id,
-                    &lifecycle,
-                    None,
-                    RELOAD_REOPEN_PATIENCE,
-                )
-                .await
-                .map_err(RouteEnsureError::into_plane)
-            } else {
-                self.ensure_route(&ctx.bind, scope, &module_id).await
-            };
-            match reopened {
-                Ok((fresh_handle, fresh_sem)) => {
-                    sent_on = fresh_handle;
-                    let _fresh_permit = match Arc::clone(&fresh_sem).acquire_owned().await {
-                        Ok(p) => p,
-                        Err(_) => {
-                            return DispatchResult::NotSent {
-                                reason: "route semaphore closed".into(),
-                            };
-                        }
-                    };
-                    match self
-                        .send_call(ctx, &module_id, &fresh_handle, call, reply_deadline, key)
-                        .await
-                    {
-                        SendAttempt::NotSent { reason } => {
-                            return DispatchResult::NotSent { reason }
-                        }
-                        SendAttempt::Reply(reply) => reply,
-                    }
-                }
-                Err(e) => {
-                    self.latch_open_refusal(ctx, &e);
-                    return DispatchResult::NotSent {
-                        reason: format!("route re-open after stale handle failed: {e}"),
-                    };
-                }
-            }
+        self.remove_batch_call_route(ctx, &call.tool_call_id);
+        // FORGOTTEN, NOT CLOSED, in both cases. For module_reloading the daemon still holds
+        // the route, and closing it looks tidier -- but it is not safe. A sibling call in
+        // the same batch may still be in flight on it (the drain is waiting for exactly
+        // that call), and a GOODBYE would cut its reply off, turning a restart into an
+        // ambiguous outcome that stops the run. And eviction here is by key, so if a sibling
+        // already re-opened, this would close the FRESH route instead. The drain removes the
+        // old binding on its own; leaving it costs nothing but a dead entry until then.
+        let _ = self.invalidate_route_for_module(&ctx.bind, scope, &module_id);
+        let reopened = if endpoint_is_reloading {
+            let lifecycle = self.capture_session_lifecycle_token(&ctx.bind);
+            self.ensure_result_route_for_lifecycle_inner(
+                &ctx.bind,
+                scope,
+                &module_id,
+                &lifecycle,
+                guard.deadline,
+                guard,
+                TOOL_DISPATCH_PATIENCE,
+                self.frozen_contract(ctx, &module_id).tool_result_v1,
+            )
+            .await
+            .map_err(|error| map_tool_open_refusal(error, &module_id))
         } else {
-            first
+            self.ensure_batch_route(ctx, &module_id, guard).await
         };
+        let (fresh_handle, fresh_sem) = match reopened {
+            Ok(reopened) => reopened,
+            // The run was cancelled or stopped during the re-open: never sent.
+            Err(_) if guard.interrupted() => return self.stopped_before_send(ctx, call),
+            // A module that stays down for the whole tool-dispatch patience ends the call
+            // with the attributed unavailable result, proven never sent, not a reopen error.
+            Err(ToolPlaneError::ModuleUnavailable {
+                module,
+                code,
+                detail,
+            }) => {
+                return self
+                    .module_unavailable_result(ctx, call, &module, &code, &detail, &fence_key);
+            }
+            Err(error) => {
+                self.latch_open_refusal(ctx, &error);
+                return DispatchResult::NotSent {
+                    reason: format!("route re-open after stale handle failed: {error}"),
+                };
+            }
+        };
+        if guard.interrupted() {
+            return self.stopped_before_send(ctx, call);
+        }
+        let fresh_permit = match Arc::clone(&fresh_sem).acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => {
+                return DispatchResult::NotSent {
+                    reason: "route semaphore closed".into(),
+                };
+            }
+        };
+        let outcome = match self
+            .send_call(
+                ctx,
+                &module_id,
+                &fresh_handle,
+                call,
+                reply_deadline,
+                key,
+                &signals,
+            )
+            .await
+        {
+            SendAttempt::NotSent { reason } => return DispatchResult::NotSent { reason },
+            SendAttempt::Reply(reply) => reply,
+        };
+        // The re-sent request holds the fresh route's credit until its terminal.
         self.finish_dispatch(
             ctx,
             call,
             &module_id,
             fence_key,
-            sent_on,
+            fresh_handle,
             composed_under,
             outcome,
             key,
-            _stale_permit,
+            fresh_permit,
+        )
+        .await
+    }
+
+    /// An unscoped call that waited for credit on a route and found it replaced once it got
+    /// the credit: nothing was sent, so it opens the route again once, through the same
+    /// tool-dispatch open (the module's gate, `guard`, the outage patience), and sends there
+    /// as its first send. It sends only after `earlier`, the calls re-opening on the same route
+    /// ahead of it, have finished. A module still down after the patience ends it with the
+    /// attributed outage result, never sent.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_on_replaced_route(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        module_id: &str,
+        fence_key: FenceKey,
+        key: Option<broca_core::tool_plane::DispatchKey<'_>>,
+        guard: &ToolOpenGuard,
+        earlier: &[CancellationToken],
+    ) -> DispatchResult {
+        let route_key = Self::route_key(&ctx.bind, None, module_id);
+        let (fresh_handle, fresh_sem) = match self.ensure_batch_route(ctx, module_id, guard).await {
+            Ok(route) => route,
+            Err(_) if guard.interrupted() => return self.stopped_before_send(ctx, call),
+            Err(ToolPlaneError::ModuleUnavailable {
+                module,
+                code,
+                detail,
+            }) => {
+                return self
+                    .module_unavailable_result(ctx, call, &module, &code, &detail, &fence_key);
+            }
+            Err(error) => {
+                self.latch_open_refusal(ctx, &error);
+                return DispatchResult::NotSent {
+                    reason: format!("route re-open after the cached route changed failed: {error}"),
+                };
+            }
+        };
+        if !Self::wait_for_resend_turns(earlier, guard).await {
+            return self.stopped_before_send(ctx, call);
+        }
+        let fresh_permit = match Arc::clone(&fresh_sem).acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                return DispatchResult::NotSent {
+                    reason: "route semaphore closed".into(),
+                }
+            }
+        };
+        // One re-open only: a route replaced again while this call waited is not chased.
+        if !self.route_is_current(&route_key, fresh_handle, &fresh_sem) {
+            return DispatchResult::NotSent {
+                reason: "cached route changed before send".into(),
+            };
+        }
+        let reply_deadline = self.reply_deadline(ctx, module_id, call);
+        let outcome = match self
+            .send_call(
+                ctx,
+                module_id,
+                &fresh_handle,
+                call,
+                reply_deadline,
+                key,
+                &guard.signals(),
+            )
+            .await
+        {
+            SendAttempt::NotSent { reason } => return DispatchResult::NotSent { reason },
+            SendAttempt::Reply(reply) => reply,
+        };
+        self.finish_dispatch(
+            ctx,
+            call,
+            module_id,
+            fence_key,
+            fresh_handle,
+            None,
+            outcome,
+            key,
+            fresh_permit,
         )
         .await
     }
@@ -2607,7 +3183,8 @@ impl SubcToolPlane {
                     signals: signals.clone(),
                 },
             );
-        self.dispatch_inner(ctx, call, Some(key)).await
+        self.dispatch_inner(ctx, call, Some(key), &ToolOpenGuard::from(signals))
+            .await
     }
 
     async fn recheck_approval_scope_inner(
@@ -2662,6 +3239,7 @@ impl SubcToolPlane {
                     &module,
                     &ctx.bind,
                     Some(&selector),
+                    self.frozen_contract(ctx, &module).tool_result_v1,
                     self.held_reply_declared(),
                 )
             },
@@ -2722,13 +3300,44 @@ impl ToolPlane for SubcToolPlane {
         calls: &[ToolCall],
         manifest: &ToolManifest,
     ) -> Result<(), ToolPlaneError> {
-        self.batch_started_inner(ctx, calls, manifest).await
+        self.batch_started_inner(ctx, calls, manifest, &ToolOpenGuard::default())
+            .await
+    }
+    async fn batch_started_guarded(
+        &self,
+        ctx: &BatchCtx,
+        calls: &[ToolCall],
+        manifest: &ToolManifest,
+        guard: &ToolOpenGuard,
+    ) -> Result<(), ToolPlaneError> {
+        self.batch_started_inner(ctx, calls, manifest, guard).await
     }
     fn dispatch_target(&self, ctx: &BatchCtx, id: &ToolCallId) -> Option<String> {
         self.dispatch_target_inner(ctx, id)
     }
+    fn dispatch_schema_pin(
+        &self,
+        ctx: &BatchCtx,
+        id: &ToolCallId,
+        tool: &str,
+    ) -> Option<broca_core::tool_plane::DispatchSchemaPin> {
+        let module = self.dispatch_target_inner(ctx, id)?;
+        // Only an admitted plan supplies the provider's schema digest and semantics.
+        // Legacy direct tools and old manifests keep an unknown pin; consulting a
+        // later catalog would invent history and add a new refusing RPC to dispatch.
+        self.batch_manifests
+            .lock()
+            .unwrap()
+            .get(&Self::batch_route_key(ctx))?
+            .provider_declarations(&module)?
+            .schema_pins
+            .as_ref()?
+            .get(tool)
+            .cloned()
+    }
     async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
-        self.dispatch_inner(ctx, call, None).await
+        self.dispatch_inner(ctx, call, None, &ToolOpenGuard::default())
+            .await
     }
     async fn dispatch_keyed(
         &self,
@@ -2736,7 +3345,17 @@ impl ToolPlane for SubcToolPlane {
         call: &ToolCall,
         key: broca_core::tool_plane::DispatchKey<'_>,
     ) -> DispatchResult {
-        self.dispatch_inner(ctx, call, Some(key)).await
+        self.dispatch_inner(ctx, call, Some(key), &ToolOpenGuard::default())
+            .await
+    }
+    async fn dispatch_guarded(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        key: Option<broca_core::tool_plane::DispatchKey<'_>>,
+        guard: &ToolOpenGuard,
+    ) -> DispatchResult {
+        self.dispatch_inner(ctx, call, key, guard).await
     }
     async fn dispatch_approved(
         &self,
@@ -2955,7 +3574,7 @@ fn catalog_entry_has_tool(entry: &CatalogEntry, tool_name: &str) -> bool {
 fn route_failure_result(call: &ToolCall, message: String) -> ToolResult {
     ToolResult {
         tool_call_id: call.tool_call_id.clone(),
-        output: ToolOutput::Error { message },
+        output: ToolOutput::error(message),
         is_error: true,
     }
 }
@@ -3018,6 +3637,92 @@ fn conn_to_plane(e: ConnError) -> ToolPlaneError {
     ToolPlaneError::Unavailable(e.to_string())
 }
 
+/// Map a tool-dispatch route-open failure to the plane error the loop reports. A refusal
+/// the daemon attributed to the module (`target_unavailable`, `module_reloading`,
+/// `module_warming`, `module_timeout`) that outlasted the tool-dispatch patience becomes
+/// [`ToolPlaneError::ModuleUnavailable`]: proven undelivered, carrying the module, the
+/// daemon's code and its detail. Everything else keeps today's mapping.
+fn map_tool_open_refusal(error: RouteEnsureError, module_id: &str) -> ToolPlaneError {
+    match error {
+        RouteEnsureError::Connection(ConnError::Rejected(message))
+            if is_module_availability_refusal(message.code()) =>
+        {
+            ToolPlaneError::ModuleUnavailable {
+                module: module_id.to_owned(),
+                code: message.code().to_owned(),
+                detail: broca_protocol::bound_module_unavailable_detail(&message.detail()),
+            }
+        }
+        error => error.into_plane(),
+    }
+}
+
+/// One call's turn in [`SubcToolPlane::begin_resend_turn`]: while it lives, a call that
+/// finds the same route replaced waits for it before sending. Dropping it ends the turn and
+/// forgets it.
+struct ResendTurn<'a> {
+    turns: &'a Mutex<HashMap<RouteKey, Vec<CancellationToken>>>,
+    key: RouteKey,
+    done: CancellationToken,
+}
+
+impl Drop for ResendTurn<'_> {
+    fn drop(&mut self) {
+        self.done.cancel();
+        let mut turns = self.turns.lock().unwrap();
+        if let Some(entry) = turns.get_mut(&self.key) {
+            entry.retain(|turn| !turn.is_cancelled());
+            if entry.is_empty() {
+                turns.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// Links the session lifecycle to the run's early-exit guard for one route-open wait: the
+/// returned token fires when the session closes OR the run is cancelled/stopped. The
+/// watcher task is aborted when the link drops (when the open finishes), so no task
+/// outlives the wait it paces.
+struct WaitCancel {
+    token: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl WaitCancel {
+    fn link(lifecycle: &CancellationToken, guard: &ToolOpenGuard) -> Self {
+        let token = CancellationToken::new();
+        let linked = token.clone();
+        let lifecycle = lifecycle.clone();
+        let cancel = guard.cancel_token();
+        let stop = guard.stop_token();
+        let task = tokio::spawn(async move {
+            async fn wait(token: Option<CancellationToken>) {
+                match token {
+                    Some(token) => token.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            }
+            tokio::select! {
+                _ = lifecycle.cancelled() => {}
+                _ = wait(cancel) => {}
+                _ = wait(stop) => {}
+            }
+            linked.cancel();
+        });
+        Self { token, task }
+    }
+
+    fn token(&self) -> &CancellationToken {
+        &self.token
+    }
+}
+
+impl Drop for WaitCancel {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// The warm-bind retry delay for `attempt` (1-based): 250ms doubling to a 5s cap.
 /// Sequence: 250ms, 500ms, 1s, 2s, 4s, 5s, 5s, … — ~8 attempts in a 30s window.
 fn warm_bind_backoff(attempt: u32) -> Duration {
@@ -3037,8 +3742,8 @@ fn map_call_tool_result(
     tool_capture::classify(id, raw)
 }
 
-// Keep the no-capture mapping unchanged, including structuredContent and malformed replies.
-fn map_legacy_call_tool_result(id: &ToolCallId, raw: &serde_json::Value) -> ToolResult {
+// Keep non-media replies unchanged, including structuredContent and malformed replies.
+pub(crate) fn map_legacy_call_tool_result(id: &ToolCallId, raw: &serde_json::Value) -> ToolResult {
     map_text_call_tool_result(id, raw, legacy_non_text_tool_content_placeholder)
 }
 
@@ -3055,10 +3760,11 @@ fn map_text_call_tool_result(
     let text = content
         .map(|blocks| {
             if blocks.iter().all(|block| {
-                block
-                    .get("text")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some()
+                tool_capture::blob_mime(block).is_none()
+                    && block
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some()
             }) {
                 return blocks
                     .iter()
@@ -3066,17 +3772,31 @@ fn map_text_call_tool_result(
                     .collect::<Vec<_>>()
                     .join("");
             }
-            blocks
+            let mut notices = Vec::new();
+            let mut text = blocks
                 .iter()
-                .map(|block| {
-                    block
-                        .get("text")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| placeholder(block))
+                .filter_map(|block| {
+                    if let Some(mime) = tool_capture::blob_mime(block) {
+                        notices.push(crate::content_v1::dropped_media_notice(mime));
+                        return None;
+                    }
+                    Some(
+                        block
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| placeholder(block)),
+                    )
                 })
                 .collect::<Vec<_>>()
-                .join("")
+                .join("");
+            for notice in notices {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(&notice);
+            }
+            text
         })
         .unwrap_or_default();
 
@@ -3091,15 +3811,13 @@ fn map_text_call_tool_result(
     {
         return ToolResult {
             tool_call_id: id.clone(),
-            output: ToolOutput::Error {
-                message: malformed_tool_reply_message(raw),
-            },
+            output: ToolOutput::error(malformed_tool_reply_message(raw)),
             is_error: true,
         };
     }
 
     let output = if is_error {
-        ToolOutput::Error { message: text }
+        ToolOutput::error(text)
     } else if content.is_none_or(Vec::is_empty) {
         match raw.get("structuredContent") {
             Some(value) => ToolOutput::Json {
@@ -3182,6 +3900,7 @@ mod tests {
 
     use super::*;
 
+    mod outage_wait_tests;
     #[cfg(not(feature = "test-attachments"))]
     mod release_tool_capture_tests;
     #[cfg(feature = "test-attachments")]
@@ -3207,6 +3926,9 @@ mod tests {
         delay: Duration,
         error: Option<ScriptedRouteOpenError>,
         gate: Option<RouteOpenGate>,
+        /// The route opens but the daemon closes it straight away, so the first call on it
+        /// finds it gone before anything is sent and re-opens.
+        closed: bool,
     }
 
     #[derive(Clone)]
@@ -3278,6 +4000,13 @@ mod tests {
         dispatched_presets: Mutex<Vec<Option<String>>>,
         dispatched_deadlines: Mutex<Vec<Duration>>,
         dispatched_arguments: Mutex<Vec<serde_json::Value>>,
+        /// Real per-module availability gates, installed by tests that prove waiting
+        /// calls share one probe while the module is down. Modules without an
+        /// installed gate open ungated, as before.
+        gates: Mutex<HashMap<String, Arc<ModuleGate>>>,
+        /// When set, the next tool call announces itself and waits for its release before it
+        /// answers, so a test can act while that call is in flight.
+        send_gate: Mutex<Option<RouteOpenGate>>,
     }
 
     impl ScriptedToolPlaneConnection {
@@ -3315,6 +4044,8 @@ mod tests {
                 dispatched_presets: Mutex::new(Vec::new()),
                 dispatched_deadlines: Mutex::new(Vec::new()),
                 dispatched_arguments: Mutex::new(Vec::new()),
+                gates: Mutex::new(HashMap::new()),
+                send_gate: Mutex::new(None),
             })
         }
 
@@ -3326,6 +4057,7 @@ mod tests {
                     error: error
                         .map(|message| ScriptedRouteOpenError::Transport(message.to_owned())),
                     gate: None,
+                    closed: false,
                 }]),
             );
         }
@@ -3335,6 +4067,26 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(module_id.to_string(), scripts.into());
+        }
+
+        /// Install a real per-module availability gate (as the live connection returns),
+        /// so the test proves waiting calls share one probe while the module is down.
+        /// `jitter` paces the probes: zero for exact attempt counts, a fixed small wait
+        /// for waits a cancel must cut.
+        fn install_real_gate_with_jitter(
+            &self,
+            module_id: &str,
+            jitter: impl Fn(Duration) -> Duration + Send + Sync + 'static,
+        ) {
+            self.gates.lock().unwrap().insert(
+                module_id.to_string(),
+                Arc::new(ModuleGate::with_jitter(jitter, CancellationToken::new())),
+            );
+        }
+
+        /// Install a real gate with no probe jitter, so the attempt count is exact.
+        fn install_real_gate(&self, module_id: &str) {
+            self.install_real_gate_with_jitter(module_id, |_| Duration::ZERO);
         }
 
         fn gate_route_open(&self, module_id: &str) -> RouteOpenGate {
@@ -3413,9 +4165,11 @@ mod tests {
                     ScriptedRouteOpenError::Transport(message) => ConnError::Transport(message),
                 });
             }
-            Ok(RouteHandle::synthetic(
-                self.next_channel.fetch_add(1, Ordering::SeqCst),
-            ))
+            let route = RouteHandle::synthetic(self.next_channel.fetch_add(1, Ordering::SeqCst));
+            if script.closed {
+                self.close(route);
+            }
+            Ok(route)
         }
 
         async fn route_close(&self, route: &RouteHandle) -> Result<(), ConnError> {
@@ -3436,6 +4190,11 @@ mod tests {
             // as the real connection does for a handle missing from its live epoch map.
             if self.closed.lock().unwrap().contains(&route.channel) {
                 return Err(ConnError::StaleRouteHandle(*route));
+            }
+            let send_gate = self.send_gate.lock().unwrap().take();
+            if let Some(gate) = send_gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
             }
             self.dispatched_presets
                 .lock()
@@ -3473,6 +4232,7 @@ mod tests {
             deadline: Duration,
             preset: Option<&str>,
             args: &ApprovedArgs,
+            _schema_pin: Option<&str>,
         ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
             if let Some(error) = self.approved_setup_error.lock().unwrap().take() {
                 return Err(crate::connection::ApprovedCallError::BeforePush(
@@ -3494,6 +4254,10 @@ mod tests {
 
         fn route_is_open(&self, route: &RouteHandle) -> bool {
             !self.closed.lock().unwrap().contains(&route.channel)
+        }
+
+        fn module_gate(&self, module_id: &str) -> Option<Arc<ModuleGate>> {
+            self.gates.lock().unwrap().get(module_id).cloned()
         }
     }
 
@@ -3570,7 +4334,10 @@ mod tests {
         );
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         let ctx = batch_ctx("approved-stale-before-push");
-        let (route, _) = plane.ensure_route(&ctx.bind, None, "aft").await.unwrap();
+        let (route, _) = plane
+            .ensure_route(&ctx.bind, None, "aft", &ToolOpenGuard::default())
+            .await
+            .unwrap();
         *conn.approved_setup_error.lock().unwrap() = Some(ConnError::StaleRouteHandle(route));
         let result = plane
             .dispatch_approved(&ctx, &call("edit"), "{}", "call-key", &Default::default())
@@ -3631,7 +4398,10 @@ mod tests {
             let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
             let ctx = batch_ctx("approved-permit");
             let call = call("edit");
-            let (_, sem) = plane.ensure_route(&ctx.bind, None, "aft").await.unwrap();
+            let (_, sem) = plane
+                .ensure_route(&ctx.bind, None, "aft", &ToolOpenGuard::default())
+                .await
+                .unwrap();
             let permit = sem.clone().acquire_owned().await.unwrap();
             let token = CancellationToken::new();
             let signals = broca_core::tool_plane::DispatchSignals::new(
@@ -3815,6 +4585,7 @@ mod tests {
                     "aft",
                     &lifecycle,
                     None,
+                    &ToolOpenGuard::default(),
                     DEFAULT_ROUTE_OPEN_PATIENCE,
                 )
                 .await
@@ -3850,6 +4621,7 @@ mod tests {
                     "aft",
                     &lifecycle,
                     None,
+                    &ToolOpenGuard::default(),
                     DEFAULT_ROUTE_OPEN_PATIENCE,
                 )
                 .await
@@ -3969,6 +4741,7 @@ mod tests {
                 "aft",
                 &lifecycle,
                 None,
+                &ToolOpenGuard::default(),
                 DEFAULT_ROUTE_OPEN_PATIENCE,
             )
             .await
@@ -4001,6 +4774,7 @@ mod tests {
                 "aft",
                 &lifecycle,
                 None,
+                &ToolOpenGuard::default(),
                 DEFAULT_ROUTE_OPEN_PATIENCE,
             )
             .await
@@ -4030,6 +4804,7 @@ mod tests {
                 "aft",
                 &lifecycle,
                 None,
+                &ToolOpenGuard::default(),
                 DEFAULT_ROUTE_OPEN_PATIENCE,
             )
             .await
@@ -4355,7 +5130,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_dispatch_rendering_stays_byte_identical() {
+    async fn legacy_dispatch_rendering_goldens() {
         let cases = [
             (
                 serde_json::json!({
@@ -4426,7 +5201,7 @@ mod tests {
             })
             .unwrap_or_default();
         let output = if is_error {
-            ToolOutput::Error { message: text }
+            ToolOutput::error(text)
         } else {
             ToolOutput::Text { text }
         };
@@ -4458,14 +5233,14 @@ mod tests {
         assert_eq!(
             result.output,
             ToolOutput::Text {
-                text: "[non-text tool content omitted: type=image mimeType=image/png data≈8 bytes]"
+                text: "[image/png not shown to the model: this runner does not pass tool images to models yet]"
                     .into()
             }
         );
     }
 
     #[test]
-    fn mixed_tool_content_preserves_source_order_with_placeholders() {
+    fn mixed_tool_content_preserves_text_and_appends_media_notice() {
         let raw = serde_json::json!({
             "content": [
                 { "type": "text", "text": "before" },
@@ -4477,7 +5252,7 @@ mod tests {
 
         let result = uncaptured_result(&ToolCallId("t1".into()), &raw);
         assert_eq!(result.output, ToolOutput::Text {
-            text: "before[non-text tool content omitted: type=image mimeType=image/jpeg data≈4 bytes]after".into()
+            text: "beforeafter\n[image/jpeg not shown to the model: this runner does not pass tool images to models yet]".into()
         });
     }
 
@@ -4512,7 +5287,7 @@ mod tests {
     }
 
     #[test]
-    fn error_with_non_text_content_keeps_error_and_placeholder() {
+    fn error_with_non_text_content_keeps_error_and_media_notice() {
         let raw = serde_json::json!({
             "content": [{ "type": "audio", "mimeType": "audio/wav", "data": "123456" }],
             "isError": true
@@ -4522,11 +5297,9 @@ mod tests {
         assert!(result.is_error);
         assert_eq!(
             result.output,
-            ToolOutput::Error {
-                message:
-                    "[non-text tool content omitted: type=audio mimeType=audio/wav data≈6 bytes]"
-                        .into()
-            }
+            ToolOutput::error(
+                "[audio/wav not shown to the model: this runner does not pass tool images to models yet]"
+            )
         );
     }
 
@@ -4538,7 +5311,7 @@ mod tests {
 
         let result = uncaptured_result(&ToolCallId("t1".into()), &raw);
         assert!(result.is_error);
-        let ToolOutput::Error { message } = result.output else {
+        let ToolOutput::Error { message, .. } = result.output else {
             panic!("expected an error output, got {:?}", result.output);
         };
         assert!(
@@ -4585,7 +5358,7 @@ mod tests {
 
         let result = uncaptured_result(&ToolCallId("t1".into()), &raw);
         assert!(result.is_error);
-        let ToolOutput::Error { message } = result.output else {
+        let ToolOutput::Error { message, .. } = result.output else {
             panic!("expected an error output");
         };
         let quoted = message.split_once("raw reply: ").unwrap().1;
@@ -4607,7 +5380,7 @@ mod tests {
         });
         let r = uncaptured_result(&ToolCallId("t1".into()), &raw);
         assert!(r.is_error);
-        assert!(matches!(r.output, ToolOutput::Error { message } if message == "boom"));
+        assert!(matches!(r.output, ToolOutput::Error { message, .. } if message == "boom"));
     }
 
     fn result(text: &str) -> ToolResult {
@@ -4651,6 +5424,7 @@ mod tests {
         );
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         let mut frozen = broca_wal::PlanManifest {
+            rich_ui: None,
             declarations: Vec::new(),
             plan: broca_wal::OpaqueJson::from_json_text(
                 serde_json::json!({"tool_items": [
@@ -4763,7 +5537,7 @@ mod tests {
             "routing failures are model-visible tool errors"
         );
         assert!(
-            matches!(result.output, ToolOutput::Error { message } if message.contains(tool_name)),
+            matches!(result.output, ToolOutput::Error { message, .. } if message.contains(tool_name)),
             "routing failure message should name the unresolved tool"
         );
     }
@@ -5268,7 +6042,7 @@ mod tests {
             "the re-open must have outlasted the default patience to prove anything: {waited:?}"
         );
         assert!(
-            waited < RELOAD_REOPEN_PATIENCE.deadline,
+            waited < TOOL_DISPATCH_PATIENCE.deadline,
             "and still be bounded: {waited:?}"
         );
     }
@@ -5308,6 +6082,204 @@ mod tests {
             "a definite answer must be delivered, never re-sent"
         );
         assert!(conn.closed_routes.lock().unwrap().is_empty());
+    }
+
+    /// A tool-call batch waits out a 25 s provider-module restart instead of failing the turn.
+    ///
+    /// The route open is refused `target_unavailable` for 25 s of paused time, then the
+    /// module accepts: the batch opens, the call completes, and exactly one tool call went
+    /// out. Against the 3 s budget this batch start fails; the 90 s tool-dispatch patience
+    /// rides it out through the same per-target gate every waiter shares.
+    #[tokio::test(start_paused = true)]
+    async fn tool_dispatch_waits_out_a_25s_module_restart() {
+        let catalog = vec![catalog_entry("aft", &["read"])];
+        let conn = ScriptedToolPlaneConnection::new(
+            vec![catalog.clone(), catalog.clone(), catalog],
+            vec![successful_tool_reply("served after restart")],
+        );
+        // 25 refusals, each taking a second to arrive: a 25 s outage.
+        let mut sequence = (0..25)
+            .map(|_| RouteOpenScript {
+                delay: Duration::from_secs(1),
+                ..RouteOpenScript::rejected("target_unavailable — module_id 'aft' is unavailable")
+            })
+            .collect::<Vec<_>>();
+        sequence.push(RouteOpenScript::default());
+        conn.script_route_open_sequence("aft", sequence);
+        conn.install_real_gate("aft");
+        let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+        let ctx = batch_ctx("batch-restart-25s");
+        let tool_call = call("read");
+        let started = Instant::now();
+        plane
+            .batch_started(
+                &ctx,
+                std::slice::from_ref(&tool_call),
+                &ToolManifest::from_tools(vec![request_tool("read", Some("aft"))]),
+            )
+            .await
+            .expect("the 90 s patience must ride out a 25 s restart");
+        assert_completed_success(plane.dispatch(&ctx, &tool_call).await);
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_secs(25),
+            "the batch must have outlasted the old 3 s budget to prove anything: {waited:?}"
+        );
+        assert_eq!(
+            conn.tool_calls.load(Ordering::SeqCst),
+            1,
+            "exactly one send after the outage: nothing was sent while the module was down"
+        );
+        assert!(
+            conn.route_open_calls.load(Ordering::SeqCst) >= 10,
+            "the open kept retrying through the outage"
+        );
+    }
+
+    /// A module down past the 90 s tool-dispatch patience ends the batch as
+    /// module-unavailable: proven undelivered, naming the module, the daemon's code and its
+    /// detail. Nothing is ever sent.
+    #[tokio::test(start_paused = true)]
+    async fn tool_dispatch_past_90s_reports_module_unavailable() {
+        let catalog = vec![catalog_entry("aft", &["read"])];
+        let conn = ScriptedToolPlaneConnection::new(
+            vec![catalog.clone(), catalog.clone(), catalog],
+            vec![],
+        );
+        // The module never comes back: every open is refused, each taking 5 s to arrive.
+        conn.script_route_open_sequence(
+            "aft",
+            vec![RouteOpenScript {
+                delay: Duration::from_secs(5),
+                ..RouteOpenScript::rejected("target_unavailable — module_id 'aft' is unavailable")
+            }],
+        );
+        conn.install_real_gate("aft");
+        let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+        let ctx = batch_ctx("batch-restart-forever");
+        let tool_call = call("read");
+        let started = Instant::now();
+        let error = plane
+            .batch_started(
+                &ctx,
+                std::slice::from_ref(&tool_call),
+                &ToolManifest::from_tools(vec![request_tool("read", Some("aft"))]),
+            )
+            .await
+            .expect_err("a module down past the patience must fail the batch");
+        let waited = started.elapsed();
+        assert!(
+            waited >= TOOL_DISPATCH_PATIENCE.deadline,
+            "the batch must have waited out the whole patience: {waited:?}"
+        );
+        match error {
+            ToolPlaneError::ModuleUnavailable {
+                module,
+                code,
+                detail,
+            } => {
+                assert_eq!(module, "aft");
+                assert_eq!(code, "target_unavailable");
+                assert!(!detail.is_empty(), "the daemon's detail is kept");
+            }
+            other => panic!("expected the attributed outage, got {other:?}"),
+        }
+        assert_eq!(
+            conn.tool_calls.load(Ordering::SeqCst),
+            0,
+            "nothing was sent"
+        );
+        let opens = conn.route_open_calls.load(Ordering::SeqCst);
+        assert!(
+            opens >= 10,
+            "the open kept retrying instead of giving up at once: {opens}"
+        );
+        assert!(
+            opens < 40,
+            "the gate paces probes while the module is down, one per tick: {opens}"
+        );
+    }
+
+    /// Run cancel ends a module-outage wait at once instead of holding the patience.
+    #[tokio::test(start_paused = true)]
+    async fn cancel_mid_wait_ends_promptly() {
+        let catalog = vec![catalog_entry("aft", &["read"])];
+        let conn = ScriptedToolPlaneConnection::new(
+            vec![catalog.clone(), catalog.clone(), catalog],
+            vec![],
+        );
+        // Instant refusals: the wait is all backoff and gate pacing, which cancel must cut.
+        // The probes are 50 ms apart (not zero), so the wait parks where cancel observes it
+        // instead of spinning through an always-due probe.
+        conn.script_route_open_sequence(
+            "aft",
+            vec![RouteOpenScript::rejected(
+                "target_unavailable — module_id 'aft' is unavailable",
+            )],
+        );
+        conn.install_real_gate_with_jitter("aft", |_| Duration::from_millis(50));
+        let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+        let ctx = batch_ctx("batch-cancel-mid-wait");
+        let tool_call = call("read");
+        let manifest = ToolManifest::from_tools(vec![request_tool("read", Some("aft"))]);
+        let cancel = CancellationToken::new();
+        let guard = ToolOpenGuard::new(Some(&cancel), None);
+        let started = Instant::now();
+        let task = tokio::spawn(async move {
+            plane
+                .batch_started_guarded(&ctx, std::slice::from_ref(&tool_call), &manifest, &guard)
+                .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        cancel.cancel();
+        let result = task.await.expect("the wait must end on cancel");
+        let waited = started.elapsed();
+        assert!(
+            matches!(result, Err(ToolPlaneError::Unavailable(_))),
+            "a cancelled wait is an unsent failure, never a success: {result:?}"
+        );
+        assert!(
+            waited < TOOL_DISPATCH_PATIENCE.deadline,
+            "cancel must end the wait at once, not at the patience: {waited:?}"
+        );
+        assert_eq!(
+            conn.tool_calls.load(Ordering::SeqCst),
+            0,
+            "nothing was sent"
+        );
+    }
+
+    /// A call already in flight when the route drops is indeterminate and never retried:
+    /// the request may have run, so the run stops for review instead of re-sending.
+    #[tokio::test]
+    async fn in_flight_call_when_route_drops_is_indeterminate() {
+        let catalog = vec![catalog_entry("aft", &["read"])];
+        let conn = ScriptedToolPlaneConnection::new(
+            vec![catalog.clone(), catalog.clone(), catalog],
+            vec![Err(ConnError::Transport("route gone (GOODBYE)".into()))],
+        );
+        *conn.close_during_call.lock().unwrap() = true;
+        let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+        let ctx = batch_ctx("batch-route-drop-in-flight");
+        let tool_call = call("read");
+        plane
+            .batch_started(
+                &ctx,
+                std::slice::from_ref(&tool_call),
+                &ToolManifest::from_tools(vec![request_tool("read", Some("aft"))]),
+            )
+            .await
+            .unwrap();
+        match plane.dispatch(&ctx, &tool_call).await {
+            DispatchResult::SentButOutcomeUnknown { .. } => {}
+            other => panic!("a sent call with no result is indeterminate, got {other:?}"),
+        }
+        assert_eq!(
+            conn.tool_calls.load(Ordering::SeqCst),
+            1,
+            "the sent call is never re-sent"
+        );
     }
 
     #[tokio::test]
@@ -6007,7 +6979,12 @@ mod tests {
                 } else {
                     plane.forget_route(&scoped, "aft", original);
                     plane
-                        .ensure_route(&scoped.bind, scoped.scope.as_ref(), "aft")
+                        .ensure_route(
+                            &scoped.bind,
+                            scoped.scope.as_ref(),
+                            "aft",
+                            &ToolOpenGuard::default(),
+                        )
                         .await
                         .unwrap();
                 }
@@ -6755,6 +7732,85 @@ mod tests {
             assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 0);
         }
 
+        /// Run cancel while an unsent scoped call holds for an unsynced owner (its route closed
+        /// and `scope.describe` says the owner has not synced) ends the hold at once: the call
+        /// is stopped before send, not held to the scope-sync bound and then drained.
+        #[tokio::test(start_paused = true)]
+        async fn run_cancel_ends_the_describe_hold_of_an_unsent_scoped_call() {
+            let (conn, plane, describer) = rig(vec![successful_tool_reply("must not be sent")]);
+            describer.script(
+                "head",
+                vec![
+                    live("head", 1, "agent-a"),
+                    live("head", 1, "agent-a"),
+                    not_live(false),
+                ],
+            );
+            let (scoped, read) = started(&plane).await;
+            conn.close(route_of(&plane, &scoped));
+            let cancel = CancellationToken::new();
+            let guard = ToolOpenGuard::new(Some(&cancel), None);
+            let started_at = Instant::now();
+            let interrupt = async {
+                sleep(Duration::from_secs(1)).await;
+                cancel.cancel();
+            };
+            let (result, ()) = tokio::join!(
+                plane.dispatch_guarded(&scoped, &read, None, &guard),
+                interrupt
+            );
+            let waited = started_at.elapsed();
+            assert!(
+                waited < Duration::from_secs(2),
+                "the cancel ends the hold: {waited:?}"
+            );
+            assert!(
+                matches!(&result, DispatchResult::NotSent { reason } if reason == "dispatch_stopped_before_send"),
+                "{result:?}"
+            );
+            assert_eq!(
+                conn.tool_calls.load(Ordering::SeqCst),
+                0,
+                "nothing was sent"
+            );
+        }
+
+        /// Run cancel while a scoped batch's open holds on its first describe (the owner has not
+        /// synced) ends the hold at once: the batch fails as interrupted and nothing opens.
+        #[tokio::test(start_paused = true)]
+        async fn run_cancel_ends_the_describe_hold_before_a_scoped_open() {
+            let (conn, plane, describer) = rig(Vec::new());
+            describer.script("head", vec![not_live(false)]);
+            let scoped = ctx("r-b1", "s", "r", Some(scope("head", 1)));
+            let cancel = CancellationToken::new();
+            let guard = ToolOpenGuard::new(Some(&cancel), None);
+            let started_at = Instant::now();
+            let interrupt = async {
+                sleep(Duration::from_secs(1)).await;
+                cancel.cancel();
+            };
+            let calls = [call("read")];
+            let manifest = manifest();
+            let (result, ()) = tokio::join!(
+                plane.batch_started_guarded(&scoped, &calls, &manifest, &guard),
+                interrupt
+            );
+            let waited = started_at.elapsed();
+            assert!(
+                waited < Duration::from_secs(2),
+                "the cancel ends the hold: {waited:?}"
+            );
+            assert!(
+                matches!(&result, Err(ToolPlaneError::Unavailable(message)) if message.contains("run cancelled or stopped")),
+                "{result:?}"
+            );
+            assert_eq!(
+                conn.route_open_calls.load(Ordering::SeqCst),
+                0,
+                "nothing opened"
+            );
+        }
+
         /// When asking the daemon about the scope fails, nothing shows that a fresh route would
         /// carry the same epoch and agent, so the unsent call is drained as `scope_unverifiable`
         /// and never re-sent.
@@ -6885,7 +7941,7 @@ mod tests {
             match plane.dispatch(&scoped, &read).await {
                 DispatchResult::Completed(result) => {
                     assert!(result.is_error);
-                    let ToolOutput::Error { message } = &result.output else {
+                    let ToolOutput::Error { message, .. } = &result.output else {
                         panic!("expected an error result, got {result:?}");
                     };
                     assert!(message.contains("scope_not_synced"), "{message}");
@@ -6927,7 +7983,8 @@ mod approval_digest_contract_tests {
                 &call,
                 Duration::from_secs(1),
                 Some("head"),
-                &args
+                &args,
+                None
             ),
             async {
                 let request = module.next_request().await;
@@ -7033,6 +8090,7 @@ mod approved_queue_contract_tests {
                     Duration::from_millis(20),
                     None,
                     Some("call-key"),
+                    None,
                     &Default::default(),
                 )
                 .await;
@@ -7187,6 +8245,69 @@ mod approved_queue_contract_tests {
             assert!(module.take_written_for_test().is_empty());
         }
     }
+
+    /// An ordinary (not approved) call goes through the real writer queue with its run's
+    /// signals: a cancel or stop that trips while the request waits for writer capacity, after
+    /// the open and the permit, leaves it unsent, and no request frame is ever written.
+    #[tokio::test]
+    async fn ordinary_cancel_and_stop_while_writer_queue_is_full_are_not_sent() {
+        for cancel in [true, false] {
+            let (conn, route, mut module) = SubcConnection::in_process_full_writer_for_test(5, 3);
+            let plane = SubcToolPlane::new(conn, "aft");
+            let ctx = BatchCtx {
+                media_capture: None,
+                batch_id: broca_protocol::BatchId("ordinary-queue".into()),
+                bind: BindIdentity::new("/project", "test", "ordinary-queue"),
+                run_id: broca_protocol::RunId("run".into()),
+                scope: None,
+            };
+            plane.routes.lock().unwrap().insert(
+                SubcToolPlane::route_key(&ctx.bind, None, "aft"),
+                RouteState {
+                    handle: route,
+                    sem: Arc::new(Semaphore::new(1)),
+                    stamp: None,
+                },
+            );
+            let call = ToolCall {
+                tool_call_id: broca_protocol::ToolCallId("ordinary".into()),
+                tool_name: "read".into(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            };
+            let token = CancellationToken::new();
+            let guard = ToolOpenGuard::new(
+                if cancel { Some(&token) } else { None },
+                if cancel { None } else { Some(&token) },
+            );
+            let mut dispatch = Box::pin(plane.dispatch_guarded(&ctx, &call, None, &guard));
+            assert!(dispatch.as_mut().now_or_never().is_none());
+            assert_eq!(
+                module.pending_count_for_test(),
+                1,
+                "the real tool request must already be waiting for writer capacity"
+            );
+            token.cancel();
+            let result = tokio::time::timeout(Duration::from_millis(250), dispatch)
+                .await
+                .expect("an interrupted enqueue must not wait for writer capacity");
+            assert!(
+                matches!(&result, DispatchResult::NotSent { reason } if reason == "dispatch_stopped_before_send"),
+                "an interruption before the push is typed not-sent, never unknown: {result:?}"
+            );
+            let frames = module.take_written_for_test();
+            assert_eq!(frames.len(), 256);
+            assert!(
+                frames
+                    .iter()
+                    .all(|frame| frame.header.ty == subc_protocol::FrameType::Ping),
+                "no tool request may be enqueued once the run is interrupted"
+            );
+            assert_eq!(module.pending_count_for_test(), 0);
+            tokio::task::yield_now().await;
+            assert!(module.take_written_for_test().is_empty());
+        }
+    }
 }
 
 /// The tool plane's route opens against a module that is down: the opens of every session to
@@ -7297,9 +8418,13 @@ mod module_gate_tests {
         let patience = RouteOpenPatience {
             deadline: Duration::from_secs(30),
             max_interval: ROUTE_OPEN_RETRY_MAX_INTERVAL,
+            waits_out_outage: false,
         };
+        let guard = ToolOpenGuard::default();
         let results = join_all(binds.iter().map(|bind| {
-            plane.ensure_route_for_lifecycle_inner(bind, None, "aft", &lifecycle, None, patience)
+            plane.ensure_route_for_lifecycle_inner(
+                bind, None, "aft", &lifecycle, None, &guard, patience,
+            )
         }))
         .await;
         let attempts = conn.attempts.lock().unwrap().clone();

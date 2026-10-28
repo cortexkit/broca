@@ -13,6 +13,7 @@ fn records(session: &BindIdentity) -> Vec<FramedRecord> {
         unreachable!()
     };
     *manifest = Some(Box::new(broca_wal::PlanManifest {
+        rich_ui: None,
         plan: broca_wal::OpaqueJson::from_json_text(
             serde_json::json!({"compaction_item":{"provider":"provider","preset":"head","params":{}}})
                 .to_string(),

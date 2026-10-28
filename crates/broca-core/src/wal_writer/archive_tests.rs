@@ -76,6 +76,29 @@ fn admission_existence_counts_archived_members_and_keeps_them_portable() {
     assert!(!f.store.ephemeral_wal_path(&f.session).exists());
 }
 
+#[test]
+fn restored_live_log_wins_after_member_index_was_warmed() {
+    let f = Fixture::new();
+    let records = f.live();
+    let live = f.store.wal_path(&f.session);
+    f.archive(1000, &std::fs::read(&live).unwrap());
+    std::fs::remove_file(&live).unwrap();
+    assert_eq!(f.store.read_records(&f.session).unwrap(), records);
+    #[cfg(unix)]
+    assert!(broca_wal::archive::cached_member_index_stats(&f.root.join("wal-archive")).is_some());
+    let mut wal = f.store.open(&f.session).unwrap();
+    #[cfg(unix)]
+    assert!(
+        broca_wal::archive::cached_member_index_stats(&f.root.join("wal-archive")).is_some(),
+        "restore must retain the index for other archived addresses"
+    );
+    wal.append(1, &WalRecord::StepStarted { step_id: StepId(4) }, true)
+        .unwrap();
+    let restored = wal.replay().unwrap();
+    assert_eq!(restored.len(), records.len() + 1);
+    assert_eq!(f.store.read_records(&f.session).unwrap(), restored);
+}
+
 /// The boot prewarm only fills the membership cache; it must not change any answer. With no
 /// archive it consults nothing. With one it consults every container, then an archived
 /// session still reads its archived transcript and a new session still reads as absent --
@@ -949,7 +972,12 @@ fn restored_extraction_retry_returns_original_transcript() {
                 BEFORE_ARCHIVE_RETRY.with(|hook| {
                     *hook.borrow_mut() = Some(Box::new(move || {
                         assert!(!path.exists());
-                        extraction::restore(&path, &payload).unwrap();
+                        extraction::restore(
+                            &path,
+                            &payload,
+                            extraction::RestoreAuthority::GuardedStandalone,
+                        )
+                        .unwrap();
                         observed.set(observed.get() + 1);
                     }));
                 });
@@ -989,7 +1017,12 @@ fn repeated_live_disappearance_is_an_error_not_an_empty_read() {
                 std::fs::remove_file(&path).unwrap();
                 BEFORE_ARCHIVE_RETRY.with(|hook| {
                     *hook.borrow_mut() = Some(Box::new(move || {
-                        extraction::restore(&path, &payload).unwrap();
+                        extraction::restore(
+                            &path,
+                            &payload,
+                            extraction::RestoreAuthority::GuardedStandalone,
+                        )
+                        .unwrap();
                         AFTER_LIVE_STAT.with(|hook| {
                             *hook.borrow_mut() = Some(Box::new(move || {
                                 std::fs::remove_file(path).unwrap();
@@ -1037,4 +1070,45 @@ fn full_record_read_distinguishes_absent_from_present_empty_wal() {
     std::fs::write(f.store.wal_path(&f.session), []).unwrap();
     assert!(f.store.read_records(&f.session).unwrap().is_empty());
     assert!(!f.store.is_retention_lineage(&f.session).unwrap());
+}
+
+#[test]
+fn owned_writer_open_restores_an_archived_log_only_under_the_sessions_tenure() {
+    use crate::lease::{lease_key_for, FileLeaseStore, LeaseStore};
+    let f = Fixture::new();
+    let records = f.live();
+    let path = f.store.wal_path(&f.session);
+    let payload = std::fs::read(&path).unwrap();
+    let archive = f.archive(1, &payload);
+    let container = std::fs::read(&archive).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let leases = FileLeaseStore::new(f.root.join("leases"));
+
+    // A lease for another session is not this open's authority: the restore refuses
+    // before it writes, so the archive stays the only copy.
+    let other = BindIdentity::new("/archive-test", "runner", "other");
+    let foreign = leases.acquire(&lease_key_for(&other)).unwrap();
+    let error = match f.store.open_owned_writer(&f.session, None, None, foreign) {
+        Ok(_) => panic!("a foreign tenure must not restore the live log"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(&error, WalError::Io(io) if io.kind() == io::ErrorKind::PermissionDenied),
+        "unexpected error: {error}"
+    );
+    assert!(!path.exists());
+    assert_eq!(std::fs::read(&archive).unwrap(), container);
+
+    // The session's own tenure restores it, and the open hands that same lease on.
+    let own = leases.acquire(&lease_key_for(&f.session)).unwrap();
+    let epoch = own.epoch();
+    let (wal, lease) = f
+        .store
+        .open_owned_writer(&f.session, None, None, own)
+        .expect("the session's tenure restores and opens its log");
+    assert_eq!(lease.epoch(), epoch);
+    assert_eq!(wal.replay().unwrap(), records);
+    assert_eq!(std::fs::read(&path).unwrap(), payload);
+    drop(wal);
+    drop(lease);
 }

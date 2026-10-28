@@ -133,6 +133,11 @@ pub fn manifest_with_archive(
 pub(crate) fn management_operations() -> Vec<ManagementOperation> {
     vec![
         ManagementOperation {
+            name: broca_wire::diagnostics::OP.into(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Read bounded, content-free diagnoses of broca's own degraded state.".into()),
+        },
+        ManagementOperation {
             name: cortexkit_role_llm_runner::ops::SESSION_HISTORY.into(),
             kind: ManagementOperationKind::Query,
             description: Some("Page surviving session history as stored entries or display rows.".into()),
@@ -325,6 +330,19 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
     ]
 }
 
+pub(crate) fn registered_management_operation(method: &str) -> bool {
+    static NAMES: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            management_operations()
+                .into_iter()
+                .map(|op| op.name)
+                .collect()
+        })
+        .contains(method)
+}
+
 pub(crate) fn observability_surfaces() -> Vec<ObservabilitySurface> {
     vec![ObservabilitySurface {
         name: OP_SUBSCRIBE.to_string(),
@@ -465,6 +483,9 @@ pub fn manifest_configured(
         // never as the flow's owner agent, and refuses tools on flow sends. The daemon routes a
         // flow-scoped bind only to modules that declare it.
         // Agent-run scopes likewise admit only Basal's attested sender, without tools.
+        // `scope-workdir/v1` asks the daemon to stamp a scope's session folder and project id
+        // on its binds. Broca measures them against the bind's project_root and still keys
+        // every session by the bind triple.
         provides: vec![
             broca_wire::LLM_RUNNER_V1.to_string(),
             broca_wire::agent_data::PROVIDES.to_string(),
@@ -476,10 +497,12 @@ pub fn manifest_configured(
             "permissions/v1".to_string(),
             subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
             subc_protocol::scope::AGENT_RUN_SCOPES_CAPABILITY.to_string(),
+            subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_string(),
         ],
         requires: Vec::new(),
         must_never_reach: Vec::new(),
     }))
+    .flow_operations(Some(crate::management_admission::flow_operations()))
     .provides(vec![ProviderRole::ManagementSurface {
             // Concurrent ACROSS sessions, FIFO WITHIN one: the registry fans requests out to
             // per-session lineage actors, and each actor processes its own commands in order
@@ -573,6 +596,7 @@ mod provenance_tests {
                 "bindings",
                 "capabilities",
                 "consumes",
+                "flow_operations",
                 "module_id",
                 "module_version",
                 "protocol_ver",
@@ -587,11 +611,11 @@ mod provenance_tests {
         assert_eq!(
             obj["capabilities"],
             serde_json::json!({
-                "provides": ["llm-runner/v1", "agent-data/v1", "classifier/v1", "tool-provider/v1", "permissions/v1", "flow-scopes/v1", "agent-run-scopes/v1"],
+                "provides": ["llm-runner/v1", "agent-data/v1", "classifier/v1", "tool-provider/v1", "permissions/v1", "flow-scopes/v1", "agent-run-scopes/v1", "scope-workdir/v1"],
                 "requires": [],
                 "must_never_reach": [],
             }),
-            "broca declares runner, agent-data, classifier, model-tool and permissions roles, flow and agent-run scope handling, and requires or denies nothing"
+            "broca declares runner, agent-data, classifier, model-tool and permissions roles, flow and agent-run scope handling, scope workdir stamps, and requires or denies nothing"
         );
         //
         // `consumes` has skip_serializing_if = "Vec::is_empty" since subc-protocol 0.19.0, so
@@ -639,11 +663,11 @@ mod provenance_tests {
         let hello = |manifest: &serde_json::Value| serde_json::json!({ "manifest": manifest });
         subc_protocol::manifest::validate_hello_event_declarations(&hello(&encoded))
             .expect("the daemon would refuse this HELLO");
-        // The control: the daemon's validator does refuse a dotted name, so the pass above
+        // The control: the daemon's validator refuses an empty name token, so the pass above
         // cannot come from a validator that accepts everything.
         let mut dotted = encoded.clone();
         dotted["events"] = serde_json::json!([
-            {"name": "compaction.advanced", "version": 1, "headers": ["session_ref"]}
+            {"name": "compaction..advanced", "version": 1, "headers": ["session_ref"]}
         ]);
         assert!(
             subc_protocol::manifest::validate_hello_event_declarations(&hello(&dotted)).is_err()
@@ -948,17 +972,17 @@ mod consumes_tests {
         assert_eq!(services, vec!["fusiform", "claustrum", "routing-b"]);
     }
 
-    /// broca never opens a route to routing with `legacy_static` on, or without the vault (the
-    /// mock providers resolve no accounts), so it declares none then.
+    /// broca never opens a route to routing without the vault (the mock providers resolve no
+    /// accounts), so it declares none then, and always declares it with the vault. The removed
+    /// `legacy_static` switch cannot turn the route off any more: the config that set it is
+    /// refused.
     #[test]
-    fn the_routing_module_is_declared_only_while_account_selection_is_active() {
-        let legacy = crate::account_routing::AccountSelectionConfig::parse(
+    fn the_routing_module_is_declared_exactly_alongside_the_vault() {
+        assert!(crate::account_routing::AccountSelectionConfig::parse(
             r#"{"account_selection":{"routing_module":"routing-b","legacy_static":true}}"#,
         )
-        .unwrap();
-        let (_, services) =
-            declared(&ConsumerRoutes::resolve(None, true).with_account_selection(&legacy));
-        assert_eq!(services, vec!["fusiform", "claustrum"]);
+        .unwrap_err()
+        .contains("unknown field `legacy_static`"));
 
         let active = crate::account_routing::AccountSelectionConfig::default();
         let (_, services) =

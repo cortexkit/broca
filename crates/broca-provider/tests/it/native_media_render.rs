@@ -291,6 +291,7 @@ fn no_bundle_keeps_legacy_carrier_markers_even_with_a_profile() {
             opts.step_context = Some(broca_protocol::StepContext {
                 run_id: "run".into(),
                 step_index: 1,
+                max_output_tokens: None,
                 session_address: None,
                 credential_id: None,
                 account_ref: None,

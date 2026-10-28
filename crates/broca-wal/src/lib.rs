@@ -6,13 +6,19 @@
 //! writer task, replay state machine, and materialized store build on top of this
 //! foundation.
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+// Test fixtures intentionally use direct I/O to prepare and inspect crash images.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 pub mod archive;
 mod directory_sync;
 pub mod file_wal;
 pub mod floor;
 pub mod framing;
+pub mod fs_ops;
+pub mod head_proof;
 pub mod record;
+pub mod state_format;
 
 pub use file_wal::{
     file_identity, format_manifest_line, read_records_range, read_records_range_from_valid_anchor,
@@ -20,16 +26,18 @@ pub use file_wal::{
     WalError, WalRangeRead, WalRangeRecords, WalTailRead, DEFAULT_MAX_READ_BYTES,
 };
 pub use floor::{raise_floor, read_floor, FEATURE_FLOOR_FILENAME};
+pub use framing::PreparedV4Frame;
 #[cfg(any(test, feature = "test-known-feature"))]
 pub use framing::{forget_feature_for_test, ForgottenFeature};
 pub use framing::{
     FrameError, FramedRecord, WalLineageId, ARCHIVE_INDEX_V2_FEATURE, COMPACTION_FEATURE,
     COMPACTION_VIEW_FEATURE, COMPACTION_WAIT_FEATURE, DEFERRED_CALL_FEATURE,
-    DISPATCH_MODULE_FEATURE, FRAMING_VERSION, GATED_FRAMING_VERSION, HEADER_LEN, KNOWN_FEATURES,
-    MAX_PAYLOAD_LEN, MESSAGE_TIMES_FEATURE, PLAN_MANIFEST_FEATURE, PLAN_REFERENCE_SLOTS_FEATURE,
-    PROVIDER_DECLARATIONS_FEATURE, PROVIDER_HELD_FEATURE, RUNNER_TAGS_FEATURE,
-    RUNNER_TAGS_V2_FEATURE, SCOPE_FEATURE, STEER_QUEUE_FEATURE, STEP_TRANSFORMS_FEATURE,
-    TOOL_REPLY_FEATURE, TOOL_TIMES_FEATURE,
+    DISPATCH_MODULE_FEATURE, FRAME_STAMPS_FEATURE, FRAMING_VERSION, GATED_FRAMING_VERSION,
+    HEADER_LEN, KNOWN_FEATURES, MAX_PAYLOAD_LEN, MESSAGE_TIMES_FEATURE, PLAN_MANIFEST_FEATURE,
+    PLAN_REFERENCE_SLOTS_FEATURE, PROVIDER_DECLARATIONS_FEATURE, PROVIDER_FALLBACK_BLOCK_FEATURE,
+    PROVIDER_HELD_FEATURE, REFUSAL_FALLBACK_FEATURE, RUNNER_TAGS_FEATURE, RUNNER_TAGS_V2_FEATURE,
+    SCOPE_FEATURE, STEER_QUEUE_FEATURE, STEP_TRANSFORMS_FEATURE, TOOL_REPLY_FEATURE,
+    TOOL_TIMES_FEATURE,
 };
 pub use record::{
     compaction_replacement_sha256, AccountDecision, ApprovalDecision, AuthSelection,
@@ -40,13 +48,15 @@ pub use record::{
     FrozenDeclaration, FrozenHoldArgument, FrozenProviderDeclarations, FrozenReferenceSlot,
     FrozenReply, FrozenResultFormat, HookOp, Hooks, LateDecision, LateExecution, LateOutcome,
     NoDispatchReason, OnExpiry, OpaqueJson, PlanManifest, ProviderFetch, ProviderHeld,
-    QueuedAdmissionFailure, RejectedCompaction, ResumeRedo, ResumeReplayed, RunConfig, RunOrigin,
-    SeedOriginKind, SetupTagCheckpoint, VaultReadOp, VaultRequest, WalRecord, WithdrawElicitation,
-    WithdrawalAnswer, ACCOUNT_DECISION_AUTH_REQUIRED, ACCOUNT_DECISION_CANDIDATES_UNKNOWN,
-    ACCOUNT_DECISION_DISABLED, ACCOUNT_DECISION_LEGACY_STATIC, ACCOUNT_DECISION_PINNED,
-    ACCOUNT_DECISION_ROUTED, ACCOUNT_DECISION_SINGLE_CANDIDATE, ACCOUNT_DECISION_UNREACHABLE,
-    ACCOUNT_DECISION_UNSUPPORTED, MAX_REPLACEMENT_BYTES,
+    QueuedAdmissionFailure, RefusalFallbackPhase, RefusalFallbackSchedule, RejectedCompaction,
+    ResumeRedo, ResumeReplayed, RunConfig, RunOrigin, SeedOriginKind, SetupTagCheckpoint,
+    StepFallback, StepRoute, StepRouteReason, UsageIteration, VaultReadOp, VaultRequest, WalRecord,
+    WithdrawElicitation, WithdrawalAnswer, ACCOUNT_DECISION_AUTH_REQUIRED,
+    ACCOUNT_DECISION_CANDIDATES_UNKNOWN, ACCOUNT_DECISION_DISABLED, ACCOUNT_DECISION_LEGACY_STATIC,
+    ACCOUNT_DECISION_PINNED, ACCOUNT_DECISION_ROUTED, ACCOUNT_DECISION_SINGLE_CANDIDATE,
+    ACCOUNT_DECISION_UNREACHABLE, ACCOUNT_DECISION_UNSUPPORTED, MAX_REPLACEMENT_BYTES,
 };
+pub use state_format::{classify_state_root, StateRootError, WalConfig, WalFormat};
 // `PauseReason` is shared caller/WAL vocabulary; it lives in `broca-protocol` (like
 // `RunFinishReason`) and is re-exported here so existing `broca_wal::PauseReason` paths
 // keep resolving.
@@ -54,3 +64,4 @@ pub use broca_protocol::PauseReason;
 pub mod migration;
 
 pub mod size_limit;
+pub mod writer_tenure;

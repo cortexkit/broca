@@ -56,8 +56,9 @@ replay-time replacement.
 | Record | fsync point | Purpose |
 |---|---|---|
 | `run_started{run_id, session, config, input}` | **ONE atomic record, synced BEFORE the first provider call** / | run open + the AUTHORITATIVE config + user input in a SINGLE record. Atomic-by-construction: a torn start leaves EITHER nothing OR a fully-started run, never a partial (config/input missing) that resume would reconstruct as a divergent (empty-prompt) request. `run_id` is the start-run idempotency key. An optional `scope{owner, ref, scope_epoch}` freezes the scope a scoped session was admitted under, on every one of its episodes; it is MUST-UNDERSTAND (feature `scope/v1`), so a record carrying it is written only in a `ver` 3 frame requiring that name, and a build without it refuses the WAL as NewerWriter rather than ignore the scope and admit a send from someone other than the scope's owner. The writer adds `scope/v1` to the state root's `wal-feature-floor` before the first such frame, and refuses the append if it cannot. A send the owner check refuses (or that adoption refuses) writes nothing. An optional `manifest` freezes what a session's first send fetched from its tool providers (the plan exactly as received and its identity, each provider's answered tools and text or the reason an optional text-only provider was absent, the tools offered to the model, the joined system text, digests and versions); it is MUST-UNDERSTAND (feature `plan-manifest/v1`), written only in a `ver` 3 frame requiring that name, so a build without it refuses the WAL as NewerWriter rather than render the session without its frozen tools. This build reads it and writes none. |
-| `model_attempt_finished{step_id, attempt, request/response body len + sha256, http_status?, content_type?, response_body_cap?, outcome, ts_ms}` | none of its own: appended as each provider HTTP attempt ends, durable at the next barrier | one per attempt (failed, cut and cancelled ones included), each before its step's `model_step_finished` or the run's terminal. INFORMATIONAL ONLY: every reader skips it like an unknown type, so replay, prompt, projection, billing and export are identical without it |
+| `model_attempt_finished{step_id, attempt, request/response body len + sha256, http_status?, content_type?, response_body_cap?, outcome, ts_ms}` | none of its own: appended as each provider HTTP attempt ends, durable at the next barrier | one per attempt (failed, cut and cancelled ones included), each before its step's `model_step_finished` or the run's terminal. Informational: it contributes no prompt, committed usage or spend fact. Resume uses its ordinal to continue attempt telemetry without reusing a durable step-scoped ordinal. |
 | `model_step_finished{step_id, assistant_message, usage}` | after provider terminal, before next send | the assembled assistant unit |
+| `model_step_refused{step_id, usage, served_model?, discarded_blocks, schedule, ts_ms?}` | **synced BEFORE the refused step is re-sent** | the source model refused the step and it is re-sent to the client-side fallback model under the same `step_id`, with no new `step_started`. The refused content is never stored and never enters a prompt; `usage` counts toward run totals because the call was billed. At most one per step. MUST-UNDERSTAND (`refusal-fallback/v1`, below) |
 | `tool_batch_started{batch_id, step_id, planned_calls[]}` | before any dispatch | brackets the batch; `planned_calls` is the durable PLAN |
 | `tool_dispatch_intent{batch_id, tool_call_id, args, module_id?, schema_pin?}` | **BEFORE** the dispatch leaves | the barrier's "before" half — ONLY for calls planned dispatchable. `module_id` (the tool provider module the call went to) and `schema_pin` (`{schema_digest, semantics}`) are MUST-UNDERSTAND (feature `dispatch-module/v1`): an intent carrying either is a `ver` 3 frame, and a build without the name refuses the WAL as NewerWriter, because skipping them would report a dispatched call as never dispatched. The writer adds `dispatch-module/v1` to `wal-feature-floor` before the first such frame. Absent on intents written before broca recorded them |
 | `tool_no_dispatch{batch_id, tool_call_id, reason}` | before next provider send | durable terminal for denied / validation-failed / unavailable-before-send / policy-blocked calls — replay NEVER re-dispatches these |
@@ -70,6 +71,14 @@ replay-time replacement.
 | `run_cancel_requested{run_id, at}` | **synced BEFORE cancellation acknowledgement** | pending boundary cancellation, or its escalation to `now`. MUST-UNDERSTAND (`run-cancel-at/v1`): an older reader refuses the WAL rather than silently resume a cancelled run. Does not replace tool dispatch/result evidence or itself publish a terminal; recovery closes the current batch and seals `Cancelled` without another model step. For a run with an open provider-held call (below), live or paused, it is written and synced for both `at: now` and `at: step_boundary`, and the cancel is answered then, before the seal: no step boundary comes before the held call's delivery, so both mean an immediate close-out. |
 | `tool_call_provider_held{batch_id, tool_call_id, call_key, module, reason, detail_digest?, held_at_ms, sequential}` | **synced BEFORE broca acts on anything else in the held reply** | a tool provider answered the call with a `held` marker (tool-provider contract §4.1, `held-reply/v1`), and the real result arrives later as a `late_results` entry for `call_key` (§7). Follows the call's `tool_dispatch_intent`; the call's eventual terminal is an ordinary `tool_result` under the same `batch_id`. `reason` is the provider's open `held.reason`, informational only; `detail_digest` is the SHA-256 of the held `detail` object, which is not stored; the interim content is never stored and never enters a prompt. `sequential` is true when the batch dispatches one call at a time. MUST-UNDERSTAND (feature `provider-held/v1`): always a `ver` 3 frame, and a build without the name refuses the WAL as NewerWriter, because skipping the record would leave an intent without a terminal, class the call indeterminate and seal the run Interrupted while the provider still owes its result. The writer adds `provider-held/v1` to `wal-feature-floor` before the first such frame, and refuses the append if it cannot. |
 | `run_paused{run_id, reason: tool_held, ts_ms?}` | **synced BEFORE the run's final `Paused` unit** | the run waits only on provider-held calls (and on calls behind them): every call is terminal, provider-held, a held successor, or approved and awaiting dispatch behind the hold, at least one provider-held call is open, and no approval card is open. Not terminal and never a crash orphan; broca resumes the same run itself when a held call's late result arrives, and the caller never resumes it. MUST-UNDERSTAND under the same `provider-held/v1`: `PauseReason` is a closed enum, so an older reader refuses the frame rather than misread the pause. `run_paused` with `auth_required` or `restart` keeps its earlier frame. |
+
+A crash with no durable terminal can resume the same step, including its refusal resend.
+The next attempt ordinal follows the largest durable ordinal for that episode's step.
+A shutdown seal that writes `run_finished{reason: interrupted}` instead closes the episode:
+an idempotent retry returns that terminal, not another provider call. Continuing the session
+opens a new episode and restarts its step-scoped ordinals at zero. Its distinct `run_id` and
+the attempt records' distinct `lineage_id:wal_seq` event IDs disambiguate the calls. Only a
+committed fallback response consumes the refusal schedule; a sealed in-flight attempt does not.
 
 Close-out terminals of a provider-held call carry an ungated `tool_result.reason`, next to the
 `run_cancel_requested` record that may precede them. `run.cancel` writes `outcome: interrupted,
@@ -156,6 +165,28 @@ addition does not change a renderer version. Older binaries ignore an unknown `r
 field in typed config decoding, but actual resumes refuse on recorded/current config drift
 rather than silently sending a request without the echo.
 
+Anthropic content-filter fallback uses two must-understand features. This release reads both
+and writes neither: they must be in every deployed reader before any build writes them.
+
+- **`provider-fallback-block/v1`** covers Anthropic's server-side fallback: the
+  `provider_fallback{from_model, to_model}` content part (the handoff block, kept at its
+  position in the assistant message) in any record carrying messages (`run_started` input,
+  `queued` and `steered` input, `send_delivered` input, `model_step_finished` output,
+  `compaction_message` replacement), and a `model_step_finished`'s optional `served_model`
+  (the wire model that served the answer, present only when it differs from the requested one)
+  and `usage_iterations` (the response's `usage.iterations`, verbatim). Every renderer drops the
+  part until an Anthropic config can opt into server-side fallback.
+- **`refusal-fallback/v1`** covers client-side refusal fallback: the `model_step_refused`
+  record above, and a `model_step_finished`'s optional `route{model, reason: refusal|schedule}`
+  (present only when the step was sent to the fallback model), `refusal_fallback` (the session's
+  schedule after the step: `source`, `fallback`, `phase{kind: fallback, remaining}` or
+  `phase{kind: probe, clean}`, `re_refusals`, `updated_at_ms?`) and `refusal_after_tool_use`
+  (omitted when false).
+
+Each record or field requires exactly its own feature. A record without them keeps its previous
+bytes and frame requirements. An older reader refuses the WAL as `NewerWriter` naming the
+feature before decoding the record.
+
 New ChatGPT admissions freeze a `chatgpt_wire` profile with admitting-host User-Agent,
 originator and sourced conversation/installation/window/turn identity. Run starts and auth
 refreezes carrying it require **`chatgpt-codex-wire/v1`**; the WAL writer publishes the feature
@@ -200,6 +231,22 @@ Waiting is active with reason `context_ceiling_wait`, never an authentication-st
 The wait uses Setup's `wait_ms` (at most 300,000 ms), including the ceiling ride and view fetches.
 After the bound a request still at the ceiling is refused even if inside the window; a request
 over the window is never sent. The terminal carries no provider error or model backoff signal.
+
+A lowered output cap requires **`output-reservation/v1`**. `output_reservation_clamped`
+records a step's output-token cap when it is lower than the run's frozen cap, synced before
+model I/O. A resume of the step renders the recorded cap again, and a cache warm or cache dump
+rebuilds the step with it, so the rebuilt bytes match the recorded digest. A build without the
+feature refuses the WAL instead of resuming the step with the frozen cap, which would be a
+different request from the one recorded.
+
+A step whose estimated input plus the frozen output cap would pass the run's context limit is
+sent with a lower cap, recorded first as `output_reservation_clamped`. The estimate is the
+previous step's measured input plus the request's growth in rendered bytes since, at two bytes
+per token, and a margin of 1,024 tokens or 1/256 of the window is kept free. A resume lowers a
+recorded cap further only if the request now needs less, and records the lower cap first. When
+not even the provider's minimum output reservation fits (4,096 tokens, the caller's smaller
+explicit cap, or one token above an Anthropic thinking budget), the run ends `error` with class
+`context_overflow` and provider code `output_reservation_exceeds_context` without sending.
 
 Send admission checks the durable estimate plus the incoming native messages without calling
 the provider. An already accepted queued head blocked by the ceiling remains pending; holding

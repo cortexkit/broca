@@ -104,7 +104,7 @@ async fn provisional_id_retry_reconciles_conflicting_settlements_before_get() {
     assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 0);
     assert!(!cards.ops.lock().unwrap().contains(&"get"));
     assert!(
-        matches!(&result.results[0].output, ToolOutput::Error { message } if message.contains("consent_conflicting_decisions"))
+        matches!(&result.results[0].output, ToolOutput::Error { message, .. } if message.contains("consent_conflicting_decisions"))
     );
     assert!(!rig.frames().iter().any(|frame| matches!(
         frame.record,
@@ -165,7 +165,7 @@ async fn provisional_id_resume_reconciles_conflicting_settlements_before_get() {
     assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 0);
     assert_eq!(cards.ops.lock().unwrap().first(), Some(&"answers"));
     assert!(
-        matches!(&result.results[0].output, ToolOutput::Error { message } if message.contains("consent_conflicting_decisions"))
+        matches!(&result.results[0].output, ToolOutput::Error { message, .. } if message.contains("consent_conflicting_decisions"))
     );
     assert!(!cards.ops.lock().unwrap().contains(&"get"));
     rig.finish().await;
@@ -282,7 +282,7 @@ async fn conflict_wait(split: bool) -> Rig {
         .batch(&crate::AllowAll, vec![call("held")], Some(resume), false)
         .await;
     assert!(
-        matches!(&result.results[0].output, ToolOutput::Error { message } if message.contains("consent_conflicting_decisions")),
+        matches!(&result.results[0].output, ToolOutput::Error { message, .. } if message.contains("consent_conflicting_decisions")),
         "all decisions for one key must be reduced before approval"
     );
     assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 0);
@@ -331,7 +331,7 @@ async fn late_feed_conflicting_answers_close_as_named_not_sent() {
     )
     .await
     .unwrap();
-    assert!(rig.frames().iter().any(|frame| matches!(&frame.record, WalRecord::LateResult { outcome: broca_wal::LateOutcome::NotSent, result, .. } if matches!(&result.output, ToolOutput::Error { message } if message.contains("consent_conflicting_decisions")))));
+    assert!(rig.frames().iter().any(|frame| matches!(&frame.record, WalRecord::LateResult { outcome: broca_wal::LateOutcome::NotSent, result, .. } if matches!(&result.output, ToolOutput::Error { message, .. } if message.contains("consent_conflicting_decisions")))));
     assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 0);
     rig.finish().await;
 }
@@ -355,7 +355,7 @@ async fn every_known_id_unavailable_await_release_detaches_with_original_code() 
             "{mode}: every known-id unavailable release must detach"
         );
         assert!(
-            matches!(&result.results[0].output, ToolOutput::Error { message } if message.contains(code)),
+            matches!(&result.results[0].output, ToolOutput::Error { message, .. } if message.contains(code)),
             "{mode}: retain the original refusal code"
         );
         assert_eq!(rig.questions.outstanding.load(Ordering::SeqCst), 0);

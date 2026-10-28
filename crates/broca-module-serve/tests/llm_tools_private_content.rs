@@ -4,10 +4,10 @@
 //! The route asks cerebellum and Basal, so the rig has to answer as both. It does that with
 //! `fake-surface`, a stand-in module (its own package under `tests/support/fake-surface`) that
 //! declares the two management operations and serves them from a fixture file. `Stub::Answering`
-//! gives it a fixture; a fixture whose value is an error body is returned as the module's own
-//! refusal, which is how Basal's `flow_not_approved` and an unreadable cerebellum answer are
-//! delivered. The `owner` and `cingulate` stand-ins are `fake-aft-stub`, which declares no
-//! management surface, so the daemon refuses a request aimed at either of them.
+//! gives it a fixture. Cerebellum's answers and outcome refusals are bare response bodies;
+//! Basal's error bodies use error frames. The `owner` and `cingulate` stand-ins are
+//! `fake-aft-stub`, which declares no management surface, so the daemon refuses a request
+//! aimed at either of them.
 
 // The handoff uses /bin/sh and records kernel process identities for cleanup.
 // Those identity helpers are implemented only on Linux and macOS.
@@ -22,6 +22,18 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MODEL: &str = "typesafe/jev-1.13.0";
+
+// Cerebellum fbcc6766, docs/contracts/private-content-query-v1.md. These reply bodies come from
+// the following vectors; SHA-256s identify whole golden-file documents for provenance only:
+// crates/cerebellum/tests/vectors/private-content-query-v1/success-marked.json
+// whole-file SHA-256 eb4c452cadd0b5d48e8855db366c599c3dcccb3408da1ea403fa5d8703032d1c
+// crates/cerebellum/tests/vectors/private-content-query-v1/success-unmarked.json
+// whole-file SHA-256 e860efcd7db12298f7af82758e8a72bc66b5e0ede81ada0c7fba40c1aa29acb2
+// crates/cerebellum/tests/vectors/private-content-query-v1/unknown-field.json
+// whole-file SHA-256 7cc2ec06859a700a91c1e6a1a57643c66ab9af848debcf9b4beb6ecaa7aeb2bc
+const CEREBELLUM_MARKED: &str = r#"{"private_content":true,"sources":["signed_in_site"]}"#;
+const CEREBELLUM_UNMARKED: &str = r#"{"private_content":false,"sources":[]}"#;
+const CEREBELLUM_REFUSAL: &str = r#"{"context":null,"detail":{"field":"owner","reason_code":"unknown_field"},"outcome":"invalid_request","session":null}"#;
 
 #[derive(Default)]
 struct Provider {
@@ -87,14 +99,13 @@ enum Stub {
     /// what a module that does not serve the operation answers, except `private_content.query`,
     /// which gets the stand-in's default answer (see `fake-surface`).
     Unreachable,
-    /// Use this JSON as the matching fixture's `stdout`: an error body refuses the request, any
-    /// other value is wrapped in `{result}`.
+    /// Use this JSON as the matching fixture's wire body. Basal and Cingulate wrap `{result}`;
+    /// its error bodies use error frames. Cerebellum's answers and refusals use response frames.
     Answering(&'static str),
 }
 
 struct Rig {
     _daemon: broca_test_support::RigChild,
-    restarted: Mutex<Vec<broca_test_support::RigChild>>,
     root: PathBuf,
     state: PathBuf,
     provider: Arc<Provider>,
@@ -136,7 +147,7 @@ impl Rig {
         }
         let state = root.join("state");
         let priced = |units| json!({"currency":"USD","exponent":9,"state":"priced","units":units,"unit_provenance":{"kind":"stated"}});
-        let row = json!({"existence":"present","model.kind":"decision","rate.output":{"state":"stated_zero"},"rate.input":priced(42_000_000)});
+        let row = json!({"existence":"present","model.kind":"decision","model.name":"Jev 1.13","provider.name":"TypeSafe","rate.output":{"state":"stated_zero"},"rate.input":priced(42_000_000)});
         std::fs::write(state.join("catalog/fusiform-lkg.json"), json!({"catalog_version":1,"resolved_at_ms":1,"source":"models.dev","models":{MODEL:row}}).to_string()).unwrap();
         let provider_state = Arc::new(Provider::default());
         let url = provider(provider_state.clone()).await;
@@ -148,18 +159,21 @@ impl Rig {
         assert!(stub.exists(), "scope authority fixture missing");
         let scopes = root.join("scopes.json");
         std::fs::write(&scopes, json!([
-            {"ref":"run","scope_epoch":1,"kind":"head","attributes":{"agent_id":"agent","run_id":"run"},"carriers":[{"principal":{"kind":"reserved","module_id":"basal"}}]},
+            {"ref":"run","scope_epoch":1,"kind":"head","attributes":{"agent_id":"agent","run_id":"run"},"carriers":[{"principal":{"kind":"reserved","module_id":"basal"}},{"principal":{"kind":"reserved","module_id":"broca"}}]},
+            {"ref":"project-a-first","scope_epoch":1,"kind":"head","project_id":"project-a","workdir":root.join("project").canonicalize().unwrap(),"attributes":{"agent_id":"agent","run_id":"project-a-first"},"carriers":[{"principal":{"kind":"reserved","module_id":"broca"}}]},
+            {"ref":"project-a-later","scope_epoch":1,"kind":"head","project_id":"project-a","workdir":root.join("project").canonicalize().unwrap(),"attributes":{"agent_id":"agent","run_id":"project-a-later"},"carriers":[{"principal":{"kind":"reserved","module_id":"broca"}}]},
+            {"ref":"project-b","scope_epoch":1,"kind":"head","project_id":"project-b","workdir":root.join("project").canonicalize().unwrap(),"attributes":{"agent_id":"agent","run_id":"project-b"},"carriers":[{"principal":{"kind":"reserved","module_id":"broca"}}]},
             {"ref":"flow","scope_epoch":1,"kind":"head","attributes":{"flow_id":"tool-flow"},"carriers":[{"principal":{"kind":"reserved","module_id":"basal"}}]}
         ]).to_string()).unwrap();
-        // Cerebellum and Basal are served by the `fake-surface` stand-in: a module that
-        // declares the two operations this route asks and serves them from a fixture file. The
+        // Cerebellum, Basal and Cingulate use the `fake-surface` stand-in, which declares
+        // their management operations and serves them from fixture files. The
         // `owner` module above is the scope authority owner and publishes the scopes; the
         // stand-ins hold none of their own.
         //
         // The daemon names the module on the command line, so the handoff passes on only what
         // the daemon does not know: the fixture path and the request log.
         let mut modules = json!({});
-        for id in ["owner", "cerebellum", "cingulate"] {
+        for id in ["owner", "cerebellum"] {
             let mut env = json!({"FAKE_AFT_MODULE_ID":id,"FAKE_AFT_LAUNCH_NONCE_PATH":root.join(format!("{id}.nonce")),"FAKE_AFT_EVENTS_PATH":json!(root.join(format!("{id}.events")))});
             if id == "owner" {
                 env["FAKE_AFT_SCOPE_SYNC_PATH"] = json!(scopes);
@@ -167,12 +181,19 @@ impl Rig {
             }
             modules[id] = json!({"program":broca_test_support::ckdev_binary(&stub, broca_test_support::scratch_root()),"args":[],"reserved":true,"enabled":true,"env":env});
         }
-        for (module_id, answer) in [("cerebellum", cerebellum), ("basal", basal)] {
+        for (module_id, answer) in [
+            ("cerebellum", cerebellum),
+            ("basal", basal),
+            (
+                "cingulate",
+                Stub::Answering(r#"{"result":{"elicitation_id":"fake-card"}}"#),
+            ),
+        ] {
             let fixture = root.join(format!("{module_id}.fixtures.jsonl"));
-            let method = if module_id == "cerebellum" {
-                "private_content.query"
-            } else {
-                "flow.private_content_providers"
+            let method = match module_id {
+                "cerebellum" => "private_content.query",
+                "cingulate" => "consent.request",
+                _ => "flow.private_content_providers",
             };
             let lines = match answer {
                 Stub::Answering(result) => vec![json!({"match":{"method":method},"stdout":result})],
@@ -211,7 +232,7 @@ impl Rig {
             });
         }
         let env = json!({"BROCA_STATE_ROOT":state,"BROCA_CONFIG_PATH":config,"BROCA_PROVIDER_BASE_URL":format!("{url}/v1"),"CK_LOG":"info"});
-        modules["broca"] = json!({"program":broca_test_support::ckdev_binary(Path::new(env!("CARGO_BIN_EXE_ck-broca")), broca_test_support::scratch_root()),"args":[],"enabled":true,"env":env});
+        modules["broca"] = json!({"program":broca_test_support::ckdev_binary(Path::new(env!("CARGO_BIN_EXE_ck-broca")), broca_test_support::scratch_root()),"args":[],"reserved":true,"enabled":true,"env":env});
         std::fs::write(
             root.join("config/cortexkit/subc.jsonc"),
             json!({"version":1,"scope_authority_owners":["owner"],"modules":modules}).to_string(),
@@ -238,7 +259,6 @@ impl Rig {
         .unwrap();
         let rig = Self {
             _daemon: broca_test_support::RigChild::new(child, &root, "daemon"),
-            restarted: Mutex::new(Vec::new()),
             root,
             state,
             provider: provider_state,
@@ -272,6 +292,18 @@ impl Rig {
 
     /// Open a tool-provider route to one broca process in this rig.
     async fn open_to(&self, target: &str, scope_ref: &str, flow: bool) -> Route {
+        self.open_with_bind_project(target, scope_ref, flow, None, false)
+            .await
+    }
+
+    async fn open_with_bind_project(
+        &self,
+        target: &str,
+        scope_ref: &str,
+        flow: bool,
+        project_id: Option<&str>,
+        held: bool,
+    ) -> Route {
         // A run scope is opened by its owner; the flow carrier is Basal, whose calls carry the
         // flow's scope.
         let caller = if flow { "basal" } else { "owner" };
@@ -303,7 +335,15 @@ impl Rig {
             scope_ref,
             Some(1),
         );
-        served_route(&connection, target, &identity, Some(scope)).await
+        served_route_with_bind_project(
+            &connection,
+            target,
+            &identity,
+            Some(scope),
+            project_id,
+            held,
+        )
+        .await
     }
 
     fn calls(&self) -> usize {
@@ -321,76 +361,35 @@ impl Rig {
         std::fs::write(path, config.to_string()).unwrap();
     }
 
-    /// Start broca again over the same state, with a module id of its own, and open a fresh
-    /// route to it.
+    /// Restart the daemon's broca over the same state and open a fresh route to the new
+    /// process. Only one broca may serve a state root at a time, so the running one is killed
+    /// first, and the daemon starts it again with the config as it is now.
     async fn restart(&self) -> Route {
-        let config = self.root.join("config/cortexkit/broca.jsonc");
-        let settings: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
-        let child = broca_test_support::tokio_rig_command(
-            broca_test_support::ckdev_binary(
-                Path::new(env!("CARGO_BIN_EXE_ck-broca")),
-                broca_test_support::scratch_root(),
-            ),
-            &self.root,
-            "restarted",
-        )
-        .unwrap()
-        .arg("--subc")
-        .arg(self.root.join("runtime/subc-connection.json"))
-        .env("SUBC_MODULE_ID", "broca-restarted")
-        .env_remove("SUBC_LAUNCH_NONCE")
-        .env_remove("SUBC_LAUNCH_NONCE_FD")
-        .env("BROCA_STATE_ROOT", &self.state)
-        .env("BROCA_CONFIG_PATH", config)
-        .env(
-            "BROCA_PROVIDER_BASE_URL",
-            settings["providers"]["typesafe"]["base_url"]
-                .as_str()
-                .unwrap(),
-        )
-        .env("XDG_CONFIG_HOME", self.root.join("config"))
-        .env("XDG_RUNTIME_DIR", self.root.join("runtime"))
-        .env("XDG_DATA_HOME", self.root.join("data"))
-        .env("HOME", self.root.join("home"))
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            let lock = spawn_lock(&self.root).unwrap();
-            lock.lock().unwrap();
-            record_process(&self.root, "restarted", child.id().unwrap());
-        }
-        self.restarted
-            .lock()
+        let roster = self.root.join("data/cortexkit/run/live-children.json");
+        let record: Value = serde_json::from_slice(&std::fs::read(&roster).unwrap()).unwrap();
+        let pid = record["children"]
+            .as_array()
             .unwrap()
-            .push(broca_test_support::RigChild::new(
-                child,
-                &self.root,
-                "restarted",
-            ));
-        // A freshly started broca registers with the daemon a moment after spawn.
-        let connection = Arc::new(
-            SubcConnection::connect_with_consumer_identity(
-                &self.root.join("runtime/subc-connection.json"),
-                Some(subc_control::ConsumerIdentity {
-                    module_id: "owner".into(),
-                    launch_nonce: std::fs::read_to_string(self.root.join("owner.nonce"))
-                        .unwrap()
-                        .trim()
-                        .into(),
-                }),
-            )
-            .await
-            .unwrap(),
-        );
-        let identity = broca_protocol::BindIdentity::new(
-            self.root.join("project").canonicalize().unwrap(),
-            "test",
-            "restart-probe",
-        );
-        served_route(&connection, "broca-restarted", &identity, None).await;
-        self.open_to("broca-restarted", "run", false).await
+            .iter()
+            .find(|child| child["module_id"] == "broca")
+            .and_then(|child| child["pid"].as_u64())
+            .map(|pid| u32::try_from(pid).unwrap())
+            .expect("the rig daemon supervises a live broca");
+        subc_os::Process::open(pid)
+            .unwrap()
+            .expect("the daemon's broca is live")
+            .signal(subc_os::Signal::Kill)
+            .unwrap();
+        // Gone means the daemon has reaped it, so a route opened next cannot reach the old
+        // process.
+        broca_test_support::wait_until("the old broca reaped", || async {
+            match subc_os::Process::open(pid) {
+                Ok(None) => Ok(()),
+                _ => Err(format!("broca {pid} still exists")),
+            }
+        })
+        .await;
+        self.open_to("broca", "run", false).await
     }
 
     /// How many `private_content.query` requests reached cerebellum.
@@ -489,11 +488,13 @@ fn cleanup_recorded_processes(root: &Path) -> std::io::Result<()> {
 /// then see the route bind before it has registered its own providers. The first call on such
 /// a route is answered by whatever guards it has, which for this route means it fails closed.
 /// Waiting for the catalog keeps the first tool call on a served route. Returns the route.
-async fn served_route(
+async fn served_route_with_bind_project(
     connection: &Arc<SubcConnection>,
     target: &str,
     identity: &broca_protocol::BindIdentity,
     scope: Option<subc_protocol::scope::ScopeSelector>,
+    project_id: Option<&str>,
+    held: bool,
 ) -> Route {
     // A daemon admits a route to a module whose registration it has not finished handling,
     // and once that route exists it does not open a second one. A module that blinks during
@@ -508,15 +509,23 @@ async fn served_route(
                 let scope = scope.clone();
                 let target = target.to_owned();
                 async move {
-                    Ok(
-                        match connection
+                    #[cfg(debug_assertions)]
+                    let opened = connection
+                        .route_open_tool_provider_with_bind_project_for_tests(
+                            &target, &identity, scope, project_id, held,
+                        )
+                        .await;
+                    #[cfg(not(debug_assertions))]
+                    let opened = {
+                        assert!(project_id.is_none() && !held);
+                        connection
                             .route_open_tool_provider_v1(&target, &identity, scope)
                             .await
-                        {
-                            Ok(route) => Ok(route),
-                            Err(error) => Err(error.to_string()),
-                        },
-                    )
+                    };
+                    Ok(match opened {
+                        Ok(route) => Ok(route),
+                        Err(error) => Err(error.to_string()),
+                    })
                 }
             })
             .await;
@@ -871,9 +880,7 @@ async fn unreachable_cerebellum_counts_as_marked_and_asks_again_on_every_call() 
     // treat as "no answer".
     let Some(rig) = Rig::start(
         "unreachable",
-        Stub::Answering(
-            r#"{"code":"private_content_unavailable","message":"cerebellum cannot tell"}"#,
-        ),
+        Stub::Answering(CEREBELLUM_REFUSAL),
         Stub::Unreachable,
     )
     .await
@@ -911,8 +918,8 @@ async fn unreachable_cerebellum_counts_as_marked_and_asks_again_on_every_call() 
 async fn an_unmarked_run_calls_an_unlisted_provider() {
     let Some(rig) = Rig::start(
         "unmarked",
-        Stub::Answering(r#"{"private_content":false,"sources":[]}"#),
-        Stub::Answering(r#"{"flow_id":"tool-flow","version":"1","code_hash":"00","providers":[]}"#),
+        Stub::Answering(CEREBELLUM_UNMARKED),
+        Stub::Answering(r#"{"result":{"flow_id":"tool-flow","version":7,"code_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","providers":[]}}"#),
     )
     .await
     else {
@@ -922,14 +929,180 @@ async fn an_unmarked_run_calls_an_unlisted_provider() {
     let result = admitted_with_retry(&rig, &route, "unmarked").await;
     assert!(result["cost_usd"].is_number());
     assert_eq!(rig.cerebellum_queries(), 1);
+    let requests = std::fs::read_to_string(rig.root.join("cerebellum.requests")).unwrap();
+    let params: Value = serde_json::from_str(
+        requests
+            .lines()
+            .find_map(|line| line.strip_prefix("private_content.query "))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(params, json!({"scope_ref": "run"}));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg(debug_assertions)]
+async fn always_grant_uses_the_daemon_project_not_the_bind_project_or_workdir() {
+    let Some(rig) = Rig::start(
+        "always-project",
+        Stub::Answering(CEREBELLUM_MARKED),
+        Stub::Unreachable,
+    )
+    .await
+    else {
+        return;
+    };
+    let first = rig.open("project-a-first", false).await;
+    let store = broca_store::grants::GrantsStore::open(rig.state.join("grants.db")).unwrap();
+    let identity = broca_store::grants::ScopeIdentity {
+        owner: "reserved:owner".into(),
+        scope_ref: "project-a-first".into(),
+        scope_epoch: 1,
+    };
+    store
+        .put_card(&broca_store::grants::Card {
+            project_id: Some("project-a".into()),
+            dedup_key: "seed".into(),
+            scope: identity.clone(),
+            agent_id: "agent".into(),
+            provider: "typesafe".into(),
+            content: "{}".into(),
+            card_id: Some("always-card".into()),
+            state: broca_store::grants::CardState::Pending,
+        })
+        .unwrap();
+    store
+        .apply_answer(
+            &identity,
+            broca_store::grants::CardAnswer {
+                dedup_key: "seed".into(),
+                card_id: "always-card".into(),
+                decision: broca_store::grants::Decision::AllowAlways,
+                run_live: false,
+            },
+            1,
+        )
+        .unwrap();
+    assert!(admitted_with_retry(&rig, &first, "first-a").await["cost_usd"].is_number());
+    let later = rig
+        .open_with_bind_project(
+            "broca",
+            "project-a-later",
+            false,
+            Some("client-project-b"),
+            false,
+        )
+        .await;
+    assert!(admitted_with_retry(&rig, &later, "later-a").await["cost_usd"].is_number());
+    assert_eq!(rig.calls(), 2);
+    for run in ["project-b", "run"] {
+        let route = rig
+            .open_with_bind_project("broca", run, false, Some("project-a"), false)
+            .await;
+        let error = refused_once_the_route_is_served(&rig, &route, run).await;
+        assert_eq!(error["detail"]["consent"], "consent_required");
+    }
+    assert_eq!(
+        rig.calls(),
+        2,
+        "a shared workdir or client bind project must not match"
+    );
+    assert!(store.revoke("always-card").unwrap());
+    assert_eq!(store.generation("agent", "typesafe").unwrap(), 1);
+    let error = refused_once_the_route_is_served(&rig, &later, "revoked-a").await;
+    assert_eq!(error["detail"]["consent"], "consent_required");
+    assert_eq!(rig.calls(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg(debug_assertions)]
+async fn consent_card_content_uses_only_the_daemon_stamped_project() {
+    let Some(rig) = Rig::start(
+        "project-card",
+        Stub::Answering(r#"{"private_content":true,"sources":["person_browser"]}"#),
+        Stub::Unreachable,
+    )
+    .await
+    else {
+        return;
+    };
+    for (run, claim, fixture, expected_project) in [
+        (
+            "run",
+            "project-a",
+            include_str!("../../broca-subc/tests/fixtures/consent/broca/private-content-card.json"),
+            None,
+        ),
+        (
+            "project-a-first",
+            "client-project-b",
+            include_str!(
+                "../../broca-subc/tests/fixtures/consent/broca/private-content-card-project.json"
+            ),
+            Some("project-a"),
+        ),
+    ] {
+        let route = rig
+            .open_with_bind_project("broca", run, false, Some(claim), true)
+            .await;
+        broca_test_support::wait_until("Cingulate's consent capability", || async {
+            let ready = route
+                .connection
+                .catalog_list()
+                .await
+                .unwrap()
+                .iter()
+                .any(|entry| {
+                    entry.module_id == "cingulate"
+                        && entry.capabilities.as_ref().is_some_and(|caps| {
+                            caps.provides
+                                .iter()
+                                .any(|cap| cap == "consent-no-expiry/v1")
+                        })
+                });
+            if ready {
+                Ok(())
+            } else {
+                Err("Cingulate has not registered".to_owned())
+            }
+        })
+        .await;
+        let reply = admitted_with_retry(&rig, &route, run).await;
+        assert_eq!(reply["held"]["reason"], "consent");
+        let identity = broca_store::grants::ScopeIdentity {
+            owner: "reserved:owner".into(),
+            scope_ref: run.into(),
+            scope_epoch: 1,
+        };
+        let conn = rusqlite::Connection::open_with_flags(
+            rig.state.join("grants.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut stmt = conn.prepare("SELECT body FROM cards").unwrap();
+        let cards = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
+        let card = cards
+            .map(|body| serde_json::from_str::<broca_store::grants::Card>(&body.unwrap()).unwrap())
+            .find(|card| card.scope == identity)
+            .unwrap();
+        assert_eq!(card.project_id.as_deref(), expected_project);
+        let mut expected: Value = serde_json::from_str(fixture).unwrap();
+        expected["dedup_key"] = json!(card.dedup_key);
+        expected["requester_ref"] = expected["dedup_key"].clone();
+        assert_eq!(
+            serde_json::from_str::<Value>(&card.content).unwrap(),
+            expected
+        );
+    }
+    assert_eq!(rig.calls(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_marked_run_ends_not_started_consent_required_and_files_nothing() {
     let Some(rig) = Rig::start(
         "marked",
-        Stub::Answering(r#"{"private_content":true,"sources":["person_browser"]}"#),
-        Stub::Answering(r#"{"flow_id":"tool-flow","version":"1","code_hash":"00","providers":[]}"#),
+        Stub::Answering(CEREBELLUM_MARKED),
+        Stub::Answering(r#"{"result":{"flow_id":"tool-flow","version":7,"code_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","providers":[]}}"#),
     )
     .await
     else {
@@ -952,7 +1125,7 @@ async fn a_marked_run_with_an_unknown_source_files_no_card() {
         // A marked answer whose only source kind broca does not know, so a card would have no
         // source to name and the call files none.
         Stub::Answering(r#"{"private_content":true,"sources":["future_source"]}"#),
-        Stub::Answering(r#"{"flow_id":"tool-flow","version":"1","code_hash":"00","providers":[]}"#),
+        Stub::Answering(r#"{"result":{"flow_id":"tool-flow","version":7,"code_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","providers":[]}}"#),
     )
     .await
     else {
@@ -963,6 +1136,108 @@ async fn a_marked_run_with_an_unknown_source_files_no_card() {
     let error = refused_once_the_route_is_served(&rig, &route, "unknown-source").await;
     assert_eq!(error["detail"]["consent"], "private_content_unknown");
     assert_eq!(rig.calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_marked_flow_uses_basals_approved_version_and_ownerless_request() {
+    let Some(rig) = Rig::start(
+        "approved-flow",
+        Stub::Answering(CEREBELLUM_MARKED),
+        Stub::Answering(r#"{"result":{"flow_id":"tool-flow","version":7,"code_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","providers":["typesafe","openai"]}}"#),
+    ).await else { return; };
+    let route = rig.open("flow", true).await;
+    let result = admitted_with_retry(&rig, &route, "approved-flow").await;
+    assert!(result["cost_usd"].is_number());
+    assert_eq!(rig.calls(), 1);
+    let requests = std::fs::read_to_string(rig.root.join("basal.requests")).unwrap();
+    let params: Value = serde_json::from_str(
+        requests
+            .lines()
+            .find_map(|line| line.strip_prefix("flow.private_content_providers "))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(params, json!({"flow_id": "tool-flow"}));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_marked_flow_with_no_declared_providers_gets_no_extra_provider() {
+    let Some(rig) = Rig::start(
+        "empty-flow",
+        Stub::Answering(CEREBELLUM_MARKED),
+        Stub::Answering(r#"{"result":{"flow_id":"tool-flow","version":7,"code_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","providers":[]}}"#),
+    ).await else { return; };
+    let route = rig.open("flow", true).await;
+    for key in ["empty-flow", "empty-flow-again", "empty-flow-cached"] {
+        let error = refused_without_writes(&rig, &route, key).await;
+        assert_eq!(error["code"], "provider_not_allowed");
+    }
+    assert_eq!(
+        requests(&rig, "basal", "flow.private_content_providers"),
+        1,
+        "the empty approved provider set is a cacheable policy, not a lookup error"
+    );
+    assert_eq!(rig.calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn basal_error_frames_never_authorize_extra_providers_or_cache_a_failure() {
+    for (name, fixture, expected) in [
+        (
+            "not-approved",
+            r#"{"code":"flow_not_approved","message":"flow has no approved version"}"#,
+            "flow_not_approved",
+        ),
+        (
+            "not-permitted",
+            r#"{"code":"not_permitted","message":"caller is not permitted"}"#,
+            "provider_not_allowed",
+        ),
+        (
+            "invalid-params",
+            r#"{"code":"invalid_params","message":"unknown parameter"}"#,
+            "provider_not_allowed",
+        ),
+        (
+            "warming",
+            r#"{"code":"module_warming","message":"module is warming"}"#,
+            "provider_not_allowed",
+        ),
+        (
+            "storage",
+            r#"{"code":"storage_unavailable","message":"storage is unavailable"}"#,
+            "provider_not_allowed",
+        ),
+    ] {
+        let Some(rig) = Rig::start(
+            name,
+            Stub::Answering(CEREBELLUM_MARKED),
+            Stub::Answering(fixture),
+        )
+        .await
+        else {
+            return;
+        };
+        let route = rig.open("flow", true).await;
+        let error = broca_test_support::wait_until("a Basal error frame", || async {
+            let error = refused_without_writes(&rig, &route, "flow-refused").await;
+            if requests(&rig, "basal", "flow.private_content_providers") == 0 {
+                Err("Basal has not served its management route yet".to_string())
+            } else {
+                Ok(error)
+            }
+        })
+        .await;
+        assert_eq!(error["code"], expected);
+        let before = requests(&rig, "basal", "flow.private_content_providers");
+        let error = refused_without_writes(&rig, &route, "flow-refused-again").await;
+        assert_eq!(error["code"], expected);
+        assert_eq!(
+            requests(&rig, "basal", "flow.private_content_providers"),
+            before + 1
+        );
+        assert_eq!(rig.calls(), 0);
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1070,6 +1345,10 @@ fn private_content_handoff() {
                 .arg(format!(
                     "--SURFACE_REQUESTS={}",
                     std::env::var("PRIVATE_CONTENT_REQUESTS").unwrap()
+                ))
+                .arg(format!(
+                    "--SURFACE_NONCE_PATH={}",
+                    hex(&root.join(format!("{module}.nonce")))
                 ));
             command
         };

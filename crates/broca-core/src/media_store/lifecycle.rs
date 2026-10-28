@@ -576,26 +576,31 @@ impl MediaStore {
         let lock = self.lock()?;
         lock.lock_shared()?;
         let state_root = self.root.parent().unwrap();
-        let wal = FileWalStore::new(state_root.join("wal"));
         let address = session_addr(session);
-        let mut deleting = false;
-        for tree in [
-            wal.root().to_path_buf(),
-            wal.ephemeral_root(),
-            wal.durable_root(),
-        ] {
-            if !tree.try_exists()? {
-                continue;
-            }
-            for entry in fs::read_dir(tree)? {
-                let path = entry?.path();
-                deleting |= path.extension().is_some_and(|ext| ext == "deleting")
-                    && path.file_name().is_some_and(|name| {
-                        name.to_string_lossy().starts_with(&format!("{address}."))
-                    });
-            }
+        // No media, no scan: when there is nothing to unlink, skip both the
+        // WAL existence checks and the WAL directory barrier. The barrier only
+        // orders the WAL unlink before dropping media entries. It is repeated
+        // even when the WAL file is already absent because a previous unlink
+        // may not yet be durable. With no refs, identities, or swept entry
+        // there is nothing to drop, so this call can skip the checks and the
+        // barrier.
+        if !self.root.join("refs").join(&address).try_exists()?
+            && !self.root.join("identities").join(&address).try_exists()?
+            && !self.root.join("swept").join(&address).try_exists()?
+        {
+            return Ok(());
         }
-        if deleting
+        let wal = FileWalStore::new(state_root.join("wal"));
+        // A `.deleting` file is only ever created in the ephemeral tree as
+        // `{address}.{lineage}.deleting` (`FileWalStore::deleting_path` and
+        // retention's `deleting`), and its tombstone is written first. The
+        // caller holds the session lease, and `delete_expired` finishes every
+        // incomplete tombstone for this address before starting a new deletion,
+        // so no other lineage's `.deleting` can appear meanwhile. Checking the
+        // exact path for each tombstone-known lineage is therefore enough. Never
+        // list a whole WAL tree here: a deletion's cost must not grow with the
+        // number of sessions on disk.
+        if has_deleting_for_address(&wal, &address)?
             || wal
                 .media_store_class(&address)
                 .map_err(io::Error::other)?
@@ -611,6 +616,37 @@ impl MediaStore {
         }
         Ok(())
     }
+}
+
+/// Exact `.deleting` checks for the tombstone-known lineages of one address.
+/// A `.deleting` file implies its tombstone was written first (the tombstone
+/// precedes the rename in `RetentionService::complete`), so enumerating the
+/// tiny per-address `expired` directory finds every production candidate
+/// without listing any WAL tree. A tombstoneless `.deleting` cannot occur in
+/// production; the once-per-sweep WAL scan in `inventory` still protects that
+/// case for collection.
+fn has_deleting_for_address(wal: &FileWalStore, address: &str) -> io::Result<bool> {
+    let expired = wal.ephemeral_root().join(format!("{address}.expired"));
+    let entries = match fs::read_dir(&expired) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let name = entry?.file_name();
+        let lineage = name.to_string_lossy();
+        if lineage.ends_with(".tmp") {
+            continue;
+        }
+        if wal
+            .ephemeral_root()
+            .join(format!("{address}.{lineage}.deleting"))
+            .try_exists()?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]

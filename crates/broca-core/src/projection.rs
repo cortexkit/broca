@@ -173,13 +173,23 @@ impl IndeterminateToolCalls {
     }
 }
 
-/// Context needed when records are projected incrementally. Placement keeps absolute
-/// lineage ordinals across episodes; the other fields describe the current episode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveCallIdentity {
+    seq: u64,
+    schema_pin: Option<String>,
+    recorded_key: Option<String>,
+    dispatched: bool,
+}
+
+/// Context for incremental projection. Placement and log identity survive episode
+/// boundaries; call facts are bounded to the current tool batch.
 ///
-/// Batch replay can construct this state internally, while the live projector keeps one instance
-/// across observed records so a later `RunFinished` can describe its last model step and dispatches.
+/// Batch replay constructs this state internally, while the live projector keeps
+/// an instance so later records retain their run, message and call identities.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ControlProjectionState {
+    wal_lineage_id: Option<broca_wal::WalLineageId>,
+    call_identities: std::collections::HashMap<ToolCallId, LiveCallIdentity>,
     placement: crate::placement::Placement,
     placement_error: Option<String>,
     assistant_ordinal: Option<u64>,
@@ -211,6 +221,8 @@ impl ControlProjectionState {
         run_id: Option<RunId>,
     ) -> Self {
         Self {
+            wal_lineage_id: None,
+            call_identities: Default::default(),
             run_id,
             final_step_finish_reason,
             has_completed_step: completed_steps > 0,
@@ -253,8 +265,32 @@ impl ControlProjectionState {
         Some(state)
     }
 
+    /// The state a projection holds just before an episode's `RunStarted`, given the
+    /// transcript ordinal where that episode's input starts.
+    ///
+    /// A `RunStarted` resets every episode-local field, and placement keeps only the absolute
+    /// next ordinal across episodes (its batch, held steers and budget facts reset at the run
+    /// start too). So projecting an episode from its `RunStarted` with this state yields the
+    /// same units and the same final state as projecting the whole log, as long as the
+    /// ordinal is the episode's own first ordinal. Use it only immediately before a
+    /// `RunStarted` record; anywhere else the episode-local fields would be missing.
+    pub fn at_episode_start(first_ord: u64) -> Self {
+        Self {
+            placement: crate::placement::Placement::new(first_ord),
+            ..Self::default()
+        }
+    }
+
     pub fn placement(&self) -> &crate::placement::Placement {
         &self.placement
+    }
+
+    /// Supply the log header identity read with the records, never a file-system
+    /// inode or the separate visible-history lineage.
+    pub fn set_wal_lineage_id(&mut self, lineage: Option<broca_wal::WalLineageId>) {
+        if lineage.is_some() {
+            self.wal_lineage_id = lineage;
+        }
     }
 
     pub fn placement_error(&self) -> Option<&str> {
@@ -271,6 +307,7 @@ impl ControlProjectionState {
         self.assistant_message = None;
         self.assistant_started = false;
         self.started_tools.clear();
+        self.call_identities.clear();
         self.cancelled = false;
         self.pending_inputs.clear();
     }
@@ -297,7 +334,32 @@ pub fn project_control_with_mids(
 ) -> Result<Vec<PlacedControlUnit>, String> {
     let mut sink = PlacedUnitSink::default();
     for framed in records {
+        let first = sink.units.len();
         project_control_record(framed, state, &mut sink);
+        for frame in &mut sink.units[first..] {
+            let (id, key, pin) = match &mut frame.event {
+                cortexkit_role_llm_runner::live::LiveEvent::ToolStarted(event) => (
+                    &event.tool_call_id,
+                    &mut event.call_key,
+                    &mut event.schema_pin,
+                ),
+                cortexkit_role_llm_runner::live::LiveEvent::ToolFinished(event) => (
+                    &event.tool_call_id,
+                    &mut event.call_key,
+                    &mut event.schema_pin,
+                ),
+                _ => continue,
+            };
+            if let Some(identity) = state.call_identities.get(&ToolCallId(id.clone())) {
+                let lineage = state.wal_lineage_id.map(|lineage| lineage.to_string());
+                *key = crate::context::tool_call_key(
+                    lineage.as_deref(),
+                    identity.seq,
+                    identity.recorded_key.as_deref(),
+                );
+                pin.clone_from(&identity.schema_pin);
+            }
+        }
         if let Some(error) = &state.placement_error {
             return Err(error.clone());
         }
@@ -489,6 +551,7 @@ fn project_control_record<S: ControlProjectionSink>(
         WalRecord::RunStarted {
             run_id,
             submission_id,
+            manifest,
             ..
         } => {
             state.reset_episode();
@@ -500,7 +563,13 @@ fn project_control_record<S: ControlProjectionSink>(
                     run_id: run_id.clone(),
                     submission_id: submission_id.clone(),
                 },
-                LiveEvent::RunStarted(live::RunStarted::new(run_id.0.clone()))
+                LiveEvent::RunStarted({
+                    let mut started = live::RunStarted::new(run_id.0.clone());
+                    started.rich_ui = manifest
+                        .as_ref()
+                        .and_then(|manifest| manifest.rich_ui.clone());
+                    started
+                })
             );
         }
         WalRecord::StepStarted { step_id } => {
@@ -508,6 +577,7 @@ fn project_control_record<S: ControlProjectionSink>(
             state.assistant_message = None;
             state.assistant_started = true;
             state.started_tools.clear();
+            state.call_identities.clear();
             record_sink.ordinal = state.assistant_ordinal;
             push!(
                 ControlUnit::StepStarted { step_id: *step_id },
@@ -561,6 +631,7 @@ fn project_control_record<S: ControlProjectionSink>(
             state.tool_result_ordinal = state.placement.held_tool_result_ordinal();
             state.assistant_message = Some(Arc::clone(assistant_message));
             state.started_tools.clear();
+            state.call_identities.clear();
             let already_started = std::mem::take(&mut state.assistant_started);
             record_sink.ordinal = state.assistant_ordinal;
             state.final_step_finish_reason = *finish_reason;
@@ -732,6 +803,7 @@ fn project_control_record<S: ControlProjectionSink>(
             state.assistant_message = None;
             state.assistant_started = false;
             state.started_tools.clear();
+            state.call_identities.clear();
             state.cancelled = false;
         }
         WalRecord::RunPaused {
@@ -791,6 +863,8 @@ fn project_control_record<S: ControlProjectionSink>(
             tool_name,
             args,
             dispatched_at_ms,
+            schema_pin,
+            call_key,
             ..
         } => {
             state
@@ -803,6 +877,32 @@ fn project_control_record<S: ControlProjectionSink>(
                     .find(|call| &call.tool_call_id == tool_call_id)
             });
             if let (Some(ordinal), Some(call)) = (state.assistant_ordinal, call) {
+                let schema = schema_pin.as_ref().and_then(|pin| {
+                    cortexkit_role_tool_provider::call::SchemaPin::new(
+                        tool_name.as_deref().unwrap_or(&call.tool_name),
+                        &pin.schema_digest,
+                        pin.semantics,
+                    )
+                    .encode()
+                    .ok()
+                });
+                let identity = LiveCallIdentity {
+                    seq: framed.seq,
+                    schema_pin: schema,
+                    recorded_key: call_key.clone(),
+                    dispatched: true,
+                };
+                match state.call_identities.entry(tool_call_id.clone()) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(identity);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry)
+                        if !entry.get().dispatched =>
+                    {
+                        entry.insert(identity);
+                    }
+                    _ => {}
+                }
                 if state.started_tools.insert(tool_call_id.clone()) {
                     record_sink.boundary(ordinal, || {
                         tool_started_event(
@@ -838,7 +938,10 @@ fn project_control_record<S: ControlProjectionSink>(
         }
         // A record type written by a newer build: informational by the contract on
         // `WalRecord`, so it emits no control unit and leaves the projection state untouched.
-        WalRecord::Unknown => {}
+        WalRecord::WriterOpened { .. }
+        | WalRecord::WriterClosed { .. }
+        | WalRecord::VisibilityLate { .. }
+        | WalRecord::Unknown => {}
         WalRecord::ContextCeilingWait {
             deadline_ms,
             unavailable: None,
@@ -852,7 +955,9 @@ fn project_control_record<S: ControlProjectionSink>(
                 });
             }
         }
-        WalRecord::ContextCeilingWait { .. } | WalRecord::ContextCeilingDecided { .. } => {}
+        WalRecord::ContextCeilingWait { .. }
+        | WalRecord::ContextCeilingDecided { .. }
+        | WalRecord::OutputReservationClamped { .. } => {}
         WalRecord::CompactionRideWait { deadline_ms, .. } => {
             if let Some(run_id) = &state.run_id {
                 push!(ControlUnit::CompactionWait {
@@ -874,6 +979,10 @@ fn project_control_record<S: ControlProjectionSink>(
         // Provider attempt evidence is known to this build but carries no session semantics:
         // it is skipped exactly like `Unknown`, so the control stream is identical without it.
         WalRecord::ModelAttemptFinished { .. } => {}
+        // A refused step is re-sent under the same step id and its refused content is never
+        // stored, so a subscriber replaying the WAL sees only the step's `StepStarted` and the
+        // answer that committed it.
+        WalRecord::ModelStepRefused { .. } => {}
         // A resume's own account of what it found: informational, so the control stream is
         // identical without it. The results a resume writes are ordinary `ToolResult` records.
         WalRecord::ResumeStarted { .. } => {}
@@ -934,6 +1043,17 @@ fn project_control_record<S: ControlProjectionSink>(
                     .find(|call| &call.tool_call_id == call_id)
             });
             if let (Some(ordinal), Some(call)) = (state.assistant_ordinal, call) {
+                // Preparation has a durable key, but no dispatched definition yet.
+                // The later intent supplies the pin without changing the prepared key.
+                state
+                    .call_identities
+                    .entry(call_id.clone())
+                    .or_insert(LiveCallIdentity {
+                        seq: framed.seq,
+                        schema_pin: None,
+                        recorded_key: None,
+                        dispatched: false,
+                    });
                 if state.started_tools.insert(call_id.clone()) {
                     record_sink.boundary(ordinal, || {
                         let mut event = live::ToolStarted::new(
@@ -1010,6 +1130,7 @@ fn project_control_record<S: ControlProjectionSink>(
                 state.tool_result_ordinal = None;
                 state.assistant_message = None;
                 state.started_tools.clear();
+                state.call_identities.clear();
             }
             _ => {}
         }
@@ -1072,7 +1193,7 @@ fn tool_finished_event(
             })
             .sum(),
         ToolOutput::Denied { reason } => reason.len(),
-        ToolOutput::Error { message } => message.len(),
+        ToolOutput::Error { message, .. } => message.len(),
     };
     LiveEvent::ToolFinished(ToolFinished::new(
         format!("m{ordinal}"),
@@ -1156,6 +1277,258 @@ fn message_shape_finish_reason(
     } else {
         FinishReason::Stop
     }
+}
+
+// Episode-bounded reads from the offset index.
+//
+// On overhaul state roots the offset index records where each run episode starts. The model
+// view and a live attach then decode only the frames of the episodes they show, folding at
+// most one episode's records to rebuild state, instead of replaying the whole log. These
+// helpers check everything they take from the index against the log before relying on it, and
+// a read that fails any check replays the whole log instead.
+
+/// One run episode as the offset index's `episode` row locates it.
+///
+/// Each field mirrors a column the indexer wrote, so episode-bounded reads never depend on the
+/// store crate. None is trusted on its own: [`replay_from_episode_start`] re-reads the episode's
+/// `RunStarted` frame and checks the ordinal where its input starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexedEpisode {
+    /// WAL sequence of the episode's `RunStarted`; `None` for records written before the first run.
+    pub run_started_seq: Option<u64>,
+    /// Byte offset where that `RunStarted` frame starts.
+    pub run_started_off: Option<u64>,
+    /// Transcript ordinal where the episode's input starts.
+    pub first_ord: u64,
+    /// Transcript ordinal just past the episode's last placed message.
+    pub end_ord: u64,
+}
+
+/// The index's tail seed at the committed projection boundary an episode read starts from.
+///
+/// The boundary is the last qualified `projection_boundary` row before the episode's
+/// `RunStarted`; the other fields are the tail seed the index holds at that boundary: exactly
+/// the inputs [`crate::replay::replay_seeded_at_validated_boundary`] takes, which validates the
+/// boundary frame before anything is replayed.
+#[derive(Debug, Clone)]
+pub struct EpisodeSeed {
+    pub boundary: crate::replay::SeedBoundary,
+    /// Transcript length the boundary covers.
+    pub ordinal_base: u64,
+    /// Steers recorded before the boundary that no step boundary has placed yet.
+    pub held_steers: Vec<broca_protocol::Message>,
+    pub tag_seed: crate::tags::TagSeed,
+    /// Model, run id and budget of the episode open at the boundary.
+    pub seed_origin: Option<broca_protocol::request::ModelHandle>,
+    pub seed_run_id: Option<RunId>,
+    pub seed_budget: Option<broca_protocol::request::BudgetConfig>,
+}
+
+/// A replay that starts at a validated position and reaches an episode's `RunStarted`.
+#[derive(Debug, Clone)]
+pub struct EpisodeReplay {
+    /// Replay of every frame given, seeded at the boundary or from the log's first record.
+    pub state: crate::replay::ReplayState,
+    /// Transcript ordinal of `state.prompt[0]`.
+    pub ordinal_base: u64,
+    /// Index, among the frames given, of the episode's `RunStarted`.
+    pub run_started: usize,
+}
+
+/// Byte offset of the log's first record: past the header frame when the log has one.
+pub fn first_record_offset(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+) -> std::io::Result<u64> {
+    log_header_info(read_at).map(|(offset, _)| offset)
+}
+
+/// Read the initial log header once, keeping its identity beside the record offset.
+/// Headerless legacy sources retain offset zero and an unknown identity.
+pub fn log_header_info(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+) -> std::io::Result<(u64, Option<broca_wal::WalLineageId>)> {
+    let header = read_at(0, broca_wal::framing::LINEAGE_FRAME_LEN as u64)?;
+    Ok(match broca_wal::framing::decode_next(&header) {
+        broca_wal::framing::DecodeStep::Lineage {
+            consumed,
+            lineage_id,
+        } => (consumed as u64, Some(lineage_id)),
+        _ => (0, None),
+    })
+}
+
+/// Decode the frames in the byte range `from..to`, which must start and end on frame
+/// boundaries, counting each decoded frame when `decode_counter` is given.
+///
+/// The range is read once through `read_at`. A log shorter than the range, a torn or corrupt
+/// frame, or a frame from a newer writer is an error: the index named a range the log does not
+/// hold, and the caller replays the whole log instead. With counting on, tests assert that a
+/// read decodes only the frames of the range it asked for, never the whole log.
+pub fn decode_positioned_frames(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    from: u64,
+    to: u64,
+    decode_counter: Option<&std::cell::Cell<u64>>,
+) -> Result<Vec<crate::replay::PositionedFrame>, String> {
+    use broca_wal::framing::{decode_next, DecodeStep};
+    let len = to
+        .checked_sub(from)
+        .ok_or_else(|| format!("WAL range {from}..{to} is reversed"))?;
+    let bytes = read_at(from, len).map_err(|error| format!("WAL read at {from}: {error}"))?;
+    if (bytes.len() as u64) < len {
+        return Err(format!(
+            "WAL ends at {} before the range end {to}",
+            from + bytes.len() as u64
+        ));
+    }
+    let mut frames = Vec::new();
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let at = from + off as u64;
+        match decode_next(&bytes[off..]) {
+            DecodeStep::Record { framed, consumed } => {
+                if let Some(counter) = decode_counter {
+                    counter.set(counter.get() + 1);
+                }
+                frames.push(crate::replay::PositionedFrame {
+                    off: at,
+                    framed: *framed,
+                });
+                off += consumed;
+            }
+            DecodeStep::Lineage { consumed, .. } => {
+                if let Some(counter) = decode_counter {
+                    counter.set(counter.get() + 1);
+                }
+                off += consumed;
+            }
+            DecodeStep::TornTail => return Err(format!("torn WAL frame at {at}")),
+            DecodeStep::Corrupt(error) => return Err(format!("corrupt WAL at {at}: {error}")),
+            DecodeStep::NewerWriter { ver, .. } => {
+                return Err(format!("newer WAL writer version {ver} at {at}"))
+            }
+        }
+    }
+    Ok(frames)
+}
+
+/// The episode whose records hold WAL sequence `seq`: the last one started at or before it.
+///
+/// `episodes` are the session's `episode` rows in episode order. `None` when `seq` precedes
+/// every run start.
+pub fn episode_holding_seq(episodes: &[IndexedEpisode], seq: u64) -> Option<usize> {
+    episodes
+        .iter()
+        .rposition(|episode| episode.run_started_seq.is_some_and(|start| start <= seq))
+}
+
+/// Where the episode's `RunStarted` sits among `frames`, if the frame at its recorded sequence
+/// is a `RunStarted` at its recorded byte offset.
+pub fn episode_start_index(
+    episode: &IndexedEpisode,
+    frames: &[crate::replay::PositionedFrame],
+) -> Option<usize> {
+    let seq = episode.run_started_seq?;
+    let index = frames
+        .iter()
+        .position(|positioned| positioned.framed.seq == seq)?;
+    let frame = &frames[index];
+    (matches!(frame.framed.record, WalRecord::RunStarted { .. })
+        && episode.run_started_off == Some(frame.off))
+    .then_some(index)
+}
+
+/// Replay `frames` from a validated position through an episode's `RunStarted` and beyond.
+///
+/// With a seed, `frames` must continue its boundary, and the replay goes through
+/// [`crate::replay::replay_seeded_at_validated_boundary`], which re-reads the boundary frame and
+/// checks its sequence, hash, lineage and qualification and the frames' contiguity. Without a
+/// seed, `frames` must begin at the log's first record, so nothing stored is relied on. Either
+/// way the frames must hold the episode's `RunStarted` at its recorded sequence and offset, and
+/// the replay must place that episode's input at the episode's recorded first ordinal. Any
+/// mismatch returns the [`crate::replay::SeedFallback`] reason, and the caller replays the whole
+/// log instead.
+pub fn replay_from_episode_start(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    seed: Option<&EpisodeSeed>,
+    episode: &IndexedEpisode,
+    frames: &[crate::replay::PositionedFrame],
+) -> Result<EpisodeReplay, crate::replay::SeedFallback> {
+    use crate::replay::SeedFallback;
+    let run_started = episode_start_index(episode, frames).ok_or(SeedFallback {
+        reason: "episode start not in the frames read",
+    })?;
+    let (state, ordinal_base) = match seed {
+        Some(seed) => (
+            crate::replay::replay_seeded_at_validated_boundary(
+                read_at,
+                &seed.boundary,
+                frames,
+                seed.seed_origin.clone(),
+                seed.seed_run_id.clone(),
+                seed.seed_budget.clone(),
+                None,
+                seed.ordinal_base,
+                false,
+                seed.tag_seed,
+                seed.held_steers.clone(),
+            )?,
+            seed.ordinal_base,
+        ),
+        None => {
+            let start = first_record_offset(read_at).map_err(|_| SeedFallback {
+                reason: "log unreadable",
+            })?;
+            // `run_started` was found, so `frames` is not empty.
+            if frames[0].framed.seq != 1 || frames[0].off != start {
+                return Err(SeedFallback {
+                    reason: "frames do not start at the log's first record",
+                });
+            }
+            if frames
+                .windows(2)
+                .any(|pair| pair[0].framed.seq + 1 != pair[1].framed.seq)
+            {
+                return Err(SeedFallback {
+                    reason: "frames have a sequence gap",
+                });
+            }
+            let state = crate::replay::replay_seeded(
+                frames.iter().map(|positioned| &positioned.framed.record),
+                None,
+                None,
+                None,
+                None,
+                0,
+                false,
+                crate::tags::TagSeed::default(),
+            )
+            .map_err(|_| SeedFallback {
+                reason: "replay refused the frames",
+            })?;
+            (state, 0)
+        }
+    };
+    // Replay records one render episode per `RunStarted`, at the ordinal where its input starts.
+    let starts_before = frames[..run_started]
+        .iter()
+        .filter(|positioned| matches!(positioned.framed.record, WalRecord::RunStarted { .. }))
+        .count();
+    let prompt_start = state
+        .render_episodes
+        .as_deref()
+        .and_then(|episodes| episodes.get(starts_before))
+        .map(|rendered| rendered.prompt_start as u64);
+    if prompt_start != Some(episode.first_ord) {
+        return Err(SeedFallback {
+            reason: "episode first ordinal mismatch",
+        });
+    }
+    Ok(EpisodeReplay {
+        state,
+        ordinal_base,
+        run_started,
+    })
 }
 
 #[cfg(test)]

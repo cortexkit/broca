@@ -73,8 +73,14 @@ mod websocket_tests;
 #[path = "transport_retention_tests.rs"]
 mod retention_tests;
 
+#[cfg(test)]
+#[path = "transport_refusal_fallback_tests.rs"]
+mod refusal_fallback_tests;
+
 #[path = "transport_websocket.rs"]
 mod responses_websocket;
+
+pub use responses_websocket::Connections as ChatgptConnections;
 
 #[path = "transport_codex_retry.rs"]
 mod codex_retry;
@@ -100,6 +106,14 @@ pub struct ProviderHttpClient {
     /// `api.anthropic.com` only. Decodes gzip, deflate, brotli and zstd responses as they stream.
     decoding: reqwest::Client,
     request_gzip: request_gzip::RequestGzipPolicy,
+    chatgpt_connections: ChatgptConnections,
+    /// Tests only: when set, every send fails at once with a refused connection, without
+    /// opening a socket. A refused localhost connect takes seconds on some platforms, so a
+    /// test that needs many connect failures in a bounded window cannot dial a real closed
+    /// port; this keeps the failure and its `ConnectFailed` outcome while removing the
+    /// operating system from the timing.
+    #[cfg(test)]
+    fail_connects: bool,
 }
 
 impl ProviderHttpClient {
@@ -120,6 +134,9 @@ impl ProviderHttpClient {
             identity: build(false),
             decoding: build(true),
             request_gzip,
+            chatgpt_connections: ChatgptConnections::default(),
+            #[cfg(test)]
+            fail_connects: false,
         }
     }
 
@@ -134,13 +151,33 @@ impl ProviderHttpClient {
 
     /// The one-attempt HTTP/1.1 pool-escape client, with this client's request-gzip policy.
     fn http1_escape(&self) -> Self {
-        Self::build(|| provider_client_builder().http1_only(), self.request_gzip)
+        let escaped = Self::build(|| provider_client_builder().http1_only(), self.request_gzip);
+        escaped.with_test_hooks_from(self)
+    }
+
+    /// Tests only: carry the test-only send hooks across the escape-client rebuild, so the
+    /// step's one escape attempt fails the same way the primary pool does.
+    #[cfg(test)]
+    fn with_test_hooks_from(mut self, source: &Self) -> Self {
+        self.fail_connects = source.fail_connects;
+        self
+    }
+
+    /// Production builds have no test-only send hooks, so the rebuilt client is already whole.
+    #[cfg(not(test))]
+    fn with_test_hooks_from(self, _source: &Self) -> Self {
+        self
     }
 
     /// The client that never decodes responses, for diagnostic tools that record a response
     /// exactly as it came off the connection.
     pub fn without_response_decoding(&self) -> &reqwest::Client {
         &self.identity
+    }
+
+    /// The executor-owned, full-session-bind socket owner; never serialized or global.
+    pub fn chatgpt_connections(&self) -> &ChatgptConnections {
+        &self.chatgpt_connections
     }
 
     /// A client that sends `api.anthropic.com` to a local test server, with its own gzip latch.
@@ -162,9 +199,17 @@ impl From<reqwest::Client> for ProviderHttpClient {
             identity: client.clone(),
             decoding: client,
             request_gzip: request_gzip::RequestGzipPolicy::isolated(false),
+            chatgpt_connections: ChatgptConnections::default(),
+            #[cfg(test)]
+            fail_connects: false,
         }
     }
 }
+
+/// [`LiveProvider::route`]: steps go to the episode's own model.
+const ROUTE_SOURCE: u8 = 0;
+/// [`LiveProvider::route`]: steps go to the episode's refusal-fallback model.
+const ROUTE_FALLBACK: u8 = 1;
 
 /// A live provider: any wire family + its frozen render config + a runtime auth
 /// credential, driven over reqwest. Generic over the family so the same transport
@@ -175,6 +220,12 @@ pub struct LiveProvider<F: WireFamily + 'static> {
     pub(crate) family: Arc<F>,
     pub(crate) frozen: Arc<FrozenRenderConfig>,
     grammar_downgraded: std::sync::atomic::AtomicBool,
+    /// The refusal-fallback model's render config, taken from `frozen.refusal_fallback` when
+    /// the episode froze one.
+    fallback: Option<Arc<FrozenRenderConfig>>,
+    /// Whether the next step goes to the fallback model ([`ROUTE_FALLBACK`]) or the episode's
+    /// own ([`ROUTE_SOURCE`]). Always the source when `fallback` is `None`.
+    route: std::sync::atomic::AtomicU8,
     /// The credential the next step is sent with. Behind a lock only so an in-step refresh can
     /// replace it: once a refreshed token has been accepted, later steps of this run must not
     /// go back to the one the provider rejected. The lock belongs to this provider instance, and
@@ -185,6 +236,7 @@ pub struct LiveProvider<F: WireFamily + 'static> {
     /// the historical behavior: the 401 ends the step.
     pub(crate) refresher: Option<Arc<dyn CredentialRefresher>>,
     websocket: Arc<responses_websocket::Session>,
+    websocket_lease: std::sync::Mutex<Option<responses_websocket::Lease>>,
     #[cfg(test)]
     escape_client_builds: std::sync::Arc<AtomicUsize>,
     #[cfg(any(test, feature = "test-harness"))]
@@ -567,6 +619,15 @@ impl StreamNormalizer for ToolNameRestoringNormalizer {
     }
 }
 
+/// `frozen` with the step's lowered output cap applied (see [`FrozenRenderConfig::for_step`]);
+/// the same allocation when the step keeps the frozen cap.
+fn step_frozen(frozen: Arc<FrozenRenderConfig>, opts: &CallOptions) -> Arc<FrozenRenderConfig> {
+    match frozen.for_step(opts) {
+        std::borrow::Cow::Borrowed(_) => frozen,
+        std::borrow::Cow::Owned(lowered) => Arc::new(lowered),
+    }
+}
+
 fn build_retry_normalizer<F: WireFamily>(
     family: &F,
     frozen: &FrozenRenderConfig,
@@ -622,6 +683,31 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
         }
         Arc::new(frozen)
     }
+
+    /// The base config the next step is rendered with, before the step's own output cap is
+    /// applied (see [`step_frozen`]): the refusal-fallback model's while the route says so,
+    /// otherwise [`Self::effective_frozen`]. A grammar downgrade applies to the fallback's
+    /// structured output too, which admission froze identical to the source's.
+    fn route_frozen(&self) -> Arc<FrozenRenderConfig> {
+        let Some(fallback) = self.routed_fallback() else {
+            return self.effective_frozen();
+        };
+        if !self.grammar_downgraded.load(Ordering::Acquire) {
+            return Arc::clone(fallback);
+        }
+        let mut frozen = (**fallback).clone();
+        if let Some(so) = &mut frozen.structured_output {
+            so.downgrade_grammar();
+        }
+        Arc::new(frozen)
+    }
+    /// The fallback model's config when the route currently sends steps there.
+    fn routed_fallback(&self) -> Option<&Arc<FrozenRenderConfig>> {
+        self.fallback
+            .as_ref()
+            .filter(|_| self.route.load(Ordering::Acquire) == ROUTE_FALLBACK)
+    }
+
     /// Convenience constructor for one-shot callers that do not own a shared HTTP client.
     pub fn new(family: F, frozen: FrozenRenderConfig, auth: AuthHandle) -> Self {
         Self::new_with_clock(family, frozen, auth, Clock::default())
@@ -647,6 +733,11 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             client,
             clock,
             family: Arc::new(family),
+            fallback: frozen
+                .refusal_fallback
+                .as_ref()
+                .map(|fallback| Arc::new(fallback.frozen.clone())),
+            route: std::sync::atomic::AtomicU8::new(ROUTE_SOURCE),
             frozen: Arc::new(frozen),
             grammar_downgraded: std::sync::atomic::AtomicBool::new(false),
             // Wrapped HERE rather than taken as an Arc, so callers keep passing an owned
@@ -661,6 +752,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             frozen_account_ref: None,
             refresher: None,
             websocket: Arc::new(responses_websocket::Session::default()),
+            websocket_lease: std::sync::Mutex::new(None),
             #[cfg(test)]
             escape_client_builds: std::sync::Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-harness"))]
@@ -713,9 +805,13 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
         cancel: CancellationToken,
         deadline: Option<Instant>,
     ) -> mpsc::Receiver<NormalizedEvent> {
-        self.start_step_under_seal(step_id, opts, cancel, deadline, None, None)
+        self.start_step_under_seal(step_id, opts, cancel, deadline, None, None, 0)
     }
 
+    // The step's identity, its shared request, cancellation, deadline, seal, progress slot and
+    // first attempt ordinal are each a separate runtime input; grouping them would only rename
+    // them.
+    #[allow(clippy::too_many_arguments)]
     fn start_step_under_seal(
         &self,
         step_id: StepId,
@@ -724,6 +820,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
         deadline: Option<Instant>,
         seal: Option<ShutdownSeal>,
         progress: Option<broca_core::provider::LiveStepProgress>,
+        first_attempt: u32,
     ) -> mpsc::Receiver<NormalizedEvent> {
         let (tx, rx) = mpsc::channel::<NormalizedEvent>(256);
         let served = self.current_auth();
@@ -756,7 +853,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
         let render_job = RenderJob {
             auth_revision: served.revision,
             family: Arc::clone(&self.family),
-            frozen: self.effective_frozen(),
+            frozen: step_frozen(self.route_frozen(), &opts),
             auth: served.auth,
             opts,
             step_id,
@@ -771,15 +868,29 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             frozen_account_ref: self.frozen_account_ref.clone(),
         });
 
+        let route = if self.routed_fallback().is_some() {
+            broca_core::refusal_fallback::StepRoute::Fallback
+        } else {
+            broca_core::refusal_fallback::StepRoute::Source
+        };
         spawn_transport_task(
             self.client.clone(),
             self.clock.clone(),
             Arc::clone(&self.family),
-            Arc::clone(&self.frozen),
+            // The normalizer reports an output-ceiling cut with the cap this step was sent with.
+            // A fallback step's response is normalized, and its retries re-addressed, with the
+            // config it was rendered with, so they name the model that answers it.
+            if route == broca_core::refusal_fallback::StepRoute::Fallback {
+                Arc::clone(&render_job.frozen)
+            } else {
+                step_frozen(Arc::clone(&self.frozen), &render_job.opts)
+            },
+            route,
             render_job,
             served.account_ref,
             recovery,
             step_id,
+            first_attempt,
             tx,
             cancel,
             deadline,
@@ -796,6 +907,24 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
 
 #[async_trait]
 impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
+    fn set_credential_revision(&self, revision: u64) {
+        self.auth.write().unwrap().revision = revision;
+    }
+
+    fn bind_run_transport(&self, session: &broca_protocol::BindIdentity) {
+        if self.frozen.family_id == crate::spec::WireFamilyId::OpenAiResponsesChatgpt
+            && self.frozen.chatgpt_wire.is_some()
+        {
+            let mut lease = self.websocket_lease.lock().unwrap();
+            if lease.is_none() {
+                *lease = self
+                    .client
+                    .chatgpt_connections
+                    .acquire(session, &self.websocket);
+            }
+        }
+    }
+
     fn reasoning_is_prefix_bound(&self) -> bool {
         self.frozen.family_id.thinking_is_prefix_bound()
     }
@@ -831,14 +960,47 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
             runtime.deadline,
             runtime.seal,
             runtime.progress,
+            runtime.first_attempt,
         )
     }
     fn close_run_transport(&self) {
+        self.websocket.close();
+        self.websocket_lease.lock().unwrap().take();
+    }
+
+    fn complete_run_transport(&self) {
+        if let Some(lease) = self.websocket_lease.lock().unwrap().take() {
+            lease.complete(&self.websocket);
+        }
         self.websocket.close();
     }
 
     fn set_chatgpt_https_policy(&self, policy: Arc<dyn Fn() -> bool + Send + Sync>) {
         self.websocket.set_policy(policy);
+    }
+
+    fn refusal_fallback_model(&self) -> Option<broca_protocol::request::ModelHandle> {
+        self.frozen
+            .refusal_fallback
+            .as_ref()
+            .map(|fallback| fallback.model.clone())
+    }
+
+    fn refusal_fallback_context_limit(&self) -> Option<u64> {
+        self.frozen
+            .refusal_fallback
+            .as_ref()
+            .and_then(|fallback| fallback.context_limit)
+    }
+
+    fn set_step_route(&self, route: broca_core::refusal_fallback::StepRoute) {
+        let route = match route {
+            broca_core::refusal_fallback::StepRoute::Fallback if self.fallback.is_some() => {
+                ROUTE_FALLBACK
+            }
+            _ => ROUTE_SOURCE,
+        };
+        self.route.store(route, Ordering::Release);
     }
 
     async fn step(&self, step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
@@ -880,11 +1042,16 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
         deadline: Option<Instant>,
         seal: ShutdownSeal,
     ) -> mpsc::Receiver<NormalizedEvent> {
-        self.start_step_under_seal(step_id, opts, cancel, deadline, Some(seal), None)
+        self.start_step_under_seal(step_id, opts, cancel, deadline, Some(seal), None, 0)
     }
 
     fn render_request(&self, opts: &CallOptions) -> Vec<u8> {
-        self.family.render(&self.effective_frozen(), opts)
+        self.family
+            .render(&self.route_frozen().for_step(opts), opts)
+    }
+
+    fn output_limits(&self) -> Option<broca_core::output_reservation::OutputLimits> {
+        self.route_frozen().output_limits()
     }
 
     fn renderer_version(&self) -> u32 {
@@ -893,9 +1060,17 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
 
     /// Only the current implementation's compatibility table can vouch for old bytes.
     /// A version copied into the frozen config is not evidence that this code reproduces it.
+    /// An embedded refusal-fallback config keeps the version it was frozen at, and must be
+    /// reproducible too.
     fn reproduces_renderer_version(&self, recorded: u32) -> bool {
         let family = self.frozen.family_id;
         crate::families::reproduces_renderer_version(family, recorded)
+            && self.fallback.as_ref().is_none_or(|fallback| {
+                crate::families::reproduces_renderer_version(
+                    fallback.family_id,
+                    fallback.renderer_version,
+                )
+            })
     }
 
     /// The frozen config carries its renderer version, so a run recorded at an earlier version
@@ -947,14 +1122,19 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
                 served: served.account_ref,
             });
         }
+        // A warm of a request the fallback model answered is shaped and addressed for it.
+        let warm_frozen = match self.routed_fallback() {
+            Some(fallback) => Arc::clone(fallback),
+            None => Arc::clone(&self.frozen),
+        };
         let body = self
             .family
-            .warm_body(&self.frozen, base)
+            .warm_body(&warm_frozen, base)
             .map_err(broca_core::WarmFailure::Unsupported)?;
         send_warm(
             &self.client,
             &self.clock,
-            self.family.endpoint(&self.frozen, &served.auth, body),
+            self.family.endpoint(&warm_frozen, &served.auth, body),
             self.frozen.family_id,
             served.account_ref,
         )
@@ -1807,10 +1987,12 @@ fn spawn_transport_task<F: WireFamily + 'static>(
     clock: Clock,
     family: Arc<F>,
     frozen: Arc<FrozenRenderConfig>,
+    route: broca_core::refusal_fallback::StepRoute,
     render_job: RenderJob<F>,
     served_account_ref: Option<String>,
     recovery: Option<AuthRecovery>,
     step_id: StepId,
+    first_attempt: u32,
     tx: mpsc::Sender<NormalizedEvent>,
     cancel: CancellationToken,
     deadline: Option<Instant>,
@@ -1911,7 +2093,7 @@ fn spawn_transport_task<F: WireFamily + 'static>(
             }
         };
 
-        let mut attempt = 0;
+        let mut attempt = first_attempt;
         let normalizer_factory = || {
             if let Some(progress) = &progress {
                 if let Some(step) = progress.lock().unwrap().as_mut() {
@@ -1981,6 +2163,8 @@ fn spawn_transport_task<F: WireFamily + 'static>(
                     seal: seal.as_ref(),
                     step_id,
                     cache_ttl_ms: crate::cache_warm::marker_ttl_ms(&frozen),
+                    first_attempt,
+                    route,
                 },
                 &retry_clock,
                 Some(websocket.as_ref()),
@@ -2189,7 +2373,11 @@ where
                 // terminal.
                 publish_attempt(
                     tx,
-                    trace.into_attempt(attempt_index, request_digest, AttemptOutcome::Cancelled),
+                    trace.into_attempt(
+                        attempt_index + step_seal.first_attempt as usize,
+                        request_digest,
+                        AttemptOutcome::Cancelled,
+                    ),
                 )
                 .await;
                 step_seal.end_attempt();
@@ -2204,7 +2392,7 @@ where
                 // open until the aborted run task drops its receiver, so the run loop never
                 // observes the stop.
                 step_seal.hand_over(trace.into_attempt(
-                    attempt_index,
+                    attempt_index + step_seal.first_attempt as usize,
                     request_digest,
                     AttemptOutcome::SealedInFlight,
                 ));
@@ -2230,9 +2418,11 @@ where
         }
         publish_attempt(
             tx,
-            trace
-                .clone()
-                .into_attempt(attempt_index, request_digest, outcome),
+            trace.clone().into_attempt(
+                attempt_index + step_seal.first_attempt as usize,
+                request_digest,
+                outcome,
+            ),
         )
         .await;
         // Only after the record is queued to the run loop: a seal waiting on this attempt
@@ -2597,6 +2787,10 @@ struct StepSeal<'a> {
     step_id: StepId,
     /// The prompt-cache lifetime the frozen config's markers declare, which each send restarts.
     cache_ttl_ms: Option<u64>,
+    /// The ordinal this call's first attempt is recorded with; see `StepRuntime::first_attempt`.
+    first_attempt: u32,
+    /// The model the step is sent to, which a warm of its bytes must address too.
+    route: broca_core::refusal_fallback::StepRoute,
 }
 
 impl StepSeal<'_> {
@@ -2614,6 +2808,7 @@ impl StepSeal<'_> {
                     body: Arc::new(body.clone()),
                     sha256: digest.sha256.clone(),
                     sent_at_ms: now_millis(),
+                    route: self.route,
                 },
                 self.cache_ttl_ms,
             );
@@ -2992,6 +3187,16 @@ async fn send_attempt(
     header_timeout: Duration,
     trace: &mut AttemptTrace,
 ) -> Result<reqwest::Response, AttemptFailure> {
+    // Tests only: fail the connect before any socket opens, so a test that needs many
+    // connect failures is not timed by the operating system's refusal speed. The outcome
+    // and error are the production refusal's: `ConnectFailed` with a retryable class.
+    #[cfg(test)]
+    if client.fail_connects {
+        return Err(AttemptFailure::transport(
+            transport_error("refused test connection (no socket opened)"),
+            AttemptOutcome::ConnectFailed,
+        ));
+    }
     let builder = attempt_request_builder(
         client,
         &request.url,
@@ -4906,6 +5111,7 @@ mod tests {
             account_ref: None,
             run_id: "render-job-run".into(),
             step_index: 7,
+            max_output_tokens: None,
         });
         opts.target_model = Some(ModelHandle::new("target-provider", "target-model"));
         opts
@@ -4977,6 +5183,7 @@ mod tests {
             account_ref: None,
             run_id: "panic-translation".into(),
             step_index: 1,
+            max_output_tokens: None,
         });
         let mut rx = provider.start_step(StepId(1), Arc::new(opts), CancellationToken::new(), None);
         let event = rx
@@ -5158,6 +5365,8 @@ mod tests {
                     finish_reason: FinishReason::Stop,
                     service_tier_used: None,
                     speed_used: None,
+                    served_model: None,
+                    usage_iterations: None,
                 }),
             ])
         }
@@ -8992,6 +9201,11 @@ mod tests {
     /// re-sends at Codex's backoff, then a connect wait of 5 s doubling to 60 s. Every send
     /// leaves its attempt record. Only the caller's cancel ends it, promptly and without an
     /// error.
+    ///
+    /// The refusal is injected, not dialed: a refused localhost connect takes seconds on
+    /// some platforms, so forty real refusals cannot fit the bounded wait below. The seam
+    /// fails the connect before any socket opens, and the `ConnectFailed` outcome it feeds
+    /// the retry decision is the production refusal's.
     #[tokio::test]
     async fn codex_unreachable_endpoint_retries_until_cancelled() {
         let address = {
@@ -9000,8 +9214,10 @@ mod tests {
         };
         let mut frozen = openai_chat_frozen_config("retry-test");
         frozen.family_id = WireFamilyId::OpenAiResponses;
+        // Never dialed: the test client refuses the connect before any socket opens.
         frozen.base_url = Some(format!("http://{address}"));
         let mut provider = LiveProvider::new(RetryTestFamily::new(0), frozen, AuthHandle::None);
+        provider.client.fail_connects = true;
         let waits = use_virtual_retry_waits(&mut provider);
         let cancel = CancellationToken::new();
         let mut rx = provider.start_step(
@@ -10164,6 +10380,7 @@ mod tests {
                 account_ref: None,
                 run_id: "run-abc".into(),
                 step_index: 7,
+                max_output_tokens: None,
             }),
             "ignored",
             1,

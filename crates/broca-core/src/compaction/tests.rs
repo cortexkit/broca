@@ -859,6 +859,7 @@ fn model_page_folds_snapshot_and_mid_turn_tail_and_refuses_after_mid() {
 
 fn manifest() -> Arc<broca_wal::PlanManifest> {
     Arc::new(broca_wal::PlanManifest {
+        rich_ui: None,
         plan: OpaqueJson::from_json_text(
             json!({"compaction_item":{"provider":"provider","preset":"head","params":{}},"composition":{}})
                 .to_string(),
@@ -1763,6 +1764,176 @@ async fn a_model_change_rides_for_a_view_and_applies_it() {
         .unwrap();
     assert_eq!(last_notice["applied_view_version"], "2");
     assert_eq!(last_notice["model"], "other");
+}
+
+fn routed_account_selection(account_ref: &str) -> broca_wal::AuthSelection {
+    broca_wal::AuthSelection {
+        credential_id: format!("vault-cred-{account_ref}"),
+        account_ref: Some(account_ref.to_owned()),
+        resolved_credential_id: Some(format!("vault-cred-{account_ref}")),
+        vault_request: None,
+        account_decision: Some(broca_wal::AccountDecision {
+            conversation_key: None,
+            conversation_key_source: None,
+            path: broca_wal::ACCOUNT_DECISION_ROUTED.to_owned(),
+            admission_id: Some("admission".into()),
+            decision_id: Some("decision".into()),
+        }),
+        auth_method: Some("oauth".into()),
+    }
+}
+
+fn account_change_events(records: &[WalRecord]) -> Vec<String> {
+    records
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::CompactionNotice { headers, .. } => headers.get("events").cloned(),
+            _ => None,
+        })
+        .flat_map(|events| {
+            events
+                .split(',')
+                .filter(|token| token.starts_with("account_change:"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+async fn run_with_account(
+    shared: &Shared,
+    views: &Arc<OneView>,
+    run_index: usize,
+    mode: crate::StartMode,
+    selection: Option<broca_wal::AuthSelection>,
+) {
+    let submission: broca_protocol::request::SubmissionRequest = serde_json::from_value(json!({
+        "model":{"provider_module_id":"stub","model_id":"model"},
+        "input":[{"role":"user","content":[{"type":"text","text":"question"}]}]
+    }))
+    .unwrap();
+    let request = crate::RunRequest::from_submission(
+        submission,
+        broca_protocol::RunId(format!("run-{run_index}")),
+        bind(),
+        broca_protocol::SubmissionId(format!("sub-{run_index}")),
+    );
+    let writer = shared.writer();
+    *views.wal.lock().unwrap() = Some(shared.clone());
+    let control = crate::RunControl {
+        manifest: Some(manifest()),
+        compaction_plane: Some(views.clone()),
+        compaction_views: None,
+        auth_selection: selection,
+        ..Default::default()
+    };
+    let model = crate::StubProvider::new(vec![model_events()]);
+    let (out, _events) = tokio::sync::mpsc::channel(256);
+    crate::run_loop_on_writer(
+        request,
+        &writer,
+        mode,
+        &model,
+        &crate::StubToolPlane::new(),
+        &crate::AllowAll,
+        shared,
+        None,
+        control,
+        &out,
+    )
+    .await
+    .unwrap();
+    let _ = writer.shutdown().await;
+}
+
+/// Two runs on one session with different routed accounts report one `AccountChange`
+/// notice and ride once for the switch; the same account reports nothing, and a restart
+/// between them neither rides spuriously nor misses the change: the comparison uses the
+/// durable last notice's account, not memory.
+#[tokio::test]
+async fn account_changes_ride_once_and_report_once_across_runs_and_restarts() {
+    use crate::compaction_provider::ride::RideCause;
+    let label_a = crate::compaction::view::account_label("acct-a");
+    let label_b = crate::compaction::view::account_label("acct-b");
+    // The same account twice: no event, no ride.
+    let shared = Shared::default();
+    let views = Arc::new(OneView::default());
+    run_with_account(
+        &shared,
+        &views,
+        0,
+        crate::StartMode::FreshOrResume,
+        Some(routed_account_selection("acct-a")),
+    )
+    .await;
+    // A restart is a fresh `run_loop` call over the same WAL: no memory carries over.
+    run_with_account(
+        &shared,
+        &views,
+        1,
+        crate::StartMode::AppendEpisode,
+        Some(routed_account_selection("acct-a")),
+    )
+    .await;
+    assert!(
+        account_change_events(&shared.records()).is_empty(),
+        "the same account reports nothing: {:?}",
+        shared.records()
+    );
+    assert!(
+        views
+            .rides
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|ride| ride.cause != RideCause::AccountChange),
+        "the same account rides nothing"
+    );
+    // A different routed account: one notice event and one ride, both with the new label.
+    run_with_account(
+        &shared,
+        &views,
+        2,
+        crate::StartMode::AppendEpisode,
+        Some(routed_account_selection("acct-b")),
+    )
+    .await;
+    let events = account_change_events(&shared.records());
+    assert_eq!(events, vec![format!("account_change:{label_b}")]);
+    let rides = views.rides.lock().unwrap().clone();
+    let account_rides: Vec<_> = rides
+        .iter()
+        .filter(|ride| ride.cause == RideCause::AccountChange)
+        .collect();
+    assert_eq!(account_rides.len(), 1, "one switch rides once: {rides:?}");
+    assert_eq!(account_rides[0].account(), Some(label_b.as_str()));
+    assert!(account_rides[0].check().is_ok());
+    // Staying on the new account reports nothing more, even after another restart.
+    run_with_account(
+        &shared,
+        &views,
+        3,
+        crate::StartMode::AppendEpisode,
+        Some(routed_account_selection("acct-b")),
+    )
+    .await;
+    assert_eq!(
+        account_change_events(&shared.records()),
+        vec![format!("account_change:{label_b}")],
+        "no re-report without another switch"
+    );
+    assert_eq!(
+        views
+            .rides
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|ride| ride.cause == RideCause::AccountChange)
+            .count(),
+        1,
+        "no re-ride without another switch"
+    );
+    let _ = label_a;
 }
 
 /// Serves views 1 and 2 of one session. The `view.get` for version 1 signals `fetching_first`

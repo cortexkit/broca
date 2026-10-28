@@ -4,8 +4,8 @@ use crate::{
     lease::acquire_archive_pass, lease_key_for, wal_writer::session_addr, FileLeaseStore,
     LeaseError, LeaseStore,
 };
-use broca_owner_only::OpenOptions;
 use broca_protocol::{BindIdentity, ToolCallId};
+use broca_wal::fs_ops::{self as fs, File, OpenOptions};
 use broca_wal::{
     archive::{ArchiveReader, ArchiveWriter, ContainerState},
     FramedRecord, WalRecord,
@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    fs::{self, File},
     io::{self, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -170,10 +169,7 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
 /// error that might mean something else.
 #[cfg(unix)]
 fn sync_dir(path: &Path) -> io::Result<()> {
-    File::open(path)
-        .map_err(at(path))?
-        .sync_all()
-        .map_err(at(path))
+    fs::sync_dir(path).map_err(at(path))
 }
 
 /// See the unix arm. NTFS does not require a directory handle to make a rename or unlink durable,
@@ -502,7 +498,7 @@ pub fn unfinished_pass(root: &Path) -> io::Result<Option<String>> {
 }
 
 fn unfinished(dir: &Path) -> io::Result<Vec<PathBuf>> {
-    if !dir.exists() {
+    if !fs::exists(dir) {
         return Ok(Vec::new());
     }
     let mut result = Vec::new();
@@ -513,7 +509,7 @@ fn unfinished(dir: &Path) -> io::Result<Vec<PathBuf>> {
             // Before the first admission, a crash can leave only a journal. No
             // session state or archive bytes need recovery, so it cannot block folds.
             if !journal.terminal()
-                && !(journal.latest().is_empty() && !path.with_extension("ark").try_exists()?)
+                && !(journal.latest().is_empty() && !fs::try_exists(&path.with_extension("ark"))?)
             {
                 result.push(path);
             }
@@ -537,6 +533,7 @@ pub fn fold_with_identities<'a>(
     options: impl Into<FoldSettings<'a>>,
     identities: &BTreeMap<String, BindIdentity>,
 ) -> io::Result<FoldReport> {
+    ensure_legacy_root(state_root)?;
     let settings = options.into();
     run_with_threshold(
         state_root,
@@ -546,6 +543,41 @@ pub fn fold_with_identities<'a>(
         identities,
         settings.cold_ms,
     )
+}
+
+/// Folding can remove live logs, including during journal resume. Overhaul
+/// roots must be refused until folding can honor open-writer markers and
+/// unpublished log tails before removing logs.
+pub fn ensure_legacy_root(state_root: &Path) -> io::Result<()> {
+    let config = broca_wal::classify_state_root(state_root).map_err(io::Error::other)?;
+    if config.is_overhaul() {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+            "wal_fold_overhaul_deferred: broca-state/2 (overhaul) folding is disabled until marker-aware retention is enabled"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod overhaul_phase_guard_tests {
+    use super::*;
+
+    #[test]
+    fn fold_library_refuses_overhaul_before_creating_maintenance_state() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("fold-overhaul-refusal-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join(broca_wal::state_format::MARKER_FILENAME);
+        std::fs::write(&marker, b"broca-state/2\n").unwrap();
+        let options = FoldOptions {
+            write: true,
+            ..Default::default()
+        };
+        let error = fold(&root, &options).unwrap_err();
+        assert!(error.to_string().contains("wal_fold_overhaul_deferred"));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        assert_eq!(std::fs::read(marker).unwrap(), b"broca-state/2\n");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -609,14 +641,14 @@ fn run_with_threshold(
             Tree::Ordinary,
         );
     }
-    if !Tree::Ordinary.live(root).is_dir() && !Tree::Durable.live(root).is_dir() {
+    if !fs::is_dir(Tree::Ordinary.live(root)) && !fs::is_dir(Tree::Durable.live(root)) {
         return Err(invalid("state root must contain wal/ or wal-durable/"));
     }
     let mut report = FoldReport::default();
     // Only durable archives are backed up. A container holding both populations
     // would either back up disposable sessions or omit durable ones.
     for tree in [Tree::Ordinary, Tree::Durable] {
-        if !tree.live(root).is_dir() {
+        if !fs::is_dir(tree.live(root)) {
             continue;
         }
         let next = run_tree(root, options, start, boundary, identities, cold_ms, tree)?;
@@ -696,7 +728,10 @@ fn run_tree(
             // have run, so an already-absent file is the SUCCESS case, not an error.
             if options.write {
                 match fs::remove_file(&ark) {
-                    Ok(()) => sync_dir(&dir)?,
+                    Ok(()) => {
+                        broca_wal::archive::invalidate_member_index(&dir);
+                        sync_dir(&dir)?;
+                    }
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                     Err(e) => {
                         return Err(invalid(format!(
@@ -743,7 +778,7 @@ fn run_tree(
             }
             return Ok(report);
         }
-        if journal.latest().is_empty() && !ark.try_exists()? {
+        if journal.latest().is_empty() && !fs::try_exists(&ark)? {
             finish(
                 root,
                 &mut journal,
@@ -794,6 +829,7 @@ fn run_tree(
         }
         journal.append(Event::Restarted, boundary)?;
         fs::remove_file(&ark)?;
+        broca_wal::archive::invalidate_member_index(&dir);
         sync_dir(&dir)?;
     }
     if !options.write {
@@ -802,7 +838,7 @@ fn run_tree(
     if let Some(path) = unfinished(&dir)?.first() {
         return Err(invalid(format!("unfinished archive pass {}; use --resume {} (or explicit --abandon) before starting another", path.display(), tree.resume_name(&path.file_name().unwrap().to_string_lossy()))));
     }
-    broca_owner_only::create_dir_all(&dir)?;
+    fs::create_dir_all(&dir)?;
     sync_dir(root)?;
     let mut stamp = start;
     for entry in fs::read_dir(&dir)? {
@@ -932,8 +968,8 @@ fn wal_paths(root: &Path, tree: Tree) -> io::Result<Vec<PathBuf>> {
     for entry in fs::read_dir(tree.live(root))? {
         let entry = entry?;
         if entry.path().extension().is_some_and(|e| e == "wal") && entry.file_type()?.is_file() {
-            if entry.path().with_extension("moving").try_exists()?
-                || entry.path().with_extension("moved").try_exists()?
+            if fs::try_exists(&entry.path().with_extension("moving"))?
+                || fs::try_exists(&entry.path().with_extension("moved"))?
             {
                 continue;
             }
@@ -1204,7 +1240,7 @@ fn unfold(root: &Path, journal: &Journal, ark: &Path, write: bool) -> io::Result
         let temp = path.with_extension("unfold-tmp");
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        if temp.exists() {
+        if fs::exists(&temp) {
             // Only our deterministic temp pathname is replaced, under the session
             // lease. A failed prior extraction never made it authoritative.
             fs::remove_file(&temp)?;
@@ -1213,6 +1249,7 @@ fn unfold(root: &Path, journal: &Journal, ark: &Path, write: bool) -> io::Result
         file.write_all(&member.payload)?;
         file.sync_all()?;
         fs::rename(&temp, &path)?;
+        broca_wal::archive::invalidate_restored_member(ark.parent().unwrap(), &session_addr);
         sync_dir(&Tree::for_journal(journal).live(root))?;
         report.restored += 1;
     }

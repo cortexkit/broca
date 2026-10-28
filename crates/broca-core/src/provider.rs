@@ -22,10 +22,20 @@ pub struct StepRuntime {
     pub deadline: Option<Instant>,
     pub seal: Option<crate::ShutdownSeal>,
     pub progress: Option<LiveStepProgress>,
+    /// The ordinal the step's first attempt in this call is recorded with. Zero for an
+    /// ordinary step; a live or resumed resend within the same step id starts after the
+    /// largest durable attempt ordinal, so ordinals stay unique within the episode's step.
+    pub first_attempt: u32,
 }
 
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Exclusively acquire any in-memory connection retained for this full session bind.
+    fn bind_run_transport(&self, _session: &broca_protocol::BindIdentity) {}
+
+    /// Pin the freshly resolved credential record version before acquiring run transport.
+    fn set_credential_revision(&self, _revision: u64) {}
+
     async fn step_with_runtime(
         &self,
         step_id: StepId,
@@ -43,9 +53,14 @@ pub trait Provider: Send + Sync {
             }
         }
     }
-    /// Release run-local network state on completion, cancellation, graceful stop or task abort.
+    /// Retire network state on cancellation, graceful stop, task abort or another abnormal exit.
     /// The loop calls this even if a caller retains the provider for a later run.
     fn close_run_transport(&self) {}
+
+    /// Release transport after a durably completed run. Abnormal exits still close it.
+    fn complete_run_transport(&self) {
+        self.close_run_transport();
+    }
 
     /// Whether a strict schema compiler refusal permits this run's one non-strict resend.
     fn structured_output_grammar_rejection(&self, _error: &broca_protocol::ProviderError) -> bool {
@@ -67,6 +82,25 @@ pub trait Provider: Send + Sync {
     /// Runtime break-glass policy for the ChatGPT socket. Evaluated per attempt, off the
     /// rendering/cache domain; providers for other families ignore it.
     fn set_chatgpt_https_policy(&self, _policy: Arc<dyn Fn() -> bool + Send + Sync>) {}
+
+    /// The model a step the source model refuses is re-sent to, when this episode froze a
+    /// client-side refusal fallback at admission. `None`, the default, means the run is not
+    /// eligible and a refusal commits as the step's answer.
+    fn refusal_fallback_model(&self) -> Option<broca_protocol::request::ModelHandle> {
+        None
+    }
+
+    /// The fallback model's context window, when [`Self::refusal_fallback_model`] is `Some` and
+    /// the catalog knew it at admission.
+    fn refusal_fallback_context_limit(&self) -> Option<u64> {
+        None
+    }
+
+    /// Send the following steps, renders and warms to `route`'s model. Only the request this
+    /// provider renders changes: the recorded render config, its renderer version and the
+    /// frozen-config blob always describe the episode's own (source) model. A provider without
+    /// a refusal fallback ignores it.
+    fn set_step_route(&self, _route: crate::refusal_fallback::StepRoute) {}
 
     /// Run ONE model step for `opts`. The returned receiver streams normalized
     /// events until the provider's terminal `Finished`/`Error`.
@@ -184,6 +218,16 @@ pub trait Provider: Send + Sync {
         false
     }
 
+    /// The output-token cap this provider's requests carry and the smallest cap it may be
+    /// lowered to, when the run's frozen config controls a cap the request sends. The run loop
+    /// lowers a step's cap (through `StepContext::max_output_tokens`) when the estimated input
+    /// plus the cap would pass the run's context limit. `None`, the default, means the request
+    /// carries no cap the loop can lower (an in-process provider, or a backend whose body omits
+    /// the field), so no step's cap is ever changed.
+    fn output_limits(&self) -> Option<crate::output_reservation::OutputLimits> {
+        None
+    }
+
     /// Re-send `base`, an exact request body this provider rendered earlier, shaped so the
     /// provider generates nothing and only reads (and so keeps) the cached prefix. One attempt,
     /// never retried. The default cannot warm and sends nothing.
@@ -200,6 +244,14 @@ pub trait Provider: Send + Sync {
 /// `run_loop` directly, without the loop needing to know the concrete type.
 #[async_trait]
 impl Provider for Box<dyn Provider> {
+    fn bind_run_transport(&self, session: &broca_protocol::BindIdentity) {
+        (**self).bind_run_transport(session);
+    }
+
+    fn set_credential_revision(&self, revision: u64) {
+        (**self).set_credential_revision(revision);
+    }
+
     async fn step_with_runtime(
         &self,
         step_id: StepId,
@@ -210,6 +262,10 @@ impl Provider for Box<dyn Provider> {
     }
     fn close_run_transport(&self) {
         (**self).close_run_transport();
+    }
+
+    fn complete_run_transport(&self) {
+        (**self).complete_run_transport();
     }
 
     fn structured_output_grammar_rejection(&self, error: &broca_protocol::ProviderError) -> bool {
@@ -226,6 +282,18 @@ impl Provider for Box<dyn Provider> {
 
     fn set_chatgpt_https_policy(&self, policy: Arc<dyn Fn() -> bool + Send + Sync>) {
         (**self).set_chatgpt_https_policy(policy);
+    }
+
+    fn refusal_fallback_model(&self) -> Option<broca_protocol::request::ModelHandle> {
+        (**self).refusal_fallback_model()
+    }
+
+    fn refusal_fallback_context_limit(&self) -> Option<u64> {
+        (**self).refusal_fallback_context_limit()
+    }
+
+    fn set_step_route(&self, route: crate::refusal_fallback::StepRoute) {
+        (**self).set_step_route(route);
     }
 
     async fn step(&self, step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
@@ -273,6 +341,10 @@ impl Provider for Box<dyn Provider> {
         (**self).render_request(opts)
     }
 
+    fn output_limits(&self) -> Option<crate::output_reservation::OutputLimits> {
+        (**self).output_limits()
+    }
+
     fn renderer_version(&self) -> u32 {
         (**self).renderer_version()
     }
@@ -313,6 +385,9 @@ impl Provider for Box<dyn Provider> {
 pub struct StubProvider {
     scripts: Arc<Mutex<VecDeque<Vec<NormalizedEvent>>>>,
     calls: Arc<Mutex<Vec<CallOptions>>>,
+    refusal_fallback: Option<(broca_protocol::request::ModelHandle, Option<u64>)>,
+    route: Arc<Mutex<crate::refusal_fallback::StepRoute>>,
+    routes: Arc<Mutex<Vec<crate::refusal_fallback::StepRoute>>>,
 }
 
 impl StubProvider {
@@ -321,19 +396,53 @@ impl StubProvider {
         Self {
             scripts: Arc::new(Mutex::new(scripts.into())),
             calls: Arc::new(Mutex::new(Vec::new())),
+            refusal_fallback: None,
+            route: Arc::new(Mutex::new(crate::refusal_fallback::StepRoute::Source)),
+            routes: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Act as an episode that froze `model` (with `context_limit`) as its refusal fallback.
+    pub fn with_refusal_fallback(
+        mut self,
+        model: broca_protocol::request::ModelHandle,
+        context_limit: Option<u64>,
+    ) -> Self {
+        self.refusal_fallback = Some((model, context_limit));
+        self
     }
 
     /// Provider call options in invocation order.
     pub fn calls(&self) -> Vec<CallOptions> {
         self.calls.lock().unwrap().clone()
     }
+
+    /// The route each call was sent on, in invocation order.
+    pub fn routes(&self) -> Vec<crate::refusal_fallback::StepRoute> {
+        self.routes.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
 impl Provider for StubProvider {
+    fn refusal_fallback_model(&self) -> Option<broca_protocol::request::ModelHandle> {
+        self.refusal_fallback
+            .as_ref()
+            .map(|(model, _)| model.clone())
+    }
+
+    fn refusal_fallback_context_limit(&self) -> Option<u64> {
+        self.refusal_fallback.as_ref().and_then(|(_, limit)| *limit)
+    }
+
+    fn set_step_route(&self, route: crate::refusal_fallback::StepRoute) {
+        *self.route.lock().unwrap() = route;
+    }
+
     async fn step(&self, _step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
         self.calls.lock().unwrap().push(opts.clone());
+        let route = *self.route.lock().unwrap();
+        self.routes.lock().unwrap().push(route);
         let script = self.scripts.lock().unwrap().pop_front().unwrap_or_default();
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {

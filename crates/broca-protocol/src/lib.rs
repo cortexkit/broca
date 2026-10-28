@@ -63,11 +63,14 @@ pub use caller::{
 };
 pub use canonical::canonical_json_bytes;
 pub use content::{
-    AssistantMessage, ContentBlock, EncryptedReasoningFormat, FinishReason, MediaKind,
-    MediaMarkerReason, MediaRef, Message, Role, TextProviderFormat, TextProviderState, ToolCall,
-    ToolOutput, ToolOutputPart, ToolResult,
+    bound_module_unavailable_detail, AssistantMessage, ContentBlock, EncryptedReasoningFormat,
+    FinishReason, MediaKind, MediaMarkerReason, MediaRef, Message, Role, TextProviderFormat,
+    TextProviderState, ToolCall, ToolOutput, ToolOutputPart, ToolResult,
+    MODULE_UNAVAILABLE_DETAIL_MAX_BYTES, MODULE_UNAVAILABLE_RETRY_MAX_BYTES,
+    TOOL_PLANE_UNAVAILABLE_MESSAGE, TOOL_PLANE_UNAVAILABLE_RETRY,
 };
 pub use cortexkit_role_llm_runner::errors::ContextCeilingDetail;
+pub use cortexkit_role_llm_runner::rich_ui::RichUiStamp;
 pub use cortexkit_role_llm_runner::run::BudgetExhaustedDetail;
 pub use diagnostic::diag;
 pub use display::DisplayEvent;

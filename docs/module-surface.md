@@ -3,6 +3,53 @@
 This document describes the module's session and run contracts, durable lineage
 model, and coordinator invariants.
 
+## Session inspection CLI
+
+`broca-session trajectory <id> [--transcript] [--out FILE]` exports JSONL directly
+from the recorded WAL, without a daemon connection. Without `--out`, JSONL goes
+to stdout. Output files are created owner-only and must not already exist. It uses
+broca's read-only WAL reader, live-first and then `wal-archive/`,
+and respects retention expiration; it never opens a recovery writer or extracts
+an archived session into the live directory.
+
+The event kinds are `run`, `run_end`, `gap`, `model_request` (one per attempt),
+`model_step`, and `tool_call`. Tool rows appear at their intent/no-dispatch record
+and include later recorded result metadata. Bash rows include recorded execution
+knobs and an `exit_code` only when the result prints a `[exit code: N]` line.
+Missing timestamps, usage, routing, and result observations remain null or absent,
+not zero. `--transcript` adds `message` rows containing text and complete tool
+arguments/results, plus a `reasoning` byte-count row per step, never reasoning text
+or provider continuation state. Message `ordinal` and `mid` use the same placement
+as `session.read`; multiple results in one tool-role message share its coordinate.
+Messages not yet visible in `session.read`, including pending inputs and open
+tool turns before dispatch, have null coordinates. Transcript rows
+stay at their source record's position, even when a later boundary places them.
+Treat transcript exports as sensitive conversation data.
+
+Task/session-name lookup is shared by trajectory, `cache-dump --session <id>`, and
+`broca-session --subc CONNECTION read <id>` (also `--session <id> read`). It tries
+the supplied name first, then `alfonso:<id>` for an unprefixed name. The lookup
+scans only the compact session-ref inventory, with the name predicate in SQL;
+it does not scan run-index history or add an index/migration. Lookup duration is
+logged at debug level. Missing names refuse with the searched spellings; an
+incomplete inventory is identified rather than claiming the session is unknown,
+and a single candidate is not treated as unique until the inventory is complete.
+Ambiguous names list up to 100 candidates' project-root, harness, and session
+values, say when more were omitted, and refuse to choose one.
+
+`--state-root DIR` overrides the normal state-root resolver for these lookups and
+offline exports. Explicit `--project-root ROOT --harness HARNESS` bypass lookup
+and keep the session name literal, as before; use the full recorded session name
+(including `alfonso:` when present) when selecting an ambiguous candidate. Existing
+read calls with only one bind flag use lookup and require that flag to match the
+recorded identity. Other daemon commands still accept their original bind flags.
+The connection file is
+only an argument; its path and contents are not printed on connection failures.
+Put the offline `trajectory` and `cache-dump` subcommands before their flags;
+prefixed global flags are refused by command name before any session lookup.
+These commands refuse `--subc` by command name,
+whether the daemon flag appears before or after the subcommand, without binding.
+
 ---
 
 ## 1. What it is
@@ -150,8 +197,8 @@ across sessions is not built (see SECURITY.md).
 
 ```
 session.read { from_ordinal?, limit?, include_tools?, after_mid?, lineage_id?, max_bytes?,
-                 include_originals? }
-    → { messages: [{ ordinal, mid, message, written_at?,
+                 include_originals?, include_rich_ui? }
+    → { messages: [{ ordinal, mid, message, written_at?, rich_ui?,
                      tool_calls?: [{ tool_call_id, call_key?, dispatched_to?, indeterminate }] }],
         next_from_ordinal?, head?, lineage_id?, lineage_state,
         tools?: [{ name, description, input_schema, module? }], tools_run_id? }
@@ -167,7 +214,7 @@ session.output_ref_read { ref_id, offset, length } → { format, size, data }
 session.head {} → { lineage_id?, last_ordinal?, head?, last_run_state?, updated_at?,
                        cache?: { last_sent_at_ms, ttl_ms?, expires_at_ms?, expiry_basis },
                        title?, model?: { provider, model, variant? }, usage?,
-                       sender?: { modes, interrupt, owner?: true }, incarnation? }
+                       sender?: { modes, interrupt, owner?: true }, incarnation?, last_run_rich_ui? }
 session.warm { lineage_id? }
     → { request_body_sha256, warm_body_sha256, cache_read_tokens?, cache_write_tokens?,
         input_tokens?, ttl_ms, expires_at_ms, expiry_basis: "estimated" } (§4a)
@@ -249,11 +296,11 @@ permission the next send actually has. This does not tighten or otherwise change
 
 Tool, step-transform and compaction plan items may omit `preset`. Broca preserves the omission
 on catalog, declaration and compaction calls; it never substitutes an empty string. An explicit
-`"worker"` tool preset still requires scope. **System-text items still require a preset**:
-tool-provider 0.10.4 defines `system_text: {preset, params}` and has no default selector. A
-preset-less system-text item is refused before fetching or writing as `invalid_params`, naming
-`plan.system_text_items[index].preset`, rather than sending a shape the provider contract cannot
-express. A preset-less step declaration refused by its provider keeps the provider's code,
+`"worker"` tool preset still requires scope. A runner declaring `system_text_default` also accepts
+a preset-less system-text item, but forwards it only when that provider's daemon catalog entry
+declares `system-text-default/v1`. Otherwise admission refuses `system_text_preset_required`
+with the provider named, before forwarding or writing. The resolved text is frozen at admission,
+just like preset-selected text. A preset-less step declaration refused by its provider keeps the provider's code,
 message and field; it does not invent a `preset_missing` difference for a nonexistent name.
 
 ### Health counters and per-request diagnostics
@@ -314,17 +361,22 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
   in the read's WAL tail come with the page; an older turn's come from a per-session cache that
   one pass over the whole WAL fills the first time a read needs them.
 - Every known run's `run.status` and `run.result` carry `usage` from completed
-  `ModelStepFinished` WAL records, including while the run is active. It always has
+  `ModelStepFinished` and billed `ModelStepRefused` WAL records, including while the run is
+  active. It always has
   `steps` and `unreported_steps`; a run with no completed step reports exactly
   `{"steps":0,"unreported_steps":0,"by_model":[]}`. A step is unreported only if **all five** token
   measurements are absent; a partial report or an explicit zero is reported.
   The optional totals `input_tokens`, `cached_input_tokens`, `cache_write_tokens`,
   `output_tokens` and `reasoning_tokens` sum only reported contributions, staying absent
   until a step reports that measurement. Partial totals are lower bounds, not estimates.
-  Input is fresh input only; reasoning is already included in output, never added to it.
+  Input is fresh input only, summed across serving iterations when a step uses more than
+  one model; reasoning is already included in output, never added to it.
   `by_model` is always present and empty until a step completes; then it lists contributions
-  in first-seen order for each `{provider, model, variant?}` frozen in the step's episode's
-  `RunConfig`.
+  in first-seen order for each `{provider, model, variant?}`. Ordinary calls use the frozen
+  episode model/variant; routed calls use their fallback model, and server handoffs use
+  each provider-reported iteration model without an episode variant. When iterations are
+  present, `steps` counts billed serving iterations rather than durable runner steps,
+  and each iteration's measurements replace the last-iteration-only top-level counters.
   Each entry carries the same counters and optional token totals. An unnamed variant is
   omitted, never an empty string; each entry contributes to the run totals, including
   unreported steps. These counters and the model breakdown do not change subscriber
@@ -1180,6 +1232,11 @@ subsequent non-content records increment them. A byte class never observed stays
 This telemetry and the attempt log's `last_content_ms` do **not** change the existing idle or
 content deadlines, retry policy, or rate-floor policy.
 
+Provider-attempt ordinals are scoped to the episode's step. A refusal resend and a
+resume of an unfinished step continue after that step's largest durable attempt ordinal;
+live `step.attempt` uses the same offset. These ordinals are not stable global IDs.
+Accounting event IDs use `lineage_id:wal_seq`, and timestamps are not join keys.
+
 ## 15. session.read consistency + pagination
 
 `session.read` cuts each page from one atomic materialized-store snapshot plus its exact
@@ -1216,6 +1273,18 @@ Each item carries both `ordinal` and `mid: "m<ordinal>"`; `mid` is the MC-coordi
 spelling used by consumers. Chunking is required for large transcripts because subc has a
 per-frame cap and closes a full egress queue.
 
+**Rich UI teaching stamp.** Broca declares `rich_ui_stamp`. A teaching provider's fetched
+`system_text.rich_ui` value (`{dialect, catalog_digest}`) is frozen at admission, never read
+from caller-supplied metadata or fetched again for later runs. Conflicting stamps refuse
+admission as `plan_stale`, with `differences` naming the stamped providers in plan order.
+Every assistant display row in `session.history` and the live `run_started` event carry
+`rich_ui` when the run has a stamp. `session.head.last_run_rich_ui` describes only the
+head's last run and is stored with its start. `session.read` includes `rich_ui` beside
+each assistant entry's `mid` only with `include_rich_ui: true`; default reads keep their
+previous bytes. All these members are omitted, never null, on unstamped runs, including
+older manifests that did not freeze teaching metadata. User, system and tool messages
+never carry the stamp.
+
 **Declared tools (opt-in).** `include_tools: true` adds `tools` and `tools_run_id` to the
 response: the tool list frozen on the durable `RunStarted` of the session's LATEST episode
 (`name`, `description`, `input_schema`, and `module` when the episode recorded one), in
@@ -1249,6 +1318,12 @@ as terminal/no-op, so a "resumable terminal" would seal the run). Replay gains a
 resume **continues the SAME run_id from the last durable boundary**; no new episode starts
 until the pause is resolved or cancelled. The error detail is persisted for `run.status`.
 (Auto pause→refresh→continue is deferred; the lineage is preserved + manually resumable.)
+
+Recorded Anthropic fallback settings are frozen on resume, even if the current switches
+are off. If the resolved credential method is not OAuth, restoring an episode that froze
+either fallback produces a permanent configuration refusal naming
+`frozen_fallback_auth_mismatch`, before any provider request or render-config refreeze.
+Resume with OAuth credentials rather than silently dropping the frozen opt-in for an API key.
 
 ## 17b. The metering lane: direct read-only storage
 
@@ -1311,14 +1386,18 @@ and "no reverse-request handler is registered for <family>", the same reply the 
 consumer SDK sends. It never reaches a pending call, even one with the same corr, and each
 refusal is counted in `health.check` as `reverse_requests_refused`.
 
-**Provider-held calls: the runtime is installed, the route capabilities are not declared.**
+**Tool result formats and provider-held calls.** Dispatch routes declare `tool-result/v1` only
+for providers whose frozen catalog declares that result format. Text and errors use the same
+stored bytes as legacy replies. Shipping builds append a notice for each omitted image; builds
+with the `test-attachments` feature capture the image instead when dispatch has a media-capture handle. Role discovery and management routes do not
+negotiate tool results.
 The daemon installs the provider-held runtime (`broca-module-serve/src/held_runtime.rs`) on
 its tool plane: the waiting slots a held call's batch waits in, a late-results intake store
 (`late-results.db` under the state root, a projection of the WAL kept out of the backup
 catalog), one puller per provider module, and boot recovery. Release builds still leave
-`content/v1` and `held-reply/v1` undeclared on every tool route, because a held call cannot be
-cancelled or stopped yet; with them undeclared no provider may hold a call, no plain call
-carries a key, nothing is registered, and every call keeps its exact wire bytes. Debug builds
+`held-reply/v1` undeclared on every tool route, because a held call cannot be
+cancelled or stopped yet; with it undeclared no provider may hold a call, no plain call
+carries a key, and nothing is registered. Debug builds
 declare both when `BROCA_TEST_DECLARE_HELD_REPLY_V1=1`; that name is a non-shipping marker the
 release fence refuses. Role and plan-fetch routes declare neither. A reply carrying `held` on
 an undeclared route becomes a malformed-reply error result with reason
@@ -1539,3 +1618,39 @@ Classed records require the must-understand WAL feature `session-class/v1`.
 A `v0.3.205` reader refuses those records by feature name; unclassed records retain
 their old bytes and remain readable. The reader, writer and capability ship
 together, with no writer switch or second rollout release.
+
+## External session and call identities
+
+New external session references use the llm-runner v2 derivation over
+`{runner: "broca", harness, session}`. Folder spelling is not part of that reference.
+The WAL address, lease and store identity remain the full
+`(project_root, harness, session)` triple. At startup, broca maps v2 references to
+their sessions and continues to accept the older folder-based v1 references. A v2
+reference shared by multiple roots is ambiguous and does not resolve to an arbitrary
+session. Queued events keep the reference from their body; their publication headers
+carry that same reference. Provider conversation IDs remain scoped
+to the full triple and are not the external session references described above.
+
+With `call_identity`, display-history tool-call parts and live `tool_started` and
+`tool_finished` frames carry the durable call's `call_key` and its recorded
+`schema_pin`. Ordinary keys are `<WAL lineage id>:<dispatch-intent sequence>`;
+approved calls preserve the preparation key recorded on their dispatch intent. Plan sessions
+freeze actual provider catalog pins at admission, protected by the must-understand
+`tool-schema-pins/v1` WAL feature. A later catalog cannot change a recorded pin.
+Legacy non-plan tools and older manifests have no recorded provider semantics, so
+their pins remain absent rather than being invented from the argument schema.
+Default `session.read` and `run.status` gain no call-identity members.
+For approved calls only, existing `session.read` attribution and tool-result delivery
+keys now preserve that recorded preparation key instead of incorrectly naming the later
+dispatch intent. `run.tool_calls` already preserved it. Ordinary keys and all `run.status`
+bytes remain unchanged.
+
+An error `session.head` can carry `last_run_error: {class, retry_after_secs?,
+resets_at_ms?}`. Its values come from the same named run's terminal reconciliation
+as `run.status`, with the same caller-facing class mapping. Fractional retry delays
+are preserved; a missing delay remains absent. Paused, interrupted, successful and
+never-written sessions carry no error summary.
+
+Compaction Setup continues to omit `ride_wait_max_ms`, `view_apply` and child-run
+`session_retention`: broca does not promise provider-chosen ride waits, marked
+next-step view application, or the per-session retention policy group.

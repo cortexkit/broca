@@ -19,6 +19,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tracing_subscriber::prelude::*;
 
 const MANAGEMENT_OPERATIONS: &[&str] = &[
+    "diagnostics.findings",
     "session.send",
     "send.status",
     "session.import",

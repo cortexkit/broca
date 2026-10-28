@@ -101,6 +101,7 @@ fn openai_spec() -> (ProviderSpec, ModelSpec) {
         limits: Limits::default(),
         cost: CostSchedule::default(),
         reasoning_options: Default::default(),
+        server_side_fallback: None,
         input_modalities: Default::default(),
         release_date: None,
         status: None,
@@ -728,21 +729,66 @@ fn openai_chat_captured_cache_read_after_write_splits_the_same_prompt() {
     );
 }
 
-/// DELIBERATELY NOT SUBTRACTED: no captured response shows whether a gateway reporting
-/// `cache_creation_input_tokens` (Alibaba) counts it inside `prompt_tokens`, so fresh input
-/// keeps the whole prompt total until a capture settles it.
+/// INCLUSIVE, SO SUBTRACTED: Alibaba's `cache_creation_input_tokens` is a class of prompt
+/// tokens, not an addition to them. Numbers from Model Studio's explicit-cache example
+/// (<https://www.alibabacloud.com/help/en/model-studio/context-cache>): the first request
+/// reports prompt_tokens 2174 with 2156 creation and 0 hits, so only 18 tokens are fresh. The
+/// second request to the same prompt reports prompt_tokens 2174 with 0 creation and 2156 hits,
+/// which pins the same 18 fresh tokens from the other side.
 #[test]
-fn openai_chat_usage_maps_cache_creation_input_tokens_detail() {
-    let usage = normalize_chat_usage(json!({
-        "prompt_tokens": 12,
+fn openai_chat_usage_splits_cache_creation_out_of_fresh_input() {
+    let write = normalize_chat_usage(json!({
+        "prompt_tokens": 2174,
         "completion_tokens": 1,
-        "prompt_tokens_details": {"cache_creation_input_tokens": 7}
+        "prompt_tokens_details": {"cache_creation_input_tokens": 2156}
     }));
 
-    assert_eq!(usage.cache_write_tokens, Some(7));
-    assert_eq!(usage.input_tokens, Some(12));
+    assert_eq!(write.cache_write_tokens, Some(2156));
+    assert_eq!(write.input_tokens, Some(18));
+    assert_eq!(write.cached_input_tokens, None);
+    assert_eq!(write.fill_tokens(), Some(2174));
+
+    let read = normalize_chat_usage(json!({
+        "prompt_tokens": 2174,
+        "completion_tokens": 1,
+        "prompt_tokens_details": {"cache_creation_input_tokens": 0, "cached_tokens": 2156}
+    }));
+
+    assert_eq!(read.cache_write_tokens, Some(0));
+    assert_eq!(read.input_tokens, Some(18));
+    assert_eq!(read.cached_input_tokens, Some(2156));
+    assert_eq!(read.fill_tokens(), Some(2174));
+}
+
+/// The same inclusive reading for a gateway that carries Alibaba's spelling at the top level
+/// of the usage object instead of under `prompt_tokens_details`.
+#[test]
+fn openai_chat_usage_splits_top_level_cache_creation_out_of_fresh_input() {
+    let usage = normalize_chat_usage(json!({
+        "prompt_tokens": 2174,
+        "completion_tokens": 1,
+        "cache_creation_input_tokens": 2156
+    }));
+
+    assert_eq!(usage.cache_write_tokens, Some(2156));
+    assert_eq!(usage.input_tokens, Some(18));
     assert_eq!(usage.cached_input_tokens, None);
-    assert_eq!(usage.fill_tokens(), Some(19));
+    assert_eq!(usage.fill_tokens(), Some(2174));
+}
+
+/// An absent key stays absent rather than becoming a reported zero: no cache is being
+/// created here, and saying "0 written" would claim a measurement the response never made.
+#[test]
+fn openai_chat_usage_leaves_cache_creation_absent_when_the_key_is_missing() {
+    let usage = normalize_chat_usage(json!({
+        "prompt_tokens": 2174,
+        "completion_tokens": 1,
+        "prompt_tokens_details": {"cached_tokens": 0}
+    }));
+
+    assert_eq!(usage.cache_write_tokens, None);
+    assert_eq!(usage.input_tokens, Some(2174));
+    assert_eq!(usage.cached_input_tokens, Some(0));
 }
 
 #[test]

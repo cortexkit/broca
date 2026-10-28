@@ -1,0 +1,29 @@
+{
+  "result": {
+    "coverage": {
+      "catalog_stale": {
+        "since_ms": 199999000,
+        "truncated": false
+      },
+      "interrupted_runs": {
+        "since_ms": 200000000,
+        "truncated": false
+      },
+      "run_errors": {
+        "since_ms": 200000000,
+        "truncated": false
+      },
+      "send_refusals": {
+        "since_ms": 199999000,
+        "truncated": false
+      },
+      "tool_outages": {
+        "since_ms": 199999000,
+        "truncated": false
+      }
+    },
+    "findings": [],
+    "generated_at_ms": 200000000,
+    "window_ms": 21600000
+  }
+}

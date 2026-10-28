@@ -14,6 +14,7 @@ use cortexkit_bus_testkit::{
 use cortexkit_bus_trait::Stream;
 use nkeys::KeyPair;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 pub(super) struct BusRig {
     server: BusServer,
@@ -21,6 +22,15 @@ pub(super) struct BusRig {
     pub names: AccountNames,
     user: Arc<KeyPair>,
     jwt: String,
+    /// The header set of every compaction advance notice published on the rig's bus, in
+    /// arrival order, without the two message-plane wire headers the transport adds.
+    advanced: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+    capture: tokio::task::JoinHandle<()>,
+}
+impl Drop for BusRig {
+    fn drop(&mut self) {
+        self.capture.abort();
+    }
 }
 fn jwt(signer: &KeyPair, subject: &str, nats: Value) -> String {
     let mut claims =
@@ -100,13 +110,59 @@ impl BusRig {
             })
             .await
             .unwrap();
+        // Subscribe before any runner can publish, so no advance notice is missed.
+        let advanced = Arc::new(Mutex::new(Vec::new()));
+        let mut notices = connection
+            .client()
+            .subscribe(broca_core::compaction_provider::notice::event_subject(
+                names.account(),
+                "broca",
+                broca_core::compaction_provider::notice::ADVANCED_EVENT,
+            ))
+            .await
+            .unwrap();
+        connection.client().flush().await.unwrap();
+        let seen = advanced.clone();
+        let capture = tokio::spawn(async move {
+            use futures::StreamExt;
+            while let Some(message) = notices.next().await {
+                let headers = message
+                    .headers
+                    .iter()
+                    .flat_map(|headers| headers.iter())
+                    .filter_map(|(name, values)| {
+                        let name: &str = name.as_ref();
+                        // The transport's own message id and content digest, not notice headers.
+                        if name.eq_ignore_ascii_case("Nats-Msg-Id")
+                            || name.eq_ignore_ascii_case("Ck-Content-Digest")
+                        {
+                            return None;
+                        }
+                        Some((name.to_owned(), values.last()?.as_str().to_owned()))
+                    })
+                    .collect();
+                seen.lock().unwrap().push(headers);
+            }
+        });
         Some(Self {
             server,
             connection,
             names,
             user,
             jwt,
+            advanced,
+            capture,
         })
+    }
+    /// The header sets of the advance notices published on this bus for `session_ref`.
+    pub fn advance_notices(&self, session_ref: &str) -> Vec<BTreeMap<String, String>> {
+        self.advanced
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|headers| headers.get("session_ref").map(String::as_str) == Some(session_ref))
+            .cloned()
+            .collect()
     }
     pub async fn register(self: &Arc<Self>, connection_file: &Path) -> tokio::task::JoinHandle<()> {
         let manifest = subc_protocol::manifest::ModuleManifest::builder("ckbus", "test")

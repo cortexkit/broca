@@ -363,6 +363,27 @@ fn projection_health_report(failures: u64, behind_sessions: u64) -> ProjectionHe
     }
 }
 
+/// Per-cause fsync totals for the writer sync deadline, reported under
+/// `wal_fsyncs`: barriers the owner asked for, deadline syncs the loop issued
+/// on its own, and the final sync of each close path. A healthy writer that
+/// appends without barriers shows deadline syncs and little else.
+fn wal_fsync_health_metrics() -> serde_json::Value {
+    wal_fsync_health_json(broca_core::durability_counters::snapshot())
+}
+
+/// Render one durability snapshot as the `wal_fsyncs` health object. Pure so
+/// tests can pin the exact shape and values.
+fn wal_fsync_health_json(
+    snapshot: broca_core::durability_counters::DurabilitySnapshot,
+) -> serde_json::Value {
+    serde_json::json!({
+        "barrier": snapshot.barrier,
+        "deadline": snapshot.deadline,
+        "shutdown": snapshot.shutdown,
+        "disconnect": snapshot.disconnect,
+    })
+}
+
 fn health_status(details: &[String]) -> subc_protocol::session::HealthStatus {
     if details.is_empty() {
         subc_protocol::session::HealthStatus::Ok
@@ -502,6 +523,8 @@ fn to_broca_identity(id: &SubcBindIdentity) -> BrocaBindIdentity {
 /// anything: the same session bound with different observations is still one lineage.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct BindObservation {
+    /// Actual route target, independent of a role declaration on a management route.
+    management: bool,
     agent_data: bool,
     /// Only llm-runner routes address a session. Other roles serve their own operations
     /// without opening a session or reading its history.
@@ -514,7 +537,13 @@ struct BindObservation {
     /// The daemon's scope stamp on the bind, or why there is none. Every send over the route
     /// carries it to admission, which decides the owner check and the scope to freeze.
     scope: broca_protocol::SendScope,
-    reads_held_reply: bool,
+    /// The session folder and project id on the bind's scope stamp, `None` on an unstamped
+    /// bind. Measured against the bind's `project_root` on each scoped send; never part of
+    /// the session key.
+    stamped_project: Option<crate::scope_workdir::StampedProject>,
+    /// What the consumer declared about reading tool replies, under either version's name for
+    /// the reply format.
+    consumer_format: crate::llm_tools::ConsumerFormat,
 }
 
 /// Preserve the scope identity, including the agent and run identifiers of an agent-run scope
@@ -1143,7 +1172,16 @@ where
     R: AsyncRead + Unpin,
     H: ServeHandler + 'static,
 {
-    send_hello(&writer, module_id, archive, consumer_routes).await?;
+    send_hello(
+        &writer,
+        module_id,
+        archive,
+        consumer_routes,
+        system_one
+            .as_ref()
+            .is_some_and(|system| system.image_references()),
+    )
+    .await?;
     let ack = {
         let _phase = stall::enter(Phase::AwaitFrame).await;
         expect_hello_ack(read_half).await?
@@ -1403,6 +1441,78 @@ where
             let Some((_, session, bind)) = routes.by_channel.get(&channel).cloned() else {
                 unreachable!("route binding disappeared after the channel/epoch guard")
             };
+            if bind.management && request_operation(&frame.body) == crate::diagnostics::OP {
+                count_management_operation(crate::diagnostics::OP);
+                match crate::management_admission::admit(
+                    crate::diagnostics::OP,
+                    bind.principal.as_ref(),
+                    &bind.scope,
+                ) {
+                    Ok(crate::management_admission::Admission::Diagnostics) => {}
+                    Err(crate::management_admission::Refusal::Diagnostics(error)) => {
+                        send_error_body(writer, ver, channel, epoch, corr, error).await?;
+                        return Ok(true);
+                    }
+                    _ => unreachable!("diagnostics scope admission returned a different operation"),
+                }
+                let req: RouteRequest = match serde_json::from_slice(&frame.body) {
+                    Ok(req) => req,
+                    Err(_) => {
+                        send_error(
+                            writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            "invalid_request",
+                            "diagnostics.findings request is not decodable",
+                        )
+                        .await?;
+                        return Ok(true);
+                    }
+                };
+                let now = now_epoch_ms();
+                let catalog_age = catalog_cache
+                    .ok_or_else(|| "catalog cache is not configured".to_owned())
+                    .and_then(|cache| {
+                        cache
+                            .health(now)
+                            .map(|h| h.age_ms)
+                            .map_err(|_| "catalog cache is unreadable".to_owned())
+                    });
+                let writer = writer.clone();
+                let slots = request_slots.clone();
+                request_tasks.spawn(reply_on_panic(
+                    writer.clone(),
+                    (ver, channel, epoch, corr),
+                    async move {
+                        let _permit = slots
+                            .acquire_owned()
+                            .await
+                            .map_err(|e| ServeIoError(e.to_string()))?;
+                        let reply = tokio::task::spawn_blocking(move || {
+                            crate::diagnostics::serving_reply(
+                                req.params,
+                                bind.principal.as_ref(),
+                                &bind.scope,
+                                catalog_age,
+                                now,
+                            )
+                        })
+                        .await
+                        .map_err(|e| ServeIoError(e.to_string()))?;
+                        match reply {
+                            Ok(reply) => {
+                                send_json_response(&writer, ver, channel, epoch, corr, &reply).await
+                            }
+                            Err(error) => {
+                                send_error_body(&writer, ver, channel, epoch, corr, error).await
+                            }
+                        }
+                    },
+                ));
+                return Ok(true);
+            }
             if bind.agent_data {
                 let caller = bind
                     .principal
@@ -1501,11 +1611,14 @@ where
                                                 .await
                                         } else {
                                             service
-                                                .answer_with_capabilities(
+                                                .answer_for_consumer_in_project(
                                                     &frame.body,
                                                     bind.principal.as_ref(),
                                                     &bind.scope,
-                                                    bind.reads_held_reply,
+                                                    bind.consumer_format,
+                                                    bind.stamped_project.as_ref().and_then(
+                                                        |stamp| stamp.project_id.as_deref(),
+                                                    ),
                                                 )
                                                 .await
                                         }
@@ -1732,6 +1845,7 @@ async fn handle_control_request(
             // owner is the principal on every earlier episode, and an episode recorded without
             // one can never satisfy that.
             let bind = BindObservation {
+                management: matches!(target, subc_protocol::RouteTarget::ManagementSurface { .. }),
                 agent_data: matches!(&target, subc_protocol::RouteTarget::InternalService { service_id, .. }
                     if service_id == broca_wire::agent_data::SERVICE_ID),
                 role: if matches!(target, subc_protocol::RouteTarget::ManagementSurface { .. })
@@ -1745,7 +1859,10 @@ async fn handle_control_request(
                 project_id: identity.project_id.clone(),
                 principal: principal.as_ref().map(to_bind_principal),
                 scope: bind_send_scope(scope.as_ref(), routes.daemon_scopes, principal.as_ref()),
-                reads_held_reply: cortexkit_role_tool_provider::consumer_reads_held_reply_v1(
+                stamped_project: scope
+                    .as_ref()
+                    .map(crate::scope_workdir::StampedProject::from_stamp),
+                consumer_format: crate::llm_tools::ConsumerFormat::from_capabilities(
                     consumer_capabilities.as_deref(),
                 ),
             };
@@ -1985,6 +2102,11 @@ async fn handle_control_request(
                     // Serve-side inbound daemon frames rejected by this process's binding guard.
                     "serve_frames_dropped_unbound_channel": SERVE_FRAMES_DROPPED_UNBOUND_CHANNEL.load(Ordering::Relaxed),
                     "serve_frames_dropped_stale_epoch": SERVE_FRAMES_DROPPED_STALE_EPOCH.load(Ordering::Relaxed),
+                    // Distinct scoped sessions whose send's stamped folder matched, differed
+                    // from, or was missing beside the bind's project_root. Sessions stay keyed
+                    // by project_root either way; `sessions_differ` is how many would move if
+                    // they were keyed by the stamped folder instead.
+                    "scoped_session_workdirs": crate::scope_workdir::health(),
                     // Requests a module sent toward broca on a route, each answered with
                     // reverse_request_unhandled because broca fronts no person who could answer.
                     // Non-zero means some module is asking and not getting what it wants.
@@ -1993,6 +2115,8 @@ async fn handle_control_request(
                     // behind-session gauge, never this historical counter.
                     "projection_failures": projection_health.failures,
                     "projection_behind_sessions": projection_health.behind_sessions,
+                    // Fsyncs the writer loop issued, by the path that issued them.
+                    "wal_fsyncs": wal_fsync_health_metrics(),
                     // Lifetime operation counts for THIS process. They reset on restart and are not
                     // fleet totals; consumers derive rates by diffing two readings from one launch.
                     // Always emit zero so a quiet process cannot be confused with an unwired counter.
@@ -2037,11 +2161,19 @@ async fn handle_control_request(
             "charge_basis_override_rows": crate::billing_routing::published_overrides()
                 .map(|published| published.rows),
             // How each new run's provider account was chosen (asked of routing, routing
-            // switched off or unreachable, pinned by the caller...) and how the run's reports to
-            // routing fared. Null in a process with no vault credential source, which asks
-            // routing nothing.
+            // switched off, refused because routing was unreachable, pinned by the caller...),
+            // how the run's reports to routing fared, and `unmapped_credentials`: listed vault
+            // credentials without the provider_ids or auth_method metadata account selection
+            // needs, which are never routed. Null in a process with no vault credential source,
+            // which asks routing nothing.
             "account_selection": crate::account_routing::published_metrics(),
             "system_one": routes.system_one.as_ref().map(|service| service.health()),
+            // What the private-content check concluded for each llm_classify call and how the
+            // calls it found marked ended: released by a standing grant, held behind a card,
+            // denied, or refused. This is what tells "cerebellum said unmarked" apart from "a
+            // grant let a private call through" when a call went out without a card. Null when
+            // this process serves no model-tool route.
+            "llm_tools_consent": routes.llm_tools.as_ref().map(|tools| tools.consent_health()),
                 });
             if let Some(Ok(catalog)) = catalog_health {
                 // Staleness is ordinary operation: expose its age and provenance while leaving
@@ -2976,6 +3108,15 @@ where
             send_req.request.principal = bind.principal.clone();
             send_req.request.scope = bind.scope.clone();
             send_req.plan = plan;
+            // Measured here, after every serve-side refusal, so only sends that reach the
+            // session are counted. The session key above stays the bind triple.
+            if matches!(&bind.scope, broca_protocol::SendScope::Stamped(_)) {
+                crate::scope_workdir::observe_scoped_send(
+                    session,
+                    bind.stamped_project.as_ref(),
+                    bind.project_id.as_deref(),
+                );
+            }
             let refusal_session_ref = send_req.session.session.clone();
             let refusal_send_id = send_req.send_id.clone();
             let refusal_delivery_mode = send_req.delivery.as_str();
@@ -3352,6 +3493,7 @@ where
                 from_ordinal: params.from_ordinal,
                 limit: params.limit,
                 include_tools: params.include_tools,
+                include_rich_ui: params.include_rich_ui,
                 after_mid: params.after_mid,
                 lineage_id: params.lineage_id,
                 max_bytes: params.max_bytes,
@@ -3952,9 +4094,23 @@ async fn send_hello(
     module_id: &str,
     archive: crate::wal_archive::WalArchiveConfig,
     consumer_routes: &crate::consumer_routes::ConsumerRoutes,
+    image_references: bool,
 ) -> Result<(), ServeIoError> {
+    let mut manifest = crate::manifest::manifest_configured(module_id, archive, consumer_routes);
+    if image_references {
+        for role in &mut manifest.provides {
+            if let subc_protocol::manifest::ProviderRole::ToolProvider { tools, .. } = role {
+                for tool in tools {
+                    if tool.name == crate::llm_tools::CLASSIFY_TOOL_NAME {
+                        tool.schema =
+                            cortexkit_llm_tools::classify::input_schema_with_image_references();
+                    }
+                }
+            }
+        }
+    }
     let body = serde_json::to_vec(&ModuleHelloBody {
-        manifest: crate::manifest::manifest_configured(module_id, archive, consumer_routes),
+        manifest,
         protocol_ver: PROTOCOL_VERSION,
         control_ops: Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
         launch_nonce: hello_launch_nonce()?,
@@ -4125,6 +4281,7 @@ fn refused_send_code(error: &ServeError) -> String {
         }
         ServeError::PlanRefused(refusal) => refusal.code().into(),
         ServeError::AccountSelectionRefused(refusal) => refusal.routing_code.clone(),
+        ServeError::RoutingUnavailable(_) => broca_wire::ROUTING_UNAVAILABLE.into(),
         ServeError::WarmRefused(refusal) => refusal.code.clone(),
         ServeError::RunPaused(_) => "run_paused".into(),
         ServeError::PreUserUnavailable { .. } => broca_module::serve::PRE_USER_UNAVAILABLE.into(),
@@ -4147,7 +4304,8 @@ fn refused_send_class(error: &ServeError) -> &'static str {
     match error {
         ServeError::Open(_, Some(class)) => shared_class_name(*class),
         ServeError::AccountSelectionRefused(refusal) => shared_class_name(refusal.class),
-        ServeError::Transient(_)
+        ServeError::RoutingUnavailable(_)
+        | ServeError::Transient(_)
         | ServeError::TagsAwaitSetup
         | ServeError::SessionMoving { .. }
         | ServeError::SessionMoved { .. }
@@ -4325,11 +4483,23 @@ async fn send_serve_error(
         }
         ServeError::AccountSelectionRefused(refusal) => {
             // Sent exactly as the broca-wire type serializes: the bytes its golden files pin.
-            let body = serde_json::to_vec(&broca_wire::AccountSelectionRefused::new(
-                refusal.routing_code.clone(),
-                refusal.class,
-                refusal.retry_after_s,
-                refusal.decision_id.clone(),
+            let body = serde_json::to_vec(
+                &broca_wire::AccountSelectionRefused::new(
+                    refusal.routing_code.clone(),
+                    refusal.class,
+                    refusal.retry_after_s,
+                    refusal.decision_id.clone(),
+                )
+                .with_routing_detail(refusal.routing_detail.clone(), refusal.resets_at_ms),
+            )
+            .map_err(|e| ServeIoError(e.to_string()))?;
+            return send_error_bytes(writer, ver, channel, epoch, corr, body).await;
+        }
+        ServeError::RoutingUnavailable(unavailable) => {
+            // Sent exactly as the broca-wire type serializes: the bytes its golden files pin.
+            let body = serde_json::to_vec(&broca_wire::RoutingUnavailable::new(
+                unavailable.reason.as_str(),
+                unavailable.budget_ms,
             ))
             .map_err(|e| ServeIoError(e.to_string()))?;
             return send_error_bytes(writer, ver, channel, epoch, corr, body).await;
@@ -5586,6 +5756,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wal_fsync_health_metrics_reports_named_causes() {
+        let metrics = wal_fsync_health_json(broca_core::durability_counters::DurabilitySnapshot {
+            barrier: 2,
+            deadline: 3,
+            shutdown: 1,
+            disconnect: 4,
+        });
+        assert_eq!(
+            metrics,
+            serde_json::json!({
+                "barrier": 2,
+                "deadline": 3,
+                "shutdown": 1,
+                "disconnect": 4,
+            }),
+            "health reports each fsync cause with its exact total"
+        );
+    }
+
     #[tokio::test]
     async fn watchdog_reader_phase_gates_name_stalls() {
         use crate::stall::{tests::Witness, Gate, State};
@@ -5813,6 +6003,7 @@ mod tests {
             lineage_id: None,
             messages: vec![
                 SessionReadMessage {
+                    rich_ui: None,
                     written_at: None,
                     delivered_as: None,
                     run: None,
@@ -5831,6 +6022,7 @@ mod tests {
                     part_digests: None,
                 },
                 SessionReadMessage {
+                    rich_ui: None,
                     written_at: None,
                     delivered_as: None,
                     run: None,
@@ -6482,6 +6674,7 @@ mod tests {
             let end = (from + 2).min(self.messages.len());
             let messages = (from..end)
                 .map(|ordinal| broca_wire::SessionReadMessage {
+                    rich_ui: None,
                     written_at: None,
                     delivered_as: None,
                     ordinal: ordinal as u64,
@@ -7731,12 +7924,14 @@ mod tests {
                 epoch: 1,
                 identity: BrocaBindIdentity::new("/tmp/project-a", "runner", "late-bind"),
                 bind: BindObservation {
+                    management: true,
                     agent_data: false,
                     role: RouteRole::LlmRunner,
                     project_id: None,
                     principal: None,
                     scope: broca_protocol::SendScope::Unstamped,
-                    reads_held_reply: false,
+                    stamped_project: None,
+                    consumer_format: Default::default(),
                 },
                 cancel,
                 refusal: Ok(None),
@@ -8873,6 +9068,19 @@ mod tests {
                 .is_some(),
             "health.check includes the stale-epoch counter, zero included"
         );
+        for counter in [
+            "sessions_same",
+            "sessions_differ",
+            "sessions_without_workdir",
+            "sessions_untracked",
+        ] {
+            assert!(
+                health["metrics"]["scoped_session_workdirs"][counter]
+                    .as_u64()
+                    .is_some(),
+                "health.check includes the scoped-session workdir counter {counter}, zero included"
+            );
+        }
 
         let bind = ModuleControlRequest::RouteBind {
             route_channel: 7,
@@ -9293,3 +9501,7 @@ mod delivery_list_tests {
 #[cfg(test)]
 #[path = "serve_classifier_tests.rs"]
 mod classifier_route_tests;
+
+#[cfg(test)]
+#[path = "serve_flow_compat_tests.rs"]
+mod flow_management_compat_tests;

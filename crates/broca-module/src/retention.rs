@@ -254,6 +254,7 @@ fn derive(
             runs.insert(
                 failure.run_id.0.clone(),
                 RetentionRunRow {
+                    attribution: None,
                     run: RunIndexRow {
                         run_id: failure.run_id.0.clone(),
                         session: session.clone(),
@@ -295,9 +296,24 @@ fn derive(
                     WalRecord::RunStarted { ts_ms, .. } => *ts_ms,
                     _ => None,
                 });
+            let mut attribution = broca_core::RunIndexAttribution::default();
+            for evidence in records
+                .iter()
+                .skip_while(|f| f.seq < frame.seq)
+                .take(1)
+                .chain(
+                    records
+                        .iter()
+                        .skip_while(|f| f.seq <= frame.seq)
+                        .take_while(|f| !matches!(f.record, WalRecord::RunStarted { .. })),
+                )
+            {
+                attribution.observe(&evidence.record);
+            }
             runs.insert(
                 run_id.0.clone(),
                 RetentionRunRow {
+                    attribution: Some(attribution),
                     run: RunIndexRow {
                         run_id: run_id.0.clone(),
                         session: session.clone(),
@@ -392,6 +408,45 @@ type EvictCaches = dyn Fn(&BindIdentity) + Send + Sync;
 
 type AcquireLease = dyn Fn(&BindIdentity) -> Result<Box<dyn LeaseHandle>, String> + Send + Sync;
 
+/// Preserve the one retryable placement state without reclassifying existing
+/// retention failures whose string-based contracts remain unchanged.
+#[derive(Debug)]
+pub(crate) enum RetentionReadError {
+    RelocationIncomplete { reason: String },
+    Other(String),
+}
+
+impl RetentionReadError {
+    fn from_wal(error: broca_wal::WalError) -> Self {
+        match error {
+            error @ broca_wal::WalError::RelocationIncomplete { .. } => {
+                Self::RelocationIncomplete {
+                    reason: error.to_string(),
+                }
+            }
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+impl From<String> for RetentionReadError {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+impl From<&str> for RetentionReadError {
+    fn from(error: &str) -> Self {
+        Self::Other(error.into())
+    }
+}
+impl std::fmt::Display for RetentionReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RelocationIncomplete { reason } => f.write_str(reason),
+            Self::Other(error) => f.write_str(error),
+        }
+    }
+}
+
 /// Shared by actors and the registry. Content mutations require the caller's session lease;
 /// expiry reads may refresh the content-free retention summary, but never run state.
 pub struct RetentionService {
@@ -399,8 +454,11 @@ pub struct RetentionService {
         std::sync::OnceLock<Arc<dyn crate::retention_withdrawals::RetentionWithdrawalAdapter>>,
     pub(crate) withdrawal_wake: tokio::sync::Notify,
     unreadable: Mutex<std::collections::HashSet<String>>,
+    relocation_incomplete: std::sync::atomic::AtomicU64,
+    overhaul_deferred: std::sync::atomic::AtomicU64,
     enrollment: Mutex<Enrollment>,
     deletion_recovery: Mutex<(bool, std::collections::HashSet<BindIdentity>)>,
+    archived_expiry: Mutex<ArchivedExpiry>,
     #[cfg(test)]
     file_work: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -414,6 +472,19 @@ pub struct RetentionService {
     resolver: Arc<dyn broca_core::ChargeBasisResolver + Send + Sync>,
     #[cfg(test)]
     before_enroll: Mutex<Option<Arc<EnrollmentHook>>>,
+}
+
+#[derive(Default)]
+struct ArchivedExpiry {
+    identity: Option<broca_core::wal_writer::ArchiveIdentity>,
+    lineages: HashMap<BindIdentity, ArchivedLineage>,
+}
+
+struct ArchivedLineage {
+    id: String,
+    wal_bytes: u64,
+    policy: Option<(u64, u64, Option<u64>)>,
+    runs: std::collections::HashSet<String>,
 }
 
 #[derive(Default)]
@@ -533,8 +604,11 @@ impl RetentionService {
             withdrawal_wake: tokio::sync::Notify::new(),
             evict: std::sync::OnceLock::new(),
             unreadable: Mutex::new(std::collections::HashSet::new()),
+            relocation_incomplete: std::sync::atomic::AtomicU64::new(0),
+            overhaul_deferred: std::sync::atomic::AtomicU64::new(0),
             enrollment: Mutex::default(),
             deletion_recovery: Mutex::default(),
+            archived_expiry: Mutex::default(),
             #[cfg(test)]
             file_work: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -648,6 +722,44 @@ impl RetentionService {
         self.unreadable.lock().unwrap().len()
     }
 
+    /// Number of retention attempts deferred for an interrupted overhaul placement.
+    pub fn relocation_incomplete_skips(&self) -> u64 {
+        self.relocation_incomplete
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn overhaul_deferred_attempts(&self) -> u64 {
+        self.overhaul_deferred
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Overhaul roots may read retained content, but destructive retention is
+    /// deferred until it can honor open-writer markers and unpublished log tails
+    /// before deleting logs.
+    pub(crate) fn defer_overhaul(&self) -> bool {
+        if !self.wal.wal_config().is_overhaul() {
+            return false;
+        }
+        self.overhaul_deferred
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(target: "retention", "retention deferred: overhaul");
+        true
+    }
+
+    pub(crate) fn live_path_for_retention(
+        &self,
+        key: &BindIdentity,
+    ) -> Result<Option<PathBuf>, RetentionReadError> {
+        self.wal.resolve_live_path(key).map_err(|error| {
+            if matches!(error, broca_wal::WalError::RelocationIncomplete { .. }) {
+                crate::diagnostics::retention_fenced(key, "wal_relocation_incomplete", self.clock.now_ms());
+                self.relocation_incomplete.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(target: "retention", session = %broca_core::session_addr(key), "retention deferred: wal_relocation_incomplete; an owned open must finish placement");
+            }
+            RetentionReadError::from_wal(error)
+        })
+    }
+
     fn current_indexed(
         &self,
         key: &BindIdentity,
@@ -729,12 +841,41 @@ impl RetentionService {
         self.expired_head(key, run, None)
     }
 
+    pub(crate) fn expired_typed(
+        &self,
+        key: &BindIdentity,
+        run: Option<&str>,
+    ) -> Result<Option<u64>, RetentionReadError> {
+        self.expired_head_with_meta(key, run, None, None)
+    }
+
     pub(crate) fn expired_head(
         &self,
         key: &BindIdentity,
         run: Option<&str>,
         head: Option<u64>,
     ) -> Result<Option<u64>, String> {
+        self.expired_head_with_meta(key, run, head, None)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn expired_head_with_meta(
+        &self,
+        key: &BindIdentity,
+        run: Option<&str>,
+        head: Option<u64>,
+        meta: Option<&broca_core::AdmissionStoreSnapshot>,
+    ) -> Result<Option<u64>, RetentionReadError> {
+        if self.defer_overhaul() {
+            crate::diagnostics::retention_fenced(key, "overhaul_deferred", self.clock.now_ms());
+            return Ok(None);
+        }
+        let overhaul_path = self
+            .wal
+            .wal_config()
+            .is_overhaul()
+            .then(|| self.live_path_for_retention(key))
+            .transpose()?;
         let run_meta = run.map(|run| self.index.run(run)).transpose()?.flatten();
         if let Some(meta) = &run_meta {
             if meta.expired_at_ms.is_some() {
@@ -751,7 +892,10 @@ impl RetentionService {
             }
         }
         self.wal.check_move(key, false).map_err(|e| e.to_string())?;
-        let path = self.wal.resolve_live_path(key).map_err(|e| e.to_string())?;
+        let path = match overhaul_path {
+            Some(path) => path,
+            None => self.live_path_for_retention(key)?,
+        };
         // Deletion may move the resolved path aside before it is opened. Let the
         // ordinary range reader resolve absence/tombstones instead of failing the read.
         let file = path
@@ -760,6 +904,9 @@ impl RetentionService {
             .transpose()?
             .flatten();
         let path = path.filter(|_| file.is_some());
+        if path.is_some() {
+            self.archived_expiry.lock().unwrap().lineages.remove(key);
+        }
         // Retention cannot be added after the first send. Retained lineages are always
         // placed in wal-ephemeral, so portable/durable logs need no expiry replay.
         if path
@@ -768,10 +915,68 @@ impl RetentionService {
         {
             return Ok(None);
         }
-        if head.is_none() {
-            self.wal.flush_for_read(key).map_err(|e| e.to_string())?;
-        }
         let stones = self.tombstones(key)?;
+        let mut archived_read = None;
+        if path.is_none() && head.is_none() {
+            let identity = self.wal.archive_identity().map_err(|e| e.to_string())?;
+            let mut cache = self.archived_expiry.lock().unwrap();
+            if cache.identity != identity {
+                cache.lineages.clear();
+                cache.identity = identity.clone();
+            }
+            if let Some(facts) = cache.lineages.get(key) {
+                if self.live_path_for_retention(key)?.is_none() {
+                    return self
+                        .expired_archived(key, run, &stones, facts)
+                        .map_err(Into::into);
+                }
+                cache.lineages.remove(key);
+            }
+            let archived = self
+                .wal
+                .read_archived_for_expiry(key)
+                .map_err(RetentionReadError::from_wal)?;
+            if let Some((read, wal_bytes)) = archived {
+                // Archive indexes identify addresses, not lineages. Parse the member's WAL
+                // records once to extract its lineage and policy, without caching records.
+                // Tombstones, index expiry and the clock remain fresh on every cache hit.
+                if let Some(id) = read
+                    .lineage_id
+                    .filter(|_| matches!(read.records(), broca_wal::WalRangeRecords::Complete(_)))
+                {
+                    let facts = ArchivedLineage {
+                        id: id.to_string(),
+                        wal_bytes,
+                        policy: policy(frames(&read)),
+                        runs: frames(&read)
+                            .iter()
+                            .filter_map(|frame| match &frame.record {
+                                WalRecord::RunStarted { run_id, .. } => Some(run_id.0.clone()),
+                                _ => None,
+                            })
+                            .collect(),
+                    };
+                    let verdict = self.expired_archived(key, run, &stones, &facts)?;
+                    if identity.is_some()
+                        && self.wal.archive_identity().map_err(|e| e.to_string())? == identity
+                        && self.live_path_for_retention(key)?.is_none()
+                    {
+                        // Bound memory even when a client probes arbitrarily many sessions.
+                        if cache.lineages.len() >= 16_384 {
+                            cache.lineages.clear();
+                        }
+                        cache.lineages.insert(key.clone(), facts);
+                    }
+                    return Ok(verdict);
+                }
+                archived_read = Some(read);
+            }
+        }
+        if head.is_none() && archived_read.is_none() {
+            self.wal
+                .flush_for_read(key)
+                .map_err(RetentionReadError::from_wal)?;
+        }
         if let Some(file) = &file {
             let bytes = file.metadata().map_err(|e| e.to_string())?.len();
             if let Some(row) = self.index.live(key)?.filter(|row| row.wal_bytes == bytes) {
@@ -804,10 +1009,13 @@ impl RetentionService {
                 }
             }
         }
-        let read = self
-            .wal
-            .read_records_range(key, 0, head, None)
-            .map_err(|e| e.to_string())?;
+        let read = match archived_read {
+            Some(read) => read,
+            None => self
+                .wal
+                .read_records_range(key, 0, head, None)
+                .map_err(RetentionReadError::from_wal)?,
+        };
         if matches!(read.records(), broca_wal::WalRangeRecords::Complete(_)) {
             if let Some(stone) = stones.iter().find(|s| {
                 Some(s.lineage_id.as_str())
@@ -860,15 +1068,57 @@ impl RetentionService {
         }
         if self
             .wal
-            .lineage_exists(key, None)
-            .map_err(|e| e.to_string())?
+            .lineage_exists(key, meta)
+            .map_err(RetentionReadError::from_wal)?
         {
             return Ok(None);
         }
+        // Deletion writes its tombstone before moving the WAL aside. When this call saw a live
+        // WAL, the tombstones above were read before that WAL vanished, so a deletion that ran
+        // in between is missing from them. Re-read: a send that finds the lease held waits
+        // only while this reports expiry, and would otherwise refuse with LeaseHeld.
+        let stones = if path.is_some() {
+            self.tombstones(key)?
+        } else {
+            stones
+        };
         Ok(stones
             .into_iter()
             .max_by_key(|stone| stone.seq)
             .map(|stone| stone.expired_at_ms))
+    }
+
+    fn expired_archived(
+        &self,
+        key: &BindIdentity,
+        run: Option<&str>,
+        stones: &[Tombstone],
+        facts: &ArchivedLineage,
+    ) -> Result<Option<u64>, String> {
+        if let Some(stone) = stones.iter().find(|stone| stone.lineage_id == facts.id) {
+            return Ok(Some(stone.expired_at_ms));
+        }
+        if run.is_some_and(|run| !facts.runs.contains(run)) {
+            return Ok(None);
+        }
+        if let Some(row) = self
+            .index
+            .lineage(&facts.id)?
+            .filter(|row| row.session == *key)
+        {
+            if row.expired_at_ms.is_some() {
+                return Ok(row.expired_at_ms);
+            }
+            if row.wal_bytes == facts.wal_bytes {
+                return Ok(row
+                    .expires_at_ms
+                    .filter(|deadline| *deadline <= self.clock.now_ms()));
+            }
+        }
+        Ok(facts
+            .policy
+            .and_then(|(_, _, deadline)| deadline)
+            .filter(|deadline| *deadline <= self.clock.now_ms()))
     }
 
     /// Keep actor maintenance bounded; enrollment repairs longer histories under the lease.
@@ -1249,6 +1499,25 @@ impl RetentionService {
         key: &BindIdentity,
         now_ms: u64,
     ) -> Result<Option<String>, String> {
+        self.delete_expired_typed(key, now_ms)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn delete_expired_typed(
+        &self,
+        key: &BindIdentity,
+        now_ms: u64,
+    ) -> Result<Option<String>, RetentionReadError> {
+        if self.defer_overhaul() {
+            crate::diagnostics::retention_fenced(key, "overhaul_deferred", now_ms);
+            return Ok(None);
+        }
+        let overhaul_path = self
+            .wal
+            .wal_config()
+            .is_overhaul()
+            .then(|| self.live_path_for_retention(key))
+            .transpose()?;
         self.wal.check_move(key, true).map_err(|e| e.to_string())?;
         for stone in self
             .tombstones(key)?
@@ -1257,7 +1526,11 @@ impl RetentionService {
         {
             self.complete(key, stone, now_ms)?;
         }
-        let Some(path) = self.wal.resolve_live_path(key).map_err(|e| e.to_string())? else {
+        let path = match overhaul_path {
+            Some(path) => path,
+            None => self.live_path_for_retention(key)?,
+        };
+        let Some(path) = path else {
             return Ok(None);
         };
         let read = self.read_path(&path);
@@ -1312,6 +1585,7 @@ impl RetentionService {
         match intake {
             Ok(None) => {}
             Ok(Some(reason)) => {
+                crate::diagnostics::retention_fenced(key, reason, now_ms);
                 if reason == "provider_held_intake_unknown" {
                     self.mark_unreadable(key);
                 }
@@ -1321,6 +1595,7 @@ impl RetentionService {
             }
             Err(_) => {
                 self.mark_unreadable(key);
+                crate::diagnostics::retention_fenced(key, "provider_held_intake_unknown", now_ms);
                 tracing::warn!(target: "retention", session = %broca_core::session_addr(key), reason = "provider_held_intake_unknown",
                     "retention deletion skipped: intake store cannot be read");
                 return Ok(None);
@@ -1420,9 +1695,16 @@ impl RetentionService {
         mut stone: Tombstone,
         now_ms: u64,
     ) -> Result<(), String> {
+        if self.defer_overhaul() {
+            crate::diagnostics::retention_fenced(key, "overhaul_deferred", now_ms);
+            return Err("retention deferred: overhaul".into());
+        }
         self.wal.check_move(key, true).map_err(|e| e.to_string())?;
         let moved = self.deleting(key, &stone.lineage_id);
-        if let Some(path) = self.wal.resolve_live_path(key).map_err(|e| e.to_string())? {
+        if let Some(path) = self
+            .live_path_for_retention(key)
+            .map_err(|e| e.to_string())?
+        {
             let identity = match self.read_path(&path) {
                 Ok(read) => read.lineage_id.map(|id| id.to_string()),
                 Err(_) => Some(self.initial_lineage(&path)?),
@@ -1542,12 +1824,16 @@ impl RetentionService {
         // A crash or removal failure before this point leaves an incomplete tombstone to retry.
         stone.completed_at_ms = Some(now_ms);
         self.write_tombstone(key, &stone)?;
+        crate::diagnostics::retention_deleted(key);
         Ok(())
     }
 
     /// Finish incomplete tombstones, retrying failed keys on later sweeps without
     /// preventing unrelated sessions from completing their deletion.
     pub fn resume_deletions(&self, now_ms: u64) -> Result<Vec<BindIdentity>, String> {
+        if self.defer_overhaul() {
+            return Ok(Vec::new());
+        }
         let mut recovery = self.deletion_recovery.lock().unwrap();
         let pending = match self.index.pending_deletions()? {
             Some(keys) => keys,
@@ -1563,8 +1849,15 @@ impl RetentionService {
         let mut completed = Vec::new();
         for key in keys {
             let result = (|| {
+                if self.wal.wal_config().is_overhaul() {
+                    self.live_path_for_retention(&key)
+                        .map_err(|error| error.to_string())?;
+                }
                 let stones = self.tombstones(&key)?;
                 if stones.iter().all(|s| s.completed_at_ms.is_some()) {
+                    if !stones.is_empty() {
+                        crate::diagnostics::retention_deleted(&key);
+                    }
                     for stone in stones {
                         self.index
                             .deletion_pending(&stone.lineage_id, &key, false)?;

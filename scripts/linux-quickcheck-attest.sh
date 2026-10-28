@@ -50,7 +50,8 @@ candidate_tree() {
 
 tree=$(candidate_tree)
 echo "linux-quickcheck-attest: checking tree $tree for crates $crate_list"
-./scripts/quickcheck.sh "${crates[@]}"
+# Package selection must not change Cargo's feature graph on the shared build server.
+python3 scripts/lib/linux-quickcheck.py "${crates[@]}"
 
 if [[ "$(candidate_tree)" != "$tree" ]]; then
   echo "linux-quickcheck-attest: tree changed during quickcheck; no attestation written" >&2

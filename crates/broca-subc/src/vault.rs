@@ -520,7 +520,8 @@ const REPORTER_SOURCE_DIRECT: &str = "direct";
 /// the vault always writes are required; the ones it omits when empty are optional.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScopedCredential {
-    /// The vault credential id.
+    /// The vault credential id: an opaque record name. Use it to address and report the
+    /// credential, never to infer its provider or method (see `provider_ids` and `auth_method`).
     pub id: String,
     pub categories: Vec<String>,
     /// The record kind, for example `oauth` or `apikey`.
@@ -544,12 +545,17 @@ pub struct ScopedCredential {
     pub email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub org_name: Option<String>,
-    /// The catalog provider ids this credential serves. Empty when the vault predates the field,
-    /// so an older vault still decodes; broca does not route by it yet.
+    /// The catalog provider ids this credential serves, set by the operator. Authoritative when
+    /// present: account selection offers a credential to routing for a provider only when this
+    /// names it, and never reads the provider from the credential id, which is an opaque record
+    /// name. Empty when the vault predates the field or the operator has not set it; such a
+    /// credential is reported unmapped and never routed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_ids: Vec<String>,
-    /// How the credential authenticates (for example `oauth`, `apikey`, `chatgpt`), where the
-    /// vault can say. Absent on an older vault and on rows the vault cannot classify.
+    /// How the credential authenticates (`apikey`, `oauth`, `chatgpt`, `antigravity`). The vault
+    /// derives it for every LLM credential, and it is authoritative: account selection matches a
+    /// run's method against it, never against the credential id. Absent on an older vault and on
+    /// non-LLM credential kinds; such a credential is reported unmapped and never routed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<String>,
 }
@@ -2906,8 +2912,11 @@ mod tests {
     /// about where the source is). Otherwise CI's layout is assumed: it checks claustrum out
     /// beside broca and names its binary in `CK_CLAUSTRUM_BIN`
     /// (`<checkout>/target/debug/ck-claustrum`), three directories below the checkout. When either
-    /// variable is set, the file must exist; with neither (a local run with no claustrum
-    /// checkout) there is nothing to compare.
+    /// variable is set, the file must exist; with neither there is nothing to compare, unless
+    /// the run requires the vault (`BROCA_REQUIRE_VAULT`), in which case the missing fixture
+    /// is a failure rather than a skip. The check is keyed solely on that flag: lanes without
+    /// a checkout (notably the Windows lib/bin/doc lane, which still runs with `CI=true`)
+    /// must skip here.
     #[test]
     fn list_scoped_strict_mirror_matches_claustrum_tip() {
         let non_empty = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
@@ -2921,8 +2930,7 @@ mod tests {
                 .to_path_buf()
         } else {
             assert!(
-                non_empty("BROCA_REQUIRE_VAULT").is_none()
-                    && std::env::var("CI").as_deref() != Ok("true"),
+                non_empty("BROCA_REQUIRE_VAULT").is_none(),
                 "claustrum source-tip comparison requires CK_CLAUSTRUM_CHECKOUT or CK_CLAUSTRUM_BIN in the required vault lane"
             );
             eprintln!("CK_CLAUSTRUM_CHECKOUT and CK_CLAUSTRUM_BIN unset: no claustrum checkout to compare against");

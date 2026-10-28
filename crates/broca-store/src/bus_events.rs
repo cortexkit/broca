@@ -135,6 +135,8 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
 
 #[derive(Default, Serialize, Deserialize)]
 struct Projection {
+    #[serde(default)]
+    attribution: broca_core::RunIndexAttribution,
     run_id: Option<String>,
     last_at_ms: u64,
     pending: u64,
@@ -526,8 +528,15 @@ impl SqliteStore {
                         open: true,
                         ..Projection::default()
                     };
+                    state.attribution.observe(&frame.record);
+                    // Event projection can create the row before the actor's active-index
+                    // write. Record its session reference in the same managed transaction so
+                    // the legacy-write triggers do not invalidate a complete inventory.
+                    tx.execute("INSERT INTO agent_data_writer VALUES(1)", [])?;
+                    crate::session_refs::insert(&tx, &broca_core::session_addr(session), session)?;
                     tx.execute("INSERT OR IGNORE INTO run_index(run_id,session,submission_id,request_identity_digest,state,state_changed_ms,title) VALUES(?1,?2,?3,?4,'active',?5,?6)",
                         params![run_id.0, serde_json::to_string(session)?, submission_id.as_ref().map(|s| &s.0), request_identity_digest, ts_ms, title])?;
+                    tx.execute("DELETE FROM agent_data_writer", [])?;
                     Some(RunEventDetail::Started {})
                 }
                 WalRecord::Steered { send_id, ts_ms, .. } => {
@@ -572,7 +581,16 @@ impl SqliteStore {
                     ..
                 } => {
                     state.last_at_ms = ts_ms.unwrap_or(state.last_at_ms);
-                    tx.execute("UPDATE run_index SET state='paused',state_changed_ms=?2 WHERE run_id=?1 AND state IN ('active','paused')", params![run_id.0, state.last_at_ms])?;
+                    state.attribution.observe(&frame.record);
+                    crate::diagnostics::write_lifecycle(
+                        &tx,
+                        &run_id.0,
+                        "paused",
+                        None,
+                        None,
+                        0,
+                        Some(&state.attribution),
+                    )?;
                     Some(RunEventDetail::Paused {
                         pause_reason: *reason,
                     })
@@ -592,9 +610,18 @@ impl SqliteStore {
                 } => {
                     state.last_at_ms = ts_ms.unwrap_or(state.last_at_ms);
                     state.open = false;
+                    state.attribution.observe(&frame.record);
                     if let Some(run_id) = &state.run_id {
                         let terminal = serde_json::to_value(reason)?.as_str().unwrap().to_owned();
-                        tx.execute("UPDATE run_index SET state=?2,state_changed_ms=?3,usage_json=?4,retries_used=?5 WHERE run_id=?1", params![run_id, terminal, state.last_at_ms, serde_json::to_string(usage)?, retries_used])?;
+                        crate::diagnostics::write_lifecycle(
+                            &tx,
+                            run_id,
+                            &terminal,
+                            Some(&serde_json::to_string(usage)?),
+                            None,
+                            *retries_used,
+                            Some(&state.attribution),
+                        )?;
                     }
                     Some(RunEventDetail::Ended {
                         terminal: *reason,
@@ -690,19 +717,23 @@ impl SqliteStore {
         let lifecycle = self.conn.lock().unwrap().query_row(
             "SELECT event_key,subject,epoch,run_id,seq,session,body FROM bus_event_outbox INDEXED BY bus_event_unpublished WHERE published_ms IS NULL AND best_effort=0 ORDER BY rowid LIMIT 1", [],
             |r| {
-                let session: String = r.get(5)?;
-                let session: BindIdentity = serde_json::from_str(&session).map_err(|e| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e)))?;
+                let body: Vec<u8> = r.get(6)?;
+                // Read the session_ref header from the queued body, not the session column,
+                // so replayed events keep the exact reference minted when they were queued.
+                let queued: serde_json::Value = serde_json::from_slice(&body).map_err(|e| rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Blob, Box::new(e)))?;
+                let reference = queued.get("session_ref").and_then(serde_json::Value::as_str)
+                    .ok_or(rusqlite::Error::InvalidColumnType(6, "session_ref".into(), rusqlite::types::Type::Blob))?;
                 let subject: String = r.get(1)?;
                 let mut headers = Headers::from([
                     ("kind".into(), subject.split(".event.broca.").nth(1).unwrap_or_default().trim_end_matches(".v1").into()),
                     ("epoch".into(),r.get(2)?), ("run_id".into(),r.get(3)?),
-                    ("seq".into(),r.get::<_,u64>(4)?.to_string()), ("session_ref".into(),agent_session_ref(&session)),
+                    ("seq".into(),r.get::<_,u64>(4)?.to_string()), ("session_ref".into(),reference.into()),
                 ]);
                 // A skip marker spans runs, so it names none.
                 if headers.get("run_id").is_some_and(String::is_empty) {
                     headers.remove("run_id");
                 }
-                Ok(Publication { event_key:r.get(0)?, headers, subject, body:r.get(6)?, digest: None })
+                Ok(Publication { event_key:r.get(0)?, headers, subject, body, digest: None })
             },
         ).optional()?;
         match lifecycle {
@@ -1073,6 +1104,36 @@ mod tests {
         s.enable_bus_events("box_test").unwrap();
         s
     }
+
+    #[test]
+    fn queued_v1_run_event_keeps_minted_reference_in_body_and_headers() {
+        let store = enabled();
+        store
+            .project_bus_events(
+                &session(),
+                "epoch",
+                &[start(), finish(2, RunFinishReason::Completed)],
+                2000,
+            )
+            .unwrap();
+        let old = broca_core::wal_writer::legacy_session_ref("runner", "/synthetic/old", "s1");
+        let event = store.pending_bus_event().unwrap().unwrap();
+        let mut body: serde_json::Value = serde_json::from_slice(&event.body).unwrap();
+        body["session_ref"] = old.clone().into();
+        let minted = serde_json::to_vec(&body).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE bus_event_outbox SET body=?1 WHERE event_key=?2",
+                rusqlite::params![minted, event.event_key],
+            )
+            .unwrap();
+        let queued = store.pending_bus_event().unwrap().unwrap();
+        assert_eq!(queued.body, minted);
+        assert_eq!(queued.headers["session_ref"], old);
+    }
     type OutboxRow = (String, u64, String, Vec<u8>, Option<u64>);
     fn rows(store: &SqliteStore) -> Vec<OutboxRow> {
         store.conn.lock().unwrap().prepare("SELECT event_key,seq,subject,body,published_ms FROM bus_event_outbox ORDER BY rowid").unwrap().query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap().collect::<Result<_,_>>().unwrap()
@@ -1086,6 +1147,93 @@ mod tests {
             .unwrap();
         assert!(rows(&store).is_empty());
         assert_eq!(store.bus_event_position(&session(), "epoch").unwrap(), 0);
+    }
+
+    #[test]
+    fn bus_outbox_ephemeral_sidekick_admission_keeps_inventory_complete() {
+        use broca_core::{FileWalStore, ReadOnlyWalReader, WalStore};
+        let root = broca_test_support::scratch_root()
+            .join(format!("bus-sidekick-completeness-{}", std::process::id(),));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("run-index.db");
+        drop(SqliteStore::open(&database).unwrap());
+        crate::session_refs::migrate(&database, &ReadOnlyWalReader::new(&root)).unwrap();
+        let store = Arc::new(SqliteStore::open(&database).unwrap());
+        store.enable_bus_events("box_test").unwrap();
+        store.begin_bus_event_period(500).unwrap();
+        assert!(store.session_refs(std::iter::empty()).unwrap().complete);
+
+        let session = BindIdentity::new(root.join("project"), "broca", "alfonso:sidekick-fixture");
+        let reference = agent_session_ref(&session);
+        let wal = FileWalStore::new(root.join("wal"));
+        wal.set_session_ref_index(store.clone());
+        let mut record = crate::conformance::run_started(
+            1,
+            "sidekick-run",
+            &session,
+            "sidekick input",
+            ModelHandle::new("test", "model"),
+        )
+        .record;
+        if let WalRecord::RunStarted {
+            retention, ts_ms, ..
+        } = &mut record
+        {
+            *retention = Some(3600);
+            *ts_ms = Some(1000);
+        }
+        let mut writer = wal.open_with_retention(&session, Some(3600)).unwrap();
+        writer.append(1, &record, true).unwrap();
+        drop(writer);
+        assert_eq!(
+            wal.resolve_live_path(&session)
+                .unwrap()
+                .unwrap()
+                .parent()
+                .unwrap(),
+            wal.ephemeral_root()
+        );
+        let known = store
+            .session_refs([reference.as_str()].into_iter())
+            .unwrap();
+        assert!(known.complete);
+        assert_eq!(known.sessions[&reference].1, session);
+        assert!(store.lookup_run("sidekick-run").unwrap().is_none());
+
+        // The durable-event projector can run before the actor's best-effort
+        // active-index write, even though the WAL writer recorded the session reference.
+        let records = wal.read_records(&session).unwrap();
+        store
+            .project_new_bus_events(&session, "epoch", &records, 2000)
+            .unwrap();
+        let found = store
+            .session_refs([reference.as_str()].into_iter())
+            .unwrap();
+        let flags: (u64, bool, u64) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT count(*) FROM agent_data_pending_session),
+             EXISTS(SELECT 1 FROM agent_data_census_done WHERE id=1),
+             (SELECT count(*) FROM agent_data_writer)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(
+            found.complete,
+            "event projection invalidated inventory: {flags:?}"
+        );
+        assert_eq!(flags, (0, true, 0));
+        assert_eq!(found.sessions[&reference].1, session);
+        assert_eq!(
+            store.lookup_run("sidekick-run").unwrap().unwrap().state,
+            RunIndexState::Active
+        );
+        drop(wal);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1105,6 +1253,15 @@ mod tests {
             store.lookup_run("r1").unwrap().unwrap().state,
             RunIndexState::Completed
         );
+        let reference = agent_session_ref(&session());
+        assert_eq!(
+            store
+                .session_refs([reference.as_str()].into_iter())
+                .unwrap()
+                .sessions[&reference]
+                .1,
+            session()
+        );
         for (key, _, _, body, _) in &values {
             assert_eq!(store.get_bus_event(key).unwrap().unwrap().1, *body);
             assert!(!String::from_utf8_lossy(body).contains("secret prompt"));
@@ -1118,6 +1275,20 @@ mod tests {
             .is_err());
         assert!(broken.lookup_run("r1").unwrap().is_none());
         assert_eq!(broken.bus_event_position(&session(), "epoch").unwrap(), 0);
+        assert!(broken
+            .session_refs([reference.as_str()].into_iter())
+            .unwrap()
+            .sessions
+            .is_empty());
+        let writers: u64 = broken
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM agent_data_writer", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(writers, 0);
     }
 
     struct Fake {

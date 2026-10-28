@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import pathlib
 import re
-from typing import Any, FrozenSet
+from typing import Any, Callable, FrozenSet
 
 GATED_FRAMING_VERSION = 3
 
@@ -26,23 +26,31 @@ GATED_FRAMING_VERSION = 3
 FRAMING_RS = pathlib.Path(__file__).resolve().parents[2] / "crates/broca-wal/src/framing.rs"
 
 
-def broca_known_features(source: str) -> FrozenSet[str]:
+def broca_known_features(
+    source: str, module_source: Callable[[str], str] = lambda module: ""
+) -> FrozenSet[str]:
     """The feature names in `KNOWN_FEATURES` in framing.rs, resolved through their constants.
 
     Read from the source rather than copied, because a copy goes stale: it once stayed empty
     while broca learned five names, so every WAL holding a tool call since then read as
     written by a newer build, and the live-run gate refused every restart as "cannot compare".
-    Raises ValueError when the table or one of its names cannot be found, so a renamed
-    constant fails loudly instead of quietly shrinking the table.
+    An entry may name a constant in another broca-wal module (`crate::head_proof::NAME`);
+    `module_source` returns that module's source text. Raises ValueError when the table or one
+    of its names cannot be found, so a renamed or moved constant fails loudly instead of
+    quietly shrinking the table.
     """
     table = re.search(r"pub const KNOWN_FEATURES: &\[&str\] = &\[(.*?)\];", source, re.DOTALL)
     if table is None:
         raise ValueError("KNOWN_FEATURES not found in framing.rs")
     names = set()
-    for constant in re.findall(r"[A-Z][A-Z0-9_]*", table.group(1)):
-        value = re.search(rf'pub const {constant}: &str = "([^"]+)";', source)
+    for module, constant in re.findall(
+        r"(?:crate::([a-z_][a-z0-9_]*)::)?([A-Z][A-Z0-9_]*)", table.group(1)
+    ):
+        text = module_source(module) if module else source
+        value = re.search(rf'pub const {constant}: &str = "([^"]+)";', text)
         if value is None:
-            raise ValueError(f"{constant} in KNOWN_FEATURES has no string value in framing.rs")
+            where = f"broca-wal's {module} module" if module else "framing.rs"
+            raise ValueError(f"{constant} in KNOWN_FEATURES has no string value in {where}")
         names.add(value.group(1))
     if not names:
         raise ValueError("KNOWN_FEATURES in framing.rs parsed as empty")
@@ -54,7 +62,17 @@ def broca_known_features(source: str) -> FrozenSet[str]:
 # each feature broca knows adds either an optional field or a record type none of them act on,
 # so knowing a name broca knows is always safe here. Tests patch this module attribute to
 # exercise a gated frame whose features are known.
-KNOWN_FEATURES: FrozenSet[str] = broca_known_features(FRAMING_RS.read_text())
+def _broca_wal_module_source(module: str) -> str:
+    """The source of broca-wal's `module`, as `src/<module>.rs` or `src/<module>/mod.rs`."""
+    for path in (FRAMING_RS.parent / f"{module}.rs", FRAMING_RS.parent / module / "mod.rs"):
+        if path.is_file():
+            return path.read_text()
+    return ""
+
+
+KNOWN_FEATURES: FrozenSet[str] = broca_known_features(
+    FRAMING_RS.read_text(), _broca_wal_module_source
+)
 
 
 class MalformedGatedFrame(ValueError):

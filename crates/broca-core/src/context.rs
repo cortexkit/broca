@@ -121,6 +121,250 @@ pub struct HeldEpisode {
     pub next_start: Option<u64>,
 }
 
+/// An offset snapshot's compaction selection. The base is the first ordinal after the
+/// recorded view's coverage, or the end of the applied range when no view exists;
+/// it is not the resident row count.
+/// Only locators, coordinates and seeds belong in the index, never hydrated message copies.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OffsetPromptWindow {
+    pub base: u64,
+    /// All system-message ordinals below the projection's prefix length, from the same
+    /// index snapshot. Systems remain visible even inside a replaced range.
+    pub systems: Vec<u64>,
+    /// Every episode containing a selected row, and the newest projected episode. Ends
+    /// are explicit because unselected episodes may lie between selected ones.
+    pub episodes: Vec<HeldEpisode>,
+    /// Fold state before retained ranges that skip earlier model steps, and at the newest
+    /// projected episode's end when it has steps. Missing state never means empty counters.
+    pub guidance: Vec<OffsetGuidanceCheckpoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffsetGuidanceCheckpoint {
+    /// First ordinal after the model steps represented by this observer, within its episode.
+    pub ordinal: u64,
+    /// The projection boundary that published this state, validated before it is used.
+    pub at_seq: u64,
+    pub fold: crate::tool_repetition::RepetitionCheckpoint,
+}
+
+fn offset_window_rows(
+    checkpoint: &crate::compaction::CompactionCheckpoint,
+) -> Result<HeldRowsRequest, crate::replay::SeedFallback> {
+    let bad = || crate::replay::SeedFallback {
+        reason: "offset prompt window has no complete compaction checkpoint",
+    };
+    let state = checkpoint
+        .state()
+        .filter(|s| s.thinking_boundary_complete())
+        .ok_or_else(bad)?;
+    if let Some(view) = &state.view {
+        let suffix_from = view
+            .view
+            .covers_through
+            .ordinal
+            .checked_add(1)
+            .ok_or_else(bad)?;
+        for range in &view.view.ranges {
+            let (from, to) = match range {
+                crate::compaction_provider::view::ViewRange::Keep { from, to, .. }
+                | crate::compaction_provider::view::ViewRange::Replace { from, to, .. } => {
+                    (*from, *to)
+                }
+                _ => return Err(bad()),
+            };
+            if from > to || to > suffix_from {
+                return Err(bad());
+            }
+        }
+        Ok(HeldRowsRequest {
+            keep: view
+                .view
+                .ranges
+                .iter()
+                .filter_map(|r| match r {
+                    crate::compaction_provider::view::ViewRange::Keep { from, to, .. } => {
+                        Some(*from..*to)
+                    }
+                    _ => None,
+                })
+                .collect(),
+            suffix_from,
+        })
+    } else {
+        let applied = state.applied.as_ref().ok_or_else(bad)?;
+        Ok(HeldRowsRequest {
+            keep: Vec::new(),
+            suffix_from: applied.range.to,
+        })
+    }
+}
+
+pub(crate) fn validate_offset_prompt_window(
+    window: &OffsetPromptWindow,
+    rows: &[Message],
+    seed: &crate::replay::ProjectionSeed,
+    boundary: &crate::replay::SeedBoundary,
+) -> Result<(), crate::replay::SeedFallback> {
+    let bad = || crate::replay::SeedFallback {
+        reason: "offset prompt window selection is incomplete",
+    };
+    let checkpoint = seed
+        .admission_checkpoint
+        .compaction
+        .as_ref()
+        .ok_or_else(bad)?;
+    if checkpoint
+        .state()
+        .and_then(|s| s.view.as_ref())
+        .is_some_and(|v| Some(v.view.lineage_id.as_str()) != boundary.lineage_id.as_deref())
+    {
+        return Err(crate::replay::SeedFallback {
+            reason: "offset prompt window belongs to another lineage",
+        });
+    }
+    let held = offset_window_rows(checkpoint)?;
+    if window.base != held.suffix_from
+        || window.base > seed.prefix_len
+        || window.systems.windows(2).any(|w| w[0] >= w[1])
+        || window.systems.iter().any(|o| *o >= seed.prefix_len)
+    {
+        return Err(bad());
+    }
+    if window
+        .guidance
+        .windows(2)
+        .any(|w| w[0].ordinal >= w[1].ordinal)
+        || window
+            .guidance
+            .iter()
+            .any(|g| g.at_seq != seed.watermark_seq || g.ordinal > seed.prefix_len)
+    {
+        return Err(bad());
+    }
+    let mut ranges = held.keep;
+    ranges.push(window.base..seed.prefix_len);
+    if seed.prefix_len > 0 {
+        ranges.push(seed.prefix_len - 1..seed.prefix_len);
+    }
+    ranges.extend(window.systems.iter().map(|o| *o..*o + 1));
+    ranges.sort_by_key(|r| r.start);
+    let mut merged: Vec<std::ops::Range<u64>> = Vec::new();
+    for range in ranges {
+        if range.start > range.end || range.end > seed.prefix_len {
+            return Err(bad());
+        }
+        if range.is_empty() {
+            continue;
+        }
+        if let Some(last) = merged.last_mut().filter(|last| last.end >= range.start) {
+            last.end = last.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    let mut actual = rows.iter();
+    for ordinal in merged.into_iter().flatten() {
+        let row = actual.next().ok_or_else(bad)?;
+        if row.ordinal != Some(ordinal)
+            || (row.role == broca_protocol::Role::System)
+                != window.systems.binary_search(&ordinal).is_ok()
+        {
+            return Err(bad());
+        }
+    }
+    if actual.next().is_some() {
+        return Err(bad());
+    }
+    let Some(newest) = window.episodes.last() else {
+        return Err(bad());
+    };
+    if newest.next_start.is_some()
+        || newest.projection != seed.open_episode.clone().ok_or_else(bad)?
+    {
+        return Err(bad());
+    }
+    Ok(())
+}
+
+pub(crate) fn finish_offset_prompt_window(
+    state: &mut crate::ReplayState,
+    window: OffsetPromptWindow,
+    seed: &crate::replay::ProjectionSeed,
+    checkpoint: &crate::AdmissionCheckpointV1,
+    projected: &[EpisodeRenderProjection],
+) -> Result<(), crate::replay::SeedFallback> {
+    let bad = || crate::replay::SeedFallback {
+        reason: "offset prompt window episode metadata is incomplete",
+    };
+    let before = seed
+        .admission_checkpoint
+        .compaction
+        .as_ref()
+        .and_then(|c| c.state())
+        .ok_or_else(bad)?;
+    let after = checkpoint
+        .compaction
+        .as_ref()
+        .and_then(|c| c.state())
+        .ok_or_else(bad)?;
+    if before.applied != after.applied || before.view != after.view || before.strips != after.strips
+    {
+        return Err(crate::replay::SeedFallback {
+            reason: "offset prompt window changed in the tail",
+        });
+    }
+    let render = crate::run::episode_render_inputs(projected)
+        .map_err(|_| bad())?
+        .ok_or_else(bad)?;
+    let mut episodes = Vec::with_capacity(projected.len());
+    for (i, projection) in projected.iter().enumerate() {
+        let start = projection.start().ok_or_else(bad)?;
+        let next = projected
+            .get(i + 1)
+            .and_then(|e| e.start())
+            .unwrap_or(state.extent);
+        let end = window
+            .episodes
+            .get(i)
+            .and_then(|e| e.next_start)
+            .unwrap_or(next);
+        if end < start || end > next || end > state.extent {
+            return Err(bad());
+        }
+        let first_step = projection.first_step().ok_or_else(bad)?;
+        if projection
+            .first_user()
+            .ok_or_else(bad)?
+            .is_some_and(|first| first < start || first >= end)
+        {
+            return Err(bad());
+        }
+        if first_step.is_some_and(|first| first < start || first >= end) {
+            return Err(bad());
+        }
+        episodes.push(crate::run::held_prompt::GuidanceEpisode {
+            render: render[i].clone(),
+            first_step,
+            end,
+        });
+    }
+    if state.prompt.iter().any(|m| {
+        m.ordinal.is_none_or(|o| {
+            !episodes
+                .iter()
+                .any(|e| e.render.prompt_start as u64 <= o && o < e.end)
+        })
+    }) {
+        return Err(bad());
+    }
+    state.compaction = checkpoint.compaction.clone().ok_or_else(bad)?;
+    // The validated prefix already contains Setup, including when the tail opens an episode.
+    state.tags_await_setup = false;
+    state.compaction_history = after.history.clone();
+    crate::run::restore_offset_prompt_guidance(state, episodes, seed, &window)
+}
+
 /// The held rows of a materialized prefix, read with the prefix's watermark, identity, length,
 /// counters and seeds in ONE store transaction.
 ///
@@ -791,6 +1035,20 @@ pub trait RunIndex: Send + Sync {
         retries_used: u32,
     ) -> Result<(), String>;
 
+    /// Publish content-free durable evidence atomically with the lifecycle state. Older index
+    /// implementations may omit attribution, but must still publish the terminal normally.
+    fn index_run_attributed(
+        &self,
+        run_id: &str,
+        state: RunIndexState,
+        usage: Option<Usage>,
+        final_step_finish_reason: Option<FinishReason>,
+        retries_used: u32,
+        _attribution: &RunIndexAttribution,
+    ) -> Result<(), String> {
+        self.index_run_terminal(run_id, state, usage, final_step_finish_reason, retries_used)
+    }
+
     /// Look up a run by id. `None` = unknown run (the lookup falls back to the WAL).
     fn lookup_run(&self, run_id: &str) -> Result<Option<RunIndexRow>, String>;
 
@@ -802,6 +1060,168 @@ pub trait RunIndex: Send + Sync {
     /// Boot discovery, including terminal sessions that ordinary restart scans never open.
     fn runs_with_withdrawals_owed(&self) -> Result<Vec<WithdrawalRun>, String> {
         Err("run index does not track withdrawal debt".into())
+    }
+}
+
+/// Scalar evidence from a run's frozen selection and durable lifecycle records. No provider
+/// messages, render configuration, prompts or tool payloads belong in the run-index evidence.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunIndexAttribution {
+    pub provider_module_id: Option<String>,
+    pub credential_id: Option<String>,
+    pub error_class: Option<String>,
+    pub error_code: Option<String>,
+    pub pause_reason: Option<String>,
+    pub interrupt_reason: Option<String>,
+    pub at_ms: Option<u64>,
+}
+
+impl RunIndexAttribution {
+    /// Attributing writers share this fold of durable lifecycle records. A start resets the
+    /// evidence; a later pause or terminal keeps only the frozen selection and its own facts.
+    pub fn observe(&mut self, record: &broca_wal::WalRecord) {
+        use broca_wal::WalRecord;
+        let (error, at_ms) = match record {
+            WalRecord::RunStarted { config, .. } => {
+                *self = Self {
+                    provider_module_id: Some(config.model.provider_module_id.clone()),
+                    credential_id: config
+                        .auth_selection
+                        .as_ref()
+                        .map(|s| s.credential_id.clone()),
+                    ..Self::default()
+                };
+                return;
+            }
+            WalRecord::RunPaused {
+                reason,
+                error,
+                ts_ms,
+                ..
+            } => {
+                self.pause_reason = Some(reason.as_str().into());
+                self.interrupt_reason = None;
+                (error, ts_ms)
+            }
+            WalRecord::RunFinished {
+                error,
+                ts_ms,
+                interrupt_reason,
+                ..
+            } => {
+                self.pause_reason = None;
+                self.interrupt_reason = interrupt_reason
+                    .as_deref()
+                    .filter(|reason| {
+                        matches!(
+                            *reason,
+                            "runner_shutdown"
+                                | "runner_crash"
+                                | "caller_stop"
+                                | "caller_cancel"
+                                | "cancelled"
+                        )
+                    })
+                    .map(str::to_owned);
+                (error, ts_ms)
+            }
+            _ => return,
+        };
+        self.at_ms = *at_ms;
+        if let Some(credential) = error
+            .as_ref()
+            .and_then(|error| error.credential_id.as_ref())
+        {
+            self.credential_id = Some(credential.clone());
+        }
+        self.error_class = error.as_ref().map(|error| {
+            broca_protocol::OpenErrorClass::from(error.class)
+                .as_str()
+                .to_owned()
+        });
+        // Provider codes are an open string and may echo request content. Only the closed
+        // operational vocabulary is safe to copy into a content-free index.
+        self.error_code = error
+            .as_ref()
+            .and_then(|error| error.provider_code.as_deref())
+            .filter(|code| {
+                matches!(
+                    *code,
+                    "account_limit_exhausted"
+                        | "upstream_api_key_rejected"
+                        | "rate_limit_exceeded"
+                        | "rate_limited"
+                        | "invalid_api_key"
+                        | "incorrect_api_key"
+                        | "context_length_exceeded"
+                        | "context_window_exceeded"
+                        | "billing_exhausted"
+                        | "credit_insufficient"
+                        | "credit_balance_exhausted"
+                        | "organization_spend_limit_exceeded"
+                        | "project_spend_limit_exceeded"
+                        | "usage_not_included"
+                        | "invalid_prompt"
+                        | "cyber_policy"
+                        | "bio_policy"
+                        | "misalignment_policy_violation"
+                        | "usage_limit_reached"
+                        | "content_filter"
+                        | "server_error"
+                        | "stream_too_slow"
+                        | "response_deadline"
+                        | "output_ceiling"
+                        | "previous_process_ended_unsealed"
+                        | "websocket_auth_rejected"
+                        | "request_invalid"
+                        | "previous_response_not_found"
+                        | "ENTITLEMENT_ERROR"
+                )
+            })
+            .map(str::to_owned);
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_attribution_tests {
+    use super::RunIndexAttribution;
+    use broca_wal::WalRecord;
+    use serde_json::json;
+
+    #[test]
+    fn diagnostics_shared_derivation_handles_start_pause_terminal_and_unrelated_records() {
+        let start: WalRecord = serde_json::from_value(json!({
+            "type":"run_started","run_id":"run","session":{"project_root":"/project","harness":"test","session":"session"},
+            "input":[],"config":{"model":{"provider_module_id":"openai","model_id":"model"},"tools":[],
+                "tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},
+                "context_epoch":0,"renderer_version":1,"tools_were_omitted":false,
+                "auth_selection":{"credential_id":"credential-one"}}
+        })).unwrap();
+        let mut a = RunIndexAttribution::default();
+        a.observe(&start);
+        assert_eq!(a.provider_module_id.as_deref(), Some("openai"));
+        assert_eq!(a.credential_id.as_deref(), Some("credential-one"));
+        let pause:WalRecord=serde_json::from_value(json!({"type":"run_paused","run_id":"run","reason":"auth_required","ts_ms":10,
+            "error":{"class":"auth_required","message":"PRIVATE TEXT","provider_code":"PRIVATE CODE","credential_id":"credential-two"}})).unwrap();
+        a.observe(&pause);
+        assert_eq!(a.pause_reason.as_deref(), Some("auth_required"));
+        assert_eq!(a.error_class.as_deref(), Some("auth_required"));
+        assert_eq!(a.credential_id.as_deref(), Some("credential-two"));
+        assert_eq!(a.error_code, None);
+        assert_eq!(a.at_ms, Some(10));
+        let finish: WalRecord = serde_json::from_value(
+            json!({"type":"run_finished","reason":"interrupted","ts_ms":20,
+            "usage":{},"interrupt_reason":"runner_shutdown"}),
+        )
+        .unwrap();
+        a.observe(&finish);
+        assert_eq!(a.pause_reason, None);
+        assert_eq!(a.error_class, None);
+        assert_eq!(a.interrupt_reason.as_deref(), Some("runner_shutdown"));
+        assert_eq!(a.at_ms, Some(20));
+        let prior = a.clone();
+        a.observe(&WalRecord::WriterClosed { writer_id: [0; 16] });
+        assert_eq!(a, prior);
     }
 }
 
@@ -1358,9 +1778,12 @@ fn read_session_page_from_rows(
 pub struct ToolCallDispatch {
     /// The model's id for the call. Display only: a model may reuse one id in several steps.
     pub tool_call_id: String,
-    /// The WAL sequence number of the call's own dispatch intent, when it has one. With the
-    /// lineage id it spells the call's key; see [`call_key`].
+    /// The call's dispatch-intent sequence, used with the log identity only when
+    /// the record carries no prepared key; see [`tool_call_key`].
     pub intent_seq: Option<u64>,
+    /// A prepared key preserved by the dispatch intent, when consent preparation
+    /// made the call durable before the intent was written.
+    pub recorded_call_key: Option<String>,
     /// The module the call was dispatched to, as its intent recorded it. Absent for a call never
     /// dispatched, and for one whose intent was written before broca recorded the module: that
     /// is never guessed.
@@ -1369,16 +1792,29 @@ pub struct ToolCallDispatch {
     pub indeterminate: bool,
 }
 
-/// A tool call's key: `<lineage_id>:<wal_seq>` of the call's own `ToolDispatchIntent`.
+/// An ordinary call's fallback key, from its own `ToolDispatchIntent`.
 ///
-/// Derived, never stored: the intent is the first durable record that holds the call alone
-/// (sibling calls share their step record, but each has its own intent), its sequence number is
-/// never reissued within a lineage once synced, and the lineage id tells two lineages at one
-/// address apart. So two sibling calls, and one model id recurring across steps, each get a
-/// distinct key, and a restart reads every key back unchanged. The spelling is printable ASCII
-/// well under the 256 bytes the tool-provider role allows.
+/// Ordinary calls use their own intent: sibling calls share a step record but have
+/// distinct intents. A synced sequence is never reissued, and the log identity
+/// distinguishes replacements at one address. Consent preparation can make a call
+/// durable earlier; its key is then recorded on the later intent and preserved by
+/// [`tool_call_key`]. Model ids may repeat without reusing either kind of key.
+/// The spelling is printable ASCII, below the tool-provider role's 256-byte bound.
 pub fn call_key(lineage_id: broca_wal::WalLineageId, intent_seq: u64) -> String {
-    format!("{lineage_id}:{intent_seq}")
+    tool_call_key(Some(&lineage_id.to_string()), intent_seq, None)
+        .expect("a known log identity yields a key")
+}
+
+/// Use the durable key the provider received. Approved calls retain their earlier
+/// preparation key; only records without one derive a key from their intent.
+pub fn tool_call_key(
+    lineage_id: Option<&str>,
+    intent_seq: u64,
+    recorded: Option<&str>,
+) -> Option<String> {
+    recorded
+        .map(str::to_owned)
+        .or_else(|| lineage_id.map(|lineage| format!("{lineage}:{intent_seq}")))
 }
 
 /// The dispatch facts of the committed tool turns `turns` of a replay over `framed`, keyed by
@@ -1404,18 +1840,21 @@ pub fn dispatches_of_turns(
         else {
             continue;
         };
-        let mut intents: HashMap<&str, (u64, Option<String>)> = HashMap::new();
+        let mut intents: HashMap<&str, (u64, Option<String>, Option<String>)> = HashMap::new();
         let mut resolved: HashSet<&str> = HashSet::new();
         for frame in &framed[step_index + 1..] {
             match &frame.record {
                 WalRecord::ToolDispatchIntent {
                     tool_call_id,
                     module_id,
+                    call_key,
                     ..
                 } => {
-                    intents
-                        .entry(tool_call_id.0.as_str())
-                        .or_insert((frame.seq, module_id.clone()));
+                    intents.entry(tool_call_id.0.as_str()).or_insert((
+                        frame.seq,
+                        module_id.clone(),
+                        call_key.clone(),
+                    ));
                 }
                 WalRecord::ToolResult { result, .. } => {
                     resolved.insert(result.tool_call_id.0.as_str());
@@ -1436,8 +1875,9 @@ pub fn dispatches_of_turns(
                 let intent = intents.get(id);
                 ToolCallDispatch {
                     tool_call_id: id.to_owned(),
-                    intent_seq: intent.map(|(seq, _)| *seq),
-                    dispatched_to: intent.and_then(|(_, module)| module.clone()),
+                    intent_seq: intent.map(|(seq, _, _)| *seq),
+                    recorded_call_key: intent.and_then(|(_, _, key)| key.clone()),
+                    dispatched_to: intent.and_then(|(_, module, _)| module.clone()),
                     indeterminate: intent.is_some() && !resolved.contains(id),
                 }
             })
@@ -1848,6 +2288,7 @@ pub(crate) fn merge_prefix_and_tail(
         open_tool_run: tail_state.open_tool_run,
         compaction: tail_state.compaction,
         compaction_history: tail_state.compaction_history,
+        output_reservation: tail_state.output_reservation,
         compaction_notice_floor: 1,
         manifest: None,
         on_restart: tail_state.on_restart,
@@ -1885,6 +2326,9 @@ pub(crate) fn merge_prefix_and_tail(
         // `latest_projection_boundary`), so every unplaced steer is in the tail.
         pending_steers: tail_state.pending_steers,
         resolution: tail_state.resolution,
+        // Only what the tail recorded: the materialized prefix keeps no schedule.
+        refusal_fallback: tail_state.refusal_fallback,
+        refused_steps: tail_state.refused_steps,
         committed_tool_turns: Vec::new(),
         held: None,
     };
@@ -2445,6 +2889,7 @@ mod tests {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -2505,6 +2950,7 @@ mod tests {
             },
             WalRecord::TurnFinished { step_id: StepId(1) },
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -2787,6 +3233,7 @@ mod tests {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -2837,6 +3284,7 @@ mod tests {
             // This naturally terminal no-tool step is durable but has no RunFinished, so the
             // corpus ends with a non-empty, not-yet-materialized tail.
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -3365,6 +3813,7 @@ mod tests {
             WalRecord::RunAuthRefrozen {
                 ts_ms: Some(50),
                 auth_selection: AuthSelection {
+                    auth_method: None,
                     credential_id: "chatgpt:openai".into(),
                     account_ref: Some("resumed-account".into()),
                     resolved_credential_id: None,
@@ -3379,6 +3828,7 @@ mod tests {
         assert_eq!(
             recovered.auth_selection,
             Some(AuthSelection {
+                auth_method: None,
                 credential_id: "chatgpt:openai".into(),
                 account_ref: Some("resumed-account".into()),
                 resolved_credential_id: None,
@@ -3514,6 +3964,7 @@ mod episode_merge_regression {
         let wal = vec![
             start("a", "a-model", "episode a"),
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -3662,5 +4113,27 @@ mod held_resume_tests {
             None,
             "starts out of order"
         );
+    }
+}
+
+#[cfg(test)]
+mod call_identity_tests {
+    #[test]
+    fn recorded_preparation_key_wins_and_ordinary_keys_keep_their_bytes() {
+        let lineage = "00000000-0000-4000-8000-000000000001";
+        assert_eq!(
+            super::tool_call_key(Some(lineage), 19, None).as_deref(),
+            Some("00000000-0000-4000-8000-000000000001:19")
+        );
+        let prepared = "00000000-0000-4000-8000-000000000001:5";
+        assert_eq!(
+            super::tool_call_key(Some(lineage), 21, Some(prepared)).as_deref(),
+            Some(prepared)
+        );
+        assert_eq!(
+            super::tool_call_key(None, 21, Some(prepared)).as_deref(),
+            Some(prepared)
+        );
+        assert!(super::tool_call_key(None, 19, None).is_none());
     }
 }

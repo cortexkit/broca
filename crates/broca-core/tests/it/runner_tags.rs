@@ -45,6 +45,8 @@ fn step(content: Vec<ContentBlock>, reason: FinishReason) -> Vec<NormalizedEvent
             finish_reason: reason,
             service_tier_used: None,
             speed_used: None,
+            served_model: None,
+            usage_iterations: None,
         }),
         NormalizedEvent::Control(ProviderControl::Finished {
             usage: Usage::default(),
@@ -68,6 +70,7 @@ fn lookup() -> Tool {
 /// A session's frozen plan manifest, with the plan's `render_tags` set as given.
 fn manifest(render_tags: bool) -> broca_wal::PlanManifest {
     broca_wal::PlanManifest {
+        rich_ui: None,
         plan: broca_wal::OpaqueJson::from_json_text(
             json!({"step_transform_items":[],"render_tags":render_tags}).to_string(),
         )

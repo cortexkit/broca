@@ -128,6 +128,7 @@ fn chatgpt_test_options<'a>(account_id: Option<&'a str>) -> ResolveOptions<'a> {
         media: false,
         media_profile: None,
         claude_code_persona: None,
+        anthropic_server_side_fallback: false,
         auth_method: Some(broca_catalog::live::AuthMethod::Chatgpt),
         family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
         project_id: None,
@@ -141,6 +142,7 @@ fn chatgpt_test_options<'a>(account_id: Option<&'a str>) -> ResolveOptions<'a> {
         structured_output: None,
         frozen_account_ref: None,
         clock: None,
+        refusal_fallback_model: None,
     }
 }
 
@@ -348,6 +350,7 @@ impl RunExecutor for ReauthCoreExec {
             config.renderer_version = provider.renderer_version();
             config.frozen_render_config = provider.render_config_blob();
             config.auth_selection = Some(broca_core::AuthSelection {
+                auth_method: None,
                 credential_id: "chatgpt:openai".into(),
                 account_ref: None,
                 resolved_credential_id: None,
@@ -409,6 +412,7 @@ impl RunExecutor for ReauthCoreExec {
             config.renderer_version = provider.renderer_version();
             config.frozen_render_config = provider.render_config_blob();
             config.auth_selection = Some(broca_core::AuthSelection {
+                auth_method: None,
                 credential_id: "chatgpt:openai".into(),
                 account_ref: None,
                 resolved_credential_id: None,
@@ -469,6 +473,7 @@ impl RunExecutor for ReauthCoreExec {
         let mut control = job.control;
         control.pause_for_auth_at_start = pause;
         control.auth_selection = Some(broca_core::AuthSelection {
+            auth_method: None,
             credential_id: "chatgpt:openai".into(),
             account_ref: None,
             resolved_credential_id: None,
@@ -607,7 +612,17 @@ fn registry_with_export(dir: &Path) -> (Arc<LineageRegistry>, Arc<broca_store::S
 /// `Io(NotFound)`, so `read_records(..).unwrap()` would panic on exactly the case these tests
 /// are proving. Any other read error still fails the test.
 fn no_durable_records(wal: &dyn broca_core::WalStore, session: &BindIdentity) -> bool {
-    match wal.read_records(session) {
+    holds_no_durable_records(wal.read_records(session))
+}
+
+/// The rule behind [`no_durable_records`], applied to one read of a session's log, for callers
+/// that read a log file by path (`broca_wal::replay_file`) rather than through a `WalStore`.
+/// The lineage frame that opens a log is framing, not a record, so a log a refused first send
+/// created holding only that frame reads as empty and passes; any record at all fails.
+pub(super) fn holds_no_durable_records(
+    read: Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError>,
+) -> bool {
+    match read {
         Ok(records) => records.is_empty(),
         Err(broca_wal::WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => true,
         Err(error) => panic!("reading the session WAL failed: {error}"),
@@ -2209,6 +2224,17 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // would wait out its drain ceiling.
         "system_one_batches_in_flight",
         "system_one",
+        // Private-content verdicts and marked-call outcomes for the llm_classify route. Null
+        // here because this rig serves no model-tool route; the counters themselves are
+        // asserted through the route in llm_tools_consent.
+        "llm_tools_consent",
+        // Scoped sessions counted by whether the daemon-stamped workdir matches the bind's
+        // project_root. Asserted below: its four counters exist, nothing here binds under a
+        // stamp, and no session ever overflows the per-process dedupe set.
+        "scoped_session_workdirs",
+        // This process's WAL fsyncs by cause. Asserted below: its four counters exist, and a
+        // writer that lost its channel without a shutdown (`disconnect`) never happens here.
+        "wal_fsyncs",
     ]
     .into_iter()
     .collect();
@@ -2235,6 +2261,45 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
     assert!(
         launch.contains('-') && !launch.starts_with('-') && !launch.ends_with('-'),
         "launch_id must carry both nonce components, got {launch:?}"
+    );
+    let fsyncs = metrics["wal_fsyncs"]
+        .as_object()
+        .expect("wal_fsyncs is an object");
+    assert_eq!(
+        fsyncs.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["barrier", "deadline", "disconnect", "shutdown"],
+        "wal_fsyncs carries one counter per sync cause"
+    );
+    assert!(
+        fsyncs.values().all(serde_json::Value::is_u64),
+        "every wal_fsyncs counter is a count, got {fsyncs:?}"
+    );
+    // Every writer here is shut down through its handle. A disconnect sync would mean one was
+    // dropped without that, which a healthy daemon never does.
+    assert_eq!(fsyncs["disconnect"], serde_json::json!(0));
+    let workdirs = metrics["scoped_session_workdirs"]
+        .as_object()
+        .expect("scoped_session_workdirs is an object");
+    assert_eq!(
+        workdirs.keys().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "sessions_differ",
+            "sessions_same",
+            "sessions_untracked",
+            "sessions_without_workdir"
+        ],
+        "scoped_session_workdirs carries one counter per outcome"
+    );
+    // This rig binds without a daemon stamp, so no session was compared. A non-zero
+    // `sessions_untracked` on any daemon means the dedupe set overflowed and counts are lost.
+    assert_eq!(
+        metrics["scoped_session_workdirs"],
+        serde_json::json!({
+            "sessions_differ": 0,
+            "sessions_same": 0,
+            "sessions_untracked": 0,
+            "sessions_without_workdir": 0,
+        })
     );
     assert_eq!(metrics["active_sessions"], serde_json::json!(1));
     assert_eq!(metrics["opening"], serde_json::json!(0));
@@ -2297,6 +2362,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         serde_json::json!(0)
     );
     assert_eq!(metrics["account_selection"], serde_json::Value::Null);
+    assert_eq!(metrics["llm_tools_consent"], serde_json::Value::Null);
     // Zero on a healthy daemon: any other number is a retained session kept past its expiry.
     // The count belongs to this registry's retention service, so other tests cannot raise it.
     assert_eq!(
@@ -6339,6 +6405,7 @@ async fn history_unreachable_refusal_golden_from_real_serve() {
         wal.append(
             1,
             &WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -6710,11 +6777,12 @@ async fn moved_tombstone_refuses_every_read_and_send_with_the_real_wire_golden()
 #[tokio::test]
 async fn reader_release_refuses_first_time_activation_fence_without_any_sidecar() {
     let mut route = PreparedWalRoute::start("activation-fence-wire", |_| {}).await;
-    let reference = cortexkit_role_llm_runner::session_ref(
-        "runner",
-        &route.dir.join("proj").to_string_lossy(),
-        "s1",
-    );
+    let reference =
+        cortexkit_role_llm_runner::session_ref(&cortexkit_role_llm_runner::SessionIdentity {
+            runner: "broca",
+            harness: "runner",
+            session: "s1",
+        });
     let authority = route.dir.join("agent-data/cuts/cut-a.json");
     broca_wal::migration::atomic_json(&route.dir, &authority, &serde_json::json!({"step":"imported","refs":[{"ref_kind":"broca-session","ref":reference}],"intent":{"op":"activate","request":{}}})).unwrap();
     let before = std::fs::read(&route.wal_path).unwrap();
@@ -6731,12 +6799,29 @@ async fn reader_release_refuses_first_time_activation_fence_without_any_sidecar(
 
 #[tokio::test]
 async fn pending_release_fence_outranks_a_tombstone_for_mutations_but_not_reads() {
-    let mut route = PreparedWalRoute::start("pending-release-wire", |_| {}).await;
-    let reference = cortexkit_role_llm_runner::session_ref(
-        "runner",
-        &route.dir.join("proj").to_string_lossy(),
-        "s1",
-    );
+    // A cut recorded before the v2 switch names the session by its folder-based v1
+    // reference; a newer one by its v2 reference. Both must fence the session the same way.
+    for version in ["v1", "v2"] {
+        pending_release_fence_outranks_a_tombstone_under(version).await;
+    }
+}
+
+async fn pending_release_fence_outranks_a_tombstone_under(version: &str) {
+    let mut route =
+        PreparedWalRoute::start(&format!("pending-release-wire-{version}"), |_| {}).await;
+    let reference = if version == "v1" {
+        broca_core::wal_writer::legacy_session_ref(
+            "runner",
+            &route.dir.join("proj").to_string_lossy(),
+            "s1",
+        )
+    } else {
+        cortexkit_role_llm_runner::session_ref(&cortexkit_role_llm_runner::SessionIdentity {
+            runner: "broca",
+            harness: "runner",
+            session: "s1",
+        })
+    };
     broca_wal::migration::atomic_json(&route.dir, &route.dir.join("agent-data/cuts/cut-a.json"),&serde_json::json!({"step":"exported","refs":[{"ref_kind":"broca-session","ref":reference}],"intent":{"op":"release","request":{}}})).unwrap();
     broca_wal::migration::atomic_json(
         &route.dir,
@@ -6758,10 +6843,11 @@ async fn pending_release_fence_outranks_a_tombstone_for_mutations_but_not_reads(
     .into_iter()
     .enumerate()
     {
-        let body = route.expect_error(i as u64 + 2, request).await;
+        let body = route.expect_error(i as u64 + 2, request.clone()).await;
         assert_eq!(
             String::from_utf8(body).unwrap(),
-            r#"{"code":"session_moving","message":"session is moving under cut cut-a","detail":{"cutId":"cut-a"}}"#
+            r#"{"code":"session_moving","message":"session is moving under cut cut-a","detail":{"cutId":"cut-a"}}"#,
+            "{version}: {request}"
         );
     }
     let body = route.expect_error(6, read_request()).await;
@@ -6936,11 +7022,12 @@ async fn protected_moved_route(first: &str, pending_release: bool) -> PreparedWa
     )
     .await;
     if pending_release {
-        let reference = cortexkit_role_llm_runner::session_ref(
-            "runner",
-            &route.dir.join("proj").to_string_lossy(),
-            "s1",
-        );
+        let reference =
+            cortexkit_role_llm_runner::session_ref(&cortexkit_role_llm_runner::SessionIdentity {
+                runner: "broca",
+                harness: "runner",
+                session: "s1",
+            });
         broca_wal::migration::atomic_json(&route.dir, &route.dir.join("agent-data/cuts/cut-a.json"),
             &serde_json::json!({"step":"exported","refs":[{"ref_kind":"broca-session","ref":reference}],"intent":{"op":"release","request":{}}})).unwrap();
     }

@@ -70,6 +70,7 @@ fn rich_request() -> CallOptions {
         account_ref: None,
         run_id: "run-conf-01".into(),
         step_index: 3,
+        max_output_tokens: None,
     });
     opts
 }
@@ -121,6 +122,7 @@ fn codeassist_spec() -> (ProviderSpec, ModelSpec) {
         limits: Limits::default(),
         cost: CostSchedule::default(),
         reasoning_options: Default::default(),
+        server_side_fallback: None,
         input_modalities: Default::default(),
         release_date: None,
         status: None,
@@ -166,6 +168,7 @@ fn request_id_is_per_step_but_stable() {
         account_ref: None,
         run_id: "run-conf-01".into(),
         step_index: 2,
+        max_output_tokens: None,
     });
     let mut step3 = rich_request();
     step3.step_context = Some(StepContext {
@@ -174,6 +177,7 @@ fn request_id_is_per_step_but_stable() {
         account_ref: None,
         run_id: "run-conf-01".into(),
         step_index: 3,
+        max_output_tokens: None,
     });
     let b2a = GoogleCodeAssist.render(&frozen(), &step2);
     let b2b = GoogleCodeAssist.render(&frozen(), &step2);

@@ -144,6 +144,7 @@ fn applied(version: u64, to: u64) -> WalRecord {
 
 fn completion(label: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        fallback: Default::default(),
         written_at_ms: None,
         tags: None,
         step_id: StepId(0),

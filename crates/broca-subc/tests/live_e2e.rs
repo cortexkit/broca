@@ -537,7 +537,7 @@ fn tool_result_texts(events: &[OutputEvent]) -> Vec<String> {
         .filter_map(|e| match e {
             OutputEvent::Control(ControlUnit::ToolResult { result }) => match &result.output {
                 ToolOutput::Text { text } => Some(text.clone()),
-                ToolOutput::Error { message } => Some(message.clone()),
+                ToolOutput::Error { message, .. } => Some(message.clone()),
                 _ => None,
             },
             _ => None,

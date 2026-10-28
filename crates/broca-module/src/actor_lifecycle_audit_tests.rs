@@ -315,7 +315,7 @@ impl Fixture {
             actor_jobs: Arc::default(),
             key,
             gen: 1,
-            lease: Some(lease),
+            lease: Some(ActorTenure::Lease(lease)),
             writer: Some(writer),
             executor: executor.clone(),
             wal_store: wal_store.clone(),
@@ -362,6 +362,7 @@ impl Fixture {
             restart_waiters: Vec::new(),
             restart_recovery_owns_waiters: false,
             resuming_for_late_result: false,
+            held_resume_owed: false,
             nested_exit_requested: false,
             warm_in_flight: Default::default(),
         };

@@ -45,7 +45,7 @@ use crate::{
     lease::{lease_key_for, LeaseError, LeaseStore},
     provider::Provider,
     replay::{replay, PendingTurn, ReplayResolution, ReplayState},
-    tool_plane::{BatchCtx, DispatchResult, ToolPlane, ToolPlaneError},
+    tool_plane::{BatchCtx, DispatchResult, ToolOpenGuard, ToolPlane, ToolPlaneError},
     tool_repetition::{result_bytes, RepetitionFold, RepetitionObserver},
     wal_writer::{session_addr, WalHandle, WalStore, WalWriteError},
 };
@@ -377,6 +377,7 @@ where
                     && checkpoint.head.is_some()
                     && checkpoint.compaction_complete()
                     && checkpoint.input_budget.is_some()
+                    && checkpoint.output_reservation.is_some()
                 {
                     // Only a budgeted episode can seed replay from the checkpoint at the store
                     // watermark. Decide from this pre-tail state: if the tail opens or corruptly
@@ -461,6 +462,46 @@ where
         base_watermark: 0,
         head_seq: safe_head,
         tail: Arc::new(records),
+        checkpoint_at_base: None,
+        checkpoint_at_head,
+    })
+}
+
+/// Staged offset-index admission loader. The store supplies one committed seed/boundary snapshot,
+/// a positioned durable tail and a full-read repair callback; legacy materialized-store readers
+/// continue to use `load_prior_wal_snapshot` until the offset store is wired into admission.
+pub fn load_prior_wal_snapshot_from_seed(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    seed: &crate::admission::AdmissionSeed,
+    tail: &[crate::replay::PositionedFrame],
+    safe_head: u64,
+    full_read: impl FnOnce() -> Result<Vec<broca_wal::FramedRecord>, String>,
+) -> Result<PriorWalSnapshot, String> {
+    if let Ok((mut base, head)) = seed.hydrate_with_base(read_at, tail, safe_head) {
+        let watermark = base.at_seq;
+        base.pending_fifo = Arc::new(Vec::new());
+        return Ok(PriorWalSnapshot {
+            base_watermark: watermark,
+            head_seq: safe_head,
+            tail: Arc::new(tail.iter().map(|p| p.framed.clone()).collect()),
+            checkpoint_at_base: Some(base),
+            checkpoint_at_head: head,
+        });
+    }
+    let frames = full_read()?;
+    if frames.last().map_or(0, |frame| frame.seq) != safe_head {
+        return Err(format!(
+            "full admission repair did not reach durable head {safe_head}"
+        ));
+    }
+    crate::replay::replay(&frames.iter().map(|p| p.record.clone()).collect::<Vec<_>>())
+        .map_err(|error| error.to_string())?;
+    let checkpoint_at_head =
+        crate::AdmissionCheckpointV1::from_frames(&frames).map_err(|error| error.to_string())?;
+    Ok(PriorWalSnapshot {
+        base_watermark: 0,
+        head_seq: safe_head,
+        tail: Arc::new(frames),
         checkpoint_at_base: None,
         checkpoint_at_head,
     })
@@ -858,21 +899,85 @@ pub enum RunError {
     /// The routing module refused to choose a provider account for this send. Refused before
     /// anything durable is written; the refusal says whether a later retry may be admitted.
     AccountSelectionRefused(AccountSelectionRefusal),
+    /// broca got no usable account decision from the routing module for this send (routing
+    /// unreachable, no decision within the admission budget, or a pick of a credential broca
+    /// did not offer). Refused before anything durable is written, always transient: broca
+    /// never picks an account on routing's behalf, so the caller retries the send.
+    RoutingUnavailable(RoutingUnavailable),
     /// Numbering the transcript's tags would pass `u64::MAX` (llm-runner
     /// `tags::try_number_parts`): the run is refused rather than show two parts one number.
     TagNumbering(broca_protocol::tags::NumberingOverflow),
 }
 
-/// Routing's refusal to choose an account, copied verbatim, with broca's classification.
+/// Why broca could not get a usable account decision from routing for a send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingUnavailableReason {
+    /// The route failed to open, the connection was lost, or the reply could not be decoded.
+    Unreachable,
+    /// Routing did not decide within the admission budget.
+    NoDecisionWithinBudget,
+    /// Routing chose an account broca had not offered it: a defect in routing.
+    InvalidPick,
+}
+
+impl RoutingUnavailableReason {
+    /// The `detail.reason` spelling on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unreachable => "unreachable",
+            Self::NoDecisionWithinBudget => "no_decision_within_budget",
+            Self::InvalidPick => "invalid_pick",
+        }
+    }
+}
+
+/// broca's statement that routing could not answer for a send, as opposed to routing's own
+/// refusal ([`AccountSelectionRefusal`]). Always transient.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingUnavailable {
+    pub reason: RoutingUnavailableReason,
+    /// The admission budget that ran out, only for
+    /// [`RoutingUnavailableReason::NoDecisionWithinBudget`].
+    pub budget_ms: Option<u64>,
+}
+
+impl RoutingUnavailable {
+    pub fn unreachable() -> Self {
+        Self {
+            reason: RoutingUnavailableReason::Unreachable,
+            budget_ms: None,
+        }
+    }
+
+    pub fn no_decision_within_budget(budget_ms: u64) -> Self {
+        Self {
+            reason: RoutingUnavailableReason::NoDecisionWithinBudget,
+            budget_ms: Some(budget_ms),
+        }
+    }
+
+    pub fn invalid_pick() -> Self {
+        Self {
+            reason: RoutingUnavailableReason::InvalidPick,
+            budget_ms: None,
+        }
+    }
+}
+
+/// Routing's refusal to choose an account, with its original detail and broca's retry hints.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountSelectionRefusal {
     /// Routing's refusal code, for example `account_hold`.
     pub routing_code: String,
-    /// Routing's `retry_after_s`, when it sent one.
+    /// The preferred wait in seconds, from routing's deadline or its `retry_after_s`.
     pub retry_after_s: Option<u64>,
+    /// Routing's reset time, when supplied, in Unix epoch milliseconds.
+    pub resets_at_ms: Option<u64>,
+    /// Routing's original structured detail, including fields unknown to this broca build.
+    pub routing_detail: Option<Box<serde_json::Value>>,
     /// Routing's decision id, when it sent one.
     pub decision_id: Option<String>,
-    /// [`ErrorClass::Transient`] or [`ErrorClass::Permanent`].
+    /// The retry/auth classification of routing's refusal.
     pub class: ErrorClass,
 }
 
@@ -897,7 +1002,8 @@ impl RunError {
             | Self::Lease(_)
             | Self::Wal(_)
             | Self::Panicked
-            | Self::Transient(_) => ErrorClass::Transient,
+            | Self::Transient(_)
+            | Self::RoutingUnavailable(_) => ErrorClass::Transient,
             Self::AccountSelectionRefused(refusal) => refusal.class,
         }
     }
@@ -946,6 +1052,11 @@ impl std::fmt::Display for RunError {
                 "account_selection_refused: routing refused to choose a provider account ({})",
                 refusal.routing_code
             ),
+            RunError::RoutingUnavailable(unavailable) => write!(
+                f,
+                "routing_unavailable: the routing module gave no usable account decision ({})",
+                unavailable.reason.as_str()
+            ),
         }
     }
 }
@@ -954,6 +1065,10 @@ impl From<WalWriteError> for RunError {
     fn from(e: WalWriteError) -> Self {
         match e {
             WalWriteError::Failed(detail) => RunError::Wal(detail),
+            WalWriteError::RelocationIncomplete { reason } => RunError::Transient(reason),
+            WalWriteError::ProofPathUnavailable => {
+                RunError::Wal(WalWriteError::ProofPathUnavailable.to_string())
+            }
             WalWriteError::SessionTooLarge { max_bytes } => RunError::SessionTooLarge { max_bytes },
             WalWriteError::RetainedSessionTooLarge { max_bytes } => {
                 RunError::RetainedSessionTooLarge { max_bytes }
@@ -967,6 +1082,9 @@ impl From<broca_wal::WalError> for RunError {
     /// failure, corruption included, stays [`RunError::Wal`] with its text, exactly as before.
     fn from(error: broca_wal::WalError) -> Self {
         match error {
+            error @ broca_wal::WalError::RelocationIncomplete { .. } => {
+                RunError::Transient(error.to_string())
+            }
             broca_wal::WalError::NewerWriter { missing, .. } => RunError::NewerWriter { missing },
             other => RunError::Wal(other.to_string()),
         }
@@ -1450,6 +1568,113 @@ where
         out,
         on_admitted,
         prior_snapshot,
+        None,
+    )
+    .await
+}
+
+/// Opt-in overhaul resume seam. The reader supplies one offset-index snapshot; reconstruction
+/// validates the boundary before using the seed and falls back to a complete WAL read if
+/// snapshot loading or validation fails.
+/// Legacy entry points never install this reader.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_loop_from_offsets<P, T, L, A, W>(
+    req: RunRequest,
+    mode: StartMode,
+    provider: &P,
+    tool_plane: &T,
+    lease_store: &L,
+    approval: &A,
+    wal_store: &W,
+    control: RunControl,
+    out: &mpsc::Sender<OutputEvent>,
+    on_admitted: Option<tokio::sync::oneshot::Sender<Result<RunId, RunError>>>,
+    offsets: &dyn crate::resume::OffsetResumeReader,
+) -> Result<RunSummary, RunError>
+where
+    P: Provider,
+    T: ToolPlane,
+    L: LeaseStore,
+    A: ApprovalPolicy,
+    W: WalStore,
+{
+    if !wal_store.wal_config().is_overhaul() {
+        return Err(RunError::Wal(
+            "offset resume requires a broca-state/2 root".into(),
+        ));
+    }
+    let lease = lease_store
+        .acquire(&lease_key_for(&req.session))
+        .map_err(|e| match e {
+            LeaseError::Held { .. } => RunError::LeaseHeld(req.session.session.clone()),
+            other => RunError::Lease(other.to_string()),
+        })?;
+    let wal = wal_store.open(&req.session).map_err(RunError::from)?;
+    let mut writer =
+        WalHandle::spawn_in_store(wal, wal_store, &req.session, lease.epoch(), Some(lease))
+            .map_err(|e| RunError::Wal(e.to_string()))?;
+    writer.bind_media_capture(wal_store, &req.session);
+    let result = run_loop_on_writer_from_offsets(
+        req,
+        &writer,
+        mode,
+        provider,
+        tool_plane,
+        approval,
+        wal_store,
+        control,
+        out,
+        on_admitted,
+        offsets,
+    )
+    .await;
+    writer.shutdown().await.map_err(RunError::from)?;
+    result
+}
+
+/// Coordinator-owned-writer variant of [`run_loop_from_offsets`]. The caller retains the
+/// writer lifecycle and lease; terminal durability is identical to the legacy writer entry.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_loop_on_writer_from_offsets<P, T, A, W>(
+    mut req: RunRequest,
+    writer: &WalHandle,
+    mode: StartMode,
+    provider: &P,
+    tool_plane: &T,
+    approval: &A,
+    wal_store: &W,
+    control: RunControl,
+    out: &mpsc::Sender<OutputEvent>,
+    on_admitted: Option<tokio::sync::oneshot::Sender<Result<RunId, RunError>>>,
+    offsets: &dyn crate::resume::OffsetResumeReader,
+) -> Result<RunSummary, RunError>
+where
+    P: Provider,
+    T: ToolPlane,
+    A: ApprovalPolicy,
+    W: WalStore,
+{
+    if !wal_store.wal_config().is_overhaul() {
+        return Err(RunError::Wal(
+            "offset resume requires a broca-state/2 root".into(),
+        ));
+    }
+    let (append_episode, auth_resolved) = mode.flags();
+    run_on_writer(
+        &mut req,
+        writer,
+        append_episode,
+        auth_resolved,
+        provider,
+        tool_plane,
+        approval,
+        wal_store,
+        None,
+        &control,
+        out,
+        on_admitted,
+        None,
+        Some(offsets),
     )
     .await
 }
@@ -1473,6 +1698,7 @@ async fn run_on_writer<P, T, A, W>(
     out: &mpsc::Sender<OutputEvent>,
     on_admitted: Option<tokio::sync::oneshot::Sender<Result<RunId, RunError>>>,
     prior_snapshot: Option<&PriorWalSnapshot>,
+    offsets: Option<&dyn crate::resume::OffsetResumeReader>,
 ) -> Result<RunSummary, RunError>
 where
     P: Provider,
@@ -1500,13 +1726,24 @@ where
     #[cfg(feature = "test-clock")]
     let control = &test_control;
     // A guard also covers unwind and task abort, where an async cleanup call cannot run.
-    struct RunTransportGuard<'a, P: Provider>(&'a P);
+    struct RunTransportGuard<'a, P: Provider> {
+        provider: &'a P,
+        completed: bool,
+    }
     impl<P: Provider> Drop for RunTransportGuard<'_, P> {
         fn drop(&mut self) {
-            self.0.close_run_transport();
+            if self.completed {
+                self.provider.complete_run_transport();
+            } else {
+                self.provider.close_run_transport();
+            }
         }
     }
-    let _transport_guard = RunTransportGuard(provider);
+    let mut transport_guard = RunTransportGuard {
+        provider,
+        completed: false,
+    };
+    provider.bind_run_transport(&req.session);
     // If the run can't even reconstruct its resume state (a WAL read / replay failure
     // BEFORE any RunStarted barrier), the run never durably admits — fire the
     // admission-ack with the error so the coordinator replies an error, not a ghost
@@ -1518,6 +1755,7 @@ where
         wal_store,
         store.clone(),
         prior_snapshot,
+        offsets,
     )
     .await;
     let (mut prior, is_resume, mut append_episode, last_input, approval_frames) = match reconstruct
@@ -1595,7 +1833,7 @@ where
     // RunPaused) is durable before the terminal is observable. The writer is NOT shut down
     // here; that's the caller's lifecycle decision (per-run wrapper shuts it down, the
     // coordinator keeps it live for the next episode).
-    run_body_with_projector(
+    let result = run_body_with_projector(
         req,
         prior,
         last_input,
@@ -1613,7 +1851,11 @@ where
         on_admitted,
         approval_frames,
     )
-    .await
+    .await;
+    transport_guard.completed = result.as_ref().is_ok_and(|summary| {
+        summary.reason == RunFinishReason::Completed && summary.paused.is_none()
+    });
+    result
 }
 
 type ReconstructedPrior = (
@@ -1631,39 +1873,74 @@ async fn reconstruct_prior<W>(
     wal_store: &W,
     store: Option<Arc<dyn SessionStore>>,
     prior_snapshot: Option<&PriorWalSnapshot>,
+    offsets: Option<&dyn crate::resume::OffsetResumeReader>,
 ) -> Result<ReconstructedPrior, RunError>
 where
     W: WalStore,
 {
     require_agent_run_scope_writer(req.scope.as_ref())?;
-    let snapshot = match prior_snapshot {
-        Some(snapshot) if prior_snapshot_matches_writer_head(writer, snapshot) => snapshot.clone(),
-        Some(_) => {
-            // A reserved append can make a snapshot stale before the writer task has flushed it.
-            // The barrier makes the retry's head authoritative before the loader tries the store
-            // checkpoint and its WAL suffix once more.
-            let safe_head = writer
-                .sync()
-                .await
-                .map_err(|error| RunError::Wal(error.to_string()))?;
-            let retried =
-                load_prior_wal_snapshot(wal_store, &req.session, safe_head, store.as_deref())
-                    .map_err(RunError::Wal)?;
-            if prior_snapshot_matches_writer_head(writer, &retried) {
-                retried
-            } else {
+    let mut offset_prior = None;
+    let snapshot = if let Some(offsets) = offsets {
+        let safe_head = writer
+            .sync()
+            .await
+            .map_err(|e| RunError::Wal(e.to_string()))?;
+        let loaded = offsets.snapshot(safe_head).and_then(|snapshot| {
+            if writer.lineage_id().map(|id| id.to_string()) != snapshot.boundary.lineage_id {
+                return Err(crate::replay::SeedFallback {
+                    reason: "offset resume writer lineage mismatch",
+                });
+            }
+            crate::resume::reconstruct_from_offsets(
+                &|off, len| offsets.read_at(off, len),
+                snapshot,
+                safe_head,
+            )
+        });
+        match loaded {
+            Ok(loaded) => {
+                offsets.reconstructed(None);
+                writer.seed_display_placement(safe_head, loaded.placement);
+                offset_prior = Some(loaded.prior);
+                loaded.snapshot
+            }
+            Err(reason) => {
+                offsets.reconstructed(Some(reason));
                 complete_snapshot(wal_store, &req.session)?
             }
         }
-        None if store.is_some() => {
-            let safe_head = writer
-                .sync()
-                .await
-                .map_err(|error| RunError::Wal(error.to_string()))?;
-            load_prior_wal_snapshot(wal_store, &req.session, safe_head, store.as_deref())
-                .map_err(RunError::Wal)?
+    } else {
+        match prior_snapshot {
+            Some(snapshot) if prior_snapshot_matches_writer_head(writer, snapshot) => {
+                snapshot.clone()
+            }
+            Some(_) => {
+                // A reserved append can make a snapshot stale before the writer task has flushed it.
+                // The barrier makes the retry's head authoritative before the loader tries the store
+                // checkpoint and its WAL suffix once more.
+                let safe_head = writer
+                    .sync()
+                    .await
+                    .map_err(|error| RunError::Wal(error.to_string()))?;
+                let retried =
+                    load_prior_wal_snapshot(wal_store, &req.session, safe_head, store.as_deref())
+                        .map_err(RunError::Wal)?;
+                if prior_snapshot_matches_writer_head(writer, &retried) {
+                    retried
+                } else {
+                    complete_snapshot(wal_store, &req.session)?
+                }
+            }
+            None if store.is_some() => {
+                let safe_head = writer
+                    .sync()
+                    .await
+                    .map_err(|error| RunError::Wal(error.to_string()))?;
+                load_prior_wal_snapshot(wal_store, &req.session, safe_head, store.as_deref())
+                    .map_err(RunError::Wal)?
+            }
+            None => complete_snapshot(wal_store, &req.session)?,
         }
-        None => complete_snapshot(wal_store, &req.session)?,
     };
 
     require_agent_run_scope_writer(
@@ -1689,7 +1966,9 @@ where
         other => other,
     };
     writer.seed_lineage_tags(lineage_tags);
-    seed_display_placement(writer, &snapshot, wal_store, store.as_deref(), &req.session);
+    if offset_prior.is_none() {
+        seed_display_placement(writer, &snapshot, wal_store, store.as_deref(), &req.session);
+    }
     let episode = snapshot.checkpoint_at_head.last_episode.as_ref();
     let is_resume = episode.is_some();
     let last_input = episode.map(|episode| episode.input.clone());
@@ -1767,6 +2046,7 @@ where
     }
 
     let mut prior = match store {
+        _ if offset_prior.is_some() => offset_prior.take().expect("checked offset prior"),
         _ if held_prior.is_some() => held_prior.take().expect("checked held prior"),
         _ if held_needs_replay => {
             replay_complete_snapshot_or_wal(&snapshot, wal_store, &req.session)?
@@ -1863,6 +2143,15 @@ where
             RunError::Wal("admission checkpoint has no session input accounting".into())
         })?;
     writer.seed_input_token_limit(prior.input_budget.limit);
+    // Store and held-row replay see only the WAL tail. The checkpoint folds the same records
+    // as full replay, including the measured request that may already be in the prefix.
+    prior.output_reservation = snapshot
+        .checkpoint_at_head
+        .output_reservation
+        .clone()
+        .ok_or_else(|| {
+            RunError::Wal("admission checkpoint has no output reservation history".into())
+        })?;
     if let Some(compaction) = &snapshot.checkpoint_at_head.compaction {
         prior.compaction = compaction.clone();
         if let Some(state) = compaction.state() {
@@ -1976,7 +2265,7 @@ async fn store_episode_render_history(
 /// The render inputs of an episode projection read from the store, or `Ok(None)` when one of
 /// its values was never computed or the episodes are out of order, so the caller replays the
 /// WAL instead.
-fn episode_render_inputs(
+pub(crate) fn episode_render_inputs(
     stored: &[crate::context::EpisodeRenderProjection],
 ) -> Result<Option<Vec<broca_protocol::request::EpisodeRenderInput>>, String> {
     if stored.is_empty()
@@ -2077,11 +2366,9 @@ where
     // acquires the session). The coordinator uses `run_loop_on_writer` instead with a
     // session-scoped writer it shuts down once at session close.
     let wal = wal_store.open(&req.session).map_err(RunError::from)?;
-    let mut writer = match owned_lease {
-        Some(lease) => WalHandle::spawn_with_lease(wal, lease),
-        None => WalHandle::spawn(wal, lease_epoch),
-    }
-    .map_err(|error| RunError::Wal(error.to_string()))?;
+    let mut writer =
+        WalHandle::spawn_in_store(wal, wal_store, &req.session, lease_epoch, owned_lease)
+            .map_err(|error| RunError::Wal(error.to_string()))?;
     writer.bind_media_capture(wal_store, &req.session);
 
     let mode = if append_episode {
@@ -2106,6 +2393,7 @@ where
         &control,
         out,
         None, // the per-run wrapper has no coordinator awaiting admission
+        None,
         None,
     ))
     .await;
@@ -2993,6 +3281,17 @@ where
     A: ApprovalPolicy,
 {
     held_prompt::release_read_metadata(&mut prior);
+    // The session's client-side refusal-fallback schedule as replay left it (see
+    // `crate::refusal_fallback`). A fresh episode applies the admission rules to it once its
+    // `RunStarted` is durable; a resumed one already has them applied by replay.
+    let mut refusal_schedule = prior.refusal_fallback.clone();
+    // A resumed episode's steps that a durable `ModelStepRefused` already re-sent to the
+    // fallback model: they go there again, and are never refused a second time.
+    let refused_steps = if is_resume && !append_episode {
+        prior.refused_steps.clone()
+    } else {
+        Default::default()
+    };
     if !is_resume && req.retention.is_some() && writer.is_retention_lineage() == Some(false) {
         return Err(RunError::Config(
             "retention disagrees with the lineage's frozen policy".into(),
@@ -3035,6 +3334,29 @@ where
             None => Vec::new(),
         }),
     };
+    let mut resumed_attempts = std::collections::HashMap::<StepId, u32>::new();
+    if is_resume && !append_episode {
+        // Step ids restart for each episode. Continue after the largest durable
+        // ordinal of this episode, including attempts of an uncommitted resend.
+        for frame in approval_frames.iter() {
+            match &frame.record {
+                WalRecord::RunStarted { .. } => resumed_attempts.clear(),
+                WalRecord::ModelAttemptFinished {
+                    step_id, attempt, ..
+                } => {
+                    let next = attempt.checked_add(1).ok_or_else(|| {
+                        RunError::Config(format!(
+                            "model attempt ordinal exhausted for step {}",
+                            step_id.0
+                        ))
+                    })?;
+                    let known = resumed_attempts.entry(*step_id).or_default();
+                    *known = (*known).max(next);
+                }
+                _ => {}
+            }
+        }
+    }
     if is_resume && !append_episode {
         let mut held =
             crate::resume::closing_held_replies(approval_frames.iter().map(|frame| &frame.record));
@@ -3449,6 +3771,10 @@ where
     // between boundaries estimates the next one.
     let mut notice_request_bytes = 0usize;
     let mut compaction_history = prior.compaction_history.clone();
+    // What the output reservation estimates the next request from; kept current below from
+    // the attempt and step records this run writes, exactly as replay folds them.
+    let mut output_history = prior.output_reservation.clone();
+    output_history.seed_from_compaction(&compaction_history);
     let compaction_item = frozen_hooks
         .map(|manifest| crate::compaction::item(manifest))
         .transpose()
@@ -4370,6 +4696,10 @@ where
         // synced, reclaim the vector when no observer retained the record; otherwise the mutable
         // prompt takes its own copy only after the record is durable.
         let episode_input = Arc::new(episode_input);
+        // Read once: the record carries it, and the refusal-fallback admission rules below
+        // compare the schedule against the same value replay will.
+        let admitted_at_ms = control.now_ms();
+        output_history.start_run(&cfg.model);
         let (run_started_seq, input_tags) = writer.record_tagged(WalRecord::RunStarted {
             written_at_ms: req
                 .input_written_at_ms
@@ -4403,7 +4733,7 @@ where
             title: req.title.clone(),
             project_id: req.project_id.clone(),
             principal: req.principal.clone(),
-            ts_ms: control.now_ms(),
+            ts_ms: admitted_at_ms,
             run_id: resolved_run_id.clone(),
             session: req.session.clone(),
             config: remember_warm_config(
@@ -4463,6 +4793,11 @@ where
         if let Some(reporter) = &control.account_reporter {
             reporter.run_started(writer.lineage_id(), run_started_seq);
         }
+        refusal_schedule = crate::refusal_fallback::on_episode_admitted(
+            refusal_schedule.take(),
+            &cfg.model,
+            admitted_at_ms,
+        );
 
         // The run is now durably ADMITTED — RunStarted+config+input are fsynced. Signal the
         // coordinator so it can reply `active{run_id}` + commit the durable run-index row
@@ -4908,7 +5243,7 @@ where
             }
         }};
     }
-    let reason = loop {
+    let reason = 'steps: loop {
         input_budget.limit = writer.input_token_limit().or(input_budget.limit);
         // A session budget is independent of episode counters and reminder inheritance.
         if let Some(detail) = input_budget.exhausted() {
@@ -5091,6 +5426,7 @@ where
         opts_mut.step_context = Some(broca_protocol::StepContext {
             run_id: resolved_run_id.0.clone(),
             step_index: step_id.0,
+            max_output_tokens: None,
             session_address: Some(session_addr(&req.session)),
             credential_id: run_credential_id.clone(),
             account_ref: run_account_ref.clone(),
@@ -5196,6 +5532,15 @@ where
                 }
             }
             let state = compaction_state.as_mut().expect("Setup is durable");
+            // The run's frozen account, when its selection names a subscription account with a
+            // vault-served account id. Rides and notices compare it against the durable last
+            // notice's account, so a restart rebuilds both sides from the WAL instead of memory.
+            // Unknown runs (no routing selection, or an unrouted credential) clear it to `None`
+            // and send neither cause nor event, leaving the last known account in place.
+            state.current_account = control
+                .auth_selection
+                .as_ref()
+                .and_then(crate::compaction::view::selection_account_label);
             let session_ref = crate::wal_writer::agent_session_ref(&req.session);
             // Ride when the prefix is being rewritten anyway, then fetch the newest announced
             // view with `view.get`; either is offered here, at the boundary, and recorded before
@@ -5389,13 +5734,34 @@ where
         let session = &req.session;
         let attempt_run_id = &resolved_run_id;
         let completed_attempt_time = std::sync::Mutex::new(None);
+        // Both a live resend and a resumed one continue after durable attempt evidence.
+        let next_attempt = resumed_attempts.remove(&step_id).unwrap_or(0);
+        let step_attempts = std::sync::atomic::AtomicU32::new(next_attempt);
+        // How many `thinking_dropped` input transformations the step's completed attempt
+        // reported, when it reported its transformations at all.
+        let thinking_dropped = std::sync::Mutex::new(None::<usize>);
+        // The body length of this step's latest attempt, for the output reservation's next
+        // estimate (replay reads it from the same `ModelAttemptFinished` records).
+        let last_attempt_bytes = std::sync::Mutex::new(None);
         let record_attempt = |attempt: broca_protocol::ModelAttempt| -> AttemptFuture<'_> {
+            step_attempts.fetch_max(
+                attempt.attempt.saturating_add(1),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            *last_attempt_bytes.lock().unwrap() = Some(attempt.request_body_len);
             if matches!(
                 attempt.outcome,
                 broca_protocol::AttemptOutcome::Complete
                     | broca_protocol::AttemptOutcome::ToolArgsTrailingGarbage
             ) {
                 *completed_attempt_time.lock().unwrap() = Some(attempt.ts_ms);
+                *thinking_dropped.lock().unwrap() =
+                    attempt.input_transformations.as_ref().map(|entries| {
+                        entries
+                            .iter()
+                            .filter(|entry| entry.kind.as_deref() == Some("thinking_dropped"))
+                            .count()
+                    });
             }
             Box::pin(async move {
                 if let Some(warm) = &control.keep_warm {
@@ -5425,11 +5791,153 @@ where
         // before either await arm so the wrapper cannot duplicate its large inline frame.
         let mut schema_resent = false;
         let mut schema_prior_retries = 0;
+        // Client-side refusal fallback (see `crate::refusal_fallback`). Only an episode that
+        // froze a fallback at admission has a `fallback_model`; every other run skips all of
+        // this, and its steps, records and bytes are exactly what they were without it.
+        let fallback_model = provider.refusal_fallback_model();
+        // A prompt that already fills the fallback model's window would only overflow it.
+        let fallback_fits = match (
+            provider.refusal_fallback_context_limit(),
+            compaction_history
+                .previous_native_usage
+                .and_then(|usage| usage.fill_tokens()),
+        ) {
+            (Some(limit), Some(fill)) => fill < limit,
+            _ => true,
+        };
+        // Set once this step has been refused and re-sent, live or before a crash: a step is
+        // re-sent at most once, and a refusal on the re-send passes through.
+        let mut fallback_resent = refused_steps.contains(&step_id);
+        let mut step_route = crate::refusal_fallback::StepRoute::Source;
+        let mut route_reason = broca_wal::StepRouteReason::Schedule;
+        if let Some(fallback) = &fallback_model {
+            let scheduled = fallback_resent
+                || crate::refusal_fallback::route(refusal_schedule.as_ref(), true)
+                    == crate::refusal_fallback::StepRoute::Fallback;
+            if scheduled && fallback_fits {
+                step_route = crate::refusal_fallback::StepRoute::Fallback;
+                if fallback_resent {
+                    route_reason = broca_wal::StepRouteReason::Refusal;
+                }
+            } else if scheduled {
+                tracing::warn!(
+                    target: "broca::refusal_fallback",
+                    session = %req.session.session,
+                    run_id = %resolved_run_id.0,
+                    step_id = step_id.0,
+                    source = %cfg.model.model_id,
+                    fallback = %fallback.model_id,
+                    "refusal fallback skipped: prompt exceeds {} context",
+                    fallback.model_id
+                );
+            }
+            provider.set_step_route(step_route);
+        }
+        let mut refusal_prior_retries = 0u32;
+        let mut first_attempt = next_attempt;
         let step = loop {
+            // A fallback step tells the renderer which model it is rendering for, as the
+            // recorded request a cache warm rebuilds does.
+            let (step_model, step_context_limit) = match (&fallback_model, step_route) {
+                (Some(fallback), crate::refusal_fallback::StepRoute::Fallback) => {
+                    (fallback, provider.refusal_fallback_context_limit())
+                }
+                _ => (&cfg.model, context_limit),
+            };
+            let mut step_opts = match (&fallback_model, step_route) {
+                (Some(fallback), crate::refusal_fallback::StepRoute::Fallback) => {
+                    Arc::new(CallOptions {
+                        target_model: Some(fallback.clone()),
+                        ..(**sent_opts).clone()
+                    })
+                }
+                _ => Arc::clone(sent_opts),
+            };
+            // Keep the step's output reservation inside the context limit: lower its cap when the
+            // estimated input plus the frozen cap would pass the limit, or end the run
+            // `context_overflow` without sending when not even the provider's floor fits.
+            //
+            // A cap this step already recorded is what an earlier attempt of it sent, so a resume
+            // renders it again even when it cannot estimate the request itself.
+            let recorded_cap = output_history.recorded_for(step_id);
+            let mut fresh_clamp = None;
+            if let (Some(limits), Some(context_limit)) =
+                (provider.output_limits(), step_context_limit)
+            {
+                // The estimate costs a render of the whole request, so it is made only when a
+                // measured earlier step on this model makes one possible. A compaction boundary
+                // already rendered the request, unless refusal fallback changed its route.
+                let estimate = output_history
+                    .has_measurement(step_model)
+                    .then(|| {
+                        let bytes = match &model_opts {
+                            Some(_) if fallback_model.is_none() => notice_request_bytes,
+                            _ => provider.render_request(&step_opts).len(),
+                        };
+                        output_history.estimate(bytes, step_model)
+                    })
+                    .flatten();
+                match estimate.map(|estimate| {
+                    (
+                        estimate,
+                        crate::output_reservation::decide(limits, context_limit, estimate),
+                    )
+                }) {
+                    Some((
+                        estimate,
+                        crate::output_reservation::Reservation::Overflow { available, floor },
+                    )) => {
+                        let error =
+                            output_reservation_overflow(estimate, available, floor, context_limit);
+                        let _ = send(
+                            out,
+                            OutputEvent::Control(ControlUnit::Error {
+                                error: error.clone().into(),
+                            }),
+                        )
+                        .await;
+                        terminal_error = Some(error);
+                        break 'steps RunFinishReason::Error;
+                    }
+                    Some((
+                        estimate,
+                        crate::output_reservation::Reservation::Clamped { max_output_tokens },
+                    )) => fresh_clamp = Some((max_output_tokens, estimate, context_limit)),
+                    Some((_, crate::output_reservation::Reservation::Unchanged)) | None => {}
+                }
+            }
+            // Only a request that now needs less than the recorded cap lowers it further.
+            let step_cap = match (recorded_cap, fresh_clamp) {
+                (Some(recorded), Some((fresh, ..))) => Some(recorded.min(fresh)),
+                (Some(recorded), None) => Some(recorded),
+                (None, Some((fresh, ..))) => Some(fresh),
+                (None, None) => None,
+            };
+            if let Some(cap) = step_cap {
+                if recorded_cap != Some(cap) {
+                    let (_, estimated_input_tokens, context_limit) =
+                        fresh_clamp.expect("a cap below the recorded one comes from a fresh clamp");
+                    writer.record(WalRecord::OutputReservationClamped {
+                        step_id,
+                        max_output_tokens: cap,
+                        estimated_input_tokens,
+                        context_limit,
+                    });
+                    // Durable before the request is sent, so a resume and any rebuild of this
+                    // step's request render the cap the provider saw.
+                    writer.sync().await?;
+                    output_history.note_recorded(step_id, cap);
+                }
+                let sent = Arc::make_mut(&mut step_opts);
+                if let Some(step_context) = sent.step_context.as_mut() {
+                    step_context.max_output_tokens = Some(cap);
+                }
+            }
             let model_step = Box::pin(run_step_watched(
                 provider,
                 step_id,
-                sent_opts,
+                &step_opts,
+                first_attempt,
                 control,
                 out,
                 &record_attempt,
@@ -5462,10 +5970,103 @@ where
                     continue;
                 }
             }
+            // A plain refusal on the source model: re-send this same step to the fallback
+            // model. The refused content is not committed or stored; only its billed usage and
+            // the schedule it arms are, in a record synced before the re-send. A run resumed
+            // after a crash that followed that sync sends the step to the fallback model; one
+            // resumed after a crash before it sends the step to the source model again.
+            // A refusal after a completed tool call commits as a tool step instead (below), and
+            // one on the fallback model commits as today. This runs before post-assistant
+            // hooks, so a hook never sees the refused message, only the fallback's answer.
+            if let (
+                Some(fallback),
+                StepOutcome::Completed {
+                    message,
+                    usage,
+                    retries_used,
+                    served_model,
+                    usage_iterations,
+                    finish_reason: Some(FinishReason::ContentFilter),
+                    ..
+                },
+            ) = (&fallback_model, &step)
+            {
+                let no_tool_calls = message.tool_calls().next().is_none();
+                if step_route == crate::refusal_fallback::StepRoute::Source
+                    && no_tool_calls
+                    && !fallback_resent
+                    && !fallback_fits
+                {
+                    tracing::warn!(
+                        target: "broca::refusal_fallback",
+                        session = %req.session.session,
+                        run_id = %resolved_run_id.0,
+                        step_id = step_id.0,
+                        source = %cfg.model.model_id,
+                        fallback = %fallback.model_id,
+                        "refusal fallback skipped: prompt exceeds {} context",
+                        fallback.model_id
+                    );
+                }
+                if step_route == crate::refusal_fallback::StepRoute::Source
+                    && no_tool_calls
+                    && !fallback_resent
+                    && fallback_fits
+                {
+                    let now = control.now_ms().filter(|at| *at != 0);
+                    let schedule = crate::refusal_fallback::on_source_refusal(
+                        refusal_schedule.as_ref(),
+                        &cfg.model,
+                        fallback,
+                        now,
+                    );
+                    let usage =
+                        broca_protocol::usage::step_usage(*usage, usage_iterations.as_deref());
+                    writer.record(WalRecord::ModelStepRefused {
+                        step_id,
+                        usage,
+                        served_model: served_model.clone(),
+                        usage_iterations: usage_iterations.clone(),
+                        discarded_blocks: message.content.len() as u32,
+                        schedule: schedule.clone(),
+                        ts_ms: now,
+                    });
+                    // Barrier: the re-send is authorized only by the durable refusal.
+                    writer.sync().await?;
+                    // The refused attempt's deltas already reached display subscribers.
+                    let _ = send(out, OutputEvent::Display(DisplayEvent::DisplayReset)).await;
+                    log_schedule(
+                        format!(
+                            "content filter on {}; re-sending step on {}",
+                            cfg.model.model_id, fallback.model_id
+                        ),
+                        &req.session,
+                        &resolved_run_id,
+                        step_id,
+                        &schedule,
+                        None,
+                    );
+                    // The refused call was billed: it counts toward the run's totals and its
+                    // input budget, as replay counts the record.
+                    total_usage += usage;
+                    input_budget.observe(usage);
+                    refusal_prior_retries = *retries_used;
+                    refusal_schedule = Some(schedule);
+                    fallback_resent = true;
+                    step_route = crate::refusal_fallback::StepRoute::Fallback;
+                    route_reason = broca_wal::StepRouteReason::Refusal;
+                    provider.set_step_route(step_route);
+                    first_attempt = step_attempts.load(std::sync::atomic::Ordering::Relaxed);
+                    *thinking_dropped.lock().unwrap() = None;
+                    continue;
+                }
+            }
             match &mut step {
                 StepOutcome::Completed { retries_used, .. }
                 | StepOutcome::Failed { retries_used, .. } => {
-                    *retries_used = retries_used.saturating_add(schema_prior_retries);
+                    *retries_used = retries_used
+                        .saturating_add(schema_prior_retries)
+                        .saturating_add(refusal_prior_retries);
                 }
             }
             break Ok(step);
@@ -5473,6 +6074,11 @@ where
         let step = match step {
             Ok(step) => step,
             Err(reason) => break reason,
+        };
+        // The model that produces this step's answer: the fallback model on a fallback step.
+        let step_origin = match (&fallback_model, step_route) {
+            (Some(fallback), crate::refusal_fallback::StepRoute::Fallback) => fallback.clone(),
+            _ => cfg.model.clone(),
         };
         let step_written_at_ms = completed_attempt_time
             .lock()
@@ -5492,8 +6098,18 @@ where
                 mut finish_reason,
                 service_tier_used,
                 speed_used,
+                served_model,
+                usage_iterations,
                 tool_args_cuts,
             } => {
+                let usage = broca_protocol::usage::step_usage(usage, usage_iterations.as_deref());
+                // A handoff is not a clean source reply, even when its target aliases the
+                // requested model and no distinct served_model is recorded.
+                let served_by_server_side_fallback = served_model.is_some()
+                    || message
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::ProviderFallback { .. }));
                 for cut in tool_args_cuts {
                     tracing::warn!(session = %req.session.session, step = step_id.0,
                         tool_name = %cut.tool_name, json_bytes = cut.json_bytes,
@@ -5501,9 +6117,7 @@ where
                         "stopped provider attempt after runaway tool argument whitespace");
                     rejected_tool_calls.push(ToolResult {
                         tool_call_id: cut.tool_call_id.clone(),
-                        output: ToolOutput::Error {
-                            message: cut.error_text(),
-                        },
+                        output: ToolOutput::error(cut.error_text()),
                         is_error: true,
                     });
                 }
@@ -5513,12 +6127,38 @@ where
                 total_usage += usage;
                 input_budget.observe(usage);
                 input_budget.limit = writer.input_token_limit().or(input_budget.limit);
+                let attempt_bytes = last_attempt_bytes.lock().unwrap().take();
+                if let Some(bytes) = attempt_bytes {
+                    output_history.note_attempt(bytes);
+                }
+                output_history.note_served_step(
+                    usage,
+                    Some(&step_origin),
+                    served_model.as_deref(),
+                    usage_iterations.as_deref(),
+                );
+                let native = broca_protocol::usage::model_usage(
+                    served_model.as_deref().unwrap_or(&step_origin.model_id),
+                    usage,
+                    usage_iterations.as_deref(),
+                )
+                .last()
+                .map(|(model, usage)| {
+                    (
+                        ModelHandle::new(&step_origin.provider_module_id, *model),
+                        *usage,
+                    )
+                });
+                compaction_history.previous_native_usage = native.as_ref().map(|(_, usage)| *usage);
+                compaction_history.previous_model = native.map(|(model, _)| model);
                 if let Some(bytes) = sent_bytes {
-                    compaction_history.previous_native_usage = Some(usage);
                     compaction_history.previous_provider_code = None;
                     compaction_history.previous_error = false;
-                    compaction_history.previous_request_bytes = Some(bytes);
-                    compaction_history.previous_model = Some(cfg.model.clone());
+                    compaction_history.previous_request_bytes = if fallback_model.is_some() {
+                        attempt_bytes.and_then(|bytes| usize::try_from(bytes).ok())
+                    } else {
+                        Some(bytes)
+                    };
                 }
                 if let Some(seal) = &control.shutdown_seal {
                     seal.note_usage(step_id, usage);
@@ -5539,6 +6179,91 @@ where
                         finish_reason = Some(FinishReason::Stop);
                     }
                 }
+                // The refusal-fallback facts this step's record carries, and the schedule after
+                // it. A source refusal that came after a completed tool call commits as a tool
+                // step (its tool calls are dispatched once, as for any tool step) and arms the
+                // schedule, so the next step goes to the fallback model. Absent on every run
+                // without a fallback, which keeps its records' bytes.
+                let step_fallback: Box<broca_wal::StepFallback> = match &fallback_model {
+                    None => Box::new(broca_wal::StepFallback {
+                        served_model: served_model.clone(),
+                        usage_iterations: usage_iterations.clone(),
+                        ..Default::default()
+                    }),
+                    Some(fallback) => {
+                        let now = control.now_ms().filter(|at| *at != 0);
+                        let refusal_after_tool_use = step_route
+                            == crate::refusal_fallback::StepRoute::Source
+                            && finish_reason == Some(FinishReason::ContentFilter)
+                            && message.tool_calls().next().is_some();
+                        let schedule = if refusal_after_tool_use {
+                            finish_reason = Some(FinishReason::ToolCalls);
+                            let armed = crate::refusal_fallback::on_source_refusal(
+                                refusal_schedule.as_ref(),
+                                &cfg.model,
+                                fallback,
+                                now,
+                            );
+                            let next = match armed.phase {
+                                broca_wal::RefusalFallbackPhase::Fallback { remaining } => {
+                                    remaining
+                                }
+                                broca_wal::RefusalFallbackPhase::Probe { .. } => 0,
+                            };
+                            log_schedule(
+                                format!(
+                                    "content filter after tool_use on {}; next {next} responses \
+                                     on {}",
+                                    cfg.model.model_id, fallback.model_id
+                                ),
+                                &req.session,
+                                &resolved_run_id,
+                                step_id,
+                                &armed,
+                                None,
+                            );
+                            Some(armed)
+                        } else {
+                            let committed = crate::refusal_fallback::on_step_committed(
+                                refusal_schedule.as_ref(),
+                                crate::refusal_fallback::CommittedStep {
+                                    route: step_route,
+                                    refused: finish_reason == Some(FinishReason::ContentFilter),
+                                    served_by_server_side_fallback,
+                                },
+                                now,
+                            );
+                            log_step_transition(
+                                refusal_schedule.as_ref(),
+                                committed.as_ref(),
+                                step_route,
+                                finish_reason,
+                                *thinking_dropped.lock().unwrap(),
+                                &req.session,
+                                &resolved_run_id,
+                                step_id,
+                            );
+                            committed
+                        };
+                        if let Some(schedule) = &schedule {
+                            refusal_schedule = Some(schedule.clone());
+                        }
+                        Box::new(broca_wal::StepFallback {
+                            // The server-side facts ride along with the client-side ones: one
+                            // step can be both routed to the fallback model and served by
+                            // Anthropic's own handoff.
+                            served_model: served_model.clone(),
+                            usage_iterations: usage_iterations.clone(),
+                            route: (step_route == crate::refusal_fallback::StepRoute::Fallback)
+                                .then(|| broca_wal::StepRoute {
+                                    model: fallback.clone(),
+                                    reason: route_reason,
+                                }),
+                            refusal_fallback: schedule,
+                            refusal_after_tool_use,
+                        })
+                    }
+                };
                 let original_message = hooks.as_ref().map(|_| message.clone());
                 let hook_output = if let Some(hooks) = &hooks {
                     let original_message = original_message
@@ -5581,6 +6306,7 @@ where
                                     false,
                                 );
                                 let mut records = vec![WalRecord::ModelStepFinished {
+                                    fallback: step_fallback.clone(),
                                     written_at_ms: step_written_at_ms,
                                     tags: None,
                                     hooks: metadata,
@@ -5678,7 +6404,7 @@ where
                         // The run's last message, announced before the run ends.
                         closing_tail.push(Message::assistant_from(
                             message.content.clone(),
-                            cfg.model.clone(),
+                            step_origin.clone(),
                         ));
                     }
                     let message = Arc::new(message);
@@ -5687,6 +6413,7 @@ where
                         hooks.is_some(),
                         writer,
                         WalRecord::ModelStepFinished {
+                            fallback: step_fallback,
                             written_at_ms: step_written_at_ms,
                             tags: None,
                             hooks: message_hooks,
@@ -5721,6 +6448,7 @@ where
                 // extraction. The prompt reclaims ownership only after the turn is durable.
                 let message = Arc::new(message);
                 let model_record = WalRecord::ModelStepFinished {
+                    fallback: step_fallback,
                     written_at_ms: step_written_at_ms,
                     tags: None,
                     hooks: message_hooks,
@@ -6102,7 +6830,7 @@ where
                     cache_prefix_blocks: None,
                     role: Role::Assistant,
                     content: assembled.content.clone(),
-                    origin: Some(cfg.model.clone()),
+                    origin: Some(step_origin.clone()),
                     ordinal: None,
                     tags: Default::default(),
                 };
@@ -6213,9 +6941,10 @@ where
             role: Role::Assistant,
             content: assembled.content,
             // Stamp the producing model so a later cross-model continuation can strip a
-            // signature this model minted. Same `cfg.model` replay stamps from the frozen
-            // config → byte-identical live-vs-resume.
-            origin: Some(cfg.model.clone()),
+            // signature this model minted. Same model replay stamps (the episode's frozen
+            // model, or the fallback model a step was routed to) → byte-identical
+            // live-vs-resume.
+            origin: Some(step_origin),
             ordinal: None,
             tags: Default::default(),
         };
@@ -6424,6 +7153,7 @@ pub(crate) async fn project_committed<W: WalStore>(
     let use_seed = seed.as_ref().is_some_and(|seed| {
         !retained_seed
             && prior_policy.is_some()
+            && seed.admission_checkpoint.output_reservation.is_some()
             && seed
                 .deferred_calls
                 .as_ref()
@@ -6440,10 +7170,9 @@ pub(crate) async fn project_committed<W: WalStore>(
         .flatten();
     // This WAL read runs inline on the async task while the store write below is offloaded to a
     // blocking thread. It is an incremental tail bounded by the projection watermark only when
-    // `use_seed` holds. A retained lineage, a seed without a recorded policy, a seed whose
-    // deferred-call summary lacks its stopped-run set, or a budgeted run without a valid seed
-    // reads from sequence zero, so its cost grows with the WAL; the seeded-write retry below is
-    // also a full read.
+    // `use_seed` holds. Retained lineages, missing policy or reservation history, incomplete
+    // deferred-call summaries, and invalid budget seeds require reading from sequence zero,
+    // so their cost grows with the WAL; the seeded-write retry below is also a full read.
     //
     // Moving the read onto a blocking thread needs an owned read handle: WalStore is threaded
     // through the run_loop entry points as a borrow, and giving it Clone is a public API change.
@@ -6890,6 +7619,113 @@ impl TransformationReading {
     }
 }
 
+/// One INFO line about the client-side refusal fallback, with the schedule's fields.
+/// `thinking_dropped` is how many earlier thinking blocks the provider dropped from the
+/// request, when the response reported its input transformations: a fallback model does not
+/// read the source model's signed thinking, and this is where that loss shows up.
+fn log_schedule(
+    message: String,
+    session: &BindIdentity,
+    run_id: &RunId,
+    step_id: StepId,
+    schedule: &broca_wal::RefusalFallbackSchedule,
+    thinking_dropped: Option<usize>,
+) {
+    let (phase, remaining, clean) = match schedule.phase {
+        broca_wal::RefusalFallbackPhase::Fallback { remaining } => {
+            ("fallback", Some(remaining), None)
+        }
+        broca_wal::RefusalFallbackPhase::Probe { clean } => ("probe", None, Some(clean)),
+    };
+    tracing::info!(
+        target: "broca::refusal_fallback",
+        session = %session.session,
+        run_id = %run_id.0,
+        step_id = step_id.0,
+        source = %schedule.source.model_id,
+        fallback = %schedule.fallback.model_id,
+        phase,
+        remaining = ?remaining,
+        clean = ?clean,
+        re_refusals = schedule.re_refusals,
+        thinking_dropped = ?thinking_dropped,
+        "{message}"
+    );
+}
+
+/// Log what a committed step did to the refusal-fallback schedule: a step answered by the
+/// fallback model (with any thinking the provider dropped from its request), a refusal on the
+/// fallback passing through, the end of a round, and the reset after enough clean source
+/// responses.
+// Each value is a separate fact of the committed step; grouping them would only rename them.
+#[allow(clippy::too_many_arguments)]
+fn log_step_transition(
+    before: Option<&broca_wal::RefusalFallbackSchedule>,
+    after: Option<&broca_wal::RefusalFallbackSchedule>,
+    route: crate::refusal_fallback::StepRoute,
+    finish_reason: Option<FinishReason>,
+    thinking_dropped: Option<usize>,
+    session: &BindIdentity,
+    run_id: &RunId,
+    step_id: StepId,
+) {
+    use broca_wal::RefusalFallbackPhase::{Fallback, Probe};
+    let Some(after) = after else {
+        return;
+    };
+    let source = &after.source.model_id;
+    let fallback = &after.fallback.model_id;
+    if route == crate::refusal_fallback::StepRoute::Fallback {
+        if finish_reason == Some(FinishReason::ContentFilter) {
+            tracing::warn!(
+                target: "broca::refusal_fallback",
+                session = %session.session,
+                run_id = %run_id.0,
+                step_id = step_id.0,
+                source = %source,
+                fallback = %fallback,
+                "refusal on {fallback} passed through (no chain)"
+            );
+        } else {
+            log_schedule(
+                format!("step answered by {fallback} for {source}"),
+                session,
+                run_id,
+                step_id,
+                after,
+                thinking_dropped,
+            );
+        }
+    }
+    match (before.map(|before| before.phase), after.phase) {
+        (Some(Fallback { .. }), Probe { .. }) => log_schedule(
+            format!("fallback round complete; returning to {source}"),
+            session,
+            run_id,
+            step_id,
+            after,
+            None,
+        ),
+        (Some(Probe { clean }), Probe { clean: now })
+            if clean < crate::refusal_fallback::CLEAN_TO_RESET
+                && now == crate::refusal_fallback::CLEAN_TO_RESET =>
+        {
+            log_schedule(
+                format!(
+                    "refusal fallback reset after {} clean {source} responses",
+                    crate::refusal_fallback::CLEAN_TO_RESET
+                ),
+                session,
+                run_id,
+                step_id,
+                after,
+                None,
+            )
+        }
+        _ => {}
+    }
+}
+
 /// Count and warn about every entry of an attempt's `input_transformations`, whatever its reason:
 /// on an account that is not enforced, a mismatched thinking block is dropped silently, so this
 /// log line and the counter are the only place the loss shows up.
@@ -7021,7 +7857,7 @@ fn append_repetition_guidance(result: &mut ToolResult, guidance: &str) {
         }
         ToolOutput::Text { text } => text.push_str(&suffix),
         ToolOutput::Denied { reason } => reason.push_str(&suffix),
-        ToolOutput::Error { message } => message.push_str(&suffix),
+        ToolOutput::Error { message, .. } => message.push_str(&suffix),
         ToolOutput::Json { value } => {
             // Structured outputs have no metadata slot. Preserve their JSON text before the note;
             // this copy is provider-facing only, while the durable result remains structured.
@@ -7090,6 +7926,124 @@ fn restore_guidance_with_originals(
         }
     }
     fold.into_observer()
+}
+
+/// Recreate the same warnings across gaps in a held prompt. Every gap needs the full,
+/// versioned observer state; otherwise hidden repeated calls could change request bytes.
+pub(crate) fn restore_offset_prompt_guidance(
+    state: &mut ReplayState,
+    episodes: Vec<held_prompt::GuidanceEpisode>,
+    seed: &crate::replay::ProjectionSeed,
+    window: &crate::context::OffsetPromptWindow,
+) -> Result<(), crate::replay::SeedFallback> {
+    use crate::replay::SeedFallback;
+    let missing = || SeedFallback {
+        reason: "offset prompt window lacks repetition checkpoint",
+    };
+    let seeded = |ordinal| -> Result<RepetitionFold, SeedFallback> {
+        let at = window
+            .guidance
+            .binary_search_by_key(&ordinal, |g| g.ordinal)
+            .map_err(|_| missing())?;
+        RepetitionFold::seeded(&window.guidance[at].fold).ok_or(SeedFallback {
+            reason: "offset prompt window repetition checkpoint is ambiguous",
+        })
+    };
+    for checkpoint in &window.guidance {
+        if checkpoint.fold.rules_version != crate::tool_repetition::REPETITION_RULES_VERSION {
+            return Err(SeedFallback {
+                reason: "offset prompt window repetition rules changed",
+            });
+        }
+        if RepetitionFold::seeded(&checkpoint.fold).is_none() {
+            return Err(SeedFallback {
+                reason: "offset prompt window repetition checkpoint is ambiguous",
+            });
+        }
+    }
+    let raw = state.prompt.clone();
+    let mut originals = Vec::new();
+    let compaction = state.compaction.state().ok_or_else(missing)?;
+    let visible = |m: &Message| {
+        let ordinal = m.ordinal.unwrap();
+        if let Some(view) = &compaction.view {
+            held_prompt::held_by(&view.view, m)
+        } else {
+            m.role == Role::System || ordinal >= window.base
+        }
+    };
+    for episode in &episodes {
+        let Some(first) = episode.first_step else {
+            continue;
+        };
+        let from = state.prompt.partition_point(|m| m.ordinal < Some(first));
+        let to = state
+            .prompt
+            .partition_point(|m| m.ordinal < Some(episode.end));
+        let mut fold = RepetitionFold::default();
+        let mut next = first;
+        for message in &mut state.prompt[from..to] {
+            if !visible(message) {
+                continue;
+            }
+            let ordinal = message.ordinal.unwrap();
+            if message.role == Role::Tool && (ordinal != next || ordinal == first) {
+                return Err(missing());
+            }
+            if ordinal != next {
+                if fold.checkpoint().is_none() {
+                    return Err(missing());
+                }
+                fold = seeded(ordinal)?;
+            }
+            let original = message.clone();
+            for (index, verdict) in fold.push(message) {
+                if let Some(guidance) = verdict.guidance() {
+                    if let ContentBlock::ToolResult(result) = &mut message.content[index] {
+                        append_repetition_guidance(result, &guidance);
+                    }
+                }
+            }
+            if original.content != message.content {
+                originals.push(original);
+            }
+            next = ordinal + 1;
+        }
+        if fold.checkpoint().is_none() {
+            return Err(missing());
+        }
+    }
+
+    // The active observer includes hidden prefix steps as well as visible ones. Continue
+    // its boundary checkpoint through raw tail messages, not through decorated outputs.
+    let active = episodes.last().ok_or_else(missing)?;
+    let first = active.first_step.unwrap_or(state.extent);
+    let tail_base = first.max(seed.prefix_len);
+    let mut fold = if first < seed.prefix_len {
+        seeded(seed.prefix_len)?
+    } else {
+        RepetitionFold::default()
+    };
+    for message in raw
+        .iter()
+        .filter(|m| m.ordinal.is_some_and(|o| o >= tail_base))
+    {
+        fold.push(message);
+    }
+    if fold.checkpoint().is_none() {
+        return Err(missing());
+    }
+    state.held = Some(Box::new(held_prompt::HeldResume {
+        episodes,
+        observer: fold.into_observer(),
+        originals,
+        tag_high: seed
+            .tag_seed
+            .high
+            .max(broca_protocol::tags::high_after(&state.prompt)),
+        replayed_messages: state.extent,
+    }));
+    Ok(())
 }
 
 /// On resume, complete an incomplete trailing tool turn WITHOUT re-running the
@@ -7292,6 +8246,40 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
     ))
 }
 
+/// The `context_overflow` refusal of a request whose estimated input leaves less room for output
+/// than the provider's floor. Nothing was sent; compacting the conversation is what helps.
+fn output_reservation_overflow(
+    estimate: u64,
+    available: u64,
+    floor: u32,
+    context_limit: u64,
+) -> ProviderError {
+    ProviderError {
+        provider_details: None,
+        provider_subcode: None,
+        refusal: None,
+        class: ErrorClass::ContextOverflow,
+        message: format!(
+            "request not sent: its estimated {estimate} input tokens leave {available} tokens of \
+             the {context_limit}-token context limit for output (after a safety margin of {} \
+             tokens), below the minimum output reservation of {floor} tokens",
+            crate::output_reservation::margin(context_limit)
+        ),
+        status: None,
+        retry_after_secs: None,
+        provider_code: Some(OUTPUT_RESERVATION_OVERFLOW_CODE.into()),
+        resets_at_ms: None,
+        resets_at_source: None,
+        limit_window: None,
+        account_ref: None,
+        credential_id: None,
+        affordable_max_tokens: None,
+    }
+}
+
+/// The `provider_code` of [`output_reservation_overflow`].
+pub const OUTPUT_RESERVATION_OVERFLOW_CODE: &str = "output_reservation_exceeds_context";
+
 /// Return the durable request only when no blocking renderer can still hold its snapshot.
 /// This intentionally uses `Arc::get_mut`, never `Arc::make_mut`: copying a multi-megabyte
 /// prompt while a render is in flight would move the same head-of-line work back to the actor.
@@ -7322,6 +8310,12 @@ enum StepOutcome {
         service_tier_used: Option<String>,
         /// Anthropic's reported `usage.speed`, verbatim; `None` when not reported.
         speed_used: Option<String>,
+        /// The wire model id that produced this answer when the provider handed the request to
+        /// another model itself, and that model differs from the requested one. `None` when the
+        /// requested model answered.
+        served_model: Option<String>,
+        /// The response's `usage.iterations`, verbatim, when the provider reported them.
+        usage_iterations: Option<Vec<broca_protocol::usage::UsageIteration>>,
     },
     Failed {
         error: ProviderError,
@@ -7355,6 +8349,7 @@ async fn run_step_watched<P: Provider>(
     provider: &P,
     step_id: StepId,
     opts: &Arc<CallOptions>,
+    first_attempt: u32,
     control: &RunControl,
     out: &mpsc::Sender<OutputEvent>,
     on_attempt: &AttemptSink<'_>,
@@ -7376,7 +8371,7 @@ async fn run_step_watched<P: Provider>(
         *progress.lock().unwrap() = Some(broca_protocol::provider::InFlightStep {
             step_id,
             started_at_ms: now,
-            attempt: 0,
+            attempt: first_attempt,
             attempt_started_at_ms: now,
             last_content_at_ms: None,
             max_content_gap_ms: None,
@@ -7404,6 +8399,7 @@ async fn run_step_watched<P: Provider>(
             provider,
             step_id,
             render_opts,
+            first_attempt,
             &step_cancel,
             watchdog_deadline,
             out,
@@ -7506,6 +8502,7 @@ async fn run_step<P: Provider>(
     provider: &P,
     step_id: StepId,
     opts: Arc<CallOptions>,
+    first_attempt: u32,
     cancel: &CancellationToken,
     deadline: Option<tokio::time::Instant>,
     out: &mpsc::Sender<OutputEvent>,
@@ -7528,6 +8525,7 @@ async fn run_step<P: Provider>(
                 deadline,
                 seal: shutdown_seal.cloned(),
                 progress,
+                first_attempt,
             },
         )
         .await;
@@ -7539,6 +8537,8 @@ async fn run_step<P: Provider>(
     let mut finish_reason: Option<FinishReason> = None;
     let mut service_tier_used: Option<String> = None;
     let mut speed_used: Option<String> = None;
+    let mut served_model: Option<String> = None;
+    let mut usage_iterations: Option<Vec<broca_protocol::usage::UsageIteration>> = None;
     let mut retries_used = 0;
     let mut finished = false;
     while let Some(ev) = rx.recv().await {
@@ -7554,6 +8554,8 @@ async fn run_step<P: Provider>(
                     finish_reason: fr,
                     service_tier_used: tier,
                     speed_used: speed,
+                    served_model: served,
+                    usage_iterations: iterations,
                     ..
                 } => {
                     usage = u;
@@ -7561,6 +8563,8 @@ async fn run_step<P: Provider>(
                     // Recorded exactly as the provider reported it; absent stays absent.
                     service_tier_used = tier;
                     speed_used = speed;
+                    served_model = served;
+                    usage_iterations = iterations;
                 }
                 ProviderControl::Finished {
                     usage: u,
@@ -7602,6 +8606,8 @@ async fn run_step<P: Provider>(
             finish_reason,
             service_tier_used,
             speed_used,
+            served_model,
+            usage_iterations,
         },
         // A message is valid only after the provider emits the protocol's final Finished control.
         // HTTP transports retry a missing final control; other providers fail safely here.
@@ -7975,8 +8981,15 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
     // never sent to the tool plane.
     enum BatchRefusal {
         /// The tool plane is unavailable or refused the route: each call gets a durable
-        /// `tool_no_dispatch`.
-        Unavailable(String),
+        /// `tool_no_dispatch`. `detail` is the stable matchable message; a refusal the
+        /// plane attributed to a module outage additionally names the module, the daemon's
+        /// code and its detail.
+        Unavailable {
+            detail: String,
+            module: Option<String>,
+            code: Option<String>,
+            refusal_detail: Option<String>,
+        },
         /// With nothing in flight, the tool plane found the run's scope or its parent gone:
         /// each call gets a `route_drained` result naming the reason, and the run stops
         /// Interrupted after this batch.
@@ -7993,16 +9006,38 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
     let batch_refusal = if stop_is_requested(stop) || cancelled_before_batch {
         Some(BatchRefusal::Stopped)
     } else {
-        match tool_plane.batch_started(&ctx, &calls, manifest).await {
+        match tool_plane
+            .batch_started_guarded(&ctx, &calls, manifest, &tool_open_guard(cancel, stop))
+            .await
+        {
             Ok(()) => None,
             // An ordinary tool-plane failure keeps the exact detail text it always had: sessions
             // already on disk hold it as their durable no-dispatch reason.
-            Err(ToolPlaneError::Unavailable(_)) => {
-                Some(BatchRefusal::Unavailable("tool plane unavailable".into()))
-            }
-            Err(error @ ToolPlaneError::ScopeRefused { .. }) => {
-                Some(BatchRefusal::Unavailable(error.to_string()))
-            }
+            Err(ToolPlaneError::Unavailable(_)) => Some(BatchRefusal::Unavailable {
+                detail: broca_protocol::TOOL_PLANE_UNAVAILABLE_MESSAGE.into(),
+                module: None,
+                code: None,
+                refusal_detail: None,
+            }),
+            // A module that stayed down for the whole tool-dispatch patience: nothing was
+            // sent, and the no-dispatch reason carries the attribution next to the stable
+            // message.
+            Err(ToolPlaneError::ModuleUnavailable {
+                module,
+                code,
+                detail,
+            }) => Some(BatchRefusal::Unavailable {
+                detail: broca_protocol::TOOL_PLANE_UNAVAILABLE_MESSAGE.into(),
+                module: Some(module),
+                code: Some(code),
+                refusal_detail: (!detail.is_empty()).then_some(detail),
+            }),
+            Err(error @ ToolPlaneError::ScopeRefused { .. }) => Some(BatchRefusal::Unavailable {
+                detail: error.to_string(),
+                module: None,
+                code: None,
+                refusal_detail: None,
+            }),
             Err(ToolPlaneError::ScopeDrained { reason }) => {
                 Some(BatchRefusal::ScopeDrained(reason))
             }
@@ -8055,11 +9090,19 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
         }
         match &batch_refusal {
             None => {}
-            Some(BatchRefusal::Unavailable(detail)) => {
+            Some(BatchRefusal::Unavailable {
+                detail,
+                module,
+                code,
+                refusal_detail,
+            }) => {
                 plan.push(CallPlan::NoDispatch {
                     tool_call_id: call.tool_call_id.clone(),
                     reason: NoDispatchReason::Unavailable {
                         detail: detail.clone(),
+                        module: module.clone(),
+                        code: code.clone(),
+                        refusal_detail: refusal_detail.clone(),
                     },
                     hooks: None,
                 });
@@ -8229,10 +9272,11 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                             // requires `dispatch-module/v1`, and the WAL raises its feature floor
                             // to that name before the first such frame.
                             module_id: tool_plane.dispatch_target(&ctx, &c.tool_call_id),
-                            // A session's frozen tools carry no schema digest yet (a fetched
-                            // catalog's `schema_digest` and `semantics` are not part of the
-                            // frozen `Tool`), so there is no pin to record.
-                            schema_pin: None,
+                            schema_pin: tool_plane.dispatch_schema_pin(
+                                &ctx,
+                                &c.tool_call_id,
+                                &c.tool_name,
+                            ),
                             approval_digest: None,
                             call_key: None,
                         })
@@ -8647,7 +9691,26 @@ fn cap_tool_result(result: &mut ToolResult, run_id: &RunId, tool_name: &str, hea
             return;
         }
         ToolOutput::Text { text } => text.as_str(),
-        ToolOutput::Error { message } => message.as_str(),
+        ToolOutput::Error {
+            message,
+            module,
+            code,
+            detail,
+            nothing_sent,
+            retry,
+        } => {
+            // Measure (and cap below) the text the model actually reads, including any
+            // module-outage attribution.
+            serialized = ToolOutput::error_model_text(
+                message,
+                module.as_deref(),
+                code.as_deref(),
+                detail.as_deref(),
+                *nothing_sent,
+                retry.as_deref(),
+            );
+            &serialized
+        }
         ToolOutput::Denied { reason } => {
             serialized = format!("denied: {reason}");
             &serialized
@@ -9042,11 +10105,30 @@ impl<T: ToolPlane> ToolPlane for ProviderHeldPlane<'_, T> {
     ) -> Result<(), ToolPlaneError> {
         self.inner.batch_started(ctx, calls, manifest).await
     }
+    async fn batch_started_guarded(
+        &self,
+        ctx: &BatchCtx,
+        calls: &[ToolCall],
+        manifest: &ToolManifest,
+        guard: &crate::tool_plane::ToolOpenGuard,
+    ) -> Result<(), ToolPlaneError> {
+        self.inner
+            .batch_started_guarded(ctx, calls, manifest, guard)
+            .await
+    }
     async fn batch_finished(&self, ctx: &BatchCtx) -> Result<(), ToolPlaneError> {
         self.inner.batch_finished(ctx).await
     }
     fn dispatch_target(&self, ctx: &BatchCtx, id: &ToolCallId) -> Option<String> {
         self.inner.dispatch_target(ctx, id)
+    }
+    fn dispatch_schema_pin(
+        &self,
+        ctx: &BatchCtx,
+        id: &ToolCallId,
+        tool: &str,
+    ) -> Option<broca_wal::DispatchSchemaPin> {
+        self.inner.dispatch_schema_pin(ctx, id, tool)
     }
     async fn register_dispatch_group(
         &self,
@@ -9057,6 +10139,44 @@ impl<T: ToolPlane> ToolPlane for ProviderHeldPlane<'_, T> {
     }
     async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
         self.inner.dispatch(ctx, call).await
+    }
+    async fn dispatch_guarded(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        key: Option<crate::tool_plane::DispatchKey<'_>>,
+        guard: &crate::tool_plane::ToolOpenGuard,
+    ) -> DispatchResult {
+        // Forward the guard to the inner plane's guarded entry point, so run cancel, stop and
+        // the step deadline end its route-open waits. A keyed call keeps what
+        // `dispatch_keyed` adds: a call resumed while provider-held rejoins its waiting slot
+        // instead of being dispatched again, and every other keyed call carries this batch's
+        // held-reply recorder.
+        let Some(key) = key else {
+            return self.inner.dispatch_guarded(ctx, call, None, guard).await;
+        };
+        if let Some(held) = self
+            .held
+            .resumed
+            .iter()
+            .find(|held| held.tool_call_id == call.tool_call_id)
+        {
+            return match self.lifecycle {
+                Some(lifecycle) => lifecycle.wait(ctx, call, &held.reply()).await,
+                None => std::future::pending().await,
+            };
+        }
+        self.inner
+            .dispatch_guarded(
+                ctx,
+                call,
+                Some(crate::tool_plane::DispatchKey {
+                    call_key: key.call_key,
+                    held_recorder: Some(self),
+                }),
+                guard,
+            )
+            .await
     }
     async fn dispatch_keyed(
         &self,
@@ -9208,25 +10328,31 @@ async fn resolve<T: ToolPlane>(
                                 call_key: key.as_deref().expect("approved call has Prepared key"),
                                 held_recorder: None,
                             },
-                            &crate::tool_plane::DispatchSignals::new(cancel, stop),
+                            &tool_open_guard(cancel, stop).signals(),
                         )
                         .await
                 }
-                None => match key.as_deref() {
-                    Some(call_key) => {
-                        tool_plane
-                            .dispatch_keyed(
-                                ctx,
-                                &call,
-                                crate::tool_plane::DispatchKey {
-                                    call_key,
-                                    held_recorder: None,
-                                },
-                            )
-                            .await
+                None => {
+                    // The route-open wait ends early on run cancel/stop, and at the run's
+                    // step deadline (see `tool_open_guard`).
+                    let guard = tool_open_guard(cancel, stop);
+                    match key.as_deref() {
+                        Some(call_key) => {
+                            tool_plane
+                                .dispatch_guarded(
+                                    ctx,
+                                    &call,
+                                    Some(crate::tool_plane::DispatchKey {
+                                        call_key,
+                                        held_recorder: None,
+                                    }),
+                                    &guard,
+                                )
+                                .await
+                        }
+                        None => tool_plane.dispatch_guarded(ctx, &call, None, &guard).await,
                     }
-                    None => tool_plane.dispatch(ctx, &call).await,
-                },
+                }
             };
             match result {
                 DispatchResult::Completed(mut result) => {
@@ -9236,7 +10362,7 @@ async fn resolve<T: ToolPlane>(
                         .map(|capture| capture.captured_for(&ctx.batch_id, &result.tool_call_id))
                         .unwrap_or_default();
                     crate::tool_media::enforce_provenance(&mut result, &captured);
-                    let malformed_held = matches!(&result.output, ToolOutput::Error { message } if message.starts_with("malformed provider-held reply:"));
+                    let malformed_held = matches!(&result.output, ToolOutput::Error { message, .. } if message.starts_with("malformed provider-held reply:"));
                     let mut resolution =
                         CallResolution::plain(result, Some(DispatchOutcome::Completed));
                     if malformed_held {
@@ -9296,16 +10422,30 @@ async fn resolve<T: ToolPlane>(
     }
 }
 
+/// The route-open guard for a batch's tool calls: the run's cancel and stop tokens, and the
+/// run's step deadline. Every batch entry point builds its guard here, so the batch start, each
+/// call and each re-open all end at the same instant.
+///
+/// A run has no step deadline for tool dispatch today: the provider watchdog
+/// (`RunControl::provider_call_timeout`) bounds only the model stream, and a call's reply
+/// deadline is that call's execution budget, not time left in the step. So the deadline is
+/// `None`, and the plane's own tool-dispatch patience is the only bound on a route-open wait
+/// besides cancel and stop.
+fn tool_open_guard(
+    cancel: Option<&CancellationToken>,
+    stop: Option<&CancellationToken>,
+) -> ToolOpenGuard {
+    ToolOpenGuard::new(cancel, stop).with_deadline(None)
+}
+
 /// The `route_drained` result for a call a scope drain stopped before it was sent. The text
 /// leads with the name so the model, and anyone reading the transcript, sees why.
 fn route_drained_result(id: &ToolCallId, reason: &str) -> ToolResult {
     ToolResult {
         tool_call_id: id.clone(),
-        output: ToolOutput::Error {
-            message: format!(
-                "route_drained: the tool was not run because its route was closed ({reason})"
-            ),
-        },
+        output: ToolOutput::error(format!(
+            "route_drained: the tool was not run because its route was closed ({reason})"
+        )),
         is_error: true,
     }
 }
@@ -9313,9 +10453,7 @@ fn route_drained_result(id: &ToolCallId, reason: &str) -> ToolResult {
 fn error_result(call: &ToolCall, message: &str) -> ToolResult {
     ToolResult {
         tool_call_id: call.tool_call_id.clone(),
-        output: ToolOutput::Error {
-            message: message.to_owned(),
-        },
+        output: ToolOutput::error(message),
         is_error: true,
     }
 }
@@ -9326,9 +10464,9 @@ fn error_result(call: &ToolCall, message: &str) -> ToolResult {
 fn unknown_result(call: &ToolCall, reason: &str) -> ToolResult {
     ToolResult {
         tool_call_id: call.tool_call_id.clone(),
-        output: ToolOutput::Error {
-            message: format!("tool outcome unknown (interrupted for review): {reason}"),
-        },
+        output: ToolOutput::error(format!(
+            "tool outcome unknown (interrupted for review): {reason}"
+        )),
         is_error: true,
     }
 }
@@ -9338,9 +10476,7 @@ fn unknown_result(call: &ToolCall, reason: &str) -> ToolResult {
 fn interrupted_result(id: &ToolCallId) -> ToolResult {
     ToolResult {
         tool_call_id: id.clone(),
-        output: ToolOutput::Error {
-            message: "tool not run: batch interrupted".into(),
-        },
+        output: ToolOutput::error("tool not run: batch interrupted"),
         is_error: true,
     }
 }
@@ -9755,7 +10891,7 @@ fn hard_stop_result(call: &ToolCall, outcome: DispatchOutcome) -> ToolResult {
     };
     ToolResult {
         tool_call_id: call.tool_call_id.clone(),
-        output: ToolOutput::Error { message },
+        output: ToolOutput::error(message),
         is_error: true,
     }
 }
@@ -10113,6 +11249,8 @@ mod tests {
             finish_reason: None,
             service_tier_used: None,
             speed_used: None,
+            served_model: None,
+            usage_iterations: None,
         });
         assert!(matches!(
             attribute_step_failure_to_cancel(completed, true),
@@ -10624,9 +11762,9 @@ mod tests {
         };
         let manifest = ToolManifest::from_tools(vec![serde_json::from_value(serde_json::json!({"name":"tool","description":"","input_schema":{},"execution_mode":"parallel"})).unwrap()]);
         let plane = crate::StubToolPlane::new().with_tool("tool", |_| {
-            crate::StubReply::Output(ToolOutput::Error {
-                message: "malformed provider-held reply: prerequisites not met".into(),
-            })
+            crate::StubReply::Output(ToolOutput::error(
+                "malformed provider-held reply: prerequisites not met",
+            ))
         });
         let (out, _events) = mpsc::channel(64);
         let outcome = dispatch_batch(
@@ -11194,7 +12332,7 @@ mod tests {
                 let terminals: Vec<_> = raw.iter().filter_map(|record| match record { WalRecord::ToolResult { result, outcome, .. } if result.tool_call_id.0 == id => Some((result, outcome)), _ => None }).collect();
                 assert_eq!(terminals.len(), 1, "close-out must include the unsent successor");
                 assert_eq!(*terminals[0].1, DispatchOutcome::Interrupted);
-                assert_eq!(terminals[0].0.output, ToolOutput::Error { message: expected.into() });
+                assert_eq!(terminals[0].0.output, ToolOutput::error(expected));
             }
             let prior = crate::replay(&raw).unwrap();
             assert!(prior.open_tool_batch.is_none());
@@ -12093,6 +13231,7 @@ mod tests {
                 has_deferred_calls: None,
                 tags: Some(crate::tags::LineageTags::Off),
                 pending_order: None,
+                output_reservation: Some(Default::default()),
                 input_budget: Some(crate::input_budget::InputTokenBudget::default()),
                 session_class: None,
                 // A valid tail seed includes the first run's WAL-derived policy.
@@ -12552,6 +13691,7 @@ mod tests {
             &provider,
             StepId(1),
             &Arc::new(CallOptions::new(Vec::new())),
+            0,
             &control,
             &out,
             &|_| Box::pin(async { Ok(()) }),
@@ -12577,7 +13717,7 @@ mod tests {
         };
         let (out, _output_rx) = mpsc::channel(1);
         let opts = Arc::new(CallOptions::new(Vec::new()));
-        let run = run_step_watched(&provider, StepId(1), &opts, &control, &out, &|_| {
+        let run = run_step_watched(&provider, StepId(1), &opts, 0, &control, &out, &|_| {
             Box::pin(async { Ok(()) })
         });
         let cancel_parent = async {
@@ -12629,6 +13769,7 @@ mod tests {
             &MessageWithoutFinishedProvider,
             StepId(1),
             Arc::new(CallOptions::new(Vec::new())),
+            0,
             &CancellationToken::new(),
             None,
             &out,
@@ -13280,6 +14421,7 @@ mod approval_gate {
                     ToolPlaneError::ScopeDrained { reason } => reason,
                     ToolPlaneError::ScopeRefused { code, .. } => code,
                     ToolPlaneError::Unavailable(reason) => reason,
+                    ToolPlaneError::ModuleUnavailable { module, .. } => module,
                 };
                 let mut result = CallResolution::plain(
                     route_drained_result(&call.tool_call_id, &reason),
@@ -13481,7 +14623,11 @@ mod approval_gate {
                         tool_name: Some(call.tool_name.clone()),
                         args: Arc::clone(&call.input),
                         module_id: plane.dispatch_target(ctx, &call.tool_call_id),
-                        schema_pin: None,
+                        schema_pin: plane.dispatch_schema_pin(
+                            ctx,
+                            &call.tool_call_id,
+                            &call.tool_name,
+                        ),
                         approval_digest: None,
                         call_key: None,
                         hooks: call.hooks.clone(),
@@ -13644,7 +14790,14 @@ mod approval_gate {
         let announced =
             !is_cancelled(control) && !stop_is_requested(control.stop_requested.as_ref());
         let start = if announced {
-            plane.batch_started(&ctx, &calls, &routed_manifest).await
+            plane
+                .batch_started_guarded(
+                    &ctx,
+                    &calls,
+                    &routed_manifest,
+                    &tool_open_guard(control.cancel.as_ref(), control.stop_requested.as_ref()),
+                )
+                .await
         } else {
             Err(ToolPlaneError::Unavailable(
                 "batch stopped before route open".into(),
@@ -13693,8 +14846,23 @@ mod approval_gate {
             } else if let Err(error) = &start {
                 Slot::Ready(Some(CallPlan::NoDispatch {
                     tool_call_id: call.tool_call_id,
-                    reason: NoDispatchReason::Unavailable {
-                        detail: error.to_string(),
+                    reason: match error {
+                        ToolPlaneError::ModuleUnavailable {
+                            module,
+                            code,
+                            detail,
+                        } => NoDispatchReason::Unavailable {
+                            detail: broca_protocol::TOOL_PLANE_UNAVAILABLE_MESSAGE.into(),
+                            module: Some(module.clone()),
+                            code: Some(code.clone()),
+                            refusal_detail: (!detail.is_empty()).then_some(detail.clone()),
+                        },
+                        error => NoDispatchReason::Unavailable {
+                            detail: error.to_string(),
+                            module: None,
+                            code: None,
+                            refusal_detail: None,
+                        },
                     },
                     hooks: None,
                 }))
@@ -14329,7 +15497,7 @@ mod approval_gate {
                                 let held = held.clone(); let call = held.call();
                                 let WalRecord::ToolCallDeferred { module, schema_pin, args_jcs, .. } = &*held.prepared else { unreachable!() };
                                 history.record(writer, WalRecord::ToolDispatchIntent { dispatched_at_ms: None, batch_id: ctx.batch_id.clone(), tool_call_id: call.tool_call_id.clone(), tool_name: Some(call.tool_name.clone()),
-                                    args: Arc::new(call.input.clone()), module_id: module.clone(), schema_pin: schema_pin.clone(), hooks: None,
+                                    args: Arc::new(call.input.clone()), module_id: module.clone(), schema_pin: schema_pin.clone().or_else(|| plane.dispatch_schema_pin(ctx, &call.tool_call_id, &call.tool_name)), hooks: None,
                                     approval_digest: None, call_key: Some(held.key.clone()) });
                                 writer.sync().await?;
                                 let before_send_cancel = control.cancel.as_ref();
@@ -15258,7 +16426,7 @@ mod approval_gate {
             if let Some(mut result) = validation {
                 // LateResult has no reason field, so retain the hook refusal code
                 // in its provider-valid error result rather than losing it at the boundary.
-                if let (Some("pre_tool_denied"), ToolOutput::Error { message }) = (
+                if let (Some("pre_tool_denied"), ToolOutput::Error { message, .. }) = (
                     result.reason.as_deref(),
                     &mut Arc::make_mut(&mut result.result).output,
                 ) {
@@ -15330,7 +16498,12 @@ mod approval_gate {
             };
         }
         if let Err(error) = plane
-            .batch_started(ctx, std::slice::from_ref(call), manifest)
+            .batch_started_guarded(
+                ctx,
+                std::slice::from_ref(call),
+                manifest,
+                &tool_open_guard(control.cancel.as_ref(), control.stop_requested.as_ref()),
+            )
             .await
         {
             return DispatchResult::NotSent {
@@ -15363,10 +16536,8 @@ mod approval_gate {
                 call,
                 args_jcs,
                 key,
-                &crate::tool_plane::DispatchSignals::new(
-                    control.cancel.as_ref(),
-                    control.stop_requested.as_ref(),
-                ),
+                &tool_open_guard(control.cancel.as_ref(), control.stop_requested.as_ref())
+                    .signals(),
             )
             .await;
         if let DispatchResult::Completed(result) = &mut outcome {

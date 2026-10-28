@@ -530,6 +530,7 @@ fn export_records_with_account(
     let mut start = run_started(0, &run_id.0, session, "hi", ModelHandle::new("stub", "m"));
     if let WalRecord::RunStarted { config, .. } = &mut start.record {
         config.auth_selection = Some(AuthSelection {
+            auth_method: None,
             credential_id: "chatgpt:openai".into(),
             account_ref: account_ref.map(str::to_string),
             resolved_credential_id: None,
@@ -2229,6 +2230,7 @@ pub(crate) fn text_step(seq: u64, step: u64, text: &str) -> FramedRecord {
     framed(
         seq,
         WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -2270,6 +2272,7 @@ fn tool_turn(seq_base: u64, step: u64) -> Vec<FramedRecord> {
         framed(
             seq_base,
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,

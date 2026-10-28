@@ -962,9 +962,10 @@ impl CompactionPlane for Views {
 
 fn manifest() -> Arc<PlanManifest> {
     Arc::new(PlanManifest {
+        rich_ui: None,
         plan: OpaqueJson::from_json_text(
             json!({"compaction_item":{"provider":"provider","preset":"head","params":{}},
-                "composition":{}})
+            "composition":{}})
             .to_string(),
         )
         .unwrap(),

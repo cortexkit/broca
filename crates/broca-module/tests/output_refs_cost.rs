@@ -195,6 +195,7 @@ fn compacting_manifest() -> broca_wal::PlanManifest {
 
 fn step(step: u64, content: Vec<ContentBlock>, finish: FinishReason) -> WalRecord {
     WalRecord::ModelStepFinished {
+        fallback: Default::default(),
         written_at_ms: None,
         tags: None,
         hooks: None,
@@ -728,10 +729,12 @@ async fn pre_message_times_history_uses_legacy_clocks_and_reports_remaining_gaps
     assert_eq!(page["messages"].as_array().unwrap().len(), 6);
 }
 
-/// The cost of both operations on a session of `OUTPUT_REFS_COST_MESSAGES` messages (20,000
-/// by default), with and without a compaction view.
+/// Benchmark, not a correctness test: prints the cost of both operations on a session of
+/// `OUTPUT_REFS_COST_MESSAGES` messages (20,000 by default), with and without a compaction
+/// view. Only `final_reply`'s output-size and payload checks can fail it; bounded work is
+/// asserted by `a_display_page_reads_each_shared_target_and_manifest_once`.
 #[tokio::test]
-#[ignore = "a measurement: run it alone, optimized, with --ignored --nocapture"]
+#[ignore = "benchmark: run it alone, optimized, with --ignored --nocapture"]
 async fn measure_output_refs_on_a_long_session() {
     let messages: u64 = std::env::var("OUTPUT_REFS_COST_MESSAGES")
         .ok()

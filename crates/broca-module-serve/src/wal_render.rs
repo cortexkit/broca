@@ -6,11 +6,28 @@ use broca_protocol::{CallOptions, StepContext};
 use broca_provider::wire::FrozenRenderConfig;
 use broca_wal::{RunConfig, WalRecord};
 
+/// Render `step` from the WAL records before it. A cap the step lowered to fit its context
+/// limit is read from `prefix`, so pass records through the step's request (its
+/// `output_reservation_clamped` record follows its `step_started`) or use
+/// [`render_step_with_output_cap`].
 pub fn render_step(
     prefix: &[WalRecord],
     config: &RunConfig,
     run_id: &str,
     step: u64,
+) -> Result<(FrozenRenderConfig, CallOptions, Vec<u8>), String> {
+    let cap = broca_core::output_reservation::recorded_cap(prefix, broca_protocol::StepId(step));
+    render_step_with_output_cap(prefix, config, run_id, step, cap)
+}
+
+/// [`render_step`] with the step's lowered output cap given by the caller, for a caller whose
+/// `prefix` ends before the step's `output_reservation_clamped` record.
+pub fn render_step_with_output_cap(
+    prefix: &[WalRecord],
+    config: &RunConfig,
+    run_id: &str,
+    step: u64,
+    max_output_tokens: Option<u32>,
 ) -> Result<(FrozenRenderConfig, CallOptions, Vec<u8>), String> {
     let (frozen, mut opts, state) = boundary_options(prefix, config, run_id, step)?;
     let family = broca_provider::registry::wire_family(frozen.family_id)
@@ -18,7 +35,10 @@ pub fn render_step(
     if let Some(state) = state.state() {
         opts = broca_core::compaction::model_options(&opts, state).map_err(|e| e.to_string())?;
     }
-    let body = family.render(&frozen, &opts);
+    if let Some(step_context) = opts.step_context.as_mut() {
+        step_context.max_output_tokens = max_output_tokens;
+    }
+    let body = family.render(&frozen.for_step(&opts), &opts);
     Ok((frozen, opts, body))
 }
 
@@ -79,6 +99,7 @@ pub fn boundary_options(
             account_ref: None,
             run_id: run_id.to_owned(),
             step_index: step,
+            max_output_tokens: None,
         }),
         target_model: Some(config.model.clone()),
     };
@@ -130,9 +151,7 @@ mod tests {
     fn restores_exact_failure_guidance_for_every_output_shape() {
         for output in [
             ToolOutput::Text { text: "raw".into() },
-            ToolOutput::Error {
-                message: "raw".into(),
-            },
+            ToolOutput::error("raw"),
             ToolOutput::Denied {
                 reason: "raw".into(),
             },
@@ -156,8 +175,20 @@ mod tests {
                 ToolOutput::Text { text } => ToolOutput::Text {
                     text: text + suffix,
                 },
-                ToolOutput::Error { message } => ToolOutput::Error {
+                ToolOutput::Error {
+                    message,
+                    module,
+                    code,
+                    detail,
+                    nothing_sent,
+                    retry,
+                } => ToolOutput::Error {
                     message: message + suffix,
+                    module,
+                    code,
+                    detail,
+                    nothing_sent,
+                    retry,
                 },
                 ToolOutput::Denied { reason } => ToolOutput::Denied {
                     reason: reason + suffix,
@@ -184,9 +215,7 @@ mod tests {
             prompt.extend(turn(
                 &format!("{n}"),
                 json!({"n": n}),
-                ToolOutput::Error {
-                    message: "raw".into(),
-                },
+                ToolOutput::error("raw"),
                 true,
             ));
         }
@@ -195,7 +224,7 @@ mod tests {
             let ContentBlock::ToolResult(result) = &prompt[index].content[0] else {
                 panic!()
             };
-            assert_eq!(result.output, ToolOutput::Error { message: format!("raw\n\nTool repetition guidance: read has failed {count} times in a row. Something about this tool or its target is not working right now; try a different route to the same goal.") });
+            assert_eq!(result.output, ToolOutput::error(format!("raw\n\nTool repetition guidance: read has failed {count} times in a row. Something about this tool or its target is not working right now; try a different route to the same goal.")));
         }
     }
 
@@ -318,7 +347,7 @@ mod replay_tests {
         let ContentBlock::ToolResult(result) = &mut expected.prompt[3].content[0] else {
             panic!()
         };
-        result.output = ToolOutput::Error { message: "raw\n\nTool repetition guidance: read has now failed 2 times with identical arguments. Read the error and change the arguments or the approach; repeating this call unchanged will fail the same way.".into() };
+        result.output = ToolOutput::error("raw\n\nTool repetition guidance: read has now failed 2 times with identical arguments. Read the error and change the arguments or the approach; repeating this call unchanged will fail the same way.");
         assert_eq!(opts.prompt, expected.prompt);
         assert_eq!(
             actual,
@@ -326,7 +355,7 @@ mod replay_tests {
                 .unwrap()
                 .render(&frozen, &expected)
         );
-        assert_eq!(records.iter().filter(|r| matches!(r, WalRecord::ToolResult { result, .. } if result.output == ToolOutput::Error { message: "raw".into() })).count(), 3);
+        assert_eq!(records.iter().filter(|r| matches!(r, WalRecord::ToolResult { result, .. } if result.output == ToolOutput::error("raw"))).count(), 3);
     }
 }
 
@@ -434,5 +463,47 @@ mod title_render_tests {
                 );
             }
         }
+    }
+
+    /// A cap the step lowered and recorded is in the rebuilt request, whether the prefix holds
+    /// its record or the caller passes it; a different run's record for the same step id is not.
+    #[test]
+    fn a_recorded_output_cap_is_rendered_into_the_rebuilt_request() {
+        let frozen = broca_provider::families::openai_responses_frozen_config("m");
+        let config: RunConfig = serde_json::from_value(json!({
+            "model": {"provider_module_id": "test", "model_id": "m"},
+            "tools": [], "tool_choice": {"type": "auto"}, "generation": {},
+            "response_format": {"type": "text"}, "context_epoch": 0,
+            "renderer_version": frozen.renderer_version,
+            "frozen_render_config": frozen
+        }))
+        .unwrap();
+        let cap = frozen.max_output_tokens - 7;
+        let clamp = |step: u64| {
+            serde_json::from_value::<WalRecord>(json!({"type": "output_reservation_clamped",
+                "step_id": step, "max_output_tokens": cap, "estimated_input_tokens": 1,
+                "context_limit": 2}))
+            .unwrap()
+        };
+        let expected = format!("\"max_output_tokens\":{cap}");
+        let frozen_cap = format!("\"max_output_tokens\":{}", frozen.max_output_tokens);
+
+        let mut with_record = records(&config, None);
+        with_record.push(clamp(1));
+        let (_, _, body) = render_step(&with_record, &config, "r2", 1).unwrap();
+        assert!(String::from_utf8_lossy(&body).contains(&expected));
+
+        let plain = records(&config, None);
+        let (_, _, passed) =
+            render_step_with_output_cap(&plain, &config, "r2", 1, Some(cap)).unwrap();
+        assert_eq!(passed, body);
+
+        // Run r1's record for its step 1 does not carry into run r2's step 1.
+        let mut earlier_run = records(&config, None);
+        earlier_run.insert(1, clamp(1));
+        let (_, _, unchanged) = render_step(&earlier_run, &config, "r2", 1).unwrap();
+        assert!(String::from_utf8_lossy(&unchanged).contains(&frozen_cap));
+        let (_, _, baseline) = render_step(&plain, &config, "r2", 1).unwrap();
+        assert_eq!(unchanged, baseline);
     }
 }

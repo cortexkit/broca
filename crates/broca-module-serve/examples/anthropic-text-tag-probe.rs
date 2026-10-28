@@ -234,7 +234,7 @@ fn response_shape(content: &[ContentBlock]) -> String {
             ContentBlock::RedactedReasoning { .. } => redacted_thinking += 1,
             ContentBlock::Text { .. } | ContentBlock::TextWithState { .. } => text += 1,
             ContentBlock::ToolCall(_) => tool_use += 1,
-            ContentBlock::ToolResult(_) => {}
+            ContentBlock::ToolResult(_) | ContentBlock::ProviderFallback { .. } => {}
         }
     }
     format!(

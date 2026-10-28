@@ -6,7 +6,7 @@
     "Control(StepStarted { step_id: StepId(1) })",
     "Display(TextDelta { message_id: MessageId(\"\"), tool_call_id: None, delta: \"synthetic-001 \" })",
     "Control(AssistantMessage { message: AssistantMessage { message_id: MessageId(\"\"), content: [Text { text: \"synthetic-001 \" }] } })",
-    "Control(StepFinished { step_id: StepId(1), usage: Usage { input_tokens: Some(10), cached_input_tokens: None, cache_write_tokens: None, output_tokens: Some(43), reasoning_tokens: Some(41) }, finish_reason: Stop, service_tier_used: Some(\"standard\"), speed_used: None })",
+    "Control(StepFinished { step_id: StepId(1), usage: Usage { input_tokens: Some(10), cached_input_tokens: None, cache_write_tokens: None, output_tokens: Some(43), reasoning_tokens: Some(41) }, finish_reason: Stop, service_tier_used: Some(\"standard\"), speed_used: None, served_model: None, usage_iterations: None })",
     "Control(Finished { usage: Usage { input_tokens: Some(10), cached_input_tokens: None, cache_write_tokens: None, output_tokens: Some(43), reasoning_tokens: Some(41) }, finish_reason: Stop, retries_used: 0 })"
   ],
   "note": "Synthetic response bytes and normalized events; preserves the original event order, field structure, usage shapes and chunk boundaries. No request or credentials.",

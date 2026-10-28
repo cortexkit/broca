@@ -266,6 +266,7 @@ fn render(
         session_address: None,
         credential_id: None,
         account_ref: None,
+        max_output_tokens: None,
     });
     options.tools = Arc::new(vec![tool()]);
     options.tool_choice = Arc::new(ToolChoice::None);
@@ -278,6 +279,23 @@ fn render(
         prompt.to_vec()
     })
     .map_err(|_| "prepared rendering failed")
+}
+
+fn render_preview(
+    frozen: &FrozenRenderConfig,
+    history: &[Message],
+    fixtures: &[Fixture],
+) -> Result<Vec<u8>, &'static str> {
+    let mut preview = frozen.clone();
+    if preview.family_id == WireFamilyId::GoogleCodeAssist
+        && preview.project_id.as_deref().is_none_or(str::is_empty)
+    {
+        // The envelope requires a project field even for an offline preview. An empty field
+        // lets the real renderer run without inventing an account project. Live execution
+        // still sees the original unresolved config and skips before credential access.
+        preview.project_id = Some(String::new());
+    }
+    render(&preview, history, fixtures)
 }
 
 #[derive(Default)]
@@ -493,7 +511,7 @@ fn preview(
                 )],
             ));
         }
-        let body = render(frozen, &history, fixtures)?;
+        let body = render_preview(frozen, &history, fixtures)?;
         let prepared = bundle(
             &history,
             frozen.media.as_ref().ok_or("media profile missing")?,
@@ -501,7 +519,7 @@ fn preview(
         );
         println!(
             "{}",
-            json!({"mode":"dry_run", "family":route.family, "model":route.model, "profile":frozen.media.as_ref().map(|p| p.profile), "request":stage + 1, "purpose":if stage == 2 {"cache_follow_up"} else {"media"}, "request_bytes":body.len(), "request_sha256":format!("{:x}", Sha256::digest(&body)), "media": prepared.media.iter().map(|m| json!({"origin":if m.tool {"tool"} else {"user"}, "carrier":m.carrier, "kind":m.reference.kind,"mime":m.reference.mime,"bytes":m.reference.byte_size,"sha256":m.reference.sha256})).collect::<Vec<_>>() })
+            json!({"mode":"dry_run", "family":route.family, "model":route.model, "profile":frozen.media.as_ref().map(|p| p.profile), "request":stage + 1, "purpose":if stage == 2 {"cache_follow_up"} else {"media"}, "live_skip":route.live_skip_reason(frozen), "request_bytes":body.len(), "request_sha256":format!("{:x}", Sha256::digest(&body)), "media": prepared.media.iter().map(|m| json!({"origin":if m.tool {"tool"} else {"user"}, "carrier":m.carrier, "kind":m.reference.kind,"mime":m.reference.mime,"bytes":m.reference.byte_size,"sha256":m.reference.sha256})).collect::<Vec<_>>() })
         );
         if stage < 2 {
             history.push(Message::new(
@@ -519,6 +537,13 @@ async fn run_live(
     frozen: &FrozenRenderConfig,
     fixtures: &[Fixture],
 ) -> Result<(), &'static str> {
+    if let Some(reason) = route.live_skip_reason(frozen) {
+        println!(
+            "{}",
+            json!({"mode":"live", "family":route.family,"model":route.model,"status":"skipped","reason":reason,"requests_sent":0,"production_gates_changed":false})
+        );
+        return Ok(());
+    }
     let credential = route
         .credential
         .as_deref()
@@ -595,10 +620,7 @@ async fn run_live(
 async fn run() -> Result<(), &'static str> {
     let args = Args::parse(std::env::args().skip(1))?;
     let routes = args.routes()?;
-    println!(
-        "{}",
-        json!({"mode":if args.live {"live"} else {"dry_run"},"families":routes.len(),"total_planned_requests":routes.len() * MAX_REQUESTS,"max_requests_per_family":MAX_REQUESTS,"retries":0})
-    );
+    println!("{}", plan_summary(&routes, args.live)?);
     let fixtures = fixtures();
     // Validate and render the whole plan before any credential access or network activity.
     let prepared = routes
@@ -622,6 +644,29 @@ async fn run() -> Result<(), &'static str> {
     Ok(())
 }
 
+fn plan_summary(routes: &[Route], live: bool) -> Result<Value, &'static str> {
+    let not_live_checked = if routes
+        .iter()
+        .any(|route| route.family == WireFamilyId::BedrockConverse)
+    {
+        vec![]
+    } else {
+        vec![json!({"family":"bedrock_converse", "reason":"no_credential"})]
+    };
+    let live_skips = routes
+        .iter()
+        .filter_map(|route| match route.frozen() {
+            Ok(frozen) => route
+                .live_skip_reason(&frozen)
+                .map(|reason| Ok(json!({"family":route.family,"reason":reason}))),
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(
+        json!({"mode":if live {"live"} else {"dry_run"},"families":routes.len(),"total_planned_requests":routes.len() * MAX_REQUESTS,"max_requests_per_family":MAX_REQUESTS,"retries":0,"not_live_checked":not_live_checked,"live_skips":live_skips}),
+    )
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     if let Err(code) = run().await {
@@ -640,6 +685,40 @@ mod tests {
     }
 
     #[test]
+    fn default_summary_caps_six_families_at_eighteen_and_names_unchecked_bedrock() {
+        let summary = plan_summary(&Args::default().routes().unwrap(), false).unwrap();
+        assert_eq!(summary["families"], 6);
+        assert_eq!(summary["total_planned_requests"], 18);
+        assert_eq!(summary["max_requests_per_family"], 3);
+        assert_eq!(summary["mode"], "dry_run");
+        assert_eq!(
+            summary["not_live_checked"],
+            json!([{"family":"bedrock_converse", "reason":"no_credential"}])
+        );
+        assert_eq!(
+            summary["live_skips"],
+            json!([{"family":"google_codeassist", "reason":"project_id_required"}])
+        );
+    }
+
+    #[tokio::test]
+    async fn codeassist_without_project_skips_before_even_parsing_a_credential_name() {
+        let route = route(WireFamilyId::GoogleCodeAssist);
+        assert!(route.credential.is_none());
+        let frozen = route.frozen().unwrap();
+        let mut history = initial_history();
+        add_exchange(&mut history, &frozen, &fixtures(), 0);
+        let preview: Value =
+            serde_json::from_slice(&render_preview(&frozen, &history, &fixtures()).unwrap())
+                .unwrap();
+        assert_eq!(preview["project"], "");
+        assert!(frozen.project_id.is_none());
+        assert!(run_live(&Args::default(), &route, &frozen, &fixtures())
+            .await
+            .is_ok());
+    }
+
+    #[test]
     fn prepared_requests_contain_fixture_bytes_on_every_family() {
         let fixtures = fixtures();
         for route in Args::default().routes().unwrap() {
@@ -647,8 +726,8 @@ mod tests {
             let mut history = initial_history();
             for stage in 0..2 {
                 add_exchange(&mut history, &frozen, &fixtures, stage);
-                let body =
-                    String::from_utf8(render(&frozen, &history, &fixtures).unwrap()).unwrap();
+                let body = String::from_utf8(render_preview(&frozen, &history, &fixtures).unwrap())
+                    .unwrap();
                 assert!(
                     body.contains(&fixtures[0].base64),
                     "{:?} image",

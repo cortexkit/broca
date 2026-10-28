@@ -38,6 +38,10 @@ pub struct SentRequest {
     pub sha256: String,
     /// When the transport started sending it, in milliseconds since the Unix epoch.
     pub sent_at_ms: u64,
+    /// The model the transport sent it to: the episode's own model, or the refusal-fallback
+    /// model while a refusal round routes steps there. A warm of these bytes must be shaped and
+    /// addressed for the same model, or it would refresh a cache the run is not using.
+    pub route: crate::refusal_fallback::StepRoute,
 }
 
 impl SentRequest {
@@ -54,6 +58,7 @@ impl std::fmt::Debug for SentRequest {
             .field("body", &format_args!("<{} bytes>", self.bytes().len()))
             .field("sha256", &self.sha256)
             .field("sent_at_ms", &self.sent_at_ms)
+            .field("route", &self.route)
             .finish()
     }
 }
@@ -341,6 +346,10 @@ pub struct RecordedRequest {
     pub opts: CallOptions,
     /// The digest the step's attempt records carry.
     pub request_body_sha256: String,
+    /// Set when the request went to the refusal-fallback model instead of the episode's: the
+    /// warm must render it for that model (`opts.target_model` already names it), and its
+    /// digest only matches when it does. `None` for a request to the episode's own model.
+    pub route: Option<broca_wal::StepRoute>,
 }
 
 /// Why the most recent request cannot be rebuilt from the WAL.
@@ -464,6 +473,31 @@ pub fn last_recorded_request(
     let (run_id, config) = effective_config(records, start, attempt_at).ok_or_else(|| {
         RecordedRequestError::Unavailable("the episode's run_started is unreadable".into())
     })?;
+    let committed_route = records[attempt_at..]
+        .iter()
+        .find_map(|record| match record {
+            WalRecord::ModelStepFinished {
+                step_id: committed,
+                fallback,
+                ..
+            } if committed == step_id => Some(fallback.route.clone()),
+            _ => None,
+        });
+    // A refusal recorded before the attempt means the attempt is the step's re-send.
+    let resent_after_refusal =
+        records[step_started..attempt_at]
+            .iter()
+            .find_map(|record| match record {
+                WalRecord::ModelStepRefused {
+                    step_id: refused,
+                    schedule,
+                    ..
+                } if refused == step_id => Some(broca_wal::StepRoute {
+                    model: schedule.fallback.clone(),
+                    reason: broca_wal::StepRouteReason::Refusal,
+                }),
+                _ => None,
+            });
 
     let mut prior = crate::replay::replay(&records[..step_started])
         .map_err(|error| RecordedRequestError::Unavailable(format!("replay the WAL: {error}")))?;
@@ -477,6 +511,26 @@ pub fn last_recorded_request(
             crate::run::restore_repetition_guidance(&mut prior.prompt[span]);
         }
     }
+    // A step that has not committed went where the schedule pointed when it opened. Whether
+    // the run was eligible for the fallback is not in the WAL, so this is a best guess, which
+    // the caller's digest comparison confirms before anything is sent.
+    let route = match committed_route {
+        Some(route) => route,
+        None => resent_after_refusal.or_else(|| {
+            prior
+                .refusal_fallback
+                .as_ref()
+                .filter(|schedule| {
+                    schedule.source == config.model
+                        && crate::refusal_fallback::route(Some(schedule), true)
+                            == crate::refusal_fallback::StepRoute::Fallback
+                })
+                .map(|schedule| broca_wal::StepRoute {
+                    model: schedule.fallback.clone(),
+                    reason: broca_wal::StepRouteReason::Schedule,
+                })
+        }),
+    };
     let mut prompt = prior.prompt;
     // Steers written before the step opened are rendered by that step; replay of the records
     // before `step_started` holds them back as pending. The step numbered them as it placed
@@ -519,8 +573,17 @@ pub fn last_recorded_request(
             account_ref: None,
             run_id: run_id.0.clone(),
             step_index: step_id.0,
+            // A cap the step lowered to fit its context limit is part of the bytes it sent.
+            max_output_tokens: crate::output_reservation::recorded_cap(
+                &records[..attempt_at],
+                *step_id,
+            ),
         }),
-        target_model: Some(config.model.clone()),
+        target_model: Some(
+            route
+                .as_ref()
+                .map_or_else(|| config.model.clone(), |route| route.model.clone()),
+        ),
         marker_order_version: prior.marker_order_version,
         render_episodes: Arc::new(prior.render_episodes.unwrap_or_default().into()),
     };
@@ -539,6 +602,7 @@ pub fn last_recorded_request(
         config,
         opts,
         request_body_sha256: request_body_sha256.clone(),
+        route,
     })
 }
 
@@ -837,6 +901,100 @@ mod tests {
         let clock = CacheClock::new();
         clock.seed_if_unknown(&records, Some(300_000));
         assert_eq!(clock.read().unwrap().prefix_tokens, None);
+    }
+
+    /// The request a warm re-sends goes to the model its step went to: a committed step's
+    /// recorded route, the fallback model for the re-send that follows a refusal, the route the
+    /// schedule gave a step still in flight, and otherwise the episode's model.
+    #[test]
+    fn the_recorded_request_follows_the_refusal_fallback_route() {
+        use broca_protocol::request::ModelHandle;
+        use serde_json::json;
+        let source = ModelHandle::new("p", "m");
+        let fallback = ModelHandle::new("p", "m-fallback");
+        let schedule = |remaining: u32| {
+            json!({"source":source,"fallback":fallback,
+                "phase":{"kind":"fallback","remaining":remaining},"re_refusals":0})
+        };
+        let record =
+            |value: serde_json::Value| -> WalRecord { serde_json::from_value(value).unwrap() };
+        let started = WalRecord::StepStarted { step_id: StepId(1) };
+        let sent = || attempt(Some(200), "complete", Some(2_000), 3_000);
+        let step = |extra: serde_json::Value| {
+            let mut value = json!({"type":"model_step_finished","step_id":1,
+                "assistant_message":{"message_id":"m","content":[{"type":"text","text":"ok"}]},
+                "usage":{},"retries_used":0});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            record(value)
+        };
+        let refusal = record(json!({"type":"model_step_refused","step_id":1,"usage":{},
+            "discarded_blocks":0,"schedule":schedule(10)}));
+        let route_of = |records: &[WalRecord]| {
+            let recorded = last_recorded_request(records).expect("the request rebuilds");
+            (
+                recorded.route.map(|route| (route.model, route.reason)),
+                recorded.opts.target_model,
+            )
+        };
+        use broca_wal::StepRouteReason::{Refusal, Schedule};
+
+        // A step to the episode's model.
+        let plain = [run_started(None), started.clone(), sent(), step(json!({}))];
+        assert_eq!(route_of(&plain), (None, Some(source.clone())));
+
+        // A committed step routed by the schedule.
+        let committed = [
+            run_started(None),
+            started.clone(),
+            sent(),
+            step(json!({"route":{"model":fallback,"reason":"schedule"},
+                "refusal_fallback":schedule(9)})),
+        ];
+        assert_eq!(
+            route_of(&committed),
+            (Some((fallback.clone(), Schedule)), Some(fallback.clone()))
+        );
+
+        // The re-send after a refusal, before its answer is durable; and the refused source
+        // attempt itself when the re-send has not been sent yet.
+        let resent = [
+            run_started(None),
+            started.clone(),
+            sent(),
+            refusal.clone(),
+            sent(),
+        ];
+        assert_eq!(
+            route_of(&resent),
+            (Some((fallback.clone(), Refusal)), Some(fallback.clone()))
+        );
+        assert_eq!(route_of(&resent[..4]), (None, Some(source.clone())));
+
+        // A step of the next episode still in flight while the schedule routes to the fallback.
+        let mut next = run_started(None);
+        if let WalRecord::RunStarted { run_id, .. } = &mut next {
+            *run_id = RunId("r2".into());
+        }
+        let in_flight = [
+            run_started(None),
+            started.clone(),
+            sent(),
+            refusal,
+            sent(),
+            step(json!({"route":{"model":fallback,"reason":"refusal"},
+                "refusal_fallback":schedule(9)})),
+            record(json!({"type":"run_finished","reason":"completed","usage":{},"retries_used":0})),
+            next,
+            started,
+            sent(),
+        ];
+        assert_eq!(
+            route_of(&in_flight),
+            (Some((fallback.clone(), Schedule)), Some(fallback))
+        );
     }
 
     #[test]

@@ -13,6 +13,18 @@ pub fn private_content_card(
     sources: &[SourceKind],
     dedup_key: &str,
 ) -> Result<Value, &'static str> {
+    private_content_card_for_project(provider, model, sources, dedup_key, None)
+}
+
+/// Offer a project-wide grant only for a project id carried by the daemon's scope stamp.
+/// Cingulate supplies the agent and project names from the filing route's stamped subject.
+pub fn private_content_card_for_project(
+    provider: &str,
+    model: &str,
+    sources: &[SourceKind],
+    dedup_key: &str,
+    project_id: Option<&str>,
+) -> Result<Value, &'static str> {
     if [provider, model]
         .iter()
         .any(|label| label.trim().is_empty())
@@ -41,15 +53,19 @@ pub fn private_content_card(
         [one, two, three] => format!("{one}, {two} and {three}"),
         _ => unreachable!("only three source kinds have display text"),
     };
+    let mut options = vec![
+        json!({"id": "allow_run", "label": "Allow for this program run", "effect": "grant"}),
+        json!({"id": "allow_24h", "label": "Allow for 24 hours", "effect": "grant"}),
+    ];
+    if project_id.is_some() {
+        options.push(json!({"id": "allow_always", "label": "Always allow for the agent in this project", "effect": "grant"}));
+    }
+    options.push(json!({"id": "deny", "label": "Deny", "effect": "decline"}));
     Ok(json!({
         "kind": "consent",
         "title": format!("Let the agent send private content to {provider}?"),
         "prompt": format!("The agent has read content from {source}.\n\nA program it is running now wants to make a model call with {provider} ({model}). The call may include some of that content.\n\nThis approval covers only {provider}. Another provider needs its own approval."),
-        "options": [
-            {"id": "allow_run", "label": "Allow for this program run", "effect": "grant"},
-            {"id": "allow_24h", "label": "Allow for 24 hours", "effect": "grant"},
-            {"id": "deny", "label": "Deny", "effect": "decline"}
-        ],
+        "options": options,
         "default": "deny", "on_expiry": "deny", "urgency": "normal",
         "material_damage": false, "late_execution": "execute",
         "target": {"kind": "provider", "label": provider},
@@ -63,6 +79,40 @@ pub fn private_content_card(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_content_cards_match_consent_fixtures_with_and_without_a_project() {
+        let key = "0ab378f55349aebe99550e29113304f58add2abe9c4fb03825326dfa2992b733";
+        for (project, fixture) in [
+            (
+                None,
+                include_str!("../tests/fixtures/consent/broca/private-content-card.json"),
+            ),
+            (
+                Some("project-a"),
+                include_str!("../tests/fixtures/consent/broca/private-content-card-project.json"),
+            ),
+        ] {
+            let actual = private_content_card_for_project(
+                "TypeSafe",
+                "Jev 1.13",
+                &[SourceKind::PersonBrowser],
+                key,
+                project,
+            )
+            .unwrap();
+            let expected: Value = serde_json::from_str(fixture).unwrap();
+            assert_eq!(actual, expected);
+            assert!(!actual.to_string().contains("project-a"));
+        }
+        assert_eq!(
+            include_bytes!("../tests/fixtures/consent/broca/private-content-card.json"),
+            include_bytes!(
+                "../../broca-module-serve/tests/fixtures/llm-tools/private-content-card.json"
+            ),
+            "the original no-project fixture must remain byte-identical",
+        );
+    }
 
     #[test]
     fn private_card_text_and_options() {

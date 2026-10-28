@@ -157,12 +157,13 @@ broca specifics:
   and `sender_not_owner.json`; the class is mapped by `ErrorClass::shared_class()` before
   serialization.
 
-  One served admission refusal carries its class in its detail, because its class depends on
-  which refusal routing sent:
+  Served admission refusals about account selection carry their class in their detail:
 
   | Code | Class | Detail |
   |---|---|---|
-  | `account_selection_refused` | `detail.class`: `transient` or `permanent` | `{routing_code, class, retry_after_s?, retry_after_secs?, decision_id?}` |
+  | `account_selection_refused` | `detail.class`: `transient`, `permanent` or `auth_required` | `{routing_code, class, retry_after_s?, retry_after_secs?, decision_id?, resets_at_ms?, routing_detail?}` |
+  | `account_limit_exhausted` | `detail.class`: `transient` | same fields, plus `provider_code: "account_limit_exhausted"` |
+  | `routing_unavailable` | `detail.class`: always `transient` | `{reason, class, budget_ms?}` |
 
   The fetch-plan admission refusal `scoped_tools_require_plan` is permanent and carries
   `detail: {class: "permanent"}`. A new send declaring non-empty legacy `tools` on a stamped
@@ -175,13 +176,44 @@ broca specifics:
 
   `account_selection_refused` means the routing module would not choose a provider account
   for the send; nothing was written. `routing_code` is routing's own refusal code, copied
-  verbatim with its `retry_after_s` and `decision_id`. It is `transient` for
+  verbatim with its original detail in `routing_detail`, `retry_after_s` and `decision_id`. It is `transient` for
   `account_hold`, `account_pool_exhausted`, `account_pool_reserve_limited`,
-  `account_quota_unknown` and `account_selection_unavailable`, with `retry_after_secs` set
-  from routing's wait when it gave one; `permanent` for `account_not_authorized`,
-  `admission_conflict` and `invalid_request`. Callers branch on `routing_code` and `class`,
+  `account_quota_unknown`, `no_eligible_account`, `account_selection_unavailable`,
+  `pin_generation_conflict`, `store_error` and `internal_error`, with `retry_after_secs` set
+  from routing's wait when it gave one; `permanent` for `admission_conflict`, `invalid_request`,
+  `unknown_decision`, `unscoped_caller`, `account_not_authorized` and
+  `account_selection_unsupported`. An authorization refusal
+  means operator policy excludes the request's credentials; logging in cannot fix it.
+  `account_selection_unsupported` means the account cannot serve the requested provider;
+  it is a permanent refusal, not a static-credential fallback.
+  Unknown refusal codes remain verbatim and transient,
+  never `routing_unavailable`. Pool exhaustion, reserve limits, account holds and unknown quota use `account_limit_exhausted`
+  instead of `account_selection_refused`, so callers wait or reroute rather than hot-retrying.
+  Routing's `reset_at_ms` is carried as `resets_at_ms`; when no wait was supplied it also yields a
+  `retry_after_secs` hint rounded up to the next second. Holds prefer `until_ms` (Unix
+  milliseconds), then legacy `retry_after_s` (seconds); legacy `reset_at` is retained only
+  in the original detail and is never parsed. A hold with neither timing field stays untimed.
+  `auth_required` retains the admit-and-pause-for-login path, with its routing code in the
+  paused run's `auth.routing_code`. `account_selection_disabled` is the routing operator's
+  module-wide off-switch: that answer admits the send on the configured static credential,
+  records an account decision with path `disabled`, and logs the literal routing code
+  `account_selection_disabled`. It is not an account or provider refusal. The undeclared aliases
+  `disabled` and `unsupported` remain transient pass-through refusals, not fallbacks.
+  Callers branch on structured fields,
   never on the message. The bodies are pinned by
   `crates/broca-wire/tests/golden/account_selection_refused.*.json`.
+
+  `routing_unavailable` means broca got no usable account decision from the routing module
+  for a send that needs one: nothing was written and broca did not pick an account itself.
+  It is broca's statement, not routing's, so it never appears as a `routing_code`.
+  `detail.reason` is `unreachable` (the route failed, the connection was lost, the reply could
+  not be decoded),
+  `no_decision_within_budget` (the admission budget ran out; `budget_ms` names it) or
+  `invalid_pick` (routing chose an account broca had not offered). Always `transient`: the
+  caller retries the same send. A run already admitted keeps its frozen selection on resume
+  and is never routed again. The bodies are pinned by
+  `crates/broca-wire/tests/golden/routing_unavailable.*.json`, which the real serve path's
+  replies are compared with.
 
   `wal_newer_writer` means the session's WAL holds a complete frame that requires WAL
   features this build does not know: a newer broca wrote it. The bytes are intact and

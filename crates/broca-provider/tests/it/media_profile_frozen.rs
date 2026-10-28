@@ -192,6 +192,7 @@ fn a_media_profile_does_not_change_text_only_request_bytes() {
             account_ref: None,
             run_id: "media".into(),
             step_index: 1,
+            max_output_tokens: None,
         });
         assert_eq!(
             family.render(&without, &opts),

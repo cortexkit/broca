@@ -167,8 +167,16 @@ mod tests {
         ] {
             let frozen = frozen_config_for_family(family, "m");
             let provider = live_provider(frozen, AuthHandle::None).expect("every family is wired");
-            // The renderer version comes straight off the frozen config.
-            assert_eq!(provider.renderer_version(), renderer_version_for(family));
+            // The renderer version comes straight off the frozen config. On Anthropic that is
+            // the version the config's own opt-in calls for, which for the family default (no
+            // opt-in) is v2 rather than the family's current constant.
+            let expected = match family {
+                WireFamilyId::AnthropicMessages => {
+                    crate::families::anthropic_renderer_version(false)
+                }
+                _ => renderer_version_for(family),
+            };
+            assert_eq!(provider.renderer_version(), expected);
         }
     }
 }

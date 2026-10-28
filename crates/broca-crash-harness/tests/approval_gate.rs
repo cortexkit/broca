@@ -55,6 +55,7 @@ fn plan() -> broca_wal::PlanManifest {
     let sub = json!({"hook":"pre_tool","phase":"approve","ops":[],"tools":["edit"],"on_unavailable":"refuse","budget_ms":500});
     let value = json!({"step_transform_items":[{"provider":"approve","preset":"head","params":{},"subscriptions":[sub.clone()]}]});
     broca_wal::PlanManifest {
+        rich_ui: None,
         plan: broca_wal::OpaqueJson::from_json_text(value.to_string()).unwrap(),
         plan_identity: "p".into(),
         composition_digest: "c".into(),

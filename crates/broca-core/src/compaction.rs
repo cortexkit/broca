@@ -207,6 +207,21 @@ pub struct CompactionState {
     /// (`CompactionRideWait`): the step and the absolute deadline. Cleared when it resolves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ride_wait: Option<(broca_protocol::StepId, u64)>,
+    /// The current run's provider-account label, from its frozen auth selection when that
+    /// names a subscription account with a vault-served account id. `None` when broca has
+    /// no account fact (no routing selection, or an unrouted credential). Updated when a
+    /// run starts and when its auth refreezes; folded from `RunStarted` and
+    /// `RunAuthRefrozen` so a restart rebuilds it from the WAL instead of memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_account: Option<String>,
+    /// The account label the newest recorded notice attributed, `None` before the first
+    /// notice with a known account. Set when a notice is recorded from the run that wrote
+    /// it when that run's account is known; left in place when that run's account is
+    /// unknown, so a later known run compares against the last known account. Durable
+    /// through the WAL (folded from notices) and checkpoints, so a restart neither rides
+    /// spuriously nor misses a change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub announced_account: Option<String>,
 }
 impl CompactionState {
     /// Send admission uses the last durable request estimate plus the new native messages,
@@ -273,9 +288,22 @@ impl CompactionState {
         self.captured.fold(record);
         self.history.fold(record);
         match record {
-            WalRecord::RunStarted { .. } => {
+            WalRecord::RunStarted { config, .. } => {
                 self.ceiling_check = None;
                 self.ride_wait = None;
+                // The run's frozen account, when it names a subscription account with a
+                // vault-served account id. Unknown selections leave the previous known
+                // account in place only by not clearing it here: an unknown run has no
+                // account fact, so `current_account` becomes `None` while
+                // `announced_account` keeps the last known account for the next known run
+                // to compare against.
+                self.current_account = config
+                    .auth_selection
+                    .as_ref()
+                    .and_then(view::selection_account_label);
+            }
+            WalRecord::RunAuthRefrozen { auth_selection, .. } => {
+                self.current_account = view::selection_account_label(auth_selection);
             }
             WalRecord::CompactionRideWait {
                 step_id,
@@ -391,6 +419,14 @@ impl CompactionState {
                 self.notice_seq = *seq;
                 self.announced = Some(view::Announced::from_headers(headers));
                 self.unannounced.clear();
+                // The last notice's account is the run's account when it was recorded,
+                // when that run's account is known. Unknown runs leave the last known
+                // account in place, so a later known run compares against it rather than
+                // against nothing. The first notice with a known account therefore baselines
+                // without an event: with no prior notice there is no change.
+                if let Some(current) = self.current_account.clone() {
+                    self.announced_account = Some(current);
+                }
             }
             WalRecord::RunFinished { .. } => {
                 if matches!(self.ceiling_check, Some(CeilingCheck::Waiting { .. })) {
@@ -441,9 +477,35 @@ impl CompactionHistory {
                 self.completed_at = *ts_ms;
                 self.current_request_bytes = usize::try_from(*request_body_len).ok();
             }
-            WalRecord::ModelStepFinished { usage, .. } => {
-                self.previous_native_usage = Some(*usage);
-                self.previous_model.clone_from(&self.current_model);
+            WalRecord::ModelStepFinished {
+                usage, fallback, ..
+            } => {
+                let requested = fallback
+                    .route
+                    .as_ref()
+                    .map(|route| &route.model)
+                    .or(self.current_model.as_ref());
+                // Checkpoints retain one prompt measurement, not the sum of prompts
+                // sent to every serving model during a server-side handoff.
+                let native = requested.and_then(|requested| {
+                    broca_protocol::usage::model_usage(
+                        fallback
+                            .served_model
+                            .as_deref()
+                            .unwrap_or(&requested.model_id),
+                        *usage,
+                        fallback.usage_iterations.as_deref(),
+                    )
+                    .last()
+                    .map(|(model, usage)| {
+                        (
+                            broca_protocol::ModelHandle::new(&requested.provider_module_id, *model),
+                            *usage,
+                        )
+                    })
+                });
+                self.previous_native_usage = native.as_ref().map(|(_, usage)| *usage);
+                self.previous_model = native.map(|(model, _)| model);
                 self.previous_provider_code = None;
                 self.previous_error = false;
                 self.previous_request_bytes = self.current_request_bytes;

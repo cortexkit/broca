@@ -15,6 +15,8 @@ pub struct RetainedHeadCheckpoint {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HeadProjection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_rich_ui: Option<broca_protocol::RichUiStamp>,
     pub model: Option<HeadModel>,
     pub usage: Option<SessionUsage>,
     run_id: Option<RunId>,
@@ -27,6 +29,7 @@ pub struct HeadProjection {
 impl Default for HeadProjection {
     fn default() -> Self {
         Self {
+            last_run_rich_ui: None,
             model: None,
             usage: None,
             run_id: None,
@@ -76,21 +79,36 @@ impl HeadProjection {
                 self.ownership
                     .fold_run_started(principal.as_ref(), scope.as_ref());
                 self.run_id = Some(run_id.clone());
+                self.last_run_rich_ui = manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.rich_ui.clone());
                 let mut model =
                     HeadModel::new(&config.model.provider_module_id, &config.model.model_id);
                 model.variant = config.variant.clone().filter(|value| !value.is_empty());
                 self.model = Some(model);
             }
-            WalRecord::ModelStepFinished { usage, .. } => {
+            // A refused call was billed, so it counts as a call of the model that refused; a
+            // step another model answered counts under that model.
+            WalRecord::ModelStepFinished { .. } | WalRecord::ModelStepRefused { .. } => {
                 if let (Some(run_id), Some(model)) = (&self.run_id, &self.model) {
-                    self.usage
-                        .get_or_insert_with(|| SessionUsage::new(&run_id.0))
-                        .record_step(
-                            &model.provider,
-                            &model.model,
-                            model.variant.as_deref(),
-                            crate::replay::reported_step_usage(usage),
-                        );
+                    let episode = broca_protocol::request::ModelHandle::new(
+                        model.provider.as_str(),
+                        model.model.as_str(),
+                    );
+                    for (provider, model, variant, usage) in crate::refusal_fallback::usage_by_model(
+                        &episode,
+                        model.variant.as_deref(),
+                        record,
+                    ) {
+                        self.usage
+                            .get_or_insert_with(|| SessionUsage::new(&run_id.0))
+                            .record_step(
+                                provider,
+                                model,
+                                variant,
+                                crate::replay::reported_step_usage(&usage),
+                            );
+                    }
                 }
             }
             WalRecord::Queued {
@@ -184,6 +202,44 @@ mod tests {
         .unwrap()
     }
 
+    /// A refused call counts under the model that refused it, and a step routed to the
+    /// refusal-fallback model, or served by a server-side fallback, under the model that
+    /// answered it, without the caller's variant.
+    #[test]
+    fn session_spend_counts_refused_and_fallback_calls_under_the_model_that_answered() {
+        let mut head = HeadProjection::default();
+        head.observe(&start("run", Some("deep")));
+        head.observe(&step(json!({"input_tokens":2,"output_tokens":1})));
+        head.observe(
+            &serde_json::from_value(json!({"type":"model_step_refused","step_id":2,
+                "usage":{"input_tokens":4,"output_tokens":1},"discarded_blocks":0,
+                "schedule":{"source":{"provider_module_id":"p","model_id":"m"},
+                "fallback":{"provider_module_id":"p","model_id":"m-fallback"},
+                "phase":{"kind":"fallback","remaining":10},"re_refusals":0}}))
+            .unwrap(),
+        );
+        let mut routed =
+            serde_json::to_value(step(json!({"input_tokens":8,"output_tokens":2}))).unwrap();
+        routed["route"] =
+            json!({"model":{"provider_module_id":"p","model_id":"m-fallback"},"reason":"refusal"});
+        head.observe(&serde_json::from_value(routed).unwrap());
+        let mut served =
+            serde_json::to_value(step(json!({"input_tokens":16,"output_tokens":4}))).unwrap();
+        served["served_model"] = json!("m-served");
+        head.observe(&serde_json::from_value(served).unwrap());
+        let usage = serde_json::to_value(head.usage.unwrap()).unwrap();
+        assert_eq!(usage["steps"], 4);
+        assert_eq!(usage["input_tokens"], 30);
+        assert_eq!(
+            usage["by_model"],
+            json!([
+                {"provider":"p","model":"m","variant":"deep","steps":2,"unreported_steps":0,"input_tokens":6,"output_tokens":2},
+                {"provider":"p","model":"m-fallback","steps":1,"unreported_steps":0,"input_tokens":8,"output_tokens":2},
+                {"provider":"p","model":"m-served","steps":1,"unreported_steps":0,"input_tokens":16,"output_tokens":4}
+            ])
+        );
+    }
+
     #[test]
     fn session_spend_keeps_model_keys_partial_counts_and_first_counted_run() {
         let mut head = HeadProjection::default();
@@ -213,5 +269,29 @@ mod tests {
                 ]
             })
         );
+    }
+    #[test]
+    fn rich_ui_stamp_tracks_the_last_start_and_survives_projection_serialization() {
+        let stamp = json!({"dialect":"1.0", "catalog_digest":"a".repeat(64)});
+        let mut value = serde_json::to_value(start("stamped", None)).unwrap();
+        value["manifest"] = json!({
+            "rich_ui":stamp, "plan":"{}", "plan_identity":"plan", "composition_digest":"composition",
+            "fetches":[], "tools":[], "system_text":"teaching", "system_digest":"system",
+            "join_version":1, "role_versions":{}
+        });
+        let mut head = HeadProjection::default();
+        head.observe(&serde_json::from_value(value).unwrap());
+        let stored = serde_json::to_vec(&head).unwrap();
+        let mut restored: HeadProjection = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored.last_run_rich_ui).unwrap(),
+            stamp
+        );
+        restored.observe(&start("unstamped", None));
+        assert!(restored.last_run_rich_ui.is_none());
+        assert!(serde_json::to_value(restored)
+            .unwrap()
+            .get("last_run_rich_ui")
+            .is_none());
     }
 }

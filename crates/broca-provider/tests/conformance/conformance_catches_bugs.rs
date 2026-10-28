@@ -36,6 +36,7 @@ fn frozen() -> FrozenRenderConfig {
         service_tier: None,
         service_tier_request: None,
         speed: None,
+        server_side_fallback: false,
         reasoning_echo: None,
         reasoning_content_required: false,
         tool_call_content_empty_string: false,
@@ -53,6 +54,7 @@ fn frozen() -> FrozenRenderConfig {
         opencode_go_deepseek_thinking: false,
         opencode_go_long_cache_retention_unsupported: false,
         media: None,
+        refusal_fallback: None,
     }
 }
 

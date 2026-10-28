@@ -163,6 +163,8 @@ impl Provider for AllocationProbeProvider {
             finish_reason: FinishReason::Stop,
             service_tier_used: None,
             speed_used: None,
+            served_model: None,
+            usage_iterations: None,
         }))
         .expect("provider channel has room");
         tx.try_send(NormalizedEvent::Control(ProviderControl::Finished {
@@ -200,6 +202,8 @@ impl Provider for TerminalAssistantAllocationProbeProvider {
             finish_reason: FinishReason::Stop,
             service_tier_used: None,
             speed_used: None,
+            served_model: None,
+            usage_iterations: None,
         }))
         .expect("provider channel has room");
         tx.try_send(NormalizedEvent::Control(ProviderControl::Finished {
@@ -328,6 +332,8 @@ impl Provider for DispatchAllocationProbeProvider {
             finish_reason,
             service_tier_used: None,
             speed_used: None,
+            served_model: None,
+            usage_iterations: None,
         }))
         .expect("provider channel has room");
         tx.try_send(NormalizedEvent::Control(ProviderControl::Finished {

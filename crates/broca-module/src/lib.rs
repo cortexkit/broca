@@ -11,6 +11,7 @@
 pub mod actor;
 pub mod cache;
 mod compaction_watch;
+pub mod diagnostics;
 pub mod executor;
 pub mod fanout;
 pub mod held_slots;

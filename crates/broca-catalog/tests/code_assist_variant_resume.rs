@@ -100,6 +100,7 @@ mod gated {
             account_ref: None,
             run_id: "run-variant-resume".into(),
             step_index: 1,
+            max_output_tokens: None,
         });
         GoogleCodeAssist.shape(frozen, &opts)
     }

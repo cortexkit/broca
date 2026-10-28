@@ -53,7 +53,7 @@ fn backfill_maps_every_distinct_run_index_triple_once() {
     );
     for session in &sessions {
         let (address,root,harness,name): (String,String,String,String) = conn.query_row(
-            "SELECT address,project_root,harness,session FROM agent_data_session_ref WHERE session_ref=?1", [agent_session_ref(session)],
+            "SELECT address,project_root,harness,session FROM agent_data_session_ref WHERE session_ref=?1", [broca_core::wal_writer::legacy_session_ref(&session.harness, &session.project_root.to_string_lossy(), &session.session)],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
         assert_eq!(address, session_addr(session));
         assert_eq!(BindIdentity::new(root, harness, name), *session);
@@ -190,6 +190,109 @@ fn legacy_cleanup_removes_only_inventory_artifacts() {
     assert!(root.join("run-index.db").exists());
     assert!(root.join("move-inventory.other").exists());
     assert_eq!(cleanup_legacy_inventory(&root).unwrap(), (0, 0));
+}
+
+#[test]
+fn legacy_cleanup_skips_an_entry_vanished_before_metadata() {
+    let root = broca_test_support::scratch_root().join("inventory-vanished-before-metadata");
+    std::fs::create_dir_all(&root).unwrap();
+    let vanished = root.join("move-inventory.tmp-vanished");
+    std::fs::write(&vanished, b"gone").unwrap();
+    std::fs::write(root.join("move-inventory.json"), b"kept").unwrap();
+    let mut removed = false;
+    let result = cleanup_legacy_inventory_with(
+        &root,
+        |path| {
+            if !removed {
+                std::fs::remove_file(path).unwrap();
+                removed = true;
+            }
+            std::fs::symlink_metadata(path)
+        },
+        |path| std::fs::remove_file(path),
+    );
+    assert!(removed);
+    assert_eq!(result.unwrap(), (1, 4));
+    assert!(!vanished.exists());
+    assert!(!root.join("move-inventory.json").exists());
+}
+
+#[test]
+fn legacy_cleanup_skips_an_entry_vanished_before_removal() {
+    let root = broca_test_support::scratch_root().join("inventory-vanished-before-removal");
+    std::fs::create_dir_all(&root).unwrap();
+    let vanished = root.join("move-inventory.tmp-vanished");
+    std::fs::write(&vanished, b"gone").unwrap();
+    std::fs::write(root.join("move-inventory.json"), b"kept").unwrap();
+    let mut removed = false;
+    let result = cleanup_legacy_inventory_with(
+        &root,
+        |path| std::fs::symlink_metadata(path),
+        |path| {
+            if !removed {
+                std::fs::remove_file(path).unwrap();
+                removed = true;
+            }
+            std::fs::remove_file(path)
+        },
+    );
+    assert!(removed);
+    assert_eq!(result.unwrap(), (1, 4));
+    assert!(!vanished.exists());
+    assert!(!root.join("move-inventory.json").exists());
+}
+
+#[test]
+fn legacy_cleanup_preserves_permission_errors() {
+    for fail_metadata in [true, false] {
+        let root = broca_test_support::scratch_root().join("inventory-permission-error");
+        std::fs::create_dir_all(&root).unwrap();
+        let artifact = root.join("move-inventory.json");
+        std::fs::write(&artifact, b"kept").unwrap();
+        let result = cleanup_legacy_inventory_with(
+            &root,
+            |path| {
+                if fail_metadata {
+                    Err(std::io::ErrorKind::PermissionDenied.into())
+                } else {
+                    std::fs::symlink_metadata(path)
+                }
+            },
+            |_| Err(std::io::ErrorKind::PermissionDenied.into()),
+        );
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(artifact.exists());
+    }
+}
+
+#[test]
+fn legacy_cleanup_rejects_missing_or_non_directory_roots() {
+    let root = broca_test_support::scratch_root().join("inventory-missing-root");
+    assert_eq!(
+        cleanup_legacy_inventory(&root).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    std::fs::write(&root, b"not a directory").unwrap();
+    assert!(cleanup_legacy_inventory(&root).is_err());
+}
+
+#[test]
+fn legacy_cleanup_rejects_a_root_vanished_during_scan() {
+    let root = broca_test_support::scratch_root().join("inventory-root-vanished");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("move-inventory.json"), b"gone").unwrap();
+    let result = cleanup_legacy_inventory_with(
+        &root,
+        |path| {
+            std::fs::remove_dir_all(&root).unwrap();
+            std::fs::symlink_metadata(path)
+        },
+        |path| std::fs::remove_file(path),
+    );
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
 }
 
 #[test]
@@ -900,4 +1003,69 @@ fn projection_repair_observes_other_process_writers() {
     assert!(status.success());
     assert!(!repair.finish().unwrap());
     assert!(broca_core::session_projection_incomplete(&root).unwrap());
+}
+
+#[test]
+fn session_ref_v2_startup_rekey_is_idempotent_and_keeps_v1() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let session = BindIdentity::new("/synthetic/project", "runner", "ref-migration");
+    let v1 = broca_core::wal_writer::legacy_session_ref(
+        &session.harness,
+        &session.project_root.to_string_lossy(),
+        &session.session,
+    );
+    let v2 = agent_session_ref(&session);
+    let address = session_addr(&session);
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agent_data_session_ref VALUES(?1,?2,?3,?4,?5)",
+            params![v1, address, "/synthetic/project", "runner", "ref-migration"],
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+        let changes = conn.total_changes();
+        init_schema(&conn).unwrap();
+        assert_eq!(
+            conn.total_changes(),
+            changes,
+            "repeated startup must not rewrite aliases"
+        );
+    }
+    let found = store
+        .session_refs([v1.as_str(), v2.as_str()].into_iter())
+        .unwrap();
+    assert_eq!(found.sessions[&v1], (address.clone(), session.clone()));
+    assert_eq!(found.sessions[&v2], (address, session));
+}
+
+#[test]
+fn session_ref_v2_ambiguous_roots_refuse_but_v1_stays_exact() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let first = BindIdentity::new("/synthetic/one", "runner", "shared");
+    let second = BindIdentity::new("/synthetic/two", "runner", "shared");
+    for session in [&first, &second] {
+        store
+            .record_session(&session_addr(session), session)
+            .unwrap();
+        let v1 = broca_core::wal_writer::legacy_session_ref(
+            &session.harness,
+            &session.project_root.to_string_lossy(),
+            &session.session,
+        );
+        assert_eq!(
+            store
+                .session_refs([v1.as_str()].into_iter())
+                .unwrap()
+                .sessions[&v1]
+                .1,
+            *session
+        );
+    }
+    assert_ne!(session_addr(&first), session_addr(&second));
+    let v2 = agent_session_ref(&first);
+    assert!(matches!(
+        store.session_refs([v2.as_str()].into_iter()),
+        Err(StoreError::InconsistentSnapshot("session_ref_ambiguous"))
+    ));
 }

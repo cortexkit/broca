@@ -74,6 +74,7 @@ async fn controlled_hook_deadlines() {
     ] {
         let sub = subscription("pre_user", None, "refuse", budget);
         let frozen = broca_wal::PlanManifest {
+            rich_ui: None,
             plan: broca_wal::OpaqueJson::from_json_text(
                 plan(std::slice::from_ref(&sub), false).to_string(),
             )

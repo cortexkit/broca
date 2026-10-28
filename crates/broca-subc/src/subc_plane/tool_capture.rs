@@ -41,6 +41,16 @@ fn blob(block: &serde_json::Value) -> Option<(&serde_json::Value, &str)> {
     }
 }
 
+pub(super) fn blob_mime(block: &serde_json::Value) -> Option<&str> {
+    let (source, _) = blob(block)?;
+    Some(
+        source
+            .get("mimeType")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("application/octet-stream"),
+    )
+}
+
 fn pending_part(
     block: &serde_json::Value,
     index: usize,
@@ -134,31 +144,14 @@ pub(super) fn classify(
     )
 }
 
-/// Negotiated content/v1 keeps its own text and error-code mapping. Only replace
-/// the image slots its mapper deliberately left as markers pending capture.
+/// Validation happens before capture classification. Only a capture-enabled dispatch replaces
+/// the normalized shipping text with ordered parts and session-owned media references.
 pub(super) fn content_v1_captures(
     result: &mut ToolResult,
     raw: &serde_json::Value,
 ) -> Vec<PendingCapture> {
-    let ToolOutput::Parts { parts } = &mut result.output else {
-        return Vec::new();
-    };
-    let Some(content) = raw.get("content").and_then(serde_json::Value::as_array) else {
-        return Vec::new();
-    };
-    let offset = usize::from(
-        raw.get("errorCode")
-            .and_then(serde_json::Value::as_str)
-            .is_some(),
-    );
-    let mut captures = Vec::new();
-    for (index, block) in content.iter().enumerate() {
-        if block.get("type").and_then(serde_json::Value::as_str) == Some("image") {
-            let (part, pending) = pending_part(block, index + offset);
-            parts[index + offset] = part;
-            captures.extend(pending);
-        }
-    }
+    let (captured_result, captures) = classify(&result.tool_call_id, raw);
+    *result = captured_result;
     captures
 }
 

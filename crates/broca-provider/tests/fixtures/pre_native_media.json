@@ -6,5 +6,9 @@
   {
     "body": "{\"inferenceConfig\":{\"maxTokens\":2048},\"messages\":[{\"content\":[{\"text\":\"question\"}],\"role\":\"user\"},{\"content\":[{\"text\":\"commentary\"},{\"text\":\"answer\"}],\"role\":\"assistant\"}]}",
     "frozen": {"family_id":"bedrock_converse","max_output_tokens":2048,"reasoning":{"mode":"none"},"renderer_version":4,"system_prompt":{"mode":"instructions_field"},"token_limit_field":"max_tokens","tool_id":"passthrough","usage":"open_ai_usage","wire_model_id":"model"}
+  },
+  {
+    "body": "{\"max_tokens\":2048,\"messages\":[{\"content\":[{\"text\":\"question\",\"type\":\"text\"}],\"role\":\"user\"},{\"content\":[{\"text\":\"commentary\",\"type\":\"text\"},{\"text\":\"answer\",\"type\":\"text\"}],\"role\":\"assistant\"}],\"model\":\"model\",\"stream\":true,\"system\":[]}",
+    "frozen": {"family_id":"anthropic_messages","max_output_tokens":2048,"reasoning":{"mode":"none"},"renderer_version":2,"system_prompt":{"mode":"instructions_field"},"token_limit_field":"max_tokens","tool_id":"passthrough","usage":"open_ai_usage","wire_model_id":"model"}
   }
 ]

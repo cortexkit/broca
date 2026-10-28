@@ -73,7 +73,9 @@ suites=(
     scripts/test-gate-phases.py
     scripts/test-ci-pipeline.py
     scripts/test-gated-commit.py
+    scripts/tests/test_linux_quickcheck.py
     scripts/test-deploy.py
+    scripts/test-check-credential-metadata.py
     scripts/test-acceptance-worker-turn.py
     scripts/test-turn-harnesses.py
     scripts/test-repro-vanished-bind-root.py

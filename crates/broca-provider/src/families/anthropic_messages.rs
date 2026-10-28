@@ -158,7 +158,8 @@ pub fn cc_version_suffix_for_transcript(messages: &[Message], version: &str) -> 
     let single = std::slice::from_ref(first_user);
     let id_map = crate::tool_id_alias::ToolIdMap::build(single, &id_grammar());
     let name_map = crate::tool_name_alias::ToolNameMap::build(&[], single);
-    let wire = convert_message(first_user, false, &id_map, &name_map, None);
+    // The first user message carries no handoff block, so the fallback echo decision is moot.
+    let wire = convert_message(first_user, false, false, &id_map, &name_map, None);
     Some(persona_rules::cc_version_suffix(
         &persona_rules::first_user_message_text(std::slice::from_ref(&wire)),
         version,
@@ -169,6 +170,40 @@ pub fn cc_version_suffix_for_transcript(messages: &[Message], version: &str) -> 
 /// the bytes the run records, retries and dumps, so every copy carries the same signature.
 fn persona_bytes(body: &Value) -> Vec<u8> {
     persona_rules::sign_body(&persona_rules::to_persona_json(body)).into_bytes()
+}
+
+fn render_body(frozen: &FrozenRenderConfig, opts: &CallOptions, body: &Value) -> Vec<u8> {
+    let fragments: Vec<_> = if frozen.server_side_fallback {
+        opts.prompt
+            .iter()
+            .filter(|message| message.role == Role::Assistant)
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::ProviderFallback { raw, .. } => Some(raw.as_deref()),
+                _ => None,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if fragments.iter().all(Option::is_none) {
+        return if persona(frozen).is_some() {
+            persona_bytes(body)
+        } else {
+            broca_protocol::canonical_json_bytes(body)
+        };
+    }
+    if persona(frozen).is_some() {
+        // Sign only after restoring the raw blocks: cch covers the body actually sent.
+        let bytes = raw_fallback::splice(
+            persona_rules::to_persona_json(body).into_bytes(),
+            &fragments,
+        );
+        persona_rules::sign_body(std::str::from_utf8(&bytes).expect("serialized JSON is UTF-8"))
+            .into_bytes()
+    } else {
+        raw_fallback::splice(broca_protocol::canonical_json_bytes(body), &fragments)
+    }
 }
 
 /// The fixed Claude Code client headers that describe the SDK and runtime the reference client
@@ -317,6 +352,8 @@ fn attach_auth(headers: &mut Vec<(String, String)>, auth: &AuthHandle) {
 /// render config passed to each method.
 pub struct AnthropicMessages;
 
+mod raw_fallback;
+
 impl WireFamily for AnthropicMessages {
     fn shape(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
         build_request_body(frozen, opts)
@@ -342,22 +379,14 @@ impl WireFamily for AnthropicMessages {
         media: &[crate::media_render::InlineMedia<'_>],
     ) -> Vec<u8> {
         let body = self.shape_with_media(frozen, opts, media);
-        if persona(frozen).is_some() {
-            persona_bytes(&body)
-        } else {
-            broca_protocol::canonical_json_bytes(&body)
-        }
+        render_body(frozen, opts, &body)
     }
 
     /// A persona run's bytes are the persona's key order with the `cch` signature written in;
     /// every other run keeps the canonical JSON of its shape.
     fn render(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Vec<u8> {
         let body = build_request_body(frozen, opts);
-        if persona(frozen).is_some() {
-            persona_bytes(&body)
-        } else {
-            broca_protocol::canonical_json_bytes(&body)
-        }
+        render_body(frozen, opts, &body)
     }
 
     fn endpoint(
@@ -411,20 +440,36 @@ impl WireFamily for AnthropicMessages {
             // The body renders `max_tokens` from this same field, so an output-ceiling error
             // names the cap the provider actually enforced.
             inner: AnthropicNormalizer::new(step_id)
-                .with_max_output_tokens(frozen.max_output_tokens),
+                .with_max_output_tokens(frozen.max_output_tokens)
+                // A response naming another model is reported as served by a server-side
+                // fallback; the requested id is the only thing that makes it "another".
+                .with_requested_model(frozen.wire_model_id.clone())
+                // Only an episode that froze a refusal fallback commits a refusal after a
+                // tool call as a tool step; every other episode assembles it as before.
+                .with_refusal_tool_use_trim(frozen.refusal_fallback.is_some()),
         })
     }
 
     fn warm_body(&self, frozen: &FrozenRenderConfig, base: &[u8]) -> Result<Vec<u8>, String> {
         let warm = crate::cache_warm::anthropic_warm_body(base)?;
+        let fragments: Vec<_> = raw_fallback::blocks(base).into_iter().map(Some).collect();
         if persona(frozen).is_none() {
-            return Ok(warm);
+            return Ok(raw_fallback::splice(warm, &fragments));
         }
         // The warm body changes the sent body, so a persona warm is re-emitted in the persona's
         // key order and signed again; its billing block is otherwise the one `base` carried.
         let body: Value = serde_json::from_slice(&warm)
             .map_err(|error| format!("the warm body is not JSON: {error}"))?;
-        Ok(persona_bytes(&body))
+        let bytes = raw_fallback::splice(
+            persona_rules::to_persona_json(&body).into_bytes(),
+            &fragments,
+        );
+        Ok(
+            persona_rules::sign_body(
+                std::str::from_utf8(&bytes).expect("serialized JSON is UTF-8"),
+            )
+            .into_bytes(),
+        )
     }
 }
 
@@ -596,7 +641,14 @@ fn build_request_body_with_media(
                 opts.target_model.as_ref(),
             );
             (
-                convert_message(m, positional && echo_safe, &id_map, &name_map, media),
+                convert_message(
+                    m,
+                    positional && echo_safe,
+                    frozen.server_side_fallback,
+                    &id_map,
+                    &name_map,
+                    media,
+                ),
                 m.cache_prefix_blocks,
                 prompt_index,
             )
@@ -717,6 +769,14 @@ fn build_request_body_with_media(
     // beta header is added in `anthropic_beta_header`. Absent leaves the body unchanged.
     if let Some(speed) = &frozen.speed {
         body["speed"] = Value::String(speed.clone());
+    }
+    // A run admitted with server-side fallback asks the runtime to hand a content-filter
+    // refusal to another model itself. The persona then appends the fallback beta and places
+    // the key after `speed`; a config without the flag renders neither. Admission freezes the
+    // flag and the version together (see `families::anthropic_renderer_version`), so a recorded
+    // config never pairs an opt-in with a version that does not describe these bytes.
+    if frozen.server_side_fallback {
+        body["fallbacks"] = Value::String("default".to_string());
     }
     if let Some(persona) = persona(frozen) {
         body["metadata"] = json!({
@@ -989,9 +1049,12 @@ fn first_echoed_message(scope: ThinkingEchoScope, non_system: &[&Message]) -> Op
 /// USER turn carrying `tool_result` blocks (Anthropic's shape). `keep_thinking` is
 /// true only for assistant messages of the current turn (the interleaved-thinking rule). `id_map` maps
 /// each canonical tool-call id to its Anthropic wire id (identity unless aliased).
+/// `echo_fallback` is true only when the request's frozen config opted into server-side
+/// fallback, which is the only case Anthropic's handoff block may be echoed back.
 fn convert_message(
     m: &Message,
     keep_thinking: bool,
+    echo_fallback: bool,
     id_map: &crate::tool_id_alias::ToolIdMap,
     name_map: &crate::tool_name_alias::ToolNameMap,
     media: Option<&crate::media_render::MediaRender<'_>>,
@@ -1017,10 +1080,10 @@ fn convert_message(
             json!({ "role": "user", "content": convert_user_content(&m.content, id_map, name_map, media) })
         }
         Role::Assistant => {
-            json!({ "role": "assistant", "content": convert_content(&m.content, keep_thinking, id_map, name_map, None) })
+            json!({ "role": "assistant", "content": convert_content(&m.content, keep_thinking, echo_fallback, id_map, name_map, None) })
         }
         Role::System => {
-            json!({ "role": "user", "content": convert_content(&m.content, false, id_map, name_map, None) })
+            json!({ "role": "user", "content": convert_content(&m.content, false, echo_fallback, id_map, name_map, None) })
         }
     }
 }
@@ -1043,6 +1106,9 @@ fn convert_user_content(
             _ => content.extend(convert_content(
                 std::slice::from_ref(block),
                 false,
+                // A `tool_result`-carrying user turn never holds a handoff block, so the
+                // fallback echo decision cannot matter here.
+                false,
                 id_map,
                 name_map,
                 media,
@@ -1055,6 +1121,7 @@ fn convert_user_content(
 fn convert_content(
     blocks: &[ContentBlock],
     keep_thinking: bool,
+    echo_fallback: bool,
     id_map: &crate::tool_id_alias::ToolIdMap,
     name_map: &crate::tool_name_alias::ToolNameMap,
     media: Option<&crate::media_render::MediaRender<'_>>,
@@ -1121,6 +1188,16 @@ fn convert_content(
             // A tool_result inside a non-Tool message is unusual; the Tool-role path
             // above handles results.
             ContentBlock::ToolResult(_) => None,
+            // Anthropic's server-side fallback handoff is echoed only to a request whose frozen
+            // config opted into server-side fallback, and restored at the position it held in
+            // the response. It is neither signed nor reasoning, so the echo-scope and
+            // cross-model rules above do not apply to it. Every other target drops it: a request
+            // that did not ask for the handoff cannot use it.
+            ContentBlock::ProviderFallback {
+                from_model,
+                to_model,
+                raw,
+            } => echo_fallback.then(|| raw_fallback::shape(from_model, to_model, raw.as_deref())),
         })
         .collect()
 }
@@ -1134,7 +1211,21 @@ fn tool_output_text(out: &ToolOutput) -> String {
         ToolOutput::Text { text } => text.clone(),
         ToolOutput::Json { value } => value.to_string(),
         ToolOutput::Denied { reason } => format!("denied: {reason}"),
-        ToolOutput::Error { message } => message.clone(),
+        ToolOutput::Error {
+            message,
+            module,
+            code,
+            detail,
+            nothing_sent,
+            retry,
+        } => ToolOutput::error_model_text(
+            message,
+            module.as_deref(),
+            code.as_deref(),
+            detail.as_deref(),
+            *nothing_sent,
+            retry.as_deref(),
+        ),
     }
 }
 
@@ -1193,6 +1284,27 @@ mod tests {
     use super::*;
     use crate::families::{anthropic_apikey_frozen_config, anthropic_frozen_config};
     use broca_protocol::{content::ToolOutput, ToolCallId};
+
+    /// An attributed module-outage error reaches the model with the module, the code
+    /// and the retry guidance; a plain error renders as its message alone.
+    #[test]
+    fn attributed_outage_error_renders_attribution_for_the_model() {
+        let text = tool_output_text(&ToolOutput::module_unavailable(
+            "aft",
+            "target_unavailable",
+            "supervised_not_registered",
+        ));
+        assert!(text.starts_with("tool plane unavailable\n"), "{text}");
+        for line in [
+            "module: aft",
+            "code: target_unavailable",
+            "detail: supervised_not_registered",
+            "nothing was sent",
+        ] {
+            assert!(text.contains(line), "{text}");
+        }
+        assert_eq!(tool_output_text(&ToolOutput::error("boom")), "boom");
+    }
 
     fn persona_frozen() -> FrozenRenderConfig {
         let mut frozen = anthropic_frozen_config("claude-opus-4-8");
@@ -1269,6 +1381,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn raw_fallbacks_are_restored_before_persona_signing_and_survive_warming() {
+        let mut frozen = persona_frozen();
+        frozen.server_side_fallback = true;
+        frozen.renderer_version = crate::families::anthropic_renderer_version(true);
+        let raw = r#"{ "to":{"model":"claude-opus-4-8"}, "type":"fallback", "from":{"model":"claude-opus-5-5"}, "trigger":{"type":"refusal","number":1.00e+2} }"#;
+        let request = opts(vec![
+            user_message("Synthetic prompt"),
+            Message::assistant_from(
+                vec![ContentBlock::ProviderFallback {
+                    from_model: "claude-opus-5-5".into(),
+                    to_model: "claude-opus-4-8".into(),
+                    raw: Some(raw.into()),
+                }],
+                ModelHandle::new("anthropic", "claude-opus-4-8"),
+            ),
+            user_message("Synthetic follow-up"),
+        ]);
+        let base = AnthropicMessages.render(&frozen, &request);
+        let base = std::str::from_utf8(&base).unwrap();
+        assert!(base.contains(raw));
+        assert_eq!(persona_rules::sign_body(base), base);
+        let warm = AnthropicMessages
+            .warm_body(&frozen, base.as_bytes())
+            .unwrap();
+        let warm = std::str::from_utf8(&warm).unwrap();
+        assert!(warm.contains(raw));
+        assert_eq!(persona_rules::sign_body(warm), warm);
+        assert_ne!(base, warm);
+    }
+
     /// The persona applies only to the OAuth identity-lead shape: an api-key config carrying a
     /// persona renders and addresses exactly as it does without one.
     #[test]
@@ -1321,6 +1464,7 @@ mod tests {
             account_ref: None,
             run_id: "run-1".into(),
             step_index: 1,
+            max_output_tokens: None,
         });
         opts
     }
@@ -1355,7 +1499,15 @@ mod tests {
                     message.origin.as_ref(),
                     opts.target_model.as_ref(),
                 );
-                convert_message(message, positional && echo_safe, &id_map, &name_map, None)
+                // The reference renderer mirrors the request's handoff echo rule.
+                convert_message(
+                    message,
+                    positional && echo_safe,
+                    frozen.server_side_fallback,
+                    &id_map,
+                    &name_map,
+                    None,
+                )
             })
             .collect()
     }

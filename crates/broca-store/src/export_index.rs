@@ -736,6 +736,7 @@ mod tests {
                 "token_limit_field": "max_tokens"
             }),
             auth_selection: Some(AuthSelection {
+                auth_method: None,
                 credential_id: "apikey:xai:work".into(),
                 account_ref: None,
                 resolved_credential_id: None,
@@ -816,6 +817,7 @@ mod tests {
                 seq: records.len() as u64 + 1,
                 fence: 1,
                 record: WalRecord::ModelStepFinished {
+                    fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
                     hooks: None,

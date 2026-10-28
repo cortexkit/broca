@@ -287,81 +287,6 @@ async fn recreated_prefix_session_read(unidentified: bool, model: bool) {
     assert_eq!(repeated.messages, page.messages);
 }
 
-#[tokio::test]
-#[ignore = "manual timing probe on a 15 MB production-framed WAL"]
-async fn owner_authorization_on_15mb_wal() {
-    let fixture = Fixture::new();
-    let mut records = vec![started(
-        &fixture.session,
-        Some(reserved("basal")),
-        Some(scope("core")),
-    )];
-    for step in 1..=256 {
-        records.push(WalRecord::StepStarted {
-            step_id: broca_protocol::StepId(step),
-        });
-        let mut record = super::tests::assistant_record();
-        let WalRecord::ModelStepFinished {
-            step_id,
-            assistant_message,
-            ..
-        } = &mut record
-        else {
-            unreachable!()
-        };
-        *step_id = broca_protocol::StepId(step);
-        *assistant_message = Arc::new(broca_protocol::AssistantMessage {
-            message_id: broca_protocol::MessageId(format!("m{step}")),
-            content: vec![broca_protocol::ContentBlock::Text {
-                text: "x".repeat(61_000),
-            }],
-        });
-        records.push(record);
-    }
-    records.push(finished());
-    fixture.append(&records);
-    let store = fixture.sqlite();
-    let range = fixture
-        .wal
-        .read_records_range(&fixture.session, 0, None, None)
-        .unwrap();
-    store.project_range(&fixture.session, &range).unwrap();
-    let bytes = std::fs::metadata(fixture.wal.wal_path(&fixture.session))
-        .unwrap()
-        .len();
-    assert!(
-        (15_000_000..17_000_000).contains(&bytes),
-        "representative WAL size: {bytes}"
-    );
-    let registry =
-        LineageRegistry::new_with_reader(Arc::new(NeverOpener), fixture.wal.clone(), Some(store));
-    let started_at = std::time::Instant::now();
-    registry
-        .authorize_session_owner(
-            &fixture.session,
-            Some(&reserved("core")),
-            &SendScope::Unstamped,
-        )
-        .await
-        .unwrap();
-    let cold_us = started_at.elapsed().as_micros();
-    let repeated_at = std::time::Instant::now();
-    registry
-        .authorize_session_owner(
-            &fixture.session,
-            Some(&reserved("core")),
-            &SendScope::Unstamped,
-        )
-        .await
-        .unwrap();
-    println!(
-        "OWNER_AUTH bytes={bytes} records={} cold_authorization_us={cold_us} repeated_authorization_us={}",
-        records.len(),
-        repeated_at.elapsed().as_micros()
-    );
-    assert_eq!(registry.slot_counts().open, 0);
-}
-
 #[cfg(unix)]
 #[tokio::test]
 async fn bind_and_owner_checks_reuse_large_wal_ownership_without_prefix_reads() {
@@ -500,6 +425,7 @@ async fn bind_and_owner_checks_reuse_large_wal_ownership_without_prefix_reads() 
 
 fn plan_manifest(identity: &str, transforms: bool) -> Box<broca_wal::PlanManifest> {
     Box::new(broca_wal::PlanManifest {
+        rich_ui: None,
         plan: broca_wal::OpaqueJson::from_json_text(if transforms {
             serde_json::json!({"step_transform_items": [{
                 "provider": "p",
@@ -1959,6 +1885,7 @@ async fn a_full_dispatch_cache_evicts_one_session_not_all() {
     let facts = vec![broca_core::ToolCallDispatch {
         tool_call_id: "call".into(),
         intent_seq: Some(4),
+        recorded_call_key: None,
         dispatched_to: Some("aft".into()),
         indeterminate: false,
     }];

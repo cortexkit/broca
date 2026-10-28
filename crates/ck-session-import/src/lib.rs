@@ -479,9 +479,9 @@ fn flush_tracked_pending(
             (
                 ContentBlock::ToolResult(broca_protocol::ToolResult {
                     tool_call_id,
-                    output: broca_protocol::ToolOutput::Error {
-                        message: "tool not run: interrupted before dispatch".into(),
-                    },
+                    output: broca_protocol::ToolOutput::error(
+                        "tool not run: interrupted before dispatch",
+                    ),
                     is_error: true,
                 }),
                 None,
@@ -816,7 +816,7 @@ mod tests {
                             broca_protocol::MediaMarkerReason::NotRequested,
                         ),
                         ToolOutput::Text { text } => text.clone(),
-                        ToolOutput::Error { message } => message.clone(),
+                        ToolOutput::Error { message, .. } => message.clone(),
                         ToolOutput::Json { value } => value.to_string(),
                         ToolOutput::Denied { reason } => reason.clone(),
                     };

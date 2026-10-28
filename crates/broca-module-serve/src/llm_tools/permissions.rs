@@ -25,9 +25,7 @@ impl Permissions {
 
     pub async fn answer(&self, body: &[u8], principal: Option<&BindPrincipal>) -> Answer {
         // Admission precedes even reading grants: the inventory is operator authority too.
-        if !matches!(principal, Some(BindPrincipal::Direct))
-            && !matches!(principal, Some(BindPrincipal::Reserved { module_id }) if module_id == "cingulate")
-        {
+        if !operator_admitted(principal) {
             return Err(error(
                 "permissions_operator_required",
                 "permissions operations require the direct operator or reserved:cingulate",
@@ -98,6 +96,7 @@ impl Permissions {
 
     async fn visible(&self, grant: &Grant, now: i64) -> bool {
         match grant.kind {
+            GrantKind::Always => grant.project.is_some(),
             GrantKind::Hours24 => grant.expires_at_ms.is_some_and(|expiry| now < expiry),
             GrantKind::Run => {
                 // An unavailable liveness check must not hide authority the operator can revoke.
@@ -128,10 +127,16 @@ impl Permissions {
     }
 }
 
+pub(crate) fn operator_admitted(principal: Option<&BindPrincipal>) -> bool {
+    matches!(principal, Some(BindPrincipal::Direct))
+        || matches!(principal, Some(BindPrincipal::Reserved { module_id }) if module_id == "cingulate")
+}
+
 fn row(grant: &Grant) -> Value {
     let duration = match grant.kind {
-        GrantKind::Run => "for this program run",
-        GrantKind::Hours24 => "for 24 hours",
+        GrantKind::Run => "for this program run".to_owned(),
+        GrantKind::Hours24 => "for 24 hours".to_owned(),
+        GrantKind::Always => format!("always in {}", grant.project.as_deref().unwrap_or("")),
     };
     let mut row = json!({
         "id":grant.id, "agent_id":grant.holder,

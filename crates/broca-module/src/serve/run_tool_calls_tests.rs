@@ -124,6 +124,7 @@ impl ClosedSession {
             .collect();
         self.append(WalRecord::StepStarted { step_id });
         self.append(WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             step_id,
             assistant_message: Arc::new(AssistantMessage {
@@ -244,6 +245,7 @@ impl ClosedSession {
         let step_id = StepId(1);
         let batch_id = BatchId("batch-duplicate-id".into());
         self.append(WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             step_id,
             assistant_message: Arc::new(AssistantMessage {
@@ -297,9 +299,7 @@ impl ClosedSession {
             batch_id: batch_id.clone(),
             result: Arc::new(ToolResult {
                 tool_call_id: call_id,
-                output: ToolOutput::Error {
-                    message: "duplicate tool_call_id from provider".into(),
-                },
+                output: ToolOutput::error("duplicate tool_call_id from provider"),
                 is_error: true,
             }),
             outcome: DispatchOutcome::Completed,
@@ -641,6 +641,7 @@ async fn run_tool_calls_ordinals_match_session_read_across_a_materialized_prefix
 async fn run_tool_calls_returns_empty_for_a_run_without_tool_calls() {
     let mut session = ClosedSession::new("empty");
     session.append(WalRecord::ModelStepFinished {
+        fallback: Default::default(),
         written_at_ms: None,
         step_id: StepId(1),
         assistant_message: Arc::new(AssistantMessage {
@@ -767,6 +768,7 @@ async fn completed_directives_match_all_published_vectors_and_old_run_bytes() {
             .iter()
             .any(|block| matches!(block, ContentBlock::ToolCall(_)));
         session.append(WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             step_id: StepId(1),
             assistant_message: Arc::new(AssistantMessage {

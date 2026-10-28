@@ -163,6 +163,12 @@ fn validate_routes(routes: &[Route]) -> Result<(), &'static str> {
 }
 
 impl Route {
+    pub fn live_skip_reason(&self, frozen: &FrozenRenderConfig) -> Option<&'static str> {
+        (self.family == WireFamilyId::GoogleCodeAssist
+            && frozen.project_id.as_deref().is_none_or(str::is_empty))
+        .then_some("project_id_required")
+    }
+
     pub fn frozen(&self) -> Result<FrozenRenderConfig, &'static str> {
         let mut frozen = self
             .frozen
@@ -280,10 +286,53 @@ mod tests {
     #[test]
     fn candidates_do_not_enable_the_production_registry() {
         let routes = Args::default().routes().unwrap();
-        assert_eq!(routes.len(), 7);
+        assert_eq!(routes.len(), 6);
         for route in routes {
             route.frozen().unwrap();
         }
         assert!(broca_provider::media_profile::LIVE_CHECKED_GATES.is_empty());
+    }
+
+    #[test]
+    fn serving_plan_pins_operator_supplied_models_and_credential_names() {
+        let routes = Args::default().routes().unwrap();
+        let expected = [
+            (
+                WireFamilyId::AnthropicMessages,
+                "claude-haiku-5-5",
+                "apikey:anthropic:ufukaltinokgmail",
+            ),
+            (WireFamilyId::OpenAiResponses, "gpt-6-luna", "apikey:openai"),
+            (
+                WireFamilyId::OpenAiResponsesChatgpt,
+                "gpt-6-luna",
+                "chatgpt:openai:live",
+            ),
+            (WireFamilyId::OpenAiChat, "gpt-6-luna", "apikey:openai"),
+            (WireFamilyId::Gemini, "gemini-3.8-flash", "apikey:google"),
+            (
+                WireFamilyId::GoogleCodeAssist,
+                "gemini-3.8-flash-medium",
+                "antigravity:google",
+            ),
+        ];
+        for (family, model, credential) in expected {
+            let route = routes.iter().find(|route| route.family == family).unwrap();
+            assert_eq!(route.model, model);
+            assert_eq!(route.credential.as_deref(), Some(credential));
+        }
+        assert!(!routes
+            .iter()
+            .any(|route| route.family == WireFamilyId::BedrockConverse));
+        let codeassist = routes
+            .iter()
+            .find(|route| route.family == WireFamilyId::GoogleCodeAssist)
+            .unwrap();
+        assert_eq!(codeassist.credential.as_deref(), Some("antigravity:google"));
+        assert_eq!(codeassist.project_id, None);
+        assert_eq!(
+            codeassist.live_skip_reason(&codeassist.frozen().unwrap()),
+            Some("project_id_required")
+        );
     }
 }

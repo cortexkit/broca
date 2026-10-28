@@ -93,6 +93,7 @@ fn start(run: &str, text: &str, max_tokens: u32) -> WalRecord {
 /// A terminal (text-only) model step.
 fn step_text(step: u64, text: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        fallback: Default::default(),
         written_at_ms: None,
         tags: None,
         hooks: None,

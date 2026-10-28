@@ -1507,3 +1507,132 @@ fn only_a_model_change_since_the_last_notice_rides() {
         Some(crate::compaction_provider::ride::RideCause::ModelChange)
     );
 }
+
+fn routed_selection(account_ref: &str) -> broca_wal::AuthSelection {
+    broca_wal::AuthSelection {
+        credential_id: format!("vault-cred-{account_ref}"),
+        account_ref: Some(account_ref.to_owned()),
+        resolved_credential_id: Some(format!("vault-cred-{account_ref}")),
+        vault_request: None,
+        account_decision: Some(broca_wal::AccountDecision {
+            conversation_key: None,
+            conversation_key_source: None,
+            path: broca_wal::ACCOUNT_DECISION_ROUTED.to_owned(),
+            admission_id: Some("admission".into()),
+            decision_id: Some("decision".into()),
+        }),
+        auth_method: Some("oauth".into()),
+    }
+}
+
+fn static_selection() -> broca_wal::AuthSelection {
+    broca_wal::AuthSelection {
+        credential_id: "oauth:anthropic".into(),
+        account_ref: Some("static-acct".into()),
+        resolved_credential_id: Some("vault-static".into()),
+        vault_request: None,
+        account_decision: Some(broca_wal::AccountDecision {
+            conversation_key: None,
+            conversation_key_source: None,
+            path: broca_wal::ACCOUNT_DECISION_SINGLE_CANDIDATE.to_owned(),
+            admission_id: Some("admission".into()),
+            decision_id: None,
+        }),
+        auth_method: None,
+    }
+}
+
+/// The account label is a truncated hash of the vault-served account id: opaque, stable,
+/// and pinned here so a change to the hash changes this test, not silent bytes.
+#[test]
+fn account_labels_are_truncated_hashes_of_the_vault_account() {
+    // SHA-256("acct-test-1"), first 32 hex characters (128 bits).
+    assert_eq!(
+        account_label("acct-test-1"),
+        "1a0b66a4c753580e7b1710d6e6057933"
+    );
+    assert_eq!(
+        selection_account_label(&routed_selection("acct-test-1")),
+        Some("1a0b66a4c753580e7b1710d6e6057933".into())
+    );
+    // The static credential's account reports the same way when routing chose nothing.
+    assert!(selection_account_label(&static_selection()).is_some());
+}
+
+/// No routing selection, or an unrouted credential, is unknown: broca sends neither the
+/// ride cause nor the event, and never a placeholder.
+#[test]
+fn unknown_accounts_send_neither_cause_nor_event() {
+    let apikey = broca_wal::AuthSelection {
+        credential_id: "apikey:deepseek".into(),
+        account_ref: None,
+        resolved_credential_id: Some("vault-apikey".into()),
+        vault_request: None,
+        account_decision: None,
+        auth_method: None,
+    };
+    assert_eq!(selection_account_label(&apikey), None);
+    let no_decision = broca_wal::AuthSelection {
+        account_decision: None,
+        ..routed_selection("acct-a")
+    };
+    assert_eq!(selection_account_label(&no_decision), None);
+    let no_account = broca_wal::AuthSelection {
+        account_ref: None,
+        ..routed_selection("acct-a")
+    };
+    assert_eq!(selection_account_label(&no_account), None);
+    // An unknown current never rides, even against a known announced account.
+    let mut state = after_setup();
+    state.announced_account = Some(account_label("acct-a"));
+    state.announced = Some(Announced {
+        model: Some("claude".into()),
+        ..Default::default()
+    });
+    assert_eq!(rewrite_ride_cause(&state, "claude"), None);
+    let prompt = conversation();
+    let notice = next_notice(&state, &prompt, facts(LINEAGE)).unwrap();
+    assert!(
+        !notice.to_headers().contains_key("events"),
+        "unknown runs send no event: {:?}",
+        notice.to_headers().get("events")
+    );
+}
+
+/// A request rides `account_change` only when the current run's account differs from the
+/// account the newest notice attributed: never before the first notice with a known
+/// account, which baselines without an event so legacy runs keep today's bytes.
+#[test]
+fn only_an_account_change_since_the_last_notice_rides() {
+    use crate::compaction_provider::ride::RideCause;
+    let label_a = account_label("acct-a");
+    let label_b = account_label("acct-b");
+    let mut state = after_setup();
+    state.current_account = Some(label_a.clone());
+    assert_eq!(
+        rewrite_ride_cause(&state, "claude"),
+        None,
+        "the first notice with a known account baselines"
+    );
+    // The first notice records the baseline without an event.
+    let prompt = conversation();
+    let first = next_notice(&state, &prompt, facts(LINEAGE)).unwrap();
+    assert!(!first.to_headers().contains_key("events"));
+    record(&mut state, &first);
+    assert_eq!(state.announced_account.as_deref(), Some(label_a.as_str()));
+    assert_eq!(
+        rewrite_ride_cause(&state, "claude"),
+        None,
+        "the same account"
+    );
+    state.current_account = Some(label_b.clone());
+    assert_eq!(
+        rewrite_ride_cause(&state, "claude"),
+        Some(RideCause::AccountChange)
+    );
+    let switched = next_notice(&state, &prompt, facts(LINEAGE)).unwrap();
+    assert_eq!(
+        switched.to_headers()["events"],
+        format!("account_change:{label_b}")
+    );
+}

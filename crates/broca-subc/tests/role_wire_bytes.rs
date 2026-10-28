@@ -82,6 +82,7 @@ fn tool_call_request_bytes_are_pinned() {
         schema_pin: None,
         preset: Some("default".into()),
         origin: None,
+        output_refs: None,
     };
     assert_eq!(
         serde_json::to_vec(&request).unwrap(),

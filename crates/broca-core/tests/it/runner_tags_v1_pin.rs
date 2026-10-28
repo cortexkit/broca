@@ -89,6 +89,8 @@ impl Provider for TurnModel {
                 finish_reason: reason,
                 service_tier_used: None,
                 speed_used: None,
+                served_model: None,
+                usage_iterations: None,
             }),
             NormalizedEvent::Control(ProviderControl::Finished {
                 usage: Usage::default(),
@@ -142,6 +144,7 @@ fn lookup() -> Tool {
 
 fn rendering_manifest() -> broca_wal::PlanManifest {
     broca_wal::PlanManifest {
+        rich_ui: None,
         plan: broca_wal::OpaqueJson::from_json_text(
             json!({"step_transform_items":[],"render_tags":true}).to_string(),
         )

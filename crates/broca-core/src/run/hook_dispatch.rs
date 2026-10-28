@@ -102,17 +102,15 @@ fn transformed_tool_result(
     let mut reason = None;
     if let Some((provider, _, _)) = &output.refusal {
         reason = Some("post_tool_unavailable".into());
-        result.output = ToolOutput::Error {
-            message: format!(
-                "post_tool_unavailable: {provider}; the call executed, but its result is withheld"
-            ),
-        };
+        result.output = ToolOutput::error(format!(
+            "post_tool_unavailable: {provider}; the call executed, but its result is withheld"
+        ));
         result.is_error = true;
     } else if let crate::hooks::Subject::PostTool { blocks, .. } = &output.subject {
         if !output.operations.is_empty() {
             let text = blocks[0].clone();
             result.output = match &original.output {
-                ToolOutput::Error { .. } => ToolOutput::Error { message: text },
+                ToolOutput::Error { .. } => ToolOutput::error(text),
                 ToolOutput::Denied { .. } if text.starts_with("denied: ") => ToolOutput::Denied {
                     reason: text[8..].into(),
                 },
@@ -168,7 +166,22 @@ pub(super) async fn resolve_hooked<T: ToolPlane>(
             broca_protocol::MediaMarkerReason::Carrier,
         ),
         ToolOutput::Text { text } => text.clone(),
-        ToolOutput::Error { message } => message.clone(),
+        ToolOutput::Error {
+            message,
+            module,
+            code,
+            detail,
+            nothing_sent,
+            retry,
+            ..
+        } => ToolOutput::error_model_text(
+            message,
+            module.as_deref(),
+            code.as_deref(),
+            detail.as_deref(),
+            *nothing_sent,
+            retry.as_deref(),
+        ),
         ToolOutput::Denied { reason } => format!("denied: {reason}"),
         ToolOutput::Json { .. } => unreachable!(),
     };

@@ -103,6 +103,32 @@ fn array_error_tool_result_round_trip_preserves_is_error_true() {
     );
 }
 
+/// Anthropic's server-side fallback handoff block has no typed equivalent: a reduction
+/// transform carries it as an opaque Anthropic block and puts its exact bytes back.
+#[test]
+fn server_side_fallback_block_round_trips_as_an_opaque_anthropic_block() {
+    let assistant = r#"{"role":"assistant","content":[{"type":"text","text":"Let me"},{"type":"fallback","from":{"model":"claude-opus-5-5"},"to":{"model":"claude-opus-4-8"}},{"type":"text","text":" check."}]}"#;
+    let body = format!(
+        r#"{{"model":"claude-opus-5-5","messages":[{{"role":"user","content":[{{"type":"text","text":"hi"}}]}},{assistant}]}}"#
+    );
+    let decoded = anthropic_decode::decode(body.as_bytes()).expect("the body decodes");
+    let ContentKind::Opaque(opaque) = &decoded.messages[1].content[1].kind else {
+        panic!(
+            "expected the handoff to decode opaque: {:?}",
+            decoded.messages[1]
+        );
+    };
+    assert_eq!(opaque.kind, "fallback");
+    assert_eq!(
+        opaque.source,
+        OpaqueSource::Wire {
+            wire: "anthropic".into()
+        }
+    );
+    let encoded = anthropic_encode::encode_messages(&decoded.messages).expect("messages encode");
+    assert_eq!(encoded[1].get(), assistant);
+}
+
 #[test]
 fn successful_array_tool_results_keep_content_kind_and_omit_is_error() {
     let with_false = br#"{"model":"claude","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":false,"content":[{"type":"text","text":"ok"}]}]}]}"#;

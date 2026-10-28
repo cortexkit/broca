@@ -278,7 +278,7 @@ async fn late_retry_tail(deny: bool) {
             0,
             "C's denial after A's completed scan must defeat later duplicate closure"
         );
-        assert!(rig.frames().iter().any(|frame| matches!(&frame.record, WalRecord::LateResult { call_key, outcome: broca_wal::LateOutcome::NotSent, result } if call_key == &key && matches!(&result.output, ToolOutput::Error { message } if message.contains("consent_conflicting_decisions")))));
+        assert!(rig.frames().iter().any(|frame| matches!(&frame.record, WalRecord::LateResult { call_key, outcome: broca_wal::LateOutcome::NotSent, result } if call_key == &key && matches!(&result.output, ToolOutput::Error { message, .. } if message.contains("consent_conflicting_decisions")))));
         assert_eq!(
             history.projection.calls[&key].elicitation_id.as_deref(),
             Some(id.as_str())
@@ -359,7 +359,7 @@ async fn held_retry_reads_new_denial_after_duplicate_proof_failure() {
         "held retries cannot authorize A from the completed snapshot before C's denial"
     );
     assert!(
-        matches!(&result.results[0].output, ToolOutput::Error { message } if message.contains("consent_conflicting_decisions"))
+        matches!(&result.results[0].output, ToolOutput::Error { message, .. } if message.contains("consent_conflicting_decisions"))
     );
     assert!(feed.tail_reads.load(Ordering::SeqCst) > 0);
     assert!(!rig.frames().iter().any(|frame| matches!(
