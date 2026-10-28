@@ -18,15 +18,25 @@ class CannotCompare(Exception):
     pass
 
 
-def recent_credentials(state_root: pathlib.Path, now_ms: int, days: int = 7) -> set[str]:
+def recent_credentials(state_root: pathlib.Path, now_ms: int, days: int = 7) -> tuple[set[str], int]:
     """Include selections on recent runs, refreezes, and activity in older runs.
 
-    The shared reader includes cold archives and rejects incomplete WAL snapshots.
+    The shared reader rejects incomplete WAL snapshots among the recent live logs.
     A deployment must not certify metadata against a partial history.
     """
+    if days >= 14:
+        raise CannotCompare("a live-only metadata scan requires a window shorter than the 14-day archive idle period")
     credentials: set[str] = set()
+    logs_read = 0
     cutoff = now_ms - days * 24 * 60 * 60 * 1000
-    for wal in logical_wals(state_root / "wal"):
+    # Logs fold into archives only after 14 idle days, so an archive cannot contain
+    # activity from the seven-day deploy window.
+    for wal in logical_wals(state_root / "wal", include_archives=False):
+        # A live WAL is append-only: without a modification since the cutoff it
+        # cannot contain a record written during the deploy window.
+        if wal.stat().st_mtime_ns < cutoff * 1_000_000:
+            continue
+        logs_read += 1
         selection = None
         for frame in read_records(wal):
             record = frame.record
@@ -41,15 +51,15 @@ def recent_credentials(state_root: pathlib.Path, now_ms: int, days: int = 7) -> 
                 selection = None
             if current_selection is None:
                 continue
+            # RunStarted uses written_at_ms; RunAuthRefrozen uses ts_ms.
+            # Legacy untimed records are not evidence of recency, but
+            # a later timed record can still make their active selection recent.
+            if not any(type(timestamp) is int and timestamp >= cutoff for timestamp in (
+                record.get("written_at_ms"), record.get("ts_ms")
+            )):
+                continue
             if not isinstance(current_selection, dict):
                 raise CannotCompare("an auth selection is not an object")
-            timestamp = record.get("ts_ms")
-            if not isinstance(timestamp, int):
-                if kind in ("run_started", "run_auth_refrozen"):
-                    raise CannotCompare("an auth selection has no recorded timestamp")
-                continue
-            if timestamp < cutoff:
-                continue
             # The recorded resolved_credential_id avoids resolving old selections through
             # today's aliases. Older records without it use their credential_id unchanged.
             credential = current_selection.get("resolved_credential_id") or current_selection.get("credential_id")
@@ -58,7 +68,7 @@ def recent_credentials(state_root: pathlib.Path, now_ms: int, days: int = 7) -> 
             credentials.add(credential)
     if not credentials:
         raise CannotCompare(f"no credentials recorded in broca runs in the last {days} days")
-    return credentials
+    return credentials, logs_read
 
 
 def compare(credentials: set[str], listing: object) -> list[str]:
@@ -105,21 +115,35 @@ def main() -> int:
     args = parser.parse_args()
     if args.days <= 0:
         parser.error("--days must be positive")
+    started = time.monotonic()
     try:
-        credentials = recent_credentials(args.state_root or default_state_root(), int(time.time() * 1000), args.days)
+        credentials, logs_read = recent_credentials(args.state_root or default_state_root(), int(time.time() * 1000), args.days)
         listing = json.loads(args.vault_listing.read_text())
         missing = compare(credentials, listing)
-    except (CannotCompare, ArchiveRefusal, OSError, ValueError, StateRootError):
-        # Never echo a JSON parse exception or WAL contents: only the
-        # projected comparison below is safe to put in deploy logs.
-        print("credential-metadata: cannot compare recent broca auth selections with the vault listing", file=sys.stderr)
+    except CannotCompare as error:
+        print(f"credential-metadata: cannot compare: {error}", file=sys.stderr)
+        return 2
+    except ArchiveRefusal as error:
+        message = str(error)
+        cause = error.__cause__
+        while cause is not None and not isinstance(cause, (json.JSONDecodeError, UnicodeDecodeError)):
+            cause = cause.__cause__
+        if cause is not None:
+            message = message.replace(str(cause), "[parser detail withheld]")
+        reason = f"{type(error).__name__}: {message}"
+        print(f"credential-metadata: cannot compare: {reason}", file=sys.stderr)
+        return 2
+    except (OSError, ValueError, StateRootError) as error:
+        # JSON parser messages can include input text; expose only the error class.
+        print(f"credential-metadata: cannot compare: invalid or unreadable input ({type(error).__name__})", file=sys.stderr)
         return 2
     if missing:
         print("credential-metadata: REFUSING deploy:", file=sys.stderr)
         for failure in missing:
             print(f"  {failure}", file=sys.stderr)
         return 1
-    print(f"credential-metadata: PASS; {len(credentials)} recently used credentials have provider_ids and auth_method")
+    print(f"credential-metadata: PASS; {len(credentials)} recently used credentials have provider_ids and auth_method; "
+          f"read {logs_read} logs in {time.monotonic() - started:.2f}s")
     return 0
 
 
