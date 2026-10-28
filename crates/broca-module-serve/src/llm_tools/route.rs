@@ -47,6 +47,11 @@ type Answer = Result<Box<RawValue>, Vec<u8>>;
 /// so a consumer built against either version reads the same bodies.
 pub const TOOL_RESULT_V1: &str = "tool-result/v1";
 
+/// tool-provider 0.10's name for the same reply format. tool-provider 0.13 no longer exports it,
+/// but broca still accepts it at bind, and its catalog names it for a consumer that declared
+/// no format, as every released build has.
+pub const CONTENT_V1: &str = "content/v1";
+
 /// What a route's consumer declared at bind about reading replies.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ConsumerFormat {
@@ -64,8 +69,8 @@ impl ConsumerFormat {
         let declares = |name: &str| capabilities.is_some_and(|caps| caps.iter().any(|c| c == name));
         let result_format = if declares(TOOL_RESULT_V1) {
             Some(TOOL_RESULT_V1)
-        } else if declares("content/v1") {
-            Some("content/v1")
+        } else if declares(CONTENT_V1) {
+            Some(CONTENT_V1)
         } else {
             None
         };
@@ -514,7 +519,7 @@ impl LlmTools {
             "semantics":1, "capabilities":[], "description":"Classify one item with a decision model.",
             "input_schema":schema,
             "modes":cortexkit_llm_tools::MODES,
-            "result_format":result_format.unwrap_or(TOOL_RESULT_V1),
+            "result_format":result_format.unwrap_or(CONTENT_V1),
         });
         if self.config.advertise_tags {
             tool["capabilities"] = json!([classify::TAG]);
