@@ -6054,6 +6054,7 @@ mod caller_message_tests {
             ContentBlock::ProviderFallback {
                 from_model: "claude-opus-5-5".into(),
                 to_model: "claude-opus-4-8".into(),
+                raw: None,
             },
             ContentBlock::Text {
                 text: " check.".into(),

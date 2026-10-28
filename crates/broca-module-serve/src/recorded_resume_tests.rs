@@ -42,13 +42,112 @@ async fn resume_http_fixture() -> ResumeHttpFixture {
                 assert!(n > 0, "request must contain the complete body");
                 bytes.extend_from_slice(&buffer[..n]);
             }
+            let anthropic = headers.lines().next().unwrap().contains("/messages ");
             captured.lock().unwrap().push(CapturedResumeRequest { headers, body: bytes[split..split + length].to_vec() });
-            let body = "data: {\"id\":\"resume\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"done\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"resume\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n";
+            let body = if anthropic {
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"resume\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"done\"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\ndata: {\"type\":\"message_stop\"}\n\n"
+            } else {
+                "data: {\"id\":\"resume\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"done\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"resume\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n"
+            };
             let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             stream.write_all(response.as_bytes()).await.unwrap();
         }
     });
     ResumeHttpFixture { url, requests, task }
+}
+
+async fn execute_frozen_fallback_auth_resume(
+    root: &std::path::Path,
+    server: &ResumeHttpFixture,
+    api_key_refrozen: bool,
+    prior_call: bool,
+) -> (Result<RunSummary, broca_core::RunError>, Vec<broca_wal::FramedRecord>) {
+    let _ = std::fs::remove_dir_all(root);
+    std::fs::create_dir_all(root).unwrap();
+    let vault = CapturingVaultDaemon::start(root).await;
+    let executor = executor_with_capturing_vault(root, &vault).await;
+    let mut req = drift_request(root);
+    req.model.model_id = "claude-opus-5-5".into();
+    let mut frozen = broca_provider::families::anthropic_frozen_config("claude-opus-5-5");
+    frozen.server_side_fallback = true;
+    frozen.renderer_version = broca_provider::families::anthropic_renderer_version(true);
+    frozen.base_url = Some(server.url.clone());
+    let mut fallback = frozen.clone();
+    fallback.wire_model_id = "claude-opus-4-8".into();
+    frozen.refusal_fallback = Some(Box::new(broca_provider::wire::RefusalFallbackConfig {
+        model: broca_protocol::ModelHandle::new("anthropic", "claude-opus-4-8"),
+        context_limit: Some(200_000), frozen: fallback,
+    }));
+    let store = Arc::clone(&executor.wal_store);
+    let mut wal = store.open(&req.session).unwrap();
+    let mut record = run_started_with_user_text(&req.session, &req.run_id.0, "");
+    if let broca_wal::WalRecord::RunStarted { config, input, .. } = &mut record {
+        config.model = req.model.clone();
+        config.renderer_version = frozen.renderer_version;
+        config.frozen_render_config = serde_json::to_value(&frozen).unwrap();
+        config.auth_selection = Some(serde_json::from_value(serde_json::json!({
+            "credential_id":"oauth:anthropic", "auth_method":"oauth"
+        })).unwrap());
+        *input = req.input.clone().into();
+    } else { unreachable!() }
+    wal.append(1, &record, true).unwrap();
+    if prior_call {
+        wal.append(1, &serde_json::from_value(serde_json::json!({"type":"step_started", "step_id":1})).unwrap(), true).unwrap();
+    }
+    if api_key_refrozen {
+        wal.append(1, &broca_wal::WalRecord::RunAuthRefrozen { ts_ms: None,
+            auth_selection: serde_json::from_value(serde_json::json!({
+                "credential_id":"apikey:anthropic", "auth_method":"apikey"
+            })).unwrap(),
+        }, true).unwrap();
+    }
+    drop(wal);
+    let writer = Arc::new(broca_core::WalHandle::spawn(store.open(&req.session).unwrap(), 1).unwrap());
+    let prior_snapshot = broca_core::load_prior_wal_snapshot(store.as_ref(), &req.session,
+        writer.durable_head().load(Ordering::Acquire), None::<&broca_store::SqliteStore>).unwrap();
+    let session = req.session.clone();
+    let job = RunJob { media: Vec::new(), media_profile: None, req, auth: None, conversation_key: None,
+        writer: Arc::clone(&writer), kind: RunKind::FreshOrResume, skip_materialization: true,
+        control: Default::default(), prior_snapshot, on_admitted: None };
+    let (out, mut events) = mpsc::channel(128);
+    let result = tokio::time::timeout(Duration::from_secs(15), executor.execute(job, out)).await
+        .expect("fallback auth resume terminates");
+    while events.recv().await.is_some() {}
+    Arc::try_unwrap(writer).unwrap_or_else(|_| panic!("executor released the writer")).shutdown().await.unwrap();
+    let records = store.read_records(&session).unwrap();
+    vault.assert_healthy();
+    drop(executor);
+    drop(vault);
+    (result, records)
+}
+
+#[tokio::test]
+async fn production_resume_keeps_frozen_oauth_fallbacks_or_refuses_api_key_by_name() {
+    if !run_catalog_drift_child("production_resume_keeps_frozen_oauth_fallbacks_or_refuses_api_key_by_name") { return; }
+    broca_catalog::install_global_catalog_cache(Arc::new(broca_catalog::CatalogCache::empty()));
+    for prior_call in [false, true] {
+        let server = resume_http_fixture().await;
+        let root = broca_test_support::scratch_root().join(format!("frozen-fallback-api-key-{prior_call}-{}", std::process::id()));
+        let (result, records) = execute_frozen_fallback_auth_resume(&root, &server, true, prior_call).await;
+        let error = result.expect_err("API-key auth cannot honor frozen OAuth fallback settings");
+        assert!(error.to_string().contains("frozen_fallback_auth_mismatch"), "{error}");
+        assert!(server.requests.lock().unwrap().is_empty());
+        assert!(!records.iter().any(|record| matches!(record.record, broca_wal::WalRecord::RunConfigRefrozen { .. })));
+        let _ = std::fs::remove_dir_all(root);
+    }
+    let server = resume_http_fixture().await;
+    let root = broca_test_support::scratch_root().join(format!("frozen-fallback-oauth-{}", std::process::id()));
+    let (result, records) = execute_frozen_fallback_auth_resume(&root, &server, false, true).await;
+    assert_eq!(result.unwrap().reason, RunFinishReason::Completed);
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let headers = requests[0].headers.to_ascii_lowercase();
+    assert!(headers.contains("authorization: bearer stand-in-token"));
+    assert!(!headers.contains("x-api-key:"));
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["fallbacks"], "default");
+    assert!(!records.iter().any(|record| matches!(record.record, broca_wal::WalRecord::RunConfigRefrozen { .. })));
+    let _ = std::fs::remove_dir_all(root);
 }
 
 /// Resolve the original opaque admission, persist its actual blob, load the real WAL

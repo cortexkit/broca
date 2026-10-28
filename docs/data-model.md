@@ -340,20 +340,25 @@ no time.
 |---|---|---|---|
 | `step_id` | u64 | required | |
 | `assistant_message` | `AssistantMessage` | required | The full assistant output, including tool calls. |
-| `usage` | `Usage` | required | This step's usage (one provider call). |
+| `usage` | `Usage` | required | This step's usage, summed field by field across serving iterations when present. Fresh input sums each iteration's fresh input; an unreported field stays absent. |
 | `finish_reason` | string | absent | `stop`, `length`, `tool_calls`, `content_filter`, `error`, `other`. |
 | `retries_used` | u32 | defaulted 0 | Retries within this step. |
 | `service_tier_used` | string | absent | Tier the provider **reported** serving, verbatim. Never filled from the requested tier. |
 | `speed_used` | string | absent | Anthropic `usage.speed`, verbatim. |
 | `served_model` | string | absent | **Must-understand, feature `provider-fallback-block/v1`.** The wire model id an Anthropic server-side fallback served the answer with, present only when it differs from the requested model. |
-| `usage_iterations` | array | absent | **Must-understand, feature `provider-fallback-block/v1`.** The response's `usage.iterations`, verbatim: entries with `type` (`message`, `fallback_message`), `model`, token counts and any other members. `usage` stays the top-level usage. |
+| `usage_iterations` | array | absent | **Must-understand, feature `provider-fallback-block/v1`.** The response's `usage.iterations`, verbatim: entries with `type` (`message`, `fallback_message`), `model`, token counts and any other members. These entries replace last-iteration-only top-level counters for accounting. |
 | `route` | `{model, reason}` | absent | **Must-understand, feature `refusal-fallback/v1`.** Present only when the step was sent to the client-side fallback model `model` (`{provider_module_id, model_id}`); `reason` is `refusal` (the source refused this step) or `schedule` (an earlier refusal's schedule routed it). |
 | `refusal_fallback` | object | absent | **Must-understand, feature `refusal-fallback/v1`.** The session's refusal-fallback schedule after this step: `source`, `fallback` (model handles), `phase` (`{kind: "fallback", remaining}` or `{kind: "probe", clean}`), `re_refusals` (u8), `updated_at_ms` (absent). |
 | `refusal_after_tool_use` | bool | absent | **Must-understand, feature `refusal-fallback/v1`.** The source model refused after completing a tool call; the step committed as a tool step. |
 
 An assistant message may hold a `provider_fallback` part, `{"type": "provider_fallback",
-"from_model": str, "to_model": str}`: Anthropic's server-side fallback handoff, at the position
-the response placed it. Any record carrying one requires `provider-fallback-block/v1`.
+"from_model": str, "to_model": str, "raw"?: str}`: Anthropic's server-side fallback handoff, at
+the position the response placed it. `raw` is the complete wire block as JSON text, preserving
+key order, whitespace and unknown fields for verbatim echo on opted-in Anthropic requests.
+Parts stored before raw capture omit it and still decode. The previous decoder ignores
+unknown members of the `provider_fallback` variant, so builds that already support that variant
+can read the new parts (but do not retain raw bytes). Builds predating the variant itself
+are refused by the existing `provider-fallback-block/v1` feature requirement.
 
 **`model_step_refused`**: **must-understand, feature `refusal-fallback/v1`.** The source model
 refused the step and it is re-sent to the client-side fallback model under the same `step_id`,
@@ -779,11 +784,16 @@ separate-reasoning normalizer), `usage` (`Usage`, section 2.5), `usage_by_servic
 
 A slice ends at a refreeze, and also where a model call is answered by another model than the
 slice's: a step routed to the refusal-fallback model (`route`) or served by an Anthropic
-server-side fallback (`served_model`). The next slice's `model` is the model that answered, so a
-run can carry a row for a fallback model. A `model_step_refused` call belongs to the slice of
+server-side fallback (`served_model`). When `usage_iterations` is present, each iteration's
+usage joins the slice for its own serving model, in provider order; consecutive iterations
+on the same model coalesce. Top-level last-iteration counters are not added again. A step's
+retries belong only to its final iteration. Missing measurements remain absent, including
+reasoning when only the top-level response reported it. The next slice's `model` is the model
+that answered, so a run can carry a row for a fallback model. A `model_step_refused` call belongs to the slice of
 the model that refused it, and a `cache_warmed` re-send of a routed step's request is billed
 under that step's model. When every call is answered by the run's own model, only refreezes
-open additional slices.
+open additional slices. The split changes fact cardinality, not schema, and applies only
+when producing new facts: previously exported insert-once facts are never rewritten.
 
 Session facts have no `kind` member and retain the shape above. Sessionless classifier
 facts dispatch on `kind: "system_one"` before decoding. They contain `fact_id`,

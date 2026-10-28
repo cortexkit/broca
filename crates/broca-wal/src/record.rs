@@ -380,6 +380,9 @@ pub enum WalRecord {
         /// response with, when it was not the requested one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         served_model: Option<String>,
+        /// Per-serving-model usage when the refused response itself used a server handoff.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage_iterations: Option<Vec<UsageIteration>>,
         /// How many content blocks the refused response carried; only the count is kept.
         discarded_blocks: u32,
         /// The schedule after this refusal.

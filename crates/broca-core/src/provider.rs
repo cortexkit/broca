@@ -23,8 +23,8 @@ pub struct StepRuntime {
     pub seal: Option<crate::ShutdownSeal>,
     pub progress: Option<LiveStepProgress>,
     /// The ordinal the step's first attempt in this call is recorded with. Zero for an
-    /// ordinary step; a step re-sent within the same step id (to the refusal-fallback model)
-    /// starts after the attempts already recorded, so ordinals stay unique within the step.
+    /// ordinary step; a live or resumed resend within the same step id starts after the
+    /// largest durable attempt ordinal, so ordinals stay unique within the episode's step.
     pub first_attempt: u32,
 }
 

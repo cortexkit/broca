@@ -480,19 +480,32 @@ impl CompactionHistory {
             WalRecord::ModelStepFinished {
                 usage, fallback, ..
             } => {
-                self.previous_native_usage = Some(*usage);
-                // Checkpoints must keep the tokenizer that measured the step, including a
-                // client-side fallback. Mixed server-side usage has no single tokenizer.
-                self.previous_model = if fallback.carries_server_side_fallback() {
-                    None
-                } else {
-                    fallback
-                        .route
-                        .as_ref()
-                        .map(|route| &route.model)
-                        .or(self.current_model.as_ref())
-                        .cloned()
-                };
+                let requested = fallback
+                    .route
+                    .as_ref()
+                    .map(|route| &route.model)
+                    .or(self.current_model.as_ref());
+                // Checkpoints retain one prompt measurement, not the sum of prompts
+                // sent to every serving model during a server-side handoff.
+                let native = requested.and_then(|requested| {
+                    broca_protocol::usage::model_usage(
+                        fallback
+                            .served_model
+                            .as_deref()
+                            .unwrap_or(&requested.model_id),
+                        *usage,
+                        fallback.usage_iterations.as_deref(),
+                    )
+                    .last()
+                    .map(|(model, usage)| {
+                        (
+                            broca_protocol::ModelHandle::new(&requested.provider_module_id, *model),
+                            *usage,
+                        )
+                    })
+                });
+                self.previous_native_usage = native.as_ref().map(|(_, usage)| *usage);
+                self.previous_model = native.map(|(model, _)| model);
                 self.previous_provider_code = None;
                 self.previous_error = false;
                 self.previous_request_bytes = self.current_request_bytes;

@@ -361,17 +361,22 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
   in the read's WAL tail come with the page; an older turn's come from a per-session cache that
   one pass over the whole WAL fills the first time a read needs them.
 - Every known run's `run.status` and `run.result` carry `usage` from completed
-  `ModelStepFinished` WAL records, including while the run is active. It always has
+  `ModelStepFinished` and billed `ModelStepRefused` WAL records, including while the run is
+  active. It always has
   `steps` and `unreported_steps`; a run with no completed step reports exactly
   `{"steps":0,"unreported_steps":0,"by_model":[]}`. A step is unreported only if **all five** token
   measurements are absent; a partial report or an explicit zero is reported.
   The optional totals `input_tokens`, `cached_input_tokens`, `cache_write_tokens`,
   `output_tokens` and `reasoning_tokens` sum only reported contributions, staying absent
   until a step reports that measurement. Partial totals are lower bounds, not estimates.
-  Input is fresh input only; reasoning is already included in output, never added to it.
+  Input is fresh input only, summed across serving iterations when a step uses more than
+  one model; reasoning is already included in output, never added to it.
   `by_model` is always present and empty until a step completes; then it lists contributions
-  in first-seen order for each `{provider, model, variant?}` frozen in the step's episode's
-  `RunConfig`.
+  in first-seen order for each `{provider, model, variant?}`. Ordinary calls use the frozen
+  episode model/variant; routed calls use their fallback model, and server handoffs use
+  each provider-reported iteration model without an episode variant. When iterations are
+  present, `steps` counts billed serving iterations rather than durable runner steps,
+  and each iteration's measurements replace the last-iteration-only top-level counters.
   Each entry carries the same counters and optional token totals. An unnamed variant is
   omitted, never an empty string; each entry contributes to the run totals, including
   unreported steps. These counters and the model breakdown do not change subscriber
@@ -1227,6 +1232,11 @@ subsequent non-content records increment them. A byte class never observed stays
 This telemetry and the attempt log's `last_content_ms` do **not** change the existing idle or
 content deadlines, retry policy, or rate-floor policy.
 
+Provider-attempt ordinals are scoped to the episode's step. A refusal resend and a
+resume of an unfinished step continue after that step's largest durable attempt ordinal;
+live `step.attempt` uses the same offset. These ordinals are not stable global IDs.
+Accounting event IDs use `lineage_id:wal_seq`, and timestamps are not join keys.
+
 ## 15. session.read consistency + pagination
 
 `session.read` cuts each page from one atomic materialized-store snapshot plus its exact
@@ -1296,6 +1306,12 @@ as terminal/no-op, so a "resumable terminal" would seal the run). Replay gains a
 resume **continues the SAME run_id from the last durable boundary**; no new episode starts
 until the pause is resolved or cancelled. The error detail is persisted for `run.status`.
 (Auto pause→refresh→continue is deferred; the lineage is preserved + manually resumable.)
+
+Recorded Anthropic fallback settings are frozen on resume, even if the current switches
+are off. If the resolved credential method is not OAuth, restoring an episode that froze
+either fallback produces a permanent configuration refusal naming
+`frozen_fallback_auth_mismatch`, before any provider request or render-config refreeze.
+Resume with OAuth credentials rather than silently dropping the frozen opt-in for an API key.
 
 ## 17b. The metering lane: direct read-only storage
 

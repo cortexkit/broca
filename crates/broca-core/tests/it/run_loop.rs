@@ -6328,6 +6328,7 @@ async fn server_side_fallback_block_breaks_an_existing_clean_streak() {
                 ContentBlock::ProviderFallback {
                     from_model: "claude-opus-5-5".into(),
                     to_model: "claude-opus-5-5-20260101".into(),
+                    raw: None,
                 },
             );
         }

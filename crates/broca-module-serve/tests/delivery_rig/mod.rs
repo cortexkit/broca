@@ -168,6 +168,10 @@ pub struct Script {
     pub stream_gate: Notify,
     /// Model steps, consumed in order across every run. An exhausted script answers text.
     pub steps: Mutex<VecDeque<Step>>,
+    /// Family-normalized events take precedence over generated steps so wire fixtures retain
+    /// their provider metadata through the real run loop and WAL writer.
+    pub normalized_steps: Mutex<VecDeque<Vec<NormalizedEvent>>>,
+    pub refusal_fallback_model: Mutex<Option<broca_protocol::ModelHandle>>,
     /// The prompt each model step was called with, in call order.
     pub prompts: Mutex<Vec<Vec<Message>>>,
     /// The names of the tools each model step was offered, in call order.
@@ -250,6 +254,14 @@ impl ScriptedProvider {
 
 #[async_trait]
 impl Provider for ScriptedProvider {
+    fn refusal_fallback_model(&self) -> Option<broca_protocol::ModelHandle> {
+        self.0.refusal_fallback_model.lock().unwrap().clone()
+    }
+
+    fn refusal_fallback_context_limit(&self) -> Option<u64> {
+        self.refusal_fallback_model().map(|_| 1_000_000)
+    }
+
     fn render_config_blob(&self) -> serde_json::Value {
         match &self.1 {
             None => serde_json::json!({ "render_config": "stateless" }),
@@ -286,16 +298,23 @@ impl Provider for ScriptedProvider {
             self.0.entered.notify_one();
             gate.await;
         }
-        let step = self
+        let (tx, rx) = mpsc::channel(8);
+        let script = self.0.clone();
+        let mut events = self
             .0
-            .steps
+            .normalized_steps
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or(Step::Text("done"));
-        let (tx, rx) = mpsc::channel(8);
-        let script = self.0.clone();
-        let mut events = step.events();
+            .unwrap_or_else(|| {
+                self.0
+                    .steps
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(Step::Text("done"))
+                    .events()
+            });
         if let Some(at) = *self.0.attempt_time.lock().unwrap() {
             events.insert(0, NormalizedEvent::Control(ProviderControl::AttemptFinished {
                 attempt: serde_json::from_value(serde_json::json!({"attempt":0,"outcome":"complete","ts_ms":at,

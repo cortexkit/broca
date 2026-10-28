@@ -3292,8 +3292,6 @@ where
     } else {
         Default::default()
     };
-    // The last committed step's usage, for the fallback's context guard.
-    let mut last_step_usage = prior.last_step_usage;
     if !is_resume && req.retention.is_some() && writer.is_retention_lineage() == Some(false) {
         return Err(RunError::Config(
             "retention disagrees with the lineage's frozen policy".into(),
@@ -3336,6 +3334,29 @@ where
             None => Vec::new(),
         }),
     };
+    let mut resumed_attempts = std::collections::HashMap::<StepId, u32>::new();
+    if is_resume && !append_episode {
+        // Step ids restart for each episode. Continue after the largest durable
+        // ordinal of this episode, including attempts of an uncommitted resend.
+        for frame in approval_frames.iter() {
+            match &frame.record {
+                WalRecord::RunStarted { .. } => resumed_attempts.clear(),
+                WalRecord::ModelAttemptFinished {
+                    step_id, attempt, ..
+                } => {
+                    let next = attempt.checked_add(1).ok_or_else(|| {
+                        RunError::Config(format!(
+                            "model attempt ordinal exhausted for step {}",
+                            step_id.0
+                        ))
+                    })?;
+                    let known = resumed_attempts.entry(*step_id).or_default();
+                    *known = (*known).max(next);
+                }
+                _ => {}
+            }
+        }
+    }
     if is_resume && !append_episode {
         let mut held =
             crate::resume::closing_held_replies(approval_frames.iter().map(|frame| &frame.record));
@@ -5713,9 +5734,9 @@ where
         let session = &req.session;
         let attempt_run_id = &resolved_run_id;
         let completed_attempt_time = std::sync::Mutex::new(None);
-        // Attempts this step has recorded, so a re-send after a refusal numbers its attempts
-        // after them.
-        let step_attempts = std::sync::atomic::AtomicU32::new(0);
+        // Both a live resend and a resumed one continue after durable attempt evidence.
+        let next_attempt = resumed_attempts.remove(&step_id).unwrap_or(0);
+        let step_attempts = std::sync::atomic::AtomicU32::new(next_attempt);
         // How many `thinking_dropped` input transformations the step's completed attempt
         // reported, when it reported its transformations at all.
         let thinking_dropped = std::sync::Mutex::new(None::<usize>);
@@ -5723,7 +5744,10 @@ where
         // estimate (replay reads it from the same `ModelAttemptFinished` records).
         let last_attempt_bytes = std::sync::Mutex::new(None);
         let record_attempt = |attempt: broca_protocol::ModelAttempt| -> AttemptFuture<'_> {
-            step_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            step_attempts.fetch_max(
+                attempt.attempt.saturating_add(1),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             *last_attempt_bytes.lock().unwrap() = Some(attempt.request_body_len);
             if matches!(
                 attempt.outcome,
@@ -5774,7 +5798,9 @@ where
         // A prompt that already fills the fallback model's window would only overflow it.
         let fallback_fits = match (
             provider.refusal_fallback_context_limit(),
-            last_step_usage.and_then(|usage| usage.fill_tokens()),
+            compaction_history
+                .previous_native_usage
+                .and_then(|usage| usage.fill_tokens()),
         ) {
             (Some(limit), Some(fill)) => fill < limit,
             _ => true,
@@ -5808,7 +5834,7 @@ where
             provider.set_step_route(step_route);
         }
         let mut refusal_prior_retries = 0u32;
-        let mut first_attempt = 0u32;
+        let mut first_attempt = next_attempt;
         let step = loop {
             // A fallback step tells the renderer which model it is rendering for, as the
             // recorded request a cache warm rebuilds does.
@@ -5959,6 +5985,7 @@ where
                     usage,
                     retries_used,
                     served_model,
+                    usage_iterations,
                     finish_reason: Some(FinishReason::ContentFilter),
                     ..
                 },
@@ -5993,10 +6020,13 @@ where
                         fallback,
                         now,
                     );
+                    let usage =
+                        broca_protocol::usage::step_usage(*usage, usage_iterations.as_deref());
                     writer.record(WalRecord::ModelStepRefused {
                         step_id,
-                        usage: *usage,
+                        usage,
                         served_model: served_model.clone(),
+                        usage_iterations: usage_iterations.clone(),
                         discarded_blocks: message.content.len() as u32,
                         schedule: schedule.clone(),
                         ts_ms: now,
@@ -6018,8 +6048,8 @@ where
                     );
                     // The refused call was billed: it counts toward the run's totals and its
                     // input budget, as replay counts the record.
-                    total_usage += *usage;
-                    input_budget.observe(*usage);
+                    total_usage += usage;
+                    input_budget.observe(usage);
                     refusal_prior_retries = *retries_used;
                     refusal_schedule = Some(schedule);
                     fallback_resent = true;
@@ -6072,6 +6102,7 @@ where
                 usage_iterations,
                 tool_args_cuts,
             } => {
+                let usage = broca_protocol::usage::step_usage(usage, usage_iterations.as_deref());
                 // A handoff is not a clean source reply, even when its target aliases the
                 // requested model and no distinct served_model is recorded.
                 let served_by_server_side_fallback = served_model.is_some()
@@ -6091,7 +6122,6 @@ where
                     });
                 }
                 total_retries_used = total_retries_used.saturating_add(retries_used);
-                last_step_usage = Some(usage);
                 // Each step is a separate billed call → ACCUMULATE, never overwrite,
                 // or a multi-step run under-reports its own total spend.
                 total_usage += usage;
@@ -6101,9 +6131,27 @@ where
                 if let Some(bytes) = attempt_bytes {
                     output_history.note_attempt(bytes);
                 }
-                output_history.note_step(usage, Some(&step_origin));
+                output_history.note_served_step(
+                    usage,
+                    Some(&step_origin),
+                    served_model.as_deref(),
+                    usage_iterations.as_deref(),
+                );
+                let native = broca_protocol::usage::model_usage(
+                    served_model.as_deref().unwrap_or(&step_origin.model_id),
+                    usage,
+                    usage_iterations.as_deref(),
+                )
+                .last()
+                .map(|(model, usage)| {
+                    (
+                        ModelHandle::new(&step_origin.provider_module_id, *model),
+                        *usage,
+                    )
+                });
+                compaction_history.previous_native_usage = native.as_ref().map(|(_, usage)| *usage);
+                compaction_history.previous_model = native.map(|(model, _)| model);
                 if let Some(bytes) = sent_bytes {
-                    compaction_history.previous_native_usage = Some(usage);
                     compaction_history.previous_provider_code = None;
                     compaction_history.previous_error = false;
                     compaction_history.previous_request_bytes = if fallback_model.is_some() {
@@ -6111,7 +6159,6 @@ where
                     } else {
                         Some(bytes)
                     };
-                    compaction_history.previous_model = Some(step_origin.clone());
                 }
                 if let Some(seal) = &control.shutdown_seal {
                     seal.note_usage(step_id, usage);
@@ -8324,7 +8371,7 @@ async fn run_step_watched<P: Provider>(
         *progress.lock().unwrap() = Some(broca_protocol::provider::InFlightStep {
             step_id,
             started_at_ms: now,
-            attempt: 0,
+            attempt: first_attempt,
             attempt_started_at_ms: now,
             last_content_at_ms: None,
             max_content_gap_ms: None,

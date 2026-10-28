@@ -312,13 +312,50 @@ impl OpenRun {
         }
     }
 
-    /// The model a step or refused call is billed under, when it is not the run's own model.
-    fn serving_model(&self, record: &WalRecord) -> Option<ModelHandle> {
-        let variant = None;
-        let (provider, model, _) =
-            crate::refusal_fallback::usage_model(&self.config.model, variant, record)?;
-        let model = ModelHandle::new(provider, model);
-        (model != self.config.model).then_some(model)
+    /// Each serving iteration joins the existing homogeneous segment, or opens a
+    /// new one when its model differs. Ordinary single-model calls keep their bytes.
+    fn record_usage<R: ChargeBasisResolver>(
+        &mut self,
+        resolver: &R,
+        record: &WalRecord,
+        at_ms: Option<u64>,
+        retries_used: u32,
+        service_tier: Option<&str>,
+    ) -> u32 {
+        let episode_model = self.config.model.clone();
+        let entries = crate::refusal_fallback::usage_by_model(&episode_model, None, record);
+        let iterations = match record {
+            WalRecord::ModelStepFinished { fallback, .. } => fallback.usage_iterations.as_deref(),
+            WalRecord::ModelStepRefused {
+                usage_iterations, ..
+            } => usage_iterations.as_deref(),
+            _ => None,
+        };
+        let mut closed_retries = 0u32;
+        for (index, (provider, model, _, usage)) in entries.iter().enumerate() {
+            let model = ModelHandle::new(*provider, *model);
+            let serving = (model != self.config.model).then_some(model);
+            closed_retries =
+                closed_retries.saturating_add(self.bill_under(resolver, serving, at_ms));
+            self.segment_calls = self.segment_calls.saturating_add(1);
+            self.usage += *usage;
+            let last = index + 1 == entries.len();
+            // Top-level response metadata describes only the last serving iteration.
+            let tier = iterations
+                .and_then(|entries| entries[index].other.get("service_tier"))
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| last.then_some(service_tier).flatten());
+            if let Some(tier) = tier {
+                *self
+                    .usage_by_service_tier
+                    .entry(tier.to_owned())
+                    .or_default() += *usage;
+            }
+            if last {
+                self.retries_used = self.retries_used.saturating_add(retries_used);
+            }
+        }
+        closed_retries
     }
 
     /// Bill the calls that follow under `serving`. When that is another model than the open
@@ -583,7 +620,6 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
             WalRecord::ModelStepFinished {
                 written_at_ms,
                 step_id,
-                usage,
                 retries_used,
                 service_tier_used,
                 fallback,
@@ -594,34 +630,26 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
                 }
                 if let Some(current) = open.as_mut() {
                     current.pause_candidate = None;
-                    let serving = current.serving_model(&framed.record);
-                    closed_retries_used = closed_retries_used.saturating_add(current.bill_under(
+                    closed_retries_used = closed_retries_used.saturating_add(current.record_usage(
                         resolver,
-                        serving,
+                        &framed.record,
                         *written_at_ms,
+                        *retries_used,
+                        service_tier_used.as_deref(),
                     ));
-                    current.segment_calls = current.segment_calls.saturating_add(1);
-                    current.usage += *usage;
-                    // Only a step that reported its tier is filed under one; see
-                    // `SpendSegment::usage_by_service_tier`.
-                    if let Some(tier) = service_tier_used {
-                        *current
-                            .usage_by_service_tier
-                            .entry(tier.clone())
-                            .or_default() += *usage;
-                    }
-                    current.retries_used = current.retries_used.saturating_add(*retries_used);
                 }
             }
             // A refused call was billed: it joins the segment of the model that refused it.
-            WalRecord::ModelStepRefused { usage, ts_ms, .. } => {
+            WalRecord::ModelStepRefused { ts_ms, .. } => {
                 if let Some(current) = open.as_mut() {
                     current.pause_candidate = None;
-                    let serving = current.serving_model(&framed.record);
-                    closed_retries_used = closed_retries_used
-                        .saturating_add(current.bill_under(resolver, serving, *ts_ms));
-                    current.segment_calls = current.segment_calls.saturating_add(1);
-                    current.usage += *usage;
+                    closed_retries_used = closed_retries_used.saturating_add(current.record_usage(
+                        resolver,
+                        &framed.record,
+                        *ts_ms,
+                        0,
+                        None,
+                    ));
                 }
             }
             WalRecord::RunFinished {
@@ -982,6 +1010,130 @@ mod tests {
             output_tokens: Some(output_tokens),
             ..Usage::default()
         }
+    }
+
+    fn synthetic_iteration_records(models: [&str; 2], retries: u32) -> Vec<FramedRecord> {
+        let mut start = started(1, "synthetic-run", Some(100));
+        if let WalRecord::RunStarted {
+            session,
+            config: frozen,
+            ..
+        } = &mut start.record
+        {
+            *session = BindIdentity::new("/synthetic", "capture", "l3");
+            **frozen = config(
+                "anthropic",
+                "claude-opus-5-5",
+                Some("oauth:anthropic:synthetic"),
+            );
+        }
+        let mut handoff = step(
+            2,
+            1,
+            Usage {
+                input_tokens: Some(2),
+                output_tokens: Some(29287),
+                cached_input_tokens: Some(20068),
+                cache_write_tokens: Some(4),
+                reasoning_tokens: Some(23621),
+            },
+            retries,
+        );
+        if let WalRecord::ModelStepFinished {
+            fallback,
+            written_at_ms,
+            ..
+        } = &mut handoff.record
+        {
+            *written_at_ms = Some(150);
+            fallback.served_model = Some(models[1].into());
+            fallback.usage_iterations = Some(serde_json::from_value(json!([
+                {"model":models[0], "input_tokens":4, "output_tokens":2124, "cache_read_input_tokens":20068, "cache_creation_input_tokens":0},
+                {"model":models[1], "input_tokens":2, "output_tokens":29287, "cache_read_input_tokens":20068, "cache_creation_input_tokens":4}
+            ])).unwrap());
+        }
+        let mut end = terminal(3, Some(200), Usage::default());
+        if let WalRecord::RunFinished { retries_used, .. } = &mut end.record {
+            *retries_used = retries;
+        }
+        vec![start, handoff, end]
+    }
+
+    #[test]
+    fn server_iteration_spend_segments_have_exact_before_and_after_bytes() {
+        let records = synthetic_iteration_records(["claude-opus-5-5", "claude-opus-4-8"], 0);
+        let mut before = records.clone();
+        if let WalRecord::ModelStepFinished { fallback, .. } = &mut before[1].record {
+            fallback.usage_iterations = None;
+        }
+        const BEFORE: &str = r#"[{"run_id":"synthetic-run","session":{"project_root":"/synthetic","harness":"capture","session":"l3"},"segment_ordinal":0,"fact_id":"fc07bbda7b53f37e36b57c65d801576d13a50b3fb38dd39b868dba2e857f9a37","provider":"anthropic","model":"claude-opus-4-8","auth_selection":"oauth:anthropic:synthetic","charge_basis":"subscription_included","charge_basis_mapping_version":1,"charge_basis_overrides":"none","usage":{"input_tokens":2,"cached_input_tokens":20068,"cache_write_tokens":4,"output_tokens":29287,"reasoning_tokens":23621},"retries_used":0,"pricing_at_ms":100,"pricing_at_precision":"exact","occurred_at_ms":200,"occurred_at_precision":"terminal","terminal_reason":"completed"}]"#;
+        assert_eq!(
+            serde_json::to_string(&compute_segments(&before, "synthetic-source", &resolver))
+                .unwrap(),
+            BEFORE
+        );
+        const AFTER: &str = r#"[{"run_id":"synthetic-run","session":{"project_root":"/synthetic","harness":"capture","session":"l3"},"segment_ordinal":0,"fact_id":"fc07bbda7b53f37e36b57c65d801576d13a50b3fb38dd39b868dba2e857f9a37","provider":"anthropic","model":"claude-opus-5-5","auth_selection":"oauth:anthropic:synthetic","charge_basis":"subscription_included","charge_basis_mapping_version":1,"charge_basis_overrides":"none","usage":{"input_tokens":4,"cached_input_tokens":20068,"cache_write_tokens":0,"output_tokens":2124},"retries_used":0,"pricing_at_ms":100,"pricing_at_precision":"exact","occurred_at_ms":200,"occurred_at_precision":"terminal","terminal_reason":null},{"run_id":"synthetic-run","session":{"project_root":"/synthetic","harness":"capture","session":"l3"},"segment_ordinal":1,"fact_id":"b0a51231865906ec3cb4e1817ec89697a8e66328b87ec6ea14652c350c653aa4","provider":"anthropic","model":"claude-opus-4-8","auth_selection":"oauth:anthropic:synthetic","charge_basis":"subscription_included","charge_basis_mapping_version":1,"charge_basis_overrides":"none","usage":{"input_tokens":2,"cached_input_tokens":20068,"cache_write_tokens":4,"output_tokens":29287},"retries_used":0,"pricing_at_ms":150,"pricing_at_precision":"exact","occurred_at_ms":200,"occurred_at_precision":"terminal","terminal_reason":"completed"}]"#;
+        assert_eq!(
+            serde_json::to_string(&compute_segments(&records, "synthetic-source", &resolver))
+                .unwrap(),
+            AFTER
+        );
+    }
+
+    #[test]
+    fn same_model_iterations_coalesce_and_count_retries_once() {
+        let mut records = synthetic_iteration_records(["claude-opus-5-5", "claude-opus-5-5"], 3);
+        if let WalRecord::ModelStepFinished {
+            fallback,
+            service_tier_used,
+            ..
+        } = &mut records[1].record
+        {
+            *service_tier_used = Some("default".into());
+            fallback.usage_iterations.as_mut().unwrap()[0]
+                .other
+                .insert("service_tier".into(), json!("priority"));
+        }
+        let segments = compute_segments(&records, "synthetic-source", &resolver);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].model, "claude-opus-5-5");
+        assert_eq!(
+            segments[0].usage,
+            Usage {
+                input_tokens: Some(6),
+                output_tokens: Some(31411),
+                cached_input_tokens: Some(40136),
+                cache_write_tokens: Some(4),
+                reasoning_tokens: None,
+            }
+        );
+        assert_eq!(segments[0].retries_used, 3);
+        let tiers = segments[0].usage_by_service_tier.as_ref().unwrap();
+        assert_eq!(tiers["priority"].output_tokens, Some(2124));
+        assert_eq!(tiers["default"].output_tokens, Some(29287));
+    }
+
+    #[test]
+    fn iteration_retry_count_and_top_level_tier_belong_only_to_the_last_segment() {
+        let mut records = synthetic_iteration_records(["claude-opus-5-5", "claude-opus-4-8"], 3);
+        if let WalRecord::ModelStepFinished {
+            service_tier_used, ..
+        } = &mut records[1].record
+        {
+            *service_tier_used = Some("default".into());
+        }
+        let segments = compute_segments(&records, "synthetic-source", &resolver);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].retries_used, 0);
+        assert_eq!(segments[1].retries_used, 3);
+        assert!(segments[0].usage_by_service_tier.is_none());
+        assert_eq!(
+            segments[1].usage_by_service_tier.as_ref().unwrap()["default"],
+            segments[1].usage
+        );
+        assert!(segments
+            .iter()
+            .all(|segment| segment.usage.reasoning_tokens.is_none()));
     }
 
     /// A model call answered by another model than the run's (a refusal-fallback route) opens a

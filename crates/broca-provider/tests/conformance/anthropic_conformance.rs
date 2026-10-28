@@ -5,7 +5,7 @@
 use broca_protocol::{
     content::{ContentBlock, FinishReason, Message, Role, ToolCall},
     request::{CallOptions, Tool, ToolChoice},
-    NormalizedEvent, ProviderControl, StepId, ToolCallId, Usage,
+    ModelHandle, NormalizedEvent, ProviderControl, StepId, ToolCallId, Usage,
 };
 use broca_provider::conformance::{
     check_freeze_against_mutation, check_render_determinism, normalize_recorded,
@@ -19,7 +19,7 @@ use broca_provider::spec::{
     WireFamilyId,
 };
 use broca_provider::wire::{CacheClass, CachePolicy, CacheTtl, MarkerSyntax, WireFamily};
-use serde_json::json;
+use serde_json::{json, Value};
 
 /// A request that exercises many tools (so a HashMap-ordered tool array, if any
 /// family had one, would surface), reasoning echo, and a tool call.
@@ -564,6 +564,7 @@ fn fallback_handoff_block_is_kept_and_echoed() {
             ContentBlock::ProviderFallback {
                 from_model: "claude-opus-5-5".into(),
                 to_model: "claude-opus-4-8".into(),
+                raw: Some(r#"{"type":"fallback","from":{"model":"claude-opus-5-5"},"to":{"model":"claude-opus-4-8"}}"#.into()),
             },
             ContentBlock::Text {
                 text: " me help.".into()
@@ -624,6 +625,49 @@ fn fallback_handoff_block_is_kept_and_echoed() {
             "a malformed handoff block must not be stored: {bad}"
         );
     }
+}
+
+#[test]
+fn fallback_raw_spelling_survives_stream_storage_and_request_rendering() {
+    let raw = r#"{ "trigger" : {"type":"refusal","future":1.00e+2}, "to":{"model":"claude-opus-4-8"}, "type":"fallback", "from":{"model":"claude-opus-5-5"}, "escaped":"\u0061" }"#;
+    let start = format!("event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{raw}}}\n\nevent: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":1}}\n\n");
+    let events = normalize_handoff(&start, "claude-opus-4-8");
+    let message = events
+        .iter()
+        .find_map(|event| match event {
+            NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) => {
+                Some(message)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let stored = serde_json::to_vec(message).unwrap();
+    let restored: broca_protocol::content::AssistantMessage =
+        serde_json::from_slice(&stored).unwrap();
+    assert!(restored.content.iter().any(|block| matches!(block,
+        ContentBlock::ProviderFallback { raw: Some(stored), .. } if stored == raw)));
+    let mut frozen = anthropic_frozen_config("claude-opus-5-5");
+    frozen.server_side_fallback = true;
+    frozen.renderer_version = broca_provider::families::anthropic_renderer_version(true);
+    let opts = CallOptions::new(vec![Message::assistant_from(
+        restored.content,
+        ModelHandle::new("anthropic", "claude-opus-5-5"),
+    )]);
+    let bytes = AnthropicMessages.render(&frozen, &opts);
+    assert!(bytes
+        .windows(raw.len())
+        .any(|window| window == raw.as_bytes()));
+    assert_eq!(
+        AnthropicMessages.shape(&frozen, &opts)["messages"][0]["content"][1],
+        serde_json::from_str::<Value>(raw).unwrap()
+    );
+    let with_media = AnthropicMessages.render_with_media(&frozen, &opts, &[]);
+    assert_eq!(bytes, with_media);
+    frozen.server_side_fallback = false;
+    let without = AnthropicMessages.render(&frozen, &opts);
+    assert!(!without
+        .windows(raw.len())
+        .any(|window| window == raw.as_bytes()));
 }
 
 /// The served model is chosen in this order: the handoff block's target, then the last fallback

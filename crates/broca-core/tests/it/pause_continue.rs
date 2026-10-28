@@ -278,7 +278,7 @@ fn auth_error_step() -> Vec<NormalizedEvent> {
 
 async fn drive_paused(
     req: RunRequest,
-    provider: &StubProvider,
+    provider: &impl broca_core::Provider,
     plane: &StubToolPlane,
     lease: &FileLeaseStore,
     wal: &FileWalStore,
@@ -1809,6 +1809,303 @@ fn fallback_model() -> ModelHandle {
 
 fn with_fallback(scripts: Vec<Vec<NormalizedEvent>>) -> StubProvider {
     StubProvider::new(scripts).with_refusal_fallback(fallback_model(), None)
+}
+
+struct AttemptedFallback {
+    inner: StubProvider,
+}
+
+fn record_ends(bytes: &[u8]) -> Vec<usize> {
+    let mut offset = 0;
+    let mut ends = Vec::new();
+    while offset < bytes.len() {
+        match broca_wal::framing::decode_next(&bytes[offset..]) {
+            broca_wal::framing::DecodeStep::Lineage { consumed, .. } => offset += consumed,
+            broca_wal::framing::DecodeStep::Record { consumed, .. } => {
+                offset += consumed;
+                ends.push(offset);
+            }
+            _ => panic!("the reference run wrote complete readable WAL frames"),
+        }
+    }
+    ends
+}
+
+#[async_trait::async_trait]
+impl broca_core::Provider for AttemptedFallback {
+    fn refusal_fallback_model(&self) -> Option<ModelHandle> {
+        Some(fallback_model())
+    }
+    fn set_step_route(&self, route: broca_core::refusal_fallback::StepRoute) {
+        broca_core::Provider::set_step_route(&self.inner, route);
+    }
+    fn reports_attempt_evidence(&self) -> bool {
+        true
+    }
+    async fn step(&self, step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
+        broca_core::Provider::step(&self.inner, step_id, opts).await
+    }
+    async fn step_with_runtime(
+        &self,
+        step_id: StepId,
+        opts: std::sync::Arc<CallOptions>,
+        runtime: broca_core::provider::StepRuntime,
+    ) -> mpsc::Receiver<NormalizedEvent> {
+        let mut source = self.step(step_id, &opts).await;
+        let (tx, rx) = mpsc::channel(32);
+        tokio::spawn(async move {
+            let attempt = broca_protocol::ModelAttempt {
+                content_progress: Default::default(),
+                attempt: runtime.first_attempt,
+                request_body_len: 1,
+                request_body_sha256: "aa".into(),
+                http_status: Some(200),
+                content_type: None,
+                response_body_len: 1,
+                response_body_sha256: "bb".into(),
+                response_body_cap: None,
+                outcome: broca_protocol::AttemptOutcome::Complete,
+                ts_ms: 100,
+                sent_at_ms: None,
+                transport: None,
+                websocket_request: None,
+                websocket_close_code: None,
+                input_transformations: None,
+                input_transformations_unmeasured: false,
+                account_observation: Default::default(),
+                credential_refresh: None,
+                served_account_ref: None,
+            };
+            if tx
+                .send(NormalizedEvent::Control(ProviderControl::AttemptFinished {
+                    attempt,
+                }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            while let Some(event) = source.recv().await {
+                if tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+        rx
+    }
+}
+
+#[tokio::test]
+async fn refusal_resend_attempt_ordinals_continue_after_crash_cuts() {
+    for completed_fallback_attempt in [false, true] {
+        let dir = broca_test_support::scratch_root().join(format!(
+            "refusal-attempt-cut-{completed_fallback_attempt}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("proj")).unwrap();
+        let session = BindIdentity::new(dir.join("proj"), "h", "s");
+        let lease = FileLeaseStore::new(dir.join("lease"));
+        let wal = FileWalStore::new(dir.join("wal"));
+        let plane = StubToolPlane::new();
+        let started = AttemptedFallback {
+            inner: with_fallback(vec![refusal_reply("m1", "no"), text_reply("m2", "answer")]),
+        };
+        drive_paused(req(&session, "hello"), &started, &plane, &lease, &wal).await;
+        let complete = records_of(&wal, &session);
+        let bytes = std::fs::read(wal.wal_path(&session)).unwrap();
+        let ends = record_ends(&bytes);
+        let lineage = {
+            use broca_wal::Wal;
+            broca_wal::FileWal::open(wal.wal_path(&session))
+                .unwrap()
+                .lineage_id()
+                .unwrap()
+        };
+        let cut = complete
+            .iter()
+            .position(|record| {
+                if completed_fallback_attempt {
+                    matches!(
+                        record,
+                        WalRecord::ModelAttemptFinished {
+                            step_id: StepId(1),
+                            attempt: 1,
+                            ..
+                        }
+                    )
+                } else {
+                    matches!(record, WalRecord::ModelStepRefused { .. })
+                }
+            })
+            .unwrap()
+            + 1;
+        std::fs::write(wal.wal_path(&session), &bytes[..ends[cut - 1]]).unwrap();
+        let resumed = AttemptedFallback {
+            inner: with_fallback(vec![text_reply("m2", "answer")]),
+        };
+        let summary = drive_paused(req(&session, "hello"), &resumed, &plane, &lease, &wal).await;
+        assert_eq!(summary.reason, RunFinishReason::Completed);
+        let records = records_of(&wal, &session);
+        let resumed_lineage = {
+            use broca_wal::Wal;
+            broca_wal::FileWal::open(wal.wal_path(&session))
+                .unwrap()
+                .lineage_id()
+                .unwrap()
+        };
+        assert_eq!(resumed_lineage, lineage);
+        let frames = wal.read_records(&session).unwrap();
+        let ids: Vec<_> = frames
+            .iter()
+            .filter(|frame| matches!(frame.record, WalRecord::ModelAttemptFinished { .. }))
+            .map(|frame| format!("{resumed_lineage}:{}", frame.seq))
+            .collect();
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            ids.len()
+        );
+        assert!(frames.windows(2).all(|pair| pair[1].seq == pair[0].seq + 1));
+        let attempts: Vec<_> = records
+            .iter()
+            .filter_map(|record| match record {
+                WalRecord::ModelAttemptFinished {
+                    step_id: StepId(1),
+                    attempt,
+                    ..
+                } => Some(*attempt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            attempts,
+            if completed_fallback_attempt {
+                vec![0, 1, 2]
+            } else {
+                vec![0, 1]
+            }
+        );
+        assert_eq!(refusals(&records), 1);
+        let after = replay(&records).unwrap().refusal_fallback.unwrap();
+        let uninterrupted = replay(&complete).unwrap().refusal_fallback.unwrap();
+        assert_eq!(after.phase, uninterrupted.phase);
+        assert_eq!(after.re_refusals, uninterrupted.re_refusals);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[tokio::test]
+async fn refusal_schedule_resume_matches_uninterrupted_ten_twenty_forty_rounds() {
+    let dir = broca_test_support::scratch_root()
+        .join(format!("refusal-round-resume-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("proj")).unwrap();
+    let session = BindIdentity::new(dir.join("proj"), "h", "s");
+    let lease = FileLeaseStore::new(dir.join("lease"));
+    let wal = FileWalStore::new(dir.join("wal"));
+    let plane = StubToolPlane::new().with_canned_text("edit", "edited");
+    let mut scripts = Vec::new();
+    let mut id = 0;
+    for round in [10, 20, 40] {
+        scripts.push(refusal_reply("refusal", "no"));
+        for _ in 0..round {
+            id += 1;
+            scripts.push(tool_reply(&format!("m{id}"), &format!("c{id}")));
+        }
+    }
+    scripts.push(text_reply("final", "done"));
+    let mut request = tool_req("r1", &session, "hello");
+    request.stop_when = vec![StopCondition::StepCount { n: 500 }];
+    let reference = AttemptedFallback {
+        inner: with_fallback(scripts.clone()),
+    };
+    let result = drive_paused(request.clone(), &reference, &plane, &lease, &wal).await;
+    assert_eq!(result.reason, RunFinishReason::Completed);
+    let complete = records_of(&wal, &session);
+    let bytes = std::fs::read(wal.wal_path(&session)).unwrap();
+    let ends = record_ends(&bytes);
+    let states = |records: &[WalRecord]| {
+        records
+            .iter()
+            .filter_map(|record| {
+                let schedule = match record {
+                    WalRecord::ModelStepRefused { schedule, .. } => Some(schedule),
+                    WalRecord::ModelStepFinished { fallback, .. } => {
+                        fallback.refusal_fallback.as_ref()
+                    }
+                    _ => None,
+                }?;
+                Some((schedule.phase, schedule.re_refusals))
+            })
+            .collect::<Vec<_>>()
+    };
+    let refusals: Vec<_> = complete
+        .iter()
+        .enumerate()
+        .filter_map(|(index, record)| {
+            matches!(record, WalRecord::ModelStepRefused { .. }).then_some(index)
+        })
+        .collect();
+    assert_eq!(refusals.len(), 3);
+    let rounds: Vec<_> = refusals
+        .iter()
+        .map(|index| match &complete[*index] {
+            WalRecord::ModelStepRefused { schedule, .. } => match schedule.phase {
+                broca_wal::RefusalFallbackPhase::Fallback { remaining } => remaining,
+                _ => panic!("a refusal arms a fallback round"),
+            },
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(rounds, [10, 20, 40]);
+    for refusal in refusals {
+        for after_attempt in [false, true] {
+            let cut = if after_attempt {
+                complete[refusal + 1..]
+                    .iter()
+                    .position(|record| matches!(record, WalRecord::ModelAttemptFinished { .. }))
+                    .unwrap()
+                    + refusal
+                    + 2
+            } else {
+                refusal + 1
+            };
+            std::fs::write(wal.wal_path(&session), &bytes[..ends[cut - 1]]).unwrap();
+            let consumed = complete[..cut]
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record,
+                        WalRecord::ModelStepFinished { .. } | WalRecord::ModelStepRefused { .. }
+                    )
+                })
+                .count();
+            let resumed = AttemptedFallback {
+                inner: with_fallback(scripts[consumed..].to_vec()),
+            };
+            let result = drive_paused(request.clone(), &resumed, &plane, &lease, &wal).await;
+            assert_eq!(result.reason, RunFinishReason::Completed);
+            let records = records_of(&wal, &session);
+            assert_eq!(states(&records), states(&complete));
+            let attempts: Vec<_> = records
+                .iter()
+                .filter_map(|record| match record {
+                    WalRecord::ModelAttemptFinished {
+                        step_id, attempt, ..
+                    } => Some((*step_id, *attempt)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                attempts
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                attempts.len()
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn committed_route(recs: &[WalRecord]) -> Vec<Option<broca_wal::StepRoute>> {

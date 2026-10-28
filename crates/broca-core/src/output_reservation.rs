@@ -133,19 +133,18 @@ impl OutputReservationHistory {
             WalRecord::ModelStepFinished {
                 usage, fallback, ..
             } => {
-                // A routed step was counted by the fallback's tokenizer, not the run's.
-                // Server-side mixed-model usage has no single tokenizer, so leave it unmeasured.
-                let model = if fallback.carries_server_side_fallback() {
-                    None
-                } else {
-                    fallback
-                        .route
-                        .as_ref()
-                        .map(|route| &route.model)
-                        .or(self.current_model.as_ref())
-                }
-                .cloned();
-                self.note_step(*usage, model.as_ref());
+                let model = fallback
+                    .route
+                    .as_ref()
+                    .map(|route| &route.model)
+                    .or(self.current_model.as_ref())
+                    .cloned();
+                self.note_served_step(
+                    *usage,
+                    model.as_ref(),
+                    fallback.served_model.as_deref(),
+                    fallback.usage_iterations.as_deref(),
+                );
             }
             WalRecord::OutputReservationClamped {
                 step_id,
@@ -167,6 +166,35 @@ impl OutputReservationHistory {
     /// A `ModelAttemptFinished` record with this rendered body length.
     pub fn note_attempt(&mut self, request_body_len: u64) {
         self.attempt_bytes = Some(request_body_len);
+    }
+
+    /// Use the last serving iteration's prompt occupancy, never the sum of prompts
+    /// sent to different tokenizers. Bind the measurement to that iteration's model.
+    pub fn note_served_step(
+        &mut self,
+        usage: broca_protocol::Usage,
+        requested: Option<&ModelHandle>,
+        served_model: Option<&str>,
+        iterations: Option<&[broca_protocol::usage::UsageIteration]>,
+    ) {
+        let measured = requested.and_then(|requested| {
+            broca_protocol::usage::model_usage(
+                served_model.unwrap_or(&requested.model_id),
+                usage,
+                iterations,
+            )
+            .last()
+            .map(|(model, usage)| {
+                (
+                    *usage,
+                    ModelHandle::new(&requested.provider_module_id, *model),
+                )
+            })
+        });
+        match measured {
+            Some((usage, model)) => self.note_step(usage, Some(&model)),
+            None => self.note_step(broca_protocol::Usage::default(), None),
+        }
     }
 
     /// A `ModelStepFinished` record with usage measured on `model`, or `None` when the
@@ -425,6 +453,45 @@ mod tests {
             history.fold(&record);
         }
         assert_eq!(history.estimate(1_000, &model("source")), None);
+    }
+
+    #[test]
+    fn server_iterations_measure_only_the_last_serving_models_prompt() {
+        let mut mixed = step(1, Some(999_999));
+        mixed["served_model"] = serde_json::json!("fallback");
+        mixed["usage_iterations"] = serde_json::json!([
+            {"model":"source", "input_tokens":111, "cache_read_input_tokens":10},
+            {"model":"fallback", "input_tokens":222, "cache_read_input_tokens":20}
+        ]);
+        let wal = records(&[run_started("source"), attempt(1, 400), mixed]);
+        let mut replayed = OutputReservationHistory::default();
+        let mut checkpoint = crate::compaction::CompactionHistory::default();
+        for record in &wal {
+            replayed.fold(record);
+            checkpoint.fold(record);
+        }
+        assert_eq!(replayed.estimate(400, &model("source")), None);
+        assert_eq!(replayed.estimate(400, &model("fallback")), Some(242));
+        let mut seeded = OutputReservationHistory::default();
+        seeded.seed_from_compaction(&checkpoint);
+        assert_eq!(seeded.estimate(400, &model("source")), None);
+        assert_eq!(seeded.estimate(400, &model("fallback")), Some(242));
+        let WalRecord::ModelStepFinished {
+            usage, fallback, ..
+        } = &wal[2]
+        else {
+            unreachable!()
+        };
+        let mut live = OutputReservationHistory::default();
+        live.start_run(&model("source"));
+        live.note_attempt(400);
+        live.note_served_step(
+            *usage,
+            Some(&model("source")),
+            fallback.served_model.as_deref(),
+            fallback.usage_iterations.as_deref(),
+        );
+        assert_eq!(live, replayed);
     }
 
     #[test]

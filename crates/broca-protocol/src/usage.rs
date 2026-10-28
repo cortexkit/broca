@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
-    /// Fresh (non-cached) request input tokens.
+    /// Fresh (non-cached) request input tokens. For a multi-iteration step this is the
+    /// sum of each iteration's fresh input, not the occupancy of a single context window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
     /// Cache-READ input tokens (cache hit). Counts toward fill.
@@ -76,9 +77,9 @@ impl Usage {
     /// This is prompt occupancy, not a measure of what the call cost. Output and
     /// reasoning are output-side, so a consumer wanting spend needs the whole struct.
     ///
-    /// Meaningful only on a SINGLE step's usage. Accumulated usage sums input across steps, and
-    /// since every step re-sends the growing prompt, the sum counts the same prompt repeatedly
-    /// and exceeds any window the model ever held.
+    /// Meaningful only for one serving iteration's usage. Step totals with multiple
+    /// iterations and run totals count re-sent prompts repeatedly, so their sum can exceed
+    /// any window the model ever held. Use `model_usage` for individual measurements.
     /// Missing input makes occupancy unknown, even if a cache count is known. When
     /// input is reported without a cache split, use that reported input alone; an
     /// unreported cache count is not itself evidence of additional occupancy.
@@ -155,9 +156,101 @@ pub struct UsageIteration {
     pub other: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Derive billed usage per serving model. Iterations replace the top-level counters,
+/// which Anthropic reports for only the last iteration of a server-side handoff.
+/// Missing measurements stay absent; in particular, a top-level reasoning split is
+/// not evidence that an earlier iteration reported reasoning.
+pub fn model_usage<'a>(
+    served_or_requested_model: &'a str,
+    usage: Usage,
+    iterations: Option<&'a [UsageIteration]>,
+) -> Vec<(&'a str, Usage)> {
+    match iterations {
+        Some(iterations) => iterations
+            .iter()
+            .map(|iteration| {
+                (
+                    iteration
+                        .model
+                        .as_deref()
+                        .unwrap_or(served_or_requested_model),
+                    Usage {
+                        input_tokens: iteration.input_tokens,
+                        cached_input_tokens: iteration.cache_read_input_tokens,
+                        cache_write_tokens: iteration.cache_creation_input_tokens,
+                        output_tokens: iteration.output_tokens,
+                        reasoning_tokens: iteration
+                            .other
+                            .get("output_tokens_details")
+                            .and_then(|details| details.get("thinking_tokens"))
+                            .and_then(serde_json::Value::as_u64),
+                    },
+                )
+            })
+            .collect(),
+        None => vec![(served_or_requested_model, usage)],
+    }
+}
+
+/// A step's counters sum its iterations, preserving unreported fields as absent.
+pub fn step_usage(usage: Usage, iterations: Option<&[UsageIteration]>) -> Usage {
+    model_usage("", usage, iterations)
+        .into_iter()
+        .fold(Usage::default(), |total, (_, usage)| total + usage)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iteration_usage_replaces_last_iteration_counters_and_sums_only_reported_fields() {
+        let iterations: Vec<UsageIteration> = serde_json::from_value(serde_json::json!([
+            {"model":"source", "input_tokens":4, "output_tokens":2124, "cache_read_input_tokens":20068, "cache_creation_input_tokens":0},
+            {"model":"target", "input_tokens":2, "output_tokens":29287, "cache_read_input_tokens":20068, "cache_creation_input_tokens":4}
+        ])).unwrap();
+        let last = Usage {
+            input_tokens: Some(2),
+            output_tokens: Some(29287),
+            reasoning_tokens: Some(23621),
+            ..Usage::default()
+        };
+        let entries = model_usage("target", last, Some(&iterations));
+        assert_eq!(entries[0].0, "source");
+        assert_eq!(entries[0].1.output_tokens, Some(2124));
+        assert_eq!(entries[1].0, "target");
+        assert_eq!(entries[1].1.output_tokens, Some(29287));
+        assert_eq!(
+            step_usage(last, Some(&iterations)),
+            Usage {
+                input_tokens: Some(6),
+                output_tokens: Some(31411),
+                cached_input_tokens: Some(40136),
+                cache_write_tokens: Some(4),
+                reasoning_tokens: None,
+            }
+        );
+        assert_eq!(
+            model_usage("requested", last, None),
+            vec![("requested", last)]
+        );
+        assert_eq!(step_usage(last, Some(&[])), Usage::default());
+        let partial: Vec<UsageIteration> = serde_json::from_value(serde_json::json!([
+            {"model":"source", "output_tokens":10, "output_tokens_details":{"thinking_tokens":7}},
+            {"model":"target", "output_tokens":0, "cache_read_input_tokens":0}
+        ]))
+        .unwrap();
+        assert_eq!(
+            step_usage(last, Some(&partial)),
+            Usage {
+                input_tokens: None,
+                output_tokens: Some(10),
+                cached_input_tokens: Some(0),
+                cache_write_tokens: None,
+                reasoning_tokens: Some(7),
+            }
+        );
+    }
 
     #[test]
     fn run_usage_treats_each_single_reported_zero_as_reported() {

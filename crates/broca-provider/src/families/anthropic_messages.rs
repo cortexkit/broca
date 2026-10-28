@@ -172,6 +172,40 @@ fn persona_bytes(body: &Value) -> Vec<u8> {
     persona_rules::sign_body(&persona_rules::to_persona_json(body)).into_bytes()
 }
 
+fn render_body(frozen: &FrozenRenderConfig, opts: &CallOptions, body: &Value) -> Vec<u8> {
+    let fragments: Vec<_> = if frozen.server_side_fallback {
+        opts.prompt
+            .iter()
+            .filter(|message| message.role == Role::Assistant)
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::ProviderFallback { raw, .. } => Some(raw.as_deref()),
+                _ => None,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if fragments.iter().all(Option::is_none) {
+        return if persona(frozen).is_some() {
+            persona_bytes(body)
+        } else {
+            broca_protocol::canonical_json_bytes(body)
+        };
+    }
+    if persona(frozen).is_some() {
+        // Sign only after restoring the raw blocks: cch covers the body actually sent.
+        let bytes = raw_fallback::splice(
+            persona_rules::to_persona_json(body).into_bytes(),
+            &fragments,
+        );
+        persona_rules::sign_body(std::str::from_utf8(&bytes).expect("serialized JSON is UTF-8"))
+            .into_bytes()
+    } else {
+        raw_fallback::splice(broca_protocol::canonical_json_bytes(body), &fragments)
+    }
+}
+
 /// The fixed Claude Code client headers that describe the SDK and runtime the reference client
 /// runs on. Only the OS and architecture come from this machine.
 const STAINLESS_PACKAGE_VERSION: &str = "0.112.1";
@@ -318,6 +352,8 @@ fn attach_auth(headers: &mut Vec<(String, String)>, auth: &AuthHandle) {
 /// render config passed to each method.
 pub struct AnthropicMessages;
 
+mod raw_fallback;
+
 impl WireFamily for AnthropicMessages {
     fn shape(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
         build_request_body(frozen, opts)
@@ -343,22 +379,14 @@ impl WireFamily for AnthropicMessages {
         media: &[crate::media_render::InlineMedia<'_>],
     ) -> Vec<u8> {
         let body = self.shape_with_media(frozen, opts, media);
-        if persona(frozen).is_some() {
-            persona_bytes(&body)
-        } else {
-            broca_protocol::canonical_json_bytes(&body)
-        }
+        render_body(frozen, opts, &body)
     }
 
     /// A persona run's bytes are the persona's key order with the `cch` signature written in;
     /// every other run keeps the canonical JSON of its shape.
     fn render(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Vec<u8> {
         let body = build_request_body(frozen, opts);
-        if persona(frozen).is_some() {
-            persona_bytes(&body)
-        } else {
-            broca_protocol::canonical_json_bytes(&body)
-        }
+        render_body(frozen, opts, &body)
     }
 
     fn endpoint(
@@ -424,14 +452,24 @@ impl WireFamily for AnthropicMessages {
 
     fn warm_body(&self, frozen: &FrozenRenderConfig, base: &[u8]) -> Result<Vec<u8>, String> {
         let warm = crate::cache_warm::anthropic_warm_body(base)?;
+        let fragments: Vec<_> = raw_fallback::blocks(base).into_iter().map(Some).collect();
         if persona(frozen).is_none() {
-            return Ok(warm);
+            return Ok(raw_fallback::splice(warm, &fragments));
         }
         // The warm body changes the sent body, so a persona warm is re-emitted in the persona's
         // key order and signed again; its billing block is otherwise the one `base` carried.
         let body: Value = serde_json::from_slice(&warm)
             .map_err(|error| format!("the warm body is not JSON: {error}"))?;
-        Ok(persona_bytes(&body))
+        let bytes = raw_fallback::splice(
+            persona_rules::to_persona_json(&body).into_bytes(),
+            &fragments,
+        );
+        Ok(
+            persona_rules::sign_body(
+                std::str::from_utf8(&bytes).expect("serialized JSON is UTF-8"),
+            )
+            .into_bytes(),
+        )
     }
 }
 
@@ -1158,13 +1196,8 @@ fn convert_content(
             ContentBlock::ProviderFallback {
                 from_model,
                 to_model,
-            } => echo_fallback.then(|| {
-                json!({
-                    "type": "fallback",
-                    "from": { "model": from_model },
-                    "to": { "model": to_model },
-                })
-            }),
+                raw,
+            } => echo_fallback.then(|| raw_fallback::shape(from_model, to_model, raw.as_deref())),
         })
         .collect()
 }
@@ -1346,6 +1379,37 @@ mod tests {
             parsed["system"][0], base_parsed["system"][0],
             "a new body, a new cch"
         );
+    }
+
+    #[test]
+    fn raw_fallbacks_are_restored_before_persona_signing_and_survive_warming() {
+        let mut frozen = persona_frozen();
+        frozen.server_side_fallback = true;
+        frozen.renderer_version = crate::families::anthropic_renderer_version(true);
+        let raw = r#"{ "to":{"model":"claude-opus-4-8"}, "type":"fallback", "from":{"model":"claude-opus-5-5"}, "trigger":{"type":"refusal","number":1.00e+2} }"#;
+        let request = opts(vec![
+            user_message("Synthetic prompt"),
+            Message::assistant_from(
+                vec![ContentBlock::ProviderFallback {
+                    from_model: "claude-opus-5-5".into(),
+                    to_model: "claude-opus-4-8".into(),
+                    raw: Some(raw.into()),
+                }],
+                ModelHandle::new("anthropic", "claude-opus-4-8"),
+            ),
+            user_message("Synthetic follow-up"),
+        ]);
+        let base = AnthropicMessages.render(&frozen, &request);
+        let base = std::str::from_utf8(&base).unwrap();
+        assert!(base.contains(raw));
+        assert_eq!(persona_rules::sign_body(base), base);
+        let warm = AnthropicMessages
+            .warm_body(&frozen, base.as_bytes())
+            .unwrap();
+        let warm = std::str::from_utf8(&warm).unwrap();
+        assert!(warm.contains(raw));
+        assert_eq!(persona_rules::sign_body(warm), warm);
+        assert_ne!(base, warm);
     }
 
     /// The persona applies only to the OAuth identity-lead shape: an api-key config carrying a

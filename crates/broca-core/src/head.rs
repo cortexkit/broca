@@ -83,14 +83,13 @@ impl HeadProjection {
             }
             // A refused call was billed, so it counts as a call of the model that refused; a
             // step another model answered counts under that model.
-            WalRecord::ModelStepFinished { usage, .. }
-            | WalRecord::ModelStepRefused { usage, .. } => {
+            WalRecord::ModelStepFinished { .. } | WalRecord::ModelStepRefused { .. } => {
                 if let (Some(run_id), Some(model)) = (&self.run_id, &self.model) {
                     let episode = broca_protocol::request::ModelHandle::new(
                         model.provider.as_str(),
                         model.model.as_str(),
                     );
-                    if let Some((provider, model, variant)) = crate::refusal_fallback::usage_model(
+                    for (provider, model, variant, usage) in crate::refusal_fallback::usage_by_model(
                         &episode,
                         model.variant.as_deref(),
                         record,
@@ -101,7 +100,7 @@ impl HeadProjection {
                                 provider,
                                 model,
                                 variant,
-                                crate::replay::reported_step_usage(usage),
+                                crate::replay::reported_step_usage(&usage),
                             );
                     }
                 }
