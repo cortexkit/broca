@@ -213,6 +213,7 @@ fn manifest(hook: &str, policies: &[&str], tool_calls: usize) -> Arc<broca_wal::
     let subs: Vec<_> = policies.iter().map(|policy| json!({"hook":hook,"ops":["append"],"on_unavailable":policy,"budget_ms":30000})).collect();
     let items: Vec<_> = subs.iter().enumerate().map(|(i, sub)| json!({"provider":format!("p{i}"),"preset":"frozen","params":{"tag":i},"subscriptions":[sub]})).collect();
     Arc::new(broca_wal::PlanManifest {
+        rich_ui: None,
         plan: broca_wal::OpaqueJson::from_json_text(
             json!({"step_transform_items":items}).to_string(),
         )

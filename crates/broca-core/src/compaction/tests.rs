@@ -859,6 +859,7 @@ fn model_page_folds_snapshot_and_mid_turn_tail_and_refuses_after_mid() {
 
 fn manifest() -> Arc<broca_wal::PlanManifest> {
     Arc::new(broca_wal::PlanManifest {
+        rich_ui: None,
         plan: OpaqueJson::from_json_text(
             json!({"compaction_item":{"provider":"provider","preset":"head","params":{}},"composition":{}})
                 .to_string(),

@@ -197,8 +197,8 @@ across sessions is not built (see SECURITY.md).
 
 ```
 session.read { from_ordinal?, limit?, include_tools?, after_mid?, lineage_id?, max_bytes?,
-                 include_originals? }
-    → { messages: [{ ordinal, mid, message, written_at?,
+                 include_originals?, include_rich_ui? }
+    → { messages: [{ ordinal, mid, message, written_at?, rich_ui?,
                      tool_calls?: [{ tool_call_id, call_key?, dispatched_to?, indeterminate }] }],
         next_from_ordinal?, head?, lineage_id?, lineage_state,
         tools?: [{ name, description, input_schema, module? }], tools_run_id? }
@@ -214,7 +214,7 @@ session.output_ref_read { ref_id, offset, length } → { format, size, data }
 session.head {} → { lineage_id?, last_ordinal?, head?, last_run_state?, updated_at?,
                        cache?: { last_sent_at_ms, ttl_ms?, expires_at_ms?, expiry_basis },
                        title?, model?: { provider, model, variant? }, usage?,
-                       sender?: { modes, interrupt, owner?: true }, incarnation? }
+                       sender?: { modes, interrupt, owner?: true }, incarnation?, last_run_rich_ui? }
 session.warm { lineage_id? }
     → { request_body_sha256, warm_body_sha256, cache_read_tokens?, cache_write_tokens?,
         input_tokens?, ttl_ms, expires_at_ms, expiry_basis: "estimated" } (§4a)
@@ -1262,6 +1262,18 @@ callers do not send unsupported fields and check compatibility tests.
 Each item carries both `ordinal` and `mid: "m<ordinal>"`; `mid` is the MC-coordinate
 spelling used by consumers. Chunking is required for large transcripts because subc has a
 per-frame cap and closes a full egress queue.
+
+**Rich UI teaching stamp.** Broca declares `rich_ui_stamp`. A teaching provider's fetched
+`system_text.rich_ui` value (`{dialect, catalog_digest}`) is frozen at admission, never read
+from caller-supplied metadata or fetched again for later runs. Conflicting stamps refuse
+admission as `plan_stale`, with `differences` naming the stamped providers in plan order.
+Every assistant display row in `session.history` and the live `run_started` event carry
+`rich_ui` when the run has a stamp. `session.head.last_run_rich_ui` describes only the
+head's last run and is stored with its start. `session.read` includes `rich_ui` beside
+each assistant entry's `mid` only with `include_rich_ui: true`; default reads keep their
+previous bytes. All these members are omitted, never null, on unstamped runs, including
+older manifests that did not freeze teaching metadata. User, system and tool messages
+never carry the stamp.
 
 **Declared tools (opt-in).** `include_tools: true` adds `tools` and `tools_run_id` to the
 response: the tool list frozen on the durable `RunStarted` of the session's LATEST episode

@@ -144,6 +144,7 @@ fn lookup() -> Tool {
 
 fn rendering_manifest() -> broca_wal::PlanManifest {
     broca_wal::PlanManifest {
+        rich_ui: None,
         plan: broca_wal::OpaqueJson::from_json_text(
             json!({"step_transform_items":[],"render_tags":true}).to_string(),
         )

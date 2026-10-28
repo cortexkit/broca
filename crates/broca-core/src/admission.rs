@@ -2778,10 +2778,8 @@ mod tests {
     fn offset_admission_compaction_manifest_before_setup_requires_full_replay() {
         let mut records = offset_corpus()[..4].to_vec();
         if let WalRecord::RunStarted { manifest, .. } = &mut records[0].record {
-            *manifest = Some(Box::new(broca_wal::PlanManifest {
-                plan: broca_wal::OpaqueJson::from_json_text(serde_json::json!({"compaction_item": {"provider":"provider", "preset":"head", "params":{}}, "composition":{}}).to_string()).unwrap(),
-                plan_identity: "plan".into(), composition_digest: "digest".into(), tools: Arc::new(vec![]), system_text: String::new(), system_digest: String::new(), join_version: 1, role_versions: Default::default(), fetches: vec![], declarations: vec![],
-            }));
+            *manifest = Some(Box::new(broca_wal::PlanManifest { rich_ui: None, plan: broca_wal::OpaqueJson::from_json_text(serde_json::json!({"compaction_item": {"provider":"provider", "preset":"head", "params":{}}, "composition":{}}).to_string()).unwrap(),
+            plan_identity: "plan".into(), composition_digest: "digest".into(), tools: Arc::new(vec![]), system_text: String::new(), system_digest: String::new(), join_version: 1, role_versions: Default::default(), fetches: vec![], declarations: vec![], }));
         }
         let (bytes, positioned) = offset_log(&records);
         let boundary = offset_boundary(&bytes, &positioned, 4);

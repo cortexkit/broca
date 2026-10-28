@@ -135,6 +135,8 @@ pub struct LastRunState {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeadResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_rich_ui: Option<cortexkit_role_llm_runner::rich_ui::RichUiStamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage_id: Option<String>,
     /// The ordinal of the newest message; absent on an empty transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -360,6 +362,7 @@ pub fn broca_role_describe_with_writers(
         "transcript_reads",
         cortexkit_role_llm_runner::capabilities::HOST_HISTORY,
         cortexkit_role_llm_runner::capabilities::HISTORY_DISPLAY,
+        cortexkit_role_llm_runner::capabilities::RICH_UI_STAMP,
         cortexkit_role_llm_runner::capabilities::CALL_IDENTITY,
         cortexkit_role_llm_runner::capabilities::OUTPUT_REFS,
         "run_ops",
@@ -597,6 +600,7 @@ mod pinned_reply_bytes {
     fn session_head_bytes_are_pinned() {
         assert_golden(
             HeadResponse {
+                last_run_rich_ui: None,
                 model: None,
                 usage: None,
                 sender: None,
@@ -631,6 +635,7 @@ mod pinned_reply_bytes {
     fn session_head_with_a_title_bytes_are_pinned() {
         assert_golden(
             HeadResponse {
+                last_run_rich_ui: None,
                 model: None,
                 usage: None,
                 sender: None,
@@ -666,6 +671,7 @@ mod pinned_reply_bytes {
     #[test]
     fn session_head_lineage_members_are_pinned() {
         let head = HeadResponse {
+            last_run_rich_ui: None,
             model: None,
             usage: None,
             sender: None,
@@ -1026,7 +1032,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "472a9a2056ab39d6bc8db9d6248ee8478a4311d1997358e6f3fd25d113142121",
+            "db369473affe16eb20048c5d70c066097183895adfbdb4ea51046cc1de6695a5",
         );
     }
 
@@ -1122,6 +1128,7 @@ mod pinned_reply_bytes {
     fn cache_facts_on_head_and_baseline_are_pinned() {
         assert_golden(
             HeadResponse {
+                last_run_rich_ui: None,
                 model: None,
                 usage: None,
                 sender: None,
@@ -1188,7 +1195,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "86abae2086fc37f5e09873c0682779a2fce496cd1d8db4cf4bf4b39796c1d59a";
+        "73bb145b2a54739de328488328b1bcb352fa743f63ff53320ffa6ea47e38db7e";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

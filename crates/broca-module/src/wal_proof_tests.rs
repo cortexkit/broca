@@ -1031,6 +1031,7 @@ impl Fixture {
     async fn with_ceiling(size: u64) -> Self {
         let mut fixture = Self::with_history(false).await;
         let manifest = broca_wal::PlanManifest {
+            rich_ui: None,
             plan: broca_wal::OpaqueJson::from_json_text(
                 r#"{"compaction_item":{"provider":"provider","params":{}},"composition":{}}"#,
             )

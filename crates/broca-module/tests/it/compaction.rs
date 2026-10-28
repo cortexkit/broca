@@ -204,10 +204,11 @@ fn manifest() -> Arc<PlanManifest> {
 /// The plan's manifest, rendering tags when `render_tags`.
 fn manifest_rendering(render_tags: bool) -> Arc<PlanManifest> {
     Arc::new(PlanManifest {
+        rich_ui: None,
         plan: OpaqueJson::from_json_text(
             json!({"compaction_item":{
-            "provider":"provider","preset":"head","params":{}},"composition":{},
-            "render_tags":render_tags})
+        "provider":"provider","preset":"head","params":{}},"composition":{},
+        "render_tags":render_tags})
             .to_string(),
         )
         .unwrap(),

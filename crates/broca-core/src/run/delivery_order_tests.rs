@@ -142,6 +142,7 @@ async fn run(name: &str, model: Model, inbox: Arc<SteerInbox>, during: Option<Or
 /// A frozen plan manifest whose plan turns `render_tags` on.
 fn rendering_manifest() -> broca_wal::PlanManifest {
     broca_wal::PlanManifest {
+        rich_ui: None,
         plan: broca_wal::OpaqueJson::from_json_text(
             serde_json::json!({"step_transform_items":[],"render_tags":true}).to_string(),
         )

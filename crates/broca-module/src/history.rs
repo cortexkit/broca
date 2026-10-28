@@ -453,6 +453,7 @@ pub async fn read<H: ServeHandler + ?Sized>(
     while from < stop {
         let mut read = SessionReadRequest::new(session.clone(), Some(from), Some(stop - from));
         read.lineage_id = Some(lineage.clone());
+        read.include_rich_ui = request.form() == HistoryForm::Display;
         read.max_bytes = Some(broca_wire::READ_MAXIMUM_MAX_BYTES);
         // Display needs stored payloads; raw history honors the caller's descriptor choice.
         read.media = if request.form() == HistoryForm::Display {
@@ -509,6 +510,9 @@ pub async fn read<H: ServeHandler + ?Sized>(
     for (entry, written_at) in entries.iter().zip(creation_times) {
         let value = if request.form() == HistoryForm::Display {
             let mut row = project(entry, request.limits.as_ref());
+            if entry.message.role == Role::Assistant {
+                row.rich_ui = entry.rich_ui.clone();
+            }
             if let Some(metadata) = metadata.get(&entry.ordinal) {
                 for call in row.tool_calls_mut() {
                     call.schema_pin = metadata.tool_pins.get(&call.tool_call_id).and_then(|pin| {

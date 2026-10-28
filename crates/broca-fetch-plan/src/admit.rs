@@ -1330,6 +1330,7 @@ pub async fn admit(
                         outcomes.insert(provider, Ok(text));
                     } else if let Some(Ok(fetched)) = outcomes.get_mut(provider) {
                         fetched.text = text.text;
+                        fetched.answer.system_text = text.answer.system_text;
                     }
                 }
                 Err(missed) => {
@@ -1527,6 +1528,28 @@ pub async fn admit(
         })
         .collect();
     let system_text = join_system_texts(texts);
+    let stamps: Vec<_> = plan
+        .system_text_items
+        .iter()
+        .filter_map(|item| {
+            let fetched = outcomes.get(item.provider.as_str())?.as_ref().ok()?;
+            let stamp = fetched.answer.system_text.as_ref()?.rich_ui.as_ref()?;
+            let stamp = broca_protocol::RichUiStamp::new(stamp.dialect(), stamp.catalog_digest())
+                .expect("the provider stamp was validated when decoding its answer");
+            Some((item.provider.as_str(), stamp))
+        })
+        .collect();
+    let rich_ui = cortexkit_role_llm_runner::rich_ui::plan_stamp(
+        stamps
+            .iter()
+            .map(|(provider, stamp)| (*provider, Some(stamp))),
+    )
+    .map_err(|conflict| Refusal::PlanStale {
+        differences: conflict.detail()["differences"]
+            .as_array()
+            .expect("conflict differences")
+            .clone(),
+    })?;
     let fetches = outcomes
         .iter()
         .map(|(provider, outcome)| ProviderFetch {
@@ -1593,6 +1616,7 @@ pub async fn admit(
     }
     Ok(Admitted {
         manifest: PlanManifest {
+            rich_ui,
             declarations: frozen_declarations,
             plan: OpaqueJson::from_json_text(plan.text.clone())
                 .expect("a plan serialized from a JSON value is JSON"),
@@ -1947,6 +1971,105 @@ mod tests {
             "tools": [],
             "system_text": system_text
         })
+    }
+
+    struct StampedFetcher(BTreeMap<String, Value>);
+
+    #[async_trait]
+    impl Fetcher for StampedFetcher {
+        async fn catalog(&self, provider: &str, _: &CatalogRequest) -> Result<Value, FetchError> {
+            Ok(self.0[provider].clone())
+        }
+        async fn declare(&self, _: &str, _: &DeclareRequest) -> Result<Value, FetchError> {
+            unreachable!("no transforms")
+        }
+        async fn describe_compaction(&self, _: &str) -> Result<DescribeAnswer, FetchError> {
+            unreachable!("no compaction")
+        }
+    }
+
+    #[tokio::test]
+    async fn rich_ui_stamp_freezes_only_the_teaching_answer_and_refuses_conflicts_in_plan_order() {
+        let mut value: Value = serde_json::from_str(&plan_for("z-teacher").text).unwrap();
+        value["system_text_items"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "provider":"a-teacher", "preset":"persona", "params":{}
+            }));
+        value["composition"]["providers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "provider":"a-teacher", "tools":[]
+            }));
+        value["composition"]["providers"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+        value["composition_digest"] = json!(
+            cortexkit_role_tool_provider::catalog::composition_digest(&value["composition"])
+                .unwrap()
+        );
+        let stamp = json!({"dialect":"1.0", "catalog_digest":"a".repeat(64)});
+        let other = json!({"dialect":"2.0", "catalog_digest":"b".repeat(64)});
+        value["rich_ui"] = other.clone();
+        let plan = parse_plan(&value, crate::plan::CompactionSupport::Unsupported).unwrap();
+        let text_digest = cortexkit_role_tool_provider::catalog::system_text_digest("teach");
+        let mut answer = catalog_answer(&plan, Some("teach"), &text_digest);
+        answer["system_text"]["rich_ui"] = stamp.clone();
+        let mut fetcher = StampedFetcher(BTreeMap::from([
+            ("z-teacher".into(), answer.clone()),
+            ("a-teacher".into(), answer),
+        ]));
+        let admitted = admit(
+            &plan,
+            &fetcher,
+            &broca_protocol::BindIdentity::new("/synthetic/stamps", "runner", "stamped"),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(admitted.manifest.rich_ui).unwrap(),
+            stamp
+        );
+        fetcher.0.get_mut("a-teacher").unwrap()["system_text"]["rich_ui"] = other.clone();
+        let refusal = admit(
+            &plan,
+            &fetcher,
+            &broca_protocol::BindIdentity::new("/synthetic/stamps", "runner", "conflict"),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refusal.code(), "plan_stale");
+        assert_eq!(
+            refusal.detail(),
+            json!({"differences":[
+                {"kind":"rich_ui", "provider":"z-teacher", "rich_ui":stamp},
+                {"kind":"rich_ui", "provider":"a-teacher", "rich_ui":other}
+            ]})
+        );
+        for answer in fetcher.0.values_mut() {
+            answer["system_text"]
+                .as_object_mut()
+                .unwrap()
+                .remove("rich_ui");
+        }
+        let unstamped = admit(
+            &plan,
+            &fetcher,
+            &broca_protocol::BindIdentity::new("/synthetic/stamps", "runner", "unstamped"),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(unstamped.manifest.rich_ui.is_none());
+        assert!(serde_json::to_value(unstamped.manifest)
+            .unwrap()
+            .get("rich_ui")
+            .is_none());
     }
 
     #[test]

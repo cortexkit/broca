@@ -83,6 +83,15 @@ fn capture_known_with_run(frame: &subc_protocol::Frame, name: &str, run: Option<
 }
 
 fn seed_history(rig: &Rig, planned: bool, owner: Option<&str>) {
+    seed_history_with_stamp(rig, planned, owner, None);
+}
+
+fn seed_history_with_stamp(
+    rig: &Rig,
+    planned: bool,
+    owner: Option<&str>,
+    stamp: Option<broca_protocol::RichUiStamp>,
+) {
     let mut start: WalRecord = serde_json::from_str(
         include_str!("../../broca-wal/tests/fixtures/before_message_times.jsonl")
             .lines()
@@ -106,6 +115,7 @@ fn seed_history(rig: &Rig, planned: bool, owner: Option<&str>) {
         });
         *ts_ms = Some(500);
         *manifest = Some(Box::new(broca_wal::PlanManifest {
+            rich_ui: stamp,
             plan: broca_wal::OpaqueJson::from_json_text(
                 json!({"composition":{}, "senders":[
                     {"module":"named"}, {"module":"starter","idle_start":true,"interrupt":true}
@@ -146,6 +156,92 @@ fn seed_history(rig: &Rig, planned: bool, owner: Option<&str>) {
         wal.append(1, &record, false).unwrap();
     }
     wal.sync().unwrap();
+}
+
+#[tokio::test]
+async fn rich_ui_stamp_serves_frozen_metadata_and_preserves_default_read_bytes() {
+    let mut rig = Rig::start("rich-ui-stamp-samples").await;
+    let stamp = json!({"dialect":"1.0", "catalog_digest":"a".repeat(64)});
+    seed_history_with_stamp(
+        &rig,
+        true,
+        Some("owner"),
+        Some(serde_json::from_value(stamp.clone()).unwrap()),
+    );
+    let default_read = rig
+        .request(7, json!({"method":"session.read","params":{}}))
+        .await;
+    capture_known(&default_read, "session_read.written_at.json");
+    let explicit_false = rig
+        .request(
+            7,
+            json!({"method":"session.read","params":{"include_rich_ui":false}}),
+        )
+        .await;
+    assert_eq!(default_read.body, explicit_false.body);
+    let read = rig
+        .request(
+            7,
+            json!({"method":"session.read","params":{"include_rich_ui":true}}),
+        )
+        .await;
+    let mut opted = result(&read);
+    assert!(opted["messages"][0].get("rich_ui").is_none());
+    assert_eq!(opted["messages"][1]["rich_ui"], stamp);
+    opted["messages"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("rich_ui");
+    assert_eq!(opted, result(&default_read));
+    let history = rig
+        .request(
+            7,
+            json!({"method":"session.history","params":{"form":"display"}}),
+        )
+        .await;
+    let history_value = result(&history);
+    assert!(history_value["messages"][0]["row"].get("rich_ui").is_none());
+    assert_eq!(history_value["messages"][1]["row"]["rich_ui"], stamp);
+    let head = rig
+        .request(7, json!({"method":"session.head","params":{}}))
+        .await;
+    assert_eq!(result(&head)["last_run_rich_ui"], stamp);
+    let frames = rig
+        .subscribe_collect(
+            8,
+            json!({"from":"start"}),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+    let start = frames
+        .iter()
+        .find(|frame| {
+            serde_json::from_slice::<serde_json::Value>(&frame.body)
+                .ok()
+                .is_some_and(|value| value["event"]["type"] == "run_started")
+        })
+        .expect("run_started live frame");
+    let live: serde_json::Value = serde_json::from_slice(&start.body).unwrap();
+    assert_eq!(live["event"]["rich_ui"], stamp);
+    for (name, frame) in [
+        ("session.history.json", &history),
+        ("run_started.json", start),
+        ("session.head.json", &head),
+        ("session.read.opt-in.json", &read),
+        ("session.read.default.json", &default_read),
+    ] {
+        println!(
+            "RICH_UI_SAMPLE {name} {}",
+            String::from_utf8_lossy(&frame.body)
+        );
+    }
+    let rig = rig.restart().await;
+    let mut rig = rig;
+    let restarted = rig
+        .request(7, json!({"method":"session.head","params":{}}))
+        .await;
+    assert_eq!(result(&restarted)["last_run_rich_ui"], stamp);
+    rig.finish().await;
 }
 
 #[tokio::test]

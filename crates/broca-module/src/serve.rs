@@ -36,6 +36,7 @@ pub struct SessionReadRequest {
     pub limit: Option<u64>,
     /// Also return the tool list frozen on the latest episode's `RunStarted`.
     pub include_tools: bool,
+    pub include_rich_ui: bool,
     /// Read strictly after the message with this `mid`, taken from an earlier page of the
     /// lineage `lineage_id`. The serve adapter refuses a request that sets it without
     /// `lineage_id`, or together with `from_ordinal`.
@@ -58,6 +59,7 @@ impl SessionReadRequest {
             from_ordinal,
             limit,
             include_tools: false,
+            include_rich_ui: false,
             after_mid: None,
             lineage_id: None,
             max_bytes: None,
@@ -408,6 +410,7 @@ fn session_read_response(
             .messages
             .into_iter()
             .map(|message| SessionReadMessage {
+                rich_ui: None,
                 written_at: message.written_at,
                 delivered_as: message
                     .run
@@ -2946,6 +2949,34 @@ impl ServeHandler for crate::LineageRegistry {
         }
         let prompt_len = page.prompt_len;
         let mut response = session_read_response(page, tools);
+        if req.include_rich_ui {
+            let mut stamps = std::collections::BTreeMap::new();
+            for entry in &mut response.messages {
+                if entry.message.role != broca_protocol::Role::Assistant {
+                    continue;
+                }
+                let Some(run) = &entry.run else { continue };
+                if let std::collections::btree_map::Entry::Vacant(slot) =
+                    stamps.entry(run.run_id.clone())
+                {
+                    let stamp = self
+                        .session_log(&req.session, &run.run_id)
+                        .await?
+                        .into_iter()
+                        .flatten()
+                        .find_map(|record| match record {
+                            broca_wal::WalRecord::RunStarted {
+                                run_id, manifest, ..
+                            } if run_id.0 == run.run_id => {
+                                manifest.and_then(|manifest| manifest.rich_ui)
+                            }
+                            _ => None,
+                        });
+                    slot.insert(stamp);
+                }
+                entry.rich_ui = stamps[&run.run_id].clone();
+            }
+        }
         if had_late || late_only {
             response.late_approvals = late;
         }
@@ -3084,6 +3115,7 @@ impl ServeHandler for crate::LineageRegistry {
             None
         };
         Ok(broca_wire::HeadResponse {
+            last_run_rich_ui: head_facts.last_run_rich_ui,
             last_run_error,
             model: head_facts.model,
             usage: head_facts.usage.filter(|usage| usage.consistent()),

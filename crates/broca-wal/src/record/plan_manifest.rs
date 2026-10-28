@@ -304,6 +304,10 @@ impl<'de> Deserialize<'de> for ProviderFetch {
 /// into the archive, and the episodes left in the live WAL must still render from it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanManifest {
+    /// The agreed stamp from the fetched system-text answers, not from the caller's plan.
+    /// Older manifests did not freeze this metadata and therefore remain unstamped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rich_ui: Option<broca_protocol::RichUiStamp>,
     /// The `plan` member of the session's first `session.send`, exactly as received.
     pub plan: OpaqueJson,
     /// The plan's identity: SHA-256, as 64 lowercase hex characters, of the RFC 8785 (JCS)
@@ -355,6 +359,69 @@ mod tests {
         let bytes = FIXTURE.trim_end();
         let record: WalRecord = serde_json::from_str(bytes).unwrap();
         assert_eq!(serde_json::to_string(&record).unwrap(), bytes);
+    }
+
+    #[test]
+    fn rich_ui_stamp_is_optional_display_metadata_and_preserves_older_manifest_bytes() {
+        let bytes = FIXTURE.trim_end();
+        let mut record: WalRecord = serde_json::from_str(bytes).unwrap();
+        assert_eq!(serde_json::to_string(&record).unwrap(), bytes);
+        let features = record.required_features();
+        let WalRecord::RunStarted {
+            manifest: Some(manifest),
+            ..
+        } = &mut record
+        else {
+            panic!("planned start");
+        };
+        assert!(manifest.rich_ui.is_none());
+        manifest.rich_ui = Some(broca_protocol::RichUiStamp::new("1.0", "a".repeat(64)).unwrap());
+        let encoded = serde_json::to_string(&record).unwrap();
+        assert_eq!(serde_json::from_str::<WalRecord>(&encoded).unwrap(), record);
+        assert_eq!(record.required_features(), features);
+    }
+
+    #[test]
+    fn rich_ui_stamp_run_started_decodes_with_the_0_3_281_manifest_definition() {
+        // Keep the released manifest's complete field set and serde attributes here: the
+        // compatibility check must not accidentally learn the new member from PlanManifest.
+        #[derive(Serialize, Deserialize)]
+        struct PreviousPlanManifest {
+            plan: OpaqueJson,
+            plan_identity: String,
+            composition_digest: String,
+            fetches: Vec<ProviderFetch>,
+            tools: Arc<Vec<Tool>>,
+            system_text: String,
+            system_digest: String,
+            join_version: u32,
+            role_versions: BTreeMap<String, String>,
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            declarations: Vec<FrozenDeclaration>,
+        }
+        #[derive(Deserialize)]
+        struct PreviousStart {
+            manifest: PreviousPlanManifest,
+        }
+        let previous: WalRecord = serde_json::from_str(FIXTURE.trim_end()).unwrap();
+        let mut stamped = previous.clone();
+        let WalRecord::RunStarted {
+            manifest: Some(manifest),
+            ..
+        } = &mut stamped
+        else {
+            panic!("planned start");
+        };
+        manifest.rich_ui = Some(broca_protocol::RichUiStamp::new("1.0", "a".repeat(64)).unwrap());
+        let new_bytes = serde_json::to_vec(&stamped).unwrap();
+        let old: PreviousStart = serde_json::from_slice(&new_bytes).unwrap();
+        let mut projected = serde_json::to_value(&stamped).unwrap();
+        projected["manifest"] = serde_json::to_value(old.manifest).unwrap();
+        assert_eq!(
+            serde_json::from_value::<WalRecord>(projected).unwrap(),
+            previous
+        );
+        assert_eq!(stamped.required_features(), previous.required_features());
     }
 
     /// Frozen reference slots round-trip through a whole `RunStarted`, written after `reply`,

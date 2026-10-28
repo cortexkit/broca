@@ -5424,6 +5424,7 @@ mod tests {
         );
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         let mut frozen = broca_wal::PlanManifest {
+            rich_ui: None,
             declarations: Vec::new(),
             plan: broca_wal::OpaqueJson::from_json_text(
                 serde_json::json!({"tool_items": [
