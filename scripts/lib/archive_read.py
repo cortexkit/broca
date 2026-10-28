@@ -150,6 +150,28 @@ def _record_payload(payload: bytes) -> bytes:
     return selected
 
 
+def _frame_at(raw: bytes, offset: int, where: str):
+    """Validate one frame independently of the direction used to reach its header."""
+    if len(raw) - offset < WAL_HEADER_LEN:
+        raise ArchiveRefusal(f"{where}: torn tail (incomplete header)")
+    length, version, seq, fence = struct.unpack_from("<IBQQ", raw, offset)
+    if version not in (1, 2, wal_gate.GATED_FRAMING_VERSION):
+        raise ArchiveRefusal(f"{where}: unsupported WAL framing version {version}")
+    if length > MAX_PAYLOAD_LEN:
+        raise ArchiveRefusal(f"{where}: payload {length} exceeds {MAX_PAYLOAD_LEN}-byte cap")
+    end = offset + WAL_HEADER_LEN + length
+    if end > len(raw):
+        raise ArchiveRefusal(f"{where}: torn tail (incomplete payload)")
+    payload = raw[offset + WAL_HEADER_LEN:end]
+    digest = raw[offset + 21:offset + WAL_HEADER_LEN]
+    expected = hashlib.sha256(raw[offset + 4:offset + 21] + payload).digest()
+    if digest != expected:
+        raise ArchiveRefusal(f"{where}: digest mismatch at sequence {seq}")
+    if version == 2 and (length, seq, fence) != (16, 0, 0):
+        raise ArchiveRefusal(f"{where}: invalid lineage frame")
+    return version, seq, fence, payload, end
+
+
 def _verified_frames(wal: pathlib.Path | ArchivedWal):
     """Share framing verification between record scans and lineage discovery."""
     raw = wal.read_bytes()
@@ -157,24 +179,8 @@ def _verified_frames(wal: pathlib.Path | ArchivedWal):
     lineage = None
     while offset < len(raw):
         where = f"{wal}: WAL frame at byte {offset}"
-        if len(raw) - offset < WAL_HEADER_LEN:
-            raise ArchiveRefusal(f"{where}: torn tail (incomplete header)")
-        length, version, seq, fence = struct.unpack_from("<IBQQ", raw, offset)
-        if version not in (1, 2, wal_gate.GATED_FRAMING_VERSION):
-            raise ArchiveRefusal(f"{where}: unsupported WAL framing version {version}")
-        if length > MAX_PAYLOAD_LEN:
-            raise ArchiveRefusal(f"{where}: payload {length} exceeds {MAX_PAYLOAD_LEN}-byte cap")
-        end = offset + WAL_HEADER_LEN + length
-        if end > len(raw):
-            raise ArchiveRefusal(f"{where}: torn tail (incomplete payload)")
-        payload = raw[offset + WAL_HEADER_LEN:end]
-        digest = raw[offset + 21:offset + WAL_HEADER_LEN]
-        expected = hashlib.sha256(raw[offset + 4:offset + 21] + payload).digest()
-        if digest != expected:
-            raise ArchiveRefusal(f"{where}: digest mismatch at sequence {seq}")
+        version, seq, fence, payload, end = _frame_at(raw, offset, where)
         if version == 2:
-            if (length, seq, fence) != (16, 0, 0):
-                raise ArchiveRefusal(f"{where}: invalid lineage frame")
             if lineage is not None and lineage != payload:
                 raise ArchiveRefusal(f"{where}: conflicting lineage IDs")
             lineage = payload
@@ -184,6 +190,19 @@ def _verified_frames(wal: pathlib.Path | ArchivedWal):
             expected_seq += 1
         yield where, version, seq, fence, payload
         offset = end
+
+
+def backward_chunks(handle, size: int, chunk_size: int = 4096):
+    """The shared EOF-first chunk walk used by live-run and recent-credential scans."""
+    pos = size
+    while pos > 0:
+        step = min(chunk_size, pos)
+        pos -= step
+        handle.seek(pos)
+        block = handle.read(step)
+        if len(block) != step:
+            raise ArchiveRefusal(f"{handle.name}: torn tail (file shortened during backward read)")
+        yield pos, block
 
 
 def read_lineage_id(wal: pathlib.Path) -> str | None:
@@ -221,6 +240,31 @@ def is_tombstoned(wal: pathlib.Path) -> bool:
     return False
 
 
+def _decode_record(where, version, seq, fence, payload) -> WalFrame | None:
+    if version == 2:
+        return None
+    try:
+        requires = ()
+        if version == wal_gate.GATED_FRAMING_VERSION:
+            missing, envelope = wal_gate.open_gated(payload)
+            if missing:
+                raise ArchiveRefusal(f"{where}: newer-writer, missing features: {', '.join(missing)}")
+            record = envelope["record"]
+            requires = tuple(envelope["requires"])
+            payload = _record_payload(payload)
+        else:
+            record = json.loads(payload)
+            # Historical test fixtures wrapped the record in a timestamped object.
+            if isinstance(record, dict) and "type" not in record and "record" in record:
+                record = record["record"]
+                payload = _record_payload(payload)
+    except (UnicodeDecodeError, ValueError) as error:
+        raise ArchiveRefusal(f"{where}: invalid record JSON: {error}") from error
+    if not isinstance(record, dict) or not isinstance(record.get("type"), str):
+        raise ArchiveRefusal(f"{where}: no tagged WAL record")
+    return WalFrame(seq, fence, record, payload, requires)
+
+
 def read_records(wal: pathlib.Path | ArchivedWal) -> list[WalFrame]:
     """Decode a live or archived WAL snapshot before exposing any scan results.
 
@@ -232,30 +276,73 @@ def read_records(wal: pathlib.Path | ArchivedWal) -> list[WalFrame]:
     absence. No repair or extraction writes are made.
     """
     frames = []
-    for where, version, seq, fence, payload in _verified_frames(wal):
-        if version == 2:
-            continue
-        try:
-            requires = ()
-            if version == wal_gate.GATED_FRAMING_VERSION:
-                missing, envelope = wal_gate.open_gated(payload)
-                if missing:
-                    raise ArchiveRefusal(f"{where}: newer-writer, missing features: {', '.join(missing)}")
-                record = envelope["record"]
-                requires = tuple(envelope["requires"])
-                payload = _record_payload(payload)
-            else:
-                record = json.loads(payload)
-                # Historical instrument fixtures used timestamp-wrapped records.
-                if isinstance(record, dict) and "type" not in record and "record" in record:
-                    record = record["record"]
-                    payload = _record_payload(payload)
-        except (UnicodeDecodeError, ValueError) as error:
-            raise ArchiveRefusal(f"{where}: invalid record JSON: {error}") from error
-        if not isinstance(record, dict) or not isinstance(record.get("type"), str):
-            raise ArchiveRefusal(f"{where}: no tagged WAL record")
-        frames.append(WalFrame(seq, fence, record, payload, requires))
+    for parts in _verified_frames(wal):
+        frame = _decode_record(*parts)
+        if frame is not None:
+            frames.append(frame)
     return frames
+
+
+_HEADER_MARKERS = re.compile(rb"[\x00-\x1f]")
+
+
+def read_records_reverse(wal: pathlib.Path, chunk_size: int = 4096):
+    """Yield verified live frames newest first, without decoding the unread prefix.
+
+    Frames have no trailing length. Find headers in backward chunks by their
+    leading length ending exactly at the preceding frame boundary, then use the
+    same digest, framing and record checks as the full forward reader. Header
+    version bytes are control bytes, which cannot occur bare inside JSON strings.
+    """
+    with wal.open("rb") as handle:
+        handle.seek(0, 2)
+        end = handle.tell()
+        overlap = b""
+        newer_seq = None
+        lineage = None
+        invalid = None
+        for pos, block in backward_chunks(handle, end, chunk_size):
+            window = block + overlap
+            for match in reversed(list(_HEADER_MARKERS.finditer(window))):
+                local = match.start() - 4
+                start = pos + local
+                if local < 0 or start + WAL_HEADER_LEN > end:
+                    continue
+                length = struct.unpack_from("<I", window, local)[0]
+                if start + WAL_HEADER_LEN + length != end:
+                    continue
+                where = f"{wal}: WAL frame at byte {start}"
+                handle.seek(start)
+                raw = handle.read(end - start)
+                try:
+                    version, seq, fence, payload, frame_end = _frame_at(raw, 0, where)
+                except ArchiveRefusal as error:
+                    # A digest/header byte can resemble a version marker. Only
+                    # a validated frame establishes the next backward boundary.
+                    invalid = error
+                    continue
+                if frame_end != len(raw):
+                    raise ArchiveRefusal(f"{where}: frame changed during backward read")
+                if version == 2:
+                    if lineage is not None and lineage != payload:
+                        raise ArchiveRefusal(f"{where}: conflicting lineage IDs")
+                    lineage = payload
+                    if start == 0 and newer_seq not in (None, 1):
+                        raise ArchiveRefusal(f"{where}: expected first record sequence 1, found {newer_seq}")
+                else:
+                    if seq < 1 or (newer_seq is not None and seq != newer_seq - 1) or (start == 0 and seq != 1):
+                        raise ArchiveRefusal(f"{where}: unexpected record sequence {seq}")
+                    newer_seq = seq
+                end = start
+                invalid = None
+                frame = _decode_record(where, version, seq, fence, payload)
+                if frame is not None:
+                    yield frame
+            overlap = window[:4]
+            if end - pos > MAX_PAYLOAD_LEN + WAL_HEADER_LEN:
+                raise invalid or ArchiveRefusal(f"{wal}: torn or corrupt frame ending at byte {end}")
+        if end:
+            raise invalid or ArchiveRefusal(f"{wal}: torn or corrupt frame ending at byte {end}")
 
 
 def fold_timestamp(path: pathlib.Path) -> int:

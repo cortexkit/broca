@@ -32,7 +32,7 @@ import sys
 import time
 
 from lib import state_root, wal_gate
-from lib.archive_read import ArchiveRefusal, logical_wals
+from lib.archive_read import ArchiveRefusal, backward_chunks, logical_wals
 
 # Live-only enumeration is intentional: archiving requires 14 idle days and an
 # exclusive writer lease, so an archived session cannot hold a live run. Revisit
@@ -143,16 +143,11 @@ def tail_state(path: pathlib.Path) -> str:
         if size == 0:
             return SEALED
         with path.open("rb") as handle:
-            pos = size
             tail = b""
             # Every block read so far, newest first, so gated frames AFTER the deciding token
             # (in blocks already passed over) are still checked once the token is found.
             blocks: list[bytes] = []
-            while pos > 0:
-                step = min(_CHUNK, pos)
-                pos -= step
-                handle.seek(pos)
-                block = handle.read(step)
+            for pos, block in backward_chunks(handle, size, _CHUNK):
                 blocks.append(block)
                 # Carry the previous head forward so a token straddling the seam survives.
                 tail = block + tail[:_OVERLAP]
