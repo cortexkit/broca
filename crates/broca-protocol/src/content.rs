@@ -4,6 +4,7 @@
 //! tools. Serialized internally-tagged (`{"type": ...}`) so the wire is
 //! self-describing and easy to read.
 
+use cortexkit_role_llm_runner::serializer_profile::error_output;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -504,24 +505,10 @@ pub const TOOL_PLANE_UNAVAILABLE_RETRY: &str =
     "the module is restarting or unavailable; retry the call in a minute";
 
 /// The most bytes the runner contract allows in a module-outage error's `detail`.
-pub const MODULE_UNAVAILABLE_DETAIL_MAX_BYTES: usize = 1024;
+pub const MODULE_UNAVAILABLE_DETAIL_MAX_BYTES: usize = error_output::DETAIL_MAX;
 
 /// The most bytes the runner contract allows in a module-outage error's `retry`.
-pub const MODULE_UNAVAILABLE_RETRY_MAX_BYTES: usize = 256;
-
-/// Whether `module` is a module id the runner contract accepts in an error's `module`: 1 to
-/// 255 bytes of UTF-8 with no control character (spaces and non-ASCII are allowed).
-fn is_contract_module_id(module: &str) -> bool {
-    (1..=255).contains(&module.len()) && !module.chars().any(char::is_control)
-}
-
-/// Whether `code` is an error code the runner contract accepts: `^[a-z][a-z0-9_]{0,63}$`.
-fn is_contract_error_code(code: &str) -> bool {
-    let mut bytes = code.bytes();
-    bytes.next().is_some_and(|first| first.is_ascii_lowercase())
-        && code.len() <= 64
-        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-}
+pub const MODULE_UNAVAILABLE_RETRY_MAX_BYTES: usize = error_output::RETRY_MAX;
 
 /// Bound a daemon refusal detail to what the runner contract allows in a module-outage
 /// error's `detail`: one line of at most [`MODULE_UNAVAILABLE_DETAIL_MAX_BYTES`] bytes.
@@ -562,33 +549,92 @@ impl ToolOutput {
     ///
     /// Strict readers of the runner contract refuse a whole history page that holds one
     /// invalid member, and the module id and code come from the daemon, so each is checked
-    /// here, where every such result is built, and left out when it does not fit: `module`
-    /// must be 1 to 255 bytes with no control character, `code` must match
-    /// `^[a-z][a-z0-9_]{0,63}$`, and no member is ever present but empty. The result stays a
-    /// valid attributed error with fewer fields, and `message` never changes.
+    /// here, where every such result is built, with the contract's own validators
+    /// (`error_output::is_valid_module` and `is_valid_code`), and left out when it does not
+    /// fit. No member is ever present but empty. The result stays a valid attributed error
+    /// with fewer fields, and `message` never changes.
     pub fn module_unavailable(
         module: impl Into<String>,
         code: impl Into<String>,
         detail: impl Into<String>,
     ) -> Self {
-        let module = Some(module.into()).filter(|module| is_contract_module_id(module));
-        let code = Some(code.into()).filter(|code| is_contract_error_code(code));
+        let module = Some(module.into()).filter(|module| error_output::is_valid_module(module));
+        let code = Some(code.into()).filter(|code| error_output::is_valid_code(code));
         let detail = bound_module_unavailable_detail(&detail.into());
-        ToolOutput::Error {
+        let output = ToolOutput::Error {
             message: TOOL_PLANE_UNAVAILABLE_MESSAGE.to_owned(),
             module,
             code,
             detail: (!detail.is_empty()).then_some(detail),
             nothing_sent: Some(true),
             retry: Some(TOOL_PLANE_UNAVAILABLE_RETRY.to_owned()),
-        }
+        };
+        debug_assert!(
+            output
+                .contract_error_output()
+                .is_some_and(|out| out.check().is_ok()),
+            "a module-outage result must satisfy the runner contract: {output:?}"
+        );
+        output
     }
 
-    /// The text the model reads for an error result's fields: the message, plus any
-    /// module-outage attribution on its own lines. A plain error renders as its message
-    /// alone, exactly as before; only an attributed outage result grows the extra lines.
-    /// Kept as one associated function (rather than a method matching `self`) so every
-    /// provider family's encoder renders these fields byte-identically.
+    /// This error result as the runner contract's `owned-broca` error output, or `None` for
+    /// any other kind of result. A `nothing_sent` of `Some(false)` maps to absent, the only
+    /// way the contract can say it.
+    pub fn contract_error_output(&self) -> Option<error_output::ErrorOutput> {
+        let ToolOutput::Error {
+            message,
+            module,
+            code,
+            detail,
+            nothing_sent,
+            retry,
+        } = self
+        else {
+            return None;
+        };
+        Some(Self::error_output_of(
+            message,
+            module.as_deref(),
+            code.as_deref(),
+            detail.as_deref(),
+            *nothing_sent,
+            retry.as_deref(),
+        ))
+    }
+
+    fn error_output_of(
+        message: &str,
+        module: Option<&str>,
+        code: Option<&str>,
+        detail: Option<&str>,
+        nothing_sent: Option<bool>,
+        retry: Option<&str>,
+    ) -> error_output::ErrorOutput {
+        let mut output = error_output::ErrorOutput::new(message);
+        if let Some(module) = module {
+            output = output.with_module(module);
+        }
+        if let Some(code) = code {
+            output = output.with_code(code);
+        }
+        if let Some(detail) = detail {
+            output = output.with_detail(detail);
+        }
+        if nothing_sent == Some(true) {
+            output = output.with_nothing_sent();
+        }
+        if let Some(retry) = retry {
+            output = output.with_retry(retry);
+        }
+        output
+    }
+
+    /// The text the model reads for an error result's fields: the runner contract's rendered
+    /// block (`error_output::render`), the message and then one line per present member. A
+    /// plain error renders as its message alone; only an attributed outage result grows the
+    /// extra lines. Kept as one associated function (rather than a method matching `self`)
+    /// so every provider family's encoder renders these fields byte-identically.
     pub fn error_model_text(
         message: &str,
         module: Option<&str>,
@@ -597,23 +643,14 @@ impl ToolOutput {
         nothing_sent: Option<bool>,
         retry: Option<&str>,
     ) -> String {
-        let mut text = message.to_owned();
-        if let Some(module) = module {
-            text.push_str(&format!("\nmodule: {module}"));
-        }
-        if let Some(code) = code {
-            text.push_str(&format!("\ncode: {code}"));
-        }
-        if let Some(detail) = detail {
-            text.push_str(&format!("\ndetail: {detail}"));
-        }
-        if nothing_sent == Some(true) {
-            text.push_str("\nnothing was sent");
-        }
-        if let Some(retry) = retry {
-            text.push_str(&format!("\nretry: {retry}"));
-        }
-        text
+        error_output::render(&Self::error_output_of(
+            message,
+            module,
+            code,
+            detail,
+            nothing_sent,
+            retry,
+        ))
     }
 }
 
