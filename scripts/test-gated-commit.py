@@ -153,12 +153,14 @@ class LinuxQuickcheckAttestation(unittest.TestCase):
         scripts.mkdir()
         shutil.copy2(ROOT / "scripts/linux-quickcheck-attest.sh", scripts)
         self.events = self.root / ".git" / "quickcheck-args"
-        quickcheck = scripts / "quickcheck.sh"
+        library = scripts / "lib"
+        library.mkdir()
+        quickcheck = library / "linux-quickcheck.py"
         quickcheck.write_text(
-            "#!/bin/sh\n"
-            "printf '%s\\n' \"$@\" > \"$QUICKCHECK_ARGS\"\n"
-            "echo 'quickcheck: ran 1 test'\n"
-            "[ \"${QUICKCHECK_FAIL:-}\" != 1 ] || exit 17\n"
+            "import os, pathlib, sys\n"
+            "pathlib.Path(os.environ['QUICKCHECK_ARGS']).write_text('\\n'.join(sys.argv[1:]) + '\\n')\n"
+            "print('quickcheck: ran 1 test')\n"
+            "sys.exit(17 if os.environ.get('QUICKCHECK_FAIL') == '1' else 0)\n"
         )
         quickcheck.chmod(0o755)
         bins = self.root / "bin"
