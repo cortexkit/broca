@@ -950,7 +950,493 @@ mod gated {
             "a provider rebuilt from the persisted blob must re-render byte-identical bytes"
         );
 
+        offset_generic_resume_at_every_cut(&dir).await;
+
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct OffsetFixture {
+        path: std::path::PathBuf,
+        candidate: Option<broca_core::resume::OffsetResumeSnapshot>,
+        observed: Mutex<Vec<Option<broca_core::replay::SeedFallback>>>,
+        reads: Mutex<Vec<(u64, u64)>>,
+        record_start: u64,
+    }
+
+    // Count reconstruction reads, not provider/config setup or the writer's own open/recovery.
+    // Forward range reads explicitly so the trait default cannot turn one into a full scan.
+    struct ReconstructionWal<'a> {
+        inner: &'a FileWalStore,
+        full_reads: std::sync::atomic::AtomicUsize,
+        ranges: Mutex<Vec<(u64, Option<u64>, bool)>>,
+    }
+
+    impl WalStore for ReconstructionWal<'_> {
+        fn open(&self, session: &BindIdentity) -> Result<Box<dyn Wal + Send>, broca_wal::WalError> {
+            self.inner.open(session)
+        }
+        fn wal_config(&self) -> broca_wal::WalConfig {
+            self.inner.wal_config()
+        }
+        fn writer_marker_root(&self) -> Option<std::path::PathBuf> {
+            self.inner.writer_marker_root()
+        }
+        fn uploads(&self) -> Option<broca_core::media_uploads::Uploads> {
+            self.inner.uploads()
+        }
+        fn check_move(
+            &self,
+            session: &BindIdentity,
+            write: bool,
+        ) -> Result<(), broca_wal::WalError> {
+            self.inner.check_move(session, write)
+        }
+        fn retired_tag_floor(&self, session: &BindIdentity) -> Result<u64, broca_wal::WalError> {
+            self.inner.retired_tag_floor(session)
+        }
+        fn retired_notice_floor(&self, session: &BindIdentity) -> Result<u64, broca_wal::WalError> {
+            self.inner.retired_notice_floor(session)
+        }
+        fn read_records(
+            &self,
+            session: &BindIdentity,
+        ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+            self.full_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.read_records(session)
+        }
+        fn read_records_range(
+            &self,
+            session: &BindIdentity,
+            after_seq: u64,
+            through_seq: Option<u64>,
+            anchor: Option<&broca_wal::WalByteAnchor>,
+        ) -> Result<broca_wal::WalRangeRead, broca_wal::WalError> {
+            self.ranges
+                .lock()
+                .unwrap()
+                .push((after_seq, through_seq, anchor.is_some()));
+            self.inner
+                .read_records_range(session, after_seq, through_seq, anchor)
+        }
+    }
+
+    #[tokio::test]
+    async fn offset_resume_refuses_legacy_root_without_writes() {
+        let dir = broca_test_support::scratch_root()
+            .join(format!("broca-offset-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = FileWalStore::new(dir.join("wal"));
+        let offsets = OffsetFixture {
+            path: store.wal_path(&request(&dir).session),
+            candidate: None,
+            observed: Mutex::new(Vec::new()),
+            reads: Mutex::new(Vec::new()),
+            record_start: 0,
+        };
+        let provider = FrozenProvider::new(anthropic_frozen_config("claude-opus-4-8"));
+        let (tx, _rx) = mpsc::channel(16);
+        let result = broca_core::run::run_loop_from_offsets(
+            request(&dir),
+            broca_core::StartMode::FreshOrResume,
+            &provider,
+            &StubToolPlane::new(),
+            &FileLeaseStore::new(dir.join("lease")),
+            &AllowAll,
+            &store,
+            Default::default(),
+            &tx,
+            None,
+            &offsets,
+        )
+        .await;
+        assert!(matches!(result, Err(RunError::Wal(reason)) if reason.contains("broca-state/2")));
+        assert!(!offsets.path.exists());
+        assert!(provider.sent.lock().unwrap().is_empty());
+        assert!(offsets.observed.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    impl broca_core::resume::OffsetResumeReader for OffsetFixture {
+        fn snapshot(
+            &self,
+            safe_head: u64,
+        ) -> Result<broca_core::resume::OffsetResumeSnapshot, broca_core::replay::SeedFallback>
+        {
+            let mut candidate = self
+                .candidate
+                .clone()
+                .ok_or(broca_core::replay::SeedFallback {
+                    reason: "offset resume has no committed boundary",
+                })?;
+            candidate.tail = broca_core::projection::decode_positioned_frames(
+                &|off, len| self.read_at(off, len),
+                candidate.boundary.frame_end,
+                std::fs::metadata(&self.path).unwrap().len(),
+                None,
+            )
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.framed.seq <= safe_head)
+            .collect();
+            assert_eq!(
+                candidate
+                    .tail
+                    .last()
+                    .map_or(candidate.boundary.seq, |p| p.framed.seq),
+                safe_head
+            );
+            Ok(candidate)
+        }
+
+        fn read_at(&self, off: u64, len: u64) -> std::io::Result<Vec<u8>> {
+            use std::io::{Read, Seek, SeekFrom};
+            self.reads.lock().unwrap().push((off, len));
+            let mut file = std::fs::File::open(&self.path)?;
+            file.seek(SeekFrom::Start(off))?;
+            let mut bytes = Vec::new();
+            file.take(len).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        }
+
+        fn reconstructed(&self, fallback: Option<broca_core::replay::SeedFallback>) {
+            self.observed.lock().unwrap().push(fallback);
+        }
+    }
+
+    fn offset_fixture(
+        store: &FileWalStore,
+        session: &BindIdentity,
+        unqualified: bool,
+    ) -> OffsetFixture {
+        use broca_core::replay::{PositionedFrame, ProjectionSeed, SeedBoundary};
+        use broca_wal::framing::{decode_next, DecodeStep};
+        use sha2::{Digest, Sha256};
+        let bytes = std::fs::read(store.wal_path(session)).unwrap();
+        let mut positions = Vec::new();
+        let mut ends = Vec::new();
+        let mut off = 0;
+        let mut lineage = None;
+        while off < bytes.len() {
+            match decode_next(&bytes[off..]) {
+                DecodeStep::Record { framed, consumed } => {
+                    positions.push(PositionedFrame {
+                        off: off as u64,
+                        framed: *framed,
+                    });
+                    off += consumed;
+                    ends.push(off as u64);
+                }
+                DecodeStep::Lineage {
+                    lineage_id,
+                    consumed,
+                } => {
+                    lineage = Some(lineage_id.to_string());
+                    off += consumed;
+                }
+                _ => panic!("FileWal fixture must decode without torn or unsupported frames"),
+            }
+        }
+        let frames: Vec<_> = positions.iter().map(|p| p.framed.clone()).collect();
+        let candidate = broca_core::replay::latest_projection_boundary(&frames, 0).map(|seq| {
+            let at = positions.iter().position(|p| p.framed.seq == seq).unwrap();
+            // This models index publication, not the measured resume: capture once from the
+            // durable FileWal prefix, retaining the exact frame positions and identity.
+            let prior = broca_core::replay::replay(
+                &frames[..=at]
+                    .iter()
+                    .map(|f| f.record.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let delta = broca_core::replay::replay_projection_tail(
+                &ProjectionSeed::empty(),
+                &frames[..=at],
+            )
+            .unwrap();
+            let mut projection = ProjectionSeed::empty();
+            projection.watermark_seq = seq;
+            projection.prefix_len = prior.extent;
+            projection.completed_steps = prior.completed_steps;
+            projection.usage = prior.usage;
+            projection.retries_used = prior.retries_used;
+            projection.last_step_usage = prior.last_step_usage;
+            projection.last_step_finish_reason = prior.last_step_finish_reason;
+            projection.last_run_id = prior.run_id;
+            projection.trailing_origin = prior.prompt.iter().rev().find_map(|m| m.origin.clone());
+            projection.tag_seed = broca_core::tags::TagSeed::from_prefix(&prior.prompt);
+            projection.admission_checkpoint = delta.admission_checkpoint;
+            projection.projection_episodes = delta.episodes;
+            projection.open_episode_span = delta.open_episode_span;
+            broca_core::resume::OffsetResumeSnapshot {
+                boundary: SeedBoundary {
+                    lineage_id: lineage,
+                    seq,
+                    frame_off: positions[at].off,
+                    frame_end: ends[at],
+                    frame_identity: Sha256::digest(
+                        &bytes[positions[at].off as usize..ends[at] as usize],
+                    )
+                    .to_vec(),
+                    qualified: !unqualified,
+                },
+                projection,
+                prefix: prior.prompt,
+                tail: positions[at + 1..].to_vec(),
+            }
+        });
+        OffsetFixture {
+            path: store.wal_path(session),
+            candidate,
+            observed: Mutex::new(Vec::new()),
+            reads: Mutex::new(Vec::new()),
+            record_start: positions.first().unwrap().off,
+        }
+    }
+
+    fn overhaul_log(dir: &std::path::Path, records: &[WalRecord]) -> FileWalStore {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(broca_wal::state_format::MARKER_FILENAME),
+            b"broca-state/2\n",
+        )
+        .unwrap();
+        let config = broca_wal::classify_state_root(dir).unwrap();
+        assert!(config.is_overhaul());
+        let store = FileWalStore::with_config(dir.join("wal"), config);
+        let mut wal = store.open(&request(dir).session).unwrap();
+        for record in records {
+            let mut record = record.clone();
+            if let WalRecord::RunStarted { session, .. } = &mut record {
+                *session = request(dir).session;
+            }
+            wal.append(1, &record, true).unwrap();
+        }
+        store
+    }
+
+    async fn drive_overhaul(
+        dir: &std::path::Path,
+        store: &FileWalStore,
+        offsets: Option<&OffsetFixture>,
+    ) -> (RunFinishReason, HashMap<usize, Vec<u8>>) {
+        let prior = read_prior_run_config(store, &request(dir).session)
+            .unwrap()
+            .unwrap();
+        let provider =
+            FrozenProvider::new(serde_json::from_value(prior.frozen_render_config).unwrap());
+        let mut req = request(dir);
+        req.input = store
+            .read_records(&req.session)
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|f| {
+                if let WalRecord::RunStarted { input, .. } = &f.record {
+                    Some(input.to_vec())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let lease = FileLeaseStore::new(dir.join("lease"));
+        let counted = ReconstructionWal {
+            inner: store,
+            full_reads: std::sync::atomic::AtomicUsize::new(0),
+            ranges: Mutex::new(Vec::new()),
+        };
+        let (tx, mut rx) = mpsc::channel(256);
+        let collector = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let summary = if let Some(offsets) = offsets {
+            broca_core::run::run_loop_from_offsets(
+                req,
+                broca_core::StartMode::FreshOrResume,
+                &provider,
+                &StubToolPlane::new(),
+                &lease,
+                &AllowAll,
+                &counted,
+                Default::default(),
+                &tx,
+                None,
+                offsets,
+            )
+            .await
+        } else {
+            run_loop(
+                req,
+                &provider,
+                &StubToolPlane::new(),
+                &lease,
+                &AllowAll,
+                &counted,
+                &tx,
+            )
+            .await
+        }
+        .unwrap();
+        if let Some(offsets) = offsets {
+            let observed = offsets.observed.lock().unwrap();
+            assert_eq!(observed.len(), 1);
+            let full_reads = counted.full_reads.load(std::sync::atomic::Ordering::SeqCst);
+            if offsets
+                .candidate
+                .as_ref()
+                .is_some_and(|candidate| candidate.boundary.qualified)
+            {
+                assert_eq!(
+                    observed[0], None,
+                    "a qualified boundary must seed reconstruction"
+                );
+                assert_eq!(
+                    full_reads, 0,
+                    "seeded reconstruction must not read the complete WAL"
+                );
+                assert!(
+                    counted
+                        .ranges
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|(after, _, _)| *after > 0),
+                    "seeded reconstruction must not request a full-span range"
+                );
+                let prefix_end = offsets.candidate.as_ref().unwrap().boundary.frame_end;
+                assert!(
+                    offsets
+                        .reads
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|(off, len)| *off > offsets.record_start
+                            || off.saturating_add(*len) < prefix_end),
+                    "positioned reads must not scan the indexed prefix"
+                );
+            } else {
+                assert!(
+                    observed[0].is_some(),
+                    "unavailable or unqualified seeds must fall back"
+                );
+                assert!(
+                    full_reads > 0,
+                    "fallback must exercise the full-read counter"
+                );
+            }
+        }
+        drop(tx);
+        collector.await.unwrap();
+        let sent = provider.sent.lock().unwrap().clone();
+        (summary.reason, sent)
+    }
+
+    async fn offset_generic_resume_at_every_cut(seed_dir: &std::path::Path) {
+        let seed = FileWalStore::new(seed_dir.join("wal"))
+            .read_records(&request(seed_dir).session)
+            .unwrap();
+        let mut episode: Vec<_> = seed
+            .into_iter()
+            .map(|f| f.record)
+            .filter(|r| {
+                matches!(
+                    r,
+                    WalRecord::RunStarted { .. }
+                        | WalRecord::StepStarted { .. }
+                        | WalRecord::ModelStepFinished { .. }
+                        | WalRecord::RunFinished { .. }
+                )
+            })
+            .collect();
+        if let WalRecord::RunStarted { run_id, .. } = &mut episode[0] {
+            *run_id = RunId("old".into());
+        }
+        let mut records = episode.clone();
+        if let WalRecord::RunStarted { run_id, input, .. } = &mut episode[0] {
+            *run_id = RunId("r".into());
+            *input = vec![Message::new(
+                Role::User,
+                vec![ContentBlock::Text {
+                    text: "next question".into(),
+                }],
+            )]
+            .into();
+        }
+        records.extend(episode);
+        let root = seed_dir.join("offset-cuts");
+        let mut qualified_attempts = 0;
+        for cut in 1..=records.len() {
+            let reference_dir = root.join(format!("reference-{cut}"));
+            let store = overhaul_log(&reference_dir, &records[..cut]);
+            let expected = drive_overhaul(&reference_dir, &store, None).await;
+            for unqualified in [false, true] {
+                let dir = root.join(format!("offset-{cut}-{unqualified}"));
+                let store = overhaul_log(&dir, &records[..cut]);
+                let offsets = offset_fixture(&store, &request(&dir).session, unqualified);
+                let has_boundary = offsets.candidate.is_some();
+                let actual = drive_overhaul(&dir, &store, Some(&offsets)).await;
+                assert_eq!(
+                    actual, expected,
+                    "request bytes at cut {cut}, unqualified={unqualified}"
+                );
+                let observed = offsets.observed.lock().unwrap();
+                assert_eq!(observed.len(), 1);
+                match (has_boundary, unqualified, observed[0].clone()) {
+                    (false, _, Some(reason)) => {
+                        assert_eq!(reason.reason, "offset resume has no committed boundary")
+                    }
+                    (true, true, Some(reason)) => assert_eq!(reason.reason, "unqualified boundary"),
+                    (true, false, None) => qualified_attempts += 1,
+                    other => panic!("unexpected offset path at cut {cut}: {other:?}"),
+                }
+            }
+        }
+        assert_eq!(
+            qualified_attempts, 5,
+            "every committed boundary at cuts 4 through 8 must seed reconstruction"
+        );
+        eprintln!("offset resume cuts 4 through 8: all 5 seeded without full reconstruction reads; unqualified controls used full replay");
+
+        // Resume from the persisted FileWal prefix through ResumeStarted, before StepStarted.
+        // Reopening that prefix must not duplicate input or change the next request; this is
+        // a persisted-prefix cut, not a process-kill or power-loss simulation.
+        let exit_source = root.join(format!("offset-{}-false", records.len() / 2 + 1));
+        let source_store =
+            FileWalStore::with_config(exit_source.join("wal"), broca_wal::WalConfig::OVERHAUL);
+        let resumed = source_store
+            .read_records(&request(&exit_source).session)
+            .unwrap();
+        let exit = resumed
+            .iter()
+            .position(|f| matches!(f.record, WalRecord::ResumeStarted { .. }))
+            .unwrap();
+        if let WalRecord::ResumeStarted { replayed, .. } = &resumed[exit].record {
+            assert_eq!(replayed.messages, 3);
+        }
+        assert!(matches!(
+            resumed[exit + 1].record,
+            WalRecord::StepStarted { .. }
+        ));
+        let exit_prefix: Vec<_> = resumed[..=exit].iter().map(|f| f.record.clone()).collect();
+        let dir = root.join("resume-exit-reference");
+        let store = overhaul_log(&dir, &exit_prefix);
+        let expected = drive_overhaul(&dir, &store, None).await;
+        for unqualified in [false, true] {
+            let dir = root.join(format!("resume-exit-offset-{unqualified}"));
+            let store = overhaul_log(&dir, &exit_prefix);
+            let offsets = offset_fixture(&store, &request(&dir).session, unqualified);
+            assert_eq!(drive_overhaul(&dir, &store, Some(&offsets)).await, expected);
+            let observed = offsets.observed.lock().unwrap();
+            assert_eq!(observed.len(), 1);
+            if unqualified {
+                assert_eq!(observed[0].as_ref().unwrap().reason, "unqualified boundary");
+            } else {
+                assert_eq!(
+                    observed[0], None,
+                    "resume-exit prefix must use its committed seed"
+                );
+            }
+        }
+        eprintln!("offset resume exit-gate durable-prefix cut: request bytes and 3-message history preserved");
     }
 
     /// An OAuth render config exactly as a run admitted before the Claude Code persona
