@@ -31,6 +31,12 @@ use tokio::sync::{broadcast, oneshot};
 use crate::lease::{LeaseHandle, OwnedWalTenure};
 
 mod extraction;
+#[path = "open_writers.rs"]
+mod open_writers;
+#[cfg(feature = "test-clock")]
+thread_local! {
+    static WRITER_FS_FOR_TEST: std::cell::RefCell<Option<Arc<dyn broca_wal::fs_ops::FsOps>>> = const { std::cell::RefCell::new(None) };
+}
 mod projection_reader;
 mod retention_changes;
 pub use projection_reader::ReadOnlyWalReader;
@@ -48,6 +54,10 @@ pub type WriterAndLease = (Box<dyn Wal + Send>, Box<dyn LeaseHandle>);
 /// Opens the per-session WAL (mirrors `LeaseStore`, so the file impl swaps for a
 /// future store without touching the loop).
 pub trait WalStore: Send + Sync {
+    /// State-root location for the writer-id/v1 marker protocol. Legacy stores need none.
+    fn writer_marker_root(&self) -> Option<PathBuf> {
+        None
+    }
     /// File-backed sessions stage uploads beside their WAL trees, never in a
     /// second host media store. In-memory stores do not offer upload staging.
     fn uploads(&self) -> Option<crate::media_uploads::Uploads> {
@@ -1034,7 +1044,16 @@ impl FileWalStore {
                     WalRecord::RunStarted { retention, .. } => Some(retention.is_some()),
                     _ => None,
                 })
-                .unwrap_or(retention.is_some() || !records.is_empty())
+                .unwrap_or_else(|| {
+                    retention.is_some()
+                        || records.iter().any(|frame| {
+                            !self.config.is_overhaul()
+                                || !matches!(
+                                    frame.record,
+                                    WalRecord::WriterOpened { .. } | WalRecord::WriterClosed { .. }
+                                )
+                        })
+                })
         } else {
             false
         };
@@ -1599,6 +1618,11 @@ pub fn session_addr(session: &BindIdentity) -> String {
 }
 
 impl WalStore for FileWalStore {
+    fn writer_marker_root(&self) -> Option<PathBuf> {
+        self.config
+            .is_overhaul()
+            .then(|| state_root_of(&self.root).to_path_buf())
+    }
     fn wal_config(&self) -> broca_wal::WalConfig {
         self.config
     }
@@ -1998,6 +2022,7 @@ impl RecordOutcome {
 }
 
 struct AppendBudget {
+    writer_close_reserve: u64,
     retained: bool,
     session_max_bytes: u64,
     max_bytes: u64,
@@ -2115,6 +2140,8 @@ impl std::fmt::Display for WalOpenError {
 impl std::error::Error for WalOpenError {}
 
 enum WalCommand {
+    #[cfg(test)]
+    BudgetSnapshot(std_mpsc::Sender<Option<(u64, u64, u64)>>),
     #[cfg(test)]
     AppendDrained(oneshot::Sender<()>),
     /// Append a record at the caller-assigned `seq`, coalesced (no fsync yet). The
@@ -2508,18 +2535,6 @@ impl WalHandle {
         Self::spawn_proven_observed(wal, last_seq, fence, observer, None)
     }
 
-    /// [`spawn`](Self::spawn) with the writer thread reading `appended_ms` from `clock`, so a
-    /// test controls the value and sees when, and on which thread, it is sampled.
-    #[cfg(test)]
-    pub(crate) fn spawn_with_stamp_clock(
-        wal: Box<dyn Wal + Send>,
-        fence: u64,
-        clock: StampClock,
-    ) -> Result<WalHandle, WalWriteError> {
-        let (wal, last_seq) = Self::prove_recovery(wal)?;
-        Self::spawn_proven_with_clock(wal, last_seq, fence, None, None, clock)
-    }
-
     /// Keep the per-run lease on the writer thread, including if its owner is cancelled.
     pub(crate) fn spawn_with_lease(
         wal: Box<dyn Wal + Send>,
@@ -2528,6 +2543,52 @@ impl WalHandle {
         let fence = lease.epoch();
         let (wal, last_seq) = Self::prove_recovery(wal)?;
         Self::spawn_proven_observed(wal, last_seq, fence, None, Some(lease))
+    }
+
+    pub(crate) fn spawn_in_store<W: WalStore>(
+        wal: Box<dyn Wal + Send>,
+        store: &W,
+        session: &BindIdentity,
+        fence: u64,
+        lease: Option<Box<dyn LeaseHandle>>,
+    ) -> Result<WalHandle, WalWriteError> {
+        if !wal.wal_config().is_overhaul() {
+            return match lease {
+                Some(lease) => Self::spawn_with_lease(wal, lease),
+                None => Self::spawn(wal, fence),
+            };
+        }
+        let fence = lease.as_ref().map_or(fence, |lease| lease.epoch());
+        let (wal, seq) = Self::prove_recovery(wal)?;
+        let context = store
+            .writer_marker_root()
+            .map(|root| open_writers::WriterContext {
+                root,
+                address: session_addr(session),
+            });
+        Self::spawn_proven_with_clock(wal, seq, fence, None, lease, (StampClock::wall(), context))
+    }
+
+    /// Exercise the production store-aware spawn with a filesystem backend on its writer thread.
+    #[cfg(feature = "test-clock")]
+    pub fn spawn_in_store_with_fs_for_test<W: WalStore>(
+        wal: Box<dyn Wal + Send>,
+        store: &W,
+        session: &BindIdentity,
+        fence: u64,
+        lease: Option<Box<dyn LeaseHandle>>,
+        fs: Arc<dyn broca_wal::fs_ops::FsOps>,
+    ) -> Result<WalHandle, WalWriteError> {
+        struct Restore(Option<Arc<dyn broca_wal::fs_ops::FsOps>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                WRITER_FS_FOR_TEST.with(|slot| {
+                    slot.replace(self.0.take());
+                });
+            }
+        }
+        let _restore = Restore(WRITER_FS_FOR_TEST.with(|slot| slot.replace(Some(fs))));
+        Self::spawn_in_store(wal, store, session, fence, lease)
     }
 
     /// Open and prove a session WAL away from the async runtime, then start its writer thread.
@@ -2591,8 +2652,21 @@ impl WalHandle {
             )))
         })??;
         let (wal, last_seq, fence, lease) = opened;
-        let mut handle = Self::spawn_proven_observed(wal, last_seq, fence, observer, None)
-            .map_err(WalOpenError::Failed)?;
+        let context = check_store
+            .writer_marker_root()
+            .map(|root| open_writers::WriterContext {
+                root,
+                address: session_addr(&check_session),
+            });
+        let mut handle = Self::spawn_proven_with_clock(
+            wal,
+            last_seq,
+            fence,
+            observer,
+            None,
+            (StampClock::wall(), context),
+        )
+        .map_err(WalOpenError::Failed)?;
         handle.bind_media_capture(check_store.as_ref(), &check_session);
         handle.move_check = Some(Arc::new(move || {
             check_store.check_move(&check_session, true)
@@ -2718,8 +2792,21 @@ impl WalHandle {
         // The writer task owns the lease until the WAL is closed: dropping the
         // handle without shutdown still joins through the task, and shutdown
         // joins before the task drops the lease. No separate lease is returned.
-        let mut handle = Self::spawn_proven_observed(wal, last_seq, fence, observer, Some(lease))
-            .map_err(WalOpenError::Failed)?;
+        let context = check_store
+            .writer_marker_root()
+            .map(|root| open_writers::WriterContext {
+                root,
+                address: session_addr(&check_session),
+            });
+        let mut handle = Self::spawn_proven_with_clock(
+            wal,
+            last_seq,
+            fence,
+            observer,
+            Some(lease),
+            (StampClock::wall(), context),
+        )
+        .map_err(WalOpenError::Failed)?;
         handle.bind_media_capture(check_store.as_ref(), &check_session);
         handle.move_check = Some(Arc::new(move || {
             check_store.check_move(&check_session, true)
@@ -2746,7 +2833,14 @@ impl WalHandle {
         observer: Option<RecordObserver>,
         lease: Option<Box<dyn LeaseHandle>>,
     ) -> Result<WalHandle, WalWriteError> {
-        Self::spawn_proven_with_clock(wal, last_seq, fence, observer, lease, StampClock::wall())
+        Self::spawn_proven_with_clock(
+            wal,
+            last_seq,
+            fence,
+            observer,
+            lease,
+            (StampClock::wall(), None),
+        )
     }
 
     fn spawn_proven_with_clock(
@@ -2755,8 +2849,9 @@ impl WalHandle {
         fence: u64,
         observer: Option<RecordObserver>,
         lease: Option<Box<dyn LeaseHandle>>,
-        clock: StampClock,
+        startup: (StampClock, Option<open_writers::WriterContext>),
     ) -> Result<WalHandle, WalWriteError> {
+        let (clock, context) = startup;
         // One owner holds the WAL and its lease from here until the writer thread takes
         // them, so a panic while preparing the handle or a failed thread spawn still
         // closes the WAL before the lease is released.
@@ -2765,6 +2860,28 @@ impl WalHandle {
             lease,
         };
         let wal = owner.wal();
+        let v4 = wal.wal_config().is_overhaul();
+        if v4 && context.is_none() {
+            return Err(WalWriteError::Failed(
+                "writer-id/v1: overhaul spawn requires a store marker root and session address"
+                    .into(),
+            ));
+        }
+        // Lifecycle records do not start a conversation. A warmed writer-only log still needs
+        // the same first-send placement, retention and runner-tag state as an empty log.
+        let unstarted = last_seq == 0
+            || (v4
+                && wal
+                    .replay()
+                    .map_err(|error| WalWriteError::Failed(error.to_string()))?
+                    .iter()
+                    .all(|frame| {
+                        matches!(
+                            frame.record,
+                            WalRecord::WriterOpened { .. } | WalRecord::WriterClosed { .. }
+                        )
+                    }));
+        let last_seq = last_seq + u64::from(v4);
         // Seq is 1-based; the first record of an empty WAL is seq 1, so the next seq
         // after a durable head of `last_seq` is `last_seq + 1`.
         let next_seq = AtomicU64::new(last_seq + 1);
@@ -2774,31 +2891,64 @@ impl WalHandle {
         let writer_poisoned = poisoned.clone();
         let lineage_id = Arc::new(Mutex::new(wal.lineage_id()));
         let writer_lineage_id = Arc::clone(&lineage_id);
-        let append_budget = wal
-            .append_budget()
-            .map(|(max_bytes, used_bytes, overhead)| {
+        let budget_scope = wal.append_budget_scope();
+        let recovery_cap = wal.recovery_byte_cap();
+        let make_budget = |budget: Option<(u64, u64, u64)>, writer_close_reserve| {
+            budget.map(|(max_bytes, used_bytes, overhead)| {
                 Mutex::new(AppendBudget {
-                    retained: wal.append_budget_scope()
-                        == retained_size::SizeScope::RetainedSession,
-                    session_max_bytes: wal.recovery_byte_cap().unwrap_or(max_bytes),
+                    writer_close_reserve,
+                    retained: budget_scope == retained_size::SizeScope::RetainedSession,
+                    session_max_bytes: recovery_cap.unwrap_or(max_bytes),
                     max_bytes,
                     used_bytes,
                     overhead,
                     reserve: retained_size::reserve_bytes(overhead),
                     refused: false,
                 })
-            });
+            })
+        };
+        let legacy_budget = (!v4).then(|| make_budget(wal.append_budget(), 0));
         // The log reports the format its store was configured with at boot. An overhaul log
         // stamps its own `writer_id` per open and raises the feature floor before each frame.
-        let v4 = wal.wal_config().is_overhaul();
         let (tx, rx) = std_mpsc::channel::<WalCommand>();
+        let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         let body = move || {
             // writer_loop drops its WAL before the lease is released, even on unwind:
             // the lease is bound outside writer_loop's frame, so an unwinding writer
             // drops the WAL first. On a normal return the lease goes back to the
             // joiner, which releases it or hands it over (see `shutdown_into_tenure`).
+            let mut owner = owner;
+            let wal = owner
+                .wal
+                .as_mut()
+                .expect("writer owner holds its WAL during startup");
+            let writer = if let Some(context) = context {
+                let address = context.address.clone();
+                match context.open(&mut **wal, fence, || clock.now_ms()) {
+                    Ok((writer, seq, record)) => {
+                        if let Some(obs) = &observer {
+                            obs.observe(seq, fence, &record, wal.lineage_id());
+                            obs.observe_tap(seq, fence, wal.lineage_id(), &record);
+                        }
+                        Some(writer)
+                    }
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(WalWriteError::Failed(format!(
+                            "writer-id/v1: cannot open writer for {address}: {error}"
+                        ))));
+                        let (wal, lease) = owner.into_parts();
+                        drop(wal);
+                        return lease;
+                    }
+                }
+            } else {
+                None
+            };
+            if v4 {
+                let _ = ready_tx.send(Ok((wal.append_budget(), wal.writer_close_reserve())));
+            }
             let (wal, lease) = owner.into_parts();
-            writer_loop(
+            writer_loop_with_identity(
                 wal,
                 fence,
                 rx,
@@ -2807,8 +2957,17 @@ impl WalHandle {
                 writer_durable_head,
                 writer_lineage_id,
                 clock,
+                writer,
             );
             lease
+        };
+        #[cfg(feature = "test-clock")]
+        let body = {
+            let fs = WRITER_FS_FOR_TEST.with(|slot| slot.borrow().clone());
+            move || match fs {
+                Some(fs) => broca_wal::fs_ops::with_fs_ops(fs, body),
+                None => body(),
+            }
         };
         #[cfg(test)]
         if FAIL_NEXT_WRITER_SPAWN.with(|fail| fail.replace(false)) {
@@ -2826,8 +2985,24 @@ impl WalHandle {
             .map_err(|error| {
                 WalWriteError::Failed(format!("WAL writer thread spawn failed: {error}"))
             })?;
+        let append_budget = if let Some(budget) = legacy_budget {
+            budget
+        } else {
+            match ready_rx.recv() {
+                Ok(Ok((budget, close_reserve))) => make_budget(budget, close_reserve),
+                error => {
+                    let _ = join.join();
+                    return Err(match error {
+                        Ok(Err(error)) => error,
+                        _ => WalWriteError::Failed(
+                            "writer-id/v1: writer startup did not complete".into(),
+                        ),
+                    });
+                }
+            }
+        };
         Ok(WalHandle {
-            display_placement: Mutex::new((last_seq == 0).then(Default::default)),
+            display_placement: Mutex::new(unstarted.then(Default::default)),
             input_token_limit: AtomicU64::new(0),
             move_check: None,
             media_capture: None,
@@ -2841,10 +3016,8 @@ impl WalHandle {
             durable_head,
             poisoned,
             lineage_id,
-            lineage_retention: Mutex::new(
-                (last_seq == 0).then_some(crate::LineageRetention::Unstarted),
-            ),
-            lineage_tags: Mutex::new((last_seq == 0).then(crate::tags::LineageTags::unstarted)),
+            lineage_retention: Mutex::new(unstarted.then_some(crate::LineageRetention::Unstarted)),
+            lineage_tags: Mutex::new(unstarted.then(crate::tags::LineageTags::unstarted)),
             live_tags: Mutex::new(None),
             #[cfg(test)]
             after_reserve_probe: Mutex::new(None),
@@ -3190,7 +3363,11 @@ impl WalHandle {
                     } else {
                         budget.reserve
                     };
-                if end.saturating_add(reserve) > budget.max_bytes {
+                if end
+                    .saturating_add(reserve)
+                    .saturating_add(budget.writer_close_reserve)
+                    > budget.max_bytes
+                {
                     budget.refused = true;
                     return RecordOutcome::Refused(budget.refusal());
                 }
@@ -3598,9 +3775,10 @@ impl Drop for WalHandle {
 // The writer thread's whole mutable state arrives as owned parameters: the WAL, the fence, the
 // command queue, the observer, the shared poison and durability gauges, the lineage gauge and
 // the clock version 4 frames are stamped from.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn writer_loop(
-    mut wal: Box<dyn Wal + Send>,
+    wal: Box<dyn Wal + Send>,
     fence: u64,
     rx: std_mpsc::Receiver<WalCommand>,
     observer: Option<RecordObserver>,
@@ -3609,6 +3787,32 @@ fn writer_loop(
     lineage_id: Arc<Mutex<Option<broca_wal::WalLineageId>>>,
     stamp_clock: StampClock,
 ) {
+    writer_loop_with_identity(
+        wal,
+        fence,
+        rx,
+        observer,
+        poisoned,
+        durable_head,
+        lineage_id,
+        stamp_clock,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn writer_loop_with_identity(
+    mut wal: Box<dyn Wal + Send>,
+    fence: u64,
+    rx: std_mpsc::Receiver<WalCommand>,
+    observer: Option<RecordObserver>,
+    poisoned: Arc<Mutex<Option<String>>>,
+    durable_head: Arc<AtomicU64>,
+    lineage_id: Arc<Mutex<Option<broca_wal::WalLineageId>>>,
+    stamp_clock: StampClock,
+    writer: Option<open_writers::OpenWriter>,
+) {
+    let mut writer = writer;
     use crate::durability_counters::{
         deadline_ms_for, monotonic_now_ms_for, record_fsync, FsyncCause,
     };
@@ -3744,6 +3948,18 @@ fn writer_loop(
                     Err(error) => set_poison(&poisoned, error),
                 }
             }
+            if current_poison(&poisoned).is_none() {
+                if let Err(error) = close_writer_identity(
+                    &mut *wal,
+                    writer.take(),
+                    fence,
+                    &stamp_clock,
+                    observer.as_ref(),
+                    &durable_head,
+                ) {
+                    set_poison(&poisoned, error);
+                }
+            }
             break;
         }
         // Group commit is unchanged: one sync still covers every append that
@@ -3752,6 +3968,10 @@ fn writer_loop(
             continue;
         };
         match cmd {
+            #[cfg(test)]
+            WalCommand::BudgetSnapshot(ack) => {
+                let _ = ack.send(wal.append_budget());
+            }
             #[cfg(test)]
             WalCommand::AppendDrained(ack) => {
                 let _ = ack.send(());
@@ -3887,6 +4107,16 @@ fn writer_loop(
                         }
                     }
                 }
+                let result = result.and_then(|()| {
+                    close_writer_identity(
+                        &mut *wal,
+                        writer.take(),
+                        fence,
+                        &stamp_clock,
+                        observer.as_ref(),
+                        &durable_head,
+                    )
+                });
                 let result = result.map_err(|error| {
                     set_poison(&poisoned, error.clone());
                     WalWriteError::Failed(error)
@@ -3905,6 +4135,30 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
         .copied()
         .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
         .unwrap_or("a non-string panic payload")
+}
+
+fn close_writer_identity(
+    wal: &mut dyn Wal,
+    writer: Option<open_writers::OpenWriter>,
+    fence: u64,
+    clock: &StampClock,
+    observer: Option<&RecordObserver>,
+    durable_head: &AtomicU64,
+) -> Result<(), String> {
+    if let Some(writer) = writer {
+        let (seq, record) = writer
+            .close(wal, fence, clock.now_ms())
+            .map_err(|error| format!("writer-id/v1: cannot close writer: {error}"))?;
+        durable_head.store(seq, Ordering::Release);
+        if let Some(obs) = observer {
+            obs.observe(seq, fence, &record, wal.lineage_id());
+            obs.observe_tap(seq, fence, wal.lineage_id(), &record);
+        }
+        if let Err(error) = writer.unlink() {
+            tracing::warn!(%error, "writer-id/v1: durable writer close succeeded but marker unlink failed; reclaim will remove the marker");
+        }
+    }
+    Ok(())
 }
 
 /// Records the first fatal writer error, which every later append and barrier then reports.
@@ -4949,3 +5203,6 @@ mod stamp_tests;
 
 #[cfg(test)]
 mod tool_times_tests;
+
+#[cfg(test)]
+mod writer_id_tests;

@@ -2092,11 +2092,9 @@ where
     // acquires the session). The coordinator uses `run_loop_on_writer` instead with a
     // session-scoped writer it shuts down once at session close.
     let wal = wal_store.open(&req.session).map_err(RunError::from)?;
-    let mut writer = match owned_lease {
-        Some(lease) => WalHandle::spawn_with_lease(wal, lease),
-        None => WalHandle::spawn(wal, lease_epoch),
-    }
-    .map_err(|error| RunError::Wal(error.to_string()))?;
+    let mut writer =
+        WalHandle::spawn_in_store(wal, wal_store, &req.session, lease_epoch, owned_lease)
+            .map_err(|error| RunError::Wal(error.to_string()))?;
     writer.bind_media_capture(wal_store, &req.session);
 
     let mode = if append_episode {

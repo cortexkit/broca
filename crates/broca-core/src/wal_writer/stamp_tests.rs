@@ -82,7 +82,21 @@ impl Root {
 
     /// A handle whose writer thread appends at `fence`.
     fn handle(&self, fence: u64) -> WalHandle {
-        WalHandle::spawn(self.open(), fence).expect("spawn the writer")
+        self.spawn(self.open(), fence, StampClock::wall())
+    }
+
+    // Overhaul spawns require store context: a context-free FileWal cannot place its durable
+    // writer-id/v1 marker and must refuse instead of opening a markerless writer.
+    fn spawn(&self, wal: Box<dyn Wal + Send>, fence: u64, clock: StampClock) -> WalHandle {
+        let (wal, seq) = WalHandle::prove_recovery(wal).unwrap();
+        let context = self
+            .wal_store
+            .writer_marker_root()
+            .map(|root| open_writers::WriterContext {
+                root,
+                address: session_addr(&self.session),
+            });
+        WalHandle::spawn_proven_with_clock(wal, seq, fence, None, None, (clock, context)).unwrap()
     }
 }
 
@@ -191,6 +205,12 @@ impl GatedWal {
 }
 
 impl Wal for GatedWal {
+    fn writer_close_reserve(&self) -> u64 {
+        self.inner.writer_close_reserve()
+    }
+    fn writer_id(&self) -> Option<[u8; 16]> {
+        self.inner.writer_id()
+    }
     fn append(&mut self, fence: u64, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
         self.inner.append(fence, record, sync)
     }
@@ -213,7 +233,12 @@ impl Wal for GatedWal {
         prepared: broca_wal::PreparedV4Frame,
         appended_ms: u64,
     ) -> Result<u64, WalError> {
-        self.pass_gate();
+        if !matches!(
+            record,
+            WalRecord::WriterOpened { .. } | WalRecord::WriterClosed { .. }
+        ) {
+            self.pass_gate();
+        }
         self.inner
             .append_v4(fence, record, sync, prepared, appended_ms)
     }
@@ -265,7 +290,7 @@ async fn overhaul_root_frames_carry_a_writer_stamp() {
     handle.shutdown().await.expect("shutdown");
 
     let landed = frames(&root);
-    assert_eq!(landed.len(), 2);
+    assert_eq!(landed.len(), 4);
     for (index, header) in landed.iter().enumerate() {
         assert_eq!(header.metadata.seq, index as u64 + 1);
         assert_eq!(header.metadata.fence, 7, "the lease tenure stays the fence");
@@ -274,28 +299,37 @@ async fn overhaul_root_frames_carry_a_writer_stamp() {
             "a frame on an overhaul root carries its write time"
         );
         assert_ne!(header.metadata.writer_id, [0; 16]);
-        assert_eq!(header.requires, ["frame-stamps/v1"]);
+        assert_eq!(
+            header.requires,
+            if index == 0 || index == 3 {
+                vec!["frame-stamps/v1", "writer-id/v1"]
+            } else {
+                vec!["frame-stamps/v1"]
+            }
+        );
     }
-    assert_eq!(
-        landed[0].metadata.writer_id, landed[1].metadata.writer_id,
+    assert!(
+        landed
+            .iter()
+            .all(|header| header.metadata.writer_id == landed[0].metadata.writer_id),
         "one writer stamps its id on every frame it appends"
     );
     assert_eq!(
         broca_wal::read_floor(&root.floor_path()).unwrap(),
-        std::collections::BTreeSet::from(["frame-stamps/v1".to_owned()]),
+        std::collections::BTreeSet::from(["frame-stamps/v1".to_owned(), "writer-id/v1".to_owned()]),
         "the floor lists what the frames require"
     );
     // The writer's own reader accepts what it wrote.
     let read = read_log(&root);
-    assert_eq!(read.len(), 2);
+    assert_eq!(read.len(), 4);
 
     // A later open is a new writer, with an id of its own.
     let handle = root.handle(8);
     handle.record(record(3)).into_result().unwrap();
     handle.shutdown().await.expect("shutdown");
     let landed = frames(&root);
-    assert_eq!(landed.len(), 3);
-    assert_ne!(landed[2].metadata.writer_id, landed[0].metadata.writer_id);
+    assert_eq!(landed.len(), 7);
+    assert_ne!(landed[4].metadata.writer_id, landed[0].metadata.writer_id);
 }
 
 #[tokio::test]
@@ -309,9 +343,9 @@ async fn a_marked_root_without_its_wal_directory_still_writes_version_4() {
     handle.shutdown().await.expect("shutdown");
 
     let landed = frames(&root);
-    assert_eq!(landed.len(), 1);
-    assert_eq!(landed[0].requires, ["frame-stamps/v1"]);
-    assert!(landed[0].metadata.appended_ms > 0);
+    assert_eq!(landed.len(), 3);
+    assert_eq!(landed[1].requires, ["frame-stamps/v1"]);
+    assert!(landed[1].metadata.appended_ms > 0);
 }
 
 #[tokio::test]
@@ -397,7 +431,7 @@ async fn appended_ms_is_sampled_on_the_writer_thread_when_it_writes() {
     };
     let (reached_tx, reached_rx) = std::sync::mpsc::channel();
     let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
-    let handle = WalHandle::spawn_with_stamp_clock(
+    let handle = root.spawn(
         Box::new(GatedWal {
             inner: root.open(),
             reached: reached_tx,
@@ -405,8 +439,7 @@ async fn appended_ms_is_sampled_on_the_writer_thread_when_it_writes() {
         }),
         3,
         clock,
-    )
-    .expect("spawn the writer");
+    );
 
     // The writer takes the first record, reads the clock (1000) and parks at the gate.
     handle.record(record(1)).into_result().unwrap();
@@ -419,7 +452,7 @@ async fn appended_ms_is_sampled_on_the_writer_thread_when_it_writes() {
     handle.record(record(2)).into_result().unwrap();
     assert_eq!(
         readers.lock().unwrap().len(),
-        1,
+        2,
         "enqueueing a record does not read the stamp clock"
     );
     now.store(2_000, Ordering::SeqCst);
@@ -427,14 +460,14 @@ async fn appended_ms_is_sampled_on_the_writer_thread_when_it_writes() {
     handle.sync().await.expect("sync past the gate");
 
     let landed = frames(&root);
-    assert_eq!(landed.len(), 2);
-    assert_eq!(landed[0].metadata.appended_ms, 1_000);
+    assert_eq!(landed.len(), 3);
+    assert_eq!(landed[1].metadata.appended_ms, 1_000);
     assert_eq!(
-        landed[1].metadata.appended_ms, 2_000,
+        landed[2].metadata.appended_ms, 2_000,
         "the second frame carries the value read when the writer wrote it"
     );
     let readers = readers.lock().unwrap().clone();
-    assert_eq!(readers, [writer_thread, writer_thread]);
+    assert_eq!(readers, [writer_thread, writer_thread, writer_thread]);
     handle.shutdown().await.expect("shutdown");
 }
 
@@ -443,15 +476,15 @@ async fn the_frame_is_prepared_at_enqueue_and_the_floor_raised_before_it_is_writ
     let root = Root::new("prepared", true);
     let (reached_tx, reached_rx) = std::sync::mpsc::channel();
     let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
-    let handle = WalHandle::spawn(
+    let handle = root.spawn(
         Box::new(GatedWal {
             inner: root.open(),
             reached: reached_tx,
             gate: Mutex::new(Some(gate_rx)),
         }),
         3,
-    )
-    .expect("spawn the writer");
+        StampClock::wall(),
+    );
     // An encode error surfaces at enqueue, on the caller's thread, because that is where the
     // version 4 payload is serialized. It is returned, never swallowed, and the writer fails
     // closed: nothing later can claim durability past the missing record.
@@ -467,33 +500,33 @@ async fn the_frame_is_prepared_at_enqueue_and_the_floor_raised_before_it_is_writ
         reached_rx.try_recv().is_err(),
         "no record reached the log after the refusal"
     );
-    assert_eq!(stored(&root).len(), FIRST_FRAME, "nothing was written");
+    assert_eq!(frames(&root).len(), 1, "only writer_opened was written");
     let _ = handle.shutdown().await;
 
     let root = Root::new("prepared-floor", true);
     let (reached_tx, reached_rx) = std::sync::mpsc::channel();
     let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
-    let handle = WalHandle::spawn(
+    let handle = root.spawn(
         Box::new(GatedWal {
             inner: root.open(),
             reached: reached_tx,
             gate: Mutex::new(Some(gate_rx)),
         }),
         3,
-    )
-    .expect("spawn the writer");
+        StampClock::wall(),
+    );
     handle.record(record(1)).into_result().unwrap();
     reached_rx
         .recv_timeout(gate_deadline())
         .expect("the writer reaches the gate");
-    // Parked before the log: no frame, so no floor yet either.
-    assert_eq!(stored(&root).len(), FIRST_FRAME);
+    // The first application append is parked; only the writer-open barrier has landed.
+    assert_eq!(frames(&root).len(), 1);
     gate_tx.send(()).unwrap();
     handle.sync().await.expect("sync past the gate");
-    assert_eq!(frames(&root).len(), 1);
+    assert_eq!(frames(&root).len(), 2);
     assert_eq!(
         broca_wal::read_floor(&root.floor_path()).unwrap(),
-        std::collections::BTreeSet::from(["frame-stamps/v1".to_owned()]),
+        std::collections::BTreeSet::from(["frame-stamps/v1".to_owned(), "writer-id/v1".to_owned()]),
     );
     handle.shutdown().await.expect("shutdown");
 }
@@ -506,7 +539,7 @@ async fn appended_ms_monotonic_per_process() {
         handle.record(record(n)).into_result().unwrap();
         handle.sync().await.unwrap();
         let stamped = frames(&root);
-        assert_eq!(stamped.len() as u64, n);
+        assert_eq!(stamped.len() as u64, n + 1);
         let mut last = 0;
         for header in &stamped {
             assert!(
@@ -528,11 +561,17 @@ async fn crash_cut_inside_a_version_4_header_is_a_torn_tail() {
     handle.record(record(2)).into_result().unwrap();
     handle.shutdown().await.expect("shutdown");
     let complete = stored(&root);
-    assert_eq!(frames(&root).len(), 2);
+    assert_eq!(frames(&root).len(), 4);
 
     // A crash mid-write leaves the first frame and its trailing identity frame whole, and cuts
     // the second frame's header partway, past the legacy header length recovery first reads.
-    let second_start = second_frame_start(&complete);
+    let first_app = second_frame_start(&complete);
+    let second_start = first_app
+        + broca_wal::framing::v4::decode_header(&complete[first_app..])
+            .unwrap()
+            .unwrap()
+            .frame_len()
+        + broca_wal::framing::LINEAGE_FRAME_LEN;
     let second = broca_wal::framing::v4::decode_header(&complete[second_start..])
         .unwrap()
         .expect("the second frame has a header");
@@ -543,17 +582,21 @@ async fn crash_cut_inside_a_version_4_header_is_a_torn_tail() {
     let recovered = root.open();
     assert_eq!(
         recovered.last_seq(),
-        1,
+        2,
         "recovery discards the header that was cut short"
     );
-    assert_eq!(frames(&root).len(), 1, "only the complete frame survives");
+    assert_eq!(
+        frames(&root).len(),
+        2,
+        "only the open and first application frames survive"
+    );
     // Appending after recovery continues from the surviving frame.
-    let handle = WalHandle::spawn(recovered, 5).expect("spawn on the recovered log");
+    let handle = root.spawn(recovered, 5, StampClock::wall());
     handle.record(record(3)).into_result().unwrap();
     handle.record(record(4)).into_result().unwrap();
     handle.shutdown().await.expect("shutdown");
     let landed = frames(&root);
-    assert_eq!(landed.len(), 3);
-    assert_eq!(landed[1].metadata.seq, 2);
-    assert_eq!(landed[2].metadata.seq, 3);
+    assert_eq!(landed.len(), 6);
+    assert_eq!(landed[3].metadata.seq, 4);
+    assert_eq!(landed[4].metadata.seq, 5);
 }

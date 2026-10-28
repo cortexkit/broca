@@ -184,6 +184,9 @@ impl ObservedWalStore {
 // test in tests/it/observed_wal_fidelity.rs compares these impls with FileWalStore's and
 // FileWal's, so a new production override cannot be missed here silently.
 impl WalStore for ObservedWalStore {
+    fn writer_marker_root(&self) -> Option<PathBuf> {
+        WalStore::writer_marker_root(&self.inner)
+    }
     fn wal_config(&self) -> broca_wal::WalConfig {
         WalStore::wal_config(&self.inner)
     }
@@ -394,6 +397,12 @@ struct ObservedWal {
 // Like the store above, every method FileWal overrides is forwarded, so the writer sees the
 // same byte budget and takes the same pre-encoded append path as in production.
 impl Wal for ObservedWal {
+    fn writer_close_reserve(&self) -> u64 {
+        self.inner.writer_close_reserve()
+    }
+    fn writer_id(&self) -> Option<[u8; 16]> {
+        self.inner.writer_id()
+    }
     fn append(&mut self, fence: u64, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
         let seq = self.inner.append(fence, record, sync)?;
         if sync {

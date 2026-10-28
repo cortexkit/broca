@@ -131,6 +131,18 @@ pub struct HookOp {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WalRecord {
+    /// A new writer has durably taken responsibility for this log's recovered prefix.
+    WriterOpened {
+        writer_id: [u8; 16],
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_writer_id: Option<[u8; 16]>,
+        recovered_through_seq: u64,
+        cause: String,
+    },
+    /// This writer will make no further appends, including after a disconnected handle.
+    WriterClosed {
+        writer_id: [u8; 16],
+    },
     /// Episode boundary open — ONE ATOMIC record: the run_id, session, the
     /// AUTHORITATIVE request config, AND the user input, all in a single framed
     /// record. Atomic-by-construction so a torn crash leaves EITHER nothing OR a
@@ -1346,6 +1358,8 @@ impl WalRecord {
         matches!(
             self,
             WalRecord::Unknown
+                | WalRecord::WriterOpened { .. }
+                | WalRecord::WriterClosed { .. }
                 | WalRecord::ModelAttemptFinished { .. }
                 | WalRecord::ResumeStarted { .. }
                 | WalRecord::CacheWarmed { .. }
@@ -1371,6 +1385,9 @@ impl WalRecord {
     /// on its own, so no caller can write a must-understand value into a frame an older build
     /// would read without checking.
     pub fn required_features(&self) -> &'static [&'static str] {
+        if matches!(self, Self::WriterOpened { .. } | Self::WriterClosed { .. }) {
+            return &["writer-id/v1"];
+        }
         let base = self.base_required_features();
         // The agent-run, session-class and input-cap unions below are precomputed tables that
         // cover only what `base_required_features` returns, plus the names the earlier tables
@@ -1814,6 +1831,8 @@ impl WalRecord {
             | Self::ToolCallProviderHeld { .. }
             | Self::DeliveryOrdered { .. }
             | Self::SendEnded { .. }
+            | Self::WriterOpened { .. }
+            | Self::WriterClosed { .. }
             | Self::Unknown => false,
         }
     }

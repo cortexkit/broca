@@ -14016,12 +14016,25 @@ mod owned_cut_tests {
             executor: Arc<dyn RunExecutor>,
             idle_ttl: Duration,
         ) -> Self {
+            Self::build_with_config(tag, owned, executor, idle_ttl, None)
+        }
+
+        fn build_with_config(
+            tag: &str,
+            owned: bool,
+            executor: Arc<dyn RunExecutor>,
+            idle_ttl: Duration,
+            config: Option<broca_wal::WalConfig>,
+        ) -> Self {
             let root = broca_test_support::scratch_root()
                 .join(format!("broca-owned-cut-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(root.join("project")).unwrap();
             migration::durable_dir(&root, &root.join("wal")).unwrap();
-            let wal = Arc::new(FileWalStore::new(root.join("wal")));
+            let wal = Arc::new(match config {
+                Some(config) => FileWalStore::with_config(root.join("wal"), config),
+                None => FileWalStore::new(root.join("wal")),
+            });
             let opener =
                 DefaultOpener::with_file_leases(root.join("leases"), wal.clone(), executor);
             let opener = if owned {
@@ -14185,6 +14198,64 @@ mod owned_cut_tests {
             LineageStatus::Idle
         );
         assert!(rig.lease_held(), "the fresh writer owns a new tenure");
+        assert!(rig.registry.stop_and_seal().await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_overhaul_move_handoff_records_close_before_releasing_writer_tenure() {
+        let rig = Rig::build_with_config(
+            "overhaul-freeze",
+            true,
+            Arc::new(HoldsAfterAdmission),
+            Duration::from_secs(3600),
+            Some(broca_wal::WalConfig::OVERHAUL),
+        );
+        let _actor = rig.registry.actor_for(&rig.session).await.unwrap();
+        let path = rig.wal.wal_path(&rig.session);
+        let opened = broca_wal::replay_file(&path, u64::MAX).unwrap();
+        let [broca_wal::FramedRecord {
+            record: broca_wal::WalRecord::WriterOpened { writer_id, .. },
+            ..
+        }] = opened.as_slice()
+        else {
+            panic!("writer must be opened before actor publication")
+        };
+        assert_eq!(
+            std::fs::read_dir(rig.root.join("open-writers"))
+                .unwrap()
+                .count(),
+            1
+        );
+        let guard = rig.lock(CutLockMode::Mutate).await;
+        assert_eq!(guard.busy[0].1, None);
+        assert!(guard.holds_tenure(&rig.session));
+        assert!(rig.lease_held());
+        let records = broca_wal::replay_file(&path, u64::MAX).unwrap();
+        assert!(
+            matches!(records.last().unwrap().record, broca_wal::WalRecord::WriterClosed { writer_id: closed } if closed == *writer_id)
+        );
+        assert_eq!(
+            std::fs::read_dir(rig.root.join("open-writers"))
+                .unwrap()
+                .count(),
+            0
+        );
+        let before = std::fs::read(&path).unwrap();
+        migration::freeze(
+            &rig.root,
+            &path,
+            &Freeze {
+                cut_id: CUT.into(),
+                end_offset: before.len() as u64,
+                lineage_id: "lineage".into(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(rig.lease_held());
+        drop(guard);
+        assert!(!rig.lease_held());
         assert!(rig.registry.stop_and_seal().await);
     }
 

@@ -8,7 +8,7 @@ repository.workspace = true
 description = "broca core: the agentic loop and its seams (provider, tool-plane, lease, approval). Provider- and transport-agnostic — no subc dependency; the subc tool plane is a separate adapter crate."
 
 [features]
-test-clock = []
+test-clock = ["broca-wal/fs-override"]
 test-attachments = ["broca-protocol/test-attachments"]
 
 [dependencies]

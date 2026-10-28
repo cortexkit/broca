@@ -1021,7 +1021,9 @@ impl AdmissionCheckpointV1 {
             WalRecord::Steered { .. } => {}
             // A record type written by a newer build: informational by the contract on
             // `WalRecord`, so it changes no admission state (only `at_seq` advances past it).
-            WalRecord::Unknown => {}
+            WalRecord::WriterOpened { .. }
+            | WalRecord::WriterClosed { .. }
+            | WalRecord::Unknown => {}
             // Compaction state is folded below; it does not change admission's episode counters.
             WalRecord::CompactionRequest { .. }
             | WalRecord::CompactionMessage { .. }

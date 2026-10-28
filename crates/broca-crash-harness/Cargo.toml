@@ -8,6 +8,9 @@ repository.workspace = true
 description = "Test-only crash-cut harness: runs a scripted scenario against the real run loop, kills it at every WAL record boundary (by truncating a copy of the log) or mid-call (by SIGKILL of a spawned runner), resumes through the real run loop, and asserts the resume invariants. A dev-dependency only; never a runtime dependency of a shipped binary."
 publish = false
 
+[features]
+writer-id-faults = ["broca-core/test-clock"]
+
 [dependencies]
 broca-core = { path = "../broca-core" }
 broca-protocol = { path = "../broca-protocol" }
