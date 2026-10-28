@@ -205,6 +205,9 @@ impl GatedWal {
 }
 
 impl Wal for GatedWal {
+    fn writer_close_reserve(&self) -> u64 {
+        self.inner.writer_close_reserve()
+    }
     fn writer_id(&self) -> Option<[u8; 16]> {
         self.inner.writer_id()
     }
@@ -305,8 +308,10 @@ async fn overhaul_root_frames_carry_a_writer_stamp() {
             }
         );
     }
-    assert_eq!(
-        landed[0].metadata.writer_id, landed[1].metadata.writer_id,
+    assert!(
+        landed
+            .iter()
+            .all(|header| header.metadata.writer_id == landed[0].metadata.writer_id),
         "one writer stamps its id on every frame it appends"
     );
     assert_eq!(
@@ -340,7 +345,7 @@ async fn a_marked_root_without_its_wal_directory_still_writes_version_4() {
     let landed = frames(&root);
     assert_eq!(landed.len(), 3);
     assert_eq!(landed[1].requires, ["frame-stamps/v1"]);
-    assert!(landed[0].metadata.appended_ms > 0);
+    assert!(landed[1].metadata.appended_ms > 0);
 }
 
 #[tokio::test]

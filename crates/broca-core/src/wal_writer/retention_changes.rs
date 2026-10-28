@@ -137,6 +137,9 @@ impl ObservedWal {
 }
 
 impl Wal for ObservedWal {
+    fn writer_close_reserve(&self) -> u64 {
+        self.inner.writer_close_reserve()
+    }
     fn writer_id(&self) -> Option<[u8; 16]> {
         self.inner.writer_id()
     }

@@ -1,4 +1,9 @@
 //! The writer-id/v1 durability protocol: a durable marker precedes open, and close precedes unlink.
+//!
+//! A durable WriterClosed is authoritative even if unlink failed or the marker reappeared after
+//! power loss. Once a writer's lease is free, its marker without a durable close means it stopped
+//! without closing. The lease-gated reclaim pass owns scanning and removing those stale markers;
+//! a normal open records succession but never deletes another writer's marker opportunistically.
 
 use broca_wal::{fs_ops, Wal, WalError, WalRecord};
 use std::path::PathBuf;

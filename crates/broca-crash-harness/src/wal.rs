@@ -397,6 +397,9 @@ struct ObservedWal {
 // Like the store above, every method FileWal overrides is forwarded, so the writer sees the
 // same byte budget and takes the same pre-encoded append path as in production.
 impl Wal for ObservedWal {
+    fn writer_close_reserve(&self) -> u64 {
+        self.inner.writer_close_reserve()
+    }
     fn writer_id(&self) -> Option<[u8; 16]> {
         self.inner.writer_id()
     }

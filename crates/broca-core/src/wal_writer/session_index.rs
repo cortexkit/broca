@@ -164,6 +164,9 @@ impl AdmissionWal {
 }
 
 impl Wal for AdmissionWal {
+    fn writer_close_reserve(&self) -> u64 {
+        self.wal.writer_close_reserve()
+    }
     fn writer_id(&self) -> Option<[u8; 16]> {
         self.wal.writer_id()
     }

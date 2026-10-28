@@ -69,6 +69,137 @@ fn first_send(root: &Root, retention_value: Option<u64>) -> WalRecord {
     record
 }
 
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn warm_ephemeral_overhaul_first_send_without_retention_agrees_on_session_cap() {
+    let mut root = Root::new(true);
+    root.store.max_read_bytes = 64_000;
+    std::fs::write(root.path.join("test-retained-wal-cap"), "8000").unwrap();
+    let wal = root
+        .store
+        .open_with_retention(&root.session, Some(60))
+        .unwrap();
+    let handle = WalHandle::spawn_in_store(wal, &root.store, &root.session, 1, None).unwrap();
+    assert!(root.store.ephemeral_wal_path(&root.session).exists());
+    let mut send = first_send(&root, None);
+    if let WalRecord::RunStarted { title, .. } = &mut send {
+        *title = Some("x".repeat(16_000));
+    }
+    handle.record(send).into_result().unwrap();
+    handle
+        .sync()
+        .await
+        .expect("first send must not poison the writer under the retained cap");
+    let (tx, rx) = std_mpsc::channel();
+    handle.tx.send(WalCommand::BudgetSnapshot(tx)).unwrap();
+    let file_cap = rx.recv().unwrap().unwrap().0;
+    let handle_cap = handle
+        .append_budget
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .max_bytes;
+    assert_eq!(file_cap, 64_000);
+    assert_eq!(handle_cap, file_cap);
+    handle.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn lifecycle_only_ephemeral_overhaul_is_not_retention_evidence() {
+    let mut root = Root::new(true);
+    root.store.max_read_bytes = 64_000;
+    std::fs::write(root.path.join("test-retained-wal-cap"), "8000").unwrap();
+    let wal = root
+        .store
+        .open_with_retention(&root.session, Some(60))
+        .unwrap();
+    WalHandle::spawn_in_store(wal, &root.store, &root.session, 1, None)
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    let wal = root.store.open(&root.session).unwrap();
+    assert_eq!(wal.append_budget_scope(), retained_size::SizeScope::Session);
+    assert_eq!(wal.append_budget().unwrap().0, 64_000);
+}
+
+fn fill_ordinary_budget(root: &Root, handle: &WalHandle) {
+    handle.record(first_send(root, None)).into_result().unwrap();
+    for _ in 0..1000 {
+        match handle.record(ordinary()) {
+            RecordOutcome::Accepted(_) => {}
+            RecordOutcome::Refused(WalWriteError::SessionTooLarge { max_bytes: 16_000 }) => return,
+            other => panic!("unexpected near-cap append outcome: {other:?}"),
+        }
+    }
+    panic!("bounded session never reached its append limit");
+}
+
+#[tokio::test]
+async fn near_cap_writer_closes_and_reopens_without_paying_another_terminal_reserve() {
+    let mut root = Root::new(true);
+    root.store.max_read_bytes = 16_000;
+    let handle = root.spawn();
+    fill_ordinary_budget(&root, &handle);
+    assert!(
+        !handle.is_poisoned(),
+        "enqueue size refusal is not a writer failure"
+    );
+    handle
+        .shutdown()
+        .await
+        .expect("held close bytes must fit even at the ordinary limit");
+    assert!(root.markers().is_empty());
+    let handle = root.spawn();
+    handle
+        .shutdown()
+        .await
+        .expect("reopened writer retains room for its close");
+    assert!(root.markers().is_empty());
+    assert!(
+        std::fs::metadata(root.store.wal_path(&root.session))
+            .unwrap()
+            .len()
+            <= 16_000
+    );
+}
+
+#[tokio::test]
+async fn run_terminal_cannot_spend_the_outstanding_writer_close_reserve() {
+    let mut root = Root::new(true);
+    root.store.max_read_bytes = 16_000;
+    let handle = root.spawn();
+    fill_ordinary_budget(&root, &handle);
+    let terminal = serde_json::from_str(
+        r#"{"type":"run_finished","reason":"completed","usage":{},"retries_used":0}"#,
+    )
+    .unwrap();
+    handle.record_terminal(terminal).unwrap();
+    handle.sync().await.unwrap();
+    handle
+        .shutdown()
+        .await
+        .expect("RunFinished must preserve the writer's close reserve");
+    assert!(root.markers().is_empty());
+    let records = root.records();
+    assert!(matches!(
+        records[records.len() - 2].record,
+        WalRecord::RunFinished { .. }
+    ));
+    assert!(matches!(
+        records.last().unwrap().record,
+        WalRecord::WriterClosed { .. }
+    ));
+    assert!(
+        std::fs::metadata(root.store.wal_path(&root.session))
+            .unwrap()
+            .len()
+            <= 16_000
+    );
+}
+
 #[tokio::test]
 async fn legacy_first_send_places_a_preopened_unstarted_wal_unchanged() {
     let root = Root::new(false);

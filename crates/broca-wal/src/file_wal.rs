@@ -475,6 +475,11 @@ pub trait Wal {
         None
     }
 
+    /// Bytes held for this open writer's durable close, separate from the run terminal reserve.
+    fn writer_close_reserve(&self) -> u64 {
+        0
+    }
+
     /// Append `record` as the version 4 frame `prepared` (built from that same record), stamped
     /// with `appended_ms`, which the caller samples on the thread that calls this, immediately
     /// before the call. The log fills in the sequence, fence and its own `writer_id`, and raises
@@ -566,6 +571,7 @@ pub struct FileWal {
     /// Minted when the log is configured as an overhaul log: the random 128-bit id stamped in
     /// every version 4 frame this open appends, so a frame names the writer that wrote it.
     writer_id: Option<[u8; 16]>,
+    writer_close_reserve: u64,
     lineage_id: Option<WalLineageId>,
     /// The machine's WAL feature floor (see [`crate::floor`]). A record that requires any WAL
     /// feature is appended only after this file lists it; with no floor configured such a
@@ -672,6 +678,19 @@ fn append_manifest_line(entry: &ManifestAppend, lineage_id: WalLineageId) -> std
 }
 
 impl FileWal {
+    fn unstarted(&self) -> Result<bool, WalError> {
+        if self.next_seq == 1 {
+            return Ok(true);
+        }
+        Ok(self.config.is_overhaul()
+            && self.replay()?.iter().all(|frame| {
+                matches!(
+                    frame.record,
+                    WalRecord::WriterOpened { .. } | WalRecord::WriterClosed { .. }
+                )
+            }))
+    }
+
     /// A status/warm open can precede the first send. Move only an unstarted file,
     /// under its caller's session lease, before the first record fixes its placement.
     ///
@@ -690,14 +709,7 @@ impl FileWal {
         if self.path == destination {
             return Ok(());
         }
-        let only_writer_records = self.config.is_overhaul()
-            && self.replay()?.iter().all(|frame| {
-                matches!(
-                    frame.record,
-                    WalRecord::WriterOpened { .. } | WalRecord::WriterClosed { .. }
-                )
-            });
-        if self.next_seq != 1 && !only_writer_records {
+        if !self.unstarted()? {
             return Err(WalError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "cannot relocate a started session WAL",
@@ -962,6 +974,7 @@ impl FileWal {
             newly_created_dirs: RefCell::new(newly_created_dirs),
             config: WalConfig::LEGACY,
             writer_id: None,
+            writer_close_reserve: 0,
             lineage_id,
             recovery_cap: DEFAULT_MAX_READ_BYTES,
             append_budget: DEFAULT_MAX_READ_BYTES,
@@ -1145,8 +1158,7 @@ impl FileWal {
                 found: current,
             });
         }
-        if self.next_seq == 1
-            && self.budget_scope == crate::size_limit::SizeScope::RetainedSession
+        if self.budget_scope == crate::size_limit::SizeScope::RetainedSession
             && matches!(
                 record,
                 WalRecord::RunStarted {
@@ -1154,6 +1166,7 @@ impl FileWal {
                     ..
                 }
             )
+            && self.unstarted()?
         {
             self.budget_scope = crate::size_limit::SizeScope::Session;
             self.append_budget = self.recovery_cap;
@@ -1207,7 +1220,26 @@ impl FileWal {
             } else {
                 1
             };
-        let reserve = if matches!(record, WalRecord::RunFinished { .. }) {
+        let lifecycle = self.config.is_overhaul()
+            && matches!(
+                record,
+                WalRecord::WriterOpened { .. } | WalRecord::WriterClosed { .. }
+            );
+        let close_reserve = match record {
+            WalRecord::WriterOpened { writer_id, .. } if lifecycle => {
+                PreparedV4Frame::prepare(&WalRecord::WriterClosed {
+                    writer_id: *writer_id,
+                })
+                .map_err(WalError::Frame)?
+                .frame_len() as u64
+                    + overhead
+            }
+            WalRecord::WriterClosed { .. } if lifecycle => 0,
+            _ => self.writer_close_reserve,
+        };
+        // Lifecycle barriers spend their own held bytes, not another run terminal's reserve.
+        // Every ordinary append, including RunFinished, must leave the outstanding close intact.
+        let reserve = if lifecycle || matches!(record, WalRecord::RunFinished { .. }) {
             0
         } else {
             crate::size_limit::reserve_bytes(overhead)
@@ -1215,7 +1247,8 @@ impl FileWal {
         let required = current
             .saturating_add(record_bytes.len() as u64)
             .saturating_add(overhead)
-            .saturating_add(reserve);
+            .saturating_add(reserve)
+            .saturating_add(close_reserve);
         if required > self.append_budget {
             return Err(WalError::TooLarge {
                 max_bytes: self.append_budget,
@@ -1275,6 +1308,7 @@ impl FileWal {
             self.fsync()?;
         }
         self.next_seq = seq + 1;
+        self.writer_close_reserve = close_reserve;
         // Advance our high-water mark past the bytes we just wrote. Only OUR appends move
         // this, so "size unchanged since our last append" ⟺ no foreign write.
         self.last_write_end = current + bytes.len() as u64;
@@ -1283,6 +1317,9 @@ impl FileWal {
 }
 
 impl Wal for FileWal {
+    fn writer_close_reserve(&self) -> u64 {
+        self.writer_close_reserve
+    }
     fn writer_id(&self) -> Option<[u8; 16]> {
         self.writer_id
     }

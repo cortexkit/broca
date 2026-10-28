@@ -3,6 +3,9 @@
 #[path = "../../broca-core/src/open_writers.rs"]
 mod actual_open_writers;
 
+#[cfg(feature = "writer-id-faults")]
+mod faults;
+
 use crate::power_loss::{Family, RecordingFs, State};
 use actual_open_writers::WriterContext;
 use broca_wal::{fs_ops::with_fs_ops, FileWal, Wal, WalRecord};
