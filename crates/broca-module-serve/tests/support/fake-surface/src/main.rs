@@ -22,6 +22,9 @@
 //!   refused `unknown_method`.
 //! - `SURFACE_REQUESTS`: a file this process appends one line to per request, so a test can
 //!   count how often broca asked.
+//! - `SURFACE_SCOPES`: optional full scope set to sync on this module's own connection
+//!   after HELLO_ACK. The file need not exist at startup; this process waits up to 60 seconds
+//!   for it to appear.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -205,6 +208,39 @@ async fn serve() -> Result<(), String> {
         &requests,
         &format!("hello-ack {:?} {}\n", ack.header.ty, String::from_utf8_lossy(&ack.body)),
     )?;
+    if std::env::args().any(|arg| arg.starts_with("--SURFACE_SCOPES=")) {
+        let path = PathBuf::from(stand_in_value("SURFACE_SCOPES"));
+        let scopes = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                match std::fs::read(&path) {
+                    Ok(bytes) => break serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .map_err(|error| format!("decode scope set: {error}")),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    Err(error) => break Err(format!("read scope set: {error}")),
+                }
+            }
+        }).await.map_err(|_| "the owner did not publish its scope set".to_owned())??;
+        // Keep optional registration fields intact; the daemon, not the stand-in's pinned
+        // protocol decoder, validates the owner's project and workdir attribution.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "op": "scope.sync", "generation": 1, "scopes": scopes
+        })).map_err(|error| error.to_string())?;
+        write(&mut stream, control(FrameType::Request, 2, body)).await?;
+        let reply = read_frame(&mut stream).await
+            .map_err(|error| format!("read scope.sync reply: {error}"))?
+            .ok_or("the daemon closed before scope.sync replied")?;
+        let body_json: serde_json::Value = serde_json::from_slice(&reply.body)
+            .map_err(|error| format!("decode scope.sync reply: {error}"))?;
+        append(&requests, &format!("{}\n", serde_json::json!({
+            "kind": if reply.header.ty == FrameType::Response { "scope_sync_response" } else { "error" },
+            "corr": reply.header.corr, "body_json": body_json
+        })))?;
+        if reply.header.ty != FrameType::Response || reply.header.corr != 2 {
+            return Err(format!("scope.sync was not accepted: {body_json}"));
+        }
+    }
     loop {
         let Some(frame) = read_frame(&mut stream)
             .await
