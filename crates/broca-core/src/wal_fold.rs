@@ -533,6 +533,7 @@ pub fn fold_with_identities<'a>(
     options: impl Into<FoldSettings<'a>>,
     identities: &BTreeMap<String, BindIdentity>,
 ) -> io::Result<FoldReport> {
+    ensure_legacy_root(state_root)?;
     let settings = options.into();
     run_with_threshold(
         state_root,
@@ -542,6 +543,41 @@ pub fn fold_with_identities<'a>(
         identities,
         settings.cold_ms,
     )
+}
+
+/// Folding can remove live logs, including during journal resume. Overhaul
+/// roots must be refused until folding can honor open-writer markers and
+/// unpublished log tails before removing logs.
+pub fn ensure_legacy_root(state_root: &Path) -> io::Result<()> {
+    let config = broca_wal::classify_state_root(state_root).map_err(io::Error::other)?;
+    if config.is_overhaul() {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+            "wal_fold_overhaul_deferred: broca-state/2 (overhaul) folding is disabled until marker-aware retention is enabled"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod overhaul_phase_guard_tests {
+    use super::*;
+
+    #[test]
+    fn fold_library_refuses_overhaul_before_creating_maintenance_state() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("fold-overhaul-refusal-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join(broca_wal::state_format::MARKER_FILENAME);
+        std::fs::write(&marker, b"broca-state/2\n").unwrap();
+        let options = FoldOptions {
+            write: true,
+            ..Default::default()
+        };
+        let error = fold(&root, &options).unwrap_err();
+        assert!(error.to_string().contains("wal_fold_overhaul_deferred"));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        assert_eq!(std::fs::read(marker).unwrap(), b"broca-state/2\n");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(test)]

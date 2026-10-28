@@ -12,6 +12,12 @@
 //! Proof writes remain in-place and unsynced. Readers must handle an unavailable
 //! proof as unavailable, and discovery/deletion must honor the marker/recovery
 //! obligation rather than considering a late exposure a completed writer.
+//!
+//! Operational limits: startup waits synchronously for writer readiness, even
+//! when reached through an async opener, so stalled startup can block that
+//! runtime thread. Freshness repair has no retry bound while I/O keeps stalling:
+//! it can append more markers, consume WAL headroom, and hold sync or shutdown.
+//! Bounded latency must not be obtained by acknowledging an unsafe head.
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};

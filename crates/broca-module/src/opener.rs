@@ -480,7 +480,7 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
                     .flatten();
                 let exists = wal
                     .lineage_exists(&session, meta.as_ref())
-                    .map_err(|e| OpenError::Open(e.to_string()))?;
+                    .map_err(OpenError::relocation_or_open)?;
                 let records = match wal.read_records(&session) {
                     Ok(records) => records,
                     // A missing live WAL permits a first run only when lineage_exists also
@@ -490,7 +490,7 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
                     {
                         Vec::new()
                     }
-                    Err(error) => return Err(OpenError::Open(error.to_string())),
+                    Err(error) => return Err(OpenError::relocation_or_open(error)),
                 };
                 let current = crate::retention::policy(&records).map(|(seconds, _, _)| seconds);
                 crate::retention::validate_retention(retention, current, exists)

@@ -567,15 +567,26 @@ impl Rig {
             wal: self.service.wal.clone(),
             store: self.store.clone(),
         });
-        let opener = Arc::new(
+        let opener = if self.service.wal.wal_config().is_overhaul() {
+            crate::opener::DefaultOpener::with_file_leases(
+                self.root.join("leases"),
+                self.service.wal.clone(),
+                executor,
+            )
+            .with_lease_domain(broca_core::lease::WalLeaseDomain::new(
+                self.root.join("leases"),
+            ))
+            .unwrap()
+        } else {
             crate::opener::DefaultOpener::new(
                 self.leases.clone(),
                 self.service.wal.clone(),
                 executor,
             )
-            .with_run_index(index.unwrap_or(self.store.clone()))
-            .with_materialized_store(self.store.clone()),
-        );
+        }
+        .with_run_index(index.unwrap_or(self.store.clone()))
+        .with_materialized_store(self.store.clone());
+        let opener = Arc::new(opener);
         let registry = crate::registry::LineageRegistry::new_with_reader(
             opener,
             self.service.wal.clone(),
@@ -627,16 +638,19 @@ async fn relocation_incomplete_preflight_never_expires_or_completes_deletion() {
     assert!(
         matches!(&error, crate::registry::OpenError::Classified { class: broca_protocol::ErrorClass::Transient, reason } if reason.contains("wal_relocation_incomplete"))
     );
-    assert!(matches!(
-        rig.service.delete_expired_typed(&rig.key, u64::MAX),
-        Err(RetentionReadError::RelocationIncomplete { .. })
-    ));
+    assert_eq!(
+        rig.service
+            .delete_expired_typed(&rig.key, u64::MAX)
+            .unwrap(),
+        None
+    );
     assert!(rig.service.resume_deletions(u64::MAX).unwrap().is_empty());
     assert!(
         rig.service.resume_deletions(u64::MAX).unwrap().is_empty(),
         "the next pass retries the deferred key"
     );
-    assert_eq!(rig.service.relocation_incomplete_skips(), 4);
+    assert_eq!(rig.service.relocation_incomplete_skips(), 1);
+    assert_eq!(rig.service.overhaul_deferred_attempts(), 3);
     assert_eq!(fs::read(&source).unwrap(), before_bytes);
     assert_eq!(fs::read(&alias).unwrap(), before_bytes);
     assert_eq!(
@@ -673,6 +687,252 @@ async fn legacy_same_inode_conflicts_keep_the_existing_retention_error_class() {
 impl Drop for Rig {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[cfg(all(unix, feature = "test-clock"))]
+#[tokio::test]
+async fn phase_one_overhaul_retention_defers_expiry_and_deletion() {
+    let rig = Rig::overhaul();
+    fs::write(rig.root.join("test-clock"), br#"{"now_ms":3000}"#).unwrap();
+    rig.service.clock.refresh().unwrap();
+    let writer = due_overhaul_writer(&rig, Arc::new(broca_wal::fs_ops::RealFs)).await;
+    writer.shutdown().await.unwrap();
+    let path = rig.service.wal.ephemeral_wal_path(&rig.key);
+    let before = fs::read(&path).unwrap();
+    let _lease = rig.service.lease(&rig.key).unwrap();
+    assert_eq!(
+        rig.service.delete_expired_typed(&rig.key, 3000).unwrap(),
+        None
+    );
+    assert_eq!(
+        rig.service.expired(&rig.key, None).unwrap(),
+        None,
+        "phase-one overhaul expiry is deferred even when the legacy deadline is due"
+    );
+    assert!(rig.service.resume_deletions(3000).unwrap().is_empty());
+    assert_eq!(rig.service.overhaul_deferred_attempts(), 3);
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(rig.service.tombstones(&rig.key).unwrap().is_empty());
+    assert!(rig
+        .store
+        .pending_retention_withdrawals()
+        .unwrap()
+        .is_empty());
+}
+
+#[cfg(all(unix, feature = "test-clock"))]
+async fn due_overhaul_writer(
+    rig: &Rig,
+    fs: Arc<dyn broca_wal::fs_ops::FsOps>,
+) -> broca_core::WalHandle {
+    let lease = rig.service.lease(&rig.key).unwrap();
+    let fence = lease.epoch();
+    let writer = broca_wal::fs_ops::with_fs_ops(fs.clone(), || {
+        let wal = rig
+            .service
+            .wal
+            .open_with_retention(&rig.key, Some(1))
+            .unwrap();
+        broca_core::WalHandle::spawn_in_store_with_fs_for_test(
+            wal,
+            rig.service.wal.as_ref(),
+            &rig.key,
+            fence,
+            Some(lease),
+            fs,
+        )
+        .unwrap()
+    });
+    writer
+        .record(started(&rig.key, "r1", Some(1), 1000))
+        .into_result()
+        .unwrap();
+    writer.record(finished(1000)).into_result().unwrap();
+    writer.sync().await.unwrap();
+    writer
+}
+
+#[cfg(all(unix, feature = "test-clock"))]
+mod overhaul_close_regressions {
+    use super::*;
+    use broca_wal::fs_ops::{FileOps, FsOps, OpenOptions, RealFs};
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    #[derive(Default)]
+    struct Faults {
+        head: AtomicBool,
+        close: AtomicBool,
+    }
+    struct FaultFs(Arc<Faults>);
+    struct FaultFile {
+        inner: Box<dyn FileOps>,
+        path: PathBuf,
+        faults: Arc<Faults>,
+    }
+    impl FsOps for FaultFs {
+        fn open(&self, path: &Path, options: &OpenOptions) -> io::Result<Box<dyn FileOps>> {
+            Ok(Box::new(FaultFile {
+                inner: RealFs.open(path, options)?,
+                path: path.to_path_buf(),
+                faults: self.0.clone(),
+            }))
+        }
+        fn metadata(&self, path: &Path) -> io::Result<fs::Metadata> {
+            RealFs.metadata(path)
+        }
+        fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+            RealFs.create_dir_all(path)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            RealFs.rename(from, to)
+        }
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            RealFs.remove_file(path)
+        }
+        fn sync_dir(&self, path: &Path) -> io::Result<()> {
+            RealFs.sync_dir(path)
+        }
+        fn create_dir(&self, path: &Path) -> io::Result<()> {
+            RealFs.create_dir(path)
+        }
+        fn hard_link(&self, from: &Path, to: &Path) -> io::Result<()> {
+            RealFs.hard_link(from, to)
+        }
+        fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+            RealFs.canonicalize(path)
+        }
+        fn read_dir(&self, path: &Path) -> io::Result<broca_wal::fs_ops::ReadDir> {
+            RealFs.read_dir(path)
+        }
+        fn validate_if_exists(&self, path: &Path) -> io::Result<()> {
+            RealFs.validate_if_exists(path)
+        }
+    }
+    impl Read for FaultFile {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.inner.read(bytes)
+        }
+    }
+    impl Seek for FaultFile {
+        fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(from)
+        }
+    }
+    impl Write for FaultFile {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.path.extension().is_some_and(|ext| ext == "head")
+                && self.faults.head.swap(false, Ordering::SeqCst)
+            {
+                return Err(io::Error::other("injected close-publication failure"));
+            }
+            if self.path.extension().is_some_and(|ext| ext == "wal")
+                && self.faults.close.load(Ordering::SeqCst)
+                && matches!(broca_wal::framing::decode_next(bytes), broca_wal::framing::DecodeStep::Record { framed, .. } if matches!(framed.record, WalRecord::WriterClosed { .. }))
+            {
+                self.faults.close.store(false, Ordering::SeqCst);
+                return Err(io::Error::other("injected interrupted close"));
+            }
+            self.inner.write(bytes)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+    impl FileOps for FaultFile {
+        fn metadata(&self) -> io::Result<fs::Metadata> {
+            self.inner.metadata()
+        }
+        fn set_len(&self, len: u64) -> io::Result<()> {
+            self.inner.set_len(len)
+        }
+        fn sync_all(&self) -> io::Result<()> {
+            self.inner.sync_all()
+        }
+        fn try_clone(&self) -> io::Result<Box<dyn FileOps>> {
+            Ok(Box::new(Self {
+                inner: self.inner.try_clone()?,
+                path: self.path.clone(),
+                faults: self.faults.clone(),
+            }))
+        }
+        fn lock(&self) -> io::Result<()> {
+            self.inner.lock()
+        }
+        fn unlock(&self) -> io::Result<()> {
+            self.inner.unlock()
+        }
+        fn try_lock(&self) -> Result<(), fs::TryLockError> {
+            self.inner.try_lock()
+        }
+        fn read_exact_at(&self, bytes: &mut [u8], offset: u64) -> io::Result<()> {
+            self.inner.read_exact_at(bytes, offset)
+        }
+    }
+
+    async fn next_send_reopens_due_history(publication_failure: bool) {
+        let rig = Rig::overhaul();
+        fs::write(rig.root.join("test-clock"), br#"{"now_ms":3000}"#).unwrap();
+        rig.service.clock.refresh().unwrap();
+        let faults = Arc::new(Faults::default());
+        let writer = due_overhaul_writer(&rig, Arc::new(FaultFs(faults.clone()))).await;
+        let lineage = writer.lineage_id().unwrap();
+        if publication_failure {
+            faults.head.store(true, Ordering::SeqCst);
+        } else {
+            faults.close.store(true, Ordering::SeqCst);
+        }
+        assert!(writer.shutdown().await.is_err());
+        let path = rig.service.wal.ephemeral_wal_path(&rig.key);
+        assert!(path.exists());
+        assert!(fs::read_dir(rig.root.join("open-writers"))
+            .unwrap()
+            .next()
+            .is_some());
+        let before = rig.service.wal.read_records(&rig.key).unwrap();
+        assert_eq!(
+            before
+                .iter()
+                .filter(|frame| matches!(frame.record, WalRecord::WriterClosed { .. }))
+                .count(),
+            usize::from(publication_failure)
+        );
+        let registry = rig.registry(None);
+        let mut next = request(&rig.key, "r2");
+        next.retention = Some(1);
+        let outcome = registry
+            .route_send(&rig.key, next, crate::executor::RunKind::FreshOrResume)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, crate::actor::SendOutcome::Active { .. }),
+            "{outcome:?}"
+        );
+        let observed = rig
+            .service
+            .wal
+            .read_records_range(&rig.key, 0, None, None)
+            .unwrap();
+        assert_eq!(
+            observed.lineage_id,
+            Some(lineage),
+            "the due retained log must not be deleted before its successor opens"
+        );
+        let records = rig.service.wal.read_records(&rig.key).unwrap();
+        assert!(records.iter().any(|frame| matches!(&frame.record, WalRecord::RunStarted { run_id, .. } if run_id.0 == "r1")));
+        assert!(records.iter().any(|frame| matches!(frame.record, WalRecord::WriterOpened { recovered_through_seq, previous_writer_id: Some(_), .. } if recovered_through_seq >= before.last().unwrap().seq)));
+        assert!(rig.service.tombstones(&rig.key).unwrap().is_empty());
+        assert!(rig.service.overhaul_deferred_attempts() > 0);
+        registry.stop_and_seal().await;
+    }
+
+    #[tokio::test]
+    async fn overdue_failed_close_publication_is_reopened_on_next_send() {
+        next_send_reopens_due_history(true).await;
+    }
+    #[tokio::test]
+    async fn overdue_interrupted_close_is_reopened_on_next_send() {
+        next_send_reopens_due_history(false).await;
     }
 }
 

@@ -29,6 +29,7 @@ struct Probe {
     events: Mutex<Vec<(&'static str, PathBuf)>>,
     lookup_on_link: Mutex<Option<(Arc<broca_core::FileWalStore>, broca_protocol::BindIdentity)>>,
     link_lookup_checks: AtomicUsize,
+    fail_directory_once: Mutex<Option<PathBuf>>,
 }
 
 struct ProbeFs {
@@ -42,6 +43,7 @@ mod batch_recording {
     use broca_wal::fs_ops::{FileOps, FsOps, OpenOptions};
 
     type Backend = Arc<Mutex<(u64, Arc<dyn FsOps>)>>;
+    type LiveHandles = Arc<Mutex<Vec<LiveHandle>>>;
 
     /// Start the crash history at a real writer's ready barrier. Existing file
     /// handles rebind at the same path/cursor with the same access options, but
@@ -49,12 +51,14 @@ mod batch_recording {
     /// the unchanged RecordingFs without replaying file creation.
     pub(super) struct BatchFs {
         backend: Backend,
+        live: LiveHandles,
     }
 
     impl BatchFs {
         pub(super) fn new() -> Self {
             Self {
                 backend: Arc::new(Mutex::new((0, Arc::new(broca_wal::fs_ops::RealFs)))),
+                live: Default::default(),
             }
         }
         pub(super) fn begin(&self, root: &Path) -> Arc<RecordingFs> {
@@ -62,6 +66,28 @@ mod batch_recording {
             let mut backend = self.backend.lock().unwrap();
             backend.0 += 1;
             backend.1 = recording.clone();
+            recording
+        }
+        /// Relocation may remove an old pathname before the next handle call.
+        /// Rebind live descriptors while the ready writer is still idle and
+        /// their original names exist, without any file or directory sync.
+        pub(super) fn begin_before_relocation(&self, root: &Path) -> Arc<RecordingFs> {
+            let recording = self.begin(root);
+            let generation = self.current().0;
+            self.live.lock().unwrap().retain(|entry| {
+                let Some(handle) = entry.handle.upgrade() else {
+                    return false;
+                };
+                rebind(
+                    &mut handle.lock().unwrap(),
+                    generation,
+                    recording.as_ref(),
+                    &entry.path,
+                    &entry.options,
+                )
+                .unwrap();
+                true
+            });
             recording
         }
         fn current(&self) -> (u64, Arc<dyn FsOps>) {
@@ -73,27 +99,50 @@ mod batch_recording {
         generation: u64,
         file: Box<dyn FileOps>,
     }
+    struct LiveHandle {
+        path: PathBuf,
+        options: OpenOptions,
+        handle: std::sync::Weak<Mutex<Handle>>,
+    }
     struct BatchFile {
         path: PathBuf,
         options: OpenOptions,
         backend: Backend,
-        handle: Mutex<Handle>,
+        handle: Arc<Mutex<Handle>>,
+        live: LiveHandles,
+    }
+
+    fn rebind(
+        handle: &mut Handle,
+        generation: u64,
+        fs: &dyn FsOps,
+        path: &Path,
+        original: &OpenOptions,
+    ) -> io::Result<()> {
+        if handle.generation != generation {
+            let cursor = handle.file.stream_position()?;
+            let mut options = original.clone();
+            options.create = false;
+            options.create_new = false;
+            options.truncate = false;
+            let mut file = fs.open(path, &options)?;
+            file.seek(SeekFrom::Start(cursor))?;
+            *handle = Handle { generation, file };
+        }
+        Ok(())
     }
 
     impl BatchFile {
         fn rebound(&self) -> io::Result<std::sync::MutexGuard<'_, Handle>> {
             let (generation, fs) = self.backend.lock().unwrap().clone();
             let mut handle = self.handle.lock().unwrap();
-            if handle.generation != generation {
-                let cursor = handle.file.stream_position()?;
-                let mut options = self.options.clone();
-                options.create = false;
-                options.create_new = false;
-                options.truncate = false;
-                let mut file = fs.open(&self.path, &options)?;
-                file.seek(SeekFrom::Start(cursor))?;
-                *handle = Handle { generation, file };
-            }
+            rebind(
+                &mut handle,
+                generation,
+                fs.as_ref(),
+                &self.path,
+                &self.options,
+            )?;
             Ok(handle)
         }
     }
@@ -101,14 +150,21 @@ mod batch_recording {
     impl FsOps for BatchFs {
         fn open(&self, path: &Path, options: &OpenOptions) -> io::Result<Box<dyn FileOps>> {
             let (generation, fs) = self.current();
+            let handle = Arc::new(Mutex::new(Handle {
+                generation,
+                file: fs.open(path, options)?,
+            }));
+            self.live.lock().unwrap().push(LiveHandle {
+                path: path.to_path_buf(),
+                options: options.clone(),
+                handle: Arc::downgrade(&handle),
+            });
             Ok(Box::new(BatchFile {
                 path: path.to_path_buf(),
                 options: options.clone(),
                 backend: self.backend.clone(),
-                handle: Mutex::new(Handle {
-                    generation,
-                    file: fs.open(path, options)?,
-                }),
+                handle,
+                live: self.live.clone(),
             }))
         }
         fn metadata(&self, path: &Path) -> io::Result<std::fs::Metadata> {
@@ -171,15 +227,24 @@ mod batch_recording {
             self.rebound()?.file.sync_all()
         }
         fn try_clone(&self) -> io::Result<Box<dyn FileOps>> {
-            let handle = self.rebound()?;
+            let handle = {
+                let handle = self.rebound()?;
+                Arc::new(Mutex::new(Handle {
+                    generation: handle.generation,
+                    file: handle.file.try_clone()?,
+                }))
+            };
+            self.live.lock().unwrap().push(LiveHandle {
+                path: self.path.clone(),
+                options: self.options.clone(),
+                handle: Arc::downgrade(&handle),
+            });
             Ok(Box::new(Self {
                 path: self.path.clone(),
                 options: self.options.clone(),
                 backend: self.backend.clone(),
-                handle: Mutex::new(Handle {
-                    generation: handle.generation,
-                    file: handle.file.try_clone()?,
-                }),
+                handle,
+                live: self.live.clone(),
             }))
         }
         fn lock(&self) -> io::Result<()> {
@@ -235,11 +300,22 @@ impl broca_wal::fs_ops::FsOps for ProbeFs {
         self.inner.rename(from, to)
     }
     fn sync_dir(&self, path: &Path) -> io::Result<()> {
-        self.probe
-            .events
-            .lock()
-            .unwrap()
-            .push(("sync_dir", path.to_path_buf()));
+        let fail = {
+            let mut target = self.probe.fail_directory_once.lock().unwrap();
+            if target.as_deref() == Some(path) {
+                target.take();
+                true
+            } else {
+                false
+            }
+        };
+        self.probe.events.lock().unwrap().push((
+            if fail { "failed_sync_dir" } else { "sync_dir" },
+            path.to_path_buf(),
+        ));
+        if fail {
+            return Err(io::Error::other("injected source-directory sync failure"));
+        }
         self.inner.sync_dir(path)
     }
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
@@ -564,6 +640,202 @@ fn try_spawn_recorded(
         )
     });
     Ok((store, session, handle?))
+}
+
+#[cfg(feature = "writer-id-faults")]
+fn spawn_owned_recorded(
+    store: &Arc<broca_core::FileWalStore>,
+    session: &broca_protocol::BindIdentity,
+    leases: &broca_core::FileLeaseStore,
+    fs: Arc<ProbeFs>,
+    retention: Option<u64>,
+) -> broca_core::WalHandle {
+    use broca_core::{LeaseStore, WalStore};
+    let lease = leases.acquire(&broca_core::lease_key_for(session)).unwrap();
+    let fence = lease.epoch();
+    let clock = fs.probe.clone();
+    with_fs_ops(fs.clone(), || {
+        let (wal, lease) = store
+            .open_owned_writer(session, retention, None, lease)
+            .unwrap();
+        broca_core::WalHandle::spawn_in_store_with_fs_and_clock_for_test(
+            wal,
+            store.as_ref(),
+            session,
+            fence,
+            Some(lease),
+            fs,
+            move || clock.now.load(Ordering::SeqCst),
+        )
+        .unwrap()
+    })
+}
+
+#[cfg(feature = "writer-id-faults")]
+fn first_run(session: &broca_protocol::BindIdentity) -> WalRecord {
+    let mut record: WalRecord = serde_json::from_str(include_str!(
+        "../../broca-wal/tests/golden/pre_step_transforms/run_started.json"
+    ))
+    .unwrap();
+    if let WalRecord::RunStarted {
+        session: key,
+        run_id,
+        retention,
+        ts_ms,
+        ..
+    } = &mut record
+    {
+        *key = session.clone();
+        *run_id = broca_protocol::RunId("first".into());
+        *retention = Some(60);
+        *ts_ms = Some(1000);
+    }
+    record
+}
+
+#[cfg(feature = "writer-id-faults")]
+fn contains_started(mut bytes: &[u8]) -> bool {
+    while !bytes.is_empty() {
+        match broca_wal::framing::decode_next(bytes) {
+            broca_wal::framing::DecodeStep::Record { framed, consumed } => {
+                if matches!(framed.record, WalRecord::RunStarted { .. }) {
+                    return true;
+                }
+                bytes = &bytes[consumed..];
+            }
+            broca_wal::framing::DecodeStep::Lineage { consumed, .. } => bytes = &bytes[consumed..],
+            _ => break,
+        }
+    }
+    false
+}
+
+#[cfg(feature = "writer-id-faults")]
+#[test]
+fn failed_source_barrier_is_repeated_before_a_reopened_log_starts() {
+    use broca_core::WalStore;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let root = Scratch::new();
+    let lease_root = Scratch::new();
+    let leases = broca_core::FileLeaseStore::new(lease_root.0.join("leases"));
+    let session = broca_protocol::BindIdentity::new("/proof", "runner", "source-barrier");
+    std::fs::create_dir_all(root.0.join("wal-durable")).unwrap();
+    let store = Arc::new(broca_core::FileWalStore::with_config(
+        root.0.join("wal"),
+        broca_wal::WalConfig::OVERHAUL,
+    ));
+    let probe = Arc::new(Probe::default());
+    probe.now.store(1000, Ordering::SeqCst);
+    let batch = Arc::new(batch_recording::BatchFs::new());
+    let fs = Arc::new(ProbeFs {
+        inner: batch.clone(),
+        probe: probe.clone(),
+    });
+    let writer = spawn_owned_recorded(&store, &session, &leases, fs.clone(), None);
+    let recording = batch.begin_before_relocation(&root.0);
+    let source = store.wal_path(&session);
+    let destination = store.ephemeral_wal_path(&session);
+    *probe.fail_directory_once.lock().unwrap() = Some(source.parent().unwrap().to_path_buf());
+    writer.record(first_run(&session)).into_result().unwrap();
+    let failure = runtime.block_on(writer.sync()).unwrap_err();
+    assert!(
+        matches!(&failure, broca_core::WalWriteError::RelocationIncomplete { reason } if reason.contains("source-directory")),
+        "{failure:?}"
+    );
+    assert!(
+        matches!(broca_core::RunError::from(failure), broca_core::RunError::Transient(reason) if reason.contains("wal_relocation_incomplete"))
+    );
+    assert!(
+        !source.exists() && destination.exists(),
+        "unlink succeeded before its directory barrier failed"
+    );
+    assert!(!store
+        .read_records(&session)
+        .unwrap()
+        .iter()
+        .any(|frame| matches!(frame.record, WalRecord::RunStarted { .. })));
+    assert!(matches!(
+        writer.record(first_run(&session)),
+        broca_core::wal_writer::RecordOutcome::Refused(
+            broca_core::WalWriteError::RelocationIncomplete { .. }
+        )
+    ));
+    assert!(runtime.block_on(writer.shutdown()).is_err());
+    probe.events.lock().unwrap().clear();
+    let writer = spawn_owned_recorded(&store, &session, &leases, fs, Some(60));
+    writer.record(first_run(&session)).into_result().unwrap();
+    runtime.block_on(writer.sync()).unwrap();
+    let events = probe.events.lock().unwrap().clone();
+    assert!(
+        events
+            .iter()
+            .any(|(op, path)| *op == "sync_dir" && path == source.parent().unwrap()),
+        "the singleton/same-path retry must still complete the old source barrier"
+    );
+    assert!(events
+        .iter()
+        .any(|(op, path)| *op == "sync_dir" && path == destination.parent().unwrap()));
+    assert!(events
+        .iter()
+        .any(|(op, path)| *op == "sync_dir" && path == &root.0.join("wal-durable")));
+    drop(events);
+    let states = recording.enumerate(2_000_000).unwrap();
+    runtime.block_on(writer.shutdown()).unwrap();
+    let source = source.strip_prefix(&root.0).unwrap();
+    let destination = destination.strip_prefix(&root.0).unwrap();
+    let mut started = 0;
+    let mut aliases = 0;
+    let mut recovered_aliases = 0;
+    let mut seen_aliases = std::collections::BTreeSet::new();
+    for state in &states {
+        let old = state.state.files.get(source);
+        let new = state.state.files.get(destination);
+        let is_started = old.or(new).is_some_and(|bytes| contains_started(bytes));
+        started += usize::from(is_started);
+        aliases += usize::from(old.is_some() && new.is_some());
+        assert!(
+            !is_started || old.is_none() || new.is_none(),
+            "a started alias pair survived cut {} after the retry",
+            state.cut
+        );
+        if old.is_some() && new.is_some() && seen_aliases.insert(state.state.clone()) {
+            let recovery = Scratch::new();
+            std::fs::remove_dir_all(&recovery.0).unwrap();
+            state.state.install(&recovery.0).unwrap();
+            let recovered_store = Arc::new(broca_core::FileWalStore::with_config(
+                recovery.0.join("wal"),
+                broca_wal::WalConfig::OVERHAUL,
+            ));
+            let tenure = broca_core::lease::WalLeaseDomain::new(lease_root.0.join("leases"))
+                .acquire(&session)
+                .unwrap();
+            match runtime.block_on(broca_core::WalHandle::open_and_spawn_owned_with_retention(
+                recovered_store.clone(),
+                session.clone(),
+                tenure,
+                None,
+                Some(60),
+            )) {
+                Ok(writer) => {
+                    assert_eq!(
+                        recovered_store.resolve_live_path(&session).unwrap(),
+                        Some(recovery.0.join(destination))
+                    );
+                    runtime.block_on(writer.shutdown()).unwrap();
+                    recovered_aliases += 1;
+                }
+                Err(error) => assert!(
+                    error.to_string().contains("corrupt"),
+                    "unexpected alias recovery refusal: {error}"
+                ),
+            }
+        }
+    }
+    assert!(started > 0 && aliases > 0 && recovered_aliases > 0);
+    eprintln!("source-barrier error/reopen: {} power-loss states, {started} started states, {aliases} unstarted alias states, {recovered_aliases} recovered alias images", states.len());
 }
 
 #[cfg(feature = "writer-id-faults")]

@@ -2186,6 +2186,7 @@ impl AppendBudget {
 #[derive(Debug, Clone)]
 pub enum WalWriteError {
     Failed(String),
+    RelocationIncomplete { reason: String },
     ProofPathUnavailable,
     RetainedSessionTooLarge { max_bytes: u64 },
     SessionTooLarge { max_bytes: u64 },
@@ -2195,6 +2196,7 @@ impl std::fmt::Display for WalWriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Failed(detail) => write!(f, "wal write failure: {detail}"),
+            Self::RelocationIncomplete { reason } => f.write_str(reason),
             Self::ProofPathUnavailable => write!(
                 f,
                 "visibility-late/v1: overhaul WAL has no file path for its durable-head proof"
@@ -2215,6 +2217,37 @@ impl std::fmt::Display for WalWriteError {
 }
 
 impl std::error::Error for WalWriteError {}
+
+impl WalWriteError {
+    fn from_wal(error: WalError) -> Self {
+        match error {
+            error @ WalError::RelocationIncomplete { .. } => Self::RelocationIncomplete {
+                reason: error.to_string(),
+            },
+            other => Self::Failed(other.to_string()),
+        }
+    }
+
+    fn detail(&self) -> String {
+        match self {
+            Self::Failed(detail) => detail.clone(),
+            Self::RelocationIncomplete { reason } => reason.clone(),
+            Self::ProofPathUnavailable => self.to_string(),
+            Self::SessionTooLarge { .. } => self.to_string(),
+            Self::RetainedSessionTooLarge { .. } => self.to_string(),
+        }
+    }
+}
+impl From<String> for WalWriteError {
+    fn from(detail: String) -> Self {
+        Self::Failed(detail)
+    }
+}
+impl From<&str> for WalWriteError {
+    fn from(detail: &str) -> Self {
+        Self::Failed(detail.into())
+    }
+}
 
 /// Why a session WAL could not be opened, recovered and proven for writing.
 ///
@@ -2244,6 +2277,15 @@ pub enum WalOpenError {
 }
 
 impl WalOpenError {
+    fn from_write(error: WalWriteError) -> Self {
+        match error {
+            WalWriteError::RelocationIncomplete { reason } => Self::RelocationIncomplete { reason },
+            other @ (WalWriteError::Failed(_)
+            | WalWriteError::ProofPathUnavailable
+            | WalWriteError::SessionTooLarge { .. }
+            | WalWriteError::RetainedSessionTooLarge { .. }) => Self::Failed(other),
+        }
+    }
     fn from_wal(error: WalError) -> Self {
         let text = WalWriteError::Failed(error.to_string());
         match error {
@@ -2568,7 +2610,7 @@ pub struct WalHandle {
     durable_head: Arc<AtomicU64>,
     /// Shared poison state: writer-side append/sequence failures and handle-side channel
     /// failures converge here, so no later durability barrier can report success.
-    poisoned: Arc<Mutex<Option<String>>>,
+    poisoned: Arc<Mutex<Option<WalWriteError>>>,
     /// The lineage identity of the file the writer task appends to, refreshed by that task
     /// after every append. A legacy file has none until its first append mints one, so a
     /// value read at spawn could be stale; readers go through [`WalHandle::lineage_id`].
@@ -2822,7 +2864,7 @@ impl WalHandle {
             let (wal, lease) = wal_store
                 .open_writer(&session, retention, session_class.as_deref(), lease)
                 .map_err(WalOpenError::from_wal)?;
-            let (wal, last_seq) = Self::prove_recovery(wal).map_err(WalOpenError::Failed)?;
+            let (wal, last_seq) = Self::prove_recovery(wal).map_err(WalOpenError::from_write)?;
             Ok::<_, WalOpenError>((wal, last_seq, fence, lease))
         })
         .await
@@ -2846,7 +2888,7 @@ impl WalHandle {
             None,
             (StampClock::wall(), context),
         )
-        .map_err(WalOpenError::Failed)?;
+        .map_err(WalOpenError::from_write)?;
         handle.bind_media_capture(check_store.as_ref(), &check_session);
         handle.move_check = Some(Arc::new(move || {
             check_store.check_move(&check_session, true)
@@ -2945,7 +2987,7 @@ impl WalHandle {
             // `prove_recovery` drops the descriptor before returning its
             // error, so by the time its Err reaches here the WAL is already
             // closed and only the tenure remains in the guard below.
-            let (wal, last_seq) = Self::prove_recovery(wal).map_err(WalOpenError::Failed)?;
+            let (wal, last_seq) = Self::prove_recovery(wal).map_err(WalOpenError::from_write)?;
             Ok::<_, WalOpenError>(OpenedOwned {
                 wal: Some(wal),
                 lease: Some(lease),
@@ -2986,7 +3028,7 @@ impl WalHandle {
             Some(lease),
             (StampClock::wall(), context),
         )
-        .map_err(WalOpenError::Failed)?;
+        .map_err(WalOpenError::from_write)?;
         handle.bind_media_capture(check_store.as_ref(), &check_session);
         handle.move_check = Some(Arc::new(move || {
             check_store.check_move(&check_session, true)
@@ -3000,8 +3042,7 @@ impl WalHandle {
         // FileWal::open has already recovered any torn tail under the caller's lease. Prove the
         // remaining complete prefix before publishing its sequence as durable: flushed bytes can
         // be readable even when a prior fsync failed. This is the one recovery barrier per spawn.
-        wal.sync()
-            .map_err(|error| WalWriteError::Failed(error.to_string()))?;
+        wal.sync().map_err(WalWriteError::from_wal)?;
         let last_seq = wal.last_seq();
         Ok((wal, last_seq))
     }
@@ -3128,13 +3169,13 @@ impl WalHandle {
                     Ok((writer, seq, record, synced)) => {
                         let mut pending = vec![(seq, Box::new(record))];
                         let opened = broca_wal::head_proof::Publisher::from_synced(synced)
-                            .map_err(|error| error.to_string())
+                            .map_err(WalWriteError::from_wal)
                             .and_then(|publisher| {
                                 publication.publisher = Some(publisher);
                                 publication.publish_synced(&mut **wal, &rx, &mut pending)
                             });
                         if let Err(error) = opened {
-                            let _ = ready_tx.send(Err(WalWriteError::Failed(error)));
+                            let _ = ready_tx.send(Err(error));
                             let (wal, lease) = owner.into_parts();
                             drop(wal);
                             return lease;
@@ -3150,9 +3191,15 @@ impl WalHandle {
                         Some(writer)
                     }
                     Err(error) => {
-                        let _ = ready_tx.send(Err(WalWriteError::Failed(format!(
-                            "writer-id/v1: cannot open writer for {address}: {error}"
-                        ))));
+                        let error = match error {
+                            error @ WalError::RelocationIncomplete { .. } => {
+                                WalWriteError::from_wal(error)
+                            }
+                            other => WalWriteError::Failed(format!(
+                                "writer-id/v1: cannot open writer for {address}: {other}"
+                            )),
+                        };
+                        let _ = ready_tx.send(Err(error));
                         let (wal, lease) = owner.into_parts();
                         drop(wal);
                         return lease;
@@ -3382,6 +3429,10 @@ impl WalHandle {
         current_poison(&self.poisoned)
     }
 
+    pub fn poison_write_error(&self) -> Option<WalWriteError> {
+        current_write_error(&self.poisoned)
+    }
+
     /// Queue a record and return explicit acceptance or refusal. Accepted sequences are
     /// not durable until sync succeeds. Callers that discard the result must sync before
     /// making a durability claim; refused appends have no sequence to publish.
@@ -3475,6 +3526,11 @@ impl WalHandle {
         reserved_terminal: bool,
         assigned: &mut Option<Vec<MessageTags>>,
     ) -> RecordOutcome {
+        if let Some(error @ WalWriteError::RelocationIncomplete { .. }) =
+            current_write_error(&self.poisoned)
+        {
+            return RecordOutcome::Refused(error);
+        }
         // Observe time once at enqueue, before encoding or publication. Recovered records
         // retain an existing observation rather than acquiring a restart-time replacement.
         match &mut record {
@@ -3789,8 +3845,8 @@ impl WalHandle {
         // that a successful ack covers everything callers had reserved before sync began.
         let (ack_rx, send_failed) = {
             let _guard = self.lock_enqueue();
-            if let Some(error) = current_poison(&self.poisoned) {
-                return Err(WalWriteError::Failed(error));
+            if let Some(error) = current_write_error(&self.poisoned) {
+                return Err(error);
             }
             let (ack_tx, ack_rx) = oneshot::channel();
             let send_failed = self.tx.send(WalCommand::Sync(ack_tx)).is_err();
@@ -3871,8 +3927,7 @@ impl WalHandle {
     ) -> (Result<(), WalWriteError>, Option<Box<dyn LeaseHandle>>) {
         let Some(join) = self.join.take() else {
             return (
-                current_poison(&self.poisoned)
-                    .map_or(Ok(()), |error| Err(WalWriteError::Failed(error))),
+                current_write_error(&self.poisoned).map_or(Ok(()), Err),
                 None,
             );
         };
@@ -3894,8 +3949,8 @@ impl WalHandle {
         if sent.is_err() {
             set_poison(&self.poisoned, "WAL writer closed before shutdown".into());
         }
-        if let Some(error) = current_poison(&self.poisoned) {
-            return (Err(WalWriteError::Failed(error)), lease);
+        if let Some(error) = current_write_error(&self.poisoned) {
+            return (Err(error), lease);
         }
         let result = result.recv().unwrap_or_else(|_| {
             let error = "WAL writer dropped the shutdown acknowledgement".to_string();
@@ -4012,11 +4067,11 @@ impl Publication {
         wal: &mut dyn Wal,
         rx: &std_mpsc::Receiver<WalCommand>,
         pending: &mut Vec<(u64, Box<WalRecord>)>,
-    ) -> Result<(), String> {
+    ) -> Result<(), WalWriteError> {
         let Some(publisher) = &mut self.publisher else {
-            return wal.sync().map_err(|error| error.to_string());
+            return wal.sync().map_err(WalWriteError::from_wal);
         };
-        publisher.sync(wal).map_err(|error| error.to_string())?;
+        publisher.sync(wal).map_err(WalWriteError::from_wal)?;
         self.publish_synced(wal, rx, pending)
     }
 
@@ -4025,7 +4080,7 @@ impl Publication {
         wal: &mut dyn Wal,
         rx: &std_mpsc::Receiver<WalCommand>,
         pending: &mut Vec<(u64, Box<WalRecord>)>,
-    ) -> Result<(), String> {
+    ) -> Result<(), WalWriteError> {
         let publisher = self
             .publisher
             .as_mut()
@@ -4093,7 +4148,7 @@ impl Publication {
                 crate::durability_counters::FsyncCause::Barrier,
                 self.fence,
             );
-            publisher.sync(wal).map_err(|error| error.to_string())?;
+            publisher.sync(wal).map_err(WalWriteError::from_wal)?;
         }
     }
 }
@@ -4103,7 +4158,7 @@ fn append_command(
     fence: u64,
     clock: &StampClock,
     command: WalCommand,
-) -> Result<(u64, Box<WalRecord>), String> {
+) -> Result<(u64, Box<WalRecord>), WalWriteError> {
     let (seq, record, result) = match command {
         WalCommand::Append { seq, record, frame } => {
             let result = match frame {
@@ -4124,10 +4179,10 @@ fn append_command(
     };
     match result {
         Ok(assigned) if assigned == seq => Ok((seq, record)),
-        Ok(assigned) => Err(format!(
+        Ok(assigned) => Err(WalWriteError::Failed(format!(
             "wal seq drift: handle assigned {seq}, wal assigned {assigned}"
-        )),
-        Err(error) => Err(error.to_string()),
+        ))),
+        Err(error) => Err(WalWriteError::from_wal(error)),
     }
 }
 
@@ -4138,7 +4193,7 @@ fn writer_loop(
     fence: u64,
     rx: std_mpsc::Receiver<WalCommand>,
     observer: Option<RecordObserver>,
-    poisoned: Arc<Mutex<Option<String>>>,
+    poisoned: Arc<Mutex<Option<WalWriteError>>>,
     durable_head: Arc<AtomicU64>,
     lineage_id: Arc<Mutex<Option<broca_wal::WalLineageId>>>,
     stamp_clock: StampClock,
@@ -4170,7 +4225,7 @@ fn writer_loop_with_identity(
     fence: u64,
     rx: std_mpsc::Receiver<WalCommand>,
     observer: Option<RecordObserver>,
-    poisoned: Arc<Mutex<Option<String>>>,
+    poisoned: Arc<Mutex<Option<WalWriteError>>>,
     durable_head: Arc<AtomicU64>,
     lineage_id: Arc<Mutex<Option<broca_wal::WalLineageId>>>,
     stamp_clock: StampClock,
@@ -4219,7 +4274,7 @@ fn writer_loop_with_identity(
         } else if dirty {
             let now = monotonic_now_ms_for(fence);
             if deadline_at_ms.is_some_and(|deadline| now >= deadline) {
-                let poison = current_poison(&poisoned);
+                let poison = current_write_error(&poisoned);
                 if poison.is_none() {
                     // Every fsync is counted by the path that issued it, for health.
                     record_fsync(FsyncCause::Deadline, fence);
@@ -4253,7 +4308,7 @@ fn writer_loop_with_identity(
                         }
                     }
                     Err(error) => {
-                        set_poison(&poisoned, error);
+                        set_write_poison(&poisoned, error);
                         deadline_at_ms = None;
                     }
                 }
@@ -4293,7 +4348,7 @@ fn writer_loop_with_identity(
         if matches!(wait, Wait::Gone) {
             // A dropped handle closes like Shutdown: sync dirty data before exit.
             if dirty {
-                let poison = current_poison(&poisoned);
+                let poison = current_write_error(&poisoned);
                 if poison.is_none() {
                     // Every fsync is counted by the path that issued it, for health.
                     record_fsync(FsyncCause::Disconnect, fence);
@@ -4314,7 +4369,7 @@ fn writer_loop_with_identity(
                             }
                         }
                     }
-                    Err(error) => set_poison(&poisoned, error),
+                    Err(error) => set_write_poison(&poisoned, error),
                 }
             }
             if current_poison(&poisoned).is_none() {
@@ -4327,7 +4382,7 @@ fn writer_loop_with_identity(
                     &durable_head,
                     publication.publisher.as_mut(),
                 ) {
-                    set_poison(&poisoned, error);
+                    set_write_poison(&poisoned, error);
                 }
             }
             break;
@@ -4369,7 +4424,7 @@ fn writer_loop_with_identity(
                                 pending_observed.push((assigned, record));
                             }
                         }
-                        Err(error) => set_poison(&poisoned, error),
+                        Err(error) => set_write_poison(&poisoned, error),
                     }
                 }
             }
@@ -4378,7 +4433,7 @@ fn writer_loop_with_identity(
                 // fsync, the current durable head is already exact — return it without
                 // paying another no-op sync. If the writer is poisoned, still surface the
                 // error even though the seqs happen to match.
-                let poison = current_poison(&poisoned);
+                let poison = current_write_error(&poisoned);
                 let res = if dirty {
                     if poison.is_none() {
                         record_fsync(FsyncCause::Barrier, fence);
@@ -4409,12 +4464,11 @@ fn writer_loop_with_identity(
                 } else {
                     poison.map_or(Ok(last_fsynced_seq), Err)
                 };
-                let res = res.map_err(|e| {
-                    set_poison(&poisoned, e.clone());
+                let res = res.inspect_err(|e| {
+                    set_write_poison(&poisoned, e.clone());
                     // The writer is poisoned now: drop the deadline with it, so
                     // the loop idles instead of retrying a sync that cannot succeed.
                     deadline_at_ms = None;
-                    WalWriteError::Failed(e)
                 });
                 let durable = res.is_ok();
                 let _ = ack.send(res);
@@ -4427,7 +4481,7 @@ fn writer_loop_with_identity(
                 }
             }
             WalCommand::Shutdown(ack) => {
-                let poison = current_poison(&poisoned);
+                let poison = current_write_error(&poisoned);
                 let result = if dirty {
                     if poison.is_none() {
                         record_fsync(FsyncCause::Shutdown, fence);
@@ -4461,9 +4515,8 @@ fn writer_loop_with_identity(
                         publication.publisher.as_mut(),
                     )
                 });
-                let result = result.map_err(|error| {
-                    set_poison(&poisoned, error.clone());
-                    WalWriteError::Failed(error)
+                let result = result.inspect_err(|error| {
+                    set_write_poison(&poisoned, error.clone());
                 });
                 let _ = ack.send(result);
                 break;
@@ -4489,11 +4542,17 @@ fn close_writer_identity(
     observer: Option<&RecordObserver>,
     durable_head: &AtomicU64,
     publisher: Option<&mut broca_wal::head_proof::Publisher>,
-) -> Result<(), String> {
+) -> Result<(), WalWriteError> {
     if let Some(writer) = writer {
-        let (seq, record, synced) = writer
-            .close(wal, fence, clock.now_ms())
-            .map_err(|error| format!("writer-id/v1: cannot close writer: {error}"))?;
+        let (seq, record, synced) =
+            writer
+                .close(wal, fence, clock.now_ms())
+                .map_err(|error| match error {
+                    error @ WalError::RelocationIncomplete { .. } => WalWriteError::from_wal(error),
+                    other => {
+                        WalWriteError::Failed(format!("writer-id/v1: cannot close writer: {other}"))
+                    }
+                })?;
         let published = if let Some(publisher) = publisher {
             publisher
                 .scan_synced(synced)
@@ -4530,7 +4589,11 @@ fn close_writer_identity(
 /// held, and the guarded section here is an `is_none` test and a move. Neither can panic, so
 /// this lock cannot be poisoned by its own critical section. Keep it that way — anything
 /// fallible added inside the guard makes the failure recorder a second failure source.
-fn set_poison(poisoned: &Mutex<Option<String>>, error: String) {
+fn set_poison(poisoned: &Mutex<Option<WalWriteError>>, error: String) {
+    set_write_poison(poisoned, WalWriteError::Failed(error));
+}
+
+fn set_write_poison(poisoned: &Mutex<Option<WalWriteError>>, error: WalWriteError) {
     let mut state = poisoned.lock().unwrap();
     if state.is_none() {
         *state = Some(error);
@@ -4539,7 +4602,11 @@ fn set_poison(poisoned: &Mutex<Option<String>>, error: String) {
 
 /// Reads the recorded writer error. Guarded section is a single clone, so it cannot panic
 /// while holding the guard and cannot poison this lock. See `set_poison` for why that matters.
-fn current_poison(poisoned: &Mutex<Option<String>>) -> Option<String> {
+fn current_poison(poisoned: &Mutex<Option<WalWriteError>>) -> Option<String> {
+    poisoned.lock().unwrap().as_ref().map(WalWriteError::detail)
+}
+
+fn current_write_error(poisoned: &Mutex<Option<WalWriteError>>) -> Option<WalWriteError> {
     poisoned.lock().unwrap().clone()
 }
 

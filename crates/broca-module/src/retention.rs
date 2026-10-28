@@ -439,6 +439,7 @@ pub struct RetentionService {
     pub(crate) withdrawal_wake: tokio::sync::Notify,
     unreadable: Mutex<std::collections::HashSet<String>>,
     relocation_incomplete: std::sync::atomic::AtomicU64,
+    overhaul_deferred: std::sync::atomic::AtomicU64,
     enrollment: Mutex<Enrollment>,
     deletion_recovery: Mutex<(bool, std::collections::HashSet<BindIdentity>)>,
     archived_expiry: Mutex<ArchivedExpiry>,
@@ -588,6 +589,7 @@ impl RetentionService {
             evict: std::sync::OnceLock::new(),
             unreadable: Mutex::new(std::collections::HashSet::new()),
             relocation_incomplete: std::sync::atomic::AtomicU64::new(0),
+            overhaul_deferred: std::sync::atomic::AtomicU64::new(0),
             enrollment: Mutex::default(),
             deletion_recovery: Mutex::default(),
             archived_expiry: Mutex::default(),
@@ -710,6 +712,24 @@ impl RetentionService {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    pub fn overhaul_deferred_attempts(&self) -> u64 {
+        self.overhaul_deferred
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Overhaul roots may read retained content, but destructive retention is
+    /// deferred until it can honor open-writer markers and unpublished log tails
+    /// before deleting logs.
+    pub(crate) fn defer_overhaul(&self) -> bool {
+        if !self.wal.wal_config().is_overhaul() {
+            return false;
+        }
+        self.overhaul_deferred
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(target: "retention", "retention deferred: overhaul");
+        true
+    }
+
     pub(crate) fn live_path_for_retention(
         &self,
         key: &BindIdentity,
@@ -829,6 +849,9 @@ impl RetentionService {
         head: Option<u64>,
         meta: Option<&broca_core::AdmissionStoreSnapshot>,
     ) -> Result<Option<u64>, RetentionReadError> {
+        if self.defer_overhaul() {
+            return Ok(None);
+        }
         let overhaul_path = self
             .wal
             .wal_config()
@@ -1467,6 +1490,9 @@ impl RetentionService {
         key: &BindIdentity,
         now_ms: u64,
     ) -> Result<Option<String>, RetentionReadError> {
+        if self.defer_overhaul() {
+            return Ok(None);
+        }
         let overhaul_path = self
             .wal
             .wal_config()
@@ -1648,6 +1674,9 @@ impl RetentionService {
         mut stone: Tombstone,
         now_ms: u64,
     ) -> Result<(), String> {
+        if self.defer_overhaul() {
+            return Err("retention deferred: overhaul".into());
+        }
         self.wal.check_move(key, true).map_err(|e| e.to_string())?;
         let moved = self.deleting(key, &stone.lineage_id);
         if let Some(path) = self.wal.resolve_live_path(key).map_err(|e| e.to_string())? {
@@ -1776,6 +1805,9 @@ impl RetentionService {
     /// Finish incomplete tombstones, retrying failed keys on later sweeps without
     /// preventing unrelated sessions from completing their deletion.
     pub fn resume_deletions(&self, now_ms: u64) -> Result<Vec<BindIdentity>, String> {
+        if self.defer_overhaul() {
+            return Ok(Vec::new());
+        }
         let mut recovery = self.deletion_recovery.lock().unwrap();
         let pending = match self.index.pending_deletions()? {
             Some(keys) => keys,

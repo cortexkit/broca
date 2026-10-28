@@ -781,7 +781,19 @@ impl FileWal {
         self.dir_needs_sync.set(true);
         self.sync()?;
         self.refresh_owned_cache();
-        crate::migration::sync_dir(&source_parent).map_err(WalError::Io)
+        crate::migration::sync_dir(&source_parent).map_err(|error| {
+            if self.config.is_overhaul() {
+                WalError::RelocationIncomplete {
+                    paths: vec![source, destination.to_path_buf()],
+                    cause: Some(format!(
+                        "source-directory barrier {}: {error}",
+                        source_parent.display()
+                    )),
+                }
+            } else {
+                WalError::Io(error)
+            }
+        })
     }
 
     /// Mark the current path and session reference as the verdict the owned
