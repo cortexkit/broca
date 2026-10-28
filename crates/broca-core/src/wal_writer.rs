@@ -2140,7 +2140,9 @@ impl std::fmt::Display for WalOpenError {
 impl std::error::Error for WalOpenError {}
 
 enum WalCommand {
-    #[cfg(test)]
+    // Its only caller is a test that needs the test clock, so a featureless test build
+    // would carry it unconstructed.
+    #[cfg(all(test, feature = "test-clock"))]
     BudgetSnapshot(std_mpsc::Sender<Option<(u64, u64, u64)>>),
     #[cfg(test)]
     AppendDrained(oneshot::Sender<()>),
@@ -3968,7 +3970,7 @@ fn writer_loop_with_identity(
             continue;
         };
         match cmd {
-            #[cfg(test)]
+            #[cfg(all(test, feature = "test-clock"))]
             WalCommand::BudgetSnapshot(ack) => {
                 let _ = ack.send(wal.append_budget());
             }
