@@ -379,6 +379,16 @@ fn retained_summary_does_not_include_records_past_durable_head() {
 fn missing_retention_summary_is_refreshed_without_rewriting_run_state() {
     let rig = Rig::new();
     let now = rig.service.clock.now_ms();
+    // Freeze the clock: the seed expires one second after `now`, and WAL setup on a
+    // slow runner can take longer than that between sampling `now` and checking expiry,
+    // which would report the seed as already expired. A fixed clock keeps the deadline
+    // in the future until the test moves it explicitly.
+    fs::write(
+        rig.root.join("test-clock"),
+        format!(r#"{{"now_ms":{now}}}"#),
+    )
+    .unwrap();
+    rig.service.clock.refresh().unwrap();
     rig.seed(1, now, Some(now));
     assert!(rig
         .store

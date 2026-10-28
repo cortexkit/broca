@@ -368,6 +368,39 @@ fn records(dir: &std::path::Path) -> Vec<WalRecord> {
         .collect()
 }
 
+/// Byte offset where the frame with `seq` ends, found by decoding the WAL file itself.
+///
+/// `WalRangeRead::anchor_at` needs the file's device-and-inode identity, which only exists
+/// on Unix, so it reports no anchors on Windows. Walking the frames needs no identity and
+/// finds the same end offset on every platform.
+fn frame_byte_end(path: &std::path::Path, seq: u64) -> u64 {
+    let bytes = std::fs::read(path).unwrap();
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        match broca_wal::framing::decode_next(&bytes[offset..]) {
+            broca_wal::framing::DecodeStep::Record { framed, consumed } => {
+                offset += consumed;
+                if framed.seq == seq {
+                    return offset as u64;
+                }
+            }
+            broca_wal::framing::DecodeStep::Lineage { consumed, .. } => {
+                offset += consumed;
+            }
+            broca_wal::framing::DecodeStep::NewerWriter { ver, .. } => {
+                panic!("newer WAL frame v{ver} at offset {offset}");
+            }
+            broca_wal::framing::DecodeStep::Corrupt(error) => {
+                panic!("WAL corruption at offset {offset}: {error}");
+            }
+            broca_wal::framing::DecodeStep::TornTail => {
+                panic!("torn WAL tail before seq {seq}");
+            }
+        }
+    }
+    panic!("seq {seq} not found in the WAL");
+}
+
 /// Rewrite the WAL to the records `keep` accepts among its first `upto`, as a crash after
 /// those records would leave it.
 fn rewrite_wal(dir: &std::path::Path, upto: usize, keep: impl Fn(&WalRecord) -> bool) {
@@ -735,13 +768,8 @@ async fn crash_continuation_restores_the_last_measurement_from_a_materialized_pr
         frames.last().unwrap().record,
         WalRecord::RunPaused { .. }
     ));
-    let range = wal
-        .read_records_range(&request(&dir).session, 0, None, None)
-        .unwrap();
-    let end = range
-        .anchor_at(frames[frames.len() - 2].seq)
-        .unwrap()
-        .byte_end;
+    let target = frames[frames.len() - 2].seq;
+    let end = frame_byte_end(&wal.wal_path(&request(&dir).session), target);
     std::fs::OpenOptions::new()
         .write(true)
         .open(wal.wal_path(&request(&dir).session))
