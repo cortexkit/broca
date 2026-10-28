@@ -3145,7 +3145,6 @@ where
         Default::default()
     };
     // The last committed step's usage, for the fallback's context guard.
-    let mut last_step_usage = prior.last_step_usage;
     if !is_resume && req.retention.is_some() && writer.is_retention_lineage() == Some(false) {
         return Err(RunError::Config(
             "retention disagrees with the lineage's frozen policy".into(),
@@ -5626,7 +5625,9 @@ where
         // A prompt that already fills the fallback model's window would only overflow it.
         let fallback_fits = match (
             provider.refusal_fallback_context_limit(),
-            last_step_usage.and_then(|usage| usage.fill_tokens()),
+            compaction_history
+                .previous_native_usage
+                .and_then(|usage| usage.fill_tokens()),
         ) {
             (Some(limit), Some(fill)) => fill < limit,
             _ => true,
@@ -5811,6 +5812,7 @@ where
                     usage,
                     retries_used,
                     served_model,
+                    usage_iterations,
                     finish_reason: Some(FinishReason::ContentFilter),
                     ..
                 },
@@ -5845,10 +5847,13 @@ where
                         fallback,
                         now,
                     );
+                    let usage =
+                        broca_protocol::usage::step_usage(*usage, usage_iterations.as_deref());
                     writer.record(WalRecord::ModelStepRefused {
                         step_id,
-                        usage: *usage,
+                        usage,
                         served_model: served_model.clone(),
+                        usage_iterations: usage_iterations.clone(),
                         discarded_blocks: message.content.len() as u32,
                         schedule: schedule.clone(),
                         ts_ms: now,
@@ -5870,8 +5875,8 @@ where
                     );
                     // The refused call was billed: it counts toward the run's totals and its
                     // input budget, as replay counts the record.
-                    total_usage += *usage;
-                    input_budget.observe(*usage);
+                    total_usage += usage;
+                    input_budget.observe(usage);
                     refusal_prior_retries = *retries_used;
                     refusal_schedule = Some(schedule);
                     fallback_resent = true;
@@ -5924,6 +5929,7 @@ where
                 usage_iterations,
                 tool_args_cuts,
             } => {
+                let usage = broca_protocol::usage::step_usage(usage, usage_iterations.as_deref());
                 // A handoff is not a clean source reply, even when its target aliases the
                 // requested model and no distinct served_model is recorded.
                 let served_by_server_side_fallback = served_model.is_some()
@@ -5943,7 +5949,6 @@ where
                     });
                 }
                 total_retries_used = total_retries_used.saturating_add(retries_used);
-                last_step_usage = Some(usage);
                 // Each step is a separate billed call → ACCUMULATE, never overwrite,
                 // or a multi-step run under-reports its own total spend.
                 total_usage += usage;
@@ -5953,9 +5958,27 @@ where
                 if let Some(bytes) = attempt_bytes {
                     output_history.note_attempt(bytes);
                 }
-                output_history.note_step(usage, Some(&step_origin));
+                output_history.note_served_step(
+                    usage,
+                    Some(&step_origin),
+                    served_model.as_deref(),
+                    usage_iterations.as_deref(),
+                );
+                let native = broca_protocol::usage::model_usage(
+                    served_model.as_deref().unwrap_or(&step_origin.model_id),
+                    usage,
+                    usage_iterations.as_deref(),
+                )
+                .last()
+                .map(|(model, usage)| {
+                    (
+                        ModelHandle::new(&step_origin.provider_module_id, *model),
+                        *usage,
+                    )
+                });
+                compaction_history.previous_native_usage = native.as_ref().map(|(_, usage)| *usage);
+                compaction_history.previous_model = native.map(|(model, _)| model);
                 if let Some(bytes) = sent_bytes {
-                    compaction_history.previous_native_usage = Some(usage);
                     compaction_history.previous_provider_code = None;
                     compaction_history.previous_error = false;
                     compaction_history.previous_request_bytes = if fallback_model.is_some() {
@@ -5963,7 +5986,6 @@ where
                     } else {
                         Some(bytes)
                     };
-                    compaction_history.previous_model = Some(step_origin.clone());
                 }
                 if let Some(seal) = &control.shutdown_seal {
                     seal.note_usage(step_id, usage);

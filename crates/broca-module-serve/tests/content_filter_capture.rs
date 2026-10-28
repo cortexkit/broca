@@ -346,13 +346,47 @@ async fn l3_real_serve_readers_keep_the_stored_handoff_and_iterations() {
         iterations,
         wire_event(L3, "message_delta")["usage"]["iterations"]
     );
-    // The WAL retains both iterations, but the billing selector still assigns the top-level
-    // last-iteration usage to one model. Retention alone is not per-model accounting.
-    assert_eq!(usage.output_tokens, Some(29287));
-    assert_eq!(
-        refusal_fallback::usage_model(&source(), None, record),
-        Some(("anthropic", "claude-opus-4-8", None))
+    assert_eq!(usage.input_tokens, Some(6));
+    assert_eq!(usage.output_tokens, Some(31411));
+    assert_eq!(usage.cached_input_tokens, Some(40136));
+    assert_eq!(usage.cache_write_tokens, Some(4));
+    // Neither iteration reports a reasoning-token breakdown; the last iteration's top-level
+    // breakdown cannot describe reasoning usage for the whole step.
+    assert_eq!(usage.reasoning_tokens, None);
+    let mut projection = broca_core::replay::RunUsageProjection::new(
+        records
+            .iter()
+            .find_map(|record| match record {
+                WalRecord::RunStarted { run_id, .. } => Some(run_id.clone()),
+                _ => None,
+            })
+            .unwrap(),
     );
+    for record in &records {
+        projection.observe(record);
+        if matches!(
+            record,
+            WalRecord::ModelStepFinished {
+                step_id: StepId(1),
+                ..
+            }
+        ) {
+            break;
+        }
+    }
+    let by_model = serde_json::to_value(&projection.usage).unwrap()["by_model"].clone();
+    let by_model = by_model.as_array().unwrap();
+    assert_eq!(by_model.len(), 2);
+    let source_usage = by_model
+        .iter()
+        .find(|row| row["model"] == "claude-opus-5-5")
+        .unwrap();
+    let target_usage = by_model
+        .iter()
+        .find(|row| row["model"] == "claude-opus-4-8")
+        .unwrap();
+    assert_eq!(source_usage["output_tokens"], 2124);
+    assert_eq!(target_usage["output_tokens"], 29287);
     capture(
         "model-step-finished.json",
         &serde_json::to_vec(record).unwrap(),

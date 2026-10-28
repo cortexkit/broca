@@ -361,17 +361,22 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
   in the read's WAL tail come with the page; an older turn's come from a per-session cache that
   one pass over the whole WAL fills the first time a read needs them.
 - Every known run's `run.status` and `run.result` carry `usage` from completed
-  `ModelStepFinished` WAL records, including while the run is active. It always has
+  `ModelStepFinished` and billed `ModelStepRefused` WAL records, including while the run is
+  active. It always has
   `steps` and `unreported_steps`; a run with no completed step reports exactly
   `{"steps":0,"unreported_steps":0,"by_model":[]}`. A step is unreported only if **all five** token
   measurements are absent; a partial report or an explicit zero is reported.
   The optional totals `input_tokens`, `cached_input_tokens`, `cache_write_tokens`,
   `output_tokens` and `reasoning_tokens` sum only reported contributions, staying absent
   until a step reports that measurement. Partial totals are lower bounds, not estimates.
-  Input is fresh input only; reasoning is already included in output, never added to it.
+  Input is fresh input only, summed across serving iterations when a step uses more than
+  one model; reasoning is already included in output, never added to it.
   `by_model` is always present and empty until a step completes; then it lists contributions
-  in first-seen order for each `{provider, model, variant?}` frozen in the step's episode's
-  `RunConfig`.
+  in first-seen order for each `{provider, model, variant?}`. Ordinary calls use the frozen
+  episode model/variant; routed calls use their fallback model, and server handoffs use
+  each provider-reported iteration model without an episode variant. When iterations are
+  present, `steps` counts billed serving iterations rather than durable runner steps,
+  and each iteration's measurements replace the last-iteration-only top-level counters.
   Each entry carries the same counters and optional token totals. An unnamed variant is
   omitted, never an empty string; each entry contributes to the run totals, including
   unreported steps. These counters and the model breakdown do not change subscriber

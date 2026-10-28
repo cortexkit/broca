@@ -162,18 +162,76 @@ pub fn usage_model<'a>(
         _ => return None,
     };
     Some(match (route, served_model) {
-        (Some(model), _) => (
+        (_, Some(served)) => (episode_model.provider_module_id.as_str(), served, None),
+        (Some(model), None) => (
             model.provider_module_id.as_str(),
             model.model_id.as_str(),
             None,
         ),
-        (None, Some(served)) => (episode_model.provider_module_id.as_str(), served, None),
         (None, None) => (
             episode_model.provider_module_id.as_str(),
             episode_model.model_id.as_str(),
             episode_variant,
         ),
     })
+}
+
+/// Usage entries for a durable step, with the identity of each serving model. The
+/// episode variant applies only to an ordinary single-model response: the provider
+/// controls the models and settings used in a server-side iteration split.
+pub fn usage_by_model<'a>(
+    episode_model: &'a ModelHandle,
+    episode_variant: Option<&'a str>,
+    record: &'a WalRecord,
+) -> Vec<(&'a str, &'a str, Option<&'a str>, broca_protocol::Usage)> {
+    let (usage, iterations) = match record {
+        WalRecord::ModelStepFinished {
+            usage, fallback, ..
+        } => (*usage, fallback.usage_iterations.as_deref()),
+        WalRecord::ModelStepRefused {
+            usage,
+            usage_iterations,
+            ..
+        } => (*usage, usage_iterations.as_deref()),
+        _ => return Vec::new(),
+    };
+    let Some((provider, model, variant)) = usage_model(episode_model, episode_variant, record)
+    else {
+        return Vec::new();
+    };
+    broca_protocol::usage::model_usage(model, usage, iterations)
+        .into_iter()
+        .map(|(model, usage)| {
+            (
+                provider,
+                model,
+                if iterations.is_some() { None } else { variant },
+                usage,
+            )
+        })
+        .collect()
+}
+
+/// Total usage of a durable step, including logs written before iteration totals
+/// were stored in the top-level usage member.
+pub fn total_step_usage(record: &WalRecord) -> Option<broca_protocol::Usage> {
+    match record {
+        WalRecord::ModelStepFinished {
+            usage, fallback, ..
+        } => Some(broca_protocol::usage::step_usage(
+            *usage,
+            fallback.usage_iterations.as_deref(),
+        )),
+        WalRecord::ModelStepRefused {
+            usage,
+            usage_iterations,
+            ..
+        } => Some(broca_protocol::usage::step_usage(
+            *usage,
+            usage_iterations.as_deref(),
+        )),
+        _ => None,
+    }
 }
 
 /// The model that answered a committed step, when it was not the episode's own: the

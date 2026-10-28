@@ -2575,7 +2575,6 @@ fn replay_seeded_with_compaction<'a>(
             WalRecord::ModelStepFinished {
                 step_id,
                 assistant_message,
-                usage: u,
                 finish_reason,
                 retries_used,
                 tags: step_tags,
@@ -2590,9 +2589,10 @@ fn replay_seeded_with_compaction<'a>(
                 if let Some(schedule) = &fallback.refusal_fallback {
                     refusal_fallback = Some(schedule.clone());
                 }
-                ep.usage.accumulate(u);
+                let usage = crate::refusal_fallback::total_step_usage(rec).unwrap();
+                ep.usage.accumulate(&usage);
                 ep.retries_used = ep.retries_used.saturating_add(*retries_used);
-                ep.last_step_usage = Some(*u);
+                ep.last_step_usage = Some(usage);
                 ep.last_step_finish_reason = *finish_reason;
                 ep.completed_steps = placement.completed_steps();
                 ep.natural_stop_reason = None;
@@ -3140,10 +3140,7 @@ fn replay_seeded_with_compaction<'a>(
             // and the same step id commits the fallback model's answer. Its usage was billed, so
             // it counts toward the episode's totals, and it records the schedule it armed.
             WalRecord::ModelStepRefused {
-                step_id,
-                usage: refused_usage,
-                schedule,
-                ..
+                step_id, schedule, ..
             } => {
                 if !ep.refused_steps.insert(*step_id) {
                     return Err(ReplayError::CorruptLineage {
@@ -3155,7 +3152,8 @@ fn replay_seeded_with_compaction<'a>(
                         ),
                     });
                 }
-                ep.usage.accumulate(refused_usage);
+                ep.usage
+                    .accumulate(&crate::refusal_fallback::total_step_usage(rec).unwrap());
                 refusal_fallback = Some(schedule.clone());
             }
             // A resume's own account of what it found. Informational under the same contract:
@@ -3519,21 +3517,20 @@ impl RunUsageProjection {
                     self.model = Some((config.model.clone(), config.variant.clone()));
                 }
             }
-            WalRecord::ModelStepFinished { usage, .. }
-            | WalRecord::ModelStepRefused { usage, .. }
+            WalRecord::ModelStepFinished { .. } | WalRecord::ModelStepRefused { .. }
                 if self.active =>
             {
                 // A refused call was billed, so it counts as a call of the model that refused.
                 if let Some((model, variant)) = &self.model {
                     let variant = variant.as_deref().filter(|value| !value.is_empty());
-                    if let Some((provider, model, variant)) =
-                        crate::refusal_fallback::usage_model(model, variant, record)
+                    for (provider, model, variant, usage) in
+                        crate::refusal_fallback::usage_by_model(model, variant, record)
                     {
                         self.usage.record_step(
                             provider,
                             model,
                             variant,
-                            reported_step_usage(usage),
+                            reported_step_usage(&usage),
                         );
                     }
                 }
@@ -3724,7 +3721,6 @@ pub fn reconcile_run_state<'a>(
             } if rid.0 == run_id => structured_output_result = Some(result.clone()),
             WalRecord::ModelStepFinished {
                 assistant_message,
-                usage,
                 finish_reason,
                 retries_used,
                 ..
@@ -3734,7 +3730,7 @@ pub fn reconcile_run_state<'a>(
                 }
                 active_zero_step_seed = false;
                 has_completed_step = true;
-                total_usage.accumulate(usage);
+                total_usage.accumulate(&crate::refusal_fallback::total_step_usage(rec).unwrap());
                 total_retries_used = total_retries_used.saturating_add(*retries_used);
                 last_step_finish_reason = *finish_reason;
                 // A step that finished no longer waits for its ride.
@@ -3743,6 +3739,9 @@ pub fn reconcile_run_state<'a>(
                         state.ride_wait_deadline_ms = None;
                     }
                 }
+            }
+            WalRecord::ModelStepRefused { .. } => {
+                total_usage.accumulate(&crate::refusal_fallback::total_step_usage(rec).unwrap());
             }
             WalRecord::ToolBatchStarted { .. } => indeterminate_tool_calls.reset_batch(),
             WalRecord::ToolDispatchIntent {
