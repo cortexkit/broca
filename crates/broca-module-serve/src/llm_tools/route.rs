@@ -64,8 +64,8 @@ impl ConsumerFormat {
         let declares = |name: &str| capabilities.is_some_and(|caps| caps.iter().any(|c| c == name));
         let result_format = if declares(TOOL_RESULT_V1) {
             Some(TOOL_RESULT_V1)
-        } else if declares(cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY) {
-            Some(cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY)
+        } else if declares("content/v1") {
+            Some("content/v1")
         } else {
             None
         };
@@ -514,7 +514,7 @@ impl LlmTools {
             "semantics":1, "capabilities":[], "description":"Classify one item with a decision model.",
             "input_schema":schema,
             "modes":cortexkit_llm_tools::MODES,
-            "result_format":result_format.unwrap_or(cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY),
+            "result_format":result_format.unwrap_or(TOOL_RESULT_V1),
         });
         if self.config.advertise_tags {
             tool["capabilities"] = json!([classify::TAG]);

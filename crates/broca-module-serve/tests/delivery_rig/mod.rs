@@ -159,6 +159,8 @@ impl Step {
 /// What the provider and tool plane of the rig do, shared with the test.
 #[derive(Default)]
 pub struct Script {
+    /// Optional real tool transport for serve-path tests; ordinary scripts keep their fake plane.
+    pub tool_plane: Mutex<Option<Arc<dyn broca_core::ToolPlane>>>,
     /// A synthetic tool's catalog schema and semantics pin; absent for legacy direct tools.
     pub schema_pin: Mutex<Option<broca_wal::DispatchSchemaPin>>,
     pub attempt_time: Mutex<Option<u64>>,
@@ -338,26 +340,40 @@ struct ScriptedTools(Arc<Script>);
 impl ToolPlane for ScriptedTools {
     async fn batch_started(
         &self,
-        _ctx: &BatchCtx,
-        _calls: &[ToolCall],
-        _manifest: &ToolManifest,
+        ctx: &BatchCtx,
+        calls: &[ToolCall],
+        manifest: &ToolManifest,
     ) -> Result<(), ToolPlaneError> {
+        let real = self.0.tool_plane.lock().unwrap().clone();
+        if let Some(real) = real {
+            return real.batch_started(ctx, calls, manifest).await;
+        }
         Ok(())
     }
 
-    fn dispatch_target(&self, _ctx: &BatchCtx, _tool_call_id: &ToolCallId) -> Option<String> {
+    fn dispatch_target(&self, ctx: &BatchCtx, tool_call_id: &ToolCallId) -> Option<String> {
+        if let Some(real) = self.0.tool_plane.lock().unwrap().as_ref() {
+            return real.dispatch_target(ctx, tool_call_id);
+        }
         Some(WORK_MODULE.into())
     }
     fn dispatch_schema_pin(
         &self,
-        _ctx: &BatchCtx,
-        _id: &ToolCallId,
-        _tool: &str,
+        ctx: &BatchCtx,
+        id: &ToolCallId,
+        tool: &str,
     ) -> Option<broca_wal::DispatchSchemaPin> {
+        if let Some(real) = self.0.tool_plane.lock().unwrap().as_ref() {
+            return real.dispatch_schema_pin(ctx, id, tool);
+        }
         self.0.schema_pin.lock().unwrap().clone()
     }
 
-    async fn dispatch(&self, _ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
+    async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
+        let real = self.0.tool_plane.lock().unwrap().clone();
+        if let Some(real) = real {
+            return real.dispatch(ctx, call).await;
+        }
         loop {
             let gate = self.0.tool_gate.notified();
             if !*self.0.hold_tool.lock().unwrap() {
@@ -395,7 +411,11 @@ impl ToolPlane for ScriptedTools {
         })
     }
 
-    async fn batch_finished(&self, _ctx: &BatchCtx) -> Result<(), ToolPlaneError> {
+    async fn batch_finished(&self, ctx: &BatchCtx) -> Result<(), ToolPlaneError> {
+        let real = self.0.tool_plane.lock().unwrap().clone();
+        if let Some(real) = real {
+            return real.batch_finished(ctx).await;
+        }
         *self.0.batch_finishes.lock().unwrap() += 1;
         Ok(())
     }

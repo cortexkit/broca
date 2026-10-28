@@ -1507,7 +1507,7 @@ async fn a_tool_result_v1_consumer_is_held_for_consent_and_gets_structured_answe
         }
     };
     assert_eq!(catalog(consumer).await, "tool-result/v1");
-    assert_eq!(catalog(ConsumerFormat::default()).await, "content/v1");
+    assert_eq!(catalog(ConsumerFormat::default()).await, "tool-result/v1");
 
     let request = json!({"name":"llm_classify","arguments":args("typesafe/jev-1.13.0"),"call_key":"raw:tool-result"});
     let held = tools

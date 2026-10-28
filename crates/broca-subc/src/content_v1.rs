@@ -1,8 +1,7 @@
-//! Explicit mapping for negotiated `content/v1` tool results.
+//! Explicit mapping for negotiated `tool-result/v1` tool results.
 //!
-//! Callers must establish both the route's `content/v1` declaration and the tool catalog's
-//! opt-in before decoding a reply with the role's types. Dispatch supplies that context only
-//! when the held-call integration seams are installed; reply shape alone is not negotiation.
+//! Callers must establish both the route's declaration and the tool catalog's opt-in before
+//! decoding a reply with the role's types; reply shape alone is not negotiation.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use broca_protocol::{ToolCallId, ToolOutput, ToolOutputPart, ToolResult};
@@ -33,8 +32,8 @@ impl std::fmt::Display for MapError {
 
 impl std::error::Error for MapError {}
 
-/// Validate and map a negotiated, final reply, preserving content order and provider error codes.
-/// `structuredContent` is program-facing and is never included in the model output.
+/// Validate a negotiated final reply, then use the legacy storage normalization. A transport
+/// change must not change stored text or rendered prompts, including errors and media notices.
 pub fn map_content_v1_result(
     id: &ToolCallId,
     reply: &result::ToolResult,
@@ -44,14 +43,21 @@ pub fn map_content_v1_result(
         return Err(MapError::ProviderHeld);
     }
 
-    let mut parts = Vec::new();
-    // The canonical result has no error-code field. Keep the code in a separate text part so
-    // provider text stays verbatim and an error remains distinguishable even when it has images.
-    if let Some(code) = &reply.error_code {
-        parts.push(ToolOutputPart::Text {
-            text: format!("[tool error: {code}]"),
-        });
+    let raw = serde_json::to_value(reply).expect("tool results serialize as JSON");
+    if reply
+        .content
+        .iter()
+        .all(|part| matches!(part, ContentPart::Text { .. } | ContentPart::Image(_)))
+    {
+        for part in &reply.content {
+            if let ContentPart::Image(image) = part {
+                STANDARD.decode(&image.data).map_err(MapError::ImageData)?;
+            }
+        }
+        return Ok(crate::subc_plane::map_legacy_call_tool_result(id, &raw));
     }
+    // Preserve the existing lossless fallback for future, unsupported content kinds.
+    let mut parts = Vec::new();
     for part in &reply.content {
         let text = match part {
             ContentPart::Text { text } => text.clone(),
@@ -176,10 +182,8 @@ pub(crate) mod tests {
                 let result = map(reply).unwrap();
                 assert_eq!(
                     result.output,
-                    ToolOutput::Parts {
-                        parts: vec![ToolOutputPart::Text {
-                            text: String::new()
-                        }]
+                    ToolOutput::Text {
+                        text: String::new()
                     }
                 );
             }

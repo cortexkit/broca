@@ -293,6 +293,7 @@ pub struct RouteHandle {
     pub channel: u16,
     pub epoch: u32,
     conn: ConnToken,
+    pub(crate) reads_tool_result: bool,
     pub(crate) reads_held_reply: bool,
 }
 
@@ -302,6 +303,7 @@ impl RouteHandle {
             channel,
             epoch,
             conn,
+            reads_tool_result: false,
             reads_held_reply: false,
         }
     }
@@ -1152,14 +1154,18 @@ impl SubcConnection {
         module_id: &str,
         identity: &BindIdentity,
         scope: Option<&subc_protocol::scope::ScopeSelector>,
+        tool_result_v1: bool,
         provider_held_installed: bool,
     ) -> ConnResult<RouteHandle> {
-        let capabilities = provider_held_installed.then(|| {
-            vec![
-                cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into(),
+        let capabilities = if provider_held_installed {
+            Some(vec![
+                cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into(),
                 cortexkit_role_tool_provider::HELD_REPLY_V1.into(),
-            ]
-        });
+            ])
+        } else {
+            tool_result_v1
+                .then(|| vec![cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into()])
+        };
         self.route_open_target_with_capabilities(
             RouteTarget::ToolProvider {
                 module_id: module_id.into(),
@@ -1236,7 +1242,7 @@ impl SubcConnection {
                 "v1".into(),
             )])),
             Some(vec![
-                cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into(),
+                cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into(),
                 cortexkit_role_tool_provider::HELD_REPLY_V1.into(),
             ]),
         )
@@ -1265,7 +1271,7 @@ impl SubcConnection {
         identity.project_id = client_project_id.map(str::to_owned);
         let capabilities = held.then(|| {
             vec![
-                cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into(),
+                cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into(),
                 cortexkit_role_tool_provider::HELD_REPLY_V1.into(),
             ]
         });
@@ -1535,12 +1541,15 @@ impl SubcConnection {
         let reads_held_reply = cortexkit_role_tool_provider::consumer_reads_held_reply_v1(
             consumer_capabilities.as_deref(),
         );
+        let reads_tool_result = cortexkit_role_tool_provider::consumer_reads_tool_result_v1(
+            consumer_capabilities.as_deref(),
+        );
         let req = ClientControlRequest::RouteOpen {
             identity,
             target,
             consumer_identity: self.shared.consumer_identity.clone(),
-            // Result-format capabilities are installed as a pair by the tool plane. Role,
-            // plan-fetch and management callers keep their previous undeclared format.
+            // Only dispatch routes negotiate result bodies. Role discovery and management
+            // routes keep their previous undeclared format; held replies are a separate opt-in.
             consumer_capabilities,
             // Admission facts come from a configured carrier module; the runner's
             // consumer legs carry none.
@@ -1562,6 +1571,7 @@ impl SubcConnection {
                         route_epoch,
                     }) => {
                         let mut handle = RouteHandle::new(route_channel, route_epoch, conn);
+                        handle.reads_tool_result = reads_tool_result;
                         handle.reads_held_reply = reads_held_reply;
                         Ok(handle)
                     }
@@ -4369,16 +4379,17 @@ impl InProcessModuleEnd {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
-    async fn dispatch_capabilities_are_installed_together_and_role_routes_stay_undeclared() {
-        for installed in [false, true] {
+    async fn dispatch_result_capability_is_independent_of_held_and_role_routes_stay_undeclared() {
+        for (result_v1, installed) in [(false, false), (true, false), (false, true)] {
             let (conn, mut write_rx, pending) = route_open_test_connection();
             let identity = broca_protocol::BindIdentity {
                 project_root: "/project".into(),
                 harness: "broca".into(),
                 session: "session".into(),
             };
-            let open =
-                conn.route_open_dispatch_single_attempt("provider", &identity, None, installed);
+            let open = conn.route_open_dispatch_single_attempt(
+                "provider", &identity, None, result_v1, installed,
+            );
             tokio::pin!(open);
             let request = tokio::select! {
                 result = &mut open => panic!("premature result: {result:?}"),
@@ -4388,7 +4399,12 @@ mod tests {
             if installed {
                 assert_eq!(
                     raw["consumer_capabilities"],
-                    serde_json::json!(["content/v1", "held-reply/v1"])
+                    serde_json::json!(["tool-result/v1", "held-reply/v1"])
+                );
+            } else if result_v1 {
+                assert_eq!(
+                    raw["consumer_capabilities"],
+                    serde_json::json!(["tool-result/v1"])
                 );
             } else {
                 assert_eq!(
@@ -4399,7 +4415,9 @@ mod tests {
                 );
             }
             answer_route_open(&pending, &request, 7);
-            assert_eq!(open.await.unwrap().reads_held_reply, installed);
+            let route = open.await.unwrap();
+            assert_eq!(route.reads_held_reply, installed);
+            assert_eq!(route.reads_tool_result, result_v1 || installed);
         }
         let (conn, mut write_rx, pending) = route_open_test_connection();
         let identity = broca_protocol::BindIdentity {
