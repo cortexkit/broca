@@ -5,17 +5,43 @@
 //! reclaim pass owns reopening those sessions and removing their old markers;
 //! a normal open records succession but never deletes another writer's marker opportunistically.
 
+use broca_protocol::BindIdentity;
 use broca_wal::{fs_ops, head_proof::SyncedPrefix, Wal, WalError, WalRecord};
+use std::io::Write;
 use std::path::PathBuf;
+
+/// Decode the marker's lease identity, including for a writer that never admitted a run.
+/// Callers must also compare its session address with the marker filename before acquiring it.
+pub fn decode_writer_marker(bytes: &[u8]) -> Result<BindIdentity, String> {
+    let marker: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    let object = marker.as_object().ok_or("writer marker is not an object")?;
+    if object.len() != 2 || marker.get("version").and_then(|value| value.as_u64()) != Some(1) {
+        return Err("unsupported writer marker version or fields".into());
+    }
+    let identity = marker
+        .get("identity")
+        .ok_or("writer marker has no identity")?;
+    if identity.as_object().is_none_or(|object| object.len() != 3) {
+        return Err("writer marker identity must contain exactly the bind triple".into());
+    }
+    let identity: BindIdentity =
+        serde_json::from_value(identity.clone()).map_err(|error| error.to_string())?;
+    identity.validate_keyable()?;
+    Ok(identity)
+}
 
 pub(crate) struct WriterContext {
     pub(crate) root: PathBuf,
     pub(crate) address: String,
+    pub(crate) identity: BindIdentity,
+    pub(crate) cause: Option<&'static str>,
 }
 
 pub(crate) struct OpenWriter {
     marker: PathBuf,
     writer_id: [u8; 16],
+    identity: BindIdentity,
 }
 
 impl WriterContext {
@@ -37,10 +63,20 @@ impl WriterContext {
         fs_ops::sync_dir(&self.root).map_err(WalError::Io)?;
         let id: String = writer_id.iter().map(|byte| format!("{byte:02x}")).collect();
         let marker = directory.join(format!("{}.{id}", self.address));
+        let temporary = marker.with_extension(format!("{id}.tmp"));
+        let identity = self.identity;
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "identity": &identity,
+        }))
+        .map_err(|error| WalError::Io(std::io::Error::other(error)))?;
         let mut options = fs_ops::OpenOptions::new();
         options.write(true).create_new(true);
-        let file = options.open(&marker).map_err(WalError::Io)?;
+        let mut file = options.open(&temporary).map_err(WalError::Io)?;
+        file.write_all(&bytes).map_err(WalError::Io)?;
         file.sync_all().map_err(WalError::Io)?;
+        drop(file);
+        fs_ops::rename(&temporary, &marker).map_err(WalError::Io)?;
         fs_ops::sync_dir(&directory).map_err(WalError::Io)?;
 
         // Recovery is already complete, but its surviving prefix must be synced before it is
@@ -58,15 +94,26 @@ impl WriterContext {
             writer_id,
             previous_writer_id,
             recovered_through_seq: wal.last_seq(),
-            cause: if previous_writer_id.is_some() {
-                "reopen"
-            } else {
-                "new"
-            }
-            .into(),
+            cause: self
+                .cause
+                .unwrap_or(if previous_writer_id.is_some() {
+                    "reopen"
+                } else {
+                    "new"
+                })
+                .into(),
         };
         let (seq, synced) = append_barrier(wal, fence, &opened, now())?;
-        Ok((OpenWriter { marker, writer_id }, seq, opened, synced))
+        Ok((
+            OpenWriter {
+                marker,
+                writer_id,
+                identity,
+            },
+            seq,
+            opened,
+            synced,
+        ))
     }
 }
 
@@ -84,11 +131,11 @@ impl OpenWriter {
         Ok((seq, record, synced))
     }
 
-    pub(crate) fn unlink(self) -> Result<(), WalError> {
+    pub(crate) fn unlink(self) -> Result<(PathBuf, BindIdentity), WalError> {
         // No directory sync is needed after unlink. A resurrected marker costs a
         // redundant successor; the durable close still forbids this writer from appending.
         fs_ops::remove_file(&self.marker).map_err(WalError::Io)?;
-        Ok(())
+        Ok((self.marker, self.identity))
     }
 }
 

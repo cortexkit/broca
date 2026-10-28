@@ -33,6 +33,7 @@ use crate::lease::{LeaseHandle, OwnedWalTenure};
 mod extraction;
 #[path = "open_writers.rs"]
 mod open_writers;
+pub use open_writers::decode_writer_marker;
 #[cfg(feature = "test-clock")]
 thread_local! {
     static WRITER_FS_FOR_TEST: std::cell::RefCell<Option<Arc<dyn broca_wal::fs_ops::FsOps>>> = const { std::cell::RefCell::new(None) };
@@ -2356,6 +2357,25 @@ enum WalCommand {
 #[derive(Clone)]
 pub(crate) struct StampClock(Arc<dyn Fn() -> u64 + Send + Sync>);
 
+#[derive(Default)]
+struct OwnedWriterStartup {
+    cause: Option<&'static str>,
+    #[cfg(feature = "test-clock")]
+    fs: Option<Arc<dyn broca_wal::fs_ops::FsOps>>,
+}
+
+#[cfg(feature = "test-clock")]
+fn with_writer_fs<T>(fs: Option<Arc<dyn broca_wal::fs_ops::FsOps>>, work: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Arc<dyn broca_wal::fs_ops::FsOps>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WRITER_FS_FOR_TEST.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+    let _restore = Restore(WRITER_FS_FOR_TEST.with(|slot| slot.replace(fs)));
+    work()
+}
+
 impl StampClock {
     pub(crate) fn wall() -> Self {
         Self(Arc::new(broca_wal::framing::appended_ms_now))
@@ -2749,6 +2769,8 @@ impl WalHandle {
             .map(|root| open_writers::WriterContext {
                 root,
                 address: session_addr(session),
+                identity: session.clone(),
+                cause: None,
             });
         Self::spawn_proven_with_clock(wal, seq, fence, None, lease, (StampClock::wall(), context))
     }
@@ -2804,6 +2826,8 @@ impl WalHandle {
             .map(|root| open_writers::WriterContext {
                 root,
                 address: session_addr(session),
+                identity: session.clone(),
+                cause: None,
             });
         Self::spawn_proven_with_clock(
             wal,
@@ -2881,16 +2905,33 @@ impl WalHandle {
             .map(|root| open_writers::WriterContext {
                 root,
                 address: session_addr(&check_session),
+                identity: check_session.clone(),
+                cause: None,
             });
-        let mut handle = Self::spawn_proven_with_clock(
-            wal,
-            last_seq,
-            fence,
-            observer,
-            None,
-            (StampClock::wall(), context),
-        )
-        .map_err(WalOpenError::from_write)?;
+        let owner = WriterOwner {
+            wal: Some(wal),
+            lease: Some(lease),
+        };
+        let (mut handle, lease) = spawn_blocking(JobKind::WalWriter, move || {
+            let (wal, lease) = owner.into_parts();
+            let handle = Self::spawn_proven_with_clock(
+                wal,
+                last_seq,
+                fence,
+                observer,
+                None,
+                (StampClock::wall(), context),
+            )
+            .map_err(WalOpenError::from_write)?;
+            // On cancellation, tuple drop joins the handle before releasing its lease.
+            Ok::<_, WalOpenError>((handle, lease.expect("guarded open retains its lease")))
+        })
+        .await
+        .map_err(|error| {
+            WalOpenError::Failed(WalWriteError::Failed(format!(
+                "WAL startup task failed: {error}"
+            )))
+        })??;
         handle.bind_media_capture(check_store.as_ref(), &check_session);
         handle.move_check = Some(Arc::new(move || {
             check_store.check_move(&check_session, true)
@@ -2947,6 +2988,71 @@ impl WalHandle {
         retention: Option<u64>,
         session_class: Option<String>,
     ) -> Result<WalHandle, WalOpenError> {
+        Self::open_and_spawn_owned_with_cause(
+            wal_store,
+            session,
+            tenure,
+            observer,
+            retention,
+            session_class,
+            OwnedWriterStartup::default(),
+        )
+        .await
+    }
+
+    /// Supersede a stopped writer under the same owned session tenure as ordinary admission.
+    pub async fn open_and_spawn_owned_for_reclaim<W: WalStore + 'static>(
+        wal_store: Arc<W>,
+        session: BindIdentity,
+        tenure: OwnedWalTenure,
+    ) -> Result<WalHandle, WalOpenError> {
+        Self::open_and_spawn_owned_with_cause(
+            wal_store,
+            session,
+            tenure,
+            None,
+            None,
+            None,
+            OwnedWriterStartup {
+                cause: Some("reclaim"),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Run the owned reclaim opener with the power-loss harness on every filesystem thread.
+    #[cfg(feature = "test-clock")]
+    pub async fn open_and_spawn_owned_for_reclaim_with_fs_for_test<W: WalStore + 'static>(
+        wal_store: Arc<W>,
+        session: BindIdentity,
+        tenure: OwnedWalTenure,
+        fs: Arc<dyn broca_wal::fs_ops::FsOps>,
+    ) -> Result<WalHandle, WalOpenError> {
+        Self::open_and_spawn_owned_with_cause(
+            wal_store,
+            session,
+            tenure,
+            None,
+            None,
+            None,
+            OwnedWriterStartup {
+                cause: Some("reclaim"),
+                fs: Some(fs),
+            },
+        )
+        .await
+    }
+
+    async fn open_and_spawn_owned_with_cause<W: WalStore + 'static>(
+        wal_store: Arc<W>,
+        session: BindIdentity,
+        tenure: OwnedWalTenure,
+        observer: Option<RecordObserver>,
+        retention: Option<u64>,
+        session_class: Option<String>,
+        startup: OwnedWriterStartup,
+    ) -> Result<WalHandle, WalOpenError> {
         // Bind before touching I/O: a wrong tenure refuses without creating
         // directories or files, truncating a torn tail, or writing lineage.
         // The tenure is consumed on both paths.
@@ -2976,26 +3082,36 @@ impl WalHandle {
         }
         let check_store = wal_store.clone();
         let check_session = session.clone();
+        #[cfg(feature = "test-clock")]
+        let open_fs = startup.fs.clone();
         let opened = spawn_blocking(JobKind::WalWriter, move || {
-            // Authority stays with this closure until the descriptor is gone:
-            // no second acquisition happens here, the caller-owned lease is
-            // reused through the store open, which also uses it to authorize
-            // restoring an archived log before the descriptor exists.
-            let lease = tenure.into_lease();
-            let fence = lease.epoch();
-            let (wal, lease) = wal_store
-                .open_owned_writer(&session, retention, session_class.as_deref(), lease)
-                .map_err(WalOpenError::from_wal)?;
-            // `prove_recovery` drops the descriptor before returning its
-            // error, so by the time its Err reaches here the WAL is already
-            // closed and only the tenure remains in the guard below.
-            let (wal, last_seq) = Self::prove_recovery(wal).map_err(WalOpenError::from_write)?;
-            Ok::<_, WalOpenError>(OpenedOwned {
-                wal: Some(wal),
-                lease: Some(lease),
-                last_seq,
-                fence,
-            })
+            let work = move || {
+                // Authority stays with this closure until the descriptor is gone:
+                // no second acquisition happens here, the caller-owned lease is
+                // reused through the store open, which also uses it to authorize
+                // restoring an archived log before the descriptor exists.
+                let lease = tenure.into_lease();
+                let fence = lease.epoch();
+                let (wal, lease) = wal_store
+                    .open_owned_writer(&session, retention, session_class.as_deref(), lease)
+                    .map_err(WalOpenError::from_wal)?;
+                // `prove_recovery` drops the descriptor before returning its
+                // error. The local lease stays held until this closure returns,
+                // after the writable descriptor has closed.
+                let (wal, last_seq) =
+                    Self::prove_recovery(wal).map_err(WalOpenError::from_write)?;
+                Ok::<_, WalOpenError>(OpenedOwned {
+                    wal: Some(wal),
+                    lease: Some(lease),
+                    last_seq,
+                    fence,
+                })
+            };
+            #[cfg(feature = "test-clock")]
+            if let Some(fs) = open_fs {
+                return broca_wal::fs_ops::with_fs_ops(fs, work);
+            }
+            work()
         })
         .await
         .map_err(|error| {
@@ -3003,16 +3119,6 @@ impl WalHandle {
                 "WAL open/recovery task failed: {error}"
             )))
         })??;
-        let mut opened = opened;
-        let wal = opened
-            .wal
-            .take()
-            .expect("owned open holds its WAL until handoff");
-        let lease = opened
-            .lease
-            .take()
-            .expect("owned open holds its tenure until handoff");
-        let (last_seq, fence) = (opened.last_seq, opened.fence);
         // The writer task owns the lease until the WAL is closed: dropping the
         // handle without shutdown still joins through the task, and shutdown
         // joins before the task drops the lease. No separate lease is returned.
@@ -3021,16 +3127,49 @@ impl WalHandle {
             .map(|root| open_writers::WriterContext {
                 root,
                 address: session_addr(&check_session),
+                identity: check_session.clone(),
+                cause: startup.cause,
             });
-        let mut handle = Self::spawn_proven_with_clock(
-            wal,
-            last_seq,
-            fence,
-            observer,
-            Some(lease),
-            (StampClock::wall(), context),
-        )
-        .map_err(WalOpenError::from_write)?;
+        // Writer startup replays the log and waits for the marker/open barrier's
+        // ready acknowledgement. Neither operation may block an async runtime worker.
+        // Keep OpenedOwned intact until this blocking job runs, including on cancellation.
+        let mut handle = spawn_blocking(JobKind::WalWriter, move || {
+            let mut opened = opened;
+            let wal = opened
+                .wal
+                .take()
+                .expect("owned open holds its WAL until handoff");
+            let lease = opened
+                .lease
+                .take()
+                .expect("owned open holds its tenure until handoff");
+            let (last_seq, fence) = (opened.last_seq, opened.fence);
+            let spawn = || {
+                Self::spawn_proven_with_clock(
+                    wal,
+                    last_seq,
+                    fence,
+                    observer,
+                    Some(lease),
+                    (StampClock::wall(), context),
+                )
+                .map_err(WalOpenError::from_write)
+            };
+            #[cfg(feature = "test-clock")]
+            {
+                with_writer_fs(startup.fs, spawn)
+            }
+            #[cfg(not(feature = "test-clock"))]
+            {
+                spawn()
+            }
+        })
+        .await
+        .map_err(|error| {
+            WalOpenError::Failed(WalWriteError::Failed(format!(
+                "WAL startup task failed: {error}"
+            )))
+        })??;
         handle.bind_media_capture(check_store.as_ref(), &check_session);
         handle.move_check = Some(Arc::new(move || {
             check_store.check_move(&check_session, true)
@@ -4576,11 +4715,85 @@ fn close_writer_identity(
                 obs.observe_tap(seq, fence, wal.lineage_id(), &record);
             }
         }
-        if let Err(error) = writer.unlink() {
-            tracing::warn!(%error, "writer-id/v1: durable writer close succeeded but marker unlink failed; reclaim will remove the marker");
+        match writer.unlink() {
+            Ok((marker, identity)) => unlink_settled_predecessors(&marker, &identity),
+            Err(error) => {
+                tracing::warn!(%error, "writer-id/v1: durable writer close succeeded but marker unlink failed; reclaim will remove the marker")
+            }
         }
     }
     Ok(())
+}
+
+fn unlink_settled_predecessors(marker: &Path, identity: &BindIdentity) {
+    use broca_wal::fs_ops;
+    use std::io::Read;
+
+    // This writer has published a newer WriterOpened and WriterClosed. Remove only
+    // verified predecessor markers while its session lease is still held. A close
+    // whose publication fails never reaches this cleanup.
+    let Some(directory) = marker.parent() else {
+        return;
+    };
+    let address = session_addr(identity);
+    let entries = match fs_ops::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(target: "writer_reclaim", path = %directory.display(), %error, "closed writer could not scan predecessor markers");
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(target: "writer_reclaim", path = %directory.display(), %error, "closed writer could not read a predecessor marker entry");
+                continue;
+            }
+        };
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some((found_address, writer)) = name.split_once('.') else {
+            continue;
+        };
+        if found_address != address
+            || writer.len() != 32
+            || !writer
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            continue;
+        }
+        let remove = || -> Result<(), String> {
+            if !entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_file()
+            {
+                return Err("writer marker is not a regular file".into());
+            }
+            let mut bytes = Vec::new();
+            fs_ops::File::open(&path)
+                .map_err(|error| error.to_string())?
+                .take(64 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| error.to_string())?;
+            if bytes.len() > 64 * 1024 {
+                return Err("writer marker exceeds the size limit".into());
+            }
+            if decode_writer_marker(&bytes)? != *identity {
+                return Err("writer marker identity does not match the closed session".into());
+            }
+            fs_ops::remove_file(&path).map_err(|error| error.to_string())
+        };
+        if let Err(error) = remove() {
+            // Retain any marker whose validation or removal fails. A later
+            // lease-gated reclaim pass must retry the remaining marker.
+            tracing::warn!(target: "writer_reclaim", path = %path.display(), %error, "closed writer retained predecessor marker");
+        }
+    }
 }
 
 /// Records the first fatal writer error, which every later append and barrier then reports.
@@ -5765,6 +5978,8 @@ mod head_proof_tests {
                 Some(open_writers::WriterContext {
                     root: root.0.clone(),
                     address: session_addr(&session),
+                    identity: session.clone(),
+                    cause: None,
                 }),
             ),
         );
@@ -5834,6 +6049,8 @@ mod head_proof_tests {
                 Some(open_writers::WriterContext {
                     root: root.0.clone(),
                     address: session_addr(session),
+                    identity: session.clone(),
+                    cause: None,
                 }),
             ),
         )
@@ -5943,6 +6160,8 @@ mod head_proof_tests {
                 Some(open_writers::WriterContext {
                     root: root.0.clone(),
                     address: session_addr(&session),
+                    identity: session.clone(),
+                    cause: None,
                 }),
             ),
         )

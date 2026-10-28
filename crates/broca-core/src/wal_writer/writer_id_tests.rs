@@ -286,6 +286,10 @@ async fn writer_opened_precedes_every_append() {
                 .join("open-writers")
                 .join(format!("{}.{expected_id}", session_addr(&root.session)))]
         );
+        assert_eq!(
+            decode_writer_marker(&std::fs::read(&root.markers()[0]).unwrap()).unwrap(),
+            root.session,
+        );
         for _ in 0..3 {
             assert!(handle.record(ordinary()).into_result().unwrap() > opened.seq);
         }
@@ -398,6 +402,8 @@ async fn lifecycle_observation_follows_durability_and_precedes_marker_unlink() {
             Some(open_writers::WriterContext {
                 root: root.path.clone(),
                 address: session_addr(&root.session),
+                identity: root.session.clone(),
+                cause: None,
             }),
         ),
     )
@@ -438,4 +444,174 @@ fn writer_records_require_writer_id_and_round_trip() {
             broca_wal::framing::DecodeStep::Record { .. }
         ));
     }
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn owned_writer_ready_barrier_does_not_block_the_runtime() {
+    use broca_wal::fs_ops::{FileOps, FsOps, OpenOptions, ReadDir, RealFs};
+    use std::fs::Metadata;
+    use std::path::Path;
+    use std::time::Duration;
+
+    struct PauseMarkerRename {
+        gate: Mutex<Option<(tokio::sync::oneshot::Sender<()>, std_mpsc::Receiver<()>)>>,
+    }
+    impl FsOps for PauseMarkerRename {
+        fn open(&self, path: &Path, options: &OpenOptions) -> io::Result<Box<dyn FileOps>> {
+            RealFs.open(path, options)
+        }
+        fn metadata(&self, path: &Path) -> io::Result<Metadata> {
+            RealFs.metadata(path)
+        }
+        fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+            RealFs.create_dir_all(path)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            if to
+                .parent()
+                .is_some_and(|parent| parent.ends_with("open-writers"))
+            {
+                if let Some((reached, release)) = self.gate.lock().unwrap().take() {
+                    let _ = reached.send(());
+                    release
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(|error| {
+                            io::Error::other(format!(
+                                "runtime could not release the writer ready barrier: {error}"
+                            ))
+                        })?;
+                }
+            }
+            RealFs.rename(from, to)
+        }
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            RealFs.remove_file(path)
+        }
+        fn sync_dir(&self, path: &Path) -> io::Result<()> {
+            RealFs.sync_dir(path)
+        }
+        fn create_dir(&self, path: &Path) -> io::Result<()> {
+            RealFs.create_dir(path)
+        }
+        fn hard_link(&self, from: &Path, to: &Path) -> io::Result<()> {
+            RealFs.hard_link(from, to)
+        }
+        fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+            RealFs.canonicalize(path)
+        }
+        fn read_dir(&self, path: &Path) -> io::Result<ReadDir> {
+            RealFs.read_dir(path)
+        }
+        fn validate_if_exists(&self, path: &Path) -> io::Result<()> {
+            RealFs.validate_if_exists(path)
+        }
+    }
+
+    let root = Root::new(true);
+    let (reached_tx, reached) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = std_mpsc::channel();
+    let fs = Arc::new(PauseMarkerRename {
+        gate: Mutex::new(Some((reached_tx, release_rx))),
+    });
+    let tenure = crate::lease::WalLeaseDomain::new(root.path.join("leases"))
+        .acquire(&root.session)
+        .unwrap();
+    let opening = WalHandle::open_and_spawn_owned_for_reclaim_with_fs_for_test(
+        Arc::new(FileWalStore::with_config(
+            root.path.join("wal"),
+            broca_wal::WalConfig::OVERHAUL,
+        )),
+        root.session.clone(),
+        tenure,
+        fs,
+    );
+    let release_on_runtime = async {
+        reached.await.unwrap();
+        let _ = release.send(());
+    };
+    let (opened, ()) = tokio::join!(opening, release_on_runtime);
+    opened
+        .expect("owned startup must leave the runtime free to release its barrier")
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn owned_overhaul_writer_keeps_lease_until_the_last_arc_closes() {
+    let root = Root::new(true);
+    let domain = crate::lease::WalLeaseDomain::new(root.path.join("leases"));
+    let store = Arc::new(FileWalStore::with_config(
+        root.path.join("wal"),
+        broca_wal::WalConfig::OVERHAUL,
+    ));
+    let owner = Arc::new(
+        WalHandle::open_and_spawn_owned(
+            store,
+            root.session.clone(),
+            domain.acquire(&root.session).unwrap(),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    let survivor = owner.clone();
+    drop(owner);
+    assert!(matches!(
+        domain.acquire(&root.session),
+        Err(crate::lease::LeaseError::Held { .. })
+    ));
+    survivor.record(ordinary()).into_result().unwrap();
+    survivor.sync().await.unwrap();
+    assert!(
+        matches!(
+            domain.acquire(&root.session),
+            Err(crate::lease::LeaseError::Held { .. })
+        ),
+        "a surviving writable Arc must exclude reclaim"
+    );
+    Arc::try_unwrap(survivor)
+        .ok()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    drop(
+        domain
+            .acquire(&root.session)
+            .expect("only the joined writer may release the lease"),
+    );
+}
+
+#[tokio::test]
+async fn published_successor_close_retires_only_verified_predecessor_markers() {
+    let root = Root::new(true);
+    let writer = root.spawn();
+    let previous = root.markers().pop().unwrap();
+    let bytes = std::fs::read(&previous).unwrap();
+    writer.shutdown().await.unwrap();
+    std::fs::write(&previous, bytes).unwrap();
+    let invalid = root.path.join("open-writers").join(format!(
+        "{}.{}",
+        session_addr(&root.session),
+        "f".repeat(32)
+    ));
+    std::fs::write(&invalid, b"{malformed identity").unwrap();
+    let next = root.spawn();
+    assert!(
+        previous.exists(),
+        "opening alone must not retire predecessor markers"
+    );
+    next.shutdown().await.unwrap();
+    assert!(
+        !previous.exists(),
+        "a successfully published newer writer settles its predecessor"
+    );
+    assert_eq!(
+        root.markers(),
+        [invalid],
+        "untrusted marker contents must remain for diagnosis"
+    );
+    assert_eq!(root.records().len(), 4);
 }
