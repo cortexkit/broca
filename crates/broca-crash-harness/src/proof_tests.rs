@@ -38,7 +38,7 @@ struct ProbeFs {
 }
 
 #[cfg(feature = "writer-id-faults")]
-mod batch_recording {
+pub(crate) mod batch_recording {
     use super::*;
     use broca_wal::fs_ops::{FileOps, FsOps, OpenOptions};
 
@@ -49,19 +49,19 @@ mod batch_recording {
     /// handles rebind at the same path/cursor with the same access options, but
     /// without create/create_new/truncate. Subsequent writer I/O goes through
     /// the unchanged RecordingFs without replaying file creation.
-    pub(super) struct BatchFs {
+    pub(crate) struct BatchFs {
         backend: Backend,
         live: LiveHandles,
     }
 
     impl BatchFs {
-        pub(super) fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 backend: Arc::new(Mutex::new((0, Arc::new(broca_wal::fs_ops::RealFs)))),
                 live: Default::default(),
             }
         }
-        pub(super) fn begin(&self, root: &Path) -> Arc<RecordingFs> {
+        pub(crate) fn begin(&self, root: &Path) -> Arc<RecordingFs> {
             let recording = Arc::new(RecordingFs::new(root).unwrap());
             let mut backend = self.backend.lock().unwrap();
             backend.0 += 1;
