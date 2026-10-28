@@ -98,6 +98,7 @@ impl Permissions {
 
     async fn visible(&self, grant: &Grant, now: i64) -> bool {
         match grant.kind {
+            GrantKind::Always => grant.project.is_some(),
             GrantKind::Hours24 => grant.expires_at_ms.is_some_and(|expiry| now < expiry),
             GrantKind::Run => {
                 // An unavailable liveness check must not hide authority the operator can revoke.
@@ -130,8 +131,9 @@ impl Permissions {
 
 fn row(grant: &Grant) -> Value {
     let duration = match grant.kind {
-        GrantKind::Run => "for this program run",
-        GrantKind::Hours24 => "for 24 hours",
+        GrantKind::Run => "for this program run".to_owned(),
+        GrantKind::Hours24 => "for 24 hours".to_owned(),
+        GrantKind::Always => format!("always in {}", grant.project.as_deref().unwrap_or("")),
     };
     let mut row = json!({
         "id":grant.id, "agent_id":grant.holder,

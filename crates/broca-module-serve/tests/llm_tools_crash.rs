@@ -84,6 +84,7 @@ async fn consent_request_cut_helper() {
     )
     .with_clock(Arc::new(|| 1000));
     let request = HoldRequest {
+        project_id: None,
         batch_id: "call".into(),
         scope: ScopeIdentity {
             owner: "reserved:owner".into(),
@@ -224,6 +225,15 @@ fn required_binary(variable: &str) -> Option<PathBuf> {
 /// configuration; all writable XDG state remains under this test's scratch root.
 #[tokio::test]
 async fn target_cingulate_admits_reserved_broca_with_private_content_card_scope() {
+    target_cingulate_admission(false).await;
+}
+
+#[tokio::test]
+async fn target_cingulate_admits_always_option_for_an_attested_project() {
+    target_cingulate_admission(true).await;
+}
+
+async fn target_cingulate_admission(project: bool) {
     let Some(cingulate) = required_binary("CINGULATE_BIN") else {
         return;
     };
@@ -247,8 +257,10 @@ async fn target_cingulate_admits_reserved_broca_with_private_content_card_scope(
         stub.is_file(),
         "set FAKE_AFT_STUB_BIN to the scope authority fixture"
     );
-    let root = broca_test_support::scratch_root()
-        .join(format!("cingulate-broca-admission-{}", std::process::id()));
+    let root = broca_test_support::scratch_root().join(format!(
+        "cingulate-broca-admission-{project}-{}",
+        std::process::id()
+    ));
     broca_test_support::remove_rig_dir(&root);
     for dir in [
         "config/cortexkit",
@@ -268,7 +280,11 @@ async fn target_cingulate_admits_reserved_broca_with_private_content_card_scope(
     )
     .unwrap();
     let scopes = root.join("scopes.json");
-    std::fs::write(&scopes, json!([{"ref":"run","scope_epoch":1,"kind":"head","attributes":{"agent_id":"example-agent","run_id":"run"},"carriers":[{"principal":{"kind":"reserved","module_id":"broca"}}]}]).to_string()).unwrap();
+    let mut scope_records = json!([{"ref":"run","scope_epoch":1,"kind":"head","attributes":{"agent_id":"example-agent","run_id":"run"},"carriers":[{"principal":{"kind":"reserved","module_id":"broca"}}]}]);
+    if project {
+        scope_records[0]["project_id"] = json!("project-a");
+    }
+    std::fs::write(&scopes, scope_records.to_string()).unwrap();
     let fixtures = root.join("cerebellum.json");
     // Cerebellum fbcc6766, crates/cerebellum/tests/vectors/private-content-query-v1/success-marked.json.
     // Whole-file SHA-256 (provenance only, not body bytes):
@@ -389,6 +405,21 @@ async fn target_cingulate_admits_reserved_broca_with_private_content_card_scope(
         "a lost or refused reply is not admission proof"
     );
     assert!(cards[0].card_id.as_deref().is_some_and(|id| !id.is_empty()));
+    assert_eq!(
+        cards[0].project_id.as_deref(),
+        project.then_some("project-a")
+    );
+    let content: Value = serde_json::from_str(&cards[0].content).unwrap();
+    let fixture: Value = serde_json::from_str(if project {
+        include_str!(
+            "../../broca-subc/tests/fixtures/consent/broca/private-content-card-project.json"
+        )
+    } else {
+        include_str!("../../broca-subc/tests/fixtures/consent/broca/private-content-card.json")
+    })
+    .unwrap();
+    assert_eq!(content["options"], fixture["options"]);
+    assert_eq!(content["scope"], fixture["scope"]);
     let _ = conn.route_close(&route).await;
     broca_test_support::kill_and_reap_tree(&mut daemon);
 }

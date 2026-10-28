@@ -4,7 +4,8 @@
 //! (`flow.private_content_providers`) before it may call a provider, so a test needs both to
 //! answer. `fake-aft-stub` declares only the tool-provider role, so the daemon refuses a
 //! `route.open` aimed at its management surface before any operation is dispatched. This binary
-//! is a module that declares a management surface, including screenshot resolution.
+//! is a module that declares a management surface, including screenshot resolution and
+//! Cingulate card filing.
 //!
 //! Configuration, from the environment and the command line:
 //!
@@ -27,8 +28,8 @@ use std::path::PathBuf;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use subc_protocol::manifest::{
-    Concurrency, IdentityScope, ManagementOperation, ManagementOperationKind, ModuleManifest,
-    ProviderRole,
+    CapabilityDeclarations, Concurrency, IdentityScope, ManagementOperation, ManagementOperationKind,
+    ModuleManifest, ProviderRole,
 };
 use subc_protocol::{ErrorBody, Flags, Frame, FrameType, ModuleHelloBody, Priority, PROTOCOL_VERSION};
 use subc_transport::{authenticate_client, read_frame, write_frame};
@@ -297,7 +298,7 @@ async fn write(stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite +
 }
 
 fn manifest(module_id: &str) -> ModuleManifest {
-    let operations = SURFACED_OPS
+    let mut operations: Vec<_> = SURFACED_OPS
         .iter()
         .map(|name| ManagementOperation {
             name: (*name).to_owned(),
@@ -305,6 +306,13 @@ fn manifest(module_id: &str) -> ModuleManifest {
             description: None,
         })
         .collect();
+    if module_id == "cingulate" {
+        operations.push(ManagementOperation {
+            name: "consent.request".into(),
+            kind: ManagementOperationKind::Mutate,
+            description: None,
+        });
+    }
     ModuleManifest::builder(module_id, env!("CARGO_PKG_VERSION")).provides(vec![
         ProviderRole::ManagementSurface {
             operations,
@@ -314,6 +322,11 @@ fn manifest(module_id: &str) -> ModuleManifest {
             concurrency: Concurrency::Serial,
         },
     ])
+    .capabilities((module_id == "cingulate").then(|| CapabilityDeclarations {
+        provides: vec!["consent-no-expiry/v1".into()],
+        requires: Vec::new(),
+        must_never_reach: Vec::new(),
+    }))
     .build()
 }
 
@@ -441,6 +454,20 @@ fn append(path: &PathBuf, line: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cingulate_declares_card_filing_and_no_expiry_without_changing_other_surfaces() {
+        let manifest = super::manifest("cingulate");
+        assert_eq!(
+            manifest.capabilities.as_ref().unwrap().provides,
+            vec!["consent-no-expiry/v1"]
+        );
+        assert!(manifest.provides.iter().any(|role| matches!(
+            role, super::ProviderRole::ManagementSurface { operations, .. }
+                if operations.iter().any(|op| op.name == "consent.request" && op.kind == super::ManagementOperationKind::Mutate)
+        )));
+        assert!(super::manifest("cerebellum").capabilities.is_none());
+    }
+
     use super::*;
 
     #[test]

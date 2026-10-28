@@ -1,0 +1,20 @@
+{
+  "kind": "consent",
+  "title": "Let the agent send private content to TypeSafe?",
+  "prompt": "The agent has read content from your Chrome.\n\nA program it is running now wants to make a model call with TypeSafe (Jev 1.13). The call may include some of that content.\n\nThis approval covers only TypeSafe. Another provider needs its own approval.",
+  "options": [
+    {"id": "allow_run", "label": "Allow for this program run", "effect": "grant"},
+    {"id": "allow_24h", "label": "Allow for 24 hours", "effect": "grant"},
+    {"id": "allow_always", "label": "Always allow for the agent in this project", "effect": "grant"},
+    {"id": "deny", "label": "Deny", "effect": "decline"}
+  ],
+  "default": "deny",
+  "on_expiry": "deny",
+  "urgency": "normal",
+  "material_damage": false,
+  "late_execution": "execute",
+  "target": {"kind": "provider", "label": "TypeSafe"},
+  "scope": {"provider": "TypeSafe"},
+  "dedup_key": "0ab378f55349aebe99550e29113304f58add2abe9c4fb03825326dfa2992b733",
+  "requester_ref": "0ab378f55349aebe99550e29113304f58add2abe9c4fb03825326dfa2992b733"
+}

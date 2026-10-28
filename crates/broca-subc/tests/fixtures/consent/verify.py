@@ -113,6 +113,32 @@ def golden():
 
 
 class ConsentFixtures(unittest.TestCase):
+    def test_private_content_card_options(self):
+        cards = [json.loads((ROOT / "broca" / name).read_bytes()) for name in (
+            "private-content-card.json", "private-content-card-project.json",
+        )]
+        for card, ids in zip(cards, (
+            ["allow_run", "allow_24h", "deny"],
+            ["allow_run", "allow_24h", "allow_always", "deny"],
+        )):
+            self.assertEqual(card["kind"], "consent")
+            self.assertEqual(card["default"], "deny")
+            self.assertEqual(card["on_expiry"], "deny")
+            self.assertNotIn("expires_in_ms", card)
+            self.assertEqual(card["scope"], {"provider": "TypeSafe"})
+            self.assertEqual(card["requester_ref"], card["dedup_key"])
+            self.assertRegex(card["dedup_key"], r"^[0-9a-f]{64}$")
+            self.assertEqual([option["id"] for option in card["options"]], ids)
+            for option in card["options"]:
+                self.assertEqual(set(option), {"id", "label", "effect"})
+                self.assertTrue(option["label"].strip())
+                self.assertEqual(option["effect"],
+                                 "decline" if option["id"] == "deny" else "grant")
+        self.assertEqual(cards[1]["options"][2]["label"],
+                         "Always allow for the agent in this project")
+        cards[1]["options"].pop(2)
+        self.assertEqual(cards[0], cards[1], "only the project-wide option may differ")
+
     def test_upstream_pins(self):
         rows = table("Source pins")
         expected = {name + "/SHA256SUMS": values for name, values in CORPORA.items()}

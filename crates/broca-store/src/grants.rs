@@ -66,6 +66,9 @@ pub struct FinalResult {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeldCall {
     pub batch_id: String,
+    /// The admission scope's attested project, retained for grant matching after restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     pub scope: ScopeIdentity,
     pub batch_scope: crate::system_one::BatchScope,
     pub principal: String,
@@ -88,6 +91,8 @@ pub struct HeldCall {
 /// Only first-admission fields are accepted. The store sets the state and immutable deadline.
 pub struct HoldRequest {
     pub batch_id: String,
+    /// Supplied only from the admission scope's daemon stamp.
+    pub project_id: Option<String>,
     pub scope: ScopeIdentity,
     pub batch_scope: crate::system_one::BatchScope,
     pub principal: String,
@@ -121,6 +126,9 @@ pub enum CardState {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Card {
+    /// Frozen from the daemon stamp when this card's content was filed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     pub dedup_key: String,
     pub scope: ScopeIdentity,
     pub agent_id: String,
@@ -135,6 +143,7 @@ pub struct Card {
 pub enum GrantKind {
     Run,
     Hours24,
+    Always,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +171,7 @@ pub struct CardAnswer {
 pub enum Decision {
     AllowRun,
     Allow24h,
+    AllowAlways,
     Deny,
 }
 
@@ -313,6 +323,7 @@ impl GrantsStore {
                     || card.scope != request.scope
                     || card.agent_id != request.agent_id
                     || card.provider != request.provider
+                    || card.project_id != request.project_id
                     || card.state != CardState::Filing
                     || card.card_id.is_some()
                 {
@@ -362,6 +373,7 @@ impl GrantsStore {
             }
             let row = HeldCall {
                 batch_id: request.batch_id,
+                project_id: request.project_id,
                 scope: request.scope,
                 batch_scope: request.batch_scope,
                 principal: request.principal,
@@ -602,18 +614,20 @@ impl GrantsStore {
                         card.state = CardState::Denied;
                         tx.execute("INSERT INTO denies VALUES (?1,?2,?3,?4) ON CONFLICT(agent_id,scope,provider) DO NOTHING", params![card.agent_id, encode(scope)?, card.provider, answer.card_id])?;
                     }
-                    Decision::AllowRun | Decision::Allow24h => {
+                    Decision::AllowRun | Decision::Allow24h | Decision::AllowAlways => {
+                        let always = matches!(answer.decision, Decision::AllowAlways);
+                        if always && card.project_id.is_none() { continue; }
                         card.state = CardState::Allowed;
                         let run = matches!(answer.decision, Decision::AllowRun);
                         if !run || answer.run_live {
                             let grant = Grant {
-                                id: answer.card_id.clone(), holder: card.agent_id.clone(), project: None,
-                                provider: card.provider.clone(), kind: if run { GrantKind::Run } else { GrantKind::Hours24 },
+                                id: answer.card_id.clone(), holder: card.agent_id.clone(), project: if always { card.project_id.clone() } else { None },
+                                provider: card.provider.clone(), kind: if run { GrantKind::Run } else if always { GrantKind::Always } else { GrantKind::Hours24 },
                                 scope: run.then(|| scope.clone()), source_card_id: answer.card_id.clone(),
                                 created_at_ms: now_ms,
-                                expires_at_ms: (!run).then(|| now_ms.saturating_add(24 * 60 * 60 * 1000)),
+                                expires_at_ms: matches!(answer.decision, Decision::Allow24h).then(|| now_ms.saturating_add(24 * 60 * 60 * 1000)),
                             };
-                            tx.execute("INSERT INTO grants VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(source_card_id) DO NOTHING", params![grant.id, grant.holder, grant.project, grant.provider, if run { "run" } else { "24_hours" }, grant.scope.as_ref().map(encode).transpose()?, grant.source_card_id, grant.created_at_ms, grant.expires_at_ms, encode(&grant)?])?;
+                            tx.execute("INSERT INTO grants VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(source_card_id) DO NOTHING", params![grant.id, grant.holder, grant.project, grant.provider, if run { "run" } else if always { "always" } else { "24_hours" }, grant.scope.as_ref().map(encode).transpose()?, grant.source_card_id, grant.created_at_ms, grant.expires_at_ms, encode(&grant)?])?;
                         }
                     }
                 }
