@@ -7,9 +7,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use broca_protocol::{ToolCallId, ToolOutput, ToolOutputPart, ToolResult};
 use cortexkit_role_tool_provider::result::{self, ContentPart};
 
-pub(crate) fn dropped_media_notice(mime: &str) -> String {
-    format!("[{mime} not shown to the model: this runner does not pass tool images to models yet]")
-}
+pub(crate) use broca_protocol::content::dropped_media_notice;
 
 /// Why a decoded reply cannot become a final model-facing result.
 #[derive(Debug)]

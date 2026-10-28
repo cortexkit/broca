@@ -774,8 +774,56 @@ pub fn is_image_only_placeholder(text: &str) -> bool {
     true
 }
 
+/// The end of the line a tool result records in place of a media part it did not pass to the
+/// model. Its start is `[` and the part's MIME type.
+const DROPPED_MEDIA_NOTICE_CLOSE: &str =
+    " not shown to the model: this runner does not pass tool images to models yet]";
+
+/// The line a tool result records in place of a media part that was not passed to the model,
+/// naming the part's MIME type so the model learns it did not see it. Each dropped part gets
+/// its own line; [`is_image_only_notice`] recognises a result made only of image lines.
+pub fn dropped_media_notice(mime: &str) -> String {
+    format!("[{mime}{DROPPED_MEDIA_NOTICE_CLOSE}")
+}
+
+/// Whether a tool result's text is nothing but dropped-media notices for images, one per line:
+/// a tool result that held only images, which the tag rules number and render as an image
+/// label. Unlike [`is_image_only_placeholder`], the renderer keeps these lines after the label,
+/// so the model still learns the images were not shown.
+pub fn is_image_only_notice(text: &str) -> bool {
+    !text.is_empty()
+        && text.split('\n').all(|line| {
+            line.strip_prefix("[image/")
+                .and_then(|rest| rest.strip_suffix(DROPPED_MEDIA_NOTICE_CLOSE))
+                .is_some_and(|subtype| !subtype.is_empty() && !subtype.contains(['[', ']']))
+        })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn image_only_notices_are_recognised_and_mixed_content_is_not() {
+        use super::{dropped_media_notice, is_image_only_notice};
+        let png = dropped_media_notice("image/png");
+        assert_eq!(
+            png,
+            "[image/png not shown to the model: this runner does not pass tool images to models yet]"
+        );
+        let gif = dropped_media_notice("image/gif; name=marker");
+        assert!(is_image_only_notice(&png));
+        assert!(is_image_only_notice(&format!("{png}\n{gif}")));
+        assert!(!is_image_only_notice(&format!(
+            "Read image attachment.\n{png}"
+        )));
+        assert!(!is_image_only_notice(&format!("{png}\n")));
+        assert!(!is_image_only_notice(&format!(
+            "{png}\n{}",
+            dropped_media_notice("application/pdf")
+        )));
+        assert!(!is_image_only_notice(&dropped_media_notice("audio/wav")));
+        assert!(!is_image_only_notice(""));
+    }
+
     /// The model-facing text for a module outage names the module, the code and the
     /// guidance lines after the stable message; a plain error renders as its message
     /// alone, exactly as before.

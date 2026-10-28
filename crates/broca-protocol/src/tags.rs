@@ -388,7 +388,10 @@ pub fn part_kind(role: Role, block: &ContentBlock, clean: bool) -> Option<PartKi
         }
         ContentBlock::ToolCall(_) => PartKind::ToolCall,
         ContentBlock::ToolResult(result) => match &result.output {
-            ToolOutput::Text { text } if crate::content::is_image_only_placeholder(text) => {
+            ToolOutput::Text { text }
+                if crate::content::is_image_only_placeholder(text)
+                    || crate::content::is_image_only_notice(text) =>
+            {
                 PartKind::ToolResultImageOnly
             }
             ToolOutput::Text { text: message }
@@ -549,6 +552,14 @@ fn render_computed(message: &mut Message, tags: &PartTags, computed: ComputedTag
                         if crate::content::is_image_only_placeholder(text) =>
                     {
                         *text = cortexkit_role_llm_runner::tags::image_label(number);
+                    }
+                    // The label carries the number; the notice lines after it keep telling the
+                    // model that the images were not shown.
+                    ToolOutput::Text { text } if crate::content::is_image_only_notice(text) => {
+                        *text = format!(
+                            "{}\n{text}",
+                            cortexkit_role_llm_runner::tags::image_label(number)
+                        );
                     }
                     ToolOutput::Text { text: message }
                     | ToolOutput::Error { message, .. }
@@ -969,6 +980,40 @@ mod tests {
             result.output,
             ToolOutput::Text {
                 text: "§3§ [image]".into()
+            }
+        );
+        let once = prompt.clone();
+        render_tags_into(&mut prompt, TagRendering::default());
+        assert_eq!(format!("{prompt:?}"), format!("{once:?}"));
+
+        // A tool result made only of dropped-image notices is numbered and labelled the same
+        // way, and keeps its notice lines after the label so the model learns it saw nothing.
+        let notices = format!(
+            "{}\n{}",
+            crate::content::dropped_media_notice("image/png"),
+            crate::content::dropped_media_notice("image/gif")
+        );
+        let mut tool = Message::new(
+            Role::Tool,
+            vec![ContentBlock::ToolResult(ToolResult {
+                tool_call_id: ToolCallId("n".into()),
+                output: ToolOutput::Text {
+                    text: notices.clone(),
+                },
+                is_error: false,
+            })],
+        );
+        number_message(&mut tool, RENDERING, &mut high).unwrap();
+        assert_eq!(tool.part_tags().unwrap().parts, vec![Some(4)]);
+        let mut prompt = vec![tool];
+        render_tags_into(&mut prompt, TagRendering::default());
+        let ContentBlock::ToolResult(result) = &prompt[0].content[0] else {
+            panic!("tool result")
+        };
+        assert_eq!(
+            result.output,
+            ToolOutput::Text {
+                text: format!("§4§ [image]\n{notices}")
             }
         );
         let once = prompt.clone();

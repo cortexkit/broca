@@ -16,9 +16,10 @@ fn schema() -> Value {
 }
 
 fn plan() -> Value {
-    let composition =
-        json!({"providers":[{"provider":"aft","tools":[{"name":"read","capabilities":[]}]}]});
+    let composition = json!({"providers":[{"provider":"aft","tools":[{"name":"read","capabilities":[]}]}],
+        "step_transform_items":[]});
     json!({"tool_items":[{"provider":"aft","preset":"reader","params":{}}],"system_text_items":[],
+        "step_transform_items":[],
         "composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(),"composition":composition})
 }
 
@@ -60,9 +61,12 @@ async fn capture(
         "composition_digest":plan["composition_digest"],"tools":[{"name":"read","description":"Read a fixture",
         "schema_digest":cortexkit_role_tool_provider::catalog::schema_digest(&schema()).unwrap(),"semantics":1,"capabilities":[],"input_schema":schema()}]}}).to_string()).unwrap();
     let surface = broca_test_support::ckdev_binary(surface, &rig.dir);
+    // The daemon hands a module its connection file as `--subc <path>`; fake-surface reads it
+    // from SUBC_CONNECTION, so the config names the file the daemon publishes.
+    let connection = runtime.join("subc-connection.json");
     std::fs::write(config.join("subc.jsonc"), json!({"version":1,"modules":{"aft":{
         "program":surface,"args":["--module-id","aft",format!("--SURFACE_FIXTURES={}",hex(&fixtures)),format!("--SURFACE_REQUESTS={}",hex(&requests))],
-        "enabled":true,"env":{"SURFACE_TOOL_RESULT":mode}}}}).to_string()).unwrap();
+        "enabled":true,"env":{"SURFACE_TOOL_RESULT":mode,"SUBC_CONNECTION":connection}}}}).to_string()).unwrap();
     let daemon_bin = broca_test_support::ckdev_binary(daemon_bin, &rig.dir);
     let child = broca_test_support::retry_executable_file_busy(|| {
         broca_test_support::tokio_rig_command(&daemon_bin, &rig.dir, "daemon")?
@@ -78,7 +82,6 @@ async fn capture(
     })
     .unwrap();
     let mut daemon = broca_test_support::RigChild::new(child, &rig.dir, "daemon");
-    let connection = runtime.join("subc-connection.json");
     broca_test_support::wait_until("AFT stand-in ready", || async {
         let log = std::fs::read_to_string(&requests).map_err(|e| e.to_string())?;
         if log.contains("hello-ack") {
