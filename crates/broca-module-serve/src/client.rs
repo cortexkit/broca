@@ -642,6 +642,7 @@ mod tests {
             // lineage genuinely has no id until its next write mints one.
             lineage_id: None,
             messages: vec![broca_wire::SessionReadMessage {
+                rich_ui: None,
                 written_at: None,
                 delivered_as: None,
                 tags: Vec::new(),

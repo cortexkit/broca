@@ -425,6 +425,7 @@ async fn bind_and_owner_checks_reuse_large_wal_ownership_without_prefix_reads() 
 
 fn plan_manifest(identity: &str, transforms: bool) -> Box<broca_wal::PlanManifest> {
     Box::new(broca_wal::PlanManifest {
+        rich_ui: None,
         plan: broca_wal::OpaqueJson::from_json_text(if transforms {
             serde_json::json!({"step_transform_items": [{
                 "provider": "p",

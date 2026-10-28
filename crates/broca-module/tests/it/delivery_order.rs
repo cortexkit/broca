@@ -498,6 +498,7 @@ fn plan_naming(sender: &str, idle_start: bool) -> broca_module::actor::SendPlan 
     broca_module::actor::SendPlan {
         identity: format!("plan-{sender}-{idle_start}"),
         manifest: Some(std::sync::Arc::new(broca_wal::PlanManifest {
+            rich_ui: None,
             plan: broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
             plan_identity: format!("plan-{sender}-{idle_start}"),
             composition_digest: "digest".into(),

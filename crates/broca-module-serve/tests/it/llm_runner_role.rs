@@ -2840,6 +2840,7 @@ async fn upload_plan_named_sender_has_standing_on_the_frozen_session() {
         ) -> Result<broca_fetch_plan::Admitted, broca_fetch_plan::Refusal> {
             Ok(broca_fetch_plan::Admitted {
                 manifest: broca_wal::PlanManifest {
+                    rich_ui: None,
                     plan: broca_wal::OpaqueJson::from_json_text(plan.text.clone()).unwrap(),
                     plan_identity: plan.identity.clone(),
                     composition_digest: plan.composition_digest.clone(),

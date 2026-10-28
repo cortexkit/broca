@@ -332,6 +332,7 @@ impl Daemon {
 pub fn frozen(state: &State) -> Arc<broca_wal::PlanManifest> {
     let tool: broca_protocol::Tool = serde_json::from_value(json!({"name":"work","description":"does work","input_schema":state.schema.lock().unwrap().clone(),"module":MODULE,"execution_mode":"sequential"})).unwrap();
     Arc::new(broca_wal::PlanManifest {
+        rich_ui: None,
         plan: broca_wal::OpaqueJson::from_json_text(plan(&state.subscriptions, false).to_string())
             .unwrap(),
         plan_identity: "frozen".into(),

@@ -70,6 +70,7 @@ pub use content::{
     TOOL_PLANE_UNAVAILABLE_MESSAGE, TOOL_PLANE_UNAVAILABLE_RETRY,
 };
 pub use cortexkit_role_llm_runner::errors::ContextCeilingDetail;
+pub use cortexkit_role_llm_runner::rich_ui::RichUiStamp;
 pub use cortexkit_role_llm_runner::run::BudgetExhaustedDetail;
 pub use diagnostic::diag;
 pub use display::DisplayEvent;

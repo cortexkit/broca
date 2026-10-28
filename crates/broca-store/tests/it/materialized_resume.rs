@@ -2311,9 +2311,10 @@ impl broca_core::compaction::CompactionPlane for HeldViews {
 
 fn held_manifest() -> Arc<broca_wal::PlanManifest> {
     Arc::new(broca_wal::PlanManifest {
+        rich_ui: None,
         plan: broca_wal::OpaqueJson::from_json_text(
             json!({"compaction_item":{"provider":"provider","preset":"head","params":{}},
-                   "composition":{},"render_tags":true})
+               "composition":{},"render_tags":true})
             .to_string(),
         )
         .unwrap(),

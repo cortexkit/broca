@@ -3493,6 +3493,7 @@ where
                 from_ordinal: params.from_ordinal,
                 limit: params.limit,
                 include_tools: params.include_tools,
+                include_rich_ui: params.include_rich_ui,
                 after_mid: params.after_mid,
                 lineage_id: params.lineage_id,
                 max_bytes: params.max_bytes,
@@ -6002,6 +6003,7 @@ mod tests {
             lineage_id: None,
             messages: vec![
                 SessionReadMessage {
+                    rich_ui: None,
                     written_at: None,
                     delivered_as: None,
                     run: None,
@@ -6020,6 +6022,7 @@ mod tests {
                     part_digests: None,
                 },
                 SessionReadMessage {
+                    rich_ui: None,
                     written_at: None,
                     delivered_as: None,
                     run: None,
@@ -6671,6 +6674,7 @@ mod tests {
             let end = (from + 2).min(self.messages.len());
             let messages = (from..end)
                 .map(|ordinal| broca_wire::SessionReadMessage {
+                    rich_ui: None,
                     written_at: None,
                     delivered_as: None,
                     ordinal: ordinal as u64,

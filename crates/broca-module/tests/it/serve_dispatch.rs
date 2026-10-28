@@ -72,6 +72,7 @@ async fn import_then_read_returns_the_canonical_transcript() {
             from_ordinal: Some(0),
             limit: Some(500),
             include_tools: false,
+            include_rich_ui: false,
             after_mid: None,
             lineage_id: None,
             max_bytes: None,

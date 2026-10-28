@@ -403,6 +403,7 @@ pub fn planned_manifest() -> broca_wal::PlanManifest {
     // A non-confining preset: these sessions run unscoped, and an episode whose plan asks for
     // the `worker` preset refuses to start without a scope.
     broca_wal::PlanManifest {
+        rich_ui: None,
         declarations: Vec::new(),
         plan: broca_wal::OpaqueJson::from_json_text(
             r#"{"tool_items":[{"provider":"aft","preset":"reader"}]}"#,

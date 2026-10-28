@@ -948,6 +948,9 @@ pub struct ReadParams {
     /// and omitted from the request when false so existing request bytes are unchanged.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub include_tools: bool,
+    /// Expose the frozen teaching stamp on assistant entries only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_rich_ui: bool,
     /// Read strictly after the message with this `mid`, taken from an earlier page of the
     /// lineage `lineage_id` names. Refused `unknown_mid` when that lineage has no such message,
     /// never answered with the newest page instead. Requires `lineage_id`, and cannot be combined
@@ -1173,6 +1176,8 @@ impl serde::Serialize for CallerBlockRef<'_> {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SessionReadMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rich_ui: Option<cortexkit_role_llm_runner::rich_ui::RichUiStamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub written_at: Option<u64>,
     pub ordinal: u64,
     /// Message-coordinate spelling used by consumers for stable message badges.
@@ -1251,6 +1256,8 @@ impl Serialize for SessionReadMessage {
             digest: &'a Option<String>,
             #[serde(skip_serializing_if = "Option::is_none")]
             part_digests: &'a Option<Vec<cortexkit_role_llm_runner::read::descriptors::PartDigest>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            rich_ui: &'a Option<cortexkit_role_llm_runner::rich_ui::RichUiStamp>,
         }
         Wire {
             written_at: self.written_at,
@@ -1263,6 +1270,7 @@ impl Serialize for SessionReadMessage {
             delivered_as: &self.delivered_as,
             digest: &self.digest,
             part_digests: &self.part_digests,
+            rich_ui: &self.rich_ui,
         }
         .serialize(serializer)
     }
@@ -1469,6 +1477,7 @@ pub fn describe_resolved_part(
         message.content.get(index).cloned().into_iter().collect(),
     );
     let mut entry = SessionReadMessage {
+        rich_ui: None,
         written_at: None,
         ordinal,
         mid: format!("m{ordinal}"),
@@ -5885,6 +5894,7 @@ mod caller_message_tests {
 
     fn read_message(content: Vec<ContentBlock>) -> SessionReadMessage {
         SessionReadMessage {
+            rich_ui: None,
             written_at: None,
             delivered_as: None,
             tags: Vec::new(),
@@ -6279,6 +6289,7 @@ mod caller_message_tests {
         );
         message.cache_prefix_blocks = Some(1);
         let response = SessionReadMessage {
+            rich_ui: None,
             written_at: None,
             delivered_as: None,
             tags: Vec::new(),

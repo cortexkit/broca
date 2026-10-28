@@ -232,6 +232,7 @@ fn manifest_format(format: Option<&str>, late_results: bool) -> ToolManifest {
         schema_pins: None,
     };
     let plan = PlanManifest {
+        rich_ui: None,
         declarations: Vec::new(),
         plan: OpaqueJson::from_json_text(
             json!({"tool_items":[{"provider":"provider"}]}).to_string(),
@@ -822,6 +823,7 @@ fn manifest_pinning(
     schema_pins: Option<std::collections::BTreeMap<String, broca_wal::DispatchSchemaPin>>,
 ) -> ToolManifest {
     let plan = PlanManifest {
+        rich_ui: None,
         declarations: Vec::new(),
         plan: OpaqueJson::from_json_text(
             json!({"tool_items":[{"provider":"provider"}]}).to_string(),

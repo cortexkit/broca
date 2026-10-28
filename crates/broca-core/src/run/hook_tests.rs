@@ -118,6 +118,7 @@ pub(super) fn frozen(
         plan["user_grants"] = json!([{"module":"p0","hook":"post_tool","tools":["edit"]}]);
     }
     broca_wal::PlanManifest {
+        rich_ui: None,
         plan: broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
         plan_identity: String::new(),
         composition_digest: String::new(),

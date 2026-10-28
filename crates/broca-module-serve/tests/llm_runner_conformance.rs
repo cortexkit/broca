@@ -954,6 +954,7 @@ fn tool_manifest() -> subc_protocol::manifest::ModuleManifest {
 struct DefaultTextProvider {
     shared: Arc<Shared>,
     session: String,
+    rich_ui: Option<cortexkit_role_llm_runner::rich_ui::RichUiStamp>,
 }
 
 #[async_trait]
@@ -986,9 +987,12 @@ impl subc_client_rs::ModuleHandler for DefaultTextProvider {
         let digest =
             cortexkit_role_tool_provider::catalog::composition_digest(composition).unwrap();
         let text = "synthetic provider default system text";
-        let answer = json!({"generation":"1","catalog_digest":"default-text","composition_digest":digest,"tools":[],
+        let mut answer = json!({"generation":"1","catalog_digest":"default-text","composition_digest":digest,"tools":[],
             "system_text":{"text":text,"item_digest":cortexkit_role_tool_provider::catalog::system_text_digest(text),
                 "preflight_digest":"default-text","composition_digest":digest,"tool_names":[]}});
+        if let Some(stamp) = &self.rich_ui {
+            answer["system_text"]["rich_ui"] = serde_json::to_value(stamp).unwrap();
+        }
         subc_client_rs::HandlerOutcome::Response(serde_json::to_vec(&answer).unwrap())
     }
 }
@@ -2400,6 +2404,76 @@ impl LlmRunnerSubject for BrocaSubject {
         )
     }
 
+    async fn rich_ui_plan_fields(
+        &self,
+        session: &str,
+        stamps: &[Option<cortexkit_role_llm_runner::rich_ui::RichUiStamp>],
+    ) -> Result<Option<Map<String, Value>>, HarnessError> {
+        let connection = self
+            .shared
+            .fixture_connection
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| HarnessError::new("no private daemon is running"))?;
+        let mut fields = self
+            .send_fields_with_plan(session, true, &Map::new())
+            .unwrap();
+        let plan = fields.get_mut("plan").unwrap();
+        for stamp in stamps {
+            let module = format!(
+                "conformance-rich-ui-{}",
+                self.shared.default_text_tasks.lock().unwrap().len()
+            );
+            let mut manifest = tool_manifest();
+            manifest.module_id = module.clone();
+            let (_, serve) = subc_client_rs::serve_with_handle(
+                &connection,
+                manifest,
+                DefaultTextProvider {
+                    shared: self.shared.clone(),
+                    session: session.into(),
+                    rich_ui: stamp.clone(),
+                },
+            )
+            .await
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+            self.shared
+                .default_text_tasks
+                .lock()
+                .unwrap()
+                .push(tokio::spawn(async move {
+                    let _ = serve.await;
+                }));
+            plan["system_text_items"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({
+                    "provider":module,"preset":"teaching","params":{}
+                }));
+            plan["composition"]["providers"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({
+                    "provider":module,"tools":[]
+                }));
+        }
+        plan["composition"]["providers"]
+            .as_array_mut()
+            .unwrap()
+            .sort_by(|a, b| {
+                a["provider"]
+                    .as_str()
+                    .unwrap()
+                    .cmp(b["provider"].as_str().unwrap())
+            });
+        plan["composition_digest"] = json!(
+            cortexkit_role_tool_provider::catalog::composition_digest(&plan["composition"])
+                .unwrap()
+        );
+        Ok(Some(fields))
+    }
+
     fn tool_provider_module(&self) -> String {
         self.shared
             .default_text_module
@@ -2439,6 +2513,7 @@ impl LlmRunnerSubject for BrocaSubject {
             DefaultTextProvider {
                 shared: self.shared.clone(),
                 session: session.into(),
+                rich_ui: None,
             },
         )
         .await
@@ -3266,6 +3341,10 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "history_mid_matches_read",
         "history_from_ordinal_and_before_ordinal",
         "history_unknown_ordinal_refused",
+        "rich_ui_stamp_served_on_stamped_run",
+        "rich_ui_stamp_absent_on_unstamped_run",
+        "rich_ui_stamp_read_needs_opt_in",
+        "rich_ui_stamp_conflict_refused",
         "display_limits_cut_on_a_utf8_boundary",
         "display_without_limits_is_whole",
         "display_pages_carry_finished_messages_only",
@@ -3360,6 +3439,34 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
             "{name}\n{}",
             report.render()
         );
+    }
+    // Broca has no replan operation; the kit cannot change a live session's frozen teaching.
+    let follows = report
+        .cases
+        .iter()
+        .find(|case| case.case == "rich_ui_stamp_head_follows_last_run")
+        .unwrap();
+    assert!(
+        matches!(&follows.outcome, CaseOutcome::Inapplicable { reason } if reason.contains("replan_rich_ui"))
+    );
+    for name in [
+        "archive_pruning_generation",
+        "archive_pruning_restored_view_refused",
+        "archive_pruning_restored_edit_refused",
+        "archive_pruning_setup_after_prune",
+        "archive_pruning_setup_initial_replaced",
+        "archive_pruning_applied_edit_pruned",
+    ] {
+        let case = report.cases.iter().find(|case| case.case == name).unwrap();
+        assert_eq!(
+            case.outcome,
+            CaseOutcome::Inapplicable {
+                reason: "archive_prunes_reasoning is not declared".into(),
+            },
+            "{name}: {:?}",
+            case.outcome
+        );
+        println!("New non-stamp kit case {name}: {:?}", case.outcome);
     }
     for name in [
         "output_refs_unsupported_plan",

@@ -15,6 +15,8 @@ pub struct RetainedHeadCheckpoint {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HeadProjection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_rich_ui: Option<broca_protocol::RichUiStamp>,
     pub model: Option<HeadModel>,
     pub usage: Option<SessionUsage>,
     run_id: Option<RunId>,
@@ -27,6 +29,7 @@ pub struct HeadProjection {
 impl Default for HeadProjection {
     fn default() -> Self {
         Self {
+            last_run_rich_ui: None,
             model: None,
             usage: None,
             run_id: None,
@@ -76,6 +79,9 @@ impl HeadProjection {
                 self.ownership
                     .fold_run_started(principal.as_ref(), scope.as_ref());
                 self.run_id = Some(run_id.clone());
+                self.last_run_rich_ui = manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.rich_ui.clone());
                 let mut model =
                     HeadModel::new(&config.model.provider_module_id, &config.model.model_id);
                 model.variant = config.variant.clone().filter(|value| !value.is_empty());
@@ -263,5 +269,29 @@ mod tests {
                 ]
             })
         );
+    }
+    #[test]
+    fn rich_ui_stamp_tracks_the_last_start_and_survives_projection_serialization() {
+        let stamp = json!({"dialect":"1.0", "catalog_digest":"a".repeat(64)});
+        let mut value = serde_json::to_value(start("stamped", None)).unwrap();
+        value["manifest"] = json!({
+            "rich_ui":stamp, "plan":"{}", "plan_identity":"plan", "composition_digest":"composition",
+            "fetches":[], "tools":[], "system_text":"teaching", "system_digest":"system",
+            "join_version":1, "role_versions":{}
+        });
+        let mut head = HeadProjection::default();
+        head.observe(&serde_json::from_value(value).unwrap());
+        let stored = serde_json::to_vec(&head).unwrap();
+        let mut restored: HeadProjection = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored.last_run_rich_ui).unwrap(),
+            stamp
+        );
+        restored.observe(&start("unstamped", None));
+        assert!(restored.last_run_rich_ui.is_none());
+        assert!(serde_json::to_value(restored)
+            .unwrap()
+            .get("last_run_rich_ui")
+            .is_none());
     }
 }

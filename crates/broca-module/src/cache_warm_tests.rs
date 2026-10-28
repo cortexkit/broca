@@ -777,6 +777,7 @@ impl Fixture {
                 from_ordinal: Some(0),
                 limit: Some(100),
                 include_tools: false,
+                include_rich_ui: false,
                 after_mid: None,
                 lineage_id: None,
                 max_bytes: None,

@@ -551,6 +551,7 @@ fn project_control_record<S: ControlProjectionSink>(
         WalRecord::RunStarted {
             run_id,
             submission_id,
+            manifest,
             ..
         } => {
             state.reset_episode();
@@ -562,7 +563,13 @@ fn project_control_record<S: ControlProjectionSink>(
                     run_id: run_id.clone(),
                     submission_id: submission_id.clone(),
                 },
-                LiveEvent::RunStarted(live::RunStarted::new(run_id.0.clone()))
+                LiveEvent::RunStarted({
+                    let mut started = live::RunStarted::new(run_id.0.clone());
+                    started.rich_ui = manifest
+                        .as_ref()
+                        .and_then(|manifest| manifest.rich_ui.clone());
+                    started
+                })
             );
         }
         WalRecord::StepStarted { step_id } => {
