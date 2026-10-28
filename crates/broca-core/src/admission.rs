@@ -2322,17 +2322,93 @@ mod tests {
 
     #[test]
     fn offset_admission_real_filewal_hydrates_without_full_read() {
+        offset_admission_real_filewal_case(false);
+    }
+
+    #[test]
+    fn offset_admission_real_filewal_empty_tail_hydrates_without_full_read() {
+        offset_admission_real_filewal_case(true);
+    }
+
+    fn offset_admission_real_filewal_case(empty_tail: bool) {
         use crate::replay::{PositionedFrame, SeedBoundary};
         use crate::WalStore;
         use broca_wal::framing::{decode_next, DecodeStep};
         use sha2::Digest;
         use std::io::{Read, Seek, SeekFrom};
 
-        let root = broca_test_support::scratch_root()
-            .join(format!("real-admission-seed-{}", std::process::id()));
+        let root = broca_test_support::scratch_root().join(format!(
+            "real-admission-seed-{empty_tail}-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
-        let records = offset_corpus();
+        let records = if empty_tail {
+            let mut records = vec![started(1, "r", None), offset_step(2)];
+            let call_id = broca_protocol::ToolCallId("call".into());
+            if let WalRecord::ModelStepFinished {
+                assistant_message, ..
+            } = &mut records[1].record
+            {
+                Arc::make_mut(assistant_message).content =
+                    vec![ContentBlock::ToolCall(broca_protocol::content::ToolCall {
+                        tool_call_id: call_id.clone(),
+                        tool_name: "work".into(),
+                        input: serde_json::json!({}),
+                        thought_signature: None,
+                    })];
+            }
+            let batch_id = broca_protocol::BatchId("batch".into());
+            records.push(frame(
+                3,
+                WalRecord::ToolBatchStarted {
+                    batch_id: batch_id.clone(),
+                    step_id: StepId(1),
+                    planned_calls: vec![call_id.clone()],
+                },
+            ));
+            records.push(frame(
+                4,
+                WalRecord::ToolDispatchIntent {
+                    dispatched_at_ms: None,
+                    batch_id: batch_id.clone(),
+                    tool_call_id: call_id.clone(),
+                    tool_name: Some("work".into()),
+                    args: Arc::new(serde_json::json!({})),
+                    module_id: None,
+                    schema_pin: None,
+                    hooks: None,
+                    approval_digest: None,
+                    call_key: None,
+                },
+            ));
+            records.push(frame(
+                5,
+                WalRecord::ToolResult {
+                    finished_at_ms: None,
+                    batch_id: batch_id.clone(),
+                    result: Arc::new(broca_protocol::content::ToolResult {
+                        tool_call_id: call_id,
+                        output: broca_protocol::content::ToolOutput::Text {
+                            text: "done".into(),
+                        },
+                        is_error: false,
+                    }),
+                    outcome: broca_wal::record::DispatchOutcome::Completed,
+                    hooks: None,
+                    reason: None,
+                    withdraw_elicitation: None,
+                    provider_held: None,
+                    tags: None,
+                },
+            ));
+            records.push(frame(6, WalRecord::ToolBatchFinished { batch_id }));
+            records.push(frame(7, WalRecord::TurnFinished { step_id: StepId(1) }));
+            records
+        } else {
+            offset_corpus()
+        };
+        let cut = if empty_tail { records.len() } else { 4 };
         let key = match &records[0].record {
             WalRecord::RunStarted { session, .. } => session.clone(),
             _ => unreachable!(),
@@ -2350,9 +2426,9 @@ mod tests {
         let mut off = 0usize;
         let mut lineage_id = None;
         let mut boundary_end = 0;
-        // The first episode's answer is qualified by its durable terminal in this log;
-        // the later episode remains paused.
-        let cut = 4;
+        // The empty-tail case ends at a committed TurnFinished boundary. The other case
+        // uses a ModelStepFinished with no tool calls; its later durable RunFinished
+        // makes that boundary safe to seed replay.
         while off < bytes.len() {
             match decode_next(&bytes[off..]) {
                 DecodeStep::Record { framed, consumed } => {
@@ -2396,7 +2472,7 @@ mod tests {
         let seed = AdmissionSeed::capture(&read_at, &boundary, &positioned[..cut])
             .expect("a multi-record FileWal admission seed must capture exact source frames");
         assert_eq!(
-            positioned[cut].off - boundary.frame_end,
+            positioned.get(cut).map_or(bytes.len() as u64, |p| p.off) - boundary.frame_end,
             broca_wal::framing::LINEAGE_FRAME_LEN as u64
         );
         let full_reads = std::cell::Cell::new(0);
@@ -2404,7 +2480,7 @@ mod tests {
             &read_at,
             &seed,
             &positioned[cut..],
-            13,
+            positioned.last().unwrap().framed.seq,
             || {
                 full_reads.set(full_reads.get() + 1);
                 panic!("a valid real FileWal admission seed must not read the full log")
@@ -2412,7 +2488,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(full_reads.get(), 0);
-        assert_eq!(snapshot.base_watermark, 4);
+        assert_eq!(snapshot.base_watermark, cut as u64);
+        assert_eq!(snapshot.tail.is_empty(), empty_tail);
         assert_eq!(
             snapshot.checkpoint_at_head,
             AdmissionCheckpointV1::from_frames(&records).unwrap()

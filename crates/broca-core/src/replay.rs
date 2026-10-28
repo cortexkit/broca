@@ -2010,8 +2010,8 @@ pub struct SeedFallback {
 /// steer the tail would then lose. So this entry point takes the boundary's stored
 /// identity, reads exactly that frame and the log's header frame through `read_at`,
 /// and compares the sequence, the frame hash and the log lineage before replaying
-/// anything. Apart from the writer's fixed-size trailing lineage metadata, only those
-/// two ranges are read: the cost stays flat while the log
+/// anything. Besides fixed-size lineage metadata and EOF probes, only those two ranges
+/// are read: the cost stays flat while the log
 /// grows, which is what sparse resume needs on a 150k-message session. Any
 /// mismatch — a missing, torn, moved, different-lineage or different-hash frame, an
 /// unqualified boundary, a tail that is not contiguous with the boundary, or a frame
@@ -2067,9 +2067,8 @@ pub fn replay_seeded_at_validated_boundary(
                 });
             }
         }
-    } else if !durable_end_reached(read_at, boundary.frame_end)? {
-        // No tail is only valid at the log's durable end: bytes past the boundary mean
-        // records the caller did not supply.
+    } else if !durable_end_reached(read_at, boundary)? {
+        // An empty tail cannot omit bytes after the boundary's optional trailing metadata.
         return Err(SeedFallback {
             reason: "empty tail before log end",
         });
@@ -2234,21 +2233,36 @@ fn validate_boundary_lineage_gap(
     }
 }
 
-/// Whether `off` is the log's durable end: a one-byte probe past it reads short.
+/// Whether the boundary ends the log, allowing FileWal's trailing lineage metadata.
 ///
-/// The probe is the only read past the boundary an empty tail needs. Bytes past the
-/// end mean records the caller did not supply, so the reader falls back instead of
-/// serving a prefix that silently drops them.
+/// An empty tail permits EOF immediately or one authenticated same-lineage frame and
+/// then EOF. Even one byte after that frame means the caller omitted part of the log.
 fn durable_end_reached(
     read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
-    off: u64,
+    boundary: &SeedBoundary,
 ) -> Result<bool, SeedFallback> {
-    match read_at(off, 1) {
+    let eof_at = |off| match read_at(off, 1) {
         Ok(bytes) => Ok(bytes.is_empty()),
         Err(_) => Err(SeedFallback {
             reason: "log unreadable",
         }),
+    };
+    if eof_at(boundary.frame_end)? {
+        return Ok(true);
     }
+    // An unidentified log cannot authenticate a lineage trailer; only physical EOF
+    // can establish its empty tail.
+    if boundary.lineage_id.is_none() {
+        return Ok(false);
+    }
+    let metadata_end = boundary
+        .frame_end
+        .checked_add(broca_wal::framing::LINEAGE_FRAME_LEN as u64)
+        .ok_or(SeedFallback {
+            reason: "boundary frame outside log",
+        })?;
+    validate_boundary_lineage_gap(read_at, boundary, metadata_end)?;
+    eof_at(metadata_end)
 }
 
 /// The log's lineage identity as its header frame records it, if any.
@@ -6813,10 +6827,36 @@ mod offset_tail_tests {
         records: Vec<WalRecord>,
         boundary: SeedBoundary,
         tail: Vec<PositionedFrame>,
+        cut: usize,
+        reads: std::cell::RefCell<Vec<(u64, u64)>>,
     }
 
     impl RealBoundaryLog {
         fn new(name: &str) -> Self {
+            Self::from_records(
+                name,
+                vec![
+                    run_started("r1", vec![user("task")]),
+                    step_started(1),
+                    text_step(1, "answer"),
+                    run_finished(RunFinishReason::Completed),
+                ],
+                3,
+            )
+        }
+
+        fn at_last_turn(name: &str) -> Self {
+            let mut records = corpus_records();
+            let cut = records
+                .iter()
+                .position(|r| matches!(r, WalRecord::TurnFinished { .. }))
+                .unwrap()
+                + 1;
+            records.truncate(cut);
+            Self::from_records(name, records, cut)
+        }
+
+        fn from_records(name: &str, records: Vec<WalRecord>, cut: usize) -> Self {
             use crate::WalStore;
             let root = broca_test_support::scratch_root()
                 .join(format!("boundary-lineage-{name}-{}", std::process::id()));
@@ -6825,12 +6865,6 @@ mod offset_tail_tests {
             let store =
                 crate::FileWalStore::with_config(root.join("wal"), broca_wal::WalConfig::OVERHAUL);
             let bind = BindIdentity::new("/tmp/project", "runner", "session");
-            let records = vec![
-                run_started("r1", vec![user("task")]),
-                step_started(1),
-                text_step(1, "answer"),
-                run_finished(RunFinishReason::Completed),
-            ];
             let mut wal = store.open(&bind).unwrap();
             for record in &records {
                 wal.append(1, record, true).unwrap();
@@ -6839,10 +6873,10 @@ mod offset_tail_tests {
             let path = store.wal_path(&bind);
             let bytes = std::fs::read(&path).unwrap();
             let scanned = scan_frames(&bytes);
-            let mut boundary = seed_boundary_for(&bytes, &scanned, 3, true);
+            let mut boundary = seed_boundary_for(&bytes, &scanned, cut as u64, true);
             boundary.lineage_id =
                 super::log_lineage_id(&bytes[..broca_wal::framing::LINEAGE_FRAME_LEN]);
-            let tail = positioned_tail(&scanned, 3);
+            let tail = positioned_tail(&scanned, cut);
             Self {
                 root,
                 path,
@@ -6850,6 +6884,8 @@ mod offset_tail_tests {
                 records,
                 boundary,
                 tail,
+                cut,
+                reads: Default::default(),
             }
         }
 
@@ -6859,13 +6895,14 @@ mod offset_tail_tests {
         ) -> Result<super::ReplayState, super::SeedFallback> {
             use std::io::{Read, Seek, SeekFrom};
             let read_at = |off, len| {
+                self.reads.borrow_mut().push((off, len));
                 let mut file = std::fs::File::open(&self.path)?;
                 file.seek(SeekFrom::Start(off))?;
                 let mut bytes = Vec::new();
                 file.take(len).read_to_end(&mut bytes)?;
                 Ok(bytes)
             };
-            let (origin, run_id, ordinal_base, held) = seeds_at_cut(&self.records, 3);
+            let (origin, run_id, ordinal_base, held) = seeds_at_cut(&self.records, self.cut);
             replay_seeded_at_validated_boundary(
                 &read_at,
                 &self.boundary,
@@ -6969,6 +7006,103 @@ mod offset_tail_tests {
         assert_eq!(
             log.validate(&log.tail).unwrap_err().reason,
             "corrupt boundary lineage gap"
+        );
+    }
+
+    #[test]
+    fn real_overhaul_empty_tail_accepts_last_boundary_without_full_read() {
+        let log = RealBoundaryLog::at_last_turn("empty-tail");
+        assert!(log.tail.is_empty());
+        assert_eq!(
+            log.bytes.len() as u64 - log.boundary.frame_end,
+            broca_wal::framing::LINEAGE_FRAME_LEN as u64
+        );
+        let seeded = log
+            .validate(&[])
+            .expect("the last boundary's trailing metadata must not force full replay");
+        assert_eq!(seeded.extent, replay(&log.records).unwrap().extent);
+        let reads = log.reads.borrow();
+        assert!(reads.iter().any(|&(off, len)| off == log.boundary.frame_end
+            && len == broca_wal::framing::LINEAGE_FRAME_LEN as u64));
+        assert!(reads
+            .iter()
+            .all(|&(off, len)| off != 0 || len <= broca_wal::framing::LINEAGE_FRAME_LEN as u64));
+        let frame_len = log.boundary.frame_end - log.boundary.frame_off;
+        assert!(
+            reads.iter().map(|(_, len)| len).sum::<u64>()
+                <= frame_len + 2 * broca_wal::framing::LINEAGE_FRAME_LEN as u64 + 2
+        );
+    }
+
+    #[test]
+    fn real_overhaul_empty_tail_accepts_eof_without_metadata() {
+        let log = RealBoundaryLog::at_last_turn("empty-no-metadata");
+        std::fs::write(&log.path, &log.bytes[..log.boundary.frame_end as usize]).unwrap();
+        log.validate(&[])
+            .expect("a boundary at physical EOF needs no metadata gap");
+    }
+
+    #[test]
+    fn real_overhaul_empty_tail_refuses_appended_record() {
+        use crate::WalStore;
+        let log = RealBoundaryLog::at_last_turn("empty-appended");
+        let store =
+            crate::FileWalStore::with_config(log.root.join("wal"), broca_wal::WalConfig::OVERHAUL);
+        let mut wal = store
+            .open(&BindIdentity::new("/tmp/project", "runner", "session"))
+            .unwrap();
+        wal.append(1, &step_started(2), true).unwrap();
+        drop(wal);
+        assert_eq!(
+            log.validate(&[]).unwrap_err().reason,
+            "empty tail before log end"
+        );
+    }
+
+    #[test]
+    fn real_overhaul_empty_tail_refuses_corrupt_trailing_metadata() {
+        let log = RealBoundaryLog::at_last_turn("empty-corrupt");
+        let mut bytes = log.bytes.clone();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&log.path, bytes).unwrap();
+        assert_eq!(
+            log.validate(&[]).unwrap_err().reason,
+            "corrupt boundary lineage gap"
+        );
+    }
+
+    #[test]
+    fn real_overhaul_empty_tail_refuses_metadata_followed_by_more_bytes() {
+        let log = RealBoundaryLog::at_last_turn("empty-extra");
+        let mut bytes = log.bytes.clone();
+        bytes.push(0);
+        std::fs::write(&log.path, bytes).unwrap();
+        assert_eq!(
+            log.validate(&[]).unwrap_err().reason,
+            "empty tail before log end"
+        );
+    }
+
+    #[test]
+    fn real_overhaul_empty_tail_refuses_short_trailing_metadata() {
+        let log = RealBoundaryLog::at_last_turn("empty-short");
+        std::fs::write(&log.path, &log.bytes[..log.bytes.len() - 1]).unwrap();
+        assert_eq!(
+            log.validate(&[]).unwrap_err().reason,
+            "short lineage gap read"
+        );
+    }
+
+    #[test]
+    fn real_overhaul_empty_tail_refuses_foreign_trailing_metadata() {
+        let log = RealBoundaryLog::at_last_turn("empty-foreign");
+        let foreign = RealBoundaryLog::at_last_turn("empty-foreign-source");
+        let mut bytes = log.bytes[..log.boundary.frame_end as usize].to_vec();
+        bytes.extend_from_slice(&foreign.bytes[..broca_wal::framing::LINEAGE_FRAME_LEN]);
+        std::fs::write(&log.path, bytes).unwrap();
+        assert_eq!(
+            log.validate(&[]).unwrap_err().reason,
+            "boundary lineage gap mismatch"
         );
     }
 }

@@ -9455,17 +9455,31 @@ mod tests {
 
     #[test]
     fn offset_paused_cancel_real_filewal_reads_two_sources_without_full_read() {
+        offset_paused_cancel_real_filewal_case(false);
+    }
+
+    #[test]
+    fn offset_paused_cancel_real_filewal_empty_tail_reads_two_sources_without_full_read() {
+        offset_paused_cancel_real_filewal_case(true);
+    }
+
+    fn offset_paused_cancel_real_filewal_case(empty_tail: bool) {
         use broca_core::replay::{PositionedFrame, SeedBoundary};
         use broca_wal::framing::{decode_next, DecodeStep};
         use sha2::Digest;
         use std::io::{Read, Seek, SeekFrom};
 
-        let root = broca_test_support::scratch_root()
-            .join(format!("real-paused-cancel-seed-{}", std::process::id()));
+        let root = broca_test_support::scratch_root().join(format!(
+            "real-paused-cancel-seed-{empty_tail}-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
         let key = BindIdentity::new("/offset-admission", "h", "real-paused");
-        let mut records = held_close_seed(&key, false)[..5].to_vec();
+        let mut records = held_close_seed(&key, false);
+        if !empty_tail {
+            records.truncate(5);
+        }
         if let WalRecord::RunStarted { config, .. } = &mut records[0] {
             config.tools_were_omitted = true;
         }
@@ -9477,6 +9491,16 @@ mod tests {
             } => (batch_id.clone(), *step_id, planned_calls.clone()),
             _ => unreachable!(),
         };
+        if empty_tail {
+            // A paused provider-held batch may commit its closing turn before the run's
+            // final terminal. A seed at that crash cut already contains the pause.
+            records.push(WalRecord::RunPaused {
+                run_id: RunId("held".into()),
+                ts_ms: None,
+                reason: broca_protocol::PauseReason::ToolHeld,
+                error: None,
+            });
+        }
         for tool_call_id in calls {
             records.push(WalRecord::ToolResult {
                 finished_at_ms: None,
@@ -9501,12 +9525,14 @@ mod tests {
         // without depending on a future terminal to qualify a no-tool answer.
         records.push(WalRecord::TurnFinished { step_id });
         let cut = records.len();
-        records.push(WalRecord::RunPaused {
-            run_id: RunId("held".into()),
-            ts_ms: None,
-            reason: broca_protocol::PauseReason::AuthRequired,
-            error: None,
-        });
+        if !empty_tail {
+            records.push(WalRecord::RunPaused {
+                run_id: RunId("held".into()),
+                ts_ms: None,
+                reason: broca_protocol::PauseReason::AuthRequired,
+                error: None,
+            });
+        }
         let store = FileWalStore::with_config(root.join("wal"), broca_wal::WalConfig::OVERHAUL);
         let mut wal = store.open(&key).unwrap();
         for record in &records {
@@ -9605,9 +9631,10 @@ mod tests {
             "one RunStarted source and the boundary TurnFinished source"
         );
         assert_eq!(
-            positioned[cut].off - boundary.frame_end,
+            positioned.get(cut).map_or(bytes.len() as u64, |p| p.off) - boundary.frame_end,
             broca_wal::framing::LINEAGE_FRAME_LEN as u64
         );
+        assert_eq!(positioned[cut..].is_empty(), empty_tail);
         std::fs::remove_dir_all(root).unwrap();
     }
 
