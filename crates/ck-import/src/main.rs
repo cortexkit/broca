@@ -23,18 +23,11 @@ use clap::{error::ErrorKind as ClapErrorKind, Parser};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-mod mc_state;
-
-use mc_state::{
-    default_context_db_path, load_compartments, prepare_state_import, submit_state_import,
-    CompartmentLoad, DEFAULT_MC_MODULE_ID,
-};
-
 #[derive(Parser, Debug)]
 #[command(
     name = "ck-import",
     version,
-    about = "Import a foreign harness session into broca"
+    about = "Import a foreign harness transcript into broca"
 )]
 struct Args {
     /// Source harness (opencode, claude-code, codex, goose, or pi).
@@ -71,15 +64,6 @@ struct Args {
     /// Broca management-surface module id.
     #[arg(long, default_value = "broca")]
     module_id: String,
-    /// Do not import magic-context compartments for an OpenCode session.
-    #[arg(long)]
-    skip_mc_state: bool,
-    /// Override magic-context's compartment database path.
-    #[arg(long)]
-    mc_state_db: Option<PathBuf>,
-    /// Magic-context management-surface module id.
-    #[arg(long, default_value = DEFAULT_MC_MODULE_ID)]
-    mc_module_id: String,
     /// Time to wait for a supervised broca module to register.
     #[arg(long, default_value_t = 30_000)]
     bind_timeout_ms: u64,
@@ -228,38 +212,7 @@ async fn run(args: Args, output: &Output) -> Result<(), String> {
     let (imported, source_cwd) =
         convert_source(reader.as_ref(), source_id, args.project_root.as_ref())?;
 
-    let mut mc_status = if args.skip_mc_state {
-        "skipped".to_string()
-    } else {
-        "absent".to_string()
-    };
     let session_id = args.session.unwrap_or_else(fresh_uuid);
-    let mut mc_compartments = None;
-    if !args.skip_mc_state && source_harness == "opencode" {
-        let coordinates = imported.coordinate_map.as_ref().ok_or_else(|| {
-            "OpenCode conversion did not produce the coordinate map required for magic-context state import"
-                .to_string()
-        })?;
-        let context_db = args
-            .mc_state_db
-            .clone()
-            .unwrap_or_else(default_context_db_path);
-        match load_compartments(&context_db, source_id, coordinates) {
-            Ok(CompartmentLoad::None) => {}
-            Ok(CompartmentLoad::Unavailable(message)) => {
-                mc_status = "unavailable".into();
-                warn_mc_state_unavailable(output, &message, &session_id);
-            }
-            Ok(CompartmentLoad::Found(compartments)) => {
-                mc_status = "prepared".into();
-                mc_compartments = Some(compartments);
-            }
-            Err(message) => {
-                mc_status = "unavailable".into();
-                warn_mc_state_unavailable(output, &message, &session_id);
-            }
-        }
-    }
 
     for warning in &imported.warnings {
         output.event(json!({"event": "warning", "message": warning}), || {
@@ -295,32 +248,6 @@ async fn run(args: Args, output: &Output) -> Result<(), String> {
     let import_id = args
         .import_id
         .unwrap_or_else(|| digest_import_id(&imported.source_ref));
-    let mc_prepared =
-        prepare_optional_mc_state(&session_id, mc_compartments, output, &mut mc_status);
-    let mc_compartment_count = mc_prepared
-        .as_ref()
-        .map_or(0, |prepared| prepared.compartment_count);
-    let mc_batch_count = mc_prepared
-        .as_ref()
-        .map_or(0, |prepared| prepared.batches.len());
-    let mc_import_id = mc_prepared
-        .as_ref()
-        .map(|prepared| prepared.import_id.clone());
-    output.event(
-        json!({
-            "event": "progress",
-            "action": "mc_state",
-            "status": &mc_status,
-            "compartment_count": mc_compartment_count,
-            "batch_count": mc_batch_count,
-            "import_id": &mc_import_id,
-        }),
-        || {
-            format!(
-                "Magic-context state: status={mc_status}, compartments={mc_compartment_count}, batches={mc_batch_count}"
-            )
-        },
-    );
     let subc = args
         .subc
         .ok_or_else(|| "--subc <subc-connection.json> is required for import mode".to_string())?;
@@ -355,7 +282,7 @@ async fn run(args: Args, output: &Output) -> Result<(), String> {
     let client = SessionClient::bind_with_timeout(
         connection,
         &args.module_id,
-        identity.clone(),
+        identity,
         std::time::Duration::from_millis(args.bind_timeout_ms),
     )
     .await
@@ -364,37 +291,6 @@ async fn run(args: Args, output: &Output) -> Result<(), String> {
         .import(imported.messages, &import_id, &imported.source_ref)
         .await
         .map_err(|error| format!("session.import: {error}"))?;
-
-    let mut mc_imported = 0usize;
-    let mut mc_duplicate = false;
-    if let Some(prepared) = &mc_prepared {
-        let mc_connection = SubcConnection::connect(&subc).await.map_err(|error| {
-            retry_instruction(
-                &format!(
-                    "state.import could not reconnect to subc ({}): {error}",
-                    subc.display()
-                ),
-                &session_id,
-            )
-        })?;
-        let outcome = submit_state_import(
-            &mc_connection,
-            &args.mc_module_id,
-            &identity,
-            std::time::Duration::from_millis(args.bind_timeout_ms),
-            prepared,
-        )
-        .await
-        .map_err(|error| {
-            retry_instruction(
-                &format!("magic-context state.import failed: {error}"),
-                &session_id,
-            )
-        })?;
-        mc_imported = outcome.imported;
-        mc_duplicate = outcome.duplicate;
-        mc_status = "imported".into();
-    }
 
     output.done(
         json!({
@@ -412,21 +308,12 @@ async fn run(args: Args, output: &Output) -> Result<(), String> {
             // Absent rather than 0 against a server that predates the field: it dropped
             // them too and simply did not say so.
             "already_imported": result.already_imported,
-            "mc_state": {
-                "status": &mc_status,
-                "compartment_count": mc_compartment_count,
-                "batch_count": mc_batch_count,
-                "import_id": &mc_import_id,
-                "imported": mc_imported,
-                "duplicate": mc_duplicate,
-            },
         }),
         || {
             format!(
                 "Imported session {session_id}: run_id={}, synthesized_tool_results={}, \
                  dropped_orphan_tool_results={}, dropped_system_messages={}, \
-                 dropped_api_error_messages={}, already_imported={}; \
-                 magic-context: status={}, compartments={}, batches={}, imported={}, duplicate={}",
+                 dropped_api_error_messages={}, already_imported={}",
                 result.run_id,
                 result.synthesized_tool_results,
                 result.dropped_orphan_tool_results,
@@ -434,12 +321,7 @@ async fn run(args: Args, output: &Output) -> Result<(), String> {
                     .dropped_system_messages
                     .map_or_else(|| "unreported".to_string(), |n| n.to_string()),
                 dropped_api_error_messages,
-                result.already_imported,
-                mc_status,
-                mc_compartment_count,
-                mc_batch_count,
-                mc_imported,
-                mc_duplicate
+                result.already_imported
             )
         },
     );
@@ -463,66 +345,6 @@ fn convert_source(
         None
     };
     Ok((imported, source_cwd))
-}
-
-fn mc_state_unavailable_message(reason: &str, session_id: &str) -> String {
-    format!(
-        "Magic-context state unavailable; continuing with lineage-only: {reason}. To retry state seeding, rerun with --session {session_id}."
-    )
-}
-
-fn warn_mc_state_unavailable(output: &Output, reason: &str, session_id: &str) {
-    let message = mc_state_unavailable_message(reason, session_id);
-    output.event(
-        json!({
-            "event": "warning",
-            "kind": "mc_state_unavailable",
-            "message": message,
-        }),
-        || format!("WARNING: {message}"),
-    );
-}
-
-fn prepare_optional_mc_state(
-    session_id: &str,
-    compartments: Option<Vec<mc_state::WireCompartment>>,
-    output: &Output,
-    status: &mut String,
-) -> Option<mc_state::PreparedStateImport> {
-    match compartments {
-        Some(compartments) => match prepare_state_import(session_id, compartments) {
-            Ok(prepared) => Some(prepared),
-            Err(message) => {
-                *status = "unavailable".into();
-                warn_mc_state_unavailable(output, &message, session_id);
-                None
-            }
-        },
-        None => None,
-    }
-}
-
-/// Build the retry instruction shown when the lineage import committed but the
-/// magic-context leg did not.
-///
-/// The `--session` id is not decoration: import idempotency is SESSION-SCOPED, because the
-/// server keys an import on the BindIdentity. A bare re-run that omitted `--session` mints a
-/// fresh UUID, addresses a different lineage, and imports the transcript a SECOND time
-/// instead of returning `already_imported` -- orphaning the session the first leg just
-/// committed. So an instruction to re-run the command is only true when the id travels with
-/// it; without the id it silently does the opposite of what it promises.
-///
-/// A deterministic id derived from the import identity would remove the need for this, and is
-/// deliberately NOT the shape here: importing one source into two sessions on purpose is a
-/// legitimate workflow (the mc12k benchmark pair does exactly that), and a derived id would
-/// turn the second one into a no-op.
-fn retry_instruction(failure: &str, session_id: &str) -> String {
-    format!(
-        "session.import succeeded, but {failure}. Re-run with --session {session_id} to resume \
-         this import: the lineage retry is then already_imported and the state retry resumes \
-         from batch 0. Re-running WITHOUT --session imports the transcript again under a new \
-         session and orphans this one"
-    )
 }
 
 fn resolve_project_root(project_root: Option<PathBuf>, source_cwd: Option<&str>) -> PathBuf {
@@ -617,51 +439,6 @@ fn fresh_uuid() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        mc_state_unavailable_message, prepare_optional_mc_state, retry_instruction, Output,
-    };
-
-    /// The instruction must carry the session id, because the retry it describes is only
-    /// idempotent when addressed to the SAME lineage. Asserting the id is present is the
-    /// whole guarantee: a message that says "re-run this command" without it sends the user
-    /// to a fresh UUID, a second import of the same transcript, and an orphaned session.
-    #[test]
-    fn retry_instruction_names_the_session_to_resume() {
-        let msg = retry_instruction("state.import failed: connection reset", "ses_abc123");
-        assert!(
-            msg.contains("--session ses_abc123"),
-            "retry instruction must name the session to resume, got: {msg}"
-        );
-        // The underlying failure has to survive too, or the user cannot tell which leg broke.
-        assert!(
-            msg.contains("connection reset"),
-            "failure detail lost: {msg}"
-        );
-        // And it must warn about the bare re-run, since that is the instruction a user who
-        // skims will follow.
-        assert!(
-            msg.contains("WITHOUT --session"),
-            "must warn that a bare re-run duplicates the import, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn optional_state_preparation_failure_becomes_a_lineage_only_status() {
-        let mut status = "prepared".to_string();
-        let prepared = prepare_optional_mc_state(
-            "ses_retry",
-            Some(Vec::new()),
-            &Output { json: true },
-            &mut status,
-        );
-
-        assert!(prepared.is_none());
-        assert_eq!(status, "unavailable");
-        let message = mc_state_unavailable_message("empty bundle", "ses_retry");
-        assert!(message.contains("continuing with lineage-only"));
-        assert!(message.contains("--session ses_retry"));
-    }
-
     use std::cell::Cell;
     use std::error::Error;
     use std::path::{Path, PathBuf};

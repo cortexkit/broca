@@ -800,8 +800,6 @@ dependencies = [
  "broca-test-support",
  "ck-session-import",
  "clap",
- "rusqlite",
- "serde",
  "serde_json",
  "sha2",
  "tokio",

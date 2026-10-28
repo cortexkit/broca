@@ -178,58 +178,6 @@ fn unsupported_harness_error_lists_supported_harnesses() {
 }
 
 #[test]
-fn malformed_mc_row_warns_and_continues_lineage_setup() {
-    let malformed = broca_test_support::scratch_root()
-        .join(format!("ck-import-malformed-mc-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&malformed);
-    let connection = rusqlite::Connection::open(&malformed).unwrap();
-    connection
-        .execute_batch(
-            "CREATE TABLE compartments (\
-               sequence INTEGER, start_message INTEGER, end_message INTEGER, \
-               start_message_id TEXT, end_message_id TEXT, title TEXT, content TEXT, \
-               legacy INTEGER, p1 TEXT, p2 TEXT, p3 TEXT, p4 TEXT, importance INTEGER, \
-               episode_type TEXT, harness TEXT, session_id TEXT\
-             );\
-             INSERT INTO compartments VALUES \
-               (1, 'not-an-integer', 1, '', '', 'malformed', '', \
-                0, 'state', NULL, NULL, NULL, 50, NULL, 'opencode', 'ses-text');",
-        )
-        .unwrap();
-    drop(connection);
-    let output = broca_test_support::retry_executable_file_busy(|| {
-        command()
-            .args(["opencode", "ses-text", "--json", "--source-db"])
-            .arg(fixture())
-            .arg("--mc-state-db")
-            .arg(&malformed)
-            .output()
-    })
-    .unwrap();
-    assert!(!output.status.success());
-    let events: Vec<serde_json::Value> = String::from_utf8(output.stdout)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert!(events
-        .iter()
-        .any(|event| { event["event"] == "warning" && event["kind"] == "mc_state_unavailable" }));
-    assert!(events
-        .iter()
-        .any(|event| { event["action"] == "mc_state" && event["status"] == "unavailable" }));
-    assert!(events.last().unwrap()["message"]
-        .as_str()
-        .unwrap()
-        .contains("--subc"));
-    assert!(events.iter().any(|event| {
-        event["kind"] == "mc_state_unavailable"
-            && event["message"].as_str().unwrap().contains("--session ")
-    }));
-    let _ = std::fs::remove_file(malformed);
-}
-
-#[test]
 fn client_message_cap_fails_before_connecting_to_subc() {
     let output = broca_test_support::retry_executable_file_busy(|| {
         command()

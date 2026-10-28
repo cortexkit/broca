@@ -11,16 +11,17 @@ ck-import opencode <opencode-session-id> \
 
 OpenCode defaults to `~/.local/share/opencode/opencode.db`; use `--source-db` to select another
 current-format database. The legacy `storage/message` directory format is not supported yet.
-When `~/.local/share/cortexkit/magic-context/context.db` contains compartments for the source
-OpenCode session, `ck-import` sends those compartments to the `magic-context` management module
-after `session.import` commits. Use `--skip-mc-state` for a lineage-only import or
-`--mc-state-db` to select a different read-only compartment database. Missing or unreadable compartment
-state emits a warning and does not block the lineage import.
+
+Imports carry transcripts only, not Magic Context compartments. The imported broca session
+summarizes its own history at its first compaction Setup, producing summaries with coordinates
+from the imported transcript.
 
 The context warning uses a rough character-count / 4 estimate and compares it with
 `--context-limit` (default 200,000). Imports are rejected client-side above 100,000 messages or
-48 MiB of canonical JSON so a subc frame-limit error is never the first failure. Both import legs
-are idempotent; if compartment seeding fails after lineage import, rerun with the same `--session <target-session-id>` printed by the import. A retry without `--session` creates a new lineage and imports the transcript again, so choose a session id up front when you may need to retry.
+48 MiB of canonical JSON so a subc frame-limit error is never the first failure. Transcript imports
+are idempotent within the same target session; retry with the same `--session <target-session-id>`
+printed by the import. A retry without `--session` creates a new lineage and imports the transcript
+again, so choose a session id up front when you may need to retry.
 
 ## Live smoke test
 
