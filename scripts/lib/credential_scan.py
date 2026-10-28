@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import errno
 import json
+import mmap
 import os
 import pathlib
 from typing import NamedTuple
 
-from .archive_read import ArchiveRefusal, read_records, read_records_reverse
+from .archive_read import ArchiveRefusal, read_records
 
 
 class CannotCompare(Exception):
@@ -19,7 +20,8 @@ class ScanResult(NamedTuple):
     skipped: set[str]
     logs_read: int = 0
     vanished: int = 0
-    fallbacks: int = 0
+    searched: int = 0
+    matches: tuple[str, ...] = ()
     error: str | None = None
 
 
@@ -86,7 +88,7 @@ def _selection(record: dict):
     return record.get("auth_selection")
 
 
-def _include(selection, credentials: set[str], skipped: set[str]):
+def _include(selection, credentials: set[str], skipped: set[str], targets: set[str] | None = None):
     if selection is None:
         return
     if not isinstance(selection, dict):
@@ -94,11 +96,16 @@ def _include(selection, credentials: set[str], skipped: set[str]):
     credential = selection.get("resolved_credential_id") or selection.get("credential_id")
     if not isinstance(credential, str) or not credential:
         raise CannotCompare("a recent auth selection has no credential id")
+    if targets is not None and credential not in targets:
+        return
     (credentials if chooser_selects_accounts(selection) else skipped).add(credential)
 
 
-def scan_forward(path: pathlib.Path, cutoff: int) -> tuple[set[str], set[str]]:
-    """The full-history attribution path, also the oracle for bounded-tail tests."""
+def scan_forward(path: pathlib.Path, cutoff: int, targets: set[str] | None = None) -> tuple[set[str], set[str]]:
+    """Find credentials selected for recent run events, including auth refreezes.
+
+    When supplied, targets limits attribution to the deficient vault rows.
+    """
     credentials: set[str] = set()
     skipped: set[str] = set()
     selection = None
@@ -111,60 +118,41 @@ def scan_forward(path: pathlib.Path, cutoff: int) -> tuple[set[str], set[str]]:
         if kind in ("run_finished", "run_sealed"):
             selection = None
         if _recent(record, cutoff):
-            _include(current, credentials, skipped)
+            _include(current, credentials, skipped, targets)
     return credentials, skipped
 
 
-def scan_reverse(path: pathlib.Path, cutoff: int) -> tuple[set[str], set[str]] | None:
-    """Return tail attribution, or request a full scan for an ambiguous boundary.
-
-    Writer activity is ordered, but queued admission times can precede earlier
-    records. An old queued admission or untimed boundary cannot establish the
-    cutoff, so those require the full forward path.
-    This deploy guard validates every frame it uses, not an unread prefix:
-    recovery and wal-verify own integrity outside the recent-credential window.
-    """
-    credentials: set[str] = set()
-    skipped: set[str] = set()
-    pending = False
-    for frame in read_records_reverse(path):
-        record = frame.record
-        kind = record["type"]
-        if kind in ("run_finished", "run_sealed"):
-            # Records after a terminal have no active selection; the terminal
-            # itself belongs to the selection immediately before it.
-            pending = _recent(record, cutoff)
-        elif kind in ("run_started", "run_auth_refrozen"):
-            pending = pending or _recent(record, cutoff)
-            if pending:
-                _include(_selection(record), credentials, skipped)
-            pending = False
-            timestamp = record.get("written_at_ms" if kind == "run_started" else "ts_ms")
-            if type(timestamp) is not int or timestamp <= 0:
-                return None
-            if timestamp < cutoff:
-                if _recent(record, cutoff) or (kind == "run_started" and record.get("submission_id") is not None):
-                    return None
-                return credentials, skipped
-        elif _recent(record, cutoff):
-            pending = True
-    return credentials, skipped
+def quoted_ids(credentials) -> tuple[tuple[str, tuple[bytes, ...]], ...]:
+    """Match canonical Rust UTF-8 JSON strings and the usual ASCII-escaped form."""
+    return tuple((credential, tuple(sorted({
+        json.dumps(credential, ensure_ascii=False).encode("utf-8"),
+        json.dumps(credential, ensure_ascii=True).encode("utf-8"),
+    }))) for credential in sorted(credentials))
 
 
-def scan_wal(task: tuple[pathlib.Path, int]) -> ScanResult:
-    """Keep errors structured before process-pool pickling loses their cause chain."""
-    path, cutoff = task
+def scan_wal(task) -> ScanResult:
+    """Search bytes first; only candidate logs pay for full verified decoding."""
+    path, cutoff, patterns = task
+    searched = 0
     try:
         try:
-            # Append-only live logs not modified in the window need no file reads.
+            # Append-only logs not modified in the window cannot contain recent use.
             if path.stat().st_mtime_ns < cutoff * 1_000_000:
                 return ScanResult(set(), set())
-            selected = scan_reverse(path, cutoff)
-            fallback = selected is None
-            if fallback:
-                selected = scan_forward(path, cutoff)
-            assert selected is not None
-            return ScanResult(*selected, logs_read=1, fallbacks=int(fallback))
+            with path.open("rb") as handle:
+                size = os.fstat(handle.fileno()).st_size
+                searched = 1
+                if size == 0:
+                    return ScanResult(set(), set(), searched=1)
+                with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                    matches = tuple(credential for credential, spellings in patterns
+                                    if any(data.find(spelling) >= 0 for spelling in spellings))
+            if not matches:
+                return ScanResult(set(), set(), searched=1)
+            # A quoted ID in tool output is not credential use. Decode every frame
+            # of candidate logs and confirm a recent chooser-method selection.
+            selected, skipped = scan_forward(path, cutoff, set(matches))
+            return ScanResult(selected, skipped, logs_read=1, searched=1, matches=matches)
         except FileNotFoundError as error:
             if error.errno != errno.ENOENT:
                 raise
@@ -175,7 +163,7 @@ def scan_wal(task: tuple[pathlib.Path, int]) -> ScanResult:
             except FileNotFoundError as recheck:
                 if recheck.errno != errno.ENOENT:
                     raise
-                return ScanResult(set(), set(), vanished=1)
+                return ScanResult(set(), set(), vanished=1, searched=searched)
             raise
     except (CannotCompare, ArchiveRefusal, OSError, ValueError) as error:
-        return ScanResult(set(), set(), error=error_detail(error))
+        return ScanResult(set(), set(), error=f"{path}: {error_detail(error)}")

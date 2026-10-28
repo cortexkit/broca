@@ -283,68 +283,6 @@ def read_records(wal: pathlib.Path | ArchivedWal) -> list[WalFrame]:
     return frames
 
 
-_HEADER_MARKERS = re.compile(rb"[\x00-\x1f]")
-
-
-def read_records_reverse(wal: pathlib.Path, chunk_size: int = 4096):
-    """Yield verified live frames newest first, without decoding the unread prefix.
-
-    Frames have no trailing length. Find headers in backward chunks by their
-    leading length ending exactly at the preceding frame boundary, then use the
-    same digest, framing and record checks as the full forward reader. Header
-    version bytes are control bytes, which cannot occur bare inside JSON strings.
-    """
-    with wal.open("rb") as handle:
-        handle.seek(0, 2)
-        end = handle.tell()
-        overlap = b""
-        newer_seq = None
-        lineage = None
-        invalid = None
-        for pos, block in backward_chunks(handle, end, chunk_size):
-            window = block + overlap
-            for match in reversed(list(_HEADER_MARKERS.finditer(window))):
-                local = match.start() - 4
-                start = pos + local
-                if local < 0 or start + WAL_HEADER_LEN > end:
-                    continue
-                length = struct.unpack_from("<I", window, local)[0]
-                if start + WAL_HEADER_LEN + length != end:
-                    continue
-                where = f"{wal}: WAL frame at byte {start}"
-                handle.seek(start)
-                raw = handle.read(end - start)
-                try:
-                    version, seq, fence, payload, frame_end = _frame_at(raw, 0, where)
-                except ArchiveRefusal as error:
-                    # A digest/header byte can resemble a version marker. Only
-                    # a validated frame establishes the next backward boundary.
-                    invalid = error
-                    continue
-                if frame_end != len(raw):
-                    raise ArchiveRefusal(f"{where}: frame changed during backward read")
-                if version == 2:
-                    if lineage is not None and lineage != payload:
-                        raise ArchiveRefusal(f"{where}: conflicting lineage IDs")
-                    lineage = payload
-                    if start == 0 and newer_seq not in (None, 1):
-                        raise ArchiveRefusal(f"{where}: expected first record sequence 1, found {newer_seq}")
-                else:
-                    if seq < 1 or (newer_seq is not None and seq != newer_seq - 1) or (start == 0 and seq != 1):
-                        raise ArchiveRefusal(f"{where}: unexpected record sequence {seq}")
-                    newer_seq = seq
-                end = start
-                invalid = None
-                frame = _decode_record(where, version, seq, fence, payload)
-                if frame is not None:
-                    yield frame
-            overlap = window[:4]
-            if end - pos > MAX_PAYLOAD_LEN + WAL_HEADER_LEN:
-                raise invalid or ArchiveRefusal(f"{wal}: torn or corrupt frame ending at byte {end}")
-        if end:
-            raise invalid or ArchiveRefusal(f"{wal}: torn or corrupt frame ending at byte {end}")
-
-
 def fold_timestamp(path: pathlib.Path) -> int:
     match = re.fullmatch(r"fold-(0|[1-9][0-9]*)\.ark", path.name)
     if match is None or int(match[1]) > 2**64 - 1:

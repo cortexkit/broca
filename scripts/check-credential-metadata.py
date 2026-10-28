@@ -28,55 +28,53 @@ def live_logs(state_root: pathlib.Path) -> list[pathlib.Path]:
     return sorted(paths)
 
 
-def recent_credentials(state_root: pathlib.Path, now_ms: int, days: int = 7) -> tuple[set[str], set[str], int, int, int]:
-    """Combine low-priority tail scans without opening old files during discovery."""
+def check_flagged_credentials(state_root: pathlib.Path, now_ms: int, flagged, days: int = 7) -> scan.ScanResult:
+    """Byte-search recent live logs; decode only candidates for deficient vault rows."""
     if days >= 14:
         raise CannotCompare("a live-only metadata scan requires a window shorter than the 14-day archive idle period")
     # Archives require 14 idle days, outside this guard's seven-day deploy window.
+    patterns = scan.quoted_ids(flagged)
+    if not patterns:
+        return scan.ScanResult(set(), set())
     paths = live_logs(state_root)
     cutoff = now_ms - days * 24 * 60 * 60 * 1000
     credentials: set[str] = set()
     skipped: set[str] = set()
-    logs_read = logs_vanished = fallbacks = 0
+    matches: set[str] = set()
+    decoded = vanished = searched = 0
     if paths:
         pool = ProcessPoolExecutor(max_workers=min(4, len(paths)), initializer=scan.lower_worker_priority)
         try:
-            for result in pool.map(scan.scan_wal, ((path, cutoff) for path in paths), chunksize=32):
+            tasks = ((path, cutoff, patterns) for path in paths)
+            for result in pool.map(scan.scan_wal, tasks, chunksize=32):
                 if result.error is not None:
                     raise CannotCompare(result.error)
                 credentials.update(result.credentials)
                 skipped.update(result.skipped)
-                logs_read += result.logs_read
-                logs_vanished += result.vanished
-                fallbacks += result.fallbacks
+                matches.update(result.matches)
+                decoded += result.logs_read
+                vanished += result.vanished
+                searched += result.searched
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
-    if not credentials and not skipped:
-        raise CannotCompare(f"no credentials recorded in broca runs in the last {days} days")
-    return credentials, skipped - credentials, logs_read, logs_vanished, fallbacks
+    return scan.ScanResult(credentials, skipped - credentials, decoded, vanished, searched, tuple(sorted(matches)))
 
 
-def compare(credentials: set[str], listing: object) -> list[str]:
+def flag_credentials(listing: object) -> dict[str, tuple[str, ...]]:
     if not isinstance(listing, dict) or type(listing.get("v")) is not int or listing["v"] != 1:
         raise CannotCompare("vault listing has an unknown version")
     if not isinstance(listing.get("credentials"), list):
         raise CannotCompare("vault listing has no credentials array")
     rows = listing["credentials"]
-    if not rows:
-        raise CannotCompare("live vault listing is empty")
-    indexed = {}
+    seen: set[str] = set()
+    flagged = {}
     for row in rows:
-        if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+        if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"]:
             raise CannotCompare("vault listing contains a row without a credential id")
-        if row["id"] in indexed:
+        credential = row["id"]
+        if credential in seen:
             raise CannotCompare("vault listing contains duplicate credential ids")
-        indexed[row["id"]] = row
-    missing = []
-    for credential in sorted(credentials):
-        row = indexed.get(credential)
-        if row is None:
-            missing.append(f"{credential}: absent from live vault listing")
-            continue
+        seen.add(credential)
         fields = []
         providers = row.get("provider_ids")
         if not isinstance(providers, list) or not providers or not all(
@@ -84,11 +82,15 @@ def compare(credentials: set[str], listing: object) -> list[str]:
         ):
             fields.append("provider_ids")
         method = row.get("auth_method")
-        if not isinstance(method, str) or not method.strip():
+        if method is None:
             fields.append("auth_method")
+        elif not isinstance(method, str):
+            raise CannotCompare("vault listing auth_method is not a string")
         if fields:
-            missing.append(f"{credential}: missing {' and '.join(fields)}")
-    return missing
+            flagged[credential] = tuple(fields)
+    # A used ID absent from this listing is an admission-resolution failure,
+    # independent of the chooser; this guard only checks deficient live vault rows.
+    return flagged
 
 
 def main() -> int:
@@ -102,22 +104,33 @@ def main() -> int:
         parser.error("--days must be positive")
     started = time.monotonic()
     try:
-        credentials, skipped, logs_read, logs_vanished, fallbacks = recent_credentials(args.state_root or default_state_root(), int(time.time() * 1000), args.days)
-        listing = json.loads(args.vault_listing.read_text())
-        missing = compare(credentials, listing)
+        flagged = flag_credentials(json.loads(args.vault_listing.read_text()))
+        result = scan.ScanResult(set(), set())
+        if flagged:
+            result = check_flagged_credentials(args.state_root or default_state_root(),
+                                               int(time.time() * 1000), flagged, args.days)
     except (CannotCompare, scan.ArchiveRefusal, OSError, ValueError, StateRootError, BrokenExecutor) as error:
         print(f"credential-metadata: cannot compare: {scan.error_detail(error)}", file=sys.stderr)
         return 2
-    if missing:
+    if result.credentials:
         print("credential-metadata: REFUSING deploy:", file=sys.stderr)
-        for failure in missing:
-            print(f"  {failure}", file=sys.stderr)
+        for credential in sorted(result.credentials):
+            print(f"  {credential}: missing {' and '.join(flagged[credential])}; confirmed recent chooser-method use",
+                  file=sys.stderr)
         return 1
-    print(f"credential-metadata: PASS; {len(credentials)} recently used credentials selected by the chooser "
-          f"have provider_ids and auth_method; read {logs_read} logs in {time.monotonic() - started:.2f}s; "
-          f"{logs_vanished} logs vanished during the scan; "
-          f"{fallbacks} full forward fallbacks; "
-          f"skipped as not chooser-selected: {', '.join(sorted(skipped)) if skipped else '(none)'}")
+    reasons = []
+    for credential, fields in sorted(flagged.items()):
+        if credential in result.skipped:
+            why = "only non-chooser-method use in the window"
+        elif credential in result.matches:
+            why = "no recent auth selection (text or older use only)"
+        else:
+            why = "not found in retained recent logs"
+        reasons.append(f"{credential} (missing {' and '.join(fields)}; {why})")
+    summary = '; '.join(reasons) if reasons else "none; all listed credentials have routing metadata"
+    print(f"credential-metadata: PASS; flagged credentials: {summary}; searched {result.searched} live logs; "
+          f"decoded {result.logs_read} matching logs; {result.vanished} logs vanished during the scan; "
+          f"elapsed {time.monotonic() - started:.2f}s")
     return 0
 
 
