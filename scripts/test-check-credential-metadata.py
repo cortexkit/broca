@@ -38,6 +38,9 @@ class MetadataDeployGate(unittest.TestCase):
             r'^[ \t]*r#"(\{"type":[^\n]*\})"#,?[ \t]*$', pins, re.MULTILINE)]
         cls.start_template = next(record for record in records if record["type"] == "run_started"
                                   and set(record["config"].get("auth_selection", {})) == {"credential_id"})
+        cls.vault_request_template = next(record["config"]["auth_selection"]["vault_request"]
+                                          for record in records if record["type"] == "run_started"
+                                          and "vault_request" in record["config"].get("auth_selection", {}))
         cls.refreeze_template = next(record for record in records if record["type"] == "run_auth_refrozen"
                                      and "ts_ms" not in record)
         cls.activity_template = next(record for record in records if record["type"] == "model_step_finished")
@@ -59,18 +62,21 @@ class MetadataDeployGate(unittest.TestCase):
         (self.root / "wal").mkdir()
         self.now = int(time.time() * 1000)
 
-    def write_records(self, records, name="session.wal"):
-        path = self.root / "wal" / name
+    def write_records(self, records, name="session.wal", tree="wal"):
+        path = self.root / tree / name
+        path.parent.mkdir(exist_ok=True)
         path.unlink(missing_ok=True)
         subprocess.run([str(self.writer), str(path)], input=json.dumps(records), text=True, check=True)
         return path
 
-    def start(self, credential, timestamp=RECENT, resolved=None):
+    def start(self, credential, timestamp=RECENT, resolved=None, method: str | None = "oauth"):
         record = copy.deepcopy(self.start_template)
         if timestamp is not None:
             record["written_at_ms"] = self.now if timestamp is RECENT else timestamp
         selection = record["config"]["auth_selection"]
         selection["credential_id"] = credential
+        if method is not None:
+            selection["auth_method"] = method
         if resolved:
             selection["resolved_credential_id"] = resolved
         return record
@@ -110,6 +116,70 @@ class MetadataDeployGate(unittest.TestCase):
         self.assertEqual(status, 0, output)
         self.assertIn("PASS; 1 recently used credentials", output)
         self.assertRegex(output, r"read 1 logs in \d+\.\d{2}s")
+
+    def cline_pass_start(self):
+        # Preserve the production module-run shape using the pinned RunStarted
+        # and VaultRequest templates, then let FileWal serialize the actual record.
+        record = self.start("apikey:cline-pass", timestamp=None, resolved="apikey:cline-pass", method=None)
+        record["config"]["model"]["provider_module_id"] = "cline-pass"
+        record["config"]["auth_selection"]["vault_request"] = copy.deepcopy(self.vault_request_template)
+        return record
+
+    def test_cline_pass_module_runs_are_skipped_and_named_without_metadata(self):
+        for tree in ("wal", "wal-ephemeral"):
+            path = self.write_records([self.cline_pass_start(), self.timed(self.attempt_template)],
+                                      f"cline-{tree}.wal", tree=tree)
+            record = GATE.read_records(path)[0].record
+            self.assertEqual(record["config"]["model"]["provider_module_id"], "cline-pass")
+            self.assertEqual(set(record["config"]["auth_selection"]),
+                             {"credential_id", "resolved_credential_id", "vault_request"})
+            self.assertNotIn("written_at_ms", record)
+        self.write_records([self.start("opaque-claude")])
+        status, output = self.run_gate([
+            {"id": "opaque-claude", "provider_ids": ["anthropic"], "auth_method": "oauth"},
+            {"id": "apikey:cline-pass", "handle": "handle-DO-NOT-LOG", "token": "token-DO-NOT-LOG"},
+        ])
+        self.assertEqual(status, 0, output)
+        self.assertIn("PASS; 1 recently used credentials selected by the chooser", output)
+        self.assertEqual(output.split("skipped as not chooser-selected: ", 1)[1].strip(), "apikey:cline-pass")
+
+    def test_only_non_chooser_runs_are_a_comparable_skip_not_empty_history(self):
+        self.write_records([self.cline_pass_start(), self.timed(self.attempt_template)])
+        status, output = self.run_gate([{"id": "apikey:cline-pass"}])
+        self.assertEqual(status, 0, output)
+        self.assertIn("PASS; 0 recently used credentials selected by the chooser", output)
+        self.assertIn("skipped as not chooser-selected: apikey:cline-pass", output)
+
+    def test_legacy_subscription_selections_still_require_metadata(self):
+        for method in ("oauth", "chatgpt"):
+            with self.subTest(method=method):
+                credential = f"{method}:new-provider:legacy"
+                self.write_records([self.start(credential, timestamp=None, method=None),
+                                    self.timed(self.attempt_template)])
+                status, output = self.run_gate([{"id": credential}])
+                self.assertEqual(status, 1, output)
+                self.assertIn(f"{credential}: missing provider_ids and auth_method", output)
+
+    def test_method_predicate_honors_explicit_metadata_before_legacy_key_spelling(self):
+        self.assertTrue(GATE.chooser_selects_accounts({"credential_id": "apikey:cline-pass", "auth_method": "oauth"}))
+        self.assertFalse(GATE.chooser_selects_accounts({"credential_id": "oauth:anthropic", "auth_method": "apikey"}))
+        self.assertFalse(GATE.chooser_selects_accounts({"credential_id": "antigravity:new-provider"}))
+        with self.assertRaisesRegex(GATE.CannotCompare, "unknown authentication method"):
+            GATE.chooser_selects_accounts({"credential_id": "opaque", "auth_method": "future-method"})
+        with self.assertRaisesRegex(GATE.CannotCompare, "no recognizable authentication method"):
+            GATE.chooser_selects_accounts({"credential_id": "opaque"})
+
+    def test_refreeze_reclassifies_the_active_selection(self):
+        refreeze = self.timed(self.refreeze_template)
+        refreeze["auth_selection"]["credential_id"] = "apikey:cline-pass"
+        self.write_records([self.start("oauth:anthropic:old", self.now - GATE.WEEK_MS - 1, method=None),
+                            refreeze])
+        self.assertEqual(GATE.recent_credentials(self.root, self.now), (set(), {"apikey:cline-pass"}, 1))
+
+    def test_a_credential_seen_in_scope_is_not_reported_as_skipped(self):
+        self.write_records([self.start("apikey:provider-module", resolved="shared", method=None)], "module.wal")
+        self.write_records([self.start("opaque-subscription", resolved="shared")])
+        self.assertEqual(GATE.recent_credentials(self.root, self.now), ({"shared"}, set(), 2))
 
     def test_refuse_names_each_used_credential_and_missing_field(self):
         self.write_records([self.start("oauth:anthropic:private"), self.start("no-method"),
@@ -158,11 +228,12 @@ class MetadataDeployGate(unittest.TestCase):
 
     def test_recent_activity_and_refreeze_count_but_old_runs_do_not(self):
         refreeze = self.timed(self.refreeze_template)
-        refreeze["auth_selection"]["credential_id"] = "refrozen"
+        refreeze["auth_selection"]["credential_id"] = "oauth:anthropic:refrozen"
+        refreeze["auth_selection"]["resolved_credential_id"] = "refrozen"
         path = self.write_records([
             self.start("old-unused", self.now - GATE.WEEK_MS - 1),
             self.timed(self.finish_template, timestamp=self.now - GATE.WEEK_MS - 1),
-            self.start("long-running", timestamp=None),
+            self.start("oauth:anthropic:long-running", timestamp=None, resolved="long-running", method=None),
             copy.deepcopy(self.step_template),
             self.timed(self.activity_template, field="written_at_ms"),
             refreeze,
@@ -173,30 +244,33 @@ class MetadataDeployGate(unittest.TestCase):
         self.assertNotIn("ts_ms", records[3])
         self.assertEqual(records[4]["written_at_ms"], self.now)
         self.assertEqual(records[5]["ts_ms"], self.now)
-        self.assertEqual(GATE.recent_credentials(self.root, self.now), ({"long-running", "refrozen"}, 1))
+        self.assertEqual(GATE.recent_credentials(self.root, self.now), ({"long-running", "refrozen"}, set(), 1))
 
     def test_recent_ts_ms_activity_counts_a_legacy_untimed_selection(self):
-        self.write_records([self.start("legacy", timestamp=None), self.timed(self.attempt_template)])
-        self.assertEqual(GATE.recent_credentials(self.root, self.now), ({"legacy"}, 1))
+        self.write_records([self.start("oauth:anthropic:legacy", timestamp=None, resolved="legacy", method=None),
+                            self.timed(self.attempt_template)])
+        self.assertEqual(GATE.recent_credentials(self.root, self.now), ({"legacy"}, set(), 1))
 
     def test_untimed_refreeze_waits_for_later_activity_without_refusing(self):
         refreeze = copy.deepcopy(self.refreeze_template)
-        refreeze["auth_selection"]["credential_id"] = "refrozen-legacy"
-        self.write_records([self.start("legacy", timestamp=None), refreeze,
+        refreeze["auth_selection"]["credential_id"] = "oauth:anthropic:refrozen-legacy"
+        self.write_records([self.start("oauth:anthropic:legacy", timestamp=None, method=None), refreeze,
                             self.timed(self.attempt_template)])
-        self.assertEqual(GATE.recent_credentials(self.root, self.now), ({"refrozen-legacy"}, 1))
+        self.assertEqual(GATE.recent_credentials(self.root, self.now), ({"oauth:anthropic:refrozen-legacy"}, set(), 1))
 
     def test_untimed_records_alone_are_not_evidence_of_recency(self):
-        self.write_records([self.start("untimed", timestamp=None), copy.deepcopy(self.step_template)])
+        self.write_records([self.start("oauth:anthropic:untimed", timestamp=None, method=None),
+                            copy.deepcopy(self.step_template)])
         status, output = self.run_gate([{"id": "untimed"}])
         self.assertEqual(status, 2, output)
         self.assertIn("no credentials recorded", output)
         self.assertNotIn("no recorded timestamp", output)
 
     def test_recent_terminal_activity_counts_and_ends_the_selection(self):
-        self.write_records([self.start("ended", timestamp=None), self.timed(self.finish_template),
+        self.write_records([self.start("oauth:anthropic:ended", timestamp=None, resolved="ended", method=None),
+                            self.timed(self.finish_template),
                             self.timed(self.attempt_template)])
-        self.assertEqual(GATE.recent_credentials(self.root, self.now), ({"ended"}, 1))
+        self.assertEqual(GATE.recent_credentials(self.root, self.now), ({"ended"}, set(), 1))
 
     def test_old_live_logs_and_archives_are_not_read(self):
         old = self.write_records([self.start("old-unused", self.now - GATE.WEEK_MS - 1)], "old.wal")

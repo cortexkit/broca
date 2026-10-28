@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Refuse a deploy if a recently used credential lacks vault routing metadata."""
+"""Refuse a deploy if a recent chooser-eligible credential lacks vault metadata."""
 from __future__ import annotations
 
 import argparse
@@ -18,8 +18,28 @@ class CannotCompare(Exception):
     pass
 
 
-def recent_credentials(state_root: pathlib.Path, now_ms: int, days: int = 7) -> tuple[set[str], int]:
-    """Include selections on recent runs, refreezes, and activity in older runs.
+def chooser_selects_accounts(selection: dict) -> bool:
+    # Mirror auth_routing::frozen_selection_credential, then account_routing::selects_accounts.
+    # An explicit auth_method belongs to an opaque vault id, which must never be parsed.
+    # Without it, AuthSelection's documented legacy format is a Broca method:provider[:account] key.
+    method = selection.get("auth_method")
+    if method is None:
+        key = selection.get("credential_id")
+        parts = key.split(":", 2) if isinstance(key, str) else []
+        if len(parts) < 2 or not parts[1]:
+            raise CannotCompare("a recent auth selection has no recognizable authentication method")
+        method = parts[0]
+    if method in ("oauth", "chatgpt"):
+        return True
+    if method in ("apikey", "antigravity"):
+        return False
+    raise CannotCompare("a recent auth selection has an unknown authentication method")
+
+
+def recent_credentials(state_root: pathlib.Path, now_ms: int, days: int = 7) -> tuple[set[str], set[str], int]:
+    """Return recent chooser-selected ids, skipped ids, and decoded-log count.
+
+    Include refreezes and recent activity in older runs.
 
     The shared reader rejects incomplete WAL snapshots among the recent live logs.
     A deployment must not certify metadata against a partial history.
@@ -27,6 +47,7 @@ def recent_credentials(state_root: pathlib.Path, now_ms: int, days: int = 7) -> 
     if days >= 14:
         raise CannotCompare("a live-only metadata scan requires a window shorter than the 14-day archive idle period")
     credentials: set[str] = set()
+    skipped: set[str] = set()
     logs_read = 0
     cutoff = now_ms - days * 24 * 60 * 60 * 1000
     # Logs fold into archives only after 14 idle days, so an archive cannot contain
@@ -65,10 +86,13 @@ def recent_credentials(state_root: pathlib.Path, now_ms: int, days: int = 7) -> 
             credential = current_selection.get("resolved_credential_id") or current_selection.get("credential_id")
             if not isinstance(credential, str) or not credential:
                 raise CannotCompare("a recent auth selection has no credential id")
-            credentials.add(credential)
-    if not credentials:
+            if chooser_selects_accounts(current_selection):
+                credentials.add(credential)
+            else:
+                skipped.add(credential)
+    if not credentials and not skipped:
         raise CannotCompare(f"no credentials recorded in broca runs in the last {days} days")
-    return credentials, logs_read
+    return credentials, skipped - credentials, logs_read
 
 
 def compare(credentials: set[str], listing: object) -> list[str]:
@@ -117,7 +141,7 @@ def main() -> int:
         parser.error("--days must be positive")
     started = time.monotonic()
     try:
-        credentials, logs_read = recent_credentials(args.state_root or default_state_root(), int(time.time() * 1000), args.days)
+        credentials, skipped, logs_read = recent_credentials(args.state_root or default_state_root(), int(time.time() * 1000), args.days)
         listing = json.loads(args.vault_listing.read_text())
         missing = compare(credentials, listing)
     except CannotCompare as error:
@@ -142,8 +166,9 @@ def main() -> int:
         for failure in missing:
             print(f"  {failure}", file=sys.stderr)
         return 1
-    print(f"credential-metadata: PASS; {len(credentials)} recently used credentials have provider_ids and auth_method; "
-          f"read {logs_read} logs in {time.monotonic() - started:.2f}s")
+    print(f"credential-metadata: PASS; {len(credentials)} recently used credentials selected by the chooser "
+          f"have provider_ids and auth_method; read {logs_read} logs in {time.monotonic() - started:.2f}s; "
+          f"skipped as not chooser-selected: {', '.join(sorted(skipped)) if skipped else '(none)'}")
     return 0
 
 
