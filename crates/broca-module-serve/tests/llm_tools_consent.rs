@@ -1567,19 +1567,11 @@ async fn consent_health_counts_each_verdict_and_outcome_and_logs_each_grant_once
     expected["marked_outcomes"]["consent_unavailable"] = json!(1);
     assert_eq!(health(), expected);
 
-    // Marked, and held behind a card.
-    let held = call("run", "card", true).await.unwrap();
-    assert_eq!(held["held"]["reason"], "consent");
-    assert_eq!(io.requests.lock().unwrap().len(), 1);
-    expected["verdicts"]["marked"] = json!(4);
-    expected["marked_outcomes"]["card_filed"] = json!(1);
-    assert_eq!(health(), expected);
-
     // Marked, and the person already denied this provider for this run.
     decide(&store, "denied-run", "deny-card", Decision::Deny);
     let refused = call("denied-run", "denied", true).await.unwrap_err();
     assert_eq!(refused["detail"]["consent"], "denied");
-    expected["verdicts"]["marked"] = json!(5);
+    expected["verdicts"]["marked"] = json!(4);
     expected["marked_outcomes"]["denied_by_standing_deny"] = json!(1);
     assert_eq!(health(), expected);
 
@@ -1601,7 +1593,7 @@ async fn consent_health_counts_each_verdict_and_outcome_and_logs_each_grant_once
     assert!(call("run", "grant-a-1", true).await.is_ok());
     assert!(call("run", "grant-a-2", true).await.is_ok());
     assert_eq!(provider.0.load(Ordering::SeqCst), 3);
-    expected["verdicts"]["marked"] = json!(7);
+    expected["verdicts"]["marked"] = json!(6);
     expected["marked_outcomes"]["released_by_grant"] = json!(2);
     assert_eq!(health(), expected);
     let logged = releases();
@@ -1626,12 +1618,25 @@ async fn consent_health_counts_each_verdict_and_outcome_and_logs_each_grant_once
     assert!(store.revoke("grant-a").unwrap());
     decide(&store, "another-run", "grant-b", Decision::Allow24h);
     assert!(call("run", "grant-b-1", true).await.is_ok());
-    expected["verdicts"]["marked"] = json!(8);
+    expected["verdicts"]["marked"] = json!(7);
     expected["marked_outcomes"]["released_by_grant"] = json!(3);
     assert_eq!(health(), expected);
     let logged = releases();
     assert_eq!(logged.len(), 2, "{logged:?}");
     assert_eq!(logged[1].fields["grant_id"], "grant-b");
+
+    // Marked, and held behind a card. This runs after the grants are revoked: a standing
+    // 24-hour grant covers every call of the agent on that provider, so a call held earlier
+    // could be released in the background whenever its card's waiter next wakes, which would
+    // make the counts above a race.
+    assert!(store.revoke("grant-b").unwrap());
+    let held = call("run", "card", true).await.unwrap();
+    assert_eq!(held["held"]["reason"], "consent");
+    assert_eq!(io.requests.lock().unwrap().len(), 1);
+    expected["verdicts"]["marked"] = json!(8);
+    expected["marked_outcomes"]["card_filed"] = json!(1);
+    assert_eq!(health(), expected);
+    assert_eq!(releases().len(), 2, "a held call is not a grant release");
 
     // Every call the check found marked or could not check ended in exactly one outcome.
     let outcomes: u64 = expected["marked_outcomes"]

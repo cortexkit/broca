@@ -5688,9 +5688,16 @@ fn fallback_provider(scripts: Vec<Vec<NormalizedEvent>>) -> StubProvider {
 
 /// Mark a step as served by Anthropic's own server-side fallback: the provider reported a wire
 /// model other than the one asked for, which is what the normalizer turns into `served_model`.
-fn served_by_server_side_fallback(mut step: Vec<NormalizedEvent>, served_model: &str) -> Vec<NormalizedEvent> {
+fn served_by_server_side_fallback(
+    mut step: Vec<NormalizedEvent>,
+    served_model: &str,
+) -> Vec<NormalizedEvent> {
     for event in &mut step {
-        if let NormalizedEvent::Control(ProviderControl::StepFinished { served_model: served, .. }) = event {
+        if let NormalizedEvent::Control(ProviderControl::StepFinished {
+            served_model: served,
+            ..
+        }) = event
+        {
             *served = Some(served_model.to_string());
         }
     }

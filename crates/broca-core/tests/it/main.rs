@@ -14,6 +14,7 @@ mod append_only_render;
 mod cancel_watchdog;
 mod graceful_stop;
 mod input_token_cap;
+mod legacy_frame_pin;
 mod lineage_replay;
 mod non_compaction_request_bytes;
 mod output_reservation;

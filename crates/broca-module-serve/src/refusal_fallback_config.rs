@@ -393,10 +393,8 @@ mod tests {
         let default = RefusalFallbackConfig::parse("{}").unwrap();
         assert!(!default.is_enabled());
         assert_eq!(default.offer_for("anthropic", "claude-opus-5-5"), None);
-        let on = RefusalFallbackConfig::parse(
-            r#"{"anthropic_fallbacks": {"refusal": true}}"#,
-        )
-        .unwrap();
+        let on =
+            RefusalFallbackConfig::parse(r#"{"anthropic_fallbacks": {"refusal": true}}"#).unwrap();
         assert!(on.is_enabled());
         assert_eq!(
             on.offer_for("anthropic", "claude-opus-5-5"),
@@ -405,10 +403,9 @@ mod tests {
         assert_eq!(on.offer_for("anthropic", "claude-haiku-5-5"), None);
         assert_eq!(on.offer_for("anthropic-platform", "claude-opus-5-5"), None);
         // The server-side switch alone offers no client-side fallback: the two are separate.
-        let other_switch = RefusalFallbackConfig::parse(
-            r#"{"anthropic_fallbacks": {"server_side": true}}"#,
-        )
-        .unwrap();
+        let other_switch =
+            RefusalFallbackConfig::parse(r#"{"anthropic_fallbacks": {"server_side": true}}"#)
+                .unwrap();
         assert!(!other_switch.is_enabled());
         assert_eq!(other_switch.offer_for("anthropic", "claude-opus-5-5"), None);
         let off = RefusalFallbackConfig::parse(
@@ -416,9 +413,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(off.offer_for("anthropic", "claude-opus-5"), None);
-        let error =
-            RefusalFallbackConfig::parse(r#"{"anthropic_fallbacks": {"refusal": "yes"}}"#)
-                .unwrap_err();
+        let error = RefusalFallbackConfig::parse(r#"{"anthropic_fallbacks": {"refusal": "yes"}}"#)
+            .unwrap_err();
         assert!(error.contains(SWITCH_KEY), "{error}");
     }
 

@@ -15,7 +15,7 @@
 //! which stays exact however far handling trails the sends, and the clock
 //! isolation test runs no writer at all.
 
-use super::{writer_loop, RecordObserver, WalCommand, WalHandle};
+use super::{writer_loop, RecordObserver, StampClock, WalCommand, WalHandle};
 use crate::durability_counters::{
     advance_fake_monotonic_ms_for_test, clear_fence_overrides_for_test, counts_for_fence,
     monotonic_now_ms_for, set_deadline_ms_for_test, set_fake_monotonic_ms_for_test, FsyncCause,
@@ -512,6 +512,7 @@ fn raw_disconnect_without_shutdown_syncs_dirty_writer() {
             poisoned,
             durable_head,
             lineage,
+            StampClock::wall(),
         );
     });
     tx.send(WalCommand::Append {
@@ -569,6 +570,7 @@ fn failed_disconnect_sync_poisons_without_publishing() {
             poisoned,
             durable_head,
             lineage,
+            StampClock::wall(),
         );
     });
     tx.send(WalCommand::Append {

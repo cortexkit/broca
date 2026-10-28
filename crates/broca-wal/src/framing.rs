@@ -161,6 +161,11 @@ const LINEAGE_PAYLOAD_LEN: u32 = 16;
 pub const GATED_FRAMING_VERSION: u8 = 3;
 pub const V4_FRAMING_VERSION: u8 = broca_wal_reader::frame::VERSION;
 pub const INTERRUPT_REASON_FEATURE: &str = "interrupt-reason/v1";
+/// Every version 4 frame names this: its header carries the `appended_ms` written immediately
+/// before the write and the `writer_id` of the writer that appended it. A reader that knows the
+/// version 4 layout but not this name refuses the log, so no build reads those fields as
+/// anything other than what they are.
+pub const FRAME_STAMPS_FEATURE: &str = "frame-stamps/v1";
 pub const TURN_DIRECTIVES_FEATURE: &str = "turn-directives/v1";
 /// A `RunStarted`, `Queued` or `Steered` record whose `request_identity_digest` carries the
 /// send's `client_message_id` (llm-runner 0.5.1 §9.11). Part of the send's identity: a build
@@ -213,6 +218,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     DELIVERY_ORDER_FEATURE,
     DISPATCH_MODULE_FEATURE,
     FLOW_SCOPE_FEATURE,
+    FRAME_STAMPS_FEATURE,
     GOOGLE_RPC_ERROR_DETAILS_FEATURE,
     INPUT_TOKEN_CAP_FEATURE,
     MEDIA_CONTENT_FEATURE,
@@ -642,6 +648,23 @@ pub fn encode_with_requires(
     frame(GATED_FRAMING_VERSION, seq, fence, &payload)
 }
 
+/// Where a version 4 header's `requires_len` field sits: after len, ver, seq, fence,
+/// appended_ms and writer_id.
+const V4_REQUIRES_LEN_FIELD: std::ops::Range<usize> = 45..47;
+
+/// Size the version 4 header would occupy, from the header alone. `None` until `buf` holds the
+/// two `requires_len` bytes, so a torn write that stops short of them is never sized.
+pub fn v4_header_len(buf: &[u8]) -> Option<usize> {
+    let field = buf.get(V4_REQUIRES_LEN_FIELD)?;
+    let requires_len = u16::from_le_bytes([field[0], field[1]]) as usize;
+    broca_wal_reader::frame::FIXED_HEADER_LEN.checked_add(requires_len)
+}
+
+/// The shared version 4 codec. broca's own writer builds version 4 headers with it rather than
+/// with a second copy of the layout, so a frame broca writes and a frame the published reader
+/// decodes can only agree.
+pub use broca_wal_reader::frame as v4;
+
 /// Encode an overhaul-root record with caller-supplied writer metadata. This is
 /// deliberately separate from legacy encoding: adding the codec must not turn
 /// version 4 writes on for existing state roots.
@@ -659,6 +682,112 @@ pub fn encode_v4(
         }
         error => FrameError::V4(error),
     })
+}
+
+/// A record's version 4 frame, settled except for the two fields the writer stamps.
+///
+/// The only way to build one is [`PreparedV4Frame::prepare`], which serializes the record with
+/// the shared codec, digests it and fixes its must-understand names (the record's own plus
+/// [`FRAME_STAMPS_FEATURE`]). An overhaul log writes nothing else: it never accepts caller-built
+/// bytes, so every version 4 frame on disk is the codec's encoding of the record it was handed
+/// with. Serializing and digesting is the costly half of framing and may run on any thread; the
+/// log assembles the short header on its writer thread with the `appended_ms` sampled there and
+/// its own `writer_id`.
+#[derive(Debug)]
+pub struct PreparedV4Frame {
+    payload: Vec<u8>,
+    payload_sha256: [u8; 32],
+    requires: Vec<&'static str>,
+    header_len: usize,
+}
+
+impl PreparedV4Frame {
+    /// Serialize and digest `record`, and check that its header will encode. The header length
+    /// depends on the feature names, never on the stamped values, so [`Self::frame_len`] is the
+    /// exact size of the frame the log will write.
+    pub fn prepare(record: &WalRecord) -> Result<Self, FrameError> {
+        let payload = serde_json::to_vec(record).map_err(FrameError::Serialize)?;
+        let payload_sha256: [u8; 32] = Sha256::digest(&payload).into();
+        let mut requires = record.required_features().to_vec();
+        requires.push(FRAME_STAMPS_FEATURE);
+        let header_len = v4_header(
+            broca_wal_reader::frame::Metadata {
+                seq: 0,
+                fence: 0,
+                appended_ms: 0,
+                writer_id: [0; 16],
+            },
+            &requires,
+            payload.len(),
+            payload_sha256,
+        )?
+        .len();
+        Ok(Self {
+            payload,
+            payload_sha256,
+            requires,
+            header_len,
+        })
+    }
+
+    /// The bytes the finished frame occupies on disk, for append budgets.
+    pub fn frame_len(&self) -> usize {
+        self.header_len + self.payload.len()
+    }
+
+    /// Every must-understand name the frame's header lists. The machine's feature floor must
+    /// list them all before the frame is written.
+    pub fn requires(&self) -> &[&'static str] {
+        &self.requires
+    }
+
+    /// The complete frame, stamped with `metadata`. Only the log that writes it calls this.
+    pub(crate) fn stamp(
+        &self,
+        metadata: broca_wal_reader::frame::Metadata,
+    ) -> Result<Vec<u8>, FrameError> {
+        let mut frame = v4_header(
+            metadata,
+            &self.requires,
+            self.payload.len(),
+            self.payload_sha256,
+        )?;
+        frame.extend_from_slice(&self.payload);
+        Ok(frame)
+    }
+}
+
+/// The shared codec's version 4 header, with its feature-name refusal mapped to the same error a
+/// legacy gated frame reports.
+fn v4_header(
+    metadata: broca_wal_reader::frame::Metadata,
+    requires: &[&str],
+    payload_len: usize,
+    payload_sha256: [u8; 32],
+) -> Result<Vec<u8>, FrameError> {
+    broca_wal_reader::frame::encode_header(metadata, requires, payload_len, payload_sha256).map_err(
+        |error| match error {
+            broca_wal_reader::Error::InvalidFeatureName { name } => {
+                FrameError::InvalidFeatureName { name }
+            }
+            error => FrameError::V4(error),
+        },
+    )
+}
+
+/// The `appended_ms` a version 4 frame written now carries: the wall clock in milliseconds since
+/// the Unix epoch, never lower than any value this process has stamped before, so the field does
+/// not go backwards within one process when the wall clock does. A clock before the epoch reads
+/// as 0 and is then raised to the last stamped value.
+pub fn appended_ms_now() -> u64 {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        });
+    let previous = LAST.fetch_max(wall, std::sync::atomic::Ordering::Relaxed);
+    wall.max(previous)
 }
 
 /// Frame an already-serialized record payload, with the same header and digest as
@@ -1305,6 +1434,7 @@ mod tests {
                 DELIVERY_ORDER_FEATURE,
                 DISPATCH_MODULE_FEATURE,
                 FLOW_SCOPE_FEATURE,
+                FRAME_STAMPS_FEATURE,
                 GOOGLE_RPC_ERROR_DETAILS_FEATURE,
                 INPUT_TOKEN_CAP_FEATURE,
                 MEDIA_CONTENT_FEATURE,
@@ -2820,5 +2950,83 @@ mod session_class_tests {
             decode_next_with(&encode(1, 1, &plain).unwrap(), &known),
             DecodeStep::Record { .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod v4_header_len_tests {
+    use super::*;
+
+    /// A real version 4 header whose requirements array is `requires` long once encoded.
+    fn header(requires: &[&str]) -> Vec<u8> {
+        broca_wal_reader::frame::encode_header(
+            broca_wal_reader::frame::Metadata {
+                seq: 1,
+                fence: 1,
+                appended_ms: 1,
+                writer_id: [7; 16],
+            },
+            requires,
+            0,
+            [0; 32],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_header_is_sized_only_once_both_requires_len_bytes_are_present() {
+        let full = header(&["frame-stamps/v1"]);
+        let expected = full.len();
+        // 44 bytes end inside the writer id, 45 before `requires_len`, 46 inside it: none of
+        // them can size the header, and none may read past the slice.
+        for len in 44..=46 {
+            assert_eq!(v4_header_len(&full[..len]), None, "{len} bytes");
+        }
+        assert_eq!(v4_header_len(&full[..47]), Some(expected), "47 bytes");
+        assert_eq!(v4_header_len(&full), Some(expected));
+        assert_eq!(v4_header_len(&[]), None);
+    }
+
+    #[test]
+    fn a_requirements_array_cut_mid_way_is_sized_but_not_decoded() {
+        // A torn write that stops inside the requirements array leaves `requires_len` whole, so
+        // the header can be sized and recovery knows how much more it would need, but the
+        // header itself is incomplete rather than corrupt.
+        for requires in [
+            &["frame-stamps/v1"][..],
+            &["frame-stamps/v1", "input-token-cap/v1"],
+        ] {
+            let full = header(requires);
+            let array_len = full.len() - broca_wal_reader::frame::FIXED_HEADER_LEN;
+            let cut = 47 + array_len / 2;
+            assert_eq!(v4_header_len(&full[..cut]), Some(full.len()));
+            assert_eq!(
+                broca_wal_reader::frame::decode_header(&full[..cut]).unwrap(),
+                None,
+                "{requires:?}: a header cut inside its requirements array needs more bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn a_prepared_frame_measures_the_frame_it_stamps() {
+        for record in [
+            WalRecord::TurnFinished {
+                step_id: broca_protocol::StepId(3),
+            },
+            WalRecord::InputTokenCapFrozen { limit: 9 },
+        ] {
+            let prepared = PreparedV4Frame::prepare(&record).unwrap();
+            assert!(prepared.requires().contains(&FRAME_STAMPS_FEATURE));
+            let frame = prepared
+                .stamp(broca_wal_reader::frame::Metadata {
+                    seq: 4,
+                    fence: 2,
+                    appended_ms: u64::MAX,
+                    writer_id: [1; 16],
+                })
+                .unwrap();
+            assert_eq!(frame.len(), prepared.frame_len(), "{record:?}");
+        }
     }
 }
