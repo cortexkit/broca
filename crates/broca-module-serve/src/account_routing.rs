@@ -434,6 +434,7 @@ pub fn classify_refusal(code: &str) -> ErrorClass {
         | "invalid_request"
         | "unknown_decision"
         | "unscoped_caller"
+        | "account_selection_unsupported"
         | ACCOUNT_NOT_AUTHORIZED => ErrorClass::Permanent,
         _ => ErrorClass::Transient,
     }

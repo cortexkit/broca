@@ -701,7 +701,7 @@ async fn two_admissions_of_the_same_send_send_the_same_admission_id() {
 
 #[tokio::test]
 async fn undeclared_disabled_and_unsupported_codes_are_refusals_not_fallbacks() {
-    for code in ["disabled", "unsupported", "account_selection_unsupported"] {
+    for code in ["disabled", "unsupported"] {
         let routing = FakeRouting::refusing(code, json!({}));
         let client = client(&routing);
         let ChoiceRefusal::Refused(refusal) =
@@ -715,6 +715,14 @@ async fn undeclared_disabled_and_unsupported_codes_are_refusals_not_fallbacks() 
         assert_eq!(refusal.class, ErrorClass::Transient);
         assert_eq!(client.counters.get("disabled"), 0);
     }
+}
+
+#[tokio::test]
+async fn account_selection_unsupported_is_refused_permanent_with_its_code_and_detail() {
+    assert_eq!(
+        refusal_for("account_selection_unsupported").await,
+        permanent("account_selection_unsupported")
+    );
 }
 
 #[tokio::test]
@@ -930,6 +938,7 @@ fn published_and_deployed_refusal_classes_are_mapped_by_name() {
         "admission_conflict",
         "unscoped_caller",
         "account_not_authorized",
+        "account_selection_unsupported",
     ] {
         assert_eq!(classify_refusal(code), ErrorClass::Permanent, "{code}");
     }
