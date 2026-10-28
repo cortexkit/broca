@@ -2174,6 +2174,149 @@ async fn live_tool_observations_and_control_bytes_survive_a_real_serve_restart()
     rig.finish().await;
 }
 
+#[tokio::test]
+async fn stateful_text_control_is_plain_text_live_and_in_attach_replay() {
+    use broca_protocol::content::{TextProviderFormat, TextProviderState};
+    use broca_protocol::{ToolCall, ToolCallId};
+
+    fn assistant_frame(frames: &[Frame]) -> Vec<u8> {
+        frames
+            .iter()
+            .find(|frame| {
+                let value: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+                value["kind"] == "control" && value["unit"]["type"] == "assistant_message"
+            })
+            .expect("assembled assistant message crossed serve")
+            .body
+            .clone()
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ControlFrame {
+        unit: Box<serde_json::value::RawValue>,
+        event: serde_json::Value,
+    }
+
+    let mut captures = Vec::new();
+    for (name, format, data) in [
+        (
+            "responses",
+            TextProviderFormat::OpenAiResponses,
+            r#"{"id":"synthetic-response-item","type":"message","phase":"final_answer"}"#,
+        ),
+        (
+            "gemini",
+            TextProviderFormat::Gemini,
+            r#"{"thoughtSignature":"synthetic-text-signature"}"#,
+        ),
+    ] {
+        let content = vec![
+            ContentBlock::TextWithState {
+                text: "answer".into(),
+                provider_state: TextProviderState {
+                    format,
+                    data: data.into(),
+                },
+            },
+            ContentBlock::Reasoning {
+                text: "thinking".into(),
+                signature: Some("synthetic-reasoning-signature".into()),
+            },
+            ContentBlock::ToolCall(ToolCall {
+                tool_call_id: ToolCallId("synthetic-call".into()),
+                tool_name: "work".into(),
+                input: serde_json::json!({"path": "/synthetic/input.txt"}),
+                thought_signature: Some("synthetic-tool-signature".into()),
+            }),
+        ];
+        let mut rig = Rig::start(&format!("subscribe-stateful-{name}")).await;
+        rig.script
+            .push(&[Step::Stream(content.clone()), Step::Text("done")]);
+        rig.script.hold_stream(true);
+        rig.send("synthetic-send", "hi", None).await;
+        rig.wait_entered().await;
+        let script = rig.script.clone();
+        let live = assistant_frame(
+            &rig.subscribe_collect_after_display_reset(
+                20,
+                serde_json::json!({"from":"start"}),
+                Duration::from_secs(5),
+                move || script.hold_stream(false),
+            )
+            .await,
+        );
+        let records = rig.wait_for_finished(1).await;
+        let stored = records.iter().find_map(|record| match record {
+            broca_wal::WalRecord::ModelStepFinished {
+                assistant_message, ..
+            } => Some(&assistant_message.content),
+            _ => None,
+        });
+        assert_eq!(stored, Some(&content));
+        rig.wait_idle().await;
+        let page = read(&mut rig, serde_json::json!({})).await;
+        let descriptors = read(&mut rig, serde_json::json!({"media":"descriptors"})).await;
+        let wal = rig.wal_bytes();
+        assert!(rig.registry().stop_and_seal().await);
+        rig = rig.restart().await;
+        let replay = assistant_frame(
+            &rig.subscribe_collect(
+                21,
+                serde_json::json!({"from":"start"}),
+                Duration::from_secs(5),
+            )
+            .await,
+        );
+        assert_eq!(
+            rig.wal_bytes(),
+            wal,
+            "attaching never rewrites provider state"
+        );
+        rig.finish().await;
+        eprintln!(
+            "SUBSCRIBE_FLATTEN_SAMPLE {name}.live {}",
+            std::str::from_utf8(&live).unwrap()
+        );
+        eprintln!(
+            "SUBSCRIBE_FLATTEN_SAMPLE {name}.replay {}",
+            std::str::from_utf8(&replay).unwrap()
+        );
+        captures.push((content, live, replay, page, descriptors));
+    }
+
+    for (content, live, replay, page, descriptors) in captures {
+        let live: ControlFrame = serde_json::from_slice(&live).unwrap();
+        let replay: ControlFrame = serde_json::from_slice(&replay).unwrap();
+        assert_eq!(live.unit.get().as_bytes(), replay.unit.get().as_bytes());
+        assert_eq!(
+            live.event,
+            serde_json::json!({"type":"message_finished","mid":"m1"})
+        );
+        assert_eq!(replay.event, live.event);
+        cortexkit_role_llm_runner::live::LiveEvent::decode_strict(&live.event).unwrap();
+        let unit: serde_json::Value = serde_json::from_str(live.unit.get()).unwrap();
+        let expected = serde_json::json!([
+            {"type":"text","text":"answer"},
+            content[1],
+            content[2],
+        ]);
+        assert_eq!(unit["message"]["content"], expected);
+        assert!(!live.unit.get().contains("provider_state"));
+        let entry = page
+            .messages
+            .iter()
+            .find(|entry| entry.mid == "m1")
+            .unwrap();
+        assert_eq!(entry.message["content"], expected);
+        let entry = descriptors
+            .messages
+            .iter()
+            .find(|entry| entry.mid == "m1")
+            .unwrap();
+        assert_eq!(entry.message["content"], expected);
+    }
+}
+
 async fn pin_live_sample(rig: &mut Rig, frames: &[Frame], run_id: &str, file: &str) {
     let page = read(rig, serde_json::json!({})).await;
     let lineage = page.lineage_id.as_ref().unwrap();

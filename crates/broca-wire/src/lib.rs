@@ -2817,11 +2817,44 @@ fn unrecognized_run_state(unit: &serde_json::Value) -> Option<UnrecognizedRunSta
     }
 }
 
+fn serialize_control_unit<S: serde::Serializer>(
+    unit: &broca_protocol::caller::ControlUnit,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct MessageRef<'a> {
+        message_id: &'a broca_protocol::MessageId,
+        content: CallerContentRef<'a>,
+    }
+
+    #[derive(Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum UnitRef<'a> {
+        AssistantMessage { message: MessageRef<'a> },
+    }
+
+    match unit {
+        broca_protocol::caller::ControlUnit::AssistantMessage { message } => {
+            // Share read's stateful-text view, not its tag cleaning or media substitutions:
+            // every other control-lane block must retain its native serialization.
+            UnitRef::AssistantMessage {
+                message: MessageRef {
+                    message_id: &message.message_id,
+                    content: CallerContentRef(&message.content),
+                },
+            }
+            .serialize(serializer)
+        }
+        unit => unit.serialize(serializer),
+    }
+}
+
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum SubscribeEventRef<'a> {
     Control {
         cursor: CursorWire,
+        #[serde(serialize_with = "serialize_control_unit")]
         unit: &'a broca_protocol::caller::ControlUnit,
     },
     Display {
@@ -2834,6 +2867,7 @@ enum SubscribeEventRef<'a> {
 enum LiveSubscribeEventRef<'a> {
     Control {
         cursor: CursorWire,
+        #[serde(serialize_with = "serialize_control_unit")]
         unit: &'a broca_protocol::caller::ControlUnit,
         seq: u64,
         event: &'a cortexkit_role_llm_runner::live::LiveEvent,
@@ -6370,6 +6404,97 @@ mod live_subscribe_tests {
         expected.pop();
         expected.extend_from_slice(br#","seq":13}"#);
         assert_eq!(live, expected);
+    }
+}
+
+#[cfg(test)]
+mod subscribe_caller_text_tests {
+    use super::*;
+    use broca_protocol::content::{TextProviderFormat, TextProviderState};
+    use broca_protocol::{AssistantMessage, ContentBlock};
+    use cortexkit_role_llm_runner::live::{LiveEvent, MessageEvent};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    #[test]
+    fn assistant_control_flattens_only_stateful_text() {
+        let native: AssistantMessage = serde_json::from_value(json!({
+            "message_id": "synthetic-message",
+            "content": [
+                {"type": "text", "text": "<result>plain</result>"},
+                {"type": "text", "text": "<result>answer</result>"},
+                {"type": "reasoning", "text": "thinking", "signature": "reasoning-signature"},
+                {"type": "redacted_reasoning", "data": "opaque-reasoning"},
+                {"type": "tool_call", "tool_call_id": "synthetic-call", "tool_name": "read",
+                 "input": {"path": "/synthetic/input.txt"}, "thought_signature": "tool-signature"},
+                {"type": "provider_fallback", "from_model": "model-a", "to_model": "model-b"},
+                {"type": "media", "kind": "image", "mime": "image/png", "byte_size": 69,
+                 "sha256": "b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640",
+                 "width": 1, "height": 1},
+                {"type": "tool_result", "tool_call_id": "synthetic-call", "is_error": false,
+                 "output": {"kind": "parts", "parts": [{"kind": "text", "text": "tool-output"}]}}
+            ]
+        }))
+        .unwrap();
+        for format in [
+            None,
+            Some(TextProviderFormat::OpenAiResponses),
+            Some(TextProviderFormat::OpenAiResponsesChatgpt),
+            Some(TextProviderFormat::Gemini),
+            Some(TextProviderFormat::GoogleCodeAssist),
+        ] {
+            let mut message = native.clone();
+            if let Some(format) = format {
+                message.content[1] = ContentBlock::TextWithState {
+                    text: "<result>answer</result>".into(),
+                    provider_state: TextProviderState {
+                        format,
+                        data: r#"{"opaque":"provider-only"}"#.into(),
+                    },
+                };
+            }
+            let stateful_block = serde_json::to_string(&message.content[1]).unwrap();
+            let unit = broca_protocol::caller::ControlUnit::AssistantMessage {
+                message: Arc::new(message),
+            };
+            let stored = serde_json::to_vec(&unit).unwrap();
+            let legacy = format!(
+                r#"{{"kind":"control","cursor":{{"wal_seq":11,"sub_index":2}},"unit":{}}}"#,
+                serde_json::to_string(&unit).unwrap()
+            );
+            let expected = if format.is_some() {
+                legacy.replace(
+                    &stateful_block,
+                    r#"{"type":"text","text":"<result>answer</result>"}"#,
+                )
+            } else {
+                legacy
+            };
+            assert_eq!(
+                String::from_utf8(encode_subscribe_control(11, 2, &unit).unwrap()).unwrap(),
+                expected
+            );
+            assert_eq!(
+                serde_json::to_vec(&SubscribeEvent::Control {
+                    wal_seq: 11,
+                    sub_index: 2,
+                    unit: unit.clone(),
+                })
+                .unwrap(),
+                expected.as_bytes()
+            );
+            let event = LiveEvent::MessageFinished(MessageEvent::new("synthetic-mid"));
+            let expected_live = format!(
+                "{},\"seq\":7,\"event\":{}}}",
+                expected.strip_suffix('}').unwrap(),
+                serde_json::to_string(&event).unwrap()
+            );
+            assert_eq!(
+                encode_live_subscribe_control(11, 2, &unit, 7, &event).unwrap(),
+                expected_live.as_bytes()
+            );
+            assert_eq!(serde_json::to_vec(&unit).unwrap(), stored);
+        }
     }
 }
 
