@@ -81,11 +81,11 @@ cortexkit-role-harness = "=0.1.0"
 cortexkit-role-tool-provider = "=0.12.1"
 cortexkit-llm-tools = "=0.2.1"
 cortexkit-role-tool-provider-conformance = "=0.10.1"
-cortexkit-role-llm-runner = "=0.7.7"
+cortexkit-role-llm-runner = "=0.7.9"
 cortexkit-bus-naming = "=0.2.7"
 cortexkit-bus-trait = "=0.3.0"
 cortexkit-bus-nats = "=0.3.0"
-cortexkit-role-llm-runner-conformance = "=0.15.8"
+cortexkit-role-llm-runner-conformance = "=0.15.11"
 # Draft 2020-12 validation of structured-output values. Default features are off so the
 # validator has no HTTP or file retriever: a schema can never make broca fetch anything.
 jsonschema = { version = "=0.58.6", default-features = false }

@@ -662,7 +662,7 @@ async fn post_tool_cancel_applies_remaining_refuse_policy_without_calling_later_
         None,
     )
     .await;
-    let ToolOutput::Error { message } = &output.results[0].output else {
+    let ToolOutput::Error { message, .. } = &output.results[0].output else {
         panic!()
     };
     assert!(message.contains("p1"));
@@ -1596,7 +1596,7 @@ async fn sealed_post_tool(
         for (result, reason) in &terminals {
             if let Some(provider) = expected_provider {
                 assert_eq!(reason.as_deref(), Some("post_tool_unavailable"));
-                let ToolOutput::Error { message } = &result.output else {
+                let ToolOutput::Error { message, .. } = &result.output else {
                     panic!("result must be withheld")
                 };
                 assert!(message.contains(provider));
@@ -2620,7 +2620,7 @@ async fn cut_step_shutdown_fallback_keeps_exact_rejection_counts() {
             1
         );
         assert!(records.iter().any(|r| matches!(r, WalRecord::ToolResult { result, .. } if matches!(&result.output,
-            ToolOutput::Error { message } if message.starts_with("tool_args_trailing_garbage:") && message.contains("json_bytes=9, whitespace_bytes=4097")))));
+            ToolOutput::Error { message, .. } if message.starts_with("tool_args_trailing_garbage:") && message.contains("json_bytes=9, whitespace_bytes=4097")))));
         assert!(!records
             .iter()
             .any(|r| matches!(r, WalRecord::ToolDispatchIntent { .. })));

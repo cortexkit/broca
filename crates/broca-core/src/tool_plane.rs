@@ -130,6 +130,17 @@ pub enum ToolPlaneError {
     /// The plane could not reach the executor after its bounded transport retry
     /// (subc unreachable / route gone / timeout).
     Unavailable(String),
+    /// A tool route's open kept being refused with a module-availability code
+    /// (`target_unavailable`, `module_reloading`, `module_warming`, `module_timeout`)
+    /// for the whole tool-dispatch patience, so the module is restarting or down.
+    /// Proven undelivered: nothing was sent. The loop reports it with the stable
+    /// `tool plane unavailable` message plus this attribution, so the model can retry
+    /// rather than give up.
+    ModuleUnavailable {
+        module: String,
+        code: String,
+        detail: String,
+    },
     /// A scoped run's route could not be opened for a reason to do with its scope, named by
     /// `code`: `scope_unsupported` (the daemon does not admit scoped routes),
     /// `scope_unverifiable` (the scope's state could not be confirmed), or a refusal the daemon
@@ -160,6 +171,14 @@ impl std::fmt::Display for ToolPlaneError {
             ToolPlaneError::ScopeDrained { reason } => write!(
                 f,
                 "route_drained: the session's scope route was closed ({reason}); nothing was sent"
+            ),
+            ToolPlaneError::ModuleUnavailable {
+                module,
+                code,
+                detail,
+            } => write!(
+                f,
+                "tool plane unavailable (module '{module}' is restarting or unavailable; nothing was sent): {code} {detail}"
             ),
         }
     }
@@ -211,6 +230,9 @@ pub enum DispatchResult {
 pub struct DispatchSignals {
     cancel: Option<tokio_util::sync::CancellationToken>,
     stop: Option<tokio_util::sync::CancellationToken>,
+    /// The run's absolute step deadline, carried so the route-open wait in front of the send
+    /// ends with it (see [`ToolOpenGuard`]). It never makes an enqueued call count as unsent.
+    deadline: Option<tokio::time::Instant>,
 }
 impl DispatchSignals {
     pub fn new(
@@ -220,7 +242,90 @@ impl DispatchSignals {
         Self {
             cancel: cancel.cloned(),
             stop: stop.cloned(),
+            deadline: None,
         }
+    }
+    pub fn interrupted(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            || self
+                .stop
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+    }
+    pub async fn cancelled(&self) {
+        async fn wait(token: Option<&tokio_util::sync::CancellationToken>) {
+            match token {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending().await,
+            }
+        }
+        tokio::select! {
+            _ = wait(self.cancel.as_ref()) => {}
+            _ = wait(self.stop.as_ref()) => {}
+        }
+    }
+}
+
+impl From<&DispatchSignals> for ToolOpenGuard {
+    /// The approved path already carries run signals to its send boundary; the same tokens
+    /// and the same absolute deadline bound its route-open wait.
+    fn from(signals: &DispatchSignals) -> Self {
+        Self {
+            cancel: signals.cancel.clone(),
+            stop: signals.stop.clone(),
+            deadline: signals.deadline,
+        }
+    }
+}
+
+/// What ends a tool-dispatch route-open wait early: the run's cancel and stop/shutdown
+/// tokens, and the run's absolute step deadline when it has one. A batch builds one guard
+/// and hands the same guard to its batch start and to every call, so every route-open wait
+/// of the batch (first open and every re-open) ends at the same instant. Carried separately
+/// from [`DispatchSignals`] (which guards the physical send) so planes whose opens never
+/// wait keep ignoring it; [`ToolOpenGuard::signals`] gives the matching send guard. Clones
+/// observe the same tokens while the wait is pending.
+#[derive(Clone, Default)]
+pub struct ToolOpenGuard {
+    cancel: Option<tokio_util::sync::CancellationToken>,
+    stop: Option<tokio_util::sync::CancellationToken>,
+    /// The run's step deadline, as an absolute instant: no route-open wait of the batch, and
+    /// no open attempt in flight, outlasts it. `None` when the run has none, which leaves the
+    /// plane's own patience as the only bound.
+    pub deadline: Option<tokio::time::Instant>,
+}
+impl ToolOpenGuard {
+    pub fn new(
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+        stop: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Self {
+        Self {
+            cancel: cancel.cloned(),
+            stop: stop.cloned(),
+            deadline: None,
+        }
+    }
+    /// The same guard ending at the absolute `deadline` (the run's step deadline).
+    pub fn with_deadline(mut self, deadline: Option<tokio::time::Instant>) -> Self {
+        self.deadline = deadline;
+        self
+    }
+    /// The send-boundary signals matching this guard: the same tokens and deadline, for
+    /// the physical enqueue that follows the open.
+    pub fn signals(&self) -> DispatchSignals {
+        DispatchSignals {
+            cancel: self.cancel.clone(),
+            stop: self.stop.clone(),
+            deadline: self.deadline,
+        }
+    }
+    pub fn cancel_token(&self) -> Option<tokio_util::sync::CancellationToken> {
+        self.cancel.clone()
+    }
+    pub fn stop_token(&self) -> Option<tokio_util::sync::CancellationToken> {
+        self.stop.clone()
     }
     pub fn interrupted(&self) -> bool {
         self.cancel
@@ -355,6 +460,37 @@ pub trait ToolPlane: Send + Sync {
 
     /// Close a batch — modelling `tool_batch_finished{batch_id}`.
     async fn batch_finished(&self, ctx: &BatchCtx) -> Result<(), ToolPlaneError>;
+
+    /// batch_started with an early-exit guard for the route-open wait: run cancel or
+    /// stop/shutdown ends the wait at once instead of holding the tool-dispatch
+    /// patience. Planes whose opens never wait keep the default, which ignores the guard.
+    async fn batch_started_guarded(
+        &self,
+        ctx: &BatchCtx,
+        calls: &[ToolCall],
+        manifest: &ToolManifest,
+        guard: &ToolOpenGuard,
+    ) -> Result<(), ToolPlaneError> {
+        let _ = guard;
+        self.batch_started(ctx, calls, manifest).await
+    }
+
+    /// dispatch/dispatch_keyed with the same early-exit guard for the route-open wait.
+    /// `key` selects the keyed form, as dispatch_keyed does. Planes whose dispatch
+    /// never waits keep the default.
+    async fn dispatch_guarded(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        key: Option<DispatchKey<'_>>,
+        guard: &ToolOpenGuard,
+    ) -> DispatchResult {
+        let _ = guard;
+        match key {
+            Some(key) => self.dispatch_keyed(ctx, call, key).await,
+            None => self.dispatch(ctx, call).await,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

@@ -2836,7 +2836,7 @@ impl LlmRunnerSubject for BrocaSubject {
             }
             let result: broca_protocol::ToolResult = serde_json::from_value(part.clone()).ok()?;
             match result.output {
-                broca_protocol::ToolOutput::Error { message }
+                broca_protocol::ToolOutput::Error { message, .. }
                     if result.is_error
                         && message.starts_with("budget_exhausted: tool not executed;") =>
                 {
@@ -2847,7 +2847,7 @@ impl LlmRunnerSubject for BrocaSubject {
                         ),
                     )
                 }
-                broca_protocol::ToolOutput::Error { message }
+                broca_protocol::ToolOutput::Error { message, .. }
                     if result.is_error
                         && message
                             == broca_protocol::structured_output::SKIPPED_AFTER_SUBMIT_MESSAGE =>
@@ -2859,7 +2859,7 @@ impl LlmRunnerSubject for BrocaSubject {
                         ),
                     )
                 }
-                broca_protocol::ToolOutput::Error { message }
+                broca_protocol::ToolOutput::Error { message, .. }
                     if result.is_error
                         && message == "tool not run: max steps reached before dispatch" =>
                 {

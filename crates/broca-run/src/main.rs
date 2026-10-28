@@ -436,7 +436,21 @@ async fn run(args: Args) -> Result<i32, String> {
                     ControlUnit::ToolResult { result } => {
                         let text = match &result.output {
                             ToolOutput::Text { text } => text.clone(),
-                            ToolOutput::Error { message } => message.clone(),
+                            ToolOutput::Error {
+                                message,
+                                module,
+                                code,
+                                detail,
+                                nothing_sent,
+                                retry,
+                            } => ToolOutput::error_model_text(
+                                message,
+                                module.as_deref(),
+                                code.as_deref(),
+                                detail.as_deref(),
+                                *nothing_sent,
+                                retry.as_deref(),
+                            ),
                             _ => String::new(),
                         };
                         emit(

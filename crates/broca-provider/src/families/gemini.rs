@@ -560,7 +560,23 @@ fn function_response_payload(out: &ToolOutput) -> Value {
         ToolOutput::Json { value } if value.is_object() => value.clone(),
         ToolOutput::Json { value } => json!({ "result": value }),
         ToolOutput::Denied { reason } => json!({ "error": format!("denied: {reason}") }),
-        ToolOutput::Error { message } => json!({ "error": message }),
+        ToolOutput::Error {
+            message,
+            module,
+            code,
+            detail,
+            nothing_sent,
+            retry,
+        } => json!({
+            "error": ToolOutput::error_model_text(
+                message,
+                module.as_deref(),
+                code.as_deref(),
+                detail.as_deref(),
+                *nothing_sent,
+                retry.as_deref(),
+            )
+        }),
     }
 }
 

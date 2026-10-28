@@ -490,7 +490,7 @@ async fn shutdown_seal_closes_the_open_batch_before_its_interrupted_terminal() {
             ] if **unknown == broca_core::outcome_unknown_result(&dispatched)
                 && not_sent.tool_call_id == sibling
                 && not_sent.is_error
-                && matches!(&not_sent.output, ToolOutput::Error { message }
+                && matches!(&not_sent.output, ToolOutput::Error { message, .. }
                     if message == broca_core::resume::NOT_DISPATCHED_TEXT)
         ),
         "{appended:#?}"

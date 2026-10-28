@@ -581,7 +581,21 @@ fn tool_output_text(out: &ToolOutput) -> String {
         ToolOutput::Text { text } => text.clone(),
         ToolOutput::Json { value } => value.to_string(),
         ToolOutput::Denied { reason } => format!("denied: {reason}"),
-        ToolOutput::Error { message } => message.clone(),
+        ToolOutput::Error {
+            message,
+            module,
+            code,
+            detail,
+            nothing_sent,
+            retry,
+        } => ToolOutput::error_model_text(
+            message,
+            module.as_deref(),
+            code.as_deref(),
+            detail.as_deref(),
+            *nothing_sent,
+            retry.as_deref(),
+        ),
     }
 }
 

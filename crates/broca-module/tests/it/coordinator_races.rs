@@ -4070,9 +4070,9 @@ fn seed_unsealed_run_with_queue(
                 batch_id: batch_id.clone(),
                 result: broca_protocol::ToolResult {
                     tool_call_id: call_id,
-                    output: broca_protocol::ToolOutput::Error {
-                        message: "tool not run: max steps reached before dispatch".into(),
-                    },
+                    output: broca_protocol::ToolOutput::error(
+                        "tool not run: max steps reached before dispatch",
+                    ),
                     is_error: true,
                 }
                 .into(),

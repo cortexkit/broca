@@ -2035,7 +2035,21 @@ fn emit_control_to(
         ControlUnit::ToolResult { result } => {
             let text = match &result.output {
                 broca_protocol::content::ToolOutput::Text { text } => text.clone(),
-                broca_protocol::content::ToolOutput::Error { message } => message.clone(),
+                broca_protocol::content::ToolOutput::Error {
+                    message,
+                    module,
+                    code,
+                    detail,
+                    nothing_sent,
+                    retry,
+                } => broca_protocol::content::ToolOutput::error_model_text(
+                    message,
+                    module.as_deref(),
+                    code.as_deref(),
+                    detail.as_deref(),
+                    *nothing_sent,
+                    retry.as_deref(),
+                ),
                 _ => String::new(),
             };
             emit_to(

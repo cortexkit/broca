@@ -108,6 +108,7 @@ impl ToolPlaneConnection for Rig {
     ) -> Result<serde_json::Value, ConnError> {
         panic!("dispatch must retain send certainty through the staged seam")
     }
+    #[allow(clippy::too_many_arguments)]
     async fn tool_call_staged(
         &self,
         _: &RouteHandle,
@@ -116,6 +117,7 @@ impl ToolPlaneConnection for Rig {
         _: Option<&str>,
         key: Option<&str>,
         _schema_pin: Option<&str>,
+        _: &broca_core::tool_plane::DispatchSignals,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
         self.sent
             .lock()
@@ -576,9 +578,7 @@ async fn undeclared_held_reply_is_a_protocol_refusal_not_a_final_answer() {
     let result = completed(plane.dispatch(&ctx, &call).await);
     assert_eq!(
         result.output,
-        ToolOutput::Error {
-            message: "malformed provider-held reply: prerequisites not met".into()
-        }
+        ToolOutput::error("malformed provider-held reply: prerequisites not met")
     );
     assert!(result.is_error);
     assert_eq!(rig.waits.load(Ordering::SeqCst), 0);
@@ -673,6 +673,7 @@ async fn negotiated_final_content_uses_only_the_frozen_opt_in() {
 async fn staged_plain_key_reaches_the_real_guarded_wire_envelope() {
     let (conn, route, mut server) = SubcConnection::in_process_for_test(7, 1);
     let call = call("call");
+    let signals = broca_core::tool_plane::DispatchSignals::default();
     let dispatch = ToolPlaneConnection::tool_call_staged(
         &conn,
         &route,
@@ -681,6 +682,7 @@ async fn staged_plain_key_reaches_the_real_guarded_wire_envelope() {
         Some("preset"),
         Some("lineage:1"),
         None,
+        &signals,
     );
     tokio::pin!(dispatch);
     let request = tokio::select! {

@@ -5962,12 +5962,7 @@ mod caller_message_tests {
             }),
             result("c", ToolOutput::Text { text: "out".into() }),
             result("d", ToolOutput::Json { value: json!({}) }),
-            result(
-                "e",
-                ToolOutput::Error {
-                    message: "no".into(),
-                },
-            ),
+            result("e", ToolOutput::error("no")),
             result(
                 "f",
                 ToolOutput::Denied {

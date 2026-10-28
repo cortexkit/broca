@@ -304,7 +304,24 @@ pub fn project(entry: &SessionReadMessage, limits: Option<&Limits>) -> DisplayRo
                         ToolOutput::Text { text } => (text.clone(), vec![]),
                         ToolOutput::Json { value } => (value.to_string(), vec![]),
                         ToolOutput::Denied { reason } => (reason.clone(), vec![]),
-                        ToolOutput::Error { message } => (message.clone(), vec![]),
+                        ToolOutput::Error {
+                            message,
+                            module,
+                            code,
+                            detail,
+                            nothing_sent,
+                            retry,
+                        } => (
+                            ToolOutput::error_model_text(
+                                message,
+                                module.as_deref(),
+                                code.as_deref(),
+                                detail.as_deref(),
+                                *nothing_sent,
+                                retry.as_deref(),
+                            ),
+                            vec![],
+                        ),
                         ToolOutput::Parts { parts } => (
                             cortexkit_role_llm_runner::run::join_text_parts(
                                 parts.iter().filter_map(|part| match part {

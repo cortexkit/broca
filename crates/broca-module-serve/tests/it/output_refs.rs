@@ -458,7 +458,7 @@ async fn repeated_ids_within_a_message_keep_unknown_dispatch_metadata_null() {
     assert_eq!(
         records
             .iter()
-            .filter(|record| matches!(record, WalRecord::ToolResult { result, .. } if matches!(&result.output, broca_protocol::content::ToolOutput::Error { message } if message == "duplicate tool_call_id from provider")))
+            .filter(|record| matches!(record, WalRecord::ToolResult { result, .. } if matches!(&result.output, broca_protocol::content::ToolOutput::Error { message, .. } if message == "duplicate tool_call_id from provider")))
             .count(),
         1
     );

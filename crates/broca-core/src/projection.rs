@@ -1186,7 +1186,7 @@ fn tool_finished_event(
             })
             .sum(),
         ToolOutput::Denied { reason } => reason.len(),
-        ToolOutput::Error { message } => message.len(),
+        ToolOutput::Error { message, .. } => message.len(),
     };
     LiveEvent::ToolFinished(ToolFinished::new(
         format!("m{ordinal}"),

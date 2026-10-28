@@ -38,7 +38,7 @@ pub(crate) fn result_bytes(output: &ToolOutput) -> Cow<'_, [u8]> {
         ToolOutput::Text { text } => Cow::Borrowed(text.as_bytes()),
         ToolOutput::Json { value } => Cow::Owned(canonical_json_bytes(value)),
         ToolOutput::Denied { reason } => Cow::Borrowed(reason.as_bytes()),
-        ToolOutput::Error { message } => Cow::Borrowed(message.as_bytes()),
+        ToolOutput::Error { message, .. } => Cow::Borrowed(message.as_bytes()),
     }
 }
 
@@ -340,7 +340,7 @@ mod tests {
             ToolOutput::Text { text } => text.as_bytes().to_vec(),
             ToolOutput::Json { value } => canonical_json_bytes(value),
             ToolOutput::Denied { reason } => reason.as_bytes().to_vec(),
-            ToolOutput::Error { message } => message.as_bytes().to_vec(),
+            ToolOutput::Error { message, .. } => message.as_bytes().to_vec(),
         }
     }
 
@@ -425,9 +425,7 @@ mod tests {
             ToolOutput::Denied {
                 reason: "policy denied".into(),
             },
-            ToolOutput::Error {
-                message: "tool failed".into(),
-            },
+            ToolOutput::error("tool failed"),
         ];
 
         for output in &outputs {

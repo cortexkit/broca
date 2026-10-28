@@ -565,13 +565,12 @@ fn convert_tool(part: &Value) -> (ToolCall, Option<ToolResult>) {
         }
         "error" | "failed" => Some(ToolResult {
             tool_call_id: ToolCallId(call_id.to_string()),
-            output: ToolOutput::Error {
-                message: state
+            output: ToolOutput::error(
+                state
                     .get("error")
                     .and_then(Value::as_str)
-                    .unwrap_or("OpenCode tool execution failed")
-                    .to_string(),
-            },
+                    .unwrap_or("OpenCode tool execution failed"),
+            ),
             is_error: true,
         }),
         _ => None,

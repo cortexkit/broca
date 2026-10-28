@@ -3241,10 +3241,29 @@ impl<'de> Deserialize<'de> for VaultReadOp {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NoDispatchReason {
-    Denied { reason: String },
-    ValidationFailed { detail: String },
-    Unavailable { detail: String },
-    PolicyBlocked { detail: String },
+    Denied {
+        reason: String,
+    },
+    ValidationFailed {
+        detail: String,
+    },
+    /// The tool plane was unavailable. `detail` is the stable matchable message
+    /// (`"tool plane unavailable"`); a refusal the plane attributed to a module outage
+    /// additionally names the module, the daemon's refusal code, and its detail, with
+    /// `nothing_sent` implied. The optional fields default for WALs written before they
+    /// existed, and old readers ignore the unknown fields, so both directions decode.
+    Unavailable {
+        detail: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        module: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refusal_detail: Option<String>,
+    },
+    PolicyBlocked {
+        detail: String,
+    },
 }
 
 /// What KIND of terminal a `tool_result` record is — drives the replay policy.

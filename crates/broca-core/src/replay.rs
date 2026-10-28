@@ -1067,9 +1067,31 @@ pub fn no_dispatch_result(tool_call_id: &ToolCallId, reason: &NoDispatchReason) 
             reason: reason.clone(),
         },
         NoDispatchReason::ValidationFailed { detail }
-        | NoDispatchReason::Unavailable { detail }
-        | NoDispatchReason::PolicyBlocked { detail } => ToolOutput::Error {
-            message: detail.clone(),
+        | NoDispatchReason::PolicyBlocked { detail } => ToolOutput::error(detail),
+        // An attributed outage keeps the stable `message` and carries what was down in
+        // sibling fields; a plain unavailable result has no attribution and renders (and
+        // serializes) exactly as before.
+        NoDispatchReason::Unavailable {
+            detail,
+            module,
+            code,
+            refusal_detail,
+        } => match module {
+            // Built by the one constructor that checks every member against the runner
+            // contract (and omits one that does not fit), so a daemon value out of contract
+            // never reaches a history page. The message stays the stable detail recorded.
+            Some(module) => {
+                let mut output = ToolOutput::module_unavailable(
+                    module.as_str(),
+                    code.clone().unwrap_or_default(),
+                    refusal_detail.clone().unwrap_or_default(),
+                );
+                if let ToolOutput::Error { message, .. } = &mut output {
+                    message.clone_from(detail);
+                }
+                output
+            }
+            None => ToolOutput::error(detail),
         },
     };
     ToolResult {
@@ -5302,6 +5324,9 @@ pub(crate) mod provider_held_tests {
             tool_call_id: ToolCallId("a".into()),
             reason: NoDispatchReason::Unavailable {
                 detail: "unavailable".into(),
+                module: None,
+                code: None,
+                refusal_detail: None,
             },
         });
         assert_eq!(status(&records).held_calls, paused.held_calls[1..]);
@@ -5579,6 +5604,72 @@ mod projected_episode_tests {
 /// These tests pin the seeded tail against a full replay at every cut, including the
 /// corpus edge cases page assembly must preserve. They run on records, not bytes,
 /// so a byte-level offset reader that decodes the same records inherits the property.
+#[cfg(test)]
+mod unavailable_result_tests {
+    use super::no_dispatch_result;
+    use broca_protocol::ToolCallId;
+    use broca_protocol::ToolOutput;
+    use broca_wal::NoDispatchReason;
+
+    /// A call refused because its module stayed down keeps the exact matchable message
+    /// and carries the outage in sibling fields, so the model sees what was down and
+    /// that nothing was sent.
+    #[test]
+    fn attributed_outage_pins_message_and_carries_fields() {
+        let id = ToolCallId("call".into());
+        let result = no_dispatch_result(
+            &id,
+            &NoDispatchReason::Unavailable {
+                detail: broca_protocol::TOOL_PLANE_UNAVAILABLE_MESSAGE.into(),
+                module: Some("aft".into()),
+                code: Some("target_unavailable".into()),
+                refusal_detail: Some("supervised_not_registered".into()),
+            },
+        );
+        assert!(result.is_error);
+        let ToolOutput::Error {
+            message,
+            module,
+            code,
+            detail,
+            nothing_sent,
+            retry,
+        } = &result.output
+        else {
+            panic!("an unavailable no-dispatch is an error result");
+        };
+        assert_eq!(message, "tool plane unavailable");
+        assert_eq!(module.as_deref(), Some("aft"));
+        assert_eq!(code.as_deref(), Some("target_unavailable"));
+        assert_eq!(detail.as_deref(), Some("supervised_not_registered"));
+        assert_eq!(*nothing_sent, Some(true));
+        assert!(retry.as_deref().is_some_and(|retry| !retry.is_empty()));
+        // The serialized shape keeps the matchable message beside the new fields.
+        let json = serde_json::to_value(&result.output).unwrap();
+        assert_eq!(json["message"], "tool plane unavailable");
+        assert_eq!(json["module"], "aft");
+        assert_eq!(json["code"], "target_unavailable");
+        assert_eq!(json["nothing_sent"], true);
+    }
+
+    /// A plain unavailable result serializes exactly as before: no new keys.
+    #[test]
+    fn plain_unavailable_serializes_without_new_keys() {
+        let result = no_dispatch_result(
+            &ToolCallId("call".into()),
+            &NoDispatchReason::Unavailable {
+                detail: "tool plane unavailable".into(),
+                module: None,
+                code: None,
+                refusal_detail: None,
+            },
+        );
+        assert_eq!(
+            serde_json::to_value(&result.output).unwrap(),
+            serde_json::json!({"kind": "error", "message": "tool plane unavailable"})
+        );
+    }
+}
 #[cfg(test)]
 mod offset_tail_tests {
     use std::sync::Arc;

@@ -1544,7 +1544,7 @@ async fn repetition_success_resets_failure_count() {
         .expect("fourth call has a model-visible result");
     assert!(matches!(
         &latest_result.output,
-        ToolOutput::Error { message } if message == "file not found"
+        ToolOutput::Error { message, .. } if message == "file not found"
     ));
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -1591,9 +1591,7 @@ async fn quiet_repetition_guard_leaves_rendered_prompt_unchanged() {
             })
         })
         .expect("the baseline contains the raw tool result");
-    result.output = ToolOutput::Error {
-        message: "file not found".into(),
-    };
+    result.output = ToolOutput::error("file not found");
     assert_eq!(
         actual,
         canonical_request_bytes(&without_guard),
@@ -2206,7 +2204,7 @@ async fn duplicate_tool_call_ids_dispatch_once_and_receive_complete_results() {
         result.is_error
             && matches!(
                 &result.output,
-                ToolOutput::Error { message }
+                ToolOutput::Error { message, .. }
                     if message == "duplicate tool_call_id from provider"
             )
     }));
@@ -2293,9 +2291,7 @@ async fn duplicate_tool_call_ids_dispatch_once_and_receive_complete_results() {
             ToolOutput::Text {
                 text: "edited".into()
             },
-            ToolOutput::Error {
-                message: "duplicate tool_call_id from provider".into()
-            }
+            ToolOutput::error("duplicate tool_call_id from provider")
         ],
         "WAL terminals follow occurrence order for repeated ids"
     );
@@ -2951,7 +2947,7 @@ async fn tripped_sequential_batch_interrupts_remaining_dispatchable_call() {
     assert_eq!(interrupted_c.len(), 1);
     assert!(matches!(
         &interrupted_c[0].output,
-        ToolOutput::Error { message } if message == "tool not run: batch interrupted"
+        ToolOutput::Error { message, .. } if message == "tool not run: batch interrupted"
     ));
 
     let _ = std::fs::remove_dir_all(dir);
@@ -4421,7 +4417,7 @@ fn tool_results_in(
                 result.is_error,
                 reason.clone(),
                 match &result.output {
-                    ToolOutput::Error { message } => message.clone(),
+                    ToolOutput::Error { message, .. } => message.clone(),
                     other => format!("{other:?}"),
                 },
             )),
@@ -4612,7 +4608,7 @@ async fn a_scope_refusal_at_batch_start_is_a_no_dispatch_naming_its_code() {
         .iter()
         .filter_map(|record| match record {
             WalRecord::ToolNoDispatch {
-                reason: NoDispatchReason::Unavailable { detail },
+                reason: NoDispatchReason::Unavailable { detail, .. },
                 ..
             } => Some(detail.clone()),
             _ => None,
@@ -4623,6 +4619,74 @@ async fn a_scope_refusal_at_batch_start_is_a_no_dispatch_naming_its_code() {
         vec!["scope_unverifiable: held scope_not_synced past the bound".to_owned()]
     );
     assert_eq!(plane.exec_count(&ToolCallId("toolu_1".into())), 0);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A module down past the tool-dispatch patience fails the batch with the stable message
+/// plus the attribution: the result's message stays exactly "tool plane unavailable"
+/// (callers match on it), while the module, the daemon's code and its detail ride in
+/// sibling fields, and nothing was sent.
+#[tokio::test]
+async fn a_module_outage_at_batch_start_keeps_stable_message_with_attribution() {
+    let (store, dir) = tmp_lease_store("module-outage");
+    let provider = StubProvider::new(vec![
+        tool_step(&[
+            ("toolu_1", "edit", json!({"path": "a"})),
+            ("toolu_2", "edit", json!({"path": "b"})),
+        ]),
+        text_step("done"),
+    ]);
+    let plane = StubToolPlane::new().with_canned_text("edit", "ran");
+    plane.fail_next_batch_start(ToolPlaneError::ModuleUnavailable {
+        module: "aft".into(),
+        code: "target_unavailable".into(),
+        detail: "supervised_not_registered".into(),
+    });
+
+    let (summary, records) = drive_wal(
+        req(
+            "module-outage",
+            vec![tool("edit", ExecutionMode::Parallel)],
+            vec![],
+        ),
+        provider,
+        &plane,
+        &store,
+        &AllowAll,
+    )
+    .await;
+
+    assert_eq!(summary.expect("run ok").reason, RunFinishReason::Completed);
+    let reasons: Vec<NoDispatchReason> = records
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::ToolNoDispatch { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasons.len(), 2);
+    for reason in &reasons {
+        let NoDispatchReason::Unavailable {
+            detail,
+            module,
+            code,
+            refusal_detail,
+        } = reason
+        else {
+            panic!("a module outage is an unavailable no-dispatch: {reason:?}");
+        };
+        assert_eq!(detail, "tool plane unavailable");
+        assert_eq!(module.as_deref(), Some("aft"));
+        assert_eq!(code.as_deref(), Some("target_unavailable"));
+        assert_eq!(refusal_detail.as_deref(), Some("supervised_not_registered"));
+    }
+    // No-dispatch calls write no tool_result record; their model-facing result is rebuilt
+    // from the reason (see the replay pin test), and its message is the stable one.
+    assert!(!records
+        .iter()
+        .any(|record| matches!(record, WalRecord::ToolResult { .. })));
+    assert_eq!(plane.exec_count(&ToolCallId("toolu_1".into())), 0);
+    assert_eq!(plane.exec_count(&ToolCallId("toolu_2".into())), 0);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -5397,7 +5461,7 @@ async fn trailing_garbage_step_commits_error_without_dispatch_and_model_retries(
             })
             .unwrap();
         assert!(error.is_error);
-        let ToolOutput::Error { message } = &error.output else {
+        let ToolOutput::Error { message, .. } = &error.output else {
             panic!("expected malformed-call error");
         };
         assert!(message.starts_with("tool_args_trailing_garbage:"));
@@ -5444,7 +5508,7 @@ async fn trailing_garbage_keeps_its_error_at_a_hard_stop() {
         .iter()
         .any(|r| matches!(r, WalRecord::ToolDispatchIntent { .. })));
     assert!(records.iter().any(|r| matches!(r, WalRecord::ToolResult { result, .. }
-        if matches!(&result.output, ToolOutput::Error { message } if message.starts_with("tool_args_trailing_garbage:")))));
+        if matches!(&result.output, ToolOutput::Error { message, .. } if message.starts_with("tool_args_trailing_garbage:")))));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -5522,7 +5586,7 @@ async fn trailing_garbage_crash_prefixes_never_dispatch_the_rejected_call() {
                 .find_map(|frame| match &frame.record {
                     WalRecord::ToolResult { result, .. } if result.tool_call_id.0 == "bad" => {
                         match &result.output {
-                            ToolOutput::Error { message } => Some(message),
+                            ToolOutput::Error { message, .. } => Some(message),
                             _ => None,
                         }
                     }
@@ -5568,7 +5632,7 @@ async fn trailing_garbage_finalize_turn_preserves_call_and_exact_error() {
         if assistant_message.tool_calls().any(|call| call.tool_call_id.0 == "bad"))
     ));
     assert!(records.iter().any(|record| matches!(record, WalRecord::ToolResult { result, .. }
-        if result.tool_call_id.0 == "bad" && matches!(&result.output, ToolOutput::Error { message }
+        if result.tool_call_id.0 == "bad" && matches!(&result.output, ToolOutput::Error { message, .. }
             if message.starts_with("tool_args_trailing_garbage:") && message.contains("json_bytes=15, whitespace_bytes=4097")))));
     let _ = std::fs::remove_dir_all(dir);
 }

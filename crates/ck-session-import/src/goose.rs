@@ -380,12 +380,7 @@ fn convert_tool_response(part: &Value, omitted_images: &mut usize) -> Option<Too
         };
         *omitted_images += omit_nested_tool_images(&mut content);
         if is_error {
-            (
-                ToolOutput::Error {
-                    message: output_text(&content),
-                },
-                true,
-            )
+            (ToolOutput::error(output_text(&content)), true)
         } else if content_is_empty(&content) {
             // An imported tool result is replayed to a model, so `content` is the field that
             // matters: MCP defines it as the model-facing result and `structuredContent` as a
@@ -411,12 +406,7 @@ fn convert_tool_response(part: &Value, omitted_images: &mut usize) -> Option<Too
             .cloned()
             .unwrap_or_else(|| Value::String("Goose tool execution failed".into()));
         *omitted_images += omit_nested_tool_images(&mut error);
-        (
-            ToolOutput::Error {
-                message: value_text(&error),
-            },
-            true,
-        )
+        (ToolOutput::error(value_text(&error)), true)
     };
     Some(ToolResult {
         tool_call_id: ToolCallId(call_id.to_string()),
@@ -469,7 +459,7 @@ fn output_text(content: &Value) -> String {
         ToolOutput::Text { text } => text,
         ToolOutput::Json { value } => value_text(&value),
         ToolOutput::Denied { reason } => reason,
-        ToolOutput::Error { message } => message,
+        ToolOutput::Error { message, .. } => message,
     }
 }
 

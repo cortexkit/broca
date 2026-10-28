@@ -549,7 +549,7 @@ fn tool_output_text(output: &ToolOutput) -> &str {
     match output {
         ToolOutput::Parts { .. } => "",
         ToolOutput::Text { text } => text,
-        ToolOutput::Error { message } => message,
+        ToolOutput::Error { message, .. } => message,
         ToolOutput::Denied { reason } => reason,
         ToolOutput::Json { .. } => "",
     }

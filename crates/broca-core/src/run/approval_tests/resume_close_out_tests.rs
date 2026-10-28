@@ -144,9 +144,7 @@ async fn resumed_duplicate_of_a_restored_call_is_refused_not_dispatched() {
     assert_eq!(result.results.len(), 2);
     assert_eq!(
         result.results[1].output,
-        ToolOutput::Error {
-            message: "duplicate tool_call_id from provider".into()
-        }
+        ToolOutput::error("duplicate tool_call_id from provider")
     );
     assert!(rig.questions.keys.lock().unwrap().is_empty());
     rig.finish().await;
@@ -265,7 +263,7 @@ async fn args_cut_resume_keeps_a_prepared_sibling_in_the_approval_gate() {
         !matches!(
             terminals[0],
             WalRecord::ToolResult { result, .. }
-                if matches!(&result.output, ToolOutput::Error { message } if message.starts_with("tool_args_trailing_garbage"))
+                if matches!(&result.output, ToolOutput::Error { message, .. } if message.starts_with("tool_args_trailing_garbage"))
         ),
         "the Prepared sibling was reported as a malformed call: {:?}",
         terminals[0]
