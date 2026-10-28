@@ -384,6 +384,22 @@ async fn target_cingulate_admission(project: bool) {
         .await
         .unwrap(),
     );
+    let cingulate_capabilities =
+        broca_test_support::wait_until("Cingulate's registered manifest", || async {
+            conn.catalog_list()
+                .await
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|entry| entry.module_id == "cingulate")
+                .and_then(|entry| entry.capabilities)
+                .map(|capabilities| capabilities.provides)
+                .ok_or_else(|| "Cingulate has not registered its capabilities".to_owned())
+        })
+        .await;
+    assert!(
+        cingulate_capabilities.iter().any(|capability| capability == subc_protocol::scope::AGENT_RUN_SCOPES_CAPABILITY),
+        "the Cingulate stand-in must match the real provider's run-scope admission: {cingulate_capabilities:?}"
+    );
     let selector = subc_protocol::scope::ScopeSelector::new(
         subc_protocol::Principal::Reserved {
             module_id: "owner".into(),

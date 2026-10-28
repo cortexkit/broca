@@ -359,7 +359,12 @@ fn manifest(module_id: &str) -> ModuleManifest {
         },
     ])
     .capabilities((module_id == "cingulate").then(|| CapabilityDeclarations {
-        provides: vec!["consent-no-expiry/v1".into()],
+        // Consent routes carry the run's scope. Advertise agent-run-scopes/v1, matching
+        // real Cingulate; this stand-in does not implement call-modes/v1.
+        provides: vec![
+            "consent-no-expiry/v1".into(),
+            subc_protocol::scope::AGENT_RUN_SCOPES_CAPABILITY.into(),
+        ],
         requires: Vec::new(),
         must_never_reach: Vec::new(),
     }))
@@ -491,11 +496,19 @@ fn append(path: &PathBuf, line: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn cingulate_accepts_agent_run_scopes_like_the_real_provider() {
+        let manifest = super::manifest("cingulate");
+        assert!(manifest.capabilities.unwrap().provides.iter().any(|capability| {
+            capability == subc_protocol::scope::AGENT_RUN_SCOPES_CAPABILITY
+        }));
+    }
+
+    #[test]
     fn cingulate_declares_card_filing_and_no_expiry_without_changing_other_surfaces() {
         let manifest = super::manifest("cingulate");
         assert_eq!(
             manifest.capabilities.as_ref().unwrap().provides,
-            vec!["consent-no-expiry/v1"]
+            vec!["consent-no-expiry/v1", "agent-run-scopes/v1"]
         );
         assert!(manifest.provides.iter().any(|role| matches!(
             role, super::ProviderRole::ManagementSurface { operations, .. }

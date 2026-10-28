@@ -1019,7 +1019,7 @@ async fn always_grant_uses_the_daemon_project_not_the_bind_project_or_workdir() 
 async fn consent_card_content_uses_only_the_daemon_stamped_project() {
     let Some(rig) = Rig::start(
         "project-card",
-        Stub::Answering(CEREBELLUM_MARKED),
+        Stub::Answering(r#"{"private_content":true,"sources":["person_browser"]}"#),
         Stub::Unreachable,
     )
     .await
