@@ -5316,6 +5316,15 @@ where
                 }
             }
             let state = compaction_state.as_mut().expect("Setup is durable");
+            // The run's frozen account, when its selection names a subscription account with a
+            // vault-served account id. Rides and notices compare it against the durable last
+            // notice's account, so a restart rebuilds both sides from the WAL instead of memory.
+            // Unknown runs (no routing selection, or an unrouted credential) clear it to `None`
+            // and send neither cause nor event, leaving the last known account in place.
+            state.current_account = control
+                .auth_selection
+                .as_ref()
+                .and_then(crate::compaction::view::selection_account_label);
             let session_ref = crate::wal_writer::agent_session_ref(&req.session);
             // Ride when the prefix is being rewritten anyway, then fetch the newest announced
             // view with `view.get`; either is offered here, at the boundary, and recorded before

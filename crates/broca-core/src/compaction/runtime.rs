@@ -1020,7 +1020,17 @@ impl Runtime<'_> {
         };
         let started = self.now();
         let ends_at = started.saturating_add(deadline_ms);
-        let request = RideRequest::new(session_ref, cause, deadline_ms);
+        let mut request = RideRequest::new(session_ref, cause, deadline_ms);
+        // An `account_change` ride carries the new account's opaque label; other causes
+        // ignore it. The label comes from durable state (the current run's account), so a
+        // restart neither rides spuriously nor misses a change. Unknown runs never reach
+        // this cause, so there is always a label here; without one the ride is still sent
+        // without it rather than with a placeholder.
+        if request.cause == RideCause::AccountChange {
+            if let Some(label) = state.current_account.clone() {
+                request = request.with_account(label);
+            }
+        }
         let ride = plane.ride(self.provider, self.bind, request);
         tokio::pin!(ride);
         let report_at = started.saturating_add(COMPACTION_WAIT_REPORT_AFTER_MS);
