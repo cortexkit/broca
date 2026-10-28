@@ -91,9 +91,9 @@ pub use context::{
     resume_state_from_store, select_held_episodes, tool_call_dispatches, tool_call_key,
     AdmissionStoreSnapshot, ExportCursor, ExportError, ExportFact, ExportIndex, ExportPage,
     HeldEpisode, HeldPrefix, HeldRowsRequest, MaterializedStore, MissingExportRun, Persister,
-    RunIndex, RunIndexRow, RunIndexState, SessionReadLineageState, SessionReadMessage,
-    SessionReadPage, SessionReadReason, SessionReadStateKind, SessionStore, StorePageRow,
-    StorePageSnapshot, StorePrefix, TagLocation, ToolCallDispatch, WithdrawalRun,
+    RunIndex, RunIndexAttribution, RunIndexRow, RunIndexState, SessionReadLineageState,
+    SessionReadMessage, SessionReadPage, SessionReadReason, SessionReadStateKind, SessionStore,
+    StorePageRow, StorePageSnapshot, StorePrefix, TagLocation, ToolCallDispatch, WithdrawalRun,
     SESSION_READ_DEFAULT_LIMIT, SESSION_READ_MAX_LIMIT,
 };
 pub use context::{

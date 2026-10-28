@@ -70,7 +70,7 @@ sha2 = "0.10"
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f", default-features = false, features = ["deflate"] }
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186", default-features = false, features = ["handshake", "connect", "rustls-tls-webpki-roots"] }
 # Exact released versions keep the benchmark and production on the same envelope.
-subc-protocol = "=0.33.0"
+subc-protocol = "=0.33.4"
 subc-transport = "=0.14.0"
 subc-control = "=0.33.0"
 subc-client-rs = "=0.31.0"

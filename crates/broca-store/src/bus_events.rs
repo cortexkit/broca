@@ -135,6 +135,8 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
 
 #[derive(Default, Serialize, Deserialize)]
 struct Projection {
+    #[serde(default)]
+    attribution: broca_core::RunIndexAttribution,
     run_id: Option<String>,
     last_at_ms: u64,
     pending: u64,
@@ -526,6 +528,7 @@ impl SqliteStore {
                         open: true,
                         ..Projection::default()
                     };
+                    state.attribution.observe(&frame.record);
                     // Event projection can create the row before the actor's active-index
                     // write. Record its session reference in the same managed transaction so
                     // the legacy-write triggers do not invalidate a complete inventory.
@@ -578,7 +581,16 @@ impl SqliteStore {
                     ..
                 } => {
                     state.last_at_ms = ts_ms.unwrap_or(state.last_at_ms);
-                    tx.execute("UPDATE run_index SET state='paused',state_changed_ms=?2 WHERE run_id=?1 AND state IN ('active','paused')", params![run_id.0, state.last_at_ms])?;
+                    state.attribution.observe(&frame.record);
+                    crate::diagnostics::write_lifecycle(
+                        &tx,
+                        &run_id.0,
+                        "paused",
+                        None,
+                        None,
+                        0,
+                        Some(&state.attribution),
+                    )?;
                     Some(RunEventDetail::Paused {
                         pause_reason: *reason,
                     })
@@ -598,9 +610,18 @@ impl SqliteStore {
                 } => {
                     state.last_at_ms = ts_ms.unwrap_or(state.last_at_ms);
                     state.open = false;
+                    state.attribution.observe(&frame.record);
                     if let Some(run_id) = &state.run_id {
                         let terminal = serde_json::to_value(reason)?.as_str().unwrap().to_owned();
-                        tx.execute("UPDATE run_index SET state=?2,state_changed_ms=?3,usage_json=?4,retries_used=?5 WHERE run_id=?1", params![run_id, terminal, state.last_at_ms, serde_json::to_string(usage)?, retries_used])?;
+                        crate::diagnostics::write_lifecycle(
+                            &tx,
+                            run_id,
+                            &terminal,
+                            Some(&serde_json::to_string(usage)?),
+                            None,
+                            *retries_used,
+                            Some(&state.attribution),
+                        )?;
                     }
                     Some(RunEventDetail::Ended {
                         terminal: *reason,

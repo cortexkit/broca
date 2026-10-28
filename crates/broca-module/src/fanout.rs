@@ -647,7 +647,10 @@ impl<W: WalStore + 'static> Fanout<W> {
         let observer = broca_core::RecordObserver::new(obs_tx, gate.observer_slots())
             .with_durable_tap(
                 Arc::new(move |seq, fence, lineage, record| {
-                    tapped.observe(seq, fence, lineage, record)
+                    tapped.observe(seq, fence, lineage, record);
+                    crate::diagnostics::observe_outage(record, || {
+                        &crate::diagnostics::TOOL_OUTAGES
+                    });
                 }),
                 approvals.healthy.clone(),
             );
@@ -1843,6 +1846,83 @@ mod tests {
         assert!(!deliver_from_ring(Cursor::new(7, 0), h, from));
         // past both → deliver.
         assert!(deliver_from_ring(Cursor::new(8, 0), h, from));
+    }
+
+    #[tokio::test]
+    async fn diagnostics_durable_outage_tap_counts_only_attributed_outages_once() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("diagnostics-tap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let wal = Arc::new(broca_core::FileWalStore::new(root.join("wal")));
+        let session = BindIdentity::new(root.join("project"), "test", "outage-tap");
+        let (_fanout, observer) = Fanout::new(wal.clone(), session.clone());
+        let writer =
+            broca_core::WalHandle::spawn_observed(wal.open(&session).unwrap(), 1, Some(observer))
+                .unwrap();
+        writer.record(run_started(&session));
+        for (n, output, is_error) in [
+            (
+                1,
+                broca_protocol::ToolOutput::Error {
+                    message: broca_protocol::TOOL_PLANE_UNAVAILABLE_MESSAGE.into(),
+                    module: Some("diagnostics-tap-module".into()),
+                    code: Some("module_unavailable".into()),
+                    detail: None,
+                    nothing_sent: Some(true),
+                    retry: None,
+                },
+                true,
+            ),
+            (
+                2,
+                broca_protocol::ToolOutput::Text {
+                    text: "PRIVATE TOOL TEXT".into(),
+                },
+                false,
+            ),
+            (
+                3,
+                broca_protocol::ToolOutput::Error {
+                    message: "PRIVATE ERROR".into(),
+                    module: None,
+                    code: None,
+                    detail: None,
+                    nothing_sent: None,
+                    retry: None,
+                },
+                true,
+            ),
+        ] {
+            writer.record(WalRecord::ToolResult {
+                finished_at_ms: None,
+                tags: None,
+                hooks: None,
+                batch_id: broca_protocol::BatchId("batch".into()),
+                result: broca_protocol::ToolResult {
+                    tool_call_id: ToolCallId(format!("call-{n}")),
+                    output,
+                    is_error,
+                }
+                .into(),
+                outcome: broca_wal::DispatchOutcome::Completed,
+                reason: None,
+                withdraw_elicitation: None,
+                provider_held: None,
+            });
+        }
+        writer.sync().await.unwrap();
+        writer.sync().await.unwrap();
+        let snapshot = crate::diagnostics::TOOL_OUTAGES
+            .snapshot(0, i64::MAX)
+            .unwrap();
+        let events: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter(|e| e.module == "diagnostics-tap-module")
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].code, "module_unavailable");
+        let _ = writer.shutdown().await;
     }
 
     // File-WAL byte anchors are recorded on unix only; on other platforms the live seed

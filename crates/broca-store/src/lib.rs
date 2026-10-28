@@ -39,6 +39,7 @@ pub mod bus_events;
 pub mod compaction_facts;
 pub mod compaction_receipts;
 pub mod db;
+pub mod diagnostics;
 pub mod export_index;
 mod fold_identities;
 pub mod grants;
@@ -835,6 +836,7 @@ impl SqliteStore {
             // the latest episode's terminal is not evidence about this run.
             let mut current: Option<String> = None;
             let mut terminal = None;
+            let mut attribution = broca_core::RunIndexAttribution::default();
             for framed in &records {
                 match &framed.record {
                     WalRecord::RunStarted {
@@ -851,6 +853,9 @@ impl SqliteStore {
                         terminal = Some((*reason, *usage, *retries_used));
                     }
                     _ => {}
+                }
+                if current.as_deref() == Some(run_id.as_str()) {
+                    attribution.observe(&framed.record);
                 }
             }
             let Some((reason, usage, retries_used)) = terminal else {
@@ -879,17 +884,21 @@ impl SqliteStore {
                 let changed = tx.execute(
                     "UPDATE run_index
                     SET state = ?2, usage_json = ?3, retries_used = ?4,
-                        state_changed_ms = ?5, withdrawals_owed = MAX(withdrawals_owed, ?6)
+                         state_changed_ms = ?5, withdrawals_owed = MAX(withdrawals_owed, ?6),
+                         provider_module_id=COALESCE(?9,provider_module_id), credential_id=COALESCE(?10,credential_id),
+                         error_class=?11,error_code=?12,pause_reason=?13,interrupt_reason=?14
                   WHERE run_id = ?1 AND state = 'active' AND session = ?7 AND lineage_id IS ?8",
                     rusqlite::params![
                         run_id,
                         state.as_str(),
                         usage_json,
                         i64::from(retries_used),
-                        Self::now_epoch_ms(),
+                        attribution.at_ms.and_then(|ms| i64::try_from(ms).ok()),
                         withdrawals_owed,
                         key,
                         expected_lineage,
+                        attribution.provider_module_id,attribution.credential_id,attribution.error_class,
+                        attribution.error_code,attribution.pause_reason,attribution.interrupt_reason,
                     ],
                 )?;
                 tx.commit()?;
@@ -1243,6 +1252,12 @@ impl SqliteStore {
             ("lineage_id", "TEXT"),
             ("expired_at_ms", "INTEGER"),
             ("withdrawals_owed", "INTEGER NOT NULL DEFAULT 0"),
+            ("provider_module_id", "TEXT"),
+            ("credential_id", "TEXT"),
+            ("error_class", "TEXT"),
+            ("error_code", "TEXT"),
+            ("pause_reason", "TEXT"),
+            ("interrupt_reason", "TEXT"),
         ] {
             if !run_index_columns.contains(column) {
                 conn.execute(
@@ -1268,6 +1283,7 @@ impl SqliteStore {
         retention::init_work_schema(conn)?;
         session_refs::init_schema(conn)?;
         bus_events::init_schema(conn)?;
+        diagnostics::init_schema(conn)?;
         compaction_receipts::init_schema(conn)?;
         compaction_facts::init_schema(conn)?;
         let source = export_index::init_schema(conn).map_err(StoreError::from)?;
@@ -2598,25 +2614,53 @@ impl RunIndex for SqliteStore {
             .map(serde_json::to_string)
             .transpose()
             .map_err(|e| e.to_string())?;
+        let finish_json = final_step_finish_reason
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        diagnostics::write_lifecycle(
+            &conn,
+            run_id,
+            state.as_str(),
+            usage_json.as_deref(),
+            finish_json.as_deref(),
+            retries_used,
+            None,
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    fn index_run_attributed(
+        &self,
+        run_id: &str,
+        state: RunIndexState,
+        usage: Option<Usage>,
+        final_step_finish_reason: Option<FinishReason>,
+        retries_used: u32,
+        attribution: &broca_core::RunIndexAttribution,
+    ) -> Result<(), String> {
+        let usage_json = usage
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| e.to_string())?;
         let finish_reason_json = final_step_finish_reason
             .as_ref()
             .map(serde_json::to_string)
             .transpose()
             .map_err(|e| e.to_string())?;
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE run_index \
-             SET state=?2, usage_json=?3, final_step_finish_reason_json=?4, retries_used=?5, \
-                 state_changed_ms=?6 \
-              WHERE run_id=?1",
-            rusqlite::params![
-                run_id,
-                state.as_str(),
-                usage_json,
-                finish_reason_json,
-                retries_used,
-                Self::now_epoch_ms(),
-            ],
+        diagnostics::write_lifecycle(
+            &conn,
+            run_id,
+            state.as_str(),
+            usage_json.as_deref(),
+            finish_reason_json.as_deref(),
+            retries_used,
+            Some(attribution),
         )
         .map_err(|e| e.to_string())?;
         Ok(())

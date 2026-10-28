@@ -254,6 +254,7 @@ fn derive(
             runs.insert(
                 failure.run_id.0.clone(),
                 RetentionRunRow {
+                    attribution: None,
                     run: RunIndexRow {
                         run_id: failure.run_id.0.clone(),
                         session: session.clone(),
@@ -295,9 +296,24 @@ fn derive(
                     WalRecord::RunStarted { ts_ms, .. } => *ts_ms,
                     _ => None,
                 });
+            let mut attribution = broca_core::RunIndexAttribution::default();
+            for evidence in records
+                .iter()
+                .skip_while(|f| f.seq < frame.seq)
+                .take(1)
+                .chain(
+                    records
+                        .iter()
+                        .skip_while(|f| f.seq <= frame.seq)
+                        .take_while(|f| !matches!(f.record, WalRecord::RunStarted { .. })),
+                )
+            {
+                attribution.observe(&evidence.record);
+            }
             runs.insert(
                 run_id.0.clone(),
                 RetentionRunRow {
+                    attribution: Some(attribution),
                     run: RunIndexRow {
                         run_id: run_id.0.clone(),
                         session: session.clone(),
@@ -736,6 +752,7 @@ impl RetentionService {
     ) -> Result<Option<PathBuf>, RetentionReadError> {
         self.wal.resolve_live_path(key).map_err(|error| {
             if matches!(error, broca_wal::WalError::RelocationIncomplete { .. }) {
+                crate::diagnostics::retention_fenced(key, "wal_relocation_incomplete", self.clock.now_ms());
                 self.relocation_incomplete.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::warn!(target: "retention", session = %broca_core::session_addr(key), "retention deferred: wal_relocation_incomplete; an owned open must finish placement");
             }
@@ -850,6 +867,7 @@ impl RetentionService {
         meta: Option<&broca_core::AdmissionStoreSnapshot>,
     ) -> Result<Option<u64>, RetentionReadError> {
         if self.defer_overhaul() {
+            crate::diagnostics::retention_fenced(key, "overhaul_deferred", self.clock.now_ms());
             return Ok(None);
         }
         let overhaul_path = self
@@ -1491,6 +1509,7 @@ impl RetentionService {
         now_ms: u64,
     ) -> Result<Option<String>, RetentionReadError> {
         if self.defer_overhaul() {
+            crate::diagnostics::retention_fenced(key, "overhaul_deferred", now_ms);
             return Ok(None);
         }
         let overhaul_path = self
@@ -1566,6 +1585,7 @@ impl RetentionService {
         match intake {
             Ok(None) => {}
             Ok(Some(reason)) => {
+                crate::diagnostics::retention_fenced(key, reason, now_ms);
                 if reason == "provider_held_intake_unknown" {
                     self.mark_unreadable(key);
                 }
@@ -1575,6 +1595,7 @@ impl RetentionService {
             }
             Err(_) => {
                 self.mark_unreadable(key);
+                crate::diagnostics::retention_fenced(key, "provider_held_intake_unknown", now_ms);
                 tracing::warn!(target: "retention", session = %broca_core::session_addr(key), reason = "provider_held_intake_unknown",
                     "retention deletion skipped: intake store cannot be read");
                 return Ok(None);
@@ -1675,11 +1696,15 @@ impl RetentionService {
         now_ms: u64,
     ) -> Result<(), String> {
         if self.defer_overhaul() {
+            crate::diagnostics::retention_fenced(key, "overhaul_deferred", now_ms);
             return Err("retention deferred: overhaul".into());
         }
         self.wal.check_move(key, true).map_err(|e| e.to_string())?;
         let moved = self.deleting(key, &stone.lineage_id);
-        if let Some(path) = self.wal.resolve_live_path(key).map_err(|e| e.to_string())? {
+        if let Some(path) = self
+            .live_path_for_retention(key)
+            .map_err(|e| e.to_string())?
+        {
             let identity = match self.read_path(&path) {
                 Ok(read) => read.lineage_id.map(|id| id.to_string()),
                 Err(_) => Some(self.initial_lineage(&path)?),
@@ -1799,6 +1824,7 @@ impl RetentionService {
         // A crash or removal failure before this point leaves an incomplete tombstone to retry.
         stone.completed_at_ms = Some(now_ms);
         self.write_tombstone(key, &stone)?;
+        crate::diagnostics::retention_deleted(key);
         Ok(())
     }
 
@@ -1829,6 +1855,9 @@ impl RetentionService {
                 }
                 let stones = self.tombstones(&key)?;
                 if stones.iter().all(|s| s.completed_at_ms.is_some()) {
+                    if !stones.is_empty() {
+                        crate::diagnostics::retention_deleted(&key);
+                    }
                     for stone in stones {
                         self.index
                             .deletion_pending(&stone.lineage_id, &key, false)?;

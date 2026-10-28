@@ -42,6 +42,7 @@ const EMBEDDED_ENGRAM_CATALOG: &[u8] = include_bytes!("../../../engram-catalog.j
 const VAULT_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    broca_module::diagnostics::initialize();
     #[cfg(feature = "heap-profile")]
     broca_heap_profile::start();
     run_runtime(serve_main())?
@@ -368,6 +369,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // Load the last-known-good before any admission is possible. The fetch leg gets its own
     // consumer connection, but construction performs no fusiform route.open; only the detached
     // poll below can dial that sibling module.
+    broca_module_serve::diagnostics::install(state_root.clone());
     let catalog_cache = Arc::new(broca_catalog::CatalogCache::open(
         state_root.join("catalog/fusiform-lkg.json"),
     ));

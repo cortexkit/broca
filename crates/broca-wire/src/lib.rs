@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agent_data;
+pub mod diagnostics;
 pub mod role;
 pub use role::*;
 pub mod warm;

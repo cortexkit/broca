@@ -444,7 +444,7 @@ async fn scoped_classifier_exports_one_measurement_per_paid_item_and_none_on_res
 
 #[tokio::test]
 async fn flow_classifier_measurement_never_inherits_its_owner_agent_or_run() {
-    let mut rig = start().await;
+    let rig = start().await;
     let stamp = serde_json::from_value(json!({
         "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
         "ref": "owners-run", "scope_epoch": 1, "kind": "head", "owner_authorized": true,
@@ -454,17 +454,23 @@ async fn flow_classifier_measurement_never_inherits_its_owner_agent_or_run() {
     let basal = Some(subc_protocol::Principal::Reserved {
         module_id: "basal".into(),
     });
-    rig.bind_with_scope(
-        9,
-        &[broca_subc::CLASSIFIER_ROLE_VERSIONS],
-        basal,
-        Some(stamp),
-    )
-    .await;
+    let principal = basal.as_ref().map(super::to_bind_principal);
+    let scope = broca_protocol::SendScope::Stamped(super::to_bind_scope(&stamp, basal.as_ref()));
     rig.provider.gate.add_permits(1);
-    rig.request(9, 1, "classify.run", classify_params("paid-flow"))
-        .await;
-    assert_eq!(rig.reply().await.header.ty, FrameType::Response);
+    // Flows classify through model tools, not management. Shared classifier measurements
+    // must keep flow identity separate from the owner's agent/run attribution.
+    rig.system_one
+        .clone()
+        .answer(
+            &serde_json::to_vec(
+                &json!({"method":"classify.run","params":classify_params("paid-flow")}),
+            )
+            .unwrap(),
+            principal.as_ref(),
+            &scope,
+        )
+        .await
+        .expect("shared flow classifier");
     let page = rig.export.read_export_page(None, 100).unwrap();
     assert_eq!(page.facts.len(), 1);
     let value = serde_json::to_value(&page.facts[0].segment).unwrap();

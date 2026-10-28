@@ -133,6 +133,11 @@ pub fn manifest_with_archive(
 pub(crate) fn management_operations() -> Vec<ManagementOperation> {
     vec![
         ManagementOperation {
+            name: broca_wire::diagnostics::OP.into(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Read bounded, content-free diagnoses of broca's own degraded state.".into()),
+        },
+        ManagementOperation {
             name: cortexkit_role_llm_runner::ops::SESSION_HISTORY.into(),
             kind: ManagementOperationKind::Query,
             description: Some("Page surviving session history as stored entries or display rows.".into()),
@@ -484,6 +489,7 @@ pub fn manifest_configured(
         requires: Vec::new(),
         must_never_reach: Vec::new(),
     }))
+    .flow_operations(Some(vec![broca_wire::diagnostics::OP.into()]))
     .provides(vec![ProviderRole::ManagementSurface {
             // Concurrent ACROSS sessions, FIFO WITHIN one: the registry fans requests out to
             // per-session lineage actors, and each actor processes its own commands in order
@@ -577,6 +583,7 @@ mod provenance_tests {
                 "bindings",
                 "capabilities",
                 "consumes",
+                "flow_operations",
                 "module_id",
                 "module_version",
                 "protocol_ver",

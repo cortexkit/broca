@@ -1,0 +1,73 @@
+{
+  "result": {
+    "coverage": {
+      "catalog_stale": {
+        "since_ms": 199999000,
+        "truncated": false
+      },
+      "interrupted_runs": {
+        "since_ms": 200000000,
+        "truncated": false
+      },
+      "run_errors": {
+        "since_ms": 199999900,
+        "truncated": false
+      },
+      "send_refusals": {
+        "since_ms": 199999000,
+        "truncated": false
+      },
+      "tool_outages": {
+        "since_ms": 199999000,
+        "truncated": false
+      }
+    },
+    "findings": [
+      {
+        "check": "paused_runs",
+        "count": 1,
+        "first_seen_ms": 110000000,
+        "hint": "Use broca-session status for a sampled run_id; inspect paused:auth_required and its frozen credential id.",
+        "key": "[\"openai\",\"credential\"]",
+        "last_seen_ms": 110000000,
+        "samples": [
+          {
+            "at_ms": 110000000,
+            "credential_id": "credential",
+            "error_class": "auth_required",
+            "error_code": null,
+            "interrupt_reason": null,
+            "provider_module_id": "openai",
+            "run_id": "paused"
+          }
+        ],
+        "severity": "error",
+        "summary": "1 runs remain paused for authentication or account availability."
+      },
+      {
+        "check": "run_errors",
+        "count": 1,
+        "first_seen_ms": 199999900,
+        "hint": "Use broca-session status for a sampled run_id; inspect its error class and provider code, not provider message text.",
+        "key": "[\"openai\",\"permanent\",\"billing_exhausted\"]",
+        "last_seen_ms": 199999900,
+        "samples": [
+          {
+            "at_ms": 199999900,
+            "credential_id": "credential",
+            "error_class": "permanent",
+            "error_code": "billing_exhausted",
+            "interrupt_reason": null,
+            "provider_module_id": "openai",
+            "rows_without_attribution": 0,
+            "run_id": "billing"
+          }
+        ],
+        "severity": "error",
+        "summary": "1 runs ended in error in the indexed window."
+      }
+    ],
+    "generated_at_ms": 200000000,
+    "window_ms": 21600000
+  }
+}

@@ -7561,6 +7561,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let head = writer.durable_head().load(Ordering::Acquire);
         self.approvals.wait_covered(head).await;
         let prepared = self.approvals.prepared(run_id, head);
+        let attribution = self.approvals.attribution(run_id, head);
         let run_id = run_id.0.clone();
         let cache = self.approvals.clone();
         let job = self.actor_jobs.track(writer);
@@ -7580,7 +7581,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 }
             }
             if let Some(index) = index {
-                index.index_run_terminal(&run_id, state, usage, reason, retries)?;
+                index.index_run_attributed(&run_id, state, usage, reason, retries, &attribution)?;
             }
             Ok(owed)
         })
@@ -7648,12 +7649,17 @@ impl<W: WalStore + 'static> LineageActor<W> {
             // As the loop's own terminal write: no usage for a run that completed no step,
             // and the last step's provider finish reason.
             crate::approval::record_terminal_debt(index.as_ref(), &projection, &target.0)?;
-            index.index_run_terminal(
+            let mut attribution = broca_core::RunIndexAttribution::default();
+            for record in &records {
+                attribution.observe(record);
+            }
+            index.index_run_attributed(
                 &target.0,
                 run_finish_index_state(reason),
                 (prior.completed_steps > 0).then_some(usage),
                 prior.last_step_finish_reason,
                 retries_used,
+                &attribution,
             )?;
             Ok(true)
         })
@@ -13865,6 +13871,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
 
     async fn expire_actor(&mut self, now_ms: u64) -> bool {
         if self.wal_store.wal_config().is_overhaul() {
+            crate::diagnostics::retention_fenced(&self.key, "overhaul_deferred", now_ms);
             if let Some(service) = self.registry.retention_service() {
                 service.defer_overhaul();
             } else {

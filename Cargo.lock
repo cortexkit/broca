@@ -269,7 +269,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "subc-protocol 0.33.0",
+ "subc-protocol 0.33.4",
  "subc-transport 0.14.0",
  "tokio",
 ]
@@ -475,7 +475,7 @@ dependencies = [
  "subc-client-rs 0.31.0",
  "subc-control 0.33.0",
  "subc-os",
- "subc-protocol 0.33.0",
+ "subc-protocol 0.33.4",
  "subc-transport 0.14.0",
  "tokio",
  "tokio-util",
@@ -535,7 +535,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "subc-protocol 0.33.0",
+ "subc-protocol 0.33.4",
  "subc-transport 0.14.0",
  "tokio",
  "tokio-tungstenite",
@@ -554,7 +554,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
- "subc-protocol 0.33.0",
+ "subc-protocol 0.33.4",
  "tokio",
 ]
 
@@ -632,7 +632,7 @@ dependencies = [
  "subc-client-rs 0.31.0",
  "subc-control 0.33.0",
  "subc-os",
- "subc-protocol 0.33.0",
+ "subc-protocol 0.33.4",
  "subc-transport 0.14.0",
  "tokio",
  "tokio-util",
@@ -1087,7 +1087,7 @@ dependencies = [
  "serde",
  "serde_jcs",
  "serde_json",
- "subc-protocol 0.33.0",
+ "subc-protocol 0.33.4",
 ]
 
 [[package]]
@@ -1166,7 +1166,7 @@ dependencies = [
  "serde",
  "serde_jcs",
  "serde_json",
- "subc-protocol 0.33.0",
+ "subc-protocol 0.33.4",
  "tokio",
 ]
 
@@ -1204,7 +1204,7 @@ dependencies = [
  "serde_jcs",
  "serde_json",
  "sha2",
- "subc-protocol 0.33.0",
+ "subc-protocol 0.33.4",
 ]
 
 [[package]]
@@ -3355,7 +3355,7 @@ dependencies = [
  "sha2",
  "subc-control 0.33.0",
  "subc-os",
- "subc-protocol 0.33.0",
+ "subc-protocol 0.33.4",
  "subc-transport 0.14.0",
  "tokio",
  "tokio-util",
@@ -3381,7 +3381,7 @@ checksum = "86c691fc8e35a2d30000801dc27dfbd54f356529f761a97a776bc239e8381808"
 dependencies = [
  "serde",
  "serde_json",
- "subc-protocol 0.33.0",
+ "subc-protocol 0.33.4",
 ]
 
 [[package]]
@@ -3407,9 +3407,9 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.33.0"
+version = "0.33.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "587cff68a0d5b98eb85a7231ce00e3a117e3e50314ad6823d42b802afa5461a3"
+checksum = "7d3427bac7ed02fa2a600018859e381ce587424f61b1eac065ec0395229da57d"
 dependencies = [
  "serde",
  "serde_json",
@@ -3446,7 +3446,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-os",
- "subc-protocol 0.33.0",
+ "subc-protocol 0.33.4",
  "subtle",
  "tokio",
 ]
