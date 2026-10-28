@@ -5,12 +5,12 @@
 //! when the held-call integration seams are installed; reply shape alone is not negotiation.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use broca_protocol::{
-    content::media_not_shown_marker, MediaKind, MediaMarkerReason, MediaRef, ToolCallId,
-    ToolOutput, ToolOutputPart, ToolResult,
-};
+use broca_protocol::{ToolCallId, ToolOutput, ToolOutputPart, ToolResult};
 use cortexkit_role_tool_provider::result::{self, ContentPart};
-use sha2::{Digest, Sha256};
+
+pub(crate) fn dropped_media_notice(mime: &str) -> String {
+    format!("[{mime} not shown to the model: this runner does not pass tool images to models yet]")
+}
 
 /// Why a decoded reply cannot become a final model-facing result.
 #[derive(Debug)]
@@ -56,20 +56,10 @@ pub fn map_content_v1_result(
         let text = match part {
             ContentPart::Text { text } => text.clone(),
             ContentPart::Image(image) => {
-                let bytes = STANDARD.decode(&image.data).map_err(MapError::ImageData)?;
-                // Tool image capture is not available on this carrier. Use the shared marker,
-                // not base64 transcript text or a reference to an object that was never stored.
-                let metadata = MediaRef {
-                    kind: MediaKind::Image,
-                    mime: image.mime_type.clone(),
-                    byte_size: bytes.len() as u64,
-                    sha256: format!("{:x}", Sha256::digest(&bytes)),
-                    // Dimensions are unnecessary for a marker; this temporary metadata is never
-                    // persisted as a MediaRef (content/v1 dimensions can exceed its u32 range).
-                    width: None,
-                    height: None,
-                };
-                media_not_shown_marker(&metadata, MediaMarkerReason::Carrier)
+                STANDARD.decode(&image.data).map_err(MapError::ImageData)?;
+                // Dispatch replaces this notice with captured media before recording the result
+                // when a capture handle is available. Otherwise the omission is durable text.
+                dropped_media_notice(&image.mime_type)
             }
             // Unknown parts retain their JSON, escaped onto one line, instead of disappearing.
             other => format!(
