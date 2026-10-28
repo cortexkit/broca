@@ -88,8 +88,21 @@ if name == "accept" and os.environ.get("WARMING_ACCEPTS"):
     if attempts <= int(os.environ["WARMING_ACCEPTS"]):
         print("ERROR bind management surface 'broca': subc rejected: module_warming")
         sys.exit(1)
+if name == "listing":
+    assert args == ["auth", "list", "--json"]
+    print(json.dumps({"v": 1, "credentials": []}))
+    if os.environ.get("FAIL_STEP") == name:
+        print("token-DO-NOT-LOG", file=sys.stderr)
+if name == "metadata":
+    listing = pathlib.Path(args[args.index("--vault-listing") + 1])
+    assert listing.stat().st_mode & 0o077 == 0
+    assert json.loads(listing.read_text()) == {"v": 1, "credentials": []}
+    sys.exit(int(os.environ.get("METADATA_STATUS", "0")))
 sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
 ''')
+        (self.scripts / "check-credential-metadata.py").write_text(
+            'import runpy, sys\nsys.argv[1:] = ["metadata", *sys.argv[1:]]\n'
+            'runpy.run_path(__file__.replace("check-credential-metadata.py", "stub.py"), run_name="__main__")\n')
         (self.scripts / "acceptance-worker-turn.py").write_text(
             'import runpy, sys\nsys.argv[1:] = ["worker-accept"]\n'
             'runpy.run_path(__file__.replace("acceptance-worker-turn.py", "stub.py"), run_name="__main__")\n')
@@ -99,6 +112,10 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
             (self.scripts / file).write_text(
                 f'#!/bin/sh\nexec python3 "$(dirname "$0")/stub.py" {step} "$@"\n')
             (self.scripts / file).chmod(0o755)
+        (self.scripts / "ck").write_text(
+            '#!/bin/sh\nexec python3 "$(dirname "$0")/stub.py" listing "$@"\n')
+        (self.scripts / "ck").chmod(0o755)
+        self.env["PATH"] = str(self.scripts) + os.pathsep + self.env["PATH"]
         # A stage build is ignored just as target/ is in the real repository.
         (self.root / ".gitignore").write_text("target/\n")
         self.sha = self.commit()
@@ -123,18 +140,45 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
         self.assertIn("STAGING FAILED", result.stderr)
         self.assertEqual(self.steps(), ["stage"])
 
+    def assert_metadata_stops_deploy(self, status):
+        result = self.deploy(METADATA_STATUS=str(status))
+        self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+        self.assertIn("ACCOUNT METADATA CHECK FAILED", result.stderr)
+        self.assertEqual(self.steps(), ["stage", "listing", "metadata"])
+
+    def test_missing_listing_command_refuses_before_placement(self):
+        (self.scripts / "ck").write_text("#!/bin/sh\nexit 127\n")
+        self.commit()
+        result = self.deploy()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("credential metadata listing unavailable", result.stderr)
+        self.assertEqual(self.steps(), ["stage"])
+
+    def test_failed_listing_refuses_without_logging_raw_stderr(self):
+        result = self.deploy(FAIL_STEP="listing")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("credential metadata listing unavailable", result.stderr)
+        self.assertNotIn("token-DO-NOT-LOG", result.stdout + result.stderr)
+        self.assertEqual(self.steps(), ["stage", "listing"])
+
+    def test_metadata_refusal_never_places_or_restarts(self):
+        self.assert_metadata_stops_deploy(1)
+
+    def test_metadata_cannot_compare_never_places_or_restarts(self):
+        self.assert_metadata_stops_deploy(2)
+
     def test_failed_placement_stops_before_verification_and_acceptance(self):
         result = self.deploy(FAIL_STEP="place")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("PLACEMENT/RESTART FAILED", result.stderr)
-        self.assertEqual(self.steps(), ["stage", "place"])
+        self.assertEqual(self.steps(), ["stage", "listing", "metadata", "place"])
         self.assertIn("Rollback:", result.stderr)
 
     def test_failed_acceptance_prints_executable_rollback_command(self):
         result = self.deploy(FAIL_STEP="accept")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("LIVE ACCEPTANCE FAILED", result.stderr)
-        self.assertEqual(self.steps(), ["stage", "place", "verify", "accept"])
+        self.assertEqual(self.steps(), ["stage", "listing", "metadata", "place", "verify", "accept"])
         command = next(line.removeprefix("Rollback: ") for line in result.stderr.splitlines()
                        if line.startswith("Rollback: "))
         (self.events).unlink()
@@ -152,19 +196,19 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("LIVE VERIFICATION FAILED", result.stderr)
         self.assertIn("Rollback:", result.stderr)
-        self.assertEqual(self.steps(), ["stage", "place", "verify"])
+        self.assertEqual(self.steps(), ["stage", "listing", "metadata", "place", "verify"])
 
     def test_missing_built_session_is_a_loud_acceptance_failure(self):
         result = self.deploy(MISSING_CLIENT="1")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("LIVE ACCEPTANCE FAILED", result.stderr)
         self.assertIn("Rollback:", result.stderr)
-        self.assertEqual(self.steps(), ["stage", "place", "verify"])
+        self.assertEqual(self.steps(), ["stage", "listing", "metadata", "place", "verify"])
 
     def test_acceptance_waits_out_a_module_still_starting(self):
         result = self.deploy(WARMING_ACCEPTS="2", BROCA_DEPLOY_WARMING_RETRY_SECS="0")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.steps(), ["stage", "place", "verify", "accept", "accept", "accept", "worker-accept", "publish"])
+        self.assertEqual(self.steps(), ["stage", "listing", "metadata", "place", "verify", "accept", "accept", "accept", "worker-accept", "publish"])
         self.assertIn("still starting (module_warming)", result.stdout)
 
     def test_acceptance_failure_other_than_warming_is_not_retried(self):
@@ -184,7 +228,7 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
     def test_failed_worker_admission_never_publishes(self):
         result = self.deploy(FAIL_STEP="worker-accept")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual(self.steps(), ["stage", "place", "verify", "accept", "worker-accept"])
+        self.assertEqual(self.steps(), ["stage", "listing", "metadata", "place", "verify", "accept", "worker-accept"])
         self.assertIn("WORKER ADMISSION ACCEPTANCE FAILED", result.stderr)
         self.assertIn("Rollback:", result.stderr)
 
@@ -192,14 +236,16 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
         result = self.deploy("--live-approved")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         records = self.records()
-        self.assertEqual(self.steps(), ["stage", "place", "verify", "accept", "worker-accept", "publish"])
+        self.assertEqual(self.steps(), ["stage", "listing", "metadata", "place", "verify", "accept", "worker-accept", "publish"])
         self.assertEqual(records[0][1], ["--marker", "new marker", "--control", "known control"])
-        self.assertIn("--restart", records[1][1])
-        self.assertIn("--live-approved", records[1][1])
-        self.assertIn(hashlib.sha256(b"signed release").hexdigest(), records[2][1])
-        self.assertEqual(records[3][1], ["0.0.2"])
-        self.assertEqual(records[4][1], [])
-        self.assertEqual(records[5][1], [self.sha, "0.0.2"])
+        self.assertEqual(records[1][1], ["auth", "list", "--json"])
+        self.assertEqual(records[2][1][0], "--vault-listing")
+        self.assertIn("--restart", records[3][1])
+        self.assertIn("--live-approved", records[3][1])
+        self.assertIn(hashlib.sha256(b"signed release").hexdigest(), records[4][1])
+        self.assertEqual(records[5][1], ["0.0.2"])
+        self.assertEqual(records[6][1], [])
+        self.assertEqual(records[7][1], [self.sha, "0.0.2"])
         self.assertIn("pid        4321", result.stdout)
         self.assertIn("sessions sealed at restart (WAL readback): session.wal", result.stdout)
         self.assertIn("acceptance PASS", result.stdout)

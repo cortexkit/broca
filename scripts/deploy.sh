@@ -48,6 +48,26 @@ fi
 [ "$(git rev-parse HEAD)" = "$sha" ] && [ -z "$(git status --porcelain)" ] || {
   echo "deploy: HEAD/worktree changed during staging; refusing placement" >&2; exit 1;
 }
+# The chooser only offers mapped vault rows. Check actual recent auth selections before
+# replacing the running build, so a missing mapping cannot strand an otherwise usable account.
+metadata_listing="$(mktemp "$logdir/credential-listing.XXXXXX")" || {
+  echo "deploy: credential metadata listing unavailable" >&2
+  exit 2
+}
+metadata_listing_error="$metadata_listing.stderr"
+trap 'rm -f "$metadata_listing" "$metadata_listing_error"' EXIT
+if ! ck auth list --json >"$metadata_listing" 2>"$metadata_listing_error"; then
+  echo "deploy: credential metadata listing unavailable" >&2
+  exit 2
+fi
+if python3 scripts/check-credential-metadata.py --vault-listing "$metadata_listing" \
+    2>&1 | tee "$logdir/account-metadata.log"; then
+  :
+else
+  status=$?
+  echo "deploy: ACCOUNT METADATA CHECK FAILED; nothing placed or restarted. See $logdir/account-metadata.log" >&2
+  exit "$status"
+fi
 staged="$HOME/.local/share/cortexkit/staging/ck-broca.$(git rev-parse --short=8 "$sha")"
 dest="$HOME/.local/share/cortexkit/bin/ck-broca"
 report="$logdir/placement.json"
