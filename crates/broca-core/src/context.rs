@@ -791,6 +791,20 @@ pub trait RunIndex: Send + Sync {
         retries_used: u32,
     ) -> Result<(), String>;
 
+    /// Publish content-free durable evidence atomically with the lifecycle state. Older index
+    /// implementations may omit attribution, but must still publish the terminal normally.
+    fn index_run_attributed(
+        &self,
+        run_id: &str,
+        state: RunIndexState,
+        usage: Option<Usage>,
+        final_step_finish_reason: Option<FinishReason>,
+        retries_used: u32,
+        _attribution: &RunIndexAttribution,
+    ) -> Result<(), String> {
+        self.index_run_terminal(run_id, state, usage, final_step_finish_reason, retries_used)
+    }
+
     /// Look up a run by id. `None` = unknown run (the lookup falls back to the WAL).
     fn lookup_run(&self, run_id: &str) -> Result<Option<RunIndexRow>, String>;
 
@@ -802,6 +816,168 @@ pub trait RunIndex: Send + Sync {
     /// Boot discovery, including terminal sessions that ordinary restart scans never open.
     fn runs_with_withdrawals_owed(&self) -> Result<Vec<WithdrawalRun>, String> {
         Err("run index does not track withdrawal debt".into())
+    }
+}
+
+/// Scalar evidence from a run's frozen selection and durable lifecycle records. No provider
+/// messages, render configuration, prompts or tool payloads belong in the run-index evidence.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunIndexAttribution {
+    pub provider_module_id: Option<String>,
+    pub credential_id: Option<String>,
+    pub error_class: Option<String>,
+    pub error_code: Option<String>,
+    pub pause_reason: Option<String>,
+    pub interrupt_reason: Option<String>,
+    pub at_ms: Option<u64>,
+}
+
+impl RunIndexAttribution {
+    /// Attributing writers share this fold of durable lifecycle records. A start resets the
+    /// evidence; a later pause or terminal keeps only the frozen selection and its own facts.
+    pub fn observe(&mut self, record: &broca_wal::WalRecord) {
+        use broca_wal::WalRecord;
+        let (error, at_ms) = match record {
+            WalRecord::RunStarted { config, .. } => {
+                *self = Self {
+                    provider_module_id: Some(config.model.provider_module_id.clone()),
+                    credential_id: config
+                        .auth_selection
+                        .as_ref()
+                        .map(|s| s.credential_id.clone()),
+                    ..Self::default()
+                };
+                return;
+            }
+            WalRecord::RunPaused {
+                reason,
+                error,
+                ts_ms,
+                ..
+            } => {
+                self.pause_reason = Some(reason.as_str().into());
+                self.interrupt_reason = None;
+                (error, ts_ms)
+            }
+            WalRecord::RunFinished {
+                error,
+                ts_ms,
+                interrupt_reason,
+                ..
+            } => {
+                self.pause_reason = None;
+                self.interrupt_reason = interrupt_reason
+                    .as_deref()
+                    .filter(|reason| {
+                        matches!(
+                            *reason,
+                            "runner_shutdown"
+                                | "runner_crash"
+                                | "caller_stop"
+                                | "caller_cancel"
+                                | "cancelled"
+                        )
+                    })
+                    .map(str::to_owned);
+                (error, ts_ms)
+            }
+            _ => return,
+        };
+        self.at_ms = *at_ms;
+        if let Some(credential) = error
+            .as_ref()
+            .and_then(|error| error.credential_id.as_ref())
+        {
+            self.credential_id = Some(credential.clone());
+        }
+        self.error_class = error.as_ref().map(|error| {
+            broca_protocol::OpenErrorClass::from(error.class)
+                .as_str()
+                .to_owned()
+        });
+        // Provider codes are an open string and may echo request content. Only the closed
+        // operational vocabulary is safe to copy into a content-free index.
+        self.error_code = error
+            .as_ref()
+            .and_then(|error| error.provider_code.as_deref())
+            .filter(|code| {
+                matches!(
+                    *code,
+                    "account_limit_exhausted"
+                        | "upstream_api_key_rejected"
+                        | "rate_limit_exceeded"
+                        | "rate_limited"
+                        | "invalid_api_key"
+                        | "incorrect_api_key"
+                        | "context_length_exceeded"
+                        | "context_window_exceeded"
+                        | "billing_exhausted"
+                        | "credit_insufficient"
+                        | "credit_balance_exhausted"
+                        | "organization_spend_limit_exceeded"
+                        | "project_spend_limit_exceeded"
+                        | "usage_not_included"
+                        | "invalid_prompt"
+                        | "cyber_policy"
+                        | "bio_policy"
+                        | "misalignment_policy_violation"
+                        | "usage_limit_reached"
+                        | "content_filter"
+                        | "server_error"
+                        | "stream_too_slow"
+                        | "response_deadline"
+                        | "output_ceiling"
+                        | "previous_process_ended_unsealed"
+                        | "websocket_auth_rejected"
+                        | "request_invalid"
+                        | "previous_response_not_found"
+                        | "ENTITLEMENT_ERROR"
+                )
+            })
+            .map(str::to_owned);
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_attribution_tests {
+    use super::RunIndexAttribution;
+    use broca_wal::WalRecord;
+    use serde_json::json;
+
+    #[test]
+    fn diagnostics_shared_derivation_handles_start_pause_terminal_and_unrelated_records() {
+        let start: WalRecord = serde_json::from_value(json!({
+            "type":"run_started","run_id":"run","session":{"project_root":"/project","harness":"test","session":"session"},
+            "input":[],"config":{"model":{"provider_module_id":"openai","model_id":"model"},"tools":[],
+                "tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},
+                "context_epoch":0,"renderer_version":1,"tools_were_omitted":false,
+                "auth_selection":{"credential_id":"credential-one"}}
+        })).unwrap();
+        let mut a = RunIndexAttribution::default();
+        a.observe(&start);
+        assert_eq!(a.provider_module_id.as_deref(), Some("openai"));
+        assert_eq!(a.credential_id.as_deref(), Some("credential-one"));
+        let pause:WalRecord=serde_json::from_value(json!({"type":"run_paused","run_id":"run","reason":"auth_required","ts_ms":10,
+            "error":{"class":"auth_required","message":"PRIVATE TEXT","provider_code":"PRIVATE CODE","credential_id":"credential-two"}})).unwrap();
+        a.observe(&pause);
+        assert_eq!(a.pause_reason.as_deref(), Some("auth_required"));
+        assert_eq!(a.error_class.as_deref(), Some("auth_required"));
+        assert_eq!(a.credential_id.as_deref(), Some("credential-two"));
+        assert_eq!(a.error_code, None);
+        assert_eq!(a.at_ms, Some(10));
+        let finish: WalRecord = serde_json::from_value(
+            json!({"type":"run_finished","reason":"interrupted","ts_ms":20,
+            "usage":{},"interrupt_reason":"runner_shutdown"}),
+        )
+        .unwrap();
+        a.observe(&finish);
+        assert_eq!(a.pause_reason, None);
+        assert_eq!(a.error_class, None);
+        assert_eq!(a.interrupt_reason.as_deref(), Some("runner_shutdown"));
+        assert_eq!(a.at_ms, Some(20));
+        let prior = a.clone();
+        a.observe(&WalRecord::WriterClosed { writer_id: [0; 16] });
+        assert_eq!(a, prior);
     }
 }
 

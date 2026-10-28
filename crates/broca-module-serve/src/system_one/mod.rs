@@ -806,7 +806,7 @@ impl SystemOne {
     }
 }
 
-fn caller_scope(
+pub(crate) fn caller_scope(
     principal: Option<&broca_protocol::BindPrincipal>,
     send: &broca_protocol::SendScope,
 ) -> Result<broca_store::system_one::BatchScope, Refusal> {

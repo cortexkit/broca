@@ -523,6 +523,8 @@ fn to_broca_identity(id: &SubcBindIdentity) -> BrocaBindIdentity {
 /// anything: the same session bound with different observations is still one lineage.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct BindObservation {
+    /// Actual route target, independent of a role declaration on a management route.
+    management: bool,
     agent_data: bool,
     /// Only llm-runner routes address a session. Other roles serve their own operations
     /// without opening a session or reading its history.
@@ -1439,6 +1441,78 @@ where
             let Some((_, session, bind)) = routes.by_channel.get(&channel).cloned() else {
                 unreachable!("route binding disappeared after the channel/epoch guard")
             };
+            if bind.management && request_operation(&frame.body) == crate::diagnostics::OP {
+                count_management_operation(crate::diagnostics::OP);
+                match crate::management_admission::admit(
+                    crate::diagnostics::OP,
+                    bind.principal.as_ref(),
+                    &bind.scope,
+                ) {
+                    Ok(crate::management_admission::Admission::Diagnostics) => {}
+                    Err(crate::management_admission::Refusal::Diagnostics(error)) => {
+                        send_error_body(writer, ver, channel, epoch, corr, error).await?;
+                        return Ok(true);
+                    }
+                    _ => unreachable!("diagnostics scope admission returned a different operation"),
+                }
+                let req: RouteRequest = match serde_json::from_slice(&frame.body) {
+                    Ok(req) => req,
+                    Err(_) => {
+                        send_error(
+                            writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            "invalid_request",
+                            "diagnostics.findings request is not decodable",
+                        )
+                        .await?;
+                        return Ok(true);
+                    }
+                };
+                let now = now_epoch_ms();
+                let catalog_age = catalog_cache
+                    .ok_or_else(|| "catalog cache is not configured".to_owned())
+                    .and_then(|cache| {
+                        cache
+                            .health(now)
+                            .map(|h| h.age_ms)
+                            .map_err(|_| "catalog cache is unreadable".to_owned())
+                    });
+                let writer = writer.clone();
+                let slots = request_slots.clone();
+                request_tasks.spawn(reply_on_panic(
+                    writer.clone(),
+                    (ver, channel, epoch, corr),
+                    async move {
+                        let _permit = slots
+                            .acquire_owned()
+                            .await
+                            .map_err(|e| ServeIoError(e.to_string()))?;
+                        let reply = tokio::task::spawn_blocking(move || {
+                            crate::diagnostics::serving_reply(
+                                req.params,
+                                bind.principal.as_ref(),
+                                &bind.scope,
+                                catalog_age,
+                                now,
+                            )
+                        })
+                        .await
+                        .map_err(|e| ServeIoError(e.to_string()))?;
+                        match reply {
+                            Ok(reply) => {
+                                send_json_response(&writer, ver, channel, epoch, corr, &reply).await
+                            }
+                            Err(error) => {
+                                send_error_body(&writer, ver, channel, epoch, corr, error).await
+                            }
+                        }
+                    },
+                ));
+                return Ok(true);
+            }
             if bind.agent_data {
                 let caller = bind
                     .principal
@@ -1771,6 +1845,7 @@ async fn handle_control_request(
             // owner is the principal on every earlier episode, and an episode recorded without
             // one can never satisfy that.
             let bind = BindObservation {
+                management: matches!(target, subc_protocol::RouteTarget::ManagementSurface { .. }),
                 agent_data: matches!(&target, subc_protocol::RouteTarget::InternalService { service_id, .. }
                     if service_id == broca_wire::agent_data::SERVICE_ID),
                 role: if matches!(target, subc_protocol::RouteTarget::ManagementSurface { .. })
@@ -7845,6 +7920,7 @@ mod tests {
                 epoch: 1,
                 identity: BrocaBindIdentity::new("/tmp/project-a", "runner", "late-bind"),
                 bind: BindObservation {
+                    management: true,
                     agent_data: false,
                     role: RouteRole::LlmRunner,
                     project_id: None,
@@ -9421,3 +9497,7 @@ mod delivery_list_tests {
 #[cfg(test)]
 #[path = "serve_classifier_tests.rs"]
 mod classifier_route_tests;
+
+#[cfg(test)]
+#[path = "serve_flow_compat_tests.rs"]
+mod flow_management_compat_tests;

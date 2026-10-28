@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 struct RunFacts {
+    attribution: broca_core::RunIndexAttribution,
     prepared: Option<bool>,
     title: Option<Option<String>>,
     auth_selection: Option<broca_wal::AuthSelection>,
@@ -89,6 +90,12 @@ impl ApprovalState {
                 run.prepared.get_or_insert(false);
                 run.title = Some(title.clone());
                 run.auth_selection = config.auth_selection.clone();
+                run.attribution.observe(record);
+            }
+            WalRecord::RunPaused { .. } | WalRecord::RunFinished { .. } => {
+                if let Some(run) = facts.current.as_ref().and_then(|id| facts.runs.get_mut(id)) {
+                    run.attribution.observe(record);
+                }
             }
             WalRecord::ToolCallDeferred {
                 batch_id,
@@ -221,6 +228,19 @@ impl ApprovalState {
         drop(facts);
         self.changed.notify_waiters();
     }
+    pub(crate) fn attribution(&self, run_id: &RunId, head: u64) -> broca_core::RunIndexAttribution {
+        if !self.healthy.load(Ordering::Acquire) || self.covered.load(Ordering::Acquire) < head {
+            return broca_core::RunIndexAttribution::default();
+        }
+        self.facts
+            .lock()
+            .unwrap()
+            .runs
+            .get(run_id)
+            .map(|run| run.attribution.clone())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn prepared(&self, run_id: &RunId, head: u64) -> Option<bool> {
         if !self.healthy.load(Ordering::Acquire) {
             return None;
@@ -332,5 +352,39 @@ impl ApprovalState {
     #[cfg(test)]
     pub(crate) fn on_awaiting_facts_lock(&self, probe: impl FnOnce() + Send + 'static) {
         *self.before_awaiting_facts.lock().unwrap() = Some(Box::new(probe));
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    use super::*;
+    #[test]
+    fn diagnostics_attribution_requires_healthy_durable_coverage() {
+        let state = ApprovalState::default();
+        let run = RunId("run".into());
+        state.facts.lock().unwrap().runs.insert(
+            run.clone(),
+            RunFacts {
+                attribution: broca_core::RunIndexAttribution {
+                    provider_module_id: Some("provider".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            state.attribution(&run, 1),
+            broca_core::RunIndexAttribution::default()
+        );
+        state.covered.store(1, Ordering::Release);
+        assert_eq!(
+            state.attribution(&run, 1).provider_module_id.as_deref(),
+            Some("provider")
+        );
+        state.healthy.store(false, Ordering::Release);
+        assert_eq!(
+            state.attribution(&run, 1),
+            broca_core::RunIndexAttribution::default()
+        );
     }
 }

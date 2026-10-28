@@ -80,6 +80,7 @@ pub struct RetentionLineageRow {
 /// The supplied title is deliberately ignored: retention run rows never store content.
 #[derive(Debug, Clone)]
 pub struct RetentionRunRow {
+    pub attribution: Option<broca_core::RunIndexAttribution>,
     pub run: RunIndexRow,
     pub state_changed_ms: Option<u64>,
 }
@@ -178,6 +179,7 @@ impl SqliteStore {
                 let run = broca_core::RunIndex::lookup_run(self, &id)?
                     .ok_or("retention run disappeared")?;
                 Ok(RetentionRunRow {
+                    attribution: None,
                     run,
                     state_changed_ms,
                 })
@@ -394,12 +396,15 @@ impl SqliteStore {
             )?;
         }
         for (row, usage_json, finish_reason_json, state_changed_ms) in prepared {
+            let empty = broca_core::RunIndexAttribution::default();
+            let a = row.attribution.as_ref().unwrap_or(&empty);
             let changed = tx.execute(
                 "INSERT INTO run_index
                     (run_id, session, lineage_id, expired_at_ms, submission_id,
                      request_identity_digest, state, usage_json, final_step_finish_reason_json,
-                      retries_used, state_changed_ms, title, withdrawals_owed)
-                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12)
+                       retries_used, state_changed_ms, title, withdrawals_owed,
+                       provider_module_id,credential_id,error_class,error_code,pause_reason,interrupt_reason)
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12,?13,?14,?15,?16,?17,?18)
                  ON CONFLICT(run_id) DO UPDATE SET
                     lineage_id=excluded.lineage_id, expired_at_ms=excluded.expired_at_ms,
                     submission_id=excluded.submission_id,
@@ -407,7 +412,13 @@ impl SqliteStore {
                     state=excluded.state, usage_json=excluded.usage_json,
                     final_step_finish_reason_json=excluded.final_step_finish_reason_json,
                     retries_used=excluded.retries_used, state_changed_ms=excluded.state_changed_ms,
-                     title=NULL, withdrawals_owed=excluded.withdrawals_owed
+                     title=NULL, withdrawals_owed=excluded.withdrawals_owed,
+                     provider_module_id=COALESCE(excluded.provider_module_id,run_index.provider_module_id),
+                     credential_id=COALESCE(excluded.credential_id,run_index.credential_id),
+                     error_class=CASE WHEN ?19 THEN excluded.error_class ELSE run_index.error_class END,
+                     error_code=CASE WHEN ?19 THEN excluded.error_code ELSE run_index.error_code END,
+                     pause_reason=CASE WHEN ?19 THEN excluded.pause_reason ELSE run_index.pause_reason END,
+                     interrupt_reason=CASE WHEN ?19 THEN excluded.interrupt_reason ELSE run_index.interrupt_reason END
                  WHERE run_index.session=excluded.session
                    AND (run_index.lineage_id IS NULL OR run_index.lineage_id=excluded.lineage_id)",
                 params![
@@ -421,8 +432,10 @@ impl SqliteStore {
                     usage_json,
                     finish_reason_json,
                     i64::from(row.run.retries_used),
-                    state_changed_ms,
+                    if row.attribution.is_some() { a.at_ms.map(integer).transpose()? } else { state_changed_ms },
                     row.run.withdrawals_owed,
+                    a.provider_module_id,a.credential_id,a.error_class,a.error_code,a.pause_reason,a.interrupt_reason,
+                    row.attribution.is_some(),
                 ],
             )?;
             if changed != 1 {
@@ -768,6 +781,7 @@ mod tests {
 
     fn run(id: &str, state: RunIndexState) -> RetentionRunRow {
         RetentionRunRow {
+            attribution: None,
             run: RunIndexRow {
                 run_id: id.into(),
                 withdrawals_owed: false,

@@ -1014,6 +1014,7 @@ where
                     method.as_token(),
                     inputs.run_id
                 );
+                record_diagnostic_refusal(provider, "routing_unavailable");
                 return Err(ChoiceRefusal::Unavailable(
                     RoutingUnavailable::invalid_pick(),
                 ));
@@ -1032,6 +1033,7 @@ where
             })
         }
         AccountForOutcome::Unreachable(cause) => {
+            record_diagnostic_refusal(provider, "routing_unavailable");
             client.counters.bump("unreachable");
             tracing::warn!(
                 target: "accounts",
@@ -1042,6 +1044,7 @@ where
             Err(ChoiceRefusal::Unavailable(RoutingUnavailable::unreachable()))
         }
         AccountForOutcome::NoDecisionWithinBudget => {
+            record_diagnostic_refusal(provider, "routing_unavailable");
             client.counters.bump("no_decision_within_budget");
             let budget_ms = ADMISSION_BUDGET.as_millis() as u64;
             tracing::warn!(
@@ -1084,6 +1087,7 @@ where
             )))
         }
         AccountForOutcome::Refused(refusal) => {
+            record_diagnostic_refusal(provider, &refusal.routing_code);
             client.counters.bump("refused");
             client
                 .counters
@@ -1118,6 +1122,24 @@ where
             Err(ChoiceRefusal::Refused(refusal))
         }
     }
+}
+
+fn record_diagnostic_refusal(provider: &str, code: &str) {
+    let code = if !code.is_empty()
+        && code.len() <= 64
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
+        code
+    } else {
+        "unattributed"
+    };
+    broca_module::diagnostics::SEND_REFUSALS.record(broca_module::diagnostics::Event {
+        at_ms: broca_module::diagnostics::now_ms(),
+        module: provider.into(),
+        code: code.into(),
+    });
 }
 
 // ------------------------------------------------------------------------------------------

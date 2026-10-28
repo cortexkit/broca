@@ -25,9 +25,7 @@ impl Permissions {
 
     pub async fn answer(&self, body: &[u8], principal: Option<&BindPrincipal>) -> Answer {
         // Admission precedes even reading grants: the inventory is operator authority too.
-        if !matches!(principal, Some(BindPrincipal::Direct))
-            && !matches!(principal, Some(BindPrincipal::Reserved { module_id }) if module_id == "cingulate")
-        {
+        if !operator_admitted(principal) {
             return Err(error(
                 "permissions_operator_required",
                 "permissions operations require the direct operator or reserved:cingulate",
@@ -127,6 +125,11 @@ impl Permissions {
             }
         }
     }
+}
+
+pub(crate) fn operator_admitted(principal: Option<&BindPrincipal>) -> bool {
+    matches!(principal, Some(BindPrincipal::Direct))
+        || matches!(principal, Some(BindPrincipal::Reserved { module_id }) if module_id == "cingulate")
 }
 
 fn row(grant: &Grant) -> Value {

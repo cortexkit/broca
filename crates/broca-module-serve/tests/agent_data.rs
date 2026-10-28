@@ -1569,6 +1569,7 @@ async fn expired_retention_ledger_ref_is_not_exportable_even_without_wal_bytes()
                 expired_at_ms: Some(60_100),
             },
             &[broca_store::retention::RetentionRunRow {
+                attribution: None,
                 run: broca_core::RunIndexRow {
                     run_id: "expired-run".into(),
                     withdrawals_owed: false,
