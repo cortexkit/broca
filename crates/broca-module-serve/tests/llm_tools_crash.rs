@@ -84,6 +84,7 @@ async fn consent_request_cut_helper() {
     )
     .with_clock(Arc::new(|| 1000));
     let request = HoldRequest {
+        project_id: None,
         batch_id: "call".into(),
         scope: ScopeIdentity {
             owner: "reserved:owner".into(),
@@ -224,6 +225,15 @@ fn required_binary(variable: &str) -> Option<PathBuf> {
 /// configuration; all writable XDG state remains under this test's scratch root.
 #[tokio::test]
 async fn target_cingulate_admits_reserved_broca_with_private_content_card_scope() {
+    target_cingulate_admission(false).await;
+}
+
+#[tokio::test]
+async fn target_cingulate_admits_always_option_for_an_attested_project() {
+    target_cingulate_admission(true).await;
+}
+
+async fn target_cingulate_admission(project: bool) {
     let Some(cingulate) = required_binary("CINGULATE_BIN") else {
         return;
     };
@@ -242,13 +252,10 @@ async fn target_cingulate_admits_reserved_broca_with_private_content_card_scope(
         subc.is_file(),
         "set SUBC_CORE_BIN to the real ck-subc binary"
     );
-    let stub = broca_test_support::subc_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN");
-    assert!(
-        stub.is_file(),
-        "set FAKE_AFT_STUB_BIN to the scope authority fixture"
-    );
-    let root = broca_test_support::scratch_root()
-        .join(format!("cingulate-broca-admission-{}", std::process::id()));
+    let root = broca_test_support::scratch_root().join(format!(
+        "cingulate-broca-admission-{project}-{}",
+        std::process::id()
+    ));
     broca_test_support::remove_rig_dir(&root);
     for dir in [
         "config/cortexkit",
@@ -268,7 +275,11 @@ async fn target_cingulate_admits_reserved_broca_with_private_content_card_scope(
     )
     .unwrap();
     let scopes = root.join("scopes.json");
-    std::fs::write(&scopes, json!([{"ref":"run","scope_epoch":1,"kind":"head","attributes":{"agent_id":"example-agent","run_id":"run"},"carriers":[{"principal":{"kind":"reserved","module_id":"broca"}}]}]).to_string()).unwrap();
+    let mut scope_records = json!([{"ref":"run","scope_epoch":1,"kind":"head","attributes":{"agent_id":"example-agent","run_id":"run"},"carriers":[{"principal":{"kind":"reserved","module_id":"broca"}}]}]);
+    if project {
+        scope_records[0]["project_id"] = json!("project-a");
+        scope_records[0]["workdir"] = json!(root.join("project").canonicalize().unwrap());
+    }
     let fixtures = root.join("cerebellum.json");
     // Cerebellum fbcc6766, crates/cerebellum/tests/vectors/private-content-query-v1/success-marked.json.
     // Whole-file SHA-256 (provenance only, not body bytes):
@@ -278,6 +289,11 @@ async fn target_cingulate_admits_reserved_broca_with_private_content_card_scope(
     std::fs::write(&handoff, format!("#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do case \"$1\" in --subc) export SUBC_CONNECTION=\"$2\"; shift 2;; *) shift;; esac; done\nexec '{}' --module-id cerebellum --SURFACE_FIXTURES={} --SURFACE_REQUESTS={}\n", surface.display(), hex_path(&fixtures), hex_path(&root.join("queries")))).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&handoff, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let owner_handoff = root.join("owner.sh");
+    let owner_fixtures = root.join("owner.fixtures.json");
+    std::fs::write(&owner_fixtures, "[]").unwrap();
+    std::fs::write(&owner_handoff, format!("#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do case \"$1\" in --subc) export SUBC_CONNECTION=\"$2\"; shift 2;; *) shift;; esac; done\nexec '{}' --module-id owner --SURFACE_FIXTURES={} --SURFACE_REQUESTS={} --SURFACE_NONCE_PATH={} --SURFACE_SCOPES={}\n", surface.display(), hex_path(&owner_fixtures), hex_path(&root.join("owner.events")), hex_path(&root.join("owner.nonce")), hex_path(&scopes))).unwrap();
+    std::fs::set_permissions(&owner_handoff, std::fs::Permissions::from_mode(0o755)).unwrap();
     let args: Vec<String> =
         serde_json::from_str(&std::env::var("CINGULATE_ARGS_JSON").unwrap_or_else(|_| "[]".into()))
             .expect("CINGULATE_ARGS_JSON is a JSON argv array");
@@ -285,7 +301,7 @@ async fn target_cingulate_admits_reserved_broca_with_private_content_card_scope(
         serde_json::from_str(&std::env::var("CINGULATE_ENV_JSON").unwrap_or_else(|_| "{}".into()))
             .expect("CINGULATE_ENV_JSON is a JSON string map");
     let modules = json!({
-        "owner":{"program":broca_test_support::ckdev_binary(&stub, broca_test_support::scratch_root()),"args":[],"reserved":true,"enabled":true,"env":{"FAKE_AFT_MODULE_ID":"owner","FAKE_AFT_SCOPE_SYNC_PATH":scopes,"FAKE_AFT_LAUNCH_NONCE_PATH":root.join("owner.nonce"),"FAKE_AFT_EVENTS_PATH":root.join("owner.events")}},
+        "owner":{"program":owner_handoff,"args":[],"reserved":true,"enabled":true},
         "cerebellum":{"program":handoff,"args":[],"reserved":true,"enabled":true},
         "cingulate":{"program":broca_test_support::ckdev_binary(&cingulate, broca_test_support::scratch_root()),"args":args,"env":extra_env,"reserved":true,"enabled":true},
         "broca":{"program":broca_test_support::ckdev_binary(Path::new(env!("CARGO_BIN_EXE_ck-broca")), broca_test_support::scratch_root()),"args":[],"reserved":true,"enabled":true,"env":{"BROCA_STATE_ROOT":state,"BROCA_CONFIG_PATH":root.join("config/cortexkit/broca.jsonc")}}
@@ -318,6 +334,45 @@ async fn target_cingulate_admits_reserved_broca_with_private_content_card_scope(
         std::fs::read_to_string(root.join("owner.nonce")).map_err(|e| e.to_string())
     })
     .await;
+    // Publish the full scope set after the owner starts. Its module connection, not the
+    // additional consumer connection below, must establish scope.sync authority.
+    let owner_events = root.join("owner.events");
+    let previous_events = std::fs::read_to_string(&owner_events)
+        .unwrap_or_default()
+        .lines()
+        .count();
+    let pending_scopes = scopes.with_extension("json.next");
+    std::fs::write(&pending_scopes, scope_records.to_string()).unwrap();
+    std::fs::rename(pending_scopes, &scopes).unwrap();
+    let synced = broca_test_support::wait_until("the owner's run scope.sync reply", || async {
+        let events = std::fs::read_to_string(&owner_events).unwrap_or_default();
+        events
+            .lines()
+            .skip(previous_events)
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|event| {
+                event["kind"] == "scope_sync_response"
+                    && event["body_json"]["results"]
+                        .as_array()
+                        .is_some_and(|results| results.iter().any(|result| result["ref"] == "run"))
+            })
+            .ok_or_else(|| format!("the owner has not synced run: {events}"))
+    })
+    .await;
+    let results: Vec<subc_protocol::scope::ScopeRecordResult> =
+        serde_json::from_value(synced["body_json"]["results"].clone()).unwrap();
+    assert_eq!(
+        results.len(),
+        1,
+        "the owner must sync exactly its run scope"
+    );
+    assert_eq!(results[0].scope_ref, "run");
+    assert_eq!(results[0].scope_epoch, 1);
+    assert_ne!(
+        results[0].outcome,
+        subc_protocol::scope::ScopeRecordOutcome::Refused,
+        "the owner's run scope was refused: {synced}"
+    );
     let conn = Arc::new(
         broca_subc::SubcConnection::connect_with_consumer_identity(
             &root.join("runtime/subc-connection.json"),
@@ -328,6 +383,22 @@ async fn target_cingulate_admits_reserved_broca_with_private_content_card_scope(
         )
         .await
         .unwrap(),
+    );
+    let cingulate_capabilities =
+        broca_test_support::wait_until("Cingulate's registered manifest", || async {
+            conn.catalog_list()
+                .await
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|entry| entry.module_id == "cingulate")
+                .and_then(|entry| entry.capabilities)
+                .map(|capabilities| capabilities.provides)
+                .ok_or_else(|| "Cingulate has not registered its capabilities".to_owned())
+        })
+        .await;
+    assert!(
+        cingulate_capabilities.iter().any(|capability| capability == subc_protocol::scope::AGENT_RUN_SCOPES_CAPABILITY),
+        "the Cingulate stand-in must match the real provider's run-scope admission: {cingulate_capabilities:?}"
     );
     let selector = subc_protocol::scope::ScopeSelector::new(
         subc_protocol::Principal::Reserved {
@@ -389,6 +460,31 @@ async fn target_cingulate_admits_reserved_broca_with_private_content_card_scope(
         "a lost or refused reply is not admission proof"
     );
     assert!(cards[0].card_id.as_deref().is_some_and(|id| !id.is_empty()));
+    assert_eq!(
+        cards[0].project_id.as_deref(),
+        project.then_some("project-a")
+    );
+    let content: Value = serde_json::from_str(&cards[0].content).unwrap();
+    let fixture: Value = serde_json::from_str(if project {
+        include_str!(
+            "../../broca-subc/tests/fixtures/consent/broca/private-content-card-project.json"
+        )
+    } else {
+        include_str!("../../broca-subc/tests/fixtures/consent/broca/private-content-card.json")
+    })
+    .unwrap();
+    assert_eq!(content["options"], fixture["options"]);
+    assert_eq!(content["scope"], fixture["scope"]);
+    if project {
+        assert_eq!(
+            content["options"][2],
+            json!({
+                "id": "allow_always",
+                "label": "Always allow for the agent in this project",
+                "effect": "grant"
+            })
+        );
+    }
     let _ = conn.route_close(&route).await;
     broca_test_support::kill_and_reap_tree(&mut daemon);
 }

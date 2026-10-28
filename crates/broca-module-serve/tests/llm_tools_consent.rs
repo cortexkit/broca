@@ -50,6 +50,7 @@ fn args(model: &str) -> Value {
 
 fn hold(key: &str, dedup: &str, model: &str, at: i64) -> HoldRequest {
     HoldRequest {
+        project_id: None,
         batch_id: key.into(),
         scope: identity(),
         batch_scope: broca_store::system_one::BatchScope::Run {
@@ -210,6 +211,7 @@ fn dedup_key_uses_full_scope_provider_and_revocation_generation() {
     );
     store
         .put_card(&Card {
+            project_id: None,
             dedup_key: key.clone(),
             scope: identity(),
             agent_id: agent.clone(),
@@ -893,6 +895,7 @@ async fn a_new_24h_grant_releases_a_different_runs_waiting_call_without_refiling
     other_scope.scope_ref = "another-run".into();
     store
         .put_card(&Card {
+            project_id: None,
             dedup_key: other.clone(),
             scope: other_scope.clone(),
             agent_id: scope().agent_id.unwrap(),
@@ -968,6 +971,334 @@ impl Asks for Marked {
         _: &str,
     ) -> Result<broca_subc::FlowPolicy, broca_subc::FlowProvidersError> {
         unreachable!("run only")
+    }
+}
+
+struct ProjectRig {
+    tools: Arc<LlmTools>,
+    store: Arc<GrantsStore>,
+    io: Arc<FakeIo>,
+    provider: Arc<Provider>,
+    clock: Arc<AtomicI64>,
+    stop: tokio_util::sync::CancellationToken,
+}
+
+impl ProjectRig {
+    fn new() -> Self {
+        let store = Arc::new(GrantsStore::open_in_memory().unwrap());
+        let io = Arc::new(FakeIo::default());
+        let clock = Arc::new(AtomicI64::new(1000));
+        let consent = coordinator(store.clone(), io.clone(), clock.clone());
+        let provider = Arc::new(Provider::default());
+        let system_clock = clock.clone();
+        let system = SystemOne::new(
+            Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap()),
+            "consent-test",
+            Arc::new(Catalog {
+                provider_name: Some("TypeSafe".into()),
+            }),
+            vec![ModelPin::jev(provider.clone())],
+            Config::default(),
+            Arc::default(),
+        )
+        .with_store_role(LLM_CLASSIFY_STORE_ROLE)
+        .with_clock(Arc::new(move || system_clock.load(Ordering::SeqCst)));
+        let stop = tokio_util::sync::CancellationToken::new();
+        let tools = Arc::new(
+            LlmTools::new(Arc::new(system), Default::default(), Arc::new(Marked))
+                .with_held(Arc::new(HeldCalls::new(
+                    store.clone(),
+                    "consent-test".into(),
+                )))
+                .with_consent(consent, stop.clone()),
+        );
+        Self {
+            tools,
+            store,
+            io,
+            provider,
+            clock,
+            stop,
+        }
+    }
+
+    async fn call(&self, run: &str, project: Option<&str>, key: &str) -> Value {
+        let mut session = scope();
+        session.scope_ref = run.into();
+        session.run_id = Some(run.into());
+        let stamp = SendScope::Stamped(BindScope {
+            scope: session,
+            owner_authorized: true,
+            kind: broca_protocol::ScopeKind::Head,
+            parent: None,
+            parent_state: None,
+        });
+        let request =
+            json!({"name":"llm_classify", "arguments":args("typesafe/jev-1.13.0"), "call_key":key});
+        let response = self
+            .tools
+            .answer_for_consumer_in_project(
+                request.to_string().as_bytes(),
+                Some(&BindPrincipal::Reserved {
+                    module_id: "caller".into(),
+                }),
+                &stamp,
+                ConsumerFormat {
+                    result_format: None,
+                    held_reply: true,
+                },
+                project,
+            )
+            .await
+            .unwrap();
+        serde_json::from_str(response.get()).unwrap()
+    }
+
+    async fn allow_always(&self) -> Grant {
+        let card = self.io.requests.lock().unwrap()[0].clone();
+        self.io.answers.lock().unwrap().push_back(record(
+            "card-1",
+            card["dedup_key"].as_str().unwrap(),
+            "allow_always",
+        ));
+        self.io.answered.notify_one();
+        broca_test_support::wait_until("always grant persisted", || async {
+            self.store
+                .grants()
+                .unwrap()
+                .into_iter()
+                .next()
+                .ok_or_else(|| "answer has not committed".to_owned())
+        })
+        .await
+    }
+}
+
+impl Drop for ProjectRig {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
+}
+
+#[tokio::test]
+async fn always_grants_are_project_scoped_listed_and_revocable_through_the_tool_path() {
+    let rig = ProjectRig::new();
+    assert_eq!(
+        rig.call("run", Some("project-a"), "first").await["held"]["reason"],
+        "consent"
+    );
+    let golden: Value = serde_json::from_str(include_str!(
+        "../../broca-subc/tests/fixtures/consent/broca/private-content-card-project.json"
+    ))
+    .unwrap();
+    assert_eq!(rig.io.requests.lock().unwrap()[0], golden);
+    let grant = rig.allow_always().await;
+    broca_test_support::wait_until("original project call completed", || async {
+        let row = rig
+            .store
+            .card_calls(golden["dedup_key"].as_str().unwrap(), 1000)
+            .unwrap()
+            .pop()
+            .unwrap();
+        if row.state == HeldState::Final {
+            Ok(())
+        } else {
+            Err("held call has not executed".to_owned())
+        }
+    })
+    .await;
+    assert_eq!(grant.kind, GrantKind::Always);
+    assert_eq!(grant.project.as_deref(), Some("project-a"));
+    assert_eq!(grant.holder, scope().agent_id.unwrap());
+    assert_eq!(grant.provider, "typesafe");
+    assert_eq!(grant.source_card_id, "card-1");
+    assert!(grant.scope.is_none());
+    assert!(grant.expires_at_ms.is_none());
+    assert!(rig
+        .call("later-run", Some("project-a"), "later")
+        .await
+        .get("held")
+        .is_none());
+    assert_eq!(rig.provider.0.load(Ordering::SeqCst), 2);
+    assert_eq!(rig.io.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        rig.call("other-project", Some("project-b"), "other").await["held"]["reason"],
+        "consent"
+    );
+    assert_eq!(
+        rig.call("no-project", None, "unstamped").await["held"]["reason"],
+        "consent"
+    );
+    let cards = rig.io.requests.lock().unwrap().clone();
+    assert_eq!(cards.len(), 3);
+    assert_eq!(
+        cards[2]["options"],
+        json!([
+            {"id":"allow_run","label":"Allow for this program run","effect":"grant"},
+            {"id":"allow_24h","label":"Allow for 24 hours","effect":"grant"},
+            {"id":"deny","label":"Deny","effect":"decline"}
+        ])
+    );
+    let permissions = broca_module_serve::llm_tools::permissions::Permissions::new(
+        rig.store.clone(),
+        Some(rig.io.clone()),
+    );
+    let list = permissions
+        .answer(
+            br#"{"name":"permissions.list","arguments":{}}"#,
+            Some(&BindPrincipal::Direct),
+        )
+        .await
+        .unwrap();
+    let list: Value = serde_json::from_str(list.get()).unwrap();
+    assert_eq!(list["grants"][0]["card_ref"], "card-1");
+    assert_eq!(
+        list["grants"][0]["scope_label"],
+        "Send private content to typesafe always in project-a"
+    );
+    let revoke = permissions
+        .answer(
+            br#"{"name":"permissions.revoke","arguments":{"id":"card-1"}}"#,
+            Some(&BindPrincipal::Direct),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(revoke.get()).unwrap()["outcome"],
+        "revoked"
+    );
+    assert_eq!(rig.store.generation(&grant.holder, "typesafe").unwrap(), 1);
+    assert_eq!(
+        rig.call("run", Some("project-a"), "after-revoke").await["held"]["reason"],
+        "consent"
+    );
+    let cards = rig.io.requests.lock().unwrap();
+    assert_eq!(cards.len(), 4);
+    assert_ne!(cards[0]["dedup_key"], cards[3]["dedup_key"]);
+}
+
+#[tokio::test]
+async fn late_always_answer_records_the_attested_project_and_admits_the_next_run() {
+    let rig = ProjectRig::new();
+    rig.call("run", Some("project-a"), "first").await;
+    rig.clock.store(1000 + HOLD_MS + 1, Ordering::SeqCst);
+    let grant = rig.allow_always().await;
+    assert_eq!(grant.created_at_ms, 1000 + HOLD_MS + 1);
+    assert_eq!(grant.project.as_deref(), Some("project-a"));
+    assert_eq!(
+        rig.provider.0.load(Ordering::SeqCst),
+        0,
+        "an expired call must not execute"
+    );
+    assert!(rig
+        .call("next-run", Some("project-a"), "next")
+        .await
+        .get("held")
+        .is_none());
+    assert_eq!(rig.provider.0.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.io.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn recovered_held_calls_match_always_grants_only_against_their_frozen_project() {
+    let path = broca_test_support::scratch_root().join("project-recovery.db");
+    let store = Arc::new(GrantsStore::open(&path).unwrap());
+    let clock = Arc::new(AtomicI64::new(1001));
+    let consent = coordinator(store.clone(), Arc::new(FakeIo::default()), clock.clone());
+    let mut rows = Vec::new();
+    for (run, project) in [
+        ("a", Some("project-a")),
+        ("b", Some("project-b")),
+        ("none", None),
+    ] {
+        let mut request = hold(run, "", "typesafe/jev-1.13.0", 1000);
+        request.scope.scope_ref = run.into();
+        request.batch_scope = broca_store::system_one::BatchScope::Run {
+            agent_id: request.agent_id.clone(),
+            run_id: run.into(),
+        };
+        request.project_id = project.map(str::to_owned);
+        request.dedup_key = consent
+            .dedup_key(&request.agent_id, "typesafe", &request.scope)
+            .unwrap();
+        let body = broca_subc::consent_card::private_content_card_for_project(
+            "TypeSafe",
+            "Jev",
+            &[broca_subc::SourceKind::PersonBrowser],
+            &request.dedup_key,
+            project,
+        )
+        .unwrap();
+        rows.push(consent.file(request, body, 1000).await.unwrap());
+    }
+    store
+        .apply_answer(
+            &rows[0].scope,
+            CardAnswer {
+                dedup_key: rows[0].dedup_key.clone(),
+                card_id: "card-1".into(),
+                decision: Decision::AllowAlways,
+                run_live: false,
+            },
+            1001,
+        )
+        .unwrap();
+    drop(consent);
+    drop(store);
+    let store = Arc::new(GrantsStore::open(&path).unwrap());
+    let consent = coordinator(store.clone(), Arc::new(FakeIo::default()), clock);
+    assert_eq!(consent.resume_granted(1001).await.unwrap(), 1);
+    for (index, expected) in [HeldState::Authorized, HeldState::Held, HeldState::Held]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(
+            store
+                .lookup(&rows[index].batch_id, 1001)
+                .unwrap()
+                .unwrap()
+                .state,
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn adding_the_always_option_replaces_card_content_without_changing_the_dedup_rule() {
+    let store = Arc::new(GrantsStore::open_in_memory().unwrap());
+    let io = Arc::new(FakeIo::default());
+    io.live.store(true, Ordering::SeqCst);
+    let consent = coordinator(store.clone(), io.clone(), Arc::new(AtomicI64::new(1000)));
+    let key = consent
+        .dedup_key(&scope().agent_id.unwrap(), "typesafe", &identity())
+        .unwrap();
+    consent
+        .file(hold("first", &key, "Jev", 1000), body(&key, "Jev"), 1000)
+        .await
+        .unwrap();
+    let mut request = hold("joining", &key, "Jev", 1000);
+    request.project_id = Some("project-a".into());
+    let body = broca_subc::consent_card::private_content_card_for_project(
+        "TypeSafe",
+        "Jev",
+        &[broca_subc::SourceKind::PersonBrowser],
+        &key,
+        Some("project-a"),
+    )
+    .unwrap();
+    consent.file(request, body, 1000).await.unwrap();
+    let cards = io.requests.lock().unwrap().clone();
+    assert_eq!(cards.len(), 2);
+    assert_eq!(cards[0]["dedup_key"], cards[1]["dedup_key"]);
+    assert_ne!(cards[0]["options"], cards[1]["options"]);
+    io.answers
+        .lock()
+        .unwrap()
+        .push_back(record("card-2", &key, "allow_run"));
+    assert!(!consent.wait_once(&key, 1000).await.unwrap());
+    for row in store.card_calls(&key, 1000).unwrap() {
+        assert_eq!(row.card_id.as_deref(), Some("card-2"));
+        assert_eq!(row.state, HeldState::Authorized);
     }
 }
 
@@ -1310,6 +1641,7 @@ async fn startup_resumes_a_held_call_whose_card_and_grant_committed_before_autho
     store.hold(request).unwrap();
     store
         .put_card(&Card {
+            project_id: None,
             dedup_key: key.clone(),
             scope: identity(),
             agent_id: scope().agent_id.unwrap(),
@@ -1426,6 +1758,7 @@ fn decide(store: &GrantsStore, scope_ref: &str, card_id: &str, decision: Decisio
     let dedup_key = format!("decided-{card_id}");
     store
         .put_card(&Card {
+            project_id: None,
             dedup_key: dedup_key.clone(),
             scope: card_scope.clone(),
             agent_id: scope().agent_id.unwrap(),

@@ -1224,6 +1224,36 @@ impl SubcConnection {
         .await
     }
 
+    /// Probe an untrusted bind project claim independently of the daemon's scope stamp.
+    /// This opener is absent from release builds and confers no project authority.
+    #[cfg(debug_assertions)]
+    pub async fn route_open_tool_provider_with_bind_project_for_tests(
+        &self,
+        module_id: &str,
+        identity: &BindIdentity,
+        scope: Option<subc_protocol::scope::ScopeSelector>,
+        client_project_id: Option<&str>,
+        held: bool,
+    ) -> ConnResult<RouteHandle> {
+        let target = RouteTarget::ToolProvider {
+            module_id: module_id.into(),
+        };
+        let role_versions = Some(std::collections::BTreeMap::from([(
+            "tool-provider".into(),
+            "v1".into(),
+        )]));
+        let mut identity = to_subc_bind(identity, &target, role_versions.as_ref());
+        identity.project_id = client_project_id.map(str::to_owned);
+        let capabilities = held.then(|| {
+            vec![
+                cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into(),
+                cortexkit_role_tool_provider::HELD_REPLY_V1.into(),
+            ]
+        });
+        self.route_open_wire_target(target, identity, scope, role_versions, capabilities)
+            .await
+    }
+
     /// Open an unscoped module-level role using the same bind translation and retry machinery
     /// as step-transform hooks. The caller bounds the entire route-open future.
     pub(crate) async fn route_open_role_within(
@@ -1464,11 +1494,30 @@ impl SubcConnection {
         role_versions: Option<std::collections::BTreeMap<String, String>>,
         consumer_capabilities: Option<Vec<String>>,
     ) -> ConnResult<RouteHandle> {
+        let identity = to_subc_bind(identity, &target, role_versions.as_ref());
+        self.route_open_wire_target(
+            target,
+            identity,
+            scope,
+            role_versions,
+            consumer_capabilities,
+        )
+        .await
+    }
+
+    async fn route_open_wire_target(
+        &self,
+        target: RouteTarget,
+        identity: subc_protocol::BindIdentity,
+        scope: Option<subc_protocol::scope::ScopeSelector>,
+        role_versions: Option<std::collections::BTreeMap<String, String>>,
+        consumer_capabilities: Option<Vec<String>>,
+    ) -> ConnResult<RouteHandle> {
         let reads_held_reply = cortexkit_role_tool_provider::consumer_reads_held_reply_v1(
             consumer_capabilities.as_deref(),
         );
         let req = ClientControlRequest::RouteOpen {
-            identity: to_subc_bind(identity, &target, role_versions.as_ref()),
+            identity,
             target,
             consumer_identity: self.shared.consumer_identity.clone(),
             // Result-format capabilities are installed as a pair by the tool plane. Role,

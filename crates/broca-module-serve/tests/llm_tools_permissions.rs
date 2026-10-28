@@ -46,6 +46,7 @@ fn identity(run: &str) -> ScopeIdentity {
 fn seed(store: &GrantsStore, key: &str, run: &str, decision: Decision, at: i64) -> Grant {
     store
         .put_card(&Card {
+            project_id: None,
             dedup_key: key.into(),
             scope: identity(run),
             agent_id: "agent".into(),
@@ -678,6 +679,7 @@ async fn unknown_liveness_cannot_mint_or_use_run_grants() {
     consent
         .file(
             HoldRequest {
+                project_id: None,
                 batch_id: "unknown-call".into(),
                 scope: identity("a"),
                 batch_scope: broca_store::system_one::BatchScope::Run {
@@ -730,6 +732,7 @@ async fn revoke_restart_changes_the_next_card_key_and_leaves_held_calls_waiting(
         let grant = seed(&store, &old_key, "a", Decision::AllowRun, now());
         let at = now();
         let hold = HoldRequest {
+            project_id: None,
             batch_id: "waiting-batch".into(),
             scope: identity("a"),
             batch_scope: broca_store::system_one::BatchScope::Run {
@@ -750,6 +753,7 @@ async fn revoke_restart_changes_the_next_card_key_and_leaves_held_calls_waiting(
         store.hold(hold).unwrap();
         store
             .put_card(&Card {
+                project_id: None,
                 dedup_key: "pending-card".into(),
                 scope: identity("a"),
                 agent_id: "agent".into(),
@@ -794,6 +798,7 @@ async fn revoke_restart_changes_the_next_card_key_and_leaves_held_calls_waiting(
     consent
         .file(
             HoldRequest {
+                project_id: None,
                 batch_id: "next-keyed-call".into(),
                 scope: identity("a"),
                 batch_scope: broca_store::system_one::BatchScope::Run {

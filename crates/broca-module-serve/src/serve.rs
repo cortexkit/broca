@@ -1537,11 +1537,14 @@ where
                                                 .await
                                         } else {
                                             service
-                                                .answer_for_consumer(
+                                                .answer_for_consumer_in_project(
                                                     &frame.body,
                                                     bind.principal.as_ref(),
                                                     &bind.scope,
                                                     bind.consumer_format,
+                                                    bind.stamped_project.as_ref().and_then(
+                                                        |stamp| stamp.project_id.as_deref(),
+                                                    ),
                                                 )
                                                 .await
                                         }

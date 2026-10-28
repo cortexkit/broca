@@ -170,11 +170,13 @@ impl LlmTools {
         let kind = match grant.kind {
             broca_store::grants::GrantKind::Run => "run",
             broca_store::grants::GrantKind::Hours24 => "24_hours",
+            broca_store::grants::GrantKind::Always => "always",
         };
-        // A run grant has no clock expiry: it lasts while its run is live.
-        let expires_at_ms = grant
-            .expires_at_ms
-            .map_or_else(|| "run_end".to_owned(), |expiry| expiry.to_string());
+        // Run grants end with their run; always grants have no automatic expiry.
+        let expires_at_ms = grant.expires_at_ms.map_or_else(
+            || if kind == "always" { "none" } else { "run_end" }.to_owned(),
+            |expiry| expiry.to_string(),
+        );
         tracing::info!(
             target: "llm_tools.consent",
             grant_id = %grant.id,
@@ -339,7 +341,7 @@ impl LlmTools {
                     params,
                 };
                 let _ = service
-                    .call(admission, true, &SendScope::Internal, Some(row), None)
+                    .call(admission, true, &SendScope::Internal, None, Some(row), None)
                     .await;
             });
         }
@@ -382,6 +384,20 @@ impl LlmTools {
         principal: Option<&BindPrincipal>,
         scope: &SendScope,
         consumer: ConsumerFormat,
+    ) -> Answer {
+        self.answer_for_consumer_in_project(body, principal, scope, consumer, None)
+            .await
+    }
+
+    /// `stamped_project_id` comes only from the daemon scope stamp, never the bind identity
+    /// or a workdir-derived project. Unstamped callers cannot use project-wide grants.
+    pub async fn answer_for_consumer_in_project(
+        self: &Arc<Self>,
+        body: &[u8],
+        principal: Option<&BindPrincipal>,
+        scope: &SendScope,
+        consumer: ConsumerFormat,
+        stamped_project_id: Option<&str>,
     ) -> Answer {
         let reads_held_reply = consumer.held_reply;
         let call: ToolCallRequest = serde_json::from_slice(body)
@@ -446,7 +462,14 @@ impl LlmTools {
                     None
                 };
                 let answer = self
-                    .call(admission, call.call_key.is_some(), scope, held, hold_caller)
+                    .call(
+                        admission,
+                        call.call_key.is_some(),
+                        scope,
+                        stamped_project_id,
+                        held,
+                        hold_caller,
+                    )
                     .await;
                 match consumer.result_format {
                     Some(_) => answer.and_then(as_tool_result),
@@ -528,6 +551,7 @@ impl LlmTools {
         mut admission: Admission,
         keyed: bool,
         scope: &SendScope,
+        stamped_project_id: Option<&str>,
         held: Option<HeldCall>,
         hold_caller: Option<(&str, &str)>,
     ) -> Answer {
@@ -690,7 +714,7 @@ impl LlmTools {
                     return Err(super::held::not_started("denied").into_bytes());
                 }
                 let grant = consent
-                    .releasing_grant(&bind.scope, &admission.provider, now)
+                    .releasing_grant(&bind.scope, stamped_project_id, &admission.provider, now)
                     .await
                     .map_err(|e| self.consent_unavailable(e))?;
                 if let Some(grant) = &grant {
@@ -720,11 +744,12 @@ impl LlmTools {
                     let dedup_key = consent
                         .dedup_key(agent, &admission.provider, &identity)
                         .map_err(|e| self.consent_unavailable(e))?;
-                    let body = broca_subc::consent_card::private_content_card(
+                    let body = broca_subc::consent_card::private_content_card_for_project(
                         provider_label,
                         model_label,
                         &sources,
                         &dedup_key,
+                        stamped_project_id,
                     )
                     .map_err(|e| self.consent_unavailable(e))?;
                     let frozen =
@@ -732,6 +757,7 @@ impl LlmTools {
                     let row = consent
                         .file_with_admission(
                             HoldRequest {
+                                project_id: stamped_project_id.map(str::to_owned),
                                 batch_id: admission.batch_id.clone(),
                                 scope: identity,
                                 batch_scope: admission.scope.clone(),
