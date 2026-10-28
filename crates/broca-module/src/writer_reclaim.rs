@@ -488,19 +488,39 @@ mod tests {
         }
 
         fn live_child_mode(&self, mode: &str) -> LiveChild {
-            let mut child = LiveChild(self.child(mode).stdout(Stdio::piped()).spawn().unwrap());
+            self.launch_writer_child(self.child(mode))
+        }
+
+        fn launch_writer_child(&self, mut command: Command) -> LiveChild {
+            let mut child = LiveChild(command.stdout(Stdio::piped()).spawn().unwrap());
             let output = child.0.stdout.take().unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
+            let transcript = Arc::new(Mutex::new(Vec::new()));
+            let captured = transcript.clone();
             std::thread::spawn(move || {
                 for line in std::io::BufReader::new(output).lines() {
-                    if line.unwrap() == "WRITER_READY" {
+                    let line = match line {
+                        Ok(line) => line,
+                        Err(error) => {
+                            captured
+                                .lock()
+                                .unwrap()
+                                .push(format!("stdout read failed: {error}"));
+                            return;
+                        }
+                    };
+                    captured.lock().unwrap().push(line.clone());
+                    if line == "WRITER_READY" {
                         let _ = tx.send(());
                         return;
                     }
                 }
             });
             rx.recv_timeout(Duration::from_secs(30))
-                .expect("child opened a real owned writer");
+                .unwrap_or_else(|error| {
+                    let status = child.0.try_wait();
+                    panic!("child opened a real owned writer: {error:?}; status={status:?}; root={}; stdout={:?}", self.path.display(), transcript.lock().unwrap());
+                });
             child
         }
 
@@ -581,7 +601,9 @@ mod tests {
                         .unwrap();
                     writer.sync().await.unwrap();
                 }
-                println!("WRITER_READY");
+                // In single-threaded mode, Rust's test harness prints no newline after its
+                // progress label. Keep readiness on a separate, exactly matched line.
+                println!("\nWRITER_READY");
                 std::io::stdout().flush().unwrap();
                 std::future::pending::<()>().await;
             } else {
@@ -596,6 +618,24 @@ mod tests {
         });
         // The child shares its parent's state root; only the parent owns cleanup.
         std::mem::forget(root);
+    }
+
+    #[test]
+    fn reclaim_child_ready_is_independent_of_libtest_thread_count() {
+        for mode in ["writer", "orphan-writer"] {
+            for threads in [1, 2] {
+                let root = Root::new();
+                let mut command = root.child(mode);
+                command.arg(format!("--test-threads={threads}"));
+                let _child = root.launch_writer_child(command);
+                let published = root.store.read_records(&root.identity).unwrap();
+                assert_eq!(published.len(), if mode == "writer" { 1 } else { 2 });
+                assert!(matches!(
+                    published[0].record,
+                    WalRecord::WriterOpened { .. }
+                ));
+            }
+        }
     }
 
     #[tokio::test]
