@@ -1248,9 +1248,10 @@ mod tests {
             .state
             .files
             .contains_key(&PathBuf::from("open-writers").join(marker.file_name().unwrap()))));
+        // Visibility publication adds sidecar writes and directory barriers to the trace.
         assert_eq!(
             states.len(),
-            432,
+            2898,
             "all reclaim crash/power-loss images must be exercised"
         );
         for state in states {

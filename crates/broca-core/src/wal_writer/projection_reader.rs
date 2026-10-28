@@ -1,5 +1,8 @@
 //! Migration-only WAL reader. It has no writer, manifest, lease, extraction or
 //! repair API, and every file is opened with `std::fs::File::open`.
+//! Even a same-inode pair can be an interrupted first-send placement. This
+//! offline reader keeps its ambiguous-address refusal; an owned session open
+//! repairs that cut, never this lease-free reader.
 use super::*;
 use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom};

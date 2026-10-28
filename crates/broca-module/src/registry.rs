@@ -224,10 +224,61 @@ pub enum OpenError {
 }
 
 impl OpenError {
+    pub(crate) fn relocation_or_open(error: broca_wal::WalError) -> Self {
+        match error {
+            error @ broca_wal::WalError::RelocationIncomplete { .. } => {
+                Self::from_wal_read(error.to_string(), &error)
+            }
+            other => Self::Open(other.to_string()),
+        }
+    }
+
+    fn optional_identity(
+        result: Result<Option<u64>, broca_wal::WalError>,
+    ) -> Result<Option<u64>, Self> {
+        match result {
+            Ok(identity) => Ok(identity),
+            Err(error @ broca_wal::WalError::RelocationIncomplete { .. }) => {
+                Err(Self::from_wal_read(error.to_string(), &error))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+    pub(crate) fn from_wal_open(error: broca_core::WalOpenError) -> Self {
+        match error {
+            broca_core::WalOpenError::RelocationIncomplete { reason } => Self::Classified {
+                reason,
+                class: broca_protocol::ErrorClass::Transient,
+            },
+            broca_core::WalOpenError::SessionMoving { cut_id } => Self::SessionMoving { cut_id },
+            broca_core::WalOpenError::SessionMoved { holder } => Self::SessionMoved { holder },
+            broca_core::WalOpenError::NewerWriter { missing, error } => Self::NewerWriter {
+                missing,
+                reason: error.to_string(),
+            },
+            // Opaque write/open failures do not establish retryability.
+            broca_core::WalOpenError::Failed(error) => Self::Open(error.to_string()),
+        }
+    }
+    pub(crate) fn from_retention(error: crate::retention::RetentionReadError) -> Self {
+        match error {
+            crate::retention::RetentionReadError::RelocationIncomplete { reason } => {
+                Self::Classified {
+                    reason,
+                    class: broca_protocol::ErrorClass::Transient,
+                }
+            }
+            crate::retention::RetentionReadError::Other(reason) => Self::Open(reason),
+        }
+    }
     /// Classify a WAL read failure, keeping a newer-writer refusal typed. `reason` is the full
     /// text to report, already including the failure's own rendering.
     pub(crate) fn from_wal_read(reason: String, error: &broca_wal::WalError) -> Self {
         match error {
+            broca_wal::WalError::RelocationIncomplete { .. } => Self::Classified {
+                reason,
+                class: broca_protocol::ErrorClass::Transient,
+            },
             broca_wal::WalError::SessionMoving { cut_id } => Self::SessionMoving {
                 cut_id: cut_id.clone(),
             },
@@ -238,7 +289,7 @@ impl OpenError {
                 missing: missing.clone(),
                 reason,
             },
-            // Only temporary OS errors establish that the same read may succeed on retry.
+            // For generic I/O failures, only these temporary OS kinds establish retryability.
             broca_wal::WalError::Io(error)
                 if matches!(
                     error.kind(),
@@ -255,6 +306,38 @@ impl OpenError {
             // Corruption, replay/shape errors and opaque failures are not presumed retryable.
             _ => OpenError::Open(reason),
         }
+    }
+}
+
+#[cfg(test)]
+mod relocation_error_tests {
+    use super::*;
+
+    #[test]
+    fn relocation_incomplete_keeps_its_class_across_read_and_actor_open() {
+        let error = broca_wal::WalError::RelocationIncomplete {
+            paths: vec!["wal/a.wal".into(), "wal-ephemeral/a.wal".into()],
+            cause: None,
+        };
+        let reason = error.to_string();
+        for mapped in [
+            OpenError::from_wal_read(reason.clone(), &error),
+            OpenError::from_wal_open(broca_core::WalOpenError::RelocationIncomplete {
+                reason: reason.clone(),
+            }),
+        ] {
+            assert!(
+                matches!(mapped, OpenError::Classified { reason: actual, class: broca_protocol::ErrorClass::Transient } if actual == reason)
+            );
+        }
+        let failure = broca_core::WalWriteError::Failed("unchanged failure".into());
+        let expected = failure.to_string();
+        assert!(
+            matches!(OpenError::from_wal_open(broca_core::WalOpenError::Failed(failure)), OpenError::Open(actual) if actual == expected)
+        );
+        assert!(
+            matches!(OpenError::from_retention(crate::retention::RetentionReadError::Other("unchanged retention error".into())), OpenError::Open(actual) if actual == "unchanged retention error")
+        );
     }
 }
 
@@ -2722,7 +2805,8 @@ impl LineageRegistry {
         })
         .await
         .ok()
-        .and_then(Result::ok)
+        .map(OpenError::optional_identity)
+        .transpose()?
         .flatten();
         let cached_head =
             identity_before.and_then(|identity| self.cached_read_proof(key, identity));
@@ -2764,6 +2848,12 @@ impl LineageRegistry {
         .await
         {
             Ok(Ok(identity)) => identity,
+            Ok(Err(error @ broca_wal::WalError::RelocationIncomplete { .. })) => {
+                return Err(OpenError::from_wal_read(
+                    format!("wal durability flush failed: {error}"),
+                    &error,
+                ));
+            }
             Ok(Err(error)) => {
                 tracing::warn!(
                     target: "session",
@@ -2807,7 +2897,8 @@ impl LineageRegistry {
         })
         .await
         .ok()
-        .and_then(Result::ok)
+        .map(OpenError::optional_identity)
+        .transpose()?
         .flatten();
         if flush_identity != identity_after {
             tracing::warn!(
@@ -4960,6 +5051,7 @@ mod tests {
         inner: Arc<FileWalStore>,
         through_seq: Mutex<Vec<Option<u64>>>,
         flushes: AtomicU64,
+        alias_on_flush: Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>>,
     }
 
     struct CandidateWalStore;
@@ -5023,6 +5115,9 @@ mod tests {
 
         fn flush_for_read(&self, session: &LineageKey) -> Result<Option<u64>, broca_wal::WalError> {
             self.flushes.fetch_add(1, Ordering::Relaxed);
+            if let Some((source, alias)) = self.alias_on_flush.lock().unwrap().take() {
+                std::fs::hard_link(source, alias).map_err(WalError::Io)?;
+            }
             self.inner.flush_for_read(session)
         }
 
@@ -5127,6 +5222,7 @@ mod tests {
                     inner: file_store,
                     through_seq: Mutex::new(Vec::new()),
                     flushes: AtomicU64::new(0),
+                    alias_on_flush: Mutex::new(None),
                 });
                 let registry = LineageRegistry::new_with_reader(
                     Arc::new(NeverOpener),
@@ -5218,10 +5314,69 @@ mod tests {
             inner: file_store,
             through_seq: Mutex::new(Vec::new()),
             flushes: AtomicU64::new(0),
+            alias_on_flush: Mutex::new(None),
         });
         let registry =
             LineageRegistry::new_with_reader(Arc::new(NeverOpener), wal_store.clone(), None);
         (registry, session, wal_store)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relocation_between_lookup_and_flush_keeps_its_named_retry_class() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = broca_test_support::scratch_root().join(format!(
+            "broca-read-relocation-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let session = BindIdentity::new(root.join("project"), "runner", "session");
+        let inner = Arc::new(FileWalStore::with_config(
+            root.join("wal"),
+            broca_wal::WalConfig::OVERHAUL,
+        ));
+        let mut wal = inner.open(&session).unwrap();
+        wal.append(1, &started_record(&session), true).unwrap();
+        drop(wal);
+        let source = inner.wal_path(&session);
+        let alias = inner.ephemeral_wal_path(&session);
+        std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        let before = std::fs::read(&source).unwrap();
+        let store = Arc::new(RecordingWalStore {
+            inner,
+            through_seq: Mutex::new(Vec::new()),
+            flushes: AtomicU64::new(0),
+            alias_on_flush: Mutex::new(Some((source.clone(), alias.clone()))),
+        });
+        let registry = LineageRegistry::new_with_reader(Arc::new(NeverOpener), store.clone(), None);
+        let error = registry.route_read(&session, None, None).await.unwrap_err();
+        assert!(
+            matches!(error, OpenError::Classified { class: broca_protocol::ErrorClass::Transient, reason } if reason.contains("wal_relocation_incomplete"))
+        );
+        assert_eq!(store.flushes.load(Ordering::Relaxed), 1);
+        assert!(
+            !store.through_seq.lock().unwrap().is_empty(),
+            "candidate lookup happened before the injected flush interleaving"
+        );
+        assert!(registry
+            .inner
+            .read_proofs
+            .lock()
+            .unwrap()
+            .entries
+            .is_empty());
+        assert_eq!(std::fs::read(&source).unwrap(), before);
+        assert_eq!(std::fs::read(&alias).unwrap(), before);
+        // The next lookup sees aliases during the identity read rather than
+        // flush; it must retain the same typed refusal without another flush.
+        let error = registry.route_read(&session, None, None).await.unwrap_err();
+        assert!(
+            matches!(error, OpenError::Classified { class: broca_protocol::ErrorClass::Transient, reason } if reason.contains("wal_relocation_incomplete"))
+        );
+        assert_eq!(store.flushes.load(Ordering::Relaxed), 1);
+        drop(registry);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(windows)]
@@ -5726,6 +5881,7 @@ mod tests {
             inner: Arc::clone(&file_store),
             through_seq: Mutex::new(Vec::new()),
             flushes: AtomicU64::new(0),
+            alias_on_flush: Mutex::new(None),
         });
         let opener = Arc::new(GaugeOpener {
             durable_head: Mutex::new(Some(writer.durable_head())),
@@ -6148,13 +6304,7 @@ impl LineageRegistry {
             if let Some(probe) = probe {
                 probe();
             }
-            let meta = if run.is_none()
-                && service
-                    .wal
-                    .resolve_live_path(&key)
-                    .map_err(|e| e.to_string())?
-                    .is_none()
-            {
+            let meta = if run.is_none() && service.live_path_for_retention(&key)?.is_none() {
                 store
                     .as_ref()
                     .map(|store| store.read_admission_snapshot(&key))
@@ -6167,7 +6317,7 @@ impl LineageRegistry {
         })
         .await
         .map_err(|e| OpenError::Open(e.to_string()))?
-        .map_err(OpenError::Open)?;
+        .map_err(OpenError::from_retention)?;
         if let Some(expired_at_ms) = expired {
             return Err(OpenError::Expired { expired_at_ms });
         }

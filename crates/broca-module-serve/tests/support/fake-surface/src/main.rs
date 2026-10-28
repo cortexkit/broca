@@ -4,7 +4,8 @@
 //! (`flow.private_content_providers`) before it may call a provider, so a test needs both to
 //! answer. `fake-aft-stub` declares only the tool-provider role, so the daemon refuses a
 //! `route.open` aimed at its management surface before any operation is dispatched. This binary
-//! is a module that declares a management surface, including screenshot resolution.
+//! is a module that declares a management surface, including screenshot resolution and
+//! Cingulate card filing.
 //!
 //! Configuration, from the environment and the command line:
 //!
@@ -21,14 +22,17 @@
 //!   refused `unknown_method`.
 //! - `SURFACE_REQUESTS`: a file this process appends one line to per request, so a test can
 //!   count how often broca asked.
+//! - `SURFACE_SCOPES`: optional full scope set to sync on this module's own connection
+//!   after HELLO_ACK. The file need not exist at startup; this process waits up to 60 seconds
+//!   for it to appear.
 
 use std::io::Write;
 use std::path::PathBuf;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use subc_protocol::manifest::{
-    Concurrency, IdentityScope, ManagementOperation, ManagementOperationKind, ModuleManifest,
-    ProviderRole,
+    CapabilityDeclarations, Concurrency, IdentityScope, ManagementOperation, ManagementOperationKind,
+    ModuleManifest, ProviderRole,
 };
 use subc_protocol::{ErrorBody, Flags, Frame, FrameType, ModuleHelloBody, Priority, PROTOCOL_VERSION};
 use subc_transport::{authenticate_client, read_frame, write_frame};
@@ -204,6 +208,39 @@ async fn serve() -> Result<(), String> {
         &requests,
         &format!("hello-ack {:?} {}\n", ack.header.ty, String::from_utf8_lossy(&ack.body)),
     )?;
+    if std::env::args().any(|arg| arg.starts_with("--SURFACE_SCOPES=")) {
+        let path = PathBuf::from(stand_in_value("SURFACE_SCOPES"));
+        let scopes = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                match std::fs::read(&path) {
+                    Ok(bytes) => break serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .map_err(|error| format!("decode scope set: {error}")),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    Err(error) => break Err(format!("read scope set: {error}")),
+                }
+            }
+        }).await.map_err(|_| "the owner did not publish its scope set".to_owned())??;
+        // Keep optional registration fields intact; the daemon, not the stand-in's pinned
+        // protocol decoder, validates the owner's project and workdir attribution.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "op": "scope.sync", "generation": 1, "scopes": scopes
+        })).map_err(|error| error.to_string())?;
+        write(&mut stream, control(FrameType::Request, 2, body)).await?;
+        let reply = read_frame(&mut stream).await
+            .map_err(|error| format!("read scope.sync reply: {error}"))?
+            .ok_or("the daemon closed before scope.sync replied")?;
+        let body_json: serde_json::Value = serde_json::from_slice(&reply.body)
+            .map_err(|error| format!("decode scope.sync reply: {error}"))?;
+        append(&requests, &format!("{}\n", serde_json::json!({
+            "kind": if reply.header.ty == FrameType::Response { "scope_sync_response" } else { "error" },
+            "corr": reply.header.corr, "body_json": body_json
+        })))?;
+        if reply.header.ty != FrameType::Response || reply.header.corr != 2 {
+            return Err(format!("scope.sync was not accepted: {body_json}"));
+        }
+    }
     loop {
         let Some(frame) = read_frame(&mut stream)
             .await
@@ -297,7 +334,7 @@ async fn write(stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite +
 }
 
 fn manifest(module_id: &str) -> ModuleManifest {
-    let operations = SURFACED_OPS
+    let mut operations: Vec<_> = SURFACED_OPS
         .iter()
         .map(|name| ManagementOperation {
             name: (*name).to_owned(),
@@ -305,6 +342,13 @@ fn manifest(module_id: &str) -> ModuleManifest {
             description: None,
         })
         .collect();
+    if module_id == "cingulate" {
+        operations.push(ManagementOperation {
+            name: "consent.request".into(),
+            kind: ManagementOperationKind::Mutate,
+            description: None,
+        });
+    }
     ModuleManifest::builder(module_id, env!("CARGO_PKG_VERSION")).provides(vec![
         ProviderRole::ManagementSurface {
             operations,
@@ -314,6 +358,16 @@ fn manifest(module_id: &str) -> ModuleManifest {
             concurrency: Concurrency::Serial,
         },
     ])
+    .capabilities((module_id == "cingulate").then(|| CapabilityDeclarations {
+        // Consent routes carry the run's scope. Advertise agent-run-scopes/v1, matching
+        // real Cingulate; this stand-in does not implement call-modes/v1.
+        provides: vec![
+            "consent-no-expiry/v1".into(),
+            subc_protocol::scope::AGENT_RUN_SCOPES_CAPABILITY.into(),
+        ],
+        requires: Vec::new(),
+        must_never_reach: Vec::new(),
+    }))
     .build()
 }
 
@@ -441,6 +495,28 @@ fn append(path: &PathBuf, line: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cingulate_accepts_agent_run_scopes_like_the_real_provider() {
+        let manifest = super::manifest("cingulate");
+        assert!(manifest.capabilities.unwrap().provides.iter().any(|capability| {
+            capability == subc_protocol::scope::AGENT_RUN_SCOPES_CAPABILITY
+        }));
+    }
+
+    #[test]
+    fn cingulate_declares_card_filing_and_no_expiry_without_changing_other_surfaces() {
+        let manifest = super::manifest("cingulate");
+        assert_eq!(
+            manifest.capabilities.as_ref().unwrap().provides,
+            vec!["consent-no-expiry/v1", "agent-run-scopes/v1"]
+        );
+        assert!(manifest.provides.iter().any(|role| matches!(
+            role, super::ProviderRole::ManagementSurface { operations, .. }
+                if operations.iter().any(|op| op.name == "consent.request" && op.kind == super::ManagementOperationKind::Mutate)
+        )));
+        assert!(super::manifest("cerebellum").capabilities.is_none());
+    }
+
     use super::*;
 
     #[test]

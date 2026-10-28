@@ -400,6 +400,8 @@ pub enum SendOutcome {
     Transient(String),
     /// The routing module refused to choose a provider account; nothing was written.
     AccountSelectionRefused(broca_core::AccountSelectionRefusal),
+    /// The routing module gave no usable account decision; nothing was written. Transient.
+    RoutingUnavailable(broca_core::RoutingUnavailable),
     /// The owner check refused the send (a different identity, no stamp on a scoped session,
     /// an adoption the session's history does not allow, or a daemon without scopes). Nothing
     /// was written, and the same send meets the same refusal again.
@@ -2309,11 +2311,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
 
     /// Mark the actor for emergency teardown as soon as its shared writer becomes poisoned.
     /// This is checked around every command dispatch because a run task owns another Arc.
-    fn observe_writer_poison(&mut self) -> Option<String> {
+    fn observe_writer_poison(&mut self) -> Option<broca_core::WalWriteError> {
         let error = self
             .writer
             .as_ref()
-            .and_then(|writer| writer.poison_error());
+            .and_then(|writer| writer.poison_write_error());
         if error.is_some() {
             self.writer_poisoned = true;
         }
@@ -2322,7 +2324,16 @@ impl<W: WalStore + 'static> LineageActor<W> {
 
     /// Reply without making a durability claim when a queued command reaches a poisoned actor.
     /// Closing responses make callers re-route after the emergency teardown has released the slot.
-    fn reply_writer_poisoned(&mut self, cmd: LineageCmd, error: String) -> bool {
+    fn reply_writer_poisoned(&mut self, cmd: LineageCmd, error: broca_core::WalWriteError) -> bool {
+        let (error, relocation) = match error {
+            broca_core::WalWriteError::RelocationIncomplete { reason } => (reason, true),
+            broca_core::WalWriteError::Failed(reason) => (reason, false),
+            other @ broca_core::WalWriteError::ProofPathUnavailable => (other.to_string(), false),
+            other @ broca_core::WalWriteError::SessionTooLarge { .. } => (other.to_string(), false),
+            other @ broca_core::WalWriteError::RetainedSessionTooLarge { .. } => {
+                (other.to_string(), false)
+            }
+        };
         match cmd {
             LineageCmd::RepairRetention { reply } => {
                 let _ = reply.send(Err("session writer is poisoned".into()));
@@ -2330,6 +2341,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
             LineageCmd::Send { reply, .. } => {
                 let outcome = if error == "expired" {
                     SendOutcome::Reopen
+                } else if relocation {
+                    SendOutcome::Transient(error)
                 } else {
                     SendOutcome::Error(format!("session writer is poisoned: {error}"))
                 };
@@ -3730,6 +3743,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 Err(StartRunFailure::Admission(RunError::AccountSelectionRefused(refusal))) => {
                     SendOutcome::AccountSelectionRefused(refusal)
                 }
+                Err(StartRunFailure::Admission(RunError::RoutingUnavailable(unavailable))) => {
+                    SendOutcome::RoutingUnavailable(unavailable)
+                }
                 Err(StartRunFailure::Admission(RunError::SessionTooLarge { max_bytes })) => {
                     SendOutcome::SessionTooLarge { max_bytes }
                 }
@@ -4162,7 +4178,17 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 .await;
         }
         if let Err(error) = writer.sync().await {
-            return SendOutcome::Error(error.to_string());
+            return match error {
+                broca_core::WalWriteError::RelocationIncomplete { reason } => {
+                    SendOutcome::Transient(reason)
+                }
+                other @ (broca_core::WalWriteError::Failed(_)
+                | broca_core::WalWriteError::ProofPathUnavailable
+                | broca_core::WalWriteError::SessionTooLarge { .. }
+                | broca_core::WalWriteError::RetainedSessionTooLarge { .. }) => {
+                    SendOutcome::Error(other.to_string())
+                }
+            };
         }
         if self.wal_scan_complete {
             if let Some(send_id) = identity.send_id {
@@ -5242,6 +5268,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     SendOutcome::RetainedSessionTooLarge { max_bytes }
                 }
                 broca_core::WalWriteError::Failed(error) => SendOutcome::Error(error),
+                broca_core::WalWriteError::RelocationIncomplete { reason } => {
+                    SendOutcome::Transient(reason)
+                }
+                broca_core::WalWriteError::ProofPathUnavailable => {
+                    SendOutcome::Error(broca_core::WalWriteError::ProofPathUnavailable.to_string())
+                }
             };
         }
         if let Err(error) = writer.sync().await {
@@ -5877,6 +5909,14 @@ impl<W: WalStore + 'static> LineageActor<W> {
                                 } => RetractOutcome::RetainedSessionTooLarge { max_bytes },
                                 broca_core::WalWriteError::Failed(error) => {
                                     RetractOutcome::Error(error)
+                                }
+                                broca_core::WalWriteError::RelocationIncomplete { reason } => {
+                                    RetractOutcome::Error(reason)
+                                }
+                                broca_core::WalWriteError::ProofPathUnavailable => {
+                                    RetractOutcome::Error(
+                                        broca_core::WalWriteError::ProofPathUnavailable.to_string(),
+                                    )
                                 }
                             }
                         }
@@ -13829,6 +13869,15 @@ impl<W: WalStore + 'static> LineageActor<W> {
     }
 
     async fn expire_actor(&mut self, now_ms: u64) -> bool {
+        if self.wal_store.wal_config().is_overhaul() {
+            if let Some(service) = self.registry.retention_service() {
+                service.defer_overhaul();
+            } else {
+                tracing::info!(target: "retention", "retention deferred: overhaul");
+            }
+            self.retention_deadline = None;
+            return false;
+        }
         let records = match self.read_wal_framed_records().await {
             Ok(records) => records,
             Err(_) => {

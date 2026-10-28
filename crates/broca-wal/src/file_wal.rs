@@ -225,6 +225,12 @@ impl WalRangeRead {
 
 #[derive(Debug)]
 pub enum WalError {
+    /// An overhaul placement was interrupted between linking and unlinking.
+    /// Lease-free readers must retry; only the session's owned open may repair.
+    RelocationIncomplete {
+        paths: Vec<PathBuf>,
+        cause: Option<String>,
+    },
     SessionMoving {
         cut_id: String,
     },
@@ -306,7 +312,8 @@ impl WalError {
         match self {
             Self::SessionMoving { cut_id } => Ok(crate::migration::MoveRefusal::Moving { cut_id }),
             Self::SessionMoved { holder } => Ok(crate::migration::MoveRefusal::Moved { holder }),
-            other @ (Self::Io(_)
+            other @ (Self::RelocationIncomplete { .. }
+            | Self::Io(_)
             | Self::Frame(_)
             | Self::TooLarge { .. }
             | Self::NonMonotonic { .. }
@@ -326,6 +333,21 @@ impl WalError {
 impl std::fmt::Display for WalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::RelocationIncomplete { paths, cause } => {
+                write!(
+                    f,
+                    "wal_relocation_incomplete: {}; the session's owned open must finish placement",
+                    paths
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(" and ")
+                )?;
+                if let Some(cause) = cause {
+                    write!(f, "; {cause}")?;
+                }
+                Ok(())
+            }
             Self::SessionMoving { cut_id } => write!(f, "session_moving {{cutId: {cut_id}}}"),
             Self::SessionMoved { holder } => write!(f, "session_moved {{holder: {holder}}}"),
             WalError::Io(e) => write!(f, "wal io: {e}"),
@@ -438,6 +460,10 @@ fn closed_error() -> WalError {
 
 /// The append-only WAL log. The loop depends on the trait, not the impl.
 pub trait Wal {
+    /// Current file location, including first-send relocation; absent for memory logs.
+    fn log_path(&self) -> Option<&Path> {
+        None
+    }
     /// Append a record at the next seq, stamping it with the lease-tenure `fence`. The fence is
     /// forensic metadata only; single-writer safety comes from the lease's OS lock and this
     /// implementation's file-integrity check. If `sync`, fsync before returning (a barrier
@@ -686,7 +712,9 @@ impl FileWal {
             && self.replay()?.iter().all(|frame| {
                 matches!(
                     frame.record,
-                    WalRecord::WriterOpened { .. } | WalRecord::WriterClosed { .. }
+                    WalRecord::WriterOpened { .. }
+                        | WalRecord::WriterClosed { .. }
+                        | WalRecord::VisibilityLate { .. }
                 )
             }))
     }
@@ -730,12 +758,42 @@ impl FileWal {
         let source_parent = self.path.parent().unwrap().to_path_buf();
         crate::migration::durable_dir(parent.parent().unwrap_or(parent), parent)
             .map_err(WalError::Io)?;
-        fs_ops::rename(&self.path, destination).map_err(WalError::Io)?;
-        self.path = destination.to_path_buf();
+        if self.config.is_overhaul() {
+            // Make the destination name durable before removing the source.
+            // Cross-directory rename alone can lose both names after power loss.
+            fs_ops::hard_link(&self.path, destination).map_err(WalError::Io)?;
+            fs_ops::sync_dir(parent).map_err(WalError::Io)?;
+            fs_ops::remove_file(&self.path).map_err(WalError::Io)?;
+        } else {
+            fs_ops::rename(&self.path, destination).map_err(WalError::Io)?;
+        }
+        let source = std::mem::replace(&mut self.path, destination.to_path_buf());
+        if self.config.is_overhaul() {
+            // Log placement, the proof rename and directory barriers are not
+            // atomic. A cut can leave an orphan proof or both log names. Readers
+            // validate pairing; a missing/mismatched proof never authorizes EOF.
+            let source_head = crate::head_proof::sidecar_path(&source);
+            if fs_ops::try_exists(&source_head).map_err(WalError::Io)? {
+                fs_ops::rename(&source_head, crate::head_proof::sidecar_path(destination))
+                    .map_err(WalError::Io)?;
+            }
+        }
         self.dir_needs_sync.set(true);
         self.sync()?;
         self.refresh_owned_cache();
-        crate::migration::sync_dir(&source_parent).map_err(WalError::Io)
+        crate::migration::sync_dir(&source_parent).map_err(|error| {
+            if self.config.is_overhaul() {
+                WalError::RelocationIncomplete {
+                    paths: vec![source, destination.to_path_buf()],
+                    cause: Some(format!(
+                        "source-directory barrier {}: {error}",
+                        source_parent.display()
+                    )),
+                }
+            } else {
+                WalError::Io(error)
+            }
+        })
     }
 
     /// Mark the current path and session reference as the verdict the owned
@@ -1214,12 +1272,10 @@ impl FileWal {
                     })
                 }
             };
-        let overhead = crate::framing::LINEAGE_FRAME_LEN as u64
-            * if self.lineage_id.is_none() && current > 0 {
-                2
-            } else {
-                1
-            };
+        let prefix_lineage =
+            self.lineage_id.is_none() && (current > 0 || self.config.is_overhaul());
+        let overhead =
+            crate::framing::LINEAGE_FRAME_LEN as u64 * if prefix_lineage { 2 } else { 1 };
         let lifecycle = self.config.is_overhaul()
             && matches!(
                 record,
@@ -1232,7 +1288,7 @@ impl FileWal {
                 })
                 .map_err(WalError::Frame)?
                 .frame_len() as u64
-                    + overhead
+                    + crate::framing::LINEAGE_FRAME_LEN as u64
             }
             WalRecord::WriterClosed { .. } if lifecycle => 0,
             _ => self.writer_close_reserve,
@@ -1278,22 +1334,22 @@ impl FileWal {
             crate::floor::raise_floor(&floor, &requires)
                 .map_err(|error| refuse(Some(floor), error.to_string()))?;
         }
-        let (lineage_id, minted_for_legacy) = match self.lineage_id {
-            Some(lineage_id) => (lineage_id, false),
+        let lineage_id = match self.lineage_id {
+            Some(lineage_id) => lineage_id,
             None => {
                 let minted = mint_lineage_id()?;
                 self.lineage_id = Some(minted);
-                (minted, true)
+                minted
             }
         };
         let lineage_bytes = encode_lineage(lineage_id);
-        let extra_metadata_len =
-            usize::from(minted_for_legacy && current > 0) * lineage_bytes.len();
+        let extra_metadata_len = usize::from(prefix_lineage) * lineage_bytes.len();
         let mut bytes =
             Vec::with_capacity(record_bytes.len() + lineage_bytes.len() + extra_metadata_len);
-        // A legacy WAL has records but no metadata. Put its newly-minted identity before the next
-        // record so even a torn record leaves a complete identity frame for the recovery open.
-        if minted_for_legacy && current > 0 {
+        // Overhaul publication needs lineage inside the first covered record's
+        // prefix, including recovery of an empty existing file. Legacy preserves
+        // its record-first layout for empty files and prefixes only nonempty ones.
+        if prefix_lineage {
             bytes.extend_from_slice(&lineage_bytes);
         }
         bytes.extend_from_slice(&record_bytes);
@@ -1317,6 +1373,9 @@ impl FileWal {
 }
 
 impl Wal for FileWal {
+    fn log_path(&self) -> Option<&Path> {
+        Some(&self.path)
+    }
     fn writer_close_reserve(&self) -> u64 {
         self.writer_close_reserve
     }
@@ -1365,7 +1424,9 @@ impl Wal for FileWal {
             self.append_budget,
             self.last_write_end,
             crate::framing::LINEAGE_FRAME_LEN as u64
-                * if self.lineage_id.is_none() && self.last_write_end > 0 {
+                * if self.lineage_id.is_none()
+                    && (self.last_write_end > 0 || self.config.is_overhaul())
+                {
                     2
                 } else {
                     1

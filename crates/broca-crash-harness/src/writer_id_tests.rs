@@ -1,7 +1,7 @@
 //! Power-loss cuts through the production writer-id/v1 lifecycle and FileWal recovery.
 
 #[path = "../../broca-core/src/open_writers.rs"]
-mod actual_open_writers;
+pub(super) mod actual_open_writers;
 
 #[cfg(feature = "writer-id-faults")]
 mod faults;
@@ -51,7 +51,7 @@ fn record_lifecycle(close: bool) -> (Scratch, Arc<RecordingFs>, [u8; 16]) {
     let writer_id = with_fs_ops(fs.clone(), || {
         let mut wal = open(&root.0);
         let id = wal.writer_id().unwrap();
-        let (writer, seq, _) = WriterContext {
+        let (writer, seq, _, _) = WriterContext {
             root: root.0.clone(),
             address: broca_core::wal_writer::session_addr(&identity()),
             identity: identity(),
@@ -67,7 +67,7 @@ fn record_lifecycle(close: bool) -> (Scratch, Arc<RecordingFs>, [u8; 16]) {
             let prepared = broca_wal::PreparedV4Frame::prepare(&record).unwrap();
             wal.append_v4(1, &record, false, prepared, 2).unwrap();
             wal.sync().unwrap();
-            writer.close(&mut wal, 1, 3).unwrap();
+            let (_, _, _) = writer.close(&mut wal, 1, 3).unwrap();
             writer.unlink().unwrap();
         }
         id

@@ -952,17 +952,17 @@ mod consumes_tests {
         assert_eq!(services, vec!["fusiform", "claustrum", "routing-b"]);
     }
 
-    /// broca never opens a route to routing with `legacy_static` on, or without the vault (the
-    /// mock providers resolve no accounts), so it declares none then.
+    /// broca never opens a route to routing without the vault (the mock providers resolve no
+    /// accounts), so it declares none then, and always declares it with the vault. The removed
+    /// `legacy_static` switch cannot turn the route off any more: the config that set it is
+    /// refused.
     #[test]
-    fn the_routing_module_is_declared_only_while_account_selection_is_active() {
-        let legacy = crate::account_routing::AccountSelectionConfig::parse(
+    fn the_routing_module_is_declared_exactly_alongside_the_vault() {
+        assert!(crate::account_routing::AccountSelectionConfig::parse(
             r#"{"account_selection":{"routing_module":"routing-b","legacy_static":true}}"#,
         )
-        .unwrap();
-        let (_, services) =
-            declared(&ConsumerRoutes::resolve(None, true).with_account_selection(&legacy));
-        assert_eq!(services, vec!["fusiform", "claustrum"]);
+        .unwrap_err()
+        .contains("unknown field `legacy_static`"));
 
         let active = crate::account_routing::AccountSelectionConfig::default();
         let (_, services) =

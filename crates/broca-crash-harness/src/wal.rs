@@ -397,6 +397,9 @@ struct ObservedWal {
 // Like the store above, every method FileWal overrides is forwarded, so the writer sees the
 // same byte budget and takes the same pre-encoded append path as in production.
 impl Wal for ObservedWal {
+    fn log_path(&self) -> Option<&std::path::Path> {
+        self.inner.log_path()
+    }
     fn writer_close_reserve(&self) -> u64 {
         self.inner.writer_close_reserve()
     }

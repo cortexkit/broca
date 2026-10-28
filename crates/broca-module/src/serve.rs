@@ -1281,6 +1281,13 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
                         .resolved_credential_id
                         .unwrap_or(selection.credential_id),
                     account_ref: selection.account_ref,
+                    routing_code: selection
+                        .account_decision
+                        .as_ref()
+                        .filter(|decision| {
+                            decision.path == broca_wal::ACCOUNT_DECISION_AUTH_REQUIRED
+                        })
+                        .map(|_| "auth_required".to_owned()),
                     path: selection
                         .account_decision
                         .map(|decision| match decision.path.as_str() {
@@ -1495,6 +1502,9 @@ pub enum ServeError {
     /// The routing module refused to choose a provider account for the send; nothing was
     /// written.
     AccountSelectionRefused(broca_core::AccountSelectionRefusal),
+    /// The routing module gave no usable account decision for the send (unreachable, no
+    /// decision in time, or a pick broca did not offer); nothing was written. Transient.
+    RoutingUnavailable(broca_core::RoutingUnavailable),
     /// `session.warm` was refused; the body is sent exactly as the broca-wire type serializes.
     WarmRefused(Box<broca_wire::WarmRefusal>),
     /// A steer or queued send was refused before writing or interrupting a run.
@@ -1603,6 +1613,11 @@ impl std::fmt::Display for ServeError {
                 f,
                 "routing refused to choose a provider account ({})",
                 refusal.routing_code
+            ),
+            ServeError::RoutingUnavailable(unavailable) => write!(
+                f,
+                "the routing module gave no usable account decision ({})",
+                unavailable.reason.as_str()
             ),
             ServeError::WarmRefused(refusal) => f.write_str(&refusal.message),
         }
@@ -2515,6 +2530,9 @@ impl ServeHandler for crate::LineageRegistry {
             SendOutcome::Transient(e) => Err(ServeError::Transient(e)),
             SendOutcome::AccountSelectionRefused(refusal) => {
                 Err(ServeError::AccountSelectionRefused(refusal))
+            }
+            SendOutcome::RoutingUnavailable(unavailable) => {
+                Err(ServeError::RoutingUnavailable(unavailable))
             }
             SendOutcome::ScopeRefused(refusal) => Err(ServeError::ScopeRefused(refusal)),
             SendOutcome::ScopeFreezeBusy { reason, run_id } => Err(ServeError::ScopeFreezeBusy {

@@ -931,7 +931,10 @@ fn project_control_record<S: ControlProjectionSink>(
         }
         // A record type written by a newer build: informational by the contract on
         // `WalRecord`, so it emits no control unit and leaves the projection state untouched.
-        WalRecord::WriterOpened { .. } | WalRecord::WriterClosed { .. } | WalRecord::Unknown => {}
+        WalRecord::WriterOpened { .. }
+        | WalRecord::WriterClosed { .. }
+        | WalRecord::VisibilityLate { .. }
+        | WalRecord::Unknown => {}
         WalRecord::ContextCeilingWait {
             deadline_ms,
             unavailable: None,

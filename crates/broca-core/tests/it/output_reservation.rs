@@ -3,14 +3,18 @@
 //! the lowered cap before sending, and ends the run `context_overflow` without sending when not
 //! even the provider's floor fits. A recorded cap is rendered again by a resume and a cache warm.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
 use broca_core::output_reservation::{margin, OutputLimits};
 use broca_core::{
-    canonical_request_bytes, provider::Provider, request_digest_hex, run_loop_with_control,
-    AllowAll, FileLeaseStore, FileWalStore, RunControl, RunRequest, StubReply, StubToolPlane,
-    WalStore,
+    canonical_request_bytes, provider::Provider, request_digest_hex,
+    run_loop_resume_after_auth_with_control, run_loop_with_control, AdmissionStoreSnapshot,
+    AllowAll, FileLeaseStore, FileWalStore, MaterializedStore, Persister, RunControl, RunRequest,
+    SessionStore, StorePrefix, StubReply, StubToolPlane, WalStore,
 };
 use broca_protocol::{
     caller::RunFinishReason,
@@ -19,9 +23,10 @@ use broca_protocol::{
     request::{CallOptions, ExecutionMode, ModelHandle, StopCondition, Tool, ToolChoice},
     ErrorClass, FinishReason, GenerationConfig, MessageId, RunId, StepId, ToolCallId, Usage,
 };
-use broca_wal::{FileWal, Wal, WalRecord};
+use broca_wal::{FileWal, FramedRecord, Wal, WalRecord};
 use serde_json::json;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 /// A 1M-token window and a catalog output limit of 131,072 tokens.
 const WINDOW: u64 = 1_048_576;
@@ -48,10 +53,11 @@ impl Sent {
 /// each request's body length in an attempt record, and that declares the window model's cap.
 #[derive(Clone)]
 struct WindowProvider {
-    /// Step 1's reported input tokens; step 2 reports a small count.
+    /// Step 1's reported input tokens in the default script; later default steps report a small count.
     first_input: u64,
     limits: Option<OutputLimits>,
     sent: Arc<Mutex<Vec<Sent>>>,
+    scripts: BTreeMap<u64, Vec<NormalizedEvent>>,
 }
 
 impl WindowProvider {
@@ -60,6 +66,7 @@ impl WindowProvider {
             first_input,
             limits: Some(OutputLimits::new(CAP, 0)),
             sent: Arc::default(),
+            scripts: BTreeMap::new(),
         }
     }
 
@@ -73,6 +80,9 @@ impl WindowProvider {
     }
 
     fn script(&self, step: u64) -> Vec<NormalizedEvent> {
+        if let Some(events) = self.scripts.get(&step) {
+            return events.clone();
+        }
         let (content, input, finish) = if step == 1 {
             (
                 vec![ContentBlock::ToolCall(ToolCall {
@@ -245,26 +255,104 @@ fn plane() -> StubToolPlane {
     })
 }
 
+struct BoundaryPlane {
+    inner: StubToolPlane,
+    stop: Option<CancellationToken>,
+}
+
+#[async_trait]
+impl broca_core::ToolPlane for BoundaryPlane {
+    async fn batch_started(
+        &self,
+        ctx: &broca_core::BatchCtx,
+        calls: &[ToolCall],
+        manifest: &broca_core::ToolManifest,
+    ) -> Result<(), broca_core::ToolPlaneError> {
+        self.inner.batch_started(ctx, calls, manifest).await
+    }
+
+    async fn batch_finished(
+        &self,
+        ctx: &broca_core::BatchCtx,
+    ) -> Result<(), broca_core::ToolPlaneError> {
+        self.inner.batch_finished(ctx).await
+    }
+
+    async fn dispatch(
+        &self,
+        ctx: &broca_core::BatchCtx,
+        call: &ToolCall,
+    ) -> broca_core::DispatchResult {
+        let result = self.inner.dispatch(ctx, call).await;
+        // Shutdown after the second tool has completed, so the loop can pause at a clean
+        // turn boundary instead of refusing a tool call that has not been sent.
+        if call.tool_call_id.0 == "t2" {
+            if let Some(stop) = &self.stop {
+                stop.cancel();
+            }
+        }
+        result
+    }
+}
+
 async fn run(dir: &std::path::Path, provider: &impl Provider) -> RunFinishReason {
-    let lease = FileLeaseStore::new(dir.join("lease"));
-    let wal = FileWalStore::new(dir.join("wal"));
-    let (tx, mut rx) = mpsc::channel(512);
-    let collector = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let summary = run_loop_with_control(
-        request(dir),
+    run_with(
+        dir,
         provider,
-        &plane(),
-        &lease,
-        &AllowAll,
-        &wal,
+        request(dir),
         None,
         RunControl {
             admitted_context_limit: Some(WINDOW),
             ..Default::default()
         },
-        &tx,
+        false,
     )
     .await
+}
+
+async fn run_with(
+    dir: &std::path::Path,
+    provider: &impl Provider,
+    req: RunRequest,
+    store: Option<Arc<dyn SessionStore>>,
+    control: RunControl,
+    after_auth: bool,
+) -> RunFinishReason {
+    let lease = FileLeaseStore::new(dir.join("lease"));
+    let wal = FileWalStore::new(dir.join("wal"));
+    let (tx, mut rx) = mpsc::channel(512);
+    let collector = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let tool_plane = BoundaryPlane {
+        inner: plane(),
+        stop: control.stop_requested.clone(),
+    };
+    let summary = if after_auth {
+        run_loop_resume_after_auth_with_control(
+            req,
+            provider,
+            &tool_plane,
+            &lease,
+            &AllowAll,
+            &wal,
+            store,
+            control,
+            &tx,
+        )
+        .await
+    } else {
+        run_loop_with_control(
+            req,
+            provider,
+            &tool_plane,
+            &lease,
+            &AllowAll,
+            &wal,
+            store,
+            control,
+            &tx,
+        )
+        .await
+    }
     .expect("run ok");
     drop(tx);
     collector.await.unwrap();
@@ -278,6 +366,39 @@ fn records(dir: &std::path::Path) -> Vec<WalRecord> {
         .into_iter()
         .map(|frame| frame.record)
         .collect()
+}
+
+/// Byte offset where the frame with `seq` ends, found by decoding the WAL file itself.
+///
+/// `WalRangeRead::anchor_at` needs the file's device-and-inode identity, which only exists
+/// on Unix, so it reports no anchors on Windows. Walking the frames needs no identity and
+/// finds the same end offset on every platform.
+fn frame_byte_end(path: &std::path::Path, seq: u64) -> u64 {
+    let bytes = std::fs::read(path).unwrap();
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        match broca_wal::framing::decode_next(&bytes[offset..]) {
+            broca_wal::framing::DecodeStep::Record { framed, consumed } => {
+                offset += consumed;
+                if framed.seq == seq {
+                    return offset as u64;
+                }
+            }
+            broca_wal::framing::DecodeStep::Lineage { consumed, .. } => {
+                offset += consumed;
+            }
+            broca_wal::framing::DecodeStep::NewerWriter { ver, .. } => {
+                panic!("newer WAL frame v{ver} at offset {offset}");
+            }
+            broca_wal::framing::DecodeStep::Corrupt(error) => {
+                panic!("WAL corruption at offset {offset}: {error}");
+            }
+            broca_wal::framing::DecodeStep::TornTail => {
+                panic!("torn WAL tail before seq {seq}");
+            }
+        }
+    }
+    panic!("seq {seq} not found in the WAL");
 }
 
 /// Rewrite the WAL to the records `keep` accepts among its first `upto`, as a crash after
@@ -323,6 +444,629 @@ fn estimate(first_input: u64, step1: &Sent, step2: &Sent, provider: &WindowProvi
     unclamped.step_context.as_mut().unwrap().max_output_tokens = None;
     let grown = provider.render_request(&unclamped).len() - step1.bytes.len();
     first_input + (grown as u64).div_ceil(2)
+}
+
+const LAST_INPUT: u64 = 1_005_937 + 1_105;
+
+fn tool_step(step: u64, usage: Usage) -> Vec<NormalizedEvent> {
+    vec![
+        NormalizedEvent::Control(ProviderControl::AssistantMessage {
+            message: AssistantMessage {
+                message_id: MessageId(format!("m{step}")),
+                content: vec![ContentBlock::ToolCall(ToolCall {
+                    thought_signature: None,
+                    tool_call_id: ToolCallId(format!("t{step}")),
+                    tool_name: "read".into(),
+                    input: json!({"path": "src/lib.rs"}),
+                })],
+            },
+        }),
+        NormalizedEvent::Control(ProviderControl::Finished {
+            usage,
+            finish_reason: FinishReason::ToolCalls,
+            retries_used: 0,
+        }),
+    ]
+}
+
+fn continuing_provider() -> WindowProvider {
+    let mut provider = WindowProvider::new(916_594);
+    provider.scripts.insert(
+        2,
+        tool_step(
+            2,
+            Usage {
+                input_tokens: Some(1_105),
+                cached_input_tokens: Some(1_005_937),
+                output_tokens: Some(10),
+                ..Default::default()
+            },
+        ),
+    );
+    provider
+}
+
+fn resume_control(stop: Option<CancellationToken>) -> RunControl {
+    RunControl {
+        admitted_context_limit: Some(WINDOW),
+        stop_requested: stop,
+        ..Default::default()
+    }
+}
+
+fn resumable_request(dir: &std::path::Path) -> RunRequest {
+    let mut req = request(dir);
+    req.on_restart = Some(broca_protocol::request::OnRestart::Resume);
+    req
+}
+
+fn assert_next_clamp(
+    wal: &[WalRecord],
+    measured: &Sent,
+    next: &Sent,
+    provider: &WindowProvider,
+) -> WalRecord {
+    let start = wal
+        .iter()
+        .rposition(|record| matches!(record, WalRecord::RunStarted { .. }))
+        .unwrap();
+    let wal = &wal[start..];
+    let expected_input = estimate(LAST_INPUT, measured, next, provider);
+    let expected_cap = WINDOW - expected_input - margin(WINDOW);
+    let expected = WalRecord::OutputReservationClamped {
+        step_id: StepId(next.step),
+        max_output_tokens: expected_cap as u32,
+        estimated_input_tokens: expected_input,
+        context_limit: WINDOW,
+    };
+    assert!(
+        wal.contains(&expected),
+        "next step must record {expected:?}"
+    );
+    assert_eq!(next.cap(), Some(expected_cap as u32));
+    let clamp_at = wal.iter().position(|record| *record == expected).unwrap();
+    let attempt_at = wal
+        .iter()
+        .position(|record| {
+            matches!(record,
+                WalRecord::ModelAttemptFinished { step_id, .. } if step_id.0 == next.step
+            )
+        })
+        .unwrap();
+    assert!(
+        clamp_at < attempt_at,
+        "clamp must be durable before sending"
+    );
+    expected
+}
+
+/// A frozen materialized prefix keeps the measured turns out of the resume's WAL tail.
+/// Projection deliberately lags while the resumed loop writes its new turns.
+struct MeasuredPrefixStore {
+    prefix: StorePrefix,
+    admission: AdmissionStoreSnapshot,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl MeasuredPrefixStore {
+    fn from_wal(dir: &std::path::Path) -> Self {
+        let wal = FileWalStore::new(dir.join("wal"));
+        let range = wal
+            .read_records_range(&request(dir).session, 0, None, None)
+            .unwrap();
+        let frames = wal.read_records(&request(dir).session).unwrap();
+        let watermark = broca_core::latest_projection_boundary(&frames, 0).unwrap();
+        let prefix_frames: Vec<_> = frames
+            .into_iter()
+            .filter(|frame| frame.seq <= watermark)
+            .collect();
+        let state = broca_core::replay(
+            &prefix_frames
+                .iter()
+                .map(|frame| frame.record.clone())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let lineage_id = range.lineage_id.map(|id| id.to_string());
+        Self {
+            prefix: StorePrefix {
+                lineage_id: lineage_id.clone(),
+                prefix: state.prompt,
+                completed_steps: state.completed_steps,
+                usage: state.usage,
+                retries_used: state.retries_used,
+                last_step_usage: state.last_step_usage,
+                last_step_finish_reason: state.last_step_finish_reason,
+                watermark_seq: watermark,
+                context_epoch: 0,
+            },
+            admission: AdmissionStoreSnapshot {
+                lineage_id,
+                watermark_seq: watermark,
+                anchor: range.anchor_at(watermark),
+                checkpoint: Some(
+                    serde_json::from_slice(
+                        &serde_json::to_vec(
+                            &broca_core::AdmissionCheckpointV1::from_frames(&prefix_frames)
+                                .unwrap(),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                ),
+            },
+            reads: Default::default(),
+        }
+    }
+}
+
+impl MaterializedStore for MeasuredPrefixStore {
+    fn read_prefix_with_watermark(
+        &self,
+        _: &broca_protocol::BindIdentity,
+    ) -> Result<StorePrefix, String> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.prefix.clone())
+    }
+
+    fn read_admission_snapshot(
+        &self,
+        _: &broca_protocol::BindIdentity,
+    ) -> Result<Option<AdmissionStoreSnapshot>, String> {
+        Ok(Some(self.admission.clone()))
+    }
+}
+
+impl Persister for MeasuredPrefixStore {
+    fn project(&self, _: &broca_protocol::BindIdentity, _: &[FramedRecord]) -> Result<u64, String> {
+        Ok(self.prefix.watermark_seq)
+    }
+}
+
+async fn compare_full_and_sparse_continuation(
+    dir: &std::path::Path,
+    store: Arc<MeasuredPrefixStore>,
+    req: RunRequest,
+    measured: &Sent,
+    after_auth: bool,
+    provider: impl Fn() -> WindowProvider,
+) {
+    let wal = FileWalStore::new(dir.join("wal"));
+    let frames = wal.read_records(&req.session).unwrap();
+    let head = frames.last().unwrap().seq;
+    let snapshot =
+        broca_core::load_prior_wal_snapshot(&wal, &req.session, head, Some(store.as_ref()))
+            .unwrap();
+    assert_eq!(
+        snapshot.base_watermark, store.prefix.watermark_seq,
+        "resume must use the checkpoint and tail, not fall back to full replay"
+    );
+    let full_state = broca_core::replay(
+        &frames
+            .iter()
+            .map(|frame| frame.record.clone())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert_eq!(
+        snapshot.checkpoint_at_head.output_reservation.as_ref(),
+        Some(&full_state.output_reservation)
+    );
+    let wal_path = wal.wal_path(&req.session);
+    let initial_bytes = std::fs::read(&wal_path).unwrap();
+
+    // Restore the identical log, including its lineage header, between the two continuations.
+    let full = provider();
+    assert_eq!(
+        run_with(
+            dir,
+            &full,
+            req.clone(),
+            None,
+            resume_control(None),
+            after_auth
+        )
+        .await,
+        RunFinishReason::Completed
+    );
+    let expected = assert_next_clamp(&records(dir), measured, full.sent().last().unwrap(), &full);
+    std::fs::write(&wal_path, initial_bytes).unwrap();
+
+    let resumed = provider();
+    assert_eq!(
+        run_with(
+            dir,
+            &resumed,
+            req,
+            Some(store.clone()),
+            resume_control(None),
+            after_auth
+        )
+        .await,
+        RunFinishReason::Completed
+    );
+    assert_eq!(
+        assert_next_clamp(
+            &records(dir),
+            measured,
+            resumed.sent().last().unwrap(),
+            &resumed
+        ),
+        expected
+    );
+    let (actual, expected) = (resumed.sent(), full.sent());
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter().zip(&expected) {
+        assert_eq!(actual.step, expected.step);
+        assert_eq!(actual.bytes, expected.bytes);
+    }
+    assert!(store.reads.load(std::sync::atomic::Ordering::SeqCst) > 0);
+}
+
+#[tokio::test]
+async fn restart_resume_restores_the_last_measurement_from_a_materialized_prefix() {
+    let dir = scratch("restart-measurement");
+    let stop = CancellationToken::new();
+    let before = continuing_provider();
+    assert_eq!(
+        run_with(
+            &dir,
+            &before,
+            resumable_request(&dir),
+            None,
+            resume_control(Some(stop)),
+            false
+        )
+        .await,
+        RunFinishReason::Interrupted
+    );
+    let initial = records(&dir);
+    assert!(initial.iter().any(|record| matches!(
+        record,
+        WalRecord::RunPaused {
+            reason: broca_protocol::PauseReason::Restart,
+            ..
+        }
+    )));
+    assert!(
+        before.sent()[1].cap().is_some(),
+        "the step before restart was clamped"
+    );
+    let store = Arc::new(MeasuredPrefixStore::from_wal(&dir));
+    assert_eq!(store.prefix.completed_steps, 2);
+    compare_full_and_sparse_continuation(
+        &dir,
+        store,
+        resumable_request(&dir),
+        &before.sent()[1],
+        false,
+        continuing_provider,
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn crash_continuation_restores_the_last_measurement_from_a_materialized_prefix() {
+    let dir = scratch("crash-measurement");
+    let before = continuing_provider();
+    assert_eq!(
+        run_with(
+            &dir,
+            &before,
+            resumable_request(&dir),
+            None,
+            resume_control(Some(CancellationToken::new())),
+            false
+        )
+        .await,
+        RunFinishReason::Interrupted
+    );
+    let wal = FileWalStore::new(dir.join("wal"));
+    let frames = wal.read_records(&request(&dir).session).unwrap();
+    assert!(matches!(
+        frames.last().unwrap().record,
+        WalRecord::RunPaused { .. }
+    ));
+    let target = frames[frames.len() - 2].seq;
+    let end = frame_byte_end(&wal.wal_path(&request(&dir).session), target);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(wal.wal_path(&request(&dir).session))
+        .unwrap()
+        .set_len(end)
+        .unwrap();
+    assert!(!records(&dir).iter().any(|record| matches!(
+        record,
+        WalRecord::RunPaused { .. } | WalRecord::RunFinished { .. }
+    )));
+    let store = Arc::new(MeasuredPrefixStore::from_wal(&dir));
+    compare_full_and_sparse_continuation(
+        &dir,
+        store,
+        resumable_request(&dir),
+        &before.sent()[1],
+        false,
+        continuing_provider,
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn auth_error() -> NormalizedEvent {
+    NormalizedEvent::Control(ProviderControl::Error {
+        error: broca_protocol::ProviderError {
+            provider_details: None,
+            provider_subcode: None,
+            refusal: None,
+            class: ErrorClass::Auth,
+            message: "credential expired".into(),
+            status: Some(401),
+            retry_after_secs: None,
+            provider_code: None,
+            resets_at_ms: None,
+            resets_at_source: None,
+            limit_window: None,
+            account_ref: None,
+            credential_id: None,
+            affordable_max_tokens: None,
+        },
+        retries_used: 0,
+    })
+}
+
+#[tokio::test]
+async fn auth_resume_preserves_the_prefix_measurement_past_an_unmeasured_step() {
+    let dir = scratch("auth-measurement");
+    let mut before = continuing_provider();
+    before.scripts.insert(3, vec![auth_error()]);
+    assert_eq!(
+        run_with(
+            &dir,
+            &before,
+            request(&dir),
+            None,
+            resume_control(None),
+            false
+        )
+        .await,
+        RunFinishReason::Interrupted
+    );
+    assert!(records(&dir).iter().any(|record| matches!(
+        record,
+        WalRecord::RunPaused {
+            reason: broca_protocol::PauseReason::AuthRequired,
+            ..
+        }
+    )));
+    let store = Arc::new(MeasuredPrefixStore::from_wal(&dir));
+    assert_eq!(store.prefix.completed_steps, 2);
+    compare_full_and_sparse_continuation(
+        &dir,
+        store,
+        request(&dir),
+        &before.sent()[1],
+        true,
+        || {
+            let mut provider = continuing_provider();
+            // The retried step reuses its recorded cap but reports no input usage. The following
+            // step still needs the last measured request, not the auth error's attempt length.
+            provider.scripts.insert(3, tool_step(3, Usage::default()));
+            provider
+        },
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_send_after_an_ended_run_uses_the_same_model_measurement() {
+    let dir = scratch("append-measurement");
+    let mut before = continuing_provider();
+    let mut final_step = WindowProvider::new(0).script(2);
+    for event in &mut final_step {
+        if let NormalizedEvent::Control(ProviderControl::Finished { usage, .. }) = event {
+            *usage = Usage {
+                input_tokens: Some(1_105),
+                cached_input_tokens: Some(1_005_937),
+                ..Default::default()
+            };
+        }
+    }
+    before.scripts.insert(2, final_step);
+    assert_eq!(
+        run_with(
+            &dir,
+            &before,
+            request(&dir),
+            None,
+            resume_control(None),
+            false
+        )
+        .await,
+        RunFinishReason::Completed
+    );
+    let store = Arc::new(MeasuredPrefixStore::from_wal(&dir));
+    let mut req = request(&dir);
+    req.run_id = RunId("next-run".into());
+    compare_full_and_sparse_continuation(&dir, store, req, &before.sent()[1], false, || {
+        let mut provider = WindowProvider::new(0);
+        provider.scripts.insert(1, provider.script(2));
+        provider
+    })
+    .await;
+    assert_eq!(
+        records(&dir)
+            .iter()
+            .filter(|record| matches!(record, WalRecord::RunStarted { .. }))
+            .count(),
+        2
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn materialized_resume_without_a_measurement_or_nearby_pressure_keeps_request_bytes() {
+    for legacy in [false, true] {
+        let dir = scratch(if legacy {
+            "legacy-measurement"
+        } else {
+            "far-resume"
+        });
+        let mut before = WindowProvider::new(1_000);
+        before.scripts.insert(
+            2,
+            tool_step(
+                2,
+                Usage {
+                    input_tokens: Some(if legacy { LAST_INPUT } else { 2_000 }),
+                    ..Default::default()
+                },
+            ),
+        );
+        assert_eq!(
+            run_with(
+                &dir,
+                &before,
+                resumable_request(&dir),
+                None,
+                resume_control(Some(CancellationToken::new())),
+                false
+            )
+            .await,
+            RunFinishReason::Interrupted
+        );
+        if legacy {
+            rewrite_wal(&dir, records(&dir).len(), |record| {
+                !matches!(record, WalRecord::ModelAttemptFinished { .. })
+            });
+        }
+        let store = Arc::new(MeasuredPrefixStore::from_wal(&dir));
+        let wal = FileWalStore::new(dir.join("wal"));
+        let path = wal.wal_path(&request(&dir).session);
+        let original = std::fs::read(&path).unwrap();
+        let baseline = WindowProvider::new(0).without_limits();
+        assert_eq!(
+            run_with(
+                &dir,
+                &baseline,
+                resumable_request(&dir),
+                None,
+                resume_control(None),
+                false
+            )
+            .await,
+            RunFinishReason::Completed
+        );
+        std::fs::write(&path, original).unwrap();
+        let resumed = WindowProvider::new(0);
+        assert_eq!(
+            run_with(
+                &dir,
+                &resumed,
+                resumable_request(&dir),
+                Some(store),
+                resume_control(None),
+                false
+            )
+            .await,
+            RunFinishReason::Completed
+        );
+        assert_eq!(resumed.sent().len(), 1);
+        assert_eq!(
+            resumed.sent()[0].bytes,
+            baseline.sent()[0].bytes,
+            "legacy={legacy}"
+        );
+        assert!(resumed.sent()[0].cap().is_none());
+        assert!(!records(&dir).iter().any(|record| matches!(
+            record,
+            WalRecord::OutputReservationClamped {
+                step_id: StepId(3),
+                ..
+            }
+        )));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[tokio::test]
+async fn a_checkpoint_without_reservation_history_recovers_it_from_the_complete_log() {
+    let dir = scratch("old-reservation-checkpoint");
+    let before = continuing_provider();
+    assert_eq!(
+        run_with(
+            &dir,
+            &before,
+            resumable_request(&dir),
+            None,
+            resume_control(Some(CancellationToken::new())),
+            false
+        )
+        .await,
+        RunFinishReason::Interrupted
+    );
+    let mut store = MeasuredPrefixStore::from_wal(&dir);
+    let mut old = serde_json::to_value(store.admission.checkpoint.take().unwrap()).unwrap();
+    old.as_object_mut().unwrap().remove("output_reservation");
+    store.admission.checkpoint = Some(serde_json::from_value(old).unwrap());
+    let wal = FileWalStore::new(dir.join("wal"));
+    let frames = wal.read_records(&request(&dir).session).unwrap();
+    let head = frames.last().unwrap().seq;
+    let mut unknown = store.admission.checkpoint.clone().unwrap();
+    unknown
+        .fold_frames(
+            &frames
+                .iter()
+                .filter(|frame| frame.seq > store.prefix.watermark_seq)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    assert!(
+        unknown.output_reservation.is_none(),
+        "folding a tail cannot repair unknown prefix history"
+    );
+    assert!(
+        broca_core::AdmissionCheckpointV1::from_frames(&frames[1..])
+            .unwrap()
+            .output_reservation
+            .is_none(),
+        "a suffix must not claim complete reservation history"
+    );
+    let snapshot =
+        broca_core::load_prior_wal_snapshot(&wal, &request(&dir).session, head, Some(&store))
+            .unwrap();
+    assert_eq!(
+        snapshot.base_watermark, 0,
+        "unknown prefix history requires complete replay"
+    );
+    assert!(snapshot
+        .checkpoint_at_head
+        .output_reservation
+        .as_ref()
+        .unwrap()
+        .has_measurement(&request(&dir).model));
+    let resumed = continuing_provider();
+    assert_eq!(
+        run_with(
+            &dir,
+            &resumed,
+            resumable_request(&dir),
+            Some(Arc::new(store)),
+            resume_control(None),
+            false
+        )
+        .await,
+        RunFinishReason::Completed
+    );
+    assert_next_clamp(
+        &records(&dir),
+        &before.sent()[1],
+        &resumed.sent()[0],
+        &resumed,
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A step with 916,594 measured input tokens on the step before it,

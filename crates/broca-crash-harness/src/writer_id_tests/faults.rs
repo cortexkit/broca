@@ -1,4 +1,5 @@
 use super::*;
+use crate::proof_tests::batch_recording::BatchFs;
 use broca_core::{FileWalStore, WalHandle, WalStore};
 use broca_wal::fs_ops::{FileOps, FsOps, OpenOptions, ReadDir};
 use std::fs::Metadata;
@@ -6,7 +7,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::atomic::AtomicBool;
 
 struct FaultFs {
-    inner: Arc<RecordingFs>,
+    inner: Arc<BatchFs>,
     log: PathBuf,
     fail_sync: Arc<AtomicBool>,
     fail_unlink: AtomicBool,
@@ -121,11 +122,11 @@ impl FileOps for FaultFile {
     }
 }
 
-fn spawn(root: &Scratch) -> (WalHandle, Arc<FaultFs>) {
+fn spawn(root: &Scratch) -> (WalHandle, Arc<FaultFs>, Arc<RecordingFs>) {
     let store = FileWalStore::with_config(root.0.join("wal"), broca_wal::WalConfig::OVERHAUL);
     let session = broca_protocol::BindIdentity::new("/writer-id-fault", "runner", "session");
     let fs = Arc::new(FaultFs {
-        inner: Arc::new(RecordingFs::new(&root.0).unwrap()),
+        inner: Arc::new(BatchFs::new()),
         log: store.wal_path(&session),
         fail_sync: Arc::new(AtomicBool::new(false)),
         fail_unlink: AtomicBool::new(false),
@@ -136,7 +137,10 @@ fn spawn(root: &Scratch) -> (WalHandle, Arc<FaultFs>) {
         WalHandle::spawn_in_store_with_fs_for_test(wal, &store, &session, 1, None, fs.clone())
             .unwrap()
     });
-    (handle, fs)
+    // Readiness proves the open prefix and its namespace durable. Journal only
+    // the close under test, rebinding the production writer's existing handles.
+    let recording = fs.inner.begin(&root.0);
+    (handle, fs, recording)
 }
 
 fn synced_image(fs: &RecordingFs) -> State {
@@ -149,10 +153,14 @@ fn synced_image(fs: &RecordingFs) -> State {
         .state
 }
 
-fn recover_image(root: &Scratch, fs: &FaultFs) -> (Vec<broca_wal::FramedRecord>, bool) {
+fn recover_image(
+    root: &Scratch,
+    fs: &FaultFs,
+    recording: &RecordingFs,
+) -> (Vec<broca_wal::FramedRecord>, bool) {
     let recovered = Scratch::new();
     recovered.clear();
-    synced_image(&fs.inner).install(&recovered.0).unwrap();
+    synced_image(recording).install(&recovered.0).unwrap();
     let relative_log = fs.log.strip_prefix(&root.0).unwrap();
     let wal = FileWal::open(recovered.0.join(relative_log)).unwrap();
     let records = wal.replay().unwrap();
@@ -166,7 +174,7 @@ fn recover_image(root: &Scratch, fs: &FaultFs) -> (Vec<broca_wal::FramedRecord>,
 #[tokio::test]
 async fn real_handle_failed_close_sync_publishes_no_close_and_keeps_marker_after_power_loss() {
     let root = Scratch::new();
-    let (handle, fs) = spawn(&root);
+    let (handle, fs, recording) = spawn(&root);
     let durable_head = handle.durable_head();
     assert_eq!(durable_head.load(Ordering::Acquire), 1);
     fs.fail_sync.store(true, Ordering::SeqCst);
@@ -188,7 +196,7 @@ async fn real_handle_failed_close_sync_publishes_no_close_and_keeps_marker_after
     );
     // A failed sync may leave readable bytes. Only the synced-only crash image can assert absence
     // of a durable close, and it is recovered by the same FileWal opener as a real restart.
-    let (records, marker_kept) = recover_image(&root, &fs);
+    let (records, marker_kept) = recover_image(&root, &fs, &recording);
     assert_eq!(records.len(), 1);
     assert!(matches!(records[0].record, WalRecord::WriterOpened { .. }));
     assert!(marker_kept);
@@ -197,7 +205,7 @@ async fn real_handle_failed_close_sync_publishes_no_close_and_keeps_marker_after
 #[tokio::test]
 async fn real_handle_unlink_failure_preserves_durable_close_and_marker_for_reclaim() {
     let root = Scratch::new();
-    let (handle, fs) = spawn(&root);
+    let (handle, fs, recording) = spawn(&root);
     let durable_head = handle.durable_head();
     fs.fail_unlink.store(true, Ordering::SeqCst);
     handle
@@ -206,7 +214,7 @@ async fn real_handle_unlink_failure_preserves_durable_close_and_marker_for_recla
         .expect("a durable close is authoritative despite cleanup failure");
     assert!(fs.unlink_attempted.load(Ordering::SeqCst));
     assert_eq!(durable_head.load(Ordering::Acquire), 2);
-    let (records, marker_kept) = recover_image(&root, &fs);
+    let (records, marker_kept) = recover_image(&root, &fs, &recording);
     assert_eq!(records.len(), 2);
     assert!(matches!(records[1].record, WalRecord::WriterClosed { .. }));
     assert!(marker_kept);

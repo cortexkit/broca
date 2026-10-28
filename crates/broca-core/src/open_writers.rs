@@ -1,12 +1,12 @@
 //! The writer-id/v1 durability protocol: a durable marker precedes open, and close precedes unlink.
 //!
-//! A durable WriterClosed is authoritative even if unlink failed or the marker reappeared after
-//! power loss. Once a writer's lease is free, its marker without a durable close means it stopped
-//! without closing. The lease-gated reclaim pass owns scanning and removing those stale markers;
+//! Every surviving marker requires a successor once the session lease is free, even when
+//! WriterClosed is durable: close publication may have been interrupted. The lease-gated
+//! reclaim pass owns reopening those sessions and removing their old markers;
 //! a normal open records succession but never deletes another writer's marker opportunistically.
 
 use broca_protocol::BindIdentity;
-use broca_wal::{fs_ops, Wal, WalError, WalRecord};
+use broca_wal::{fs_ops, head_proof::SyncedPrefix, Wal, WalError, WalRecord};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -45,12 +45,12 @@ pub(crate) struct OpenWriter {
 }
 
 impl WriterContext {
-    pub(crate) fn open(
+    pub(crate) fn open<'a>(
         self,
-        wal: &mut dyn Wal,
+        wal: &'a mut dyn Wal,
         fence: u64,
         now: impl Fn() -> u64,
-    ) -> Result<(OpenWriter, u64, WalRecord), WalError> {
+    ) -> Result<(OpenWriter, u64, WalRecord, SyncedPrefix<'a>), WalError> {
         let writer_id = wal.writer_id().ok_or_else(|| {
             WalError::Io(std::io::Error::other(
                 "writer-id/v1: overhaul WAL has no writer identity",
@@ -103,7 +103,7 @@ impl WriterContext {
                 })
                 .into(),
         };
-        let seq = append_barrier(wal, fence, &opened, now())?;
+        let (seq, synced) = append_barrier(wal, fence, &opened, now())?;
         Ok((
             OpenWriter {
                 marker,
@@ -112,45 +112,46 @@ impl WriterContext {
             },
             seq,
             opened,
+            synced,
         ))
     }
 }
 
 impl OpenWriter {
-    pub(crate) fn close(
+    pub(crate) fn close<'a>(
         &self,
-        wal: &mut dyn Wal,
+        wal: &'a mut dyn Wal,
         fence: u64,
         now: u64,
-    ) -> Result<(u64, WalRecord), WalError> {
+    ) -> Result<(u64, WalRecord, SyncedPrefix<'a>), WalError> {
         let record = WalRecord::WriterClosed {
             writer_id: self.writer_id,
         };
-        let seq = append_barrier(wal, fence, &record, now)?;
-        Ok((seq, record))
+        let (seq, synced) = append_barrier(wal, fence, &record, now)?;
+        Ok((seq, record, synced))
     }
 
     pub(crate) fn unlink(self) -> Result<(PathBuf, BindIdentity), WalError> {
-        // No directory sync is needed after unlink. A resurrected marker is conservative:
-        // the durable WriterClosed still proves that this writer cannot append again.
+        // No directory sync is needed after unlink. A resurrected marker costs a
+        // redundant successor; the durable close still forbids this writer from appending.
         fs_ops::remove_file(&self.marker).map_err(WalError::Io)?;
         Ok((self.marker, self.identity))
     }
 }
 
-fn append_barrier(
-    wal: &mut dyn Wal,
+fn append_barrier<'a>(
+    wal: &'a mut dyn Wal,
     fence: u64,
     record: &WalRecord,
     now: u64,
-) -> Result<u64, WalError> {
+) -> Result<(u64, SyncedPrefix<'a>), WalError> {
     let prepared = broca_wal::PreparedV4Frame::prepare(record).map_err(WalError::Frame)?;
     let expected = wal.last_seq() + 1;
-    let seq = wal.append_v4(fence, record, true, prepared, now)?;
+    let (seq, synced) = SyncedPrefix::append_v4(wal, fence, record, prepared, now)?;
     if seq != expected {
         return Err(WalError::Io(std::io::Error::other(format!(
             "writer-id/v1: lifecycle sequence drift: expected {expected}, assigned {seq}"
         ))));
     }
-    Ok(seq)
+    Ok((seq, synced))
 }

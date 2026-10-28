@@ -136,7 +136,9 @@ impl AdmissionWal {
                 self.wal.replay()?.iter().all(|frame| {
                     matches!(
                         frame.record,
-                        WalRecord::WriterOpened { .. } | WalRecord::WriterClosed { .. }
+                        WalRecord::WriterOpened { .. }
+                            | WalRecord::WriterClosed { .. }
+                            | WalRecord::VisibilityLate { .. }
                     )
                 })
             } else {
@@ -156,6 +158,31 @@ impl AdmissionWal {
                     };
                     self.wal.relocate_unstarted(path)?;
                     self.legacy_fence.0 = path.clone();
+                    if self.wal.wal_config().is_overhaul() {
+                        // A prior unlink may be visible but not durable after a
+                        // failed directory sync. Repeat the directory-sync
+                        // barrier for every possible placement directory before
+                        // the log can become started,
+                        // including when relocation itself was a same-path no-op.
+                        let paths = [ordinary.clone(), ephemeral.clone(), durable.clone()];
+                        let directories: std::collections::BTreeSet<_> =
+                            paths.iter().filter_map(|path| path.parent()).collect();
+                        for directory in directories {
+                            let barrier = || -> std::io::Result<()> {
+                                if broca_wal::fs_ops::try_exists(directory)? {
+                                    broca_wal::fs_ops::sync_dir(directory)?;
+                                }
+                                Ok(())
+                            };
+                            barrier().map_err(|error| WalError::RelocationIncomplete {
+                                paths: paths.to_vec(),
+                                cause: Some(format!(
+                                    "first-send directory barrier {}: {error}",
+                                    directory.display()
+                                )),
+                            })?;
+                        }
+                    }
                 }
             }
         }
@@ -164,6 +191,9 @@ impl AdmissionWal {
 }
 
 impl Wal for AdmissionWal {
+    fn log_path(&self) -> Option<&std::path::Path> {
+        self.wal.log_path()
+    }
     fn writer_close_reserve(&self) -> u64 {
         self.wal.writer_close_reserve()
     }

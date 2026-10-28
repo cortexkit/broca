@@ -186,14 +186,19 @@ impl Consent {
         provider: &str,
         now: i64,
     ) -> Result<bool, GrantsError> {
-        Ok(self.releasing_grant(scope, provider, now).await?.is_some())
+        Ok(self
+            .releasing_grant(scope, None, provider, now)
+            .await?
+            .is_some())
     }
 
-    /// The live grant that lets this scope call `provider` now, if any: the same decision as
-    /// [`Self::granted`], naming the grant so the route can report which one released a call.
+    /// The live grant that lets this scope call `provider` now, naming the grant so the route
+    /// can report which one released a call. `project_id` must come from the scope's daemon
+    /// stamp; without it only run and 24-hour grants can match.
     pub async fn releasing_grant(
         &self,
         scope: &SessionScope,
+        project_id: Option<&str>,
         provider: &str,
         now: i64,
     ) -> Result<Option<Grant>, GrantsError> {
@@ -209,6 +214,11 @@ impl Consent {
                 continue;
             }
             match grant.kind {
+                GrantKind::Always
+                    if project_id.is_some() && grant.project.as_deref() == project_id =>
+                {
+                    return Ok(Some(grant))
+                }
                 GrantKind::Hours24 if grant.expires_at_ms.is_some_and(|expiry| now < expiry) => {
                     return Ok(Some(grant))
                 }
@@ -243,8 +253,14 @@ impl Consent {
                 self.store
                     .finish_unstarted(&row.batch_id, &not_started("denied"), observed)?;
             } else if self
-                .granted(&session(&row), &row.provider, observed)
+                .releasing_grant(
+                    &session(&row),
+                    row.project_id.as_deref(),
+                    &row.provider,
+                    observed,
+                )
                 .await?
+                .is_some()
             {
                 authorized += usize::from(self.store.authorize(&row.batch_id, (self.clock)())?);
             }
@@ -276,6 +292,7 @@ impl Consent {
             .card(&request.dedup_key)?
             .is_some_and(|card| card.state == CardState::Filing);
         let card = Card {
+            project_id: request.project_id.clone(),
             dedup_key: request.dedup_key.clone(),
             scope: request.scope.clone(),
             agent_id: request.agent_id.clone(),
@@ -551,6 +568,7 @@ impl Consent {
         let decision = match record.fields.get("answered_choice_id")?.as_str()? {
             "allow_run" => Decision::AllowRun,
             "allow_24h" => Decision::Allow24h,
+            "allow_always" if card.project_id.is_some() => Decision::AllowAlways,
             "deny" => Decision::Deny,
             _ => return None,
         };
@@ -669,7 +687,10 @@ impl Consent {
                             && ((grant.kind == GrantKind::Hours24
                                 && grant.expires_at_ms.is_some_and(|expiry| now < expiry))
                                 || (grant.kind == GrantKind::Run
-                                    && grant.scope.as_ref() == Some(&row.scope)))
+                                    && grant.scope.as_ref() == Some(&row.scope))
+                                || (grant.kind == GrantKind::Always
+                                    && row.project_id.is_some()
+                                    && grant.project == row.project_id))
                     });
                     if admitted {
                         self.store.authorize(&row.batch_id, now)?;

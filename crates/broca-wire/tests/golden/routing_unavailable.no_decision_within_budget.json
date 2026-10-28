@@ -1,0 +1,1 @@
+{"code":"routing_unavailable","message":"the routing module gave no account decision for this send within the 1500 ms admission budget; nothing was written, retry the send","detail":{"reason":"no_decision_within_budget","class":"transient","budget_ms":1500}}

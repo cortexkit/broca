@@ -352,6 +352,7 @@ pub fn plan_projection(
     let incremental_seed = seed.clone().filter(|seed| {
         seed.admission_checkpoint.ownership_complete()
             && seed.admission_checkpoint.head.is_some()
+            && seed.admission_checkpoint.output_reservation.is_some()
             && (!budgeted || crate::budget_replay_seed_is_valid(seed))
     });
     let time_placement = incremental_seed
@@ -694,7 +695,9 @@ impl ProjectionBoundaryState {
     pub fn observe(&mut self, frame: &FramedRecord) -> Vec<ProjectionBoundaryFact> {
         if matches!(
             frame.record,
-            WalRecord::WriterOpened { .. } | WalRecord::WriterClosed { .. }
+            WalRecord::WriterOpened { .. }
+                | WalRecord::WriterClosed { .. }
+                | WalRecord::VisibilityLate { .. }
         ) {
             return Vec::new();
         }

@@ -377,6 +377,7 @@ where
                     && checkpoint.head.is_some()
                     && checkpoint.compaction_complete()
                     && checkpoint.input_budget.is_some()
+                    && checkpoint.output_reservation.is_some()
                 {
                     // Only a budgeted episode can seed replay from the checkpoint at the store
                     // watermark. Decide from this pre-tail state: if the tail opens or corruptly
@@ -858,21 +859,85 @@ pub enum RunError {
     /// The routing module refused to choose a provider account for this send. Refused before
     /// anything durable is written; the refusal says whether a later retry may be admitted.
     AccountSelectionRefused(AccountSelectionRefusal),
+    /// broca got no usable account decision from the routing module for this send (routing
+    /// unreachable, no decision within the admission budget, or a pick of a credential broca
+    /// did not offer). Refused before anything durable is written, always transient: broca
+    /// never picks an account on routing's behalf, so the caller retries the send.
+    RoutingUnavailable(RoutingUnavailable),
     /// Numbering the transcript's tags would pass `u64::MAX` (llm-runner
     /// `tags::try_number_parts`): the run is refused rather than show two parts one number.
     TagNumbering(broca_protocol::tags::NumberingOverflow),
 }
 
-/// Routing's refusal to choose an account, copied verbatim, with broca's classification.
+/// Why broca could not get a usable account decision from routing for a send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingUnavailableReason {
+    /// The route failed to open, the connection was lost, or the reply could not be decoded.
+    Unreachable,
+    /// Routing did not decide within the admission budget.
+    NoDecisionWithinBudget,
+    /// Routing chose an account broca had not offered it: a defect in routing.
+    InvalidPick,
+}
+
+impl RoutingUnavailableReason {
+    /// The `detail.reason` spelling on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unreachable => "unreachable",
+            Self::NoDecisionWithinBudget => "no_decision_within_budget",
+            Self::InvalidPick => "invalid_pick",
+        }
+    }
+}
+
+/// broca's statement that routing could not answer for a send, as opposed to routing's own
+/// refusal ([`AccountSelectionRefusal`]). Always transient.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingUnavailable {
+    pub reason: RoutingUnavailableReason,
+    /// The admission budget that ran out, only for
+    /// [`RoutingUnavailableReason::NoDecisionWithinBudget`].
+    pub budget_ms: Option<u64>,
+}
+
+impl RoutingUnavailable {
+    pub fn unreachable() -> Self {
+        Self {
+            reason: RoutingUnavailableReason::Unreachable,
+            budget_ms: None,
+        }
+    }
+
+    pub fn no_decision_within_budget(budget_ms: u64) -> Self {
+        Self {
+            reason: RoutingUnavailableReason::NoDecisionWithinBudget,
+            budget_ms: Some(budget_ms),
+        }
+    }
+
+    pub fn invalid_pick() -> Self {
+        Self {
+            reason: RoutingUnavailableReason::InvalidPick,
+            budget_ms: None,
+        }
+    }
+}
+
+/// Routing's refusal to choose an account, with its original detail and broca's retry hints.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountSelectionRefusal {
     /// Routing's refusal code, for example `account_hold`.
     pub routing_code: String,
-    /// Routing's `retry_after_s`, when it sent one.
+    /// The preferred wait in seconds, from routing's deadline or its `retry_after_s`.
     pub retry_after_s: Option<u64>,
+    /// Routing's reset time, when supplied, in Unix epoch milliseconds.
+    pub resets_at_ms: Option<u64>,
+    /// Routing's original structured detail, including fields unknown to this broca build.
+    pub routing_detail: Option<Box<serde_json::Value>>,
     /// Routing's decision id, when it sent one.
     pub decision_id: Option<String>,
-    /// [`ErrorClass::Transient`] or [`ErrorClass::Permanent`].
+    /// The retry/auth classification of routing's refusal.
     pub class: ErrorClass,
 }
 
@@ -897,7 +962,8 @@ impl RunError {
             | Self::Lease(_)
             | Self::Wal(_)
             | Self::Panicked
-            | Self::Transient(_) => ErrorClass::Transient,
+            | Self::Transient(_)
+            | Self::RoutingUnavailable(_) => ErrorClass::Transient,
             Self::AccountSelectionRefused(refusal) => refusal.class,
         }
     }
@@ -946,6 +1012,11 @@ impl std::fmt::Display for RunError {
                 "account_selection_refused: routing refused to choose a provider account ({})",
                 refusal.routing_code
             ),
+            RunError::RoutingUnavailable(unavailable) => write!(
+                f,
+                "routing_unavailable: the routing module gave no usable account decision ({})",
+                unavailable.reason.as_str()
+            ),
         }
     }
 }
@@ -954,6 +1025,10 @@ impl From<WalWriteError> for RunError {
     fn from(e: WalWriteError) -> Self {
         match e {
             WalWriteError::Failed(detail) => RunError::Wal(detail),
+            WalWriteError::RelocationIncomplete { reason } => RunError::Transient(reason),
+            WalWriteError::ProofPathUnavailable => {
+                RunError::Wal(WalWriteError::ProofPathUnavailable.to_string())
+            }
             WalWriteError::SessionTooLarge { max_bytes } => RunError::SessionTooLarge { max_bytes },
             WalWriteError::RetainedSessionTooLarge { max_bytes } => {
                 RunError::RetainedSessionTooLarge { max_bytes }
@@ -967,6 +1042,9 @@ impl From<broca_wal::WalError> for RunError {
     /// failure, corruption included, stays [`RunError::Wal`] with its text, exactly as before.
     fn from(error: broca_wal::WalError) -> Self {
         match error {
+            error @ broca_wal::WalError::RelocationIncomplete { .. } => {
+                RunError::Transient(error.to_string())
+            }
             broca_wal::WalError::NewerWriter { missing, .. } => RunError::NewerWriter { missing },
             other => RunError::Wal(other.to_string()),
         }
@@ -1878,6 +1956,15 @@ where
             RunError::Wal("admission checkpoint has no session input accounting".into())
         })?;
     writer.seed_input_token_limit(prior.input_budget.limit);
+    // Store and held-row replay see only the WAL tail. The checkpoint folds the same records
+    // as full replay, including the measured request that may already be in the prefix.
+    prior.output_reservation = snapshot
+        .checkpoint_at_head
+        .output_reservation
+        .clone()
+        .ok_or_else(|| {
+            RunError::Wal("admission checkpoint has no output reservation history".into())
+        })?;
     if let Some(compaction) = &snapshot.checkpoint_at_head.compaction {
         prior.compaction = compaction.clone();
         if let Some(state) = compaction.state() {
@@ -5236,6 +5323,15 @@ where
                 }
             }
             let state = compaction_state.as_mut().expect("Setup is durable");
+            // The run's frozen account, when its selection names a subscription account with a
+            // vault-served account id. Rides and notices compare it against the durable last
+            // notice's account, so a restart rebuilds both sides from the WAL instead of memory.
+            // Unknown runs (no routing selection, or an unrouted credential) clear it to `None`
+            // and send neither cause nor event, leaving the last known account in place.
+            state.current_account = control
+                .auth_selection
+                .as_ref()
+                .and_then(crate::compaction::view::selection_account_label);
             let session_ref = crate::wal_writer::agent_session_ref(&req.session);
             // Ride when the prefix is being rewritten anyway, then fetch the newest announced
             // view with `view.get`; either is offered here, at the boundary, and recorded before
@@ -6824,6 +6920,7 @@ pub(crate) async fn project_committed<W: WalStore>(
     let use_seed = seed.as_ref().is_some_and(|seed| {
         !retained_seed
             && prior_policy.is_some()
+            && seed.admission_checkpoint.output_reservation.is_some()
             && seed
                 .deferred_calls
                 .as_ref()
@@ -6840,10 +6937,9 @@ pub(crate) async fn project_committed<W: WalStore>(
         .flatten();
     // This WAL read runs inline on the async task while the store write below is offloaded to a
     // blocking thread. It is an incremental tail bounded by the projection watermark only when
-    // `use_seed` holds. A retained lineage, a seed without a recorded policy, a seed whose
-    // deferred-call summary lacks its stopped-run set, or a budgeted run without a valid seed
-    // reads from sequence zero, so its cost grows with the WAL; the seeded-write retry below is
-    // also a full read.
+    // `use_seed` holds. Retained lineages, missing policy or reservation history, incomplete
+    // deferred-call summaries, and invalid budget seeds require reading from sequence zero,
+    // so their cost grows with the WAL; the seeded-write retry below is also a full read.
     //
     // Moving the read onto a blocking thread needs an owned read handle: WalStore is threaded
     // through the run_loop entry points as a borrow, and giving it Clone is a public API change.
@@ -12663,6 +12759,7 @@ mod tests {
                 has_deferred_calls: None,
                 tags: Some(crate::tags::LineageTags::Off),
                 pending_order: None,
+                output_reservation: Some(Default::default()),
                 input_budget: Some(crate::input_budget::InputTokenBudget::default()),
                 session_class: None,
                 // A valid tail seed includes the first run's WAL-derived policy.

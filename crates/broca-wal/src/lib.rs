@@ -16,6 +16,7 @@ pub mod file_wal;
 pub mod floor;
 pub mod framing;
 pub mod fs_ops;
+pub mod head_proof;
 pub mod record;
 pub mod state_format;
 
