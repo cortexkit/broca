@@ -375,7 +375,7 @@ fn reply_shape(content: &[ContentBlock]) -> Value {
             ContentBlock::Text { .. } => text += 1,
             ContentBlock::TextWithState { .. } => text_with_state += 1,
             ContentBlock::ToolCall(_) => tool_calls += 1,
-            ContentBlock::ToolResult(_) => {}
+            ContentBlock::ToolResult(_) | ContentBlock::ProviderFallback { .. } => {}
         }
     }
     json!({

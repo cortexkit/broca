@@ -696,19 +696,23 @@ impl SqliteStore {
         let lifecycle = self.conn.lock().unwrap().query_row(
             "SELECT event_key,subject,epoch,run_id,seq,session,body FROM bus_event_outbox INDEXED BY bus_event_unpublished WHERE published_ms IS NULL AND best_effort=0 ORDER BY rowid LIMIT 1", [],
             |r| {
-                let session: String = r.get(5)?;
-                let session: BindIdentity = serde_json::from_str(&session).map_err(|e| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e)))?;
+                let body: Vec<u8> = r.get(6)?;
+                // Read the session_ref header from the queued body, not the session column,
+                // so replayed events keep the exact reference minted when they were queued.
+                let queued: serde_json::Value = serde_json::from_slice(&body).map_err(|e| rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Blob, Box::new(e)))?;
+                let reference = queued.get("session_ref").and_then(serde_json::Value::as_str)
+                    .ok_or(rusqlite::Error::InvalidColumnType(6, "session_ref".into(), rusqlite::types::Type::Blob))?;
                 let subject: String = r.get(1)?;
                 let mut headers = Headers::from([
                     ("kind".into(), subject.split(".event.broca.").nth(1).unwrap_or_default().trim_end_matches(".v1").into()),
                     ("epoch".into(),r.get(2)?), ("run_id".into(),r.get(3)?),
-                    ("seq".into(),r.get::<_,u64>(4)?.to_string()), ("session_ref".into(),agent_session_ref(&session)),
+                    ("seq".into(),r.get::<_,u64>(4)?.to_string()), ("session_ref".into(),reference.into()),
                 ]);
                 // A skip marker spans runs, so it names none.
                 if headers.get("run_id").is_some_and(String::is_empty) {
                     headers.remove("run_id");
                 }
-                Ok(Publication { event_key:r.get(0)?, headers, subject, body:r.get(6)?, digest: None })
+                Ok(Publication { event_key:r.get(0)?, headers, subject, body, digest: None })
             },
         ).optional()?;
         match lifecycle {
@@ -1078,6 +1082,36 @@ mod tests {
         let s = SqliteStore::open_in_memory().unwrap();
         s.enable_bus_events("box_test").unwrap();
         s
+    }
+
+    #[test]
+    fn queued_v1_run_event_keeps_minted_reference_in_body_and_headers() {
+        let store = enabled();
+        store
+            .project_bus_events(
+                &session(),
+                "epoch",
+                &[start(), finish(2, RunFinishReason::Completed)],
+                2000,
+            )
+            .unwrap();
+        let old = broca_core::wal_writer::legacy_session_ref("runner", "/synthetic/old", "s1");
+        let event = store.pending_bus_event().unwrap().unwrap();
+        let mut body: serde_json::Value = serde_json::from_slice(&event.body).unwrap();
+        body["session_ref"] = old.clone().into();
+        let minted = serde_json::to_vec(&body).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE bus_event_outbox SET body=?1 WHERE event_key=?2",
+                rusqlite::params![minted, event.event_key],
+            )
+            .unwrap();
+        let queued = store.pending_bus_event().unwrap().unwrap();
+        assert_eq!(queued.body, minted);
+        assert_eq!(queued.headers["session_ref"], old);
     }
     type OutboxRow = (String, u64, String, Vec<u8>, Option<u64>);
     fn rows(store: &SqliteStore) -> Vec<OutboxRow> {

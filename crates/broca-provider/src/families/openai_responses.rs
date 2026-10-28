@@ -475,6 +475,8 @@ fn user_text_content(
                     | ContentBlock::RedactedReasoning { .. }
                     | ContentBlock::ToolCall(_)
                     | ContentBlock::ToolResult(_) => None,
+                    // Anthropic's server-side fallback handoff means nothing to this family's API: dropped.
+                    ContentBlock::ProviderFallback { .. } => None,
                 })
                 .collect(),
         );
@@ -603,6 +605,8 @@ fn convert_assistant_items(
             ContentBlock::Reasoning { .. }
             | ContentBlock::RedactedReasoning { .. }
             | ContentBlock::ToolResult(_) => {}
+            // Anthropic's server-side fallback handoff means nothing to this family's API: dropped.
+            ContentBlock::ProviderFallback { .. } => {}
         }
     }
     flush_text(&mut out, &mut text);
@@ -1382,6 +1386,9 @@ impl OpenAiResponsesNormalizer {
                 finish_reason: self.finish_reason,
                 service_tier_used: self.service_tier_used.clone(),
                 speed_used: None,
+                // No non-Anthropic family reports a server-side fallback or per-model usage.
+                served_model: None,
+                usage_iterations: None,
             }));
             out.push(NormalizedEvent::Control(ProviderControl::Finished {
                 usage: self.usage,
@@ -1739,6 +1746,7 @@ fn response_error_class(event: &Value, code: Option<&str>) -> ErrorClass {
             | "organization_spend_limit_exceeded"
             | "project_spend_limit_exceeded"
             | "invalid_prompt"
+            | "content_filter"
             | "cyber_policy"
             | "bio_policy"
             | "misalignment_policy_violation",
@@ -1799,6 +1807,41 @@ mod tests {
         let error = response_stream_error(&typed, true, false);
         assert_eq!(error.class, ErrorClass::Transient);
         assert_eq!(error.provider_code, None);
+    }
+
+    /// A filtered stream must not be retried: `content_filter` ends the step in every
+    /// error shape the classifier reads, while an unlisted failure code still retries.
+    #[test]
+    fn content_filter_stream_error_is_permanent() {
+        for event in [
+            serde_json::json!({"type":"response.failed","response":{"error":{"code":"content_filter"}}}),
+            serde_json::json!({"type":"error","error":{"code":"content_filter"}}),
+            serde_json::json!({"type":"error","code":"content_filter"}),
+        ] {
+            let nested = event["type"] == "response.failed";
+            let error = response_stream_error(&event, nested, false);
+            assert_eq!(error.class, ErrorClass::Permanent, "{event}");
+            assert_eq!(
+                error.provider_code.as_deref(),
+                Some("content_filter"),
+                "{event}"
+            );
+            assert_eq!(error.status, None);
+        }
+        for event in [
+            serde_json::json!({"type":"response.failed","response":{"error":{"code":"internal_error"}}}),
+            serde_json::json!({"type":"error","error":{"code":"internal_error"}}),
+            serde_json::json!({"type":"error","code":"internal_error"}),
+        ] {
+            let nested = event["type"] == "response.failed";
+            let error = response_stream_error(&event, nested, false);
+            assert_eq!(error.class, ErrorClass::Transient, "{event}");
+            assert_eq!(
+                error.provider_code.as_deref(),
+                Some("internal_error"),
+                "{event}"
+            );
+        }
     }
 
     fn extract_assistant_text(events: &[NormalizedEvent]) -> String {

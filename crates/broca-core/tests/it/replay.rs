@@ -120,6 +120,7 @@ fn assistant_tool_call(id: &str, name: &str) -> AssistantMessage {
 
 fn step_with_call(step: u64, id: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        fallback: Default::default(),
         written_at_ms: None,
         tags: None,
         hooks: None,
@@ -152,6 +153,7 @@ fn usage_with_cache(input_tokens: u64, cached_input_tokens: u64, output_tokens: 
 
 fn step_text_with_usage(step: u64, text: &str, usage: Usage) -> WalRecord {
     WalRecord::ModelStepFinished {
+        fallback: Default::default(),
         written_at_ms: None,
         tags: None,
         hooks: None,
@@ -845,6 +847,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -1386,6 +1389,11 @@ async fn provider_attempt_records_change_nothing_replay_reads() {
             );
             turn.1 = plain_turn.1;
         }
+        // The output reservation is the one reader of attempt records: it takes an attempt's
+        // rendered body length as the measurement its next estimate scales from. It is asserted
+        // on its own below; everything else replay reads must not change.
+        let reservation = state.output_reservation.clone();
+        state.output_reservation = plain_state.output_reservation.clone();
         assert_eq!(
             format!("{state:?}"),
             format!("{plain_state:?}"),
@@ -1398,6 +1406,15 @@ async fn provider_attempt_records_change_nothing_replay_reads() {
             "{label}"
         );
         checkpoint.at_seq = plain_checkpoint.at_seq;
+        // The checkpoint carries the reservation fold replay builds from the same log, so a
+        // resume from it clamps as a full replay would. That fold is the one part allowed to
+        // differ from the plain log's checkpoint.
+        assert_eq!(
+            format!("{:?}", checkpoint.output_reservation),
+            format!("{:?}", Some(&reservation)),
+            "{label}: the checkpoint's reservation fold is replay's"
+        );
+        checkpoint.output_reservation = plain_checkpoint.output_reservation.clone();
         assert_eq!(
             format!("{checkpoint:?}"),
             format!("{plain_checkpoint:?}"),
@@ -1425,6 +1442,19 @@ async fn provider_attempt_records_change_nothing_replay_reads() {
     }
     assert!(inserted >= 6, "both model steps carry attempt records");
     compare("live-shaped attempt records", &live_shaped, inserted);
+    // With an attempt record before each finished step, as the live loop writes them, the
+    // output reservation has a measurement for the run's model; without them it has none.
+    let model = records
+        .iter()
+        .find_map(|r| match r {
+            WalRecord::RunStarted { config, .. } => Some(config.model.clone()),
+            _ => None,
+        })
+        .expect("the run's RunStarted");
+    assert!(replay(&live_shaped)
+        .output_reservation
+        .has_measurement(&model));
+    assert!(!plain_state.output_reservation.has_measurement(&model));
 
     for insert_at in 1..records.len() {
         let label = format!("attempt record before record {insert_at}/{}", records.len());
@@ -1435,14 +1465,17 @@ async fn provider_attempt_records_change_nothing_replay_reads() {
         );
         compare(&label, &with_records, 1);
 
-        // A crash right after the attempt record: the WAL ends on it.
-        let cut = replay(&with_records[..=insert_at]);
+        // A crash right after the attempt record: the WAL ends on it. The output reservation
+        // holds that attempt's body length for the step it belongs to, which is the one
+        // difference allowed.
+        let mut cut = replay(&with_records[..=insert_at]);
         let cut_plain = replay(&records[..insert_at]);
         assert_eq!(
             render_prompt(&cut.prompt),
             render_prompt(&cut_plain.prompt),
             "{label}: rendered prompt of the cut WAL"
         );
+        cut.output_reservation = cut_plain.output_reservation.clone();
         assert_eq!(
             format!("{cut:?}"),
             format!("{cut_plain:?}"),
@@ -2508,6 +2541,7 @@ async fn cross_episode_resume_is_exactly_once() {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -3182,6 +3216,7 @@ fn budget_fired_semantic_validation_rejects_wrong_early_reordered_and_duplicate_
     let mut reordered = vec![
         budgeted_start("r"),
         WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -3552,4 +3587,326 @@ async fn a_new_episode_appends_onto_a_lineage_sealed_by_an_interrupt() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─────────────── content-filter fallback: refused steps and the schedule ───────────────
+
+const FALLBACK_SOURCE: &str = "claude-opus-5-5";
+const FALLBACK_MODEL: &str = "claude-opus-4-8";
+
+fn fallback_handle() -> ModelHandle {
+    ModelHandle::new("anthropic", FALLBACK_MODEL)
+}
+
+fn source_handle() -> ModelHandle {
+    ModelHandle::new("anthropic", FALLBACK_SOURCE)
+}
+
+/// A run start on the Anthropic source model, admitted at `ts_ms`.
+fn source_start(run: &str, model: &str, ts_ms: Option<u64>) -> WalRecord {
+    let mut record = start(run, "hi");
+    if let WalRecord::RunStarted {
+        config, ts_ms: at, ..
+    } = &mut record
+    {
+        config.model = ModelHandle::new("anthropic", model);
+        *at = ts_ms;
+    }
+    record
+}
+
+fn schedule(phase: serde_json::Value, re_refusals: u8, at: u64) -> serde_json::Value {
+    json!({"source": source_handle(), "fallback": fallback_handle(), "phase": phase,
+        "re_refusals": re_refusals, "updated_at_ms": at})
+}
+
+fn refused(step: u64, input_tokens: u64, schedule: serde_json::Value) -> WalRecord {
+    serde_json::from_value(json!({"type":"model_step_refused","step_id":step,
+        "usage":{"input_tokens":input_tokens,"output_tokens":2},"discarded_blocks":1,
+        "schedule":schedule}))
+    .unwrap()
+}
+
+/// A committed step with the fallback members `extra` merged in.
+fn fallback_step(step: u64, content: serde_json::Value, extra: serde_json::Value) -> WalRecord {
+    let mut value = json!({"type":"model_step_finished","step_id":step,
+        "assistant_message":{"message_id":format!("m{step}"),"content":content},
+        "usage":{"input_tokens":5,"output_tokens":3},"retries_used":0});
+    value
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    serde_json::from_value(value).unwrap()
+}
+
+fn routed(reason: &str) -> serde_json::Value {
+    json!({"model": fallback_handle(), "reason": reason})
+}
+
+fn finished(usage: Usage) -> WalRecord {
+    WalRecord::RunFinished {
+        interrupt_reason: None,
+        ts_ms: None,
+        reason: RunFinishReason::Completed,
+        usage,
+        error: None,
+        retries_used: 0,
+    }
+}
+
+/// The records of a plain source refusal of step 1, re-sent to the fallback model: the run
+/// start, the step, the refused attempt, the refusal (synced before the re-send), the
+/// fallback's attempt, and the fallback's committed answer.
+fn plain_refusal_records() -> Vec<WalRecord> {
+    vec![
+        source_start("r", FALLBACK_SOURCE, Some(1_000)),
+        WalRecord::StepStarted { step_id: StepId(1) },
+        attempt_record(StepId(1), 0, AttemptOutcome::Complete),
+        refused(
+            1,
+            100,
+            schedule(json!({"kind":"fallback","remaining":10}), 0, 2_000),
+        ),
+        attempt_record(StepId(1), 1, AttemptOutcome::Complete),
+        fallback_step(
+            1,
+            json!([{"type":"text","text":"fallback answer"}]),
+            json!({"route": routed("refusal"),
+                "refusal_fallback": schedule(json!({"kind":"fallback","remaining":9}), 0, 3_000)}),
+        ),
+    ]
+}
+
+fn assistant_messages(prompt: &[Message]) -> Vec<&Message> {
+    prompt
+        .iter()
+        .filter(|m| m.role == Role::Assistant)
+        .collect()
+}
+
+/// A refused-then-re-sent step replays as the fallback's answer alone, stamped with the
+/// fallback model; the refused call adds its usage and leaves the schedule it armed.
+#[test]
+fn a_refused_step_replays_as_the_fallback_answer_with_both_calls_billed() {
+    let mut records = plain_refusal_records();
+    records.push(finished(Usage::default()));
+    let state = replay(&records);
+    let answers = assistant_messages(&state.prompt);
+    assert_eq!(answers.len(), 1, "{:?}", state.prompt);
+    assert_eq!(
+        answers[0].content,
+        vec![ContentBlock::Text {
+            text: "fallback answer".into()
+        }]
+    );
+    assert_eq!(answers[0].origin, Some(fallback_handle()));
+    assert_eq!(state.completed_steps, 1);
+    assert_eq!(state.usage.input_tokens, Some(105));
+    assert_eq!(state.usage.output_tokens, Some(5));
+    assert_eq!(
+        state.refused_steps,
+        [StepId(1)]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    let schedule = state
+        .refusal_fallback
+        .expect("the schedule survives replay");
+    assert_eq!(
+        schedule.phase,
+        broca_wal::RefusalFallbackPhase::Fallback { remaining: 9 }
+    );
+    assert_eq!(
+        broca_core::refusal_fallback::route(Some(&schedule), true),
+        broca_core::refusal_fallback::StepRoute::Fallback
+    );
+
+    // `by_model`: the refused call under the source, the answer under the fallback.
+    let mut usage = broca_core::replay::RunUsageProjection::new(RunId("r".into()));
+    for record in &records {
+        usage.observe(record);
+    }
+    let rows = serde_json::to_value(&usage.usage).unwrap();
+    let by_model = rows["by_model"].as_array().unwrap();
+    let row = |model: &str| {
+        by_model
+            .iter()
+            .find(|row| row["model"] == model)
+            .unwrap_or_else(|| panic!("no {model} row in {rows}"))
+            .clone()
+    };
+    assert_eq!(by_model.len(), 2, "{rows}");
+    assert_eq!(row(FALLBACK_SOURCE)["steps"], 1);
+    assert_eq!(row(FALLBACK_SOURCE)["input_tokens"], 100);
+    assert_eq!(row(FALLBACK_MODEL)["steps"], 1);
+    assert_eq!(row(FALLBACK_MODEL)["input_tokens"], 5);
+}
+
+/// Crash cuts at each boundary of a plain refusal. Before the refusal is durable the step is
+/// redone on the source with no schedule; after it, the step is redone with the schedule
+/// routing it to the fallback; a lost fallback answer reads the same as the cut after the
+/// refusal; a durable one is the fallback's message.
+#[test]
+fn refusal_crash_cuts_replay_to_the_expected_route_and_state() {
+    let records = plain_refusal_records();
+    // Before the refusal record is durable.
+    let before = replay(&records[..3]);
+    assert_eq!(
+        before.resolution,
+        ReplayResolution::Resume { pending: None }
+    );
+    assert_eq!(before.refusal_fallback, None);
+    assert!(before.refused_steps.is_empty());
+    assert_eq!(before.usage, Usage::default());
+    assert!(assistant_messages(&before.prompt).is_empty());
+    assert_eq!(
+        broca_core::refusal_fallback::route(before.refusal_fallback.as_ref(), true),
+        broca_core::refusal_fallback::StepRoute::Source
+    );
+
+    // After the refusal, with or without the fallback's attempt, and with the fallback's
+    // answer queued but never synced: the same state.
+    for cut in [4, 5] {
+        let after = replay(&records[..cut]);
+        assert_eq!(after.resolution, ReplayResolution::Resume { pending: None });
+        assert_eq!(after.completed_steps, 0);
+        assert!(assistant_messages(&after.prompt).is_empty());
+        assert_eq!(after.usage.input_tokens, Some(100));
+        assert!(after.refused_steps.contains(&StepId(1)));
+        assert_eq!(
+            broca_core::refusal_fallback::route(after.refusal_fallback.as_ref(), true),
+            broca_core::refusal_fallback::StepRoute::Fallback
+        );
+    }
+
+    // The fallback's answer is durable but the run's terminal is not.
+    let answered = replay(&records);
+    assert!(matches!(
+        answered.resolution,
+        ReplayResolution::LineageIdle { .. }
+    ));
+    assert_eq!(
+        assistant_messages(&answered.prompt)[0].origin,
+        Some(fallback_handle())
+    );
+}
+
+/// A refusal after a completed tool call commits the step as a tool step and arms the
+/// schedule; a cut after the tool-plan barrier keeps both, the call is not re-sent to the
+/// model, and the next step routes to the fallback.
+#[test]
+fn a_refusal_after_tool_use_survives_a_cut_after_the_tool_plan_barrier() {
+    let records = vec![
+        source_start("r", FALLBACK_SOURCE, Some(1_000)),
+        WalRecord::StepStarted { step_id: StepId(1) },
+        fallback_step(
+            1,
+            json!([{"type":"tool_call","tool_call_id":"t1","tool_name":"edit","input":{}}]),
+            json!({"finish_reason":"tool_calls","refusal_after_tool_use":true,
+                "refusal_fallback": schedule(json!({"kind":"fallback","remaining":10}), 0, 2_000)}),
+        ),
+        batch_started("b1", 1, &["t1"]),
+        intent("b1", "t1"),
+    ];
+    let state = replay(&records);
+    assert!(
+        matches!(state.resolution, ReplayResolution::Interrupted { ref indeterminate } if indeterminate == &[ToolCallId("t1".into())]),
+        "{:?}",
+        state.resolution
+    );
+    assert_eq!(
+        state.open_tool_turn.as_ref().unwrap().0.origin,
+        Some(source_handle())
+    );
+    assert!(state.refused_steps.is_empty());
+    assert_eq!(
+        broca_core::refusal_fallback::route(state.refusal_fallback.as_ref(), true),
+        broca_core::refusal_fallback::StepRoute::Fallback
+    );
+
+    // The batch commits and step 2 goes to the fallback by the schedule.
+    let mut records = records;
+    records.extend([
+        result("b1", "t1", DispatchOutcome::Completed),
+        batch_finished("b1"),
+        WalRecord::TurnFinished { step_id: StepId(1) },
+        WalRecord::StepStarted { step_id: StepId(2) },
+        fallback_step(
+            2,
+            json!([{"type":"text","text":"done"}]),
+            json!({"route": routed("schedule"),
+                "refusal_fallback": schedule(json!({"kind":"fallback","remaining":9}), 0, 3_000)}),
+        ),
+    ]);
+    let state = replay(&records);
+    let answers = assistant_messages(&state.prompt);
+    assert_eq!(answers.len(), 2);
+    assert_eq!(answers[0].origin, Some(source_handle()));
+    assert_eq!(answers[1].origin, Some(fallback_handle()));
+}
+
+/// A step is re-sent at most once: a second refusal record for it is corruption.
+#[test]
+fn a_second_refusal_of_the_same_step_is_refused_as_corrupt() {
+    let mut records = plain_refusal_records();
+    records.truncate(4);
+    records.push(refused(
+        1,
+        100,
+        schedule(json!({"kind":"fallback","remaining":10}), 0, 2_500),
+    ));
+    match replay_raw(&records) {
+        Err(error) => assert!(
+            error.to_string().contains("second model_step_refused"),
+            "{error}"
+        ),
+        Ok(state) => panic!("a duplicate refusal replayed: {:?}", state.resolution),
+    }
+}
+
+/// The schedule carries into the next episode of the same source model, and is cleared by
+/// an episode under another model or one admitted more than a day after it last changed.
+#[test]
+fn the_schedule_carries_across_episodes_until_a_model_change_or_a_day_idle() {
+    let mut records = plain_refusal_records();
+    records.push(finished(Usage::default()));
+    let next = |model: &str, ts: u64| {
+        let mut records = records.clone();
+        records.push(source_start("r2", model, Some(ts)));
+        replay(&records).refusal_fallback
+    };
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+    assert!(next(FALLBACK_SOURCE, 3_000 + DAY).is_some());
+    assert_eq!(next(FALLBACK_SOURCE, 3_001 + DAY), None);
+    assert_eq!(next("claude-fable-5-1", 4_000), None);
+}
+
+/// A step answered by an Anthropic server-side fallback keeps the episode's model as its
+/// origin (its served model is attribution, not identity) and counts under the served model.
+#[test]
+fn a_server_side_fallback_step_keeps_its_origin_and_counts_under_the_served_model() {
+    let records = vec![
+        source_start("r", FALLBACK_SOURCE, None),
+        WalRecord::StepStarted { step_id: StepId(1) },
+        fallback_step(
+            1,
+            json!([{"type":"provider_fallback","from_model":FALLBACK_SOURCE,"to_model":FALLBACK_MODEL},
+                {"type":"text","text":"ok"}]),
+            json!({"served_model": FALLBACK_MODEL}),
+        ),
+    ];
+    let state = replay(&records);
+    let answers = assistant_messages(&state.prompt);
+    assert_eq!(answers[0].origin, Some(source_handle()));
+    assert!(matches!(
+        answers[0].content[0],
+        ContentBlock::ProviderFallback { .. }
+    ));
+    let mut usage = broca_core::replay::RunUsageProjection::new(RunId("r".into()));
+    for record in &records {
+        usage.observe(record);
+    }
+    let rows = serde_json::to_value(&usage.usage).unwrap();
+    assert_eq!(rows["by_model"][0]["model"], FALLBACK_MODEL, "{rows}");
+    assert_eq!(rows["by_model"].as_array().unwrap().len(), 1);
 }

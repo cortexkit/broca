@@ -474,7 +474,9 @@ fn repairable_import_prefix(
             } if dangling_seed => dangling_seed = false,
             // A record type from a newer build is informational by the contract on
             // `WalRecord`, so it neither makes nor breaks a repairable import prefix.
-            WalRecord::Unknown => {}
+            WalRecord::WriterOpened { .. }
+            | WalRecord::WriterClosed { .. }
+            | WalRecord::Unknown => {}
             // This reader release decodes compaction records but does not act on them yet.
             WalRecord::CompactionRequest { .. }
             | WalRecord::CompactionMessage { .. }
@@ -483,6 +485,7 @@ fn repairable_import_prefix(
             | WalRecord::CompactionViewApplied { .. }
             | WalRecord::ContextCeilingWait { .. }
             | WalRecord::ContextCeilingDecided { .. }
+            | WalRecord::OutputReservationClamped { .. }
             | WalRecord::CompactionRideWait { .. }
             | WalRecord::CompactionRideWaitEnded { .. }
             | WalRecord::CompactionNotice { .. } => {}

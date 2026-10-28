@@ -3282,4 +3282,267 @@
       ]
     }
   }
+,
+  "catalog.get \u2014 anthropic server-side fallback capability": {
+    "request": {
+      "arguments": {
+        "model_id": "claude-opus-5-5",
+        "provider_id": "anthropic"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "models": {
+        "anthropic/claude-sonnet-4-5": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.output_modalities": [
+            "text"
+          ],
+          "capability.reasoning": true,
+          "capability.reasoning_options": [
+            {
+              "min": 1024,
+              "type": "budget_tokens"
+            }
+          ],
+          "capability.structured_output": true,
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 1000000,
+          "limit.output": 64000,
+          "model.canonical_id": null,
+          "model.family": "claude-sonnet",
+          "model.open_weights": false,
+          "model.status": null,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 300000000
+          },
+          "rate.cache_write": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 3750000000
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 15000000000
+          },
+          "wire.npm": {
+            "from": "provider",
+            "value": "@ai-sdk/anthropic"
+          }
+        },
+        "anthropic/claude-opus-5-5": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.output_modalities": [
+            "text"
+          ],
+          "capability.reasoning": true,
+          "capability.reasoning_options": [
+            {
+              "min": 1024,
+              "type": "budget_tokens"
+            }
+          ],
+          "capability.structured_output": true,
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 1000000,
+          "limit.output": 64000,
+          "model.canonical_id": null,
+          "model.family": "claude-sonnet",
+          "model.open_weights": false,
+          "model.status": null,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 300000000
+          },
+          "rate.cache_write": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 3750000000
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 15000000000
+          },
+          "wire.npm": {
+            "from": "provider",
+            "value": "@ai-sdk/anthropic"
+          },
+          "capability.server_side_fallback": true
+        },
+        "anthropic/claude-haiku-5-5": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.output_modalities": [
+            "text"
+          ],
+          "capability.reasoning": true,
+          "capability.reasoning_options": [
+            {
+              "min": 1024,
+              "type": "budget_tokens"
+            }
+          ],
+          "capability.structured_output": true,
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 1000000,
+          "limit.output": 64000,
+          "model.canonical_id": null,
+          "model.family": "claude-sonnet",
+          "model.open_weights": false,
+          "model.status": null,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 300000000
+          },
+          "rate.cache_write": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 3750000000
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 15000000000
+          },
+          "wire.npm": {
+            "from": "provider",
+            "value": "@ai-sdk/anthropic"
+          },
+          "capability.server_side_fallback": false
+        },
+        "anthropic/claude-sonnet-5": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.output_modalities": [
+            "text"
+          ],
+          "capability.reasoning": true,
+          "capability.reasoning_options": [
+            {
+              "min": 1024,
+              "type": "budget_tokens"
+            }
+          ],
+          "capability.structured_output": true,
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 1000000,
+          "limit.output": 64000,
+          "model.canonical_id": null,
+          "model.family": "claude-sonnet",
+          "model.open_weights": false,
+          "model.status": null,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 300000000
+          },
+          "rate.cache_write": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 3750000000
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 15000000000
+          },
+          "wire.npm": {
+            "from": "provider",
+            "value": "@ai-sdk/anthropic"
+          }
+        }
+      },
+      "resolved_at_ms": 0,
+      "source": "models.dev"
+    }
+  }
 }

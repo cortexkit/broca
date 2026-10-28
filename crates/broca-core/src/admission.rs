@@ -687,6 +687,10 @@ pub struct AdmissionCheckpointV1 {
     /// outlives the next thing the session's actor writes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_order: Option<StagedOrder>,
+    /// The complete WAL's reservation fold, including measurements before the store watermark.
+    /// Missing on older checkpoints; a tail alone cannot recover an earlier measured request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_reservation: Option<crate::output_reservation::OutputReservationHistory>,
 }
 
 /// A `DeliveryOrdered` record set aside for the `Queued` record that follows it.
@@ -723,6 +727,9 @@ impl AdmissionCheckpointV1 {
             compaction: Some(crate::compaction::CompactionCheckpoint::None),
             tags: Some(crate::tags::LineageTags::unstarted()),
             pending_order: None,
+            output_reservation: Some(
+                crate::output_reservation::OutputReservationHistory::default(),
+            ),
         }
     }
 
@@ -734,6 +741,7 @@ impl AdmissionCheckpointV1 {
             checkpoint.has_deferred_calls = None;
             checkpoint.lineage_retention = None;
             checkpoint.tags = None;
+            checkpoint.output_reservation = None;
         }
         checkpoint.fold_frames(records)?;
         if checkpoint
@@ -767,6 +775,9 @@ impl AdmissionCheckpointV1 {
 
     /// Fold one WAL record. The mutation is committed only after all corruption checks pass.
     pub fn fold_record(&mut self, seq: u64, record: &WalRecord) -> Result<(), ReplayError> {
+        if let Some(history) = &mut self.output_reservation {
+            history.fold(record);
+        }
         if let Some(head) = &mut self.head {
             head.observe(record);
         }
@@ -1021,7 +1032,9 @@ impl AdmissionCheckpointV1 {
             WalRecord::Steered { .. } => {}
             // A record type written by a newer build: informational by the contract on
             // `WalRecord`, so it changes no admission state (only `at_seq` advances past it).
-            WalRecord::Unknown => {}
+            WalRecord::WriterOpened { .. }
+            | WalRecord::WriterClosed { .. }
+            | WalRecord::Unknown => {}
             // Compaction state is folded below; it does not change admission's episode counters.
             WalRecord::CompactionRequest { .. }
             | WalRecord::CompactionMessage { .. }
@@ -1030,11 +1043,16 @@ impl AdmissionCheckpointV1 {
             | WalRecord::CompactionViewApplied { .. }
             | WalRecord::ContextCeilingWait { .. }
             | WalRecord::ContextCeilingDecided { .. }
+            | WalRecord::OutputReservationClamped { .. }
             | WalRecord::CompactionRideWait { .. }
             | WalRecord::CompactionRideWaitEnded { .. }
             | WalRecord::CompactionNotice { .. } => {}
             // Provider attempt evidence is informational only, skipped exactly like `Unknown`.
             WalRecord::ModelAttemptFinished { .. } => {}
+            // A refused step neither opens, pauses nor ends an episode: its re-send commits
+            // under the same step id, and the run's `RunFinished` carries the refused call's
+            // usage in its totals.
+            WalRecord::ModelStepRefused { .. } => {}
             // A resume's own account of what it found: informational, skipped like `Unknown`.
             WalRecord::ResumeStarted { .. } => {}
             // A cache warm changes no episode, queue or ownership state.
@@ -1090,6 +1108,19 @@ impl AdmissionCheckpointV1 {
                     .last_episode
                     .as_ref()
                     .map(|episode| episode.config.model.clone());
+                // The first run's account was folded before the checkpoint had a state
+                // (Setup creates it), so it would otherwise be lost on a refold. Seed it
+                // here from the durable episode that wrote it, so a restart rebuilds the
+                // same baseline without memory.
+                if state.current_account.is_none() {
+                    state.current_account = self.last_episode.as_ref().and_then(|episode| {
+                        episode
+                            .config
+                            .auth_selection
+                            .as_ref()
+                            .and_then(crate::compaction::view::selection_account_label)
+                    });
+                }
             }
         }
         Ok(())
@@ -1500,6 +1531,7 @@ mod tests {
             frame(
                 3,
                 WalRecord::ModelStepFinished {
+                    fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
                     hooks: None,
@@ -1548,6 +1580,7 @@ mod tests {
             frame(
                 2,
                 WalRecord::ModelStepFinished {
+                    fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
                     hooks: None,
@@ -1780,6 +1813,7 @@ mod tests {
             frame(
                 12,
                 WalRecord::ModelStepFinished {
+                    fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
                     hooks: None,
@@ -1871,6 +1905,7 @@ mod tests {
             frame(
                 19,
                 WalRecord::ModelStepFinished {
+                    fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
                     hooks: None,
@@ -2131,6 +2166,7 @@ mod tests {
                 WalRecord::RunAuthRefrozen {
                     ts_ms: Some(10),
                     auth_selection: AuthSelection {
+                        auth_method: None,
                         credential_id: "chatgpt:openai".into(),
                         account_ref: Some("first-account".into()),
                         resolved_credential_id: None,
@@ -2144,6 +2180,7 @@ mod tests {
                 WalRecord::RunAuthRefrozen {
                     ts_ms: Some(20),
                     auth_selection: AuthSelection {
+                        auth_method: None,
                         credential_id: "chatgpt:openai".into(),
                         account_ref: Some("second-account".into()),
                         resolved_credential_id: None,
@@ -2163,6 +2200,7 @@ mod tests {
         )
         .expect("replay accepts independent auth refreezes");
         let expected = AuthSelection {
+            auth_method: None,
             credential_id: "chatgpt:openai".into(),
             account_ref: Some("second-account".into()),
             resolved_credential_id: None,
@@ -2207,6 +2245,7 @@ mod tests {
             frame(
                 2,
                 WalRecord::ModelStepFinished {
+                    fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
                     hooks: None,
@@ -2281,6 +2320,7 @@ mod tests {
         };
         config.budget = Some(budget.clone());
         let step = |id, content| WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -2401,6 +2441,7 @@ mod tests {
     #[test]
     fn checkpoint_json_with_pending_payload_is_byte_stable() {
         let checkpoint = AdmissionCheckpointV1 {
+            output_reservation: None,
             head: None,
             has_deferred_calls: None,
             tags: None,

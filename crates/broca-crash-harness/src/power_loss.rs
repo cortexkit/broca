@@ -1385,6 +1385,7 @@ mod tests {
 
     fn large_pending_step() -> WalRecord {
         WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,

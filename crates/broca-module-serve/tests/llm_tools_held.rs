@@ -66,7 +66,7 @@ fn request(who: &str, key: &str, at: i64) -> HoldRequest {
         json!({"principal":format!("reserved:{who}"),"owner":"reserved:owner","scope_ref":"run","scope_epoch":1,"call_key":key}),
     );
     let params = json!({"batch_id":batch_id,"model":args["model"],"questions":args["questions"],"items":[args["item"].clone()],"max_cost_usd":args["max_cost_usd"]}).to_string();
-    HoldRequest { batch_id, scope: scope(), batch_scope: BatchScope::Run { agent_id: "agent".into(), run_id: "run".into() },
+    HoldRequest { project_id: None, batch_id, scope: scope(), batch_scope: BatchScope::Run { agent_id: "agent".into(), run_id: "run".into() },
         principal: format!("reserved:{who}"), call_key: key.into(), agent_id: "agent".into(), provider: "typesafe".into(), model: "typesafe/jev-1.13.0".into(),
         request: params, args_digest: hash(args), frozen_row: json!({"input_rate_nanos":42_000_000,"output_rate_nanos":0,"charge_basis":"metered_api"}).to_string(),
         dedup_key: "one-card".into(), admitted_at_ms: at }
@@ -81,6 +81,7 @@ fn insert(store: &GrantsStore, who: &str, key: &str, at: i64) -> HeldCall {
 
 fn card() -> Card {
     Card {
+        project_id: None,
         dedup_key: "one-card".into(),
         scope: scope(),
         agent_id: "agent".into(),
@@ -138,6 +139,96 @@ fn schema_and_private_file_survive_reopen() {
             0o600
         );
     }
+}
+
+#[test]
+fn always_answer_after_reopen_uses_the_frozen_project_and_cannot_be_recreated_after_revoke() {
+    let path = broca_test_support::scratch_root().join("always-grants.db");
+    let store = GrantsStore::open(&path).unwrap();
+    let mut request = request("p1", "always", 1000);
+    request.project_id = Some("project-a".into());
+    let row = match store.hold(request).unwrap() {
+        HoldAdmission::Inserted(row) => row,
+        other => panic!("unexpected admission: {other:?}"),
+    };
+    let mut card = card();
+    card.project_id = Some("project-a".into());
+    store.put_card(&card).unwrap();
+    drop(store);
+    let store = GrantsStore::open(&path).unwrap();
+    assert_eq!(
+        store
+            .lookup(&row.batch_id, 1000)
+            .unwrap()
+            .unwrap()
+            .project_id
+            .as_deref(),
+        Some("project-a")
+    );
+    assert_eq!(
+        store
+            .card("one-card")
+            .unwrap()
+            .unwrap()
+            .project_id
+            .as_deref(),
+        Some("project-a")
+    );
+    let answer = || CardAnswer {
+        dedup_key: "one-card".into(),
+        card_id: "card-1".into(),
+        decision: Decision::AllowAlways,
+        run_live: false,
+    };
+    store
+        .apply_answer(&scope(), answer(), 1000 + HOLD_MS + 1)
+        .unwrap();
+    let grant = store.grants().unwrap().pop().unwrap();
+    assert_eq!(grant.kind, GrantKind::Always);
+    assert_eq!(grant.project.as_deref(), Some("project-a"));
+    assert!(store.revoke(&grant.id).unwrap());
+    drop(store);
+    let store = GrantsStore::open(&path).unwrap();
+    store
+        .apply_answer(&scope(), answer(), 1000 + HOLD_MS + 2)
+        .unwrap();
+    assert!(store.grants().unwrap().is_empty());
+    assert_eq!(store.generation("agent", "typesafe").unwrap(), 1);
+}
+
+#[test]
+fn legacy_cards_and_held_calls_without_project_remain_readable_and_never_mint_always() {
+    let store = GrantsStore::open_in_memory().unwrap();
+    let row = insert(&store, "p1", "no-project", 1000);
+    let card = card();
+    for body in [
+        serde_json::to_value(&row).unwrap(),
+        serde_json::to_value(&card).unwrap(),
+    ] {
+        assert!(body.get("project_id").is_none());
+    }
+    let legacy_row: HeldCall = serde_json::from_value(serde_json::to_value(&row).unwrap()).unwrap();
+    let legacy_card: Card = serde_json::from_value(serde_json::to_value(&card).unwrap()).unwrap();
+    assert!(legacy_row.project_id.is_none());
+    assert!(legacy_card.project_id.is_none());
+    store.put_card(&legacy_card).unwrap();
+    store
+        .apply_answer(
+            &scope(),
+            CardAnswer {
+                dedup_key: "one-card".into(),
+                card_id: "card-1".into(),
+                decision: Decision::AllowAlways,
+                run_live: true,
+            },
+            1001,
+        )
+        .unwrap();
+    assert!(store.grants().unwrap().is_empty());
+    assert_eq!(
+        store.card("one-card").unwrap().unwrap().state,
+        CardState::Pending
+    );
 }
 
 #[test]

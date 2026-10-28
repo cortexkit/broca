@@ -31,6 +31,12 @@ use tokio::sync::{broadcast, oneshot};
 use crate::lease::{LeaseHandle, OwnedWalTenure};
 
 mod extraction;
+#[path = "open_writers.rs"]
+mod open_writers;
+#[cfg(feature = "test-clock")]
+thread_local! {
+    static WRITER_FS_FOR_TEST: std::cell::RefCell<Option<Arc<dyn broca_wal::fs_ops::FsOps>>> = const { std::cell::RefCell::new(None) };
+}
 mod projection_reader;
 mod retention_changes;
 pub use projection_reader::ReadOnlyWalReader;
@@ -40,7 +46,7 @@ pub use projection_gap::{
     SESSION_PROJECTION_INCOMPLETE,
 };
 mod session_index;
-pub use session_index::{agent_session_ref, SessionRefIndex};
+pub use session_index::{agent_session_ref, legacy_session_ref, SessionRefIndex};
 
 /// A writer opened under a session lease, and the lease its caller keeps.
 pub type WriterAndLease = (Box<dyn Wal + Send>, Box<dyn LeaseHandle>);
@@ -48,6 +54,10 @@ pub type WriterAndLease = (Box<dyn Wal + Send>, Box<dyn LeaseHandle>);
 /// Opens the per-session WAL (mirrors `LeaseStore`, so the file impl swaps for a
 /// future store without touching the loop).
 pub trait WalStore: Send + Sync {
+    /// State-root location for the writer-id/v1 marker protocol. Legacy stores need none.
+    fn writer_marker_root(&self) -> Option<PathBuf> {
+        None
+    }
     /// File-backed sessions stage uploads beside their WAL trees, never in a
     /// second host media store. In-memory stores do not offer upload staging.
     fn uploads(&self) -> Option<crate::media_uploads::Uploads> {
@@ -60,6 +70,13 @@ pub trait WalStore: Send + Sync {
     fn check_move(&self, _session: &BindIdentity, _write: bool) -> Result<(), WalError> {
         Ok(())
     }
+    /// The frame format the logs this store opens write, decided once at boot. Each log the
+    /// store opens reports the same value through [`Wal::wal_config`], which is what a writer
+    /// handle reads at spawn. The default, for stores with no state root, is legacy.
+    fn wal_config(&self) -> broca_wal::WalConfig {
+        broca_wal::WalConfig::LEGACY
+    }
+
     /// Open (creating if absent) the WAL for `session`, ready for appends.
     fn open(&self, session: &BindIdentity) -> Result<Box<dyn Wal + Send>, WalError>;
 
@@ -240,6 +257,22 @@ pub trait WalStore: Send + Sync {
         session: &BindIdentity,
     ) -> Result<Vec<broca_wal::FramedRecord>, WalError>;
 
+    /// Read records with their log-header identity from the same snapshot.
+    /// Stores without a header retain their existing full-read behavior and
+    /// report an unknown identity rather than inventing one from the bind key.
+    fn read_records_with_lineage(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<
+        (
+            Vec<broca_wal::FramedRecord>,
+            Option<broca_wal::WalLineageId>,
+        ),
+        WalError,
+    > {
+        self.read_records(session).map(|records| (records, None))
+    }
+
     /// Read records after a sequence watermark, optionally bounded by the caller's
     /// last fsynced safe head. Implementations may use `anchor` as a validated byte-offset
     /// hint; correctness must not depend on it.
@@ -327,6 +360,13 @@ pub trait WalStore: Send + Sync {
 /// to the same log across processes and restarts.
 pub struct FileWalStore {
     root: PathBuf,
+    /// The frame format every log this store opens writes, decided once at boot (see
+    /// [`FileWalStore::with_config`]). [`FileWalStore::new`] is legacy only.
+    config: broca_wal::WalConfig,
+    /// Set by [`FileWalStore::new`] when its state root is not plainly legacy: every writable
+    /// open then refuses with this error, so a legacy-only store never writes legacy frames
+    /// into a root that may be an overhaul root.
+    refusal: Option<broca_wal::StateRootError>,
     backup_classes: Vec<String>,
     max_read_bytes: u64,
     session_index: Arc<Mutex<Option<Arc<dyn SessionRefIndex>>>>,
@@ -382,6 +422,15 @@ thread_local! {
 
 /// Diagnostic sidecar stored next to the `wal/` directory.
 pub const WAL_MANIFEST_FILENAME: &str = "wal-manifest";
+
+/// The state root holding a store's log directory: its parent, where the `state-format` marker,
+/// the feature floor and the sibling log trees live.
+fn state_root_of(root: &Path) -> PathBuf {
+    match root.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
 
 impl FileWalStore {
     /// Count human prompts when an older episode has no recorded count, bounded by this
@@ -469,13 +518,17 @@ impl FileWalStore {
     }
 
     pub fn check_move(&self, session: &BindIdentity, write: bool) -> Result<(), WalError> {
-        broca_wal::migration::guard(
+        // A cut file may name the session by its folder-based v1 reference (recorded before
+        // the v2 switch) or by its v2 reference. Check both in one pass, so a pending release
+        // under either reference outranks a moved tombstone for writes.
+        let legacy = legacy_session_ref(
+            &session.harness,
+            &session.project_root.to_string_lossy(),
+            &session.session,
+        );
+        broca_wal::migration::guard_refs(
             &self.wal_path(session),
-            &cortexkit_role_llm_runner::session_ref(
-                &session.harness,
-                &session.project_root.to_string_lossy(),
-                &session.session,
-            ),
+            &[&legacy, &agent_session_ref(session)],
             write,
         )
     }
@@ -642,9 +695,34 @@ impl FileWalStore {
         Ok((addresses, unreadable))
     }
 
+    /// A legacy-only store over the log directory `root` (a state root's `wal/`).
+    ///
+    /// It reads its state root's `state-format` marker once, here. When the marker is absent the
+    /// root is legacy and the store writes today's frames. When the root is marked, or its marker
+    /// cannot be read or is unknown, the store is poisoned instead: it still reads, but every
+    /// writable open refuses with [`broca_wal::StateRootError::OverhaulRootNeedsConfig`]. A root
+    /// whose format was decided at boot uses [`Self::with_config`].
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        let refusal = broca_wal::state_format::legacy_store_refusal(&state_root_of(&root));
+        Self::build(root, broca_wal::WalConfig::LEGACY, refusal)
+    }
+
+    /// A store over the log directory `root` whose frame format was decided once at boot by
+    /// [`broca_wal::classify_state_root`]. Every log it opens writes in `config`'s format.
+    pub fn with_config(root: impl Into<PathBuf>, config: broca_wal::WalConfig) -> Self {
+        Self::build(root.into(), config, None)
+    }
+
+    fn build(
+        root: PathBuf,
+        config: broca_wal::WalConfig,
+        refusal: Option<broca_wal::StateRootError>,
+    ) -> Self {
         Self {
-            root: root.into(),
+            root,
+            config,
+            refusal,
             backup_classes: vec!["head".into()],
             max_read_bytes: DEFAULT_MAX_READ_BYTES,
             session_index: Arc::default(),
@@ -902,6 +980,9 @@ impl FileWalStore {
         session_class: Option<&str>,
         authority: extraction::RestoreAuthority<'_>,
     ) -> Result<(Box<dyn Wal + Send>, Arc<AtomicBool>), WalError> {
+        if let Some(refusal) = &self.refusal {
+            return Err(WalError::StateRoot(refusal.clone()));
+        }
         self.check_move(session, true)?;
         let lookup = self.archived_member(session)?;
         let path = if let Some(member) = lookup.member {
@@ -913,6 +994,19 @@ impl FileWalStore {
             // Extraction preserves the logical address and payload; session-ref
             // candidates need no location update.
             extraction::restore(&path, &member.payload, authority).map_err(WalError::Io)?;
+            let archive = if lookup.durable {
+                "wal-archive-durable"
+            } else {
+                "wal-archive"
+            };
+            broca_wal::archive::invalidate_restored_member(
+                &self
+                    .root
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""))
+                    .join(archive),
+                &session_addr(session),
+            );
             path
         } else if let Some(path) = self.resolve_live_path(session)? {
             path
@@ -933,18 +1027,15 @@ impl FileWalStore {
         );
         let retained = path == self.ephemeral_wal_path(session);
         let wal = FileWal::open_with_manifest_and_session_ref(
-            path,
+            path.clone(),
             self.manifest_path(),
             session_addr(session),
             identity,
-            cortexkit_role_llm_runner::session_ref(
-                &session.harness,
-                &session.project_root.to_string_lossy(),
-                &session.session,
-            ),
+            agent_session_ref(session),
         )?
         .with_recovery_cap(self.max_read_bytes)
-        .with_feature_floor(self.feature_floor_path());
+        .with_feature_floor(self.feature_floor_path())
+        .with_wal_config(self.config)?;
         let retained_policy = if retained {
             let records = wal.replay()?;
             records
@@ -953,7 +1044,16 @@ impl FileWalStore {
                     WalRecord::RunStarted { retention, .. } => Some(retention.is_some()),
                     _ => None,
                 })
-                .unwrap_or(retention.is_some() || !records.is_empty())
+                .unwrap_or_else(|| {
+                    retention.is_some()
+                        || records.iter().any(|frame| {
+                            !self.config.is_overhaul()
+                                || !matches!(
+                                    frame.record,
+                                    WalRecord::WriterOpened { .. } | WalRecord::WriterClosed { .. }
+                                )
+                        })
+                })
         } else {
             false
         };
@@ -968,6 +1068,17 @@ impl FileWalStore {
                 session_addr(session),
                 self.root.parent().unwrap_or(&self.root).to_path_buf(),
                 self.session_index.clone(),
+                (
+                    path,
+                    [
+                        legacy_session_ref(
+                            &session.harness,
+                            &session.project_root.to_string_lossy(),
+                            &session.session,
+                        ),
+                        agent_session_ref(session),
+                    ],
+                ),
             )
             .with_placement(
                 self.wal_path(session),
@@ -1160,11 +1271,9 @@ impl FileWalStore {
             while let Some(path) =
                 paths.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
             {
-                if let Err(error) = broca_wal::archive::read_newest_member(
-                    std::slice::from_ref(path),
-                    "0000000000000000",
-                    self.max_read_bytes,
-                ) {
+                if let Err(error) =
+                    broca_wal::archive::prewarm_container_membership(path, self.max_read_bytes)
+                {
                     first_error
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -1509,6 +1618,14 @@ pub fn session_addr(session: &BindIdentity) -> String {
 }
 
 impl WalStore for FileWalStore {
+    fn writer_marker_root(&self) -> Option<PathBuf> {
+        self.config
+            .is_overhaul()
+            .then(|| state_root_of(&self.root).to_path_buf())
+    }
+    fn wal_config(&self) -> broca_wal::WalConfig {
+        self.config
+    }
     fn uploads(&self) -> Option<crate::media_uploads::Uploads> {
         self.root.parent().map(crate::media_uploads::Uploads::at)
     }
@@ -1713,6 +1830,20 @@ impl WalStore for FileWalStore {
         &self,
         session: &BindIdentity,
     ) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
+        self.read_records_with_lineage(session)
+            .map(|(records, _)| records)
+    }
+
+    fn read_records_with_lineage(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<
+        (
+            Vec<broca_wal::FramedRecord>,
+            Option<broca_wal::WalLineageId>,
+        ),
+        WalError,
+    > {
         // READ-ONLY: decode the committed records, discarding a torn final record in
         // memory. This must NOT go through `FileWal::open` — open truncates a torn tail
         // (writer-recovery), and a reader runs CONCURRENTLY with the live writer, so
@@ -1722,11 +1853,10 @@ impl WalStore for FileWalStore {
         // The range reader distinguishes an absent log from a present empty log and retries
         // archive lookup if the live file moved into an archive during the read. replay_file
         // deliberately collapses NotFound to empty, so it cannot supply that distinction.
-        match self
-            .read_records_range(session, 0, None, None)?
-            .into_records()
-        {
-            broca_wal::WalRangeRecords::Complete(records) => Ok(records),
+        let range = self.read_records_range(session, 0, None, None)?;
+        let lineage = range.lineage_id;
+        match range.into_records() {
+            broca_wal::WalRangeRecords::Complete(records) => Ok((records, lineage)),
             broca_wal::WalRangeRecords::Absent => Err(WalError::Io(io::Error::new(
                 io::ErrorKind::NotFound,
                 "session WAL is absent after live and archive lookup",
@@ -1892,6 +2022,7 @@ impl RecordOutcome {
 }
 
 struct AppendBudget {
+    writer_close_reserve: u64,
     retained: bool,
     session_max_bytes: u64,
     max_bytes: u64,
@@ -2009,6 +2140,10 @@ impl std::fmt::Display for WalOpenError {
 impl std::error::Error for WalOpenError {}
 
 enum WalCommand {
+    // Its only caller is a test that needs the test clock, so a featureless test build
+    // would carry it unconstructed.
+    #[cfg(all(test, feature = "test-clock"))]
+    BudgetSnapshot(std_mpsc::Sender<Option<(u64, u64, u64)>>),
     #[cfg(test)]
     AppendDrained(oneshot::Sender<()>),
     /// Append a record at the caller-assigned `seq`, coalesced (no fsync yet). The
@@ -2020,10 +2155,39 @@ enum WalCommand {
         record: Box<WalRecord>,
         frame: Option<Vec<u8>>,
     },
+    /// Append `record` to an overhaul log as the version 4 frame `prepared`, which the
+    /// enqueueing thread built from that record. The writer thread samples `appended_ms` from
+    /// its stamp clock immediately before handing the frame to the log, which stamps the header.
+    AppendV4 {
+        seq: u64,
+        record: Box<WalRecord>,
+        prepared: broca_wal::PreparedV4Frame,
+    },
     /// fsync everything pending + ack with the last FSYNCED seq (a barrier point).
     Sync(oneshot::Sender<Result<u64, WalWriteError>>),
     /// Final fsync if anything is still dirty, then stop the writer.
     Shutdown(std_mpsc::Sender<Result<(), WalWriteError>>),
+}
+
+/// Where a writer thread reads the `appended_ms` it stamps in a version 4 frame. Production
+/// uses [`broca_wal::framing::appended_ms_now`], the wall clock held from going backwards within
+/// the process; a test can drive its own to see exactly when, and on which thread, it is read.
+#[derive(Clone)]
+pub(crate) struct StampClock(Arc<dyn Fn() -> u64 + Send + Sync>);
+
+impl StampClock {
+    pub(crate) fn wall() -> Self {
+        Self(Arc::new(broca_wal::framing::appended_ms_now))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_fn(clock: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        Self(Arc::new(clock))
+    }
+
+    fn now_ms(&self) -> u64 {
+        (self.0)()
+    }
 }
 
 /// Publishes every record after the writer's fsync makes it durable, in FIFO order.
@@ -2063,11 +2227,14 @@ pub type DurableRecordTap =
 /// pointer keeps each slot small and independent of the record's size; the record itself is
 /// still cloned once per publish, exactly as before.
 #[derive(Clone, Debug)]
-pub struct ObservedRecord(Arc<broca_wal::FramedRecord>);
+pub struct ObservedRecord(Arc<(broca_wal::FramedRecord, Option<broca_wal::WalLineageId>)>);
 
 impl ObservedRecord {
     pub fn new(framed: broca_wal::FramedRecord) -> Self {
-        Self(Arc::new(framed))
+        Self(Arc::new((framed, None)))
+    }
+    pub fn lineage_id(&self) -> Option<broca_wal::WalLineageId> {
+        self.0 .1
     }
 }
 
@@ -2081,7 +2248,7 @@ impl std::ops::Deref for ObservedRecord {
     type Target = broca_wal::FramedRecord;
 
     fn deref(&self) -> &broca_wal::FramedRecord {
-        &self.0
+        &self.0 .0
     }
 }
 
@@ -2105,18 +2272,27 @@ impl RecordObserver {
         self
     }
 
-    fn observe(&self, seq: u64, fence: u64, record: &WalRecord) {
+    fn observe(
+        &self,
+        seq: u64,
+        fence: u64,
+        record: &WalRecord,
+        lineage: Option<broca_wal::WalLineageId>,
+    ) {
         if self.subscribers.load(Ordering::Acquire) == 0 {
             return;
         }
         // `broadcast` is bounded and non-blocking: when the projector falls behind it drops
         // the oldest queued records and reports `Lagged`, which makes every live subscriber
         // detach and recover from the WAL rather than allowing this writer-side queue to grow.
-        let _ = self.tx.send(ObservedRecord::new(broca_wal::FramedRecord {
-            seq,
-            fence,
-            record: record.clone(),
-        }));
+        let _ = self.tx.send(ObservedRecord(Arc::new((
+            broca_wal::FramedRecord {
+                seq,
+                fence,
+                record: record.clone(),
+            },
+            lineage,
+        ))));
     }
 
     fn observe_tap(
@@ -2267,6 +2443,10 @@ pub struct WalHandle {
     /// then, and nothing is tagged while it is unknown). Read and advanced only under the
     /// enqueue lock, so tags follow WAL order. See [`crate::tags`].
     lineage_tags: Mutex<Option<crate::tags::LineageTags>>,
+    /// True when the log reports an overhaul format at spawn: every record then goes to the
+    /// writer as a [`broca_wal::PreparedV4Frame`] built on the enqueueing thread, and never as a
+    /// legacy frame. Fixed for the writer's lifetime; a log's format does not change under it.
+    v4: bool,
     /// Tags assigned to tool results, assistant messages and budget messages, kept until the
     /// run loop attaches them to the messages it adds to its in-memory prompt. (A steer's
     /// messages get their tags from the record the steer inbox writes, see `SteerInbox::deliver`.) Retained only while a run that renders tags
@@ -2367,6 +2547,52 @@ impl WalHandle {
         Self::spawn_proven_observed(wal, last_seq, fence, None, Some(lease))
     }
 
+    pub(crate) fn spawn_in_store<W: WalStore>(
+        wal: Box<dyn Wal + Send>,
+        store: &W,
+        session: &BindIdentity,
+        fence: u64,
+        lease: Option<Box<dyn LeaseHandle>>,
+    ) -> Result<WalHandle, WalWriteError> {
+        if !wal.wal_config().is_overhaul() {
+            return match lease {
+                Some(lease) => Self::spawn_with_lease(wal, lease),
+                None => Self::spawn(wal, fence),
+            };
+        }
+        let fence = lease.as_ref().map_or(fence, |lease| lease.epoch());
+        let (wal, seq) = Self::prove_recovery(wal)?;
+        let context = store
+            .writer_marker_root()
+            .map(|root| open_writers::WriterContext {
+                root,
+                address: session_addr(session),
+            });
+        Self::spawn_proven_with_clock(wal, seq, fence, None, lease, (StampClock::wall(), context))
+    }
+
+    /// Exercise the production store-aware spawn with a filesystem backend on its writer thread.
+    #[cfg(feature = "test-clock")]
+    pub fn spawn_in_store_with_fs_for_test<W: WalStore>(
+        wal: Box<dyn Wal + Send>,
+        store: &W,
+        session: &BindIdentity,
+        fence: u64,
+        lease: Option<Box<dyn LeaseHandle>>,
+        fs: Arc<dyn broca_wal::fs_ops::FsOps>,
+    ) -> Result<WalHandle, WalWriteError> {
+        struct Restore(Option<Arc<dyn broca_wal::fs_ops::FsOps>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                WRITER_FS_FOR_TEST.with(|slot| {
+                    slot.replace(self.0.take());
+                });
+            }
+        }
+        let _restore = Restore(WRITER_FS_FOR_TEST.with(|slot| slot.replace(Some(fs))));
+        Self::spawn_in_store(wal, store, session, fence, lease)
+    }
+
     /// Open and prove a session WAL away from the async runtime, then start its writer thread.
     ///
     /// The lease moves into the blocking operation so cancellation cannot release it while torn-tail
@@ -2428,8 +2654,21 @@ impl WalHandle {
             )))
         })??;
         let (wal, last_seq, fence, lease) = opened;
-        let mut handle = Self::spawn_proven_observed(wal, last_seq, fence, observer, None)
-            .map_err(WalOpenError::Failed)?;
+        let context = check_store
+            .writer_marker_root()
+            .map(|root| open_writers::WriterContext {
+                root,
+                address: session_addr(&check_session),
+            });
+        let mut handle = Self::spawn_proven_with_clock(
+            wal,
+            last_seq,
+            fence,
+            observer,
+            None,
+            (StampClock::wall(), context),
+        )
+        .map_err(WalOpenError::Failed)?;
         handle.bind_media_capture(check_store.as_ref(), &check_session);
         handle.move_check = Some(Arc::new(move || {
             check_store.check_move(&check_session, true)
@@ -2555,8 +2794,21 @@ impl WalHandle {
         // The writer task owns the lease until the WAL is closed: dropping the
         // handle without shutdown still joins through the task, and shutdown
         // joins before the task drops the lease. No separate lease is returned.
-        let mut handle = Self::spawn_proven_observed(wal, last_seq, fence, observer, Some(lease))
-            .map_err(WalOpenError::Failed)?;
+        let context = check_store
+            .writer_marker_root()
+            .map(|root| open_writers::WriterContext {
+                root,
+                address: session_addr(&check_session),
+            });
+        let mut handle = Self::spawn_proven_with_clock(
+            wal,
+            last_seq,
+            fence,
+            observer,
+            Some(lease),
+            (StampClock::wall(), context),
+        )
+        .map_err(WalOpenError::Failed)?;
         handle.bind_media_capture(check_store.as_ref(), &check_session);
         handle.move_check = Some(Arc::new(move || {
             check_store.check_move(&check_session, true)
@@ -2583,6 +2835,25 @@ impl WalHandle {
         observer: Option<RecordObserver>,
         lease: Option<Box<dyn LeaseHandle>>,
     ) -> Result<WalHandle, WalWriteError> {
+        Self::spawn_proven_with_clock(
+            wal,
+            last_seq,
+            fence,
+            observer,
+            lease,
+            (StampClock::wall(), None),
+        )
+    }
+
+    fn spawn_proven_with_clock(
+        wal: Box<dyn Wal + Send>,
+        last_seq: u64,
+        fence: u64,
+        observer: Option<RecordObserver>,
+        lease: Option<Box<dyn LeaseHandle>>,
+        startup: (StampClock, Option<open_writers::WriterContext>),
+    ) -> Result<WalHandle, WalWriteError> {
+        let (clock, context) = startup;
         // One owner holds the WAL and its lease from here until the writer thread takes
         // them, so a panic while preparing the handle or a failed thread spawn still
         // closes the WAL before the lease is released.
@@ -2591,6 +2862,28 @@ impl WalHandle {
             lease,
         };
         let wal = owner.wal();
+        let v4 = wal.wal_config().is_overhaul();
+        if v4 && context.is_none() {
+            return Err(WalWriteError::Failed(
+                "writer-id/v1: overhaul spawn requires a store marker root and session address"
+                    .into(),
+            ));
+        }
+        // Lifecycle records do not start a conversation. A warmed writer-only log still needs
+        // the same first-send placement, retention and runner-tag state as an empty log.
+        let unstarted = last_seq == 0
+            || (v4
+                && wal
+                    .replay()
+                    .map_err(|error| WalWriteError::Failed(error.to_string()))?
+                    .iter()
+                    .all(|frame| {
+                        matches!(
+                            frame.record,
+                            WalRecord::WriterOpened { .. } | WalRecord::WriterClosed { .. }
+                        )
+                    }));
+        let last_seq = last_seq + u64::from(v4);
         // Seq is 1-based; the first record of an empty WAL is seq 1, so the next seq
         // after a durable head of `last_seq` is `last_seq + 1`.
         let next_seq = AtomicU64::new(last_seq + 1);
@@ -2600,28 +2893,64 @@ impl WalHandle {
         let writer_poisoned = poisoned.clone();
         let lineage_id = Arc::new(Mutex::new(wal.lineage_id()));
         let writer_lineage_id = Arc::clone(&lineage_id);
-        let append_budget = wal
-            .append_budget()
-            .map(|(max_bytes, used_bytes, overhead)| {
+        let budget_scope = wal.append_budget_scope();
+        let recovery_cap = wal.recovery_byte_cap();
+        let make_budget = |budget: Option<(u64, u64, u64)>, writer_close_reserve| {
+            budget.map(|(max_bytes, used_bytes, overhead)| {
                 Mutex::new(AppendBudget {
-                    retained: wal.append_budget_scope()
-                        == retained_size::SizeScope::RetainedSession,
-                    session_max_bytes: wal.recovery_byte_cap().unwrap_or(max_bytes),
+                    writer_close_reserve,
+                    retained: budget_scope == retained_size::SizeScope::RetainedSession,
+                    session_max_bytes: recovery_cap.unwrap_or(max_bytes),
                     max_bytes,
                     used_bytes,
                     overhead,
                     reserve: retained_size::reserve_bytes(overhead),
                     refused: false,
                 })
-            });
+            })
+        };
+        let legacy_budget = (!v4).then(|| make_budget(wal.append_budget(), 0));
+        // The log reports the format its store was configured with at boot. An overhaul log
+        // stamps its own `writer_id` per open and raises the feature floor before each frame.
         let (tx, rx) = std_mpsc::channel::<WalCommand>();
+        let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         let body = move || {
             // writer_loop drops its WAL before the lease is released, even on unwind:
             // the lease is bound outside writer_loop's frame, so an unwinding writer
             // drops the WAL first. On a normal return the lease goes back to the
             // joiner, which releases it or hands it over (see `shutdown_into_tenure`).
+            let mut owner = owner;
+            let wal = owner
+                .wal
+                .as_mut()
+                .expect("writer owner holds its WAL during startup");
+            let writer = if let Some(context) = context {
+                let address = context.address.clone();
+                match context.open(&mut **wal, fence, || clock.now_ms()) {
+                    Ok((writer, seq, record)) => {
+                        if let Some(obs) = &observer {
+                            obs.observe(seq, fence, &record, wal.lineage_id());
+                            obs.observe_tap(seq, fence, wal.lineage_id(), &record);
+                        }
+                        Some(writer)
+                    }
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(WalWriteError::Failed(format!(
+                            "writer-id/v1: cannot open writer for {address}: {error}"
+                        ))));
+                        let (wal, lease) = owner.into_parts();
+                        drop(wal);
+                        return lease;
+                    }
+                }
+            } else {
+                None
+            };
+            if v4 {
+                let _ = ready_tx.send(Ok((wal.append_budget(), wal.writer_close_reserve())));
+            }
             let (wal, lease) = owner.into_parts();
-            writer_loop(
+            writer_loop_with_identity(
                 wal,
                 fence,
                 rx,
@@ -2629,8 +2958,18 @@ impl WalHandle {
                 writer_poisoned,
                 writer_durable_head,
                 writer_lineage_id,
+                clock,
+                writer,
             );
             lease
+        };
+        #[cfg(feature = "test-clock")]
+        let body = {
+            let fs = WRITER_FS_FOR_TEST.with(|slot| slot.borrow().clone());
+            move || match fs {
+                Some(fs) => broca_wal::fs_ops::with_fs_ops(fs, body),
+                None => body(),
+            }
         };
         #[cfg(test)]
         if FAIL_NEXT_WRITER_SPAWN.with(|fail| fail.replace(false)) {
@@ -2648,24 +2987,39 @@ impl WalHandle {
             .map_err(|error| {
                 WalWriteError::Failed(format!("WAL writer thread spawn failed: {error}"))
             })?;
+        let append_budget = if let Some(budget) = legacy_budget {
+            budget
+        } else {
+            match ready_rx.recv() {
+                Ok(Ok((budget, close_reserve))) => make_budget(budget, close_reserve),
+                error => {
+                    let _ = join.join();
+                    return Err(match error {
+                        Ok(Err(error)) => error,
+                        _ => WalWriteError::Failed(
+                            "writer-id/v1: writer startup did not complete".into(),
+                        ),
+                    });
+                }
+            }
+        };
         Ok(WalHandle {
-            display_placement: Mutex::new((last_seq == 0).then(Default::default)),
+            display_placement: Mutex::new(unstarted.then(Default::default)),
             input_token_limit: AtomicU64::new(0),
             move_check: None,
             media_capture: None,
             pending_media: Mutex::default(),
             fence,
             append_budget,
+            v4,
             tx,
             enqueue_lock: Mutex::new(()),
             next_seq,
             durable_head,
             poisoned,
             lineage_id,
-            lineage_retention: Mutex::new(
-                (last_seq == 0).then_some(crate::LineageRetention::Unstarted),
-            ),
-            lineage_tags: Mutex::new((last_seq == 0).then(crate::tags::LineageTags::unstarted)),
+            lineage_retention: Mutex::new(unstarted.then_some(crate::LineageRetention::Unstarted)),
+            lineage_tags: Mutex::new(unstarted.then(crate::tags::LineageTags::unstarted)),
             live_tags: Mutex::new(None),
             #[cfg(test)]
             after_reserve_probe: Mutex::new(None),
@@ -2938,6 +3292,13 @@ impl WalHandle {
                 return RecordOutcome::Refused(WalWriteError::Failed(error));
             }
         };
+        // On an overhaul log, the record's version 4 frame, serialized and digested here so the
+        // writer thread only stamps its header. Prepared before the split below because both arms
+        // send it. Fail-stop like any other append failure: preparing poisons the handle itself.
+        let prepared = match self.prepare_v4(&record) {
+            Ok(prepared) => prepared,
+            Err(error) => return RecordOutcome::Refused(error),
+        };
         let (seq, frame) = if let Some(budget) = &self.append_budget {
             let seq = self.next_seq.load(Ordering::SeqCst);
             let mut budget = budget.lock().unwrap();
@@ -2964,27 +3325,39 @@ impl WalHandle {
                 // enqueue lock and the budget lock. A panic there must not unwind through
                 // them: it would poison both, and every later call on this handle would panic
                 // on the poisoned locks. It fails this append like an encode error instead.
-                let encoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    broca_wal::framing::encode(seq, self.fence, &record)
-                }));
-                let frame = match encoded {
-                    Ok(Ok(frame)) => frame,
-                    Ok(Err(error)) => {
-                        set_poison(&self.poisoned, error.to_string());
-                        return RecordOutcome::Refused(WalWriteError::Failed(error.to_string()));
-                    }
-                    Err(panic) => {
-                        let error = format!(
-                            "framing WAL record {seq} panicked: {}",
-                            panic_text(panic.as_ref())
-                        );
-                        set_poison(&self.poisoned, error.clone());
-                        return RecordOutcome::Refused(WalWriteError::Failed(error));
+                //
+                // An overhaul log measures its budget by the version 4 frame prepared above, which
+                // is exactly the size the log will write; only a legacy log encodes here.
+                let (frame_len, frame) = match &prepared {
+                    Some(prepared) => (prepared.frame_len(), None),
+                    None => {
+                        let encoded =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                broca_wal::framing::encode(seq, self.fence, &record)
+                            }));
+                        let frame = match encoded {
+                            Ok(Ok(frame)) => frame,
+                            Ok(Err(error)) => {
+                                set_poison(&self.poisoned, error.to_string());
+                                return RecordOutcome::Refused(WalWriteError::Failed(
+                                    error.to_string(),
+                                ));
+                            }
+                            Err(panic) => {
+                                let error = format!(
+                                    "framing WAL record {seq} panicked: {}",
+                                    panic_text(panic.as_ref())
+                                );
+                                set_poison(&self.poisoned, error.clone());
+                                return RecordOutcome::Refused(WalWriteError::Failed(error));
+                            }
+                        };
+                        (frame.len(), Some(frame))
                     }
                 };
                 let end = budget
                     .used_bytes
-                    .saturating_add(frame.len() as u64)
+                    .saturating_add(frame_len as u64)
                     .saturating_add(budget.overhead);
                 let reserve =
                     if reserved_terminal || matches!(record, WalRecord::RunFinished { .. }) {
@@ -2992,7 +3365,11 @@ impl WalHandle {
                     } else {
                         budget.reserve
                     };
-                if end.saturating_add(reserve) > budget.max_bytes {
+                if end
+                    .saturating_add(reserve)
+                    .saturating_add(budget.writer_close_reserve)
+                    > budget.max_bytes
+                {
                     budget.refused = true;
                     return RecordOutcome::Refused(budget.refusal());
                 }
@@ -3001,7 +3378,7 @@ impl WalHandle {
                     budget.refused = false;
                 }
                 self.next_seq.fetch_add(1, Ordering::SeqCst);
-                (seq, Some(frame))
+                (seq, frame)
             }
         } else {
             (self.next_seq.fetch_add(1, Ordering::SeqCst), None)
@@ -3038,20 +3415,50 @@ impl WalHandle {
             _ => {}
         }
         self.capture_for_append(seq, &record);
-        if self
-            .tx
-            .send(WalCommand::Append {
+        let command = match prepared {
+            Some(prepared) => WalCommand::AppendV4 {
+                seq,
+                record: Box::new(record),
+                prepared,
+            },
+            None => WalCommand::Append {
                 seq,
                 record: Box::new(record),
                 frame,
-            })
-            .is_err()
-        {
+            },
+        };
+        if self.tx.send(command).is_err() {
             let error = format!("append command for seq {seq} could not reach the writer task");
             set_poison(&self.poisoned, error.clone());
             return RecordOutcome::Refused(WalWriteError::Failed(error));
         }
         RecordOutcome::Accepted(seq)
+    }
+
+    /// Serialize and digest a record's version 4 frame on this thread, so the writer thread only
+    /// stamps its header. `None` on a legacy log, which keeps today's frames. An encode error or a
+    /// panic in the codec poisons the handle and is returned; nothing falls back to another
+    /// encoding.
+    fn prepare_v4(
+        &self,
+        record: &WalRecord,
+    ) -> Result<Option<broca_wal::PreparedV4Frame>, WalWriteError> {
+        if !self.v4 {
+            return Ok(None);
+        }
+        let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            broca_wal::PreparedV4Frame::prepare(record)
+        }));
+        let error = match prepared {
+            Ok(Ok(prepared)) => return Ok(Some(prepared)),
+            Ok(Err(error)) => error.to_string(),
+            Err(panic) => format!(
+                "framing a version 4 WAL record panicked: {}",
+                panic_text(panic.as_ref())
+            ),
+        };
+        set_poison(&self.poisoned, error.clone());
+        Err(WalWriteError::Failed(error))
     }
 
     fn capture_for_append(&self, seq: u64, record: &WalRecord) {
@@ -3367,7 +3774,36 @@ impl Drop for WalHandle {
     }
 }
 
+// The writer thread's whole mutable state arrives as owned parameters: the WAL, the fence, the
+// command queue, the observer, the shared poison and durability gauges, the lineage gauge and
+// the clock version 4 frames are stamped from.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn writer_loop(
+    wal: Box<dyn Wal + Send>,
+    fence: u64,
+    rx: std_mpsc::Receiver<WalCommand>,
+    observer: Option<RecordObserver>,
+    poisoned: Arc<Mutex<Option<String>>>,
+    durable_head: Arc<AtomicU64>,
+    lineage_id: Arc<Mutex<Option<broca_wal::WalLineageId>>>,
+    stamp_clock: StampClock,
+) {
+    writer_loop_with_identity(
+        wal,
+        fence,
+        rx,
+        observer,
+        poisoned,
+        durable_head,
+        lineage_id,
+        stamp_clock,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn writer_loop_with_identity(
     mut wal: Box<dyn Wal + Send>,
     fence: u64,
     rx: std_mpsc::Receiver<WalCommand>,
@@ -3375,7 +3811,14 @@ fn writer_loop(
     poisoned: Arc<Mutex<Option<String>>>,
     durable_head: Arc<AtomicU64>,
     lineage_id: Arc<Mutex<Option<broca_wal::WalLineageId>>>,
+    stamp_clock: StampClock,
+    writer: Option<open_writers::OpenWriter>,
 ) {
+    let mut writer = writer;
+    use crate::durability_counters::{
+        deadline_ms_for, monotonic_now_ms_for, record_fsync, FsyncCause,
+    };
+
     // The seq of the last record APPENDED (coalesced, maybe not yet fsynced) and the
     // last record made DURABLE by a successful fsync. A control-stream cursor may only
     // advance to `last_fsynced_seq` — `last_appended_seq` includes records past the
@@ -3385,21 +3828,180 @@ fn writer_loop(
     let mut last_appended_seq = wal.last_seq();
     let mut last_fsynced_seq = wal.last_seq();
     let mut dirty = false;
-    let mut pending_observed = Vec::new();
+    // The sync deadline: the monotonic instant (in ms) by which dirty data must be
+    // synced. Set when an append makes a clean writer dirty, and never slid while
+    // dirty, so a queue that never empties cannot postpone the sync past it. Cleared
+    // whenever the writer goes clean, and also when a sync fails: the writer is then
+    // poisoned and must idle until close, not spin on a deadline that can never succeed.
+    let mut deadline_at_ms: Option<u64> = None;
+    let mut pending_observed: Vec<(u64, Box<WalRecord>)> = Vec::new();
     let has_tap = observer
         .as_ref()
         .is_some_and(|observer| observer.tap.is_some());
-    while let Ok(cmd) = rx.recv() {
+
+    // What the blocking wait below returned: a command, a bare timeout that
+    // carried no command, or proof the handle is gone.
+    enum Wait {
+        Command(WalCommand),
+        Empty,
+        Gone,
+    }
+
+    loop {
+        // One clock sample per dirty iteration; clean writers read no clock.
+        // The deadline is checked before every command on that sample: at most
+        // one command is handled past the deadline, so a queue that never
+        // empties still syncs on time. The same sample bounds the wait, so a
+        // dirty writer wakes at its deadline even when nothing arrives. A dirty
+        // writer with no deadline is poisoned (its sync already failed), so it
+        // idles like a clean one until close.
+        let wait = if dirty {
+            let now = monotonic_now_ms_for(fence);
+            if deadline_at_ms.is_some_and(|deadline| now >= deadline) {
+                let poison = current_poison(&poisoned);
+                if poison.is_none() {
+                    // Every fsync is counted by the path that issued it, for health.
+                    record_fsync(FsyncCause::Deadline, fence);
+                }
+                match sync_result(&*wal, &poison) {
+                    Ok(()) => {
+                        last_fsynced_seq = last_appended_seq;
+                        durable_head.store(last_fsynced_seq, Ordering::Release);
+                        dirty = false;
+                        deadline_at_ms = None;
+                        if let Some(obs) = &observer {
+                            if has_tap {
+                                for (seq, record) in &pending_observed {
+                                    obs.observe(*seq, fence, record, wal.lineage_id());
+                                }
+                            } else {
+                                for (seq, record) in pending_observed.drain(..) {
+                                    obs.observe(seq, fence, &record, wal.lineage_id());
+                                }
+                            }
+                        }
+                        if has_tap {
+                            if let Some(obs) = &observer {
+                                for (seq, record) in pending_observed.drain(..) {
+                                    obs.observe_tap(seq, fence, wal.lineage_id(), &record);
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        set_poison(&poisoned, error);
+                        deadline_at_ms = None;
+                    }
+                }
+            }
+            // Wait for the next command. The bound reuses the sample above: a
+            // still-installed deadline postdates it by definition (a due one
+            // just synced). A writer that just went clean or poisoned has no
+            // deadline, so it blocks in `recv()` until a command arrives.
+            if dirty {
+                match deadline_at_ms {
+                    Some(deadline) => {
+                        match rx.recv_timeout(std::time::Duration::from_millis(
+                            deadline.saturating_sub(now),
+                        )) {
+                            Ok(command) => Wait::Command(command),
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Wait::Empty,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Wait::Gone,
+                        }
+                    }
+                    None => match rx.recv() {
+                        Ok(command) => Wait::Command(command),
+                        Err(_) => Wait::Gone,
+                    },
+                }
+            } else {
+                match rx.recv() {
+                    Ok(command) => Wait::Command(command),
+                    Err(_) => Wait::Gone,
+                }
+            }
+        } else {
+            match rx.recv() {
+                Ok(command) => Wait::Command(command),
+                Err(_) => Wait::Gone,
+            }
+        };
+        if matches!(wait, Wait::Gone) {
+            // A dropped handle closes like Shutdown: sync dirty data before exit.
+            if dirty {
+                let poison = current_poison(&poisoned);
+                if poison.is_none() {
+                    // Every fsync is counted by the path that issued it, for health.
+                    record_fsync(FsyncCause::Disconnect, fence);
+                }
+                match sync_result(&*wal, &poison) {
+                    Ok(()) => {
+                        last_fsynced_seq = last_appended_seq;
+                        durable_head.store(last_fsynced_seq, Ordering::Release);
+                        if let Some(obs) = &observer {
+                            for (seq, record) in pending_observed.drain(..) {
+                                obs.observe(seq, fence, &record, wal.lineage_id());
+                                if has_tap {
+                                    obs.observe_tap(seq, fence, wal.lineage_id(), &record);
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => set_poison(&poisoned, error),
+                }
+            }
+            if current_poison(&poisoned).is_none() {
+                if let Err(error) = close_writer_identity(
+                    &mut *wal,
+                    writer.take(),
+                    fence,
+                    &stamp_clock,
+                    observer.as_ref(),
+                    &durable_head,
+                ) {
+                    set_poison(&poisoned, error);
+                }
+            }
+            break;
+        }
+        // Group commit is unchanged: one sync still covers every append that
+        // preceded it.
+        let Wait::Command(cmd) = wait else {
+            continue;
+        };
         match cmd {
+            #[cfg(all(test, feature = "test-clock"))]
+            WalCommand::BudgetSnapshot(ack) => {
+                let _ = ack.send(wal.append_budget());
+            }
             #[cfg(test)]
             WalCommand::AppendDrained(ack) => {
                 let _ = ack.send(());
             }
-            WalCommand::Append { seq, record, frame } => {
+            command @ (WalCommand::Append { .. } | WalCommand::AppendV4 { .. }) => {
                 if current_poison(&poisoned).is_none() {
-                    let result = match frame {
-                        Some(frame) => wal.append_preencoded(fence, &record, false, frame),
-                        None => wal.append(fence, &record, false),
+                    let (seq, record, result) = match command {
+                        WalCommand::Append { seq, record, frame } => {
+                            let result = match frame {
+                                Some(frame) => wal.append_preencoded(fence, &record, false, frame),
+                                None => wal.append(fence, &record, false),
+                            };
+                            (seq, record, result)
+                        }
+                        WalCommand::AppendV4 {
+                            seq,
+                            record,
+                            prepared,
+                        } => {
+                            // A version 4 frame's `appended_ms` is this thread's sample, taken
+                            // immediately before the log stamps and writes it; the payload was
+                            // serialized and digested on the enqueueing thread.
+                            let appended_ms = stamp_clock.now_ms();
+                            let result =
+                                wal.append_v4(fence, &record, false, prepared, appended_ms);
+                            (seq, record, result)
+                        }
+                        _ => unreachable!("matched as an append above"),
                     };
                     match result {
                         // The WAL self-assigns the seq deterministically; it MUST equal
@@ -3408,8 +4010,17 @@ fn writer_loop(
                         // handle's counter and the WAL drifted — a bug, not a runtime
                         // condition — so poison rather than write a wrong-cursor record.
                         Ok(assigned) if assigned == seq => {
+                            let became_dirty = !dirty;
                             last_appended_seq = assigned;
                             dirty = true;
+                            if became_dirty {
+                                // The deadline starts when the writer goes dirty and
+                                // never slides: later appends cannot postpone it.
+                                deadline_at_ms = Some(
+                                    monotonic_now_ms_for(fence)
+                                        .saturating_add(deadline_ms_for(fence)),
+                                );
+                            }
                             // A legacy file mints its identity on this first append.
                             *lineage_id.lock().unwrap() = wal.lineage_id();
                             // Keep observer delivery behind the same durability barrier as the
@@ -3436,18 +4047,22 @@ fn writer_loop(
                 // error even though the seqs happen to match.
                 let poison = current_poison(&poisoned);
                 let res = if dirty {
+                    if poison.is_none() {
+                        record_fsync(FsyncCause::Barrier, fence);
+                    }
                     sync_result(&*wal, &poison).map(|()| {
                         last_fsynced_seq = last_appended_seq;
                         durable_head.store(last_fsynced_seq, Ordering::Release);
                         dirty = false;
+                        deadline_at_ms = None;
                         if let Some(obs) = &observer {
                             if has_tap {
                                 for (seq, record) in &pending_observed {
-                                    obs.observe(*seq, fence, record);
+                                    obs.observe(*seq, fence, record, wal.lineage_id());
                                 }
                             } else {
                                 for (seq, record) in pending_observed.drain(..) {
-                                    obs.observe(seq, fence, &record);
+                                    obs.observe(seq, fence, &record, wal.lineage_id());
                                 }
                             }
                         }
@@ -3458,6 +4073,9 @@ fn writer_loop(
                 };
                 let res = res.map_err(|e| {
                     set_poison(&poisoned, e.clone());
+                    // The writer is poisoned now: drop the deadline with it, so
+                    // the loop idles instead of retrying a sync that cannot succeed.
+                    deadline_at_ms = None;
                     WalWriteError::Failed(e)
                 });
                 let durable = res.is_ok();
@@ -3473,6 +4091,9 @@ fn writer_loop(
             WalCommand::Shutdown(ack) => {
                 let poison = current_poison(&poisoned);
                 let result = if dirty {
+                    if poison.is_none() {
+                        record_fsync(FsyncCause::Shutdown, fence);
+                    }
                     sync_result(&*wal, &poison)
                 } else {
                     poison.map_or(Ok(()), Err)
@@ -3481,13 +4102,23 @@ fn writer_loop(
                     durable_head.store(last_appended_seq, Ordering::Release);
                     if let Some(obs) = &observer {
                         for (seq, record) in pending_observed.drain(..) {
-                            obs.observe(seq, fence, &record);
+                            obs.observe(seq, fence, &record, wal.lineage_id());
                             if has_tap {
                                 obs.observe_tap(seq, fence, wal.lineage_id(), &record);
                             }
                         }
                     }
                 }
+                let result = result.and_then(|()| {
+                    close_writer_identity(
+                        &mut *wal,
+                        writer.take(),
+                        fence,
+                        &stamp_clock,
+                        observer.as_ref(),
+                        &durable_head,
+                    )
+                });
                 let result = result.map_err(|error| {
                     set_poison(&poisoned, error.clone());
                     WalWriteError::Failed(error)
@@ -3506,6 +4137,30 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
         .copied()
         .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
         .unwrap_or("a non-string panic payload")
+}
+
+fn close_writer_identity(
+    wal: &mut dyn Wal,
+    writer: Option<open_writers::OpenWriter>,
+    fence: u64,
+    clock: &StampClock,
+    observer: Option<&RecordObserver>,
+    durable_head: &AtomicU64,
+) -> Result<(), String> {
+    if let Some(writer) = writer {
+        let (seq, record) = writer
+            .close(wal, fence, clock.now_ms())
+            .map_err(|error| format!("writer-id/v1: cannot close writer: {error}"))?;
+        durable_head.store(seq, Ordering::Release);
+        if let Some(obs) = observer {
+            obs.observe(seq, fence, &record, wal.lineage_id());
+            obs.observe_tap(seq, fence, wal.lineage_id(), &record);
+        }
+        if let Err(error) = writer.unlink() {
+            tracing::warn!(%error, "writer-id/v1: durable writer close succeeded but marker unlink failed; reclaim will remove the marker");
+        }
+    }
+    Ok(())
 }
 
 /// Records the first fatal writer error, which every later append and barrier then reports.
@@ -4482,7 +5137,7 @@ mod tests {
         let subscribers = Arc::new(AtomicUsize::new(0));
         let observer = RecordObserver::new(tx, subscribers.clone());
 
-        observer.observe(1, 7, &WalRecord::StepStarted { step_id: StepId(1) });
+        observer.observe(1, 7, &WalRecord::StepStarted { step_id: StepId(1) }, None);
         assert!(
             matches!(
                 rx.try_recv(),
@@ -4492,7 +5147,7 @@ mod tests {
         );
 
         subscribers.fetch_add(1, Ordering::AcqRel);
-        observer.observe(2, 7, &WalRecord::StepStarted { step_id: StepId(2) });
+        observer.observe(2, 7, &WalRecord::StepStarted { step_id: StepId(2) }, None);
         let framed = rx
             .try_recv()
             .expect("once a subscriber enables the gate, records must publish live");
@@ -4517,6 +5172,7 @@ mod tests {
                 &WalRecord::StepStarted {
                     step_id: StepId(seq),
                 },
+                None,
             );
         }
 
@@ -4533,6 +5189,9 @@ mod tests {
 mod archive_tests;
 
 #[cfg(test)]
+mod deadline_tests;
+
+#[cfg(test)]
 mod shutdown_tests;
 
 #[cfg(test)]
@@ -4542,4 +5201,10 @@ pub(crate) mod retention_tests;
 mod session_class_tests;
 
 #[cfg(test)]
+mod stamp_tests;
+
+#[cfg(test)]
 mod tool_times_tests;
+
+#[cfg(test)]
+mod writer_id_tests;

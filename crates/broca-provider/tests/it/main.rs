@@ -70,6 +70,7 @@ mod openai_responses_chatgpt_render_golden;
 mod openai_responses_e2e;
 mod openai_responses_golden;
 mod ordinal_render_invariant;
+mod provider_fallback_render;
 mod provider_state_legacy;
 mod provider_text_state;
 mod reasoning_content_required;

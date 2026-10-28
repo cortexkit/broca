@@ -19,11 +19,27 @@ fn record_candidate(
 }
 
 pub fn agent_session_ref(session: &BindIdentity) -> String {
-    cortexkit_role_llm_runner::session_ref(
-        &session.harness,
-        &session.project_root.to_string_lossy(),
-        &session.session,
-    )
+    cortexkit_role_llm_runner::session_ref(&cortexkit_role_llm_runner::SessionIdentity {
+        runner: "broca",
+        harness: &session.harness,
+        session: &session.session,
+    })
+}
+
+/// Folder-based reference retained for old handles and durable move fences.
+/// Keep this derivation independent of the external reference's version.
+pub fn legacy_session_ref(harness: &str, project_root: &str, session: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = format!(
+        r#"{{"harness":{},"project_root":{},"session":{}}}"#,
+        serde_json::to_string(harness).unwrap(),
+        serde_json::to_string(project_root).unwrap(),
+        serde_json::to_string(session).unwrap(),
+    );
+    Sha256::digest(bytes.as_bytes())[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Attempt discovery persistence before WAL durability; a durable gap marker
@@ -63,6 +79,10 @@ pub(super) struct AdmissionWal {
     state_root: PathBuf,
     index: Arc<Mutex<Option<Arc<dyn SessionRefIndex>>>>,
     placement: Option<(PathBuf, PathBuf, PathBuf, Vec<String>)>,
+    /// The session's WAL path, whose `.moved`/`.moving` marker files and pending cut files
+    /// are checked before every append, with the session's v1 and v2 references: a pending
+    /// cut that names either reference refuses the append.
+    legacy_fence: (PathBuf, [String; 2]),
 }
 
 impl AdmissionWal {
@@ -71,6 +91,7 @@ impl AdmissionWal {
         address: String,
         state_root: PathBuf,
         index: Arc<Mutex<Option<Arc<dyn SessionRefIndex>>>>,
+        legacy_fence: (PathBuf, [String; 2]),
     ) -> Self {
         Self {
             wal,
@@ -78,6 +99,7 @@ impl AdmissionWal {
             state_root,
             index,
             placement: None,
+            legacy_fence,
         }
     }
 
@@ -96,6 +118,8 @@ impl AdmissionWal {
         &mut self,
         record: &WalRecord,
     ) -> Result<Option<ProjectionAdmission>, WalError> {
+        let [legacy, current] = &self.legacy_fence.1;
+        broca_wal::migration::guard_refs(&self.legacy_fence.0, &[legacy, current], true)?;
         let mut admission = None;
         if let WalRecord::RunStarted {
             session,
@@ -108,7 +132,17 @@ impl AdmissionWal {
             admission =
                 record_candidate(index.as_deref(), &self.state_root, &self.address, session)
                     .map_err(|error| WalError::Io(std::io::Error::other(error)))?;
-            if self.wal.last_seq() == 0 {
+            let unstarted = if self.wal.wal_config().is_overhaul() {
+                self.wal.replay()?.iter().all(|frame| {
+                    matches!(
+                        frame.record,
+                        WalRecord::WriterOpened { .. } | WalRecord::WriterClosed { .. }
+                    )
+                })
+            } else {
+                self.wal.last_seq() == 0
+            };
+            if unstarted {
                 if let Some((ordinary, ephemeral, durable, classes)) = &self.placement {
                     let path = if retention.is_some() {
                         ephemeral
@@ -121,6 +155,7 @@ impl AdmissionWal {
                         ordinary
                     };
                     self.wal.relocate_unstarted(path)?;
+                    self.legacy_fence.0 = path.clone();
                 }
             }
         }
@@ -129,6 +164,12 @@ impl AdmissionWal {
 }
 
 impl Wal for AdmissionWal {
+    fn writer_close_reserve(&self) -> u64 {
+        self.wal.writer_close_reserve()
+    }
+    fn writer_id(&self) -> Option<[u8; 16]> {
+        self.wal.writer_id()
+    }
     fn append(&mut self, fence: u64, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
         let _projection_admission = self.before_append(record)?;
         self.wal.append(fence, record, sync)
@@ -142,6 +183,21 @@ impl Wal for AdmissionWal {
     ) -> Result<u64, WalError> {
         let _projection_admission = self.before_append(record)?;
         self.wal.append_preencoded(fence, record, sync, frame)
+    }
+    fn append_v4(
+        &mut self,
+        fence: u64,
+        record: &WalRecord,
+        sync: bool,
+        prepared: broca_wal::PreparedV4Frame,
+        appended_ms: u64,
+    ) -> Result<u64, WalError> {
+        let _projection_admission = self.before_append(record)?;
+        self.wal
+            .append_v4(fence, record, sync, prepared, appended_ms)
+    }
+    fn wal_config(&self) -> broca_wal::WalConfig {
+        self.wal.wal_config()
     }
     fn sync(&self) -> Result<(), WalError> {
         self.wal.sync()

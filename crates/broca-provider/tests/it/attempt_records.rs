@@ -666,13 +666,27 @@ mod gated {
             .filter(|r| !matches!(r, WalRecord::ModelAttemptFinished { .. }))
             .collect();
         let all: Vec<WalRecord> = framed.iter().map(|f| f.record.clone()).collect();
-        let with_state = replay(&all).unwrap();
+        let mut with_state = replay(&all).unwrap();
         let without_state = replay(&stripped).unwrap();
         assert_eq!(
             serde_json::to_vec(&with_state.prompt).unwrap(),
             serde_json::to_vec(&without_state.prompt).unwrap(),
             "reconstructed prompt bytes"
         );
+        // The output reservation is the one reader of attempt records: it takes each attempt's
+        // rendered body length as the measurement its next estimate scales from. Only the replay
+        // with them has it; everything else must match.
+        let model = all
+            .iter()
+            .find_map(|r| match r {
+                WalRecord::RunStarted { config, .. } => Some(config.model.clone()),
+                _ => None,
+            })
+            .expect("the run's RunStarted");
+        assert!(with_state.output_reservation.has_measurement(&model));
+        assert!(!without_state.output_reservation.has_measurement(&model));
+        let reservation = with_state.output_reservation.clone();
+        with_state.output_reservation = without_state.output_reservation.clone();
         assert_eq!(format!("{with_state:?}"), format!("{without_state:?}"));
         let units = |frames: &[FramedRecord]| -> Vec<_> {
             project_control(frames)
@@ -689,6 +703,13 @@ mod gated {
         let mut checkpoint = AdmissionCheckpointV1::from_frames(&framed).unwrap();
         let stripped_checkpoint = AdmissionCheckpointV1::from_frames(&stripped_frames).unwrap();
         checkpoint.at_seq = stripped_checkpoint.at_seq;
+        // The checkpoint carries the reservation fold replay builds from the same log, so a
+        // resume from it clamps as a full replay would; that fold is the one allowed difference.
+        assert_eq!(
+            format!("{:?}", checkpoint.output_reservation),
+            format!("{:?}", Some(&reservation))
+        );
+        checkpoint.output_reservation = stripped_checkpoint.output_reservation.clone();
         assert_eq!(
             format!("{checkpoint:?}"),
             format!("{stripped_checkpoint:?}")
@@ -1062,6 +1083,7 @@ mod gated {
         let lease = FileLeaseStore::new(dir.join("lease"));
         let wal = FileWalStore::new(dir.join("wal"));
         let selection = AuthSelection {
+            auth_method: None,
             credential_id: "oauth:anthropic:resume".into(),
             account_ref: Some("account-a".into()),
             resolved_credential_id: None,

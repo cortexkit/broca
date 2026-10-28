@@ -57,7 +57,10 @@ fn archived_expiry_checks_bound_member_decodes() {
         keys.len(), start.elapsed()
     );
     assert!(decodes <= keys.len() as u64, "{decodes} member decodes");
-    assert!(opens <= keys.len() as u64, "{opens} archive opens");
+    // One open per session's member read, plus one per container the archive member index
+    // reads once to build itself (this rig seals a single container). The bound is what
+    // matters: opens track sessions and containers, never the 1,000 checks.
+    assert!(opens <= keys.len() as u64 + 1, "{opens} archive opens");
 }
 
 #[tokio::test]
@@ -227,6 +230,7 @@ fn archived_expiry_cache_invalidates_on_publication_conflict_and_corruption() {
 
 fn large_expiry_step() -> WalRecord {
     WalRecord::ModelStepFinished {
+        fallback: Default::default(),
         written_at_ms: None,
         tags: None,
         hooks: None,
@@ -375,6 +379,16 @@ fn retained_summary_does_not_include_records_past_durable_head() {
 fn missing_retention_summary_is_refreshed_without_rewriting_run_state() {
     let rig = Rig::new();
     let now = rig.service.clock.now_ms();
+    // Freeze the clock: the seed expires one second after `now`, and WAL setup on a
+    // slow runner can take longer than that between sampling `now` and checking expiry,
+    // which would report the seed as already expired. A fixed clock keeps the deadline
+    // in the future until the test moves it explicitly.
+    fs::write(
+        rig.root.join("test-clock"),
+        format!(r#"{{"now_ms":{now}}}"#),
+    )
+    .unwrap();
+    rig.service.clock.refresh().unwrap();
     rig.seed(1, now, Some(now));
     assert!(rig
         .store
@@ -1509,6 +1523,7 @@ async fn status_of_expired_large_session_refuses_in_the_status_opener() {
             wal.append(
                 1,
                 &WalRecord::ModelStepFinished {
+                    fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
                     hooks: None,
@@ -2232,6 +2247,87 @@ async fn send_waits_for_in_progress_deletion_to_complete_before_opening_fresh_li
     assert!(registry.stop_and_seal().await);
 }
 
+/// The opener waits on a held lease only while `expired` reports expiry. A deletion that
+/// writes its tombstone and removes the WAL while `expired` is between reading the tombstones
+/// and finding the WAL gone must still be reported, or a racing send refuses with LeaseHeld.
+#[test]
+fn expiry_check_overlapping_a_completing_deletion_still_reports_expiry() {
+    type Deletion = Box<dyn FnOnce() + Send>;
+    struct DeleteOnLiveLookup {
+        store: Arc<SqliteStore>,
+        during: Mutex<Option<Deletion>>,
+    }
+    impl RetentionIndex for DeleteOnLiveLookup {
+        fn live(&self, key: &BindIdentity) -> Result<Option<RetentionLineageRow>, String> {
+            let deletion = self.during.lock().unwrap().take();
+            if let Some(deletion) = deletion {
+                deletion();
+            }
+            RetentionIndex::live(self.store.as_ref(), key)
+        }
+        fn lineage(&self, id: &str) -> Result<Option<RetentionLineageRow>, String> {
+            RetentionIndex::lineage(self.store.as_ref(), id)
+        }
+        fn runs(&self, id: &str) -> Result<Vec<RetentionRunRow>, String> {
+            RetentionIndex::runs(self.store.as_ref(), id)
+        }
+        fn candidates(&self, now: u64) -> Result<Vec<RetentionLineageRow>, String> {
+            RetentionIndex::candidates(self.store.as_ref(), now)
+        }
+        fn run(&self, id: &str) -> Result<Option<RunRetention>, String> {
+            RetentionIndex::run(self.store.as_ref(), id)
+        }
+        fn upsert(
+            &self,
+            row: &RetentionLineageRow,
+            runs: &[RetentionRunRow],
+        ) -> Result<(), String> {
+            RetentionIndex::upsert(self.store.as_ref(), row, runs)
+        }
+    }
+    let rig = Rig::new();
+    let old = rig.seed(1, 100, Some(200));
+    rig.service.rederive(&rig.key).unwrap();
+    let index = Arc::new(DeleteOnLiveLookup {
+        store: rig.store.clone(),
+        during: Mutex::new(None),
+    });
+    let checker = RetentionService::new(
+        rig.service.wal.clone(),
+        index.clone(),
+        rig.leases.clone(),
+        rig.store.clone(),
+        Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1)),
+    )
+    .unwrap();
+    // The checker has already resolved the live WAL and read the (still empty) tombstone
+    // directory when it consults the index; the whole deletion runs at that point.
+    *index.during.lock().unwrap() = Some(Box::new({
+        let deleter = rig.service.clone();
+        let key = rig.key.clone();
+        let old = old.clone();
+        move || {
+            let _lease = deleter.lease(&key).unwrap();
+            assert_eq!(deleter.delete_expired(&key, 1200).unwrap(), Some(old));
+        }
+    }));
+    let verdict = checker.expired(&rig.key, None).unwrap();
+    assert!(
+        index.during.lock().unwrap().is_none(),
+        "the deletion ran inside the expiry check"
+    );
+    assert!(!rig.service.wal.ephemeral_wal_path(&rig.key).exists());
+    let stone = rig
+        .service
+        .tombstones(&rig.key)
+        .unwrap()
+        .into_iter()
+        .find(|stone| stone.lineage_id == old)
+        .unwrap();
+    assert!(stone.completed_at_ms.is_some());
+    assert_eq!(verdict, Some(stone.expired_at_ms));
+}
+
 struct QuotaRefusalExecutor {
     config: broca_wal::RunConfig,
     observed: tokio::sync::mpsc::Sender<broca_core::keep_warm_wait::WarmTick>,
@@ -2686,6 +2782,7 @@ fn seed_owed_question_with_scope_at(
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -3850,6 +3947,7 @@ async fn assert_tight_crash_recovery(open_batch: bool) {
         wal.append(
             1,
             &WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -4454,6 +4552,7 @@ async fn missing_materialized_history_is_not_known_empty_ownership() {
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -4517,6 +4616,7 @@ async fn zero_record_wal_does_not_hide_materialized_ownership_history() {
         wal.append(
             1,
             &WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -4587,6 +4687,7 @@ async fn append_repairs_inferred_prior_terminal_before_refusing_new_admission_at
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -4733,6 +4834,7 @@ async fn cold_forever_status_uses_bounded_wal_without_opening_actor() {
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,

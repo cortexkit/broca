@@ -506,12 +506,12 @@ impl CutArtifacts for FileCutArtifacts {
             ));
         }
         for plan in &plans {
-            if broca_wire::agent_data::session_ref(
+            if !broca_wire::agent_data::matches_session_ref(
+                &plan.reference,
                 &plan.session.harness,
                 &plan.session.project_root.to_string_lossy(),
                 &plan.session.session,
-            ) != plan.reference
-            {
+            ) {
                 return Err(refusal(
                     "invalid_request",
                     "resolved session does not match its ref",
@@ -685,12 +685,26 @@ impl CutArtifacts for FileCutArtifacts {
                         "source snapshot does not match the frozen item",
                     ));
                 }
-                move_install::verify_received(
+                let recorded_session = move_install::verify_received(
                     &plan.reference,
                     &plan.bytes,
                     plan.end_offset,
                     &plan.digest,
                 )?;
+                if recorded_session.project_root.as_os_str()
+                    != plan.session.project_root.as_os_str()
+                    || recorded_session.harness != plan.session.harness
+                    || recorded_session.session != plan.session.session
+                {
+                    return Err(refusal(
+                        "invalid_request",
+                        format!(
+                            "source WAL does not record the carried bind triple for ref {}",
+                            plan.reference
+                        ),
+                        Value::Null,
+                    ));
+                }
                 if op == Op::Export {
                     let current = if live.try_exists().map_err(unavailable)? {
                         std::fs::read(&live).map_err(unavailable)?

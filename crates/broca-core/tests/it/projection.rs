@@ -126,6 +126,7 @@ fn assistant_two_calls() -> AssistantMessage {
 
 fn step_with_two_calls(step: u64) -> WalRecord {
     WalRecord::ModelStepFinished {
+        fallback: Default::default(),
         written_at_ms: None,
         tags: None,
         hooks: None,
@@ -321,6 +322,7 @@ fn projection_shape_and_cursors() {
 #[test]
 fn run_terminal_carries_last_recorded_step_finish_reason() {
     let terminal_step = WalRecord::ModelStepFinished {
+        fallback: Default::default(),
         written_at_ms: None,
         tags: None,
         hooks: None,
@@ -1158,6 +1160,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
         WalRecord::RunAuthRefrozen {
             ts_ms: None,
             auth_selection: AuthSelection {
+                auth_method: None,
                 credential_id: "chatgpt:openai".into(),
                 account_ref: Some("account-all".into()),
                 resolved_credential_id: None,

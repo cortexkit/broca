@@ -374,6 +374,9 @@ pub fn part_kind(role: Role, block: &ContentBlock, clean: bool) -> Option<PartKi
     Some(match block {
         // Runner tags currently assign no number to a standalone media block.
         ContentBlock::Media(_) => return None,
+        // A server-side fallback handoff is provider bookkeeping, not text the model wrote, so
+        // it never shows a number.
+        ContentBlock::ProviderFallback { .. } => return None,
         ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => match role {
             Role::System => PartKind::TurnSystem,
             Role::Assistant => text_kind(&exposed_model_text(clean, text), PartKind::AssistantText),

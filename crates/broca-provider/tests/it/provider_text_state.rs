@@ -102,6 +102,7 @@ fn replayed(frozen: &FrozenRenderConfig, message: &AssistantMessage) -> CallOpti
         account_ref: None,
         run_id: "state".into(),
         step_index: 2,
+        max_output_tokens: None,
     });
     opts
 }
@@ -315,6 +316,7 @@ fn legacy_frozen_configs_keep_pre_state_decode_and_render_bytes() {
             account_ref: None,
             run_id: "legacy".into(),
             step_index: 2,
+            max_output_tokens: None,
         });
         let body: Value = serde_json::from_slice(&family.render(&frozen, &opts)).unwrap();
         let expected = if index < 2 {
@@ -406,6 +408,7 @@ fn responses_reasoning_summary_request_bytes_survive_wal_replay() {
             account_ref: None,
             run_id: "summary".into(),
             step_index: 2,
+            max_output_tokens: None,
         });
         let body: Value = serde_json::from_slice(&OpenAiResponses.render(&frozen, &opts)).unwrap();
         let expected = if stateless {

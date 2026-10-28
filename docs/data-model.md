@@ -39,7 +39,16 @@ paths rather than begin an empty history (`crates/broca-module-serve/src/state_r
   catalog/fusiform-lkg.json last-known-good model catalog
   logs/                     daily log files
   request-dumps/            debug request dumps
+  broca.lock                held by the one ck-broca serving this root   (below)
 ```
+
+Only one `ck-broca` process may serve a state root. At boot, before it touches anything else
+in the root, it takes an exclusive OS advisory lock on `broca.lock` (`flock` on Unix,
+`LockFileEx` on Windows) and holds it until it exits; the kernel releases it however the
+process dies. A second process finding the lock held logs one ERROR naming the root and exits
+non-zero at once, without writing to the root. The file holds no data and never marks a root
+as holding state. The command-line tools (store-maintenance, wal-fold, broca-session) do not
+take it (`crates/broca-module-serve/src/state_root_lock.rs`).
 
 The WAL is the source of truth. Everything in `run-index.db` is derived from it, although
 not all of it can be regenerated (section 4 says which parts cannot).
@@ -306,9 +315,15 @@ re-authentication. May appear more than once, and after provider calls.
 | `ts_ms` | u64 | absent. Wall-clock ms when the refreeze was recorded. |
 | `auth_selection` | `AuthSelection` | required |
 
-`AuthSelection` (also `RunConfig.auth_selection`): `credential_id` (required, the
-`<method>:<provider>[:<account>]` routing key); absent-when-unset `account_ref`,
-`resolved_credential_id`, and `vault_request`. `vault_request` is
+`AuthSelection` (also `RunConfig.auth_selection`): `credential_id` (required); absent-when-unset
+`account_ref`, `resolved_credential_id`, `vault_request`, `account_decision`, and
+`auth_method`. Without `auth_method`, `credential_id` is the `<method>:<provider>[:<account>]`
+broca key, and method, provider and account parse out of it. With `auth_method` (a string such
+as `oauth`, `chatgpt`, `apikey`, `antigravity`, frozen from the vault's metadata when routing
+chose the credential), `credential_id` is the vault's own credential id, an opaque record name:
+resume reads it verbatim and takes the method from `auth_method`, and nothing parses the id.
+A `run_started` or `run_auth_refrozen` whose selection carries `auth_method` is
+**must-understand, feature `auth-selection-method/v1`** (a `ver = 3` frame). `vault_request` is
 `{min_ttl_ms: i64|null (always written), force_refresh: bool (absent on get_scoped),
 op: "get"|"get_scoped"|<unknown string> (absent on older records, meaning "get")}`.
 `account_ref` is empty by construction for `apikey` and `antigravity` credentials, so key
@@ -330,6 +345,29 @@ no time.
 | `retries_used` | u32 | defaulted 0 | Retries within this step. |
 | `service_tier_used` | string | absent | Tier the provider **reported** serving, verbatim. Never filled from the requested tier. |
 | `speed_used` | string | absent | Anthropic `usage.speed`, verbatim. |
+| `served_model` | string | absent | **Must-understand, feature `provider-fallback-block/v1`.** The wire model id an Anthropic server-side fallback served the answer with, present only when it differs from the requested model. |
+| `usage_iterations` | array | absent | **Must-understand, feature `provider-fallback-block/v1`.** The response's `usage.iterations`, verbatim: entries with `type` (`message`, `fallback_message`), `model`, token counts and any other members. `usage` stays the top-level usage. |
+| `route` | `{model, reason}` | absent | **Must-understand, feature `refusal-fallback/v1`.** Present only when the step was sent to the client-side fallback model `model` (`{provider_module_id, model_id}`); `reason` is `refusal` (the source refused this step) or `schedule` (an earlier refusal's schedule routed it). |
+| `refusal_fallback` | object | absent | **Must-understand, feature `refusal-fallback/v1`.** The session's refusal-fallback schedule after this step: `source`, `fallback` (model handles), `phase` (`{kind: "fallback", remaining}` or `{kind: "probe", clean}`), `re_refusals` (u8), `updated_at_ms` (absent). |
+| `refusal_after_tool_use` | bool | absent | **Must-understand, feature `refusal-fallback/v1`.** The source model refused after completing a tool call; the step committed as a tool step. |
+
+An assistant message may hold a `provider_fallback` part, `{"type": "provider_fallback",
+"from_model": str, "to_model": str}`: Anthropic's server-side fallback handoff, at the position
+the response placed it. Any record carrying one requires `provider-fallback-block/v1`.
+
+**`model_step_refused`**: **must-understand, feature `refusal-fallback/v1`.** The source model
+refused the step and it is re-sent to the client-side fallback model under the same `step_id`,
+with no new `step_started`. Synced before the re-send. The refused content is never stored. At
+most one per step.
+
+| Field | Type | Rule | Meaning |
+|---|---|---|---|
+| `step_id` | u64 | required | The step being re-sent. |
+| `usage` | `Usage` | required | The refused response's billed usage. |
+| `served_model` | string | absent | As on `model_step_finished`. |
+| `discarded_blocks` | u32 | required | How many content blocks the refused response held. |
+| `schedule` | object | required | The schedule after the refusal, shaped like `model_step_finished.refusal_fallback`. |
+| `ts_ms` | u64 | absent | Wall-clock Unix ms of the refusal. |
 
 **`turn_finished`**: `step_id` (u64). The turn (step plus its tool batch) is committed.
 Synced.
@@ -434,6 +472,7 @@ the whole WAL instead of skipping it.
 | `input_token_budget_exhausted` | must-understand, `input-token-cap/v1` | The input-token budget ran out; written in the terminal barrier with any never-dispatched tool results. |
 | `context_ceiling_wait` | must-understand, `context-ceiling/v1` | A step's bounded wait at the context ceiling. |
 | `context_ceiling_decided` | must-understand, `context-ceiling/v1` | The durable decision of a ceiling check, before any model I/O: permit the step, or seal the run without sending. |
+| `output_reservation_clamped` | must-understand, `output-reservation/v1` | A step's output-token cap, lowered before any model I/O so the estimated input plus the cap stays inside the run's context limit. Written only for a lowered step; a resume and every rebuild of the step's request (cache warm, cache dump) render the recorded cap. |
 | `structured_output_downgraded` | must-understand, `structured-output-downgrade/v1` | The provider refused the strict schema's grammar; from this barrier on the run renders non-strict, including after a crash. |
 | `structured_output_result` | must-understand, `structured-output/v1` | The run's structured output and its validation, written in the same commit as `run_finished` and never recomputed on read. |
 | `run_cancel_requested` | must-understand, `run-cancel-at/v1` | An accepted cancellation, synced before it is acknowledged. It does not seal the episode; recovery still repairs the open tool batch. |
@@ -449,7 +488,8 @@ the whole WAL instead of skipping it.
 | `question_withdrawal_acknowledged` | none; informational | How the withdrawal of a held call's question ended. An older build skips it and computes the same session. |
 
 Several records documented above also become must-understand when they carry certain fields
-(for example `run_started` with a scope, a plan manifest or retention, and `run_paused` with
+(for example `run_started` with a scope, a plan manifest or retention, `run_started` and
+`run_auth_refrozen` whose `auth_selection` carries `auth_method`, and `run_paused` with
 reason `restart`). `WalRecord::required_features` in the same file lists every case.
 
 #### Unknown record types
@@ -485,6 +525,7 @@ reported it, the sum covers those steps only, a lower bound.
 **Which records carry usage:**
 
 - `model_step_finished.usage`: one step, one provider call.
+- `model_step_refused.usage`: one refused provider call; it counts toward the run total.
 - `run_finished.usage`: the run's accumulated usage.
 - `model_attempt_finished` carries **none**. Nothing else in the WAL does.
 
@@ -735,6 +776,14 @@ separate-reasoning normalizer), `usage` (`Usage`, section 2.5), `usage_by_servic
 (absent when no step reported a tier; buckets need not sum to `usage`), `retries_used`,
 `pricing_at_ms`, `pricing_at_precision`, `occurred_at_ms`, `occurred_at_precision`,
 `terminal_reason` (final slice only). New fields are only ever added.
+
+A slice ends at a refreeze, and also where a model call is answered by another model than the
+slice's: a step routed to the refusal-fallback model (`route`) or served by an Anthropic
+server-side fallback (`served_model`). The next slice's `model` is the model that answered, so a
+run can carry a row for a fallback model. A `model_step_refused` call belongs to the slice of
+the model that refused it, and a `cache_warmed` re-send of a routed step's request is billed
+under that step's model. When every call is answered by the run's own model, only refreezes
+open additional slices.
 
 Session facts have no `kind` member and retain the shape above. Sessionless classifier
 facts dispatch on `kind: "system_one"` before decoding. They contain `fact_id`,

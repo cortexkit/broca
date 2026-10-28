@@ -1358,9 +1358,12 @@ fn read_session_page_from_rows(
 pub struct ToolCallDispatch {
     /// The model's id for the call. Display only: a model may reuse one id in several steps.
     pub tool_call_id: String,
-    /// The WAL sequence number of the call's own dispatch intent, when it has one. With the
-    /// lineage id it spells the call's key; see [`call_key`].
+    /// The call's dispatch-intent sequence, used with the log identity only when
+    /// the record carries no prepared key; see [`tool_call_key`].
     pub intent_seq: Option<u64>,
+    /// A prepared key preserved by the dispatch intent, when consent preparation
+    /// made the call durable before the intent was written.
+    pub recorded_call_key: Option<String>,
     /// The module the call was dispatched to, as its intent recorded it. Absent for a call never
     /// dispatched, and for one whose intent was written before broca recorded the module: that
     /// is never guessed.
@@ -1369,16 +1372,29 @@ pub struct ToolCallDispatch {
     pub indeterminate: bool,
 }
 
-/// A tool call's key: `<lineage_id>:<wal_seq>` of the call's own `ToolDispatchIntent`.
+/// An ordinary call's fallback key, from its own `ToolDispatchIntent`.
 ///
-/// Derived, never stored: the intent is the first durable record that holds the call alone
-/// (sibling calls share their step record, but each has its own intent), its sequence number is
-/// never reissued within a lineage once synced, and the lineage id tells two lineages at one
-/// address apart. So two sibling calls, and one model id recurring across steps, each get a
-/// distinct key, and a restart reads every key back unchanged. The spelling is printable ASCII
-/// well under the 256 bytes the tool-provider role allows.
+/// Ordinary calls use their own intent: sibling calls share a step record but have
+/// distinct intents. A synced sequence is never reissued, and the log identity
+/// distinguishes replacements at one address. Consent preparation can make a call
+/// durable earlier; its key is then recorded on the later intent and preserved by
+/// [`tool_call_key`]. Model ids may repeat without reusing either kind of key.
+/// The spelling is printable ASCII, below the tool-provider role's 256-byte bound.
 pub fn call_key(lineage_id: broca_wal::WalLineageId, intent_seq: u64) -> String {
-    format!("{lineage_id}:{intent_seq}")
+    tool_call_key(Some(&lineage_id.to_string()), intent_seq, None)
+        .expect("a known log identity yields a key")
+}
+
+/// Use the durable key the provider received. Approved calls retain their earlier
+/// preparation key; only records without one derive a key from their intent.
+pub fn tool_call_key(
+    lineage_id: Option<&str>,
+    intent_seq: u64,
+    recorded: Option<&str>,
+) -> Option<String> {
+    recorded
+        .map(str::to_owned)
+        .or_else(|| lineage_id.map(|lineage| format!("{lineage}:{intent_seq}")))
 }
 
 /// The dispatch facts of the committed tool turns `turns` of a replay over `framed`, keyed by
@@ -1404,18 +1420,21 @@ pub fn dispatches_of_turns(
         else {
             continue;
         };
-        let mut intents: HashMap<&str, (u64, Option<String>)> = HashMap::new();
+        let mut intents: HashMap<&str, (u64, Option<String>, Option<String>)> = HashMap::new();
         let mut resolved: HashSet<&str> = HashSet::new();
         for frame in &framed[step_index + 1..] {
             match &frame.record {
                 WalRecord::ToolDispatchIntent {
                     tool_call_id,
                     module_id,
+                    call_key,
                     ..
                 } => {
-                    intents
-                        .entry(tool_call_id.0.as_str())
-                        .or_insert((frame.seq, module_id.clone()));
+                    intents.entry(tool_call_id.0.as_str()).or_insert((
+                        frame.seq,
+                        module_id.clone(),
+                        call_key.clone(),
+                    ));
                 }
                 WalRecord::ToolResult { result, .. } => {
                     resolved.insert(result.tool_call_id.0.as_str());
@@ -1436,8 +1455,9 @@ pub fn dispatches_of_turns(
                 let intent = intents.get(id);
                 ToolCallDispatch {
                     tool_call_id: id.to_owned(),
-                    intent_seq: intent.map(|(seq, _)| *seq),
-                    dispatched_to: intent.and_then(|(_, module)| module.clone()),
+                    intent_seq: intent.map(|(seq, _, _)| *seq),
+                    recorded_call_key: intent.and_then(|(_, _, key)| key.clone()),
+                    dispatched_to: intent.and_then(|(_, module, _)| module.clone()),
                     indeterminate: intent.is_some() && !resolved.contains(id),
                 }
             })
@@ -1848,6 +1868,7 @@ pub(crate) fn merge_prefix_and_tail(
         open_tool_run: tail_state.open_tool_run,
         compaction: tail_state.compaction,
         compaction_history: tail_state.compaction_history,
+        output_reservation: tail_state.output_reservation,
         compaction_notice_floor: 1,
         manifest: None,
         on_restart: tail_state.on_restart,
@@ -1885,6 +1906,9 @@ pub(crate) fn merge_prefix_and_tail(
         // `latest_projection_boundary`), so every unplaced steer is in the tail.
         pending_steers: tail_state.pending_steers,
         resolution: tail_state.resolution,
+        // Only what the tail recorded: the materialized prefix keeps no schedule.
+        refusal_fallback: tail_state.refusal_fallback,
+        refused_steps: tail_state.refused_steps,
         committed_tool_turns: Vec::new(),
         held: None,
     };
@@ -2445,6 +2469,7 @@ mod tests {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -2505,6 +2530,7 @@ mod tests {
             },
             WalRecord::TurnFinished { step_id: StepId(1) },
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -2787,6 +2813,7 @@ mod tests {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -2837,6 +2864,7 @@ mod tests {
             // This naturally terminal no-tool step is durable but has no RunFinished, so the
             // corpus ends with a non-empty, not-yet-materialized tail.
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -3365,6 +3393,7 @@ mod tests {
             WalRecord::RunAuthRefrozen {
                 ts_ms: Some(50),
                 auth_selection: AuthSelection {
+                    auth_method: None,
                     credential_id: "chatgpt:openai".into(),
                     account_ref: Some("resumed-account".into()),
                     resolved_credential_id: None,
@@ -3379,6 +3408,7 @@ mod tests {
         assert_eq!(
             recovered.auth_selection,
             Some(AuthSelection {
+                auth_method: None,
                 credential_id: "chatgpt:openai".into(),
                 account_ref: Some("resumed-account".into()),
                 resolved_credential_id: None,
@@ -3514,6 +3544,7 @@ mod episode_merge_regression {
         let wal = vec![
             start("a", "a-model", "episode a"),
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -3662,5 +3693,27 @@ mod held_resume_tests {
             None,
             "starts out of order"
         );
+    }
+}
+
+#[cfg(test)]
+mod call_identity_tests {
+    #[test]
+    fn recorded_preparation_key_wins_and_ordinary_keys_keep_their_bytes() {
+        let lineage = "00000000-0000-4000-8000-000000000001";
+        assert_eq!(
+            super::tool_call_key(Some(lineage), 19, None).as_deref(),
+            Some("00000000-0000-4000-8000-000000000001:19")
+        );
+        let prepared = "00000000-0000-4000-8000-000000000001:5";
+        assert_eq!(
+            super::tool_call_key(Some(lineage), 21, Some(prepared)).as_deref(),
+            Some(prepared)
+        );
+        assert_eq!(
+            super::tool_call_key(None, 21, Some(prepared)).as_deref(),
+            Some(prepared)
+        );
+        assert!(super::tool_call_key(None, 19, None).is_none());
     }
 }

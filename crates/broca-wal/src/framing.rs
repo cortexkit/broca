@@ -161,6 +161,11 @@ const LINEAGE_PAYLOAD_LEN: u32 = 16;
 pub const GATED_FRAMING_VERSION: u8 = 3;
 pub const V4_FRAMING_VERSION: u8 = broca_wal_reader::frame::VERSION;
 pub const INTERRUPT_REASON_FEATURE: &str = "interrupt-reason/v1";
+/// Every version 4 frame names this: its header carries the `appended_ms` written immediately
+/// before the write and the `writer_id` of the writer that appended it. A reader that knows the
+/// version 4 layout but not this name refuses the log, so no build reads those fields as
+/// anything other than what they are.
+pub const FRAME_STAMPS_FEATURE: &str = "frame-stamps/v1";
 pub const TURN_DIRECTIVES_FEATURE: &str = "turn-directives/v1";
 /// A `RunStarted`, `Queued` or `Steered` record whose `request_identity_digest` carries the
 /// send's `client_message_id` (llm-runner 0.5.1 §9.11). Part of the send's identity: a build
@@ -181,6 +186,10 @@ pub const MEDIA_CONTENT_FEATURE: &str = "media-content/v1";
 /// requires it unless a provider declared something.
 pub const PROVIDER_DECLARATIONS_FEATURE: &str = "provider-declarations/v1";
 
+/// Catalog schema identities frozen in a plan. Readers that drop the map could
+/// dispatch a resumed run without its admitted tool definition's schema pin.
+pub const TOOL_SCHEMA_PINS_FEATURE: &str = "tool-schema-pins/v1";
+
 /// The feature names this build understands in a gated frame's `requires` list.
 ///
 /// THIS IS THE ONLY TABLE. Every reader path (replay, the anchored range read behind
@@ -193,10 +202,12 @@ pub const PROVIDER_DECLARATIONS_FEATURE: &str = "provider-declarations/v1";
 /// as [`DecodeStep::NewerWriter`]. `ck-broca --wal-known-features` prints this list so
 /// placement tooling can refuse to install a build that cannot read what is already on disk.
 pub const KNOWN_FEATURES: &[&str] = &[
+    "writer-id/v1",
     INTERRUPT_REASON_FEATURE,
     TURN_DIRECTIVES_FEATURE,
     AGENT_RUN_SCOPE_FEATURE,
     ARCHIVE_INDEX_V2_FEATURE,
+    AUTH_SELECTION_METHOD_FEATURE,
     CHATGPT_CODEX_WIRE_FEATURE,
     CLIENT_MESSAGE_ID_FEATURE,
     COMPACTION_RIDE_WAIT_FEATURE,
@@ -208,15 +219,20 @@ pub const KNOWN_FEATURES: &[&str] = &[
     DELIVERY_ORDER_FEATURE,
     DISPATCH_MODULE_FEATURE,
     FLOW_SCOPE_FEATURE,
+    FRAME_STAMPS_FEATURE,
     GOOGLE_RPC_ERROR_DETAILS_FEATURE,
     INPUT_TOKEN_CAP_FEATURE,
     MEDIA_CONTENT_FEATURE,
     OPENROUTER_REASONING_FEATURE,
+    OUTPUT_RESERVATION_FEATURE,
     PLAN_MANIFEST_FEATURE,
     PLAN_REFERENCE_SLOTS_FEATURE,
     PROVIDER_DECLARATIONS_FEATURE,
+    PROVIDER_FALLBACK_BLOCK_FEATURE,
+    TOOL_SCHEMA_PINS_FEATURE,
     PROVIDER_HELD_FEATURE,
     PROVIDER_TEXT_STATE_FEATURE,
+    REFUSAL_FALLBACK_FEATURE,
     RESTART_PAUSE_FEATURE,
     RETENTION_FEATURE,
     RUNNER_TAGS_FEATURE,
@@ -252,6 +268,14 @@ pub const CHATGPT_CODEX_WIRE_FEATURE: &str = "chatgpt-codex-wire/v1";
 /// OpenRouter-tagged reasoning and its frozen echo policy cannot be read faithfully by older
 /// builds. This is distinct from text-part phase/signature state in provider-text-state/v1.
 pub const OPENROUTER_REASONING_FEATURE: &str = "openrouter-reasoning/v1";
+
+/// A step's output-token cap lowered below the run's frozen cap so that the request stays
+/// inside the run's context limit (`WalRecord::OutputReservationClamped`). The cap is part of
+/// the request the step sent, and a resume or a rebuild of that request (cache warm, cache
+/// dump) renders it again. A reader without the feature would skip the record and render the
+/// frozen cap instead: a different request from the recorded one, which the provider may refuse
+/// for crossing the context window. So it must refuse the WAL.
+pub const OUTPUT_RESERVATION_FEATURE: &str = "output-reservation/v1";
 
 /// Compaction's issued fence, applied view and other answers. Missing it must refuse the
 /// WAL rather than lose an applied view or allow a superseded request to apply on replay.
@@ -334,6 +358,12 @@ pub const SESSION_CLASS_FEATURE: &str = "session-class/v1";
 /// Ignoring a session input cap would authorize paid model steps the caller forbade.
 pub const INPUT_TOKEN_CAP_FEATURE: &str = "input-token-cap/v1";
 
+/// A `RunStarted` or `RunAuthRefrozen` whose credential selection names its auth method
+/// (`AuthSelection::auth_method`). Its `credential_id` is then the vault's opaque credential
+/// id; a reader without this feature would parse that id for a method and resume on the wrong
+/// credential or wire family, so it must refuse the log instead.
+pub const AUTH_SELECTION_METHOD_FEATURE: &str = "auth-selection-method/v1";
+
 /// A run frozen with structured output renders its schema into every request and ends when the
 /// model calls `submit_result`. A reader that skipped the frozen settings would resume the run
 /// without the schema or the submit tool, and would dispatch the calls a submit skipped.
@@ -362,6 +392,19 @@ pub const TOOL_TIMES_FEATURE: &str = "tool-times/v1";
 
 /// Preserve read-entry times across rollback; dropping them would change an already served entry.
 pub const MESSAGE_TIMES_FEATURE: &str = "message-times/v1";
+
+/// Anthropic's server-side fallback, as a step records it: the `provider_fallback` content part
+/// (the handoff block, in any record that carries messages) and a `ModelStepFinished`'s
+/// `served_model` or `usage_iterations`. An older build's closed content decoder cannot read the
+/// part, and skipping the fields would bill the step to the requested model instead of the one
+/// that served it, so all three are must-understand.
+pub const PROVIDER_FALLBACK_BLOCK_FEATURE: &str = "provider-fallback-block/v1";
+
+/// Client-side refusal fallback: the `ModelStepRefused` record and a `ModelStepFinished`'s
+/// `route`, `refusal_fallback` or `refusal_after_tool_use`. A reader that skipped them would
+/// lose the session's fallback schedule, attribute a fallback-answered step to the wrong model,
+/// and miss the refused call's billed usage, so all are must-understand.
+pub const REFUSAL_FALLBACK_FEATURE: &str = "refusal-fallback/v1";
 
 /// The feature a `RunStarted` carrying the session's frozen scope requires
 /// (`WalRecord::RunStarted::scope`). A reader without it must refuse such a WAL: skipping the
@@ -606,6 +649,23 @@ pub fn encode_with_requires(
     frame(GATED_FRAMING_VERSION, seq, fence, &payload)
 }
 
+/// Where a version 4 header's `requires_len` field sits: after len, ver, seq, fence,
+/// appended_ms and writer_id.
+const V4_REQUIRES_LEN_FIELD: std::ops::Range<usize> = 45..47;
+
+/// Size the version 4 header would occupy, from the header alone. `None` until `buf` holds the
+/// two `requires_len` bytes, so a torn write that stops short of them is never sized.
+pub fn v4_header_len(buf: &[u8]) -> Option<usize> {
+    let field = buf.get(V4_REQUIRES_LEN_FIELD)?;
+    let requires_len = u16::from_le_bytes([field[0], field[1]]) as usize;
+    broca_wal_reader::frame::FIXED_HEADER_LEN.checked_add(requires_len)
+}
+
+/// The shared version 4 codec. broca's own writer builds version 4 headers with it rather than
+/// with a second copy of the layout, so a frame broca writes and a frame the published reader
+/// decodes can only agree.
+pub use broca_wal_reader::frame as v4;
+
 /// Encode an overhaul-root record with caller-supplied writer metadata. This is
 /// deliberately separate from legacy encoding: adding the codec must not turn
 /// version 4 writes on for existing state roots.
@@ -623,6 +683,112 @@ pub fn encode_v4(
         }
         error => FrameError::V4(error),
     })
+}
+
+/// A record's version 4 frame, settled except for the two fields the writer stamps.
+///
+/// The only way to build one is [`PreparedV4Frame::prepare`], which serializes the record with
+/// the shared codec, digests it and fixes its must-understand names (the record's own plus
+/// [`FRAME_STAMPS_FEATURE`]). An overhaul log writes nothing else: it never accepts caller-built
+/// bytes, so every version 4 frame on disk is the codec's encoding of the record it was handed
+/// with. Serializing and digesting is the costly half of framing and may run on any thread; the
+/// log assembles the short header on its writer thread with the `appended_ms` sampled there and
+/// its own `writer_id`.
+#[derive(Debug)]
+pub struct PreparedV4Frame {
+    payload: Vec<u8>,
+    payload_sha256: [u8; 32],
+    requires: Vec<&'static str>,
+    header_len: usize,
+}
+
+impl PreparedV4Frame {
+    /// Serialize and digest `record`, and check that its header will encode. The header length
+    /// depends on the feature names, never on the stamped values, so [`Self::frame_len`] is the
+    /// exact size of the frame the log will write.
+    pub fn prepare(record: &WalRecord) -> Result<Self, FrameError> {
+        let payload = serde_json::to_vec(record).map_err(FrameError::Serialize)?;
+        let payload_sha256: [u8; 32] = Sha256::digest(&payload).into();
+        let mut requires = record.required_features().to_vec();
+        requires.push(FRAME_STAMPS_FEATURE);
+        let header_len = v4_header(
+            broca_wal_reader::frame::Metadata {
+                seq: 0,
+                fence: 0,
+                appended_ms: 0,
+                writer_id: [0; 16],
+            },
+            &requires,
+            payload.len(),
+            payload_sha256,
+        )?
+        .len();
+        Ok(Self {
+            payload,
+            payload_sha256,
+            requires,
+            header_len,
+        })
+    }
+
+    /// The bytes the finished frame occupies on disk, for append budgets.
+    pub fn frame_len(&self) -> usize {
+        self.header_len + self.payload.len()
+    }
+
+    /// Every must-understand name the frame's header lists. The machine's feature floor must
+    /// list them all before the frame is written.
+    pub fn requires(&self) -> &[&'static str] {
+        &self.requires
+    }
+
+    /// The complete frame, stamped with `metadata`. Only the log that writes it calls this.
+    pub(crate) fn stamp(
+        &self,
+        metadata: broca_wal_reader::frame::Metadata,
+    ) -> Result<Vec<u8>, FrameError> {
+        let mut frame = v4_header(
+            metadata,
+            &self.requires,
+            self.payload.len(),
+            self.payload_sha256,
+        )?;
+        frame.extend_from_slice(&self.payload);
+        Ok(frame)
+    }
+}
+
+/// The shared codec's version 4 header, with its feature-name refusal mapped to the same error a
+/// legacy gated frame reports.
+fn v4_header(
+    metadata: broca_wal_reader::frame::Metadata,
+    requires: &[&str],
+    payload_len: usize,
+    payload_sha256: [u8; 32],
+) -> Result<Vec<u8>, FrameError> {
+    broca_wal_reader::frame::encode_header(metadata, requires, payload_len, payload_sha256).map_err(
+        |error| match error {
+            broca_wal_reader::Error::InvalidFeatureName { name } => {
+                FrameError::InvalidFeatureName { name }
+            }
+            error => FrameError::V4(error),
+        },
+    )
+}
+
+/// The `appended_ms` a version 4 frame written now carries: the wall clock in milliseconds since
+/// the Unix epoch, never lower than any value this process has stamped before, so the field does
+/// not go backwards within one process when the wall clock does. A clock before the epoch reads
+/// as 0 and is then raised to the last stamped value.
+pub fn appended_ms_now() -> u64 {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        });
+    let previous = LAST.fetch_max(wall, std::sync::atomic::Ordering::Relaxed);
+    wall.max(previous)
 }
 
 /// Frame an already-serialized record payload, with the same header and digest as
@@ -883,6 +1049,12 @@ mod retention_tests;
 
 #[cfg(test)]
 mod provider_held_tests;
+
+#[cfg(test)]
+mod fallback_tests;
+
+#[cfg(test)]
+mod reader_release_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1247,10 +1419,12 @@ mod tests {
         assert_eq!(
             KNOWN_FEATURES,
             &[
+                "writer-id/v1",
                 INTERRUPT_REASON_FEATURE,
                 TURN_DIRECTIVES_FEATURE,
                 AGENT_RUN_SCOPE_FEATURE,
                 ARCHIVE_INDEX_V2_FEATURE,
+                AUTH_SELECTION_METHOD_FEATURE,
                 CHATGPT_CODEX_WIRE_FEATURE,
                 CLIENT_MESSAGE_ID_FEATURE,
                 COMPACTION_RIDE_WAIT_FEATURE,
@@ -1262,15 +1436,20 @@ mod tests {
                 DELIVERY_ORDER_FEATURE,
                 DISPATCH_MODULE_FEATURE,
                 FLOW_SCOPE_FEATURE,
+                FRAME_STAMPS_FEATURE,
                 GOOGLE_RPC_ERROR_DETAILS_FEATURE,
                 INPUT_TOKEN_CAP_FEATURE,
                 MEDIA_CONTENT_FEATURE,
                 OPENROUTER_REASONING_FEATURE,
+                OUTPUT_RESERVATION_FEATURE,
                 PLAN_MANIFEST_FEATURE,
                 PLAN_REFERENCE_SLOTS_FEATURE,
                 PROVIDER_DECLARATIONS_FEATURE,
+                PROVIDER_FALLBACK_BLOCK_FEATURE,
+                TOOL_SCHEMA_PINS_FEATURE,
                 PROVIDER_HELD_FEATURE,
                 PROVIDER_TEXT_STATE_FEATURE,
+                REFUSAL_FALLBACK_FEATURE,
                 RESTART_PAUSE_FEATURE,
                 RETENTION_FEATURE,
                 RUNNER_TAGS_FEATURE,
@@ -1290,6 +1469,7 @@ mod tests {
         );
         assert_eq!(TOOL_REPLY_FEATURE, "tool-reply/v1");
         assert_eq!(MESSAGE_TIMES_FEATURE, "message-times/v1");
+        assert_eq!(OUTPUT_RESERVATION_FEATURE, "output-reservation/v1");
         assert_eq!(RUNNER_TAGS_FEATURE, "runner-tags/v1");
         assert_eq!(RUNNER_TAGS_V2_FEATURE, "runner-tags/v2");
         assert_eq!(ARCHIVE_INDEX_V2_FEATURE, "archive-index/v2");
@@ -1300,7 +1480,13 @@ mod tests {
         assert_eq!(PLAN_MANIFEST_FEATURE, "plan-manifest/v1");
         assert_eq!(PLAN_REFERENCE_SLOTS_FEATURE, "plan-reference-slots/v1");
         assert_eq!(PROVIDER_DECLARATIONS_FEATURE, "provider-declarations/v1");
+        assert_eq!(TOOL_SCHEMA_PINS_FEATURE, "tool-schema-pins/v1");
         assert_eq!(PROVIDER_TEXT_STATE_FEATURE, "provider-text-state/v1");
+        assert_eq!(
+            PROVIDER_FALLBACK_BLOCK_FEATURE,
+            "provider-fallback-block/v1"
+        );
+        assert_eq!(REFUSAL_FALLBACK_FEATURE, "refusal-fallback/v1");
         assert_eq!(CHATGPT_CODEX_WIRE_FEATURE, "chatgpt-codex-wire/v1");
         assert_eq!(OPENROUTER_REASONING_FEATURE, "openrouter-reasoning/v1");
         assert_eq!(RESTART_PAUSE_FEATURE, "restart-pause/v1");
@@ -1312,6 +1498,7 @@ mod tests {
             "google-rpc-error-details/v1"
         );
         assert_eq!(INPUT_TOKEN_CAP_FEATURE, "input-token-cap/v1");
+        assert_eq!(AUTH_SELECTION_METHOD_FEATURE, "auth-selection-method/v1");
         assert_eq!(STEER_QUEUE_FEATURE, "steer-queue/v1");
         assert_eq!(STEP_TRANSFORMS_FEATURE, "step-transforms/v1");
         assert_eq!(STRUCTURED_OUTPUT_FEATURE, "structured-output/v1");
@@ -1325,6 +1512,54 @@ mod tests {
     /// paragraph break requires its own feature, so an older reader refuses the WAL by that
     /// name instead of resuming the run without the break. A frozen structured output without
     /// the flag, or with it false, requires nothing new.
+    #[test]
+    fn auth_selection_method_is_must_understand_on_both_selection_records() {
+        use crate::record::WalRecord;
+        // The method is the selection's last key, so every older key keeps its place.
+        const PINNED: &[&str] = &[
+            r#"{"type":"run_started","run_id":"r","session":{"project_root":"/tmp/project","harness":"runner","session":"session"},"config":{"model":{"provider_module_id":"anthropic","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1,"auth_selection":{"credential_id":"work-claude","account_ref":"acct-1","account_decision":{"path":"routed","admission_id":"r","decision_id":"acd-1"},"auth_method":"oauth"}},"input":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"origin":{"kind":"fresh"}}"#,
+            r#"{"type":"run_auth_refrozen","ts_ms":5,"auth_selection":{"credential_id":"work-claude","account_ref":"acct-1","auth_method":"oauth"}}"#,
+        ];
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != AUTH_SELECTION_METHOD_FEATURE)
+            .collect();
+        for pinned in PINNED {
+            let record: WalRecord = serde_json::from_str(pinned).unwrap();
+            assert_eq!(serde_json::to_string(&record).unwrap(), *pinned);
+            assert_eq!(record.required_features(), &[AUTH_SELECTION_METHOD_FEATURE]);
+            let bytes = encode(1, 1, &record).unwrap();
+            assert_eq!(bytes[4], GATED_FRAMING_VERSION);
+            match decode_next(&bytes) {
+                DecodeStep::Record { framed, .. } => assert_eq!(framed.record, record),
+                _ => panic!("this build reads a selection with a method"),
+            }
+            // A build without the feature refuses the log by the feature's name rather than
+            // resume it by parsing the opaque credential id.
+            assert!(
+                matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [AUTH_SELECTION_METHOD_FEATURE])
+            );
+
+            // The same record without the method needs no feature at all.
+            let mut without = record.clone();
+            match &mut without {
+                WalRecord::RunStarted { config, .. } => {
+                    config.auth_selection.as_mut().unwrap().auth_method = None
+                }
+                WalRecord::RunAuthRefrozen { auth_selection, .. } => {
+                    auth_selection.auth_method = None
+                }
+                _ => unreachable!(),
+            }
+            assert!(without.required_features().is_empty());
+            assert!(matches!(
+                decode_next_with(&encode(1, 1, &without).unwrap(), &older),
+                DecodeStep::Record { .. }
+            ));
+        }
+    }
+
     #[test]
     fn structured_output_paragraph_break_is_must_understand() {
         // Serialized from the protocol type, so renaming its field cannot leave this gate
@@ -1404,6 +1639,33 @@ mod tests {
             decode_next_with(&bytes, &old),
             DecodeStep::NewerWriter { .. }
         ));
+    }
+
+    /// A lowered output cap is part of the request its step sent, so it is written in a gated
+    /// frame requiring `output-reservation/v1`: a build without the feature refuses the WAL
+    /// rather than skip the record and resume the step with the frozen cap.
+    #[test]
+    fn a_lowered_output_cap_requires_its_own_feature() {
+        let record = WalRecord::OutputReservationClamped {
+            step_id: broca_protocol::StepId(175),
+            max_output_tokens: 124_990,
+            estimated_input_tokens: 919_490,
+            context_limit: 1_048_576,
+        };
+        assert_eq!(record.required_features(), &[OUTPUT_RESERVATION_FEATURE]);
+        let bytes = encode(1, 1, &record).unwrap();
+        assert_eq!(bytes[4], GATED_FRAMING_VERSION);
+        assert!(
+            matches!(decode_next(&bytes), DecodeStep::Record { framed, .. } if framed.record == record)
+        );
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != OUTPUT_RESERVATION_FEATURE)
+            .collect();
+        assert!(
+            matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [OUTPUT_RESERVATION_FEATURE])
+        );
     }
 
     #[test]
@@ -2690,5 +2952,83 @@ mod session_class_tests {
             decode_next_with(&encode(1, 1, &plain).unwrap(), &known),
             DecodeStep::Record { .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod v4_header_len_tests {
+    use super::*;
+
+    /// A real version 4 header whose requirements array is `requires` long once encoded.
+    fn header(requires: &[&str]) -> Vec<u8> {
+        broca_wal_reader::frame::encode_header(
+            broca_wal_reader::frame::Metadata {
+                seq: 1,
+                fence: 1,
+                appended_ms: 1,
+                writer_id: [7; 16],
+            },
+            requires,
+            0,
+            [0; 32],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_header_is_sized_only_once_both_requires_len_bytes_are_present() {
+        let full = header(&["frame-stamps/v1"]);
+        let expected = full.len();
+        // 44 bytes end inside the writer id, 45 before `requires_len`, 46 inside it: none of
+        // them can size the header, and none may read past the slice.
+        for len in 44..=46 {
+            assert_eq!(v4_header_len(&full[..len]), None, "{len} bytes");
+        }
+        assert_eq!(v4_header_len(&full[..47]), Some(expected), "47 bytes");
+        assert_eq!(v4_header_len(&full), Some(expected));
+        assert_eq!(v4_header_len(&[]), None);
+    }
+
+    #[test]
+    fn a_requirements_array_cut_mid_way_is_sized_but_not_decoded() {
+        // A torn write that stops inside the requirements array leaves `requires_len` whole, so
+        // the header can be sized and recovery knows how much more it would need, but the
+        // header itself is incomplete rather than corrupt.
+        for requires in [
+            &["frame-stamps/v1"][..],
+            &["frame-stamps/v1", "input-token-cap/v1"],
+        ] {
+            let full = header(requires);
+            let array_len = full.len() - broca_wal_reader::frame::FIXED_HEADER_LEN;
+            let cut = 47 + array_len / 2;
+            assert_eq!(v4_header_len(&full[..cut]), Some(full.len()));
+            assert_eq!(
+                broca_wal_reader::frame::decode_header(&full[..cut]).unwrap(),
+                None,
+                "{requires:?}: a header cut inside its requirements array needs more bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn a_prepared_frame_measures_the_frame_it_stamps() {
+        for record in [
+            WalRecord::TurnFinished {
+                step_id: broca_protocol::StepId(3),
+            },
+            WalRecord::InputTokenCapFrozen { limit: 9 },
+        ] {
+            let prepared = PreparedV4Frame::prepare(&record).unwrap();
+            assert!(prepared.requires().contains(&FRAME_STAMPS_FEATURE));
+            let frame = prepared
+                .stamp(broca_wal_reader::frame::Metadata {
+                    seq: 4,
+                    fence: 2,
+                    appended_ms: u64::MAX,
+                    writer_id: [1; 16],
+                })
+                .unwrap();
+            assert_eq!(frame.len(), prepared.frame_len(), "{record:?}");
+        }
     }
 }

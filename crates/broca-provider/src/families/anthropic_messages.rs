@@ -158,7 +158,8 @@ pub fn cc_version_suffix_for_transcript(messages: &[Message], version: &str) -> 
     let single = std::slice::from_ref(first_user);
     let id_map = crate::tool_id_alias::ToolIdMap::build(single, &id_grammar());
     let name_map = crate::tool_name_alias::ToolNameMap::build(&[], single);
-    let wire = convert_message(first_user, false, &id_map, &name_map, None);
+    // The first user message carries no handoff block, so the fallback echo decision is moot.
+    let wire = convert_message(first_user, false, false, &id_map, &name_map, None);
     Some(persona_rules::cc_version_suffix(
         &persona_rules::first_user_message_text(std::slice::from_ref(&wire)),
         version,
@@ -411,7 +412,13 @@ impl WireFamily for AnthropicMessages {
             // The body renders `max_tokens` from this same field, so an output-ceiling error
             // names the cap the provider actually enforced.
             inner: AnthropicNormalizer::new(step_id)
-                .with_max_output_tokens(frozen.max_output_tokens),
+                .with_max_output_tokens(frozen.max_output_tokens)
+                // A response naming another model is reported as served by a server-side
+                // fallback; the requested id is the only thing that makes it "another".
+                .with_requested_model(frozen.wire_model_id.clone())
+                // Only an episode that froze a refusal fallback commits a refusal after a
+                // tool call as a tool step; every other episode assembles it as before.
+                .with_refusal_tool_use_trim(frozen.refusal_fallback.is_some()),
         })
     }
 
@@ -596,7 +603,14 @@ fn build_request_body_with_media(
                 opts.target_model.as_ref(),
             );
             (
-                convert_message(m, positional && echo_safe, &id_map, &name_map, media),
+                convert_message(
+                    m,
+                    positional && echo_safe,
+                    frozen.server_side_fallback,
+                    &id_map,
+                    &name_map,
+                    media,
+                ),
                 m.cache_prefix_blocks,
                 prompt_index,
             )
@@ -717,6 +731,14 @@ fn build_request_body_with_media(
     // beta header is added in `anthropic_beta_header`. Absent leaves the body unchanged.
     if let Some(speed) = &frozen.speed {
         body["speed"] = Value::String(speed.clone());
+    }
+    // A run admitted with server-side fallback asks the runtime to hand a content-filter
+    // refusal to another model itself. The persona then appends the fallback beta and places
+    // the key after `speed`; a config without the flag renders neither. Admission freezes the
+    // flag and the version together (see `families::anthropic_renderer_version`), so a recorded
+    // config never pairs an opt-in with a version that does not describe these bytes.
+    if frozen.server_side_fallback {
+        body["fallbacks"] = Value::String("default".to_string());
     }
     if let Some(persona) = persona(frozen) {
         body["metadata"] = json!({
@@ -989,9 +1011,12 @@ fn first_echoed_message(scope: ThinkingEchoScope, non_system: &[&Message]) -> Op
 /// USER turn carrying `tool_result` blocks (Anthropic's shape). `keep_thinking` is
 /// true only for assistant messages of the current turn (the interleaved-thinking rule). `id_map` maps
 /// each canonical tool-call id to its Anthropic wire id (identity unless aliased).
+/// `echo_fallback` is true only when the request's frozen config opted into server-side
+/// fallback, which is the only case Anthropic's handoff block may be echoed back.
 fn convert_message(
     m: &Message,
     keep_thinking: bool,
+    echo_fallback: bool,
     id_map: &crate::tool_id_alias::ToolIdMap,
     name_map: &crate::tool_name_alias::ToolNameMap,
     media: Option<&crate::media_render::MediaRender<'_>>,
@@ -1017,10 +1042,10 @@ fn convert_message(
             json!({ "role": "user", "content": convert_user_content(&m.content, id_map, name_map, media) })
         }
         Role::Assistant => {
-            json!({ "role": "assistant", "content": convert_content(&m.content, keep_thinking, id_map, name_map, None) })
+            json!({ "role": "assistant", "content": convert_content(&m.content, keep_thinking, echo_fallback, id_map, name_map, None) })
         }
         Role::System => {
-            json!({ "role": "user", "content": convert_content(&m.content, false, id_map, name_map, None) })
+            json!({ "role": "user", "content": convert_content(&m.content, false, echo_fallback, id_map, name_map, None) })
         }
     }
 }
@@ -1043,6 +1068,9 @@ fn convert_user_content(
             _ => content.extend(convert_content(
                 std::slice::from_ref(block),
                 false,
+                // A `tool_result`-carrying user turn never holds a handoff block, so the
+                // fallback echo decision cannot matter here.
+                false,
                 id_map,
                 name_map,
                 media,
@@ -1055,6 +1083,7 @@ fn convert_user_content(
 fn convert_content(
     blocks: &[ContentBlock],
     keep_thinking: bool,
+    echo_fallback: bool,
     id_map: &crate::tool_id_alias::ToolIdMap,
     name_map: &crate::tool_name_alias::ToolNameMap,
     media: Option<&crate::media_render::MediaRender<'_>>,
@@ -1121,6 +1150,21 @@ fn convert_content(
             // A tool_result inside a non-Tool message is unusual; the Tool-role path
             // above handles results.
             ContentBlock::ToolResult(_) => None,
+            // Anthropic's server-side fallback handoff is echoed only to a request whose frozen
+            // config opted into server-side fallback, and restored at the position it held in
+            // the response. It is neither signed nor reasoning, so the echo-scope and
+            // cross-model rules above do not apply to it. Every other target drops it: a request
+            // that did not ask for the handoff cannot use it.
+            ContentBlock::ProviderFallback {
+                from_model,
+                to_model,
+            } => echo_fallback.then(|| {
+                json!({
+                    "type": "fallback",
+                    "from": { "model": from_model },
+                    "to": { "model": to_model },
+                })
+            }),
         })
         .collect()
 }
@@ -1356,6 +1400,7 @@ mod tests {
             account_ref: None,
             run_id: "run-1".into(),
             step_index: 1,
+            max_output_tokens: None,
         });
         opts
     }
@@ -1390,7 +1435,15 @@ mod tests {
                     message.origin.as_ref(),
                     opts.target_model.as_ref(),
                 );
-                convert_message(message, positional && echo_safe, &id_map, &name_map, None)
+                // The reference renderer mirrors the request's handoff echo rule.
+                convert_message(
+                    message,
+                    positional && echo_safe,
+                    frozen.server_side_fallback,
+                    &id_map,
+                    &name_map,
+                    None,
+                )
             })
             .collect()
     }

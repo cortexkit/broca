@@ -800,6 +800,19 @@ pub(crate) fn notice_at(
     {
         events.push(Event::ModelChange);
     }
+    // Every provider-account switch is reported in the next notice, ridden or not
+    // (compaction-provider/v1 §5, §8). The label is the current run's opaque account
+    // label; unknown runs send no event and leave the last known account in place.
+    // The first notice with a known account baselines without an event, so legacy runs
+    // and notices without a change keep today's bytes.
+    if let (Some(current), Some(announced)) = (
+        state.current_account.as_deref(),
+        state.announced_account.as_deref(),
+    ) {
+        if current != announced {
+            events.push(Event::AccountChange(current.to_owned()));
+        }
+    }
     events.extend(facts.events);
     let unchanged = announced.is_some_and(|a| {
         a.lineage_id.as_deref() == Some(facts.lineage_id)
@@ -958,15 +971,73 @@ pub fn ceiling_ride(
     }
 }
 
+/// The opaque prompt-cache label broca sends for a provider account
+/// (compaction-provider/v1 §5, §8): the first 32 lowercase hex characters (128 bits) of
+/// SHA-256 over the vault-served account id's UTF-8 bytes. Hashing keeps the label opaque:
+/// it never is nor contains a credential, token, email address or anything identifying the
+/// person, while equal accounts give equal labels and different accounts give different
+/// labels. The 32-hex form fits the contract's `[A-Za-z0-9._-]{1,64}` grammar.
+///
+/// Pure, so the run loop and the WAL fold share it: the same vault account id always maps
+/// to the same label within a runner.
+pub fn account_label(account_ref: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(account_ref.as_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    hex[..32].to_owned()
+}
+
+/// The account label for a run's frozen auth selection, or `None` when broca has no
+/// account fact and must send neither the ride cause nor the event.
+///
+/// Known only for subscription accounts (`oauth`, `chatgpt`) whose selection carries a
+/// routing decision and a vault-served account id. No routing selection (no selection at
+/// all, as on the mock path; no `account_decision`, as on old records and on runs whose
+/// credential method routing does not select between) or an unrouted credential (an
+/// `apikey` or `antigravity` method, an unknown method token, or no vault account id) is
+/// unknown. A placeholder is never sent: unknown stays `None`.
+pub fn selection_account_label(selection: &broca_wal::AuthSelection) -> Option<String> {
+    let subscription = match selection.auth_method.as_deref() {
+        Some("oauth") | Some("chatgpt") => true,
+        Some(_) => return None,
+        None => match selection.credential_id.split_once(':') {
+            Some((method, _)) => matches!(method, "oauth" | "chatgpt"),
+            None => return None,
+        },
+    };
+    if !subscription {
+        return None;
+    }
+    selection.account_decision.as_ref()?;
+    let account_ref = selection
+        .account_ref
+        .as_deref()
+        .filter(|value| !value.is_empty())?;
+    Some(account_label(account_ref))
+}
+
 /// Why the request at this boundary rewrites its prefix anyway, so that a ride costs the
-/// session nothing it would not pay already (compaction-provider/v1 §8): today only a model
-/// change, judged against the model the newest notice announced. `None` before the first
-/// notice, which has nothing to compare with.
+/// session nothing it would not pay already (compaction-provider/v1 §8): a model change,
+/// judged against the model the newest notice announced, or an account change, judged
+/// against the account label the newest notice attributed. `None` before the first notice,
+/// which has nothing to compare with, and before the first notice with a known account,
+/// which baselines without an event so legacy runs keep today's bytes.
+///
+/// An account change wins over a model change when both happened: either cause rebuilds an
+/// already-warm cache, and the notice carries both events while the ride carries one.
 ///
 /// broca names no other cause. It places cache markers without knowing the lifetime the model
 /// provider gives them, so it never claims `ttl_expired`. It does not detect a change of the
 /// system text or tool surface between requests, so it never claims `surface_change` either.
 pub fn rewrite_ride_cause(state: &CompactionState, model: &str) -> Option<RideCause> {
+    if let (Some(current), Some(announced)) = (
+        state.current_account.as_deref(),
+        state.announced_account.as_deref(),
+    ) {
+        if current != announced {
+            return Some(RideCause::AccountChange);
+        }
+    }
     state
         .announced
         .as_ref()?

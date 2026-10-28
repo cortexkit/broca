@@ -266,7 +266,7 @@ async fn main() -> Result<(), String> {
                 cortexkit_role_classifier::provider::item_code_for_status(status)
                     .unwrap_or("provider_error")
             ),
-            ProviderReply::Transport(message) => format!(
+            ProviderReply::Transport(message) | ProviderReply::Unconnected(message) => format!(
                 "{name}: no reply in {elapsed} ms ({message}), so broca would record provider_error"
             ),
             // Only the Workers AI client answers this; the TypeSafe client never does.

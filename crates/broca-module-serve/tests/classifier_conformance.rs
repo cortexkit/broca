@@ -23,12 +23,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD, Engine};
 use broca_subc::{RouteHandle, RouteOpenRetry, SubcConnection};
 use cortexkit_role_classifier_conformance::{
-    run_suite, state_key, ClassifierRoute, ClassifierSubject, Reply, RouteFailure, Scripted,
-    ServedModel, SuiteVerdict, CHECKS,
+    run_suite, state_key, CheckOutcome, ClassifierRoute, ClassifierSubject, Reply, RouteFailure,
+    Scripted, ServedModel, SuiteVerdict, CHECKS,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -258,9 +260,18 @@ struct Rig {
     state_root: PathBuf,
     owner_nonce: PathBuf,
     basal_nonce: PathBuf,
+    image_fixtures: Option<PathBuf>,
 }
 
 async fn start_rig(name: &str, served: Served) -> Option<Rig> {
+    start_rig_with_references(name, served, None).await
+}
+
+async fn start_rig_with_references(
+    name: &str,
+    served: Served,
+    surface: Option<PathBuf>,
+) -> Option<Rig> {
     let subc = broca_test_support::subc_bin("ck-subc", "SUBC_CORE_BIN");
     if !subc.exists() {
         assert!(
@@ -300,10 +311,12 @@ async fn start_rig(name: &str, served: Served) -> Option<Rig> {
     let broca_config = config_home.join("cortexkit/broca.jsonc");
     std::fs::write(
         &broca_config,
-        serde_json::to_vec(&json!({"providers": {
-            "typesafe": {"base_url": format!("{stand_in}/v1")},
-            "cloudflare-workers-ai": {"base_url": format!("{stand_in}/client/v4")},
-        }}))
+        serde_json::to_vec(
+            &json!({"llm_tools":{"image_references":surface.is_some()},"providers": {
+                "typesafe": {"base_url": format!("{stand_in}/v1")},
+                "cloudflare-workers-ai": {"base_url": format!("{stand_in}/client/v4")},
+            }}),
+        )
         .unwrap(),
     )
     .unwrap();
@@ -328,7 +341,7 @@ async fn start_rig(name: &str, served: Served) -> Option<Rig> {
         .unwrap(),
     )
     .unwrap();
-    let config = json!({
+    let mut config = json!({
         "version": 1,
         "scope_authority_owners": ["classifier-owner"],
         "modules": {
@@ -361,6 +374,20 @@ async fn start_rig(name: &str, served: Served) -> Option<Rig> {
                 "enabled": true
             }
         }
+    });
+    let image_fixtures = surface.map(|surface| {
+        let fixtures = root.join("images.fixtures.json");
+        std::fs::write(&fixtures, "[]").unwrap();
+        let hex = |path: &Path| path.to_string_lossy().as_bytes().iter()
+            .map(|byte| format!("{byte:02x}")).collect::<String>();
+        config["modules"]["cerebellum"] = json!({
+            "program":broca_test_support::ckdev_binary(surface, broca_test_support::scratch_root()),
+            // The daemon names neither the module id nor a FAKE_AFT_MODULE_ID for a supervised
+            // module, so the stand-in is told it is `cerebellum` here; without it, it exits at once.
+            "args":["--module-id","cerebellum",format!("--SURFACE_FIXTURES={}",hex(&fixtures)),format!("--SURFACE_REQUESTS={}",hex(&root.join("images.requests")))],
+            "reserved":true,"enabled":true,"env":{"SUBC_CONNECTION":connection_file}
+        });
+        fixtures
     });
     std::fs::write(
         config_home.join("cortexkit/subc.jsonc"),
@@ -409,6 +436,16 @@ async fn start_rig(name: &str, served: Served) -> Option<Rig> {
         }
     })
     .await;
+    if image_fixtures.is_some() {
+        broca_test_support::wait_until("Cerebellum image source registered", || async {
+            std::fs::read_to_string(root.join("images.requests"))
+                .ok()
+                .filter(|text| text.contains("hello-ack"))
+                .map(|_| ())
+                .ok_or_else(|| "image source not registered".to_owned())
+        })
+        .await;
+    }
     Some(Rig {
         _daemon: daemon,
         served,
@@ -419,6 +456,7 @@ async fn start_rig(name: &str, served: Served) -> Option<Rig> {
         state_root,
         owner_nonce,
         basal_nonce,
+        image_fixtures,
     })
 }
 
@@ -625,6 +663,114 @@ impl ClassifierSubject for Subject<'_> {
     async fn pause(&self) {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+
+    async fn issue_image_reference(&self, content_type: &str, bytes: Vec<u8>) -> Option<String> {
+        let path = self.rig.image_fixtures.as_ref()?;
+        let mut fixtures: Vec<Value> =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let handle = format!("ih{:032x}", fixtures.len());
+        // The stand-in answers `image.resolve` with the binary reply body (a `u32`
+        // big-endian head length, the head as JSON, then the image bytes), so the fixture
+        // carries those exact body bytes base64-encoded; the stand-in only pipes them.
+        let head = serde_json::to_vec(&json!({
+            "content_type": content_type,
+            "length": bytes.len(),
+            "sha256": format!("{:x}", Sha256::digest(&bytes)),
+        }))
+        .unwrap();
+        let mut body = (head.len() as u32).to_be_bytes().to_vec();
+        body.extend_from_slice(&head);
+        body.extend_from_slice(&bytes);
+        fixtures.push(
+            json!({"match":{"method":"image.resolve","scope_ref":"classifier-run","handle":handle},
+            "stdout":STANDARD.encode(body)}),
+        );
+        let temporary = path.with_extension("new");
+        std::fs::write(&temporary, serde_json::to_vec(&fixtures).unwrap()).unwrap();
+        std::fs::rename(temporary, path).unwrap();
+        Some(handle)
+    }
+
+    async fn set_image_source_down(&self, down: bool) {
+        let path = self
+            .rig
+            .image_fixtures
+            .as_ref()
+            .expect("image source configured")
+            .with_extension("down");
+        if down {
+            std::fs::write(path, "").unwrap();
+        } else {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(unix),
+    ignore = "the stand-in Cerebellum (fake-surface) uses Unix-only APIs and is not built on Windows"
+)]
+async fn classifier_image_reference_conformance_uses_stand_in_cerebellum() {
+    let Some(surface) = std::env::var_os("FAKE_SURFACE_BIN")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+    else {
+        assert!(
+            !require_subc(),
+            "image-reference conformance requires a rebuilt FAKE_SURFACE_BIN"
+        );
+        eprintln!(
+            "SKIP image-reference conformance: set FAKE_SURFACE_BIN to the rebuilt fake-surface"
+        );
+        return;
+    };
+    let Some(rig) =
+        start_rig_with_references("image-references", Served::WorkersAi, Some(surface)).await
+    else {
+        return;
+    };
+    let report = run_suite(&Subject { rig: &rig }).await;
+    assert_eq!(report.verdict, SuiteVerdict::Passed, "{:#?}", report.checks);
+    for check in report.checks.iter().filter(|check| {
+        check.check.starts_with("image_reference_")
+            || check.check == "image_source_down_refused_transient"
+    }) {
+        assert_eq!(check.outcome, CheckOutcome::Passed, "{check:?}");
+    }
+    let received = rig.state.received.lock().unwrap();
+    assert!(
+        received
+            .iter()
+            .any(|(_, body)| body["images"][0]["base64"].is_string()),
+        "resolved images reached Workers AI"
+    );
+}
+
+fn assert_legacy_conformance(
+    report: &cortexkit_role_classifier_conformance::SuiteReport,
+    images: bool,
+) {
+    assert_eq!(report.checks.len(), CHECKS.len());
+    for check in &report.checks {
+        // The opt-in cases are inapplicable on legacy routes; every pre-existing check must
+        // still pass. Image-capable legacy routes also test the unsupported-reference refusal.
+        let reference_only = matches!(
+            check.check,
+            "image_reference_resolved_and_answered"
+                | "image_reference_oversized_refused_like_inline"
+                | "image_source_down_refused_transient"
+                | "image_reference_identity_is_its_handle"
+        );
+        if reference_only || (!images && check.check == "image_reference_follows_declaration") {
+            assert!(
+                matches!(check.outcome, CheckOutcome::NotApplicable { .. }),
+                "{check:?}"
+            );
+        } else {
+            assert_eq!(check.outcome, CheckOutcome::Passed, "{check:?}");
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -636,13 +782,7 @@ async fn classifier_conformance_suite_passes_against_the_real_serve_path() {
     for check in &report.checks {
         println!("{}: {:?}", check.check, check.outcome);
     }
-    assert_eq!(report.checks.len(), CHECKS.len());
-    assert_eq!(
-        report.verdict,
-        SuiteVerdict::Passed,
-        "every check must run and pass: {:#?}",
-        report.checks
-    );
+    assert_legacy_conformance(&report, false);
     // The batch store is broca's own file, beside (never inside) the run index.
     assert!(rig.state_root.join("system-one.db").exists());
 }
@@ -660,13 +800,7 @@ async fn classifier_conformance_suite_passes_through_workers_ai() {
     for check in &report.checks {
         println!("{}: {:?}", check.check, check.outcome);
     }
-    assert_eq!(report.checks.len(), CHECKS.len());
-    assert_eq!(
-        report.verdict,
-        SuiteVerdict::Passed,
-        "every check must run and pass: {:#?}",
-        report.checks
-    );
+    assert_legacy_conformance(&report, true);
     let received = rig.state.received.lock().unwrap().clone();
     assert!(!received.is_empty(), "the suite reached the stand-in");
     for (path, body) in &received {

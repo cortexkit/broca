@@ -4,12 +4,17 @@
 mod admission;
 pub mod consent;
 pub mod held;
+mod held_images;
+#[cfg(test)]
+mod held_images_tests;
+mod observed;
 pub mod permissions;
 mod private_content;
 mod route;
+pub(crate) mod spend;
 
 pub use private_content::{Asks, SubcAsks};
-pub use route::{LlmTools, NoPrivateContent, CLASSIFY_TOOL_NAME};
+pub use route::{ConsumerFormat, LlmTools, NoPrivateContent, CLASSIFY_TOOL_NAME, TOOL_RESULT_V1};
 
 /// No answer is released when its price cannot be measured. The contract tells the caller
 /// to charge its request ceiling against its budget rather than pretending the call was free.

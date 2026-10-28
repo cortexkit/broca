@@ -137,6 +137,12 @@ impl ObservedWal {
 }
 
 impl Wal for ObservedWal {
+    fn writer_close_reserve(&self) -> u64 {
+        self.inner.writer_close_reserve()
+    }
+    fn writer_id(&self) -> Option<[u8; 16]> {
+        self.inner.writer_id()
+    }
     fn append(&mut self, fence: u64, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
         let result = self.inner.append(fence, record, sync);
         self.note_retention(record);
@@ -159,6 +165,26 @@ impl Wal for ObservedWal {
             self.durable();
         }
         result
+    }
+    fn append_v4(
+        &mut self,
+        fence: u64,
+        record: &WalRecord,
+        sync: bool,
+        prepared: broca_wal::PreparedV4Frame,
+        appended_ms: u64,
+    ) -> Result<u64, WalError> {
+        let result = self
+            .inner
+            .append_v4(fence, record, sync, prepared, appended_ms);
+        self.note_retention(record);
+        if sync && result.is_ok() {
+            self.durable();
+        }
+        result
+    }
+    fn wal_config(&self) -> broca_wal::WalConfig {
+        self.inner.wal_config()
     }
 
     fn sync(&self) -> Result<(), WalError> {

@@ -22,6 +22,7 @@ pub mod compaction;
 pub mod consent;
 pub mod context;
 pub mod delivery_order;
+pub mod durability_counters;
 pub mod head;
 pub mod hooks;
 pub mod import;
@@ -33,6 +34,7 @@ pub mod media_store;
 pub mod media_uploads;
 pub mod media_validation;
 pub mod message_times;
+pub mod output_reservation;
 pub mod placement;
 pub mod projection;
 mod projection_health;
@@ -41,6 +43,7 @@ pub mod projection_plan;
 mod projection_plan_tests;
 pub mod provider;
 pub mod queue;
+pub mod refusal_fallback;
 pub mod render;
 pub mod replay;
 pub use context::StorePageReadError;
@@ -85,12 +88,13 @@ pub use context::{
     call_key, catch_up_usage_exports, dispatches_of_turns, effective_context,
     emit_lineage_usage_exports, read_session_page, read_session_page_owned,
     read_session_page_owned_with_dispatches, record_time_ms, replay_transcript,
-    resume_state_from_store, select_held_episodes, tool_call_dispatches, AdmissionStoreSnapshot,
-    ExportCursor, ExportError, ExportFact, ExportIndex, ExportPage, HeldEpisode, HeldPrefix,
-    HeldRowsRequest, MaterializedStore, MissingExportRun, Persister, RunIndex, RunIndexRow,
-    RunIndexState, SessionReadLineageState, SessionReadMessage, SessionReadPage, SessionReadReason,
-    SessionReadStateKind, SessionStore, StorePageRow, StorePageSnapshot, StorePrefix, TagLocation,
-    ToolCallDispatch, WithdrawalRun, SESSION_READ_DEFAULT_LIMIT, SESSION_READ_MAX_LIMIT,
+    resume_state_from_store, select_held_episodes, tool_call_dispatches, tool_call_key,
+    AdmissionStoreSnapshot, ExportCursor, ExportError, ExportFact, ExportIndex, ExportPage,
+    HeldEpisode, HeldPrefix, HeldRowsRequest, MaterializedStore, MissingExportRun, Persister,
+    RunIndex, RunIndexRow, RunIndexState, SessionReadLineageState, SessionReadMessage,
+    SessionReadPage, SessionReadReason, SessionReadStateKind, SessionStore, StorePageRow,
+    StorePageSnapshot, StorePrefix, TagLocation, ToolCallDispatch, WithdrawalRun,
+    SESSION_READ_DEFAULT_LIMIT, SESSION_READ_MAX_LIMIT,
 };
 pub use context::{
     read_session_model_page, ModelEntry, ModelPage, ModelPageError, ModelPageRequest, ReadView,
@@ -146,8 +150,9 @@ pub use run::{
     run_loop_append_episode, run_loop_on_writer, run_loop_on_writer_admitted,
     run_loop_on_writer_admitted_with_prior_snapshot, run_loop_resume_after_auth,
     run_loop_resume_after_auth_with_control, run_loop_under_lease, run_loop_with_control,
-    run_loop_with_store, AccountSelectionRefusal, OutputEvent, PriorWalSnapshot, RunControl,
-    RunError, RunRequest, RunSummary, StartMode,
+    run_loop_with_store, AccountSelectionRefusal, OutputEvent, PriorWalSnapshot,
+    RoutingUnavailable, RoutingUnavailableReason, RunControl, RunError, RunRequest, RunSummary,
+    StartMode,
 };
 pub use shutdown_seal::{SealedAttempt, ShutdownSeal};
 pub use steer::{OrderedAcceptance, SteerInbox};

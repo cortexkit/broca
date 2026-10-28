@@ -127,7 +127,7 @@ enum ScopeReading {
     /// The scope or its parent is gone; the reason names which ([`drain_ends_run`] holds).
     Gone(&'static str),
     /// The scope is live; this is the stamp a route opened now would carry.
-    Live(ScopeStamp),
+    Live(Box<ScopeStamp>),
     /// The owner has not synced since the daemon started: wait, as for `scope_not_synced` on
     /// open.
     NotSynced,
@@ -159,7 +159,7 @@ fn read_describe(opened_epoch: u64, answer: &DescribedScope) -> ScopeReading {
             } else if stamp.parent_state == Some(ParentState::Ended) {
                 ScopeReading::Gone(SCOPE_PARENT_ENDED)
             } else {
-                ScopeReading::Live(stamp.clone())
+                ScopeReading::Live(Box::new(stamp.clone()))
             }
         }
     }
@@ -415,6 +415,7 @@ trait ToolPlaneConnection: Send + Sync {
         _deadline: Duration,
         _preset: Option<&str>,
         _args: &ApprovedArgs,
+        _schema_pin: Option<&str>,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
         Err(crate::connection::ApprovedCallError::BeforePush(
             ConnError::Protocol("approved_dispatch_unavailable".into()).into(),
@@ -424,6 +425,7 @@ trait ToolPlaneConnection: Send + Sync {
     /// An ordinary (not approved) call's send. `signals` are the run's cancel and stop: a
     /// call they interrupted before its request is enqueued is never sent, and is reported
     /// before-push (not sent).
+    #[allow(clippy::too_many_arguments)]
     async fn tool_call_staged(
         &self,
         route: &RouteHandle,
@@ -431,11 +433,17 @@ trait ToolPlaneConnection: Send + Sync {
         deadline: Duration,
         preset: Option<&str>,
         _call_key: Option<&str>,
+        schema_pin: Option<&str>,
         signals: &broca_core::tool_plane::DispatchSignals,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
         if signals.interrupted() {
             return Err(crate::connection::ApprovedCallError::BeforePush(
                 crate::connection::ApprovedSetupError::Interrupted,
+            ));
+        }
+        if schema_pin.is_some() {
+            return Err(crate::connection::ApprovedCallError::BeforePush(
+                ConnError::Protocol("pinned_dispatch_unavailable".into()).into(),
             ));
         }
         self.tool_call(
@@ -480,6 +488,7 @@ impl ToolPlaneConnection for SubcConnection {
         self.route_open_dispatch_single_attempt(module_id, identity, scope, provider_held_installed)
             .await
     }
+    #[allow(clippy::too_many_arguments)]
     async fn tool_call_staged(
         &self,
         route: &RouteHandle,
@@ -487,6 +496,7 @@ impl ToolPlaneConnection for SubcConnection {
         deadline: Duration,
         preset: Option<&str>,
         call_key: Option<&str>,
+        schema_pin: Option<&str>,
         signals: &broca_core::tool_plane::DispatchSignals,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
         let args = serde_json::to_string(&call.input).map_err(|error| {
@@ -505,6 +515,7 @@ impl ToolPlaneConnection for SubcConnection {
             deadline,
             preset,
             call_key,
+            schema_pin,
             signals,
         )
         .await
@@ -532,6 +543,7 @@ impl ToolPlaneConnection for SubcConnection {
         deadline: Duration,
         preset: Option<&str>,
         args: &ApprovedArgs,
+        schema_pin: Option<&str>,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
         self.tool_call_raw_guarded(
             route,
@@ -541,6 +553,7 @@ impl ToolPlaneConnection for SubcConnection {
             deadline,
             preset,
             Some(&args.key),
+            schema_pin,
             &args.signals,
         )
         .await
@@ -802,6 +815,17 @@ impl SubcToolPlane {
             .and_then(|calls| calls.get(&call.tool_call_id))
             .cloned();
         let preset = self.frozen_preset(ctx, module);
+        let schema_pin = self
+            .dispatch_schema_pin(ctx, &call.tool_call_id, &call.tool_name)
+            .and_then(|pin| {
+                cortexkit_role_tool_provider::call::SchemaPin::new(
+                    &call.tool_name,
+                    pin.schema_digest,
+                    pin.semantics,
+                )
+                .encode()
+                .ok()
+            });
         let late_results = self.frozen_contract(ctx, module).late_results;
         let plain_key = key.filter(|_| {
             self.held_reply_declared() && late_results && self.conn.consumer_module_id().is_some()
@@ -838,7 +862,14 @@ impl SubcToolPlane {
             }
             SendAttempt::approved_reply(
                 self.conn
-                    .tool_call_approved(route, call, deadline, preset.as_deref(), &args)
+                    .tool_call_approved(
+                        route,
+                        call,
+                        deadline,
+                        preset.as_deref(),
+                        &args,
+                        schema_pin.as_deref(),
+                    )
                     .await,
             )
         } else {
@@ -858,6 +889,7 @@ impl SubcToolPlane {
                     deadline,
                     preset.as_deref(),
                     plain_key.map(|key| key.call_key),
+                    schema_pin.as_deref(),
                     signals,
                 )
                 .await;
@@ -2129,7 +2161,7 @@ impl SubcToolPlane {
             })?;
             match self.read_scope(scope, cancel, guard.deadline, true).await {
                 ScopeReading::Live(after) if may_resend_under(&before, &after) => {
-                    return Ok((handle, Some(after)));
+                    return Ok((handle, Some(*after)));
                 }
                 // The run was cancelled or stopped while the describe held: the route opened
                 // but carries nothing, so close it.
@@ -3190,6 +3222,26 @@ impl ToolPlane for SubcToolPlane {
     fn dispatch_target(&self, ctx: &BatchCtx, id: &ToolCallId) -> Option<String> {
         self.dispatch_target_inner(ctx, id)
     }
+    fn dispatch_schema_pin(
+        &self,
+        ctx: &BatchCtx,
+        id: &ToolCallId,
+        tool: &str,
+    ) -> Option<broca_core::tool_plane::DispatchSchemaPin> {
+        let module = self.dispatch_target_inner(ctx, id)?;
+        // Only an admitted plan supplies the provider's schema digest and semantics.
+        // Legacy direct tools and old manifests keep an unknown pin; consulting a
+        // later catalog would invent history and add a new refusing RPC to dispatch.
+        self.batch_manifests
+            .lock()
+            .unwrap()
+            .get(&Self::batch_route_key(ctx))?
+            .provider_declarations(&module)?
+            .schema_pins
+            .as_ref()?
+            .get(tool)
+            .cloned()
+    }
     async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
         self.dispatch_inner(ctx, call, None, &ToolOpenGuard::default())
             .await
@@ -4072,6 +4124,7 @@ mod tests {
             deadline: Duration,
             preset: Option<&str>,
             args: &ApprovedArgs,
+            _schema_pin: Option<&str>,
         ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
             if let Some(error) = self.approved_setup_error.lock().unwrap().take() {
                 return Err(crate::connection::ApprovedCallError::BeforePush(
@@ -7821,7 +7874,8 @@ mod approval_digest_contract_tests {
                 &call,
                 Duration::from_secs(1),
                 Some("head"),
-                &args
+                &args,
+                None
             ),
             async {
                 let request = module.next_request().await;
@@ -7927,6 +7981,7 @@ mod approved_queue_contract_tests {
                     Duration::from_millis(20),
                     None,
                     Some("call-key"),
+                    None,
                     &Default::default(),
                 )
                 .await;

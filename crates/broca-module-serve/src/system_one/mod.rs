@@ -24,6 +24,9 @@
 //!   existing grace, and never longer.
 
 mod classify;
+mod images;
+pub use images::ImageResolver;
+pub(crate) use images::PreparedImages;
 pub mod credential;
 pub mod typesafe;
 pub mod workers_ai;
@@ -150,8 +153,13 @@ pub enum ProviderReply {
         code: Option<u64>,
         retry_after_ms: Option<u64>,
     },
-    /// No reply: the connection failed or the attempt ran out of time.
+    /// No reply: the attempt ran out of time, or the connection failed in a way that may
+    /// have come after the request was sent, so the provider may have billed it.
     Transport(String),
+    /// No reply because no connection was ever made (name lookup, a refused connect, TLS
+    /// setup): nothing reached the provider. Answered exactly as [`Self::Transport`]; only the
+    /// model tools' refusal spend tells the two apart.
+    Unconnected(String),
     /// The credential could not be read, so nothing was sent.
     Credential(String),
 }
@@ -188,6 +196,17 @@ pub struct ModelPin {
 /// TypeSafe's moving `jev-latest` alias, which already names a newer model and would let it
 /// answer, and be billed, as 1.13.0.
 const JEV_1_13_0_WIRE: &str = cortexkit_role_classifier::provider::models::JEV_1_13_0;
+
+/// A catalog key's provider id and model id. Catalog keys are `<provider>/<model>` and only
+/// the provider id is free of slashes, so the key splits once, at its first slash: Clef's
+/// `cloudflare-workers-ai/@cf/cloudflare/clef` is provider `cloudflare-workers-ai`, model
+/// `@cf/cloudflare/clef`. Usage facts carry the two ids apart, as session facts do, so a
+/// consumer prices them by the provider's own model id. `None` for a key that does not name
+/// both.
+pub(crate) fn catalog_key_parts(key: &str) -> Option<(&str, &str)> {
+    key.split_once('/')
+        .filter(|(provider, model)| !provider.is_empty() && !model.is_empty())
+}
 
 /// Consent uses only the catalog's human labels. A missing display fact is not permission
 /// to show a provider or model identifier on the person's approval card.
@@ -250,6 +269,7 @@ impl ModelPin {
 
 /// The System One service: the batch store, the routing pins, and the concurrency caps.
 pub struct SystemOne {
+    image_resolver: Option<Arc<dyn ImageResolver>>,
     store: Arc<SystemOneStore>,
     /// The store role every batch this service claims, records and releases is keyed under.
     role: String,
@@ -316,6 +336,7 @@ impl SystemOne {
         in_flight: Arc<AtomicUsize>,
     ) -> Self {
         Self {
+            image_resolver: None,
             store,
             role: STORE_ROLE.to_owned(),
             owner: owner.into(),
@@ -365,10 +386,16 @@ impl SystemOne {
                 .map_err(|e| e.to_string())?
             {
                 let mut metrics = self.metrics.lock().unwrap_or_else(|p| p.into_inner());
-                let spend = metrics
-                    .spend_nanos_by_model
-                    .entry(pending.fact.model.clone())
-                    .or_default();
+                // Health keys spend by catalog key, which the fact's bare model id alone does
+                // not name. A fact written by an older build already carries the whole key as
+                // its model and is counted under it unchanged.
+                let fact = &pending.fact;
+                let catalog_key = if fact.model.starts_with(&format!("{}/", fact.provider)) {
+                    fact.model.clone()
+                } else {
+                    format!("{}/{}", fact.provider, fact.model)
+                };
+                let spend = metrics.spend_nanos_by_model.entry(catalog_key).or_default();
                 *spend = spend.saturating_add(pending.spend_nanos);
             }
             self.store
@@ -422,6 +449,7 @@ impl SystemOne {
         .with_clock(self.clock.clone());
         service.export = self.export.clone();
         service.charge_basis = self.charge_basis.clone();
+        service.image_resolver = self.image_resolver.clone();
         service
     }
 
@@ -459,22 +487,38 @@ impl SystemOne {
         args_digest: String,
         admission: ToolAdmission,
         admitted_at_ms: Option<i64>,
+        images: Arc<images::PreparedImages>,
     ) -> Result<Box<RawValue>, Refusal> {
-        self.sweep()
+        // Every refusal of a model tool states its spend. One that no step marked is marked
+        // here by whether a provider attempt was ever started: before the first one nothing was
+        // spent; after it the provider may have billed a call nothing measured.
+        let mut dispatched = false;
+        let answer = async {
+            self.sweep()
+                .await
+                .map_err(|_| internal_refusal("batch retention is unavailable"))?;
+            let gauge = self.in_flight.clone();
+            gauge.fetch_add(1, Ordering::Relaxed);
+            let _lowered = GaugeGuard(gauge);
+            let _slot = self.call_slots.clone().acquire_owned().await;
+            classify::run_inner(
+                &self,
+                &params,
+                &scope,
+                admitted_at_ms,
+                Some((&args_digest, &admission)),
+                Some(&images),
+                &mut dispatched,
+            )
             .await
-            .map_err(|_| internal_refusal("batch retention is unavailable"))?;
-        let gauge = self.in_flight.clone();
-        gauge.fetch_add(1, Ordering::Relaxed);
-        let _lowered = GaugeGuard(gauge);
-        let _slot = self.call_slots.clone().acquire_owned().await;
-        classify::run_inner(
-            &self,
-            &params,
-            &scope,
-            admitted_at_ms,
-            Some((&args_digest, &admission)),
-        )
-        .await
+        }
+        .await;
+        let spend = if dispatched {
+            crate::llm_tools::spend::Spend::Unknown
+        } else {
+            crate::llm_tools::spend::Spend::Nothing
+        };
+        answer.map_err(|refusal| spend.mark_undeclared(refusal))
     }
 
     /// The batch recorded under this service's role for `batch_id`, with its outcomes; `None`
@@ -594,10 +638,16 @@ impl SystemOne {
                 classify::is_classifier_row(&row).then(|| self.model_entry(pin, &row))
             })
             .collect();
-        RoleDescribe::new(
+        let describe = RoleDescribe::new(
             Limits::new(self.config.max_items, self.config.max_request_bytes),
             models,
-        )
+        );
+        if self.image_references() {
+            describe
+                .with_image_reference(cortexkit_model_batch::image::ImageReferenceSupport::new())
+        } else {
+            describe
+        }
     }
 
     /// Answer one request on a classifier route. The reply is the `result` text, or the body
@@ -646,7 +696,27 @@ impl SystemOne {
                         .batches_failed += 1;
                     refusal_body(&e)
                 })?;
-                self.spawn_call(params.to_owned(), scope).await
+                let stored = if self.image_references() {
+                    let request = cortexkit_role_classifier::request::parse_request(params)
+                        .map_err(|e| refusal_body(&e))?;
+                    self.stored_batch(&request.batch_id)
+                        .await
+                        .map_err(|_| {
+                            refusal_body(&internal_refusal("batch replay is unavailable"))
+                        })?
+                        .filter(|stored| {
+                            (self.clock)().saturating_sub(stored.admitted_at_ms)
+                                < broca_store::system_one::RETENTION_MS
+                        })
+                } else {
+                    None
+                };
+                let images = self
+                    .prepare_images(params, send, stored.as_ref())
+                    .await
+                    .map_err(|e| refusal_body(&e))?;
+                self.spawn_call_with_images(params.to_owned(), scope, None, images)
+                    .await
             }
             other => Err(error_body(
                 "unknown_method",
@@ -675,6 +745,22 @@ impl SystemOne {
         scope: broca_store::system_one::BatchScope,
         admitted_at_ms: Option<i64>,
     ) -> Result<Box<RawValue>, Vec<u8>> {
+        self.spawn_call_with_images(
+            params,
+            scope,
+            admitted_at_ms,
+            images::PreparedImages::default(),
+        )
+        .await
+    }
+
+    async fn spawn_call_with_images(
+        self: Arc<Self>,
+        params: String,
+        scope: broca_store::system_one::BatchScope,
+        admitted_at_ms: Option<i64>,
+        images: images::PreparedImages,
+    ) -> Result<Box<RawValue>, Vec<u8>> {
         // Raised here and lowered by the task itself, so a caller that stops waiting (its
         // route closed) does not hide a call that is still running.
         let gauge = Arc::clone(&self.in_flight);
@@ -684,7 +770,20 @@ impl SystemOne {
         let task = tokio::spawn(async move {
             let _lowered = lowered;
             let _slot = Arc::clone(&service.call_slots).acquire_owned().await;
-            classify::run(&service, &params, &scope, admitted_at_ms).await
+            if images.0.is_empty() {
+                classify::run(&service, &params, &scope, admitted_at_ms).await
+            } else {
+                classify::run_inner(
+                    &service,
+                    &params,
+                    &scope,
+                    admitted_at_ms,
+                    None,
+                    Some(&images),
+                    &mut false,
+                )
+                .await
+            }
         });
         let result = match task.await {
             Ok(Ok(reply)) => Ok(reply),
@@ -839,7 +938,14 @@ mod tool_admission_tests {
         };
         service
             .clone()
-            .execute_tool(params, scope, "digest".into(), admission, Some(1000))
+            .execute_tool(
+                params,
+                scope,
+                "digest".into(),
+                admission,
+                Some(1000),
+                Arc::new(images::PreparedImages::default()),
+            )
             .await
             .unwrap();
         let stored = service.stored_batch("held").await.unwrap().unwrap();

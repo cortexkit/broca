@@ -124,6 +124,7 @@ fn anthropic_spec() -> (ProviderSpec, ModelSpec) {
         limits: Limits::default(),
         cost: CostSchedule::default(),
         reasoning_options: Default::default(),
+        server_side_fallback: None,
         input_modalities: Default::default(),
         release_date: None,
         status: None,
@@ -469,4 +470,278 @@ fn anthropic_usage_maps_thinking_tokens_detail_without_touching_output_or_fill()
             "fill is input + cache-read only"
         );
     }
+}
+
+// ─────────────────── server-side fallback ───────────────────
+
+/// A synthetic response in which the runtime ran the source model, handed the request to a
+/// fallback model, and reported both parts in `usage.iterations`. It is written from the shape
+/// the provider is documented to send, not from a captured response, so the normalizer must
+/// tolerate fields it does not name.
+fn handoff_stream(fallback_block: &str, message_model: &str) -> String {
+    format!(
+        "event: message_start\n\
+         data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_f\",\"model\":\"{message_model}\",\"usage\":{{\"input_tokens\":11,\"output_tokens\":0,\"iterations\":[{{\"type\":\"message\",\"model\":\"claude-opus-5-5\",\"input_tokens\":11,\"output_tokens\":0}}]}}}}}}\n\n\
+         event: content_block_start\n\
+         data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+         event: content_block_delta\n\
+         data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"Let\"}}}}\n\n\
+         event: content_block_stop\n\
+         data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+         {fallback_block}\
+         event: content_block_start\n\
+         data: {{\"type\":\"content_block_start\",\"index\":2,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+         event: content_block_delta\n\
+         data: {{\"type\":\"content_block_delta\",\"index\":2,\"delta\":{{\"type\":\"text_delta\",\"text\":\" me help.\"}}}}\n\n\
+         event: content_block_stop\n\
+         data: {{\"type\":\"content_block_stop\",\"index\":2}}\n\n\
+         event: message_delta\n\
+         data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":7,\"iterations\":[{{\"type\":\"message\",\"model\":\"claude-opus-5-5\",\"input_tokens\":11,\"output_tokens\":2}},{{\"type\":\"fallback_message\",\"model\":\"claude-opus-4-8\",\"input_tokens\":3,\"output_tokens\":5,\"future_field\":{{\"kept\":true}}}}]}}}}\n\n\
+         event: message_stop\n\
+         data: {{\"type\":\"message_stop\"}}\n\n"
+    )
+}
+
+fn valid_handoff_block() -> &'static str {
+    "event: content_block_start\n\
+     data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"fallback\",\"from\":{\"model\":\"claude-opus-5-5\"},\"to\":{\"model\":\"claude-opus-4-8\"}}}\n\n\
+     event: content_block_stop\n\
+     data: {\"type\":\"content_block_stop\",\"index\":1}\n\n"
+}
+
+fn normalize_handoff(fallback_block: &str, message_model: &str) -> Vec<NormalizedEvent> {
+    let events = normalize_recorded(
+        &AnthropicMessages,
+        &anthropic_frozen_config("claude-opus-5-5"),
+        StepId(1),
+        handoff_stream(fallback_block, message_model).as_bytes(),
+        7,
+    )
+    .expect("the stream normalizes");
+    events
+}
+
+fn finished_step(events: &[NormalizedEvent]) -> (Option<String>, Option<Vec<serde_json::Value>>) {
+    events
+        .iter()
+        .find_map(|event| match event {
+            NormalizedEvent::Control(ProviderControl::StepFinished {
+                served_model,
+                usage_iterations,
+                ..
+            }) => Some((
+                served_model.clone(),
+                usage_iterations
+                    .as_ref()
+                    .map(|iterations| serde_json::to_value(iterations).unwrap())
+                    .and_then(|value| value.as_array().cloned()),
+            )),
+            _ => None,
+        })
+        .expect("the stream finishes the step")
+}
+
+/// The handoff block is a content part in the assembled message, at the position it held in the
+/// stream, and the step reports the model the runtime actually served. A block whose model ids
+/// do not fit the grammar the runtime accepts is dropped rather than stored, so it can never be
+/// rendered into a later request.
+#[test]
+fn fallback_handoff_block_is_kept_and_echoed() {
+    let events = normalize_handoff(valid_handoff_block(), "claude-opus-4-8");
+    let message = events
+        .iter()
+        .find_map(|event| match event {
+            NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) => {
+                Some(message)
+            }
+            _ => None,
+        })
+        .expect("an assembled message");
+    assert_eq!(
+        message.content,
+        vec![
+            ContentBlock::Text { text: "Let".into() },
+            ContentBlock::ProviderFallback {
+                from_model: "claude-opus-5-5".into(),
+                to_model: "claude-opus-4-8".into(),
+            },
+            ContentBlock::Text {
+                text: " me help.".into()
+            },
+        ]
+    );
+    // The handoff is not content a caller reads, so only the two text blocks stream as
+    // display deltas.
+    let streamed: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            NormalizedEvent::Display(broca_protocol::display::DisplayEvent::TextDelta {
+                delta,
+                ..
+            }) => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(streamed, vec!["Let", " me help."]);
+
+    for bad in [
+        // The wrong id prefix.
+        "event: content_block_start\n\
+         data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"fallback\",\"from\":{\"model\":\"gpt-5\"},\"to\":{\"model\":\"claude-opus-4-8\"}}}\n\n\
+         event: content_block_stop\n\
+         data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        // A missing side.
+        "event: content_block_start\n\
+         data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"fallback\",\"from\":{\"model\":\"claude-opus-5-5\"}}}\n\n\
+         event: content_block_stop\n\
+         data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        // Characters the runtime's id grammar excludes.
+        "event: content_block_start\n\
+         data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"fallback\",\"from\":{\"model\":\"claude-opus-5-5\"},\"to\":{\"model\":\"claude-opus-4.8\"}}}\n\n\
+         event: content_block_stop\n\
+         data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        // A prefix without a model name is not an id.
+        "event: content_block_start\n\
+         data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"fallback\",\"from\":{\"model\":\"claude-opus-5-5\"},\"to\":{\"model\":\"claude-\"}}}\n\n\
+         event: content_block_stop\n\
+         data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+    ] {
+        let events = normalize_handoff(bad, "claude-opus-4-8");
+        let message = events
+            .iter()
+            .find_map(|event| match event {
+                NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) => {
+                    Some(message)
+                }
+                _ => None,
+            })
+            .expect("an assembled message");
+        assert!(
+            !message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ProviderFallback { .. })),
+            "a malformed handoff block must not be stored: {bad}"
+        );
+    }
+}
+
+/// The served model is chosen in this order: the handoff block's target, then the last fallback
+/// iteration, then a `message.model` that names another model. An alias of the requested id is
+/// the requested model, so an ordinary response reports nothing.
+#[test]
+fn served_model_resolution_order() {
+    // The handoff block wins over everything else.
+    let block = valid_handoff_block().replace("claude-opus-4-8", "claude-haiku-5-5");
+    let (served, _) = finished_step(&normalize_handoff(&block, "claude-sonnet-5-5"));
+    assert_eq!(served.as_deref(), Some("claude-haiku-5-5"));
+
+    // A handoff alone suffices, even if message.model still names the requested source.
+    let events = normalize_recorded(
+        &AnthropicMessages,
+        &anthropic_frozen_config("claude-opus-5-5"),
+        StepId(1),
+        format!(
+            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"model\":\"claude-opus-5-5\"}}}}\n\n\
+             {}event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+            valid_handoff_block()
+        ).as_bytes(),
+        7,
+    ).expect("normalizes");
+    assert_eq!(
+        finished_step(&events),
+        (Some("claude-opus-4-8".into()), None)
+    );
+
+    let block = valid_handoff_block().replace("claude-opus-4-8", "claude-opus-5-5-20260101");
+    let events = normalize_handoff(&block, "claude-opus-5-5");
+    assert_eq!(
+        finished_step(&events).0,
+        None,
+        "an alias handoff keeps its block, not distinct model attribution"
+    );
+
+    // Without a block, the last fallback iteration names the model that finished the response.
+    let (served, _) = finished_step(&normalize_handoff("", "claude-sonnet-5-5"));
+    assert_eq!(served.as_deref(), Some("claude-opus-4-8"));
+
+    // `message.model` alone reports a different model too.
+    let events = normalize_recorded(
+        &AnthropicMessages,
+        &anthropic_frozen_config("claude-opus-5-5"),
+        StepId(1),
+        "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":9}}}\n\n\
+         event: message_stop\n\
+         data: {\"type\":\"message_stop\"}\n\n"
+            .as_bytes(),
+        7,
+    )
+    .expect("normalizes");
+    assert_eq!(finished_step(&events).0.as_deref(), Some("claude-opus-4-8"));
+
+    // The requested model, including its dated alias, is not a fallback.
+    for requested in ["claude-opus-5-5", "claude-opus-5-5-20260101"] {
+        let events = normalize_recorded(
+            &AnthropicMessages,
+            &anthropic_frozen_config("claude-opus-5-5"),
+            StepId(1),
+            format!(
+                "event: message_start\n\
+                 data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_s\",\"model\":\"{requested}\",\"usage\":{{\"input_tokens\":9}}}}}}\n\n\
+                 event: message_stop\n\
+                 data: {{\"type\":\"message_stop\"}}\n\n"
+            )
+            .as_bytes(),
+            7,
+        )
+        .expect("normalizes");
+        assert_eq!(finished_step(&events).0, None, "{requested}");
+    }
+}
+
+/// `usage.iterations` is kept verbatim, unknown fields included, while the step's `usage` stays
+/// the provider's top-level usage: the two are reported separately and the top-level total is
+/// never replaced by a sum of the entries.
+#[test]
+fn iterations_kept_verbatim() {
+    let events = normalize_handoff(valid_handoff_block(), "claude-opus-4-8");
+    let (_, iterations) = finished_step(&events);
+    assert_eq!(
+        iterations,
+        Some(vec![
+            json!({"type": "message", "model": "claude-opus-5-5", "input_tokens": 11, "output_tokens": 2}),
+            json!({
+                "type": "fallback_message",
+                "model": "claude-opus-4-8",
+                "input_tokens": 3,
+                "output_tokens": 5,
+                "future_field": {"kept": true},
+            }),
+        ])
+    );
+    let usage = events
+        .iter()
+        .find_map(|event| match event {
+            NormalizedEvent::Control(ProviderControl::StepFinished { usage, .. }) => Some(*usage),
+            _ => None,
+        })
+        .expect("step usage");
+    assert_eq!(usage.input_tokens, Some(11));
+    assert_eq!(usage.output_tokens, Some(7));
+
+    // An ordinary response carries no iterations at all.
+    let events = normalize_recorded(
+        &AnthropicMessages,
+        &anthropic_frozen_config("claude-opus-5-5"),
+        StepId(1),
+        "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_o\",\"usage\":{\"input_tokens\":3}}}\n\n\
+         event: message_stop\n\
+         data: {\"type\":\"message_stop\"}\n\n"
+            .as_bytes(),
+        7,
+    )
+    .expect("normalizes");
+    assert_eq!(finished_step(&events), (None, None));
 }

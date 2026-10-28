@@ -23,9 +23,29 @@ pub struct ViewReceipt {
     pub received_at_ms: u64,
 }
 
+/// What committing a `view_ready` receipt did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReceiptWrite {
+    /// A receipt for this version, or a newer one of the same lineage, was already durable.
+    Held,
+    /// The receipt is durable. The store keeps one receipt per session, so if `replaced` is
+    /// `Some`, it is the prior receipt this write replaced, which is no longer stored.
+    Recorded { replaced: Option<ReplacedReceipt> },
+}
+
+/// The receipt a newer delivery overwrote, as it was stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplacedReceipt {
+    pub lineage_id: String,
+    pub view_version: String,
+}
+
 impl SqliteStore {
     /// Commit before acknowledging the bus delivery. Decimal strings preserve all u64 versions.
-    pub fn receive_compaction_view(&self, receipt: &ViewReceipt) -> Result<bool, StoreError> {
+    pub fn receive_compaction_view(
+        &self,
+        receipt: &ViewReceipt,
+    ) -> Result<ReceiptWrite, StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let held = tx.query_row(
@@ -33,7 +53,7 @@ impl SqliteStore {
             [&receipt.ready.session_ref],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         );
-        match held {
+        let replaced = match held {
             Ok((lineage, version))
                 if lineage == receipt.lineage_id
                     && version
@@ -41,11 +61,15 @@ impl SqliteStore {
                         .ok()
                         .is_some_and(|v| v >= receipt.ready.view_version) =>
             {
-                return Ok(false)
+                return Ok(ReceiptWrite::Held)
             }
-            Ok(_) | Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Ok((lineage_id, view_version)) => Some(ReplacedReceipt {
+                lineage_id,
+                view_version,
+            }),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
             Err(error) => return Err(error.into()),
-        }
+        };
         tx.execute(
             "INSERT OR REPLACE INTO compaction_view_receipt VALUES(?1,?2,?3,?4,?5,?6)",
             params![
@@ -58,7 +82,7 @@ impl SqliteStore {
             ],
         )?;
         tx.commit()?;
-        Ok(true)
+        Ok(ReceiptWrite::Recorded { replaced })
     }
 
     /// Page startup recovery so a large receipt table cannot create an unbounded database read.
@@ -116,9 +140,23 @@ mod tests {
         newer.ready.view_version = u64::MAX;
         {
             let store = SqliteStore::open(&path).unwrap();
-            assert!(store.receive_compaction_view(&first).unwrap());
-            assert!(store.receive_compaction_view(&newer).unwrap());
-            assert!(!store.receive_compaction_view(&first).unwrap());
+            assert_eq!(
+                store.receive_compaction_view(&first).unwrap(),
+                ReceiptWrite::Recorded { replaced: None }
+            );
+            assert_eq!(
+                store.receive_compaction_view(&newer).unwrap(),
+                ReceiptWrite::Recorded {
+                    replaced: Some(ReplacedReceipt {
+                        lineage_id: "lineage".into(),
+                        view_version: "1".into(),
+                    })
+                }
+            );
+            assert_eq!(
+                store.receive_compaction_view(&first).unwrap(),
+                ReceiptWrite::Held
+            );
             store.clear_compaction_receipt(&first).unwrap();
         }
         let store = SqliteStore::open(&path).unwrap();

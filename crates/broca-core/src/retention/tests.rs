@@ -72,6 +72,7 @@ pub(crate) fn frames(retention: Option<u64>) -> Vec<FramedRecord> {
         started("r1", retention),
         WalRecord::StepStarted { step_id: StepId(1) },
         WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,

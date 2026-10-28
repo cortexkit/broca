@@ -32,6 +32,11 @@ pub use compaction::{
     CompactionRange, CompactionStabilityRank, CompactionStrip, CompactionViewChoice,
     CompactionWait, CompactionWaitExit, RejectedCompaction, MAX_REPLACEMENT_BYTES,
 };
+mod fallback;
+pub use fallback::{
+    RefusalFallbackPhase, RefusalFallbackSchedule, StepFallback, StepRoute, StepRouteReason,
+    UsageIteration,
+};
 
 fn is_false(value: &bool) -> bool {
     !*value
@@ -126,6 +131,18 @@ pub struct HookOp {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WalRecord {
+    /// A new writer has durably taken responsibility for this log's recovered prefix.
+    WriterOpened {
+        writer_id: [u8; 16],
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_writer_id: Option<[u8; 16]>,
+        recovered_through_seq: u64,
+        cause: String,
+    },
+    /// This writer will make no further appends, including after a disconnected handle.
+    WriterClosed {
+        writer_id: [u8; 16],
+    },
     /// Episode boundary open — ONE ATOMIC record: the run_id, session, the
     /// AUTHORITATIVE request config, AND the user input, all in a single framed
     /// record. Atomic-by-construction so a torn crash leaves EITHER nothing OR a
@@ -331,6 +348,38 @@ pub enum WalRecord {
         /// One tag per block of `assistant_message`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tags: Option<Box<MessageTags>>,
+        /// Server-side and client-side fallback facts about this step, flattened into the
+        /// record as top-level keys. All absent on an ordinary step, which then keeps its
+        /// exact bytes. Each present member is must-understand (see [`StepFallback`]). Boxed
+        /// so the common step pays one small allocation, not the record's size.
+        #[serde(flatten)]
+        fallback: Box<StepFallback>,
+    },
+    /// The source model refused a step (`stop_reason: "refusal"`) and the step is being re-sent
+    /// to the client-side fallback model under the same step id, with no new `StepStarted`.
+    /// Synced before the re-send, so a crash after it re-sends the step on the fallback model
+    /// and a crash before it re-sends the step on the source.
+    ///
+    /// The refused content is deliberately not stored: it must never reach a prompt or a
+    /// reader. The refused attempt's `ModelAttemptFinished` digests remain the forensic link.
+    /// Contributes nothing to the prompt; its `usage` counts toward the run's totals because the
+    /// call was billed. At most one per step. Requires `refusal-fallback/v1`.
+    ModelStepRefused {
+        /// The step being re-sent.
+        step_id: StepId,
+        /// The refused response's billed usage.
+        usage: Usage,
+        /// As on `ModelStepFinished`: the wire model a server-side fallback served the refused
+        /// response with, when it was not the requested one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        served_model: Option<String>,
+        /// How many content blocks the refused response carried; only the count is kept.
+        discarded_blocks: u32,
+        /// The schedule after this refusal.
+        schedule: RefusalFallbackSchedule,
+        /// Wall-clock time the refusal was recorded, Unix milliseconds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ts_ms: Option<u64>,
     },
     /// Evidence for ONE provider HTTP attempt of a model step: what was sent and received, as
     /// byte lengths and SHA-256 digests, and how the attempt ended. One per attempt, failed
@@ -589,6 +638,23 @@ pub enum WalRecord {
     ContextCeilingDecided {
         step_id: StepId,
         detail: Option<broca_protocol::ContextCeilingDetail>,
+    },
+    /// A step's output-token cap, lowered below the run's frozen cap before any model I/O so
+    /// that the estimated input plus the output reservation stays inside the run's context
+    /// limit. Written (and synced) only for a step whose cap was lowered; a step sent with the
+    /// frozen cap writes nothing, so its WAL bytes are as before. The step's request, and every
+    /// re-render of it (a resume, a cache warm, a cache dump), renders `max_output_tokens`
+    /// instead of the frozen cap. Must-understand: `output-reservation/v1`, because a build that
+    /// skipped the record would resume the step with the frozen cap, a different request from
+    /// the one recorded.
+    OutputReservationClamped {
+        step_id: StepId,
+        /// The cap the step's request carries.
+        max_output_tokens: u32,
+        /// The input-token estimate the cap was derived from, kept for diagnosis only.
+        estimated_input_tokens: u64,
+        /// The run's frozen context limit the estimate was checked against.
+        context_limit: u64,
     },
     /// A rewrite ride (compaction-provider 0.5.1 §8) whose answer has been pending for
     /// `COMPACTION_WAIT_REPORT_AFTER_MS` (llm-runner 0.5.2 §6): the step waits for it until
@@ -1292,6 +1358,8 @@ impl WalRecord {
         matches!(
             self,
             WalRecord::Unknown
+                | WalRecord::WriterOpened { .. }
+                | WalRecord::WriterClosed { .. }
                 | WalRecord::ModelAttemptFinished { .. }
                 | WalRecord::ResumeStarted { .. }
                 | WalRecord::CacheWarmed { .. }
@@ -1317,6 +1385,9 @@ impl WalRecord {
     /// on its own, so no caller can write a must-understand value into a frame an older build
     /// would read without checking.
     pub fn required_features(&self) -> &'static [&'static str] {
+        if matches!(self, Self::WriterOpened { .. } | Self::WriterClosed { .. }) {
+            return &["writer-id/v1"];
+        }
         let base = self.base_required_features();
         // The agent-run, session-class and input-cap unions below are precomputed tables that
         // cover only what `base_required_features` returns, plus the names the earlier tables
@@ -1423,6 +1494,15 @@ impl WalRecord {
         } else {
             base
         };
+        let base = if matches!(self, WalRecord::RunStarted { manifest: Some(manifest), .. }
+            if manifest.fetches.iter().any(|fetch| matches!(&fetch.outcome,
+                FetchOutcome::Answered { declarations_frozen: Some(declarations), .. }
+                    if declarations.schema_pins.is_some())))
+        {
+            with_feature(base, crate::framing::TOOL_SCHEMA_PINS_FEATURE)
+        } else {
+            base
+        };
         let identity_digest = match self {
             WalRecord::RunStarted {
                 request_identity_digest,
@@ -1459,6 +1539,16 @@ impl WalRecord {
         };
         let base = if self.carries_provider_text_state() {
             with_feature(base, crate::framing::PROVIDER_TEXT_STATE_FEATURE)
+        } else {
+            base
+        };
+        let base = if self.carries_provider_fallback() {
+            with_feature(base, crate::framing::PROVIDER_FALLBACK_BLOCK_FEATURE)
+        } else {
+            base
+        };
+        let base = if self.carries_refusal_fallback() {
+            with_feature(base, crate::framing::REFUSAL_FALLBACK_FEATURE)
         } else {
             base
         };
@@ -1516,6 +1606,11 @@ impl WalRecord {
         };
         let base = if self.carries_tool_reply() {
             with_feature(base, crate::framing::TOOL_REPLY_FEATURE)
+        } else {
+            base
+        };
+        let base = if self.carries_auth_selection_method() {
+            with_feature(base, crate::framing::AUTH_SELECTION_METHOD_FEATURE)
         } else {
             base
         };
@@ -1599,6 +1694,18 @@ impl WalRecord {
         }
     }
 
+    /// Whether a credential selection this record freezes names its auth method. Its
+    /// `credential_id` is then the vault's opaque id, which an older reader would parse for a
+    /// method, so the record is must-understand.
+    fn carries_auth_selection_method(&self) -> bool {
+        let selection = match self {
+            WalRecord::RunStarted { config, .. } => config.auth_selection.as_ref(),
+            WalRecord::RunAuthRefrozen { auth_selection, .. } => Some(auth_selection),
+            _ => None,
+        };
+        selection.is_some_and(|selection| selection.auth_method.is_some())
+    }
+
     fn carries_media_content(&self) -> bool {
         use broca_protocol::{ContentBlock, ToolOutput};
         let result = |result: &ToolResult| matches!(result.output, ToolOutput::Parts { .. });
@@ -1610,6 +1717,7 @@ impl WalRecord {
                 | ContentBlock::TextWithState { .. }
                 | ContentBlock::Reasoning { .. }
                 | ContentBlock::RedactedReasoning { .. }
+                | ContentBlock::ProviderFallback { .. }
                 | ContentBlock::ToolCall(_) => false,
             })
         };
@@ -1687,6 +1795,7 @@ impl WalRecord {
             Self::CompactionMessage { replacement, .. } => messages(replacement),
             Self::CompactionViewApplied { view, .. } => view_carries_media_content(view),
             Self::ModelAttemptFinished { .. }
+            | Self::ModelStepRefused { .. }
             | Self::StepStarted { .. }
             | Self::ToolBatchStarted { .. }
             | Self::ToolBatchFinished { .. }
@@ -1696,6 +1805,7 @@ impl WalRecord {
             | Self::InputTokenBudgetExhausted { .. }
             | Self::ContextCeilingWait { .. }
             | Self::ContextCeilingDecided { .. }
+            | Self::OutputReservationClamped { .. }
             | Self::StructuredOutputDowngraded { .. }
             | Self::StructuredOutputResult { .. }
             | Self::RunFinished { .. }
@@ -1721,6 +1831,8 @@ impl WalRecord {
             | Self::ToolCallProviderHeld { .. }
             | Self::DeliveryOrdered { .. }
             | Self::SendEnded { .. }
+            | Self::WriterOpened { .. }
+            | Self::WriterClosed { .. }
             | Self::Unknown => false,
         }
     }
@@ -1834,6 +1946,45 @@ impl WalRecord {
         }
     }
 
+    /// Whether this record carries Anthropic's server-side fallback: the `provider_fallback`
+    /// content part in any message it holds, or a step's `served_model` or `usage_iterations`.
+    fn carries_provider_fallback(&self) -> bool {
+        let blocks = |content: &[broca_protocol::content::ContentBlock]| {
+            content.iter().any(|block| {
+                matches!(
+                    block,
+                    broca_protocol::content::ContentBlock::ProviderFallback { .. }
+                )
+            })
+        };
+        let messages = |input: &[Message]| input.iter().any(|message| blocks(&message.content));
+        match self {
+            Self::RunStarted { input, .. } => messages(input),
+            Self::ModelStepFinished {
+                assistant_message,
+                fallback,
+                ..
+            } => blocks(&assistant_message.content) || fallback.carries_server_side_fallback(),
+            Self::Queued { request, .. } => messages(&request.input),
+            Self::Steered { input, .. } => messages(input),
+            Self::SendDelivered { input, .. } => {
+                input.as_deref().is_some_and(|input| messages(input))
+            }
+            Self::CompactionMessage { replacement, .. } => messages(replacement),
+            _ => false,
+        }
+    }
+
+    /// Whether this record carries client-side refusal-fallback state: a refused step, or a
+    /// step's route, schedule or refusal-after-tool-use flag.
+    fn carries_refusal_fallback(&self) -> bool {
+        match self {
+            Self::ModelStepRefused { .. } => true,
+            Self::ModelStepFinished { fallback, .. } => fallback.carries_refusal_fallback(),
+            _ => false,
+        }
+    }
+
     fn carries_provider_text_state(&self) -> bool {
         let blocks = |content: &[broca_protocol::content::ContentBlock]| {
             content.iter().any(|block| {
@@ -1926,6 +2077,9 @@ impl WalRecord {
             } => &[crate::framing::CONTEXT_CEILING_FEATURE],
             WalRecord::StructuredOutputDowngraded { .. } => {
                 &[crate::framing::STRUCTURED_OUTPUT_DOWNGRADE_FEATURE]
+            }
+            WalRecord::OutputReservationClamped { .. } => {
+                &[crate::framing::OUTPUT_RESERVATION_FEATURE]
             }
             WalRecord::RunCancelRequested { .. } => &[crate::framing::RUN_CANCEL_AT_FEATURE],
             WalRecord::CompactionRequest { .. }
@@ -2816,8 +2970,9 @@ pub struct SetupTagCheckpoint {
 /// it maps to lives only in the 0600 handle map, never in the WAL.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthSelection {
-    /// The credential id (`<method>:<provider>[:<account>]`) to re-`get` on resume. Method,
-    /// provider, and account all parse back out of this one string, so no separate fields.
+    /// The credential id to re-`get` on resume. Without [`AuthSelection::auth_method`] it is a
+    /// broca key (`<method>:<provider>[:<account>]`) whose method, provider and account parse
+    /// back out of it; with it, it is the vault's opaque credential id (see that field).
     pub credential_id: String,
     /// The vault-served account id (a provider-side account UUID) the credential resolved to
     /// at admission, frozen verbatim so usage export can label spend with the SAME account the
@@ -2846,7 +3001,9 @@ pub struct AuthSelection {
     /// concluded their credential pin never reached broca.
     ///
     /// Key on `credential_id` instead: it is always present, it is the caller's pin verbatim, and
-    /// method, provider and account all parse back out of it. Use `account_ref` only when you
+    /// on a selection without `auth_method` method, provider and account parse back out of it
+    /// (with `auth_method`, it is the vault's opaque id and the method is that field). Use
+    /// `account_ref` only when you
     /// specifically need the provider-side account UUID, and expect it on chatgpt and oauth only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_ref: Option<String>,
@@ -2883,6 +3040,21 @@ pub struct AuthSelection {
     /// (the OpenCode and mock paths), so those keep their bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_decision: Option<AccountDecision>,
+    /// How the credential authenticates (`oauth`, `chatgpt`, `apikey`, `antigravity`), frozen
+    /// at admission from the vault's own metadata for a credential routing chose.
+    ///
+    /// PRESENT CHANGES WHAT `credential_id` IS. With it, `credential_id` is the vault's own
+    /// credential id, an opaque record name: a resume reads that credential verbatim and takes
+    /// the method from here, never from the id's spelling and never through a
+    /// `vault.credential_ids` alias. Without it (every record written before this field, and
+    /// every selection broca resolved from its own configuration) `credential_id` is a broca
+    /// key `<method>:<provider>[:<account>]`, read as before.
+    ///
+    /// Kept as the written string so a method a later build adds still decodes. A record
+    /// carrying it requires the must-understand feature `auth-selection-method/v1`: an older
+    /// build would parse the id for its method, so it must refuse such a log instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<String>,
 }
 
 /// Which path decided a run's provider account, with the admission and decision ids routing
@@ -2901,7 +3073,8 @@ pub struct AccountDecision {
     /// re-serializes to its stored bytes.
     pub path: String,
     /// The id broca asked routing about this run under, and names it by in its account reports
-    /// to routing. Absent when broca reports nothing for the run (the `legacy_static` path).
+    /// to routing. Absent when broca reports nothing for the run (the `legacy_static` path older
+    /// builds wrote).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_id: Option<String>,
     /// Routing's id for the decision that chose the account, when routing chose it.
@@ -2946,7 +3119,8 @@ pub const ACCOUNT_DECISION_ROUTED: &str = "routed";
 /// Routing answered that account selection is switched off; the static pick was used.
 pub const ACCOUNT_DECISION_DISABLED: &str = "disabled";
 /// Routing gave no answer in time (route refused, timeout, malformed reply); the static pick
-/// was used.
+/// was used. Written only by builds that admitted such a send: a send routing cannot answer
+/// is now refused before anything is written. Kept so those older runs still read and resume.
 pub const ACCOUNT_DECISION_UNREACHABLE: &str = "unreachable";
 /// Routing does not select accounts for this provider; the static pick was used.
 pub const ACCOUNT_DECISION_UNSUPPORTED: &str = "unsupported";
@@ -2954,8 +3128,9 @@ pub const ACCOUNT_DECISION_UNSUPPORTED: &str = "unsupported";
 pub const ACCOUNT_DECISION_PINNED: &str = "pinned";
 /// The provider had at most one candidate account, so there was nothing to ask.
 pub const ACCOUNT_DECISION_SINGLE_CANDIDATE: &str = "single_candidate";
-/// The operator's `account_selection.legacy_static` setting in `broca.jsonc`, an emergency
-/// switch, bypassed routing entirely.
+/// The operator's former `account_selection.legacy_static` setting in `broca.jsonc`, an
+/// emergency switch, bypassed routing entirely. The setting no longer exists, so this path is
+/// no longer written; it is kept so runs recorded under it still read and resume.
 pub const ACCOUNT_DECISION_LEGACY_STATIC: &str = "legacy_static";
 /// broca had no vault listing to ask routing with in time; the static pick was used.
 pub const ACCOUNT_DECISION_CANDIDATES_UNKNOWN: &str = "candidates_unknown";
@@ -3170,6 +3345,7 @@ mod schema_tests {
     #[test]
     fn model_step_finished_arc_keeps_existing_wal_bytes() {
         let record = WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -3369,6 +3545,7 @@ mod schema_tests {
     fn pre_resolved_credential_run_config_bytes_are_unchanged() {
         let mut config = min_config();
         config.auth_selection = Some(AuthSelection {
+            auth_method: None,
             credential_id: "apikey:kimi-code-plan-global".into(),
             account_ref: None,
             resolved_credential_id: None,
@@ -3386,6 +3563,7 @@ mod schema_tests {
     fn pre_vault_request_run_started_bytes_are_unchanged() {
         let mut config = min_config();
         config.auth_selection = Some(AuthSelection {
+            auth_method: None,
             credential_id: "oauth:anthropic:work".into(),
             account_ref: Some("acct-1".into()),
             resolved_credential_id: Some("oauth:anthropic:shared".into()),
@@ -3437,6 +3615,7 @@ mod schema_tests {
     fn pre_account_decision_run_started_bytes_are_unchanged() {
         let mut config = min_config();
         config.auth_selection = Some(AuthSelection {
+            auth_method: None,
             credential_id: "oauth:anthropic:work".into(),
             account_ref: Some("acct-1".into()),
             resolved_credential_id: Some("oauth:anthropic:work".into()),
@@ -3488,6 +3667,7 @@ mod schema_tests {
     fn an_account_decision_adds_one_key_and_keeps_its_bytes() {
         const STORED: &str = r#"{"credential_id":"oauth:anthropic:work","account_ref":"acct-1","vault_request":{"min_ttl_ms":600000,"op":"get_scoped"},"account_decision":{"path":"routed","admission_id":"run-1","decision_id":"acd-1"}}"#;
         let selection = AuthSelection {
+            auth_method: None,
             credential_id: "oauth:anthropic:work".into(),
             account_ref: Some("acct-1".into()),
             resolved_credential_id: None,
@@ -3524,6 +3704,7 @@ mod schema_tests {
         // reported. A step whose response reported no tier must keep exactly these bytes, and
         // these bytes must keep decoding to the same record.
         let full = WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -3546,6 +3727,7 @@ mod schema_tests {
             speed_used: None,
         };
         let bare = WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -3577,6 +3759,7 @@ mod schema_tests {
     #[test]
     fn old_records_default_retries_used_to_zero() {
         let model = WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -4125,6 +4308,7 @@ mod schema_tests {
                 submission_id: Some(SubmissionId("sub1".into())),
             },
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -4175,6 +4359,7 @@ mod schema_tests {
             WalRecord::RunAuthRefrozen {
                 ts_ms: Some(123),
                 auth_selection: AuthSelection {
+                    auth_method: None,
                     credential_id: "chatgpt:openai".into(),
                     account_ref: Some("account-1".into()),
                     resolved_credential_id: None,
@@ -4651,6 +4836,7 @@ mod schema_tests {
     fn run_config_freezes_only_the_resolved_auth_pin_effect() {
         let mut config = *min_config();
         config.auth_selection = Some(AuthSelection {
+            auth_method: None,
             credential_id: "apikey:openai:astro".into(),
             account_ref: None,
             resolved_credential_id: None,
@@ -4751,6 +4937,7 @@ mod schema_tests {
     #[test]
     fn model_step_finished_preserves_signed_tool_call() {
         let rec = WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -4795,6 +4982,7 @@ mod schema_tests {
         assert_eq!(decoded_call, call);
 
         let rec = WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,

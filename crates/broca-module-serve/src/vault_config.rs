@@ -434,6 +434,18 @@ impl VaultAddressing {
         }
     }
 
+    /// The vault credential id a frozen selection reads. A selection frozen with its
+    /// `auth_method` names the vault's own credential id, read verbatim with no alias lookup;
+    /// an older one holds a broca key, mapped like any key. `None` for a key that does not
+    /// parse, which no read ever used.
+    pub fn vault_id_for_selection(&self, selection: &broca_wal::AuthSelection) -> Option<String> {
+        if selection.auth_method.is_some() {
+            return Some(selection.credential_id.clone());
+        }
+        CredentialId::parse(&selection.credential_id)
+            .map(|key| self.vault_id_for(&key).into_owned())
+    }
+
     /// The `vault.credential_ids` aliases, sorted by key, for the startup census.
     pub fn aliases(&self) -> Vec<(&str, &str)> {
         let mut aliases: Vec<(&str, &str)> = self

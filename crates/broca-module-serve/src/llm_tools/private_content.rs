@@ -28,6 +28,7 @@ use cortexkit_role_classifier::errors::{ErrorClass, Refusal, RefusalDetail};
 use serde::Serialize;
 use subc_protocol::Principal;
 
+use super::observed::{Counters, Verdict};
 use crate::config::LlmToolsConfig;
 
 /// `detail.consent` for a marked scope that may not call this provider. No consent card is
@@ -194,6 +195,8 @@ struct ConsentDetail<'a> {
     class: ErrorClass,
     provider: &'a str,
     consent: &'a str,
+    /// Always `true`: these refusals end the call before any provider attempt.
+    no_spend: bool,
 }
 
 /// The decisions and the cache they produce, for the life of one `LlmTools`.
@@ -202,6 +205,8 @@ pub(super) struct PrivateContent {
     asks: Arc<dyn Asks>,
     marked: Mutex<BTreeMap<ScopeIdentity, MarkedScope>>,
     flows: Mutex<BTreeMap<ScopeIdentity, broca_subc::ApprovedFlowProviders>>,
+    /// Each admitted call's verdict, and the route's record of how marked calls ended.
+    pub(super) counters: Counters,
 }
 
 impl PrivateContent {
@@ -211,6 +216,7 @@ impl PrivateContent {
             asks,
             marked: Mutex::new(BTreeMap::new()),
             flows: Mutex::new(BTreeMap::new()),
+            counters: Counters::default(),
         }
     }
 
@@ -226,6 +232,7 @@ impl PrivateContent {
             ));
         };
         if is_local(provider) || self.listed(provider) {
+            self.counters.verdict(Verdict::NotAsked);
             return Ok(());
         }
         match identity.flow_id.clone() {
@@ -259,6 +266,7 @@ impl PrivateContent {
             Some(marked) => (marked, true),
             None => self.ask(identity).await,
         };
+        self.counters.verdict(verdict(&marked, answered));
         if !marked.marked {
             return Ok(());
         }
@@ -315,15 +323,17 @@ impl PrivateContent {
             tracing::info!(target: "llm_tools", flow = flow_id, version = approved.version,
                 code_hash = %approved.code_hash, "using the flow's approved provider policy");
             if approved.providers.iter().any(|listed| listed == provider) {
+                self.counters.verdict(Verdict::NotAsked);
                 return Ok(());
             }
         }
         // A flow broca asked about is one cerebellum may have marked. An unmarked flow may call
         // any provider; Basal's list adds providers to the base set for a marked one.
-        let marked = match self.cached(identity) {
-            Some(marked) => marked,
-            None => self.ask(identity).await.0,
+        let (marked, answered) = match self.cached(identity) {
+            Some(marked) => (marked, true),
+            None => self.ask(identity).await,
         };
+        self.counters.verdict(verdict(&marked, answered));
         if !marked.marked {
             return Ok(());
         }
@@ -420,6 +430,16 @@ fn recognized(answer: broca_subc::PrivateContent) -> MarkedScope {
     }
 }
 
+/// The verdict a looked-up scope counts under. No answer is treated as marked by the policy,
+/// but it is counted apart so an operator can tell a marked run from a failed question.
+fn verdict(marked: &MarkedScope, answered: bool) -> Verdict {
+    match (marked.marked, answered) {
+        (false, _) => Verdict::Unmarked,
+        (true, true) => Verdict::Marked,
+        (true, false) => Verdict::Unreachable,
+    }
+}
+
 /// A local model runs on this machine, so private content never leaves it. These are the
 /// provider ids broca's catalog gives models it serves locally.
 fn is_local(provider: &str) -> bool {
@@ -433,7 +453,8 @@ fn encoded_refusal(code: &str, message: String, consent: Option<(&str, &str)>) -
             let mut detail = RefusalDetail::new(ErrorClass::Permanent);
             detail.field = Some("model".into());
             let refusal = Refusal::new(code, message).with_detail(detail);
-            serde_json::to_vec(&refusal).expect("a refusal encodes")
+            serde_json::to_vec(&super::spend::Spend::Nothing.mark(refusal))
+                .expect("a refusal encodes")
         }
         Some((provider, consent)) => serde_json::to_vec(&ConsentRefusal {
             code,
@@ -442,6 +463,7 @@ fn encoded_refusal(code: &str, message: String, consent: Option<(&str, &str)>) -
                 class: ErrorClass::Permanent,
                 provider,
                 consent,
+                no_spend: true,
             },
         })
         .expect("a consent refusal encodes"),
@@ -525,6 +547,7 @@ mod tests {
     fn listed() -> LlmToolsConfig {
         LlmToolsConfig {
             advertise_tags: false,
+            image_references: false,
             private_content_providers: vec!["anthropic".into(), "anthropic-platform".into()],
         }
     }
@@ -731,6 +754,68 @@ mod tests {
         // The epoch after that is new work: the earlier mark does not apply to it.
         refused(policy.admit(&run(3), "typesafe").await);
         assert_eq!(stub.marked_asks.load(Ordering::SeqCst), 4);
+    }
+
+    fn verdicts(policy: &PrivateContent) -> Value {
+        policy.counters.health()["verdicts"].clone()
+    }
+
+    #[tokio::test]
+    async fn each_call_counts_the_verdict_it_was_admitted_or_refused_on() {
+        let counts = |not_asked: u64, unmarked: u64, marked: u64, unreachable: u64| {
+            serde_json::json!({"not_asked": not_asked, "unmarked": unmarked,
+                "marked": marked, "unreachable": unreachable})
+        };
+        let stub = Stub::answering(broca_subc::PrivateContent::unmarked());
+        let policy = policy(listed(), stub.clone());
+        admitted(policy.admit(&run(1), "typesafe").await);
+        assert_eq!(verdicts(&policy), counts(0, 1, 0, 0));
+        // A local model and a listed provider never ask cerebellum.
+        admitted(policy.admit(&run(1), "ollama").await);
+        admitted(policy.admit(&run(1), "anthropic").await);
+        assert_eq!(verdicts(&policy), counts(2, 1, 0, 0));
+        assert_eq!(stub.marked_asks.load(Ordering::SeqCst), 1);
+
+        // A fresh marked answer and the cached one each count as marked, an answer naming no
+        // known source included.
+        *stub.marked.lock().unwrap() = Some(marked(&["person_browser"]));
+        refused(policy.admit(&run(2), "typesafe").await);
+        refused(policy.admit(&run(2), "typesafe").await);
+        *stub.marked.lock().unwrap() = Some(marked(&["future_source"]));
+        refused(policy.admit(&run(3), "typesafe").await);
+        assert_eq!(verdicts(&policy), counts(2, 1, 3, 0));
+
+        // No answer is refused like a marked scope but counted apart.
+        stub.marked_fails.store(true, Ordering::SeqCst);
+        let error = refused(policy.admit(&run(4), "typesafe").await);
+        assert_eq!(error["detail"]["consent"], PRIVATE_CONTENT_UNREACHABLE);
+        assert_eq!(verdicts(&policy), counts(2, 1, 3, 1));
+    }
+
+    #[tokio::test]
+    async fn flow_calls_count_their_verdicts_and_an_unapproved_flow_counts_none() {
+        let stub = Stub::answering(marked(&["person_browser"]))
+            .answering_flows(approved_providers(vec!["cloudflare-workers-ai".into()]));
+        let approved = policy(listed(), stub.clone());
+        // Basal's approved list admits without asking cerebellum.
+        admitted(approved.admit(&flow(1), "cloudflare-workers-ai").await);
+        refused(approved.admit(&flow(1), "typesafe").await);
+        assert_eq!(
+            verdicts(&approved),
+            serde_json::json!({"not_asked": 1, "unmarked": 0, "marked": 1, "unreachable": 0})
+        );
+
+        let stub = Stub::answering(broca_subc::PrivateContent::unmarked()).answering_flows(
+            broca_subc::FlowPolicy::NotApproved {
+                message: "this flow has no approved version".into(),
+            },
+        );
+        let unapproved = policy(listed(), stub);
+        refused(unapproved.admit(&flow(1), "typesafe").await);
+        assert_eq!(
+            verdicts(&unapproved),
+            serde_json::json!({"not_asked": 0, "unmarked": 0, "marked": 0, "unreachable": 0})
+        );
     }
 
     #[tokio::test]

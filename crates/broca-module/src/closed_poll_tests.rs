@@ -48,6 +48,7 @@ impl RunExecutor for TerminalExecutor {
             let _ = ack.send(Ok(job.req.run_id.clone()));
         }
         job.writer.record(WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -624,6 +625,7 @@ async fn large_closed_session_status_poll_cost_is_independent_of_history() {
             .append(
                 1,
                 &WalRecord::ModelStepFinished {
+                    fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
                     hooks: None,

@@ -269,6 +269,13 @@ pub struct StepContext {
     /// The frozen provider account, passed only to transport diagnostics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_ref: Option<String>,
+    /// This step's output-token cap, when the run lowered it below the frozen render config's
+    /// cap so that the estimated input plus the output reservation stays inside the model's
+    /// context window. `None` renders the frozen cap unchanged. The runner records the lowered
+    /// value in the WAL (`output_reservation_clamped`) before sending, so a resume and every
+    /// request rebuilt from the WAL render the same cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
 }
 
 fn arc_value_is_null(value: &Arc<Value>) -> bool {

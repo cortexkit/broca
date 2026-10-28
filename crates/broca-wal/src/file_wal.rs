@@ -17,9 +17,11 @@ use crate::writer_tenure::{OwnedWalTenure, TenureError};
 
 use crate::{
     framing::{
-        decode_next, encode, encode_lineage, DecodeStep, FrameError, FramedRecord, WalLineageId,
+        decode_next, encode, encode_lineage, DecodeStep, FrameError, FramedRecord, PreparedV4Frame,
+        WalLineageId,
     },
     record::WalRecord,
+    state_format::{StateRootError, WalConfig, WalFormat},
 };
 
 use broca_protocol::BindIdentity;
@@ -28,6 +30,10 @@ pub const DEFAULT_MAX_READ_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[path = "human_prompt_count.rs"]
 mod human_prompt_count;
+
+#[cfg(test)]
+#[path = "file_wal_v4_tests.rs"]
+mod v4_tests;
 pub use human_prompt_count::{
     count_human_prompts_in_bytes, read_human_prompt_count, HumanPromptCount,
 };
@@ -283,6 +289,16 @@ pub enum WalError {
         requires: Vec<String>,
         reason: String,
     },
+    /// The state root's log format could not be decided, or a store refuses to write on it
+    /// (see [`StateRootError`]). Nothing was opened or written.
+    StateRoot(StateRootError),
+    /// A frame of the `offered` format was handed to a log of the `log` format: an overhaul log
+    /// writes only the version 4 frames it stamps itself, and a legacy log never writes them.
+    /// Nothing was written.
+    FrameFormat {
+        log: WalFormat,
+        offered: WalFormat,
+    },
 }
 
 impl WalError {
@@ -300,7 +316,9 @@ impl WalError {
             | Self::ForeignWrite { .. }
             | Self::ConflictingLineageIds { .. }
             | Self::Entropy(_)
-            | Self::FeatureFloor { .. }) => Err(other),
+            | Self::FeatureFloor { .. }
+            | Self::StateRoot(_)
+            | Self::FrameFormat { .. }) => Err(other),
         }
     }
 }
@@ -362,7 +380,22 @@ impl std::fmt::Display for WalError {
                 ),
                 requires.join(", ")
             ),
+            WalError::StateRoot(error) => error.fmt(f),
+            WalError::FrameFormat { log, offered } => write!(
+                f,
+                "wal append refused: a {} log does not write {} frames",
+                format_name(*log),
+                format_name(*offered)
+            ),
         }
+    }
+}
+
+/// How a refusal names a frame format.
+fn format_name(format: WalFormat) -> &'static str {
+    match format {
+        WalFormat::Legacy => "legacy",
+        WalFormat::Overhaul => "version 4 (broca-state/2)",
     }
 }
 
@@ -430,6 +463,43 @@ pub trait Wal {
         None
     }
 
+    /// The frame format this log writes, as the store that opened it was configured at boot.
+    /// A writer handle reads it once, at spawn, to choose how it hands records over: an
+    /// overhaul log takes them through [`Wal::append_v4`] only. The default is legacy.
+    fn wal_config(&self) -> WalConfig {
+        WalConfig::LEGACY
+    }
+
+    /// The random identity minted by this overhaul WAL open; never supplied by a caller.
+    fn writer_id(&self) -> Option<[u8; 16]> {
+        None
+    }
+
+    /// Bytes held for this open writer's durable close, separate from the run terminal reserve.
+    fn writer_close_reserve(&self) -> u64 {
+        0
+    }
+
+    /// Append `record` as the version 4 frame `prepared` (built from that same record), stamped
+    /// with `appended_ms`, which the caller samples on the thread that calls this, immediately
+    /// before the call. The log fills in the sequence, fence and its own `writer_id`, and raises
+    /// the feature floor over every name the frame lists before writing it.
+    ///
+    /// Only an overhaul log writes version 4 frames; the default refuses, as a legacy log does.
+    fn append_v4(
+        &mut self,
+        _fence: u64,
+        _record: &WalRecord,
+        _sync: bool,
+        _prepared: PreparedV4Frame,
+        _appended_ms: u64,
+    ) -> Result<u64, WalError> {
+        Err(WalError::FrameFormat {
+            log: WalFormat::Legacy,
+            offered: WalFormat::Overhaul,
+        })
+    }
+
     fn recovery_byte_cap(&self) -> Option<u64> {
         None
     }
@@ -495,6 +565,13 @@ pub struct FileWal {
     /// upward. The first directory-sync pass drains this list after syncing every directory
     /// whose direct child was newly created.
     newly_created_dirs: RefCell<Vec<PathBuf>>,
+    /// The frame format this log writes, set by the store that opened it from the boot
+    /// decision. Legacy unless [`FileWal::with_wal_config`] says otherwise.
+    config: WalConfig,
+    /// Minted when the log is configured as an overhaul log: the random 128-bit id stamped in
+    /// every version 4 frame this open appends, so a frame names the writer that wrote it.
+    writer_id: Option<[u8; 16]>,
+    writer_close_reserve: u64,
     lineage_id: Option<WalLineageId>,
     /// The machine's WAL feature floor (see [`crate::floor`]). A record that requires any WAL
     /// feature is appended only after this file lists it; with no floor configured such a
@@ -535,6 +612,21 @@ fn mint_lineage_id() -> Result<WalLineageId, WalError> {
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Ok(WalLineageId::from_bytes(bytes))
+}
+
+/// Where an append's bytes come from.
+enum FrameSource {
+    /// Encode the record here, in this log's format.
+    Encode,
+    /// A legacy frame the writer handle encoded to measure its budget. Only a legacy log takes
+    /// it, after checking it is exactly the frame its sequence, fence and record require.
+    Legacy(Vec<u8>),
+    /// A version 4 payload the writer handle prepared, and the `appended_ms` its writer thread
+    /// sampled. Only an overhaul log takes it, and stamps the header itself.
+    V4 {
+        prepared: PreparedV4Frame,
+        appended_ms: u64,
+    },
 }
 
 struct ManifestAppend {
@@ -586,6 +678,19 @@ fn append_manifest_line(entry: &ManifestAppend, lineage_id: WalLineageId) -> std
 }
 
 impl FileWal {
+    fn unstarted(&self) -> Result<bool, WalError> {
+        if self.next_seq == 1 {
+            return Ok(true);
+        }
+        Ok(self.config.is_overhaul()
+            && self.replay()?.iter().all(|frame| {
+                matches!(
+                    frame.record,
+                    WalRecord::WriterOpened { .. } | WalRecord::WriterClosed { .. }
+                )
+            }))
+    }
+
     /// A status/warm open can precede the first send. Move only an unstarted file,
     /// under its caller's session lease, before the first record fixes its placement.
     ///
@@ -604,7 +709,7 @@ impl FileWal {
         if self.path == destination {
             return Ok(());
         }
-        if self.next_seq != 1 {
+        if !self.unstarted()? {
             return Err(WalError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "cannot relocate a started session WAL",
@@ -867,6 +972,9 @@ impl FileWal {
             last_write_end,
             dir_needs_sync: Cell::new(true),
             newly_created_dirs: RefCell::new(newly_created_dirs),
+            config: WalConfig::LEGACY,
+            writer_id: None,
+            writer_close_reserve: 0,
             lineage_id,
             recovery_cap: DEFAULT_MAX_READ_BYTES,
             append_budget: DEFAULT_MAX_READ_BYTES,
@@ -884,6 +992,22 @@ impl FileWal {
     pub fn with_feature_floor(mut self, floor: impl Into<PathBuf>) -> Self {
         self.feature_floor = Some(floor.into());
         self
+    }
+
+    /// Write this log in `config`'s format, as decided once at boot for its state root. An
+    /// overhaul log mints its random `writer_id` here, so each open stamps its own; it then writes
+    /// only version 4 frames it stamps itself and refuses caller-encoded bytes.
+    pub fn with_wal_config(mut self, config: WalConfig) -> Result<Self, WalError> {
+        self.writer_id = match config.format {
+            WalFormat::Legacy => None,
+            WalFormat::Overhaul => {
+                let mut id = [0u8; 16];
+                getrandom::fill(&mut id).map_err(WalError::Entropy)?;
+                Some(id)
+            }
+        };
+        self.config = config;
+        Ok(self)
     }
 
     /// The first barrier syncs the file, its parent, and parents of directories
@@ -958,12 +1082,35 @@ impl FileWal {
         self
     }
 
+    /// Assemble the version 4 frame `prepared` at `seq`, with this open's `writer_id`, and hand
+    /// back the names it requires.
+    fn stamp_v4(
+        &self,
+        seq: u64,
+        fence: u64,
+        prepared: PreparedV4Frame,
+        appended_ms: u64,
+    ) -> Result<(Vec<u8>, std::borrow::Cow<'static, [&'static str]>), WalError> {
+        let writer_id = self
+            .writer_id
+            .expect("an overhaul log mints its writer id when it is configured");
+        let frame = prepared
+            .stamp(crate::framing::v4::Metadata {
+                seq,
+                fence,
+                appended_ms,
+                writer_id,
+            })
+            .map_err(WalError::Frame)?;
+        Ok((frame, prepared.requires().to_vec().into()))
+    }
+
     fn append_frame(
         &mut self,
         fence: u64,
         record: &WalRecord,
         sync: bool,
-        frame: Option<Vec<u8>>,
+        source: FrameSource,
     ) -> Result<u64, WalError> {
         // One validation phase per tenure: the open-time guard cleared the
         // fenced path and reference under the held tenure, so owned appends
@@ -1011,8 +1158,7 @@ impl FileWal {
                 found: current,
             });
         }
-        if self.next_seq == 1
-            && self.budget_scope == crate::size_limit::SizeScope::RetainedSession
+        if self.budget_scope == crate::size_limit::SizeScope::RetainedSession
             && matches!(
                 record,
                 WalRecord::RunStarted {
@@ -1020,23 +1166,80 @@ impl FileWal {
                     ..
                 }
             )
+            && self.unstarted()?
         {
             self.budget_scope = crate::size_limit::SizeScope::Session;
             self.append_budget = self.recovery_cap;
         }
         let seq = self.next_seq;
-        let preencoded = frame.is_some();
-        let record_bytes = match frame {
-            Some(frame) => frame,
-            None => encode(seq, fence, record).map_err(WalError::Frame)?,
-        };
+        let preencoded = matches!(source, FrameSource::Legacy(_));
+        // The bytes this append writes, and every name the machine's feature floor must list
+        // before they exist. A legacy log writes exactly what it always has. An overhaul log
+        // writes only version 4 frames it stamps here, from a payload the shared codec built:
+        // caller-encoded bytes are refused, and nothing falls back to the legacy encoding.
+        let (record_bytes, requires): (Vec<u8>, std::borrow::Cow<'static, [&'static str]>) =
+            match (self.config.format, source) {
+                (WalFormat::Legacy, FrameSource::Encode) => (
+                    encode(seq, fence, record).map_err(WalError::Frame)?,
+                    record.required_features().into(),
+                ),
+                (WalFormat::Legacy, FrameSource::Legacy(frame)) => {
+                    (frame, record.required_features().into())
+                }
+                // A direct append, one that did not come through a writer handle, is stamped
+                // with the time it reaches this log.
+                (WalFormat::Overhaul, FrameSource::Encode) => self.stamp_v4(
+                    seq,
+                    fence,
+                    PreparedV4Frame::prepare(record).map_err(WalError::Frame)?,
+                    crate::framing::appended_ms_now(),
+                )?,
+                (
+                    WalFormat::Overhaul,
+                    FrameSource::V4 {
+                        prepared,
+                        appended_ms,
+                    },
+                ) => self.stamp_v4(seq, fence, prepared, appended_ms)?,
+                (log @ WalFormat::Overhaul, FrameSource::Legacy(_)) => {
+                    return Err(WalError::FrameFormat {
+                        log,
+                        offered: WalFormat::Legacy,
+                    })
+                }
+                (log @ WalFormat::Legacy, FrameSource::V4 { .. }) => {
+                    return Err(WalError::FrameFormat {
+                        log,
+                        offered: WalFormat::Overhaul,
+                    })
+                }
+            };
         let overhead = crate::framing::LINEAGE_FRAME_LEN as u64
             * if self.lineage_id.is_none() && current > 0 {
                 2
             } else {
                 1
             };
-        let reserve = if matches!(record, WalRecord::RunFinished { .. }) {
+        let lifecycle = self.config.is_overhaul()
+            && matches!(
+                record,
+                WalRecord::WriterOpened { .. } | WalRecord::WriterClosed { .. }
+            );
+        let close_reserve = match record {
+            WalRecord::WriterOpened { writer_id, .. } if lifecycle => {
+                PreparedV4Frame::prepare(&WalRecord::WriterClosed {
+                    writer_id: *writer_id,
+                })
+                .map_err(WalError::Frame)?
+                .frame_len() as u64
+                    + overhead
+            }
+            WalRecord::WriterClosed { .. } if lifecycle => 0,
+            _ => self.writer_close_reserve,
+        };
+        // Lifecycle barriers spend their own held bytes, not another run terminal's reserve.
+        // Every ordinary append, including RunFinished, must leave the outstanding close intact.
+        let reserve = if lifecycle || matches!(record, WalRecord::RunFinished { .. }) {
             0
         } else {
             crate::size_limit::reserve_bytes(overhead)
@@ -1044,13 +1247,16 @@ impl FileWal {
         let required = current
             .saturating_add(record_bytes.len() as u64)
             .saturating_add(overhead)
-            .saturating_add(reserve);
+            .saturating_add(reserve)
+            .saturating_add(close_reserve);
         if required > self.append_budget {
             return Err(WalError::TooLarge {
                 max_bytes: self.append_budget,
                 file_size: required,
             });
         }
+        // A legacy pre-encoded frame is checked to be exactly the one its sequence, fence and
+        // record require. A version 4 frame was stamped above from the codec's own payload.
         if preencoded {
             crate::framing::validate_preencoded(&record_bytes, seq, fence, record)
                 .map_err(WalError::Frame)?;
@@ -1058,8 +1264,8 @@ impl FileWal {
         // Raise the floor BEFORE the frame exists, and refuse the append if it cannot be
         // raised. Placement reads the floor to decide which builds may run on this machine;
         // a gated frame written first would be data it does not know about if the process
-        // died before the floor caught up.
-        let requires = record.required_features();
+        // died before the floor caught up. Every version 4 frame names `frame-stamps/v1`, so
+        // on an overhaul log this runs before every append.
         if !requires.is_empty() {
             let refuse = |path: Option<PathBuf>, reason: String| WalError::FeatureFloor {
                 path,
@@ -1069,7 +1275,7 @@ impl FileWal {
             let Some(floor) = self.feature_floor.clone() else {
                 return Err(refuse(None, "no feature floor is configured".into()));
             };
-            crate::floor::raise_floor(&floor, requires)
+            crate::floor::raise_floor(&floor, &requires)
                 .map_err(|error| refuse(Some(floor), error.to_string()))?;
         }
         let (lineage_id, minted_for_legacy) = match self.lineage_id {
@@ -1102,6 +1308,7 @@ impl FileWal {
             self.fsync()?;
         }
         self.next_seq = seq + 1;
+        self.writer_close_reserve = close_reserve;
         // Advance our high-water mark past the bytes we just wrote. Only OUR appends move
         // this, so "size unchanged since our last append" ⟺ no foreign write.
         self.last_write_end = current + bytes.len() as u64;
@@ -1110,8 +1317,14 @@ impl FileWal {
 }
 
 impl Wal for FileWal {
+    fn writer_close_reserve(&self) -> u64 {
+        self.writer_close_reserve
+    }
+    fn writer_id(&self) -> Option<[u8; 16]> {
+        self.writer_id
+    }
     fn append(&mut self, fence: u64, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
-        self.append_frame(fence, record, sync, None)
+        self.append_frame(fence, record, sync, FrameSource::Encode)
     }
 
     fn append_preencoded(
@@ -1121,7 +1334,30 @@ impl Wal for FileWal {
         sync: bool,
         frame: Vec<u8>,
     ) -> Result<u64, WalError> {
-        self.append_frame(fence, record, sync, Some(frame))
+        self.append_frame(fence, record, sync, FrameSource::Legacy(frame))
+    }
+
+    fn append_v4(
+        &mut self,
+        fence: u64,
+        record: &WalRecord,
+        sync: bool,
+        prepared: PreparedV4Frame,
+        appended_ms: u64,
+    ) -> Result<u64, WalError> {
+        self.append_frame(
+            fence,
+            record,
+            sync,
+            FrameSource::V4 {
+                prepared,
+                appended_ms,
+            },
+        )
+    }
+
+    fn wal_config(&self) -> WalConfig {
+        self.config
     }
 
     fn append_budget(&self) -> Option<(u64, u64, u64)> {
@@ -1358,7 +1594,8 @@ impl OwnedWriterWal {
     /// Append a record at the next seq, stamped with the tenure's epoch.
     pub fn append(&mut self, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
         let fence = self.epoch();
-        self.wal.append_frame(fence, record, sync, None)
+        self.wal
+            .append_frame(fence, record, sync, FrameSource::Encode)
     }
 
     /// Append a frame encoded by the single writer's enqueue path, stamped
@@ -1370,7 +1607,8 @@ impl OwnedWriterWal {
         frame: Vec<u8>,
     ) -> Result<u64, WalError> {
         let fence = self.epoch();
-        self.wal.append_frame(fence, record, sync, Some(frame))
+        self.wal
+            .append_frame(fence, record, sync, FrameSource::Legacy(frame))
     }
 
     /// Move an unstarted log before its first record fixes its placement.
@@ -1598,15 +1836,38 @@ fn scan_prefix<T>(
         let mut frame = header[..n].to_vec();
         if n == header.len() {
             let len = u32::from_le_bytes(header[..4].try_into().unwrap());
+            // A version 4 header is longer than the legacy one: its requirements array comes
+            // before the CRC and the payload. Read that array before sizing the frame from
+            // `len`, or the reader would assemble a frame short of its own header and never
+            // reach the payload, which a crash leaves unwritten, so recovery discards it.
+            let header_len = if header[4] == crate::framing::V4_FRAMING_VERSION {
+                match crate::framing::v4_header_len(&header) {
+                    Some(header_len) => header_len,
+                    None => return Ok(scan),
+                }
+            } else {
+                header.len()
+            };
+            if header_len > header.len() {
+                let extra = header_len - header.len();
+                let extra_budget = max_bytes.saturating_sub(offset + header.len() as u64);
+                let read = extra.min(usize::try_from(extra_budget).unwrap_or(usize::MAX));
+                let mut rest = vec![0u8; read];
+                let n = read_up_to(&mut file, &mut rest)?;
+                scan.bytes_read += n as u64;
+                rest.truncate(n);
+                frame.extend_from_slice(&rest);
+            }
             if len <= crate::framing::MAX_PAYLOAD_LEN {
-                let size = header.len() + len as usize;
+                let size = header_len + len as usize;
                 // The declared payload may be a torn tail's damaged length. Read
                 // only within budget; exceptional classification below probes one
                 // more byte to distinguish EOF from an actually oversized source.
                 let bounded_size = size.min(usize::try_from(available).unwrap_or(usize::MAX));
-                frame.resize(bounded_size, 0);
-                let n = read_up_to(&mut file, &mut frame[header.len()..])?;
-                frame.truncate(header.len() + n);
+                let already = frame.len();
+                frame.resize(bounded_size.max(already), 0);
+                let n = read_up_to(&mut file, &mut frame[already..])?;
+                frame.truncate(already + n);
                 scan.bytes_read += n as u64;
             }
         }
@@ -3125,6 +3386,7 @@ mod tests {
             wal.append(
                 1,
                 &WalRecord::ModelStepFinished {
+                    fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
                     hooks: None,
@@ -3251,6 +3513,7 @@ mod tests {
 
     fn run_started(n: u64) -> WalRecord {
         WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -3558,6 +3821,7 @@ mod tests {
     #[cfg(unix)]
     fn large_step(n: u64, text_bytes: usize) -> WalRecord {
         WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -4207,6 +4471,7 @@ mod tests {
             wal.append(
                 1,
                 &WalRecord::ModelStepFinished {
+                    fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
                     hooks: None,

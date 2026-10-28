@@ -127,6 +127,7 @@ fn seeded_episode_coordinates_are_absolute_and_a_steer_is_not_the_first_user() {
 
 fn text_step(step: u64, text: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        fallback: Default::default(),
         written_at_ms: None,
         tags: None,
         hooks: None,
@@ -145,6 +146,7 @@ fn text_step(step: u64, text: &str) -> WalRecord {
 
 fn call_step(step: u64, call: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        fallback: Default::default(),
         written_at_ms: None,
         tags: None,
         hooks: None,

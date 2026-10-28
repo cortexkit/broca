@@ -195,6 +195,7 @@ fn compacting_manifest() -> broca_wal::PlanManifest {
 
 fn step(step: u64, content: Vec<ContentBlock>, finish: FinishReason) -> WalRecord {
     WalRecord::ModelStepFinished {
+        fallback: Default::default(),
         written_at_ms: None,
         tags: None,
         hooks: None,

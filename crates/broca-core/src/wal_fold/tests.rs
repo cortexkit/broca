@@ -1004,6 +1004,8 @@ fn a_sealed_unfinished_pass_serves_members_through_the_verified_index() {
             assert!(read_newest_member(&paths, "ffffffffffffffff", MAX_BYTES)
                 .unwrap()
                 .is_none());
+            // Directory lookups need not populate the separate fallback membership cache.
+            broca_wal::archive::prewarm_container_membership(&paths[0], MAX_BYTES).unwrap();
             assert_eq!(
                 cached_membership(&paths[0]),
                 Some(CachedMembership::Verified)
@@ -2420,11 +2422,12 @@ fn fold_fences_only_refs_named_by_pending_activation() {
     let f = Fixture::new();
     let (protected, bytes) = f.session("protected", Some(1));
     let (other, _) = f.session("other", Some(1));
-    let reference = cortexkit_role_llm_runner::session_ref(
-        &protected.harness,
-        &protected.project_root.to_string_lossy(),
-        &protected.session,
-    );
+    let reference =
+        cortexkit_role_llm_runner::session_ref(&cortexkit_role_llm_runner::SessionIdentity {
+            runner: "broca",
+            harness: &protected.harness,
+            session: &protected.session,
+        });
     let authority = f.root.join("agent-data/cuts/cut.json");
     broca_wal::migration::atomic_json(&f.root, &authority, &serde_json::json!({"refs":[{"ref_kind":"broca-session","ref":reference}],"intent":{"op":"activate","request":{}}})).unwrap();
     let before = fs::read(&authority).unwrap();
@@ -2473,11 +2476,12 @@ fn pending_move_intent_refuses_open_before_restoring_archived_copy() {
     assert_eq!(f.fold().removed, 1);
     let path = f.store.wal_path(&session);
     assert!(!path.exists());
-    let reference = cortexkit_role_llm_runner::session_ref(
-        &session.harness,
-        &session.project_root.to_string_lossy(),
-        &session.session,
-    );
+    let reference =
+        cortexkit_role_llm_runner::session_ref(&cortexkit_role_llm_runner::SessionIdentity {
+            runner: "broca",
+            harness: &session.harness,
+            session: &session.session,
+        });
     let authority = f.root.join("agent-data/cuts/cut.json");
     broca_wal::migration::atomic_json(
         &f.root,

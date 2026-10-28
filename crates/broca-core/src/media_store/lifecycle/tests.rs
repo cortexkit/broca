@@ -19,6 +19,30 @@ fn fixture() -> (PathBuf, MediaStore, BindIdentity) {
     (root, store, session)
 }
 
+/// Production [`sweep`], retried while the store lock's non-blocking exclusive lock is refused.
+///
+/// Other tests in this process spawn children (`lsof`, or a copy of this test binary). A child
+/// forked while this test's media session holds its shared store lock keeps a duplicate of that
+/// descriptor until its exec closes it, so for that moment the lock still has a shared holder and
+/// the sweep is refused, exactly as a live registration would refuse it. In production a refused
+/// sweep waits for its next pass; a test waits here, under the shared hang guard.
+fn swept(root: &Path) -> SweepReport {
+    broca_test_support::wait_until_sync("a media sweep takes the store lock", || {
+        match sweep(root) {
+            Ok(report) => Ok(report),
+            Err(error)
+                if error
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<std::fs::TryLockError>())
+                    .is_some_and(|inner| matches!(inner, std::fs::TryLockError::WouldBlock)) =>
+            {
+                Err(error.to_string())
+            }
+            Err(error) => panic!("media sweep failed: {error}"),
+        }
+    })
+}
+
 fn reference(bytes: &[u8]) -> MediaRef {
     crate::media_validation::validate_media(bytes, "application/pdf").unwrap()
 }
@@ -80,7 +104,7 @@ fn live_lease_preserves_refused_entries_then_first_unleased_sweep_frees_only_una
         })
         .unwrap_err();
     drop(handle);
-    let report = sweep(&root).unwrap();
+    let report = swept(&root);
     assert_eq!(report.leased, 1);
     assert_eq!(
         digests(&fs::read(manifest(&store, &session)).unwrap())
@@ -90,7 +114,7 @@ fn live_lease_preserves_refused_entries_then_first_unleased_sweep_frees_only_una
     );
     assert_eq!(store.read_verified(&reference(REFUSED)).unwrap(), REFUSED);
     drop(lease);
-    assert_eq!(sweep(&root).unwrap().objects_removed, 1);
+    assert_eq!(swept(&root).objects_removed, 1);
     assert!(matches!(
         store.read_verified(&reference(REFUSED)),
         Err(MediaReadError::Missing(_))
@@ -112,7 +136,7 @@ fn same_named_sessions_in_different_projects_survive_each_others_deletion() {
     assert!(manifest(&store, &first).exists());
     fs::remove_file(first_wal).unwrap();
     store.remove_session_after_wal_removal(&first).unwrap();
-    sweep(&root).unwrap();
+    swept(&root);
     assert!(!manifest(&store, &first).exists());
     assert!(manifest(&store, &second).exists());
     assert_eq!(store.read_verified(&reference(BYTES)).unwrap(), BYTES);
@@ -124,7 +148,7 @@ fn same_named_sessions_in_different_projects_survive_each_others_deletion() {
     );
     fs::remove_file(second_wal).unwrap();
     store.remove_session_after_wal_removal(&second).unwrap();
-    assert_eq!(sweep(&root).unwrap().objects_removed, 1);
+    assert_eq!(swept(&root).objects_removed, 1);
 }
 
 #[test]
@@ -137,10 +161,10 @@ fn orphan_manifest_is_reclaimed_only_after_its_lease_is_released() {
         .unwrap()
         .register_and_append(&reference(BYTES), BYTES, || Ok(()))
         .unwrap();
-    assert_eq!(sweep(&root).unwrap().leased, 1);
+    assert_eq!(swept(&root).leased, 1);
     assert!(manifest(&store, &session).exists());
     drop(lease);
-    assert_eq!(sweep(&root).unwrap().manifests_removed, 1);
+    assert_eq!(swept(&root).manifests_removed, 1);
     assert!(!manifest(&store, &session).exists());
     assert!(matches!(
         store.read_verified(&reference(BYTES)),
@@ -153,7 +177,7 @@ fn wal_references_survive_even_if_the_manifest_is_missing() {
     let (root, store, session) = fixture();
     accepted(&root, &store, &session);
     fs::remove_file(manifest(&store, &session)).unwrap();
-    assert_eq!(sweep(&root).unwrap().objects_removed, 0);
+    assert_eq!(swept(&root).objects_removed, 0);
     assert_eq!(store.read_verified(&reference(BYTES)).unwrap(), BYTES);
 }
 
@@ -168,7 +192,7 @@ fn wal_in_another_class_does_not_keep_an_unreferenced_copy() {
         .register_and_append(&reference(BYTES), BYTES, || Ok(()))
         .unwrap();
     fs::remove_file(manifest(&ordinary, &session)).unwrap();
-    assert_eq!(sweep(&root).unwrap().objects_removed, 1);
+    assert_eq!(swept(&root).objects_removed, 1);
     assert_eq!(store.read_verified(&reference(BYTES)).unwrap(), BYTES);
     assert!(matches!(
         ordinary.read_verified(&reference(BYTES)),
@@ -191,7 +215,7 @@ fn archive_fold_keeps_manifest_and_object() {
     archive.seal().unwrap();
     fs::remove_file(&path).unwrap();
     assert!(store.remove_session_after_wal_removal(&session).is_err());
-    sweep(&root).unwrap();
+    swept(&root);
     assert!(manifest(&store, &session).exists());
     assert_eq!(store.read_verified(&reference(BYTES)).unwrap(), BYTES);
 }
@@ -257,7 +281,7 @@ fn interrupted_retention_deletion_keeps_manifest_and_object() {
         .join(format!("{}.interrupted.deleting", session_addr(&session)));
     broca_owner_only::create_dir_all(deleting.parent().unwrap()).unwrap();
     fs::rename(path, deleting).unwrap();
-    sweep(&root).unwrap();
+    swept(&root);
     assert!(manifest(&store, &session).exists());
     assert_eq!(store.read_verified(&reference(BYTES)).unwrap(), BYTES);
 }
@@ -286,14 +310,14 @@ fn sweep_lock_is_exclusive_and_deadline_prevents_unbounded_work() {
 fn unchanged_manifest_is_not_rewritten_but_a_changed_one_is_reconciled() {
     let (root, store, session) = fixture();
     accepted(&root, &store, &session);
-    assert_eq!(sweep(&root).unwrap().reconciled, 1);
-    assert_eq!(sweep(&root).unwrap().reconciled, 0);
+    assert_eq!(swept(&root).reconciled, 1);
+    assert_eq!(swept(&root).reconciled, 0);
     store
         .session(&session)
         .unwrap()
         .register_and_append(&reference(REFUSED), REFUSED, || Ok(()))
         .unwrap();
-    assert_eq!(sweep(&root).unwrap().reconciled, 1);
+    assert_eq!(swept(&root).reconciled, 1);
     assert_eq!(
         fs::read_to_string(manifest(&store, &session)).unwrap(),
         format!("{}\n", reference(BYTES).sha256)
@@ -339,11 +363,11 @@ fn dropping_one_session_manifest_does_not_replay_unrelated_wals() {
 fn changed_wal_cannot_reuse_a_previous_manifest_cache_stamp() {
     let (root, store, session) = fixture();
     let path = accepted(&root, &store, &session);
-    sweep(&root).unwrap();
+    swept(&root);
     let digest = &reference(BYTES).sha256;
     fs::write(manifest(&store, &session), format!("{digest}\n{digest}\n")).unwrap();
     fs::write(path, []).unwrap();
-    sweep(&root).unwrap();
+    swept(&root);
     assert!(fs::read(manifest(&store, &session)).unwrap().is_empty());
     assert!(matches!(
         store.read_verified(&reference(BYTES)),
@@ -359,7 +383,7 @@ fn sweep_skips_empty_stores_without_touching_the_wal_corpus() {
     fs::write(path, b"unrelated to an empty media store").unwrap();
     let _archive = crate::lease::acquire_archive_pass(&root).unwrap();
     let before = fs::read(manifest(&store, &session)).unwrap();
-    let report = sweep(&root).unwrap();
+    let report = swept(&root);
     assert_eq!(report.wal_reads, 0);
     assert_eq!(report.reconciled, 0);
     assert_eq!(fs::read(manifest(&store, &session)).unwrap(), before);
@@ -386,7 +410,7 @@ fn sweep_reads_each_manifest_candidate_once_and_ignores_other_wals() {
         )
         .unwrap();
     }
-    let report = sweep(&root).unwrap();
+    let report = swept(&root);
     assert_eq!(
         report.wal_reads, 1,
         "all populated classes must share one candidate inventory"
@@ -402,7 +426,7 @@ fn damaged_manifest_retains_every_object_in_its_class() {
     accepted(&root, &store, &session);
     fs::write(store.root.join("objects/orphan"), b"orphan").unwrap();
     fs::write(manifest(&store, &session), b"incomplete digest").unwrap();
-    let report = sweep(&root).unwrap();
+    let report = swept(&root);
     assert_eq!(report.retained_classes, 1);
     assert_eq!(report.wal_reads, 0);
     assert_eq!(report.objects_removed, 0);
@@ -463,7 +487,7 @@ fn preview_preserves_all_files_and_lease_epochs_and_respects_live_writers() {
     let lease = leases.acquire(&lease_key_for(&session)).unwrap();
     assert_eq!(lease.epoch(), epoch + 1, "preview changed the lease epoch");
     drop(lease);
-    assert_eq!(sweep(&root).unwrap().objects_removed, 1);
+    assert_eq!(swept(&root).objects_removed, 1);
 }
 
 /// Counts the WAL directory barriers a removal performs. Production emits this step from

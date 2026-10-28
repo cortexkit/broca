@@ -1076,7 +1076,7 @@ impl LineageRegistry {
         }
     }
     fn cut_gate(&self, key: &LineageKey) -> Arc<tokio::sync::Mutex<()>> {
-        let reference = cortexkit_role_llm_runner::session_ref(
+        let reference = broca_core::wal_writer::legacy_session_ref(
             &key.harness,
             &key.project_root.to_string_lossy(),
             &key.session,
@@ -1113,18 +1113,18 @@ impl LineageRegistry {
     ) -> Result<MoveSessionGuard, OpenError> {
         let mut sorted = sessions.to_vec();
         sorted.sort_by_key(|key| {
-            cortexkit_role_llm_runner::session_ref(
+            broca_core::wal_writer::legacy_session_ref(
                 &key.harness,
                 &key.project_root.to_string_lossy(),
                 &key.session,
             )
         });
         sorted.dedup_by(|a, b| {
-            cortexkit_role_llm_runner::session_ref(
+            broca_core::wal_writer::legacy_session_ref(
                 &a.harness,
                 &a.project_root.to_string_lossy(),
                 &a.session,
-            ) == cortexkit_role_llm_runner::session_ref(
+            ) == broca_core::wal_writer::legacy_session_ref(
                 &b.harness,
                 &b.project_root.to_string_lossy(),
                 &b.session,
@@ -1141,11 +1141,11 @@ impl LineageRegistry {
             let handle = {
                 let slots = self.inner.slots.lock().unwrap();
                 if let Some((bound, _)) = slots.get_key_value(&key) {
-                    if cortexkit_role_llm_runner::session_ref(
+                    if broca_core::wal_writer::legacy_session_ref(
                         &bound.harness,
                         &bound.project_root.to_string_lossy(),
                         &bound.session,
-                    ) != cortexkit_role_llm_runner::session_ref(
+                    ) != broca_core::wal_writer::legacy_session_ref(
                         &key.harness,
                         &key.project_root.to_string_lossy(),
                         &key.session,
@@ -5689,6 +5689,7 @@ mod tests {
 
     pub(super) fn assistant_record() -> WalRecord {
         WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -6347,6 +6348,7 @@ mod offset_page_tests {
 
     fn text_step(step: u64, text: &str) -> WalRecord {
         WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -6380,6 +6382,7 @@ mod offset_page_tests {
     fn corpus_wal() -> (Vec<u8>, Vec<WalRecord>) {
         let mut records = vec![run_started("r1", vec![user("task")]), step_started(1)];
         records.push(WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,

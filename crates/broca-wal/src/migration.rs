@@ -58,7 +58,12 @@ impl From<MoveRefusal> for crate::WalError {
 }
 
 pub fn guard(wal: &Path, session_ref: &str, write: bool) -> Result<(), crate::WalError> {
-    check(wal, session_ref, write)
+    guard_refs(wal, &[session_ref], write)
+}
+
+/// [`guard`] for a session named by several references; see [`check_refs`].
+pub fn guard_refs(wal: &Path, session_refs: &[&str], write: bool) -> Result<(), crate::WalError> {
+    check_refs(wal, session_refs, write)
         .map_err(crate::WalError::Io)?
         .map_err(Into::into)
 }
@@ -218,6 +223,7 @@ fn publish_json_bytes(
         .open(&temp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
+    publication_ready(path)?;
     fs::rename(&temp, path)?;
     sync_dir(parent)?;
     if let Some(publication) = publication {
@@ -472,6 +478,18 @@ pub fn cut_fence(wal_root: &Path, session_ref: &str) -> io::Result<Option<String
 }
 
 pub fn check(wal: &Path, session_ref: &str, write: bool) -> io::Result<Result<(), MoveRefusal>> {
+    check_refs(wal, &[session_ref], write)
+}
+
+/// [`check`] for a session that cut files may name by more than one reference (the
+/// folder-based v1 reference and the runner-identity v2 one). A write is fenced by a pending
+/// cut naming any of them before the moved tombstone is consulted, so the precedence of a
+/// pending release over a tombstone does not depend on which reference the cut recorded.
+pub fn check_refs(
+    wal: &Path,
+    session_refs: &[&str],
+    write: bool,
+) -> io::Result<Result<(), MoveRefusal>> {
     if wal
         .components()
         .any(|part| part.as_os_str() == "wal-staging")
@@ -490,8 +508,10 @@ pub fn check(wal: &Path, session_ref: &str, write: bool) -> io::Result<Result<()
         .and_then(|parent| Some(parent.parent()?.join("wal").join(wal.file_name()?)));
     let wal = canonical.as_deref().unwrap_or(wal);
     if write {
-        if let Some(cut_id) = cut_fence(wal.parent().unwrap_or(Path::new(".")), session_ref)? {
-            return Ok(Err(MoveRefusal::Moving { cut_id }));
+        for session_ref in session_refs {
+            if let Some(cut_id) = cut_fence(wal.parent().unwrap_or(Path::new(".")), session_ref)? {
+                return Ok(Err(MoveRefusal::Moving { cut_id }));
+            }
         }
     }
     if let Some(moved) = read_json::<Moved>(&wal.with_extension("moved"))? {

@@ -440,6 +440,8 @@ fn convert_model_parts(
                 parts.push(part);
             }
             ContentBlock::ToolResult(_) => {}
+            // Anthropic's server-side fallback handoff means nothing to this family's API: dropped.
+            ContentBlock::ProviderFallback { .. } => {}
         }
     }
     parts
@@ -1183,6 +1185,9 @@ impl StreamNormalizer for GeminiNormalizer {
                     .clone()
                     .or_else(|| self.body_service_tier.clone()),
                 speed_used: None,
+                // No non-Anthropic family reports a server-side fallback or per-model usage.
+                served_model: None,
+                usage_iterations: None,
             }),
             NormalizedEvent::Control(ProviderControl::Finished {
                 usage: self.usage,
@@ -1203,7 +1208,9 @@ fn map_finish_reason(fr: &str) -> FinishReason {
         "STOP" => FinishReason::Stop,
         "MAX_TOKENS" => FinishReason::Length,
         "MALFORMED_FUNCTION_CALL" | "UNEXPECTED_TOOL_CALL" => FinishReason::ToolCalls,
-        "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" => FinishReason::ContentFilter,
+        "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" => {
+            FinishReason::ContentFilter
+        }
         _ => FinishReason::Other,
     }
 }
@@ -1400,6 +1407,29 @@ mod tests {
             terminal_finish_reasons(&events),
             vec![FinishReason::Stop, FinishReason::Stop]
         );
+    }
+
+    /// A filtered candidate ends the step as filtered, while a normal stop still ends it
+    /// as a stop: both share the candidate `finishReason` mapping.
+    #[test]
+    fn spii_finish_reason_is_content_filter() {
+        for (finish_reason, expected) in [
+            ("SPII", FinishReason::ContentFilter),
+            ("STOP", FinishReason::Stop),
+        ] {
+            let events = normalize_response_values(&[json!({
+                "candidates": [{
+                    "finishReason": finish_reason,
+                    "content": {"parts": [{"text": "answer"}]}
+                }]
+            })]);
+
+            assert_eq!(
+                terminal_finish_reasons(&events),
+                vec![expected, expected],
+                "finishReason {finish_reason:?}"
+            );
+        }
     }
 
     #[test]

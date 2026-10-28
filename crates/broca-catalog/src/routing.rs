@@ -5,6 +5,8 @@ use broca_provider::spec::WireFamilyId;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::runtime::SERVER_SIDE_FALLBACK_FACT;
+
 pub(crate) const MISSING_CODE_ASSIST_TIERS: &str = "Google Code Assist is unavailable for this model: Fusiform has not published reasoning-tier backend model IDs (missing route.reasoning_wire_ids); choose a model with a published Google Code Assist route";
 
 /// Fusiform's wire.api follows models.dev's published Anthropic-root convention:
@@ -22,6 +24,17 @@ pub(crate) fn renderer_base_url(family: WireFamilyId, served: &str) -> String {
     served.to_string()
 }
 
+/// Read a boolean row fact that may be absent. A value of the wrong type, or an explicit null,
+/// simply states nothing here.
+///
+/// Reporting a malformed value is the row reader's job (`server_side_fallback_fact` in
+/// `runtime.rs`), because it is the one place that has the row's catalog id to name. This decode
+/// also runs on documents that carry no such id, and a WARN from each of them for one bad fact
+/// would report the same defect several times per refresh.
+fn optional_flag(facts: &BTreeMap<String, Value>, fact: &str) -> Option<bool> {
+    facts.get(fact).and_then(Value::as_bool)
+}
+
 /// Provenance is an open string: a new producer source does not change the served value.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct WireFact {
@@ -36,6 +49,10 @@ pub struct RoutingFacts {
     pub shape: Option<WireFact>,
     pub reasoning_wire_ids: Option<BTreeMap<String, String>>,
     pub reasoning_default: Option<String>,
+    /// Whether the runtime accepts a request that asks it to hand a refusal to another model
+    /// itself. `None` when the catalog states nothing (an older catalog, a point-in-time read,
+    /// or a value that was malformed), which callers read as false.
+    pub server_side_fallback: Option<bool>,
     pub successor: Option<String>,
     error: Option<String>,
 }
@@ -60,6 +77,7 @@ impl RoutingFacts {
                 shape: read(facts, "wire.shape")?,
                 reasoning_wire_ids: read(facts, "route.reasoning_wire_ids")?,
                 reasoning_default: read(facts, "route.reasoning_default")?,
+                server_side_fallback: optional_flag(facts, SERVER_SIDE_FALLBACK_FACT),
                 successor: read(facts, "successor")?,
                 error: None,
             })
@@ -126,6 +144,83 @@ mod tests {
         let response: crate::FusiformCatalogResponse =
             serde_json::from_value(vectors()[name]["response"].clone()).unwrap();
         RoutingFacts::decode(response.models.values().next().unwrap())
+    }
+
+    /// The test vectors whose response holds more than one row, read whole: these facts are
+    /// per row, so a test picks its row by catalog id.
+    fn named_row(vector: &str) -> crate::FusiformCatalogResponse {
+        serde_json::from_value(vectors()[vector]["response"].clone()).unwrap()
+    }
+
+    /// The server-side fallback fact is a per-row claim, stated as a bare boolean, whose
+    /// absence says nothing: unlike every other decoded fact it cannot refuse the row.
+    #[test]
+    fn server_side_fallback_decodes_beside_the_routing_facts_it_travels_with() {
+        let response = named_row("catalog.get — anthropic server-side fallback capability");
+        let expected = [
+            ("claude-opus-5-5", Some(true)),
+            ("claude-haiku-5-5", Some(false)),
+            ("claude-sonnet-5", None),
+        ];
+        for (model, stated) in expected {
+            let facts = RoutingFacts::decode(&response.models[&format!("anthropic/{model}")]);
+            assert_eq!(
+                facts.server_side_fallback, stated,
+                "{model} states {stated:?}"
+            );
+            assert!(facts.validate().is_ok(), "{model} route must decode");
+        }
+    }
+
+    /// A malformed value disables this one fact and leaves the row's route alone. Today one
+    /// unreadable routing fact fails the whole decode, and an optional feature must not take a
+    /// model offline. The WARN for the value comes from the row reader, which knows the row's
+    /// catalog id; see the catalog tests.
+    #[test]
+    fn malformed_refusal_fallback_fact_keeps_the_route() {
+        let response = named_row("catalog.get — anthropic server-side fallback capability");
+        // Give the probe row a complete route, so the assertion below is about this one fact
+        // rather than about whatever else the fixture row may lack.
+        let mut row_facts = response.models["anthropic/claude-opus-5-5"].clone();
+        row_facts.insert(
+            "wire.npm".into(),
+            serde_json::json!({"value": "@ai-sdk/anthropic", "from": "provider"}),
+        );
+        row_facts.insert(
+            "wire.api".into(),
+            serde_json::json!({"value": "https://api.anthropic.com/v1", "from": "curated"}),
+        );
+        let clean_route = RoutingFacts::decode(&row_facts)
+            .route()
+            .expect("the probe row routes");
+
+        for value in [
+            serde_json::json!("true"),
+            serde_json::json!(1),
+            serde_json::json!("maybe"),
+            serde_json::json!([true]),
+            serde_json::json!({"value": true}),
+        ] {
+            let mut malformed = row_facts.clone();
+            malformed.insert(SERVER_SIDE_FALLBACK_FACT.into(), value.clone());
+
+            let facts = RoutingFacts::decode(&malformed);
+
+            assert_eq!(
+                facts.route(),
+                Ok(clean_route.clone()),
+                "{value}: a malformed optional fact must not fail the row's route"
+            );
+            assert_eq!(
+                facts.server_side_fallback, None,
+                "{value}: an unreadable value reads as not stated"
+            );
+            assert_eq!(
+                facts.tier(None),
+                RoutingFacts::decode(&row_facts).tier(None),
+                "{value}"
+            );
+        }
     }
 
     #[test]

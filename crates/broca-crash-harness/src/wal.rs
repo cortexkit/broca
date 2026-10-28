@@ -184,6 +184,13 @@ impl ObservedWalStore {
 // test in tests/it/observed_wal_fidelity.rs compares these impls with FileWalStore's and
 // FileWal's, so a new production override cannot be missed here silently.
 impl WalStore for ObservedWalStore {
+    fn writer_marker_root(&self) -> Option<PathBuf> {
+        WalStore::writer_marker_root(&self.inner)
+    }
+    fn wal_config(&self) -> broca_wal::WalConfig {
+        WalStore::wal_config(&self.inner)
+    }
+
     fn uploads(&self) -> Option<broca_core::media_uploads::Uploads> {
         WalStore::uploads(&self.inner)
     }
@@ -304,6 +311,13 @@ impl WalStore for ObservedWalStore {
         WalStore::read_records(&self.inner, session)
     }
 
+    fn read_records_with_lineage(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<(Vec<FramedRecord>, Option<WalLineageId>), WalError> {
+        WalStore::read_records_with_lineage(&self.inner, session)
+    }
+
     fn read_records_range(
         &self,
         session: &BindIdentity,
@@ -383,6 +397,12 @@ struct ObservedWal {
 // Like the store above, every method FileWal overrides is forwarded, so the writer sees the
 // same byte budget and takes the same pre-encoded append path as in production.
 impl Wal for ObservedWal {
+    fn writer_close_reserve(&self) -> u64 {
+        self.inner.writer_close_reserve()
+    }
+    fn writer_id(&self) -> Option<[u8; 16]> {
+        self.inner.writer_id()
+    }
     fn append(&mut self, fence: u64, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
         let seq = self.inner.append(fence, record, sync)?;
         if sync {
@@ -403,6 +423,27 @@ impl Wal for ObservedWal {
             self.synced.lock().unwrap().insert(seq);
         }
         Ok(seq)
+    }
+
+    fn append_v4(
+        &mut self,
+        fence: u64,
+        record: &WalRecord,
+        sync: bool,
+        prepared: broca_wal::PreparedV4Frame,
+        appended_ms: u64,
+    ) -> Result<u64, WalError> {
+        let seq = self
+            .inner
+            .append_v4(fence, record, sync, prepared, appended_ms)?;
+        if sync {
+            self.synced.lock().unwrap().insert(seq);
+        }
+        Ok(seq)
+    }
+
+    fn wal_config(&self) -> broca_wal::WalConfig {
+        self.inner.wal_config()
     }
 
     fn append_budget(&self) -> Option<(u64, u64, u64)> {

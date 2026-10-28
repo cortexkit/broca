@@ -905,6 +905,8 @@ impl BrocaSubject {
         // terminal (or with no restart), and it has no route of its own to poll.
         self.settle_compaction(session, file_terminal_is_enough())
             .await?;
+        // Read the bus before taking the lock on the scripted sessions: the wait may be long.
+        let notices = self.bus_advance_notices(session).await?;
         let sessions = self.shared.compaction.lock().unwrap();
         let state = sessions
             .get(session)
@@ -945,12 +947,51 @@ impl BrocaSubject {
                 model_inputs: state.inputs.clone(),
                 // Broca's host has no standalone Magic Context to hand a session to.
                 standalone_handoffs: 0,
-                // This scripted provider does not subscribe to the bus, so it captures no advance
-                // notices. Only the cut cases read them, and those need `publish_compaction_view`,
-                // which this adapter does not implement, so the kit reports them inapplicable.
-                notices: Vec::new(),
+                notices,
             },
         )
+    }
+
+    /// The advance notices broca published for `session`, as captured on the rig's bus.
+    /// Publication follows the WAL record on the bus publisher's next pass, so this waits
+    /// (bounded) until the bus has carried as many notices as the WAL recorded. The WAL is
+    /// consulted only for that count; every returned header set comes from the bus.
+    #[cfg(feature = "test-clock")]
+    async fn bus_advance_notices(
+        &self,
+        session: &str,
+    ) -> Result<Vec<BTreeMap<String, String>>, HarnessError> {
+        let Some(bus) = self.bus.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let bind = self.bind_identity(session);
+        let reference = broca_core::agent_session_ref(&bind);
+        let wal = broca_core::FileWalStore::new(self.compaction_root(session)?.join("wal"));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let recorded = wal
+                .read_records(&bind)
+                .unwrap_or_default()
+                .iter()
+                .filter(|frame| {
+                    matches!(frame.record, broca_wal::WalRecord::CompactionNotice { .. })
+                })
+                .count();
+            let published = bus.advance_notices(&reference);
+            if published.len() >= recorded || Instant::now() >= deadline {
+                return Ok(published);
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Without the test clock no bus rig exists, so nothing is captured.
+    #[cfg(not(feature = "test-clock"))]
+    async fn bus_advance_notices(
+        &self,
+        _session: &str,
+    ) -> Result<Vec<BTreeMap<String, String>>, HarnessError> {
+        Ok(Vec::new())
     }
 
     fn compaction_root(&self, session: &str) -> Result<PathBuf, HarnessError> {

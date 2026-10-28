@@ -64,15 +64,11 @@ pub fn automatic_warm_prices(
     prefix_tokens: u64,
     ttl_ms: u64,
 ) -> Result<broca_core::keep_warm::WarmCosts, String> {
-    use crate::auth_routing::{AuthMethod, CredentialId};
+    use crate::auth_routing::AuthMethod;
     let frozen =
         frozen_render_config(config).map_err(|error| format!("pricing_unavailable: {error}"))?;
-    let credential = config
-        .auth_selection
-        .as_ref()
-        .and_then(|selection| CredentialId::parse(&selection.credential_id))
-        .ok_or("pricing_unavailable: auth_method")?;
-    let subscription = matches!(credential.method, AuthMethod::Oauth | AuthMethod::Chatgpt);
+    let (method, _) = frozen_credential(config).ok_or("pricing_unavailable: auth_method")?;
+    let subscription = matches!(method, AuthMethod::Oauth | AuthMethod::Chatgpt);
     broca_catalog::keep_warm::warm_prices(
         &config.model.provider_module_id,
         &config.model.model_id,
@@ -88,12 +84,8 @@ pub fn responses_warm_cost(
     config: &broca_wal::RunConfig,
     usage: broca_protocol::Usage,
 ) -> Result<f64, String> {
-    use crate::auth_routing::{AuthMethod, CredentialId};
-    let credential = config
-        .auth_selection
-        .as_ref()
-        .and_then(|selection| CredentialId::parse(&selection.credential_id))
-        .ok_or("pricing_unavailable: auth_method")?;
+    use crate::auth_routing::AuthMethod;
+    let (method, _) = frozen_credential(config).ok_or("pricing_unavailable: auth_method")?;
     broca_catalog::keep_warm::responses_warm_cost(
         &config.model.provider_module_id,
         &config.model.model_id,
@@ -104,13 +96,27 @@ pub fn responses_warm_cost(
                 .ok_or("pricing_unavailable: usage")?,
             usage.output_tokens.ok_or("pricing_unavailable: usage")?,
         ),
-        matches!(credential.method, AuthMethod::Oauth | AuthMethod::Chatgpt),
+        matches!(method, AuthMethod::Oauth | AuthMethod::Chatgpt),
     )
     .map_err(|error| error.to_string())
 }
 
-/// Query quota using the provider parsed from frozen `auth_selection.credential_id` and the
-/// vault account UUID in frozen `auth_selection.account_ref`. The prefrontal routing module,
+/// The method and provider of the run's frozen credential selection, read as the selection
+/// froze them (see [`crate::auth_routing::frozen_selection_credential`]).
+fn frozen_credential(
+    config: &broca_wal::RunConfig,
+) -> Option<(crate::auth_routing::AuthMethod, String)> {
+    config.auth_selection.as_ref().and_then(|selection| {
+        crate::auth_routing::frozen_selection_credential(
+            selection,
+            config.model.provider_module_id.as_str(),
+        )
+    })
+}
+
+/// Query quota using the frozen selection's provider (parsed from a broca key, or the run's
+/// provider for a selection frozen with its method) and the vault account UUID in frozen
+/// `auth_selection.account_ref`. The prefrontal routing module,
 /// which chooses accounts and reports quota, needs exactly these identities, not a catalog
 /// alias or the credential-id suffix.
 pub async fn automatic_warm_quota_for_config(
@@ -120,13 +126,12 @@ pub async fn automatic_warm_quota_for_config(
 ) -> Result<(), String> {
     let frozen = frozen_render_config(config).map_err(|_| "reading_missing")?;
     let selection = config.auth_selection.as_ref().ok_or("account_unknown")?;
-    let credential = crate::auth_routing::CredentialId::parse(&selection.credential_id)
-        .ok_or("account_unknown")?;
+    let (method, provider) = frozen_credential(config).ok_or("account_unknown")?;
     match crate::keep_warm_quota::automatic_warm_quota(
         client,
-        &credential.provider,
+        &provider,
         selection.account_ref.as_deref(),
-        credential.method,
+        method,
         frozen.family_id,
         headers,
     )
@@ -160,6 +165,7 @@ mod automatic_tests {
         )
         .unwrap();
         config.auth_selection = Some(broca_wal::AuthSelection {
+            auth_method: None,
             credential_id: "oauth:anthropic:credential-suffix-is-not-account".into(),
             account_ref: Some("00000000-0000-4000-8000-00000000000a".into()),
             resolved_credential_id: None,

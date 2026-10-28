@@ -28,6 +28,8 @@ pub mod merge;
 pub mod routing;
 pub mod runtime;
 
+#[cfg(test)]
+pub(crate) use runtime::test_catalog_lock;
 pub use runtime::{
     catalog, global_catalog_cache, install_global_catalog_cache, CatalogCache, CatalogHealth,
     CatalogRefreshError, CatalogSnapshot, CatalogSource, CatalogUnavailable,
@@ -792,6 +794,10 @@ fn map_model(model_id: &str, entry: &Value, raw_policy: RawPolicy) -> ModelSpec 
             .get("reasoning_options")
             .and_then(ReasoningOptions::from_value)
             .unwrap_or_default(),
+        // The snapshot spelling of fusiform's `capability.server_side_fallback`. The vendored
+        // copy states none, but a test catalog can, so both read paths agree. A value that is
+        // not a boolean reads as unstated, like the fusiform reader's.
+        server_side_fallback: entry.get("server_side_fallback").and_then(Value::as_bool),
         release_date: entry
             .get("release_date")
             .and_then(Value::as_str)
@@ -2154,6 +2160,7 @@ mod tests {
                 account_ref: None,
                 run_id: "fixed-run".into(),
                 step_index: 1,
+                max_output_tokens: None,
             });
             opts
         };
@@ -2213,7 +2220,16 @@ mod tests {
                 &provider_spec,
                 &model_spec,
                 2048,
-                renderer_version_for(family),
+                // This fixture does not opt in to server-side fallback, so the free version is
+                // the one admission would record for it: v2 on Anthropic, the current version
+                // elsewhere. `resolve_frozen` takes the version as an input rather than
+                // deriving it, so the opt-in rule has to be applied here.
+                match family {
+                    WireFamilyId::AnthropicMessages => {
+                        broca_provider::families::anthropic_renderer_version(false)
+                    }
+                    _ => renderer_version_for(family),
+                },
             )
             .expect("synthetic catalog fixtures publish known capability flags");
             if family == WireFamilyId::GoogleCodeAssist {
