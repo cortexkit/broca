@@ -377,6 +377,7 @@ where
                     && checkpoint.head.is_some()
                     && checkpoint.compaction_complete()
                     && checkpoint.input_budget.is_some()
+                    && checkpoint.output_reservation.is_some()
                 {
                     // Only a budgeted episode can seed replay from the checkpoint at the store
                     // watermark. Decide from this pre-tail state: if the tail opens or corruptly
@@ -1948,6 +1949,15 @@ where
             RunError::Wal("admission checkpoint has no session input accounting".into())
         })?;
     writer.seed_input_token_limit(prior.input_budget.limit);
+    // Store and held-row replay see only the WAL tail. The checkpoint folds the same records
+    // as full replay, including the measured request that may already be in the prefix.
+    prior.output_reservation = snapshot
+        .checkpoint_at_head
+        .output_reservation
+        .clone()
+        .ok_or_else(|| {
+            RunError::Wal("admission checkpoint has no output reservation history".into())
+        })?;
     if let Some(compaction) = &snapshot.checkpoint_at_head.compaction {
         prior.compaction = compaction.clone();
         if let Some(state) = compaction.state() {
@@ -6894,6 +6904,7 @@ pub(crate) async fn project_committed<W: WalStore>(
     let use_seed = seed.as_ref().is_some_and(|seed| {
         !retained_seed
             && prior_policy.is_some()
+            && seed.admission_checkpoint.output_reservation.is_some()
             && seed
                 .deferred_calls
                 .as_ref()
@@ -6910,10 +6921,9 @@ pub(crate) async fn project_committed<W: WalStore>(
         .flatten();
     // This WAL read runs inline on the async task while the store write below is offloaded to a
     // blocking thread. It is an incremental tail bounded by the projection watermark only when
-    // `use_seed` holds. A retained lineage, a seed without a recorded policy, a seed whose
-    // deferred-call summary lacks its stopped-run set, or a budgeted run without a valid seed
-    // reads from sequence zero, so its cost grows with the WAL; the seeded-write retry below is
-    // also a full read.
+    // `use_seed` holds. Retained lineages, missing policy or reservation history, incomplete
+    // deferred-call summaries, and invalid budget seeds require reading from sequence zero,
+    // so their cost grows with the WAL; the seeded-write retry below is also a full read.
     //
     // Moving the read onto a blocking thread needs an owned read handle: WalStore is threaded
     // through the run_loop entry points as a borrow, and giving it Clone is a public API change.
@@ -12733,6 +12743,7 @@ mod tests {
                 has_deferred_calls: None,
                 tags: Some(crate::tags::LineageTags::Off),
                 pending_order: None,
+                output_reservation: Some(Default::default()),
                 input_budget: Some(crate::input_budget::InputTokenBudget::default()),
                 session_class: None,
                 // A valid tail seed includes the first run's WAL-derived policy.

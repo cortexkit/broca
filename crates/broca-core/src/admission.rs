@@ -687,6 +687,10 @@ pub struct AdmissionCheckpointV1 {
     /// outlives the next thing the session's actor writes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_order: Option<StagedOrder>,
+    /// The complete WAL's reservation fold, including measurements before the store watermark.
+    /// Missing on older checkpoints; a tail alone cannot recover an earlier measured request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_reservation: Option<crate::output_reservation::OutputReservationHistory>,
 }
 
 /// A `DeliveryOrdered` record set aside for the `Queued` record that follows it.
@@ -723,6 +727,9 @@ impl AdmissionCheckpointV1 {
             compaction: Some(crate::compaction::CompactionCheckpoint::None),
             tags: Some(crate::tags::LineageTags::unstarted()),
             pending_order: None,
+            output_reservation: Some(
+                crate::output_reservation::OutputReservationHistory::default(),
+            ),
         }
     }
 
@@ -734,6 +741,7 @@ impl AdmissionCheckpointV1 {
             checkpoint.has_deferred_calls = None;
             checkpoint.lineage_retention = None;
             checkpoint.tags = None;
+            checkpoint.output_reservation = None;
         }
         checkpoint.fold_frames(records)?;
         if checkpoint
@@ -767,6 +775,9 @@ impl AdmissionCheckpointV1 {
 
     /// Fold one WAL record. The mutation is committed only after all corruption checks pass.
     pub fn fold_record(&mut self, seq: u64, record: &WalRecord) -> Result<(), ReplayError> {
+        if let Some(history) = &mut self.output_reservation {
+            history.fold(record);
+        }
         if let Some(head) = &mut self.head {
             head.observe(record);
         }
@@ -2417,6 +2428,7 @@ mod tests {
     #[test]
     fn checkpoint_json_with_pending_payload_is_byte_stable() {
         let checkpoint = AdmissionCheckpointV1 {
+            output_reservation: None,
             head: None,
             has_deferred_calls: None,
             tags: None,

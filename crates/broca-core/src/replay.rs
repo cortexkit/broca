@@ -4377,6 +4377,7 @@ pub(crate) mod projection_boundary_tests {
                 has_deferred_calls: None,
                 tags: None,
                 pending_order: None,
+                output_reservation: Some(Default::default()),
                 input_budget: Some(crate::input_budget::InputTokenBudget::default()),
                 session_class: None,
                 lineage_retention: None,

@@ -2973,6 +2973,7 @@ fn projection_seed_from_complete_tx(
             checkpoint.at_seq == watermark_seq
                 && checkpoint.compaction_complete()
                 && checkpoint.head.is_some()
+                && checkpoint.output_reservation.is_some()
         })
     else {
         return Ok(None);
@@ -5593,6 +5594,68 @@ mod tests {
             assert_eq!(repaired.watermark_seq, 5);
             assert_eq!(repaired.checkpoint.expect("checkpoint").at_seq, 5);
         }
+    }
+
+    #[test]
+    fn missing_output_reservation_checkpoint_is_repaired_lazily() {
+        use broca_core::{AdmissionCheckpointV1, MaterializedStore, Persister};
+
+        let store = sqlite_store();
+        let session = crate::conformance::session("reservation-checkpoint-repair");
+        let mut records = crate::conformance::base_records(&session);
+        records.extend(crate::conformance::text_turn(2, 1, "first"));
+        store.project(&session, &records).unwrap();
+        let checkpoint = store
+            .read_admission_snapshot(&session)
+            .unwrap()
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        let mut old = serde_json::to_value(checkpoint).unwrap();
+        old.as_object_mut().unwrap().remove("output_reservation");
+        let encoded = serde_json::json!({"version": 1, "checkpoint": old}).to_string();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE meta SET admission_checkpoint_json=?2 WHERE session=?1",
+                rusqlite::params![SqliteStore::key(&session), encoded],
+            )
+            .unwrap();
+
+        assert!(store.projection_seed(&session).unwrap().is_none());
+        let old = store
+            .read_admission_snapshot(&session)
+            .unwrap()
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        assert!(old.output_reservation.is_none());
+        records.extend(crate::conformance::text_turn(4, 2, "repair"));
+        store.project(&session, &records).unwrap();
+        let repaired = store
+            .projection_seed(&session)
+            .unwrap()
+            .unwrap()
+            .admission_checkpoint;
+        assert_eq!(
+            repaired,
+            AdmissionCheckpointV1::from_frames(&records).unwrap()
+        );
+        assert_eq!(
+            repaired.output_reservation.as_ref(),
+            Some(
+                &broca_core::replay(
+                    &records
+                        .iter()
+                        .map(|frame| frame.record.clone())
+                        .collect::<Vec<_>>()
+                )
+                .unwrap()
+                .output_reservation
+            )
+        );
     }
 
     #[test]
