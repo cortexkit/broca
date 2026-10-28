@@ -1393,6 +1393,28 @@ mod tests {
     }
     use super::*;
 
+    /// Runs `test` alone in a child copy of this test binary and returns whether the caller is
+    /// that child, which then runs the test body. The parent only checks that the child passed.
+    fn in_isolated_process(test: &str) -> bool {
+        const CHILD_TEST: &str = "BROCA_ISOLATED_FANOUT_TEST";
+        if std::env::var(CHILD_TEST).as_deref() == Ok(test) {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD_TEST, test)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("spawn the isolated test");
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "isolated test {test} failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
     /// THE DELIVERY COUNTERS MOVE ON A REAL DELIVERY, AND ONLY ON ONE.
     ///
     /// A counter that reads zero forever is worse than no counter: it answers the operator's
@@ -1402,10 +1424,15 @@ mod tests {
     ///
     /// Three arms, because the failure modes are different: a payload delivery must count, a
     /// control-plane notice carrying no unit must NOT (it would inflate the denominator), and a
-    /// send to a closed sink must NOT (it never arrived). Deltas rather than absolutes, since
-    /// the counters are process-global and other tests share them.
+    /// send to a closed sink must NOT (it never arrived). The counters are process-global, so
+    /// another test delivering at the same moment would move them between a read and its
+    /// check; the test therefore runs alone in a child copy of this binary.
     #[tokio::test]
     async fn delivery_counters_count_arrivals_and_nothing_else() {
+        if !in_isolated_process("fanout::tests::delivery_counters_count_arrivals_and_nothing_else")
+        {
+            return;
+        }
         let cancel = CancellationToken::new();
         let (tx, rx) = mpsc::channel::<Delivery>(8);
 
