@@ -55,13 +55,13 @@ async fn record_reply(raw: serde_json::Value, negotiated: bool) -> ToolResult {
 
     let rig = Rig::new(true, true, negotiated, false);
     *rig.reply.lock().unwrap() = raw;
-    let plane = rig.plane(true);
+    let plane = rig.plane(false);
     let call = call("media-notice-call");
     plane
         .batch_started(
             &ctx,
             std::slice::from_ref(&call),
-            &manifest_declaring(negotiated, false),
+            &manifest_format(negotiated.then_some("tool-result/v1"), false),
         )
         .await
         .unwrap();
@@ -70,6 +70,18 @@ async fn record_reply(raw: serde_json::Value, negotiated: bool) -> ToolResult {
     else {
         panic!("tool must complete")
     };
+    assert_eq!(completed(plane.dispatch(&ctx, &call).await), result);
+    assert_eq!(
+        rig.sent.lock().unwrap().len(),
+        1,
+        "completed replies are never redispatched"
+    );
+    assert_eq!(*rig.opened_result.lock().unwrap(), vec![negotiated]);
+    assert_eq!(
+        *rig.opened_declaring.lock().unwrap(),
+        vec![false],
+        "held replies stay off"
+    );
     writer
         .record(result_record(&ctx, result.clone()))
         .into_result()
@@ -184,6 +196,142 @@ async fn no_media_result_matches_pinned_pre_notice_bytes() {
             serde_json::to_vec(&result).unwrap(),
             fixture.trim_end().as_bytes()
         );
+    }
+}
+
+#[tokio::test]
+async fn tool_result_v1_valid_replies_store_and_render_like_legacy() {
+    let cases = [
+        (
+            "one text",
+            json!({"content":[{"type":"text","text":"12:00\n"}]}),
+        ),
+        (
+            "two texts",
+            json!({"content":[{"type":"text","text":"12:"},{"type":"text","text":"00\n"}]}),
+        ),
+        (
+            "error with code",
+            json!({"content":[{"type":"text","text":"cannot read\n"}],"isError":true,"errorCode":"not_found"}),
+        ),
+        (
+            "text plus PNG",
+            json!({"content":[{"type":"text","text":"read image"},image("image/png",PNG)]}),
+        ),
+        ("image only", json!({"content":[image("image/png",PNG)]})),
+        (
+            "two images",
+            json!({"content":[image("image/png",PNG),image("image/gif",GIF)]}),
+        ),
+        ("empty text", json!({"content":[{"type":"text","text":""}]})),
+    ];
+    for (name, mut raw) in cases {
+        let attachments: Vec<_> = raw["content"].as_array().unwrap().iter()
+            .filter(|part| part["type"] == "image")
+            .map(|part| json!({"kind":"image","data":part["data"],"mime":part["mimeType"],"width":part["width"],"height":part["height"],"alt":"fixture"}))
+            .collect();
+        raw["structuredContent"] = json!({"id":"read-fixture","success":raw["isError"] != true,"attachments":attachments,"complete":true,"truncated":false});
+        let legacy = record_reply(raw.clone(), false).await;
+        let v1 = record_reply(raw, true).await;
+        assert_eq!(
+            serde_json::to_vec(&v1).unwrap(),
+            serde_json::to_vec(&legacy).unwrap(),
+            "{name}"
+        );
+        assert_eq!(
+            crate::content_v1::tests::render_model_request(v1),
+            crate::content_v1::tests::render_model_request(legacy),
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tool_result_v1_aft_shaped_text_and_errors_preserve_stored_bytes() {
+    // These paired bodies follow the AFT tool provider's encoder: structured fields are the native response,
+    // while only a negotiated error adds errorCode. Neither side field changes stored text.
+    let cases: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/content_v1/aft_replies.json"
+    ))
+    .unwrap();
+    for case in cases.as_array().unwrap() {
+        let legacy = record_reply(case["legacy"].clone(), false).await;
+        let v1 = record_reply(case["v1"].clone(), true).await;
+        assert_eq!(
+            serde_json::to_vec(&v1).unwrap(),
+            serde_json::to_vec(&legacy).unwrap(),
+            "{}",
+            case["name"]
+        );
+        assert_eq!(
+            crate::content_v1::tests::render_model_request(v1),
+            crate::content_v1::tests::render_model_request(legacy)
+        );
+    }
+}
+
+#[tokio::test]
+async fn tool_result_v1_empty_content_is_a_named_terminal_error_once() {
+    for structured in [None, Some(json!({"private":"structured-only"}))] {
+        let mut raw = json!({"content":[]});
+        if let Some(structured) = structured {
+            raw["structuredContent"] = structured;
+        }
+        let legacy = record_reply(raw.clone(), false).await;
+        assert!(!legacy.is_error);
+        let v1 = record_reply(raw, true).await;
+        assert!(v1.is_error);
+        let ToolOutput::Error { message, .. } = v1.output else {
+            panic!("invalid v1 must be a typed tool error")
+        };
+        assert!(
+            message.contains("malformed tool-result/v1 tool reply"),
+            "{message}"
+        );
+        assert!(
+            message.contains("content: must contain at least one part"),
+            "{message}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tool_result_v1_requires_catalog_declaration_and_upgrades_a_warm_legacy_bind() {
+    for format in [None, Some("tool-result/v1"), Some("content/v1")] {
+        let rig = Rig::new(true, true, false, false);
+        let plane = rig.plane(false);
+        let ctx = ctx();
+        plane
+            .ensure_route(&ctx.bind, None, "provider", &ToolOpenGuard::default())
+            .await
+            .unwrap();
+        *rig.reply.lock().unwrap() =
+            json!({"content":[{"type":"text","text":"boom"}],"isError":true});
+        let call = call("declaration");
+        plane
+            .batch_started(
+                &ctx,
+                std::slice::from_ref(&call),
+                &manifest_format(format, false),
+            )
+            .await
+            .unwrap();
+        let result = completed(plane.dispatch(&ctx, &call).await);
+        let expected = if format == Some("tool-result/v1") {
+            assert_eq!(*rig.opened_result.lock().unwrap(), vec![false, true]);
+            "errorCode"
+        } else {
+            assert_eq!(*rig.opened_result.lock().unwrap(), vec![false]);
+            assert_eq!(result.output, ToolOutput::error("boom"));
+            "boom"
+        };
+        assert!(serde_json::to_string(&result).unwrap().contains(expected));
+        assert!(rig
+            .opened_declaring
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|held| !held));
     }
 }
 

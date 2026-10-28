@@ -17,10 +17,10 @@
 //!   feed. A store that is missing or unreadable is rebuilt from the live WALs first, off the
 //!   startup path; until that scan completes every pulled entry is Blocked and nothing is acked.
 //!
-//! The `held-reply/v1` and `content/v1` route capabilities stay UNDECLARED in release builds:
+//! The `held-reply/v1` route capability stays UNDECLARED in release builds:
 //! a held call cannot be cancelled or stopped yet, so no production provider may hold one. With
-//! the capabilities undeclared, no call carries a plain key and nothing is registered, so every
-//! call keeps its exact wire bytes. Debug builds may declare them for tests (see
+//! held replies undeclared, no call carries a plain key and nothing is registered. Result-only
+//! negotiation is independent. Debug builds may declare held replies for tests (see
 //! [`declare_held_reply_for_tests`]).
 //!
 //! Known edge: a provider keeps at most 1,000 unacked results per session and drops the oldest

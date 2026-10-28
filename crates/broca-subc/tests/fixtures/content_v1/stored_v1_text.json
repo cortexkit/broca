@@ -1,1 +1,1 @@
-{"tool_call_id":"media-notice-call","output":{"kind":"parts","parts":[{"kind":"text","text":"Read text: "},{"kind":"text","text":"12:00\n"}]},"is_error":false}
+{"tool_call_id":"media-notice-call","output":{"kind":"text","text":"Read text: 12:00\n"},"is_error":false}
