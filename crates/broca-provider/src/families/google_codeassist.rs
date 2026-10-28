@@ -268,7 +268,9 @@ fn apply_antigravity_generation_defaults(body: &mut Value, frozen: &FrozenRender
 /// Whether the request body's `maxOutputTokens` is `frozen.max_output_tokens` (or bounded by
 /// it), so a step that lowers that value lowers the cap sent. An Antigravity tier model without
 /// a caller cap renders its tier ceiling instead, and before renderer version 7 a caller cap is
-/// bounded only by the tier ceiling.
+/// bounded only by the tier ceiling. Its one caller, `FrozenRenderConfig::output_limits`, exists
+/// only in builds with broca-core linked, so this does too.
+#[cfg(any(feature = "live", test))]
 pub(crate) fn renders_frozen_output_cap(frozen: &FrozenRenderConfig) -> bool {
     antigravity_max_output_tokens(&frozen.wire_model_id).is_none()
         || (frozen.caller_max_output_tokens.is_some() && frozen.renderer_version >= 7)
