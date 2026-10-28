@@ -779,11 +779,16 @@ separate-reasoning normalizer), `usage` (`Usage`, section 2.5), `usage_by_servic
 
 A slice ends at a refreeze, and also where a model call is answered by another model than the
 slice's: a step routed to the refusal-fallback model (`route`) or served by an Anthropic
-server-side fallback (`served_model`). The next slice's `model` is the model that answered, so a
-run can carry a row for a fallback model. A `model_step_refused` call belongs to the slice of
+server-side fallback (`served_model`). When `usage_iterations` is present, each iteration's
+usage joins the slice for its own serving model, in provider order; consecutive iterations
+on the same model coalesce. Top-level last-iteration counters are not added again. A step's
+retries belong only to its final iteration. Missing measurements remain absent, including
+reasoning when only the top-level response reported it. The next slice's `model` is the model
+that answered, so a run can carry a row for a fallback model. A `model_step_refused` call belongs to the slice of
 the model that refused it, and a `cache_warmed` re-send of a routed step's request is billed
 under that step's model. When every call is answered by the run's own model, only refreezes
-open additional slices.
+open additional slices. The split changes fact cardinality, not schema, and applies only
+when producing new facts: previously exported insert-once facts are never rewritten.
 
 Session facts have no `kind` member and retain the shape above. Sessionless classifier
 facts dispatch on `kind: "system_one"` before decoding. They contain `fact_id`,
