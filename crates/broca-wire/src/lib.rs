@@ -1952,6 +1952,10 @@ pub struct PausedRunAuth {
     /// Absent on older selections that froze no account decision; unknown paths stay verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Routing's auth-required answer when it caused the login pause, rather than a provider
+    /// rejecting the frozen credential during a model call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_code: Option<String>,
 }
 
 /// A run-keyed status response resolved from the live actor, durable index, or WAL.
@@ -3666,7 +3670,8 @@ pub const ACCOUNT_SELECTION_REFUSED: &str = "account_selection_refused";
 /// `message`, `detail`). Its exact bytes are pinned by golden files under `tests/golden/`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccountSelectionRefused {
-    /// Always [`ACCOUNT_SELECTION_REFUSED`].
+    /// [`broca_protocol::error::ACCOUNT_LIMIT_EXHAUSTED`] for exhausted or reserve-limited
+    /// pools, holds or unknown quota; otherwise [`ACCOUNT_SELECTION_REFUSED`].
     pub code: String,
     /// Human-readable; derived from `detail`, never parsed.
     pub message: String,
@@ -3680,10 +3685,11 @@ pub struct AccountSelectionRefusedDetail {
     pub routing_code: String,
     /// `transient` when retrying the same send later may be admitted (an account hold, an
     /// exhausted or reserve-limited pool, unknown quota, a stale roster), `permanent` when it
-    /// cannot without someone acting first (every candidate excluded, or a request routing
-    /// rejected as malformed or conflicting).
+    /// cannot without someone acting first (a malformed or conflicting request, or an operator
+    /// policy exclusion). Routing's `auth_required` answer admits a run to pause for login
+    /// instead of returning this refusal.
     pub class: broca_protocol::OpenErrorClass,
-    /// Routing's `retry_after_s`, verbatim, when it sent one.
+    /// The preferred wait in seconds, from routing's deadline or its `retry_after_s`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_s: Option<u64>,
     /// The same wait as the structured retry hint every broca error class carries, so a
@@ -3693,6 +3699,16 @@ pub struct AccountSelectionRefusedDetail {
     /// Routing's id for the decision behind the refusal, when it sent one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_id: Option<String>,
+    /// The account-limit marker shared with terminal provider errors, for ordinary callers'
+    /// wait-or-reroute policy. A pool refusal names no individual exhausted account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_code: Option<String>,
+    /// Routing's reset time in Unix epoch milliseconds, when supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at_ms: Option<u64>,
+    /// Routing's original detail, retained even when it contains fields broca does not know.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_detail: Option<Box<serde_json::Value>>,
 }
 
 impl AccountSelectionRefused {
@@ -3706,8 +3722,21 @@ impl AccountSelectionRefused {
             Some(seconds) => format!("; retry after {seconds} s"),
             None => String::new(),
         };
+        let account_limit = matches!(
+            routing_code.as_str(),
+            "account_pool_exhausted"
+                | "account_pool_reserve_limited"
+                | "account_hold"
+                | "account_quota_unknown"
+                | "no_eligible_account"
+        );
+        let code = if account_limit {
+            broca_protocol::error::ACCOUNT_LIMIT_EXHAUSTED
+        } else {
+            ACCOUNT_SELECTION_REFUSED
+        };
         Self {
-            code: ACCOUNT_SELECTION_REFUSED.to_owned(),
+            code: code.to_owned(),
             message: format!(
                 "the routing module refused to choose a provider account for this send \
                  ({routing_code}){retry}"
@@ -3718,7 +3747,124 @@ impl AccountSelectionRefused {
                 retry_after_s,
                 retry_after_secs: retry_after_s.map(|seconds| seconds as f64),
                 decision_id,
+                provider_code: account_limit.then(|| code.to_owned()),
+                resets_at_ms: None,
+                routing_detail: None,
             },
+        }
+    }
+
+    pub fn with_routing_detail(
+        mut self,
+        detail: Option<Box<serde_json::Value>>,
+        resets_at_ms: Option<u64>,
+    ) -> Self {
+        self.detail.routing_detail = detail;
+        self.detail.resets_at_ms = resets_at_ms;
+        self
+    }
+}
+
+/// The error code refusing a send because broca got no usable account decision from the
+/// routing module: routing could not be reached, did not decide within the admission budget,
+/// or chose an account broca had not offered it. Distinct from [`ACCOUNT_SELECTION_REFUSED`],
+/// whose `detail.routing_code` is always routing's own word: this is broca's statement that
+/// routing did not answer usefully, so it never claims routing said anything.
+pub const ROUTING_UNAVAILABLE: &str = "routing_unavailable";
+
+/// The error body for [`ROUTING_UNAVAILABLE`]. Nothing was written: the run never started,
+/// and broca did not pick an account on routing's behalf. Always transient, so a caller's
+/// ordinary retry of the same send applies. Callers branch on `detail.reason`, never on the
+/// message. Its exact bytes are pinned by golden files under `tests/golden/`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoutingUnavailable {
+    /// Always [`ROUTING_UNAVAILABLE`].
+    pub code: String,
+    /// Human-readable; derived from `detail`, never parsed.
+    pub message: String,
+    pub detail: RoutingUnavailableDetail,
+}
+
+/// Why routing's answer was unusable, with broca's classification of the refusal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoutingUnavailableDetail {
+    /// `unreachable` (the route failed, the connection was lost, the reply could not be
+    /// decoded), `no_decision_within_budget`
+    /// (the admission budget ran out), or `invalid_pick` (routing chose an account broca had
+    /// not offered). Kept as a string so a reason a later build adds still decodes.
+    pub reason: String,
+    /// Always `transient`.
+    pub class: broca_protocol::OpenErrorClass,
+    /// The admission budget that ran out, in milliseconds; present only with
+    /// `no_decision_within_budget`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_ms: Option<u64>,
+}
+
+impl RoutingUnavailable {
+    pub fn new(reason: &str, budget_ms: Option<u64>) -> Self {
+        let message = match (reason, budget_ms) {
+            ("no_decision_within_budget", Some(budget_ms)) => format!(
+                "the routing module gave no account decision for this send within the \
+                 {budget_ms} ms admission budget; nothing was written, retry the send"
+            ),
+            ("invalid_pick", _) => "the routing module chose an account broca did not offer \
+                                    for this send; nothing was written, retry the send"
+                .to_owned(),
+            _ => "the routing module could not be reached for this send's account decision; \
+                  nothing was written, retry the send"
+                .to_owned(),
+        };
+        Self {
+            code: ROUTING_UNAVAILABLE.to_owned(),
+            message,
+            detail: RoutingUnavailableDetail {
+                reason: reason.to_owned(),
+                class: broca_protocol::ErrorClass::Transient.into(),
+                budget_ms,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod routing_unavailable_golden {
+    use super::*;
+
+    /// The reply for each reason, byte for byte. The same files are compared with the reply
+    /// the real serve path sends (`account_selection_real_daemon`), so this pins the type and
+    /// that test pins the path.
+    #[test]
+    fn each_reason_serializes_to_its_golden_file() {
+        for (body, file) in [
+            (
+                RoutingUnavailable::new("unreachable", None),
+                "routing_unavailable.unreachable.json",
+            ),
+            (
+                RoutingUnavailable::new("no_decision_within_budget", Some(1500)),
+                "routing_unavailable.no_decision_within_budget.json",
+            ),
+            (
+                RoutingUnavailable::new("invalid_pick", None),
+                "routing_unavailable.invalid_pick.json",
+            ),
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/golden")
+                .join(file);
+            let golden = std::fs::read(&path)
+                .unwrap_or_else(|error| panic!("read golden {}: {error}", path.display()));
+            assert_eq!(
+                String::from_utf8(serde_json::to_vec(&body).unwrap()).unwrap(),
+                String::from_utf8(golden.clone()).unwrap(),
+                "serialized refusal differs from {}",
+                path.display()
+            );
+            assert_eq!(
+                serde_json::from_slice::<RoutingUnavailable>(&golden).unwrap(),
+                body
+            );
         }
     }
 }
@@ -3778,7 +3924,7 @@ mod account_selection_refused_golden {
     }
 
     const POOL_EXHAUSTED_SHA256: &str =
-        "786bfd039451ebb5f5cecd0d7f45428acc2b23ca518d90299ba656dc9963602e";
+        "b2782d4a2ecc703e07f3590660b254e8cca95e440d8b8c526e286b37a712a776";
     const ADMISSION_CONFLICT_SHA256: &str =
         "dd54e79088fd3443de13d848f3949d7ad4c1743f7b9b9cc436d4d923d8533780";
 }

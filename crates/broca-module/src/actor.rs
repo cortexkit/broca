@@ -397,6 +397,8 @@ pub enum SendOutcome {
     Transient(String),
     /// The routing module refused to choose a provider account; nothing was written.
     AccountSelectionRefused(broca_core::AccountSelectionRefusal),
+    /// The routing module gave no usable account decision; nothing was written. Transient.
+    RoutingUnavailable(broca_core::RoutingUnavailable),
     /// The owner check refused the send (a different identity, no stamp on a scoped session,
     /// an adoption the session's history does not allow, or a daemon without scopes). Nothing
     /// was written, and the same send meets the same refusal again.
@@ -3726,6 +3728,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 }
                 Err(StartRunFailure::Admission(RunError::AccountSelectionRefused(refusal))) => {
                     SendOutcome::AccountSelectionRefused(refusal)
+                }
+                Err(StartRunFailure::Admission(RunError::RoutingUnavailable(unavailable))) => {
+                    SendOutcome::RoutingUnavailable(unavailable)
                 }
                 Err(StartRunFailure::Admission(RunError::SessionTooLarge { max_bytes })) => {
                     SendOutcome::SessionTooLarge { max_bytes }

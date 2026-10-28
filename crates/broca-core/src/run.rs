@@ -858,21 +858,85 @@ pub enum RunError {
     /// The routing module refused to choose a provider account for this send. Refused before
     /// anything durable is written; the refusal says whether a later retry may be admitted.
     AccountSelectionRefused(AccountSelectionRefusal),
+    /// broca got no usable account decision from the routing module for this send (routing
+    /// unreachable, no decision within the admission budget, or a pick of a credential broca
+    /// did not offer). Refused before anything durable is written, always transient: broca
+    /// never picks an account on routing's behalf, so the caller retries the send.
+    RoutingUnavailable(RoutingUnavailable),
     /// Numbering the transcript's tags would pass `u64::MAX` (llm-runner
     /// `tags::try_number_parts`): the run is refused rather than show two parts one number.
     TagNumbering(broca_protocol::tags::NumberingOverflow),
 }
 
-/// Routing's refusal to choose an account, copied verbatim, with broca's classification.
+/// Why broca could not get a usable account decision from routing for a send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingUnavailableReason {
+    /// The route failed to open, the connection was lost, or the reply could not be decoded.
+    Unreachable,
+    /// Routing did not decide within the admission budget.
+    NoDecisionWithinBudget,
+    /// Routing chose an account broca had not offered it: a defect in routing.
+    InvalidPick,
+}
+
+impl RoutingUnavailableReason {
+    /// The `detail.reason` spelling on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unreachable => "unreachable",
+            Self::NoDecisionWithinBudget => "no_decision_within_budget",
+            Self::InvalidPick => "invalid_pick",
+        }
+    }
+}
+
+/// broca's statement that routing could not answer for a send, as opposed to routing's own
+/// refusal ([`AccountSelectionRefusal`]). Always transient.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingUnavailable {
+    pub reason: RoutingUnavailableReason,
+    /// The admission budget that ran out, only for
+    /// [`RoutingUnavailableReason::NoDecisionWithinBudget`].
+    pub budget_ms: Option<u64>,
+}
+
+impl RoutingUnavailable {
+    pub fn unreachable() -> Self {
+        Self {
+            reason: RoutingUnavailableReason::Unreachable,
+            budget_ms: None,
+        }
+    }
+
+    pub fn no_decision_within_budget(budget_ms: u64) -> Self {
+        Self {
+            reason: RoutingUnavailableReason::NoDecisionWithinBudget,
+            budget_ms: Some(budget_ms),
+        }
+    }
+
+    pub fn invalid_pick() -> Self {
+        Self {
+            reason: RoutingUnavailableReason::InvalidPick,
+            budget_ms: None,
+        }
+    }
+}
+
+/// Routing's refusal to choose an account, with its original detail and broca's retry hints.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountSelectionRefusal {
     /// Routing's refusal code, for example `account_hold`.
     pub routing_code: String,
-    /// Routing's `retry_after_s`, when it sent one.
+    /// The preferred wait in seconds, from routing's deadline or its `retry_after_s`.
     pub retry_after_s: Option<u64>,
+    /// Routing's reset time, when supplied, in Unix epoch milliseconds.
+    pub resets_at_ms: Option<u64>,
+    /// Routing's original structured detail, including fields unknown to this broca build.
+    pub routing_detail: Option<Box<serde_json::Value>>,
     /// Routing's decision id, when it sent one.
     pub decision_id: Option<String>,
-    /// [`ErrorClass::Transient`] or [`ErrorClass::Permanent`].
+    /// The retry/auth classification of routing's refusal.
     pub class: ErrorClass,
 }
 
@@ -897,7 +961,8 @@ impl RunError {
             | Self::Lease(_)
             | Self::Wal(_)
             | Self::Panicked
-            | Self::Transient(_) => ErrorClass::Transient,
+            | Self::Transient(_)
+            | Self::RoutingUnavailable(_) => ErrorClass::Transient,
             Self::AccountSelectionRefused(refusal) => refusal.class,
         }
     }
@@ -945,6 +1010,11 @@ impl std::fmt::Display for RunError {
                 f,
                 "account_selection_refused: routing refused to choose a provider account ({})",
                 refusal.routing_code
+            ),
+            RunError::RoutingUnavailable(unavailable) => write!(
+                f,
+                "routing_unavailable: the routing module gave no usable account decision ({})",
+                unavailable.reason.as_str()
             ),
         }
     }
