@@ -122,7 +122,12 @@ impl OverhaulRunSource {
             .resolve_live_path(key)
             .map_err(|e| e.to_string())?
             .ok_or("run log is not live")?;
-        let file = File::open(path).map_err(|e| e.to_string())?;
+        // Windows requires write access for sync_all's FlushFileBuffers call.
+        let file = File::options()
+            .read(true)
+            .write(cfg!(windows))
+            .open(path)
+            .map_err(|e| e.to_string())?;
         let len = file.metadata().map_err(|e| e.to_string())?.len();
         // Sync the same descriptor we read, not a pathname that a move could replace.
         // Bytes appended after this captured length belong to the next read.
@@ -594,6 +599,30 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn run_row_read_barrier_works_with_an_open_writer() {
+        let mut f = Fixture::new("read-barrier");
+        f.start("target");
+        f.index();
+        let run = RunId("target".into());
+        let path = f.source.wal.wal_path(&f.key);
+        let before = std::fs::read(&path).unwrap();
+        let active = f
+            .source
+            .read(&f.key, &run)
+            .expect("the run-row durability barrier must succeed with the WAL writer open")
+            .expect("the indexed active run must be readable");
+        assert_eq!(active.state.state.as_str(), "active");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        f.finish(RunFinishReason::Interrupted);
+        let before = std::fs::read(&path).unwrap();
+        let terminal = f.source.read(&f.key, &run).unwrap().unwrap();
+        assert_eq!(terminal.state.state.as_str(), "interrupted");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(f.source.wal.range_reads_for_test(), 0);
     }
 
     #[tokio::test]
