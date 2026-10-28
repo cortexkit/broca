@@ -3015,7 +3015,8 @@ impl WalHandle {
             None,
             OwnedWriterStartup {
                 cause: Some("reclaim"),
-                ..Default::default()
+                #[cfg(feature = "test-clock")]
+                fs: None,
             },
         )
         .await
