@@ -3855,6 +3855,7 @@ fn prior_snapshot_handoff_excludes_pending_payloads_and_shares_pending_storage()
             has_deferred_calls: None,
             tags: None,
             pending_order: None,
+            output_reservation: Some(Default::default()),
             input_budget: None,
             session_class: None,
             lineage_retention: None,

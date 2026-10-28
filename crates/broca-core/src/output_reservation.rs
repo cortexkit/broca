@@ -100,7 +100,7 @@ pub fn decide(limits: OutputLimits, context_limit: u64, estimated_input: u64) ->
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Measured {
     /// The step's full input occupancy as the provider reported it.
     input_tokens: u64,
@@ -112,7 +112,7 @@ struct Measured {
 /// What the loop needs from the WAL to estimate the next request's input and to reuse a cap a
 /// step already recorded. Folded from replayed records at run start and from the records the
 /// loop writes as it runs, so the live value and the replayed value agree.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OutputReservationHistory {
     current_model: Option<ModelHandle>,
     /// The body length of the latest attempt not yet closed by a `ModelStepFinished`.
