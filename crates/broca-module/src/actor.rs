@@ -6488,6 +6488,52 @@ impl<W: WalStore + 'static> LineageActor<W> {
         Ok(())
     }
 
+    /// Offset-store counterpart of the legacy paused finalizer's request reconstruction.
+    /// The broca.db admission path will supply a consistent seed and positioned tail before
+    /// handing the request to the existing pre-cancelled executor. No production caller uses
+    /// this seam until the offset store replaces the legacy admission checkpoint.
+    #[allow(dead_code, reason = "wired by the broca.db admission path")]
+    fn paused_cancel_request_from_seed(
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        seed: &broca_core::admission::AdmissionSeed,
+        tail: &[broca_core::replay::PositionedFrame],
+        safe_head: u64,
+        run_id: &RunId,
+        full_read: impl FnOnce() -> Result<Vec<broca_wal::FramedRecord>, String>,
+    ) -> Result<Option<(SubmissionRequest, Option<String>)>, String> {
+        let episode = match seed.paused_episode(read_at, tail, safe_head) {
+            Ok(Some(episode)) => Some(episode),
+            // A non-paused summary is not enough to decline a requested paused cancellation.
+            // Repair from the durable prefix before deciding that there is no paused request.
+            Ok(None) | Err(_) => {
+                let frames = full_read()?;
+                if frames.last().map_or(0, |frame| frame.seq) != safe_head {
+                    return Err(format!(
+                        "paused cancellation repair did not reach durable head {safe_head}"
+                    ));
+                }
+                broca_core::replay::replay(
+                    &frames.iter().map(|p| p.record.clone()).collect::<Vec<_>>(),
+                )
+                .map_err(|error| error.to_string())?;
+                broca_core::AdmissionCheckpointV1::from_frames(&frames)
+                    .map_err(|error| error.to_string())?
+                    .last_episode
+            }
+        };
+        Ok(episode
+            .filter(|episode| {
+                episode.run_id == *run_id && episode.disposition == EpisodeDisposition::Paused
+            })
+            .map(|episode| {
+                let mut request = submission_from_episode(&episode);
+                if episode.config.tools_were_omitted {
+                    request.tools = None;
+                }
+                (request, episode.request_identity_digest)
+            }))
+    }
+
     async fn start_paused_cancel_finalizer(
         &mut self,
         run_id: &RunId,
@@ -9250,6 +9296,160 @@ mod tests {
                 .iter()
                 .any(|frame| matches!(frame.record, WalRecord::RunFinished { .. })));
             let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn offset_admission_paused_cancel_rebuilds_request_bytes_and_repairs_bad_seed() {
+        use broca_core::replay::{PositionedFrame, SeedBoundary};
+        use broca_wal::framing::{decode_next, DecodeStep};
+        use sha2::Digest;
+        let key = BindIdentity::new("/offset-admission", "h", "s");
+        for (config_refreeze, auth_refreezes) in
+            [(false, 0), (true, 0), (false, 1), (true, 1), (true, 2)]
+        {
+            let mut records = held_close_seed(&key, false)[..2].to_vec();
+            if let WalRecord::RunStarted { config, .. } = &mut records[0] {
+                config.tools_were_omitted = true;
+            }
+            if let WalRecord::ModelStepFinished {
+                assistant_message, ..
+            } = &mut records[1]
+            {
+                Arc::make_mut(assistant_message).content =
+                    vec![broca_protocol::ContentBlock::Text {
+                        text: "answer before auth pause".into(),
+                    }];
+            }
+            if config_refreeze {
+                records.insert(1, WalRecord::RunConfigRefrozen { renderer_version: 2, ts_ms: None, frozen_render_config: serde_json::json!({"wire": "refrozen cancellation setup"}) });
+            }
+            for auth in 0..auth_refreezes {
+                records.insert(
+                    1,
+                    WalRecord::RunAuthRefrozen {
+                        ts_ms: None,
+                        auth_selection: broca_wal::AuthSelection {
+                            credential_id: format!("apikey:stub:refrozen{auth}"),
+                            account_ref: None,
+                            resolved_credential_id: None,
+                            vault_request: None,
+                            account_decision: None,
+                            auth_method: None,
+                        },
+                    },
+                );
+            }
+            let boundary_cut = records.len();
+            records.push(WalRecord::RunPaused {
+                run_id: RunId("held".into()),
+                ts_ms: None,
+                reason: broca_protocol::PauseReason::AuthRequired,
+                error: None,
+            });
+            let mut bytes = Vec::new();
+            let positioned: Vec<_> = records
+                .iter()
+                .enumerate()
+                .map(|(i, record)| {
+                    let seq = i as u64 + 1;
+                    let off = bytes.len() as u64;
+                    bytes.extend(broca_wal::framing::encode(seq, 1, record).unwrap());
+                    PositionedFrame {
+                        off,
+                        framed: broca_wal::FramedRecord {
+                            seq,
+                            fence: 1,
+                            record: record.clone(),
+                        },
+                    }
+                })
+                .collect();
+            let boundary = SeedBoundary {
+                lineage_id: None,
+                seq: boundary_cut as u64,
+                frame_off: positioned[boundary_cut - 1].off,
+                frame_end: positioned[boundary_cut].off,
+                frame_identity: sha2::Sha256::digest(
+                    &bytes[positioned[boundary_cut - 1].off as usize
+                        ..positioned[boundary_cut].off as usize],
+                )
+                .to_vec(),
+                qualified: true,
+            };
+            let read_raw = |off: u64, len: u64| {
+                let off = (off as usize).min(bytes.len());
+                Ok(bytes[off..off.saturating_add(len as usize).min(bytes.len())].to_vec())
+            };
+            let seed = broca_core::admission::AdmissionSeed::capture(
+                &read_raw,
+                &boundary,
+                &positioned[..boundary_cut],
+            )
+            .unwrap();
+            let reads = std::cell::Cell::new(0);
+            let read_at = |off, len| {
+                let data = read_raw(off, len)?;
+                if matches!(decode_next(&data), DecodeStep::Record { consumed, .. } if consumed == data.len())
+                {
+                    reads.set(reads.get() + 1);
+                }
+                Ok(data)
+            };
+            // The seed is still the pre-pause commit: the durable pause belongs to the tail.
+            // Reopening with that old seed must produce the legacy finalizer's exact request.
+            let frames: Vec<_> = positioned.iter().map(|p| p.framed.clone()).collect();
+            let full = broca_core::AdmissionCheckpointV1::from_frames(&frames)
+                .unwrap()
+                .last_episode
+                .unwrap();
+            let mut expected_request = submission_from_episode(&full);
+            expected_request.tools = None;
+            let expected = (expected_request, full.request_identity_digest.clone());
+            let actual = LineageActor::<FileWalStore>::paused_cancel_request_from_seed(
+                &read_at,
+                &seed,
+                &positioned[boundary_cut..],
+                frames.len() as u64,
+                &RunId("held".into()),
+                || panic!("valid paused seed must not replay the session"),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+            assert!(actual.0.tools.is_none());
+            assert!(actual.1.is_some());
+            assert_eq!(
+                reads.get(),
+                2 + u32::from(config_refreeze) + auth_refreezes,
+                "two base source frames plus each inline refreeze"
+            );
+
+            let mut bad = serde_json::to_value(&seed).unwrap();
+            bad["qualified"] = serde_json::json!(false);
+            let bad = serde_json::from_value(bad).unwrap();
+            let repairs = std::cell::Cell::new(0);
+            let repaired = LineageActor::<FileWalStore>::paused_cancel_request_from_seed(
+                &read_at,
+                &bad,
+                &positioned[boundary_cut..],
+                frames.len() as u64,
+                &RunId("held".into()),
+                || {
+                    repairs.set(repairs.get() + 1);
+                    Ok(frames.clone())
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(repairs.get(), 1);
+            assert_eq!(
+                serde_json::to_vec(&repaired).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
         }
     }
 
