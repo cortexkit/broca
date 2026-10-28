@@ -449,6 +449,17 @@ struct ErrorBodyView {
 
 /// Read one `route.account_for` reply.
 pub fn classify_account_for_reply(reply: Result<Vec<u8>, Vec<u8>>) -> AccountForOutcome {
+    let received_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    classify_account_for_reply_at(reply, received_at_ms)
+}
+
+fn classify_account_for_reply_at(
+    reply: Result<Vec<u8>, Vec<u8>>,
+    received_at_ms: u64,
+) -> AccountForOutcome {
     match reply {
         Ok(body) => {
             let parsed: Value = match serde_json::from_slice(&body) {
@@ -491,17 +502,18 @@ pub fn classify_account_for_reply(reply: Result<Vec<u8>, Vec<u8>>) -> AccountFor
                 SELECTION_DISABLED => AccountForOutcome::SelectionDisabled { decision_id },
                 code => {
                     let resets_at_ms = if code == "account_hold" {
-                        detail["until_ms"].as_u64()
+                        // A hold's absolute end wins over its legacy relative wait. Anchor
+                        // relative waits to receipt time; reset_at is diagnostic text only.
+                        detail["until_ms"].as_u64().or_else(|| {
+                            detail["retry_after_s"].as_u64().map(|seconds| {
+                                received_at_ms.saturating_add(seconds.saturating_mul(1000))
+                            })
+                        })
                     } else {
                         detail["reset_at_ms"].as_u64()
                     };
-                    let reset_wait = resets_at_ms.map(|reset| {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-                        reset.saturating_sub(now).div_ceil(1000)
-                    });
+                    let reset_wait = resets_at_ms
+                        .map(|reset| reset.saturating_sub(received_at_ms).div_ceil(1000));
                     let retry_after_s = if code == "account_hold" && resets_at_ms.is_some() {
                         reset_wait
                     } else {

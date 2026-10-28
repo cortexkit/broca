@@ -837,7 +837,24 @@ fn permanent(code: &str) -> AccountSelectionRefusal {
 
 #[tokio::test]
 async fn account_hold_is_refused_transient() {
-    assert_eq!(refusal_for("account_hold").await, transient("account_hold"));
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let refusal = refusal_for("account_hold").await;
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let reset = refusal.resets_at_ms.expect("legacy hold has an end time");
+    assert!((before + 1_260_000..=after + 1_260_000).contains(&reset));
+    assert_eq!(
+        refusal,
+        AccountSelectionRefusal {
+            resets_at_ms: Some(reset),
+            ..transient("account_hold")
+        }
+    );
 }
 
 #[tokio::test]
@@ -959,10 +976,13 @@ fn published_and_deployed_refusal_classes_are_mapped_by_name() {
 }
 
 fn assert_hold_timing(detail: Value, reset: Option<u64>, wait: Option<u64>) {
-    let outcome = classify_account_for_reply(Err(serde_json::to_vec(&json!({
-        "code": "account_hold", "message": "held", "detail": detail,
-    }))
-    .unwrap()));
+    let outcome = classify_account_for_reply_at(
+        Err(serde_json::to_vec(&json!({
+            "code": "account_hold", "message": "held", "detail": detail,
+        }))
+        .unwrap()),
+        NOW as u64,
+    );
     let AccountForOutcome::Refused(refusal) = outcome else {
         panic!("expected a hold")
     };
@@ -974,8 +994,11 @@ fn assert_hold_timing(detail: Value, reset: Option<u64>, wait: Option<u64>) {
         refusal.class,
         refusal.retry_after_s,
         refusal.decision_id,
-    );
+    )
+    .with_routing_detail(refusal.routing_detail.clone(), refusal.resets_at_ms);
     assert_eq!(body.code, "account_limit_exhausted");
+    assert_eq!(body.detail.resets_at_ms, reset);
+    assert_eq!(body.detail.retry_after_secs, wait.map(|s| s as f64));
     assert_eq!(*refusal.routing_detail.unwrap(), detail);
 }
 
@@ -986,14 +1009,43 @@ fn account_hold_until_ms_takes_precedence_over_legacy_retry() {
         Some(0),
         Some(0),
     );
+    assert_hold_timing(
+        json!({"until_ms": NOW + 60_001, "retry_after_s": 900, "reset_at": "not a date"}),
+        Some(NOW as u64 + 60_001),
+        Some(61),
+    );
 }
 
 #[test]
 fn account_hold_legacy_retry_seconds_are_used_without_parsing_reset_at() {
     assert_hold_timing(
         json!({"retry_after_s": 60, "reset_at": "2026-10-28T12:00:00Z"}),
-        None,
+        Some(NOW as u64 + 60_000),
         Some(60),
+    );
+    assert_hold_timing(
+        json!({"retry_after_s": 60, "reset_at": "not a date"}),
+        Some(NOW as u64 + 60_000),
+        Some(60),
+    );
+}
+
+#[test]
+fn account_hold_legacy_retry_without_reset_at_has_an_end_time() {
+    assert_hold_timing(
+        json!({"retry_after_s": 60}),
+        Some(NOW as u64 + 60_000),
+        Some(60),
+    );
+    assert_hold_timing(json!({"retry_after_s": 0}), Some(NOW as u64), Some(0));
+}
+
+#[test]
+fn account_hold_legacy_retry_saturates_without_overflow() {
+    assert_hold_timing(
+        json!({"retry_after_s": u64::MAX}),
+        Some(u64::MAX),
+        Some((u64::MAX - NOW as u64).div_ceil(1000)),
     );
 }
 
