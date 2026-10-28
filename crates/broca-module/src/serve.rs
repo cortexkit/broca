@@ -581,6 +581,13 @@ fn final_message_of(
         .map_or(records.len(), |offset| start + 1 + offset);
     let transcript = broca_core::replay_transcript(&records[..end])
         .map_err(|error| ServeError::Open(format!("replay failed: {error}"), None))?;
+    final_message_from_prompt(&transcript, run_id)
+}
+
+fn final_message_from_prompt(
+    transcript: &[broca_protocol::Message],
+    run_id: &broca_protocol::RunId,
+) -> Result<broca_wire::FinalMessage, ServeError> {
     let (ordinal, message) = transcript
         .iter()
         .enumerate()
@@ -3141,9 +3148,14 @@ impl ServeHandler for crate::LineageRegistry {
         session: &LineageKey,
         run_id: broca_protocol::RunId,
     ) -> Result<broca_wire::RunResultResponse, ServeError> {
-        let (state, mut records) = self
-            .route_run_state_with_wal(session, run_id.clone())
-            .await?;
+        let row_read = self.read_run_row_state(session, &run_id).await?;
+        let (state, mut records) = match &row_read {
+            Some(read) => (Some(read.state.clone()), Some(read.records.clone())),
+            None => {
+                self.route_run_state_with_wal(session, run_id.clone())
+                    .await?
+            }
+        };
         let auth_selection = state.as_ref().and_then(frozen_auth_selection);
         let mut detail = state.as_ref().and_then(|state| state.budget_detail.clone());
         let mut context_ceiling = state
@@ -3223,7 +3235,10 @@ impl ServeHandler for crate::LineageRegistry {
                 Some(records) => records,
                 None => self.read_durable_wal(session).await?.0,
             };
-            let message = final_message_of(&records, &run_id)?;
+            let message = match &row_read {
+                Some(read) => final_message_from_prompt(&read.replayed.prompt, &run_id)?,
+                None => final_message_of(&records, &run_id)?,
+            };
             directives = completed_directives(&records, &run_id, &message.text);
             Some(message)
         } else {
@@ -3284,6 +3299,9 @@ impl ServeHandler for crate::LineageRegistry {
             });
         }
         let run_id = request.run_id.clone();
+        let row_read = self
+            .read_run_row(session, &broca_protocol::RunId(run_id.clone()))
+            .await?;
         let limit = request
             .limit
             .unwrap_or(broca_core::SESSION_READ_DEFAULT_LIMIT)
@@ -3291,10 +3309,22 @@ impl ServeHandler for crate::LineageRegistry {
         let (range, run_start_seq, run_end_seq, lineage_id, seed, range_start_seq, fallback) =
             match request.after.as_deref() {
                 None => {
-                    let range = self
-                        .read_run_tool_calls_range(session, &run_id, 0, None, None)
-                        .await?;
-                    let records = run_tool_call_records(&range)?;
+                    let range = match &row_read {
+                        Some(read) => {
+                            let mut range =
+                                broca_wal::WalRangeRead::without_anchors(read.records.clone());
+                            range.lineage_id = read.lineage_id;
+                            range
+                        }
+                        None => {
+                            self.read_run_tool_calls_range(session, &run_id, 0, None, None)
+                                .await?
+                        }
+                    };
+                    let records = match &row_read {
+                        Some(read) => read.records.as_slice(),
+                        None => run_tool_call_records(&range)?,
+                    };
                     let Some((start, end)) = run_tool_call_bounds(records, &run_id) else {
                         return Err(ServeError::UnknownRun(run_id));
                     };
@@ -3328,15 +3358,31 @@ impl ServeHandler for crate::LineageRegistry {
                         ));
                     }
                     let lineage_id = cursor.lineage_id.clone();
-                    let range = self
-                        .read_run_tool_calls_range(
-                            session,
-                            &run_id,
-                            cursor.step_seq - 1,
-                            cursor.anchor_before.map(Into::into),
-                            Some(cursor.batch_end_seq),
-                        )
-                        .await?;
+                    let range = match &row_read {
+                        Some(read) => {
+                            let records = read
+                                .records
+                                .iter()
+                                .filter(|f| {
+                                    f.seq >= cursor.step_seq && f.seq <= cursor.batch_end_seq
+                                })
+                                .cloned()
+                                .collect();
+                            let mut range = broca_wal::WalRangeRead::without_anchors(records);
+                            range.lineage_id = read.lineage_id;
+                            range
+                        }
+                        None => {
+                            self.read_run_tool_calls_range(
+                                session,
+                                &run_id,
+                                cursor.step_seq - 1,
+                                cursor.anchor_before.map(Into::into),
+                                Some(cursor.batch_end_seq),
+                            )
+                            .await?
+                        }
+                    };
                     let observed_lineage =
                         range.lineage_id.as_ref().map(|lineage| lineage.to_string());
                     if observed_lineage
@@ -3358,9 +3404,35 @@ impl ServeHandler for crate::LineageRegistry {
                     )
                 }
             };
-        let records = run_tool_call_records(&range)?;
+        let row_records = row_read.as_ref().map(|read| {
+            read.records
+                .iter()
+                .filter(|f| {
+                    seed.as_ref().is_none_or(|cursor| {
+                        f.seq >= cursor.step_seq && f.seq <= cursor.batch_end_seq
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        let records = match &row_records {
+            Some(records) => records.as_slice(),
+            None => run_tool_call_records(&range)?,
+        };
         let step_ordinals = if seed.is_none() {
-            committed_tool_step_ordinals(records)
+            match &row_read {
+                Some(read) => read
+                    .replayed
+                    .committed_tool_turns
+                    .iter()
+                    .filter_map(|(index, record_index)| {
+                        let message = read.replayed.prompt.get(*index)?;
+                        let seq = read.records.get(*record_index)?.seq;
+                        Some((seq, message.ordinal.unwrap_or(*index as u64)))
+                    })
+                    .collect(),
+                None => committed_tool_step_ordinals(records),
+            }
         } else {
             std::collections::HashMap::new()
         };
@@ -3561,7 +3633,11 @@ impl ServeHandler for crate::LineageRegistry {
         session: &LineageKey,
         run_id: broca_protocol::RunId,
     ) -> Result<RunStatusResponse, ServeError> {
-        let state = self.route_run_state(session, run_id.clone()).await?;
+        let row_read = self.read_run_row_state(session, &run_id).await?;
+        let state = match &row_read {
+            Some(read) => Some(read.state.clone()),
+            None => self.route_run_state(session, run_id.clone()).await?,
+        };
         let mut response = run_status_response(state);
         // Lifecycle resolution above remains authoritative when its transcript reader or
         // final text is unavailable. Enrich the answer only with readable durable metadata.
@@ -3569,7 +3645,10 @@ impl ServeHandler for crate::LineageRegistry {
             response,
             RunStatusResponse::Interrupted { .. } | RunStatusResponse::Completed { .. }
         ) {
-            self.read_durable_wal(session).await.ok().map(|read| read.0)
+            match &row_read {
+                Some(read) => Some(read.records.clone()),
+                None => self.read_durable_wal(session).await.ok().map(|read| read.0),
+            }
         } else {
             None
         };
@@ -3580,9 +3659,12 @@ impl ServeHandler for crate::LineageRegistry {
             (RunStatusResponse::Completed { directives, .. }, Some(records))
                 if wake_directive_requested(records, &run_id) =>
             {
-                *directives = final_message_of(records, &run_id)
-                    .ok()
-                    .and_then(|message| completed_directives(records, &run_id, &message.text));
+                *directives = match &row_read {
+                    Some(read) => final_message_from_prompt(&read.replayed.prompt, &run_id),
+                    None => final_message_of(records, &run_id),
+                }
+                .ok()
+                .and_then(|message| completed_directives(records, &run_id, &message.text));
             }
             _ => {}
         }

@@ -703,10 +703,13 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ttl) = idle_ttl {
         opener_builder = opener_builder.with_idle_ttl(ttl);
     }
-    let registry = Arc::new(LineageRegistry::new_with_sources(
+    let run_rows =
+        run_row_source_for_state_root(state_format, &state_root, crash_orphan_wal.clone())?;
+    let registry = Arc::new(LineageRegistry::new_with_run_rows(
         Arc::new(opener_builder),
         Some(wal_reader),
         Some(store_reader),
+        run_rows,
     ));
     registry.set_retention_service(retention);
     // System One: decision models served in this process with no session. Its batch record
@@ -1231,9 +1234,50 @@ fn opener_for_state_root(
     }
 }
 
+fn run_row_source_for_state_root(
+    format: state_format::StateFormat,
+    root: &Path,
+    wal: Arc<FileWalStore>,
+) -> Result<Option<Arc<broca_module::registry::OverhaulRunSource>>, ServeIoError> {
+    match format {
+        state_format::StateFormat::Legacy => Ok(None),
+        state_format::StateFormat::Overhaul => {
+            let db = broca_store::db::OverhaulDb::open(root)
+                .map_err(|e| ServeIoError(format!("open run-row index: {e}")))?;
+            Ok(Some(Arc::new(
+                broca_module::registry::OverhaulRunSource::new(Arc::new(db), wal),
+            )))
+        }
+    }
+}
+
 #[cfg(test)]
 mod overhaul_opener_tests {
     use super::*;
+
+    #[test]
+    fn run_rows_are_constructed_only_for_overhaul_roots() {
+        let root =
+            broca_test_support::scratch_root().join(format!("run-row-boot-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let wal = Arc::new(FileWalStore::new(root.join("wal")));
+        assert!(run_row_source_for_state_root(
+            state_format::StateFormat::Legacy,
+            &root,
+            wal.clone()
+        )
+        .unwrap()
+        .is_none());
+        assert!(!root.join("broca.db").exists());
+        std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
+        assert!(
+            run_row_source_for_state_root(state_format::StateFormat::Overhaul, &root, wal)
+                .unwrap()
+                .is_some()
+        );
+        assert!(root.join("broca.db").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn overhaul_startup_uses_a_root_aware_owned_writer_domain() {
@@ -1309,15 +1353,32 @@ async fn mark_crash_orphans(
     wal_store: Arc<FileWalStore>,
     process_started: std::time::SystemTime,
 ) -> broca_module::registry::CrashOrphanSweep {
-    let candidates = spawn_blocking(JobKind::Recovery, move || run_index.active_runs())
-        .await
-        .map_err(|error| error.to_string())
-        .and_then(|result| result.map_err(|error| error.to_string()));
+    let row_registry = registry.clone();
+    let candidates = spawn_blocking(JobKind::Recovery, move || {
+        let legacy = run_index
+            .active_runs()
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|(id, key)| (broca_protocol::RunId(id), key))
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|error| error.to_string());
+        if let Some(rows) = row_registry.overhaul_active_runs(legacy.as_deref().unwrap_or_default())
+        {
+            match rows {
+                Ok(rows) => return Ok(rows),
+                Err(error) => tracing::warn!(
+                    "run-row orphan discovery fell back to the legacy index: {error}"
+                ),
+            }
+        }
+        legacy
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|result| result.map_err(|error| error.to_string()));
     let candidates = match candidates {
-        Ok(rows) => rows
-            .into_iter()
-            .map(|(run_id, key)| (broca_protocol::RunId(run_id), key))
-            .collect(),
+        Ok(rows) => rows,
         Err(error) => {
             tracing::warn!(
                 target: "lifecycle",

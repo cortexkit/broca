@@ -9453,6 +9453,191 @@ mod tests {
         }
     }
 
+    #[test]
+    fn offset_paused_cancel_real_filewal_reads_two_sources_without_full_read() {
+        offset_paused_cancel_real_filewal_case(false);
+    }
+
+    #[test]
+    fn offset_paused_cancel_real_filewal_empty_tail_reads_two_sources_without_full_read() {
+        offset_paused_cancel_real_filewal_case(true);
+    }
+
+    fn offset_paused_cancel_real_filewal_case(empty_tail: bool) {
+        use broca_core::replay::{PositionedFrame, SeedBoundary};
+        use broca_wal::framing::{decode_next, DecodeStep};
+        use sha2::Digest;
+        use std::io::{Read, Seek, SeekFrom};
+
+        let root = broca_test_support::scratch_root().join(format!(
+            "real-paused-cancel-seed-{empty_tail}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
+        let key = BindIdentity::new("/offset-admission", "h", "real-paused");
+        let mut records = held_close_seed(&key, false);
+        if !empty_tail {
+            records.truncate(5);
+        }
+        if let WalRecord::RunStarted { config, .. } = &mut records[0] {
+            config.tools_were_omitted = true;
+        }
+        let (batch_id, step_id, calls) = match &records[2] {
+            WalRecord::ToolBatchStarted {
+                batch_id,
+                step_id,
+                planned_calls,
+            } => (batch_id.clone(), *step_id, planned_calls.clone()),
+            _ => unreachable!(),
+        };
+        if empty_tail {
+            // A paused provider-held batch may commit its closing turn before the run's
+            // final terminal. A seed at that crash cut already contains the pause.
+            records.push(WalRecord::RunPaused {
+                run_id: RunId("held".into()),
+                ts_ms: None,
+                reason: broca_protocol::PauseReason::ToolHeld,
+                error: None,
+            });
+        }
+        for tool_call_id in calls {
+            records.push(WalRecord::ToolResult {
+                finished_at_ms: None,
+                batch_id: batch_id.clone(),
+                result: Arc::new(broca_protocol::content::ToolResult {
+                    tool_call_id,
+                    output: broca_protocol::content::ToolOutput::Text {
+                        text: "finished".into(),
+                    },
+                    is_error: false,
+                }),
+                outcome: broca_wal::record::DispatchOutcome::Completed,
+                hooks: None,
+                reason: None,
+                withdraw_elicitation: None,
+                provider_held: None,
+                tags: None,
+            });
+        }
+        records.push(WalRecord::ToolBatchFinished { batch_id });
+        // A committed tool turn qualifies immediately, so the paused run has a valid cut
+        // without depending on a future terminal to qualify a no-tool answer.
+        records.push(WalRecord::TurnFinished { step_id });
+        let cut = records.len();
+        if !empty_tail {
+            records.push(WalRecord::RunPaused {
+                run_id: RunId("held".into()),
+                ts_ms: None,
+                reason: broca_protocol::PauseReason::AuthRequired,
+                error: None,
+            });
+        }
+        let store = FileWalStore::with_config(root.join("wal"), broca_wal::WalConfig::OVERHAUL);
+        let mut wal = store.open(&key).unwrap();
+        for record in &records {
+            wal.append(1, record, true).unwrap();
+        }
+        drop(wal);
+        let path = store.wal_path(&key);
+        let bytes = std::fs::read(&path).unwrap();
+        let mut positioned = Vec::new();
+        let mut off = 0usize;
+        let mut lineage_id = None;
+        let mut boundary_end = 0;
+        while off < bytes.len() {
+            match decode_next(&bytes[off..]) {
+                DecodeStep::Record { framed, consumed } => {
+                    if framed.seq == cut as u64 {
+                        boundary_end = (off + consumed) as u64;
+                    }
+                    positioned.push(PositionedFrame {
+                        off: off as u64,
+                        framed: *framed,
+                    });
+                    off += consumed;
+                }
+                DecodeStep::Lineage {
+                    lineage_id: found,
+                    consumed,
+                } => {
+                    lineage_id = Some(found.to_string());
+                    off += consumed;
+                }
+                _ => panic!("the real paused log must decode at byte {off}"),
+            }
+        }
+        let boundary = SeedBoundary {
+            lineage_id,
+            seq: cut as u64,
+            frame_off: positioned[cut - 1].off,
+            frame_end: boundary_end,
+            frame_identity: sha2::Sha256::digest(
+                &bytes[positioned[cut - 1].off as usize..boundary_end as usize],
+            )
+            .to_vec(),
+            qualified: true,
+        };
+        let read_raw = |off, len| {
+            let mut file = std::fs::File::open(&path)?;
+            file.seek(SeekFrom::Start(off))?;
+            let mut bytes = Vec::new();
+            file.take(len).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        };
+        let seed =
+            broca_core::admission::AdmissionSeed::capture(&read_raw, &boundary, &positioned[..cut])
+                .expect("a multi-record FileWal paused seed must capture exact source frames");
+        let source_reads = std::cell::Cell::new(0);
+        let full_reads = std::cell::Cell::new(0);
+        let read_at = |off, len| {
+            let bytes = read_raw(off, len)?;
+            if matches!(decode_next(&bytes),DecodeStep::Record { consumed, .. } if consumed==bytes.len())
+            {
+                source_reads.set(source_reads.get() + 1);
+            }
+            Ok(bytes)
+        };
+        let actual = LineageActor::<FileWalStore>::paused_cancel_request_from_seed(
+            &read_at,
+            &seed,
+            &positioned[cut..],
+            positioned.last().unwrap().framed.seq,
+            &RunId("held".into()),
+            || {
+                full_reads.set(full_reads.get() + 1);
+                panic!("a valid real FileWal paused seed must not replay the full log")
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let frames: Vec<_> = positioned.iter().map(|p| p.framed.clone()).collect();
+        let episode = broca_core::AdmissionCheckpointV1::from_frames(&frames)
+            .unwrap()
+            .last_episode
+            .unwrap();
+        let mut request = submission_from_episode(&episode);
+        request.tools = None;
+        assert_eq!(
+            serde_json::to_vec(&actual).unwrap(),
+            serde_json::to_vec(&(request, episode.request_identity_digest)).unwrap()
+        );
+        assert!(actual.0.tools.is_none());
+        assert!(actual.1.is_some());
+        assert_eq!(full_reads.get(), 0);
+        assert_eq!(
+            source_reads.get(),
+            2,
+            "one RunStarted source and the boundary TurnFinished source"
+        );
+        assert_eq!(
+            positioned.get(cut).map_or(bytes.len() as u64, |p| p.off) - boundary.frame_end,
+            broca_wal::framing::LINEAGE_FRAME_LEN as u64
+        );
+        assert_eq!(positioned[cut..].is_empty(), empty_tail);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn held_close_seed(key: &BindIdentity, sequential: bool) -> Vec<WalRecord> {
         use broca_protocol::content::{AssistantMessage, ContentBlock, ToolCall};
         use broca_protocol::{BatchId, MessageId, StepId, ToolCallId};

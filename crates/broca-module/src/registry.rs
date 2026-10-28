@@ -613,6 +613,10 @@ pub struct LineageRegistry {
     inner: Arc<Inner>,
 }
 
+#[path = "run_rows.rs"]
+mod run_rows;
+pub use run_rows::OverhaulRunSource;
+
 /// A failed durability boundary. Historical events survive successful session recovery.
 #[derive(Clone, Debug)]
 pub struct SealFailure {
@@ -750,6 +754,7 @@ struct Inner {
     next_gen: AtomicU64,
     opener: Arc<dyn LineageOpener>,
     reader: Option<ReadSources>,
+    run_rows: Option<Arc<OverhaulRunSource>>,
     /// No-actor reads retain a file-identity-scoped proof so transcript pagination does not fsync
     /// again while every requested frame remains within the already-proven durable prefix.
     read_proofs: Mutex<BoundedSessionCache<ReadProof>>,
@@ -1319,6 +1324,16 @@ impl LineageRegistry {
         wal_store: Option<Arc<dyn broca_core::WalStore>>,
         store: Option<Arc<dyn broca_core::MaterializedStore>>,
     ) -> Self {
+        Self::new_with_run_rows(opener, wal_store, store, None)
+    }
+
+    /// Boot supplies a run-row reader only when its state-format decision is `broca-state/2`.
+    pub fn new_with_run_rows(
+        opener: Arc<dyn LineageOpener>,
+        wal_store: Option<Arc<dyn broca_core::WalStore>>,
+        store: Option<Arc<dyn broca_core::MaterializedStore>>,
+        run_rows: Option<Arc<OverhaulRunSource>>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 batches_in_flight: Arc::new(AtomicUsize::new(0)),
@@ -1337,6 +1352,7 @@ impl LineageRegistry {
                 next_gen: AtomicU64::new(1),
                 opener,
                 reader: wal_store.map(|wal_store| ReadSources { wal_store, store }),
+                run_rows,
                 read_proofs: Mutex::new(BoundedSessionCache::new(SESSION_CACHE_SESSIONS)),
                 dispatch_cache: Mutex::new(BoundedSessionCache::new(DISPATCH_CACHE_SESSIONS)),
                 frozen_senders: Mutex::new(BoundedSessionCache::new(SESSION_CACHE_SESSIONS)),
@@ -1355,6 +1371,69 @@ impl LineageRegistry {
                 cache: crate::cache::CacheTable::default(),
             }),
         }
+    }
+
+    pub(crate) async fn read_run_row(
+        &self,
+        key: &LineageKey,
+        run_id: &RunId,
+    ) -> Result<Option<run_rows::RunRead>, OpenError> {
+        let Some(source) = self.inner.run_rows.clone() else {
+            return Ok(None);
+        };
+        self.check_expired(key, Some(&run_id.0)).await?;
+        if self.check_move(key, true).is_err() {
+            return Ok(None);
+        }
+        let key = key.clone();
+        let run_id = run_id.clone();
+        let read = spawn_blocking(JobKind::StoreRead, move || source.read(&key, &run_id)).await;
+        // Rows are rebuildable hints: a missing or unverifiable row is not an unknown run.
+        Ok(match read {
+            Ok(Ok(read)) => read,
+            Ok(Err(error)) => {
+                tracing::debug!("run-row read fell back to WAL replay: {error}");
+                None
+            }
+            Err(_) => None,
+        })
+    }
+
+    pub(crate) async fn read_run_row_state(
+        &self,
+        key: &LineageKey,
+        run_id: &RunId,
+    ) -> Result<Option<run_rows::RunRead>, OpenError> {
+        let Some(mut read) = self.read_run_row(key, run_id).await? else {
+            return Ok(None);
+        };
+        if read.state.state == broca_core::RunIndexState::Active {
+            // An active cold run still needs the existing orphan-recovery policy;
+            // an indexed row must not turn a dead writer into a live run.
+            let state = self.route_run_state(key, run_id.clone()).await?;
+            match state {
+                Some(state) if state.state == broca_core::RunIndexState::Active => {
+                    read.state = state
+                }
+                _ => return self.read_run_row(key, run_id).await,
+            }
+        }
+        Ok(Some(read))
+    }
+
+    /// Active candidates come from the overhaul run table when that source is installed.
+    pub fn overhaul_active_runs(
+        &self,
+        fallback: &[(RunId, LineageKey)],
+    ) -> Option<Result<Vec<(RunId, LineageKey)>, String>> {
+        self.inner.run_rows.as_ref().map(|source| {
+            source.active_runs(fallback).map(|candidates| {
+                candidates.into_iter().filter(|(run_id,key)| {
+                if self.check_move(key,true).is_err() { return true; }
+                !matches!(source.read(key,run_id),Ok(Some(read)) if read.state.state.is_terminal())
+            }).collect()
+            })
+        })
     }
 
     /// Install what reads a frozen config's prompt-cache declaration. Set once, before serving;
