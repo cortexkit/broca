@@ -37,6 +37,9 @@ use crate::replay::{OpenCallState, ReplayResolution, ReplayState};
 pub struct OffsetResumeSnapshot {
     pub boundary: crate::replay::SeedBoundary,
     pub projection: crate::replay::ProjectionSeed,
+    /// Absent for the dense, zero-based prefix. A window selects absolute transcript rows
+    /// from the same index transaction as the boundary and projection.
+    pub window: Option<crate::context::OffsetPromptWindow>,
     pub prefix: Vec<broca_protocol::Message>,
     pub tail: Vec<crate::replay::PositionedFrame>,
 }
@@ -59,9 +62,9 @@ pub trait OffsetResumeReader: Send + Sync {
     fn reconstructed(&self, _fallback: Option<crate::replay::SeedFallback>) {}
 }
 
-/// Validate snapshot consistency and the boundary before using continuation state. Unsupported
-/// compaction/deferred-history shapes return a fallback so the caller reads the complete WAL
-/// rather than producing an incomplete prompt.
+/// Validate snapshot consistency and the boundary before using continuation state. A compacted
+/// prefix must supply its complete selected window; missing coordinates or continuation state
+/// return a fallback so the caller reads the complete WAL rather than producing a partial prompt.
 pub fn reconstruct_from_offsets(
     read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
     snapshot: OffsetResumeSnapshot,
@@ -71,15 +74,17 @@ pub fn reconstruct_from_offsets(
         replay_projection_tail, replay_seeded_at_validated_boundary, SeedFallback,
     };
     let bad = |reason| SeedFallback { reason };
-    let seed = snapshot.projection;
+    let mut seed = snapshot.projection;
+    let window = snapshot.window;
     if seed.watermark_seq != snapshot.boundary.seq
         || seed.admission_checkpoint.at_seq != seed.watermark_seq
-        || seed.prefix_len != snapshot.prefix.len() as u64
-        || snapshot
-            .prefix
-            .iter()
-            .enumerate()
-            .any(|(ord, m)| m.ordinal != Some(ord as u64))
+        || (window.is_none()
+            && (seed.prefix_len != snapshot.prefix.len() as u64
+                || snapshot
+                    .prefix
+                    .iter()
+                    .enumerate()
+                    .any(|(ord, m)| m.ordinal != Some(ord as u64))))
         || snapshot
             .tail
             .last()
@@ -98,10 +103,10 @@ pub fn reconstruct_from_offsets(
         || seed.admission_checkpoint.has_deferred_calls != Some(false)
         || seed.admission_checkpoint.input_budget.is_none()
         || seed.admission_checkpoint.output_reservation.is_none()
-        || !matches!(
+        || (window.is_none() && !matches!(
             seed.admission_checkpoint.compaction,
             Some(crate::compaction::CompactionCheckpoint::None)
-        )
+        ))
         || crate::replay::tail_contains_compaction_setup(
             &snapshot
                 .tail
@@ -116,6 +121,21 @@ pub fn reconstruct_from_offsets(
             WalRecord::RunConfigRefrozen { .. } | WalRecord::RunAuthRefrozen { .. }))
     {
         return Err(bad("offset resume prefix needs full replay"));
+    }
+    if let Some(window) = &window {
+        crate::context::validate_offset_prompt_window(
+            window,
+            &snapshot.prefix,
+            &seed,
+            &snapshot.boundary,
+        )?;
+        seed.projection_episodes = Some(
+            window
+                .episodes
+                .iter()
+                .map(|e| e.projection.clone())
+                .collect(),
+        );
     }
     let episode = seed.admission_checkpoint.last_episode.as_ref();
     let mut state = replay_seeded_at_validated_boundary(
@@ -146,16 +166,18 @@ pub fn reconstruct_from_offsets(
     let delta = replay_projection_tail(&seed, &frames)
         .map_err(|_| bad("offset resume projection composition failed"))?;
     let checkpoint = delta.admission_checkpoint;
-    if !matches!(
-        checkpoint.compaction,
-        Some(crate::compaction::CompactionCheckpoint::None)
-    ) {
+    if window.is_none()
+        && !matches!(
+            checkpoint.compaction,
+            Some(crate::compaction::CompactionCheckpoint::None)
+        )
+    {
         return Err(bad("offset resume compaction needs full replay"));
     }
     let episodes = delta
         .episodes
         .ok_or_else(|| bad("offset resume has no episode coordinates"))?;
-    if episodes.first().and_then(|e| e.start()) != Some(0)
+    if (window.is_none() && episodes.first().and_then(|e| e.start()) != Some(0))
         || episodes.iter().enumerate().any(|(i, e)| {
             let end = episodes
                 .get(i + 1)
@@ -203,10 +225,22 @@ pub fn reconstruct_from_offsets(
     }
     prefix.reserve(state.prompt.len() + 256);
     prefix.append(&mut state.prompt);
-    if prefix.len() as u64 != state.extent {
+    if window.is_none() && prefix.len() as u64 != state.extent {
         return Err(bad("offset resume prompt extent is inconsistent"));
     }
     state.prompt = prefix;
+    if let Some(window) = window {
+        if delta.truncate_prefix_to.is_some() {
+            return Err(bad("offset prompt window was abandoned"));
+        }
+        crate::context::finish_offset_prompt_window(
+            &mut state,
+            window,
+            &seed,
+            &checkpoint,
+            &episodes,
+        )?;
+    }
     state.message_runs = vec![None; state.prompt.len()];
     state.completed_steps = delta.completed_steps;
     state.usage = delta.usage;
@@ -376,6 +410,7 @@ mod offset_resume_tests {
         projection.projection_episodes = delta.episodes;
         projection.open_episode_span = delta.open_episode_span;
         OffsetResumeSnapshot {
+            window: None,
             boundary: SeedBoundary {
                 lineage_id: None,
                 seq: positions[boundary].framed.seq,
@@ -529,6 +564,394 @@ mod offset_resume_tests {
             vec![boundary_range, (0, framing::LINEAGE_FRAME_LEN as u64)],
             "read only the boundary and lineage header, never the history range"
         );
+    }
+
+    fn compacted_tools(replaced_turns: usize, with_view: bool) -> Vec<WalRecord> {
+        let mut first = start("window");
+        if let WalRecord::RunStarted { input, .. } = &mut first {
+            *input = vec![
+                Message::new(
+                    Role::System,
+                    vec![ContentBlock::Text {
+                        text: "system".into(),
+                    }],
+                ),
+                Message::new(
+                    Role::User,
+                    vec![ContentBlock::Text {
+                        text: "question".into(),
+                    }],
+                ),
+            ]
+            .into();
+        }
+        let mut records = vec![first];
+        for turn in 1..=5 {
+            records.push(WalRecord::StepStarted {
+                step_id: StepId(turn),
+            });
+            let mut batch = crate::replay::deferred_tests::batch(&["call"]);
+            batch.remove(0);
+            if let WalRecord::ModelStepFinished {
+                assistant_message,
+                step_id,
+                ..
+            } = &mut batch[0]
+            {
+                *step_id = StepId(turn);
+                let ContentBlock::ToolCall(call) = &mut Arc::make_mut(assistant_message).content[0]
+                else {
+                    unreachable!()
+                };
+                call.tool_name = "read".into();
+            }
+            if let WalRecord::ToolBatchStarted { step_id, .. } = &mut batch[1] {
+                *step_id = StepId(turn);
+            }
+            records.extend(batch);
+            let mut result = crate::replay::deferred_tests::terminal("call", None);
+            if let WalRecord::ToolResult {
+                result, outcome, ..
+            } = &mut result
+            {
+                *result = crate::replay::deferred_tests::result("call", "same result");
+                *outcome = broca_wal::DispatchOutcome::Completed;
+            }
+            records.push(result);
+            records.push(WalRecord::ToolBatchFinished {
+                batch_id: broca_protocol::BatchId("b".into()),
+            });
+            if turn as usize == replaced_turns {
+                let replacement = Arc::new(vec![Message::new(
+                    Role::User,
+                    vec![ContentBlock::Text {
+                        text: "summary".into(),
+                    }],
+                )]);
+                records.push(WalRecord::CompactionMessage {
+                    provider: "compactor".into(),
+                    kind: broca_wal::CompactionMessageKind::Setup,
+                    compaction_id: "window".into(),
+                    version: 1,
+                    range: broca_wal::CompactionRange {
+                        from: 1,
+                        to: 2 + 2 * turn,
+                    },
+                    sha256: broca_wal::compaction_replacement_sha256(&replacement).unwrap(),
+                    replacement,
+                    request_id: None,
+                    cursor: None,
+                    call_when: None,
+                    stability: None,
+                    ceiling: None,
+                    tag_checkpoint: None,
+                    ride_wait_ms: None,
+                });
+                if with_view {
+                    use crate::compaction_provider::{
+                        lineage::MessageRef,
+                        view::{CompactionView, ViewRange},
+                    };
+                    let base = 2 + 2 * turn;
+                    let summary = serde_json::to_string(&vec![Message::new(
+                        Role::User,
+                        vec![ContentBlock::Text {
+                            text: "summary".into(),
+                        }],
+                    )])
+                    .unwrap();
+                    let ranges = if turn >= 3 {
+                        vec![
+                            ViewRange::replace(0, 4, summary.clone()),
+                            ViewRange::keep(4, 6),
+                            ViewRange::replace(6, base, summary),
+                        ]
+                    } else {
+                        vec![ViewRange::replace(0, base, summary)]
+                    };
+                    let view = CompactionView::new(
+                        "session",
+                        2,
+                        "lineage",
+                        MessageRef {
+                            ordinal: base - 1,
+                            mid: format!("m{}", base - 1),
+                        },
+                        ranges,
+                    );
+                    records.push(WalRecord::CompactionViewApplied {
+                        provider: "compactor".into(),
+                        view_version: 2,
+                        view: broca_wal::OpaqueJson::from_json_text(
+                            serde_json::to_string(&view).unwrap(),
+                        )
+                        .unwrap(),
+                        choice: broca_wal::CompactionViewChoice::Applied,
+                    });
+                }
+            }
+            records.push(WalRecord::TurnFinished {
+                step_id: StepId(turn),
+            });
+        }
+        records
+    }
+
+    fn window_snapshot(
+        bytes: &[u8],
+        positions: &[PositionedFrame],
+        ends: &[u64],
+        boundary: usize,
+    ) -> OffsetResumeSnapshot {
+        let mut candidate = snapshot(bytes, positions, ends, boundary);
+        let episodes = candidate
+            .projection
+            .projection_episodes
+            .as_ref()
+            .unwrap()
+            .clone();
+        candidate.projection.open_episode = episodes.last().cloned();
+        let compaction = candidate
+            .projection
+            .admission_checkpoint
+            .compaction
+            .as_ref()
+            .unwrap()
+            .state()
+            .unwrap();
+        let base = compaction.view.as_ref().map_or_else(
+            || compaction.applied.as_ref().unwrap().range.to,
+            |v| v.view.covers_through.ordinal + 1,
+        );
+        let mut fold = crate::tool_repetition::RepetitionFold::default();
+        let mut guidance = Vec::new();
+        for message in candidate.prefix.iter().skip(2) {
+            fold.push(message);
+            if let Some(checkpoint) = fold.checkpoint() {
+                guidance.push(crate::context::OffsetGuidanceCheckpoint {
+                    ordinal: message.ordinal.unwrap() + 1,
+                    at_seq: candidate.projection.watermark_seq,
+                    fold: checkpoint,
+                });
+            }
+        }
+        let newest = candidate.prefix.last().unwrap().ordinal;
+        candidate.prefix.retain(|m| {
+            compaction.view.as_ref().map_or_else(
+                || m.role == Role::System || m.ordinal >= Some(base),
+                |v| crate::run::held_prompt::held_by(&v.view, m),
+            ) || m.ordinal == newest
+        });
+        candidate.window = Some(crate::context::OffsetPromptWindow {
+            base,
+            systems: vec![0],
+            guidance,
+            episodes: episodes
+                .into_iter()
+                .map(|projection| crate::context::HeldEpisode {
+                    projection,
+                    next_start: None,
+                })
+                .collect(),
+        });
+        candidate
+    }
+
+    fn file_window(
+        records: &[WalRecord],
+        label: &str,
+    ) -> (Vec<u8>, Vec<PositionedFrame>, Vec<u64>, String) {
+        use crate::WalStore;
+        let root = broca_test_support::scratch_root()
+            .join(format!("offset-window-{}-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(broca_wal::state_format::MARKER_FILENAME),
+            b"broca-state/2\n",
+        )
+        .unwrap();
+        let store = crate::FileWalStore::with_config(
+            root.join("wal"),
+            broca_wal::classify_state_root(&root).unwrap(),
+        );
+        let WalRecord::RunStarted { session, .. } = &records[0] else {
+            unreachable!()
+        };
+        let mut wal = store.open(session).unwrap();
+        let lineage = wal.lineage_id().unwrap().to_string();
+        for record in records {
+            let mut record = record.clone();
+            if let WalRecord::CompactionViewApplied { view, .. } = &mut record {
+                let mut value: serde_json::Value =
+                    serde_json::from_str(view.as_json_text()).unwrap();
+                value["lineage_id"] = lineage.clone().into();
+                *view = broca_wal::OpaqueJson::from_json_text(value.to_string()).unwrap();
+            }
+            wal.append(1, &record, true).unwrap();
+        }
+        drop(wal);
+        let bytes = std::fs::read(store.wal_path(session)).unwrap();
+        let mut positions = Vec::new();
+        let mut ends = Vec::new();
+        let mut lineage = None;
+        let mut off = 0;
+        while off < bytes.len() {
+            match framing::decode_next(&bytes[off..]) {
+                framing::DecodeStep::Record { framed, consumed } => {
+                    positions.push(PositionedFrame {
+                        off: off as u64,
+                        framed: *framed,
+                    });
+                    off += consumed;
+                    ends.push(off as u64);
+                }
+                framing::DecodeStep::Lineage {
+                    lineage_id,
+                    consumed,
+                } => {
+                    lineage = Some(lineage_id.to_string());
+                    off += consumed;
+                }
+                _ => panic!("real WAL fixture must decode"),
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+        (bytes, positions, ends, lineage.unwrap())
+    }
+
+    fn rendered_window(state: &ReplayState, full: bool) -> broca_protocol::CallOptions {
+        let mut options = broca_protocol::CallOptions::new(state.prompt.clone());
+        if full {
+            for span in state.episode_step_spans.as_ref().unwrap() {
+                crate::run::restore_repetition_guidance(&mut options.prompt[span.clone()]);
+            }
+        }
+        options.render_episodes = Arc::new(state.render_episodes.clone().unwrap().into());
+        crate::compaction::model_options(&options, state.compaction.state().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn offset_resume_window_preserves_file_wal_request_bytes_at_every_cut() {
+        for (replaced, with_view) in [(1, false), (2, false), (3, false), (1, true), (3, true)] {
+            let records = compacted_tools(replaced, with_view);
+            let boundary = records.iter().position(|r| matches!(r, WalRecord::TurnFinished { step_id } if step_id.0 as usize == replaced)).unwrap();
+            for cut in boundary + 1..=records.len() {
+                let (bytes, positions, ends, lineage) =
+                    file_window(&records[..cut], &format!("{replaced}-{with_view}-{cut}"));
+                let mut candidate = window_snapshot(&bytes, &positions, &ends, boundary);
+                candidate.boundary.lineage_id = Some(lineage);
+                assert_eq!(
+                    candidate.prefix.len(),
+                    if with_view && replaced == 3 { 4 } else { 2 },
+                    "only selected rows and newest anchor are resident below the cut"
+                );
+                let loaded =
+                    reconstruct_from_offsets(&reader(&bytes), candidate, cut as u64).unwrap();
+                let full = crate::replay::replay(
+                    &positions
+                        .iter()
+                        .map(|p| p.framed.record.clone())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+                let actual = rendered_window(&loaded.prior, false);
+                let expected = rendered_window(&full, true);
+                assert_eq!(
+                    crate::canonical_request_bytes(&actual),
+                    crate::canonical_request_bytes(&expected),
+                    "replacement {replaced}, cut {cut}"
+                );
+                assert_eq!(actual.render_episodes, expected.render_episodes);
+                assert_eq!(loaded.prior.extent, full.extent);
+                assert_eq!(
+                    loaded.prior.held.as_ref().unwrap().observer,
+                    crate::tool_repetition::RepetitionObserver::from_prompt(&full.prompt[2..])
+                );
+                if full.prompt.len() >= 6 && replaced == 1 {
+                    let text = String::from_utf8(crate::canonical_request_bytes(&actual)).unwrap();
+                    assert!(text.contains("returned exactly the same result 2 times"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn offset_resume_window_rejects_unproven_selection_and_guidance() {
+        let records = compacted_tools(1, false);
+        let boundary = records
+            .iter()
+            .position(|r| matches!(r, WalRecord::TurnFinished { .. }))
+            .unwrap();
+        let (bytes, positions, ends, lineage) = file_window(&records, "refusals");
+        for case in 0..8 {
+            let mut candidate = window_snapshot(&bytes, &positions, &ends, boundary);
+            candidate.boundary.lineage_id = Some(lineage.clone());
+            match case {
+                0 => candidate.boundary.frame_identity[0] ^= 1,
+                1 => candidate.boundary.qualified = false,
+                2 => candidate.window.as_mut().unwrap().base += 1,
+                3 => candidate.prefix.pop().map(|_| ()).unwrap(),
+                4 => candidate.window.as_mut().unwrap().guidance.clear(),
+                5 => {
+                    candidate.window.as_mut().unwrap().guidance[0]
+                        .fold
+                        .rules_version += 1
+                }
+                6 => candidate.window.as_mut().unwrap().guidance[0].at_seq -= 1,
+                _ => candidate.window.as_mut().unwrap().episodes.clear(),
+            }
+            let error = reconstruct_from_offsets(&reader(&bytes), candidate, records.len() as u64)
+                .err()
+                .expect("unproven windows must fall back");
+            if case == 5 {
+                assert_eq!(
+                    error.reason,
+                    "offset prompt window repetition rules changed"
+                );
+            }
+            if case == 4 {
+                assert_eq!(
+                    error.reason,
+                    "offset prompt window lacks repetition checkpoint"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn offset_resume_window_preserves_episode_boundaries_in_the_tail() {
+        let mut records = compacted_tools(1, true);
+        let boundary = records
+            .iter()
+            .position(|r| matches!(r, WalRecord::TurnFinished { .. }))
+            .unwrap();
+        records.extend([
+            finish(),
+            start("after-view"),
+            WalRecord::StepStarted { step_id: StepId(1) },
+            step(1),
+        ]);
+        for cut in records.len() - 3..=records.len() {
+            let (bytes, positions, ends, lineage) =
+                file_window(&records[..cut], &format!("episode-{cut}"));
+            let mut candidate = window_snapshot(&bytes, &positions, &ends, boundary);
+            candidate.boundary.lineage_id = Some(lineage);
+            let loaded = reconstruct_from_offsets(&reader(&bytes), candidate, cut as u64).unwrap();
+            let full = crate::replay::replay(
+                &positions
+                    .iter()
+                    .map(|p| p.framed.record.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            assert_eq!(
+                crate::canonical_request_bytes(&rendered_window(&loaded.prior, false)),
+                crate::canonical_request_bytes(&rendered_window(&full, true))
+            );
+            assert_eq!(loaded.prior.tags_await_setup, full.tags_await_setup);
+            assert_eq!(loaded.prior.completed_steps, full.completed_steps);
+        }
     }
 
     #[test]

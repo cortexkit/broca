@@ -7881,6 +7881,124 @@ fn restore_guidance_with_originals(
     fold.into_observer()
 }
 
+/// Recreate the same warnings across gaps in a held prompt. Every gap needs the full,
+/// versioned observer state; otherwise hidden repeated calls could change request bytes.
+pub(crate) fn restore_offset_prompt_guidance(
+    state: &mut ReplayState,
+    episodes: Vec<held_prompt::GuidanceEpisode>,
+    seed: &crate::replay::ProjectionSeed,
+    window: &crate::context::OffsetPromptWindow,
+) -> Result<(), crate::replay::SeedFallback> {
+    use crate::replay::SeedFallback;
+    let missing = || SeedFallback {
+        reason: "offset prompt window lacks repetition checkpoint",
+    };
+    let seeded = |ordinal| -> Result<RepetitionFold, SeedFallback> {
+        let at = window
+            .guidance
+            .binary_search_by_key(&ordinal, |g| g.ordinal)
+            .map_err(|_| missing())?;
+        RepetitionFold::seeded(&window.guidance[at].fold).ok_or(SeedFallback {
+            reason: "offset prompt window repetition checkpoint is ambiguous",
+        })
+    };
+    for checkpoint in &window.guidance {
+        if checkpoint.fold.rules_version != crate::tool_repetition::REPETITION_RULES_VERSION {
+            return Err(SeedFallback {
+                reason: "offset prompt window repetition rules changed",
+            });
+        }
+        if RepetitionFold::seeded(&checkpoint.fold).is_none() {
+            return Err(SeedFallback {
+                reason: "offset prompt window repetition checkpoint is ambiguous",
+            });
+        }
+    }
+    let raw = state.prompt.clone();
+    let mut originals = Vec::new();
+    let compaction = state.compaction.state().ok_or_else(missing)?;
+    let visible = |m: &Message| {
+        let ordinal = m.ordinal.unwrap();
+        if let Some(view) = &compaction.view {
+            held_prompt::held_by(&view.view, m)
+        } else {
+            m.role == Role::System || ordinal >= window.base
+        }
+    };
+    for episode in &episodes {
+        let Some(first) = episode.first_step else {
+            continue;
+        };
+        let from = state.prompt.partition_point(|m| m.ordinal < Some(first));
+        let to = state
+            .prompt
+            .partition_point(|m| m.ordinal < Some(episode.end));
+        let mut fold = RepetitionFold::default();
+        let mut next = first;
+        for message in &mut state.prompt[from..to] {
+            if !visible(message) {
+                continue;
+            }
+            let ordinal = message.ordinal.unwrap();
+            if message.role == Role::Tool && (ordinal != next || ordinal == first) {
+                return Err(missing());
+            }
+            if ordinal != next {
+                if fold.checkpoint().is_none() {
+                    return Err(missing());
+                }
+                fold = seeded(ordinal)?;
+            }
+            let original = message.clone();
+            for (index, verdict) in fold.push(message) {
+                if let Some(guidance) = verdict.guidance() {
+                    if let ContentBlock::ToolResult(result) = &mut message.content[index] {
+                        append_repetition_guidance(result, &guidance);
+                    }
+                }
+            }
+            if original.content != message.content {
+                originals.push(original);
+            }
+            next = ordinal + 1;
+        }
+        if fold.checkpoint().is_none() {
+            return Err(missing());
+        }
+    }
+
+    // The active observer includes hidden prefix steps as well as visible ones. Continue
+    // its boundary checkpoint through raw tail messages, not through decorated outputs.
+    let active = episodes.last().ok_or_else(missing)?;
+    let first = active.first_step.unwrap_or(state.extent);
+    let tail_base = first.max(seed.prefix_len);
+    let mut fold = if first < seed.prefix_len {
+        seeded(seed.prefix_len)?
+    } else {
+        RepetitionFold::default()
+    };
+    for message in raw
+        .iter()
+        .filter(|m| m.ordinal.is_some_and(|o| o >= tail_base))
+    {
+        fold.push(message);
+    }
+    if fold.checkpoint().is_none() {
+        return Err(missing());
+    }
+    state.held = Some(Box::new(held_prompt::HeldResume {
+        episodes,
+        observer: fold.into_observer(),
+        originals,
+        tag_high: seed
+            .tag_seed
+            .high
+            .max(broca_protocol::tags::high_after(&state.prompt)),
+        replayed_messages: state.extent,
+    }));
+    Ok(())
+}
+
 /// On resume, complete an incomplete trailing tool turn WITHOUT re-running the
 /// (already durable, already billed) model step. Re-dispatches ONLY the calls that
 /// never left the process, reuses the durable terminals, and appends the

@@ -1170,6 +1170,7 @@ mod gated {
             projection.projection_episodes = delta.episodes;
             projection.open_episode_span = delta.open_episode_span;
             broca_core::resume::OffsetResumeSnapshot {
+                window: None,
                 boundary: SeedBoundary {
                     lineage_id: lineage,
                     seq,

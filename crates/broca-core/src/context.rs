@@ -121,6 +121,250 @@ pub struct HeldEpisode {
     pub next_start: Option<u64>,
 }
 
+/// An offset snapshot's compaction selection. The base is the first ordinal after the
+/// recorded view's coverage, or the end of the applied range when no view exists;
+/// it is not the resident row count.
+/// Only locators, coordinates and seeds belong in the index, never hydrated message copies.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OffsetPromptWindow {
+    pub base: u64,
+    /// All system-message ordinals below the projection's prefix length, from the same
+    /// index snapshot. Systems remain visible even inside a replaced range.
+    pub systems: Vec<u64>,
+    /// Every episode containing a selected row, and the newest projected episode. Ends
+    /// are explicit because unselected episodes may lie between selected ones.
+    pub episodes: Vec<HeldEpisode>,
+    /// Fold state before retained ranges that skip earlier model steps, and at the newest
+    /// projected episode's end when it has steps. Missing state never means empty counters.
+    pub guidance: Vec<OffsetGuidanceCheckpoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffsetGuidanceCheckpoint {
+    /// First ordinal after the model steps represented by this observer, within its episode.
+    pub ordinal: u64,
+    /// The projection boundary that published this state, validated before it is used.
+    pub at_seq: u64,
+    pub fold: crate::tool_repetition::RepetitionCheckpoint,
+}
+
+fn offset_window_rows(
+    checkpoint: &crate::compaction::CompactionCheckpoint,
+) -> Result<HeldRowsRequest, crate::replay::SeedFallback> {
+    let bad = || crate::replay::SeedFallback {
+        reason: "offset prompt window has no complete compaction checkpoint",
+    };
+    let state = checkpoint
+        .state()
+        .filter(|s| s.thinking_boundary_complete())
+        .ok_or_else(bad)?;
+    if let Some(view) = &state.view {
+        let suffix_from = view
+            .view
+            .covers_through
+            .ordinal
+            .checked_add(1)
+            .ok_or_else(bad)?;
+        for range in &view.view.ranges {
+            let (from, to) = match range {
+                crate::compaction_provider::view::ViewRange::Keep { from, to, .. }
+                | crate::compaction_provider::view::ViewRange::Replace { from, to, .. } => {
+                    (*from, *to)
+                }
+                _ => return Err(bad()),
+            };
+            if from > to || to > suffix_from {
+                return Err(bad());
+            }
+        }
+        Ok(HeldRowsRequest {
+            keep: view
+                .view
+                .ranges
+                .iter()
+                .filter_map(|r| match r {
+                    crate::compaction_provider::view::ViewRange::Keep { from, to, .. } => {
+                        Some(*from..*to)
+                    }
+                    _ => None,
+                })
+                .collect(),
+            suffix_from,
+        })
+    } else {
+        let applied = state.applied.as_ref().ok_or_else(bad)?;
+        Ok(HeldRowsRequest {
+            keep: Vec::new(),
+            suffix_from: applied.range.to,
+        })
+    }
+}
+
+pub(crate) fn validate_offset_prompt_window(
+    window: &OffsetPromptWindow,
+    rows: &[Message],
+    seed: &crate::replay::ProjectionSeed,
+    boundary: &crate::replay::SeedBoundary,
+) -> Result<(), crate::replay::SeedFallback> {
+    let bad = || crate::replay::SeedFallback {
+        reason: "offset prompt window selection is incomplete",
+    };
+    let checkpoint = seed
+        .admission_checkpoint
+        .compaction
+        .as_ref()
+        .ok_or_else(bad)?;
+    if checkpoint
+        .state()
+        .and_then(|s| s.view.as_ref())
+        .is_some_and(|v| Some(v.view.lineage_id.as_str()) != boundary.lineage_id.as_deref())
+    {
+        return Err(crate::replay::SeedFallback {
+            reason: "offset prompt window belongs to another lineage",
+        });
+    }
+    let held = offset_window_rows(checkpoint)?;
+    if window.base != held.suffix_from
+        || window.base > seed.prefix_len
+        || window.systems.windows(2).any(|w| w[0] >= w[1])
+        || window.systems.iter().any(|o| *o >= seed.prefix_len)
+    {
+        return Err(bad());
+    }
+    if window
+        .guidance
+        .windows(2)
+        .any(|w| w[0].ordinal >= w[1].ordinal)
+        || window
+            .guidance
+            .iter()
+            .any(|g| g.at_seq != seed.watermark_seq || g.ordinal > seed.prefix_len)
+    {
+        return Err(bad());
+    }
+    let mut ranges = held.keep;
+    ranges.push(window.base..seed.prefix_len);
+    if seed.prefix_len > 0 {
+        ranges.push(seed.prefix_len - 1..seed.prefix_len);
+    }
+    ranges.extend(window.systems.iter().map(|o| *o..*o + 1));
+    ranges.sort_by_key(|r| r.start);
+    let mut merged: Vec<std::ops::Range<u64>> = Vec::new();
+    for range in ranges {
+        if range.start > range.end || range.end > seed.prefix_len {
+            return Err(bad());
+        }
+        if range.is_empty() {
+            continue;
+        }
+        if let Some(last) = merged.last_mut().filter(|last| last.end >= range.start) {
+            last.end = last.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    let mut actual = rows.iter();
+    for ordinal in merged.into_iter().flatten() {
+        let row = actual.next().ok_or_else(bad)?;
+        if row.ordinal != Some(ordinal)
+            || (row.role == broca_protocol::Role::System)
+                != window.systems.binary_search(&ordinal).is_ok()
+        {
+            return Err(bad());
+        }
+    }
+    if actual.next().is_some() {
+        return Err(bad());
+    }
+    let Some(newest) = window.episodes.last() else {
+        return Err(bad());
+    };
+    if newest.next_start.is_some()
+        || newest.projection != seed.open_episode.clone().ok_or_else(bad)?
+    {
+        return Err(bad());
+    }
+    Ok(())
+}
+
+pub(crate) fn finish_offset_prompt_window(
+    state: &mut crate::ReplayState,
+    window: OffsetPromptWindow,
+    seed: &crate::replay::ProjectionSeed,
+    checkpoint: &crate::AdmissionCheckpointV1,
+    projected: &[EpisodeRenderProjection],
+) -> Result<(), crate::replay::SeedFallback> {
+    let bad = || crate::replay::SeedFallback {
+        reason: "offset prompt window episode metadata is incomplete",
+    };
+    let before = seed
+        .admission_checkpoint
+        .compaction
+        .as_ref()
+        .and_then(|c| c.state())
+        .ok_or_else(bad)?;
+    let after = checkpoint
+        .compaction
+        .as_ref()
+        .and_then(|c| c.state())
+        .ok_or_else(bad)?;
+    if before.applied != after.applied || before.view != after.view || before.strips != after.strips
+    {
+        return Err(crate::replay::SeedFallback {
+            reason: "offset prompt window changed in the tail",
+        });
+    }
+    let render = crate::run::episode_render_inputs(projected)
+        .map_err(|_| bad())?
+        .ok_or_else(bad)?;
+    let mut episodes = Vec::with_capacity(projected.len());
+    for (i, projection) in projected.iter().enumerate() {
+        let start = projection.start().ok_or_else(bad)?;
+        let next = projected
+            .get(i + 1)
+            .and_then(|e| e.start())
+            .unwrap_or(state.extent);
+        let end = window
+            .episodes
+            .get(i)
+            .and_then(|e| e.next_start)
+            .unwrap_or(next);
+        if end < start || end > next || end > state.extent {
+            return Err(bad());
+        }
+        let first_step = projection.first_step().ok_or_else(bad)?;
+        if projection
+            .first_user()
+            .ok_or_else(bad)?
+            .is_some_and(|first| first < start || first >= end)
+        {
+            return Err(bad());
+        }
+        if first_step.is_some_and(|first| first < start || first >= end) {
+            return Err(bad());
+        }
+        episodes.push(crate::run::held_prompt::GuidanceEpisode {
+            render: render[i].clone(),
+            first_step,
+            end,
+        });
+    }
+    if state.prompt.iter().any(|m| {
+        m.ordinal.is_none_or(|o| {
+            !episodes
+                .iter()
+                .any(|e| e.render.prompt_start as u64 <= o && o < e.end)
+        })
+    }) {
+        return Err(bad());
+    }
+    state.compaction = checkpoint.compaction.clone().ok_or_else(bad)?;
+    // The validated prefix already contains Setup, including when the tail opens an episode.
+    state.tags_await_setup = false;
+    state.compaction_history = after.history.clone();
+    crate::run::restore_offset_prompt_guidance(state, episodes, seed, &window)
+}
+
 /// The held rows of a materialized prefix, read with the prefix's watermark, identity, length,
 /// counters and seeds in ONE store transaction.
 ///

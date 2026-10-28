@@ -70,7 +70,9 @@ const NO_PROGRESS_WARN_AFTER: u32 = 2;
 /// A canonical identity for "this exact call". Arguments ride through the same key-sorting
 /// canonicaliser the render path uses, so argument key order cannot produce two identities for one
 /// call -- which would silently defeat the counter.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct CallSignature {
     tool_name: String,
     args_digest: u64,
@@ -273,15 +275,93 @@ impl RepetitionObserver {
 /// The episode fold shared by whole-prompt restoration and streamed store reads.
 /// Only the immediately preceding assistant's calls survive a page boundary; no message rows do.
 #[derive(Default)]
-pub(crate) struct RepetitionFold {
+pub struct RepetitionFold {
     observer: RepetitionObserver,
     pending_calls: Option<Vec<ToolCall>>,
 }
 
+/// Content-free continuation of the repetition rules: call identities, result digests and
+/// counters, never argument or output text. Bump the version when warning rules change.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RepetitionCheckpoint {
+    pub rules_version: u32,
+    exact_failures: Vec<(CallSignature, u32)>,
+    tool_failures: Vec<(String, u32)>,
+    no_progress: Vec<(CallSignature, (u64, u32))>,
+}
+
+pub const REPETITION_RULES_VERSION: u32 = 1;
+
 impl RepetitionFold {
+    pub(crate) fn seeded(checkpoint: &RepetitionCheckpoint) -> Option<Self> {
+        if checkpoint.rules_version != REPETITION_RULES_VERSION
+            || !checkpoint
+                .exact_failures
+                .windows(2)
+                .all(|pair| pair[0].0 < pair[1].0)
+            || !checkpoint
+                .no_progress
+                .windows(2)
+                .all(|pair| pair[0].0 < pair[1].0)
+            || !checkpoint
+                .tool_failures
+                .windows(2)
+                .all(|pair| pair[0].0 < pair[1].0)
+        {
+            return None;
+        }
+        Some(Self {
+            observer: RepetitionObserver {
+                exact_failures: checkpoint.exact_failures.iter().cloned().collect(),
+                tool_failures: checkpoint.tool_failures.iter().cloned().collect(),
+                no_progress: checkpoint.no_progress.iter().cloned().collect(),
+            },
+            pending_calls: None,
+        })
+    }
+
+    /// A turn boundary has no outstanding calls. Refuse a checkpoint that would need to
+    /// retain their argument text to pair a result after the boundary.
+    pub fn checkpoint(&self) -> Option<RepetitionCheckpoint> {
+        if self
+            .pending_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty())
+        {
+            return None;
+        }
+        let mut exact_failures: Vec<_> = self
+            .observer
+            .exact_failures
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let mut tool_failures: Vec<_> = self
+            .observer
+            .tool_failures
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let mut no_progress: Vec<_> = self
+            .observer
+            .no_progress
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        exact_failures.sort_by(|a, b| a.0.cmp(&b.0));
+        tool_failures.sort_by(|a, b| a.0.cmp(&b.0));
+        no_progress.sort_by(|a, b| a.0.cmp(&b.0));
+        Some(RepetitionCheckpoint {
+            rules_version: REPETITION_RULES_VERSION,
+            exact_failures,
+            tool_failures,
+            no_progress,
+        })
+    }
+
     /// Observe raw outputs before a caller decorates its model-visible copies. Block indexes
     /// identify results within this message, not by provider IDs (which may repeat across steps).
-    pub(crate) fn push(&mut self, message: &Message) -> Vec<(usize, RepetitionVerdict)> {
+    pub fn push(&mut self, message: &Message) -> Vec<(usize, RepetitionVerdict)> {
         let previous = self.pending_calls.take();
         let mut verdicts = Vec::new();
         if message.role == Role::Tool {
@@ -331,6 +411,43 @@ mod tests {
             input,
             thought_signature: None,
         }
+    }
+
+    #[test]
+    fn repetition_checkpoint_roundtrips_full_state_without_content() {
+        let call = call("read", serde_json::json!({"secret": "private-argument"}));
+        let assistant = Message::new(Role::Assistant, vec![ContentBlock::ToolCall(call.clone())]);
+        let tool = Message::new(
+            Role::Tool,
+            vec![ContentBlock::ToolResult(broca_protocol::ToolResult {
+                tool_call_id: call.tool_call_id,
+                output: ToolOutput::Text {
+                    text: "private-output".into(),
+                },
+                is_error: false,
+            })],
+        );
+        let mut fold = RepetitionFold::default();
+        fold.push(&assistant);
+        assert!(
+            fold.checkpoint().is_none(),
+            "a checkpoint must not retain pending arguments"
+        );
+        fold.push(&tool);
+        let encoded = serde_json::to_string(&fold.checkpoint().unwrap()).unwrap();
+        assert!(!encoded.contains("private-argument") && !encoded.contains("private-output"));
+        let checkpoint = serde_json::from_str(&encoded).unwrap();
+        let mut resumed = RepetitionFold::seeded(&checkpoint).unwrap();
+        resumed.push(&assistant);
+        assert!(matches!(
+            resumed.push(&tool).as_slice(),
+            [(_, RepetitionVerdict::NoProgress { count: 2, .. })]
+        ));
+        let mut ambiguous: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let rows = ambiguous["no_progress"].as_array_mut().unwrap();
+        rows.push(rows[0].clone());
+        let ambiguous = serde_json::from_value(ambiguous).unwrap();
+        assert!(RepetitionFold::seeded(&ambiguous).is_none());
     }
 
     fn legacy_result_bytes(output: &ToolOutput) -> Vec<u8> {
