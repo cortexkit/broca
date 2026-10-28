@@ -600,6 +600,11 @@ fn fallback_handoff_block_is_kept_and_echoed() {
          data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"fallback\",\"from\":{\"model\":\"claude-opus-5-5\"},\"to\":{\"model\":\"claude-opus-4.8\"}}}\n\n\
          event: content_block_stop\n\
          data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        // A prefix without a model name is not an id.
+        "event: content_block_start\n\
+         data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"fallback\",\"from\":{\"model\":\"claude-opus-5-5\"},\"to\":{\"model\":\"claude-\"}}}\n\n\
+         event: content_block_stop\n\
+         data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
     ] {
         let events = normalize_handoff(bad, "claude-opus-4-8");
         let message = events
@@ -627,11 +632,34 @@ fn fallback_handoff_block_is_kept_and_echoed() {
 #[test]
 fn served_model_resolution_order() {
     // The handoff block wins over everything else.
-    let (served, _) = finished_step(&normalize_handoff(
-        valid_handoff_block(),
-        "claude-sonnet-5-5",
-    ));
-    assert_eq!(served.as_deref(), Some("claude-opus-4-8"));
+    let block = valid_handoff_block().replace("claude-opus-4-8", "claude-haiku-5-5");
+    let (served, _) = finished_step(&normalize_handoff(&block, "claude-sonnet-5-5"));
+    assert_eq!(served.as_deref(), Some("claude-haiku-5-5"));
+
+    // A handoff alone suffices, even if message.model still names the requested source.
+    let events = normalize_recorded(
+        &AnthropicMessages,
+        &anthropic_frozen_config("claude-opus-5-5"),
+        StepId(1),
+        format!(
+            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"model\":\"claude-opus-5-5\"}}}}\n\n\
+             {}event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+            valid_handoff_block()
+        ).as_bytes(),
+        7,
+    ).expect("normalizes");
+    assert_eq!(
+        finished_step(&events),
+        (Some("claude-opus-4-8".into()), None)
+    );
+
+    let block = valid_handoff_block().replace("claude-opus-4-8", "claude-opus-5-5-20260101");
+    let events = normalize_handoff(&block, "claude-opus-5-5");
+    assert_eq!(
+        finished_step(&events).0,
+        None,
+        "an alias handoff keeps its block, not distinct model attribution"
+    );
 
     // Without a block, the last fallback iteration names the model that finished the response.
     let (served, _) = finished_step(&normalize_handoff("", "claude-sonnet-5-5"));

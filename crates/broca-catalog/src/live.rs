@@ -1573,7 +1573,7 @@ fn freeze_refusal_fallback(
         &provider_spec,
         &model_spec,
         max_tokens,
-        renderer_version_for(family),
+        broca_provider::families::anthropic_renderer_version(false),
     )
     .map_err(|error| error.to_string())?;
     apply_auth_method_quirks(provider_id, auth_method, &mut fallback);
@@ -2845,9 +2845,10 @@ mod tests {
         assert_eq!(frozen.base_url, source.base_url);
         assert_eq!(frozen.structured_output, source.structured_output);
         assert_eq!(
-            frozen.renderer_version,
-            renderer_version_for(WireFamilyId::AnthropicMessages)
+            frozen.renderer_version, 2,
+            "the un-opted fallback keeps the renderer used before server-side opt-in"
         );
+        assert!(!frozen.server_side_fallback);
         // A fallback never carries a fallback of its own.
         assert!(frozen.refusal_fallback.is_none());
         // The embedded config round-trips through the recorded blob.

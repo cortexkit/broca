@@ -148,25 +148,27 @@ impl StateFormatConfig {
 /// fallback on Anthropic OAuth runs.
 ///
 /// ```jsonc
-/// {"anthropic_fallbacks": {"server_side": true, "refusal": true}}
+/// {"anthropic_fallbacks": {
+///     "server_side": false,
+///     "refusal_resend": {"enabled": false, "models": {"claude-opus-5-5": "claude-opus-4-8"}}
+/// }}
 /// ```
 ///
 /// Both are off unless an operator turns them on, so a build carrying the code sends the
 /// requests it always did. `server_side` lets Anthropic hand a refusal to another model itself;
-/// `refusal` lets broca re-send a refused step to the model its `refusal_fallback` mapping
-/// names.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct AnthropicFallbackSwitches {
+/// `refusal_resend.enabled` lets broca re-send a refused step to the model its `models` mapping
+/// names. An absent mapping keeps the shipped defaults; an explicit mapping replaces them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AnthropicFallbackConfig {
     /// `anthropic_fallbacks.server_side`: ask Anthropic to hand a content-filter refusal to
     /// another model itself (`fallbacks: "default"` on an OAuth request for a model whose
     /// catalog row supports it).
     pub server_side: bool,
-    /// `anthropic_fallbacks.refusal`: allow a refused step to be re-sent to the model the
-    /// `refusal_fallback` section maps it to.
-    pub refusal: bool,
+    /// The client-side switch and source-to-target model mapping, frozen only at admission.
+    pub refusal_resend: crate::refusal_fallback_config::RefusalFallbackConfig,
 }
 
-impl AnthropicFallbackSwitches {
+impl AnthropicFallbackConfig {
     pub fn load_default() -> Result<Self, String> {
         use crate::config_home::ConfigHome;
         match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
@@ -188,105 +190,184 @@ impl AnthropicFallbackSwitches {
     }
 
     /// Parse the switches out of a whole `broca.jsonc`. The key is strict about its shape: an
-    /// unknown member or a non-boolean value refuses boot rather than being read as off, because
+    /// unknown member or a malformed value refuses boot rather than being read as off, because
     /// an operator who wrote the key meant to change behaviour and a silent "off" would hide the
     /// typo until a refusal surprised them in production.
     pub fn parse(text: &str) -> Result<Self, String> {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
-        struct Switches {
+        struct Fallbacks {
             #[serde(default)]
             server_side: bool,
             #[serde(default)]
-            refusal: bool,
+            refusal_resend: Resend,
         }
         #[derive(serde::Deserialize)]
-        struct File {
+        #[serde(deny_unknown_fields)]
+        struct Resend {
             #[serde(default)]
-            anthropic_fallbacks: Option<Switches>,
+            enabled: bool,
+            #[serde(default = "default_models")]
+            models: std::collections::BTreeMap<String, String>,
+        }
+        impl Default for Resend {
+            fn default() -> Self {
+                Self {
+                    enabled: false,
+                    models: default_models(),
+                }
+            }
+        }
+        fn default_models() -> std::collections::BTreeMap<String, String> {
+            crate::refusal_fallback_config::RefusalFallbackConfig::default()
+                .mappings()
+                .clone()
         }
         let text = crate::cache_routing::strip_trailing_commas(
             &crate::cache_routing::strip_jsonc_comments(text),
         );
-        let file: File = serde_json::from_str(&text)
+        let mut file: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text)
             .map_err(|error| format!("parse anthropic_fallbacks: {error}"))?;
-        Ok(match file.anthropic_fallbacks {
-            None => Self::default(),
-            Some(switches) => Self {
-                server_side: switches.server_side,
-                refusal: switches.refusal,
-            },
+        for legacy in [
+            "refusal_fallback",
+            "anthropic_refusal_fallback",
+            "anthropic_server_side_fallback",
+        ] {
+            if file.contains_key(legacy) {
+                return Err(format!(
+                    "{legacy}: retired root key; configure anthropic_fallbacks instead"
+                ));
+            }
+        }
+        let Some(block) = file.remove("anthropic_fallbacks") else {
+            return Ok(Self::default());
+        };
+        let fallbacks: Fallbacks = serde_json::from_value(block).map_err(|error| {
+            format!("anthropic_fallbacks.refusal_resend or server_side: {error}")
+        })?;
+        // The nested object's absence must keep the shipped mapping just like an absent block.
+        let resend = fallbacks.refusal_resend;
+        Ok(Self {
+            server_side: fallbacks.server_side,
+            refusal_resend: crate::refusal_fallback_config::RefusalFallbackConfig::new(
+                resend.models,
+            )?
+            .with_enabled(resend.enabled),
         })
     }
 }
 
 #[cfg(test)]
-mod anthropic_fallback_switch_tests {
-    use super::AnthropicFallbackSwitches;
+mod anthropic_fallback_config_tests {
+    use super::AnthropicFallbackConfig;
 
     #[test]
     fn absent_key_leaves_both_layers_off() {
         for text in ["{}", "{ \"cache\": {} }", "// only a comment\n{}"] {
             assert_eq!(
-                AnthropicFallbackSwitches::parse(text).unwrap(),
-                AnthropicFallbackSwitches::default(),
+                AnthropicFallbackConfig::parse(text).unwrap(),
+                AnthropicFallbackConfig::default(),
                 "{text}"
             );
         }
-        let off = AnthropicFallbackSwitches::default();
+        let off = AnthropicFallbackConfig::default();
         assert!(!off.server_side);
-        assert!(!off.refusal);
+        assert!(!off.refusal_resend.is_enabled());
+        assert_eq!(off.refusal_resend.mappings().len(), 4);
+        for source in [
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "claude-fable-5",
+            "claude-fable-5-1",
+        ] {
+            assert_eq!(
+                off.refusal_resend.target(source).unwrap().model,
+                "claude-opus-4-8"
+            );
+        }
     }
 
     #[test]
     fn each_switch_opts_in_its_own_layer() {
-        let server_side = AnthropicFallbackSwitches::parse(
+        let server_side = AnthropicFallbackConfig::parse(
             "{\n  // staging\n  \"anthropic_fallbacks\": { \"server_side\": true },\n}",
         )
         .unwrap();
         assert!(server_side.server_side);
-        assert!(!server_side.refusal, "the other switch stays off");
+        assert!(
+            !server_side.refusal_resend.is_enabled(),
+            "the other switch stays off"
+        );
+        assert_eq!(server_side.refusal_resend.mappings().len(), 4);
 
-        let refusal =
-            AnthropicFallbackSwitches::parse("{\"anthropic_fallbacks\": {\"refusal\": true}}")
-                .unwrap();
-        assert!(refusal.refusal);
-        assert!(!refusal.server_side, "the other switch stays off");
-
-        let both = AnthropicFallbackSwitches::parse(
-            "{\"anthropic_fallbacks\": {\"server_side\": true, \"refusal\": true}}",
+        let refusal = AnthropicFallbackConfig::parse(
+            "{\"anthropic_fallbacks\": {\"refusal_resend\": {\"enabled\": true}}}",
         )
         .unwrap();
-        assert!(both.server_side && both.refusal);
+        assert!(refusal.refusal_resend.is_enabled());
+        assert!(!refusal.server_side, "the other switch stays off");
+
+        let both = AnthropicFallbackConfig::parse(
+            "{\"anthropic_fallbacks\": {\"server_side\": true, \"refusal_resend\": {\"enabled\": true}}}",
+        )
+        .unwrap();
+        assert!(both.server_side && both.refusal_resend.is_enabled());
     }
 
     #[test]
     fn a_misspelt_or_wrongly_typed_switch_refuses() {
-        for text in [
-            "{\"anthropic_fallbacks\": {\"server_sides\": true}}",
-            "{\"anthropic_fallbacks\": {\"server_side\": \"true\"}}",
-            "{\"anthropic_fallbacks\": {\"refusals\": true}}",
-            "{\"anthropic_fallbacks\": {\"refusal\": 1}}",
-            "{\"anthropic_fallbacks\": true}",
+        for (text, named) in [
+            (
+                r#"{"anthropic_fallbacks": {"server_sides": true}}"#,
+                "server_sides",
+            ),
+            (
+                r#"{"anthropic_fallbacks": {"server_side": "true"}}"#,
+                "server_side",
+            ),
+            (r#"{"anthropic_fallbacks": {"refusal": true}}"#, "refusal"),
+            (
+                r#"{"anthropic_fallbacks": {"refusal_resend": {"enable": true}}}"#,
+                "enable",
+            ),
+            (
+                r#"{"anthropic_fallbacks": {"refusal_resend": {"enabled": 1}}}"#,
+                "refusal_resend",
+            ),
+            (
+                r#"{"anthropic_fallbacks": {"refusal_resend": {"model": {}}}}"#,
+                "model",
+            ),
+            (
+                r#"{"anthropic_fallbacks": {"refusal_resend": true}}"#,
+                "refusal_resend",
+            ),
+            (r#"{"anthropic_fallbacks": true}"#, "anthropic_fallbacks"),
+            (r#"{"anthropic_fallbacks": null}"#, "anthropic_fallbacks"),
         ] {
-            assert!(
-                AnthropicFallbackSwitches::parse(text).is_err(),
-                "{text} must not be read as a switch"
-            );
+            let error = AnthropicFallbackConfig::parse(text).unwrap_err();
+            assert!(error.contains(named), "{text}: {error}");
         }
     }
 
     #[test]
     fn other_root_keys_are_ignored() {
-        // This loader owns one block; the file's other sections, including the retired root
-        // boolean the refusal mapping used to read, belong to other loaders. A file carrying
-        // them still reads both switches as off rather than failing here.
-        let switches = AnthropicFallbackSwitches::parse(
-            "{\"anthropic_refusal_fallback\": true, \"refusal_fallback\": {\"a\": \"b\"}}",
-        )
-        .unwrap();
+        let switches = AnthropicFallbackConfig::parse(r#"{"cache": {}, "providers": {}}"#).unwrap();
         assert!(!switches.server_side);
-        assert!(!switches.refusal);
+        assert!(!switches.refusal_resend.is_enabled());
+    }
+
+    #[test]
+    fn retired_root_keys_refuse_by_name() {
+        for key in [
+            "refusal_fallback",
+            "anthropic_refusal_fallback",
+            "anthropic_server_side_fallback",
+        ] {
+            let error =
+                AnthropicFallbackConfig::parse(&format!(r#"{{"{key}": {{}}}}"#)).unwrap_err();
+            assert!(error.contains(key), "{error}");
+        }
     }
 }
 

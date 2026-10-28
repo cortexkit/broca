@@ -463,6 +463,8 @@ impl AnthropicNormalizer {
                 if !self.started {
                     return Err(NormalizeError::NoActiveMessage);
                 }
+                // Assembly drains the block buffer, including the strongest served-model signal.
+                let served_model = self.served_model();
                 let message = self.assemble_message()?;
                 self.completed = true;
                 out.extend(self.arguments_guard.event());
@@ -475,7 +477,7 @@ impl AnthropicNormalizer {
                     finish_reason: self.finish_reason,
                     service_tier_used: self.service_tier_used.clone(),
                     speed_used: self.speed_used.clone(),
-                    served_model: self.served_model(),
+                    served_model,
                     usage_iterations: self.usage_iterations.clone(),
                 }));
                 out.push(NormalizedEvent::Control(ProviderControl::Finished {
@@ -758,26 +760,30 @@ impl AnthropicNormalizer {
     /// `message.model` that names another model. A `message.model` that is only a dated alias of
     /// the requested id is the same model, so it does not count.
     fn served_model(&self) -> Option<String> {
-        if let Some(handoff) = self.blocks.values().rev().find_map(|buf| match buf {
+        let handoff = self.blocks.values().rev().find_map(|buf| match buf {
             BlockBuf::Fallback { to_model, .. } => Some(to_model.clone()),
             _ => None,
-        }) {
-            return Some(handoff);
-        }
-        if let Some(iteration) = self
+        });
+        let iteration = self
             .usage_iterations
             .iter()
             .flatten()
             .rev()
             .find(|entry| entry.kind.as_deref() == Some("fallback_message"))
+            .and_then(|entry| entry.model.clone());
+        let served = handoff.or(iteration).or_else(|| {
+            self.requested_model.as_ref()?;
+            self.reported_model.clone()
+        })?;
+        if self
+            .requested_model
+            .as_deref()
+            .is_some_and(|requested| is_alias_of(&served, requested))
         {
-            if let Some(model) = iteration.model.clone() {
-                return Some(model);
-            }
+            None
+        } else {
+            Some(served)
         }
-        let reported = self.reported_model.as_deref()?;
-        let requested = self.requested_model.as_deref()?;
-        (!is_alias_of(reported, requested)).then(|| reported.to_owned())
     }
 }
 
@@ -801,12 +807,11 @@ fn is_fallback_wire_model(model: &str) -> bool {
     let Some(rest) = model.strip_prefix("claude-") else {
         return false;
     };
-    !model.is_empty()
+    !rest.is_empty()
         && model.len() <= 128
-        && (rest.is_empty()
-            || rest
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'))
+        && rest
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 fn block_index(v: &Value) -> usize {

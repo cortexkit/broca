@@ -5676,6 +5676,7 @@ where
                     message,
                     usage,
                     retries_used,
+                    served_model,
                     finish_reason: Some(FinishReason::ContentFilter),
                     ..
                 },
@@ -5713,7 +5714,7 @@ where
                     writer.record(WalRecord::ModelStepRefused {
                         step_id,
                         usage: *usage,
-                        served_model: None,
+                        served_model: served_model.clone(),
                         discarded_blocks: message.content.len() as u32,
                         schedule: schedule.clone(),
                         ts_ms: now,
@@ -5789,11 +5790,13 @@ where
                 usage_iterations,
                 tool_args_cuts,
             } => {
-                // Whether Anthropic's own fallback served this reply, from the wire model the
-                // response reported. Layer 2 reads it as "not a clean reply from the source":
-                // a handoff is the source model declining, so it must not advance the schedule's
-                // streak of clean source responses.
-                let served_by_server_side_fallback = served_model.is_some();
+                // A handoff is not a clean source reply, even when its target aliases the
+                // requested model and no distinct served_model is recorded.
+                let served_by_server_side_fallback = served_model.is_some()
+                    || message
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::ProviderFallback { .. }));
                 for cut in tool_args_cuts {
                     tracing::warn!(session = %req.session.session, step = step_id.0,
                         tool_name = %cut.tool_name, json_bytes = cut.json_bytes,

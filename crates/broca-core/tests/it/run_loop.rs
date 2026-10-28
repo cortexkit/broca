@@ -6210,6 +6210,96 @@ async fn server_side_fallback_reply_does_not_count_toward_the_clean_streak() {
     );
 }
 
+/// A refused server-side handoff is still eligible for the client backstop, and its billed
+/// attempt retains the server's model attribution even though its content is discarded.
+#[tokio::test]
+async fn a_refused_server_side_fallback_keeps_its_served_model_before_resend() {
+    let provider = fallback_provider(vec![
+        served_by_server_side_fallback(refusal_step("no"), "claude-haiku-5-5"),
+        text_step("answered"),
+    ]);
+    let wal = SyncTrackingWalStore::default();
+    let (summary, _) = drive_fallback(
+        req("refused-handoff", vec![], vec![]),
+        &provider,
+        &StubToolPlane::new(),
+        &wal,
+        "rf3d",
+    )
+    .await;
+    assert_eq!(summary.reason, RunFinishReason::Completed);
+    assert_eq!(
+        provider.routes(),
+        vec![
+            broca_core::refusal_fallback::StepRoute::Source,
+            broca_core::refusal_fallback::StepRoute::Fallback
+        ]
+    );
+    let records = wal_records(&wal);
+    let refused = refused_records(&records);
+    assert!(
+        matches!(refused.as_slice(), [WalRecord::ModelStepRefused { served_model: Some(model), .. }] if model == "claude-haiku-5-5")
+    );
+}
+
+/// A handoff block breaks an existing streak even without distinct served-model attribution,
+/// as happens when the reported target is an alias of the requested model.
+#[tokio::test]
+async fn server_side_fallback_block_breaks_an_existing_clean_streak() {
+    use broca_core::refusal_fallback::StepRoute::{Fallback, Source};
+    let mut scripts = vec![refusal_step("no")];
+    let mut expected = vec![Source];
+    for _ in 0..broca_core::refusal_fallback::ROUND_STEPS {
+        scripts.push(tool_step(&[("c1", "edit", json!({"path": "1"}))]));
+        expected.push(Fallback);
+    }
+    scripts.push(tool_step(&[("probe", "edit", json!({"path": "2"}))]));
+    expected.push(Source);
+    let mut handed_off = text_step("handed on");
+    for event in &mut handed_off {
+        if let NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) = event {
+            message.content.insert(
+                0,
+                ContentBlock::ProviderFallback {
+                    from_model: "claude-opus-5-5".into(),
+                    to_model: "claude-opus-5-5-20260101".into(),
+                },
+            );
+        }
+    }
+    scripts.push(handed_off);
+    expected.push(Source);
+    let wal = SyncTrackingWalStore::default();
+    let provider = fallback_provider(scripts);
+    let plane = StubToolPlane::new().with_canned_text("edit", "edited");
+    let (summary, _) = drive_fallback(
+        req(
+            "refusal-server-block",
+            vec![tool("edit", ExecutionMode::Parallel)],
+            vec![],
+        ),
+        &provider,
+        &plane,
+        &wal,
+        "rf3c",
+    )
+    .await;
+    assert_eq!(summary.reason, RunFinishReason::Completed);
+    assert_eq!(provider.routes(), expected);
+    let records = wal_records(&wal);
+    let steps = step_fallbacks(&records);
+    assert_eq!(
+        phase(&steps[steps.len() - 2].1),
+        Some(broca_wal::RefusalFallbackPhase::Probe { clean: 1 })
+    );
+    assert!(steps.last().unwrap().1.served_model.is_none());
+    assert_eq!(
+        replay(&records).unwrap().refusal_fallback.unwrap().phase,
+        broca_wal::RefusalFallbackPhase::Probe { clean: 0 },
+        "the handoff block breaks the streak independently of served_model"
+    );
+}
+
 /// A refusal from the fallback model passes through: it commits as `content_filter`, with no
 /// second re-send and the schedule unchanged.
 #[tokio::test]
