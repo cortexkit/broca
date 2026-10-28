@@ -154,7 +154,7 @@ fn l3_keeps_handoff_and_both_usage_iterations_separate_from_last_iteration_usage
     let message = assistant(&events);
     assert!(matches!(message.content.as_slice(), [
         ContentBlock::Reasoning { .. },
-        ContentBlock::ProviderFallback { from_model, to_model },
+        ContentBlock::ProviderFallback { from_model, to_model, .. },
         ContentBlock::Reasoning { .. },
         ContentBlock::ToolCall(_),
     ] if from_model == "claude-opus-5-5" && to_model == "claude-opus-4-8"));
@@ -218,13 +218,15 @@ fn l3_server_handoff_resets_the_clean_source_streak() {
 }
 
 #[test]
-fn l4_reply_is_normal_but_current_handoff_echo_loses_the_trigger() {
+fn l4_reply_is_normal_and_stored_handoff_echo_is_verbatim() {
     let events = normalize(L3);
     let mut frozen = anthropic_frozen_config("claude-opus-5-5");
     frozen.server_side_fallback = true;
     frozen.renderer_version = anthropic_renderer_version(true);
+    let stored = serde_json::to_vec(assistant(&events)).unwrap();
+    let restored: AssistantMessage = serde_json::from_slice(&stored).unwrap();
     let request = CallOptions::new(vec![
-        Message::assistant_from(assistant(&events).content.clone(), source()),
+        Message::assistant_from(restored.content, source()),
         Message::new(
             Role::User,
             vec![ContentBlock::Text {
@@ -251,13 +253,13 @@ fn l4_reply_is_normal_but_current_handoff_echo_loses_the_trigger() {
         original["trigger"],
         json!({"type":"refusal", "category":"cyber"})
     );
-    // Characterize the lossy echo, not a byte-identical round trip: the stored part has no
-    // trigger field, so the next request cannot reproduce the provider's original block.
+    assert_eq!(*echoed, original);
     assert_eq!(
-        echoed,
-        &json!({"type":"fallback", "from":{"model":"claude-opus-5-5"}, "to":{"model":"claude-opus-4-8"}})
+        raw_request_fallback(&bytes),
+        raw_request_fallback(include_bytes!(
+            "../../broca-provider/tests/fixtures/content_filter/l4.request.json"
+        ))
     );
-    assert_ne!(*echoed, original);
 
     let events = normalize(L4);
     assert!(matches!(
@@ -288,6 +290,26 @@ fn l4_reply_is_normal_but_current_handoff_echo_loses_the_trigger() {
             .len(),
         1
     );
+}
+
+fn raw_request_fallback(bytes: &[u8]) -> String {
+    #[derive(serde::Deserialize)]
+    struct Request {
+        messages: Vec<MessageContent>,
+    }
+    #[derive(serde::Deserialize)]
+    struct MessageContent {
+        content: Vec<Box<serde_json::value::RawValue>>,
+    }
+    serde_json::from_slice::<Request>(bytes)
+        .unwrap()
+        .messages
+        .into_iter()
+        .flat_map(|message| message.content)
+        .find(|block| serde_json::from_str::<Value>(block.get()).unwrap()["type"] == "fallback")
+        .unwrap()
+        .get()
+        .to_owned()
 }
 
 fn capture(name: &str, bytes: &[u8]) {

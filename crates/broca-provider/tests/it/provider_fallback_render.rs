@@ -23,6 +23,7 @@ fn handoff() -> ContentBlock {
     ContentBlock::ProviderFallback {
         from_model: "claude-handoff-source-9".into(),
         to_model: TO_MODEL.into(),
+        raw: None,
     }
 }
 

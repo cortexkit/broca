@@ -416,7 +416,55 @@ pub enum ContentBlock {
     ProviderFallback {
         from_model: String,
         to_model: String,
+        /// The complete provider block as JSON text, including key order and whitespace.
+        /// Stored as a string so typed message decoding cannot reserialize the opaque block.
+        /// Older parts omit it; readers predating this member ignore the extra field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod fallback_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn fallback_raw_is_optional_and_the_previous_variant_ignores_it() {
+        let legacy = r#"{"type":"provider_fallback","from_model":"claude-source","to_model":"claude-target"}"#;
+        let decoded: ContentBlock = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(
+            &decoded,
+            ContentBlock::ProviderFallback { raw: None, .. }
+        ));
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), legacy);
+        let raw = r#"{ "type":"fallback", "from":{"model":"claude-source"}, "to":{"model":"claude-target"}, "future":1.00 }"#;
+        let current = ContentBlock::ProviderFallback {
+            from_model: "claude-source".into(),
+            to_model: "claude-target".into(),
+            raw: Some(raw.into()),
+        };
+        let bytes = serde_json::to_vec(&current).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ContentBlock>(&bytes).unwrap(),
+            current
+        );
+        // This is the pre-raw variant's serde declaration: its unknown-field policy
+        // lets the previous build read the new member without retaining it.
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum Previous {
+            ProviderFallback {
+                from_model: String,
+                to_model: String,
+            },
+        }
+        let Previous::ProviderFallback {
+            from_model,
+            to_model,
+        } = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(from_model, "claude-source");
+        assert_eq!(to_model, "claude-target");
+    }
 }
 
 /// An assembled, complete tool call (input is the full JSON args, not deltas).

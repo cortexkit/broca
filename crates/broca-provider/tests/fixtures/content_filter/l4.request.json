@@ -1,0 +1,1 @@
+{"messages":[{"role":"assistant","content":[{"type":"fallback","from":{"model":"claude-opus-5-5"},"to":{"model":"claude-opus-4-8"},"trigger":{"type":"refusal","category":"cyber"}}]},{"role":"user","content":[{"type":"text","text":"Synthetic follow-up."}]}]}

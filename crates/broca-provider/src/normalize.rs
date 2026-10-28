@@ -106,6 +106,7 @@ enum BlockBuf {
     Fallback {
         from_model: String,
         to_model: String,
+        raw: Option<String>,
     },
 }
 
@@ -221,7 +222,19 @@ impl AnthropicNormalizer {
             return Ok(Vec::new());
         }
         let v: Value = serde_json::from_str(json).map_err(NormalizeError::Json)?;
-        self.push(&v)
+        let out = self.push(&v)?;
+        if v.get("type").and_then(Value::as_str) == Some("content_block_start") {
+            if let Some(BlockBuf::Fallback { raw, .. }) = self.blocks.get_mut(&block_index(&v)) {
+                #[derive(serde::Deserialize)]
+                struct Start<'a> {
+                    #[serde(borrow)]
+                    content_block: &'a serde_json::value::RawValue,
+                }
+                let start: Start<'_> = serde_json::from_str(json).map_err(NormalizeError::Json)?;
+                *raw = Some(start.content_block.get().to_owned());
+            }
+        }
+        Ok(out)
     }
 
     /// Push one decoded event. Unknown event types are ignored (forward-compat).
@@ -337,6 +350,7 @@ impl AnthropicNormalizer {
                                     BlockBuf::Fallback {
                                         from_model: from_model.to_owned(),
                                         to_model: to_model.to_owned(),
+                                        raw: None,
                                     }
                                 }
                                 _ => {
@@ -705,9 +719,11 @@ impl AnthropicNormalizer {
                 BlockBuf::Fallback {
                     from_model,
                     to_model,
+                    raw,
                 } => content.push(ContentBlock::ProviderFallback {
                     from_model,
                     to_model,
+                    raw,
                 }),
                 BlockBuf::ToolUse {
                     id,
