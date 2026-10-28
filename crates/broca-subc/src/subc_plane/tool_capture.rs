@@ -41,6 +41,16 @@ fn blob(block: &serde_json::Value) -> Option<(&serde_json::Value, &str)> {
     }
 }
 
+pub(super) fn blob_mime(block: &serde_json::Value) -> Option<&str> {
+    let (source, _) = blob(block)?;
+    Some(
+        source
+            .get("mimeType")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("application/octet-stream"),
+    )
+}
+
 fn pending_part(
     block: &serde_json::Value,
     index: usize,

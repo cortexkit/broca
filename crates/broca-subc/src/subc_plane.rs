@@ -3649,7 +3649,7 @@ fn map_call_tool_result(
     tool_capture::classify(id, raw)
 }
 
-// Keep the no-capture mapping unchanged, including structuredContent and malformed replies.
+// Keep non-media replies unchanged, including structuredContent and malformed replies.
 fn map_legacy_call_tool_result(id: &ToolCallId, raw: &serde_json::Value) -> ToolResult {
     map_text_call_tool_result(id, raw, legacy_non_text_tool_content_placeholder)
 }
@@ -3667,10 +3667,11 @@ fn map_text_call_tool_result(
     let text = content
         .map(|blocks| {
             if blocks.iter().all(|block| {
-                block
-                    .get("text")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some()
+                tool_capture::blob_mime(block).is_none()
+                    && block
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some()
             }) {
                 return blocks
                     .iter()
@@ -3678,17 +3679,31 @@ fn map_text_call_tool_result(
                     .collect::<Vec<_>>()
                     .join("");
             }
-            blocks
+            let mut notices = Vec::new();
+            let mut text = blocks
                 .iter()
-                .map(|block| {
-                    block
-                        .get("text")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| placeholder(block))
+                .filter_map(|block| {
+                    if let Some(mime) = tool_capture::blob_mime(block) {
+                        notices.push(crate::content_v1::dropped_media_notice(mime));
+                        return None;
+                    }
+                    Some(
+                        block
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| placeholder(block)),
+                    )
                 })
                 .collect::<Vec<_>>()
-                .join("")
+                .join("");
+            for notice in notices {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(&notice);
+            }
+            text
         })
         .unwrap_or_default();
 
@@ -5022,7 +5037,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_dispatch_rendering_stays_byte_identical() {
+    async fn legacy_dispatch_rendering_goldens() {
         let cases = [
             (
                 serde_json::json!({
@@ -5125,14 +5140,14 @@ mod tests {
         assert_eq!(
             result.output,
             ToolOutput::Text {
-                text: "[non-text tool content omitted: type=image mimeType=image/png data≈8 bytes]"
+                text: "[image/png not shown to the model: this runner does not pass tool images to models yet]"
                     .into()
             }
         );
     }
 
     #[test]
-    fn mixed_tool_content_preserves_source_order_with_placeholders() {
+    fn mixed_tool_content_preserves_text_and_appends_media_notice() {
         let raw = serde_json::json!({
             "content": [
                 { "type": "text", "text": "before" },
@@ -5144,7 +5159,7 @@ mod tests {
 
         let result = uncaptured_result(&ToolCallId("t1".into()), &raw);
         assert_eq!(result.output, ToolOutput::Text {
-            text: "before[non-text tool content omitted: type=image mimeType=image/jpeg data≈4 bytes]after".into()
+            text: "beforeafter\n[image/jpeg not shown to the model: this runner does not pass tool images to models yet]".into()
         });
     }
 
@@ -5179,7 +5194,7 @@ mod tests {
     }
 
     #[test]
-    fn error_with_non_text_content_keeps_error_and_placeholder() {
+    fn error_with_non_text_content_keeps_error_and_media_notice() {
         let raw = serde_json::json!({
             "content": [{ "type": "audio", "mimeType": "audio/wav", "data": "123456" }],
             "isError": true
@@ -5190,7 +5205,7 @@ mod tests {
         assert_eq!(
             result.output,
             ToolOutput::error(
-                "[non-text tool content omitted: type=audio mimeType=audio/wav data≈6 bytes]"
+                "[audio/wav not shown to the model: this runner does not pass tool images to models yet]"
             )
         );
     }

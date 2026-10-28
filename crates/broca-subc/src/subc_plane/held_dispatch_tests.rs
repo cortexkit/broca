@@ -10,6 +10,9 @@ use broca_wal::{
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+#[path = "tests/dropped_media_tests.rs"]
+mod dropped_media_tests;
+
 struct Rig {
     identity: bool,
     declared_route: bool,
