@@ -286,6 +286,10 @@ async fn writer_opened_precedes_every_append() {
                 .join("open-writers")
                 .join(format!("{}.{expected_id}", session_addr(&root.session)))]
         );
+        assert_eq!(
+            decode_writer_marker(&std::fs::read(&root.markers()[0]).unwrap()).unwrap(),
+            root.session,
+        );
         for _ in 0..3 {
             assert!(handle.record(ordinary()).into_result().unwrap() > opened.seq);
         }
@@ -398,6 +402,8 @@ async fn lifecycle_observation_follows_durability_and_precedes_marker_unlink() {
             Some(open_writers::WriterContext {
                 root: root.path.clone(),
                 address: session_addr(&root.session),
+                identity: root.session.clone(),
+                cause: None,
             }),
         ),
     )

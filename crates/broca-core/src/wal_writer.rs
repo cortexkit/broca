@@ -33,6 +33,7 @@ use crate::lease::{LeaseHandle, OwnedWalTenure};
 mod extraction;
 #[path = "open_writers.rs"]
 mod open_writers;
+pub use open_writers::decode_writer_marker;
 #[cfg(feature = "test-clock")]
 thread_local! {
     static WRITER_FS_FOR_TEST: std::cell::RefCell<Option<Arc<dyn broca_wal::fs_ops::FsOps>>> = const { std::cell::RefCell::new(None) };
@@ -2173,6 +2174,25 @@ enum WalCommand {
 #[derive(Clone)]
 pub(crate) struct StampClock(Arc<dyn Fn() -> u64 + Send + Sync>);
 
+#[derive(Default)]
+struct OwnedWriterStartup {
+    cause: Option<&'static str>,
+    #[cfg(feature = "test-clock")]
+    fs: Option<Arc<dyn broca_wal::fs_ops::FsOps>>,
+}
+
+#[cfg(feature = "test-clock")]
+fn with_writer_fs<T>(fs: Option<Arc<dyn broca_wal::fs_ops::FsOps>>, work: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Arc<dyn broca_wal::fs_ops::FsOps>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WRITER_FS_FOR_TEST.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+    let _restore = Restore(WRITER_FS_FOR_TEST.with(|slot| slot.replace(fs)));
+    work()
+}
+
 impl StampClock {
     pub(crate) fn wall() -> Self {
         Self(Arc::new(broca_wal::framing::appended_ms_now))
@@ -2565,6 +2585,8 @@ impl WalHandle {
             .map(|root| open_writers::WriterContext {
                 root,
                 address: session_addr(session),
+                identity: session.clone(),
+                cause: None,
             });
         Self::spawn_proven_with_clock(wal, seq, fence, None, lease, (StampClock::wall(), context))
     }
@@ -2657,6 +2679,8 @@ impl WalHandle {
             .map(|root| open_writers::WriterContext {
                 root,
                 address: session_addr(&check_session),
+                identity: check_session.clone(),
+                cause: None,
             });
         let mut handle = Self::spawn_proven_with_clock(
             wal,
@@ -2723,6 +2747,71 @@ impl WalHandle {
         retention: Option<u64>,
         session_class: Option<String>,
     ) -> Result<WalHandle, WalOpenError> {
+        Self::open_and_spawn_owned_with_cause(
+            wal_store,
+            session,
+            tenure,
+            observer,
+            retention,
+            session_class,
+            OwnedWriterStartup::default(),
+        )
+        .await
+    }
+
+    /// Supersede a stopped writer under the same owned session tenure as ordinary admission.
+    pub async fn open_and_spawn_owned_for_reclaim<W: WalStore + 'static>(
+        wal_store: Arc<W>,
+        session: BindIdentity,
+        tenure: OwnedWalTenure,
+    ) -> Result<WalHandle, WalOpenError> {
+        Self::open_and_spawn_owned_with_cause(
+            wal_store,
+            session,
+            tenure,
+            None,
+            None,
+            None,
+            OwnedWriterStartup {
+                cause: Some("reclaim"),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Run the owned reclaim opener with the power-loss harness on every filesystem thread.
+    #[cfg(feature = "test-clock")]
+    pub async fn open_and_spawn_owned_for_reclaim_with_fs_for_test<W: WalStore + 'static>(
+        wal_store: Arc<W>,
+        session: BindIdentity,
+        tenure: OwnedWalTenure,
+        fs: Arc<dyn broca_wal::fs_ops::FsOps>,
+    ) -> Result<WalHandle, WalOpenError> {
+        Self::open_and_spawn_owned_with_cause(
+            wal_store,
+            session,
+            tenure,
+            None,
+            None,
+            None,
+            OwnedWriterStartup {
+                cause: Some("reclaim"),
+                fs: Some(fs),
+            },
+        )
+        .await
+    }
+
+    async fn open_and_spawn_owned_with_cause<W: WalStore + 'static>(
+        wal_store: Arc<W>,
+        session: BindIdentity,
+        tenure: OwnedWalTenure,
+        observer: Option<RecordObserver>,
+        retention: Option<u64>,
+        session_class: Option<String>,
+        startup: OwnedWriterStartup,
+    ) -> Result<WalHandle, WalOpenError> {
         // Bind before touching I/O: a wrong tenure refuses without creating
         // directories or files, truncating a torn tail, or writing lineage.
         // The tenure is consumed on both paths.
@@ -2752,26 +2841,35 @@ impl WalHandle {
         }
         let check_store = wal_store.clone();
         let check_session = session.clone();
+        #[cfg(feature = "test-clock")]
+        let open_fs = startup.fs.clone();
         let opened = spawn_blocking(JobKind::WalWriter, move || {
-            // Authority stays with this closure until the descriptor is gone:
-            // no second acquisition happens here, the caller-owned lease is
-            // reused through the store open, which also uses it to authorize
-            // restoring an archived log before the descriptor exists.
-            let lease = tenure.into_lease();
-            let fence = lease.epoch();
-            let (wal, lease) = wal_store
-                .open_owned_writer(&session, retention, session_class.as_deref(), lease)
-                .map_err(WalOpenError::from_wal)?;
-            // `prove_recovery` drops the descriptor before returning its
-            // error, so by the time its Err reaches here the WAL is already
-            // closed and only the tenure remains in the guard below.
-            let (wal, last_seq) = Self::prove_recovery(wal).map_err(WalOpenError::Failed)?;
-            Ok::<_, WalOpenError>(OpenedOwned {
-                wal: Some(wal),
-                lease: Some(lease),
-                last_seq,
-                fence,
-            })
+            let work = move || {
+                // Authority stays with this closure until the descriptor is gone:
+                // no second acquisition happens here, the caller-owned lease is
+                // reused through the store open, which also uses it to authorize
+                // restoring an archived log before the descriptor exists.
+                let lease = tenure.into_lease();
+                let fence = lease.epoch();
+                let (wal, lease) = wal_store
+                    .open_owned_writer(&session, retention, session_class.as_deref(), lease)
+                    .map_err(WalOpenError::from_wal)?;
+                // `prove_recovery` drops the descriptor before returning its
+                // error. The local lease stays held until this closure returns,
+                // after the writable descriptor has closed.
+                let (wal, last_seq) = Self::prove_recovery(wal).map_err(WalOpenError::Failed)?;
+                Ok::<_, WalOpenError>(OpenedOwned {
+                    wal: Some(wal),
+                    lease: Some(lease),
+                    last_seq,
+                    fence,
+                })
+            };
+            #[cfg(feature = "test-clock")]
+            if let Some(fs) = open_fs {
+                return broca_wal::fs_ops::with_fs_ops(fs, work);
+            }
+            work()
         })
         .await
         .map_err(|error| {
@@ -2797,16 +2895,24 @@ impl WalHandle {
             .map(|root| open_writers::WriterContext {
                 root,
                 address: session_addr(&check_session),
+                identity: check_session.clone(),
+                cause: startup.cause,
             });
-        let mut handle = Self::spawn_proven_with_clock(
-            wal,
-            last_seq,
-            fence,
-            observer,
-            Some(lease),
-            (StampClock::wall(), context),
-        )
-        .map_err(WalOpenError::Failed)?;
+        let spawn = || {
+            Self::spawn_proven_with_clock(
+                wal,
+                last_seq,
+                fence,
+                observer,
+                Some(lease),
+                (StampClock::wall(), context),
+            )
+            .map_err(WalOpenError::Failed)
+        };
+        #[cfg(feature = "test-clock")]
+        let mut handle = with_writer_fs(startup.fs, spawn)?;
+        #[cfg(not(feature = "test-clock"))]
+        let mut handle = spawn()?;
         handle.bind_media_capture(check_store.as_ref(), &check_session);
         handle.move_check = Some(Arc::new(move || {
             check_store.check_move(&check_session, true)

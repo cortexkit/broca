@@ -316,6 +316,14 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         wal_store = wal_store.with_durable_observer(bus_hints.observer());
     }
     let wal_store = Arc::new(wal_store);
+    // Writer reclamation is format-specific maintenance, not legacy retention work.
+    // Its first background pass runs without waiting for a send to reopen a dead writer.
+    let _writer_reclaim = match state_format {
+        state_format::StateFormat::Overhaul => {
+            broca_module::actor::writer_reclaim::spawn(wal_store.clone())
+        }
+        state_format::StateFormat::Legacy => None,
+    };
     let crash_orphan_wal = wal_store.clone();
 
     // The provider-held runtime: the slots a held call waits in, and the intake that pulls each

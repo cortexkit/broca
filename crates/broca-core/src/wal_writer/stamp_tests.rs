@@ -95,6 +95,8 @@ impl Root {
             .map(|root| open_writers::WriterContext {
                 root,
                 address: session_addr(&self.session),
+                identity: self.session.clone(),
+                cause: None,
             });
         WalHandle::spawn_proven_with_clock(wal, seq, fence, None, None, (clock, context)).unwrap()
     }

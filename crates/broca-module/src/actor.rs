@@ -44,6 +44,9 @@ use tokio_util::sync::CancellationToken;
 use crate::executor::{RunExecutor, RunJob, RunKind};
 use crate::registry::{ActorHandle, CloseToken, LineageKey, RegistryHandle};
 
+#[path = "writer_reclaim.rs"]
+pub mod writer_reclaim;
+
 /// How long an idle actor (no run, no pending work, no subscribers) holds the lease
 /// before releasing it. Keeps the lease bounded AND exercises the reopen/close races in
 /// v1 (a close path that never runs is a close path that rots).
@@ -7310,6 +7313,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         .await;
         drop(writer_tenure);
         drop(self.lease.take());
+        writer_reclaim::wake_after_teardown(self.wal_store.as_ref());
     }
 
     async fn teardown_poisoned(&mut self) {
@@ -7327,6 +7331,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         .await;
         drop(writer_tenure);
         drop(self.lease.take());
+        writer_reclaim::wake_after_teardown(self.wal_store.as_ref());
         if let Some(close_token) = close_token {
             close_token.commit();
         } else {

@@ -53,7 +53,9 @@ fn record_lifecycle(close: bool) -> (Scratch, Arc<RecordingFs>, [u8; 16]) {
         let id = wal.writer_id().unwrap();
         let (writer, seq, _) = WriterContext {
             root: root.0.clone(),
-            address: "addr".into(),
+            address: broca_core::wal_writer::session_addr(&identity()),
+            identity: identity(),
+            cause: None,
         }
         .open(&mut wal, 1, || 1)
         .unwrap();
@@ -84,12 +86,25 @@ fn check_records(records: &[broca_wal::FramedRecord], marker_exists: bool, write
 
 fn marker(writer_id: [u8; 16]) -> PathBuf {
     let id: String = writer_id.iter().map(|byte| format!("{byte:02x}")).collect();
-    PathBuf::from("open-writers").join(format!("addr.{id}"))
+    PathBuf::from("open-writers").join(format!(
+        "{}.{id}",
+        broca_core::wal_writer::session_addr(&identity())
+    ))
+}
+
+fn identity() -> broca_protocol::BindIdentity {
+    broca_protocol::BindIdentity::new("/writer-id", "harness", "power")
 }
 
 fn check_state(state: &State, root: &Scratch, writer_id: [u8; 16]) {
     root.clear();
     state.install(&root.0).unwrap();
+    if let Some(bytes) = state.files.get(&marker(writer_id)) {
+        assert_eq!(
+            actual_open_writers::decode_writer_marker(bytes).unwrap(),
+            identity()
+        );
+    }
     let wal = open(&root.0);
     check_records(
         &wal.replay().unwrap(),
@@ -109,6 +124,16 @@ fn marker_durable_before_writer_opened() {
     assert!(states
         .iter()
         .any(|state| state.state.files.contains_key(&marker(id))));
+    assert!(
+        states.iter().any(|state| {
+            !state.state.files.contains_key(&marker(id))
+                && state.state.files.iter().any(|(path, bytes)| {
+                    path.extension().is_some_and(|extension| extension == "tmp")
+                        && actual_open_writers::decode_writer_marker(bytes).ok() == Some(identity())
+                })
+        }),
+        "a cut after the temporary marker write but before rename must be exercised"
+    );
     for state in states {
         check_state(&state.state, &recovery, id);
     }
