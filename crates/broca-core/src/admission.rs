@@ -1108,6 +1108,19 @@ impl AdmissionCheckpointV1 {
                     .last_episode
                     .as_ref()
                     .map(|episode| episode.config.model.clone());
+                // The first run's account was folded before the checkpoint had a state
+                // (Setup creates it), so it would otherwise be lost on a refold. Seed it
+                // here from the durable episode that wrote it, so a restart rebuilds the
+                // same baseline without memory.
+                if state.current_account.is_none() {
+                    state.current_account = self.last_episode.as_ref().and_then(|episode| {
+                        episode
+                            .config
+                            .auth_selection
+                            .as_ref()
+                            .and_then(crate::compaction::view::selection_account_label)
+                    });
+                }
             }
         }
         Ok(())
