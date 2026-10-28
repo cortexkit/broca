@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -43,8 +44,22 @@ class Fixture(unittest.TestCase):
         return self.git("rev-parse", "HEAD")
 
     def run_script(self, name, *args, **env):
-        return subprocess.run(["bash", str(self.scripts / name), *args], cwd=self.root,
-                              env=dict(self.env, **env), text=True, capture_output=True, timeout=20)
+        command = ["bash", str(self.scripts / name), *args]
+        with subprocess.Popen(command, cwd=self.root, env=dict(self.env, **env), text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as process:
+            try:
+                stdout, stderr = process.communicate(timeout=20)
+            except subprocess.TimeoutExpired:
+                # A failed FIFO rendezvous must fail the test, not leave a stage
+                # child holding the captured output pipe open indefinitely.
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.communicate(timeout=5)
+                raise
+            return subprocess.CompletedProcess(command, process.wait(), stdout, stderr)
 
     def records(self):
         return [json.loads(line) for line in self.events.read_text().splitlines()] if self.events.exists() else []
@@ -56,12 +71,20 @@ class DeployTests(Fixture):
         shutil.copy2(ROOT / "scripts/deploy.sh", self.scripts)
         stub = self.scripts / "stub.py"
         stub.write_text(r'''
-import json, os, pathlib, subprocess, sys
+import json, os, pathlib, signal, stat, subprocess, sys
 name, *args = sys.argv[1:]
 home = pathlib.Path(os.environ["HOME"])
 with open(os.environ["EVENTS"], "a") as log:
     log.write(json.dumps([name, args]) + "\n")
 if name == "stage":
+    if os.environ.get("STAGE_ENTERED_FIFO"):
+        (home / "stage-active").touch()
+        with open(os.environ["STAGE_ENTERED_FIFO"], "w") as entered:
+            entered.write("staging\n")
+        with open(os.environ["METADATA_RELEASE_FIFO"]) as release:
+            assert release.read() == "metadata active\n"
+        assert (home / "metadata-active").exists()
+        (home / "stage-active").unlink()
     subprocess.run(["git", "describe", "--exact-match", "--tags", "HEAD"], check=True)
     seam = home / ".local/share/cortexkit/staging"
     seam.mkdir(parents=True)
@@ -72,7 +95,10 @@ if name == "stage":
     if not os.environ.get("MISSING_CLIENT"):
         client.write_text("#!/bin/sh\nexit 0\n")
         client.chmod(0o755)
+    (home / "stage-finished").touch()
 if name == "place" and "--report" in args:
+    assert (home / "stage-finished").exists()
+    assert (home / "metadata-done").read_text() == "0"
     backup = home / "rollback copy"
     backup.write_bytes(b"previous release")
     pathlib.Path(args[args.index("--report")+1]).write_text(json.dumps({
@@ -97,7 +123,32 @@ if name == "metadata":
     listing = pathlib.Path(args[args.index("--vault-listing") + 1])
     assert listing.stat().st_mode & 0o077 == 0
     assert json.loads(listing.read_text()) == {"v": 1, "credentials": []}
-    sys.exit(int(os.environ.get("METADATA_STATUS", "0")))
+    output = os.fstat(sys.stdout.fileno())
+    assert stat.S_ISREG(output.st_mode) and output.st_mode & 0o077 == 0
+    if os.environ.get("STAGE_ENTERED_FIFO"):
+        with open(os.environ["STAGE_ENTERED_FIFO"]) as entered:
+            assert entered.read() == "staging\n"
+        assert (home / "stage-active").exists()
+        (home / "metadata-active").touch()
+        if os.environ.get("HOLD_METADATA"):
+            child = subprocess.Popen([sys.executable, "-c",
+                "import signal; print('ready', flush=True); signal.pause()"],
+                stdout=subprocess.PIPE, text=True)
+            assert child.stdout.readline() == "ready\n"
+            def stopped(signum, frame):
+                # Waiting, not terminating, proves the group signal reached the child.
+                child.wait(timeout=5)
+                (home / "metadata-stopped").write_text("child reaped")
+                sys.exit(143)
+            signal.signal(signal.SIGTERM, stopped)
+        with open(os.environ["METADATA_RELEASE_FIFO"], "w") as release:
+            release.write("metadata active\n")
+        if os.environ.get("HOLD_METADATA"):
+            signal.pause()
+    status = int(os.environ.get("METADATA_STATUS", "0"))
+    (home / "metadata-done").write_text(str(status))
+    print(f"metadata fixture result: {status}")
+    sys.exit(status)
 sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
 ''')
         (self.scripts / "check-credential-metadata.py").write_text(
@@ -126,6 +177,31 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
     def steps(self):
         return [record[0] for record in self.records()]
 
+    def assert_gated_steps(self, following):
+        steps = self.steps()
+        self.assertCountEqual(steps[:3], ["stage", "listing", "metadata"])
+        self.assertLess(steps.index("listing"), steps.index("metadata"))
+        self.assertEqual(steps[3:], following)
+
+    def overlap(self):
+        # Neither stage nor metadata can finish before the other starts, so a
+        # serial implementation fails the rendezvous instead of passing by luck.
+        entered = self.home / "stage-entered.fifo"
+        release = self.home / "metadata-release.fifo"
+        os.mkfifo(entered)
+        os.mkfifo(release)
+        return {"STAGE_ENTERED_FIFO": str(entered), "METADATA_RELEASE_FIFO": str(release)}
+
+    def assert_metadata_log(self, result, status):
+        logdir = Path(next(line.removeprefix("deploy: logs ") for line in result.stdout.splitlines()
+                           if line.startswith("deploy: logs ")))
+        log = logdir / "account-metadata.log"
+        self.assertIn(f"metadata fixture result: {status}", result.stdout)
+        self.assertIn(f"metadata fixture result: {status}", log.read_text())
+        self.assertEqual(log.stat().st_mode & 0o077, 0)
+        self.assertEqual(list(logdir.glob("credential-listing.*")), [])
+        self.assertEqual(list(logdir.glob("credential-output.*")), [])
+
     def test_dirty_tree_refuses_before_tag_or_staging(self):
         (self.root / "uncommitted").write_text("dirty")
         result = self.deploy()
@@ -138,28 +214,30 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
         result = self.deploy(FAIL_STEP="stage")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("STAGING FAILED", result.stderr)
-        self.assertEqual(self.steps(), ["stage"])
+        self.assertIn("stage", self.steps())
+        self.assertTrue(set(self.steps()) <= {"stage", "listing", "metadata"})
 
     def assert_metadata_stops_deploy(self, status):
         result = self.deploy(METADATA_STATUS=str(status))
         self.assertEqual(result.returncode, status, result.stdout + result.stderr)
         self.assertIn("ACCOUNT METADATA CHECK FAILED", result.stderr)
-        self.assertEqual(self.steps(), ["stage", "listing", "metadata"])
+        self.assert_gated_steps([])
+        self.assert_metadata_log(result, status)
 
     def test_missing_listing_command_refuses_before_placement(self):
         (self.scripts / "ck").write_text("#!/bin/sh\nexit 127\n")
         self.commit()
         result = self.deploy()
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("credential metadata listing unavailable", result.stderr)
+        self.assertIn("credential metadata listing unavailable", result.stdout + result.stderr)
         self.assertEqual(self.steps(), ["stage"])
 
     def test_failed_listing_refuses_without_logging_raw_stderr(self):
         result = self.deploy(FAIL_STEP="listing")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("credential metadata listing unavailable", result.stderr)
+        self.assertIn("credential metadata listing unavailable", result.stdout + result.stderr)
         self.assertNotIn("token-DO-NOT-LOG", result.stdout + result.stderr)
-        self.assertEqual(self.steps(), ["stage", "listing"])
+        self.assertCountEqual(self.steps(), ["stage", "listing"])
 
     def test_metadata_refusal_never_places_or_restarts(self):
         self.assert_metadata_stops_deploy(1)
@@ -167,18 +245,44 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
     def test_metadata_cannot_compare_never_places_or_restarts(self):
         self.assert_metadata_stops_deploy(2)
 
+    def test_metadata_check_runs_concurrently_with_staging(self):
+        result = self.deploy(**self.overlap())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_gated_steps(["place", "verify", "accept", "worker-accept", "publish"])
+        self.assertTrue((self.home / "stage-finished").exists())
+        self.assertTrue((self.home / "metadata-active").exists())
+        self.assert_metadata_log(result, 0)
+
+    def test_overlapping_metadata_refusal_still_blocks_restart(self):
+        result = self.deploy(METADATA_STATUS="1", **self.overlap())
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assert_gated_steps([])
+        self.assertTrue((self.home / "stage-finished").exists())
+        self.assertIn("ACCOUNT METADATA CHECK FAILED", result.stderr)
+        self.assert_metadata_log(result, 1)
+
+    def test_stage_failure_stops_the_background_gate_and_its_child(self):
+        result = self.deploy(FAIL_STEP="stage", HOLD_METADATA="1", **self.overlap())
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("STAGING FAILED", result.stderr)
+        self.assert_gated_steps([])
+        self.assertEqual((self.home / "metadata-stopped").read_text(), "child reaped")
+        logdir = next((self.home / ".local/state/cortexkit/broca/deploys").iterdir())
+        self.assertEqual(list(logdir.glob("credential-listing.*")), [])
+        self.assertEqual(list(logdir.glob("credential-output.*")), [])
+
     def test_failed_placement_stops_before_verification_and_acceptance(self):
         result = self.deploy(FAIL_STEP="place")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("PLACEMENT/RESTART FAILED", result.stderr)
-        self.assertEqual(self.steps(), ["stage", "listing", "metadata", "place"])
+        self.assert_gated_steps(["place"])
         self.assertIn("Rollback:", result.stderr)
 
     def test_failed_acceptance_prints_executable_rollback_command(self):
         result = self.deploy(FAIL_STEP="accept")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("LIVE ACCEPTANCE FAILED", result.stderr)
-        self.assertEqual(self.steps(), ["stage", "listing", "metadata", "place", "verify", "accept"])
+        self.assert_gated_steps(["place", "verify", "accept"])
         command = next(line.removeprefix("Rollback: ") for line in result.stderr.splitlines()
                        if line.startswith("Rollback: "))
         (self.events).unlink()
@@ -196,19 +300,19 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("LIVE VERIFICATION FAILED", result.stderr)
         self.assertIn("Rollback:", result.stderr)
-        self.assertEqual(self.steps(), ["stage", "listing", "metadata", "place", "verify"])
+        self.assert_gated_steps(["place", "verify"])
 
     def test_missing_built_session_is_a_loud_acceptance_failure(self):
         result = self.deploy(MISSING_CLIENT="1")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("LIVE ACCEPTANCE FAILED", result.stderr)
         self.assertIn("Rollback:", result.stderr)
-        self.assertEqual(self.steps(), ["stage", "listing", "metadata", "place", "verify"])
+        self.assert_gated_steps(["place", "verify"])
 
     def test_acceptance_waits_out_a_module_still_starting(self):
         result = self.deploy(WARMING_ACCEPTS="2", BROCA_DEPLOY_WARMING_RETRY_SECS="0")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.steps(), ["stage", "listing", "metadata", "place", "verify", "accept", "accept", "accept", "worker-accept", "publish"])
+        self.assert_gated_steps(["place", "verify", "accept", "accept", "accept", "worker-accept", "publish"])
         self.assertIn("still starting (module_warming)", result.stdout)
 
     def test_acceptance_failure_other_than_warming_is_not_retried(self):
@@ -228,24 +332,25 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
     def test_failed_worker_admission_never_publishes(self):
         result = self.deploy(FAIL_STEP="worker-accept")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual(self.steps(), ["stage", "listing", "metadata", "place", "verify", "accept", "worker-accept"])
+        self.assert_gated_steps(["place", "verify", "accept", "worker-accept"])
         self.assertIn("WORKER ADMISSION ACCEPTANCE FAILED", result.stderr)
         self.assertIn("Rollback:", result.stderr)
 
     def test_success_passes_probes_and_approval_reports_pid_and_only_then_publishes(self):
         result = self.deploy("--live-approved")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        records = self.records()
-        self.assertEqual(self.steps(), ["stage", "listing", "metadata", "place", "verify", "accept", "worker-accept", "publish"])
-        self.assertEqual(records[0][1], ["--marker", "new marker", "--control", "known control"])
-        self.assertEqual(records[1][1], ["auth", "list", "--json"])
-        self.assertEqual(records[2][1][0], "--vault-listing")
-        self.assertIn("--restart", records[3][1])
-        self.assertIn("--live-approved", records[3][1])
-        self.assertIn(hashlib.sha256(b"signed release").hexdigest(), records[4][1])
-        self.assertEqual(records[5][1], ["0.0.2"])
-        self.assertEqual(records[6][1], [])
-        self.assertEqual(records[7][1], [self.sha, "0.0.2"])
+        records = dict(self.records())
+        self.assert_gated_steps(["place", "verify", "accept", "worker-accept", "publish"])
+        self.assertEqual(records["stage"], ["--marker", "new marker", "--control", "known control"])
+        self.assertEqual(records["listing"], ["auth", "list", "--json"])
+        self.assertEqual(records["metadata"][0], "--vault-listing")
+        self.assertIn("--restart", records["place"])
+        self.assertIn("--live-approved", records["place"])
+        self.assertIn(hashlib.sha256(b"signed release").hexdigest(), records["verify"])
+        self.assertEqual(records["accept"], ["0.0.2"])
+        self.assertEqual(records["worker-accept"], [])
+        self.assertEqual(records["publish"], [self.sha, "0.0.2"])
+        self.assert_metadata_log(result, 0)
         self.assertIn("pid        4321", result.stdout)
         self.assertIn("sessions sealed at restart (WAL readback): session.wal", result.stdout)
         self.assertIn("acceptance PASS", result.stdout)

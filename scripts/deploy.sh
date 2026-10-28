@@ -41,6 +41,44 @@ logs="$HOME/.local/state/cortexkit/broca/deploys"
 mkdir -p "$logs"
 logdir="$(mktemp -d "$logs/${sha:0:8}.XXXXXX")"
 echo "deploy: logs $logdir"
+# Overlap the read-only metadata gate with staging, but do not permit placement
+# until its status has been collected. Captured output stays private until then.
+metadata_pid="" metadata_listing="" metadata_listing_error="" metadata_output=""
+cleanup_metadata() {
+  local status=$?
+  trap - EXIT
+  if [ -n "$metadata_pid" ]; then
+    # The gate owns a process group, including vault/checker descendants, so an
+    # earlier deploy failure cannot leave the background scan running.
+    kill -TERM -- "-$metadata_pid" 2>/dev/null || true
+    wait "$metadata_pid" 2>/dev/null || true
+    kill -KILL -- "-$metadata_pid" 2>/dev/null || true
+  fi
+  rm -f "$metadata_listing" "$metadata_listing_error" "$metadata_output"
+  exit "$status"
+}
+trap cleanup_metadata EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+metadata_listing="$(mktemp "$logdir/credential-listing.XXXXXX")" || {
+  echo "deploy: credential metadata listing unavailable" >&2
+  exit 2
+}
+metadata_listing_error="$metadata_listing.stderr"
+metadata_output="$(mktemp "$logdir/credential-output.XXXXXX")" || exit 2
+# Job control gives this worker its own process group without a setsid dependency.
+set -m
+(
+  set +m
+  trap - EXIT INT TERM
+  if ! ck auth list --json >"$metadata_listing" 2>"$metadata_listing_error"; then
+    echo "deploy: credential metadata listing unavailable" >&2
+    exit 2
+  fi
+  exec python3 scripts/check-credential-metadata.py --vault-listing "$metadata_listing"
+) >"$metadata_output" 2>&1 &
+metadata_pid=$!
+set +m
 if ! bash scripts/stage-release.sh --marker "$MARKER" --control "$CONTROL" 2>&1 | tee "$logdir/stage.log"; then
   echo "deploy: STAGING FAILED; nothing placed or restarted. See $logdir/stage.log" >&2
   exit 1
@@ -48,26 +86,6 @@ fi
 [ "$(git rev-parse HEAD)" = "$sha" ] && [ -z "$(git status --porcelain)" ] || {
   echo "deploy: HEAD/worktree changed during staging; refusing placement" >&2; exit 1;
 }
-# The chooser only offers mapped vault rows. Check actual recent auth selections before
-# replacing the running build, so a missing mapping cannot strand an otherwise usable account.
-metadata_listing="$(mktemp "$logdir/credential-listing.XXXXXX")" || {
-  echo "deploy: credential metadata listing unavailable" >&2
-  exit 2
-}
-metadata_listing_error="$metadata_listing.stderr"
-trap 'rm -f "$metadata_listing" "$metadata_listing_error"' EXIT
-if ! ck auth list --json >"$metadata_listing" 2>"$metadata_listing_error"; then
-  echo "deploy: credential metadata listing unavailable" >&2
-  exit 2
-fi
-if python3 scripts/check-credential-metadata.py --vault-listing "$metadata_listing" \
-    2>&1 | tee "$logdir/account-metadata.log"; then
-  :
-else
-  status=$?
-  echo "deploy: ACCOUNT METADATA CHECK FAILED; nothing placed or restarted. See $logdir/account-metadata.log" >&2
-  exit "$status"
-fi
 staged="$HOME/.local/share/cortexkit/staging/ck-broca.$(git rev-parse --short=8 "$sha")"
 dest="$HOME/.local/share/cortexkit/bin/ck-broca"
 report="$logdir/placement.json"
@@ -95,6 +113,19 @@ rollback_command() {
   fi
   echo "Rollback: no rollback snapshot was created; inspect $logdir/place.log before retrying."
 }
+# Placement can restart the daemon. Collect the real worker status before that
+# first restart-capable command, including refusal and cannot-compare outcomes.
+if wait "$metadata_pid"; then
+  metadata_status=0
+else
+  metadata_status=$?
+fi
+metadata_pid=""
+tee "$logdir/account-metadata.log" <"$metadata_output"
+if [ "$metadata_status" -ne 0 ]; then
+  echo "deploy: ACCOUNT METADATA CHECK FAILED; nothing placed or restarted. See $logdir/account-metadata.log" >&2
+  exit "$metadata_status"
+fi
 if ! bash scripts/place-release.sh --staged "$staged" --restart --report "$report" \
     ${placement_args[@]+"${placement_args[@]}"} 2>&1 | tee "$logdir/place.log"; then
   echo "deploy: PLACEMENT/RESTART FAILED. See $logdir/place.log" >&2
