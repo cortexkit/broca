@@ -611,7 +611,17 @@ fn registry_with_export(dir: &Path) -> (Arc<LineageRegistry>, Arc<broca_store::S
 /// `Io(NotFound)`, so `read_records(..).unwrap()` would panic on exactly the case these tests
 /// are proving. Any other read error still fails the test.
 fn no_durable_records(wal: &dyn broca_core::WalStore, session: &BindIdentity) -> bool {
-    match wal.read_records(session) {
+    holds_no_durable_records(wal.read_records(session))
+}
+
+/// The rule behind [`no_durable_records`], applied to one read of a session's log, for callers
+/// that read a log file by path (`broca_wal::replay_file`) rather than through a `WalStore`.
+/// The lineage frame that opens a log is framing, not a record, so a log a refused first send
+/// created holding only that frame reads as empty and passes; any record at all fails.
+pub(super) fn holds_no_durable_records(
+    read: Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError>,
+) -> bool {
+    match read {
         Ok(records) => records.is_empty(),
         Err(broca_wal::WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => true,
         Err(error) => panic!("reading the session WAL failed: {error}"),

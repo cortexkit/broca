@@ -150,8 +150,9 @@ pub use run::{
     run_loop_append_episode, run_loop_on_writer, run_loop_on_writer_admitted,
     run_loop_on_writer_admitted_with_prior_snapshot, run_loop_resume_after_auth,
     run_loop_resume_after_auth_with_control, run_loop_under_lease, run_loop_with_control,
-    run_loop_with_store, AccountSelectionRefusal, OutputEvent, PriorWalSnapshot, RunControl,
-    RunError, RunRequest, RunSummary, StartMode,
+    run_loop_with_store, AccountSelectionRefusal, OutputEvent, PriorWalSnapshot,
+    RoutingUnavailable, RoutingUnavailableReason, RunControl, RunError, RunRequest, RunSummary,
+    StartMode,
 };
 pub use shutdown_seal::{SealedAttempt, ShutdownSeal};
 pub use steer::{OrderedAcceptance, SteerInbox};
