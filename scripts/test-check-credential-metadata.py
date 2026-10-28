@@ -111,7 +111,11 @@ class MetadataDeployGate(unittest.TestCase):
         return record
 
     def run_gate(self, rows):
-        return self.run_listing({"v": 1, "credentials": rows})
+        # Ordinary fixtures are model rows; category-scope tests bypass this
+        # helper so an absent category is not filled in accidentally.
+        return self.run_listing({"v": 1, "credentials": [
+            {"categories": ["llm-provider"], **row} for row in rows
+        ]})
 
     def run_listing(self, document, raw=False):
         output = io.StringIO()
@@ -138,7 +142,7 @@ class MetadataDeployGate(unittest.TestCase):
             {"id": "apikey:cline-pass"}, {"id": "apikey:muse"}, {"id": "oauth:cursor"},
         ])
         self.assertEqual(status, 0, output)
-        self.assertIn("PASS; flagged credentials:", output)
+        self.assertIn("flagged credentials:", output)
         self.assertIn("searched 1 live logs; decoded 0 matching logs", output)
         for credential in ("apikey:cline-pass", "apikey:muse", "oauth:cursor"):
             self.assertIn(credential, output)
@@ -155,8 +159,56 @@ class MetadataDeployGate(unittest.TestCase):
                 {"id": "listed", "provider_ids": ["new-provider"], "auth_method": "oauth"},
             ])
         self.assertEqual(status, 0, output)
-        self.assertIn("flagged credentials: none; all listed credentials have routing metadata", output)
+        self.assertIn("flagged credentials: none; all model-provider credentials have routing metadata", output)
         self.assertIn("searched 0 live logs; decoded 0 matching logs", output)
+
+    def test_only_exact_llm_provider_categories_are_flagged(self):
+        rows = [
+            {"id": "apns-alfonso", "categories": ["notification"]},
+            {"id": "brave", "categories": ["web-search"]},
+            {"id": "missing-category"},
+            {"id": "null-category", "categories": None},
+            {"id": "string-category", "categories": "llm-provider"},
+            {"id": "category-substring", "categories": ["llm-provider-extra"]},
+            {"id": "complete", "categories": ["llm-provider"],
+             "provider_ids": ["anthropic"], "auth_method": "oauth"},
+        ]
+        for credential in ("apikey:cline-pass", "apikey:muse", "oauth:cursor"):
+            rows.append({"id": credential, "categories": ["other", "llm-provider"], "auth_method": "apikey"})
+        self.assertEqual(GATE.flag_credentials({"v": 1, "credentials": rows}), {
+            credential: ("provider_ids",) for credential in ("apikey:cline-pass", "apikey:muse", "oauth:cursor")
+        })
+
+    def test_non_model_and_missing_category_rows_do_not_trigger_a_log_scan(self):
+        self.write_records([self.start("brave"), self.start("missing-category")])
+        with mock.patch.object(GATE, "live_logs", side_effect=AssertionError("out-of-scope scan")):
+            status, output = self.run_listing({"v": 1, "credentials": [
+                {"id": "brave", "categories": ["web-search"]},
+                {"id": "missing-category"},
+            ]})
+        self.assertEqual(status, 0, output)
+        self.assertIn("searched 0 live logs; decoded 0 matching logs", output)
+        self.assertNotIn("brave", output)
+        self.assertNotIn("missing-category", output)
+
+    def test_byte_search_for_all_flagged_ids_shares_one_open_and_mapping(self):
+        path = self.write_records([self.start("first"), self.start("second")])
+        opened = []
+        original_open = pathlib.Path.open
+
+        def track_open(candidate, *args, **kwargs):
+            opened.append(candidate)
+            return original_open(candidate, *args, **kwargs)
+
+        with mock.patch.object(pathlib.Path, "open", new=track_open), \
+             mock.patch.object(SCAN.mmap, "mmap", wraps=SCAN.mmap.mmap) as mapping, \
+             mock.patch.object(SCAN, "scan_forward", return_value=({"first", "second"}, set())) as decode:
+            result = SCAN.scan_wal((path, self.now - GATE.WEEK_MS, SCAN.quoted_ids({"first", "second", "absent"})))
+        self.assertIsNone(result.error)
+        self.assertEqual(opened, [path])
+        mapping.assert_called_once()
+        self.assertEqual(set(result.matches), {"first", "second"})
+        decode.assert_called_once_with(path, self.now - GATE.WEEK_MS, {"first", "second"})
 
     def test_id_only_in_tool_text_is_a_byte_hit_but_not_a_selection(self):
         tool = copy.deepcopy(self.tool_result_template)
@@ -382,6 +434,7 @@ class MetadataDeployGate(unittest.TestCase):
         self.assertEqual(status, 0, output)
         self.assertIn("searched 2 live logs; decoded 2 matching logs", output)
         self.assertIn("elapsed 0.25s", output)
+        self.assertTrue(output.startswith("credential-metadata: PASS; elapsed 0.25s; searched 2 live logs; "))
 
     def test_byte_prefilter_and_full_forward_scan_agree_on_fixture_verdicts(self):
         old = self.now - GATE.WEEK_MS - 1
@@ -497,7 +550,7 @@ class MetadataDeployGate(unittest.TestCase):
         self.assertTrue(all(result.error is None for result in results))
         listing = self.root / "live-listing.json"
         listing.write_text(json.dumps({"v": 1, "credentials": [
-            {"id": "worker"},
+            {"id": "worker", "categories": ["llm-provider"]},
         ]}))
         result = subprocess.run([sys.executable, str(SCRIPTS / "check-credential-metadata.py"),
                                  "--state-root", str(self.root), "--vault-listing", str(listing)],

@@ -144,6 +144,8 @@ def scan_wal(task) -> ScanResult:
                 searched = 1
                 if size == 0:
                     return ScanResult(set(), set(), searched=1)
+                # Every flagged ID is searched on this one mapping, not by
+                # reopening or remapping the log once per credential.
                 with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as data:
                     matches = tuple(credential for credential, spellings in patterns
                                     if any(data.find(spelling) >= 0 for spelling in spellings))

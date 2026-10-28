@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Refuse a deploy if a recent chooser-eligible credential lacks vault metadata."""
+"""Refuse deploys if a model credential with recent OAuth/ChatGPT use lacks routing metadata."""
 from __future__ import annotations
 
 import argparse
@@ -75,6 +75,11 @@ def flag_credentials(listing: object) -> dict[str, tuple[str, ...]]:
         if credential in seen:
             raise CannotCompare("vault listing contains duplicate credential ids")
         seen.add(credential)
+        # The vault's llm-provider category defines model credentials. A missing
+        # category is outside this guard's scope, not missing routing metadata.
+        categories = row.get("categories")
+        if not isinstance(categories, list) or "llm-provider" not in categories:
+            continue
         fields = []
         providers = row.get("provider_ids")
         if not isinstance(providers, list) or not providers or not all(
@@ -127,10 +132,10 @@ def main() -> int:
         else:
             why = "not found in retained recent logs"
         reasons.append(f"{credential} (missing {' and '.join(fields)}; {why})")
-    summary = '; '.join(reasons) if reasons else "none; all listed credentials have routing metadata"
-    print(f"credential-metadata: PASS; flagged credentials: {summary}; searched {result.searched} live logs; "
+    summary = '; '.join(reasons) if reasons else "none; all model-provider credentials have routing metadata"
+    print(f"credential-metadata: PASS; elapsed {time.monotonic() - started:.2f}s; searched {result.searched} live logs; "
           f"decoded {result.logs_read} matching logs; {result.vanished} logs vanished during the scan; "
-          f"elapsed {time.monotonic() - started:.2f}s")
+          f"flagged credentials: {summary}")
     return 0
 
 
