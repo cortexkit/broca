@@ -383,6 +383,7 @@ trait ToolPlaneConnection: Send + Sync {
         module_id: &str,
         identity: &BindIdentity,
         scope: Option<&ScopeSelector>,
+        _tool_result_v1: bool,
         _provider_held_installed: bool,
     ) -> Result<RouteHandle, ConnError> {
         self.route_open(module_id, identity, scope).await
@@ -483,10 +484,17 @@ impl ToolPlaneConnection for SubcConnection {
         module_id: &str,
         identity: &BindIdentity,
         scope: Option<&ScopeSelector>,
+        tool_result_v1: bool,
         provider_held_installed: bool,
     ) -> Result<RouteHandle, ConnError> {
-        self.route_open_dispatch_single_attempt(module_id, identity, scope, provider_held_installed)
-            .await
+        self.route_open_dispatch_single_attempt(
+            module_id,
+            identity,
+            scope,
+            tool_result_v1,
+            provider_held_installed,
+        )
+        .await
     }
     #[allow(clippy::too_many_arguments)]
     async fn tool_call_staged(
@@ -663,7 +671,7 @@ pub struct SubcToolPlane {
     batch_presets: Mutex<HashMap<BatchRouteKey, ToolManifest>>,
     approved_args: Mutex<HashMap<BatchRouteKey, HashMap<ToolCallId, ApprovedArgs>>>,
     provider_held: Option<ProviderHeldSupport>,
-    /// Whether tool routes declare `content/v1` and `held-reply/v1`; see
+    /// Whether tool routes declare `held-reply/v1` alongside their result format; see
     /// [`Self::held_reply_declared`]. Settable only in debug builds.
     declares_held_reply: bool,
     /// The frozen tool manifest of each batch in progress. It is the only source of a
@@ -720,6 +728,7 @@ pub struct SubcToolPlane {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FrozenContract {
     pub content_v1: bool,
+    pub tool_result_v1: bool,
     pub late_results: bool,
 }
 
@@ -741,17 +750,16 @@ impl SubcToolPlane {
         self
     }
 
-    /// Debug builds only: declare `content/v1` and `held-reply/v1` on every tool-dispatch route,
-    /// so a provider may answer `held`. Release builds cannot declare them: a held call has no
-    /// cancel or stop close-out yet, so production keeps both capabilities undeclared and every
-    /// call's wire bytes exactly as they were before the held runtime was installed.
+    /// Debug builds only: declare `tool-result/v1` and `held-reply/v1` on every tool-dispatch route,
+    /// so a provider may answer `held`. Production negotiates result bodies independently,
+    /// but cannot declare held replies until held calls have cancel and stop close-out.
     #[cfg(debug_assertions)]
     pub fn declaring_held_reply_for_tests(mut self) -> Self {
         self.declares_held_reply = true;
         self
     }
 
-    /// Whether this plane's tool routes declare `held-reply/v1` (with `content/v1`). Only then
+    /// Whether this plane's tool routes declare `held-reply/v1` (with `tool-result/v1`). Only then
     /// does a plain call carry its key to a `late_results` provider, and only then is any call
     /// registered with the intake: without the declaration no provider may hold a call, so a key
     /// or a registration would change the wire and the store for nothing.
@@ -772,12 +780,13 @@ impl SubcToolPlane {
             content_v1: declarations
                 .and_then(|declarations| declarations.result_formats.as_ref())
                 .is_some_and(|formats| {
-                    formats.values().any(|format| {
-                        format.0
-                            == cortexkit_role_tool_provider::result::ResultFormat::ContentV1
-                                .as_str()
-                    })
+                    formats
+                        .values()
+                        .any(|format| matches!(format.0.as_str(), "content/v1" | "tool-result/v1"))
                 }),
+            tool_result_v1: declarations
+                .and_then(|declarations| declarations.result_formats.as_ref())
+                .is_some_and(|formats| formats.values().any(|format| format.0 == "tool-result/v1")),
         }
     }
 
@@ -792,7 +801,8 @@ impl SubcToolPlane {
             .and_then(|declarations| declarations.result_formats.as_ref())
             .and_then(|formats| formats.get(tool))
             .is_some_and(|format| {
-                format.0 == cortexkit_role_tool_provider::result::ResultFormat::ContentV1.as_str()
+                format.0 == "tool-result/v1"
+                    || (self.held_reply_declared() && format.0 == "content/v1")
             })
     }
 
@@ -1489,7 +1499,7 @@ impl SubcToolPlane {
             return drained(SCOPE_UNVERIFIABLE);
         };
         let (fresh, sem) = match self
-            .ensure_route_for_lifecycle_inner(
+            .ensure_result_route_for_lifecycle_inner(
                 &ctx.bind,
                 Some(scope),
                 module_id,
@@ -1497,6 +1507,7 @@ impl SubcToolPlane {
                 guard.deadline,
                 guard,
                 patience,
+                self.frozen_contract(ctx, module_id).tool_result_v1,
             )
             .await
             .map_err(|error| map_tool_open_refusal(error, module_id))
@@ -1599,19 +1610,23 @@ impl SubcToolPlane {
                 let content_v1 = self.frozen_tool_is_content_v1(ctx, module_id, &call.tool_name);
                 let late_results = self.frozen_contract(ctx, module_id).late_results;
                 let has_held = raw.get("held").is_some();
-                let decoded = (sent_on.reads_held_reply && content_v1)
-                    .then(|| {
-                        serde_json::from_value::<cortexkit_role_tool_provider::result::ToolResult>(
-                            raw.clone(),
-                        )
-                        .ok()
-                        .filter(|reply| {
-                            cortexkit_role_tool_provider::result::validate(reply).is_ok()
-                        })
+                let decoded = (sent_on.reads_tool_result && content_v1).then(|| {
+                    serde_json::from_value::<cortexkit_role_tool_provider::result::ToolResult>(
+                        raw.clone(),
+                    )
+                    .map_err(|error| error.to_string())
+                    .and_then(|reply| {
+                        cortexkit_role_tool_provider::result::validate(&reply)
+                            .map_err(|error| error.to_string())?;
+                        Ok(reply)
                     })
-                    .flatten();
+                });
                 if has_held {
-                    let held = decoded.as_ref().and_then(|reply| reply.held());
+                    let held = decoded
+                        .as_ref()
+                        .and_then(|reply| reply.as_ref().ok())
+                        .filter(|_| sent_on.reads_held_reply)
+                        .and_then(|reply| reply.held());
                     let eligible_key = key.filter(|key| {
                         self.registered_keys
                             .lock()
@@ -1673,16 +1688,25 @@ impl SubcToolPlane {
                         ),
                         Vec::new(),
                     )
-                } else if sent_on.reads_held_reply && content_v1 {
+                } else if sent_on.reads_tool_result && content_v1 {
                     let mut result = decoded
                         .as_ref()
+                        .expect("negotiated result was decoded")
+                        .as_ref()
+                        .map_err(Clone::clone)
                         .and_then(|reply| {
-                            crate::content_v1::map_content_v1_result(&call.tool_call_id, reply).ok()
+                            crate::content_v1::map_content_v1_result(&call.tool_call_id, reply)
+                                .map_err(|error| error.to_string())
                         })
-                        .unwrap_or_else(|| {
-                            route_failure_result(call, "malformed content/v1 tool reply".into())
+                        .unwrap_or_else(|reason| {
+                            route_failure_result(
+                                call,
+                                format!("malformed tool-result/v1 tool reply: {reason}"),
+                            )
                         });
-                    let captures = if ctx.media_capture.is_some() {
+                    let captures = if ctx.media_capture.is_some()
+                        && decoded.as_ref().is_some_and(Result::is_ok)
+                    {
                         tool_capture::content_v1_captures(&mut result, &raw)
                     } else {
                         Vec::new()
@@ -2002,6 +2026,32 @@ impl SubcToolPlane {
         .map_err(|error| map_tool_open_refusal(error, module_id))
     }
 
+    async fn ensure_batch_route(
+        &self,
+        ctx: &BatchCtx,
+        module_id: &str,
+        guard: &ToolOpenGuard,
+    ) -> Result<(RouteHandle, Arc<Semaphore>), ToolPlaneError> {
+        if !self.frozen_contract(ctx, module_id).tool_result_v1 {
+            return self
+                .ensure_route(&ctx.bind, ctx.scope.as_ref(), module_id, guard)
+                .await;
+        }
+        let lifecycle = self.capture_session_lifecycle_token(&ctx.bind);
+        self.ensure_result_route_for_lifecycle_inner(
+            &ctx.bind,
+            ctx.scope.as_ref(),
+            module_id,
+            &lifecycle,
+            guard.deadline,
+            guard,
+            TOOL_DISPATCH_PATIENCE,
+            true,
+        )
+        .await
+        .map_err(|error| map_tool_open_refusal(error, module_id))
+    }
+
     /// Open a route to `module_id` for `bind`, under `scope` when the run was admitted under
     /// one. This is the only place a tool route is opened, so it is where a scoped run's route
     /// is guaranteed to carry its scope: a scoped open that cannot carry it is refused, never
@@ -2016,6 +2066,7 @@ impl SubcToolPlane {
         retry_deadline: Option<Instant>,
         guard: &ToolOpenGuard,
         patience: RouteOpenPatience,
+        tool_result_v1: bool,
     ) -> Result<(RouteHandle, Option<ScopeStamp>), RouteEnsureError> {
         // One computed deadline keeps the caller budget authoritative while retaining a short
         // per-iteration cap. Using either bound alone would either overshoot a short warm timeout
@@ -2052,8 +2103,13 @@ impl SubcToolPlane {
         };
         let Some(scope) = scope else {
             let attempt = || {
-                self.conn
-                    .route_open_dispatch(module_id, bind, None, self.held_reply_declared())
+                self.conn.route_open_dispatch(
+                    module_id,
+                    bind,
+                    None,
+                    tool_result_v1,
+                    self.held_reply_declared(),
+                )
             };
             return match outage {
                 Some(outage) => {
@@ -2127,6 +2183,7 @@ impl SubcToolPlane {
                     module_id,
                     bind,
                     Some(&selector),
+                    tool_result_v1,
                     self.held_reply_declared(),
                 )
             };
@@ -2217,6 +2274,31 @@ impl SubcToolPlane {
         guard: &ToolOpenGuard,
         patience: RouteOpenPatience,
     ) -> Result<(RouteHandle, Arc<Semaphore>), RouteEnsureError> {
+        self.ensure_result_route_for_lifecycle_inner(
+            bind,
+            scope,
+            module_id,
+            lifecycle,
+            retry_deadline,
+            guard,
+            patience,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_result_route_for_lifecycle_inner(
+        &self,
+        bind: &BindIdentity,
+        scope: Option<&SessionScope>,
+        module_id: &str,
+        lifecycle: &CancellationToken,
+        retry_deadline: Option<Instant>,
+        guard: &ToolOpenGuard,
+        patience: RouteOpenPatience,
+        tool_result_v1: bool,
+    ) -> Result<(RouteHandle, Arc<Semaphore>), RouteEnsureError> {
         let key = Self::route_key(bind, scope, module_id);
         if lifecycle.is_cancelled() {
             return Err(RouteEnsureError::Plane(ToolPlaneError::Unavailable(
@@ -2238,8 +2320,19 @@ impl SubcToolPlane {
         // the module is down, whatever route each waiter wants. When the module returns, each
         // waiting call makes one open of its own: a bounded burst, after which this cache keeps
         // one route per key as before.
-        if let Some(r) = self.routes.lock().unwrap().get(&key) {
-            return Ok((r.handle, Arc::clone(&r.sem)));
+        let obsolete = {
+            let mut routes = self.routes.lock().unwrap();
+            if let Some(r) = routes.get(&key) {
+                if r.handle.reads_tool_result == (tool_result_v1 || self.held_reply_declared()) {
+                    return Ok((r.handle, Arc::clone(&r.sem)));
+                }
+            }
+            routes.remove(&key)
+        };
+        // A warm bind may predate plan admission. Rebind before sending if the frozen
+        // catalog now selects a different result format; never infer it from reply shape.
+        if let Some(obsolete) = obsolete {
+            self.close_route_best_effort(obsolete.handle);
         }
         // Resolve the window from THIS route's provider at open time (per-provider, cached
         // per module_id) — not a single global memo.
@@ -2256,6 +2349,7 @@ impl SubcToolPlane {
                 retry_deadline,
                 guard,
                 patience,
+                tool_result_v1,
             )
             .await?;
         let sem = Arc::new(Semaphore::new(window));
@@ -2510,11 +2604,12 @@ impl SubcToolPlane {
             .unwrap()
             .insert(Self::batch_route_key(ctx), resolved);
 
-        let route_results =
-            join_all(modules.iter().map(|module_id| {
-                self.ensure_route(&ctx.bind, ctx.scope.as_ref(), module_id, guard)
-            }))
-            .await;
+        let route_results = join_all(
+            modules
+                .iter()
+                .map(|module_id| self.ensure_batch_route(ctx, module_id, guard)),
+        )
+        .await;
         // join_all retains input order. Check every result in the same BTreeSet order as the
         // former serial loop so completion timing cannot change which module error is returned.
         let mut handles = HashMap::new();
@@ -2699,8 +2794,7 @@ impl SubcToolPlane {
         // call never left the process; safe to (re-)dispatch). A module that stays down
         // for the whole tool-dispatch patience instead ends the call with the attributed
         // unavailable result (still never sent).
-        let (route_handle, sem) = match self.ensure_route(&ctx.bind, scope, &module_id, guard).await
-        {
+        let (route_handle, sem) = match self.ensure_batch_route(ctx, &module_id, guard).await {
             Ok(rs) => rs,
             // The run was cancelled or stopped during the open: never sent.
             Err(_) if guard.interrupted() => return self.stopped_before_send(ctx, call),
@@ -2884,7 +2978,7 @@ impl SubcToolPlane {
         let _ = self.invalidate_route_for_module(&ctx.bind, scope, &module_id);
         let reopened = if endpoint_is_reloading {
             let lifecycle = self.capture_session_lifecycle_token(&ctx.bind);
-            self.ensure_route_for_lifecycle_inner(
+            self.ensure_result_route_for_lifecycle_inner(
                 &ctx.bind,
                 scope,
                 &module_id,
@@ -2892,11 +2986,12 @@ impl SubcToolPlane {
                 guard.deadline,
                 guard,
                 TOOL_DISPATCH_PATIENCE,
+                self.frozen_contract(ctx, &module_id).tool_result_v1,
             )
             .await
             .map_err(|error| map_tool_open_refusal(error, &module_id))
         } else {
-            self.ensure_route(&ctx.bind, scope, &module_id, guard).await
+            self.ensure_batch_route(ctx, &module_id, guard).await
         };
         let (fresh_handle, fresh_sem) = match reopened {
             Ok(reopened) => reopened,
@@ -2978,10 +3073,7 @@ impl SubcToolPlane {
         earlier: &[CancellationToken],
     ) -> DispatchResult {
         let route_key = Self::route_key(&ctx.bind, None, module_id);
-        let (fresh_handle, fresh_sem) = match self
-            .ensure_route(&ctx.bind, None, module_id, guard)
-            .await
-        {
+        let (fresh_handle, fresh_sem) = match self.ensure_batch_route(ctx, module_id, guard).await {
             Ok(route) => route,
             Err(_) if guard.interrupted() => return self.stopped_before_send(ctx, call),
             Err(ToolPlaneError::ModuleUnavailable {
@@ -3147,6 +3239,7 @@ impl SubcToolPlane {
                     &module,
                     &ctx.bind,
                     Some(&selector),
+                    self.frozen_contract(ctx, &module).tool_result_v1,
                     self.held_reply_declared(),
                 )
             },
@@ -3649,8 +3742,8 @@ fn map_call_tool_result(
     tool_capture::classify(id, raw)
 }
 
-// Keep the no-capture mapping unchanged, including structuredContent and malformed replies.
-fn map_legacy_call_tool_result(id: &ToolCallId, raw: &serde_json::Value) -> ToolResult {
+// Keep non-media replies unchanged, including structuredContent and malformed replies.
+pub(crate) fn map_legacy_call_tool_result(id: &ToolCallId, raw: &serde_json::Value) -> ToolResult {
     map_text_call_tool_result(id, raw, legacy_non_text_tool_content_placeholder)
 }
 
@@ -3667,10 +3760,11 @@ fn map_text_call_tool_result(
     let text = content
         .map(|blocks| {
             if blocks.iter().all(|block| {
-                block
-                    .get("text")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some()
+                tool_capture::blob_mime(block).is_none()
+                    && block
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some()
             }) {
                 return blocks
                     .iter()
@@ -3678,17 +3772,31 @@ fn map_text_call_tool_result(
                     .collect::<Vec<_>>()
                     .join("");
             }
-            blocks
+            let mut notices = Vec::new();
+            let mut text = blocks
                 .iter()
-                .map(|block| {
-                    block
-                        .get("text")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| placeholder(block))
+                .filter_map(|block| {
+                    if let Some(mime) = tool_capture::blob_mime(block) {
+                        notices.push(crate::content_v1::dropped_media_notice(mime));
+                        return None;
+                    }
+                    Some(
+                        block
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| placeholder(block)),
+                    )
                 })
                 .collect::<Vec<_>>()
-                .join("")
+                .join("");
+            for notice in notices {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(&notice);
+            }
+            text
         })
         .unwrap_or_default();
 
@@ -5022,7 +5130,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_dispatch_rendering_stays_byte_identical() {
+    async fn legacy_dispatch_rendering_goldens() {
         let cases = [
             (
                 serde_json::json!({
@@ -5125,14 +5233,14 @@ mod tests {
         assert_eq!(
             result.output,
             ToolOutput::Text {
-                text: "[non-text tool content omitted: type=image mimeType=image/png data≈8 bytes]"
+                text: "[image/png not shown to the model: this runner does not pass tool images to models yet]"
                     .into()
             }
         );
     }
 
     #[test]
-    fn mixed_tool_content_preserves_source_order_with_placeholders() {
+    fn mixed_tool_content_preserves_text_and_appends_media_notice() {
         let raw = serde_json::json!({
             "content": [
                 { "type": "text", "text": "before" },
@@ -5144,7 +5252,7 @@ mod tests {
 
         let result = uncaptured_result(&ToolCallId("t1".into()), &raw);
         assert_eq!(result.output, ToolOutput::Text {
-            text: "before[non-text tool content omitted: type=image mimeType=image/jpeg data≈4 bytes]after".into()
+            text: "beforeafter\n[image/jpeg not shown to the model: this runner does not pass tool images to models yet]".into()
         });
     }
 
@@ -5179,7 +5287,7 @@ mod tests {
     }
 
     #[test]
-    fn error_with_non_text_content_keeps_error_and_placeholder() {
+    fn error_with_non_text_content_keeps_error_and_media_notice() {
         let raw = serde_json::json!({
             "content": [{ "type": "audio", "mimeType": "audio/wav", "data": "123456" }],
             "isError": true
@@ -5190,7 +5298,7 @@ mod tests {
         assert_eq!(
             result.output,
             ToolOutput::error(
-                "[non-text tool content omitted: type=audio mimeType=audio/wav data≈6 bytes]"
+                "[audio/wav not shown to the model: this runner does not pass tool images to models yet]"
             )
         );
     }

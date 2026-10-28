@@ -6,7 +6,7 @@ use broca_wal::{DispatchOutcome, WalRecord};
 use serde_json::json;
 
 #[tokio::test]
-async fn capture_off_image_result_preserves_legacy_wal_and_writes_no_media() {
+async fn capture_off_image_result_records_notice_and_writes_no_media() {
     assert!(!broca_protocol::attachments_enabled());
     let data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
     assert_eq!(data.len(), 92);
@@ -68,9 +68,9 @@ async fn capture_off_image_result_preserves_legacy_wal_and_writes_no_media() {
             );
         }
         let expected = if is_error {
-            r#"{"tool_call_id":"release-call","output":{"kind":"error","message":"before[non-text tool content omitted: type=image mimeType=image/png data≈92 bytes]after"},"is_error":true}"#
+            r#"{"tool_call_id":"release-call","output":{"kind":"error","message":"beforeafter\n[image/png not shown to the model: this runner does not pass tool images to models yet]"},"is_error":true}"#
         } else {
-            r#"{"tool_call_id":"release-call","output":{"kind":"text","text":"before[non-text tool content omitted: type=image mimeType=image/png data≈92 bytes]after"},"is_error":false}"#
+            r#"{"tool_call_id":"release-call","output":{"kind":"text","text":"beforeafter\n[image/png not shown to the model: this runner does not pass tool images to models yet]"},"is_error":false}"#
         };
         assert_eq!(serde_json::to_vec(&result).unwrap(), expected.as_bytes());
         let frames = store.read_records(&ctx.bind).unwrap();

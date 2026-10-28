@@ -959,6 +959,66 @@ mod gated {
         path: std::path::PathBuf,
         candidate: Option<broca_core::resume::OffsetResumeSnapshot>,
         observed: Mutex<Vec<Option<broca_core::replay::SeedFallback>>>,
+        reads: Mutex<Vec<(u64, u64)>>,
+        record_start: u64,
+    }
+
+    // Count reconstruction reads, not provider/config setup or the writer's own open/recovery.
+    // Forward range reads explicitly so the trait default cannot turn one into a full scan.
+    struct ReconstructionWal<'a> {
+        inner: &'a FileWalStore,
+        full_reads: std::sync::atomic::AtomicUsize,
+        ranges: Mutex<Vec<(u64, Option<u64>, bool)>>,
+    }
+
+    impl WalStore for ReconstructionWal<'_> {
+        fn open(&self, session: &BindIdentity) -> Result<Box<dyn Wal + Send>, broca_wal::WalError> {
+            self.inner.open(session)
+        }
+        fn wal_config(&self) -> broca_wal::WalConfig {
+            self.inner.wal_config()
+        }
+        fn writer_marker_root(&self) -> Option<std::path::PathBuf> {
+            self.inner.writer_marker_root()
+        }
+        fn uploads(&self) -> Option<broca_core::media_uploads::Uploads> {
+            self.inner.uploads()
+        }
+        fn check_move(
+            &self,
+            session: &BindIdentity,
+            write: bool,
+        ) -> Result<(), broca_wal::WalError> {
+            self.inner.check_move(session, write)
+        }
+        fn retired_tag_floor(&self, session: &BindIdentity) -> Result<u64, broca_wal::WalError> {
+            self.inner.retired_tag_floor(session)
+        }
+        fn retired_notice_floor(&self, session: &BindIdentity) -> Result<u64, broca_wal::WalError> {
+            self.inner.retired_notice_floor(session)
+        }
+        fn read_records(
+            &self,
+            session: &BindIdentity,
+        ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+            self.full_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.read_records(session)
+        }
+        fn read_records_range(
+            &self,
+            session: &BindIdentity,
+            after_seq: u64,
+            through_seq: Option<u64>,
+            anchor: Option<&broca_wal::WalByteAnchor>,
+        ) -> Result<broca_wal::WalRangeRead, broca_wal::WalError> {
+            self.ranges
+                .lock()
+                .unwrap()
+                .push((after_seq, through_seq, anchor.is_some()));
+            self.inner
+                .read_records_range(session, after_seq, through_seq, anchor)
+        }
     }
 
     #[tokio::test]
@@ -972,6 +1032,8 @@ mod gated {
             path: store.wal_path(&request(&dir).session),
             candidate: None,
             observed: Mutex::new(Vec::new()),
+            reads: Mutex::new(Vec::new()),
+            record_start: 0,
         };
         let provider = FrozenProvider::new(anthropic_frozen_config("claude-opus-4-8"));
         let (tx, _rx) = mpsc::channel(16);
@@ -1030,6 +1092,7 @@ mod gated {
 
         fn read_at(&self, off: u64, len: u64) -> std::io::Result<Vec<u8>> {
             use std::io::{Read, Seek, SeekFrom};
+            self.reads.lock().unwrap().push((off, len));
             let mut file = std::fs::File::open(&self.path)?;
             file.seek(SeekFrom::Start(off))?;
             let mut bytes = Vec::new();
@@ -1127,6 +1190,8 @@ mod gated {
             path: store.wal_path(session),
             candidate,
             observed: Mutex::new(Vec::new()),
+            reads: Mutex::new(Vec::new()),
+            record_start: positions.first().unwrap().off,
         }
     }
 
@@ -1176,6 +1241,11 @@ mod gated {
             })
             .unwrap();
         let lease = FileLeaseStore::new(dir.join("lease"));
+        let counted = ReconstructionWal {
+            inner: store,
+            full_reads: std::sync::atomic::AtomicUsize::new(0),
+            ranges: Mutex::new(Vec::new()),
+        };
         let (tx, mut rx) = mpsc::channel(256);
         let collector = tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let summary = if let Some(offsets) = offsets {
@@ -1186,7 +1256,7 @@ mod gated {
                 &StubToolPlane::new(),
                 &lease,
                 &AllowAll,
-                store,
+                &counted,
                 Default::default(),
                 &tx,
                 None,
@@ -1200,12 +1270,60 @@ mod gated {
                 &StubToolPlane::new(),
                 &lease,
                 &AllowAll,
-                store,
+                &counted,
                 &tx,
             )
             .await
         }
         .unwrap();
+        if let Some(offsets) = offsets {
+            let observed = offsets.observed.lock().unwrap();
+            assert_eq!(observed.len(), 1);
+            let full_reads = counted.full_reads.load(std::sync::atomic::Ordering::SeqCst);
+            if offsets
+                .candidate
+                .as_ref()
+                .is_some_and(|candidate| candidate.boundary.qualified)
+            {
+                assert_eq!(
+                    observed[0], None,
+                    "a qualified boundary must seed reconstruction"
+                );
+                assert_eq!(
+                    full_reads, 0,
+                    "seeded reconstruction must not read the complete WAL"
+                );
+                assert!(
+                    counted
+                        .ranges
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|(after, _, _)| *after > 0),
+                    "seeded reconstruction must not request a full-span range"
+                );
+                let prefix_end = offsets.candidate.as_ref().unwrap().boundary.frame_end;
+                assert!(
+                    offsets
+                        .reads
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|(off, len)| *off > offsets.record_start
+                            || off.saturating_add(*len) < prefix_end),
+                    "positioned reads must not scan the indexed prefix"
+                );
+            } else {
+                assert!(
+                    observed[0].is_some(),
+                    "unavailable or unqualified seeds must fall back"
+                );
+                assert!(
+                    full_reads > 0,
+                    "fallback must exercise the full-read counter"
+                );
+            }
+        }
         drop(tx);
         collector.await.unwrap();
         let sent = provider.sent.lock().unwrap().clone();
@@ -1268,21 +1386,15 @@ mod gated {
                     }
                     (true, true, Some(reason)) => assert_eq!(reason.reason, "unqualified boundary"),
                     (true, false, None) => qualified_attempts += 1,
-                    (true, false, Some(reason)) => {
-                        // FileWal's lineage markers are legitimate bytes between records. These
-                        // cuts fall back to the complete WAL while the validator rejects the gap.
-                        assert_eq!(reason.reason, "tail byte offset mismatch");
-                        qualified_attempts += 1;
-                        eprintln!("offset resume cut {cut}: typed fallback: {}", reason.reason);
-                    }
                     other => panic!("unexpected offset path at cut {cut}: {other:?}"),
                 }
             }
         }
-        assert!(
-            qualified_attempts > 0,
-            "exercise a committed seed, not only unavailable-index repair"
+        assert_eq!(
+            qualified_attempts, 5,
+            "every committed boundary at cuts 4 through 8 must seed reconstruction"
         );
+        eprintln!("offset resume cuts 4 through 8: all 5 seeded without full reconstruction reads; unqualified controls used full replay");
 
         // Resume from the persisted FileWal prefix through ResumeStarted, before StepStarted.
         // Reopening that prefix must not duplicate input or change the next request; this is
@@ -1313,6 +1425,16 @@ mod gated {
             let store = overhaul_log(&dir, &exit_prefix);
             let offsets = offset_fixture(&store, &request(&dir).session, unqualified);
             assert_eq!(drive_overhaul(&dir, &store, Some(&offsets)).await, expected);
+            let observed = offsets.observed.lock().unwrap();
+            assert_eq!(observed.len(), 1);
+            if unqualified {
+                assert_eq!(observed[0].as_ref().unwrap().reason, "unqualified boundary");
+            } else {
+                assert_eq!(
+                    observed[0], None,
+                    "resume-exit prefix must use its committed seed"
+                );
+            }
         }
         eprintln!("offset resume exit-gate durable-prefix cut: request bytes and 3-message history preserved");
     }

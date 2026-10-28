@@ -39,6 +39,8 @@ use subc_transport::{authenticate_client, read_frame, write_frame};
 
 const SURFACED_OPS: [&str; 3] = ["private_content.query", "flow.private_content_providers", "image.resolve"];
 
+mod tool_result;
+
 fn main() {
     if let Some(()) = relaunch() {
         return;
@@ -168,6 +170,7 @@ fn stand_in_value(name: &str) -> String {
 
 async fn serve() -> Result<(), String> {
     let (module_id, nonce) = identity()?;
+    let mut tool_routes = tool_result::Routes::default();
     // A flow caller must connect under Basal's daemon-issued identity, not the scope owner's.
     // The rig uses the optional nonce file to open that additional consumer connection.
     if std::env::args().any(|arg| arg.starts_with("--SURFACE_NONCE_PATH=")) {
@@ -255,6 +258,9 @@ async fn serve() -> Result<(), String> {
         if frame.header.channel == 0 && is_route_bind(&frame) {
             // A consumer opened a route to this surface: accept it and serve its channel.
             append(&requests, &format!("route.bind {}\n", String::from_utf8_lossy(&frame.body)))?;
+            if tool_result::enabled() {
+                tool_routes.bind(&frame)?;
+            }
             let accepted = serde_json::to_vec(&serde_json::json!({"op":"route.bind"}))
                 .unwrap_or_default();
             write(&mut stream, reply_frame(&frame, FrameType::Response, accepted, false)).await?;
@@ -284,6 +290,12 @@ async fn serve() -> Result<(), String> {
             &requests,
             &format!("{} {}\n", method, request["params"]),
         )?;
+        if tool_result::enabled() {
+            append(&requests, &format!("tool-result-request {request}\n"))?;
+            let body = tool_routes.answer(&frame, &request)?;
+            write(&mut stream, reply_frame(&frame, FrameType::Response, body, false)).await?;
+            continue;
+        }
         // Leave the image request unanswered to exercise the caller's source timeout.
         // Other operations remain available while the image source is down.
         if method == "image.resolve" && fixtures.with_extension("down").exists() {
@@ -334,6 +346,9 @@ async fn write(stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite +
 }
 
 fn manifest(module_id: &str) -> ModuleManifest {
+    if tool_result::enabled() {
+        return tool_result::manifest(module_id);
+    }
     let mut operations: Vec<_> = SURFACED_OPS
         .iter()
         .map(|name| ManagementOperation {

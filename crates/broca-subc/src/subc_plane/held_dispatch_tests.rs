@@ -10,6 +10,9 @@ use broca_wal::{
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+#[path = "tests/dropped_media_tests.rs"]
+mod dropped_media_tests;
+
 struct Rig {
     identity: bool,
     declared_route: bool,
@@ -24,6 +27,7 @@ struct Rig {
     release_registration: tokio::sync::Notify,
     /// Whether each tool route this rig opened was asked to declare the held-reply capabilities.
     opened_declaring: Mutex<Vec<bool>>,
+    opened_result: Mutex<Vec<bool>>,
 }
 
 impl Rig {
@@ -42,6 +46,7 @@ impl Rig {
             block_registration: AtomicBool::new(false),
             registering: tokio::sync::Notify::new(),
             opened_declaring: Mutex::new(Vec::new()),
+            opened_result: Mutex::new(Vec::new()),
             release_registration: tokio::sync::Notify::new(),
         })
     }
@@ -81,10 +86,13 @@ impl ToolPlaneConnection for Rig {
         _: &str,
         _: &BindIdentity,
         _: Option<&ScopeSelector>,
+        tool_result_v1: bool,
         installed: bool,
     ) -> Result<RouteHandle, ConnError> {
         self.opened_declaring.lock().unwrap().push(installed);
+        self.opened_result.lock().unwrap().push(tool_result_v1);
         let mut route = RouteHandle::synthetic(7);
+        route.reads_tool_result = (tool_result_v1 || installed) && self.declared_route;
         route.reads_held_reply = installed && self.declared_route;
         Ok(route)
     }
@@ -209,11 +217,15 @@ fn call(id: &str) -> ToolCall {
 /// The batch's frozen plan as the run freezes it: a module in the plan, the tool it offers,
 /// and whatever declarations the provider answered at admission.
 fn manifest_declaring(opt_in: bool, late_results: bool) -> ToolManifest {
+    manifest_format(opt_in.then_some("content/v1"), late_results)
+}
+
+fn manifest_format(format: Option<&str>, late_results: bool) -> ToolManifest {
     let declarations = FrozenProviderDeclarations {
-        result_formats: opt_in.then(|| {
+        result_formats: format.map(|format| {
             std::collections::BTreeMap::from([(
                 "tool".to_owned(),
-                FrozenResultFormat("content/v1".to_owned()),
+                FrozenResultFormat(format.to_owned()),
             )])
         }),
         late_results: late_results.then_some(true),
@@ -624,9 +636,11 @@ async fn held_record_sync_failure_cannot_join_a_waiting_slot() {
 #[tokio::test]
 async fn negotiated_final_content_uses_only_the_frozen_opt_in() {
     // A live catalog that no longer lists the opt-in cannot change how this batch reads a
-    // reply: the session froze the tool's format when it was admitted.
+    // reply: the session froze the tool's format when it was admitted. A missing errorCode
+    // distinguishes strict negotiated validation from legacy decoding even though valid text
+    // now has the same stored shape on both paths.
     let rig = Rig::new(true, true, true, true);
-    *rig.reply.lock().unwrap() = json!({"content":[{"type":"text","text":"model text"}],"structuredContent":{"private":"program data"}});
+    *rig.reply.lock().unwrap() = json!({"content":[{"type":"text","text":"model text"}],"isError":true,"structuredContent":{"private":"program data"}});
     let plane = rig.plane(true);
     let ctx = ctx();
     let call = call("call");
@@ -639,14 +653,11 @@ async fn negotiated_final_content_uses_only_the_frozen_opt_in() {
         .await
         .unwrap();
     let result = completed(plane.dispatch(&ctx, &call).await);
-    assert_eq!(
-        result.output,
-        ToolOutput::Parts {
-            parts: vec![broca_protocol::ToolOutputPart::Text {
-                text: "model text".into()
-            }]
-        }
-    );
+    assert!(result.is_error);
+    let ToolOutput::Error { message, .. } = result.output else {
+        panic!("invalid negotiated errors must be typed tool errors")
+    };
+    assert!(message.contains("errorCode"), "{message}");
     plane.batch_finished(&ctx).await.unwrap();
     let ctx = BatchCtx {
         batch_id: BatchId("next".into()),
@@ -661,12 +672,7 @@ async fn negotiated_final_content_uses_only_the_frozen_opt_in() {
         .await
         .unwrap();
     let result = completed(plane.dispatch(&ctx, &call).await);
-    assert_eq!(
-        result.output,
-        ToolOutput::Text {
-            text: "model text".into()
-        }
-    );
+    assert_eq!(result.output, ToolOutput::error("model text"));
 }
 
 #[tokio::test]

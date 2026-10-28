@@ -97,7 +97,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -108,7 +108,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -320,7 +320,7 @@ dependencies = [
  "cortexkit-role-compaction-provider",
  "cortexkit-role-llm-runner 0.7.9",
  "cortexkit-role-step-transform-provider",
- "cortexkit-role-tool-provider 0.12.1",
+ "cortexkit-role-tool-provider",
  "futures",
  "serde",
  "serde_jcs",
@@ -366,7 +366,7 @@ dependencies = [
  "cortexkit-role-compaction-provider",
  "cortexkit-role-llm-runner 0.7.9",
  "cortexkit-role-step-transform-provider",
- "cortexkit-role-tool-provider 0.12.1",
+ "cortexkit-role-tool-provider",
  "futures",
  "serde",
  "serde_jcs",
@@ -407,7 +407,7 @@ dependencies = [
  "broca-wire",
  "cortexkit-bus-trait",
  "cortexkit-role-llm-runner 0.7.9",
- "cortexkit-role-tool-provider 0.12.1",
+ "cortexkit-role-tool-provider",
  "futures",
  "getrandom 0.3.4",
  "rusqlite",
@@ -458,7 +458,7 @@ dependencies = [
  "cortexkit-role-llm-runner 0.7.9",
  "cortexkit-role-llm-runner-conformance",
  "cortexkit-role-step-transform-provider",
- "cortexkit-role-tool-provider 0.12.1",
+ "cortexkit-role-tool-provider",
  "flate2",
  "futures",
  "getrandom 0.3.4",
@@ -623,7 +623,7 @@ dependencies = [
  "broca-wal",
  "cortexkit-model-batch",
  "cortexkit-role-step-transform-provider",
- "cortexkit-role-tool-provider 0.12.1",
+ "cortexkit-role-tool-provider",
  "cortexkit-role-tool-provider-conformance",
  "futures",
  "serde",
@@ -1183,22 +1183,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-provider"
-version = "0.10.6"
+version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6f01258ddb6261fd1e2089c1fac40f46b9e2f7fcaa7f023843a924277964731"
-dependencies = [
- "serde",
- "serde_jcs",
- "serde_json",
- "sha2",
- "subc-protocol 0.32.4",
-]
-
-[[package]]
-name = "cortexkit-role-tool-provider"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6bc5c3968f8aaefb5c675afff6171f4e0110000c48bf83d0c941df2e7f93ee5"
+checksum = "a4573679ac1a504974aab21b60d2e4e5ecd4264830f1e5066f9e8941f6f97b94"
 dependencies = [
  "serde",
  "serde_jcs",
@@ -1209,16 +1196,16 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-provider-conformance"
-version = "0.10.1"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d917b2b6ae9797a09da083670a8039c2905bf988dbd89c1dbab5c718b5c352d"
+checksum = "f6775f73511eaa32fca482b0c862e8949252fc9d1fd3edf1026832efe481881c"
 dependencies = [
  "async-trait",
  "cortexkit-role-harness",
- "cortexkit-role-tool-provider 0.10.6",
+ "cortexkit-role-tool-provider",
  "futures-util",
  "serde_json",
- "subc-protocol 0.32.4",
+ "subc-protocol 0.33.0",
  "tokio",
 ]
 
@@ -1415,7 +1402,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2218,7 +2205,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2964,7 +2951,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3278,7 +3265,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3509,7 +3496,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

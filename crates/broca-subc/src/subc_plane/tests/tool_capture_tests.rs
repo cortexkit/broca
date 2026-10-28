@@ -312,7 +312,7 @@ async fn reference_only_reply_is_a_provenance_marker_even_when_object_exists() {
 }
 
 #[tokio::test]
-async fn negotiated_image_slots_capture_without_losing_error_code_or_text() {
+async fn negotiated_image_slots_capture_with_legacy_error_text() {
     let (_root, ctx, store) = capture_ctx("negotiated");
     let raw = json!({"content":[{"type":"text","text":"before"}, media_block("image", "image/png", &png()), {"type":"text","text":"after"}], "isError":true, "errorCode":"provider_error"});
     let mut raw = raw;
@@ -329,21 +329,15 @@ async fn negotiated_image_slots_capture_without_losing_error_code_or_text() {
     assert_eq!(
         parts(&result)[0],
         ToolOutputPart::Text {
-            text: "[tool error: provider_error]".into()
-        }
-    );
-    assert_eq!(
-        parts(&result)[1],
-        ToolOutputPart::Text {
             text: "before".into()
         }
     );
     assert_eq!(
-        store.read_verified(reference(&parts(&result)[2])).unwrap(),
+        store.read_verified(reference(&parts(&result)[1])).unwrap(),
         png()
     );
     assert_eq!(
-        parts(&result)[3],
+        parts(&result)[2],
         ToolOutputPart::Text {
             text: "after".into()
         }
