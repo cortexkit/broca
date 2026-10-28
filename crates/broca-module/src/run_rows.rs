@@ -258,13 +258,9 @@ impl OverhaulRunSource {
                 (Some("no_tool_step"), DecodeStep::Record { framed, .. }) => {
                     matches!(&framed.record,WalRecord::ModelStepFinished { assistant_message, .. } if assistant_message.tool_calls().next().is_none())
                 }
-                (Some("zero_step_seed"), DecodeStep::Record { framed, .. }) => matches!(
-                    framed.record,
-                    WalRecord::RunStarted {
-                        origin: broca_wal::RunOrigin::SeededFrom { .. },
-                        ..
-                    }
-                ),
+                (Some("zero_step_seed"), DecodeStep::Record { framed, .. }) => {
+                    matches!(framed.record, WalRecord::RunStarted { .. })
+                }
                 _ => false,
             };
             if !kind_matches {
@@ -897,7 +893,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_rows_after_zero_step_ordinary_episode_visibly_fall_back() {
+    async fn run_rows_without_historical_boundary_visibly_fall_back() {
         let mut f = Fixture::new("zero-step-fallback");
         f.start("zero-step");
         f.finish(RunFinishReason::Interrupted);
@@ -910,6 +906,17 @@ mod tests {
         );
         f.finish(RunFinishReason::Completed);
         f.index();
+        // An older index has no ordinary zero-step cut. It must still use full replay.
+        f.source
+            .db
+            .authoritative_transaction(|tx| {
+                tx.execute(
+                    "DELETE FROM projection_boundary WHERE kind='zero_step_seed'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
         assert!(f
             .source
             .read(&f.key, &RunId("target".into()))
@@ -929,6 +936,156 @@ mod tests {
         assert!(
             f.source.wal.range_reads_for_test() > before,
             "missing historical seed must visibly take the full-replay range path"
+        );
+    }
+
+    #[test]
+    fn ordinary_zero_step_boundary_requires_terminal_and_preserves_legacy_cuts() {
+        let mut f = Fixture::new("zero-step-qualification");
+        f.start("zero-step");
+        f.index();
+        let db = f.source.db.clone();
+        let qualified = || {
+            db.read_snapshot(|tx| {
+                Ok(tx.query_row(
+                    "SELECT qualified FROM projection_boundary WHERE kind='zero_step_seed'",
+                    [],
+                    |r| r.get::<_, bool>(0),
+                )?)
+            })
+            .unwrap()
+        };
+        assert!(!qualified(), "a start alone is not a committed cut");
+        f.append(WalRecord::RunPaused {
+            run_id: RunId("zero-step".into()),
+            ts_ms: None,
+            reason: broca_protocol::PauseReason::AuthRequired,
+            error: None,
+        });
+        f.index();
+        assert!(!qualified(), "a pause cannot qualify a historical cut");
+        f.finish(RunFinishReason::Interrupted);
+        f.index();
+        assert!(qualified());
+        let frames = f.source.wal.read_records(&f.key).unwrap();
+        assert_eq!(
+            broca_core::replay::latest_projection_boundary(&frames, 0),
+            None,
+            "legacy materialization must not acquire an ordinary zero-step cut"
+        );
+
+        f.start("stepped");
+        f.step(
+            1,
+            vec![ContentBlock::Text {
+                text: "answer".into(),
+            }],
+        );
+        f.finish(RunFinishReason::Completed);
+        f.index();
+        f.source.db.read_snapshot(|tx| {
+            let qualified: bool = tx.query_row(
+                "SELECT qualified FROM projection_boundary WHERE kind='zero_step_seed' AND run_id='stepped'",
+                [], |r| r.get(0),
+            )?;
+            assert!(!qualified, "a step disqualifies the run-start cut");
+            Ok(())
+        }).unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_rows_after_zero_step_ordinary_episodes_equal_full_replay() {
+        let mut f = Fixture::new("zero-step-historical");
+        let runs = [
+            ("zero-first", false, RunFinishReason::Interrupted),
+            ("tool-answer", true, RunFinishReason::Completed),
+            ("zero-interrupted", false, RunFinishReason::Interrupted),
+            ("answer", true, RunFinishReason::Completed),
+            ("zero-cancelled", false, RunFinishReason::Cancelled),
+            ("tool-limit", true, RunFinishReason::MaxSteps),
+            ("zero-last", false, RunFinishReason::Interrupted),
+            ("last-answer", true, RunFinishReason::Completed),
+        ];
+        for (id, stepped, reason) in runs {
+            f.start(id);
+            f.index();
+            if stepped {
+                if id.starts_with("tool-") {
+                    f.tool_turn();
+                }
+                f.step(
+                    2,
+                    vec![ContentBlock::Text {
+                        text: format!("answer-{id}"),
+                    }],
+                );
+            }
+            f.finish(reason);
+            // Exercise incremental publication, including qualification of a cut whose
+            // candidate was saved by an earlier index transaction.
+            f.index();
+        }
+        let legacy = f.registry(false);
+        let indexed = f.registry(true);
+        let mut origin_runs = 0;
+        for (id, _, _) in runs {
+            let run = RunId(id.into());
+            let expected_status = legacy.run_status(&f.key, run.clone()).await.unwrap();
+            let expected_result = legacy.run_result(&f.key, run.clone()).await.unwrap();
+            let expected_calls = legacy
+                .run_tool_calls(&f.key, ToolCallsRequest::new(id))
+                .await
+                .unwrap();
+            f.source.reads.lock().unwrap().clear();
+            assert!(
+                f.source.read(&f.key, &run).unwrap().is_some(),
+                "run {id} needs a usable historical boundary"
+            );
+            if f.source
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(off, n)| *off == 0 && *n > broca_wal::framing::LINEAGE_FRAME_LEN as u64)
+            {
+                origin_runs += 1;
+            }
+            let before = f.source.wal.range_reads_for_test();
+            assert_eq!(
+                serde_json::to_value(indexed.run_status(&f.key, run.clone()).await.unwrap())
+                    .unwrap(),
+                serde_json::to_value(expected_status).unwrap(),
+                "status for {id}"
+            );
+            assert_eq!(
+                serde_json::to_value(indexed.run_result(&f.key, run).await.unwrap()).unwrap(),
+                serde_json::to_value(expected_result).unwrap(),
+                "result for {id}"
+            );
+            assert_eq!(
+                serde_json::to_value(
+                    indexed
+                        .run_tool_calls(&f.key, ToolCallsRequest::new(id))
+                        .await
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(expected_calls).unwrap(),
+                "tool calls for {id}"
+            );
+            assert_eq!(
+                f.source.wal.range_reads_for_test(),
+                before,
+                "indexed run {id} must not fall back to a sequence-zero range"
+            );
+        }
+        eprintln!(
+            "historical run reads: {origin_runs}/{} origin replays; 0 full-range fallbacks",
+            runs.len()
+        );
+        assert_eq!(
+            origin_runs, 1,
+            "only the first episode replays from the log origin"
         );
     }
 }

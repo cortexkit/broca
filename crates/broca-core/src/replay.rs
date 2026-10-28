@@ -2147,7 +2147,7 @@ pub fn replay_seeded_at_validated_boundary(
             reason: "boundary lineage mismatch",
         });
     }
-    if !boundary_frame_is_seedable(&framed.record) {
+    if !boundary_frame_is_seedable(&framed.record, tail) {
         return Err(SeedFallback {
             reason: "boundary frame cannot seed a tail",
         });
@@ -2279,13 +2279,15 @@ fn log_lineage_id(header: &[u8]) -> Option<String> {
 
 /// Whether the boundary frame's record can ever seed a tail.
 ///
-/// Only a committed turn boundary qualifies: a `TurnFinished`, a model step with no
-/// tool calls, or an import-seeded `RunStarted`. Anything else — a tool-calling step
+/// A `TurnFinished`, a model step with no tool calls, or an import/fork-seeded
+/// `RunStarted` can seed a tail directly. An ordinary `RunStarted` additionally
+/// requires its terminal in the contiguous tail before any step or new episode.
+/// Anything else — a tool-calling step
 /// swallowed before its batch committed, a bare dispatch intent with an empty suffix
 /// after it, a queued or steered record held before unfinished tool work, or any
 /// informational record — leaves state the tail cannot reconstruct, so the reader
 /// falls back to a full replay even when the frame itself is intact.
-fn boundary_frame_is_seedable(record: &WalRecord) -> bool {
+fn boundary_frame_is_seedable(record: &WalRecord, tail: &[PositionedFrame]) -> bool {
     match record {
         WalRecord::TurnFinished { .. } => true,
         WalRecord::ModelStepFinished {
@@ -2295,6 +2297,16 @@ fn boundary_frame_is_seedable(record: &WalRecord) -> bool {
             origin: broca_wal::RunOrigin::SeededFrom { .. },
             ..
         } => true,
+        WalRecord::RunStarted { .. } => tail
+            .iter()
+            .find_map(|p| match p.framed.record {
+                WalRecord::RunFinished { .. } => Some(true),
+                WalRecord::StepStarted { .. }
+                | WalRecord::ModelStepFinished { .. }
+                | WalRecord::RunStarted { .. } => Some(false),
+                _ => None,
+            })
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -3468,7 +3480,8 @@ fn replay_seeded_with_compaction<'a>(
 /// Return the newest WAL sequence after `watermark` that a materialized store may
 /// safely fold into its projection.
 ///
-/// Planning and offset indexing use the same eligibility fold. A `TurnFinished`
+/// Planning and offset indexing share the eligibility fold, but ordinary zero-step
+/// start cuts are offset-only and do not change legacy materialization. A `TurnFinished`
 /// is safe only with no steer pending across it. A
 /// no-tool `ModelStepFinished` becomes safe only when a later `RunFinished` closes the same
 /// episode; the boundary remains at the step so the terminal record stays in the WAL tail.
@@ -6341,6 +6354,51 @@ mod offset_tail_tests {
                 framed: framed.clone(),
             })
             .collect()
+    }
+
+    #[test]
+    fn ordinary_zero_step_boundary_refuses_unfinished_or_stepped_episode() {
+        for (case, suffix) in [
+            ("unfinished", Vec::new()),
+            (
+                "stepped",
+                vec![
+                    WalRecord::StepStarted { step_id: StepId(1) },
+                    run_finished(RunFinishReason::Interrupted),
+                ],
+            ),
+            (
+                "different-episode",
+                vec![
+                    run_started("other", vec![user("other")]),
+                    run_finished(RunFinishReason::Interrupted),
+                ],
+            ),
+        ] {
+            let mut records = vec![run_started("zero-step", vec![user("input")])];
+            records.extend(suffix);
+            let bytes = encode_log(&records);
+            let scanned = scan_frames(&bytes);
+            let boundary = seed_boundary_for(&bytes, &scanned, 1, true);
+            let result = replay_seeded_at_validated_boundary(
+                &log_reader(&bytes, None),
+                &boundary,
+                &positioned_tail(&scanned, 1),
+                None,
+                None,
+                None,
+                None,
+                1,
+                false,
+                Default::default(),
+                Vec::new(),
+            );
+            assert_eq!(
+                result.unwrap_err().reason,
+                "boundary frame cannot seed a tail",
+                "{case}"
+            );
+        }
     }
 
     /// A tail seeded at a validated boundary replays exactly what a full replay holds
