@@ -181,9 +181,11 @@ impl<'de> Deserialize<'de> for CorrectionId {
 pub enum AttemptCorrectionReason {
     /// Later provider usage or a repaired normalization replaces previously reported usage.
     UsageReconciled,
-    /// Correct request/response facts, including model attribution, status, timing or outcome.
+    /// Correct response evidence, including model_used, status, timing or outcome;
+    /// never change the reservation's request identity.
     ProviderEvidenceCorrected,
-    /// Correct the vault credential/account attribution, without inferring its billing model.
+    /// Correct only reservation.credential, including its account attribution, without
+    /// inferring a billing model. Every other reservation field remains unchanged.
     CredentialAttributionCorrected,
 }
 
@@ -307,6 +309,8 @@ pub struct AttemptRun {
 
 /// Complete pre-send facts, repeated on settlement. Only `attempt_id` joins records;
 /// the 0-based attempt ordinal and send index are informational and may repeat after restore.
+/// Corrections repeat these fields unchanged under bill-attempts/v1, except credential for
+/// CredentialAttributionCorrected. Any other reservation change requires a new feature name.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AttemptReservation {
     pub run_id: RunId,
@@ -953,6 +957,14 @@ pub enum WalRecord {
     /// Later evidence about an already reported attempt, not a second terminal or another send.
     /// attempt_id identifies the corrected attempt; correction_id deduplicates this correction.
     /// The envelope is a complete replacement of the previous evidence, never a delta.
+    /// With several corrections, the latest in log order (frame seq) is the evidence in force.
+    /// appended_ms is for the watermark only, not correction precedence: it can tie across writers.
+    ///
+    /// Under bill-attempts/v1 every reservation field stays unchanged, including provider,
+    /// model_sent, run_id and step_id. Only the envelope may change, plus reservation.credential
+    /// when reason is CredentialAttributionCorrected. Any other reservation change requires a
+    /// new feature name. Readers retaining the original reservation must not apply a correction
+    /// that violates this rule; a single-record decoder has no earlier reservation to compare.
     AttemptCorrected {
         attempt_id: AttemptId,
         correction_id: CorrectionId,
