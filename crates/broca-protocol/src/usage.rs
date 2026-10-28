@@ -130,6 +130,31 @@ pub fn sum_reported(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     }
 }
 
+/// One entry of a provider's per-model usage split, as Anthropic reports it for a response it
+/// handed from one model to another (`usage.iterations`). Kept verbatim: the named members are
+/// the ones broca reads, and every other member stays in `other` so nothing the provider sent
+/// is lost.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct UsageIteration {
+    /// The entry's kind (`message`, `fallback_message`, ...); kept open.
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// The model id the provider reported for this entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
+    /// Every other member of the entry, verbatim.
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

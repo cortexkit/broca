@@ -244,6 +244,14 @@ pub struct FrozenRenderConfig {
     /// that way keeps rendering it, and blobs recorded without the field read back as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_code_persona: Option<ClaudeCodePersona>,
+    /// Whether this episode's Anthropic requests ask the runtime to hand a content-filter
+    /// refusal to another model itself: the body's `fallbacks: "default"` and the
+    /// `server-side-fallback` beta that follows from it. Set at admission only for an OAuth
+    /// (Claude-subscription) identity-lead run whose catalog row states the capability. A
+    /// resumed run keeps its recorded value. Omitted when false, so every config recorded
+    /// before this field rendered (and keeps rendering) exactly the bytes it did.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub server_side_fallback: bool,
     /// OpenCode Go's transport-only session header. It is re-derived from the session reference
     /// after restart and is not part of the frozen request-body identity.
     #[serde(skip)]
@@ -378,6 +386,11 @@ impl FrozenRenderConfig {
         ))
     }
 }
+
+/// One entry of an Anthropic response's `usage.iterations`: the part of the response one model
+/// produced. When the runtime hands a refusal to another model itself, the response carries one
+/// entry per model it ran, each with its own token counts.
+pub use broca_protocol::usage::UsageIteration;
 
 /// Conversation identity and episode-local request numbering for the Antigravity envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

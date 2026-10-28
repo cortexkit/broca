@@ -10,23 +10,27 @@
 //! In the config-home `broca.jsonc`:
 //!
 //! ```jsonc
-//! {"refusal_fallback": {
-//!     "claude-opus-5-5": "claude-opus-4-8",
-//!     "claude-opus-5": "claude-opus-4-8",
-//! }}
+//! {"anthropic_fallbacks": {"refusal_resend": {
+//!     "enabled": false,
+//!     "models": {
+//!         "claude-opus-5-5": "claude-opus-4-8",
+//!         "claude-opus-5": "claude-opus-4-8",
+//!     },
+//! }}}
 //! ```
 //!
-//! With no section, [`DEFAULT_MAPPINGS`] applies. An explicit section replaces the defaults
-//! wholesale, and an empty object (`{"refusal_fallback": {}}`) switches the fallback off, so an
-//! operator can both add a mapping and withdraw one that shipped. Both sides of every entry name
+//! Without `models`, [`DEFAULT_MAPPINGS`] applies. An explicit mapping replaces the defaults
+//! wholesale, and an empty mapping is refused by name. Use `enabled: false` to switch the
+//! fallback off. Both sides of every entry name
 //! a model on provider [`FALLBACK_PROVIDER`]: the fallback runs on the same account and the same
 //! wire family as the model that refused, so only the model id changes.
 //!
-//! The mapping alone sends nothing anywhere: the operator switch `anthropic_refusal_fallback`, a
-//! root boolean in the same file, must also be `true` (it defaults to `false`). Only then is a
-//! fresh episode whose model has a mapping offered its fallback at admission, and whether it is
-//! actually frozen still depends on the episode (Anthropic OAuth, and the rest of the rules in
-//! `broca_catalog::live`).
+//! The mapping alone sends nothing anywhere: `anthropic_fallbacks.refusal_resend.enabled` in
+//! the same file must also be `true` (it defaults to `false`; see
+//! [`crate::config::AnthropicFallbackConfig`], which holds this switch beside the server-side
+//! one). Only then is a fresh episode whose model has a mapping offered its fallback at
+//! admission, and whether it is actually frozen still depends on the episode (Anthropic OAuth,
+//! and the rest of the rules in `broca_catalog::live`).
 //!
 //! Every entry is validated at load time. A defective entry refuses boot by name rather than
 //! being dropped, because a mapping an operator wrote and broca ignored would only be noticed
@@ -37,7 +41,6 @@ use std::io;
 use std::path::Path;
 
 use broca_catalog::CatalogSnapshot;
-use serde::Deserialize;
 
 /// The provider every mapped model belongs to.
 pub const FALLBACK_PROVIDER: &str = "anthropic";
@@ -58,7 +61,7 @@ pub struct FallbackTarget {
     pub model: String,
 }
 
-/// The `refusal_fallback` section of `broca.jsonc`: source model id → fallback model id, both on
+/// The `anthropic_fallbacks.refusal_resend` section: source model id → fallback model id, both on
 /// [`FALLBACK_PROVIDER`].
 ///
 /// The maps carry model ids rather than resolved routes on purpose. A model's catalog row can be
@@ -67,13 +70,16 @@ pub struct FallbackTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefusalFallbackConfig {
     mappings: BTreeMap<String, String>,
-    /// The operator switch `anthropic_refusal_fallback`. Off, no episode is offered a
+    /// The operator's `refusal_resend.enabled` switch. Off, no episode is offered a
     /// fallback whatever the mappings say.
     enabled: bool,
 }
 
-/// The `broca.jsonc` root key that switches the client-side refusal fallback on.
-pub const SWITCH_KEY: &str = "anthropic_refusal_fallback";
+/// The `broca.jsonc` key that switches the client-side refusal fallback on. It lives in the
+/// `anthropic_fallbacks` block, beside the server-side switch, so both layers of the same
+/// feature are turned on in one place.
+pub const SWITCH_KEY: &str = "anthropic_fallbacks.refusal_resend.enabled";
+const MODELS_KEY: &str = "anthropic_fallbacks.refusal_resend.models";
 
 impl Default for RefusalFallbackConfig {
     fn default() -> Self {
@@ -90,20 +96,19 @@ impl Default for RefusalFallbackConfig {
 impl RefusalFallbackConfig {
     /// Build from pairs. Values are validated exactly as a loaded file's are.
     pub fn new(mappings: BTreeMap<String, String>) -> Result<Self, String> {
+        if mappings.is_empty() {
+            return Err(format!("{MODELS_KEY}: must not be empty; use {SWITCH_KEY}: false to disable refusal resend"));
+        }
         for (source, fallback) in &mappings {
+            validate_model_id(&format!("{MODELS_KEY}.{source}"), "source model", source)?;
             validate_model_id(
-                &format!("refusal_fallback.{source}"),
-                "source model",
-                source,
-            )?;
-            validate_model_id(
-                &format!("refusal_fallback.{source}"),
+                &format!("{MODELS_KEY}.{source}"),
                 "fallback model",
                 fallback,
             )?;
             if source == fallback {
                 return Err(format!(
-                    "refusal_fallback.{source}: maps {source} to itself, so a refusal would \
+                    "{MODELS_KEY}.{source}: maps {source} to itself, so a refusal would \
                      re-send the step to the model that just refused it"
                 ));
             }
@@ -163,29 +168,10 @@ impl RefusalFallbackConfig {
             .map_err(|error| format!("parse broca config {}: {error}", path.display()))
     }
 
-    /// Parse the `refusal_fallback` section of a `broca.jsonc` text. Other root keys belong to
-    /// other loaders and are ignored. A file that keeps every shipped entry spelled out is left
-    /// as written; a file that leaves entries out replaces the defaults with exactly what it
-    /// names.
+    /// Read the client-side policy through the single fallback block parser so every loader
+    /// validates the same switch and mapping schema.
     pub fn parse(text: &str) -> Result<Self, String> {
-        let stripped = crate::cache_routing::strip_trailing_commas(
-            &crate::cache_routing::strip_jsonc_comments(text),
-        );
-        let object: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(&stripped).map_err(|error| error.to_string())?;
-        let enabled = match object.get(SWITCH_KEY) {
-            None => false,
-            Some(serde_json::Value::Bool(enabled)) => *enabled,
-            Some(other) => return Err(format!("{SWITCH_KEY} must be true or false, not {other}")),
-        };
-        let Some(section) = object.get("refusal_fallback") else {
-            return Ok(Self::default().with_enabled(enabled));
-        };
-        let entries: BTreeMap<String, String> =
-            serde_json::from_value(section.clone()).map_err(|error| {
-                format!("refusal_fallback must map model ids to model ids: {error}")
-            })?;
-        Ok(Self::new(entries)?.with_enabled(enabled))
+        Ok(crate::config::AnthropicFallbackConfig::parse(text)?.refusal_resend)
     }
 
     /// The model a refused step on `source` is re-sent to, or `None` when `source` has no
@@ -221,7 +207,7 @@ impl RefusalFallbackConfig {
             .filter(|(model, _)| !catalog.contains_model(FALLBACK_PROVIDER, model))
             .map(|(model, side)| {
                 format!(
-                    "refusal_fallback names {model} as a {side} model, but the loaded catalog \
+                    "{MODELS_KEY} names {model} as a {side} model, but the loaded catalog \
                      does not serve {FALLBACK_PROVIDER}/{model}; that mapping stays unused until \
                      a catalog refresh serves it"
                 )
@@ -243,16 +229,6 @@ fn validate_model_id(entry: &str, side: &str, model: &str) -> Result<(), String>
         ));
     }
     Ok(())
-}
-
-/// The `broca.jsonc` root keys this module reads, as the shape a JSON parser sees them. The
-/// parser above reads the raw object instead, so that a defective entry is refused by name;
-/// this view pins the root key and the entry type for that reading.
-#[derive(Deserialize)]
-#[cfg_attr(not(test), allow(dead_code))]
-struct BrocaConfigRefusalFallbackView {
-    #[serde(default)]
-    refusal_fallback: Option<BTreeMap<String, String>>,
 }
 
 #[cfg(test)]
@@ -291,7 +267,9 @@ mod tests {
             r#"{
             // Other config loaders own other root keys.
             "providers": {},
-            "refusal_fallback": {"claude-opus-5-5": "claude-opus-4-6",},
+            "anthropic_fallbacks": {"refusal_resend": {
+                "models": {"claude-opus-5-5": "claude-opus-4-6",},
+            }},
         }"#,
         )
         .unwrap();
@@ -308,48 +286,46 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_section_switches_the_fallback_off() {
-        let config = RefusalFallbackConfig::parse(r#"{"refusal_fallback": {}}"#).unwrap();
-        assert!(config.is_empty());
-        assert_eq!(config.target("claude-opus-5-5"), None);
+    fn an_empty_mapping_is_refused_by_name_even_when_disabled() {
+        for enabled in [false, true] {
+            let error = RefusalFallbackConfig::parse(&format!(
+                r#"{{"anthropic_fallbacks": {{"refusal_resend": {{"enabled": {enabled}, "models": {{}}}}}}}}"#
+            )).unwrap_err();
+            assert!(error.contains(MODELS_KEY), "{error}");
+            assert!(error.contains("empty"), "{error}");
+        }
     }
 
     #[test]
     fn a_mapping_to_itself_is_refused_naming_the_entry() {
         let error = RefusalFallbackConfig::parse(
-            r#"{"refusal_fallback": {"claude-opus-5": "claude-opus-5"}}"#,
+            r#"{"anthropic_fallbacks": {"refusal_resend": {"models": {"claude-opus-5": "claude-opus-5"}}}}"#,
         )
         .unwrap_err();
-        assert!(error.contains("refusal_fallback.claude-opus-5"), "{error}");
+        assert!(
+            error.contains(&format!("{MODELS_KEY}.claude-opus-5")),
+            "{error}"
+        );
         assert!(error.contains("itself"), "{error}");
     }
 
     #[test]
     fn a_malformed_entry_is_refused_naming_it() {
-        for (text, named) in [
+        for (models, named) in [
+            (r#"{"claude-opus-5": ""}"#, "claude-opus-5"),
+            (r#"{"": "claude-opus-4-8"}"#, "models."),
             (
-                r#"{"refusal_fallback": {"claude-opus-5": ""}}"#,
+                r#"{"claude-opus-5": "anthropic/claude-opus-4-8"}"#,
                 "claude-opus-5",
             ),
-            (
-                r#"{"refusal_fallback": {"": "claude-opus-4-8"}}"#,
-                "refusal_fallback.",
-            ),
-            (
-                r#"{"refusal_fallback": {"claude-opus-5": "anthropic/claude-opus-4-8"}}"#,
-                "claude-opus-5",
-            ),
-            (
-                r#"{"refusal_fallback": {"claude-opus-5": 42}}"#,
-                "refusal_fallback",
-            ),
-            (r#"{"refusal_fallback": null}"#, "refusal_fallback"),
-            (
-                r#"{"refusal_fallback": ["claude-opus-5"]}"#,
-                "refusal_fallback",
-            ),
+            (r#"{"claude-opus-5": 42}"#, "refusal_resend"),
+            ("null", "refusal_resend"),
+            (r#"["claude-opus-5"]"#, "refusal_resend"),
         ] {
-            let error = RefusalFallbackConfig::parse(text).unwrap_err();
+            let text = format!(
+                r#"{{"anthropic_fallbacks": {{"refusal_resend": {{"models": {models}}}}}}}"#
+            );
+            let error = RefusalFallbackConfig::parse(&text).unwrap_err();
             assert!(error.contains(named), "{text}: {error}");
         }
     }
@@ -389,7 +365,10 @@ mod tests {
         let default = RefusalFallbackConfig::parse("{}").unwrap();
         assert!(!default.is_enabled());
         assert_eq!(default.offer_for("anthropic", "claude-opus-5-5"), None);
-        let on = RefusalFallbackConfig::parse(r#"{"anthropic_refusal_fallback": true}"#).unwrap();
+        let on = RefusalFallbackConfig::parse(
+            r#"{"anthropic_fallbacks": {"refusal_resend": {"enabled": true}}}"#,
+        )
+        .unwrap();
         assert!(on.is_enabled());
         assert_eq!(
             on.offer_for("anthropic", "claude-opus-5-5"),
@@ -397,23 +376,28 @@ mod tests {
         );
         assert_eq!(on.offer_for("anthropic", "claude-haiku-5-5"), None);
         assert_eq!(on.offer_for("anthropic-platform", "claude-opus-5-5"), None);
+        // The server-side switch alone offers no client-side fallback: the two are separate.
+        let other_switch =
+            RefusalFallbackConfig::parse(r#"{"anthropic_fallbacks": {"server_side": true}}"#)
+                .unwrap();
+        assert!(!other_switch.is_enabled());
+        assert_eq!(other_switch.offer_for("anthropic", "claude-opus-5-5"), None);
         let off = RefusalFallbackConfig::parse(
-            r#"{"anthropic_refusal_fallback": false, "refusal_fallback": {"claude-opus-5": "claude-opus-4-8"}}"#,
+            r#"{"anthropic_fallbacks": {"refusal_resend": {"enabled": false, "models": {"claude-opus-5": "claude-opus-4-8"}}}}"#,
         )
         .unwrap();
         assert_eq!(off.offer_for("anthropic", "claude-opus-5"), None);
-        let error =
-            RefusalFallbackConfig::parse(r#"{"anthropic_refusal_fallback": "yes"}"#).unwrap_err();
-        assert!(error.contains(SWITCH_KEY), "{error}");
+        let error = RefusalFallbackConfig::parse(
+            r#"{"anthropic_fallbacks": {"refusal_resend": {"enabled": "yes"}}}"#,
+        )
+        .unwrap_err();
+        assert!(error.contains("refusal_resend"), "{error}");
     }
 
     #[test]
-    fn the_file_view_accepts_the_key_the_parser_reads() {
-        let view: BrocaConfigRefusalFallbackView =
-            serde_json::from_str(r#"{"refusal_fallback": {"a": "b"}}"#).unwrap();
-        assert_eq!(
-            view.refusal_fallback.unwrap(),
-            BTreeMap::from([("a".to_string(), "b".to_string())])
-        );
+    fn the_legacy_root_mapping_is_refused_by_name() {
+        let error =
+            RefusalFallbackConfig::parse(r#"{"refusal_fallback": {"a": "b"}}"#).unwrap_err();
+        assert!(error.contains("refusal_fallback"), "{error}");
     }
 }

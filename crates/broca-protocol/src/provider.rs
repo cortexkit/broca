@@ -80,6 +80,15 @@ pub enum ProviderControl {
         /// (fast mode is not a service tier there). Absent when the response had none.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         speed_used: Option<String>,
+        /// The wire model id that produced this response when the provider handed the request
+        /// to another model itself (Anthropic server-side fallback) and that model differs from
+        /// the requested one. Absent when the requested model answered.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        served_model: Option<String>,
+        /// The response's `usage.iterations`, kept verbatim when the provider reported them.
+        /// One entry per model that ran, each with its own token counts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage_iterations: Option<Vec<crate::usage::UsageIteration>>,
     },
     /// Provider stream finished (terminal, non-error).
     Finished {

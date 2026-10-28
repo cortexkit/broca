@@ -333,7 +333,7 @@ impl ServingModel {
             tool_call: model.capabilities.tool_call,
             structured_output: model.capabilities.structured_output,
             reasoning_options: model.reasoning_options.clone(),
-            server_side_fallback: None,
+            server_side_fallback: model.server_side_fallback,
             // The legacy snapshot path carries no fusiform mode rates, so it offers no tier
             // that needs one.
             priced_modes: Vec::new(),
@@ -2576,6 +2576,15 @@ fn global_slot() -> &'static RwLock<Arc<CatalogCache>> {
 /// Replace the process catalog cache during module startup, after its LKG has been loaded.
 pub fn install_global_catalog_cache(cache: Arc<CatalogCache>) {
     *global_slot().write().expect("global catalog lock poisoned") = cache;
+}
+
+/// The process-wide catalog slot. Every test that installs its own catalog takes this gate for
+/// as long as it resolves, because the slot itself is shared by the whole test binary: without
+/// it, two tests' catalogs can replace each other between an install and the lookup it was
+/// meant to answer. Production installs once from the fusiform poll and needs no gate.
+pub fn test_catalog_lock() -> &'static std::sync::Mutex<()> {
+    static GATE: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 pub fn global_catalog_cache() -> Arc<CatalogCache> {

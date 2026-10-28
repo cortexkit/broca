@@ -7,8 +7,10 @@
 //! broca matches the vectors exactly on the persona: the billing block (apart from
 //! `cc_prev_req`, which broca does not send), the `cch` rule, the URL, every Claude Code header
 //! and its value and order, `metadata.user_id`, and the top-level key order. Request-construction
-//! differences are pinned in `DIFFERENCES`. The raw vector betas are exact; the render comparison
-//! omits only OpenCode's host streaming beta and its server-side fallback feature.
+//! differences are pinned in `DIFFERENCES`. The vectors that carry `fallbacks` also carry
+//! OpenCode's server-side fallback opt-in, which broca sends when the run's frozen config opts in
+//! (an OAuth episode the catalog marks capable), so those vectors match exactly too, beta
+//! included. The render comparison omits only OpenCode's host streaming beta.
 
 use broca_protocol::{
     content::{ContentBlock, Message, Role, ToolCall, ToolOutput, ToolResult},
@@ -330,6 +332,9 @@ fn broca_frozen(case: &Value, vectors: &Value) -> FrozenRenderConfig {
         },
     });
     frozen.speed = sent["speed"].as_str().map(str::to_string);
+    // OpenCode sends `fallbacks: "default"` on these vectors, which is broca's server-side
+    // fallback opt-in: an OAuth episode whose catalog row states the capability freezes it.
+    frozen.server_side_fallback = sent.get("fallbacks").and_then(Value::as_str) == Some("default");
     // A `json_schema` output is broca's structured output in its strict final-text form.
     if let Some(schema) = sent.pointer("/output_config/format/schema") {
         use broca_protocol::structured_output::{
@@ -365,8 +370,7 @@ struct Difference {
 /// - `messages` / `tools` / top-level `cache_control`: anthropic-auth sets `cache_control` by its
 ///   own cache mode (its automatic mode is one top-level marker) and prefixes tool names `mcp_`;
 ///   broca keeps caller tool names and its own breakpoint policy.
-/// - `diagnostics`, `fallbacks`, the `server-side-fallback` beta: OpenCode cache diagnostics and
-///   server-side fallback, which broca does not send.
+/// - `diagnostics`: OpenCode's cache diagnostics, which broca does not send.
 /// - `fine-grained-tool-streaming-2025-05-14`: a beta the OpenCode host sends, passed through;
 ///   broca has no host betas.
 /// - `cc_prev_req` (checked in the billing test): broca does not send it.
@@ -380,17 +384,17 @@ const DIFFERENCES: [Difference; 7] = [
     Difference {
         id: "fable51-first-turn",
         differing_fields: &["messages", "system"],
-        vector_only_keys: &["diagnostics", "fallbacks"],
+        vector_only_keys: &["diagnostics"],
     },
     Difference {
         id: "opus55-continuation-replayed-thinking",
         differing_fields: &["messages", "system", "thinking"],
-        vector_only_keys: &["diagnostics", "fallbacks"],
+        vector_only_keys: &["diagnostics"],
     },
     Difference {
         id: "opus55-effort-change",
         differing_fields: &["messages", "system"],
-        vector_only_keys: &["diagnostics", "fallbacks"],
+        vector_only_keys: &["diagnostics"],
     },
     Difference {
         id: "sonnet55-between-tools",
@@ -561,20 +565,21 @@ fn broca_renders_each_vectors_persona_exactly() {
             persona::select_betas(&ours, &frozen.wire_model_id, &[]),
             "{id}: betas follow from the sent body"
         );
-        // OpenCode supplies a host streaming beta and enables fallbacks=default; broca has
-        // neither input. Every other beta, including JSON-schema output, must match in order.
+        // OpenCode supplies a host streaming beta, which broca has no input for; every other
+        // beta, including the server-side fallback and JSON-schema output betas, must match in
+        // order. The fallback beta is derived from the body above, never added directly.
         let reference_betas = header(&case, "anthropic-beta")
             .unwrap()
             .split(',')
-            .filter(|beta| {
-                !matches!(
-                    *beta,
-                    "fine-grained-tool-streaming-2025-05-14" | "server-side-fallback-2026-07-01"
-                )
-            })
+            .filter(|beta| *beta != "fine-grained-tool-streaming-2025-05-14")
             .collect::<Vec<_>>()
             .join(",");
         assert_eq!(ours_beta, reference_betas, "{id}: production beta list");
+        assert_eq!(
+            ours_beta.contains("server-side-fallback-2026-07-01"),
+            ours["fallbacks"] == "default",
+            "{id}: the fallback beta follows from the body"
+        );
 
         // Transport-owned headers (Connection, Host, Accept-Encoding, Content-Length) are the
         // HTTP client's; the machine-dependent and per-request ones are compared by form.

@@ -95,6 +95,8 @@ impl Provider for TurnModel {
                 finish_reason: reason,
                 service_tier_used: None,
                 speed_used: None,
+                served_model: None,
+                usage_iterations: None,
             }),
             NormalizedEvent::Control(ProviderControl::Finished {
                 usage: Usage::default(),

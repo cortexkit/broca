@@ -906,4 +906,26 @@ mod gated {
             "Anthropic cross-model",
         );
     }
+
+    /// With both content-filter fallback switches off, an Anthropic request is exactly the
+    /// request this renderer sent before either layer existed: the frozen version stays the one
+    /// the pinned goldens were recorded at, and the bytes equal the golden (which this branch
+    /// did not touch). The version is asserted directly because it is what a later resume
+    /// compares: recording a newer one for unchanged bytes is what would refuse a rollback.
+    #[test]
+    fn both_switches_off_render_the_bytes_and_version_the_goldens_were_pinned_at() {
+        let pinned_at: u32 = GOLDEN_VERSION.trim().parse().expect("a version number");
+        let frozen = anthropic_frozen_config("claude-opus-4-8");
+        assert!(!frozen.server_side_fallback, "nothing opts in by default");
+        assert_eq!(frozen.renderer_version, pinned_at);
+        assert_eq!(
+            AnthropicMessages.render(&frozen, &fixed_request()),
+            GOLDEN.as_bytes()
+        );
+        // The opt-in is what moves the version, and it is the only thing that does.
+        assert_ne!(
+            broca_provider::families::anthropic_renderer_version(true),
+            pinned_at
+        );
+    }
 }

@@ -1169,6 +1169,9 @@ impl StreamNormalizer for GeminiNormalizer {
                     .clone()
                     .or_else(|| self.body_service_tier.clone()),
                 speed_used: None,
+                // No non-Anthropic family reports a server-side fallback or per-model usage.
+                served_model: None,
+                usage_iterations: None,
             }),
             NormalizedEvent::Control(ProviderControl::Finished {
                 usage: self.usage,

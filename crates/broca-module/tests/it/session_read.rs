@@ -492,6 +492,8 @@ fn tool_step() -> Vec<NormalizedEvent> {
             finish_reason: FinishReason::ToolCalls,
             service_tier_used: None,
             speed_used: None,
+            served_model: None,
+            usage_iterations: None,
         }),
         ctrl(ProviderControl::Finished {
             usage: usage(),
@@ -515,6 +517,8 @@ fn text_step(text: &str) -> Vec<NormalizedEvent> {
             finish_reason: FinishReason::Stop,
             service_tier_used: None,
             speed_used: None,
+            served_model: None,
+            usage_iterations: None,
         }),
         ctrl(ProviderControl::Finished {
             usage: usage(),

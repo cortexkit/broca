@@ -76,6 +76,8 @@ fn text_step_with_usage(text: &str, step_usage: Usage) -> Vec<NormalizedEvent> {
             finish_reason: FinishReason::Stop,
             service_tier_used: None,
             speed_used: None,
+            served_model: None,
+            usage_iterations: None,
         }),
         ctrl(ProviderControl::Finished {
             usage: step_usage,
@@ -101,6 +103,8 @@ fn length_step(text: &str) -> Vec<NormalizedEvent> {
             finish_reason: FinishReason::Length,
             service_tier_used: None,
             speed_used: None,
+            served_model: None,
+            usage_iterations: None,
         }),
         ctrl(ProviderControl::Finished {
             usage: usage(10, 4096),
@@ -137,6 +141,8 @@ fn tool_step(calls: &[(&str, &str, serde_json::Value)]) -> Vec<NormalizedEvent> 
             finish_reason: FinishReason::ToolCalls,
             service_tier_used: None,
             speed_used: None,
+            served_model: None,
+            usage_iterations: None,
         }),
         ctrl(ProviderControl::Finished {
             usage: usage(10, 8),
@@ -2972,6 +2978,8 @@ async fn run_usage_accumulates_across_steps() {
                     finish_reason,
                     service_tier_used: None,
                     speed_used: None,
+                    served_model: None,
+                    usage_iterations: None,
                 }),
                 NormalizedEvent::Control(ProviderControl::Finished { finish_reason, .. }) => {
                     ctrl(ProviderControl::Finished {
@@ -2999,6 +3007,8 @@ async fn run_usage_accumulates_across_steps() {
                     finish_reason,
                     service_tier_used: None,
                     speed_used: None,
+                    served_model: None,
+                    usage_iterations: None,
                 }),
                 NormalizedEvent::Control(ProviderControl::Finished { finish_reason, .. }) => {
                     ctrl(ProviderControl::Finished {
@@ -5676,6 +5686,24 @@ fn fallback_provider(scripts: Vec<Vec<NormalizedEvent>>) -> StubProvider {
     StubProvider::new(scripts).with_refusal_fallback(fallback_handle(), Some(1_000_000))
 }
 
+/// Mark a step as served by Anthropic's own server-side fallback: the provider reported a wire
+/// model other than the one asked for, which is what the normalizer turns into `served_model`.
+fn served_by_server_side_fallback(
+    mut step: Vec<NormalizedEvent>,
+    served_model: &str,
+) -> Vec<NormalizedEvent> {
+    for event in &mut step {
+        if let NormalizedEvent::Control(ProviderControl::StepFinished {
+            served_model: served,
+            ..
+        }) = event
+        {
+            *served = Some(served_model.to_string());
+        }
+    }
+    step
+}
+
 /// An in-memory WAL that remembers how many records the last sync covered.
 #[derive(Clone, Default)]
 struct SyncTrackingWalStore {
@@ -6113,6 +6141,162 @@ async fn fallback_schedule_doubles_and_returns() {
     assert_eq!(
         replayed.refusal_fallback.map(|schedule| schedule.phase),
         Some(broca_wal::RefusalFallbackPhase::Probe { clean: 1 })
+    );
+}
+
+/// A source reply Anthropic's own server-side fallback served is not a clean reply from the
+/// source: the service did not answer, it handed the request on. It must therefore break the
+/// client-side schedule's streak of clean source responses instead of advancing it. Both layers
+/// are on here, since that is the only shape in which they can interact.
+///
+/// One refusal starts a full round (10 fallback steps), then the source is probed once and the
+/// handoff serves that reply. The probe therefore records 0; a reply counted as clean would
+/// record 1.
+#[tokio::test]
+async fn server_side_fallback_reply_does_not_count_toward_the_clean_streak() {
+    use broca_core::refusal_fallback::StepRoute::{Fallback, Source};
+    let mut scripts = vec![refusal_step("no")];
+    let mut expected = vec![Source];
+    for _ in 0..broca_core::refusal_fallback::ROUND_STEPS {
+        scripts.push(tool_step(&[("c1", "edit", json!({"path": "1"}))]));
+        expected.push(Fallback);
+    }
+    // The probe: Anthropic itself hands this reply to another model.
+    scripts.push(served_by_server_side_fallback(
+        text_step("handed on"),
+        "claude-opus-4-8",
+    ));
+    expected.push(Source);
+
+    let wal = SyncTrackingWalStore::default();
+    let provider = fallback_provider(scripts);
+    let plane = StubToolPlane::new().with_canned_text("edit", "edited");
+    let (summary, _) = drive_fallback(
+        req(
+            "refusal-server-side",
+            vec![tool("edit", ExecutionMode::Parallel)],
+            vec![],
+        ),
+        &provider,
+        &plane,
+        &wal,
+        "rf3b",
+    )
+    .await;
+    assert_eq!(summary.reason, RunFinishReason::Completed);
+    assert_eq!(provider.routes(), expected);
+
+    let records = wal_records(&wal);
+    let served: Vec<Option<String>> = step_fallbacks(&records)
+        .into_iter()
+        .map(|(_, fallback, _)| fallback.served_model.clone())
+        .collect();
+    // The probe reply is the run's last step, so it is recorded and says what served it; no
+    // other step in this run was handed off.
+    assert_eq!(
+        served.last(),
+        Some(&Some("claude-opus-4-8".to_string())),
+        "the handed-off probe reply names the model that produced it: {served:?}"
+    );
+    assert!(
+        served[..served.len() - 1].iter().all(Option::is_none),
+        "nothing else in this run was handed off: {served:?}"
+    );
+    let replayed = replay(&records).expect("replay");
+    assert_eq!(
+        replayed.refusal_fallback.map(|schedule| schedule.phase),
+        Some(broca_wal::RefusalFallbackPhase::Probe { clean: 0 }),
+        "the handoff broke the streak instead of counting as a clean source reply"
+    );
+}
+
+/// A refused server-side handoff is still eligible for the client backstop, and its billed
+/// attempt retains the server's model attribution even though its content is discarded.
+#[tokio::test]
+async fn a_refused_server_side_fallback_keeps_its_served_model_before_resend() {
+    let provider = fallback_provider(vec![
+        served_by_server_side_fallback(refusal_step("no"), "claude-haiku-5-5"),
+        text_step("answered"),
+    ]);
+    let wal = SyncTrackingWalStore::default();
+    let (summary, _) = drive_fallback(
+        req("refused-handoff", vec![], vec![]),
+        &provider,
+        &StubToolPlane::new(),
+        &wal,
+        "rf3d",
+    )
+    .await;
+    assert_eq!(summary.reason, RunFinishReason::Completed);
+    assert_eq!(
+        provider.routes(),
+        vec![
+            broca_core::refusal_fallback::StepRoute::Source,
+            broca_core::refusal_fallback::StepRoute::Fallback
+        ]
+    );
+    let records = wal_records(&wal);
+    let refused = refused_records(&records);
+    assert!(
+        matches!(refused.as_slice(), [WalRecord::ModelStepRefused { served_model: Some(model), .. }] if model == "claude-haiku-5-5")
+    );
+}
+
+/// A handoff block breaks an existing streak even without distinct served-model attribution,
+/// as happens when the reported target is an alias of the requested model.
+#[tokio::test]
+async fn server_side_fallback_block_breaks_an_existing_clean_streak() {
+    use broca_core::refusal_fallback::StepRoute::{Fallback, Source};
+    let mut scripts = vec![refusal_step("no")];
+    let mut expected = vec![Source];
+    for _ in 0..broca_core::refusal_fallback::ROUND_STEPS {
+        scripts.push(tool_step(&[("c1", "edit", json!({"path": "1"}))]));
+        expected.push(Fallback);
+    }
+    scripts.push(tool_step(&[("probe", "edit", json!({"path": "2"}))]));
+    expected.push(Source);
+    let mut handed_off = text_step("handed on");
+    for event in &mut handed_off {
+        if let NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) = event {
+            message.content.insert(
+                0,
+                ContentBlock::ProviderFallback {
+                    from_model: "claude-opus-5-5".into(),
+                    to_model: "claude-opus-5-5-20260101".into(),
+                },
+            );
+        }
+    }
+    scripts.push(handed_off);
+    expected.push(Source);
+    let wal = SyncTrackingWalStore::default();
+    let provider = fallback_provider(scripts);
+    let plane = StubToolPlane::new().with_canned_text("edit", "edited");
+    let (summary, _) = drive_fallback(
+        req(
+            "refusal-server-block",
+            vec![tool("edit", ExecutionMode::Parallel)],
+            vec![],
+        ),
+        &provider,
+        &plane,
+        &wal,
+        "rf3c",
+    )
+    .await;
+    assert_eq!(summary.reason, RunFinishReason::Completed);
+    assert_eq!(provider.routes(), expected);
+    let records = wal_records(&wal);
+    let steps = step_fallbacks(&records);
+    assert_eq!(
+        phase(&steps[steps.len() - 2].1),
+        Some(broca_wal::RefusalFallbackPhase::Probe { clean: 1 })
+    );
+    assert!(steps.last().unwrap().1.served_model.is_none());
+    assert_eq!(
+        replay(&records).unwrap().refusal_fallback.unwrap().phase,
+        broca_wal::RefusalFallbackPhase::Probe { clean: 0 },
+        "the handoff block breaks the streak independently of served_model"
     );
 }
 

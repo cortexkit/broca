@@ -23,11 +23,13 @@ use broca_protocol::{
     usage::Usage,
 };
 
+use crate::wire::UsageIteration;
+use serde_json::Value;
+
 // NOTE: `redacted_thinking` is mapped to a DISTINCT `ContentBlock::RedactedReasoning`
 // (NOT `Reasoning.signature`); its encrypted `data` blob is preserved BYTE-VERBATIM
 // so it can be echoed back exactly on the next turn (Anthropic cache/multi-turn
 // requirement). See the content.rs TODO for the request-side round-trip.
-use serde_json::Value;
 
 // `NormalizedEvent` is the canonical type from broca-protocol (re-exported by this
 // crate's lib.rs); the normalizer produces it directly.
@@ -98,6 +100,13 @@ enum BlockBuf {
         input_json: String,
         start_input: Value,
     },
+    /// Anthropic's server-side fallback handoff: the runtime switched the response from one
+    /// model to another here. Neither signed nor reasoning, so it is kept as reported and
+    /// rendered back only to a target that opted in.
+    Fallback {
+        from_model: String,
+        to_model: String,
+    },
 }
 
 /// Streaming normalizer for ONE Anthropic message (= one step). Construct with
@@ -123,6 +132,15 @@ pub struct AnthropicNormalizer {
     /// `message.input_transformations` from `message_start`, verbatim; `None` when the
     /// response did not carry the field (it is present only under the thinking-binding beta).
     input_transformations: Option<Vec<broca_protocol::InputTransformation>>,
+    /// `message.model` from `message_start`: the model the provider says it served. Stays
+    /// `None` when the response names no model.
+    reported_model: Option<String>,
+    /// `usage.iterations` from the last event that reported them, verbatim. A server-side
+    /// fallback splits a response into one iteration per model it ran.
+    usage_iterations: Option<Vec<UsageIteration>>,
+    /// The wire model id the caller's request asked for. A response that names a different
+    /// model was served by a server-side fallback, and only then is `served_model` reported.
+    requested_model: Option<String>,
     /// Drop blocks the stream never finished when the response is a refusal that came after
     /// at least one completed tool call; see [`Self::with_refusal_tool_use_trim`].
     trim_refusal_after_tool_use: bool,
@@ -145,8 +163,19 @@ impl AnthropicNormalizer {
             service_tier_used: None,
             speed_used: None,
             input_transformations: None,
+            reported_model: None,
+            usage_iterations: None,
+            requested_model: None,
             trim_refusal_after_tool_use: false,
         }
+    }
+
+    /// Record the wire model id this step's request asked for, so a response naming another
+    /// model can be reported as served by a fallback. Absent means the id is unknown, and then
+    /// no response is reported as served by a fallback.
+    pub fn with_requested_model(mut self, requested_model: impl Into<String>) -> Self {
+        self.requested_model = Some(requested_model.into());
+        self
     }
 
     /// For a request whose episode froze a client-side refusal fallback: when the response
@@ -204,6 +233,12 @@ impl AnthropicNormalizer {
                 let msg = v.get("message");
                 if let Some(id) = msg.and_then(|m| m.get("id")).and_then(Value::as_str) {
                     self.message_id = Some(MessageId(id.to_owned()));
+                }
+                // The model the provider says produced this response. It is recorded for
+                // attribution only and never rendered; a later `message_delta` that names no
+                // model leaves it standing, like the token counts below.
+                if let Some(model) = msg.and_then(|m| m.get("model")).and_then(Value::as_str) {
+                    self.reported_model = Some(model.to_owned());
                 }
                 if let Some(u) = msg.and_then(|m| m.get("usage")) {
                     self.merge_usage(u);
@@ -283,6 +318,39 @@ impl AnthropicNormalizer {
                             input_json: String::new(),
                             start_input: cb.get("input").cloned().unwrap_or(Value::Null),
                         },
+                        // Anthropic's server-side fallback handoff. Its model ids must match
+                        // `^claude-[a-z0-9-]+$` and be at most 128 characters because they are
+                        // rendered back into a later request; a block whose ids do not is
+                        // dropped with a WARN instead of being stored, so nothing unvalidated
+                        // can reach a request body.
+                        Some("fallback") => {
+                            let model = |side: &str| {
+                                cb.get(side)
+                                    .and_then(|s| s.get("model"))
+                                    .and_then(Value::as_str)
+                            };
+                            match (model("from"), model("to")) {
+                                (Some(from_model), Some(to_model))
+                                    if is_fallback_wire_model(from_model)
+                                        && is_fallback_wire_model(to_model) =>
+                                {
+                                    BlockBuf::Fallback {
+                                        from_model: from_model.to_owned(),
+                                        to_model: to_model.to_owned(),
+                                    }
+                                }
+                                _ => {
+                                    tracing::warn!(
+                                        target: "anthropic_normalize",
+                                        from = model("from"),
+                                        to = model("to"),
+                                        "dropped a server-side fallback block whose model ids are \
+                                         missing or malformed"
+                                    );
+                                    return Ok(out);
+                                }
+                            }
+                        }
                         _ => return Ok(out), // unknown block type: ignore
                     };
                     self.blocks.insert(idx, buf);
@@ -395,6 +463,8 @@ impl AnthropicNormalizer {
                 if !self.started {
                     return Err(NormalizeError::NoActiveMessage);
                 }
+                // Assembly drains the block buffer, including the strongest served-model signal.
+                let served_model = self.served_model();
                 let message = self.assemble_message()?;
                 self.completed = true;
                 out.extend(self.arguments_guard.event());
@@ -407,6 +477,8 @@ impl AnthropicNormalizer {
                     finish_reason: self.finish_reason,
                     service_tier_used: self.service_tier_used.clone(),
                     speed_used: self.speed_used.clone(),
+                    served_model,
+                    usage_iterations: self.usage_iterations.clone(),
                 }));
                 out.push(NormalizedEvent::Control(ProviderControl::Finished {
                     usage: self.usage,
@@ -493,6 +565,30 @@ impl AnthropicNormalizer {
         }
         if let Some(speed) = u.get("speed").and_then(Value::as_str) {
             self.speed_used = Some(speed.to_owned());
+        }
+        // A response that ran more than one model reports one entry per model here. They are
+        // recorded verbatim, not summed: the top-level counts above stay the provider's own
+        // total, and deciding later whether that total is the sum of these entries or only the
+        // last one needs no re-read of the wire.
+        if let Some(entries) = u.get("iterations").and_then(Value::as_array) {
+            self.usage_iterations = Some(
+                entries
+                    .iter()
+                    .map(|entry| {
+                        serde_json::from_value::<UsageIteration>(entry.clone()).unwrap_or(
+                            UsageIteration {
+                                kind: None,
+                                model: None,
+                                input_tokens: None,
+                                output_tokens: None,
+                                cache_creation_input_tokens: None,
+                                cache_read_input_tokens: None,
+                                other: Default::default(),
+                            },
+                        )
+                    })
+                    .collect(),
+            );
         }
         let g = |k: &str| u.get(k).and_then(Value::as_u64);
         if let Some(x) = g("input_tokens") {
@@ -606,6 +702,13 @@ impl AnthropicNormalizer {
                         provider_format: None,
                     })
                 }
+                BlockBuf::Fallback {
+                    from_model,
+                    to_model,
+                } => content.push(ContentBlock::ProviderFallback {
+                    from_model,
+                    to_model,
+                }),
                 BlockBuf::ToolUse {
                     id,
                     name,
@@ -648,6 +751,67 @@ impl AnthropicNormalizer {
             content,
         })
     }
+
+    /// The wire model that produced this response, when the runtime handed the request on to a
+    /// different model (server-side fallback). `None` means the requested model answered, which
+    /// is the ordinary case and what keeps an ordinary step's record byte-identical.
+    ///
+    /// The handoff block is the strongest report, then the last fallback iteration, then a
+    /// `message.model` that names another model. A `message.model` that is only a dated alias of
+    /// the requested id is the same model, so it does not count.
+    fn served_model(&self) -> Option<String> {
+        let handoff = self.blocks.values().rev().find_map(|buf| match buf {
+            BlockBuf::Fallback { to_model, .. } => Some(to_model.clone()),
+            _ => None,
+        });
+        let iteration = self
+            .usage_iterations
+            .iter()
+            .flatten()
+            .rev()
+            .find(|entry| entry.kind.as_deref() == Some("fallback_message"))
+            .and_then(|entry| entry.model.clone());
+        let served = handoff.or(iteration).or_else(|| {
+            self.requested_model.as_ref()?;
+            self.reported_model.clone()
+        })?;
+        if self
+            .requested_model
+            .as_deref()
+            .is_some_and(|requested| is_alias_of(&served, requested))
+        {
+            None
+        } else {
+            Some(served)
+        }
+    }
+}
+
+/// Whether `model` names the same model as `requested`: equal, or the requested id followed by
+/// a dated suffix (`-20260101`) that the provider appends to report the exact snapshot it ran.
+/// Anything else is a different model.
+fn is_alias_of(model: &str, requested: &str) -> bool {
+    match model.strip_prefix(requested) {
+        Some("") => true,
+        Some(suffix) => {
+            let suffix = suffix.trim_start_matches('-');
+            suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// Whether `model` is a well-formed Anthropic model id: `^claude-[a-z0-9-]+$`, at most 128
+/// characters — the grammar the handoff block's model ids must satisfy to be rendered back.
+fn is_fallback_wire_model(model: &str) -> bool {
+    let Some(rest) = model.strip_prefix("claude-") else {
+        return false;
+    };
+    !rest.is_empty()
+        && model.len() <= 128
+        && rest
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 fn block_index(v: &Value) -> usize {

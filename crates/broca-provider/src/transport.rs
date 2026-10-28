@@ -5352,6 +5352,8 @@ mod tests {
                     finish_reason: FinishReason::Stop,
                     service_tier_used: None,
                     speed_used: None,
+                    served_model: None,
+                    usage_iterations: None,
                 }),
             ])
         }

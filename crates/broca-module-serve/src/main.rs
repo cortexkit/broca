@@ -225,12 +225,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let account_selection =
         broca_module_serve::account_routing::AccountSelectionConfig::load_default_path()
             .map_err(ServeIoError)?;
-    // The `refusal_fallback` section: which model a refused step is re-sent to. A malformed
-    // section refuses boot by name, like the defaults above: a mapping that was silently
-    // dropped would only be noticed when a refusal happened and nothing switched.
-    let refusal_fallback =
-        broca_module_serve::refusal_fallback_config::RefusalFallbackConfig::load_default_path()
-            .map_err(ServeIoError)?;
+    // The operator switches for content-filter fallback, both layers under one key. A malformed
+    // block refuses boot by name, like the sections above; without one, both stay off.
+    let anthropic_fallbacks = broca_module_serve::config::AnthropicFallbackConfig::load_default()
+        .map_err(ServeIoError)?;
     let consumer_routes = ConsumerRoutes::resolve(
         std::env::var(broca_module_serve::consumer_routes::TOOL_MODULE_ENV)
             .ok()
@@ -430,7 +428,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         broca_subc::RouteOpenRetry::default_patience(),
     )))
     .with_provider_overrides(provider_overrides)
-    .with_refusal_fallback(refusal_fallback)
     .with_claude_code_install_id(
         match broca_module_serve::claude_code_identity::load_or_create_install_id(&state_root) {
             Ok(install_id) => Some(install_id),
@@ -445,6 +442,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let cache_table =
         broca_module_serve::CacheTtlTable::load_default_path().map_err(ServeIoError)?;
     executor_impl = executor_impl.with_cache_table(cache_table);
+    // Both content-filter fallback switches, read above with the other early config so the
+    // refusal mapping can take its own switch from the same block.
+    executor_impl = executor_impl.with_anthropic_fallbacks(anthropic_fallbacks);
     let charge_basis_table = Arc::new(ChargeBasisTable::load_default_path().map_err(ServeIoError)?);
     if let Some(notice) = charge_basis_table.ignored_version_notice() {
         tracing::warn!(target: "billing", "{notice}");
@@ -2748,10 +2748,6 @@ mod executor {
         /// Configured hosts change only the endpoint. Keeping them out of provider_base_url
         /// prevents them from disabling credentials and cache planning like the mock path.
         provider_overrides: broca_module_serve::provider_overrides::ProviderOverrides,
-        /// The operator's client-side refusal fallback: the `anthropic_refusal_fallback` switch
-        /// and the model each source model's refused steps are re-sent to. Consulted only when a
-        /// fresh episode is admitted; a resume keeps what its recorded config froze.
-        refusal_fallback: broca_module_serve::refusal_fallback_config::RefusalFallbackConfig,
         /// Vault access shared with the provider transport's in-step token refresher.
         /// Absent only for mock providers and executors not yet configured for real calls.
         vault: Option<Arc<VaultAuth>>,
@@ -2768,6 +2764,9 @@ mod executor {
         /// `broca_module_serve::claude_code_identity`). `None` admits Anthropic OAuth episodes
         /// without a persona, in the shape they had before it existed.
         claude_code_install_id: Option<String>,
+        /// The operator switches and refusal-resend model mapping for Anthropic OAuth runs.
+        /// Consulted only at admission; a resume keeps its recorded policy. Both switches default off.
+        anthropic_fallbacks: broca_module_serve::config::AnthropicFallbackConfig,
         /// Each session's pinned `cc_version` suffix once computed in this process (`None` when
         /// its WAL could not be read), so the WAL is read for it at most once per session.
         cc_suffix_memo: Arc<std::sync::Mutex<std::collections::HashMap<String, Option<String>>>>,
@@ -2818,13 +2817,12 @@ mod executor {
                 clock: broca_core::clock::Clock::default(),
                 provider_base_url,
                 provider_overrides: Default::default(),
-                // Off unless the boot config switches it on.
-                refusal_fallback: Default::default(),
                 vault: None,
                 context_management: Default::default(),
                 cache_table: CacheTtlTable::shipped_defaults(),
                 routing: None,
                 claude_code_install_id: None,
+                anthropic_fallbacks: Default::default(),
                 cc_suffix_memo: Default::default(),
                 cc_suffix_wal_bytes: Default::default(),
                 cc_prompt_memo: Default::default(),
@@ -2963,6 +2961,15 @@ mod executor {
             self
         }
 
+        /// Install the operator switches for Anthropic content-filter fallback.
+        pub fn with_anthropic_fallbacks(
+            mut self,
+            config: broca_module_serve::config::AnthropicFallbackConfig,
+        ) -> Self {
+            self.anthropic_fallbacks = config;
+            self
+        }
+
         pub fn with_hook_plane(mut self, hooks: Arc<broca_subc::SubcHookPlane>) -> Self {
             self.hooks = Some(hooks);
             self
@@ -3087,15 +3094,6 @@ mod executor {
             overrides: broca_module_serve::provider_overrides::ProviderOverrides,
         ) -> Self {
             self.provider_overrides = overrides;
-            self
-        }
-
-        /// Install the refusal-fallback switch and mapping loaded at boot.
-        pub fn with_refusal_fallback(
-            mut self,
-            config: broca_module_serve::refusal_fallback_config::RefusalFallbackConfig,
-        ) -> Self {
-            self.refusal_fallback = config;
             self
         }
 
@@ -4034,10 +4032,13 @@ mod executor {
                     .as_ref()
                     .map(|refresh| refresh.refresher.clone()),
                 structured_output: job.req.structured_output.as_ref().filter(|_| fresh_episode),
+                // Off unless an operator turned it on; a resume keeps its recorded value.
+                anthropic_server_side_fallback: self.anthropic_fallbacks.server_side,
                 // Offered only to a fresh episode, and only with the operator switch on; the
                 // catalog then decides whether the episode is eligible and freezes it.
                 refusal_fallback_model: self
-                    .refusal_fallback
+                    .anthropic_fallbacks
+                    .refusal_resend
                     .offer_for(
                         job.req.model.provider_module_id.as_str(),
                         job.req.model.model_id.as_str(),
@@ -4891,6 +4892,7 @@ mod executor {
                     media: false,
                     media_profile: None,
                     claude_code_persona: None,
+                    anthropic_server_side_fallback: false,
                     auth_method: method,
                     family_override,
                     project_id: None,
@@ -4920,6 +4922,7 @@ mod executor {
                 media: false,
                 media_profile: None,
                 claude_code_persona: None,
+                anthropic_server_side_fallback: false,
                 auth_method: Some(AuthMethod::Chatgpt),
                 family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
                 project_id: None,

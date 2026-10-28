@@ -36,6 +36,7 @@ fn frozen() -> FrozenRenderConfig {
         service_tier: None,
         service_tier_request: None,
         speed: None,
+        server_side_fallback: false,
         reasoning_echo: None,
         reasoning_content_required: false,
         tool_call_content_empty_string: false,
