@@ -82,14 +82,18 @@ impl WriterContext {
         // Recovery is already complete, but its surviving prefix must be synced before it is
         // advertised as durable. Read the log itself, never a stored sequence watermark.
         wal.sync()?;
-        let previous_writer_id = wal
-            .replay()?
-            .iter()
-            .rev()
-            .find_map(|frame| match frame.record {
-                WalRecord::WriterOpened { writer_id, .. } => Some(writer_id),
-                _ => None,
-            });
+        let path = wal
+            .log_path()
+            .map(std::path::Path::to_owned)
+            .unwrap_or_default();
+        let previous_writer_id =
+            broca_wal::access_counter::writer_open(&path, false, || wal.replay())?
+                .iter()
+                .rev()
+                .find_map(|frame| match frame.record {
+                    WalRecord::WriterOpened { writer_id, .. } => Some(writer_id),
+                    _ => None,
+                });
         let opened = WalRecord::WriterOpened {
             writer_id,
             previous_writer_id,
