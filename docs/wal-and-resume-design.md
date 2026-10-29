@@ -51,6 +51,25 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   A torn/corrupt TRAILING
   record (crash mid-append) is discarded (never committed); **non-tail
   corruption FAILS LOUD**.
+- **Version 4 recovery uses a published durability lower bound.** A checksum-valid
+  `.head` sidecar must belong to the embedded lineage, fit within the file, and
+  match the covered final version 4 frame's identity, sequence, writer and stamp.
+  Recovery still validates every covered frame; damage within that region refuses
+  rather than discarding synced history. After validating the bound, recovery
+  retains complete, checksum-valid contiguous frames until the first damaged
+  frame, then truncates that frame and everything after it, even if later pending
+  frames persisted out of order. The truncation is file-synced before opening the
+  append handle, counted, and logged with offsets/lengths only, never content.
+  A proof is a lower bound, not a deletion watermark: a crash after fsync but
+  before proof publication can leave already-dispatched tool intents beyond an
+  older proof. Keeping their intact prefix preserves indeterminate-call recovery
+  and prevents re-dispatch. The freshness stamp binds the proof to its frame;
+  elapsed wall-clock age does not invalidate an established durability barrier.
+  Missing, unreadable, torn, mismatched or overlong proofs cannot distinguish
+  pending damage from synced corruption, so recovery does not use proof-based
+  truncation there. Its availability cost is that an unsynced damaged tail
+  followed by intact data can still refuse to open when the sidecar did not
+  survive. Legacy framing, bytes, and recovery policy remain unchanged.
 - **`len` is capped + header-validated before allocation** — never allocate
   on `len` alone.
 - **`fence`** = the writer's lease-tenure epoch (§5), recorded for forensic correlation only;

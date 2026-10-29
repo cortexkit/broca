@@ -8,7 +8,9 @@
 
 mod scenarios;
 
-use broca_core::{outcome_unknown_result, FileWalStore, RunControl};
+use broca_core::{
+    outcome_unknown_result, reconcile_run_state, FileWalStore, RunControl, RunIndexState,
+};
 use broca_crash_harness::{
     drive, HarnessPlane, InFlight, KillPoint, KillReport, KillTrigger, LogImage, Render,
     RunnerHandle, ScriptedProvider, Suite,
@@ -20,7 +22,10 @@ use broca_protocol::{
     request::CallOptions,
     FinishReason, MessageId, RunId, ToolCallId, Usage,
 };
-use broca_wal::{DispatchOutcome, WalRecord};
+use broca_wal::{
+    head_proof::{sidecar_path, HeadProof, Publisher, SyncedPrefix},
+    DispatchOutcome, FileWal, Wal, WalConfig, WalRecord,
+};
 
 broca_crash_harness::crash_harness_child!(scenarios::by_name);
 
@@ -65,6 +70,88 @@ fn results_after(records: &[WalRecord], from: usize) -> Vec<(String, DispatchOut
             _ => None,
         })
         .collect()
+}
+
+#[tokio::test]
+async fn a_fsynced_intent_beyond_a_stale_head_proof_survives_open_and_resume_never_resends() {
+    let handle = RunnerHandle::new(scenarios::ONE_EDIT).await;
+    let kill = kill_after_intent_of(&handle, "t1").await;
+    let prefix = kill.durable.records();
+    let path = broca_crash_harness::wal_path(&kill.state_root, &scenarios::session());
+
+    // Keep the reference lineage while replacing its legacy records with v4.
+    std::fs::write(&path, &kill.durable.bytes[..kill.durable.end_of_records(0)]).unwrap();
+    let mut wal = FileWal::open(&path)
+        .unwrap()
+        .with_feature_floor(kill.state_root.join(broca_wal::FEATURE_FLOOR_FILENAME))
+        .with_wal_config(WalConfig::OVERHAUL)
+        .unwrap();
+    let (intent, before_intent) = prefix.split_last().unwrap();
+    assert!(
+        matches!(intent, WalRecord::ToolDispatchIntent { tool_call_id, .. } if tool_call_id == &t("t1"))
+    );
+    for record in before_intent {
+        wal.append(1, record, false).unwrap();
+    }
+    let mut publisher = Publisher::from_synced(SyncedPrefix::sync(&wal).unwrap()).unwrap();
+    publisher.publish(|| 0).unwrap();
+    let sidecar = std::fs::read(sidecar_path(&path)).unwrap();
+    let proof = HeadProof::decode(&sidecar).unwrap();
+
+    // Dispatch is allowed after this fsync, before a newer proof is published.
+    let intent_seq = wal.append(1, intent, true).unwrap();
+    assert!(intent_seq > proof.durable_seq);
+    let through_intent = std::fs::read(&path).unwrap();
+    let reference = handle.reference.log.records();
+    wal.append(1, &reference[prefix.len()], false).unwrap();
+    wal.append(1, &reference[prefix.len() + 1], false).unwrap();
+    drop(wal);
+    let mut damaged = std::fs::read(&path).unwrap();
+    let pending_end = LogImage::parse(damaged.clone())
+        .record_frame(prefix.len())
+        .unwrap()
+        .end;
+    damaged[pending_end - 1] ^= 1;
+    std::fs::write(&path, damaged).unwrap();
+
+    let reopened = FileWal::open(&path).unwrap();
+    assert_eq!(reopened.last_seq(), intent_seq);
+    assert_eq!(std::fs::read(&path).unwrap(), through_intent);
+    assert_eq!(std::fs::read(sidecar_path(&path)).unwrap(), sidecar);
+    assert_eq!(
+        reopened
+            .replay()
+            .unwrap()
+            .into_iter()
+            .map(|f| f.record)
+            .collect::<Vec<_>>(),
+        prefix
+    );
+    drop(reopened);
+
+    let store = FileWalStore::with_config(kill.state_root.join("wal"), WalConfig::OVERHAUL);
+    let provider = ScriptedProvider::for_scenario(&handle.scenario);
+    let plane = HarnessPlane::for_scenario(&handle.scenario);
+    let outcome = drive(
+        (handle.scenario.request)(),
+        (handle.scenario.control)(),
+        &kill.state_root,
+        &store,
+        &provider,
+        &plane,
+    )
+    .await;
+    assert_eq!(outcome.reason, RunFinishReason::Interrupted);
+    assert_eq!(provider.request_count(), 0);
+    assert!(plane.dispatched().is_empty());
+    let records = LogImage::read(&path).records();
+    assert_eq!(
+        results_after(&records, prefix.len()),
+        vec![("t1".into(), DispatchOutcome::Unknown)]
+    );
+    let status = reconcile_run_state(&records, "r").unwrap();
+    assert_eq!(status.state, RunIndexState::Interrupted);
+    assert_eq!(status.indeterminate_tool_calls, Some(vec![t("t1")]));
 }
 
 #[tokio::test]

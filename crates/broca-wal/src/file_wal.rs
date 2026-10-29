@@ -28,6 +28,14 @@ use broca_protocol::BindIdentity;
 
 pub const DEFAULT_MAX_READ_BYTES: u64 = 1024 * 1024 * 1024;
 
+static RECOVERY_TAIL_TRUNCATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Successful, file-synced recovery truncations in this process.
+pub fn recovery_tail_truncations() -> u64 {
+    RECOVERY_TAIL_TRUNCATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[path = "human_prompt_count.rs"]
 mod human_prompt_count;
 
@@ -950,10 +958,12 @@ impl FileWal {
                         file_size: size,
                     });
                 }
-                scan_prefix(
+                let proof = recovery_head_proof(&path, size);
+                scan_prefix_with_proof(
                     std::io::BufReader::new(file),
                     max_read_bytes,
                     |_| None::<()>,
+                    proof,
                 )?
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -983,6 +993,15 @@ impl FileWal {
                     .map_err(WalError::Io)?;
                 trunc.set_len(valid_end).map_err(WalError::Io)?;
                 trunc.sync_all().map_err(WalError::Io)?; // durable before appending after it
+                let truncations = RECOVERY_TAIL_TRUNCATIONS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                tracing::warn!(
+                    valid_end,
+                    discarded_bytes = meta.len() - valid_end,
+                    truncations,
+                    "WAL recovery durably truncated an incomplete append tail"
+                );
             }
         }
         let mut create_opts = OpenOptions::new();
@@ -1873,10 +1892,30 @@ fn read_up_to(file: &mut impl Read, bytes: &mut [u8]) -> Result<usize, WalError>
 /// Strictly decode one body at a time, retaining only the caller's selected value.
 /// Recovery needs the verified end and sequence, not all historical message bodies.
 fn scan_prefix<T>(
+    file: impl Read,
+    max_bytes: u64,
+    found: impl FnMut(&FramedRecord) -> Option<T>,
+) -> Result<PrefixScan<T>, WalError> {
+    scan_prefix_with_proof(file, max_bytes, found, None)
+}
+
+fn recovery_head_proof(path: &Path, file_size: u64) -> Option<crate::head_proof::HeadProof> {
+    let mut bytes = Vec::new();
+    File::open(crate::head_proof::sidecar_path(path))
+        .ok()?
+        .take(broca_wal_reader::proof::PROOF_LEN as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    crate::head_proof::HeadProof::decode(&bytes).filter(|proof| proof.durable_end <= file_size)
+}
+
+fn scan_prefix_with_proof<T>(
     mut file: impl Read,
     max_bytes: u64,
     mut found: impl FnMut(&FramedRecord) -> Option<T>,
+    mut proof: Option<crate::head_proof::HeadProof>,
 ) -> Result<PrefixScan<T>, WalError> {
+    let mut proven_end = None;
     let mut scan = PrefixScan {
         found: None,
         bytes_read: 0,
@@ -1937,6 +1976,29 @@ fn scan_prefix<T>(
                 validate_contiguous_sequence(scan.last_seq, 1, framed.seq)?;
                 scan.last_seq = Some(framed.seq);
                 scan.valid_end += consumed as u64;
+                if frame.get(4) != Some(&crate::framing::V4_FRAMING_VERSION) {
+                    // Legacy recovery must not acquire a different policy from a sidecar.
+                    proof = None;
+                    proven_end = None;
+                }
+                if let Some(head) = &proof {
+                    if scan.valid_end == head.durable_end
+                        && scan
+                            .lineage_id
+                            .is_some_and(|id| id.as_bytes() == head.lineage_id)
+                        && broca_wal_reader::frame::decode_header(&frame)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|header| {
+                                header.identity == head.frame_identity
+                                    && header.metadata.seq == head.durable_seq
+                                    && header.metadata.writer_id == head.writer_id
+                                    && header.metadata.appended_ms == head.appended_ms
+                            })
+                    {
+                        proven_end = Some(head.durable_end);
+                    }
+                }
                 if let Some(value) = found(&framed) {
                     scan.found = Some(value);
                     return Ok(scan);
@@ -1948,6 +2010,13 @@ fn scan_prefix<T>(
             } => {
                 fold_lineage_id(&mut scan.lineage_id, lineage_id)?;
                 scan.valid_end += consumed as u64;
+                if proof
+                    .as_ref()
+                    .is_some_and(|head| head.lineage_id != lineage_id.as_bytes())
+                {
+                    proof = None;
+                    proven_end = None;
+                }
             }
             DecodeStep::NewerWriter { ver, missing } => {
                 return Err(WalError::NewerWriter {
@@ -1956,7 +2025,30 @@ fn scan_prefix<T>(
                     missing,
                 });
             }
-            DecodeStep::Corrupt(_) | DecodeStep::TornTail => {
+            step @ (DecodeStep::Corrupt(_) | DecodeStep::TornTail) => {
+                if proven_end.is_some_and(|end| offset >= end)
+                    && !crate::framing::digest_verifies(&frame)
+                {
+                    // A proof follows fsync, so intact frames beyond an older proof may
+                    // already have caused effects (for example a dispatched tool intent).
+                    // Keep that contiguous prefix; only the first damaged frame and all
+                    // later pending bytes can be lost safely, even if later frames survived.
+                    return Ok(scan);
+                }
+                if proof.as_ref().is_some_and(|head| {
+                    offset < head.durable_end
+                        && scan
+                            .lineage_id
+                            .is_some_and(|id| id.as_bytes() == head.lineage_id)
+                }) {
+                    return Err(WalError::Corrupt {
+                        offset: offset as usize,
+                        source: match step {
+                            DecodeStep::Corrupt(source) => source,
+                            _ => FrameError::NonTailIncompleteFrame,
+                        },
+                    });
+                }
                 // Only the exceptional path reads ahead. A damaged length cannot tell
                 // us whether intact records follow it, so inspect the bounded suffix.
                 let before = frame.len();

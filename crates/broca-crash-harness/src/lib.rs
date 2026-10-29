@@ -667,3 +667,5 @@ pub fn resume_records(records: &[WalRecord]) -> usize {
         .filter(|record| matches!(record, WalRecord::ResumeStarted { .. }))
         .count()
 }
+#[cfg(all(test, unix))]
+mod v4_recovery_tests;
