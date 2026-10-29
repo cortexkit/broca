@@ -257,8 +257,8 @@ pub fn publish_unmapped(unmapped: Arc<UnmappedCredentials>) {
 }
 
 /// The published counters as `health.check` reports them, with `unmapped_credentials`: how
-/// many credentials in broca's latest vault listing lack the `provider_ids` or `auth_method`
-/// metadata account selection needs, and so are never offered to routing. `null` when this
+/// many in-scope credentials in broca's latest vault listing lack the `provider_ids` or
+/// recognized `auth_method` metadata account selection needs, and so are never offered to routing. `null` when this
 /// process asks no routing module (no vault credential source).
 pub fn published_metrics() -> Value {
     let Some(counters) = PUBLISHED.get() else {
@@ -269,6 +269,12 @@ pub fn published_metrics() -> Value {
         .get()
         .map_or(0, |unmapped| unmapped.count()));
     metrics
+}
+
+pub fn published_unmapped_credentials() -> BTreeMap<String, &'static str> {
+    PUBLISHED_UNMAPPED
+        .get()
+        .map_or_else(BTreeMap::new, |unmapped| unmapped.snapshot())
 }
 
 // ------------------------------------------------------------------------------------------
@@ -596,11 +602,23 @@ impl Candidates {
     }
 }
 
-/// Which account-selection metadata a listed credential lacks, or `None` when it has both.
+/// Which account-selection metadata a listed credential lacks, or `None` when it has both
+/// provider ids and a recognized authentication method.
 /// `auth_method` is derived by the vault for every LLM credential; `provider_ids` is set by the
 /// operator. A credential without either cannot be matched to a provider and method without
 /// guessing from its id, so it is not routed at all.
 pub fn unmapped_field(row: &ScopedCredential) -> Option<&'static str> {
+    if row
+        .auth_method
+        .as_deref()
+        .is_some_and(|method| AuthMethod::from_token(method).is_none())
+    {
+        return Some(if row.provider_ids.is_empty() {
+            "provider_ids and recognized auth_method"
+        } else {
+            "recognized auth_method"
+        });
+    }
     match (row.provider_ids.is_empty(), row.auth_method.is_none()) {
         (false, false) => None,
         (true, false) => Some("provider_ids"),
@@ -609,7 +627,23 @@ pub fn unmapped_field(row: &ScopedCredential) -> Option<&'static str> {
     }
 }
 
-/// The credentials of the latest vault listing that are unmapped (see [`unmapped_field`]),
+// Cursor's vault record is read only by insula for quota; no broca model route uses it
+// for authentication. Unknown or absent adapters remain in scope.
+const NON_MODEL_REFRESH_ADAPTERS: &[&str] = &["cursor"];
+
+pub fn metadata_in_chooser_scope(row: &ScopedCredential) -> bool {
+    row.auth_method
+        .as_deref()
+        .and_then(AuthMethod::from_token)
+        .map(selects_accounts)
+        .unwrap_or(true)
+        && !row
+            .refresh_adapter
+            .as_deref()
+            .is_some_and(|adapter| NON_MODEL_REFRESH_ADAPTERS.contains(&adapter))
+}
+
+/// The in-scope credentials of the latest vault listing that are unmapped (see [`unmapped_field`]),
 /// with the field each lacks. Each id is warned about once when it becomes unmapped, never per
 /// admission; one that gains its metadata leaves the set and is warned about again only if it
 /// loses it again.
@@ -624,6 +658,7 @@ impl UnmappedCredentials {
         let current: BTreeMap<String, &'static str> = listing
             .credentials
             .iter()
+            .filter(|row| metadata_in_chooser_scope(row))
             .filter_map(|row| unmapped_field(row).map(|missing| (row.id.clone(), missing)))
             .collect();
         let mut known = self.ids.lock().unwrap();
@@ -642,6 +677,10 @@ impl UnmappedCredentials {
     /// How many credentials of the latest listing are unmapped.
     pub fn count(&self) -> usize {
         self.ids.lock().unwrap().len()
+    }
+
+    pub fn snapshot(&self) -> BTreeMap<String, &'static str> {
+        self.ids.lock().unwrap().clone()
     }
 }
 

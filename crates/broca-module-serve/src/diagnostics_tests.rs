@@ -32,7 +32,7 @@ fn healthy(store: &broca_store::SqliteStore, since: i64) -> Evidence {
         late_fence_ms: None,
         retention: Ok(vec![]),
         catalog_age_ms: Ok(100),
-        unmapped_credentials: 0,
+        unmapped_credentials: BTreeMap::new(),
         rings: ["send_refusals", "catalog_stale", "tool_outages"]
             .map(|check| {
                 (
@@ -62,20 +62,7 @@ fn seed(
     details: SeedDetails<'_>,
 ) {
     let (provider, class, code, pause, interrupt) = details;
-    store
-        .index_run_active(&RunIndexRow {
-            run_id: id.into(),
-            session: BindIdentity::new("/project", "test", "session"),
-            submission_id: None,
-            request_identity_digest: None,
-            state: RunIndexState::Active,
-            usage: None,
-            final_step_finish_reason: None,
-            retries_used: 0,
-            title: None,
-            withdrawals_owed: false,
-        })
-        .unwrap();
+    seed_active(store, id);
     store
         .index_run_attributed(
             id,
@@ -94,6 +81,190 @@ fn seed(
             },
         )
         .unwrap();
+}
+fn seed_active(store: &broca_store::SqliteStore, id: &str) {
+    store
+        .index_run_active(&RunIndexRow {
+            run_id: id.into(),
+            session: BindIdentity::new("/project", "test", "session"),
+            submission_id: None,
+            request_identity_digest: None,
+            state: RunIndexState::Active,
+            usage: None,
+            final_step_finish_reason: None,
+            retries_used: 0,
+            title: None,
+            withdrawals_owed: false,
+        })
+        .unwrap();
+}
+fn seed_legacy(store: &broca_store::SqliteStore, id: &str, state: RunIndexState) {
+    seed_active(store, id);
+    store
+        .index_run_attributed(id, state, None, None, 0, &RunIndexAttribution::default())
+        .unwrap();
+}
+
+fn metadata_scope_listing() -> broca_subc::vault::ScopedList {
+    let credentials: Vec<_> = [
+        ("apikey:cline-pass", Some("apikey"), None),
+        ("apikey:muse", Some("apikey"), None),
+        ("antigravity-work", Some("antigravity"), Some("google")),
+        ("oauth:cursor", Some("oauth"), Some("cursor")),
+        ("opaque-claude", Some("oauth"), Some("anthropic")),
+        ("opaque-chatgpt", Some("chatgpt"), Some("openai")),
+        ("no-adapter", Some("oauth"), None),
+        ("unknown-adapter", Some("oauth"), Some("future-adapter")),
+        ("unknown-method", Some("future-method"), None),
+        ("missing-method", None, None),
+    ]
+    .map(|(id, method, adapter)| {
+        json!({
+            "id":id,"categories":["llm-provider"],"type":"oauth","serves":[],
+            "state":"active","record_version":1,"operations":["read"],
+            "auth_method":method,"refresh_adapter":adapter
+        })
+    })
+    .into();
+    serde_json::from_value(json!({
+        "credentials":credentials,"grants":0,"grant_tuples":[],"view":"test"
+    }))
+    .unwrap()
+}
+fn unmapped_credentials() -> BTreeMap<String, &'static str> {
+    let unmapped = crate::account_routing::UnmappedCredentials::default();
+    unmapped.observe(&metadata_scope_listing());
+    unmapped.snapshot()
+}
+
+#[test]
+fn diagnostics_unmapped_credentials_use_chooser_scope_and_name_vault_fixes() {
+    let store = broca_store::SqliteStore::open_in_memory().unwrap();
+    let mut evidence = healthy(&store, 0);
+    evidence.unmapped_credentials = unmapped_credentials();
+    let reply = report(evidence, NOW, DEFAULT_WINDOW_MS);
+    let keys: Vec<_> = reply.findings.iter().map(|f| f.key.as_str()).collect();
+    assert_eq!(
+        keys,
+        [
+            "missing-method",
+            "no-adapter",
+            "opaque-chatgpt",
+            "opaque-claude",
+            "unknown-adapter",
+            "unknown-method"
+        ]
+    );
+    for f in &reply.findings {
+        assert_eq!(f.check, "credential_metadata_missing");
+        assert_eq!(f.severity, Severity::Warn);
+        assert_eq!(f.count, 1);
+        assert_eq!(f.samples[0]["credential_id"], f.key);
+        assert!(f.hint.contains("vault"));
+        assert!(f.hint.contains("non-model credential type"));
+    }
+}
+
+#[test]
+fn diagnostics_legacy_null_rows_are_one_info_finding_not_operational_errors() {
+    let store = broca_store::SqliteStore::open_in_memory().unwrap();
+    for (id, state) in [
+        ("legacy-pause", RunIndexState::Paused),
+        ("legacy-error", RunIndexState::Error),
+        ("legacy-interruption", RunIndexState::Interrupted),
+    ] {
+        seed_legacy(&store, id, state);
+    }
+    let reply = answer(
+        json!({}),
+        Some(&principal()),
+        &scope(principal(), ScopeKind::Head, false, true),
+        NOW,
+        |since| Ok(healthy(&store, since)),
+    )
+    .unwrap();
+    assert_eq!(reply.findings.len(), 1, "{:#?}", reply.findings);
+    let finding = &reply.findings[0];
+    assert_eq!(finding.check, "data_quality");
+    assert_eq!(finding.severity, Severity::Info);
+    assert_eq!(finding.count, 3);
+    assert!(finding.samples[0]["oldest_row_ms"].is_null());
+    assert!(finding.samples[0]["newest_row_ms"].is_null());
+    assert_eq!(
+        finding.samples[0]["counts_by_check"],
+        json!({"paused_runs":1,"run_errors":1,"interrupted_runs":1})
+    );
+    for field in [
+        "state_changed_ms",
+        "provider_module_id",
+        "credential_id",
+        "error_class",
+        "error_code",
+        "pause_reason",
+        "interrupt_reason",
+    ] {
+        assert_eq!(finding.samples[0]["missing_fields"][field], 3, "{field}");
+    }
+}
+
+#[test]
+fn diagnostics_auth_pauses_keep_severity_alongside_legacy_rows() {
+    for (age, severity) in [(100, Severity::Warn), (90_000_000, Severity::Error)] {
+        let store = broca_store::SqliteStore::open_in_memory().unwrap();
+        seed_legacy(&store, "legacy-pause", RunIndexState::Paused);
+        seed(
+            &store,
+            "auth-pause",
+            RunIndexState::Paused,
+            NOW - age,
+            (Some("anthropic"), None, None, Some("auth_required"), None),
+        );
+        seed(
+            &store,
+            "other-pause",
+            RunIndexState::Paused,
+            NOW - 100,
+            (None, None, None, Some("waiting"), None),
+        );
+        let reply = report(healthy(&store, 0), NOW, DEFAULT_WINDOW_MS);
+        assert_eq!(reply.findings.len(), 2);
+        let pause = reply
+            .findings
+            .iter()
+            .find(|f| f.check == "paused_runs")
+            .unwrap();
+        assert_eq!(pause.count, 1);
+        assert_eq!(pause.severity, severity);
+        assert_eq!(pause.samples[0]["run_id"], "auth-pause");
+    }
+}
+
+#[test]
+fn diagnostics_partial_attribution_reports_known_row_time_bounds() {
+    let store = broca_store::SqliteStore::open_in_memory().unwrap();
+    seed(
+        &store,
+        "partial-error",
+        RunIndexState::Error,
+        NOW - 200,
+        (None, Some("auth_required"), None, None, None),
+    );
+    seed(
+        &store,
+        "partial-interruption",
+        RunIndexState::Interrupted,
+        NOW - 100,
+        (Some("anthropic"), None, None, None, None),
+    );
+    seed_legacy(&store, "untimed", RunIndexState::Error);
+    let reply = report(healthy(&store, 0), NOW, DEFAULT_WINDOW_MS);
+    assert_eq!(reply.findings.len(), 1);
+    let quality = &reply.findings[0];
+    assert_eq!(quality.severity, Severity::Info);
+    assert_eq!(quality.count, 3);
+    assert_eq!(quality.samples[0]["oldest_row_ms"], NOW - 200);
+    assert_eq!(quality.samples[0]["newest_row_ms"], NOW - 100);
+    assert_eq!(quality.samples[0]["missing_fields"]["state_changed_ms"], 1);
 }
 
 #[test]
@@ -275,7 +446,11 @@ fn diagnostics_seeded_checks_floor_and_restart_exclusion() {
         last_ms: NOW - 100,
     }]);
     evidence.catalog_age_ms = Ok(22_000_000);
-    evidence.unmapped_credentials = 2;
+    evidence.unmapped_credentials = [
+        ("claude-work".into(), "provider_ids"),
+        ("chatgpt-work".into(), "auth_method"),
+    ]
+    .into();
     for (check, module, code) in [
         ("send_refusals", "routing", "account_limit_exhausted"),
         ("tool_outages", "aft", "module_unavailable"),
@@ -324,7 +499,7 @@ fn diagnostics_seeded_checks_floor_and_restart_exclusion() {
             .filter(|f| f.check == "run_errors")
             .map(|f| f.count)
             .sum::<u64>(),
-        2
+        1
     );
     assert_eq!(
         reply
@@ -333,6 +508,15 @@ fn diagnostics_seeded_checks_floor_and_restart_exclusion() {
             .filter(|f| f.check == "interrupted_runs")
             .map(|f| f.count)
             .sum::<u64>(),
+        1
+    );
+    assert_eq!(
+        reply
+            .findings
+            .iter()
+            .find(|f| f.check == "data_quality")
+            .unwrap()
+            .count,
         2
     );
     assert_eq!(
@@ -370,6 +554,7 @@ fn diagnostics_seeded_checks_floor_and_restart_exclusion() {
 #[test]
 fn diagnostics_unreadable_sources_are_not_silent() {
     let store = broca_store::SqliteStore::open_in_memory().unwrap();
+    seed_legacy(&store, "legacy", RunIndexState::Error);
     let mut evidence = healthy(&store, 0);
     evidence.retention = Err("unreadable".into());
     evidence.catalog_age_ms = Err("unreadable".into());
@@ -383,11 +568,14 @@ fn diagnostics_unreadable_sources_are_not_silent() {
         "send_refusals",
         "tool_outages",
     ] {
-        assert!(reply
-            .findings
-            .iter()
-            .any(|f| f.check == check && f.key == "evidence_unavailable"));
+        assert!(reply.findings.iter().any(|f| f.check == check
+            && f.key == "evidence_unavailable"
+            && f.severity == Severity::Error));
     }
+    assert!(reply
+        .findings
+        .iter()
+        .any(|f| f.check == "data_quality" && f.severity == Severity::Info));
     let root = broca_test_support::scratch_root().join("diagnostics-unreadable-source");
     let result = answer(
         json!({}),
@@ -465,6 +653,13 @@ fn diagnostics_findings_v1_vectors_match_serving_replies() {
     ] {
         vector(name, json!({"method":OP,"params":params}));
     }
+    vector(
+        "credential-scope.json",
+        json!({
+            "listing":metadata_scope_listing(),
+            "flagged":unmapped_credentials().keys().collect::<Vec<_>>()
+        }),
+    );
     let head = scope(principal(), ScopeKind::Head, false, true);
     let reply = answer(json!({}), Some(&principal()), &head, NOW, |since| {
         Ok(healthy(&store, since))
@@ -499,8 +694,20 @@ fn diagnostics_findings_v1_vectors_match_serving_replies() {
             None,
         ),
     );
+    seed_legacy(&store, "legacy-pause", RunIndexState::Paused);
+    seed_legacy(&store, "legacy-error", RunIndexState::Error);
+    seed_legacy(&store, "legacy-interruption", RunIndexState::Interrupted);
+    seed(
+        &store,
+        "partial-error",
+        RunIndexState::Error,
+        NOW - 200,
+        (None, Some("auth_required"), None, None, None),
+    );
     let reply = answer(json!({}), Some(&principal()), &head, NOW, |since| {
-        Ok(healthy(&store, since))
+        let mut evidence = healthy(&store, since);
+        evidence.unmapped_credentials = unmapped_credentials();
+        Ok(evidence)
     })
     .unwrap();
     vector("reply-findings.json", json!({"result":reply}));
@@ -604,7 +811,7 @@ fn diagnostics_untimed_overflow_is_explicit_in_finding_and_coverage() {
             class: None,
             code: None,
             pause_reason: None,
-            interrupt_reason: None
+            interrupt_reason: None,
         };
         SCAN_LIMIT + 1
     ];
@@ -612,10 +819,14 @@ fn diagnostics_untimed_overflow_is_explicit_in_finding_and_coverage() {
     let finding = reply
         .findings
         .iter()
-        .find(|f| f.check == "run_errors")
+        .find(|f| f.check == "data_quality")
         .unwrap();
     assert_eq!(finding.count, SCAN_LIMIT as u64);
-    assert_eq!(finding.samples[0]["truncated"], true);
+    assert_eq!(finding.severity, Severity::Info);
+    assert_eq!(
+        finding.samples[0]["truncated_checks"],
+        json!(["run_errors"])
+    );
     assert!(reply.coverage["run_errors"].truncated);
-    assert!(finding.summary.contains("20000"));
+    assert_eq!(finding.samples[0]["scan_limit"], 20000);
 }

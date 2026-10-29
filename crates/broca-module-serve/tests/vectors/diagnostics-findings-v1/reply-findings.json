@@ -65,6 +65,134 @@
         ],
         "severity": "error",
         "summary": "1 runs ended in error in the indexed window."
+      },
+      {
+        "check": "credential_metadata_missing",
+        "count": 1,
+        "first_seen_ms": 200000000,
+        "hint": "Fix the credential in the vault: set its provider ids and authentication method, or use a non-model credential type if routed model selection must not use it.",
+        "key": "missing-method",
+        "last_seen_ms": 200000000,
+        "samples": [
+          {
+            "credential_id": "missing-method",
+            "missing_fields": "provider_ids and auth_method"
+          }
+        ],
+        "severity": "warn",
+        "summary": "A listed model credential lacks recognized routing metadata required for account selection."
+      },
+      {
+        "check": "credential_metadata_missing",
+        "count": 1,
+        "first_seen_ms": 200000000,
+        "hint": "Fix the credential in the vault: set its provider ids and authentication method, or use a non-model credential type if routed model selection must not use it.",
+        "key": "no-adapter",
+        "last_seen_ms": 200000000,
+        "samples": [
+          {
+            "credential_id": "no-adapter",
+            "missing_fields": "provider_ids"
+          }
+        ],
+        "severity": "warn",
+        "summary": "A listed model credential lacks recognized routing metadata required for account selection."
+      },
+      {
+        "check": "credential_metadata_missing",
+        "count": 1,
+        "first_seen_ms": 200000000,
+        "hint": "Fix the credential in the vault: set its provider ids and authentication method, or use a non-model credential type if routed model selection must not use it.",
+        "key": "opaque-chatgpt",
+        "last_seen_ms": 200000000,
+        "samples": [
+          {
+            "credential_id": "opaque-chatgpt",
+            "missing_fields": "provider_ids"
+          }
+        ],
+        "severity": "warn",
+        "summary": "A listed model credential lacks recognized routing metadata required for account selection."
+      },
+      {
+        "check": "credential_metadata_missing",
+        "count": 1,
+        "first_seen_ms": 200000000,
+        "hint": "Fix the credential in the vault: set its provider ids and authentication method, or use a non-model credential type if routed model selection must not use it.",
+        "key": "opaque-claude",
+        "last_seen_ms": 200000000,
+        "samples": [
+          {
+            "credential_id": "opaque-claude",
+            "missing_fields": "provider_ids"
+          }
+        ],
+        "severity": "warn",
+        "summary": "A listed model credential lacks recognized routing metadata required for account selection."
+      },
+      {
+        "check": "credential_metadata_missing",
+        "count": 1,
+        "first_seen_ms": 200000000,
+        "hint": "Fix the credential in the vault: set its provider ids and authentication method, or use a non-model credential type if routed model selection must not use it.",
+        "key": "unknown-adapter",
+        "last_seen_ms": 200000000,
+        "samples": [
+          {
+            "credential_id": "unknown-adapter",
+            "missing_fields": "provider_ids"
+          }
+        ],
+        "severity": "warn",
+        "summary": "A listed model credential lacks recognized routing metadata required for account selection."
+      },
+      {
+        "check": "credential_metadata_missing",
+        "count": 1,
+        "first_seen_ms": 200000000,
+        "hint": "Fix the credential in the vault: set its provider ids and authentication method, or use a non-model credential type if routed model selection must not use it.",
+        "key": "unknown-method",
+        "last_seen_ms": 200000000,
+        "samples": [
+          {
+            "credential_id": "unknown-method",
+            "missing_fields": "provider_ids and recognized auth_method"
+          }
+        ],
+        "severity": "warn",
+        "summary": "A listed model credential lacks recognized routing metadata required for account selection."
+      },
+      {
+        "check": "data_quality",
+        "count": 4,
+        "first_seen_ms": 200000000,
+        "hint": "Inspect run_index attribution and state_changed_ms. NULL fields may come from legacy or synthetic writers; do not infer an operational failure or invent an observation time.",
+        "key": "legacy_run_index_rows",
+        "last_seen_ms": 200000000,
+        "samples": [
+          {
+            "counts_by_check": {
+              "interrupted_runs": 1,
+              "paused_runs": 1,
+              "run_errors": 2
+            },
+            "missing_fields": {
+              "credential_id": 3,
+              "error_class": 3,
+              "error_code": 4,
+              "interrupt_reason": 4,
+              "pause_reason": 4,
+              "provider_module_id": 4,
+              "state_changed_ms": 3
+            },
+            "newest_row_ms": 199999800,
+            "oldest_row_ms": 199999800,
+            "scan_limit": 20000,
+            "truncated_checks": []
+          }
+        ],
+        "severity": "info",
+        "summary": "Indexed rows lack classification metadata or observation times; they are excluded from operational findings, not treated as failing runs."
       }
     ],
     "generated_at_ms": 200000000,

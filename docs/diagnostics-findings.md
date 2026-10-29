@@ -35,7 +35,7 @@ unknown params are errors; windows are never clamped.
 
 Success is a frame body with `result.generated_at_ms`, `result.window_ms`, and
 `result.findings`. Each finding has `check`, stable `key`, `severity` (`warn` or
-`error`), positive `count`, `first_seen_ms`, `last_seen_ms`, a sentence `summary`,
+`error` or `info`), positive `count`, `first_seen_ms`, `last_seen_ms`, a sentence `summary`,
 up to five object `samples`, and an investigation `hint`. Samples contain only
 identifiers, codes and times, never prompts, arguments, tool output or provider
 message text. Counts do not shrink when samples or findings are trimmed.
@@ -50,15 +50,16 @@ a complete inventory or a pagination cursor.
 
 | Check | Source and rule |
 | --- | --- |
-| `paused_runs` | Current indexed authentication/account pauses, independent of the window, grouped by provider and frozen credential. Warn; error after 24 hours. Legacy rows without pause attribution remain visible as `unattributed`, not assumed to be authentication pauses. |
+| `paused_runs` | Current indexed authentication/account pauses with a pause reason and observation time, independent of the window, grouped by provider and frozen credential. Warn; error after 24 hours. |
 | `deletion_fenced` | Process map of retention refusals/deferments, keyed by session address and fence kind. Includes held intake, incomplete relocation and overhaul deferral. Warn; cleared only after deletion completion. Rebuilds as retention sweeps observe sessions after boot. |
 | `late_results_rebuild_required` | State-root `late-results-rebuild-required` marker. Error; observation never clears or repairs it. |
 | `catalog_stale` | Cached catalog age beyond the 30-minute poll cadence, or timestamped refused/failed polls in the window. Age warns after 30 minutes and errors after six hours; historical poll refusals warn separately with their observed count. |
-| `credential_metadata_missing` | Account-selection health's current `unmapped_credentials` count. Warn. These are listed model credentials that cannot be offered to routing; this does not claim they were actually used by a routed run. |
+| `credential_metadata_missing` | One warn finding naming each currently unmapped credential in the account chooser's scope. These credentials cannot be offered to routing; this does not claim they were actually used by a routed run. |
 | `send_refusals` | Timestamped routing-refused send admissions grouped by routing code. Warn. Unreachable routing is `routing_unavailable`. Invalid/non-token codes are `unattributed`. |
-| `run_errors` | Indexed error terminals grouped by provider, shared error class and safe provider code. Floors below. Unattributed legacy/synthetic rows are retained, even below a floor. |
+| `run_errors` | Indexed error terminals with provider, error class and observation time, grouped by provider, shared error class and safe provider code. Floors below. A missing optional provider code or credential does not prevent classification. |
 | `tool_outages` | Newly durable attributed unavailable tool results/no-dispatch records, grouped by module. Warn. Counts calls/results, not outage episodes. |
-| `interrupted_runs` | Indexed interrupted terminals other than explicit `runner_shutdown`/`runner_crash` seals, plus `transform_unavailable`. Warn. Unknown causes are `unattributed`; restart membership is never inferred from a timestamp. |
+| `interrupted_runs` | Indexed interrupted terminals with an interruption reason and observation time, other than explicit `runner_shutdown`/`runner_crash` seals, plus observed `transform_unavailable` terminals. Warn; a run is not classified as restart-related based only on its timestamp. |
+| `data_quality` | One info finding for indexed rows excluded from `paused_runs`, `run_errors` and `interrupted_runs` because classification fields or observation times are NULL. Counts do not contribute to operational severity. |
 
 `result.coverage` is additive. For each ring-backed check it gives `since_ms`
 (process start, or the oldest retained event after eviction) and `truncated`.
@@ -69,10 +70,30 @@ They are process-local, not a durable incident ledger.
 
 Run-error coverage reports the oldest attributed row in the bounded window
 scan, or the report time when none was observed. Interruption coverage likewise
-describes the rows examined. Terminal rows without observation times generate
-an explicit `unknown_observation_time` finding instead of being silently placed
-inside or outside the requested window. Samples count `rows_without_attribution`;
-NULL metadata cannot distinguish an old row from a newer synthetic writer.
+describes classifiable rows. Rows without observation times are never placed
+inside or outside the requested window: they join the single `data_quality`
+finding instead. NULL metadata cannot distinguish an old row from a newer
+synthetic writer. An unavailable evidence source still fails explicitly; it is
+never downgraded to data quality.
+
+The data-quality sample has `counts_by_check`, `missing_fields`, `oldest_row_ms`,
+`newest_row_ms`, `scan_limit` and `truncated_checks`. Field counts cover NULLs
+among excluded rows, including optional or state-inapplicable attribution fields;
+those optional NULLs alone do not exclude a row. The oldest/newest times bound
+only recorded `state_changed_ms` values and are null when every excluded row is
+untimed. They are not guessed from run ids or session logs. The finding's
+`first_seen_ms`/`last_seen_ms` are the time of the data-quality observation, not
+invented transition times. Truncated counts are bounded observations, not an
+exhaustive legacy inventory.
+
+Credential metadata scope reuses `account_routing::selects_accounts`: OAuth
+(Claude-subscription) and ChatGPT methods, not API keys or Antigravity. Missing
+or unknown methods remain in the metadata-check scope. The known non-model `cursor` refresh adapter is
+excluded because its vault record is used only for quota, not a broca model
+route. Missing, unknown and every other adapter remain in scope. Each finding
+names the credential and missing fields, with a vault-side remedy: set provider
+ids and a recognized method, or use a non-model type. The deploy guard mirrors
+this scope; a serving-generated row fixture checks Rust/Python agreement.
 
 The six-hour error floors, calibrated from the operator's 2026-10-28 seven-day
 production aggregate (1,359 error runs), are:
