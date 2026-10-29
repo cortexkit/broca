@@ -12,10 +12,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod billing;
+pub mod checkpoint;
 pub mod error;
 pub mod features;
 pub mod frame;
 pub mod proof;
+pub mod resolve;
+pub mod unreadable;
 
 pub use error::{Error, HeaderCorruption};
 
