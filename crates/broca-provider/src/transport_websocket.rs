@@ -1118,6 +1118,9 @@ async fn drive_socket(
             observation.full_input_reason = (!continuation).then_some(full_input_reason);
         }
     }
+    // Reserve the actual response.create bytes, including continuation metadata, before
+    // enqueueing the command. The pump cannot write a model request ahead of this receipt.
+    trace.reserve_send(request, text.len(), false).await?;
     trace.sent_at_ms = Some(if request.codex_wire {
         send_started_at_ms
     } else {
@@ -2170,6 +2173,86 @@ async fn codex_failed_send_retires_socket_and_consumes_receipt() {
             .physical_send_count,
         0
     );
+}
+
+#[tokio::test]
+async fn websocket_request_reserved_before_write_on_kept_connection() {
+    use crate::families::{openai_responses_chatgpt_frozen_config, OpenAiResponsesChatgpt};
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let wire_order = order.clone();
+    let peer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut config = tungstenite::protocol::WebSocketConfig::default();
+        config.extensions.permessage_deflate =
+            Some(tungstenite::extensions::compression::deflate::DeflateConfig::default());
+        let mut socket = tokio_tungstenite::accept_async_with_config(stream, Some(config))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let frame = socket.next().await.unwrap().unwrap();
+            assert!(frame.is_text());
+            wire_order.lock().unwrap().push("write");
+            socket.send(Message::Text(serde_json::json!({
+                "type":"response.completed", "response":{"id":"response", "status":"completed", "output":[],
+                "usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}
+            }).to_string().into())).await.unwrap();
+        }
+    });
+    let request: PreparedHttpRequest = HttpRequest {
+        method: crate::wire::HttpMethod::Post,
+        url: format!("http://{address}/responses"),
+        headers: vec![],
+        body: br#"{"model":"m","stream":true,"input":[]}"#.to_vec(),
+    }
+    .into();
+    let hook = Arc::new(super::tests::TestAttemptHook::new(order.clone()));
+    let session = Session::default();
+    let client = build_provider_http_client();
+    let (tx, _rx) = mpsc::channel(256);
+    for ordinal in 0..2 {
+        let mut trace = AttemptTrace {
+            attempt_hook: Some(hook.clone()),
+            attempt_ordinal: ordinal,
+            ..Default::default()
+        };
+        let normalizer = OpenAiResponsesChatgpt
+            .normalizer(&openai_responses_chatgpt_frozen_config("m"), StepId(1));
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            drive_socket(
+                &session,
+                &client,
+                &request,
+                &Clock::default(),
+                normalizer,
+                &tx,
+                &mut trace,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(trace.socket_reused, Some(ordinal != 0));
+        trace
+            .settle_send(
+                &RequestDigest::of(&request.body),
+                AttemptOutcome::Complete,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    peer.await.unwrap();
+    session.close();
+    assert_eq!(
+        *order.lock().unwrap(),
+        ["durable", "write", "outcome", "durable", "write", "outcome"]
+    );
+    assert_eq!(hook.sends.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]

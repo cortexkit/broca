@@ -26,6 +26,8 @@ pub struct StepRuntime {
     /// ordinary step; a live or resumed resend within the same step id starts after the
     /// largest durable attempt ordinal, so ordinals stay unique within the episode's step.
     pub first_attempt: u32,
+    /// Absent on legacy roots; a physical send must await the reservation's durable receipt.
+    pub attempt_hook: Option<Arc<dyn crate::run::AttemptHook>>,
 }
 
 #[async_trait]
