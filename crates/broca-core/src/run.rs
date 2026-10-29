@@ -2019,6 +2019,7 @@ where
                 session: req.session.clone(),
                 view,
                 tail: Arc::clone(&snapshot.tail),
+
                 base_watermark: snapshot.base_watermark,
                 head_seq: snapshot.head_seq,
                 writer_lineage: writer.lineage_id().map(|lineage| lineage.to_string()),
@@ -3156,6 +3157,7 @@ fn render_new_tags(
     prompt: &mut [Message],
     rendered_len: &mut usize,
     render_tags: bool,
+    defer_media_tags: bool,
     frozen_render_config: &serde_json::Value,
     mut originals: Option<&mut crate::compaction::OriginalMessages>,
 ) {
@@ -3163,6 +3165,15 @@ fn render_new_tags(
         return;
     }
     for message in prompt.iter_mut().skip(*rendered_len) {
+        // Media-only tool results gain a text label during tagging. Preparation needs the
+        // original part positions; the media renderer tags its final request copy instead.
+        if defer_media_tags
+            && crate::compaction::media_refs(&message.content)
+                .next()
+                .is_some()
+        {
+            continue;
+        }
         let original = originals
             .as_ref()
             .filter(|_| message.part_tags().is_some())
@@ -3184,6 +3195,84 @@ fn render_new_tags(
         }
     }
     *rendered_len = prompt.len();
+}
+
+#[cfg(all(test, feature = "test-attachments"))]
+mod media_tag_preparation_tests {
+    use super::*;
+
+    #[test]
+    fn media_part_positions_survive_until_preparation_while_plain_text_keeps_legacy_tags() {
+        use broca_protocol::tags::{number_message, ComputedRules};
+        let reference = broca_protocol::MediaRef {
+            kind: broca_protocol::MediaKind::Image,
+            mime: "image/png".into(),
+            byte_size: 69,
+            sha256: "a".repeat(64),
+            width: Some(1),
+            height: Some(1),
+        };
+        let mut prompt = vec![
+            Message::new(
+                broca_protocol::Role::User,
+                vec![ContentBlock::Text {
+                    text: "plain".into(),
+                }],
+            ),
+            Message::new(
+                broca_protocol::Role::Tool,
+                vec![ContentBlock::ToolResult(broca_protocol::ToolResult {
+                    tool_call_id: ToolCallId("capture".into()),
+                    is_error: false,
+                    output: broca_protocol::ToolOutput::Parts {
+                        parts: vec![broca_protocol::ToolOutputPart::Media { media: reference }],
+                    },
+                })],
+            ),
+        ];
+        let mut high = 0;
+        for message in &mut prompt {
+            number_message(
+                message,
+                ComputedRules {
+                    render: true,
+                    clean: false,
+                },
+                &mut high,
+            )
+            .unwrap();
+        }
+        let raw = prompt[1].clone();
+        let mut legacy = prompt.clone();
+        render_new_tags(
+            &mut prompt,
+            &mut 0,
+            true,
+            true,
+            &serde_json::json!({}),
+            None,
+        );
+        render_new_tags(
+            &mut legacy,
+            &mut 0,
+            true,
+            false,
+            &serde_json::json!({}),
+            None,
+        );
+        assert_eq!(
+            prompt[0], legacy[0],
+            "plain text is unchanged by media preparation"
+        );
+        assert_eq!(
+            prompt[1], raw,
+            "tag labels must not shift a captured media part"
+        );
+        assert_ne!(
+            legacy[1].content, raw.content,
+            "the legacy projection inserts its media-only label"
+        );
+    }
 }
 
 fn stamp_raw_suffix(raw: &mut [Message], position: &mut PromptPosition) -> usize {
@@ -3695,6 +3784,10 @@ where
             }),
         )
     };
+    #[cfg(feature = "test-attachments")]
+    let defer_media_tags = provider.defer_media_tags(render_tags);
+    #[cfg(not(feature = "test-attachments"))]
+    let defer_media_tags = false;
     writer.retain_live_tags(render_tags && computed_tags.is_none());
     let context_limit = if is_resume && !append_episode {
         prior
@@ -5406,6 +5499,7 @@ where
                 &mut mutable_call_options(&mut opts).prompt,
                 &mut tags_rendered_len,
                 render_tags,
+                defer_media_tags,
                 &provider.render_config_blob(),
                 originals.as_mut(),
             );
@@ -5512,6 +5606,7 @@ where
                 &mut mutable_call_options(&mut opts).prompt,
                 &mut tags_rendered_len,
                 render_tags,
+                defer_media_tags,
                 &provider.render_config_blob(),
                 originals.as_mut(),
             );
@@ -5587,8 +5682,8 @@ where
             release_held!(Some(&*state));
             let mut request = crate::compaction::BoundaryRequest::default();
             request
-                .refresh(&opts, state, &system_positions, |view| {
-                    provider.render_request(view)
+                .refresh_checked(&opts, state, &system_positions, |view| {
+                    provider.try_render_request(view)
                 })
                 .map_err(|error| RunError::Wal(error.to_string()))?;
             notice_request_bytes = request.bytes;
@@ -5648,8 +5743,8 @@ where
             };
             // A ceiling ride or a view-ready notification may have changed the durable view.
             request
-                .refresh(&opts, state, &system_positions, |view| {
-                    provider.render_request(view)
+                .refresh_checked(&opts, state, &system_positions, |view| {
+                    provider.try_render_request(view)
                 })
                 .map_err(|error| RunError::Wal(error.to_string()))?;
             notice_request_bytes = request.bytes;
@@ -5867,16 +5962,18 @@ where
                 // The estimate costs a render of the whole request, so it is made only when a
                 // measured earlier step on this model makes one possible. A compaction boundary
                 // already rendered the request, unless refusal fallback changed its route.
-                let estimate = output_history
-                    .has_measurement(step_model)
-                    .then(|| {
-                        let bytes = match &model_opts {
-                            Some(_) if fallback_model.is_none() => notice_request_bytes,
-                            _ => provider.render_request(&step_opts).len(),
-                        };
-                        output_history.estimate(bytes, step_model)
-                    })
-                    .flatten();
+                let estimate = if output_history.has_measurement(step_model) {
+                    let bytes = match &model_opts {
+                        Some(_) if fallback_model.is_none() => notice_request_bytes,
+                        _ => provider
+                            .try_render_request(&step_opts)
+                            .map_err(|error| RunError::Wal(error.message))?
+                            .len(),
+                    };
+                    output_history.estimate(bytes, step_model)
+                } else {
+                    None
+                };
                 match estimate.map(|estimate| {
                     (
                         estimate,
@@ -13227,6 +13324,8 @@ mod tests {
             trailing_origin: None,
             last_run_id: Some(RunId("budget".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                #[cfg(feature = "test-attachments")]
+                media: None,
                 head: None,
                 has_deferred_calls: None,
                 tags: Some(crate::tags::LineageTags::Off),

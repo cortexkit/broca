@@ -220,6 +220,10 @@ pub struct LiveProvider<F: WireFamily + 'static> {
     pub(crate) family: Arc<F>,
     pub(crate) frozen: Arc<FrozenRenderConfig>,
     grammar_downgraded: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "test-attachments")]
+    media_renderer: std::sync::RwLock<Option<Arc<broca_core::provider::MediaRequestRenderer>>>,
+    #[cfg(feature = "test-attachments")]
+    media_render_tags: std::sync::atomic::AtomicBool,
     /// The refusal-fallback model's render config, taken from `frozen.refusal_fallback` when
     /// the episode froze one.
     fallback: Option<Arc<FrozenRenderConfig>>,
@@ -297,6 +301,10 @@ impl From<HttpRequest> for PreparedHttpRequest {
 /// Immutable, whole-request input for one blocking render. All expensive input stays behind
 /// shared handles; the closure is the sole owner that releases its prompt snapshot.
 struct RenderJob<F: WireFamily + 'static> {
+    #[cfg(feature = "test-attachments")]
+    media_renderer: Option<Arc<broca_core::provider::MediaRequestRenderer>>,
+    #[cfg(feature = "test-attachments")]
+    media_render_tags: bool,
     auth_revision: u64,
     family: Arc<F>,
     frozen: Arc<FrozenRenderConfig>,
@@ -483,13 +491,25 @@ fn ratelimit_unified_headers(
 }
 
 impl<F: WireFamily + 'static> RenderJob<F> {
-    fn render(self) -> RenderedRequest {
+    fn render(self) -> Result<RenderedRequest, Box<ProviderError>> {
         // This scan is deliberately in the same blocking job as rendering: it walks the entire
         // prompt to preserve aliases from historical tool calls on every resumed step.
         let name_map = Arc::new(crate::tool_name_alias::ToolNameMap::build(
             &self.opts.tools,
             &self.opts.prompt,
         ));
+        #[cfg(feature = "test-attachments")]
+        let body = if let Some(renderer) = &self.media_renderer {
+            renderer(
+                &serde_json::to_value(&*self.frozen).expect("frozen render config serializes"),
+                &self.opts,
+                self.media_render_tags,
+                true,
+            )?
+        } else {
+            self.family.render(&self.frozen, &self.opts)
+        };
+        #[cfg(not(feature = "test-attachments"))]
         let body = self.family.render(&self.frozen, &self.opts);
         let mut request =
             PreparedHttpRequest::from(self.family.endpoint(&self.frozen, &self.auth, body));
@@ -524,11 +544,11 @@ impl<F: WireFamily + 'static> RenderJob<F> {
         request.wire_model_id = Some(self.frozen.wire_model_id.clone());
         maybe_dump_rendered_request(&request.body, &self.opts, self.step_id);
         let request_digest = RequestDigest::of(&request.body);
-        RenderedRequest {
+        Ok(RenderedRequest {
             request,
             name_map,
             request_digest,
-        }
+        })
     }
 }
 
@@ -740,6 +760,10 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             route: std::sync::atomic::AtomicU8::new(ROUTE_SOURCE),
             frozen: Arc::new(frozen),
             grammar_downgraded: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "test-attachments")]
+            media_renderer: std::sync::RwLock::new(None),
+            #[cfg(feature = "test-attachments")]
+            media_render_tags: std::sync::atomic::AtomicBool::new(false),
             // Wrapped HERE rather than taken as an Arc, so callers keep passing an owned
             // AuthHandle and the sharing stays inside this file. Each step takes a cheap Arc
             // snapshot of the current credential rather than a deep copy of the secret; only
@@ -851,6 +875,10 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             return rx;
         }
         let render_job = RenderJob {
+            #[cfg(feature = "test-attachments")]
+            media_renderer: self.media_renderer.read().unwrap().clone(),
+            #[cfg(feature = "test-attachments")]
+            media_render_tags: self.media_render_tags.load(Ordering::Relaxed),
             auth_revision: served.revision,
             family: Arc::clone(&self.family),
             frozen: step_frozen(self.route_frozen(), &opts),
@@ -907,6 +935,24 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
 
 #[async_trait]
 impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
+    #[cfg(feature = "test-attachments")]
+    fn supports_media_renderer(&self) -> bool {
+        true
+    }
+
+    #[cfg(feature = "test-attachments")]
+    fn set_media_request_renderer(
+        &self,
+        renderer: Arc<broca_core::provider::MediaRequestRenderer>,
+    ) {
+        *self.media_renderer.write().unwrap() = Some(renderer);
+    }
+
+    #[cfg(feature = "test-attachments")]
+    fn defer_media_tags(&self, render_tags: bool) -> bool {
+        self.media_render_tags.store(render_tags, Ordering::Relaxed);
+        self.media_renderer.read().unwrap().is_some()
+    }
     fn set_credential_revision(&self, revision: u64) {
         self.auth.write().unwrap().revision = revision;
     }
@@ -1046,8 +1092,23 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
     }
 
     fn render_request(&self, opts: &CallOptions) -> Vec<u8> {
-        self.family
-            .render(&self.route_frozen().for_step(opts), opts)
+        self.try_render_request(opts)
+            .expect("provider request could not be prepared")
+    }
+
+    fn try_render_request(&self, opts: &CallOptions) -> Result<Vec<u8>, Box<ProviderError>> {
+        let route = self.route_frozen();
+        let frozen = route.for_step(opts);
+        #[cfg(feature = "test-attachments")]
+        if let Some(renderer) = self.media_renderer.read().unwrap().as_ref() {
+            return renderer(
+                &serde_json::to_value(&frozen).expect("frozen render config serializes"),
+                opts,
+                self.media_render_tags.load(Ordering::Relaxed),
+                false,
+            );
+        }
+        Ok(self.family.render(&frozen, opts))
     }
 
     fn output_limits(&self) -> Option<broca_core::output_reservation::OutputLimits> {
@@ -2060,7 +2121,16 @@ fn spawn_transport_task<F: WireFamily + 'static>(
             }
         };
         let rendered = match rendered {
-            Ok(rendered) => rendered,
+            Ok(Ok(rendered)) => rendered,
+            Ok(Err(error)) => {
+                let _ = tx
+                    .send(NormalizedEvent::Control(ProviderControl::Error {
+                        error: *error,
+                        retries_used: 0,
+                    }))
+                    .await;
+                return;
+            }
             Err(join_error) => {
                 // Render assertions, including tool-name alias invariants, now unwind through
                 // the blocking handle. Keep that failure on the typed provider-error path instead
@@ -5033,6 +5103,10 @@ mod tests {
     {
         let direct = family.render(&frozen, &opts);
         let job = super::RenderJob {
+            #[cfg(feature = "test-attachments")]
+            media_renderer: None,
+            #[cfg(feature = "test-attachments")]
+            media_render_tags: false,
             auth_revision: 0,
             family: Arc::new(family),
             frozen: Arc::new(frozen),
@@ -5042,7 +5116,8 @@ mod tests {
         };
         let offloaded = tokio::task::spawn_blocking(move || job.render())
             .await
-            .expect("render job joins");
+            .expect("render job joins")
+            .expect("render job succeeds");
         assert_eq!(
             offloaded.request.body,
             Bytes::from(direct),

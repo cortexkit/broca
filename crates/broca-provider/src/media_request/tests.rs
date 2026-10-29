@@ -9,6 +9,9 @@ use broca_wal::WalRecord;
 use serde_json::json;
 use std::path::PathBuf;
 
+mod checkpoint_compat_tests;
+#[cfg(feature = "test-attachments")]
+mod live_tests;
 mod render_tests;
 
 struct Fixture {

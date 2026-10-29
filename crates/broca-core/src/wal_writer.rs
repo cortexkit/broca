@@ -3134,6 +3134,30 @@ pub struct WalHandle {
 }
 
 impl WalHandle {
+    /// A media-free prefix has no captures or aging history to restore. Its already-seeded
+    /// placement is sufficient to start tracking the first later capture without rereading it.
+    #[cfg(feature = "test-attachments")]
+    pub fn empty_media_checkpoint(
+        &self,
+        at_seq: u64,
+    ) -> Result<crate::media_request::MediaCheckpoint, String> {
+        let _enqueue = self.lock_enqueue();
+        if self.durable_head.load(Ordering::Acquire) != at_seq
+            || self.next_seq.load(Ordering::Acquire) != at_seq + 1
+        {
+            return Err("media seed head changed before executor initialization".into());
+        }
+        let placement = self
+            .display_placement
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or("media seed has no validated placement")?;
+        Ok(crate::media_request::MediaCheckpoint::empty_at(
+            placement, at_seq,
+        ))
+    }
+
     /// Transfer only captures covered by a successful WAL barrier. Appends racing after that
     /// barrier wait for the next one, so an uncommitted steer cannot authorize rendered media.
     pub(crate) fn take_media_captures(&self) -> crate::compaction::CapturedMedia {

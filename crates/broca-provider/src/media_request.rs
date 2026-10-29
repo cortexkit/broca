@@ -18,6 +18,11 @@ use broca_protocol::{
 
 use crate::media_profile::{MediaCarrier, MediaProfile};
 
+#[cfg(feature = "test-attachments")]
+mod live;
+#[cfg(feature = "test-attachments")]
+pub use live::LiveMedia;
+
 /// An occurrence in the assembled prompt. Replacement messages can repeat a captured reference;
 /// each repetition counts against the budget even though the object is read from one digest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -55,7 +60,7 @@ pub enum AgingEvent {
 /// advancing an unchanged view touches only newly shown or newly unprotected media. Bytes
 /// and message text are never retained here. An aged occurrence never becomes young again
 /// merely because a compaction view temporarily hides it.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct MediaAging {
     shown: BTreeMap<Occurrence, (MediaCost, bool)>,
     unprotected: BTreeSet<Occurrence>,
@@ -165,43 +170,11 @@ impl MediaAging {
         let mut step_open = false;
         let mut active = profile.clone();
         for record in records {
-            session.fold(record)?;
-            let frozen = match record {
-                broca_wal::WalRecord::RunStarted { config, .. } => {
-                    Some(&config.frozen_render_config)
-                }
-                broca_wal::WalRecord::RunConfigRefrozen {
-                    frozen_render_config,
-                    ..
-                } => Some(frozen_render_config),
-                _ => None,
-            };
-            let next: Option<MediaProfile> = frozen
-                .and_then(|frozen| frozen.get("media"))
-                .filter(|value| !value.is_null())
-                .map(|value| {
-                    serde_json::from_value(value.clone())
-                        .map_err(|error| format!("invalid frozen media profile: {error}"))
-                })
-                .transpose()?;
-            if let Some(next) = next.filter(|next| next != &active) {
-                active = next;
-                state = Self::default();
-                state.reconcile_view(&active, &session.selected_bindings());
-                session.take_changes();
-            } else {
-                state.fold_changes(&active, session.take_changes());
-            }
+            state.fold_wal_record(&mut active, session, record)?;
             match record {
                 broca_wal::WalRecord::RunStarted { .. } => step_open = false,
                 broca_wal::WalRecord::StepStarted { .. } => step_open = true,
-                broca_wal::WalRecord::ModelAttemptFinished { .. } => {
-                    state.apply(&active, AgingEvent::Boundary)
-                }
-                broca_wal::WalRecord::ModelStepFinished { .. } => {
-                    state.apply(&active, AgingEvent::Boundary);
-                    step_open = false;
-                }
+                broca_wal::WalRecord::ModelStepFinished { .. } => step_open = false,
                 _ => {}
             }
         }
@@ -209,6 +182,50 @@ impl MediaAging {
             state.apply(&active, AgingEvent::Boundary);
         }
         Ok(state)
+    }
+
+    /// The incremental equivalent of replay, used by a live session after each durable tail.
+    pub fn fold_wal_record(
+        &mut self,
+        active: &mut MediaProfile,
+        session: &mut SessionMedia,
+        record: &broca_wal::WalRecord,
+    ) -> Result<(), String> {
+        session.fold(record)?;
+        let frozen = match record {
+            broca_wal::WalRecord::RunStarted { config, .. } => Some(&config.frozen_render_config),
+            broca_wal::WalRecord::RunConfigRefrozen {
+                frozen_render_config,
+                ..
+            } => Some(frozen_render_config),
+            _ => None,
+        };
+        let next: Option<MediaProfile> = frozen
+            .and_then(|frozen| frozen.get("media"))
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|error| format!("invalid frozen media profile: {error}"))
+            })
+            .transpose()?;
+        if let Some(next) = next.filter(|next| next != active) {
+            *active = next;
+            *self = Self::default();
+            self.reconcile_view(active, &session.selected_bindings());
+            session.take_changes();
+        } else {
+            self.fold_changes(active, session.take_changes());
+        }
+        match record {
+            broca_wal::WalRecord::ModelAttemptFinished { .. } => {
+                self.apply(active, AgingEvent::Boundary)
+            }
+            broca_wal::WalRecord::ModelStepFinished { .. } => {
+                self.apply(active, AgingEvent::Boundary);
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     pub fn replay(profile: &MediaProfile, events: impl IntoIterator<Item = AgingEvent>) -> Self {

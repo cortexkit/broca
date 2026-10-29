@@ -49,6 +49,23 @@ async fn serve_model(bodies: Arc<Mutex<Vec<Vec<u8>>>>) -> String {
 }
 
 async fn serve_model_sse(bodies: Arc<Mutex<Vec<Vec<u8>>>>, response: &'static str) -> String {
+    serve_model_responses(bodies, vec![response]).await
+}
+
+async fn serve_model_responses(
+    bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+    responses: Vec<&'static str>,
+) -> String {
+    serve_model_responses_paused(bodies, responses, None).await
+}
+
+async fn serve_model_responses_paused(
+    bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+    responses: Vec<&'static str>,
+    pause: Option<(usize, Arc<tokio::sync::Notify>)>,
+) -> String {
+    assert!(!responses.is_empty());
+    let responses = Arc::new(responses);
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("bind the model server");
@@ -56,6 +73,8 @@ async fn serve_model_sse(bodies: Arc<Mutex<Vec<Vec<u8>>>>, response: &'static st
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let bodies = bodies.clone();
+            let responses = responses.clone();
+            let pause = pause.clone();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stream);
                 let mut content_length = 0usize;
@@ -75,7 +94,16 @@ async fn serve_model_sse(bodies: Arc<Mutex<Vec<Vec<u8>>>>, response: &'static st
                 if reader.read_exact(&mut body).await.is_err() {
                     return;
                 }
-                bodies.lock().unwrap().push(body);
+                let (index, response) = {
+                    let mut bodies = bodies.lock().unwrap();
+                    let index = bodies.len();
+                    let response = responses[bodies.len().min(responses.len() - 1)];
+                    bodies.push(body);
+                    (index, response)
+                };
+                if let Some((_, gate)) = pause.filter(|(at, _)| *at == index) {
+                    gate.notified().await;
+                }
                 let mut stream = reader.into_inner();
                 let head = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
