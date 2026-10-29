@@ -80,6 +80,23 @@ enum Operation {
     Sync(Stream),
 }
 
+/// A journal operation's shape, independent of random identities and checksums.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OperationKind {
+    Observe,
+    Change(Vec<ChangeKind>),
+    SyncFile,
+    SyncDirectory,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeKind {
+    Write,
+    Resize,
+    SetEntry,
+    RemoveEntry,
+}
+
 #[derive(Clone, Default)]
 struct Image {
     entries: BTreeMap<PathBuf, Node>,
@@ -325,6 +342,39 @@ impl RecordingFs {
     pub fn enumerate(&self, limit: usize) -> io::Result<Vec<SurvivingState>> {
         let mut remaining = limit;
         self.enumerate_with_budget(&mut remaining)
+    }
+
+    /// Inspect trace coverage without depending on the bytes that deduplicate at each cut.
+    pub fn operation_kinds(&self) -> Vec<OperationKind> {
+        self.journal
+            .lock()
+            .unwrap()
+            .operations
+            .iter()
+            .map(|operation| match operation {
+                Operation::Observe => OperationKind::Observe,
+                Operation::Change(changes) => OperationKind::Change(
+                    changes
+                        .iter()
+                        .map(|change| match change {
+                            Change::Write { .. } => ChangeKind::Write,
+                            Change::Resize { .. } => ChangeKind::Resize,
+                            Change::Entry { node: Some(_), .. } => ChangeKind::SetEntry,
+                            Change::Entry { node: None, .. } => ChangeKind::RemoveEntry,
+                        })
+                        .collect(),
+                ),
+                Operation::Sync(Stream::File(_)) => OperationKind::SyncFile,
+                Operation::Sync(Stream::Directory(_)) => OperationKind::SyncDirectory,
+            })
+            .collect()
+    }
+
+    /// Every completed operation, including the empty prefix, must have a surviving image.
+    pub fn assert_all_cuts_covered(&self, states: &[SurvivingState]) {
+        let cuts: BTreeSet<_> = states.iter().map(|state| state.cut).collect();
+        let operations = self.journal.lock().unwrap().operations.len();
+        assert_eq!(cuts, (0..=operations).collect(), "missing operation cut");
     }
 
     fn enumerate_with_budget(&self, remaining: &mut usize) -> io::Result<Vec<SurvivingState>> {
@@ -972,6 +1022,49 @@ mod tests {
             .into_iter()
             .filter(|state| state.cut == final_cut)
             .collect()
+    }
+
+    #[test]
+    fn power_loss_trace_and_cut_coverage_survive_zero_byte_deduplication() {
+        let counts: Vec<_> = [0, 1]
+            .into_iter()
+            .map(|byte| {
+                let root = Scratch::new();
+                let recording = root.recording();
+                with_fs_ops(recording.clone(), || {
+                    let mut file = fs_ops::File::create(root.0.join("data")).unwrap();
+                    file.write_all(&[byte]).unwrap();
+                });
+                assert_eq!(
+                    recording.operation_kinds(),
+                    vec![
+                        OperationKind::Change(vec![ChangeKind::SetEntry, ChangeKind::Resize]),
+                        OperationKind::Change(vec![ChangeKind::Write]),
+                    ]
+                );
+                let states = recording.enumerate(100).unwrap();
+                recording.assert_all_cuts_covered(&states);
+                states.len()
+            })
+            .collect();
+        // Persisting a zero and leaving a zero-filled extension are the same image.
+        assert!(counts[0] < counts[1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "missing operation cut")]
+    fn power_loss_cut_coverage_rejects_a_missing_cut() {
+        let root = Scratch::new();
+        let recording = root.recording();
+        with_fs_ops(recording.clone(), || {
+            fs_ops::File::create(root.0.join("data"))
+                .unwrap()
+                .write_all(b"data")
+                .unwrap();
+        });
+        let mut states = recording.enumerate(100).unwrap();
+        states.retain(|state| state.cut != 1);
+        recording.assert_all_cuts_covered(&states);
     }
 
     #[test]
