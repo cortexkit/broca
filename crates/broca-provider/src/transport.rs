@@ -281,6 +281,7 @@ pub struct LiveProvider<F: WireFamily + 'static> {
     clock: Clock,
     pub(crate) family: Arc<F>,
     pub(crate) frozen: Arc<FrozenRenderConfig>,
+    subscription_auth: bool,
     grammar_downgraded: std::sync::atomic::AtomicBool,
     #[cfg(feature = "test-attachments")]
     media_renderer: std::sync::RwLock<Option<Arc<broca_core::provider::MediaRequestRenderer>>>,
@@ -324,6 +325,7 @@ struct PreparedHttpRequest {
     /// The request's wire family, so a non-2xx answer is classified by the family that sent it.
     /// `None` only for a request built outside a render job (tests). Read only on error.
     family: Option<crate::spec::WireFamilyId>,
+    subscription_auth: bool,
     /// The wire family and the caller's service tier, when one was requested, so a non-2xx
     /// answer can be recognised as the provider refusing that tier. Read only on error.
     service_tier: Option<(
@@ -353,6 +355,7 @@ impl From<HttpRequest> for PreparedHttpRequest {
             headers: request.headers,
             body: Bytes::from(request.body),
             family: None,
+            subscription_auth: false,
             service_tier: None,
             session_address: None,
             run_id: None,
@@ -367,6 +370,7 @@ impl From<HttpRequest> for PreparedHttpRequest {
 /// Immutable, whole-request input for one blocking render. All expensive input stays behind
 /// shared handles; the closure is the sole owner that releases its prompt snapshot.
 struct RenderJob<F: WireFamily + 'static> {
+    subscription_auth: bool,
     #[cfg(feature = "test-attachments")]
     media_renderer: Option<Arc<broca_core::provider::MediaRequestRenderer>>,
     #[cfg(feature = "test-attachments")]
@@ -660,6 +664,7 @@ impl<F: WireFamily + 'static> RenderJob<F> {
             }));
         }
         request.family = Some(self.frozen.family_id);
+        request.subscription_auth = self.subscription_auth;
         request.service_tier = self
             .frozen
             .service_tier_request
@@ -840,7 +845,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             &self.client,
             &self.clock,
             request,
-            self.frozen.family_id,
+            self.account_limit_context(),
             account,
         )
         .await
@@ -967,6 +972,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
                 .map(|fallback| Arc::new(fallback.frozen.clone())),
             route: std::sync::atomic::AtomicU8::new(ROUTE_SOURCE),
             frozen: Arc::new(frozen),
+            subscription_auth: false,
             grammar_downgraded: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "test-attachments")]
             media_renderer: std::sync::RwLock::new(None),
@@ -1010,6 +1016,20 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
     pub fn with_credential_refresher(mut self, refresher: Arc<dyn CredentialRefresher>) -> Self {
         self.refresher = Some(refresher);
         self
+    }
+
+    /// Preserve the resolved credential method for refusals that mean different things for
+    /// prepaid API keys and replenishing subscriptions. Bearer headers alone cannot tell them apart.
+    pub fn with_auth_method(mut self, method: Option<&str>) -> Self {
+        self.subscription_auth = method.is_some_and(|method| method != "apikey");
+        self
+    }
+
+    fn account_limit_context(&self) -> AccountLimitContext {
+        AccountLimitContext {
+            family: self.frozen.family_id,
+            subscription_auth: self.subscription_auth,
+        }
     }
 
     /// Keep the account selected when the run was admitted separate from the account
@@ -1084,6 +1104,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             return rx;
         }
         let render_job = RenderJob {
+            subscription_auth: self.subscription_auth,
             #[cfg(feature = "test-attachments")]
             media_renderer: self.media_renderer.read().unwrap().clone(),
             #[cfg(feature = "test-attachments")]
@@ -1387,7 +1408,7 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
             &self.client,
             &self.clock,
             request,
-            self.frozen.family_id,
+            self.account_limit_context(),
             account,
         )
         .await
@@ -1406,7 +1427,7 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
             &self.client,
             &self.clock,
             request,
-            self.frozen.family_id,
+            self.account_limit_context(),
             account,
             hook,
             policy,
@@ -1429,11 +1450,12 @@ async fn send_warm(
     client: &ProviderHttpClient,
     clock: &Clock,
     request: HttpRequest,
-    family: crate::spec::WireFamilyId,
+    family: impl Into<AccountLimitContext>,
     served_account_ref: Option<String>,
     hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
     policy: Option<broca_core::cache_warm::WarmSendPolicy>,
 ) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
+    let family = family.into();
     match hook {
         None => send_warm_legacy(client, clock, request, family, served_account_ref).await,
         Some(hook) => {
@@ -1456,9 +1478,11 @@ async fn send_warm_legacy(
     client: &ProviderHttpClient,
     clock: &Clock,
     request: HttpRequest,
-    family: crate::spec::WireFamilyId,
+    family: impl Into<AccountLimitContext>,
     served_account_ref: Option<String>,
 ) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
+    let classification = family.into();
+    let family = classification.family;
     let warm_body_sha256 = lower_hex(&Sha256::digest(&request.body));
     let anthropic_api_host = request_gzip::is_anthropic_api_host(&request.url);
     let identity = Bytes::from(request.body);
@@ -1548,8 +1572,8 @@ async fn send_warm_legacy(
                 Some(family),
                 None,
             );
-            let error = classify_account_limit_exhausted(
-                family,
+            let error = classify_account_limit_exhausted_with_auth(
+                classification,
                 code,
                 &headers,
                 &text,
@@ -1608,11 +1632,13 @@ async fn send_warm_journaled(
     client: &ProviderHttpClient,
     clock: &Clock,
     request: HttpRequest,
-    family: crate::spec::WireFamilyId,
+    family: impl Into<AccountLimitContext>,
     served_account_ref: Option<String>,
     hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
     policy: Option<broca_core::cache_warm::WarmSendPolicy>,
 ) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
+    let classification = family.into();
+    let family = classification.family;
     use broca_wal::record::{AttemptEnvelope, AttemptSent, BillingAttemptOutcome as Outcome};
     let warm_body_sha256 = lower_hex(&Sha256::digest(&request.body));
     let anthropic_api_host = request_gzip::is_anthropic_api_host(&request.url);
@@ -1755,8 +1781,8 @@ async fn send_warm_journaled(
                 Some(family),
                 None,
             );
-            let error = classify_account_limit_exhausted(
-                family,
+            let error = classify_account_limit_exhausted_with_auth(
+                classification,
                 code,
                 &headers,
                 &text,
@@ -2750,6 +2776,7 @@ fn spawn_transport_task<F: WireFamily + 'static>(
                 headers: fresh.headers,
                 body: sent.body.clone(),
                 family: sent.family,
+                subscription_auth: sent.subscription_auth,
                 service_tier: sent.service_tier.clone(),
                 session_address: sent.session_address.clone(),
                 run_id: sent.run_id.clone(),
@@ -3800,8 +3827,11 @@ async fn drive_attempt(
         let error = match request.family {
             Some(family) => {
                 let error = classify_chatgpt_upstream_key_rejection(family, code, &text, error);
-                classify_account_limit_exhausted(
-                    family,
+                classify_account_limit_exhausted_with_auth(
+                    AccountLimitContext {
+                        family,
+                        subscription_auth: request.subscription_auth,
+                    },
                     code,
                     &headers,
                     &text,
@@ -4729,6 +4759,33 @@ pub fn classify_account_limit_exhausted(
     now: SystemTime,
     error: ProviderError,
 ) -> ProviderError {
+    classify_account_limit_exhausted_with_auth(family.into(), status, headers, body, now, error)
+}
+
+#[derive(Clone, Copy)]
+struct AccountLimitContext {
+    family: crate::spec::WireFamilyId,
+    subscription_auth: bool,
+}
+
+impl From<crate::spec::WireFamilyId> for AccountLimitContext {
+    fn from(family: crate::spec::WireFamilyId) -> Self {
+        Self {
+            family,
+            subscription_auth: false,
+        }
+    }
+}
+
+fn classify_account_limit_exhausted_with_auth(
+    context: AccountLimitContext,
+    status: u16,
+    headers: &crate::wire::ResponseHeaders,
+    body: &str,
+    now: SystemTime,
+    error: ProviderError,
+) -> ProviderError {
+    let family = context.family;
     if status == 402 {
         if let Some(unaffordable) = openrouter_credit_insufficient(body, &error) {
             return unaffordable;
@@ -4740,6 +4797,20 @@ pub fn classify_account_limit_exhausted(
     ) && (status == 402 || status == 403)
     {
         if let Some(exhausted) = xai_spending_limit_reached(body, status, &error) {
+            if context.subscription_auth
+                && (error.provider_code.as_deref() == Some("personal-team-blocked:spending-limit")
+                    || extract_provider_code(body).as_deref()
+                        == Some("personal-team-blocked:spending-limit"))
+            {
+                let resets_at_ms = retry_after_deadline(now, error.retry_after_secs);
+                return ProviderError {
+                    class: ErrorClass::Transient,
+                    provider_code: Some(ACCOUNT_LIMIT_EXHAUSTED.to_owned()),
+                    resets_at_ms,
+                    resets_at_source: resets_at_ms.map(|_| "retry_after".to_owned()),
+                    ..exhausted
+                };
+            }
             return exhausted;
         }
     }
@@ -5086,7 +5157,8 @@ fn openrouter_credit_insufficient(body: &str, error: &ProviderError) -> Option<P
 }
 
 /// xAI's spending limit refusal: HTTP 402 or 403 with code `personal-team-blocked:spending-limit`.
-/// Class is permanent, with no resets_at_ms and no retry within the run.
+/// Without credential context, preserve the API-key classification: permanent billing exhaustion.
+/// The auth-aware caller classifies a subscription refusal as a transient account limit.
 fn xai_spending_limit_reached(
     body: &str,
     status: u16,
@@ -5723,6 +5795,7 @@ mod tests {
     {
         let direct = family.render(&frozen, &opts);
         let job = super::RenderJob {
+            subscription_auth: false,
             #[cfg(feature = "test-attachments")]
             media_renderer: None,
             #[cfg(feature = "test-attachments")]
@@ -6748,6 +6821,7 @@ mod tests {
         let mut frozen = crate::families::anthropic_frozen_config("m");
         frozen.speed = Some("fast".into());
         let rendered = super::RenderJob {
+            subscription_auth: false,
             #[cfg(feature = "test-attachments")]
             media_renderer: None,
             #[cfg(feature = "test-attachments")]
@@ -10594,6 +10668,135 @@ mod tests {
             assert!(classified.is_billing_exhausted());
             assert_eq!(classified.provider_code.as_deref(), Some(BILLING_EXHAUSTED));
             assert_eq!(classified.resets_at_ms, None);
+        }
+    }
+
+    #[test]
+    fn xai_subscription_spending_limit_is_an_untimed_account_wall() {
+        let headers = crate::wire::ResponseHeaders::new(std::iter::empty::<(&str, &str)>());
+        for family in [WireFamilyId::OpenAiChat, WireFamilyId::OpenAiResponses] {
+            for status in [402, 403] {
+                for (method, expected_code, expected_class) in [
+                    (
+                        Some("oauth"),
+                        ACCOUNT_LIMIT_EXHAUSTED,
+                        ErrorClass::Transient,
+                    ),
+                    (
+                        Some("chatgpt"),
+                        ACCOUNT_LIMIT_EXHAUSTED,
+                        ErrorClass::Transient,
+                    ),
+                    (
+                        Some("antigravity"),
+                        ACCOUNT_LIMIT_EXHAUSTED,
+                        ErrorClass::Transient,
+                    ),
+                    (Some("apikey"), BILLING_EXHAUSTED, ErrorClass::Permanent),
+                    (None, BILLING_EXHAUSTED, ErrorClass::Permanent),
+                ] {
+                    let provider = LiveProvider::new(
+                        OpenAiResponses,
+                        frozen_config_for_family(family, "grok-4.7"),
+                        AuthHandle::Bearer("test-token".into()),
+                    )
+                    .with_auth_method(method);
+                    let error = super::classify_account_limit_exhausted_with_auth(
+                        provider.account_limit_context(),
+                        status,
+                        &headers,
+                        XAI_SPENDING_LIMIT_BODY,
+                        UNIX_EPOCH,
+                        classify_http_error(status, XAI_SPENDING_LIMIT_BODY, None, None),
+                    );
+                    assert_eq!(
+                        error.provider_code.as_deref(),
+                        Some(expected_code),
+                        "{family:?} {status} {method:?}"
+                    );
+                    assert_eq!(error.class, expected_class);
+                    assert_eq!(error.status, Some(status));
+                    assert_eq!(error.resets_at_ms, None);
+                    assert_eq!(error.resets_at_source, None);
+                    assert_eq!(error.limit_window, None);
+                }
+            }
+        }
+        let context = super::AccountLimitContext {
+            family: WireFamilyId::OpenAiResponses,
+            subscription_auth: true,
+        };
+        for (status, body) in [
+            (400, XAI_SPENDING_LIMIT_BODY),
+            (403, r#"{"error":{"code":"insufficient_quota"}}"#),
+        ] {
+            let raw = classify_http_error(status, body, None, None);
+            let error = super::classify_account_limit_exhausted_with_auth(
+                context,
+                status,
+                &headers,
+                body,
+                UNIX_EPOCH,
+                raw.clone(),
+            );
+            assert_eq!(error, raw);
+        }
+    }
+
+    #[tokio::test]
+    async fn xai_subscription_spending_limit_is_an_account_wall_on_both_warm_paths() {
+        for journaled in [false, true] {
+            let server = ScriptedServer::start(vec![ScriptResponse::Http {
+                status: 403,
+                headers: Vec::new(),
+                body: XAI_SPENDING_LIMIT_BODY.as_bytes(),
+            }])
+            .await;
+            let mut frozen = openai_responses_frozen_config("grok-4.7");
+            frozen.base_url = Some(server.url.clone());
+            let provider = LiveProvider::new(
+                OpenAiResponses,
+                frozen,
+                AuthHandle::Bearer("test-token".into()),
+            )
+            .with_auth_method(Some("oauth"));
+            let body =
+                broca_core::Provider::render_request(&provider, &CallOptions::new(Vec::new()));
+            let root = attempt_scratch("xai-subscription-warm");
+            let mut writer = None;
+            let result = if journaled {
+                let (warm_writer, _) = warm_writer(&root).await;
+                let journal = Arc::new(broca_core::cache_warm::WarmJournal::new(
+                    warm_writer.clone(),
+                    broca_core::ShutdownSeal::new(),
+                    warm_template(),
+                    "base".into(),
+                    None,
+                ));
+                writer = Some(warm_writer);
+                broca_core::Provider::warm_with_hook(&provider, &body, Some(journal)).await
+            } else {
+                broca_core::Provider::warm(&provider, &body).await
+            };
+            let Err(broca_core::WarmFailure::Provider(error)) = result else {
+                panic!("expected a provider quota refusal");
+            };
+            assert_eq!(
+                error.provider_code.as_deref(),
+                Some(ACCOUNT_LIMIT_EXHAUSTED)
+            );
+            assert_eq!(error.class, ErrorClass::Transient);
+            assert_eq!(error.resets_at_ms, None);
+            assert_eq!(server.request_bodies().len(), 1);
+            if let Some(writer) = writer {
+                Arc::try_unwrap(writer)
+                    .ok()
+                    .expect("warm released writer")
+                    .shutdown()
+                    .await
+                    .unwrap();
+            }
+            std::fs::remove_dir_all(root).unwrap();
         }
     }
 

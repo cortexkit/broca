@@ -24,7 +24,7 @@ pub use broca_provider::service_tier::ServiceTier;
 use broca_provider::spec::{AuthKind, CapabilityFlag, ReasoningOptions};
 pub use broca_provider::variant::FrozenVariant;
 use broca_provider::variant::{freeze_variant, resolve_variant};
-use broca_provider::{live_provider_with_clock_and_refresher, ProviderHttpClient};
+use broca_provider::{live_provider_with_options, ProviderHttpClient, ProviderOptions};
 // Re-exported so a consumer (the module executor) can name the resolved family for the
 // (provider, auth-method) consistency guard without depending on broca-provider directly.
 pub use broca_provider::spec::WireFamilyId;
@@ -496,14 +496,19 @@ pub fn provider_for_recorded_config(
     };
     let resolved_auth = resolve_family_auth(auth, &frozen, &auth_kind, provider_id, &opts)?;
     validate_recorded_fallback_auth(provider_id, resolved_auth.auth_method, &frozen)?;
-    live_provider_with_clock_and_refresher(
+    live_provider_with_options(
         Some(http_client),
         frozen,
         resolved_auth.handle,
-        resolved_auth.refresher,
-        frozen_account_ref.map(str::to_owned),
-        served_account_ref.map(str::to_owned),
-        clock.clone(),
+        ProviderOptions {
+            refresher: resolved_auth.refresher,
+            auth_method: resolved_auth
+                .auth_method
+                .map(|method| method.as_token().to_owned()),
+            frozen_account_ref: frozen_account_ref.map(str::to_owned),
+            served_account_ref: served_account_ref.map(str::to_owned),
+            clock: clock.clone(),
+        },
     )
     .map_err(|error| error.to_string())
 }
@@ -847,7 +852,8 @@ fn resolve_provider_inner(
             .clone()
             .unwrap_or_else(|| "<family default>".into());
         let wire_model = frozen.wire_model_id.clone();
-        let provider = resolved_live_provider(http_client, frozen, handle, refresher, opts)?;
+        let provider =
+            resolved_live_provider(http_client, frozen, handle, refresher, auth_method, opts)?;
         return Ok(ProviderResolution {
             provider,
             auth_method,
@@ -933,7 +939,8 @@ fn resolve_provider_inner(
             "openai-compatible",
             opts.auth_method,
         );
-        let provider = resolved_live_provider(http_client, frozen, handle, refresher, opts)?;
+        let provider =
+            resolved_live_provider(http_client, frozen, handle, refresher, auth_method, opts)?;
         return Ok(ProviderResolution {
             provider,
             auth_method,
@@ -1153,7 +1160,8 @@ fn resolve_provider_inner(
         // Read back from the frozen config: on Code Assist a variant may have moved the wire id
         // to another tier, and this reports the id actually sent.
         let wire_model = frozen.wire_model_id.clone();
-        let provider = resolved_live_provider(http_client, frozen, handle, refresher, opts)?;
+        let provider =
+            resolved_live_provider(http_client, frozen, handle, refresher, auth_method, opts)?;
         return Ok(ProviderResolution {
             provider,
             auth_method,
@@ -1364,7 +1372,8 @@ fn resolve_provider_inner(
         .unwrap_or_else(|| "<family default>".to_string());
 
     let refresher = secret_refresher_for(auth, opts, &auth_kind, provider_id, auth_method);
-    let provider = resolved_live_provider(http_client, frozen, handle, refresher, opts)?;
+    let provider =
+        resolved_live_provider(http_client, frozen, handle, refresher, auth_method, opts)?;
     Ok(ProviderResolution {
         provider,
         auth_method,
@@ -1899,16 +1908,20 @@ fn resolved_live_provider(
     frozen: FrozenRenderConfig,
     auth: AuthHandle,
     refresher: Option<Arc<dyn CredentialRefresher>>,
+    auth_method: Option<AuthMethod>,
     opts: &ResolveOptions<'_>,
 ) -> Result<Box<dyn broca_core::provider::Provider>, String> {
-    live_provider_with_clock_and_refresher(
+    live_provider_with_options(
         http_client.cloned(),
         frozen,
         auth,
-        refresher,
-        opts.frozen_account_ref.map(str::to_owned),
-        opts.account_id.map(str::to_owned),
-        opts.clock.cloned().unwrap_or_default(),
+        ProviderOptions {
+            refresher,
+            auth_method: auth_method.map(|method| method.as_token().to_owned()),
+            frozen_account_ref: opts.frozen_account_ref.map(str::to_owned),
+            served_account_ref: opts.account_id.map(str::to_owned),
+            clock: opts.clock.cloned().unwrap_or_default(),
+        },
     )
     .map_err(|error| error.to_string())
 }
@@ -3449,6 +3462,100 @@ mod tests {
             request.extend_from_slice(&chunk[..read]);
         }
         (headers, request[header_end..header_end + length].to_vec())
+    }
+
+    #[tokio::test]
+    async fn xai_subscription_method_survives_step_resolution_and_recorded_warm() {
+        use broca_protocol::{ErrorClass, NormalizedEvent, ProviderControl};
+        use tokio::io::AsyncWriteExt;
+
+        seed_catalog_for_resolution();
+        for (method, expected_code, expected_class) in [
+            (
+                AuthMethod::Oauth,
+                "account_limit_exhausted",
+                ErrorClass::Transient,
+            ),
+            (
+                AuthMethod::ApiKey,
+                "billing_exhausted",
+                ErrorClass::Permanent,
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let upstream = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    capture_codex_request(&mut socket).await;
+                    let body = r#"{"code":"personal-team-blocked:spending-limit","error":"You have run out of credits or need a Grok subscription..."}"#;
+                    let response = format!("HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            let client = broca_provider::build_provider_http_client();
+            let auth = AuthMode::Secret("test-token".into());
+            let resolution = resolve_catalog_episode_at_base_url(
+                "xai/grok-4.5",
+                &url,
+                Some(2048),
+                &auth,
+                &ResolveOptions {
+                    auth_method: Some(method),
+                    ..Default::default()
+                },
+                client.clone(),
+                EpisodeRenderConfig::default(),
+            )
+            .unwrap();
+            let options = CallOptions::new(vec![Message::new(
+                Role::User,
+                vec![ContentBlock::Text { text: "hi".into() }],
+            )]);
+            let mut events = resolution
+                .provider
+                .step(broca_protocol::StepId(1), &options)
+                .await;
+            let mut terminal = None;
+            let mut attempts = 0;
+            while let Some(event) = events.recv().await {
+                match event {
+                    NormalizedEvent::Control(ProviderControl::Error { error, .. }) => {
+                        terminal = Some(error)
+                    }
+                    NormalizedEvent::Control(ProviderControl::AttemptFinished { .. }) => {
+                        attempts += 1
+                    }
+                    _ => {}
+                }
+            }
+            let terminal = terminal.expect("step must return the refusal");
+            assert_eq!(terminal.provider_code.as_deref(), Some(expected_code));
+            assert_eq!(terminal.class, expected_class);
+            assert_eq!(terminal.resets_at_ms, None);
+            assert_eq!(attempts, 1);
+            let frozen = serde_json::from_value(resolution.provider.render_config_blob()).unwrap();
+            let warm = provider_for_recorded_config(
+                "xai",
+                "grok-4.5",
+                frozen,
+                &auth,
+                Some(method),
+                None,
+                None,
+                client,
+                &broca_core::clock::Clock::default(),
+            )
+            .unwrap();
+            let base = resolution.provider.render_request(&options);
+            let Err(broca_core::WarmFailure::Provider(error)) = warm.warm(&base).await else {
+                panic!("warm must return the provider refusal");
+            };
+            assert_eq!(error.provider_code.as_deref(), Some(expected_code));
+            assert_eq!(error.class, expected_class);
+            assert_eq!(error.resets_at_ms, None);
+            upstream.await.unwrap();
+        }
     }
 
     #[tokio::test]
