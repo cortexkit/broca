@@ -236,7 +236,7 @@ pub struct ImportedSession {
     pub warnings: Vec<String>,
     /// Claude Code client-side API failure notices omitted before canonical import.
     pub dropped_api_error_messages: usize,
-    /// Present for OpenCode, whose magic-context rows use source message coordinates.
+    /// Maps source message and block coordinates to imported coordinates for OpenCode.
     pub coordinate_map: Option<CoordinateMap>,
 }
 
