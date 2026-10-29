@@ -200,6 +200,15 @@ impl Route {
         frozen.max_output_tokens = 512;
         frozen.caller_max_output_tokens = Some(512);
         frozen.prompt_cache_key = Some("broca-synthetic-media-live".into());
+        if self.family == WireFamilyId::AnthropicMessages && frozen.cache.is_none() {
+            // Use the same no-override default as production cache routing. A prompt cache
+            // key is an OpenAI hint and cannot enable Anthropic's explicit breakpoints.
+            frozen.cache = broca_module_serve::cache_routing::default_cache_policy(
+                self.family,
+                "anthropic",
+                None,
+            );
+        }
         if let Some(url) = &self.base_url {
             frozen.base_url = Some(url.clone());
         }

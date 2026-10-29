@@ -486,13 +486,87 @@ fn cache_stable(usages: &[Usage]) -> bool {
     matches!((usages.get(1).and_then(|u| u.cached_input_tokens), usages.get(2).and_then(|u| u.cached_input_tokens)), (Some(before), Some(after)) if before > 0 && after >= before)
 }
 
+fn cache_control_paths(body: &[u8]) -> Result<Vec<String>, &'static str> {
+    fn walk(value: &Value, path: &str, paths: &mut Vec<String>) -> Result<(), &'static str> {
+        match value {
+            Value::Object(fields) => {
+                for (key, value) in fields {
+                    let identifier = key
+                        .as_bytes()
+                        .first()
+                        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+                        && key
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+                    let next = if identifier {
+                        format!("{path}.{key}")
+                    } else {
+                        format!(
+                            "{path}[{}]",
+                            serde_json::to_string(key).map_err(|_| "cache_path_encode_failed")?
+                        )
+                    };
+                    if key == "cache_control" {
+                        paths.push(next.clone());
+                    }
+                    walk(value, &next, paths)?;
+                }
+            }
+            Value::Array(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    walk(value, &format!("{path}[{index}]"), paths)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    let value: Value = serde_json::from_slice(body).map_err(|_| "cache_path_decode_failed")?;
+    let mut paths = vec![];
+    walk(&value, "$", &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn remove_anthropic_cache_hints(body: &mut Value) {
+    fn blocks(content: &mut Value) {
+        let Some(parts) = content.as_array_mut() else {
+            return;
+        };
+        for part in parts {
+            let tool_result = part.get("type").and_then(Value::as_str) == Some("tool_result");
+            if let Some(fields) = part.as_object_mut() {
+                fields.remove("cache_control");
+            }
+            if tool_result {
+                if let Some(content) = part.get_mut("content") {
+                    blocks(content);
+                }
+            }
+        }
+    }
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            if let Some(content) = message.get_mut("content") {
+                blocks(content);
+            }
+        }
+    }
+}
+
 fn prefix_stable(previous: &[u8], next: &[u8], family: WireFamilyId) -> bool {
-    let (Ok(previous), Ok(next)) = (
+    let (Ok(mut previous), Ok(mut next)) = (
         serde_json::from_slice::<Value>(previous),
         serde_json::from_slice::<Value>(next),
     ) else {
         return false;
     };
+    if family == WireFamilyId::AnthropicMessages {
+        // The production planner can move cache hints as the tail grows without changing
+        // prompt content. Ignore only block annotations, never tool input or media bytes.
+        remove_anthropic_cache_hints(&mut previous);
+        remove_anthropic_cache_hints(&mut next);
+    }
     let pointer = match family {
         WireFamilyId::AnthropicMessages
         | WireFamilyId::BedrockConverse
@@ -577,7 +651,7 @@ fn preview(
         );
         println!(
             "{}",
-            json!({"mode":"dry_run", "family":route.family, "model":route.model, "profile":frozen.media.as_ref().map(|p| p.profile), "request":stage + 1, "purpose":if stage == 2 {"cache_follow_up"} else {"media"}, "live_skip":route.live_skip_reason(frozen), "request_bytes":body.len(), "request_sha256":format!("{:x}", Sha256::digest(&body)), "media": prepared.media.iter().map(|m| json!({"origin":if m.tool {"tool"} else {"user"}, "carrier":m.carrier, "kind":m.reference.kind,"mime":m.reference.mime,"bytes":m.reference.byte_size,"sha256":m.reference.sha256})).collect::<Vec<_>>() })
+            json!({"mode":"dry_run", "family":route.family, "model":route.model, "profile":frozen.media.as_ref().map(|p| p.profile), "request":stage + 1, "purpose":if stage == 2 {"cache_follow_up"} else {"media"}, "live_skip":route.live_skip_reason(frozen), "cache_control_paths":cache_control_paths(&body)?, "request_bytes":body.len(), "request_sha256":format!("{:x}", Sha256::digest(&body)), "media": prepared.media.iter().map(|m| json!({"origin":if m.tool {"tool"} else {"user"}, "carrier":m.carrier, "kind":m.reference.kind,"mime":m.reference.mime,"bytes":m.reference.byte_size,"sha256":m.reference.sha256})).collect::<Vec<_>>() })
         );
         if stage < 2 {
             history.push(Message::new(
@@ -789,6 +863,134 @@ mod tests {
                 {"family":"google_codeassist", "reason":"project_id_required", "missing_field":"project_id"}
             ])
         );
+    }
+
+    #[test]
+    fn cache_control_paths_report_locations_without_values_or_content() {
+        let body = json!({
+            "system":[{"text":"private content", "cache_control":{"type":"ephemeral"}}],
+            "messages":[{"content":[{"type":"tool_result", "content":[{"text":"private nested content", "cache_control":{"type":"ephemeral"}}]}]}]
+        });
+        assert_eq!(
+            cache_control_paths(&serde_json::to_vec(&body).unwrap()).unwrap(),
+            [
+                "$.messages[0].content[0].content[0].cache_control",
+                "$.system[0].cache_control",
+            ]
+        );
+        assert!(cache_control_paths(b"not json").is_err());
+    }
+
+    #[test]
+    fn anthropic_requests_freeze_production_cache_defaults_with_media() {
+        let route = Args::default()
+            .routes()
+            .unwrap()
+            .into_iter()
+            .find(|route| route.family == WireFamilyId::AnthropicMessages)
+            .unwrap();
+        let frozen = route.frozen().unwrap();
+        let production = broca_module_serve::resolve_cache_policy(
+            WireFamilyId::AnthropicMessages,
+            "anthropic",
+            None,
+            &broca_module_serve::CacheTtlTable::shipped_defaults(),
+            &probe_identity().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(frozen.cache, production);
+        assert!(matches!(
+            frozen.cache.as_ref().map(|policy| &policy.class),
+            Some(broca_provider::wire::CacheClass::Markers { .. })
+        ));
+        let frozen = preview_config(&route, &frozen).unwrap();
+        let fixtures = fixtures();
+        let mut history = initial_history();
+        let mut previous: Option<Vec<u8>> = None;
+        for stage in 0..3 {
+            if stage < 2 {
+                add_exchange(&mut history, &frozen, &fixtures, stage);
+            } else {
+                history.push(Message::new(
+                    Role::User,
+                    vec![text(
+                        "Repeat the preceding media values in the same format.",
+                    )],
+                ));
+            }
+            let body = render(&frozen, &history, &fixtures).unwrap();
+            let paths = cache_control_paths(&body).unwrap();
+            assert!(paths.iter().any(|path| path.starts_with("$.system[")));
+            assert!(paths.iter().any(|path| path.starts_with("$.messages[")));
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            let parts: Vec<_> = value["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|message| message["content"].as_array().unwrap())
+                .collect();
+            for part in parts
+                .iter()
+                .filter(|part| matches!(part["type"].as_str(), Some("image" | "document")))
+            {
+                assert!(part.get("cache_control").is_none());
+            }
+            if stage > 0 {
+                let tool = parts
+                    .iter()
+                    .find(|part| part["type"] == "tool_result")
+                    .unwrap();
+                assert!(tool["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|part| part["type"] == "image"));
+                assert!(tool["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|part| part["type"] == "document"));
+                if stage == 1 {
+                    assert!(tool.get("cache_control").is_some());
+                }
+            }
+            if let Some(before) = &previous {
+                assert!(prefix_stable(before, &body, route.family));
+            }
+            previous = Some(body);
+            if stage < 2 {
+                history.push(Message::new(
+                    Role::Assistant,
+                    vec![text("Dry-run answer placeholder.")],
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn anthropic_cache_hints_do_not_hide_real_prefix_changes() {
+        let before = json!({"messages":[{"role":"user","content":[{"type":"tool_result","content":[{"type":"text","text":"one"},{"type":"image","source":{"data":"original"}}],"cache_control":{"type":"ephemeral"}}]}]});
+        let mut after = before.clone();
+        after["messages"][0]["content"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_control");
+        after["messages"][0]["content"][0]["content"][0]["cache_control"] =
+            json!({"type":"ephemeral"});
+        let stable = |left: &Value, right: &Value| {
+            prefix_stable(
+                &serde_json::to_vec(left).unwrap(),
+                &serde_json::to_vec(right).unwrap(),
+                WireFamilyId::AnthropicMessages,
+            )
+        };
+        assert!(stable(&before, &after));
+        after["messages"][0]["content"][0]["content"][1]["source"]["data"] = json!("changed");
+        assert!(!stable(&before, &after));
+        let input = json!({"messages":[{"role":"assistant","content":[{"type":"tool_use","input":{"cache_control":"data, not a hint"}}]}]});
+        let mut changed = input.clone();
+        changed["messages"][0]["content"][0]["input"]["cache_control"] = json!("changed data");
+        assert!(!stable(&input, &changed));
     }
 
     #[tokio::test]

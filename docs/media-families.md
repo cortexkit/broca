@@ -60,6 +60,13 @@ token or capability handle belongs in the plan. Credentials are read by name onl
 through the dev-tools handle map and subc, and only after `--live` and
 `BROCA_LIVE_TESTS=1`. `--subc` and `--timeout-secs` are optional.
 
+For Anthropic, a missing frozen cache policy is filled by
+`broca_module_serve::cache_routing::default_cache_policy` for the `anthropic`
+provider, with no caller override or declared tail. This is the same default
+used by production's `resolve_cache_policy`: five-minute markers with the `ttl`
+field omitted, as in production. An explicitly supplied frozen policy is kept.
+The provider renderer chooses every breakpoint; the probe does not place any.
+
 The Anthropic route selects the long-standing `oauth:anthropic` subscription
 credential; ChatGPT selects `chatgpt:openai`. The temporary live-check handles
 have been revoked. API-key Anthropic routes remain supported for funded keys.
@@ -100,7 +107,10 @@ live, so no audio fixtures are included in that route.
 Fixtures are synthetic and checked in beside the example; no session data is read.
 
 Dry-run JSON lines list family, wire model, profile, carrier, media kind, MIME,
-decoded byte size, digest, and complete rendered request size/digest. Live lines
+decoded byte size, digest, and complete rendered request size/digest.
+`cache_control_paths` lists the JSONPath of each `cache_control` field in the
+actual rendered body, including tool-result wrappers; it never prints the
+marker-bearing object or content. Live lines
 report HTTP status, allowlisted provider code, usage including cached tokens, and
 fixed-string media-check booleans, never the answer. `cache_stable` requires a
 positive reported cache hit on request 2 and no decrease on request 3; missing
@@ -108,6 +118,11 @@ usage, zero hits or interrupted runs are inconclusive, not passes. Media checks
 must also pass independently. A provider rejection spends a slot and is never
 retried. The probe only changes candidate profiles in memory, never the production
 registry or a running admission's frozen config.
+
+Prefix stability compares prior rendered message content. For Anthropic it
+ignores only block-level `cache_control` annotations, which the production
+planner may move as the tail grows; tool input and media bytes still must match.
+This comparison never changes the sent bodies or the reported breakpoint paths.
 
 Paste results beside the matching profile below in this format (one row per
 request; use `not serving` for a family not exercised):
@@ -122,9 +137,10 @@ when old frozen flags or MIME lists are present. Code Assist's current all-kind
 flag must not be enabled from PNG/PDF-only evidence:
 audio/video remain unverified by those checks. Untested profiles retain markers.
 
-The dated results below are transcribed from the operator's local evidence file
-`.cortexkit/internal-docs/investigations/media-live-check-2026-10-29.md`, which is
-kept outside version control. No new provider requests are implied by this table.
+The results below combine the operator's local evidence file
+`.cortexkit/internal-docs/investigations/media-live-check-2026-10-29.md` with
+subsequent operator-reported reruns. Evidence stays outside version control;
+recording these outcomes does not make any worker-run provider request.
 
 ## Kinds, MIME types and catalog modalities
 
@@ -251,10 +267,11 @@ person's media is refused (`carrier`) and tool media renders as markers.
 
 **Live check, 2026-10-28/29:** `claude-haiku-5-5` with the platform API key was not
 verified: HTTP 400, "Your credit balance is too low to access the Anthropic API."
-OAuth subscription media remains unverified live. The probe now preserves
-`credential.get.account_id` and uses the production persona factory, including
-its credential-ID fallback when no account ID is returned; it no longer skips
-solely because an account UUID is absent.
+The subsequent `oauth:anthropic` subscription check passed all three requests:
+person image/PDF, tool image/PDF and the follow-up. Cache writes and reads were
+zero on every request (`cache_stable: false`): that probe had no explicit
+`cache_control` policy. Media acceptance is verified; cache placement with the
+production policy still needs the operator's rerun.
 
 Sources: https://platform.claude.com/docs/en/build-with-claude/vision ·
 https://platform.claude.com/docs/en/build-with-claude/pdf-support ·
