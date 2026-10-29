@@ -33,3 +33,21 @@ each family. In particular:
 | Bedrock ConverseStream | Actual complete event stream with `metadata.usage`, separate cache-populating and cache-hit responses and all native counters. Preserve `serviceTier` if reported. Do not infer model from the request when the response does not name it. | Status line, `content-type`, `x-amzn-requestid`, and `x-amzn-errortype` on errors. | Non-2xx response or event-stream exception, headers and complete payload, any usage metadata. |
 
 An absent response-header request ID is a valid unknown result, not a reason to manufacture one.
+
+Socket attempts retain a request ID only when an individual wrapped error supplies a recognized
+response header; normal socket responses have no request ID here, and a connection-level upgrade
+ID is never copied to requests on a reused socket. The wrapped-header tests are synthetic.
+
+The in-band error tests cover a root-level `usage` beside `error` on Anthropic/Chat and
+`usageMetadata` beside `error` on Gemini/Code Assist's decoded response, not a vendor promise
+that native errors contain usage.
+Responses lifecycle metadata is retained before completion; a created-event tier is provisional,
+and a later reported terminal tier takes precedence. Envelope finish reasons require a reported
+wire reason/status, not a locally synthesized canonical completion.
+
+HTTP error evidence requires a complete readable JSON body; accumulated prefixes discarded by
+an error/cap are not decoded. Evidence from cache-warming responses likewise requires the
+complete body read to succeed.
+No claim is made that every partial HTTP-error/warm body, nested error shape, or warm handoff
+without tagged iterations has recoverable usage. The allocation guard measures five decoder
+`push` paths, not wrapper/transport construction, `finish`, allocation bytes or CPU time.

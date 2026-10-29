@@ -956,6 +956,11 @@ impl OpenAiResponsesNormalizer {
         let v: Value =
             serde_json::from_str(payload).map_err(|e| NormalizeError::Invalid(e.to_string()))?;
         let event_type = v.get("type").and_then(Value::as_str).unwrap_or_default();
+        if event_type == "response.created" {
+            if let (Some(evidence), Some(response)) = (&self.response_evidence, v.get("response")) {
+                evidence.lock().unwrap().observe_response(response);
+            }
+        }
         if self.response_evidence.is_some() && event_type == "response.failed" {
             if let Some(response) = v.get("response") {
                 if let Some(usage) = response.get("usage") {
@@ -1331,7 +1336,18 @@ impl OpenAiResponsesNormalizer {
                         }
                     }
                     if let Some(evidence) = &self.response_evidence {
-                        evidence.lock().unwrap().finish_reason = Some(self.finish_reason);
+                        let reason = resp
+                            .pointer("/incomplete_details/reason")
+                            .and_then(Value::as_str)
+                            .map(map_incomplete_reason)
+                            .or_else(|| {
+                                resp.get("status")
+                                    .and_then(Value::as_str)
+                                    .map(map_response_status)
+                            });
+                        if reason.is_some() {
+                            evidence.lock().unwrap().finish_reason = reason;
+                        }
                     }
                 }
                 self.finish_terminal(out)?;

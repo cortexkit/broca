@@ -700,6 +700,7 @@ impl OpenAiChatNormalizer {
         }
 
         if let Some(error) = openai_chat_stream_error(&v) {
+            self.observe_error_response(&v);
             out.push(NormalizedEvent::Control(ProviderControl::Error {
                 error,
                 retries_used: 0,
@@ -1126,9 +1127,14 @@ impl OpenAiChatNormalizer {
 
 impl StreamNormalizer for OpenAiChatNormalizer {
     fn observe_error_response(&mut self, response: &Value) {
+        if self.response_evidence.is_none() {
+            return;
+        }
+        let previous = self.usage;
         if let Some(usage) = response.get("usage") {
             self.merge_usage(usage);
         }
+        self.usage = previous;
         if let Some(evidence) = &self.response_evidence {
             evidence.lock().unwrap().observe_response(response);
         }

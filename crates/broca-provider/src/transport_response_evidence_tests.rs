@@ -579,3 +579,5 @@ async fn synthetic_response_evidence_refresh_witness_is_sticky_but_served_accoun
         Some("quota-account")
     );
 }
+
+include!("transport_response_evidence_regression_tests.rs");

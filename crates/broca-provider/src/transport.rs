@@ -4098,20 +4098,20 @@ fn observe_response_finish(
             if let NormalizedEvent::Control(ProviderControl::StepFinished {
                 service_tier_used,
                 speed_used,
+                served_model,
                 ..
             }) = event
             {
                 let mut evidence = evidence.lock().unwrap();
+                if let Some(model) = served_model {
+                    evidence.observe_served_model(model);
+                }
                 if service_tier_used.is_some() {
                     evidence.service_tier_used = service_tier_used.clone();
                 }
                 if speed_used.is_some() {
                     evidence.speed_used = speed_used.clone();
                 }
-            }
-            if let NormalizedEvent::Control(ProviderControl::Finished { finish_reason, .. }) = event
-            {
-                evidence.lock().unwrap().finish_reason = Some(*finish_reason);
             }
         }
     }
@@ -4122,6 +4122,28 @@ fn response_envelope(
     vendor_request_id: Option<String>,
 ) -> broca_wal::record::AttemptEnvelope {
     use broca_wal::record::{AttemptEnvelope, AttemptModelUsage};
+    fn model_row<'a>(
+        models: &'a mut Vec<AttemptModelUsage>,
+        model: &str,
+    ) -> &'a mut AttemptModelUsage {
+        let index = models
+            .iter()
+            .position(|row| row.model_used == model)
+            .unwrap_or_else(|| {
+                models.push(AttemptModelUsage {
+                    model_used: model.to_owned(),
+                    usage: Default::default(),
+                    cache_write_5m_tokens: None,
+                    cache_write_1h_tokens: None,
+                });
+                models.len() - 1
+            });
+        &mut models[index]
+    }
+    let mut models = Vec::new();
+    for model in evidence.handoff_models {
+        model_row(&mut models, &model);
+    }
     let mut envelope = AttemptEnvelope {
         usage: evidence.usage,
         model_used: evidence.model_used,
@@ -4137,25 +4159,22 @@ fn response_envelope(
             .and_then(|creation| creation.get(key))
             .and_then(Value::as_u64)
     };
+    let mut tagged_iterations = false;
+    let mut unattributed_iterations = false;
     if let Some(raw) = &envelope.usage_raw {
         envelope.cache_write_5m_tokens = split(raw, "ephemeral_5m_input_tokens");
         envelope.cache_write_1h_tokens = split(raw, "ephemeral_1h_input_tokens");
-        if let Some(iterations) =
-            raw.get("iterations")
-                .and_then(Value::as_array)
-                .filter(|entries| {
-                    !entries.is_empty()
-                        && entries.iter().all(|entry| {
-                            entry
-                                .get("model")
-                                .and_then(Value::as_str)
-                                .is_some_and(|model| !model.is_empty())
-                        })
-                })
-        {
-            let mut models = std::collections::BTreeMap::<String, AttemptModelUsage>::new();
+        if let Some(iterations) = raw.get("iterations").and_then(Value::as_array) {
             for entry in iterations {
-                let model = entry["model"].as_str().unwrap();
+                let Some(model) = entry
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .filter(|model| !model.is_empty())
+                else {
+                    unattributed_iterations = true;
+                    continue;
+                };
+                tagged_iterations = true;
                 let counters = |key: &str| entry.get(key).and_then(Value::as_u64);
                 let usage = broca_protocol::Usage {
                     input_tokens: counters("input_tokens"),
@@ -4167,14 +4186,7 @@ fn response_envelope(
                         .and_then(|details| details.get("thinking_tokens"))
                         .and_then(Value::as_u64),
                 };
-                let model = models
-                    .entry(model.to_owned())
-                    .or_insert_with(|| AttemptModelUsage {
-                        model_used: model.to_owned(),
-                        usage: Default::default(),
-                        cache_write_5m_tokens: None,
-                        cache_write_1h_tokens: None,
-                    });
+                let model = model_row(&mut models, model);
                 model.usage += usage;
                 model.cache_write_5m_tokens = broca_protocol::usage::sum_reported(
                     model.cache_write_5m_tokens,
@@ -4185,18 +4197,28 @@ fn response_envelope(
                     split(entry, "ephemeral_1h_input_tokens"),
                 );
             }
-            if models.len() > 1 {
-                envelope.model_used = None;
-                envelope.usage = None;
-                envelope.cache_write_5m_tokens = None;
-                envelope.cache_write_1h_tokens = None;
-                envelope.usage_by_model = Some(models.into_values().collect());
-            } else if let Some(model) = models.into_values().next() {
-                envelope.model_used = Some(model.model_used);
-                envelope.usage = Some(model.usage);
-                envelope.cache_write_5m_tokens = model.cache_write_5m_tokens;
-                envelope.cache_write_1h_tokens = model.cache_write_1h_tokens;
-            }
+        }
+    }
+    if models.len() > 1 {
+        // A handoff proves which models served, not their shares. Keep only tagged
+        // counters on named rows; unsplit/untagged counters remain solely in usage_raw.
+        envelope.model_used = None;
+        envelope.usage = None;
+        envelope.cache_write_5m_tokens = None;
+        envelope.cache_write_1h_tokens = None;
+        envelope.usage_by_model = Some(models);
+    } else if unattributed_iterations {
+        // A single known name cannot stand in for an iteration with no model tag.
+        envelope.model_used = None;
+        envelope.usage = None;
+        envelope.cache_write_5m_tokens = None;
+        envelope.cache_write_1h_tokens = None;
+    } else if tagged_iterations {
+        if let Some(model) = models.pop() {
+            envelope.model_used = Some(model.model_used);
+            envelope.usage = Some(model.usage);
+            envelope.cache_write_5m_tokens = model.cache_write_5m_tokens;
+            envelope.cache_write_1h_tokens = model.cache_write_1h_tokens;
         }
     }
     if envelope

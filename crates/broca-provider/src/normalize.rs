@@ -30,6 +30,7 @@ use serde_json::Value;
 /// ordinary normalization keeps its existing usage and event representation.
 #[derive(Debug, Default)]
 pub struct ResponseEvidence {
+    pub(crate) handoff_models: Vec<String>,
     pub(crate) usage: Option<Usage>,
     pub(crate) usage_raw: Option<Value>,
     pub(crate) model_used: Option<String>,
@@ -41,6 +42,20 @@ pub struct ResponseEvidence {
 pub type SharedResponseEvidence = std::sync::Arc<std::sync::Mutex<ResponseEvidence>>;
 
 impl ResponseEvidence {
+    pub(crate) fn observe_handoff(&mut self, from: &str, to: &str) {
+        for model in [from, to] {
+            if !model.is_empty() && !self.handoff_models.iter().any(|known| known == model) {
+                self.handoff_models.push(model.to_owned());
+            }
+        }
+    }
+
+    pub(crate) fn observe_served_model(&mut self, served: &str) {
+        if let Some(source) = self.model_used.clone().filter(|source| source != served) {
+            self.observe_handoff(&source, served);
+        }
+    }
+
     pub(crate) fn observe_response(&mut self, response: &Value) {
         if let Some(model) = response
             .get("model")
@@ -205,9 +220,24 @@ impl AnthropicNormalizer {
     }
 
     pub(crate) fn observe_error_response(&mut self, response: &Value) {
+        if self.response_evidence.is_none() {
+            return;
+        }
+        let previous = (
+            self.usage,
+            self.service_tier_used.take(),
+            self.speed_used.take(),
+            self.usage_iterations.take(),
+        );
         if let Some(usage) = response.get("usage") {
             self.merge_usage(usage);
         }
+        (
+            self.usage,
+            self.service_tier_used,
+            self.speed_used,
+            self.usage_iterations,
+        ) = previous;
         if let Some(evidence) = &self.response_evidence {
             evidence.lock().unwrap().observe_response(response);
         }
@@ -416,6 +446,12 @@ impl AnthropicNormalizer {
                                     if is_fallback_wire_model(from_model)
                                         && is_fallback_wire_model(to_model) =>
                                 {
+                                    if let Some(evidence) = &self.response_evidence {
+                                        evidence
+                                            .lock()
+                                            .unwrap()
+                                            .observe_handoff(from_model, to_model);
+                                    }
                                     BlockBuf::Fallback {
                                         from_model: from_model.to_owned(),
                                         to_model: to_model.to_owned(),
@@ -573,6 +609,7 @@ impl AnthropicNormalizer {
                 }));
             }
             "error" => {
+                self.observe_error_response(v);
                 let err = v.get("error");
                 let message = err
                     .and_then(|e| e.get("message"))

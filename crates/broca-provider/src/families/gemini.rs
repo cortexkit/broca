@@ -865,6 +865,7 @@ impl GeminiNormalizer {
             evidence.lock().unwrap().observe_response(v);
         }
         if let Some(error) = v.get("error").filter(|error| error.is_object()) {
+            self.observe_error_response(v);
             let code = error.get("status").and_then(Value::as_str);
             let message = error.get("message").and_then(Value::as_str).unwrap_or("");
             let status = error
@@ -1145,10 +1146,15 @@ fn synthetic_inbound_id(index: u32, policy: ToolIdPolicy) -> String {
 
 impl StreamNormalizer for GeminiNormalizer {
     fn observe_error_response(&mut self, response: &Value) {
+        if self.response_evidence.is_none() {
+            return;
+        }
+        let previous = self.usage;
         let response = response.get("response").unwrap_or(response);
         if let Some(usage) = response.get("usageMetadata") {
             self.merge_usage(usage);
         }
+        self.usage = previous;
         if let Some(evidence) = &self.response_evidence {
             evidence.lock().unwrap().observe_response(response);
         }
