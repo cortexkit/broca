@@ -10,7 +10,9 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use broca_core::media_request::{MediaId, MediaLocation};
-use broca_module_serve::{devtools, CredentialId};
+use broca_module_serve::{
+    claude_code_identity, devtools, state_root::resolve_state_root, CredentialId,
+};
 use broca_protocol::{
     AssistantMessage, BindIdentity, CallOptions, ContentBlock, ExecutionMode, MediaKind, MediaRef,
     Message, ModelHandle, NormalizedEvent, ProviderControl, Role, StepId, Tool, ToolCall,
@@ -260,12 +262,55 @@ fn render(
     .map_err(|_| "prepared rendering failed")
 }
 
-fn render_preview(
+fn probe_identity() -> Result<BindIdentity, &'static str> {
+    Ok(BindIdentity::new(
+        std::env::current_dir().map_err(|_| "working_directory_unavailable")?,
+        "media-live-check",
+        "media-live-check",
+    ))
+}
+
+fn oauth_config(
+    route: &Route,
     frozen: &FrozenRenderConfig,
-    history: &[Message],
-    fixtures: &[Fixture],
-) -> Result<Vec<u8>, &'static str> {
+    identity: &BindIdentity,
+    install_id: &str,
+    account_id: Option<&str>,
+) -> Result<FrozenRenderConfig, &'static str> {
+    let mut resolved = frozen.clone();
+    resolved.claude_code_persona = Some(
+        claude_code_identity::fresh_persona(
+            install_id,
+            account_id,
+            route
+                .credential
+                .as_deref()
+                .ok_or("named_credential_required")?,
+            identity,
+            None,
+            1,
+        )
+        .map_err(|_| "oauth_persona_unavailable")?,
+    );
+    Ok(resolved)
+}
+
+fn preview_config(
+    route: &Route,
+    frozen: &FrozenRenderConfig,
+) -> Result<FrozenRenderConfig, &'static str> {
     let mut preview = frozen.clone();
+    if route.is_anthropic_oauth() {
+        // Preview uses an explicit synthetic install seed and the production None-account
+        // fallback. Live execution rebuilds this persona from the vault reply and real seed.
+        preview = oauth_config(
+            route,
+            &preview,
+            &probe_identity()?,
+            "media-live-offline-preview",
+            None,
+        )?;
+    }
     if preview.family_id == WireFamilyId::GoogleCodeAssist
         && preview.project_id.as_deref().is_none_or(str::is_empty)
     {
@@ -274,7 +319,7 @@ fn render_preview(
         // still sees the original unresolved config and skips before credential access.
         preview.project_id = Some(String::new());
     }
-    render(&preview, history, fixtures)
+    Ok(preview)
 }
 
 #[derive(Default)]
@@ -309,7 +354,7 @@ async fn send_once(
     request: HttpRequest,
     budget: &mut plan::Budget,
     mut error_detail: Option<&mut ErrorDetail>,
-    secret: &str,
+    redactions: &[&str],
 ) -> Result<Observation, &'static str> {
     budget.take()?;
     let url = reqwest::Url::parse(&request.url).map_err(|_| "invalid_request_url")?;
@@ -347,7 +392,7 @@ async fn send_once(
                     "http_error",
                     Some(observation.code),
                     "provider error fields unavailable",
-                    secret,
+                    redactions,
                 )
                 .map_err(|_| "error_detail_write_failed")?;
         }
@@ -355,7 +400,7 @@ async fn send_once(
     }
     let wire_errors_recorded = match error_detail.as_deref_mut() {
         Some(detail) => detail
-            .record_wire_errors(&bytes, secret)
+            .record_wire_errors(&bytes, redactions)
             .map_err(|_| "error_detail_write_failed")?,
         None => false,
     };
@@ -390,7 +435,7 @@ async fn send_once(
                             &format!("{:?}", error.class),
                             error.provider_code.as_deref(),
                             &error.message,
-                            secret,
+                            redactions,
                         )
                         .map_err(|_| "error_detail_write_failed")?;
                 }
@@ -511,6 +556,7 @@ fn preview(
     frozen: &FrozenRenderConfig,
     fixtures: &[Fixture],
 ) -> Result<(), &'static str> {
+    let preview = preview_config(route, frozen)?;
     let mut history = initial_history();
     for stage in 0..MAX_REQUESTS {
         if stage < 2 {
@@ -523,7 +569,7 @@ fn preview(
                 )],
             ));
         }
-        let body = render_preview(frozen, &history, fixtures)?;
+        let body = render(&preview, &history, fixtures)?;
         let prepared = bundle(
             &history,
             frozen.media.as_ref().ok_or("media profile missing")?,
@@ -562,15 +608,29 @@ async fn run_live(
         .as_deref()
         .and_then(CredentialId::parse)
         .ok_or("named_credential_required")?;
-    let identity = BindIdentity::new(
-        std::env::current_dir().map_err(|_| "working_directory_unavailable")?,
-        "media-live-check",
-        "media-live-check",
-    );
-    let token = devtools::credential(&credential, &args.subc_path(), &identity)
+    let identity = probe_identity()?;
+    let secret = devtools::credential_with_metadata(&credential, &args.subc_path(), &identity)
         .await
         .map_err(|_| "named_credential_read_failed")?;
-    let auth = auth(route, token.clone())?;
+    let mut resolved = frozen.clone();
+    if route.is_anthropic_oauth() {
+        let state = resolve_state_root().map_err(|_| "install_identity_unavailable")?;
+        let install_id = claude_code_identity::load_or_create_install_id(&state.path)
+            .map_err(|_| "install_identity_unavailable")?;
+        resolved = oauth_config(
+            route,
+            &resolved,
+            &identity,
+            &install_id,
+            secret.account_id.as_deref(),
+        )?;
+    }
+    let frozen = &resolved;
+    let auth = auth(route, secret.token.clone())?;
+    let redactions = [
+        secret.token.as_str(),
+        secret.account_id.as_deref().unwrap_or_default(),
+    ];
     let family = wire_family(route.family).ok_or("wire family unavailable")?;
     let client = build_single_attempt_http_client();
     let mut budget = plan::Budget::default();
@@ -607,7 +667,7 @@ async fn run_live(
                 request,
                 &mut budget,
                 error_detail.as_deref_mut(),
-                &token,
+                &redactions,
             ),
         )
         .await
@@ -726,7 +786,6 @@ mod tests {
         assert_eq!(
             summary["live_skips"],
             json!([
-                {"family":"anthropic_messages", "reason":"oauth_account_metadata_unavailable", "missing_field":"account_uuid"},
                 {"family":"google_codeassist", "reason":"project_id_required", "missing_field":"project_id"}
             ])
         );
@@ -739,9 +798,15 @@ mod tests {
         let frozen = route.frozen().unwrap();
         let mut history = initial_history();
         add_exchange(&mut history, &frozen, &fixtures(), 0);
-        let preview: Value =
-            serde_json::from_slice(&render_preview(&frozen, &history, &fixtures()).unwrap())
-                .unwrap();
+        let preview: Value = serde_json::from_slice(
+            &render(
+                &preview_config(&route, &frozen).unwrap(),
+                &history,
+                &fixtures(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(preview["project"], "");
         assert!(frozen.project_id.is_none());
         assert!(
@@ -751,43 +816,58 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn unresolved_oauth_skips_before_credential_parsing() {
+    #[test]
+    fn oauth_uses_vault_account_id_and_the_production_credential_fallback() {
         let route: Route = serde_json::from_value(json!({
-            "family":"anthropic_messages", "model":"claude-haiku-5-5", "credential":"oauth:"
+            "family":"anthropic_messages", "model":"claude-haiku-5-5", "credential":"oauth:anthropic"
         }))
         .unwrap();
         let frozen = route.frozen().unwrap();
-        assert_eq!(
-            route.live_skip_reason(&frozen),
-            Some("oauth_account_metadata_unavailable")
-        );
-        assert_eq!(route.missing_live_field(&frozen), Some("account_uuid"));
-        assert!(
-            run_live(&Args::default(), &route, &frozen, &fixtures(), None)
-                .await
-                .is_ok()
-        );
+        assert_eq!(route.live_skip_reason(&frozen), None);
+        assert_eq!(route.missing_live_field(&frozen), None);
+        let uuid = "00000000-0000-4000-8000-000000000001";
+        for (account, expected_uuid, device_account) in [
+            (Some(uuid), Some(uuid), uuid),
+            (Some("opaque-account"), None, "opaque-account"),
+            (None, None, "oauth:anthropic"),
+            (Some(""), None, "oauth:anthropic"),
+        ] {
+            let configured = oauth_config(
+                &route,
+                &frozen,
+                &probe_identity().unwrap(),
+                "synthetic-install",
+                account,
+            )
+            .unwrap();
+            let persona = configured.claude_code_persona.as_ref().unwrap();
+            assert_eq!(persona.account_uuid.as_deref(), expected_uuid);
+            assert_eq!(
+                persona.device_id,
+                broca_provider::wire::ClaudeCodePersona::derive_device_id(
+                    "synthetic-install",
+                    device_account
+                )
+            );
+            assert_eq!(persona.prompt_ordinal, Some(1));
+            assert!(persona.prompt_id.is_some());
+            assert_eq!(route.live_skip_reason(&configured), None);
+        }
     }
 
     #[test]
     fn resolved_oauth_uses_production_persona_headers_and_api_keys_still_work() {
-        use broca_provider::wire::ClaudeCodePersona;
         let route: Route = serde_json::from_value(json!({
             "family":"anthropic_messages", "model":"claude-haiku-5-5", "credential":"oauth:anthropic"
         })).unwrap();
-        let mut frozen = route.frozen().unwrap();
-        frozen.claude_code_persona = Some(
-            serde_json::from_value(json!({
-                "version":ClaudeCodePersona::CURRENT_VERSION,
-                "device_id":"a".repeat(64),
-                "account_uuid":"00000000-0000-4000-8000-000000000001",
-                "session_id":"00000000-0000-4000-8000-000000000002",
-                "prompt_id":"00000000-0000-4000-8000-000000000003",
-                "prompt_ordinal":1
-            }))
-            .unwrap(),
-        );
+        let frozen = oauth_config(
+            &route,
+            &route.frozen().unwrap(),
+            &probe_identity().unwrap(),
+            "synthetic-install",
+            Some("00000000-0000-4000-8000-000000000001"),
+        )
+        .unwrap();
         assert_eq!(route.live_skip_reason(&frozen), None);
         let family = wire_family(route.family).unwrap();
         let fixtures = fixtures();
@@ -846,11 +926,12 @@ mod tests {
         let fixtures = fixtures();
         for route in Args::default().routes().unwrap() {
             let frozen = route.frozen().unwrap();
+            let preview = preview_config(&route, &frozen).unwrap();
             let mut history = initial_history();
             for stage in 0..2 {
                 add_exchange(&mut history, &frozen, &fixtures, stage);
-                let body = String::from_utf8(render_preview(&frozen, &history, &fixtures).unwrap())
-                    .unwrap();
+                let body =
+                    String::from_utf8(render(&preview, &history, &fixtures).unwrap()).unwrap();
                 assert!(
                     body.contains(&fixtures[0].base64),
                     "{:?} image",
@@ -998,7 +1079,7 @@ mod tests {
         };
         let client = build_single_attempt_http_client();
         let mut budget = plan::Budget::default();
-        let default = send_once(&client, &frozen, request(), &mut budget, None, secret)
+        let default = send_once(&client, &frozen, request(), &mut budget, None, &[secret])
             .await
             .unwrap();
         assert_eq!(default.status, Some(400));
@@ -1010,7 +1091,7 @@ mod tests {
             request(),
             &mut budget,
             Some(&mut detail),
-            secret,
+            &[secret],
         )
         .await
         .unwrap();
@@ -1051,7 +1132,7 @@ mod tests {
         };
         let client = build_single_attempt_http_client();
         let mut budget = plan::Budget::default();
-        let observation = send_once(&client, &frozen, request(), &mut budget, None, "")
+        let observation = send_once(&client, &frozen, request(), &mut budget, None, &[])
             .await
             .unwrap();
         assert_eq!(observation.status, Some(307));
@@ -1059,7 +1140,7 @@ mod tests {
         budget.take().unwrap();
         budget.take().unwrap();
         assert_eq!(
-            send_once(&client, &frozen, request(), &mut budget, None, "")
+            send_once(&client, &frozen, request(), &mut budget, None, &[])
                 .await
                 .err(),
             Some("family_request_cap")

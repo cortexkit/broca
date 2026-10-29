@@ -50,18 +50,18 @@ impl ErrorDetail {
         fallback_type: &str,
         fallback_code: Option<&str>,
         fallback_message: &str,
-        secret: &str,
+        redactions: &[&str],
     ) -> io::Result<()> {
         self.append_fields(
             wire_errors(body).into_iter().next(),
             fallback_type,
             fallback_code,
             fallback_message,
-            secret,
+            redactions,
         )
     }
 
-    pub fn record_wire_errors(&mut self, body: &[u8], secret: &str) -> io::Result<bool> {
+    pub fn record_wire_errors(&mut self, body: &[u8], redactions: &[&str]) -> io::Result<bool> {
         let errors = wire_errors(body);
         let found = !errors.is_empty();
         for fields in errors {
@@ -70,7 +70,7 @@ impl ErrorDetail {
                 "provider_error",
                 None,
                 "provider error fields unavailable",
-                secret,
+                redactions,
             )?;
         }
         Ok(found)
@@ -82,7 +82,7 @@ impl ErrorDetail {
         fallback_type: &str,
         fallback_code: Option<&str>,
         fallback_message: &str,
-        secret: &str,
+        redactions: &[&str],
     ) -> io::Result<()> {
         let value = |name: &str| {
             fields
@@ -95,11 +95,10 @@ impl ErrorDetail {
                 })
         };
         let clean = |text: &str, limit: usize| {
-            let mut text = if secret.is_empty() {
-                text.to_owned()
-            } else {
-                text.replace(secret, "[redacted]")
-            };
+            let mut text = text.to_owned();
+            for value in redactions.iter().copied().filter(|value| !value.is_empty()) {
+                text = text.replace(value, "[redacted]");
+            }
             truncate(&mut text, limit);
             text
         };
@@ -199,14 +198,21 @@ mod tests {
     fn private_error_records_append_are_capped_and_exclude_headers_and_secrets() {
         let path = path("append.jsonl");
         let secret = "synthetic-secret-not-a-credential";
-        let body = json!({"headers":{"authorization":secret}, "error":{"type":"invalid_request_error", "code":"unsupported", "message":format!("{secret} {}", "界\n".repeat(2000))}}).to_string();
+        let account = "synthetic-account-id";
+        let body = json!({"headers":{"authorization":secret}, "error":{"type":"invalid_request_error", "code":"unsupported", "message":format!("{secret} {account} {}", "界\n".repeat(2000))}}).to_string();
         let mut detail = ErrorDetail::open(&path).unwrap();
         detail
-            .record(body.as_bytes(), "fallback", None, "fallback", secret)
+            .record(
+                body.as_bytes(),
+                "fallback",
+                None,
+                "fallback",
+                &[secret, account],
+            )
             .unwrap();
         drop(detail);
         let mut detail = ErrorDetail::open(&path).unwrap();
-        detail.record(b"data: {\"error\":{\"type\":\"billing_error\",\"code\":\"no_credit\",\"message\":\"unfunded\"}}\n", "fallback", None, "fallback", secret).unwrap();
+        detail.record(b"data: {\"error\":{\"type\":\"billing_error\",\"code\":\"no_credit\",\"message\":\"unfunded\"}}\n", "fallback", None, "fallback", &[secret, account]).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         for line in bytes.split_inclusive(|byte| *byte == b'\n') {
             assert!(line.len() <= 1024);
@@ -223,6 +229,7 @@ mod tests {
         assert!(!text.contains("authorization"));
         assert!(!text.contains("headers"));
         assert!(!text.contains(secret));
+        assert!(!text.contains(account));
         assert!(text.contains("[redacted]"));
         #[cfg(unix)]
         {
@@ -239,7 +246,7 @@ mod tests {
         let path = path("stream.jsonl");
         let mut detail = ErrorDetail::open(&path).unwrap();
         let body = b"data: {\"response\":{\"error\":{\"type\":\"billing_error\",\"code\":429,\"message\":\"no credit\"}},\"other\":\"not retained\"}\n\ndata: {\"error\":{\"type\":\"invalid_request_error\",\"code\":\"input\",\"message\":\"not available\"}}\n\n";
-        assert!(detail.record_wire_errors(body, "").unwrap());
+        assert!(detail.record_wire_errors(body, &[]).unwrap());
         let text = std::fs::read_to_string(&path).unwrap();
         let records: Vec<Value> = text
             .lines()

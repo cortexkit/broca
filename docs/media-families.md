@@ -35,7 +35,7 @@ body or provider error message. Unknown provider codes are `other_redacted`.
 An optional `--error-detail <file>` appends only error type, code and message to
 a local owner-only file (Unix mode 0600), with each encoded JSON line capped at
 1 KiB including its newline. Existing non-private files and links are refused.
-No headers enter that file, known credential values are redacted, and its contents
+No headers enter that file, known token/account values are redacted, and its contents
 are never copied to stdout or stderr. Without the flag, no error-detail file is
 opened. The flag has no effect during a dry-run.
 
@@ -64,11 +64,22 @@ The Anthropic route selects the long-standing `oauth:anthropic` subscription
 credential; ChatGPT selects `chatgpt:openai`. The temporary live-check handles
 have been revoked. API-key Anthropic routes remain supported for funded keys.
 OAuth uses the provider's identity-lead, persona, header and beta derivation,
-never a separate handwritten header list. The current token-only devtools helper
-does not expose the account UUID needed for the production persona. Unless an
-actual resolved persona is present in the non-secret frozen config, the OAuth
-route reports `skipped: oauth_account_metadata_unavailable`, naming
-`account_uuid`, before any credential access. The probe never guesses that fact.
+never a separate handwritten header list. Its devtools metadata accessor preserves
+the optional `credential.get` reply's `account_id` beside the token. The probe
+passes that value to production's `claude_code_identity::fresh_persona`; the
+factory maps UUID account IDs to `account_uuid` and uses the selected credential
+ID when the vault has no account ID. There is no separate required vault
+`account_uuid` field, so OAuth no longer skips for absent account metadata.
+
+The reply contract and mapping are owned here: `GetOutcome::Success` and
+`decode_get_reply` in `crates/broca-subc/src/vault.rs:411-431,476-503` retain
+`account_id`; `fresh_persona` in
+`crates/broca-module-serve/src/claude_code_identity.rs:209-241` applies the
+production identity/fallback rules. These local definitions describe the vault
+reply contract this client consumes. Live setup uses the normal persisted
+install identity and probe session identity. Dry-run calls the same factory with
+an explicit synthetic install seed and no account ID; it reads no credential or
+install file.
 
 Bedrock is absent from the serving plan because the operator has no Bedrock
 credential; the summary records it as not live-checked with reason
@@ -240,8 +251,10 @@ person's media is refused (`carrier`) and tool media renders as markers.
 
 **Live check, 2026-10-28/29:** `claude-haiku-5-5` with the platform API key was not
 verified: HTTP 400, "Your credit balance is too low to access the Anthropic API."
-OAuth subscription media remains unverified; the token-only standalone probe
-skips it when the production persona's `account_uuid` is unavailable.
+OAuth subscription media remains unverified live. The probe now preserves
+`credential.get.account_id` and uses the production persona factory, including
+its credential-ID fallback when no account ID is returned; it no longer skips
+solely because an account UUID is absent.
 
 Sources: https://platform.claude.com/docs/en/build-with-claude/vision ·
 https://platform.claude.com/docs/en/build-with-claude/pdf-support ·
@@ -355,8 +368,10 @@ https://developers.openai.com/api/reference/resources/responses/methods/create
 Audio is refused before publication or send, naming `audio`; stored tool audio
 renders as a marker. Legacy audio flags and MIME lists cannot enable it.
 With audio removed, the person PNG passed (HTTP 200; 12,537 input tokens).
-Tool images and PDFs were not checked live. Image and PDF profile behavior is
-unchanged: images are native and PDFs remain unavailable on this backend.
+The subsequent image-only rerun also passed the person image, tool image and
+cache follow-up, with `cache_stable: true`. PDFs were not checked live. Image
+and PDF profile behavior is unchanged: images are native and PDFs remain
+unavailable on this backend.
 
 The ChatGPT backend takes the Responses body at the ChatGPT Codex endpoint and has no
 public reference. The primary source is OpenAI's own Codex client, which serializes

@@ -165,20 +165,15 @@ fn validate_routes(routes: &[Route]) -> Result<(), &'static str> {
 }
 
 impl Route {
-    pub fn live_skip_reason(&self, frozen: &FrozenRenderConfig) -> Option<&'static str> {
-        if self.family == WireFamilyId::AnthropicMessages
+    pub fn is_anthropic_oauth(&self) -> bool {
+        self.family == WireFamilyId::AnthropicMessages
             && self
                 .credential
                 .as_deref()
                 .is_some_and(|name| name.starts_with("oauth:"))
-            && frozen
-                .claude_code_persona
-                .as_ref()
-                .and_then(|persona| persona.account_uuid.as_deref())
-                .is_none_or(str::is_empty)
-        {
-            return Some("oauth_account_metadata_unavailable");
-        }
+    }
+
+    pub fn live_skip_reason(&self, frozen: &FrozenRenderConfig) -> Option<&'static str> {
         (self.family == WireFamilyId::GoogleCodeAssist
             && frozen.project_id.as_deref().is_none_or(str::is_empty))
         .then_some("project_id_required")
@@ -186,7 +181,6 @@ impl Route {
 
     pub fn missing_live_field(&self, frozen: &FrozenRenderConfig) -> Option<&'static str> {
         match self.live_skip_reason(frozen) {
-            Some("oauth_account_metadata_unavailable") => Some("account_uuid"),
             Some("project_id_required") => Some("project_id"),
             _ => None,
         }
@@ -197,12 +191,7 @@ impl Route {
             .frozen
             .clone()
             .unwrap_or_else(|| frozen_config_for_family(self.family, &self.model));
-        if self.family == WireFamilyId::AnthropicMessages
-            && self
-                .credential
-                .as_deref()
-                .is_some_and(|name| name.starts_with("oauth:"))
-        {
+        if self.is_anthropic_oauth() {
             frozen.system_prompt =
                 broca_provider::policy::SystemPromptPolicy::RequiredIdentityLead {
                     identity: broca_provider::families::CLAUDE_CODE_IDENTITY.into(),
