@@ -338,7 +338,7 @@ fn restore_media_and_wal(source: &Path, destination: &Path) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_daemon_killed_media_request_resumes_identical_bytes() {
+async fn real_daemon_portable_media_recovery_after_kill_preserves_request_bytes() {
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let gate = Arc::new(tokio::sync::Notify::new());
     let url = serve_model_responses_paused(

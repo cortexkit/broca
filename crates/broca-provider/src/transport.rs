@@ -214,6 +214,8 @@ const ROUTE_FALLBACK: u8 = 1;
 /// A live provider: any wire family + its frozen render config + a runtime auth
 /// credential, driven over reqwest. Generic over the family so the same transport
 /// loop runs every grammar.
+/// Live-media behavior is behind `test-attachments`; fallible-render plumbing also
+/// compiles in shipping builds and delegates to family rendering without that feature.
 pub struct LiveProvider<F: WireFamily + 'static> {
     pub(crate) client: ProviderHttpClient,
     clock: Clock,
