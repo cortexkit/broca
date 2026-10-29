@@ -5709,6 +5709,8 @@ mod tests {
 
     #[derive(Clone)]
     enum ScriptResponse {
+        // Only the Unix-only power-loss recording test holds a response open.
+        #[cfg_attr(not(unix), allow(dead_code))]
         Hold,
         Http {
             status: u16,
@@ -5730,6 +5732,9 @@ mod tests {
         heads: Arc<Mutex<Vec<String>>>,
         task: tokio::task::JoinHandle<()>,
         order: Arc<Mutex<Vec<&'static str>>>,
+        // Read only by the Unix-only power-loss recording test, which cancels once a request
+        // has been written.
+        #[cfg_attr(not(unix), allow(dead_code))]
         written: Arc<tokio::sync::Notify>,
     }
 
@@ -6657,6 +6662,9 @@ mod tests {
         reservations.len()
     }
 
+    // The power-loss recording models file identity, and so hard links, only on Unix. The
+    // overhaul writer relocates a log by hard link, so recording one is Unix-only too.
+    #[cfg(unix)]
     #[tokio::test]
     async fn attempt_hook_outcomes_before_terminal_on_run_loop_exits() {
         for exit in [
@@ -6747,6 +6755,8 @@ mod tests {
         }
     }
 
+    // Unix-only for the same reason: it records the overhaul writer's hard-link relocation.
+    #[cfg(unix)]
     #[tokio::test]
     async fn compression_refusal_pair_is_accepted_by_billing_reader() {
         use broca_wal::WalRecord;
