@@ -42,6 +42,9 @@ enum RoutingMode {
         code: &'static str,
         retry_after_s: Option<u64>,
     },
+    Hold {
+        detail: Value,
+    },
     AuthRequired,
     /// Reply with bytes broca cannot decode as an account decision.
     MalformedReply,
@@ -212,6 +215,11 @@ impl subc_client_rs::ModuleHandler for RoutingModule {
                     "decision_id": "acd-refused",
                     "exclusions": [],
                 }),
+            },
+            RoutingMode::Hold { detail } => subc_client_rs::HandlerOutcome::ErrorWithDetail {
+                code: "account_hold".into(),
+                message: "account route is held".into(),
+                detail,
             },
             RoutingMode::AuthRequired => subc_client_rs::HandlerOutcome::ErrorWithDetail {
                 code: "auth_required".into(),
@@ -2179,6 +2187,100 @@ async fn routing_refusals_keep_their_code_and_pool_limits_are_account_limits() {
         assert_eq!(error["detail"]["retry_after_secs"], 1260.0);
         assert!(!error.to_string().contains("unreachable"));
         assert!(!error.to_string().contains("could not be reached"));
+    }
+    let root = rig.root.clone();
+    drop(rig);
+    broca_test_support::remove_rig_dir(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn routing_hold_forms_preserve_end_times_without_writing() {
+    let Some(rig) = Rig::start().await else {
+        return;
+    };
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    for (name, detail, absolute_end, relative_seconds) in [
+        (
+            "hold-until",
+            json!({"until_ms": 4_000_000_000_000_u64}),
+            Some(4_000_000_000_000_u64),
+            None,
+        ),
+        (
+            "hold-until-wins",
+            json!({"until_ms": 4_000_000_000_000_u64, "retry_after_s": 60,
+                "reset_at": "not a date"}),
+            Some(4_000_000_000_000_u64),
+            None,
+        ),
+        ("hold-retry", json!({"retry_after_s": 60}), None, Some(60)),
+        (
+            "hold-retry-date",
+            json!({"retry_after_s": 60, "reset_at": "2026-10-28T12:00:00Z"}),
+            None,
+            Some(60),
+        ),
+        (
+            "hold-retry-invalid-date",
+            json!({"retry_after_s": 60, "reset_at": "not a date"}),
+            None,
+            Some(60),
+        ),
+        (
+            "hold-date-only",
+            json!({"reset_at": "2026-10-28T12:00:00Z"}),
+            None,
+            None,
+        ),
+    ] {
+        rig.routing.set(RoutingMode::Hold {
+            detail: detail.clone(),
+        });
+        let asked_before = rig.routing.requests.lock().unwrap().len();
+        let before = now_ms();
+        let (error, _) = rig.refused_send(name, &format!("send-{name}")).await;
+        let after = now_ms();
+        assert_eq!(error["code"], "account_limit_exhausted", "{error}");
+        let refused = &error["detail"];
+        assert_eq!(refused["class"], "transient");
+        assert_eq!(refused["routing_code"], "account_hold");
+        assert_eq!(refused["provider_code"], "account_limit_exhausted");
+        assert_eq!(refused["routing_detail"], detail);
+        if let Some(end) = absolute_end {
+            assert_eq!(refused["resets_at_ms"], end);
+            let wait = refused["retry_after_s"].as_u64().unwrap();
+            assert!((end.saturating_sub(after).div_ceil(1000)
+                ..=end.saturating_sub(before).div_ceil(1000))
+                .contains(&wait));
+            assert_eq!(refused["retry_after_secs"], wait as f64);
+        } else if let Some(seconds) = relative_seconds {
+            let end = refused["resets_at_ms"].as_u64().unwrap();
+            assert!((before + seconds * 1000..=after + seconds * 1000).contains(&end));
+            assert_eq!(refused["retry_after_s"], seconds);
+            assert_eq!(refused["retry_after_secs"], seconds as f64);
+        } else {
+            assert!(refused.get("resets_at_ms").is_none());
+            assert!(refused.get("retry_after_s").is_none());
+            assert!(refused.get("retry_after_secs").is_none());
+        }
+        assert!(rig.frames(name).is_empty());
+        let methods: Vec<String> = rig
+            .routing
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .skip(asked_before)
+            .map(|request| request["method"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(methods, ["route.account_for"]);
+        assert!(rig.vault.scoped_reads().is_empty());
+        assert!(rig.upstream.authorized_as.lock().unwrap().is_empty());
     }
     let root = rig.root.clone();
     drop(rig);

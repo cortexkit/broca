@@ -191,8 +191,11 @@ broca specifics:
   instead of `account_selection_refused`, so callers wait or reroute rather than hot-retrying.
   Routing's `reset_at_ms` is carried as `resets_at_ms`; when no wait was supplied it also yields a
   `retry_after_secs` hint rounded up to the next second. Holds prefer `until_ms` (Unix
-  milliseconds), then legacy `retry_after_s` (seconds); legacy `reset_at` is retained only
-  in the original detail and is never parsed. A hold with neither timing field stays untimed.
+  milliseconds), then legacy `retry_after_s` (seconds). A legacy wait's end is the time broca
+  received the routing answer plus that wait. Either form supplies `resets_at_ms`, with
+  `retry_after_s` and `retry_after_secs` derived from that end and rounded up to the next
+  second. Legacy `reset_at` is retained only in the original detail and is never parsed.
+  A hold with neither numeric timing field stays untimed.
   `auth_required` retains the admit-and-pause-for-login path, with its routing code in the
   paused run's `auth.routing_code`. `account_selection_disabled` is the routing operator's
   module-wide off-switch: that answer admits the send on the configured static credential,
