@@ -5,7 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Read-only version 4 broca WAL frame codec"
+description = "Read-only broca WAL v4 billing records, published-head proofs, and resumable checkpoints"
+readme = "README.md"
+keywords = ["wal", "billing", "cortexkit"]
+categories = ["encoding", "parser-implementations"]
+include = ["src/**", "tests/**", "README.md", "CHANGELOG.md"]
 
 [dependencies]
 serde.workspace = true
