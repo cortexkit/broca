@@ -53,6 +53,8 @@ struct Server {
     url: String,
     bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     task: tokio::task::JoinHandle<()>,
+    connections: Arc<AtomicU64>,
+    first_bytes: Arc<AtomicU64>,
 }
 
 impl Drop for Server {
@@ -67,13 +69,30 @@ impl Server {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = Arc::clone(&bodies);
+        let connections = Arc::new(AtomicU64::new(0));
+        let first_bytes = Arc::new(AtomicU64::new(0));
+        let accepted = connections.clone();
+        let observed_bytes = first_bytes.clone();
         let task = tokio::spawn(async move {
-            for reply in script {
+            let mut script = script.into_iter();
+            loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
+                accepted.fetch_add(1, Ordering::SeqCst);
+                let reply = script.next().unwrap_or_else(|| Reply::Full {
+                    status: 500,
+                    headers: vec![],
+                    body: b"unexpected request".to_vec(),
+                });
                 let recorded = Arc::clone(&recorded);
+                let observed_bytes = observed_bytes.clone();
                 // Each connection on its own task, so a stalled step does not keep a warm from
                 // being accepted.
                 tokio::spawn(async move {
+                    let mut first = [0];
+                    if socket.peek(&mut first).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    observed_bytes.fetch_add(1, Ordering::SeqCst);
                     let body = read_body(&mut socket).await;
                     let reply = match reply {
                         Reply::WarmOrText
@@ -100,7 +119,20 @@ impl Server {
                 });
             }
         });
-        Self { url, bodies, task }
+        Self {
+            url,
+            bodies,
+            task,
+            connections,
+            first_bytes,
+        }
+    }
+
+    fn network_activity(&self) -> (u64, u64) {
+        (
+            self.connections.load(Ordering::SeqCst),
+            self.first_bytes.load(Ordering::SeqCst),
+        )
     }
 
     fn bodies(&self) -> Vec<Vec<u8>> {
@@ -127,6 +159,30 @@ impl Server {
         )
         .await
     }
+}
+
+#[tokio::test]
+async fn listener_observes_connection_and_first_byte_before_a_complete_body() {
+    let server = Server::start(vec![]).await;
+    let mut socket = TcpStream::connect(server.url.strip_prefix("http://").unwrap())
+        .await
+        .unwrap();
+    socket.write_all(b"P").await.unwrap();
+    broca_test_support::wait_until("connection and first byte recorded", || async {
+        (server.network_activity() == (1, 1))
+            .then_some(())
+            .ok_or_else(|| format!("activity={:?}", server.network_activity()))
+    })
+    .await;
+    assert!(
+        server.bodies().is_empty(),
+        "the observation must precede full-body recording"
+    );
+    socket
+        .write_all(b"OST /probe HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\n\r\n")
+        .await
+        .unwrap();
+    server.wait_for(1).await;
 }
 
 async fn read_body(socket: &mut TcpStream) -> Vec<u8> {
@@ -489,6 +545,8 @@ impl broca_core::keep_warm_wait::KeepWarmDriver for ObservedWarmer {
 /// Runs the real loop with one provider, and sends warms through another (the same one unless
 /// a test swaps in a different config or account).
 struct WarmExecutor {
+    #[cfg(feature = "test-clock")]
+    permission_gate: std::sync::Mutex<Option<Arc<broca_core::cache_warm::WarmPermissionGate>>>,
     held: HeldWarmTool,
     skips: Arc<AtomicU64>,
     hold_automatic: Arc<std::sync::atomic::AtomicBool>,
@@ -600,7 +658,19 @@ impl RunExecutor for WarmExecutor {
         &self,
         job: crate::executor::WarmJob,
     ) -> Result<broca_core::WarmSent, crate::executor::WarmError> {
-        crate::executor::send_warm(self.warm_provider.as_ref(), job.base).await
+        #[cfg(feature = "test-clock")]
+        if let Some(gate) = self.permission_gate.lock().unwrap().take() {
+            job.attempt_hook
+                .as_ref()
+                .expect("overhaul hook must reach executor")
+                .set_warm_permission_gate_for_test(gate);
+        }
+        crate::executor::send_warm_with_hook(
+            self.warm_provider.as_ref(),
+            job.base,
+            job.attempt_hook,
+        )
+        .await
     }
 }
 
@@ -625,6 +695,15 @@ impl Fixture {
         run_config: impl FnOnce(&mut FrozenRenderConfig),
         warm: impl FnOnce(FrozenRenderConfig) -> P,
     ) -> Self {
+        Self::with_wal_config(script, run_config, warm, broca_wal::WalConfig::default()).await
+    }
+
+    async fn with_wal_config<P: broca_core::Provider + 'static>(
+        script: Vec<Reply>,
+        run_config: impl FnOnce(&mut FrozenRenderConfig),
+        warm: impl FnOnce(FrozenRenderConfig) -> P,
+        wal_config: broca_wal::WalConfig,
+    ) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let server = Server::start(script).await;
         let root = broca_test_support::scratch_root().join(format!(
@@ -634,10 +713,12 @@ impl Fixture {
         ));
         std::fs::create_dir_all(root.join("project")).unwrap();
         let key = BindIdentity::new(root.join("project"), "runner", "session");
-        let wal_store = Arc::new(FileWalStore::new(root.join("wal")));
+        let wal_store = Arc::new(FileWalStore::with_config(root.join("wal"), wal_config));
         let mut frozen = warmable(&server.url);
         run_config(&mut frozen);
         let executor = Arc::new(WarmExecutor {
+            #[cfg(feature = "test-clock")]
+            permission_gate: Default::default(),
             held: Default::default(),
             skips: Default::default(),
             hold_automatic: Default::default(),
@@ -673,16 +754,44 @@ impl Fixture {
         executor: &Arc<WarmExecutor>,
         export: &Arc<broca_store::SqliteStore>,
     ) -> LineageRegistry {
-        let opener = DefaultOpener::new(
-            Arc::new(FileLeaseStore::new(root.join("leases"))),
-            Arc::clone(&wal_store),
-            Arc::clone(executor) as Arc<dyn RunExecutor>,
-        )
+        let lease_root = root.join("leases");
+        let leases = Arc::new(FileLeaseStore::new(lease_root.clone()));
+        let overhaul = wal_store.wal_config().is_overhaul();
+        let opener = if overhaul {
+            DefaultOpener::with_file_leases(
+                lease_root.clone(),
+                Arc::clone(&wal_store),
+                Arc::clone(executor) as Arc<dyn RunExecutor>,
+            )
+            .with_lease_domain(broca_core::lease::WalLeaseDomain::new(lease_root))
+            .unwrap()
+        } else {
+            DefaultOpener::new(
+                leases.clone(),
+                Arc::clone(&wal_store),
+                Arc::clone(executor) as Arc<dyn RunExecutor>,
+            )
+        }
         .with_export_index(export.clone())
         .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| {
             (broca_core::ChargeBasis::MeteredApi, 1)
         }));
+        let retention = overhaul.then(|| {
+            Arc::new(
+                crate::retention::RetentionService::new(
+                    wal_store.clone(),
+                    export.clone(),
+                    leases,
+                    export.clone(),
+                    Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::MeteredApi, 1)),
+                )
+                .unwrap(),
+            )
+        });
         let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal_store, None);
+        if let Some(retention) = retention {
+            registry.set_retention_service(retention);
+        }
         registry.set_cache_declarer(Arc::new(ConfiguredDeclarer(Arc::clone(&executor.ttl_ms))));
         registry
     }
@@ -711,6 +820,9 @@ impl Fixture {
     fn request(&self, run: &str, text: &str) -> RunRequest {
         let mut req = super::tests::text_req(&self.key, run);
         req.model = broca_protocol::request::ModelHandle::new("anthropic", "claude-opus-4-8");
+        if self.executor.wal_store.wal_config().is_overhaul() {
+            req.retention = Some(7 * 24 * 60 * 60);
+        }
         req.input = vec![Message::new(
             Role::User,
             vec![ContentBlock::Text { text: text.into() }],
@@ -1182,6 +1294,58 @@ async fn a_warm_on_an_exhausted_account_is_refused() {
         }
     );
     assert_eq!(fixture.server.bodies().len(), 1, "nothing is sent");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_overhaul_warm_does_not_clear_account_wall() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let fixture = Fixture::with_wal_config(
+        vec![
+            text_turn("hello"),
+            Reply::Gated(
+                release.clone(),
+                Box::new(Reply::Full {
+                    status: 529,
+                    headers: vec![],
+                    body: b"overloaded".to_vec(),
+                }),
+            ),
+            Reply::Full {
+                status: 429,
+                headers: vec![
+                    ("Content-Type", "application/json"),
+                    ("anthropic-ratelimit-unified-status", "rejected"),
+                    ("anthropic-ratelimit-unified-reset", "4102444800"),
+                ],
+                body: br#"{"type":"error","error":{"type":"rate_limit_error","message":"limit"}}"#
+                    .to_vec(),
+            },
+        ],
+        |_| {},
+        provider_for,
+        broca_wal::WalConfig::OVERHAUL,
+    )
+    .await;
+    fixture.turn("r1", "q", RunKind::FreshOrResume).await;
+    let registry = fixture.registry.clone();
+    let key = fixture.key.clone();
+    let warm = tokio::spawn(async move { ServeHandler::warm(&registry, &key, None).await });
+    fixture.server.wait_for(2).await;
+    fixture.turn("r2", "another", RunKind::AppendEpisode).await;
+    release.notify_one();
+    assert!(warm.await.unwrap().is_err());
+    assert_eq!(warm_records(&fixture.records()).len(), 1);
+    assert_eq!(
+        fixture.refused(None).await.detail,
+        broca_wire::WarmRefusalDetail::AccountWalled {
+            resets_at_ms: 4_102_444_800_000
+        }
+    );
+    assert_eq!(
+        fixture.server.bodies().len(),
+        3,
+        "the failed warm must not admit another request"
+    );
 }
 
 /// A credential that now belongs to another account is refused without sending.
@@ -1975,7 +2139,7 @@ async fn an_in_flight_warm_of_a_source_step_is_unchanged_by_the_refusal_fallback
     }
 }
 
-/// A warm the provider refuses is reported with the provider's error and recorded nowhere.
+/// Legacy roots retain the success-only warm record contract.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_warm_the_provider_refuses_is_reported_and_not_recorded() {
     let fixture = Fixture::start(vec![
@@ -1992,6 +2156,440 @@ async fn a_warm_the_provider_refuses_is_reported_and_not_recorded() {
     let refusal = fixture.refused(None).await;
     assert_eq!(refusal.code, "warm_failed");
     assert!(warm_records(&fixture.records()).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_warm_recorded() {
+    use broca_wal::record::BillingAttemptOutcome;
+    let fixture = Fixture::with_wal_config(
+        vec![
+            text_turn("hello"),
+            Reply::Full {
+                status: 529,
+                headers: vec![],
+                body: b"overloaded".to_vec(),
+            },
+            Reply::WarmOrText,
+        ],
+        |_| {},
+        provider_for,
+        broca_wal::WalConfig::OVERHAUL,
+    )
+    .await;
+    fixture.turn("r1", "q", RunKind::FreshOrResume).await;
+    let before = fixture.registry.cache_clock_reading(&fixture.key).unwrap();
+    assert_eq!(fixture.refused(None).await.code, "warm_failed");
+    assert_eq!(
+        fixture.registry.cache_clock_reading(&fixture.key).unwrap(),
+        before
+    );
+    let records = fixture.records();
+    let warms = warm_records(&records);
+    assert_eq!(warms.len(), 1);
+    let WalRecord::CacheWarmed {
+        attempt_id: Some(id),
+        reservation: Some(reservation),
+        envelope: Some(envelope),
+        ..
+    } = &warms[0]
+    else {
+        panic!("missing warm billing envelope")
+    };
+    assert!(reservation.warm);
+    assert_eq!(envelope.http_status, Some(529));
+    assert_eq!(envelope.outcome, BillingAttemptOutcome::HttpError);
+    assert_eq!(envelope.usage, None);
+    assert!(records
+        .iter()
+        .any(|r| matches!(r, WalRecord::AttemptReserved { attempt_id, .. } if attempt_id == id)));
+    fixture
+        .warm(None)
+        .await
+        .expect("failure releases the manual warm slot");
+    assert_eq!(
+        warm_records(&fixture.records()).len(),
+        2,
+        "no duplicate success terminal"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_warm_record_bytes_keep_the_original_ttl_and_no_billing_fields() {
+    let fixture = Fixture::start(vec![text_turn("hello"), warm_answer()]).await;
+    fixture.turn("r1", "q", RunKind::FreshOrResume).await;
+    fixture.warm(None).await.unwrap();
+    let mut records = warm_records(&fixture.records());
+    assert_eq!(records.len(), 1);
+    let record = &mut records[0];
+    let WalRecord::CacheWarmed {
+        request_body_sha256,
+        warm_body_sha256,
+        sent_at_ms,
+        ttl_ms,
+        expires_at_ms,
+        ..
+    } = record
+    else {
+        unreachable!()
+    };
+    assert_eq!(*ttl_ms, Some(3_600_000));
+    assert_eq!(*expires_at_ms, Some(*sent_at_ms + 3_600_000));
+    // Only nondeterministic send time and request digests are normalized for the byte pin.
+    *request_body_sha256 = "aa".into();
+    *warm_body_sha256 = "bb".into();
+    *sent_at_ms = 100;
+    *expires_at_ms = Some(3_600_100);
+    const LEGACY: &str = r#"{"type":"cache_warmed","run_id":"r1","step_id":1,"request_body_sha256":"aa","warm_body_sha256":"bb","usage":{"input_tokens":3,"cached_input_tokens":4000,"cache_write_tokens":0,"output_tokens":0},"ratelimit_headers":{"anthropic-ratelimit-unified-status":"allowed"},"sent_at_ms":100,"ttl_ms":3600000,"expires_at_ms":3600100}"#;
+    assert_eq!(serde_json::to_string(record).unwrap(), LEGACY);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_idle_warm_refreshes_export_with_outcome() {
+    use broca_wal::record::BillingAttemptOutcome as Outcome;
+    let fixture = Fixture::with_wal_config(
+        vec![
+            text_turn("hello"),
+            Reply::Full {
+                status: 529,
+                headers: vec![("Content-Type", "application/json")],
+                body:
+                    br#"{"usage":{"input_tokens":3,"cache_read_input_tokens":4,"output_tokens":1}}"#
+                        .to_vec(),
+            },
+            warm_answer(),
+        ],
+        |_| {},
+        provider_for,
+        broca_wal::WalConfig::OVERHAUL,
+    )
+    .await;
+    fixture.turn("r1", "q", RunKind::FreshOrResume).await;
+    broca_test_support::wait_until("ordinary run fact exported before failed warm", || async {
+        let present = !fixture
+            .export
+            .read_page(None, 100)
+            .unwrap()
+            .facts
+            .is_empty();
+        present
+            .then_some(())
+            .ok_or_else(|| "ordinary fact has not reached export index".to_owned())
+    })
+    .await;
+    let ordinary = fixture.export.read_page(None, 100).unwrap().facts;
+    let ordinary_bytes: Vec<_> = ordinary
+        .iter()
+        .map(|f| (f.export_seq, serde_json::to_vec(&f.segment).unwrap()))
+        .collect();
+    assert_eq!(fixture.refused(None).await.code, "warm_failed");
+    broca_test_support::wait_until("failed idle warm exported without another run", || async {
+        fixture
+            .export
+            .read_page(None, 100)
+            .unwrap()
+            .facts
+            .iter()
+            .any(|f| f.segment.as_session().unwrap().warm_outcome == Some(Outcome::HttpError))
+            .then_some(())
+            .ok_or_else(|| "failed warm has not reached export index".to_owned())
+    })
+    .await;
+    let failed_page = fixture.export.read_page(None, 100).unwrap();
+    let failed = failed_page
+        .facts
+        .iter()
+        .find(|f| f.segment.as_session().unwrap().warm)
+        .unwrap();
+    assert_eq!(
+        failed.segment.as_session().unwrap().usage.input_tokens,
+        Some(3)
+    );
+    assert_eq!(
+        failed.segment.as_session().unwrap().usage.output_tokens,
+        Some(1)
+    );
+    let old_facts: Vec<_> = failed_page
+        .facts
+        .iter()
+        .filter(|f| !f.segment.as_session().unwrap().warm)
+        .cloned()
+        .collect();
+    assert_eq!(
+        old_facts
+            .iter()
+            .map(|f| (f.export_seq, serde_json::to_vec(&f.segment).unwrap()))
+            .collect::<Vec<_>>(),
+        ordinary_bytes,
+        "re-emitting a run must not alter existing facts"
+    );
+    fixture.warm(None).await.unwrap();
+    broca_test_support::wait_until("successful overhaul warm exported", || async {
+        fixture
+            .export
+            .read_page(None, 100)
+            .unwrap()
+            .facts
+            .iter()
+            .any(|f| f.segment.as_session().unwrap().warm_outcome == Some(Outcome::Complete))
+            .then_some(())
+            .ok_or_else(|| "successful warm has not reached export index".to_owned())
+    })
+    .await;
+    if let Some(directory) = std::env::var_os("BROCA_WARM_EXPORT_SAMPLE_DIR") {
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let page = fixture.export.read_page(None, 100).unwrap();
+        for (name, outcome) in [
+            ("failed-overhaul-warm.json", Outcome::HttpError),
+            ("successful-overhaul-warm.json", Outcome::Complete),
+        ] {
+            let fact = page
+                .facts
+                .iter()
+                .find(|f| f.segment.as_session().unwrap().warm_outcome == Some(outcome))
+                .unwrap();
+            std::fs::write(
+                directory.join(name),
+                serde_json::to_vec_pretty(&fact.segment).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[cfg(feature = "test-clock")]
+fn assert_unsent_warm_released_once(records: &[WalRecord]) {
+    let ids: Vec<_> = records
+        .iter()
+        .filter_map(|r| match r {
+            WalRecord::AttemptReserved {
+                attempt_id,
+                reservation,
+            } if reservation.warm => Some(attempt_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids.len(), 1);
+    assert_eq!(records.iter().filter(|r| matches!(r, WalRecord::AttemptReleased { attempt_id, envelope, .. }
+        if attempt_id == ids[0] && envelope.sent == broca_wal::record::AttemptSent::No && envelope.usage.is_none())).count(), 1);
+    assert!(warm_records(records).is_empty());
+}
+
+#[cfg(feature = "test-clock")]
+async fn assert_late_success_was_ignored(gate: &broca_core::cache_warm::WarmPermissionGate) {
+    broca_test_support::wait_until(
+        "successful late barrier acknowledgement rejected",
+        || async {
+            let success = gate.successful_ack.load(Ordering::SeqCst);
+            let dropped = gate.receiver_dropped.load(Ordering::SeqCst);
+            (success && dropped).then_some(()).ok_or_else(|| {
+                format!("successful_sync={success}, receipt_receiver_dropped={dropped}")
+            })
+        },
+    )
+    .await;
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_warm_permission_denial_and_late_barrier_write_no_request() {
+    for shutdown in [false, true] {
+        let fixture = Fixture::with_wal_config(
+            vec![text_turn("hello"), Reply::WarmOrText],
+            |_| {},
+            provider_for,
+            broca_wal::WalConfig::OVERHAUL,
+        )
+        .await;
+        fixture.turn("r1", "q", RunKind::FreshOrResume).await;
+        let before = fixture.registry.cache_clock_reading(&fixture.key).unwrap();
+        let gate = Arc::new(if shutdown {
+            broca_core::cache_warm::WarmPermissionGate::successful()
+        } else {
+            broca_core::cache_warm::WarmPermissionGate::default()
+        });
+        *fixture.executor.permission_gate.lock().unwrap() = Some(gate.clone());
+        let registry = fixture.registry.clone();
+        let key = fixture.key.clone();
+        let warm = tokio::spawn(async move { ServeHandler::warm(&registry, &key, None).await });
+        gate.entered.notified().await;
+        assert_eq!(
+            fixture.server.network_activity(),
+            (1, 1),
+            "no extra connection or first request byte before permission"
+        );
+        assert_eq!(
+            fixture.server.bodies().len(),
+            1,
+            "no HTTP bytes before durable permission"
+        );
+        if shutdown {
+            assert!(fixture.registry.stop_and_seal().await);
+            gate.release.cancel();
+            assert_late_success_was_ignored(&gate).await;
+        } else {
+            gate.release.cancel();
+        }
+        assert!(warm.await.unwrap().is_err());
+        assert_eq!(
+            fixture.registry.cache_clock_reading(&fixture.key).unwrap(),
+            before
+        );
+        if !shutdown {
+            assert!(fixture.registry.stop_and_seal().await);
+        }
+        assert_eq!(
+            fixture.server.bodies().len(),
+            1,
+            "denied or late permission must never send"
+        );
+        assert_unsent_warm_released_once(&fixture.records());
+        assert_eq!(fixture.server.network_activity(), (1, 1));
+    }
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test(flavor = "multi_thread")]
+async fn automatic_warm_permission_denial_writes_no_request() {
+    let fixture = Fixture::with_wal_config(
+        vec![held_tool_turn(), Reply::WarmOrText],
+        |_| {},
+        provider_for,
+        broca_wal::WalConfig::OVERHAUL,
+    )
+    .await;
+    let gate = Arc::new(broca_core::cache_warm::WarmPermissionGate::default());
+    *fixture.executor.permission_gate.lock().unwrap() = Some(gate.clone());
+    fixture
+        .start_automatic_held(Some(broca_protocol::request::KeepWarm::Auto))
+        .await;
+    gate.entered.notified().await;
+    assert_eq!(fixture.server.network_activity(), (1, 1));
+    assert_eq!(
+        fixture.server.bodies().len(),
+        1,
+        "automatic warm waits before any HTTP bytes"
+    );
+    gate.release.cancel();
+    fixture.wait_warm_stop("unsupported").await;
+    assert_eq!(fixture.server.network_activity(), (1, 1));
+    assert_eq!(
+        fixture.server.bodies().len(),
+        1,
+        "a refused barrier is not send permission"
+    );
+    fixture.finish_held().await;
+    assert!(fixture.registry.stop_and_seal().await);
+    assert_unsent_warm_released_once(&fixture.records());
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_automatic_warm_ignores_late_successful_barrier_acknowledgement() {
+    let fixture = Fixture::with_wal_config(
+        vec![held_tool_turn(), Reply::WarmOrText],
+        |_| {},
+        provider_for,
+        broca_wal::WalConfig::OVERHAUL,
+    )
+    .await;
+    let gate = Arc::new(broca_core::cache_warm::WarmPermissionGate::successful());
+    *fixture.executor.permission_gate.lock().unwrap() = Some(gate.clone());
+    fixture
+        .start_automatic_held(Some(broca_protocol::request::KeepWarm::Auto))
+        .await;
+    gate.entered.notified().await;
+    assert_eq!(fixture.server.network_activity(), (1, 1));
+    assert_eq!(
+        fixture
+            .registry
+            .route_cancel(&fixture.key, RunId("held-auto".into()))
+            .await
+            .unwrap(),
+        CancelOutcome::Ack
+    );
+    fixture.finish_held().await;
+    assert!(fixture.registry.stop_and_seal().await);
+    gate.release.cancel();
+    assert_late_success_was_ignored(&gate).await;
+    assert_eq!(
+        fixture.server.network_activity(),
+        (1, 1),
+        "a successful receipt after cancellation must not start a connection"
+    );
+    assert_unsent_warm_released_once(&fixture.records());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn automatic_failed_warm_recorded() {
+    let fixture = Fixture::with_wal_config(
+        vec![
+            held_tool_turn(),
+            Reply::Full {
+                status: 529,
+                headers: vec![],
+                body: b"overloaded".to_vec(),
+            },
+            Reply::WarmOrText,
+        ],
+        |_| {},
+        provider_for,
+        broca_wal::WalConfig::OVERHAUL,
+    )
+    .await;
+    fixture
+        .start_automatic_held(Some(broca_protocol::request::KeepWarm::Auto))
+        .await;
+    fixture.wait_warms(1).await;
+    let records = fixture.records();
+    let warms = warm_records(&records);
+    assert_eq!(warms.len(), 1);
+    assert!(
+        matches!(&warms[0], WalRecord::CacheWarmed { trigger: Some(trigger), envelope: Some(envelope), .. }
+        if trigger == "keep_warm" && envelope.outcome == broca_wal::record::BillingAttemptOutcome::HttpError && envelope.usage.is_none())
+    );
+    fixture.finish_held().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn overhaul_idle_warm_shutdown_settles_before_writer_close() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let fixture = Fixture::with_wal_config(
+        vec![
+            text_turn("hello"),
+            Reply::Gated(release, Box::new(Reply::WarmOrText)),
+        ],
+        |_| {},
+        provider_for,
+        broca_wal::WalConfig::OVERHAUL,
+    )
+    .await;
+    fixture.turn("r1", "q", RunKind::FreshOrResume).await;
+    let registry = fixture.registry.clone();
+    let key = fixture.key.clone();
+    let warm = tokio::spawn(async move { ServeHandler::warm(&registry, &key, None).await });
+    fixture.server.wait_for(2).await;
+    assert!(fixture.registry.stop_and_seal().await);
+    assert!(
+        warm.await.unwrap().is_err(),
+        "shutdown closes the warm's reply"
+    );
+    let records = fixture.records();
+    let warms = warm_records(&records);
+    assert_eq!(warms.len(), 1);
+    assert!(
+        matches!(&warms[0], WalRecord::CacheWarmed { envelope: Some(envelope), .. }
+        if envelope.outcome == broca_wal::record::BillingAttemptOutcome::Unknown && envelope.usage.is_none())
+    );
+    let warm_seq = records
+        .iter()
+        .position(|r| matches!(r, WalRecord::CacheWarmed { .. }))
+        .unwrap();
+    let closed_seq = records
+        .iter()
+        .rposition(|r| matches!(r, WalRecord::WriterClosed { .. }))
+        .unwrap();
+    assert!(warm_seq < closed_seq);
 }
 
 /// The admission reply's baseline and `session.baseline` both carry the session's cache

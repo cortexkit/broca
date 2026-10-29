@@ -6098,6 +6098,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 session: self.key.clone(),
                 config,
                 base,
+                attempt_hook: None,
             },
         ))
     }
@@ -6125,13 +6126,26 @@ impl<W: WalStore + 'static> LineageActor<W> {
             )));
             return;
         };
-        let (pending, job) = match self.prepare_warm(lineage_id).await {
+        let (pending, mut job) = match self.prepare_warm(lineage_id).await {
             Ok(prepared) => prepared,
             Err(outcome) => {
                 let _ = reply.send(*outcome);
                 return;
             }
         };
+        let active_seal = match &self.state {
+            RunState::Active { shutdown_seal, .. } => Some(shutdown_seal),
+            RunState::Idle => None,
+        };
+        job.attempt_hook = crate::keep_warm::manual_warm_hook(
+            self.writer
+                .as_ref()
+                .expect("warm preparation requires a writer"),
+            active_seal,
+            &job,
+            &pending.run_id,
+        )
+        .map(|journal| journal as Arc<dyn broca_core::run::AttemptHook>);
         let pending = PendingWarm::new(pending, reply, permit);
         let executor = Arc::clone(&self.executor);
         let terminal_tx = self.terminal_tx.clone();
@@ -6175,6 +6189,16 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let sent = match result {
             Ok(sent) => sent,
             Err(error) => {
+                if self
+                    .writer
+                    .as_ref()
+                    .is_some_and(|writer| writer.is_overhaul())
+                    && !matches!(&self.state, RunState::Active { run_id: active, .. } if *active == run_id)
+                {
+                    // A failed idle warm can report usage after the run was already exported.
+                    // Refresh that run's facts without treating the attempt as a cache refresh.
+                    self.spawn_live_usage_export(run_id);
+                }
                 if self.retention_lineage
                     || self
                         .writer
@@ -6200,22 +6224,24 @@ impl<W: WalStore + 'static> LineageActor<W> {
             sent.sent_at_ms,
             sent.ratelimit_headers.iter().cloned().collect(),
         );
-        writer.record(WalRecord::CacheWarmed {
-            attempt_id: None,
-            reservation: None,
-            envelope: None,
-            trigger: None,
-            run_id: run_id.clone(),
-            step_id,
-            request_body_sha256: request_body_sha256.clone(),
-            warm_body_sha256: sent.warm_body_sha256.clone(),
-            usage: sent.usage,
-            served_account_ref: sent.served_account_ref.clone(),
-            ratelimit_headers: sent.ratelimit_headers.iter().cloned().collect(),
-            sent_at_ms: sent.sent_at_ms,
-            ttl_ms: Some(ttl_ms),
-            expires_at_ms: Some(expires_at_ms),
-        });
+        if !writer.is_overhaul() {
+            writer.record(WalRecord::CacheWarmed {
+                attempt_id: None,
+                reservation: None,
+                envelope: None,
+                trigger: None,
+                run_id: run_id.clone(),
+                step_id,
+                request_body_sha256: request_body_sha256.clone(),
+                warm_body_sha256: sent.warm_body_sha256.clone(),
+                usage: sent.usage,
+                served_account_ref: sent.served_account_ref.clone(),
+                ratelimit_headers: sent.ratelimit_headers.iter().cloned().collect(),
+                sent_at_ms: sent.sent_at_ms,
+                ttl_ms: Some(ttl_ms),
+                expires_at_ms: Some(expires_at_ms),
+            });
+        }
         self.registry
             .cache_clock(&self.key)
             .note_sent(sent.sent_at_ms, Some(ttl_ms));
@@ -8062,6 +8088,18 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// rest of its teardown is done and drops it where it would drop an actor-held lease,
     /// so both tenure kinds release at the same point of the close.
     async fn shutdown_writer(&mut self) -> WriterClosed {
+        if self
+            .writer
+            .as_ref()
+            .is_some_and(|writer| writer.is_overhaul())
+        {
+            if let Some(task) = self.warm_task.take() {
+                // Overhaul warm journals hold the writer until their fallback is queued.
+                // Join the warm before the final barrier so no send outlives writer tenure.
+                task.abort();
+                let _ = task.await;
+            }
+        }
         if let Some(task) = self.withdrawal_task.take() {
             task.stop().await;
         }

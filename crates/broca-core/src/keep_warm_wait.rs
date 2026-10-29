@@ -15,6 +15,9 @@ pub struct WarmTiming {
 
 pub enum WarmTick {
     Sent,
+    SentWithCost {
+        cost: f64,
+    },
     ResponsesSent {
         usage: broca_protocol::Usage,
         cost: f64,
@@ -23,6 +26,11 @@ pub enum WarmTick {
     Stop {
         reason: String,
         detail: Option<String>,
+    },
+    StopWithCost {
+        reason: String,
+        detail: Option<String>,
+        cost: f64,
     },
 }
 
@@ -44,6 +52,16 @@ pub trait KeepWarmDriver: Send + Sync {
         _usage: &broca_protocol::Usage,
     ) -> Result<f64, String> {
         self.costs(config).map(|costs| costs.warm)
+    }
+    /// Price measured usage of a failed sent attempt, never the successful-refresh estimate.
+    fn failed_cost(
+        &self,
+        _config: &RunConfig,
+        _reservation: &broca_wal::record::AttemptReservation,
+        _envelope: &broca_wal::record::AttemptEnvelope,
+        _ttl_ms: Option<u64>,
+    ) -> Result<f64, String> {
+        Err("reported warm usage pricing unavailable".into())
     }
     async fn warm(&self, config: &RunConfig, run_id: &RunId) -> WarmTick;
 }
@@ -157,6 +175,10 @@ pub async fn wait_tools_with_spend<F: Future>(
                         spent += tick_cost;
                         next = delay(warm.driver.as_ref(), timing).map(|delay| tokio::time::Instant::now() + delay);
                     }
+                    WarmTick::SentWithCost { cost } => {
+                        spent += cost;
+                        next = delay(warm.driver.as_ref(), timing).map(|delay| tokio::time::Instant::now() + delay);
+                    }
                     WarmTick::ResponsesSent { usage, cost } => {
                         spent += cost;
                         let missed = usage.cached_input_tokens.zip(usage.input_tokens).map(|(cached, fresh)| (cached, cached.saturating_add(fresh)));
@@ -177,6 +199,14 @@ pub async fn wait_tools_with_spend<F: Future>(
                         next = None;
                         if reason != "unsupported" || warm.log_unsupported() {
                             tracing::info!(target: "cache_warm", stop = %reason, detail = ?detail, "keep_warm stopped");
+                        }
+                    }
+                    WarmTick::StopWithCost { reason, detail, cost } => {
+                        spent += cost;
+                        stopped = true;
+                        next = None;
+                        if reason != "unsupported" || warm.log_unsupported() {
+                            tracing::info!(target: "cache_warm", stop = %reason, detail = ?detail, spent, "keep_warm stopped");
                         }
                     }
                 }
@@ -221,18 +251,120 @@ pub(crate) fn batch_spend_iter<'a>(
                 run_id,
                 step_id: warmed_step,
                 usage,
+                envelope,
+                reservation,
+                ttl_ms,
                 ..
             } if trigger.as_deref() == Some("keep_warm")
                 && run_id == warm.run_id
                 && *warmed_step == step_id =>
             {
-                Some(
-                    warm.driver
+                Some(match envelope.as_deref() {
+                    envelope if crate::cache_warm::warm_reached_the_cache(envelope) => warm
+                        .driver
                         .recorded_cost(warm.config, usage)
                         .unwrap_or(f64::INFINITY),
-                )
+                    Some(envelope) if crate::cache_warm::warm_budget_needs_pricing(envelope) => {
+                        match reservation.as_deref() {
+                            Some(reservation) => warm.driver.failed_cost(warm.config, reservation, envelope, *ttl_ms).unwrap_or(f64::INFINITY),
+                            None => {
+                                tracing::warn!(target: "cache_warm", stop = "pricing_unavailable", "warm budget exhausted: failed warm has no reservation identifying its model");
+                                f64::INFINITY
+                            }
+                        }
+                    }
+                    _ => 0.0,
+                })
             }
             _ => None,
         })
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct ChargedDriver {
+        costs_called: AtomicUsize,
+        warms: AtomicUsize,
+        next_decision: tokio::sync::Notify,
+    }
+    #[async_trait::async_trait]
+    impl KeepWarmDriver for ChargedDriver {
+        fn timing(&self, _: &RunConfig) -> Result<WarmTiming, String> {
+            Ok(WarmTiming {
+                ttl_ms: 1000,
+                lead_ms: 0,
+                after_send_ms: Some(1),
+            })
+        }
+        fn last_sent_at_ms(&self) -> Option<u64> {
+            Some(0)
+        }
+        fn costs(&self, _: &RunConfig) -> Result<crate::keep_warm::WarmCosts, String> {
+            if self.costs_called.fetch_add(1, Ordering::SeqCst) == 1 {
+                self.next_decision.notify_one();
+            }
+            Ok(crate::keep_warm::WarmCosts {
+                warm: 10.0,
+                bust: 21.0,
+            })
+        }
+        async fn warm(&self, _: &RunConfig, _: &RunId) -> WarmTick {
+            self.warms.fetch_add(1, Ordering::SeqCst);
+            // A measured failed first attempt cost four, then the successful resend cost ten.
+            WarmTick::SentWithCost { cost: 14.0 }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_budget_counts_failed_usage_before_a_successful_resend() {
+        let driver = Arc::new(ChargedDriver {
+            costs_called: AtomicUsize::new(0),
+            warms: AtomicUsize::new(0),
+            next_decision: Default::default(),
+        });
+        let done = CancellationToken::new();
+        let task = {
+            let driver = driver.clone();
+            let done = done.clone();
+            tokio::spawn(async move {
+                let driver: Arc<dyn KeepWarmDriver> = driver;
+                let config = serde_json::from_value(serde_json::json!({
+                    "model": broca_protocol::request::ModelHandle::new("p", "m"), "tools": [],
+                    "tool_choice": broca_protocol::ToolChoice::Auto, "generation": broca_protocol::GenerationConfig::default(),
+                    "response_format": broca_protocol::request::ResponseFormat::default(), "context_epoch": 0, "renderer_version": 1,
+                })).unwrap();
+                let unsupported = AtomicBool::new(false);
+                let missed = AtomicBool::new(false);
+                let run = RunId("r".into());
+                wait_tools_with_spend(
+                    done.cancelled(),
+                    Some(WarmWait {
+                        driver: &driver,
+                        config: &config,
+                        run_id: &run,
+                        cancel: None,
+                        unsupported_logged: &unsupported,
+                        warm_missed: &missed,
+                    }),
+                    0.0,
+                )
+                .await;
+            })
+        };
+        driver.next_decision.notified().await;
+        done.cancel();
+        task.await.unwrap();
+        assert_eq!(
+            driver.warms.load(Ordering::SeqCst),
+            1,
+            "fourteen spent leaves no room for another ten-unit warm"
+        );
+    }
 }

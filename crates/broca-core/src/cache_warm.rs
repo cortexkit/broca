@@ -185,8 +185,9 @@ fn last_cache_usage(records: &[WalRecord], last_sent_at_ms: u64) -> Option<Usage
             WalRecord::CacheWarmed {
                 sent_at_ms,
                 usage: reported,
+                envelope,
                 ..
-            } if *sent_at_ms == last_sent_at_ms => {
+            } if *sent_at_ms == last_sent_at_ms && warm_reached_the_cache(envelope.as_deref()) => {
                 latest_step = None;
                 usage = Some(*reported);
             }
@@ -209,8 +210,8 @@ fn last_cache_usage(records: &[WalRecord], last_sent_at_ms: u64) -> Option<Usage
 /// the provider has already dropped the prefix and charges to write it again. An old attempt with
 /// no such bound is not counted.
 ///
-/// A warm counts from its own `sent_at_ms`: a `CacheWarmed` record is written only for a warm the
-/// provider answered.
+/// A warm counts from its own `sent_at_ms` only when its billing envelope records success.
+/// Legacy warm records have no envelope and were written only for answered warms.
 pub fn last_cache_send_at_ms(records: &[WalRecord]) -> Option<u64> {
     let mut latest: Option<u64> = None;
     let mut bound = SendLowerBound::default();
@@ -222,13 +223,28 @@ pub fn last_cache_send_at_ms(records: &[WalRecord]) -> Option<u64> {
                 sent_at_ms,
                 ..
             } if attempt_reached_the_cache(*http_status, outcome) => sent_at_ms.or(bound.at_ms),
-            WalRecord::CacheWarmed { sent_at_ms, .. } => Some(*sent_at_ms),
+            WalRecord::CacheWarmed {
+                sent_at_ms,
+                envelope,
+                ..
+            } if warm_reached_the_cache(envelope.as_deref()) => Some(*sent_at_ms),
             _ => None,
         };
         latest = latest.max(sent_at_ms);
         bound.observe(record);
     }
     latest
+}
+
+pub(crate) fn warm_reached_the_cache(
+    envelope: Option<&broca_wal::record::AttemptEnvelope>,
+) -> bool {
+    use broca_wal::record::{AttemptSent, BillingAttemptOutcome};
+    envelope.is_none_or(|e| {
+        e.sent == AttemptSent::Yes
+            && e.http_status.is_some_and(|s| (200..300).contains(&s))
+            && e.outcome == BillingAttemptOutcome::Complete
+    })
 }
 
 /// Whether a model request attempt reached the provider and was accepted for processing, so its
@@ -319,6 +335,421 @@ pub struct WarmSent {
     /// The provider's rate-limit headers on the response, verbatim (lowercase names).
     pub ratelimit_headers: Vec<(String, String)>,
     pub http_status: u16,
+}
+
+/// Missing or reported-zero counts consume no warm budget and require no price lookup.
+/// Here `Usage.output_tokens` already includes reasoning tokens; do not add them again.
+pub fn warm_budget_needs_pricing(envelope: &broca_wal::record::AttemptEnvelope) -> bool {
+    envelope.sent != broca_wal::record::AttemptSent::No
+        && envelope.usage.is_some_and(|usage| {
+            [
+                usage.input_tokens,
+                usage.cached_input_tokens,
+                usage.cache_write_tokens,
+                usage.output_tokens,
+                envelope.cache_write_5m_tokens,
+                envelope.cache_write_1h_tokens,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|tokens| tokens > 0)
+        })
+}
+
+/// The same reservation and measured outcome used by live and restarted warm-budget pricing.
+/// The reservation identifies the actual model, which can differ from the episode's model.
+#[derive(Debug, Clone)]
+pub struct FailedWarmAttempt {
+    pub reservation: broca_wal::record::AttemptReservation,
+    pub envelope: broca_wal::record::AttemptEnvelope,
+    /// Marker TTL captured when the actual frozen route was prepared; absent means unknown.
+    pub ttl_ms: Option<u64>,
+}
+
+/// Warm-only send facts taken from the exact frozen render route used for the request.
+#[derive(Debug, Clone, Default)]
+pub struct WarmSendPolicy {
+    /// A routed fallback's catalog provider; the source provider is already in the reservation.
+    pub provider: Option<String>,
+    /// The selected frozen marker policy, never the episode's cache-clock estimate.
+    pub ttl_ms: Option<u64>,
+}
+
+/// A warm owns its journal even when no run is active. The seal orders permission and
+/// settlement against shutdown, while the writer's barrier precedes every physical send.
+/// A full WAL can refuse a terminal append even after permission was durable. Such a reservation
+/// remains conservative possibly-billed evidence for reclaim; a per-ID terminal is not guaranteed
+/// across storage refusal or power loss.
+pub struct WarmJournal {
+    writer: Arc<crate::WalHandle>,
+    seal: crate::ShutdownSeal,
+    template: broca_wal::record::AttemptReservation,
+    request_body_sha256: String,
+    trigger: Option<String>,
+    pending: Mutex<std::collections::BTreeMap<broca_wal::record::AttemptId, WarmPending>>,
+    failed: Mutex<Vec<FailedWarmAttempt>>,
+    #[cfg(feature = "test-clock")]
+    permission_gate: Mutex<Option<Arc<WarmPermissionGate>>>,
+}
+
+/// A deterministic pending durability barrier for cross-layer warm permission tests.
+#[cfg(feature = "test-clock")]
+#[derive(Default)]
+pub struct WarmPermissionGate {
+    pub entered: tokio::sync::Notify,
+    pub release: tokio_util::sync::CancellationToken,
+    pub acknowledged: tokio::sync::Notify,
+    pub successful_ack: std::sync::atomic::AtomicBool,
+    pub receiver_dropped: std::sync::atomic::AtomicBool,
+    late_success: bool,
+}
+
+#[cfg(feature = "test-clock")]
+impl WarmPermissionGate {
+    /// Hold a real successful sync receipt, then acknowledge it independently of the waiter.
+    pub fn successful() -> Self {
+        Self {
+            late_success: true,
+            ..Self::default()
+        }
+    }
+}
+
+struct WarmPending {
+    reservation: broca_wal::record::AttemptReservation,
+    started: bool,
+    ttl_ms: Option<u64>,
+}
+
+impl WarmJournal {
+    pub fn new(
+        writer: Arc<crate::WalHandle>,
+        seal: crate::ShutdownSeal,
+        template: broca_wal::record::AttemptReservation,
+        request_body_sha256: String,
+        trigger: Option<String>,
+    ) -> Self {
+        Self {
+            writer,
+            seal,
+            template,
+            request_body_sha256,
+            trigger,
+            pending: Mutex::new(Default::default()),
+            failed: Mutex::new(Vec::new()),
+            #[cfg(feature = "test-clock")]
+            permission_gate: Mutex::new(None),
+        }
+    }
+
+    /// Report only measured failed-attempt usage to the live warm budget. The WAL contains
+    /// the same evidence for restart accounting; absent usage is never priced using the
+    /// successful-refresh estimate.
+    pub fn failed_attempts(&self) -> Vec<FailedWarmAttempt> {
+        self.failed.lock().unwrap().clone()
+    }
+
+    fn terminal(
+        &self,
+        id: broca_wal::record::AttemptId,
+        pending: &WarmPending,
+        envelope: broca_wal::record::AttemptEnvelope,
+        sent: Option<WarmSent>,
+        warm_body_sha256: String,
+    ) -> WalRecord {
+        WalRecord::CacheWarmed {
+            attempt_id: Some(id),
+            reservation: Some(Box::new(pending.reservation.clone())),
+            usage: envelope.usage.unwrap_or_default(),
+            sent_at_ms: envelope.sent_at_ms.unwrap_or_default(),
+            envelope: Some(Box::new(envelope)),
+            trigger: self.trigger.clone(),
+            run_id: pending.reservation.run_id.clone(),
+            step_id: pending.reservation.step_id,
+            request_body_sha256: self.request_body_sha256.clone(),
+            warm_body_sha256,
+            served_account_ref: pending.reservation.credential.account_ref.clone(),
+            ratelimit_headers: sent
+                .as_ref()
+                .map(|s| s.ratelimit_headers.iter().cloned().collect())
+                .unwrap_or_default(),
+            ttl_ms: pending.ttl_ms,
+            expires_at_ms: sent
+                .as_ref()
+                .and_then(|s| pending.ttl_ms.map(|ttl| s.sent_at_ms.saturating_add(ttl))),
+        }
+    }
+
+    fn fallback(&self, id: broca_wal::record::AttemptId, pending: &WarmPending) -> WalRecord {
+        use broca_wal::record::{AttemptEnvelope, AttemptSent};
+        let envelope = AttemptEnvelope {
+            sent: if pending.started {
+                AttemptSent::Unknown
+            } else {
+                AttemptSent::No
+            },
+            finished_at_ms: Some(warm_epoch_ms()),
+            ..Default::default()
+        };
+        if pending.started {
+            self.terminal(id, pending, envelope, None, String::new())
+        } else {
+            WalRecord::AttemptReleased {
+                attempt_id: id,
+                reservation: Box::new(pending.reservation.clone()),
+                envelope: Box::new(envelope),
+            }
+        }
+    }
+
+    fn abandon(&self, id: &broca_wal::record::AttemptId) {
+        if let Some(pending) = self.pending.lock().unwrap().remove(id) {
+            // The seal may already own the fallback; settling through it prevents duplicates.
+            let _ = self.seal.settle_billing_attempt(
+                &self.writer,
+                id,
+                self.fallback(id.clone(), &pending),
+            );
+        }
+    }
+}
+
+impl Drop for WarmJournal {
+    fn drop(&mut self) {
+        let ids: Vec<_> = self.pending.lock().unwrap().keys().cloned().collect();
+        for id in ids {
+            self.abandon(&id);
+        }
+    }
+}
+
+struct WarmPermission<'a> {
+    journal: &'a WarmJournal,
+    id: Option<broca_wal::record::AttemptId>,
+}
+impl Drop for WarmPermission<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.journal.abandon(&id);
+        }
+    }
+}
+
+fn warm_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn warm_journal_error(detail: impl std::fmt::Display) -> ProviderError {
+    ProviderError {
+        class: broca_protocol::ErrorClass::Permanent,
+        message: format!("cache warm attempt durability failed: {detail}"),
+        provider_code: Some("attempt_durability_failed".into()),
+        provider_details: None,
+        provider_subcode: None,
+        refusal: None,
+        status: None,
+        retry_after_secs: None,
+        resets_at_ms: None,
+        resets_at_source: None,
+        limit_window: None,
+        account_ref: None,
+        credential_id: None,
+        affordable_max_tokens: None,
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::run::AttemptHook for WarmJournal {
+    #[cfg(feature = "test-clock")]
+    fn set_warm_permission_gate_for_test(&self, gate: Arc<WarmPermissionGate>) {
+        *self.permission_gate.lock().unwrap() = Some(gate);
+    }
+    async fn before_send(
+        &self,
+        send: crate::run::PhysicalSend,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<broca_wal::record::AttemptId, ProviderError> {
+        if cancel.is_cancelled() {
+            return Err(warm_journal_error("reservation cancelled"));
+        }
+        let id = crate::attempt_id::mint_attempt_id().map_err(warm_journal_error)?;
+        let pending = WarmPending {
+            reservation: broca_wal::record::AttemptReservation {
+                attempt: send.attempt,
+                send_index: send.send_index,
+                reserved_at_ms: warm_epoch_ms(),
+                endpoint_host: send.endpoint_host,
+                model_sent: send.model_sent,
+                request_body_bytes: send.request_body_bytes,
+                compressed: send.compressed,
+                provider: send
+                    .warm
+                    .as_ref()
+                    .and_then(|policy| policy.provider.clone())
+                    .unwrap_or_else(|| self.template.provider.clone()),
+                credential: broca_wal::record::AttemptCredential {
+                    account_ref: send.account_ref,
+                    ..self.template.credential.clone()
+                },
+                run: broca_wal::record::AttemptRun {
+                    speed_requested: send.speed_requested,
+                    ..self.template.run.clone()
+                },
+                ..self.template.clone()
+            },
+            started: false,
+            ttl_ms: send.warm.as_ref().and_then(|policy| policy.ttl_ms),
+        };
+        let record = WalRecord::AttemptReserved {
+            attempt_id: id.clone(),
+            reservation: Box::new(pending.reservation.clone()),
+        };
+        if !self
+            .seal
+            .reserve_billing_attempt(
+                &self.writer,
+                id.clone(),
+                record,
+                self.fallback(id.clone(), &pending),
+            )
+            .map_err(warm_journal_error)?
+        {
+            return Err(warm_journal_error(
+                "shutdown sealed before warm reservation",
+            ));
+        }
+        self.pending.lock().unwrap().insert(id.clone(), pending);
+        let mut permission = WarmPermission {
+            journal: self,
+            id: Some(id.clone()),
+        };
+        let barrier = async {
+            #[cfg(feature = "test-clock")]
+            {
+                let gate = self.permission_gate.lock().unwrap().clone();
+                if let Some(gate) = gate {
+                    if !gate.late_success {
+                        gate.entered.notify_one();
+                        gate.release.cancelled().await;
+                        return Err(crate::WalWriteError::from(
+                            "warm durability barrier refused by test gate",
+                        ));
+                    }
+                    let result = self.writer.sync().await.map(|_| ());
+                    let (ack, receipt) = tokio::sync::oneshot::channel();
+                    tokio::spawn(async move {
+                        gate.entered.notify_one();
+                        gate.release.cancelled().await;
+                        gate.successful_ack
+                            .store(result.is_ok(), std::sync::atomic::Ordering::SeqCst);
+                        gate.receiver_dropped.store(
+                            ack.send(result).is_err(),
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                        gate.acknowledged.notify_one();
+                    });
+                    return receipt.await.map_err(|_| {
+                        crate::WalWriteError::from("warm test acknowledgement task ended")
+                    })?;
+                }
+            }
+            self.writer.sync().await.map(|_| ())
+        };
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(warm_journal_error("reservation cancelled before send permission")),
+            _ = self.seal.tripped() => return Err(warm_journal_error("shutdown sealed before send permission")),
+            result = tokio::time::timeout(std::time::Duration::from_secs(30), barrier) => {
+                result.map_err(|_| warm_journal_error("reservation permission deadline expired"))?.map_err(warm_journal_error)?;
+            }
+        }
+        if cancel.is_cancelled() {
+            return Err(warm_journal_error(
+                "reservation cancelled before warm start",
+            ));
+        }
+        {
+            let mut pending = self.pending.lock().unwrap();
+            let pending = pending
+                .get_mut(&id)
+                .expect("warm reservation retained until permission");
+            let started = WarmPending {
+                reservation: pending.reservation.clone(),
+                started: true,
+                ttl_ms: pending.ttl_ms,
+            };
+            if !self
+                .seal
+                .start_billing_attempt(&id, self.fallback(id.clone(), &started))
+            {
+                return Err(warm_journal_error("shutdown sealed before warm start"));
+            }
+            pending.started = true;
+        }
+        permission.id.take();
+        Ok(id)
+    }
+
+    async fn finished(
+        &self,
+        _id: broca_wal::record::AttemptId,
+        _attempt: broca_protocol::ModelAttempt,
+        _outcome: broca_wal::record::BillingAttemptOutcome,
+    ) -> Result<(), ProviderError> {
+        Err(warm_journal_error(
+            "model settlement sent to a warm journal",
+        ))
+    }
+
+    async fn warm_finished(
+        &self,
+        id: broca_wal::record::AttemptId,
+        envelope: broca_wal::record::AttemptEnvelope,
+        sent: Option<WarmSent>,
+        warm_body_sha256: String,
+    ) -> Result<(), ProviderError> {
+        let compressed_refusal =
+            envelope.outcome == broca_wal::record::BillingAttemptOutcome::CompressionRefused;
+        let failed = (!warm_reached_the_cache(Some(&envelope))
+            && warm_budget_needs_pricing(&envelope))
+        .then(|| broca_wal::record::AttemptEnvelope {
+            sent: envelope.sent,
+            usage: envelope.usage,
+            outcome: envelope.outcome,
+            cache_write_5m_tokens: envelope.cache_write_5m_tokens,
+            cache_write_1h_tokens: envelope.cache_write_1h_tokens,
+            ..Default::default()
+        });
+        let failed = {
+            let mut pending = self.pending.lock().unwrap();
+            let Some(entry) = pending.get(&id) else {
+                return Err(warm_journal_error("warm reservation already settled"));
+            };
+            let failed = failed.map(|envelope| FailedWarmAttempt {
+                reservation: entry.reservation.clone(),
+                envelope,
+                ttl_ms: entry.ttl_ms,
+            });
+            let record = self.terminal(id.clone(), entry, envelope, sent, warm_body_sha256);
+            self.seal
+                .settle_billing_attempt(&self.writer, &id, record)
+                .map_err(warm_journal_error)?;
+            pending.remove(&id);
+            failed
+        };
+        if let Some(failed) = failed {
+            self.failed.lock().unwrap().push(failed);
+        }
+        // The resend reservation's barrier commits the compression refusal and new permission
+        // together. A final outcome has its own barrier because an idle session may write no more.
+        if !compressed_refusal {
+            self.writer.sync().await.map_err(warm_journal_error)?;
+        }
+        Ok(())
+    }
 }
 
 /// Why a provider did not warm.
@@ -412,7 +843,10 @@ pub fn account_wall(records: &[WalRecord], now_ms: u64) -> Option<u64> {
         WalRecord::RunFinished { error, .. } | WalRecord::RunPaused { error, .. } => {
             Some(error.as_ref())
         }
-        WalRecord::ModelStepFinished { .. } | WalRecord::CacheWarmed { .. } => Some(None),
+        WalRecord::ModelStepFinished { .. } => Some(None),
+        WalRecord::CacheWarmed { envelope, .. } if warm_reached_the_cache(envelope.as_deref()) => {
+            Some(None)
+        }
         _ => None,
     })??;
     (latest_error.provider_code.as_deref() == Some(ACCOUNT_LIMIT_EXHAUSTED))
@@ -610,6 +1044,196 @@ pub fn last_recorded_request(
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct WarmSyncGate {
+        held: Mutex<bool>,
+        release: std::sync::Condvar,
+        entered: tokio::sync::Notify,
+        records: Mutex<Vec<broca_wal::FramedRecord>>,
+    }
+
+    struct WarmTestWal(Arc<WarmSyncGate>);
+    impl broca_wal::Wal for WarmTestWal {
+        fn append(
+            &mut self,
+            fence: u64,
+            record: &WalRecord,
+            _: bool,
+        ) -> Result<u64, broca_wal::WalError> {
+            let mut records = self.0.records.lock().unwrap();
+            let seq = records.len() as u64 + 1;
+            records.push(broca_wal::FramedRecord {
+                seq,
+                fence,
+                record: record.clone(),
+            });
+            Ok(seq)
+        }
+        fn sync(&self) -> Result<(), broca_wal::WalError> {
+            let mut held = self.0.held.lock().unwrap();
+            self.0.entered.notify_one();
+            while *held {
+                held = self.0.release.wait(held).unwrap();
+            }
+            Ok(())
+        }
+        fn replay(&self) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+            Ok(self.0.records.lock().unwrap().clone())
+        }
+        fn tail_after_seq(
+            &self,
+            seq: u64,
+        ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+            Ok(self.replay()?.into_iter().filter(|r| r.seq > seq).collect())
+        }
+        fn last_seq(&self) -> u64 {
+            self.0.records.lock().unwrap().len() as u64
+        }
+    }
+
+    fn warm_template() -> broca_wal::record::AttemptReservation {
+        serde_json::from_value(serde_json::json!({
+            "run_id":"r", "step_id":1, "attempt":0, "send_index":1, "warm":true,
+            "reserved_at_ms":100, "provider":"p", "endpoint_host":"example.com", "model_sent":"m",
+            "credential":{}, "run":{},
+            "session":{"project_root":"/project", "harness":"runner", "session":"s", "session_ref":"ref"},
+            "request_body_bytes":10, "compressed":false
+        })).unwrap()
+    }
+
+    fn warm_physical_send() -> crate::run::PhysicalSend {
+        crate::run::PhysicalSend {
+            attempt: 0,
+            send_index: 1,
+            endpoint_host: "example.com".into(),
+            model_sent: "m".into(),
+            request_body_bytes: 10,
+            compressed: false,
+            account_ref: None,
+            speed_requested: None,
+            warm: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_timeout_during_hook_releases() {
+        warm_permission_interrupted("timeout").await;
+    }
+
+    #[tokio::test]
+    async fn warm_cancel_and_seal_during_hook_release() {
+        warm_permission_interrupted("cancel").await;
+        warm_permission_interrupted("seal").await;
+    }
+
+    #[tokio::test]
+    async fn warm_already_cancelled_or_sealed_never_reserves() {
+        use crate::run::AttemptHook;
+        for sealed in [false, true] {
+            let gate = Arc::new(WarmSyncGate::default());
+            let writer =
+                Arc::new(crate::WalHandle::spawn(Box::new(WarmTestWal(gate.clone())), 1).unwrap());
+            let seal = crate::ShutdownSeal::new();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            if sealed {
+                seal.seal_and_collect(std::time::Duration::ZERO).await;
+            } else {
+                cancel.cancel();
+            }
+            let journal =
+                WarmJournal::new(writer.clone(), seal, warm_template(), "base".into(), None);
+            assert!(journal
+                .before_send(warm_physical_send(), cancel)
+                .await
+                .is_err());
+            writer.sync().await.unwrap();
+            assert!(!gate.records.lock().unwrap().iter().any(|f| matches!(
+                f.record,
+                WalRecord::AttemptReserved { .. }
+                    | WalRecord::AttemptReleased { .. }
+                    | WalRecord::CacheWarmed { .. }
+            )));
+            drop(journal);
+            Arc::try_unwrap(writer)
+                .ok()
+                .unwrap()
+                .shutdown()
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn warm_permission_interrupted(cause: &str) {
+        use crate::run::AttemptHook;
+        let gate = Arc::new(WarmSyncGate::default());
+        let writer =
+            Arc::new(crate::WalHandle::spawn(Box::new(WarmTestWal(gate.clone())), 1).unwrap());
+        // Consume the writer's initial recovery sync before gating the reservation barrier.
+        gate.entered.notified().await;
+        *gate.held.lock().unwrap() = true;
+        let seal = crate::ShutdownSeal::new();
+        let journal = Arc::new(WarmJournal::new(
+            writer.clone(),
+            seal.clone(),
+            warm_template(),
+            "aa".into(),
+            None,
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = {
+            let journal = journal.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move { journal.before_send(warm_physical_send(), cancel).await })
+        };
+        gate.entered.notified().await;
+        match cause {
+            "timeout" => {
+                tokio::time::pause();
+                tokio::time::advance(std::time::Duration::from_secs(31)).await;
+            }
+            "cancel" => cancel.cancel(),
+            "seal" => {
+                seal.seal_and_collect(std::time::Duration::ZERO).await;
+            }
+            _ => unreachable!(),
+        }
+        let result = task.await.unwrap();
+        if cause == "timeout" {
+            tokio::time::resume();
+        }
+        *gate.held.lock().unwrap() = false;
+        gate.release.notify_all();
+        let error = result.expect_err("no send permission while durability is stalled");
+        assert_eq!(
+            error.provider_code.as_deref(),
+            Some("attempt_durability_failed")
+        );
+        writer.sync().await.unwrap();
+        {
+            let records = gate.records.lock().unwrap();
+            let ids: Vec<_> = records
+                .iter()
+                .filter_map(|r| match &r.record {
+                    WalRecord::AttemptReserved { attempt_id, .. } => Some(attempt_id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(ids.len(), 1);
+            assert_eq!(records.iter().filter(|r| matches!(&r.record, WalRecord::AttemptReleased { attempt_id, envelope, .. }
+            if attempt_id == ids[0] && envelope.sent == broca_wal::record::AttemptSent::No && envelope.usage.is_none())).count(), 1);
+            assert!(!records
+                .iter()
+                .any(|r| matches!(r.record, WalRecord::CacheWarmed { .. })));
+        }
+        drop(journal);
+        Arc::try_unwrap(writer)
+            .ok()
+            .expect("warm journal released the writer")
+            .shutdown()
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn the_expiry_fence_refuses_under_five_seconds_and_unknown_clocks() {
         let reading = |ttl_ms| {
@@ -662,6 +1286,43 @@ mod tests {
             r#"{{"type":"cache_warmed","run_id":"r","step_id":1,"request_body_sha256":"aa","warm_body_sha256":"bb","usage":{{}},"sent_at_ms":{sent_at_ms}}}"#
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn failed_warm_not_cache_send() {
+        use broca_wal::record::{AttemptEnvelope, AttemptSent, BillingAttemptOutcome};
+        for (status, outcome) in [
+            (Some(529), BillingAttemptOutcome::HttpError),
+            (Some(200), BillingAttemptOutcome::IdleTimeout),
+            (Some(200), BillingAttemptOutcome::ChunkError),
+            (Some(200), BillingAttemptOutcome::Unknown),
+            (None, BillingAttemptOutcome::HeaderTimeout),
+        ] {
+            let mut failed = warmed(200);
+            if let WalRecord::CacheWarmed { envelope, .. } = &mut failed {
+                *envelope = Some(Box::new(AttemptEnvelope {
+                    sent: AttemptSent::Yes,
+                    http_status: status,
+                    outcome,
+                    ..Default::default()
+                }));
+            }
+            let records = [attempt(Some(200), "complete", Some(100), 110), failed];
+            assert_eq!(last_cache_send_at_ms(&records), Some(100), "{outcome:?}");
+            let clock = CacheClock::new();
+            clock.seed_if_unknown(&records, Some(300_000));
+            assert_eq!(clock.read().unwrap().last_sent_at_ms, 100);
+        }
+        let mut success = warmed(200);
+        if let WalRecord::CacheWarmed { envelope, .. } = &mut success {
+            *envelope = Some(Box::new(AttemptEnvelope {
+                sent: AttemptSent::Yes,
+                http_status: Some(200),
+                outcome: BillingAttemptOutcome::Complete,
+                ..Default::default()
+            }));
+        }
+        assert_eq!(last_cache_send_at_ms(&[success]), Some(200));
     }
 
     #[test]

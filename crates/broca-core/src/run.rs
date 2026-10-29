@@ -8521,12 +8521,18 @@ pub struct PhysicalSend {
     pub compressed: bool,
     pub account_ref: Option<String>,
     pub speed_requested: Option<String>,
+    /// Present only for warms; derived from the selected frozen request's marker policy.
+    pub warm: Option<crate::cache_warm::WarmSendPolicy>,
 }
 
 /// A receipt is permission to send only after the reservation has crossed a durability barrier.
 /// Implementations must not hold writer locks across an await. Warms can use the same seam.
 #[async_trait::async_trait]
 pub trait AttemptHook: Send + Sync {
+    #[cfg(feature = "test-clock")]
+    fn set_warm_permission_gate_for_test(&self, _gate: Arc<crate::cache_warm::WarmPermissionGate>) {
+        panic!("permission gate requires a warm journal");
+    }
     async fn before_send(
         &self,
         send: PhysicalSend,
@@ -8539,6 +8545,20 @@ pub trait AttemptHook: Send + Sync {
         attempt: ModelAttempt,
         outcome: broca_wal::record::BillingAttemptOutcome,
     ) -> Result<(), ProviderError>;
+
+    /// Warm usage is independent of model-step telemetry. A hook that cannot persist it must
+    /// refuse settlement rather than silently discard the provider's billing evidence.
+    async fn warm_finished(
+        &self,
+        _id: broca_wal::record::AttemptId,
+        _envelope: broca_wal::record::AttemptEnvelope,
+        _sent: Option<crate::WarmSent>,
+        _warm_body_sha256: String,
+    ) -> Result<(), ProviderError> {
+        Err(attempt_hook_error(
+            "warm settlement is unsupported by this attempt hook",
+        ))
+    }
 }
 
 enum AttemptRequest {
@@ -11601,6 +11621,7 @@ mod tests {
             compressed: false,
             account_ref: None,
             speed_requested: None,
+            warm: None,
         }
     }
 
