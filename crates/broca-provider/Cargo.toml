@@ -78,6 +78,7 @@ tokio-tungstenite = { workspace = true, optional = true }
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"], optional = true }
 
 [dev-dependencies]
+broca-wal-reader = { path = "../broca-wal-reader" }
 broca-module-serve = { path = "../broca-module-serve" }
 broca-crash-harness = { path = "../broca-crash-harness" }
 # The shared Claude OAuth wire vectors (`vectors::VECTORS_JSON`) the persona tests are pinned to.

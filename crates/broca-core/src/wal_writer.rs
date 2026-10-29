@@ -3158,6 +3158,11 @@ impl WalHandle {
         ))
     }
 
+    /// The boot-decided format of this writer, fixed for its lifetime.
+    pub fn is_overhaul(&self) -> bool {
+        self.v4
+    }
+
     /// Transfer only captures covered by a successful WAL barrier. Appends racing after that
     /// barrier wait for the next one, so an uncommitted steer cannot authorize rendered media.
     pub(crate) fn take_media_captures(&self) -> crate::compaction::CapturedMedia {

@@ -220,6 +220,7 @@ async fn a_fallback_step_sends_the_fallback_request_and_continues_the_attempt_or
                 progress: Some(Arc::clone(&progress)),
                 // Three attempts of this step were recorded before the re-send.
                 first_attempt: 3,
+                attempt_hook: None,
             },
         )
         .await;
@@ -361,6 +362,7 @@ async fn a_fallback_step_sends_the_fallback_model_with_its_recorded_output_cap()
                 seal: None,
                 progress: None,
                 first_attempt: 0,
+                attempt_hook: None,
             },
         )
         .await;

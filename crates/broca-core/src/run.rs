@@ -593,10 +593,12 @@ pub struct RunControl {
     /// this signal. Boundary cancellation uses the shared `steer` inbox instead, so it can
     /// forbid the next StepStarted without aborting this step's model or tool work.
     pub cancel: Option<CancellationToken>,
-    /// Per-model-call timeout (the provider watchdog). The model-stream await is
-    /// otherwise unbounded and would pin the lease until process death; on timeout the
-    /// loop cooperatively cancels at the same safe boundary as `cancel` and releases the
-    /// lease. `None` ⇒ unbounded (today's behavior).
+    /// Per-model-call timeout (the provider watchdog). Normal expiry closes Interrupted
+    /// and releases the lease after writer shutdown. On overhaul roots, a reservation
+    /// durability failure takes precedence and fails the step with a WAL error instead.
+    /// This does not bound public run completion: a kernel sync that never returns keeps
+    /// exclusive writer ownership and requires supervisor-level process recovery.
+    /// `None` leaves the model-stream await unbounded.
     pub provider_call_timeout: Option<std::time::Duration>,
     /// Whether to emit ordinary payload-bearing control units (`AssistantMessage`, `ToolCall`,
     /// and `ToolResult`) on `out`. Direct loop consumers use these units, so this defaults to
@@ -3806,6 +3808,7 @@ where
             .as_ref()
             .and_then(|config| config.work_class.as_deref()),
     );
+    let billing_work_class = writer.is_overhaul().then(|| work_class.clone()).flatten();
     // The requested reasoning variant follows the same frozen-on-resume rule as the workload
     // class: a resumed episode keeps what it was admitted with, whatever the retry sends.
     let variant = admitted_work_class(
@@ -5816,11 +5819,11 @@ where
         }
 
         // Run the model step, draining the normalized stream, under the optional
-        // provider-call watchdog. A timeout means the model stream didn't terminate in time:
-        // nothing durable was recorded for this step, so stop cooperatively as Interrupted at
-        // this safe boundary (a later episode re-runs the step). A caller cancellation uses the
-        // separate Cancelled terminal chosen at the watch site. This releases the lease that an
-        // unbounded await would pin until process death.
+        // provider-call watchdog. With healthy durability, timeout closes Interrupted at
+        // this safe boundary (a later episode re-runs the step); caller cancellation uses
+        // the separate Cancelled terminal. On overhaul roots, reservation durability failure
+        // instead propagates a WAL error. Writer shutdown can still wait on a stuck kernel
+        // sync: the lease must remain held until that writer exits.
         //
         // Failed attempts need their own durability barrier: a retry may remain open longer
         // than account reporting waits, or the process may crash before the step ends.
@@ -5838,7 +5841,11 @@ where
         // The body length of this step's latest attempt, for the output reservation's next
         // estimate (replay reads it from the same `ModelAttemptFinished` records).
         let last_attempt_bytes = std::sync::Mutex::new(None);
+        let journaled_attempts = writer
+            .is_overhaul()
+            .then(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
         let record_attempt = |attempt: broca_protocol::ModelAttempt| -> AttemptFuture<'_> {
+            let journaled_attempts = &journaled_attempts;
             step_attempts.fetch_max(
                 attempt.attempt.saturating_add(1),
                 std::sync::atomic::Ordering::Relaxed,
@@ -5864,6 +5871,17 @@ where
                 }
                 let needs_sync = attempt.outcome != broca_protocol::AttemptOutcome::Complete;
                 report_input_transformations(session, attempt_run_id, step_id, &attempt);
+                let journaled_seq = journaled_attempts
+                    .as_ref()
+                    .and_then(|recorded| recorded.lock().unwrap().remove(&attempt.attempt));
+                if let Some(seq) = journaled_seq {
+                    // The physical-send journal already wrote the billing terminal. Keep the
+                    // account reporter for progress, but never append a second settlement here.
+                    if let Some(reporter) = &control.account_reporter {
+                        reporter.attempt_recorded(writer.lineage_id(), seq, &attempt);
+                    }
+                    return Ok(());
+                }
                 match &control.account_reporter {
                     Some(reporter) => {
                         let seq = writer
@@ -6030,6 +6048,12 @@ where
                     step_context.max_output_tokens = Some(cap);
                 }
             }
+            let hook_channel = writer
+                .is_overhaul()
+                .then(tokio::sync::mpsc::unbounded_channel);
+            let attempt_hook = hook_channel
+                .as_ref()
+                .map(|(tx, _)| Arc::new(ChannelAttemptHook(tx.clone())) as Arc<dyn AttemptHook>);
             let model_step = Box::pin(run_step_watched(
                 provider,
                 step_id,
@@ -6037,11 +6061,77 @@ where
                 first_attempt,
                 control,
                 out,
-                &record_attempt,
+                AttemptCallbacks {
+                    record: &record_attempt,
+                    before_send: attempt_hook,
+                },
             ));
             // Keep the same pinned model future while filing delayed receipts; no receipt may
             // cancel, restart, or change the request already being streamed by the provider.
-            let model_result = model_step.await?;
+            let model_result = if writer.is_overhaul() {
+                let (_, mut hook_requests) = hook_channel.expect("overhaul hook channel");
+                use broca_wal::record::{
+                    AttemptCredential, AttemptReservation, AttemptRun, AttemptSession,
+                };
+                let auth = control.auth_selection.clone().or_else(|| {
+                    prior
+                        .run_config
+                        .as_ref()
+                        .and_then(|config| config.auth_selection.clone())
+                });
+                let template = AttemptReservation {
+                    run_id: resolved_run_id.clone(),
+                    step_id,
+                    attempt: first_attempt,
+                    send_index: 1,
+                    warm: false,
+                    reserved_at_ms: 0,
+                    provider: step_model.provider_module_id.clone(),
+                    endpoint_host: String::new(),
+                    model_sent: String::new(),
+                    credential: AttemptCredential {
+                        credential_ref: None,
+                        account_ref: None,
+                        auth_method: auth.as_ref().and_then(|auth| auth.auth_method.clone()),
+                        auth_selection: auth,
+                        provider_ids: None,
+                        plan_tier: None,
+                        plan_tier_source: None,
+                    },
+                    session: AttemptSession {
+                        bind: req.session.clone(),
+                        session_ref: crate::agent_session_ref(&req.session),
+                    },
+                    run: AttemptRun {
+                        flow_id: req.scope.as_ref().and_then(|scope| scope.flow_id.clone()),
+                        work_class: billing_work_class.clone(),
+                        context_limit: step_context_limit,
+                        service_tier_requested: service_tier.map(|tier| tier.as_str().to_owned()),
+                        ..Default::default()
+                    },
+                    request_body_bytes: 0,
+                    compressed: false,
+                    input_tokens_estimate: None,
+                };
+                journal_model_step(
+                    model_step,
+                    &mut hook_requests,
+                    &mut AttemptJournal {
+                        writer,
+                        seal: control.shutdown_seal.as_ref(),
+                        template,
+                        pending: Default::default(),
+                        recorded: journaled_attempts
+                            .as_ref()
+                            .expect("overhaul attempt journal"),
+                        #[cfg(test)]
+                        before_start: None,
+                    },
+                )
+                .await??
+            } else {
+                model_step.await?
+            };
             let mut step = match model_result {
                 Ok(step) => step,
                 Err(reason) => break Err(reason),
@@ -8420,6 +8510,428 @@ enum StepOutcome {
     },
 }
 
+/// Facts known at a physical send site, independent of rendering and retry policy.
+#[derive(Clone, Debug)]
+pub struct PhysicalSend {
+    pub attempt: u32,
+    pub send_index: u32,
+    pub endpoint_host: String,
+    pub model_sent: String,
+    pub request_body_bytes: u64,
+    pub compressed: bool,
+    pub account_ref: Option<String>,
+    pub speed_requested: Option<String>,
+}
+
+/// A receipt is permission to send only after the reservation has crossed a durability barrier.
+/// Implementations must not hold writer locks across an await. Warms can use the same seam.
+#[async_trait::async_trait]
+pub trait AttemptHook: Send + Sync {
+    async fn before_send(
+        &self,
+        send: PhysicalSend,
+        cancel: CancellationToken,
+    ) -> Result<broca_wal::record::AttemptId, ProviderError>;
+
+    async fn finished(
+        &self,
+        id: broca_wal::record::AttemptId,
+        attempt: ModelAttempt,
+        outcome: broca_wal::record::BillingAttemptOutcome,
+    ) -> Result<(), ProviderError>;
+}
+
+enum AttemptRequest {
+    Reserve {
+        send: PhysicalSend,
+        cancel: CancellationToken,
+        reply: tokio::sync::oneshot::Sender<Result<broca_wal::record::AttemptId, ProviderError>>,
+    },
+    Finish {
+        id: broca_wal::record::AttemptId,
+        attempt: ModelAttempt,
+        outcome: broca_wal::record::BillingAttemptOutcome,
+        reply: tokio::sync::oneshot::Sender<Result<(), ProviderError>>,
+    },
+}
+
+struct ChannelAttemptHook(tokio::sync::mpsc::UnboundedSender<AttemptRequest>);
+
+/// Keep the real permission timeout/cancellation path available to attachment integration
+/// tests without a writer. Holding the opaque receiver keeps receipts pending rather than
+/// turning the wait into an immediate closed-channel refusal.
+#[cfg(feature = "test-attachments")]
+#[doc(hidden)]
+pub fn unreceipted_attempt_hook_for_test() -> (Arc<dyn AttemptHook>, impl Send) {
+    let (tx, receiver) = tokio::sync::mpsc::unbounded_channel();
+    (Arc::new(ChannelAttemptHook(tx)), receiver)
+}
+
+/// Bounds cooperative reservation permission, not public run completion or writer teardown.
+/// A kernel fsync that never returns retains exclusive writer ownership and can still stall
+/// shutdown; the supervisor handles that process-level failure without releasing the lease early.
+const RESERVATION_PERMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn attempt_hook_error(detail: impl std::fmt::Display) -> ProviderError {
+    ProviderError {
+        class: ErrorClass::Permanent,
+        message: format!("provider attempt durability failed: {detail}"),
+        provider_code: Some("attempt_durability_failed".into()),
+        provider_details: None,
+        provider_subcode: None,
+        refusal: None,
+        status: None,
+        retry_after_secs: None,
+        resets_at_ms: None,
+        resets_at_source: None,
+        limit_window: None,
+        account_ref: None,
+        credential_id: None,
+        affordable_max_tokens: None,
+    }
+}
+
+#[async_trait::async_trait]
+impl AttemptHook for ChannelAttemptHook {
+    async fn before_send(
+        &self,
+        send: PhysicalSend,
+        cancel: CancellationToken,
+    ) -> Result<broca_wal::record::AttemptId, ProviderError> {
+        let (reply, receipt) = tokio::sync::oneshot::channel();
+        self.0
+            .send(AttemptRequest::Reserve {
+                send,
+                cancel: cancel.clone(),
+                reply,
+            })
+            .map_err(|_| attempt_hook_error("run stopped before reservation"))?;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(attempt_hook_error("reservation cancelled before send permission")),
+            result = tokio::time::timeout(RESERVATION_PERMISSION_TIMEOUT, receipt) => {
+                result.map_err(|_| attempt_hook_error("reservation permission deadline expired"))?
+                    .map_err(|_| attempt_hook_error("reservation receipt closed"))?
+            }
+        }
+    }
+
+    async fn finished(
+        &self,
+        id: broca_wal::record::AttemptId,
+        attempt: ModelAttempt,
+        outcome: broca_wal::record::BillingAttemptOutcome,
+    ) -> Result<(), ProviderError> {
+        let (reply, receipt) = tokio::sync::oneshot::channel();
+        self.0
+            .send(AttemptRequest::Finish {
+                id,
+                attempt,
+                outcome,
+                reply,
+            })
+            .map_err(|_| attempt_hook_error("run stopped before settlement"))?;
+        receipt
+            .await
+            .map_err(|_| attempt_hook_error("settlement receipt closed"))?
+    }
+}
+
+struct PendingAttempt {
+    reservation: broca_wal::record::AttemptReservation,
+    started: bool,
+    barrier_acknowledged: bool,
+}
+
+impl PendingAttempt {
+    fn fallback(&self, id: broca_wal::record::AttemptId) -> WalRecord {
+        self.fallback_for(id, self.started)
+    }
+
+    fn fallback_for(&self, id: broca_wal::record::AttemptId, started: bool) -> WalRecord {
+        use broca_wal::record::{AttemptEnvelope, AttemptSent};
+        let reservation = Box::new(self.reservation.clone());
+        let envelope = Box::new(AttemptEnvelope {
+            sent: if started {
+                AttemptSent::Unknown
+            } else {
+                AttemptSent::No
+            },
+            finished_at_ms: epoch_millis(),
+            ..Default::default()
+        });
+        if started {
+            WalRecord::AttemptFinished {
+                attempt_id: id,
+                reservation,
+                envelope,
+            }
+        } else {
+            WalRecord::AttemptReleased {
+                attempt_id: id,
+                reservation,
+                envelope,
+            }
+        }
+    }
+}
+
+struct AttemptJournal<'a> {
+    writer: &'a WalHandle,
+    seal: Option<&'a crate::ShutdownSeal>,
+    template: broca_wal::record::AttemptReservation,
+    pending: std::collections::BTreeMap<broca_wal::record::AttemptId, PendingAttempt>,
+    recorded: &'a std::sync::Mutex<std::collections::BTreeMap<u32, u64>>,
+    #[cfg(test)]
+    before_start: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+}
+
+impl AttemptJournal<'_> {
+    fn settle(
+        &mut self,
+        id: &broca_wal::record::AttemptId,
+        terminal: WalRecord,
+    ) -> Result<Option<u64>, WalWriteError> {
+        let seq = if let Some(seal) = self.seal {
+            seal.settle_billing_attempt(self.writer, id, terminal)?
+        } else {
+            Some(self.writer.record(terminal).into_result()?)
+        };
+        self.pending.remove(id);
+        Ok(seq)
+    }
+
+    async fn handle(
+        &mut self,
+        request: AttemptRequest,
+        step_stopped: &CancellationToken,
+    ) -> Result<(), WalWriteError> {
+        use broca_wal::record::{AttemptEnvelope, AttemptSent, BillingAttemptOutcome};
+        match request {
+            AttemptRequest::Reserve {
+                send,
+                cancel,
+                mut reply,
+            } => {
+                if step_stopped.is_cancelled() {
+                    let _ =
+                        reply.send(Err(attempt_hook_error("step completed before reservation")));
+                    return Ok(());
+                }
+                let id = match crate::attempt_id::mint_attempt_id() {
+                    Ok(id) => id,
+                    Err(error) => {
+                        let _ = reply.send(Err(attempt_hook_error(error)));
+                        return Ok(());
+                    }
+                };
+                let pending = PendingAttempt {
+                    reservation: broca_wal::record::AttemptReservation {
+                        attempt: send.attempt,
+                        send_index: send.send_index,
+                        reserved_at_ms: epoch_millis().ok_or_else(|| {
+                            WalWriteError::from(
+                                "attempt reservation requires a wall clock timestamp",
+                            )
+                        })?,
+                        endpoint_host: send.endpoint_host,
+                        model_sent: send.model_sent,
+                        request_body_bytes: send.request_body_bytes,
+                        compressed: send.compressed,
+                        run: broca_wal::record::AttemptRun {
+                            speed_requested: send.speed_requested,
+                            ..self.template.run.clone()
+                        },
+                        credential: broca_wal::record::AttemptCredential {
+                            account_ref: send.account_ref,
+                            ..self.template.credential.clone()
+                        },
+                        ..self.template.clone()
+                    },
+                    started: false,
+                    barrier_acknowledged: false,
+                };
+                let record = WalRecord::AttemptReserved {
+                    attempt_id: id.clone(),
+                    reservation: Box::new(pending.reservation.clone()),
+                };
+                if let Some(seal) = self.seal {
+                    if !seal.reserve_billing_attempt(
+                        self.writer,
+                        id.clone(),
+                        record,
+                        pending.fallback(id.clone()),
+                    )? {
+                        let _ = reply.send(Err(attempt_hook_error(
+                            "shutdown sealed before reservation",
+                        )));
+                        return Ok(());
+                    }
+                } else {
+                    self.writer.record(record).into_result()?;
+                }
+                self.pending.insert(id.clone(), pending);
+                // No lock is held while the writer drains its queue and fsyncs. A previous
+                // outcome, including compression refusal, rides this reservation's barrier.
+                let sealed = async {
+                    match self.seal {
+                        Some(seal) => seal.tripped().await,
+                        None => std::future::pending().await,
+                    }
+                };
+                let failure = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => Some("reservation cancelled before its durability barrier completed"),
+                    _ = step_stopped.cancelled() => Some("step stopped before its reservation barrier completed"),
+                    _ = reply.closed() => Some("reservation receipt closed before its durability barrier completed"),
+                    _ = sealed => Some("shutdown sealed before the reservation barrier completed"),
+                    _ = tokio::time::sleep(RESERVATION_PERMISSION_TIMEOUT) => Some("reservation durability barrier deadline expired"),
+                    result = self.writer.sync() => { result?; None },
+                };
+                if let Some(detail) = failure {
+                    let _ = reply.send(Err(attempt_hook_error(detail)));
+                    return Err(WalWriteError::from(format!(
+                        "attempt_durability_failed: {detail}"
+                    )));
+                }
+                self.pending.get_mut(&id).unwrap().barrier_acknowledged = true;
+                if cancel.is_cancelled() || reply.is_closed() {
+                    let terminal = self.pending[&id].fallback(id.clone());
+                    self.settle(&id, terminal)?;
+                    let _ =
+                        reply.send(Err(attempt_hook_error("send cancelled during reservation")));
+                    return Ok(());
+                }
+                #[cfg(test)]
+                if let Some((reached, proceed)) = self.before_start.take() {
+                    reached.notify_one();
+                    proceed.notified().await;
+                }
+                let pending = self.pending.get_mut(&id).unwrap();
+                if self.seal.is_some_and(|seal| {
+                    !seal.start_billing_attempt(&id, pending.fallback_for(id.clone(), true))
+                }) {
+                    let _ = reply.send(Err(attempt_hook_error("shutdown sealed before send")));
+                    return Ok(());
+                }
+                pending.started = true;
+                if reply.send(Ok(id.clone())).is_err() {
+                    let pending = self.pending.get_mut(&id).unwrap();
+                    pending.started = false;
+                    let terminal = pending.fallback(id.clone());
+                    self.settle(&id, terminal)?;
+                }
+            }
+            AttemptRequest::Finish {
+                id,
+                attempt,
+                outcome,
+                reply,
+            } => {
+                let Some(pending) = self.pending.get(&id) else {
+                    let _ = reply.send(Err(attempt_hook_error(
+                        "unknown or already settled reservation",
+                    )));
+                    return Ok(());
+                };
+                let not_sent = outcome == BillingAttemptOutcome::ConnectFailed;
+                let envelope = AttemptEnvelope {
+                    sent: if not_sent {
+                        AttemptSent::No
+                    } else if attempt.sent_at_ms.is_some() {
+                        AttemptSent::Yes
+                    } else {
+                        AttemptSent::Unknown
+                    },
+                    sent_at_ms: if not_sent { None } else { attempt.sent_at_ms },
+                    finished_at_ms: Some(attempt.ts_ms),
+                    response_bytes: attempt.response_body_len,
+                    http_status: attempt.http_status,
+                    outcome,
+                    ..Default::default()
+                };
+                let ordinal = attempt.attempt;
+                let mut record =
+                    WalRecord::model_attempt_finished(pending.reservation.step_id, attempt);
+                if let WalRecord::ModelAttemptFinished {
+                    attempt_id,
+                    reservation,
+                    envelope: slot,
+                    ..
+                } = &mut record
+                {
+                    *attempt_id = Some(id.clone());
+                    *reservation = Some(Box::new(pending.reservation.clone()));
+                    *slot = Some(Box::new(envelope));
+                }
+                if let Some(seq) = self.settle(&id, record)? {
+                    // Compression refusal produces no stream event. Do not let its
+                    // ordinal suppress telemetry for a resend cancelled before sending.
+                    if outcome != BillingAttemptOutcome::CompressionRefused {
+                        self.recorded.lock().unwrap().insert(ordinal, seq);
+                    }
+                }
+                let _ = reply.send(Ok(()));
+            }
+        }
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<(), WalWriteError> {
+        // An unresolved barrier can still complete after its waiter is dropped. Preserve
+        // the unsent seal slot for the writer's later close-out, without waiting again.
+        let settled: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| pending.barrier_acknowledged)
+            .map(|(id, pending)| (id.clone(), pending.fallback(id.clone())))
+            .collect();
+        for (id, terminal) in settled {
+            self.settle(&id, terminal)?;
+        }
+        Ok(())
+    }
+}
+
+async fn journal_model_step<F: std::future::Future>(
+    step: F,
+    requests: &mut tokio::sync::mpsc::UnboundedReceiver<AttemptRequest>,
+    journal: &mut AttemptJournal<'_>,
+) -> Result<F::Output, WalWriteError> {
+    tokio::pin!(step);
+    let step_stopped = CancellationToken::new();
+    let result = loop {
+        tokio::select! {
+            biased;
+            Some(request) = requests.recv() => {
+                let (handled, completed) = {
+                    let operation = journal.handle(request, &step_stopped);
+                    tokio::pin!(operation);
+                    tokio::select! {
+                        biased;
+                        handled = &mut operation => (handled, None),
+                        result = &mut step => {
+                            step_stopped.cancel();
+                            (operation.await, Some(result))
+                        }
+                    }
+                };
+                // A durability failure outranks the saved step/watchdog result. The log
+                // cannot safely commit the ordinary Interrupted close-out in that case.
+                if let Err(error) = handled { journal.close()?; return Err(error); }
+                if let Some(result) = completed { break result; }
+            },
+            result = &mut step => break result,
+        }
+    };
+    step_stopped.cancel();
+    while let Ok(request) = requests.try_recv() {
+        journal.handle(request, &step_stopped).await?;
+    }
+    journal.close()?;
+    Ok(result)
+}
+
 /// Whether the run's cancel token (if any) has been tripped.
 fn is_cancelled(control: &RunControl) -> bool {
     control.cancel.as_ref().is_some_and(|t| t.is_cancelled())
@@ -8449,8 +8961,12 @@ async fn run_step_watched<P: Provider>(
     first_attempt: u32,
     control: &RunControl,
     out: &mpsc::Sender<OutputEvent>,
-    on_attempt: &AttemptSink<'_>,
+    attempts: AttemptCallbacks<'_>,
 ) -> Result<Result<StepOutcome, RunFinishReason>, WalWriteError> {
+    let AttemptCallbacks {
+        record: on_attempt,
+        before_send: attempt_hook,
+    } = attempts;
     struct ProgressGuard(Option<crate::provider::LiveStepProgress>);
     impl Drop for ProgressGuard {
         fn drop(&mut self) {
@@ -8504,6 +9020,7 @@ async fn run_step_watched<P: Provider>(
             on_attempt,
             control.shutdown_seal.as_ref(),
             control.step_progress.clone(),
+            attempt_hook,
         );
         tokio::pin!(step);
 
@@ -8585,6 +9102,11 @@ type AttemptFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), WalWriteError>> + Send + 'a>>;
 type AttemptSink<'a> = dyn Fn(ModelAttempt) -> AttemptFuture<'a> + Send + Sync + 'a;
 
+struct AttemptCallbacks<'a> {
+    record: &'a AttemptSink<'a>,
+    before_send: Option<Arc<dyn AttemptHook>>,
+}
+
 /// How long a cancelled step's stream is read for its last attempt record. The transport sends
 /// that record and closes the stream without any network wait, so this bound is only reached
 /// if the provider task is starved; the record is then lost rather than the cancel delayed.
@@ -8607,6 +9129,7 @@ async fn run_step<P: Provider>(
     on_attempt: &AttemptSink<'_>,
     shutdown_seal: Option<&crate::ShutdownSeal>,
     progress: Option<crate::provider::LiveStepProgress>,
+    attempt_hook: Option<Arc<dyn AttemptHook>>,
 ) -> Result<StepOutcome, WalWriteError> {
     let _ = send(
         out,
@@ -8623,6 +9146,7 @@ async fn run_step<P: Provider>(
                 seal: shutdown_seal.cloned(),
                 progress,
                 first_attempt,
+                attempt_hook,
             },
         )
         .await;
@@ -11056,6 +11580,864 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
+
+    fn attempt_template() -> broca_wal::record::AttemptReservation {
+        serde_json::from_value(serde_json::json!({
+            "run_id":"billing-run", "step_id":1, "attempt":0, "send_index":1,
+            "warm":false, "reserved_at_ms":1, "provider":"test", "endpoint_host":"example.com",
+            "model_sent":"model", "credential":{},
+            "session":{"project_root":"/project","harness":"runner","session":"s","session_ref":"ref"},
+            "run":{}, "request_body_bytes":10, "compressed":false
+        })).unwrap()
+    }
+
+    fn physical_send() -> PhysicalSend {
+        PhysicalSend {
+            attempt: 0,
+            send_index: 1,
+            endpoint_host: "example.com".into(),
+            model_sent: "model".into(),
+            request_body_bytes: 10,
+            compressed: false,
+            account_ref: None,
+            speed_requested: None,
+        }
+    }
+
+    struct BusyAttemptWal {
+        inner: RecordingWal,
+        hold: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        entered: Arc<Notify>,
+        synced_heads: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    struct UnblockBarrierOnDrop(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+    impl Drop for UnblockBarrierOnDrop {
+        fn drop(&mut self) {
+            *self.0 .0.lock().unwrap() = false;
+            self.0 .1.notify_all();
+        }
+    }
+
+    #[derive(Default)]
+    struct ReservationWaitProvider {
+        granted: Arc<std::sync::atomic::AtomicUsize>,
+        refusal: Arc<std::sync::Mutex<Option<ProviderError>>>,
+        refused: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ReservationWaitProvider {
+        async fn step(
+            &self,
+            _step_id: StepId,
+            _opts: &CallOptions,
+        ) -> mpsc::Receiver<NormalizedEvent> {
+            unreachable!("reservation test must pass runtime state")
+        }
+        async fn step_with_runtime(
+            &self,
+            _step_id: StepId,
+            _opts: Arc<CallOptions>,
+            runtime: crate::provider::StepRuntime,
+        ) -> mpsc::Receiver<NormalizedEvent> {
+            let (tx, rx) = mpsc::channel(4);
+            let granted = self.granted.clone();
+            let refusal = self.refusal.clone();
+            let refused = self.refused.clone();
+            tokio::spawn(async move {
+                let result = runtime
+                    .attempt_hook
+                    .unwrap()
+                    .before_send(physical_send(), runtime.cancel)
+                    .await;
+                match result {
+                    Ok(_) => {
+                        granted.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(error) => {
+                        *refusal.lock().unwrap() = Some(error.clone());
+                        refused.notify_one();
+                        let _ = tx
+                            .send(NormalizedEvent::Control(ProviderControl::Error {
+                                error,
+                                retries_used: 0,
+                            }))
+                            .await;
+                    }
+                }
+            });
+            rx
+        }
+        fn render_request(&self, _opts: &CallOptions) -> Vec<u8> {
+            b"{}".to_vec()
+        }
+    }
+
+    async fn check_stuck_reservation_barrier(watchdog: bool) {
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hold = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let entered = Arc::new(Notify::new());
+        let writer = WalHandle::spawn(
+            Box::new(BusyAttemptWal {
+                inner: RecordingWal {
+                    records: records.clone(),
+                },
+                hold: hold.clone(),
+                entered: entered.clone(),
+                synced_heads: Default::default(),
+            }),
+            1,
+        )
+        .unwrap();
+        *hold.0.lock().unwrap() = true;
+        // Release only during teardown, after checking that the step failed while the
+        // writer remained blocked. A panic also unblocks the writer before its join.
+        let unblock = UnblockBarrierOnDrop(hold.clone());
+        let cancel = CancellationToken::new();
+        let provider = ReservationWaitProvider::default();
+        let control = RunControl {
+            cancel: Some(cancel.clone()),
+            provider_call_timeout: watchdog.then_some(Duration::from_millis(50)),
+            ..Default::default()
+        };
+        let seal = crate::ShutdownSeal::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let hook = Arc::new(ChannelAttemptHook(tx));
+        let recorded = Default::default();
+        let mut journal = AttemptJournal {
+            writer: &writer,
+            seal: Some(&seal),
+            template: attempt_template(),
+            pending: Default::default(),
+            recorded: &recorded,
+            before_start: None,
+        };
+        let opts = Arc::new(CallOptions::new(Vec::new()));
+        let (out, _rx) = mpsc::channel(4);
+        let step = run_step_watched(
+            &provider,
+            StepId(1),
+            &opts,
+            0,
+            &control,
+            &out,
+            AttemptCallbacks {
+                record: &|_| Box::pin(async { Ok(()) }),
+                before_send: Some(hook),
+            },
+        );
+        let cancel_at_barrier = async {
+            entered.notified().await;
+            if !watchdog {
+                cancel.cancel();
+            }
+        };
+        let (result, ()) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                journal_model_step(step, &mut rx, &mut journal)
+            ),
+            cancel_at_barrier
+        );
+        assert!(
+            *hold.0.lock().unwrap(),
+            "the barrier must still be held when the step stops"
+        );
+        let error =
+            match result.expect("stuck reservation must not starve cancellation or watchdog") {
+                Err(error) => error,
+                Ok(_) => panic!("durability failure must abort the step"),
+            };
+        assert!(
+            error.to_string().contains("attempt_durability_failed"),
+            "{error}"
+        );
+        tokio::time::timeout(Duration::from_millis(100), provider.refused.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            provider
+                .refusal
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .provider_code
+                .as_deref(),
+            Some("attempt_durability_failed")
+        );
+        assert_eq!(provider.granted.load(Ordering::SeqCst), 0);
+        assert!(journal.pending.values().all(|pending| !pending.started));
+        drop(unblock);
+        writer.sync().await.unwrap();
+        seal.seal_and_collect(Duration::ZERO).await;
+        seal.record_hook_fallbacks(&writer).await.unwrap();
+        let records = records.lock().unwrap();
+        assert_eq!(records.iter().filter(|record| matches!(record, WalRecord::AttemptReleased { envelope, .. } if envelope.sent == broca_wal::record::AttemptSent::No)).count(), 1);
+        assert!(!records
+            .iter()
+            .any(|record| matches!(record, WalRecord::AttemptFinished { .. })));
+    }
+
+    #[tokio::test]
+    async fn attempt_hook_stuck_barrier_caller_cancel_is_bounded() {
+        check_stuck_reservation_barrier(false).await;
+    }
+
+    #[tokio::test]
+    async fn attempt_hook_stuck_barrier_provider_watchdog_is_pollable() {
+        check_stuck_reservation_barrier(true).await;
+    }
+
+    impl broca_wal::Wal for BusyAttemptWal {
+        fn append(
+            &mut self,
+            fence: u64,
+            record: &WalRecord,
+            sync: bool,
+        ) -> Result<u64, broca_wal::WalError> {
+            self.inner.append(fence, record, sync)
+        }
+        fn sync(&self) -> Result<(), broca_wal::WalError> {
+            let (lock, changed) = &*self.hold;
+            let mut hold = lock.lock().unwrap();
+            if *hold {
+                self.entered.notify_one();
+            }
+            while *hold {
+                hold = changed.wait(hold).unwrap();
+            }
+            self.synced_heads
+                .lock()
+                .unwrap()
+                .push(self.inner.records.lock().unwrap().len());
+            self.inner.sync()
+        }
+        fn replay(&self) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+            self.inner.replay()
+        }
+        fn tail_after_seq(
+            &self,
+            seq: u64,
+        ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+            self.inner.tail_after_seq(seq)
+        }
+        fn last_seq(&self) -> u64 {
+            self.inner.last_seq()
+        }
+    }
+
+    #[tokio::test]
+    async fn attempt_hook_writer_busy_and_pause_releases_unsent() {
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hold = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let entered = Arc::new(Notify::new());
+        let writer = WalHandle::spawn(
+            Box::new(BusyAttemptWal {
+                inner: RecordingWal {
+                    records: records.clone(),
+                },
+                hold: hold.clone(),
+                entered: entered.clone(),
+                synced_heads: Default::default(),
+            }),
+            1,
+        )
+        .unwrap();
+        *hold.0.lock().unwrap() = true;
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let hook = ChannelAttemptHook(tx);
+        let recorded = Default::default();
+        let seal = crate::ShutdownSeal::new();
+        let mut journal = AttemptJournal {
+            writer: &writer,
+            seal: Some(&seal),
+            template: attempt_template(),
+            pending: Default::default(),
+            recorded: &recorded,
+            before_start: None,
+        };
+        let step = async {
+            let error = hook
+                .before_send(physical_send(), cancel.clone())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.provider_code.as_deref(),
+                Some("attempt_durability_failed")
+            );
+        };
+        let unblock = async {
+            entered.notified().await;
+            // A reservation barrier must not retain the writer's enqueue lock. Enqueueing
+            // another record while fsync is blocked would deadlock if the hook held it.
+            writer
+                .record(WalRecord::TurnFinished {
+                    step_id: StepId(99),
+                })
+                .into_result()
+                .unwrap();
+            cancel.cancel();
+            *hold.0.lock().unwrap() = false;
+            hold.1.notify_all();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(journal_model_step(step, &mut rx, &mut journal), unblock)
+        })
+        .await
+        .expect("reservation holds no writer lock across await");
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("attempt_durability_failed"));
+        // The failed barrier leaves an unsent fallback, rather than pretending a release
+        // is already durable. Close it only after the test writer can make progress again.
+        seal.seal_and_collect(Duration::ZERO).await;
+        seal.record_hook_fallbacks(&writer).await.unwrap();
+        let (out, _rx) = mpsc::channel(16);
+        pause_run_impl(
+            &writer,
+            &out,
+            &RunControl::default(),
+            RunId("billing-run".into()),
+            broca_protocol::PauseReason::AuthRequired,
+            None,
+            0,
+            Usage::default(),
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        let records = records.lock().unwrap();
+        let release = records
+            .iter()
+            .position(|record| matches!(record, WalRecord::AttemptReleased { .. }))
+            .unwrap();
+        let pause = records
+            .iter()
+            .position(|record| matches!(record, WalRecord::RunPaused { .. }))
+            .unwrap();
+        assert!(release < pause);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record, WalRecord::AttemptReserved { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(
+                    record,
+                    WalRecord::AttemptFinished { .. } | WalRecord::ModelAttemptFinished { .. }
+                ))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attempt_hook_missing_receipt_has_permission_deadline() {
+        let (tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let hook = ChannelAttemptHook(tx);
+        let error = tokio::time::timeout(
+            RESERVATION_PERMISSION_TIMEOUT + Duration::from_secs(1),
+            hook.before_send(physical_send(), CancellationToken::new()),
+        )
+        .await
+        .expect("permission wait must be bounded even without a provider watchdog")
+        .unwrap_err();
+        assert_eq!(
+            error.provider_code.as_deref(),
+            Some("attempt_durability_failed")
+        );
+        assert!(error.message.contains("permission deadline"));
+        let AttemptRequest::Reserve { reply, .. } = requests.try_recv().unwrap() else {
+            panic!("one reservation request")
+        };
+        assert!(
+            reply.is_closed(),
+            "a late handler must not grant send permission"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_step_refuses_late_reservation_without_send_permission() {
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = WalHandle::spawn(
+            Box::new(RecordingWal {
+                records: records.clone(),
+            }),
+            1,
+        )
+        .unwrap();
+        let (tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let hook = ChannelAttemptHook(tx);
+        let recorded = Default::default();
+        let mut journal = AttemptJournal {
+            writer: &writer,
+            seal: None,
+            template: attempt_template(),
+            pending: Default::default(),
+            recorded: &recorded,
+            before_start: None,
+        };
+        let reservation = hook.before_send(physical_send(), CancellationToken::new());
+        tokio::pin!(reservation);
+        let step = async {
+            // Enqueue from the step's final poll, after the outer select has already
+            // polled the empty request queue. Keep the receipt alive after completion.
+            assert!(futures::poll!(&mut reservation).is_pending());
+            17
+        };
+        assert_eq!(
+            journal_model_step(step, &mut requests, &mut journal)
+                .await
+                .unwrap(),
+            17
+        );
+        let permission = reservation.await;
+        assert!(
+            permission.is_err(),
+            "a completed step must not grant a late send permission"
+        );
+        assert_eq!(
+            permission.unwrap_err().provider_code.as_deref(),
+            Some("attempt_durability_failed")
+        );
+        writer.sync().await.unwrap();
+        assert!(
+            records.lock().unwrap().is_empty(),
+            "a late reservation must not create a new send intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_step_still_settles_late_finish() {
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = WalHandle::spawn(
+            Box::new(RecordingWal {
+                records: records.clone(),
+            }),
+            1,
+        )
+        .unwrap();
+        let (tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let hook = ChannelAttemptHook(tx);
+        let recorded = Default::default();
+        let mut journal = AttemptJournal {
+            writer: &writer,
+            seal: None,
+            template: attempt_template(),
+            pending: Default::default(),
+            recorded: &recorded,
+            before_start: None,
+        };
+        let reservation = hook.before_send(physical_send(), CancellationToken::new());
+        tokio::pin!(reservation);
+        assert!(futures::poll!(&mut reservation).is_pending());
+        journal
+            .handle(requests.recv().await.unwrap(), &CancellationToken::new())
+            .await
+            .unwrap();
+        let id = reservation.await.unwrap();
+        let mut attempt = transformation_attempt(None, true);
+        attempt.sent_at_ms = Some(1);
+        let finish = hook.finished(
+            id.clone(),
+            attempt,
+            broca_wal::record::BillingAttemptOutcome::Complete,
+        );
+        tokio::pin!(finish);
+        let step = async {
+            assert!(futures::poll!(&mut finish).is_pending());
+            23
+        };
+        assert_eq!(
+            journal_model_step(step, &mut requests, &mut journal)
+                .await
+                .unwrap(),
+            23
+        );
+        finish.await.unwrap();
+        writer.sync().await.unwrap();
+        let records = records.lock().unwrap();
+        assert_eq!(records.iter().filter(|record| matches!(record, WalRecord::ModelAttemptFinished { attempt_id: Some(terminal_id), .. } if terminal_id == &id)).count(), 1);
+        assert!(!records.iter().any(|record| matches!(
+            record,
+            WalRecord::AttemptFinished { .. } | WalRecord::AttemptReleased { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn attempt_hook_compression_refusal_and_resend_share_one_sync() {
+        use broca_wal::record::BillingAttemptOutcome;
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let synced_heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = WalHandle::spawn(
+            Box::new(BusyAttemptWal {
+                inner: RecordingWal {
+                    records: records.clone(),
+                },
+                hold: Default::default(),
+                entered: Default::default(),
+                synced_heads: synced_heads.clone(),
+            }),
+            1,
+        )
+        .unwrap();
+        synced_heads.lock().unwrap().clear();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let hook = ChannelAttemptHook(tx);
+        let recorded = Default::default();
+        let mut journal = AttemptJournal {
+            writer: &writer,
+            seal: None,
+            template: attempt_template(),
+            pending: Default::default(),
+            recorded: &recorded,
+            before_start: None,
+        };
+        let step = async {
+            let mut send = physical_send();
+            send.compressed = true;
+            let first = hook
+                .before_send(send.clone(), CancellationToken::new())
+                .await
+                .unwrap();
+            let mut refusal = transformation_attempt(None, true);
+            refusal.sent_at_ms = Some(1);
+            refusal.http_status = Some(415);
+            refusal.outcome = broca_protocol::AttemptOutcome::HttpError;
+            hook.finished(
+                first.clone(),
+                refusal,
+                BillingAttemptOutcome::CompressionRefused,
+            )
+            .await
+            .unwrap();
+            assert!(recorded.lock().unwrap().is_empty());
+            send.send_index = 2;
+            send.compressed = false;
+            let second = hook
+                .before_send(send, CancellationToken::new())
+                .await
+                .unwrap();
+            assert_ne!(first, second);
+            hook.finished(
+                second,
+                transformation_attempt(None, true),
+                BillingAttemptOutcome::Complete,
+            )
+            .await
+            .unwrap();
+        };
+        journal_model_step(step, &mut rx, &mut journal)
+            .await
+            .unwrap();
+        writer.sync().await.unwrap();
+        assert_eq!(
+            *synced_heads.lock().unwrap(),
+            [1, 3, 4],
+            "refusal is not synced separately from resend reservation"
+        );
+        let records = records.lock().unwrap();
+        assert!(
+            matches!(&records[1], WalRecord::ModelAttemptFinished { envelope: Some(envelope), .. } if envelope.outcome == BillingAttemptOutcome::CompressionRefused)
+        );
+        assert!(
+            matches!(&records[2], WalRecord::AttemptReserved { reservation, .. } if reservation.send_index == 2 && !reservation.compressed)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "explicit disk-fsync latency measurement on each target"]
+    async fn attempt_hook_render_to_send_latency_and_fsync_cost() {
+        use crate::durability_counters::{counts_for_fence, FsyncCause};
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/scratch")
+            .join(format!(
+                "attempt-latency-{}",
+                crate::attempt_id::mint_attempt_id().unwrap().as_str()
+            ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let template = attempt_template();
+        let session = template.session.bind.clone();
+        let store =
+            crate::FileWalStore::with_config(root.join("wal"), broca_wal::WalConfig::OVERHAUL);
+        let fence = 0x4154544500000000 + u64::from(std::process::id());
+        let writer =
+            WalHandle::spawn_in_store(store.open(&session).unwrap(), &store, &session, fence, None)
+                .unwrap();
+        assert!(writer.is_overhaul());
+        let recorded = Default::default();
+        let mut journal = AttemptJournal {
+            writer: &writer,
+            seal: None,
+            template,
+            pending: Default::default(),
+            recorded: &recorded,
+            before_start: None,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let hook = ChannelAttemptHook(tx);
+        let mut first = Vec::new();
+        let mut retry = Vec::new();
+        let step = async {
+            for _ in 0..256 {
+                // Admission must be durable before acknowledging active; tool results must
+                // be durable before rendering the next step. Rendering after either sync
+                // leaves the new reservation needing its own durability barrier.
+                writer
+                    .record(WalRecord::TurnFinished {
+                        step_id: StepId(99),
+                    })
+                    .into_result()
+                    .unwrap();
+                writer.sync().await.unwrap();
+                for ordinal in 0..2 {
+                    let body = serde_json::to_vec(
+                        &serde_json::json!({"model":"m", "input":"x".repeat(8192)}),
+                    )
+                    .unwrap();
+                    let before = counts_for_fence(fence);
+                    let rendered = std::time::Instant::now();
+                    let mut send = physical_send();
+                    send.attempt = ordinal;
+                    send.request_body_bytes = body.len() as u64;
+                    let id = hook
+                        .before_send(send, CancellationToken::new())
+                        .await
+                        .unwrap();
+                    let latency = rendered.elapsed().as_nanos();
+                    if ordinal == 0 {
+                        first.push(latency);
+                    } else {
+                        retry.push(latency);
+                    }
+                    let after = counts_for_fence(fence);
+                    assert_eq!(
+                        after.get(FsyncCause::Barrier) - before.get(FsyncCause::Barrier),
+                        1
+                    );
+                    assert_eq!(after.total() - before.total(), 1);
+                    let mut terminal = transformation_attempt(None, true);
+                    terminal.attempt = ordinal;
+                    hook.finished(
+                        id,
+                        terminal,
+                        broca_wal::record::BillingAttemptOutcome::Complete,
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+        };
+        journal_model_step(step, &mut rx, &mut journal)
+            .await
+            .unwrap();
+        fn percentiles(samples: &mut [u128]) -> (u128, u128) {
+            samples.sort_unstable();
+            (
+                samples[samples.len() / 2],
+                samples[(samples.len() * 99).div_ceil(100) - 1],
+            )
+        }
+        let (first_p50, first_p99) = percentiles(&mut first);
+        let (retry_p50, retry_p99) = percentiles(&mut retry);
+        println!("attempt reservation latency: os={} samples_per_kind=256 first_p50_ns={first_p50} first_p99_ns={first_p99} retry_p50_ns={retry_p50} retry_p99_ns={retry_p99}; added_fsyncs_per_attempt barrier=1 deadline=0 shutdown=0 disconnect=0", std::env::consts::OS);
+        println!("computed production-count day: first=110956 retry=221 extra_barrier=111177 extra_deadline=0 extra_shutdown=0 extra_disconnect=0 (computed, not observed)");
+        drop(journal);
+        writer.shutdown().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn attempt_hook_shutdown_cut_terminals_precede_interrupted_exactly_once() {
+        use broca_wal::record::{AttemptEnvelope, AttemptSent, BillingAttemptOutcome};
+        for point in [
+            "enqueued",
+            "synced",
+            "send_started",
+            "response_begun",
+            "settled",
+        ] {
+            let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let writer = WalHandle::spawn(
+                Box::new(RecordingWal {
+                    records: records.clone(),
+                }),
+                1,
+            )
+            .unwrap();
+            let seal = crate::ShutdownSeal::new();
+            let id = crate::attempt_id::mint_attempt_id().unwrap();
+            let mut pending = PendingAttempt {
+                reservation: attempt_template(),
+                started: false,
+                barrier_acknowledged: point != "enqueued",
+            };
+            assert!(seal
+                .reserve_billing_attempt(
+                    &writer,
+                    id.clone(),
+                    WalRecord::AttemptReserved {
+                        attempt_id: id.clone(),
+                        reservation: Box::new(pending.reservation.clone()),
+                    },
+                    pending.fallback(id.clone())
+                )
+                .unwrap());
+            if point != "enqueued" {
+                writer.sync().await.unwrap();
+            }
+            let started = matches!(point, "send_started" | "response_begun" | "settled");
+            if started {
+                pending.started = true;
+                assert!(seal.start_billing_attempt(&id, pending.fallback(id.clone())));
+            }
+            if point == "settled" {
+                let mut terminal = WalRecord::model_attempt_finished(
+                    StepId(1),
+                    transformation_attempt(None, true),
+                );
+                if let WalRecord::ModelAttemptFinished {
+                    attempt_id,
+                    reservation,
+                    envelope,
+                    ..
+                } = &mut terminal
+                {
+                    *attempt_id = Some(id.clone());
+                    *reservation = Some(Box::new(pending.reservation.clone()));
+                    *envelope = Some(Box::new(AttemptEnvelope {
+                        sent: AttemptSent::Yes,
+                        outcome: BillingAttemptOutcome::Complete,
+                        ..Default::default()
+                    }));
+                }
+                seal.settle_billing_attempt(&writer, &id, terminal).unwrap();
+            }
+            seal.seal_and_collect(Duration::ZERO).await;
+            seal.record_hook_fallbacks(&writer).await.unwrap();
+            // A late completion cannot settle again after the seal has taken its slot.
+            seal.settle_billing_attempt(&writer, &id, pending.fallback(id.clone()))
+                .unwrap();
+            writer
+                .record_terminal(WalRecord::RunFinished {
+                    interrupt_reason: None,
+                    ts_ms: None,
+                    reason: RunFinishReason::Interrupted,
+                    usage: Usage::default(),
+                    error: None,
+                    retries_used: 0,
+                })
+                .unwrap();
+            writer.sync().await.unwrap();
+            let records = records.lock().unwrap();
+            let terminals: Vec<_> = records
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| {
+                    matches!(
+                        record,
+                        WalRecord::AttemptReleased { .. }
+                            | WalRecord::AttemptFinished { .. }
+                            | WalRecord::ModelAttemptFinished { .. }
+                    )
+                })
+                .collect();
+            assert_eq!(terminals.len(), 1, "{point}");
+            assert!(
+                terminals[0].0
+                    < records
+                        .iter()
+                        .position(|record| matches!(record, WalRecord::RunFinished { .. }))
+                        .unwrap(),
+                "{point}"
+            );
+            assert!(
+                match terminals[0].1 {
+                    WalRecord::AttemptReleased { envelope, .. } =>
+                        !started && envelope.sent == AttemptSent::No,
+                    WalRecord::AttemptFinished { envelope, .. } =>
+                        started && point != "settled" && envelope.sent == AttemptSent::Unknown,
+                    WalRecord::ModelAttemptFinished { .. } => point == "settled",
+                    _ => false,
+                },
+                "wrong terminal at {point}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn attempt_hook_seal_refused_start_releases_through_real_channel() {
+        use broca_wal::record::AttemptSent;
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = WalHandle::spawn(
+            Box::new(RecordingWal {
+                records: records.clone(),
+            }),
+            1,
+        )
+        .unwrap();
+        let seal = crate::ShutdownSeal::new();
+        let cancel = CancellationToken::new();
+        let reached = Arc::new(Notify::new());
+        let proceed = Arc::new(Notify::new());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let hook = ChannelAttemptHook(tx);
+        let recorded = Default::default();
+        let mut journal = AttemptJournal {
+            writer: &writer,
+            seal: Some(&seal),
+            template: attempt_template(),
+            pending: Default::default(),
+            recorded: &recorded,
+            before_start: Some((reached.clone(), proceed.clone())),
+        };
+        let step = async {
+            let result = hook.before_send(physical_send(), cancel.clone()).await;
+            assert!(
+                result.is_err(),
+                "a sealed reservation must never grant send permission"
+            );
+        };
+        let cancel_and_seal = async {
+            reached.notified().await;
+            // Force cancellation and sealing after the journal's cancellation check,
+            // but before the seal decides whether the durable reservation may start.
+            cancel.cancel();
+            seal.seal_and_collect(Duration::ZERO).await;
+            proceed.notify_one();
+        };
+        let (result, ()) = tokio::join!(
+            journal_model_step(step, &mut rx, &mut journal),
+            cancel_and_seal
+        );
+        result.unwrap();
+        seal.record_hook_fallbacks(&writer).await.unwrap();
+        let records = records.lock().unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record, WalRecord::AttemptReserved { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(records.iter().filter(|record| matches!(record, WalRecord::AttemptReleased { envelope, .. } if envelope.sent == AttemptSent::No)).count(), 1);
+        assert!(
+            !records
+                .iter()
+                .any(|record| matches!(record, WalRecord::AttemptFinished { .. })),
+            "refused start must remain provably unsent"
+        );
+    }
 
     fn transformation_attempt(
         report: Option<Vec<broca_protocol::InputTransformation>>,
@@ -13793,7 +15175,10 @@ mod tests {
             0,
             &control,
             &out,
-            &|_| Box::pin(async { Ok(()) }),
+            AttemptCallbacks {
+                record: &|_| Box::pin(async { Ok(()) }),
+                before_send: None,
+            },
         )
         .await;
 
@@ -13816,9 +15201,18 @@ mod tests {
         };
         let (out, _output_rx) = mpsc::channel(1);
         let opts = Arc::new(CallOptions::new(Vec::new()));
-        let run = run_step_watched(&provider, StepId(1), &opts, 0, &control, &out, &|_| {
-            Box::pin(async { Ok(()) })
-        });
+        let run = run_step_watched(
+            &provider,
+            StepId(1),
+            &opts,
+            0,
+            &control,
+            &out,
+            AttemptCallbacks {
+                record: &|_| Box::pin(async { Ok(()) }),
+                before_send: None,
+            },
+        );
         let cancel_parent = async {
             tokio::time::timeout(
                 std::time::Duration::from_secs(1),
@@ -13874,6 +15268,7 @@ mod tests {
             &out,
             &mut None,
             &|_| Box::pin(async { Ok(()) }),
+            None,
             None,
             None,
         )

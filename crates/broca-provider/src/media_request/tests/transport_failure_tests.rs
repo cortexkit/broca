@@ -2,19 +2,20 @@ use super::*;
 use broca_core::{media_request::DurableMediaSeed, Provider, WalStore};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-struct HttpReceiver {
-    url: String,
+pub(super) struct HttpReceiver {
+    pub(super) url: String,
     accepted: Arc<AtomicUsize>,
+    bodies: Arc<Mutex<Vec<Vec<u8>>>>,
     probe: std::net::TcpListener,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl HttpReceiver {
-    fn start() -> Self {
+    pub(super) fn start() -> Self {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -22,6 +23,8 @@ impl HttpReceiver {
         let listener = tokio::net::TcpListener::from_std(listener).unwrap();
         let accepted = Arc::new(AtomicUsize::new(0));
         let count = accepted.clone();
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let captured = bodies.clone();
         let task = tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -54,18 +57,31 @@ impl HttpReceiver {
                     }
                     request.extend_from_slice(&bytes[..read]);
                 }
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(request[end..end + length].to_vec());
                 socket.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
             }
         });
         Self {
             url,
             accepted,
+            bodies,
             probe,
             task,
         }
     }
 
-    async fn finish(self) -> usize {
+    pub(super) fn bodies(&self) -> Vec<Vec<u8>> {
+        self.bodies.lock().unwrap().clone()
+    }
+
+    pub(super) fn accepted(&self) -> usize {
+        self.accepted.load(Ordering::SeqCst)
+    }
+
+    pub(super) async fn finish(self) -> usize {
         self.task.abort();
         let _ = self.task.await;
         // Stop and join the receiver before probing the backlog, so its accept loop cannot race

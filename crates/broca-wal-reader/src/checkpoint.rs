@@ -3,7 +3,7 @@
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-pub(crate) const VERSION: u64 = 1;
+pub(crate) const VERSION: u64 = 2;
 // chatgpt-codex-wire/v1 adds transport digests outside the reservation and envelope returned
 // by Billed. Frame stamps and writer succession are interpreted by the positioned reader and
 // billing fold respectively.

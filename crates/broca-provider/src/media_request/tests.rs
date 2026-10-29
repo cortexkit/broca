@@ -14,6 +14,8 @@ mod checkpoint_compat_tests;
 mod live_tests;
 mod render_tests;
 #[cfg(feature = "test-attachments")]
+mod reservation_aging_tests;
+#[cfg(feature = "test-attachments")]
 mod seed_repair_tests;
 #[cfg(feature = "test-attachments")]
 mod transport_failure_tests;

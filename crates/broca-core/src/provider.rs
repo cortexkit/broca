@@ -17,7 +17,8 @@ use tokio_util::sync::CancellationToken;
 pub type LiveStepProgress = Arc<Mutex<Option<broca_protocol::provider::InFlightStep>>>;
 
 /// Session-owned media rendering, installed only by the attachment test executor.
-/// The booleans select tag rendering and commit aging for a send, respectively.
+/// The booleans select tag rendering and commit the durable step boundary to aging,
+/// respectively. That commit is not physical-send permission.
 /// Estimates must not age a not-yet-final view.
 #[cfg(feature = "test-attachments")]
 pub type MediaRequestRenderer = dyn Fn(
@@ -39,6 +40,9 @@ pub struct StepRuntime {
     /// ordinary step; a live or resumed resend within the same step id starts after the
     /// largest durable attempt ordinal, so ordinals stay unique within the episode's step.
     pub first_attempt: u32,
+    /// This hook is absent on legacy roots. When present, it gates a physical send on
+    /// the reservation's durable receipt.
+    pub attempt_hook: Option<Arc<dyn crate::run::AttemptHook>>,
 }
 
 #[async_trait]

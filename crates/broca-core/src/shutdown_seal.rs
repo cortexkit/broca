@@ -53,6 +53,7 @@ struct State {
     handed_over: Option<SealedAttempt>,
     hooks: std::collections::BTreeMap<HookStage, Vec<WalRecord>>,
     sealed_hooks: Vec<Vec<WalRecord>>,
+    pending_attempts: std::collections::BTreeMap<broca_wal::record::AttemptId, WalRecord>,
 }
 
 /// The record of the attempt that was in flight when the seal stopped it.
@@ -75,6 +76,57 @@ pub enum HookStage {
 }
 
 impl ShutdownSeal {
+    /// Enqueue a reservation and install its unsent fallback at the seal's linearization point.
+    pub(crate) fn reserve_billing_attempt(
+        &self,
+        writer: &crate::WalHandle,
+        id: broca_wal::record::AttemptId,
+        reservation: WalRecord,
+        fallback: WalRecord,
+    ) -> Result<bool, crate::WalWriteError> {
+        let mut state = self.inner.state.lock().unwrap();
+        if state.sealed {
+            return Ok(false);
+        }
+        writer.record(reservation).into_result()?;
+        state.pending_attempts.insert(id, fallback);
+        Ok(true)
+    }
+
+    /// Mark a durable reservation as possibly sent before granting the transport permission.
+    pub(crate) fn start_billing_attempt(
+        &self,
+        id: &broca_wal::record::AttemptId,
+        fallback: WalRecord,
+    ) -> bool {
+        let mut state = self.inner.state.lock().unwrap();
+        if state.sealed {
+            return false;
+        }
+        if let Some(slot) = state.pending_attempts.get_mut(id) {
+            *slot = fallback;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Settlement and fallback removal are indivisible, even when shutdown already tripped.
+    pub(crate) fn settle_billing_attempt(
+        &self,
+        writer: &crate::WalHandle,
+        id: &broca_wal::record::AttemptId,
+        terminal: WalRecord,
+    ) -> Result<Option<u64>, crate::WalWriteError> {
+        let mut state = self.inner.state.lock().unwrap();
+        if state.pending_attempts.contains_key(id) {
+            let seq = writer.record(terminal).into_result()?;
+            state.pending_attempts.remove(id);
+            return Ok(Some(seq));
+        }
+        Ok(None)
+    }
+
     /// Deposit or replace the whole-chain fallback under the seal's linearization lock.
     /// False means the loop has lost to shutdown and must park without further writes.
     pub fn deposit_hook(&self, stage: HookStage, record: WalRecord) -> bool {
@@ -134,6 +186,9 @@ impl ShutdownSeal {
             );
             for records in std::mem::take(&mut state.sealed_hooks) {
                 let _ = writer.record_group(records);
+            }
+            for terminal in std::mem::take(&mut state.pending_attempts).into_values() {
+                writer.record(terminal).into_result()?;
             }
         }
         writer.sync_for_seal().await?;

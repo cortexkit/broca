@@ -223,7 +223,7 @@ impl<'de> Deserialize<'de> for AttemptSent {
 
 /// Closed billing outcomes: `complete`, `tool_args_trailing_garbage`, `eof_before_completion`,
 /// `chunk_error`, `idle_timeout`, `content_timeout`, `byte_limit`, `decode_error`, `rate_floor`,
-/// `cancelled`, `sealed_in_flight`, `http_error`, `provider_error`, `connect_failed`,
+/// `cancelled`, `sealed_in_flight`, `http_error`, `compression_refused`, `provider_error`, `connect_failed`,
 /// `header_timeout`, `no_status`, `unknown`. Transport names retain the meanings of the
 /// legacy forensic [`AttemptOutcome`], whose independently open vocabulary is unchanged.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,6 +241,8 @@ pub enum BillingAttemptOutcome {
     Cancelled,
     SealedInFlight,
     HttpError,
+    /// A compressed request the provider refused, retried uncompressed as a second attempt.
+    CompressionRefused,
     ProviderError,
     ConnectFailed,
     HeaderTimeout,
@@ -6232,6 +6234,54 @@ mod bill_attempt_tests {
     const MULTI_ENVELOPE: &str = r#"{"sent":true,"response_bytes":99,"outcome":"complete","sent_at_ms":101,"finished_at_ms":200,"http_status":200,"finish_reason":"stop","usage_by_model":[{"model_used":"source-model","usage":{"input_tokens":10,"cache_write_tokens":30,"output_tokens":40,"reasoning_tokens":5},"cache_write_5m_tokens":0,"cache_write_1h_tokens":30},{"model_used":"fallback-model","usage":{"input_tokens":7,"cached_input_tokens":11,"output_tokens":9}}],"reasoning_included_in_output":true,"usage_raw":{"iterations":[{"model":"source-model"},{"model":"fallback-model"}]},"vendor_request_id":"vendor-id","service_tier_used":"default","speed_used":"standard"}"#;
     const LEGACY_ATTEMPT: &str = r#"{"type":"model_attempt_finished","step_id":2,"attempt":0,"request_body_len":12,"request_body_sha256":"aa","response_body_len":0,"response_body_sha256":"e3b0","outcome":"connect_failed","ts_ms":5}"#;
     const LEGACY_WARM: &str = r#"{"type":"cache_warmed","run_id":"r","step_id":2,"request_body_sha256":"aa","warm_body_sha256":"bb","usage":{},"sent_at_ms":1790000000000}"#;
+
+    #[test]
+    fn bill_attempt_compression_refused_pinned_bytes() {
+        use sha2::{Digest, Sha256};
+        const ENVELOPE: &str = r#"{"sent":true,"response_bytes":0,"outcome":"compression_refused","sent_at_ms":101,"finished_at_ms":200,"http_status":415}"#;
+        let envelope: AttemptEnvelope = serde_json::from_str(ENVELOPE).unwrap();
+        assert_eq!(envelope.outcome, BillingAttemptOutcome::CompressionRefused);
+        assert_eq!(serde_json::to_string(&envelope).unwrap(), ENVELOPE);
+        let json = format!(
+            r#"{{"type":"model_attempt_finished","attempt_id":"{ID}","reservation":{RESERVATION},"envelope":{ENVELOPE},"step_id":1,"attempt":0,"request_body_len":123,"request_body_sha256":"aa","http_status":415,"response_body_len":0,"response_body_sha256":"e3b0","outcome":"http_error","ts_ms":200}}"#
+        );
+        let record: WalRecord = serde_json::from_str(&json).unwrap();
+        let payload = serde_json::to_vec(&record).unwrap();
+        assert_eq!(payload, json.as_bytes());
+        let frame = crate::framing::encode_v4(
+            broca_wal_reader::frame::Metadata {
+                seq: 1,
+                fence: 1,
+                appended_ms: 200,
+                writer_id: [1; 16],
+            },
+            &[],
+            &record,
+        )
+        .unwrap();
+        let crate::framing::DecodeStep::Record { framed, consumed } =
+            crate::framing::decode_next(&frame)
+        else {
+            panic!("compression refusal frame must decode");
+        };
+        assert_eq!(consumed, frame.len());
+        assert_eq!(framed.record, record);
+        if let Some(output) = std::env::var_os("BROCA_COMPRESSION_SAMPLE_DIR") {
+            let output = std::path::PathBuf::from(output);
+            std::fs::create_dir_all(&output).unwrap();
+            std::fs::write(output.join("compression_refused.json"), &payload).unwrap();
+            std::fs::write(output.join("compression_refused.frame"), &frame).unwrap();
+            std::fs::write(
+                output.join("SHA256SUMS"),
+                format!(
+                    "{:x}  compression_refused.json\n{:x}  compression_refused.frame\n",
+                    Sha256::digest(&payload),
+                    Sha256::digest(&frame),
+                ),
+            )
+            .unwrap();
+        }
+    }
 
     pub(super) fn golden_records() -> Vec<String> {
         let mut records = vec![

@@ -27,6 +27,11 @@ pub struct LiveMedia {
 }
 
 impl LiveMedia {
+    #[cfg(test)]
+    pub(super) fn aging_for_test(&self) -> MediaAging {
+        self.state.lock().unwrap().aging.clone()
+    }
+
     pub fn new(store: MediaStore, read_tail: Box<ReadTail>) -> Self {
         Self {
             state: Mutex::new(State {
