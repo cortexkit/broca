@@ -2151,6 +2151,7 @@ impl RecordOutcome {
 
 struct AppendBudget {
     writer_close_reserve: u64,
+    reopen_reserve: u64,
     retained: bool,
     session_max_bytes: u64,
     max_bytes: u64,
@@ -3697,7 +3698,8 @@ impl WalHandle {
             lease,
         };
         let wal = owner.wal();
-        let v4 = wal.wal_config().is_overhaul();
+        let config = wal.wal_config();
+        let v4 = config.is_overhaul();
         if v4 && context.is_none() {
             return Err(WalWriteError::Failed(
                 "writer-id/v1: overhaul spawn requires a store marker root and session address"
@@ -3746,12 +3748,13 @@ impl WalHandle {
             budget.map(|(max_bytes, used_bytes, overhead)| {
                 Mutex::new(AppendBudget {
                     writer_close_reserve,
+                    reopen_reserve: retained_size::reopen_reserve_bytes(config),
                     retained: budget_scope == retained_size::SizeScope::RetainedSession,
                     session_max_bytes: recovery_cap.unwrap_or(max_bytes),
                     max_bytes,
                     used_bytes,
                     overhead,
-                    reserve: retained_size::reserve_bytes(overhead),
+                    reserve: retained_size::terminal_reserve_bytes(overhead, config),
                     refused: false,
                 })
             })
@@ -4266,6 +4269,7 @@ impl WalHandle {
                 if end
                     .saturating_add(self.publication_bytes.load(Ordering::SeqCst))
                     .saturating_add(reserve)
+                    .saturating_add(budget.reopen_reserve)
                     .saturating_add(budget.writer_close_reserve)
                     > budget.max_bytes
                 {

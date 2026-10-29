@@ -34,6 +34,25 @@ mod human_prompt_count;
 #[cfg(test)]
 #[path = "file_wal_v4_tests.rs"]
 mod v4_tests;
+
+#[cfg(feature = "fs-override")]
+thread_local! {
+    static WRITER_ID_FOR_TEST: std::cell::Cell<Option<[u8; 16]>> = const { std::cell::Cell::new(None) };
+}
+
+/// Fix IDs minted by overhaul opens in `work` on this thread, to exercise payload-width limits.
+#[cfg(feature = "fs-override")]
+pub fn with_writer_id_for_test<T>(writer_id: [u8; 16], work: impl FnOnce() -> T) -> T {
+    struct Restore(Option<[u8; 16]>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WRITER_ID_FOR_TEST.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(WRITER_ID_FOR_TEST.with(|slot| slot.replace(Some(writer_id))));
+    work()
+}
+
 pub use human_prompt_count::{
     count_human_prompts_in_bytes, read_human_prompt_count, HumanPromptCount,
 };
@@ -1061,6 +1080,8 @@ impl FileWal {
             WalFormat::Overhaul => {
                 let mut id = [0u8; 16];
                 getrandom::fill(&mut id).map_err(WalError::Entropy)?;
+                #[cfg(feature = "fs-override")]
+                let id = WRITER_ID_FOR_TEST.with(|slot| slot.get().unwrap_or(id));
                 Some(id)
             }
         };
@@ -1295,15 +1316,21 @@ impl FileWal {
         };
         // Lifecycle barriers spend their own held bytes, not another run terminal's reserve.
         // Every ordinary append, including RunFinished, must leave the outstanding close intact.
-        let reserve = if lifecycle || matches!(record, WalRecord::RunFinished { .. }) {
+        let terminal_reserve = if lifecycle || matches!(record, WalRecord::RunFinished { .. }) {
             0
         } else {
-            crate::size_limit::reserve_bytes(overhead)
+            crate::size_limit::terminal_reserve_bytes(overhead, self.config)
+        };
+        let reopen_reserve = if lifecycle {
+            0
+        } else {
+            crate::size_limit::reopen_reserve_bytes(self.config)
         };
         let required = current
             .saturating_add(record_bytes.len() as u64)
             .saturating_add(overhead)
-            .saturating_add(reserve)
+            .saturating_add(terminal_reserve)
+            .saturating_add(reopen_reserve)
             .saturating_add(close_reserve);
         if required > self.append_budget {
             return Err(WalError::TooLarge {
