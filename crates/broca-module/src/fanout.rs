@@ -441,6 +441,7 @@ pub use display_replay::DisplaySender;
 /// subscribers attach via the actor's Subscribe command.
 pub struct Fanout<W: WalStore> {
     approvals: Arc<crate::approval_state::ApprovalState>,
+    source_warm: crate::source_warm::Events,
     ring: LazyRing<Arc<ControlEvent>>,
     /// Signals that the bounded writer→projector queue dropped records. Registered as part of
     /// the attach barrier so an attaching subscriber cannot miss a detach signal.
@@ -627,6 +628,7 @@ impl<W: WalStore + 'static> Fanout<W> {
     /// the observer, projects each record, and broadcasts the units on the ring.
     pub fn new(wal_store: Arc<W>, session: BindIdentity) -> (Self, broca_core::RecordObserver) {
         let approvals = Arc::new(crate::approval_state::ApprovalState::default());
+        let source_warm = crate::source_warm::Events::default();
         let ring = LazyRing::new(RING_CAPACITY);
         let display_ring = DisplaySender::new(DISPLAY_RING_CAPACITY);
         let (detach_ring, _) = broadcast::channel(1);
@@ -644,10 +646,12 @@ impl<W: WalStore + 'static> Fanout<W> {
             projector_cancel.clone(),
         ));
         let tapped = approvals.clone();
+        let source_tap = source_warm.clone();
         let observer = broca_core::RecordObserver::new(obs_tx, gate.observer_slots())
             .with_durable_tap(
                 Arc::new(move |seq, fence, lineage, record| {
                     tapped.observe(seq, fence, lineage, record);
+                    source_tap.observe(seq, record);
                     crate::diagnostics::observe_outage(record, || {
                         &crate::diagnostics::TOOL_OUTAGES
                     });
@@ -657,6 +661,7 @@ impl<W: WalStore + 'static> Fanout<W> {
         (
             Self {
                 approvals,
+                source_warm,
                 ring,
                 detach_ring,
                 display_ring,
@@ -674,6 +679,16 @@ impl<W: WalStore + 'static> Fanout<W> {
 
     pub(crate) fn approval_state(&self) -> Arc<crate::approval_state::ApprovalState> {
         self.approvals.clone()
+    }
+
+    pub(crate) fn source_warm_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::source_warm::Event> {
+        self.source_warm.subscribe()
+    }
+
+    pub(crate) fn source_warm_run_cancelled(&self) {
+        self.source_warm.run_cancelled();
     }
 
     /// A cloneable sender into the lossy display ring — handed to the run's `out`-drain

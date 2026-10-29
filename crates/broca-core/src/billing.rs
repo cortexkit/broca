@@ -535,6 +535,8 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
     resolver: &R,
 ) -> Vec<SpendSegment> {
     let mut output = Vec::new();
+    let mut last_request = std::collections::HashMap::new();
+    let mut refused_requests = std::collections::HashSet::new();
     let mut open: Option<OpenRun> = None;
     let mut closed_retries_used = 0u32;
     // Every episode's session and effective config (refreezes applied), by run id, tracked even
@@ -646,8 +648,22 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
                     ));
                 }
             }
+            WalRecord::ModelAttemptFinished {
+                step_id,
+                request_body_sha256,
+                ..
+            } => {
+                if let Some(run) = latest_run.as_ref() {
+                    last_request.insert((run.clone(), *step_id), request_body_sha256.clone());
+                }
+            }
             // A refused call was billed: it joins the segment of the model that refused it.
-            WalRecord::ModelStepRefused { ts_ms, .. } => {
+            WalRecord::ModelStepRefused { step_id, ts_ms, .. } => {
+                if let Some(run) = latest_run.as_ref() {
+                    if let Some(digest) = last_request.get(&(run.clone(), *step_id)) {
+                        refused_requests.insert((run.clone(), *step_id, digest.clone()));
+                    }
+                }
                 if let Some(current) = open.as_mut() {
                     current.pause_candidate = None;
                     closed_retries_used = closed_retries_used.saturating_add(current.record_usage(
@@ -692,18 +708,28 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
                 usage,
                 sent_at_ms,
                 envelope,
+                request_body_sha256,
                 ..
             } => {
                 // A warm is billed under the run whose request it re-sent. A warm naming a run
                 // this WAL holds no start of has no config to bill it with, and yields no fact.
                 if let Some((session, config, scope)) = episodes.get(run_id) {
                     if target_run.is_none_or(|target| target == run_id) {
-                        // The re-sent request went to the model its step was routed to.
-                        let routed = routed_steps.get(&(run_id.clone(), *step_id)).map(|model| {
-                            let mut config = config.clone();
-                            config.model = model.clone();
-                            config
-                        });
+                        // A refusal and its fallback resend share a step id. The request digest
+                        // distinguishes a source-cache warm from a warm of the fallback answer.
+                        let source = refused_requests.contains(&(
+                            run_id.clone(),
+                            *step_id,
+                            request_body_sha256.clone(),
+                        ));
+                        let routed = routed_steps
+                            .get(&(run_id.clone(), *step_id))
+                            .filter(|_| !source)
+                            .map(|model| {
+                                let mut config = config.clone();
+                                config.model = model.clone();
+                                config
+                            });
                         let mut segment = warm_segment(
                             source_instance_id,
                             run_id,

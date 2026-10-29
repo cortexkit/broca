@@ -160,6 +160,7 @@ pub fn prefix_tokens(usage: Usage) -> Option<u64> {
 }
 
 fn last_cache_usage(records: &[WalRecord], last_sent_at_ms: u64) -> Option<Usage> {
+    let latest_digest = latest_cache_request_digest(records);
     let mut bound = SendLowerBound::default();
     let mut latest_step = None;
     let mut usage = None;
@@ -183,11 +184,15 @@ fn last_cache_usage(records: &[WalRecord], last_sent_at_ms: u64) -> Option<Usage
                 ..
             } if latest_step == Some(*step_id) => usage = Some(*reported),
             WalRecord::CacheWarmed {
+                request_body_sha256,
                 sent_at_ms,
                 usage: reported,
                 envelope,
                 ..
-            } if *sent_at_ms == last_sent_at_ms && warm_reached_the_cache(envelope.as_deref()) => {
+            } if *sent_at_ms == last_sent_at_ms
+                && warm_reached_the_cache(envelope.as_deref())
+                && latest_digest.is_none_or(|digest| digest == request_body_sha256) =>
+            {
                 latest_step = None;
                 usage = Some(*reported);
             }
@@ -199,7 +204,7 @@ fn last_cache_usage(records: &[WalRecord], last_sent_at_ms: u64) -> Option<Usage
 }
 
 /// When the most recent request the session's WAL records as having reached the provider's cache
-/// started sending: the later of its last such model request and its last warm. `None` when the
+/// started sending: the later of its last such model request and its last matching warm. `None` when the
 /// WAL records no such request, and the cache's age is then unknown.
 ///
 /// The cache's lifetime starts when a request is sent, not when its response ends, so a model
@@ -213,6 +218,7 @@ fn last_cache_usage(records: &[WalRecord], last_sent_at_ms: u64) -> Option<Usage
 /// A warm counts from its own `sent_at_ms` only when its billing envelope records success.
 /// Legacy warm records have no envelope and were written only for answered warms.
 pub fn last_cache_send_at_ms(records: &[WalRecord]) -> Option<u64> {
+    let latest_digest = latest_cache_request_digest(records);
     let mut latest: Option<u64> = None;
     let mut bound = SendLowerBound::default();
     for record in records {
@@ -224,16 +230,51 @@ pub fn last_cache_send_at_ms(records: &[WalRecord]) -> Option<u64> {
                 ..
             } if attempt_reached_the_cache(*http_status, outcome) => sent_at_ms.or(bound.at_ms),
             WalRecord::CacheWarmed {
+                request_body_sha256,
                 sent_at_ms,
                 envelope,
                 ..
-            } if warm_reached_the_cache(envelope.as_deref()) => Some(*sent_at_ms),
+            } if warm_reached_the_cache(envelope.as_deref())
+                && latest_digest.is_none_or(|digest| digest == request_body_sha256) =>
+            {
+                Some(*sent_at_ms)
+            }
             _ => None,
         };
         latest = latest.max(sent_at_ms);
         bound.observe(record);
     }
     latest
+}
+
+// A standby source warm can finish after a fallback request. Its digest identifies another
+// request and must not extend the active route's clock or replace its token-count evidence.
+fn latest_cache_request_digest(records: &[WalRecord]) -> Option<&str> {
+    let has_fallback = records
+        .iter()
+        .rev()
+        .find_map(|record| match record {
+            WalRecord::RunStarted { config, .. } => Some(
+                config
+                    .frozen_render_config
+                    .get("refusal_fallback")
+                    .is_some(),
+            ),
+            _ => None,
+        })
+        .unwrap_or(false);
+    if !has_fallback {
+        return None;
+    }
+    records.iter().rev().find_map(|record| match record {
+        WalRecord::ModelAttemptFinished {
+            request_body_sha256,
+            http_status,
+            outcome,
+            ..
+        } if attempt_reached_the_cache(*http_status, outcome) => Some(request_body_sha256.as_str()),
+        _ => None,
+    })
 }
 
 pub(crate) fn warm_reached_the_cache(
@@ -1673,5 +1714,38 @@ mod tests {
                 prefix_tokens: None
             })
         );
+    }
+
+    #[test]
+    fn a_source_warm_does_not_extend_the_active_fallback_cache_clock() {
+        let mut started = run_started(Some(1));
+        if let WalRecord::RunStarted { config, .. } = &mut started {
+            config.frozen_render_config = serde_json::json!({"refusal_fallback":{}});
+        }
+        let mut fallback = attempt(Some(200), "complete", Some(200), 300);
+        if let WalRecord::ModelAttemptFinished {
+            request_body_sha256,
+            ..
+        } = &mut fallback
+        {
+            *request_body_sha256 = "fallback-digest".into();
+        }
+        let records = vec![
+            started,
+            attempt(Some(200), "complete", Some(100), 150),
+            fallback,
+            serde_json::from_value(serde_json::json!({
+                "type":"model_step_finished", "step_id":1,
+                "assistant_message":{"message_id":"fallback-answer","content":[]},
+                "usage":{"cached_input_tokens":50}
+            }))
+            .unwrap(),
+            warmed(400),
+        ];
+        assert_eq!(last_cache_send_at_ms(&records), Some(200));
+        let clock = CacheClock::default();
+        clock.seed_if_unknown(&records, Some(300_000));
+        assert_eq!(clock.read().unwrap().last_sent_at_ms, 200);
+        assert_eq!(clock.read().unwrap().prefix_tokens, Some(50));
     }
 }

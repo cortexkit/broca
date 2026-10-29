@@ -307,6 +307,7 @@ impl Fixture {
             retention_deadline: None,
             admitting_retention: None,
             warm_task: None,
+            source_warm_task: None,
             withdrawal_task: None,
             withdrawal_index_lock: Arc::default(),
             approvals,

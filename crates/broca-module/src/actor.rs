@@ -1350,6 +1350,7 @@ pub struct LineageActor<W: WalStore> {
     admitting_retention: Option<u64>,
     admitting_session_class: Option<String>,
     warm_task: Option<tokio::task::JoinHandle<()>>,
+    source_warm_task: Option<crate::source_warm::Task>,
     withdrawal_task: Option<crate::approval::WithdrawalTask>,
     withdrawal_index_lock: Arc<std::sync::Mutex<()>>,
     approvals: Arc<crate::approval_state::ApprovalState>,
@@ -1699,6 +1700,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             admitting_retention: None,
             admitting_session_class: None,
             warm_task: None,
+            source_warm_task: None,
             withdrawal_task: None,
             withdrawal_index_lock: Arc::default(),
             approvals: approvals.clone(),
@@ -1893,6 +1895,54 @@ impl<W: WalStore + 'static> LineageActor<W> {
             ));
         }
         let mut idle_deadline = tokio::time::Instant::now() + self.idle_ttl;
+        let source_events = self.fanout.source_warm_events();
+        let has_frozen_fallback = self.prior_snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot
+                .checkpoint_at_head
+                .last_episode
+                .as_ref()
+                .is_some_and(|episode| {
+                    episode
+                        .config
+                        .frozen_render_config
+                        .get("refusal_fallback")
+                        .is_some()
+                })
+        });
+        let source_frames = if has_frozen_fallback {
+            self.read_wal_framed_records().await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let safe_head = source_frames.last().map_or(0, |frame| frame.seq);
+        let source_records = source_frames
+            .into_iter()
+            .map(|frame| frame.record)
+            .collect();
+        let writer = self
+            .writer
+            .as_ref()
+            .expect("writer live while serving")
+            .clone();
+        let registry = self.registry.clone();
+        self.source_warm_task = Some(crate::source_warm::spawn(
+            crate::source_warm::Runtime {
+                session: self.key.clone(),
+                writer,
+                store: self.wal_store.clone(),
+                executor: self.executor.clone(),
+                declare: Arc::new(move |config| registry.cache_declaration(config)),
+                slot: self.warm_in_flight.clone(),
+                stopping: self.registry.stopping_signal(),
+                export: self
+                    .export_index
+                    .clone()
+                    .zip(self.charge_basis_resolver.clone()),
+            },
+            source_events,
+            source_records,
+            safe_head,
+        ));
         let clock = self
             .registry
             .retention_service()
@@ -4230,6 +4280,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 .queue_submission(run_id, request, identity, skip_materialization, INTERRUPT)
                 .await;
             if matches!(outcome, SendOutcome::Pending { .. }) {
+                self.fanout.source_warm_run_cancelled();
                 cancel.cancel();
             }
             return outcome;
@@ -6449,6 +6500,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         return CancelOutcome::Error(error.to_string());
                     }
                 }
+                self.fanout.source_warm_run_cancelled();
                 cancel.cancel();
                 self.pending_cancels.insert(
                     run_id.clone(),
@@ -7265,6 +7317,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if matches!(self.state, RunState::Active { .. })
             || self.fanout.has_live_subscribers()
             || self.warm_in_flight.occupied()
+            || self
+                .source_warm_task
+                .as_ref()
+                .is_some_and(|task| task.holds_idle.load(Ordering::Acquire))
             || self.withdrawal_task.as_ref().is_some_and(|task| {
                 task.pending(
                     self.writer
@@ -8088,6 +8144,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// rest of its teardown is done and drops it where it would drop an actor-held lease,
     /// so both tenure kinds release at the same point of the close.
     async fn shutdown_writer(&mut self) -> WriterClosed {
+        if let Some(task) = self.source_warm_task.take() {
+            task.stop().await;
+        }
         if self
             .writer
             .as_ref()
