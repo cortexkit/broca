@@ -431,6 +431,9 @@ struct ChunkWarning {
 #[derive(Clone, Default)]
 struct AttemptTrace {
     attempt_hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
+    response_evidence: Option<crate::normalize::SharedResponseEvidence>,
+    vendor_request_id: Option<String>,
+    auth_refreshed: bool,
     attempt_id: Option<broca_wal::record::AttemptId>,
     attempt_ordinal: u32,
     send_index: u32,
@@ -504,6 +507,7 @@ impl AttemptTrace {
                         request_body_bytes: body_bytes as u64,
                         compressed,
                         account_ref: self.served_account_ref.clone(),
+                        auth_refreshed: self.auth_refreshed,
                         speed_requested: request.speed_requested.clone(),
                         warm: None,
                     },
@@ -536,6 +540,13 @@ impl AttemptTrace {
                 self.clone()
                     .into_attempt(self.attempt_ordinal as usize, digest, outcome),
                 billing_outcome,
+                Some(response_envelope(
+                    self.response_evidence
+                        .as_ref()
+                        .map(|evidence| std::mem::take(&mut *evidence.lock().unwrap()))
+                        .unwrap_or_default(),
+                    self.vendor_request_id.take(),
+                )),
             )
             .await?;
         }
@@ -705,6 +716,12 @@ impl ToolNameRestoringNormalizer {
 }
 
 impl StreamNormalizer for ToolNameRestoringNormalizer {
+    fn observe_error_response(&mut self, response: &Value) {
+        self.inner.observe_error_response(response);
+    }
+    fn set_response_evidence(&mut self, evidence: crate::normalize::SharedResponseEvidence) {
+        self.inner.set_response_evidence(evidence);
+    }
     fn websocket_telemetry(&mut self) {
         self.inner.websocket_telemetry();
     }
@@ -870,6 +887,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             None => Arc::clone(&self.frozen),
         };
         if let Some(policy) = policy {
+            policy.auth_refreshed = served.auth_refreshed;
             policy.provider = fallback.and_then(|_| {
                 self.frozen
                     .refusal_fallback
@@ -978,6 +996,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             // an in-step refresh after a 401 ever replaces it.
             auth: Arc::new(std::sync::RwLock::new(ServedAuth {
                 revision: 0,
+                auth_refreshed: false,
                 auth: Arc::new(auth),
                 account_ref: None,
             })),
@@ -1663,6 +1682,9 @@ async fn send_warm_journaled(
                                 request_body_bytes: gzip.as_ref().unwrap_or(&identity).len() as u64,
                                 compressed: gzip.is_some(),
                                 account_ref: served_account_ref.clone(),
+                                auth_refreshed: policy
+                                    .as_ref()
+                                    .is_some_and(|policy| policy.auth_refreshed),
                                 speed_requested: serde_json::from_slice::<Value>(&identity)
                                     .ok()
                                     .and_then(|body| {
@@ -1704,6 +1726,7 @@ async fn send_warm_journaled(
             })?;
             let status = response.status();
             envelope.http_status = Some(status.as_u16());
+            envelope.vendor_request_id = vendor_request_id(response.headers());
             let header_map = response.headers().clone();
             let body = read_warm_body(response, &failed, &mut envelope).await?;
             warm_billing_usage(&body, family, &mut envelope);
@@ -1840,36 +1863,43 @@ fn warm_billing_usage(
     let Some(value) = value else {
         return;
     };
-    let Some(raw) = value.get("usage").filter(|u| u.is_object()) else {
-        return;
-    };
-    let usage = match family {
-        crate::spec::WireFamilyId::OpenAiResponses
-        | crate::spec::WireFamilyId::OpenAiResponsesChatgpt => {
-            crate::cache_warm::responses_response_usage(body)
-        }
-        _ => crate::cache_warm::anthropic_response_usage(body),
-    };
-    envelope.usage = Some(usage);
-    envelope.usage_raw = Some(raw.clone());
-    envelope.model_used = value
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    envelope.service_tier_used = value
-        .get("service_tier")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    envelope.speed_used = raw.get("speed").and_then(Value::as_str).map(str::to_owned);
-    envelope.cache_write_5m_tokens = raw
-        .pointer("/cache_creation/ephemeral_5m_input_tokens")
-        .and_then(Value::as_u64);
-    envelope.cache_write_1h_tokens = raw
-        .pointer("/cache_creation/ephemeral_1h_input_tokens")
-        .and_then(Value::as_u64);
-    if usage.reasoning_tokens.is_some() {
-        envelope.reasoning_included_in_output = Some(true);
+    let mut evidence = crate::normalize::ResponseEvidence::default();
+    evidence.observe_response(&value);
+    if let Some(raw) = value.get("usage").filter(|usage| usage.is_object()) {
+        let usage = match family {
+            crate::spec::WireFamilyId::OpenAiResponses
+            | crate::spec::WireFamilyId::OpenAiResponsesChatgpt => {
+                crate::cache_warm::responses_response_usage(body)
+            }
+            _ => crate::cache_warm::anthropic_response_usage(body),
+        };
+        evidence.observe_usage(raw, usage);
     }
+    evidence.finish_reason = value
+        .get("stop_reason")
+        .and_then(Value::as_str)
+        .map(crate::normalize::map_stop_reason)
+        .or_else(|| {
+            value
+                .pointer("/incomplete_details/reason")
+                .and_then(Value::as_str)
+                .map(crate::families::openai_responses::map_incomplete_reason)
+        })
+        .or_else(|| {
+            value
+                .get("status")
+                .and_then(Value::as_str)
+                .map(crate::families::openai_responses::map_response_status)
+        });
+    *envelope = broca_wal::record::AttemptEnvelope {
+        sent: envelope.sent,
+        sent_at_ms: envelope.sent_at_ms,
+        finished_at_ms: envelope.finished_at_ms,
+        response_bytes: envelope.response_bytes,
+        http_status: envelope.http_status,
+        outcome: envelope.outcome,
+        ..response_envelope(evidence, envelope.vendor_request_id.take())
+    };
 }
 
 /// Read a whole warm answer, up to its size limit.
@@ -2909,6 +2939,12 @@ where
                 refreshed = recovery.recovery.refresher.refresh_expiring() => refreshed,
             };
             if let Some(refreshed) = refreshed {
+                recovery
+                    .recovery
+                    .current
+                    .write()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .auth_refreshed = true;
                 // The same account check as a 401 refresh: a token for another account is
                 // never sent. Nothing was sent since the previous attempt, so the retries
                 // used are those already spent.
@@ -2960,6 +2996,15 @@ where
         step_seal.note_sent(&request.body, request_digest);
         let mut trace = AttemptTrace {
             attempt_hook: request.attempt_hook.clone(),
+            auth_refreshed: request.attempt_hook.is_some()
+                && auth_recovery.as_ref().is_some_and(|recovery| {
+                    recovery
+                        .recovery
+                        .current
+                        .read()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .auth_refreshed
+                }),
             attempt_ordinal: attempt_index as u32 + step_seal.first_attempt,
             attempt_cancel: request.attempt_hook.as_ref().map(|_| cancel.clone()),
             send_index: 1,
@@ -3124,6 +3169,12 @@ where
                         warn_attempt_retry(&failure, &trace, "not_retryable", "authentication");
                         return Err((failure.error, attempt_index as u32));
                     };
+                    recovery
+                        .recovery
+                        .current
+                        .write()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .auth_refreshed = true;
                     if let Some(mut error) = refreshed_account_changed_error(
                         recovery.recovery.frozen_account_ref.as_deref(),
                         &recovery.sent_auth,
@@ -3381,6 +3432,7 @@ fn refreshed_account_changed_error(
 /// Keep each token together with its associated account when carrying auth between steps.
 #[derive(Clone)]
 struct ServedAuth {
+    auth_refreshed: bool,
     /// Local to this provider/run. Even a refresh returning the same header bytes starts
     /// a new socket authentication revision; it never changes the canonical request body.
     revision: u64,
@@ -3426,6 +3478,7 @@ impl StepAuthRecovery<'_> {
             .unwrap_or_else(|poison| poison.into_inner());
         request.auth_revision = current.revision.wrapping_add(1);
         *current = ServedAuth {
+            auth_refreshed: true,
             auth,
             account_ref,
             revision: request.auth_revision,
@@ -3685,6 +3738,10 @@ async fn drive_attempt(
     trace: &mut AttemptTrace,
 ) -> Result<Vec<NormalizedEvent>, AttemptFailure> {
     trace.ephemeral_session = request.ephemeral_session;
+    if trace.attempt_hook.is_some() {
+        let evidence = trace.response_evidence.get_or_insert_with(Default::default);
+        normalizer.set_response_evidence(evidence.clone());
+    }
     if request.ephemeral_session {
         normalizer.private_error_diagnostics();
     }
@@ -3785,6 +3842,11 @@ async fn drive_attempt(
             Some(text) => text,
             None => read_error_text(&mut resp, trace).await,
         };
+        if trace.attempt_hook.is_some() {
+            if let Ok(response) = serde_json::from_str::<Value>(&text) {
+                normalizer.observe_error_response(&response);
+            }
+        }
         log_opencode_go_refusal(&request.headers, code, &headers, &text);
         let error = classify_http_error_in_family(
             code,
@@ -3901,7 +3963,7 @@ async fn send_attempt(
     // lifetime from the request, and after a restart this stamp is what dates it.
     trace.sent_at_ms = Some(now_millis());
     trace.sent_at = Some(std::time::Instant::now());
-    tokio::time::timeout(header_timeout, builder.body(body).send())
+    let response = tokio::time::timeout(header_timeout, builder.body(body).send())
         .await
         .map_err(|_| {
             AttemptFailure::transport(
@@ -3922,7 +3984,11 @@ async fn send_attempt(
                 AttemptOutcome::NoStatus
             };
             AttemptFailure::transport(transport_error(&e.to_string()), outcome)
-        })
+        })?;
+    if trace.attempt_hook.is_some() {
+        trace.vendor_request_id = vendor_request_id(response.headers());
+    }
+    Ok(response)
 }
 
 /// Read a non-2xx body for its diagnostic text into `trace`, leaving the response's headers
@@ -4003,6 +4069,150 @@ async fn drive_selected_attempt(
         trace,
     )
     .await
+}
+
+fn vendor_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    // Response object ids and client-generated correlation ids are not vendor request ids.
+    [
+        "request-id",
+        "x-request-id",
+        "x-amzn-requestid",
+        "x-goog-request-id",
+    ]
+    .iter()
+    .find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+    })
+    .map(str::to_owned)
+}
+
+fn observe_response_finish(
+    evidence: &Option<crate::normalize::SharedResponseEvidence>,
+    events: &[NormalizedEvent],
+) {
+    if let Some(evidence) = evidence {
+        for event in events {
+            if let NormalizedEvent::Control(ProviderControl::StepFinished {
+                service_tier_used,
+                speed_used,
+                ..
+            }) = event
+            {
+                let mut evidence = evidence.lock().unwrap();
+                if service_tier_used.is_some() {
+                    evidence.service_tier_used = service_tier_used.clone();
+                }
+                if speed_used.is_some() {
+                    evidence.speed_used = speed_used.clone();
+                }
+            }
+            if let NormalizedEvent::Control(ProviderControl::Finished { finish_reason, .. }) = event
+            {
+                evidence.lock().unwrap().finish_reason = Some(*finish_reason);
+            }
+        }
+    }
+}
+
+fn response_envelope(
+    evidence: crate::normalize::ResponseEvidence,
+    vendor_request_id: Option<String>,
+) -> broca_wal::record::AttemptEnvelope {
+    use broca_wal::record::{AttemptEnvelope, AttemptModelUsage};
+    let mut envelope = AttemptEnvelope {
+        usage: evidence.usage,
+        model_used: evidence.model_used,
+        finish_reason: evidence.finish_reason,
+        service_tier_used: evidence.service_tier_used,
+        speed_used: evidence.speed_used,
+        vendor_request_id,
+        usage_raw: evidence.usage_raw,
+        ..Default::default()
+    };
+    let split = |raw: &Value, key: &str| {
+        raw.get("cache_creation")
+            .and_then(|creation| creation.get(key))
+            .and_then(Value::as_u64)
+    };
+    if let Some(raw) = &envelope.usage_raw {
+        envelope.cache_write_5m_tokens = split(raw, "ephemeral_5m_input_tokens");
+        envelope.cache_write_1h_tokens = split(raw, "ephemeral_1h_input_tokens");
+        if let Some(iterations) =
+            raw.get("iterations")
+                .and_then(Value::as_array)
+                .filter(|entries| {
+                    !entries.is_empty()
+                        && entries.iter().all(|entry| {
+                            entry
+                                .get("model")
+                                .and_then(Value::as_str)
+                                .is_some_and(|model| !model.is_empty())
+                        })
+                })
+        {
+            let mut models = std::collections::BTreeMap::<String, AttemptModelUsage>::new();
+            for entry in iterations {
+                let model = entry["model"].as_str().unwrap();
+                let counters = |key: &str| entry.get(key).and_then(Value::as_u64);
+                let usage = broca_protocol::Usage {
+                    input_tokens: counters("input_tokens"),
+                    cached_input_tokens: counters("cache_read_input_tokens"),
+                    cache_write_tokens: counters("cache_creation_input_tokens"),
+                    output_tokens: counters("output_tokens"),
+                    reasoning_tokens: entry
+                        .get("output_tokens_details")
+                        .and_then(|details| details.get("thinking_tokens"))
+                        .and_then(Value::as_u64),
+                };
+                let model = models
+                    .entry(model.to_owned())
+                    .or_insert_with(|| AttemptModelUsage {
+                        model_used: model.to_owned(),
+                        usage: Default::default(),
+                        cache_write_5m_tokens: None,
+                        cache_write_1h_tokens: None,
+                    });
+                model.usage += usage;
+                model.cache_write_5m_tokens = broca_protocol::usage::sum_reported(
+                    model.cache_write_5m_tokens,
+                    split(entry, "ephemeral_5m_input_tokens"),
+                );
+                model.cache_write_1h_tokens = broca_protocol::usage::sum_reported(
+                    model.cache_write_1h_tokens,
+                    split(entry, "ephemeral_1h_input_tokens"),
+                );
+            }
+            if models.len() > 1 {
+                envelope.model_used = None;
+                envelope.usage = None;
+                envelope.cache_write_5m_tokens = None;
+                envelope.cache_write_1h_tokens = None;
+                envelope.usage_by_model = Some(models.into_values().collect());
+            } else if let Some(model) = models.into_values().next() {
+                envelope.model_used = Some(model.model_used);
+                envelope.usage = Some(model.usage);
+                envelope.cache_write_5m_tokens = model.cache_write_5m_tokens;
+                envelope.cache_write_1h_tokens = model.cache_write_1h_tokens;
+            }
+        }
+    }
+    if envelope
+        .usage
+        .is_some_and(|usage| usage.reasoning_tokens.is_some())
+        || envelope.usage_by_model.as_ref().is_some_and(|models| {
+            models
+                .iter()
+                .any(|model| model.usage.reasoning_tokens.is_some())
+        })
+    {
+        // Canonical usage includes reasoning in output even when the vendor reports
+        // reasoning separately from its visible-output counter.
+        envelope.reasoning_included_in_output = Some(true);
+    }
+    envelope
 }
 
 /// The response headers a normalizer may read, as lowercase names with UTF-8 values; a value
@@ -4124,6 +4334,10 @@ where
     E: std::error::Error,
 {
     futures::pin_mut!(stream);
+    if trace.attempt_hook.is_some() {
+        let evidence = trace.response_evidence.get_or_insert_with(Default::default);
+        normalizer.set_response_evidence(evidence.clone());
+    }
     let mut stream_bytes = 0usize;
     if trace.transport.as_deref() == Some("websocket") {
         normalizer.websocket_telemetry();
@@ -4224,6 +4438,7 @@ where
         *trace.content_progress = progress;
         let events = result
             .map_err(|error| AttemptFailure::normalize(error, AttemptOutcome::DecodeError))?;
+        observe_response_finish(&trace.response_evidence, &events);
         trace.output_seen |= events.iter().any(|event| {
             matches!(event,
             NormalizedEvent::Display(DisplayEvent::TextDelta { delta, .. }
@@ -4295,6 +4510,7 @@ where
     *trace.content_progress = progress;
     let final_events = result
         .map_err(|error| AttemptFailure::normalize(error, AttemptOutcome::EofBeforeCompletion))?;
+    observe_response_finish(&trace.response_evidence, &final_events);
     if !record_attempt_events(final_events, &mut completion, tx).await? {
         return Ok(Vec::new());
     }
@@ -5690,6 +5906,10 @@ mod tests {
 
     const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
+    mod response_evidence_tests {
+        include!("transport_response_evidence_tests.rs");
+    }
+
     mod context_overflow {
         include!("transport_context_overflow_tests.rs");
     }
@@ -6322,6 +6542,7 @@ mod tests {
                 broca_wal::record::BillingAttemptOutcome,
             )>,
         >,
+        pub(super) responses: Mutex<Vec<Option<broca_wal::record::AttemptEnvelope>>>,
         pub(super) deny: bool,
     }
 
@@ -6331,6 +6552,7 @@ mod tests {
                 order,
                 sends: Default::default(),
                 finished: Default::default(),
+                responses: Default::default(),
                 deny: false,
             }
         }
@@ -6363,7 +6585,9 @@ mod tests {
             id: broca_wal::record::AttemptId,
             attempt: ModelAttempt,
             outcome: broca_wal::record::BillingAttemptOutcome,
+            response: Option<broca_wal::record::AttemptEnvelope>,
         ) -> Result<(), ProviderError> {
+            self.responses.lock().unwrap().push(response);
             self.finished.lock().unwrap().push((id, attempt, outcome));
             self.order.lock().unwrap().push("outcome");
             Ok(())
@@ -6860,9 +7084,11 @@ mod tests {
             id: broca_wal::record::AttemptId,
             attempt: ModelAttempt,
             outcome: broca_wal::record::BillingAttemptOutcome,
+            response: Option<broca_wal::record::AttemptEnvelope>,
         ) -> Result<(), ProviderError> {
             self.waits.lock().unwrap().push(Duration::from_secs(239));
-            broca_core::run::AttemptHook::finished(&self.inner, id, attempt, outcome).await
+            broca_core::run::AttemptHook::finished(&self.inner, id, attempt, outcome, response)
+                .await
         }
     }
 
@@ -7508,6 +7734,7 @@ mod tests {
                     account_ref: None,
                     speed_requested: None,
                     warm: None,
+                    auth_refreshed: false,
                 },
                 Default::default(),
             )

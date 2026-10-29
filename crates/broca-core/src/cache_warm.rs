@@ -369,6 +369,8 @@ pub struct FailedWarmAttempt {
 /// Warm-only send facts taken from the exact frozen render route used for the request.
 #[derive(Debug, Clone, Default)]
 pub struct WarmSendPolicy {
+    /// Whether the served token was refreshed after admission recorded its resolved credential ID.
+    pub auth_refreshed: bool,
     /// A routed fallback's catalog provider; the source provider is already in the reservation.
     pub provider: Option<String>,
     /// The selected frozen marker policy, never the episode's cache-clock estimate.
@@ -590,10 +592,11 @@ impl crate::run::AttemptHook for WarmJournal {
                     .as_ref()
                     .and_then(|policy| policy.provider.clone())
                     .unwrap_or_else(|| self.template.provider.clone()),
-                credential: broca_wal::record::AttemptCredential {
-                    account_ref: send.account_ref,
-                    ..self.template.credential.clone()
-                },
+                credential: crate::admission::attempt_credential_for_send(
+                    &self.template.credential,
+                    send.account_ref,
+                    send.auth_refreshed,
+                ),
                 run: broca_wal::record::AttemptRun {
                     speed_requested: send.speed_requested,
                     ..self.template.run.clone()
@@ -698,6 +701,7 @@ impl crate::run::AttemptHook for WarmJournal {
         _id: broca_wal::record::AttemptId,
         _attempt: broca_protocol::ModelAttempt,
         _outcome: broca_wal::record::BillingAttemptOutcome,
+        _response: Option<broca_wal::record::AttemptEnvelope>,
     ) -> Result<(), ProviderError> {
         Err(warm_journal_error(
             "model settlement sent to a warm journal",
@@ -1112,6 +1116,7 @@ mod tests {
             account_ref: None,
             speed_requested: None,
             warm: None,
+            auth_refreshed: false,
         }
     }
 

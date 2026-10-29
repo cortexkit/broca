@@ -1079,6 +1079,7 @@ enum BlockBuf {
 }
 
 pub struct BedrockStreamNormalizer {
+    response_evidence: Option<crate::normalize::SharedResponseEvidence>,
     reasoning_enabled: bool,
     arguments_guard: crate::wire::ToolArgsGuard,
     completed_blocks: std::collections::HashSet<usize>,
@@ -1106,6 +1107,7 @@ pub struct BedrockStreamNormalizer {
 impl BedrockStreamNormalizer {
     fn new(step_id: StepId) -> Self {
         Self {
+            response_evidence: None,
             reasoning_enabled: false,
             arguments_guard: Default::default(),
             completed_blocks: Default::default(),
@@ -1173,6 +1175,9 @@ impl BedrockStreamNormalizer {
                     string_field(event_payload, &["stopReason", "stop_reason"])
                 {
                     self.finish_reason = map_stop_reason(stop_reason);
+                    if let Some(evidence) = &self.response_evidence {
+                        evidence.lock().unwrap().finish_reason = Some(self.finish_reason);
+                    }
                     self.stop_reason = Some(stop_reason.to_owned());
                 }
                 self.message_stopped = true;
@@ -1188,6 +1193,9 @@ impl BedrockStreamNormalizer {
                     .and_then(Value::as_str)
                 {
                     self.service_tier_used = Some(tier.to_owned());
+                    if let Some(evidence) = &self.response_evidence {
+                        evidence.lock().unwrap().service_tier_used = Some(tier.to_owned());
+                    }
                 }
                 self.saw_metadata = true;
                 self.emit_final_if_ready(out)?;
@@ -1407,6 +1415,9 @@ impl BedrockStreamNormalizer {
         ) {
             self.usage.cache_write_tokens = Some(value);
         }
+        if let Some(evidence) = &self.response_evidence {
+            evidence.lock().unwrap().observe_usage(usage, self.usage);
+        }
     }
 
     fn emit_final_if_ready(
@@ -1522,6 +1533,14 @@ impl BedrockStreamNormalizer {
 }
 
 impl StreamNormalizer for BedrockStreamNormalizer {
+    fn observe_error_response(&mut self, response: &Value) {
+        if let Some(usage) = response.get("usage") {
+            self.merge_usage(usage);
+        }
+    }
+    fn set_response_evidence(&mut self, evidence: crate::normalize::SharedResponseEvidence) {
+        self.response_evidence = Some(evidence);
+    }
     fn content_progress(&self) -> broca_protocol::provider::ContentProgress {
         self.content_observer.snapshot()
     }
