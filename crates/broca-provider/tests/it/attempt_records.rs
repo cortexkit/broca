@@ -613,11 +613,20 @@ mod gated {
                 credential_refresh,
                 served_account_ref,
                 content_progress: _,
+                attempt_id,
+                reservation,
+                envelope,
             } = record
             else {
                 unreachable!()
             };
             assert_eq!(step_id, finished_step, "attempt {index}");
+            // The billing-attempt members are written only once that feature has a writer;
+            // today's attempts must still carry none of them.
+            assert!(
+                attempt_id.is_none() && reservation.is_none() && envelope.is_none(),
+                "attempt {index}: billing-attempt members written without their writer"
+            );
             // Every attempt here reached the server, so each records when its request was handed
             // over, which is never after the attempt ended.
             assert!(

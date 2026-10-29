@@ -153,6 +153,10 @@ fn tag_of(record: &WalRecord) -> &'static str {
         WalRecord::ModelStepFinished { .. } => "model_step_finished",
         WalRecord::ModelStepRefused { .. } => "model_step_refused",
         WalRecord::ModelAttemptFinished { .. } => "model_attempt_finished",
+        WalRecord::AttemptReserved { .. } => "attempt_reserved",
+        WalRecord::AttemptFinished { .. } => "attempt_finished",
+        WalRecord::AttemptReleased { .. } => "attempt_released",
+        WalRecord::AttemptCorrected { .. } => "attempt_corrected",
         WalRecord::StepStarted { .. } => "step_started",
         WalRecord::ToolBatchStarted { .. } => "tool_batch_started",
         WalRecord::ToolDispatchIntent { .. } => "tool_dispatch_intent",
@@ -719,6 +723,7 @@ fn asynchronous_compaction_records_keep_their_bytes_and_require_the_view_feature
 /// never written.
 #[test]
 fn the_pinned_bytes_cover_every_record_kind() {
+    let billing = super::bill_attempt_tests::golden_records();
     let pinned: std::collections::BTreeSet<&str> = PINNED
         .iter()
         .copied()
@@ -734,6 +739,7 @@ fn the_pinned_bytes_cover_every_record_kind() {
         .chain(FALLBACK_PINNED.iter().map(|(bytes, _)| *bytes))
         .chain(OUTPUT_RESERVATION_PINNED.iter().copied())
         .chain(WRITER_ID_PINNED.iter().copied())
+        .chain(billing.iter().map(String::as_str))
         .map(|bytes| tag_of(&serde_json::from_str::<WalRecord>(bytes).unwrap()))
         .collect();
     // The tag of every arm of the exhaustive `tag_of` except `WalRecord::Unknown`, the
@@ -747,6 +753,10 @@ fn the_pinned_bytes_cover_every_record_kind() {
         "model_step_finished",
         "model_step_refused",
         "model_attempt_finished",
+        "attempt_reserved",
+        "attempt_finished",
+        "attempt_released",
+        "attempt_corrected",
         "step_started",
         "tool_batch_started",
         "tool_dispatch_intent",

@@ -1050,6 +1050,10 @@ impl AdmissionCheckpointV1 {
             | WalRecord::CompactionNotice { .. } => {}
             // Provider attempt evidence is informational only, skipped exactly like `Unknown`.
             WalRecord::ModelAttemptFinished { .. } => {}
+            WalRecord::AttemptReserved { .. }
+            | WalRecord::AttemptFinished { .. }
+            | WalRecord::AttemptReleased { .. }
+            | WalRecord::AttemptCorrected { .. } => {}
             // A refused step neither opens, pauses nor ends an episode: its re-send commits
             // under the same step id, and the run's `RunFinished` carries the refused call's
             // usage in its totals.

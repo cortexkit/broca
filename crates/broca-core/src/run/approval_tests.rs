@@ -1507,6 +1507,9 @@ async fn restart_wait_spend_uses_batch_cache_warmed_usage_and_starts_no_extra_wa
             seq,
             fence: 1,
             record: WalRecord::CacheWarmed {
+                attempt_id: None,
+                reservation: None,
+                envelope: None,
                 trigger: Some("keep_warm".into()),
                 run_id: run.clone(),
                 step_id: StepId(if seq < 3 { 1 } else { 2 }),

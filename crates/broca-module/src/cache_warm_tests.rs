@@ -841,6 +841,9 @@ impl Fixture {
             },
             WalRecord::StepStarted { step_id: StepId(1) },
             WalRecord::ModelAttemptFinished {
+                attempt_id: None,
+                reservation: None,
+                envelope: None,
                 content_progress: Default::default(),
                 step_id: StepId(1),
                 attempt: 0,
@@ -1534,6 +1537,9 @@ async fn after_a_restart_the_clock_counts_from_a_warm_newer_than_the_request() {
             date_the_request(records, now_ms - 61 * 60_000);
             let request_body_sha256 = attempt_digests(records).pop().unwrap();
             records.push(WalRecord::CacheWarmed {
+                attempt_id: None,
+                reservation: None,
+                envelope: None,
                 trigger: None,
                 run_id: RunId("r1".into()),
                 step_id: StepId(1),

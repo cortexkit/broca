@@ -4829,6 +4829,9 @@ mod keep_warm_scheduler {
                 ..Usage::default()
             };
             self.writer.record(WalRecord::CacheWarmed {
+                attempt_id: None,
+                reservation: None,
+                envelope: None,
                 trigger: Some("keep_warm".into()),
                 run_id: run_id.clone(),
                 step_id: StepId(1),

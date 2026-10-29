@@ -100,6 +100,453 @@ pub struct HookOp {
     pub note: Option<String>,
 }
 
+/// The billing join key: exactly 128 random bits encoded as 32 lowercase hex characters.
+/// Positions, run ids and attempt ordinals are not billing identities.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct AttemptId(String);
+
+impl AttemptId {
+    /// Encode bytes supplied by the OS random source without reserving version or variant bits.
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        use std::fmt::Write;
+        let mut hex = String::with_capacity(32);
+        for byte in bytes {
+            write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        Self(hex)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for AttemptId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer).map_err(|error| {
+            serde::de::Error::custom(format!(
+                "attempt_id must be a lowercase hexadecimal string: {error}"
+            ))
+        })?;
+        if value.len() != 32
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(serde::de::Error::custom(
+                "attempt_id must be exactly 32 lowercase hexadecimal characters",
+            ));
+        }
+        Ok(Self(value))
+    }
+}
+
+fn present_attempt_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<AttemptId>, D::Error> {
+    AttemptId::deserialize(deserializer).map(Some)
+}
+
+/// Identity of one correction, independent of the physical attempt it corrects.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct CorrectionId(AttemptId);
+
+impl CorrectionId {
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(AttemptId::from_bytes(bytes))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl<'de> Deserialize<'de> for CorrectionId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        AttemptId::deserialize(deserializer)
+            .map(Self)
+            .map_err(|error| {
+                serde::de::Error::custom(format!(
+                    "correction_id must be exactly 32 lowercase hexadecimal characters: {error}"
+                ))
+            })
+    }
+}
+
+/// Closed reasons for replacing an attempt's evidence. Corrections never add another send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptCorrectionReason {
+    /// Later provider usage or a repaired normalization replaces previously reported usage.
+    UsageReconciled,
+    /// Correct response evidence, including model_used, status, timing or outcome;
+    /// never change the reservation's request identity.
+    ProviderEvidenceCorrected,
+    /// Correct only reservation.credential, including its account attribution, without
+    /// inferring a billing model. Every other reservation field remains unchanged.
+    CredentialAttributionCorrected,
+}
+
+/// Whether a physical send happened. Unknown is explicit rather than a missing/false value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AttemptSent {
+    Yes,
+    No,
+    #[default]
+    Unknown,
+}
+
+impl Serialize for AttemptSent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Yes => serializer.serialize_bool(true),
+            Self::No => serializer.serialize_bool(false),
+            Self::Unknown => serializer.serialize_str("unknown"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AttemptSent {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match Value::deserialize(deserializer)? {
+            Value::Bool(true) => Ok(Self::Yes),
+            Value::Bool(false) => Ok(Self::No),
+            Value::String(value) if value == "unknown" => Ok(Self::Unknown),
+            _ => Err(serde::de::Error::custom(
+                "sent must be true, false or \"unknown\"",
+            )),
+        }
+    }
+}
+
+/// Closed billing outcomes: `complete`, `tool_args_trailing_garbage`, `eof_before_completion`,
+/// `chunk_error`, `idle_timeout`, `content_timeout`, `byte_limit`, `decode_error`, `rate_floor`,
+/// `cancelled`, `sealed_in_flight`, `http_error`, `provider_error`, `connect_failed`,
+/// `header_timeout`, `no_status`, `unknown`. Transport names retain the meanings of the
+/// legacy forensic [`AttemptOutcome`], whose independently open vocabulary is unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingAttemptOutcome {
+    Complete,
+    ToolArgsTrailingGarbage,
+    EofBeforeCompletion,
+    ChunkError,
+    IdleTimeout,
+    ContentTimeout,
+    ByteLimit,
+    DecodeError,
+    RateFloor,
+    Cancelled,
+    SealedInFlight,
+    HttpError,
+    ProviderError,
+    ConnectFailed,
+    HeaderTimeout,
+    NoStatus,
+    /// Recovery has no definitive outcome. It is never a usage measurement.
+    #[default]
+    Unknown,
+}
+
+/// Credential facts recorded verbatim as returned by the vault, not a classification
+/// of whether the call is metered. Absent plan_tier means unknown, never a default tier.
+///
+/// Quota joins prefer account_ref for identified accounts. credential_ref identifies account-less
+/// vault credentials such as OpenCode Go and Kimi for Coding. The insula quota provider may have
+/// no credentialRef for non-vault lanes (Codex local login, Antigravity editor cache). For an account
+/// with two lanes, insula reports the vault ref when the vault lane supplies the quota reading,
+/// or no credentialRef when a local non-vault login supplies it; never another credential's ref.
+///
+/// Metadata vocabularies are open strings: known auth_method examples are `apikey`, `oauth`,
+/// `chatgpt`, `antigravity`; plan_tier examples are `max_5x`, `max_20x`, `pro_200`;
+/// plan_tier_source examples are `operator`, `detected`. Readers preserve unfamiliar values.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttemptCredential {
+    /// Vault id of the credential actually served, from that token's VaultToken.resolved_credential_id
+    /// (the nonempty credential_id in a credential.get/get_scoped reply), unchanged. Absent without
+    /// a vault witness. It need not equal auth_selection.credential_id, a frozen resume lookup key,
+    /// nor the admission-time resolved_credential_id after a different token has been served.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_selection: Option<AuthSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_tier_source: Option<String>,
+}
+
+/// The bind identity and opaque session reference at reservation time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttemptSession {
+    #[serde(flatten)]
+    pub bind: BindIdentity,
+    pub session_ref: String,
+}
+
+/// Price-affecting request facts, retained even when the outcome is lost.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AttemptRun {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier_requested: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_requested: Option<String>,
+}
+
+/// Complete pre-send facts, repeated on settlement. Only `attempt_id` joins records;
+/// the 0-based attempt ordinal and send index are informational and may repeat after restore.
+/// Corrections repeat these fields unchanged under bill-attempts/v1, except credential for
+/// CredentialAttributionCorrected. Any other reservation change requires a new feature name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttemptReservation {
+    pub run_id: RunId,
+    pub step_id: StepId,
+    pub attempt: u32,
+    /// One for the initial send, two for its uncompressed resend.
+    pub send_index: u32,
+    pub warm: bool,
+    pub reserved_at_ms: u64,
+    /// Catalog provider slug, not a module address or a model prefix.
+    pub provider: String,
+    pub endpoint_host: String,
+    /// Bare model id written in the request body after alias resolution, without a provider prefix.
+    pub model_sent: String,
+    pub credential: AttemptCredential,
+    pub session: AttemptSession,
+    pub run: AttemptRun,
+    pub request_body_bytes: u64,
+    pub compressed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens_estimate: Option<u64>,
+}
+
+/// Usage for one serving model, in first-provider-occurrence order. Repeated iterations of
+/// the same model are coalesced. Input tokens exclude cache reads and cache writes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttemptModelUsage {
+    /// Bare vendor-reported model id, without a provider prefix.
+    pub model_used: String,
+    pub usage: Usage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_5m_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_1h_tokens: Option<u64>,
+}
+
+/// Complete terminal evidence, never a correction delta. Input tokens exclude cache
+/// reads/writes; unreported optional values stay absent, not zero/false/default tier.
+/// Billing-envelope writers must include `sent`, `outcome` and `response_bytes`; readers reject
+/// an envelope missing any of them. Legacy terminal records may omit the envelope altogether.
+/// Writers must encode multi-model usage in `usage_by_model`, coalescing repeated models in
+/// provider order, rather than recording only the last iteration's usage.
+///
+/// The decoder requires the sum of both reported cache-write splits to equal cache_write_tokens,
+/// and reasoning_included_in_output whenever any normalized usage has reasoning_tokens (even zero).
+/// It cannot infer whether a provider's input count was normalized correctly or verify provider
+/// order after the fact; those are writer obligations. When reported usage is absent, billing
+/// readers, not broca, apply this rule: a 4xx with zero response bytes means zero usage;
+/// any response bytes or any 200 means unknown usage. A recovery outcome unknown is never a measurement.
+/// service_tier_used and speed_used are open verbatim provider strings, not closed enums:
+/// known tier examples include `default`, `flex`, `priority`, `standard`; speed examples include
+/// `fast`, `standard`. Readers preserve unknown values, and never infer them from requested values.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct AttemptEnvelope {
+    pub sent: AttemptSent,
+    /// Bytes received and evidenced by this terminal, zero when none were observed durably.
+    pub response_bytes: u64,
+    pub outcome: BillingAttemptOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<FinishReason>,
+    /// Bare vendor-reported model id for a single-model reply; never inferred from model_sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_used: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_by_model: Option<Vec<AttemptModelUsage>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_5m_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_1h_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_included_in_output: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_raw: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier_used: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_used: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for AttemptEnvelope {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Fields {
+            sent: AttemptSent,
+            response_bytes: u64,
+            outcome: BillingAttemptOutcome,
+            sent_at_ms: Option<u64>,
+            finished_at_ms: Option<u64>,
+            http_status: Option<u16>,
+            finish_reason: Option<FinishReason>,
+            model_used: Option<String>,
+            usage: Option<Usage>,
+            usage_by_model: Option<Vec<AttemptModelUsage>>,
+            cache_write_5m_tokens: Option<u64>,
+            cache_write_1h_tokens: Option<u64>,
+            reasoning_included_in_output: Option<bool>,
+            usage_raw: Option<Value>,
+            vendor_request_id: Option<String>,
+            service_tier_used: Option<String>,
+            speed_used: Option<String>,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        let envelope = Self {
+            sent: fields.sent,
+            response_bytes: fields.response_bytes,
+            outcome: fields.outcome,
+            sent_at_ms: fields.sent_at_ms,
+            finished_at_ms: fields.finished_at_ms,
+            http_status: fields.http_status,
+            finish_reason: fields.finish_reason,
+            model_used: fields.model_used,
+            usage: fields.usage,
+            usage_by_model: fields.usage_by_model,
+            cache_write_5m_tokens: fields.cache_write_5m_tokens,
+            cache_write_1h_tokens: fields.cache_write_1h_tokens,
+            reasoning_included_in_output: fields.reasoning_included_in_output,
+            usage_raw: fields.usage_raw,
+            vendor_request_id: fields.vendor_request_id,
+            service_tier_used: fields.service_tier_used,
+            speed_used: fields.speed_used,
+        };
+        envelope.validate().map_err(serde::de::Error::custom)?;
+        Ok(envelope)
+    }
+}
+
+impl AttemptEnvelope {
+    fn validate(&self) -> Result<(), &'static str> {
+        fn splits(
+            usage: Option<Usage>,
+            five: Option<u64>,
+            hour: Option<u64>,
+        ) -> Result<(), &'static str> {
+            if let (Some(five), Some(hour)) = (five, hour) {
+                if five.checked_add(hour).is_none()
+                    || five.checked_add(hour) != usage.and_then(|u| u.cache_write_tokens)
+                {
+                    return Err("cache_write_5m_tokens + cache_write_1h_tokens must equal cache_write_tokens");
+                }
+            }
+            Ok(())
+        }
+        splits(
+            self.usage,
+            self.cache_write_5m_tokens,
+            self.cache_write_1h_tokens,
+        )?;
+        let mut reasoning = self.usage.is_some_and(|u| u.reasoning_tokens.is_some());
+        if let Some(models) = &self.usage_by_model {
+            if models.len() < 2
+                || self.usage.is_some()
+                || self.model_used.is_some()
+                || self.cache_write_5m_tokens.is_some()
+                || self.cache_write_1h_tokens.is_some()
+            {
+                return Err("usage_by_model requires at least two models and no top-level model_used, usage or cache-write splits");
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for model in models {
+                if model.model_used.is_empty() || !seen.insert(&model.model_used) {
+                    return Err("usage_by_model must coalesce repeated model_used entries");
+                }
+                splits(
+                    Some(model.usage),
+                    model.cache_write_5m_tokens,
+                    model.cache_write_1h_tokens,
+                )?;
+                reasoning |= model.usage.reasoning_tokens.is_some();
+            }
+        }
+        if reasoning && self.reasoning_included_in_output.is_none() {
+            return Err(
+                "reasoning_included_in_output is required when reasoning_tokens is present",
+            );
+        }
+        if self.sent == AttemptSent::No
+            && (self.sent_at_ms.is_some() || self.response_bytes != 0 || self.http_status.is_some())
+        {
+            return Err("sent false cannot carry a sent timestamp, HTTP status or response bytes");
+        }
+        if self.outcome == BillingAttemptOutcome::Unknown
+            && (self.usage.is_some()
+                || self.usage_by_model.is_some()
+                || self.usage_raw.is_some()
+                || self.cache_write_5m_tokens.is_some()
+                || self.cache_write_1h_tokens.is_some())
+        {
+            return Err("unknown outcome must not carry usage");
+        }
+        Ok(())
+    }
+}
+
+fn recovery_envelope<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Box<AttemptEnvelope>, D::Error> {
+    let envelope = AttemptEnvelope::deserialize(deserializer)?;
+    if envelope.outcome != BillingAttemptOutcome::Unknown {
+        return Err(serde::de::Error::custom(
+            "attempt_finished recovery terminal requires outcome unknown",
+        ));
+    }
+    Ok(Box::new(envelope))
+}
+
+fn released_envelope<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Box<AttemptEnvelope>, D::Error> {
+    let envelope = AttemptEnvelope::deserialize(deserializer)?;
+    if envelope.sent != AttemptSent::No
+        || envelope.response_bytes != 0
+        || envelope.sent_at_ms.is_some()
+        || envelope.http_status.is_some()
+        || envelope.usage.is_some()
+        || envelope.usage_by_model.is_some()
+        || envelope.usage_raw.is_some()
+        || envelope.cache_write_5m_tokens.is_some()
+        || envelope.cache_write_1h_tokens.is_some()
+    {
+        return Err(serde::de::Error::custom(
+            "attempt_released requires provably unsent evidence and no response or usage",
+        ));
+    }
+    Ok(Box::new(envelope))
+}
+
 /// One durable record. Internally tagged (`{"type": …}`) for a self-describing,
 /// debuggable log.
 ///
@@ -397,14 +844,25 @@ pub enum WalRecord {
     /// run's terminal when the step failed). Appended without an fsync; it becomes durable at
     /// the next existing barrier.
     ///
-    /// PURELY INFORMATIONAL under the skip contract on this enum: replay, the reconstructed
+    /// Legacy records are purely informational under the skip contract: replay, the reconstructed
     /// prompt, projection, the control stream, billing and export all skip it exactly as they
     /// skip [`WalRecord::Unknown`], so a WAL with these records removed reads as the same
     /// session. `retries_used` on `ModelStepFinished` stays the authoritative retry count.
     ModelAttemptFinished {
+        /// The only billing join key; absent on legacy, non-billing records.
+        #[serde(
+            default,
+            deserialize_with = "present_attempt_id",
+            skip_serializing_if = "Option::is_none"
+        )]
+        attempt_id: Option<AttemptId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reservation: Option<Box<AttemptReservation>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        envelope: Option<Box<AttemptEnvelope>>,
         /// The same step id the step's `ModelStepFinished` carries.
         step_id: StepId,
-        /// 0-based attempt ordinal within the step, gapless.
+        /// 0-based attempt ordinal within the step, informational, never a billing join key.
         attempt: u32,
         request_body_len: u64,
         /// Lowercase hex SHA-256 of the canonical rendered body, excluding socket framing.
@@ -432,8 +890,8 @@ pub enum WalRecord {
         /// Optional timestamps and byte counts for text, reasoning/summary, function-argument
         /// and refusal deltas, plus the longest gap between consecutive real-content records and
         /// when that gap ended, non-content bytes, a bounded event tally and the suffix following
-        /// the last content. Provider and model come from the run's `run_started`; no identity is
-        /// duplicated on the attempt.
+        /// the last content. Legacy attempts take provider/model context from run_started;
+        /// billing attempts repeat the physical send's identity in reservation/envelope.
         #[serde(flatten)]
         content_progress: Box<broca_protocol::provider::ContentProgress>,
         /// Wall-clock time the request was handed to the HTTP client, Unix milliseconds: when the
@@ -469,6 +927,50 @@ pub enum WalRecord {
         credential_refresh: Option<CredentialRefresh>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         served_account_ref: Option<String>,
+    },
+    /// Complete pre-send evidence, durably recorded before any request bytes are sent.
+    /// Exactly one terminal closes each attempt_id: ModelAttemptFinished, CacheWarmed,
+    /// AttemptReleased or the recovery-only AttemptFinished. Corrections are not terminals.
+    /// Requires `bill-attempts/v1`; contributes no session or prompt state.
+    AttemptReserved {
+        attempt_id: AttemptId,
+        reservation: Box<AttemptReservation>,
+    },
+    /// Recovery terminal for an open reservation after a crash: outcome unknown, no usage,
+    /// and sent true, false or unknown according to durable evidence. response_bytes counts
+    /// only durably observed bytes, not a claim that a remote server received nothing.
+    /// Do not write this terminal as ModelAttemptFinished: that record's body lengths can be
+    /// read as measured sizes, which recovery cannot establish.
+    AttemptFinished {
+        attempt_id: AttemptId,
+        reservation: Box<AttemptReservation>,
+        #[serde(deserialize_with = "recovery_envelope")]
+        envelope: Box<AttemptEnvelope>,
+    },
+    /// Settlement only for a provably unsent reservation (sent false), never an uncertain crash.
+    AttemptReleased {
+        attempt_id: AttemptId,
+        reservation: Box<AttemptReservation>,
+        #[serde(deserialize_with = "released_envelope")]
+        envelope: Box<AttemptEnvelope>,
+    },
+    /// Later evidence about an already reported attempt, not a second terminal or another send.
+    /// attempt_id identifies the corrected attempt; correction_id deduplicates this correction.
+    /// The envelope is a complete replacement of the previous evidence, never a delta.
+    /// With several corrections, the latest in log order (frame seq) is the evidence in force.
+    /// appended_ms is for the watermark only, not correction precedence: it can tie across writers.
+    ///
+    /// Under bill-attempts/v1 every reservation field stays unchanged, including provider,
+    /// model_sent, run_id and step_id. Only the envelope may change, plus reservation.credential
+    /// when reason is CredentialAttributionCorrected. Any other reservation change requires a
+    /// new feature name. Readers retaining the original reservation must not apply a correction
+    /// that violates this rule; a single-record decoder has no earlier reservation to compare.
+    AttemptCorrected {
+        attempt_id: AttemptId,
+        correction_id: CorrectionId,
+        reason: AttemptCorrectionReason,
+        reservation: Box<AttemptReservation>,
+        envelope: Box<AttemptEnvelope>,
     },
     /// Step boundary open marker — written when a model step begins. Pure
     /// replay/projection observability (a `StepStarted`/`StepFinished` bracket for
@@ -938,10 +1440,22 @@ pub enum WalRecord {
     ///
     /// PURELY INFORMATIONAL under the skip contract on this enum: replay, the reconstructed
     /// prompt, projection and the control stream skip it exactly as they skip
-    /// [`WalRecord::Unknown`]. It is never a transcript message, and no reader feature gates it.
+    /// [`WalRecord::Unknown`]. It is never a transcript message. Records carrying billing
+    /// evidence require `bill-attempts/v1`; legacy records remain ungated.
     /// Billing reads it: each warm becomes its own export fact, marked `warm`, on the run whose
     /// request it re-sent. An older build skips it and so exports no fact for it.
     CacheWarmed {
+        /// The only billing join key; absent on legacy warms.
+        #[serde(
+            default,
+            deserialize_with = "present_attempt_id",
+            skip_serializing_if = "Option::is_none"
+        )]
+        attempt_id: Option<AttemptId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reservation: Option<Box<AttemptReservation>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        envelope: Option<Box<AttemptEnvelope>>,
         /// `trigger` is `keep_warm` for warms sent by the tool-wait scheduler; absent for warms
         /// requested through `session.warm`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -955,7 +1469,8 @@ pub enum WalRecord {
         request_body_sha256: String,
         /// Lowercase hex SHA-256 of the bytes the warm actually sent.
         warm_body_sha256: String,
-        /// The usage the provider reported for the warm; a count it did not report is absent.
+        /// Legacy export usage only. Billing readers use envelope.usage (or its usage_by_model)
+        /// and ignore this field whenever a billing envelope is present.
         usage: Usage,
         /// The account of the credential that sent the warm, when the credential source names
         /// one.
@@ -1336,6 +1851,9 @@ impl WalRecord {
             account_observation: _,
         } = attempt;
         WalRecord::ModelAttemptFinished {
+            attempt_id: None,
+            reservation: None,
+            envelope: None,
             step_id,
             attempt,
             request_body_len,
@@ -1372,6 +1890,10 @@ impl WalRecord {
                 | WalRecord::WriterClosed { .. }
                 | WalRecord::VisibilityLate { .. }
                 | WalRecord::ModelAttemptFinished { .. }
+                | WalRecord::AttemptReserved { .. }
+                | WalRecord::AttemptFinished { .. }
+                | WalRecord::AttemptReleased { .. }
+                | WalRecord::AttemptCorrected { .. }
                 | WalRecord::ResumeStarted { .. }
                 | WalRecord::CacheWarmed { .. }
                 | WalRecord::QuestionWithdrawalAcknowledged { .. }
@@ -1663,6 +2185,11 @@ impl WalRecord {
         } else {
             base
         };
+        let base = if self.carries_billing_attempt() {
+            with_feature(base, crate::framing::BILL_ATTEMPTS_FEATURE)
+        } else {
+            base
+        };
         if matches!(
             self,
             Self::ToolDispatchIntent {
@@ -1685,6 +2212,28 @@ impl WalRecord {
             with_feature(base, crate::framing::TOOL_TIMES_FEATURE)
         } else {
             base
+        }
+    }
+
+    fn carries_billing_attempt(&self) -> bool {
+        match self {
+            Self::AttemptReserved { .. }
+            | Self::AttemptFinished { .. }
+            | Self::AttemptReleased { .. }
+            | Self::AttemptCorrected { .. } => true,
+            Self::ModelAttemptFinished {
+                attempt_id,
+                reservation,
+                envelope,
+                ..
+            }
+            | Self::CacheWarmed {
+                attempt_id,
+                reservation,
+                envelope,
+                ..
+            } => attempt_id.is_some() || reservation.is_some() || envelope.is_some(),
+            _ => false,
         }
     }
 
@@ -1809,6 +2358,10 @@ impl WalRecord {
             Self::CompactionMessage { replacement, .. } => messages(replacement),
             Self::CompactionViewApplied { view, .. } => view_carries_media_content(view),
             Self::ModelAttemptFinished { .. }
+            | Self::AttemptReserved { .. }
+            | Self::AttemptFinished { .. }
+            | Self::AttemptReleased { .. }
+            | Self::AttemptCorrected { .. }
             | Self::ModelStepRefused { .. }
             | Self::StepStarted { .. }
             | Self::ToolBatchStarted { .. }
@@ -5668,3 +6221,420 @@ mod affinity_source_tests {
 
 #[cfg(test)]
 mod step_transform_tests;
+
+#[cfg(test)]
+mod bill_attempt_tests {
+    use super::*;
+
+    const ID: &str = "00112233445566778899aabbccddeeff";
+    const RESERVATION: &str = r#"{"run_id":"r","step_id":1,"attempt":0,"send_index":1,"warm":false,"reserved_at_ms":100,"provider":"opencode-go","endpoint_host":"example.com","model_sent":"model","credential":{"credential_ref":"apikey:opencode-go","account_ref":"account","auth_selection":{"credential_id":"apikey:opencode-go","resolved_credential_id":"apikey:opencode-go"},"auth_method":"apikey","provider_ids":["opencode-go","kimi-for-coding"],"plan_tier":"max_5x","plan_tier_source":"operator"},"session":{"project_root":"/project","harness":"runner","session":"s","session_ref":"ref"},"run":{"flow_id":"flow","work_class":"interactive","context_limit":200000,"service_tier_requested":"priority","speed_requested":"fast"},"request_body_bytes":123,"compressed":true,"input_tokens_estimate":20}"#;
+    const ENVELOPE: &str = r#"{"sent":true,"response_bytes":99,"outcome":"complete","sent_at_ms":101,"finished_at_ms":200,"http_status":200,"finish_reason":"stop","model_used":"model","usage":{"input_tokens":10,"cached_input_tokens":20,"cache_write_tokens":30,"output_tokens":40,"reasoning_tokens":5},"cache_write_5m_tokens":0,"cache_write_1h_tokens":30,"reasoning_included_in_output":true,"usage_raw":{"future_vendor_key":{"count":9}},"vendor_request_id":"vendor-id","service_tier_used":"default","speed_used":"standard"}"#;
+    const MULTI_ENVELOPE: &str = r#"{"sent":true,"response_bytes":99,"outcome":"complete","sent_at_ms":101,"finished_at_ms":200,"http_status":200,"finish_reason":"stop","usage_by_model":[{"model_used":"source-model","usage":{"input_tokens":10,"cache_write_tokens":30,"output_tokens":40,"reasoning_tokens":5},"cache_write_5m_tokens":0,"cache_write_1h_tokens":30},{"model_used":"fallback-model","usage":{"input_tokens":7,"cached_input_tokens":11,"output_tokens":9}}],"reasoning_included_in_output":true,"usage_raw":{"iterations":[{"model":"source-model"},{"model":"fallback-model"}]},"vendor_request_id":"vendor-id","service_tier_used":"default","speed_used":"standard"}"#;
+    const LEGACY_ATTEMPT: &str = r#"{"type":"model_attempt_finished","step_id":2,"attempt":0,"request_body_len":12,"request_body_sha256":"aa","response_body_len":0,"response_body_sha256":"e3b0","outcome":"connect_failed","ts_ms":5}"#;
+    const LEGACY_WARM: &str = r#"{"type":"cache_warmed","run_id":"r","step_id":2,"request_body_sha256":"aa","warm_body_sha256":"bb","usage":{},"sent_at_ms":1790000000000}"#;
+
+    pub(super) fn golden_records() -> Vec<String> {
+        let mut records = vec![
+            format!(
+                r#"{{"type":"attempt_reserved","attempt_id":"{ID}","reservation":{RESERVATION}}}"#
+            ),
+            format!(
+                r#"{{"type":"attempt_released","attempt_id":"{ID}","reservation":{RESERVATION},"envelope":{{"sent":false,"response_bytes":0,"outcome":"cancelled","finished_at_ms":200}}}}"#
+            ),
+            format!(
+                r#"{{"type":"attempt_corrected","attempt_id":"{ID}","correction_id":"ffeeddccbbaa99887766554433221100","reason":"usage_reconciled","reservation":{RESERVATION},"envelope":{ENVELOPE}}}"#
+            ),
+            format!(
+                r#"{{"type":"attempt_finished","attempt_id":"{ID}","reservation":{RESERVATION},"envelope":{{"sent":"unknown","response_bytes":0,"outcome":"unknown","finished_at_ms":200}}}}"#
+            ),
+        ];
+        for (kind, legacy) in [
+            ("model_attempt_finished", LEGACY_ATTEMPT),
+            ("cache_warmed", LEGACY_WARM),
+        ] {
+            let current = if kind == "model_attempt_finished" {
+                legacy
+                    .replace("connect_failed", "complete")
+                    .replace("\"step_id\":2", "\"step_id\":1")
+                    .replace("\"ts_ms\":5", "\"ts_ms\":200")
+                    .replace("\"request_body_len\":12", "\"request_body_len\":123")
+                    .replace("\"response_body_len\":0", "\"response_body_len\":99")
+            } else {
+                legacy
+                    .replace("\"step_id\":2", "\"step_id\":1")
+                    .replace("1790000000000", "101")
+            };
+            let reservation = if kind == "cache_warmed" {
+                RESERVATION.replace("\"warm\":false", "\"warm\":true")
+            } else {
+                RESERVATION.to_owned()
+            };
+            let suffix = current
+                .strip_prefix(&format!(r#"{{"type":"{kind}","#))
+                .unwrap();
+            let envelope = if kind == "model_attempt_finished" {
+                MULTI_ENVELOPE
+            } else {
+                ENVELOPE
+            };
+            records.push(format!(r#"{{"type":"{kind}","attempt_id":"{ID}","reservation":{reservation},"envelope":{envelope},{suffix}"#));
+        }
+        records
+    }
+
+    #[test]
+    fn bill_attempt_golden_records_cover_every_field() {
+        for golden in golden_records() {
+            let record: WalRecord = serde_json::from_str(&golden).unwrap();
+            assert_ne!(record, WalRecord::Unknown);
+            assert_eq!(serde_json::to_string(&record).unwrap(), golden);
+            assert_eq!(
+                record.required_features(),
+                &[crate::framing::BILL_ATTEMPTS_FEATURE]
+            );
+            assert!(record.is_informational());
+            let value = serde_json::to_value(&record).unwrap();
+            assert_eq!(value["reservation"]["run"]["speed_requested"], "fast");
+            assert_eq!(value["reservation"]["credential"]["auth_method"], "apikey");
+            assert!(value["reservation"]["credential"].get("kind").is_none());
+            assert!(value["reservation"]["credential"]
+                .get("billing_model")
+                .is_none());
+            if let WalRecord::ModelAttemptFinished {
+                attempt,
+                reservation: Some(reservation),
+                ..
+            } = record
+            {
+                assert_eq!(attempt, reservation.attempt);
+            }
+        }
+    }
+
+    #[test]
+    fn bill_attempt_decoder_enforces_usage_arithmetic_and_model_attribution() {
+        let single: Value = serde_json::from_str(ENVELOPE).unwrap();
+        let multi: Value = serde_json::from_str(MULTI_ENVELOPE).unwrap();
+        let rejected = |value: Value, expected: &str| {
+            let error = serde_json::from_value::<AttemptEnvelope>(value)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        };
+        for field in ["response_bytes", "sent", "outcome"] {
+            let mut value = single.clone();
+            value.as_object_mut().unwrap().remove(field);
+            rejected(value, field);
+        }
+        let mut value = single.clone();
+        value["cache_write_1h_tokens"] = serde_json::json!(31);
+        rejected(value, "cache_write_tokens");
+        let mut value = single.clone();
+        value["cache_write_5m_tokens"] = serde_json::json!(u64::MAX);
+        rejected(value, "cache_write_tokens");
+        let mut value = single.clone();
+        value["usage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_write_tokens");
+        rejected(value, "cache_write_tokens");
+        for mut value in [single.clone(), multi.clone()] {
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("reasoning_included_in_output");
+            rejected(value, "reasoning_included_in_output");
+        }
+        let mut value = multi.clone();
+        value["usage"] = serde_json::json!({"output_tokens":9});
+        rejected(value, "no top-level");
+        let mut value = multi.clone();
+        value["usage_by_model"][1]["model_used"] = serde_json::json!("source-model");
+        rejected(value, "coalesce");
+        let mut value = multi.clone();
+        value["usage_by_model"].as_array_mut().unwrap().pop();
+        rejected(value, "at least two models");
+        let mut value = multi.clone();
+        value["usage_by_model"][0]["cache_write_1h_tokens"] = serde_json::json!(31);
+        rejected(value, "cache_write_tokens");
+        let mut value = single.clone();
+        value["outcome"] = serde_json::json!("unknown");
+        rejected(value, "must not carry usage");
+        let mut value = single.clone();
+        value["sent"] = serde_json::json!(false);
+        rejected(value, "sent false");
+        let mut value = single.clone();
+        value["outcome"] = serde_json::json!("future-outcome");
+        rejected(value, "unknown variant");
+        let decoded: AttemptEnvelope = serde_json::from_value(multi).unwrap();
+        let models = decoded.usage_by_model.unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .map(|m| m.model_used.as_str())
+                .collect::<Vec<_>>(),
+            ["source-model", "fallback-model"]
+        );
+        assert!(decoded.usage.is_none());
+        assert_eq!(models[0].usage.input_tokens, Some(10));
+    }
+
+    #[test]
+    fn bill_attempt_recovery_terminal_is_unknown_and_never_released_when_uncertain() {
+        let records = golden_records();
+        let recovery: Value = serde_json::from_str(&records[3]).unwrap();
+        for sent in [
+            serde_json::json!(true),
+            serde_json::json!(false),
+            serde_json::json!("unknown"),
+        ] {
+            let mut value = recovery.clone();
+            value["envelope"]["sent"] = sent;
+            let record: WalRecord = serde_json::from_value(value).unwrap();
+            assert!(matches!(record, WalRecord::AttemptFinished { .. }));
+            assert!(record.is_informational());
+        }
+        let mut value = recovery.clone();
+        value["envelope"]["outcome"] = serde_json::json!("complete");
+        assert!(serde_json::from_value::<WalRecord>(value)
+            .unwrap_err()
+            .to_string()
+            .contains("requires outcome unknown"));
+        let mut value = recovery.clone();
+        value["envelope"]["usage"] = serde_json::json!({});
+        assert!(serde_json::from_value::<WalRecord>(value)
+            .unwrap_err()
+            .to_string()
+            .contains("must not carry usage"));
+        let mut value = recovery;
+        value["type"] = serde_json::json!("attempt_released");
+        assert!(serde_json::from_value::<WalRecord>(value)
+            .unwrap_err()
+            .to_string()
+            .contains("provably unsent"));
+    }
+
+    #[test]
+    fn bill_attempt_corrections_have_independent_ids_and_closed_reasons() {
+        let value: Value = serde_json::from_str(&golden_records()[2]).unwrap();
+        assert!(value.get("corrects").is_none());
+        assert_ne!(value["attempt_id"], value["correction_id"]);
+        for reason in [
+            "usage_reconciled",
+            "provider_evidence_corrected",
+            "credential_attribution_corrected",
+        ] {
+            let mut corrected = value.clone();
+            corrected["reason"] = serde_json::json!(reason);
+            assert!(serde_json::from_value::<WalRecord>(corrected).is_ok());
+        }
+        for field in ["correction_id", "reason"] {
+            let mut corrected = value.clone();
+            corrected.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<WalRecord>(corrected)
+                .unwrap_err()
+                .to_string()
+                .contains(field));
+        }
+        let mut delta = value.clone();
+        delta["envelope"] = serde_json::json!({"usage":{"output_tokens":5}});
+        assert!(serde_json::from_value::<WalRecord>(delta).is_err());
+        let mut corrected = value;
+        corrected["reason"] = serde_json::json!("arbitrary");
+        assert!(serde_json::from_value::<WalRecord>(corrected)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown variant"));
+    }
+
+    #[test]
+    fn bill_attempt_absent_fields_stay_absent_and_reported_zero_stays_zero() {
+        for (json, expected) in [
+            (
+                r#"{"sent":"unknown","response_bytes":0,"outcome":"unknown"}"#,
+                r#"{"sent":"unknown","response_bytes":0,"outcome":"unknown"}"#,
+            ),
+            (
+                r#"{"sent":true,"response_bytes":1,"outcome":"complete","usage":{}}"#,
+                r#"{"sent":true,"response_bytes":1,"outcome":"complete","usage":{}}"#,
+            ),
+            (
+                r#"{"sent":true,"response_bytes":0,"outcome":"http_error","usage":{"input_tokens":0},"cache_write_5m_tokens":0,"reasoning_included_in_output":false}"#,
+                r#"{"sent":true,"response_bytes":0,"outcome":"http_error","usage":{"input_tokens":0},"cache_write_5m_tokens":0,"reasoning_included_in_output":false}"#,
+            ),
+        ] {
+            let envelope: AttemptEnvelope = serde_json::from_str(json).unwrap();
+            assert_eq!(serde_json::to_string(&envelope).unwrap(), expected);
+        }
+        let run: AttemptRun = serde_json::from_str("{}").unwrap();
+        assert_eq!(serde_json::to_string(&run).unwrap(), "{}");
+        let credential: AttemptCredential = serde_json::from_str("{}").unwrap();
+        assert_eq!(serde_json::to_string(&credential).unwrap(), "{}");
+        let mut reservation: Value = serde_json::from_str(RESERVATION).unwrap();
+        reservation
+            .as_object_mut()
+            .unwrap()
+            .remove("input_tokens_estimate");
+        let decoded: AttemptReservation = serde_json::from_value(reservation.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), reservation);
+    }
+
+    #[test]
+    fn bill_attempt_vault_and_provider_metadata_vocabularies_remain_open() {
+        let credential_json = serde_json::json!({
+            "credential_ref":"opaque-served-id", "auth_method":"future-auth",
+            "provider_ids":["future-provider"], "plan_tier":"future-plan",
+            "plan_tier_source":"future-source"
+        });
+        let credential: AttemptCredential =
+            serde_json::from_value(credential_json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(credential).unwrap(), credential_json);
+        let credential: AttemptCredential = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(credential.plan_tier, None);
+        assert!(serde_json::to_value(credential)
+            .unwrap()
+            .get("plan_tier")
+            .is_none());
+        let mut value: Value = serde_json::from_str(ENVELOPE).unwrap();
+        value["service_tier_used"] = serde_json::json!("future-tier");
+        value["speed_used"] = serde_json::json!("future-speed");
+        let envelope: AttemptEnvelope = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(envelope).unwrap(), value);
+    }
+
+    #[test]
+    fn bill_attempt_legacy_attempt_and_warm_bytes_are_unchanged() {
+        for pinned in [LEGACY_ATTEMPT, LEGACY_WARM] {
+            let record: WalRecord = serde_json::from_str(pinned).unwrap();
+            assert_eq!(serde_json::to_string(&record).unwrap(), pinned);
+            assert!(record.required_features().is_empty());
+            let frame = crate::framing::encode(1, 1, &record).unwrap();
+            assert_eq!(&frame[crate::framing::HEADER_LEN..], pinned.as_bytes());
+        }
+    }
+
+    #[test]
+    fn bill_attempt_and_correction_ids_are_validated_by_name() {
+        let bytes = [0xab; 16];
+        assert_eq!(
+            AttemptId::from_bytes(bytes).as_str(),
+            "abababababababababababababababab"
+        );
+        for invalid in [
+            "",
+            "0011",
+            "00112233445566778899AABBCCDDEEFF",
+            "g0112233445566778899aabbccddeeff",
+            "00112233445566778899aabbccddeeff00",
+        ] {
+            for kind in golden_records() {
+                let mut value: Value = serde_json::from_str(&kind).unwrap();
+                value["attempt_id"] = Value::String(invalid.into());
+                let err = serde_json::from_value::<WalRecord>(value).unwrap_err();
+                assert!(err.to_string().contains("attempt_id"), "{err}");
+            }
+            let mut value: Value = serde_json::from_str(&golden_records()[2]).unwrap();
+            value["correction_id"] = Value::String(invalid.into());
+            let err = serde_json::from_value::<WalRecord>(value).unwrap_err();
+            assert!(err.to_string().contains("correction_id"), "{err}");
+        }
+        for invalid in [Value::Null, serde_json::json!(123), serde_json::json!(true)] {
+            for golden in golden_records() {
+                let mut value: Value = serde_json::from_str(&golden).unwrap();
+                value["attempt_id"] = invalid.clone();
+                let err = serde_json::from_value::<WalRecord>(value).unwrap_err();
+                assert!(err.to_string().contains("attempt_id"), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn bill_attempt_each_optional_billing_field_requires_the_feature() {
+        for legacy in [LEGACY_ATTEMPT, LEGACY_WARM] {
+            for (field, value) in [
+                ("attempt_id", serde_json::json!(ID)),
+                ("reservation", serde_json::from_str(RESERVATION).unwrap()),
+                ("envelope", serde_json::from_str(ENVELOPE).unwrap()),
+            ] {
+                let mut record: Value = serde_json::from_str(legacy).unwrap();
+                record[field] = value;
+                let record: WalRecord = serde_json::from_value(record).unwrap();
+                assert_eq!(
+                    record.required_features(),
+                    &[crate::framing::BILL_ATTEMPTS_FEATURE]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bill_attempt_samples_use_the_writer_and_reader_codecs() {
+        use broca_wal_reader::{
+            features::Policy,
+            frame::{decode_next_with_policy, DecodeStep, Metadata},
+        };
+        use sha2::{Digest, Sha256};
+        let output = std::env::var_os("BROCA_ATTEMPT_SAMPLE_DIR").map(std::path::PathBuf::from);
+        let mut sums = String::new();
+        for golden in golden_records() {
+            let record: WalRecord = serde_json::from_str(&golden).unwrap();
+            let bytes = crate::framing::encode_v4(
+                Metadata {
+                    seq: 1,
+                    fence: 1,
+                    appended_ms: 200,
+                    writer_id: [1; 16],
+                },
+                &[],
+                &record,
+            )
+            .unwrap();
+            let DecodeStep::Frame(frame) =
+                decode_next_with_policy(&bytes, crate::framing::KNOWN_FEATURES, Policy::All)
+                    .unwrap()
+            else {
+                panic!("reader did not decode billing sample");
+            };
+            assert_eq!(frame.consumed, bytes.len());
+            assert_eq!(frame.payload, golden.as_bytes());
+            assert_eq!(frame.header.metadata.appended_ms, 200);
+            assert_eq!(
+                serde_json::from_slice::<WalRecord>(frame.payload).unwrap(),
+                record
+            );
+            assert_eq!(
+                decode_next_with_policy(&bytes, &[], Policy::All).unwrap_err(),
+                broca_wal_reader::Error::NewerWriter {
+                    features: vec![crate::framing::BILL_ATTEMPTS_FEATURE.into()],
+                }
+            );
+            let kind = serde_json::from_str::<Value>(&golden).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            if let Some(output) = &output {
+                std::fs::create_dir_all(output).unwrap();
+                let decoded = serde_json::to_vec_pretty(&serde_json::json!({
+                    "seq":frame.header.metadata.seq,
+                    "fence":frame.header.metadata.fence,
+                    "appended_ms":frame.header.metadata.appended_ms,
+                    "writer_id":frame.header.metadata.writer_id,
+                    "requires":frame.header.requires,
+                    "record":serde_json::from_slice::<Value>(frame.payload).unwrap(),
+                }))
+                .unwrap();
+                for (name, contents) in [
+                    (format!("{kind}.json"), frame.payload),
+                    (format!("{kind}.wal"), bytes.as_slice()),
+                    (format!("{kind}.decoded.json"), decoded.as_slice()),
+                ] {
+                    std::fs::write(output.join(&name), contents).unwrap();
+                    sums.push_str(&format!("{:x}  {name}\n", Sha256::digest(contents)));
+                }
+            }
+        }
+        if let Some(output) = output {
+            std::fs::write(output.join("SHA256SUMS"), sums).unwrap();
+        }
+    }
+}
