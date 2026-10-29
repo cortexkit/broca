@@ -125,6 +125,7 @@ struct OfflineArgs {
 #[derive(Subcommand)]
 enum OfflineCommand {
     CacheDump(CacheDumpArgs),
+    CacheDiagnose(TrajectoryArgs),
     Trajectory(TrajectoryArgs),
 }
 
@@ -188,6 +189,37 @@ fn trajectory(args: TrajectoryArgs) -> Result<i32, String> {
         writeln!(output).map_err(|_| "cannot write trajectory")?;
     }
     output.flush().map_err(|_| "cannot flush trajectory")?;
+    Ok(0)
+}
+
+fn cache_diagnose(args: TrajectoryArgs) -> Result<i32, String> {
+    if args.transcript {
+        return Err("cache-diagnose does not export transcripts".into());
+    }
+    let root = state_root(args.state_root.as_ref())?;
+    let bind = match (args.project_root, args.harness) {
+        (Some(project), Some(harness)) => {
+            broca_protocol::BindIdentity::new(project, harness, &args.id)
+        }
+        (None, None) => broca_module_serve::session_lookup::lookup(&root, &args.id)?,
+        _ => return Err("--project-root and --harness must be provided together".into()),
+    };
+    let rows = broca_module_serve::cache_diagnose::read(&root, &bind)?;
+    let mut output: Box<dyn Write> = match args.out {
+        Some(path) => {
+            let mut options = broca_owner_only::OpenOptions::new();
+            options.write(true).create_new(true);
+            Box::new(options.open(path).map_err(|_| {
+                "cannot create private cache diagnosis output (existing files are never overwritten)"
+            })?)
+        }
+        None => Box::new(std::io::stdout().lock()),
+    };
+    for row in rows {
+        serde_json::to_writer(&mut output, &row).map_err(|_| "cannot write cache diagnosis")?;
+        writeln!(output).map_err(|_| "cannot write cache diagnosis")?;
+    }
+    output.flush().map_err(|_| "cannot flush cache diagnosis")?;
     Ok(0)
 }
 
@@ -297,6 +329,8 @@ enum Cmd {
     },
     /// Export digest-verified request bodies directly from live or archived WALs (no daemon).
     CacheDump(CacheDumpArgs),
+    /// Diagnose recorded prompt-cache prefixes without a daemon connection.
+    CacheDiagnose(TrajectoryArgs),
     /// Export run, model and tool events from a live or archived session WAL (no daemon).
     Trajectory(TrajectoryArgs),
     /// Compose a tool-only fetch plan from live provider catalogs, without sending a turn.
@@ -665,17 +699,19 @@ fn content_import_id(messages: &[broca_protocol::Message]) -> Result<String, Str
 async fn main() {
     if std::env::args_os()
         .nth(1)
-        .is_some_and(|a| a == "cache-dump" || a == "trajectory")
+        .is_some_and(|a| a == "cache-dump" || a == "cache-diagnose" || a == "trajectory")
     {
         let args = OfflineArgs::parse();
         let result = if args.subc.is_some() {
             Err(offline_daemon_refusal(match &args.command {
                 OfflineCommand::CacheDump(_) => "cache-dump",
+                OfflineCommand::CacheDiagnose(_) => "cache-diagnose",
                 OfflineCommand::Trajectory(_) => "trajectory",
             }))
         } else {
             match args.command {
                 OfflineCommand::CacheDump(args) => cache_dump(args),
+                OfflineCommand::CacheDiagnose(args) => cache_diagnose(args),
                 OfflineCommand::Trajectory(args) => trajectory(args),
             }
         };
@@ -721,6 +757,7 @@ fn validate_max_output_tokens(cmd: &Cmd) -> Result<(), String> {
 async fn run(args: Args) -> Result<i32, String> {
     match &args.cmd {
         Cmd::CacheDump(_) => return Err(offline_daemon_refusal("cache-dump")),
+        Cmd::CacheDiagnose(_) => return Err(offline_daemon_refusal("cache-diagnose")),
         Cmd::Trajectory(_) => return Err(offline_daemon_refusal("trajectory")),
         _ => {}
     }
@@ -827,7 +864,7 @@ async fn run(args: Args) -> Result<i32, String> {
         Cmd::ComposePlan { .. } => {
             unreachable!("compose-plan is dispatched before the management-surface bind")
         }
-        Cmd::CacheDump(_) | Cmd::Trajectory(_) => {
+        Cmd::CacheDump(_) | Cmd::CacheDiagnose(_) | Cmd::Trajectory(_) => {
             unreachable!("offline commands are refused before the management-surface bind")
         }
         Cmd::Run {
@@ -2317,6 +2354,39 @@ fn emit_to(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cache_diagnose_accepts_task_ids_and_explicit_offline_binding() {
+        use clap::Parser;
+        let args = super::OfflineArgs::try_parse_from([
+            "broca-session",
+            "cache-diagnose",
+            "task-id",
+            "--state-root",
+            "copied-state",
+            "--project-root",
+            "/project",
+            "--harness",
+            "test",
+            "--out",
+            "diagnosis.jsonl",
+        ])
+        .unwrap();
+        let super::OfflineCommand::CacheDiagnose(args) = args.command else {
+            panic!("wrong offline command")
+        };
+        assert_eq!(args.id, "task-id");
+        assert_eq!(args.harness.as_deref(), Some("test"));
+        assert_eq!(args.out, Some(std::path::PathBuf::from("diagnosis.jsonl")));
+        assert!(super::OfflineArgs::try_parse_from([
+            "broca-session",
+            "cache-diagnose",
+            "id",
+            "--harness",
+            "test"
+        ])
+        .is_err());
+    }
+
     use std::sync::Arc;
 
     use super::{cache_params, load_plan, read_page_event, run, Args, Cmd, PathBuf};

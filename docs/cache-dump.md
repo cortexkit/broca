@@ -24,3 +24,103 @@ On Unix, new output directories use mode 0700 and files use mode 0600. Existing 
 Digest mismatches produce metadata with `verified: false`, both digests and no body or response. The reason is `transformed_request` when the attempt carries `input_transformations`, otherwise `digest_mismatch`. Prompt-reduction transforms are not rerun: their output is not durably available, and their requests can only be exported if the raw replay happens to match exactly. A response-bearing step without durable usage counts as examined and, when no stronger failure applies, skipped under `missing_step_usage`; it gets metadata and a body only when the digest verifies, never a response file. Failed retries of completed steps are folded into the final completed attempt. Other families get metadata but no body or response. Renderer/replay failures are counted as `render_unavailable`; unsupported families as `family not exported`.
 
 The summary reports candidate sessions read, undated terminal runs excluded from time selection, calls examined, excluded by the attempt-time cutoff, exported and verified, digest mismatches, and skips by reason. The legacy `sessions_not_found` field remains present but empty on successful selection; missing names now refuse before a summary or export is produced. Each skipped call has exactly one reason matching its metadata: rendering unavailable first, then digest mismatch/transformed request, then unsupported family, then missing step usage. The verified count includes unsupported-family calls whose request digests match; the exported count includes only verified calls in supported families with a body, response and metadata file. Zero examined calls exits nonzero even if the selection or output directory is valid. Source read failures also exit nonzero. A concurrent writer may advance after the read snapshot; rerun to a fresh output directory to include later calls.
+
+## Offline cache diagnosis
+
+```sh
+broca-session cache-diagnose alfonso:example
+broca-session cache-diagnose example --state-root ./copied-state --out ./diagnosis.jsonl
+```
+
+`cache-diagnose` uses the same read-only session/task lookup, explicit
+`--project-root`/`--harness` binding, retention checks, and live/archive WAL reader.
+It prints one JSONL `cache_attempt` row for **every** `ModelAttemptFinished`, including
+failed retries, rather than selecting one response per step. No daemon, network,
+request-body export, or WAL changes are involved. `--out` creates a new owner-only
+file; stdout is the default. The output contains account references and other
+diagnostic identifiers, but no prompt text, thinking text, signatures, or body bytes.
+
+The shared `broca_provider::cache_evidence::compare_rendered_requests` compares
+canonical logical requests reconstructed by `wal_render`, after checking their
+recorded SHA-256. A missing or mismatching reconstruction makes `cache_evidence`
+null with a `reason`, including on the following comparison; it never silently
+compares against an older valid attempt. The first attempt has null evidence and
+`reason: "first_attempt"`. `compared_to` is the preceding attempt's
+`<lineage_id>:<wal_seq>` in this lineage, across run boundaries. No verdict is
+emitted: MC retains its shared attribution classifier.
+
+### Evidence coordinates and prefix rules
+
+- `extends_previous` means the previous normalized request is a prefix of the
+  current request, with all settings and tool/system segments unchanged. A clean
+  message-tail append is `(true, null)` for `(extends_previous, first_divergence)`.
+  An edit, removal, insertion before the end, or changed setting is false with
+  its first divergence, **even after the previous cache marker**. The classifier,
+  not broca's comparison, decides whether that coordinate is inside cached input.
+- `previous_last_breakpoint` uses the same coordinate space as `first_divergence`:
+  `{region, message_index?, part_index?}`. Regions are `system`, `tools`,
+  `messages`, and `provider_state`. There are no synthetic message indexes.
+  Indexes are zero-based wire-array positions (including system/developer items
+  embedded in Chat/Responses arrays). Tool indexes use `part_index`; Bedrock's
+  standalone `cachePoint` uses its own block index. Non-positional settings have
+  a region and optional changed `field`. `prefix_tokens_before` is omitted:
+  JSON segments do not establish tokenizer boundaries.
+- A null breakpoint with `ttl_kind: "explicit"` means the previous request had
+  no explicit marker. With `ttl_kind: "implicit"`, a null breakpoint is normal.
+  TTL policy is taken from the previous request's frozen config, including
+  omitted-on-wire Anthropic default TTLs; unknown implicit lifetimes stay null.
+- Explicit prefix region order is **tools → system → messages**, for both
+  Anthropic Messages and Bedrock Converse, regardless of JSON key order.
+  Anthropic documents this hierarchy in [Prompt caching: structuring your
+  prompt](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
+  AWS states “Cache checkpoints are processed in this order: tools → system →
+  messages” and that earlier-section edits invalidate later sections in
+  [Prompt caching for faster model inference](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html).
+  Broca's Converse renderer builds `toolConfig.tools`, `system`, and
+  `messages[].content` separately (`families/bedrock_converse.rs`,
+  `build_request_body_with_media`); its marker planner inserts standalone
+  `cachePoint` blocks in system/messages (`apply_bedrock_marker_policy_to_body`).
+  Serialization order is not the cache-prefix order. Provider settings are
+  separate evidence; they are not another position in this three-region prefix.
+
+### Segmentation and normalization
+
+| Family | System / tools / messages |
+| --- | --- |
+| Anthropic | `system[]` / `tools[]` / `messages[].role` and `content[]` |
+| Bedrock Converse | `system[]` / `toolConfig.tools[]` / `messages[].role` and `content[]` |
+| OpenAI Chat | system/developer `messages[]` / `tools[]` / other `messages[]` and `content` |
+| OpenAI Responses, ChatGPT | `instructions` and system/developer `input[]` / `tools[]` / other `input[]` and `content[]` |
+| Gemini | `systemInstruction.parts[]` / `tools[]` / `contents[].role` and `parts[]` |
+| Code Assist | Gemini segmentation inside `request`; remaining envelope fields are provider state |
+
+Remaining request settings and opaque reasoning items are preserved. The only
+normalizations are cache markers (`cache_control`, Bedrock `cachePoint`), output
+caps (`max_tokens`, `max_completion_tokens`, `max_output_tokens`,
+`inferenceConfig.maxTokens`, `generationConfig.maxOutputTokens`), Code Assist's
+per-step `requestId`, the Anthropic billing-header line (body signature and
+request/episode/turn correlation), `metadata.user_id`'s device/session IDs, and
+ChatGPT's named client-metadata routing/turn IDs. Comments at each normalization
+name the fields and why they rotate. Output caps are not cached prompt input;
+broca intentionally clamps them near the window limit. Model, cache keys,
+tool choice, reasoning settings/budgets, signed thinking (including
+`thinking.signature`), provider text state, and unknown settings remain raw.
+
+ChatGPT comparison uses its canonical full logical input, whose digest excludes
+socket framing. Rows separately expose the recorded `continuation` and
+`full_input_reason`; a continuation's transmitted suffix is not mistaken for a
+deleted prefix. The offline command does not reconstruct socket receipts.
+
+`idle_gap_ms` uses send times, never response-end times. Required numeric evidence
+uses zero when timestamps are missing; the row's `idle_gap_known: false` prevents
+interpreting that as a measured zero gap. Similarly, `account_comparison_known`
+distinguishes unavailable account identity from known equality. Attempt billing
+usage/corrections take precedence; only the final complete attempt of a legacy
+step without a billing envelope inherits step usage. Failed retries never borrow
+that meter. Retention is unmetered when needed counts are missing.
+
+`retention.expected` is `prev.cache_read + prev.cache_write` when the previous
+request wrote cache tokens, otherwise `prev.cache_read + prev.input`. The ratio
+is current cache read divided by expected: `stable` ≥95%, `warning` ≥80% and
+<95%, `bust` <80%, and `full_bust` for zero read after cache existed. Before a
+cache existed the status is `base`. Ratios are fractions, not percentages.
