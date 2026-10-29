@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 description = "broca provider module: owns one provider's SSE transport + auth, normalizes wire->canonical stream-parts, emits the two lanes over the direct runner<->provider socket."
 
+[[example]]
+name = "media-live-check"
+required-features = ["live"]
+
 [features]
 # E2E-only virtual retry waits; keeps transport retry decisions real without waiting out backoff.
 test-harness = []
@@ -73,6 +77,7 @@ tokio-tungstenite = { workspace = true, optional = true }
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"], optional = true }
 
 [dev-dependencies]
+broca-wal-reader = { path = "../broca-wal-reader" }
 broca-module-serve = { path = "../broca-module-serve" }
 broca-crash-harness = { path = "../broca-crash-harness" }
 # The shared Claude OAuth wire vectors (`vectors::VECTORS_JSON`) the persona tests are pinned to.

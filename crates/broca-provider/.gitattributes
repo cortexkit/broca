@@ -1,0 +1,2 @@
+# PDFs contain byte offsets and fixed-width xref entries; line-ending conversion corrupts them.
+examples/media-live/fixtures/*.pdf binary

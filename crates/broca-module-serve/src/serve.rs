@@ -2044,6 +2044,16 @@ async fn handle_control_request(
                 }
             }
             let retention_unreadable = health_registry.retention_unreadable_sessions();
+            let held_runtime = crate::held_runtime::health_gauges();
+            if held_runtime["rebuild_required"] == true {
+                details
+                    .push("late-results-rebuild-required: intake completeness is unknown".into());
+            }
+            if held_runtime["withdrawals"]["failed"].as_u64().unwrap_or(0) > 0
+                || held_runtime["withdrawals"].get("error").is_some()
+            {
+                details.push("provider-held tool.withdraw failures need attention".into());
+            }
             if retention_unreadable > 0 {
                 details.push(format!("{retention_unreadable} retained logs blocked by unreadability without a current projection"));
             }
@@ -2066,6 +2076,7 @@ async fn handle_control_request(
                     "agent_data_ops": crate::agent_data::health_counts(routes.agent_data.as_deref()),
                     "retention_unreadable_sessions": retention_unreadable,
                     "retention_repairs_pending": health_registry.retention_repairs_pending(),
+                    "provider_held": held_runtime,
                     "stall_watchdog": crate::stall::health_gauges(),
                     // The identity of THIS process, so a caller can tell "my work finished while I
                     // was away" from "the process holding my work is gone" -- WITHOUT already

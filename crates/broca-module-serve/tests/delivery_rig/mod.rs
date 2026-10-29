@@ -819,6 +819,33 @@ impl Rig {
         collect_subscription_frames_at(&mut self.reader, corr, quiet, None::<fn()>, |_| true).await
     }
 
+    /// `subscribe_collect_bound`, but first waiting under the shared hang guard for a frame
+    /// matching `until`. Only then does `quiet` start. A `{"from": "start"}` replay can take
+    /// longer than any fixed quiet window on a slow runner, so a test that needs a particular
+    /// replayed frame must wait for that frame rather than for the stream to go quiet.
+    pub async fn subscribe_collect_bound_until(
+        &mut self,
+        channel: u16,
+        params: serde_json::Value,
+        quiet: Duration,
+        until: impl Fn(&Frame) -> bool,
+    ) -> Vec<Frame> {
+        self.corr += 1;
+        let corr = self.corr;
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            1,
+            corr,
+            serde_json::to_vec(&serde_json::json!({"method":"session.subscribe","params":params}))
+                .unwrap(),
+        )
+        .unwrap();
+        write_frame(&mut self.writer, &frame).await.unwrap();
+        collect_subscription_frames_at(&mut self.reader, corr, quiet, Some(|| {}), until).await
+    }
+
     /// `subscribe_collect`, calling `on_attach` once the subscription's first frame arrives.
     /// Subscribed with `{"from": "start"}`, the control lane replays the lineage's durable
     /// records at attach, so its first control frame proves control replay has started, not

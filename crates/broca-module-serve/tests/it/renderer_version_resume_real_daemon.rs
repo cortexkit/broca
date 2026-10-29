@@ -45,6 +45,10 @@ fn require_subc() -> bool {
 
 /// Answers every request with `TEXT_SSE` and records each request body.
 async fn serve_model(bodies: Arc<Mutex<Vec<Vec<u8>>>>) -> String {
+    serve_model_sse(bodies, TEXT_SSE).await
+}
+
+async fn serve_model_sse(bodies: Arc<Mutex<Vec<Vec<u8>>>>, response: &'static str) -> String {
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("bind the model server");
@@ -75,10 +79,10 @@ async fn serve_model(bodies: Arc<Mutex<Vec<Vec<u8>>>>) -> String {
                 let mut stream = reader.into_inner();
                 let head = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                    TEXT_SSE.len()
+                    response.len()
                 );
                 let _ = stream.write_all(head.as_bytes()).await;
-                let _ = stream.write_all(TEXT_SSE.as_bytes()).await;
+                let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.shutdown().await;
             });
         }
@@ -103,6 +107,22 @@ impl Drop for Rig {
 
 impl Rig {
     async fn start(model_url: &str) -> Option<Self> {
+        let catalog = super::routing_fixture::with_served_routing(serde_json::json!({
+            "source": "renderer-version-resume", "resolved_at_ms": 1, "catalog_version": 1,
+            "models": {format!("{PROVIDER}/{MODEL}"): {
+                "existence": "present", "capability.attachment": false,
+                "capability.input_modalities": ["text", "image"],
+                "capability.reasoning": false, "capability.tool_call": true,
+                "limit.context": 1000000, "limit.output": 8192
+            }}
+        }));
+        let rig = Self::launch(model_url, Some(catalog)).await?;
+        assert!(rig.wait_for_module_live().await, "broca never became live");
+        Some(rig)
+    }
+
+    // A caller may register a live catalog producer before opening the first broca route.
+    async fn launch(model_url: &str, catalog: Option<Value>) -> Option<Self> {
         let subc_source = broca_test_support::subc_bin("ck-subc", "SUBC_CORE_BIN");
         let fake_aft = broca_test_support::subc_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN");
         for bin in [&subc_source, &fake_aft] {
@@ -136,27 +156,13 @@ impl Rig {
         let config_path = config_home.join("cortexkit").join("subc.jsonc");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&runtime_dir).unwrap();
-        // The catalog lists the one Gemini model; with BROCA_PROVIDER_BASE_URL set the module
-        // resolves it through the catalog at the mock host with no credential.
-        let catalog = super::routing_fixture::with_served_routing(serde_json::json!({
-            "source": "renderer-version-resume",
-            "resolved_at_ms": 1,
-            "catalog_version": 1,
-            "models": {
-                format!("{PROVIDER}/{MODEL}"): {
-                    "existence": "present",
-                    "capability.attachment": false,
-                    "capability.input_modalities": ["text", "image"],
-                    "capability.reasoning": false,
-                    "capability.tool_call": true,
-                    "limit.context": 1000000,
-                    "limit.output": 8192
-                }
-            }
-        }));
-        let catalog_path = runtime_dir.join("broca-state/catalog/fusiform-lkg.json");
-        std::fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
-        std::fs::write(&catalog_path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
+        // A seeded catalog keeps renderer-version tests offline. Leaving it absent
+        // requires bootstrap to fetch facts from the live catalog module.
+        if let Some(catalog) = catalog {
+            let catalog_path = runtime_dir.join("broca-state/catalog/fusiform-lkg.json");
+            std::fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
+            std::fs::write(&catalog_path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
+        }
         let config = serde_json::json!({
             "version": 1,
             "modules": {
@@ -213,7 +219,6 @@ impl Rig {
             }
         })
         .await;
-        assert!(rig.wait_for_module_live().await, "broca never became live");
         Some(rig)
     }
 
@@ -266,6 +271,10 @@ impl Rig {
         .unwrap()
     }
 }
+
+#[cfg(feature = "test-attachments")]
+#[path = "media_acceptance.rs"]
+mod media_acceptance;
 
 fn session_records(wal_dir: &Path, session: &str) -> Option<Vec<WalRecord>> {
     for entry in std::fs::read_dir(wal_dir).ok()?.flatten() {

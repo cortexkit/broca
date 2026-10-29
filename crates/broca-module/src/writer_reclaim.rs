@@ -1263,6 +1263,10 @@ mod tests {
     #[cfg(all(feature = "test-clock", unix))]
     #[tokio::test]
     async fn reclaim_crash_and_power_loss_cuts_are_idempotent() {
+        use super::power_loss::ChangeKind::{RemoveEntry, Resize, SetEntry, Write};
+        use super::power_loss::OperationKind::{
+            Change, Observe as O, SyncDirectory as D, SyncFile as S,
+        };
         use super::power_loss::{Family, RecordingFs};
 
         let root = Root::new();
@@ -1278,6 +1282,89 @@ mod tests {
             .await
             .unwrap();
         let states = fs.enumerate(100_000).unwrap();
+        // Zero bytes in random identities or proof CRCs can merge byte-identical
+        // images. Pin the operation trace and cover every cut, not the image count.
+        assert_eq!(
+            fs.operation_kinds(),
+            vec![
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                S,
+                D,
+                D,
+                Change(vec![SetEntry]), // Successor temporary marker.
+                Change(vec![Write]),
+                S,
+                Change(vec![RemoveEntry, SetEntry]),
+                D,
+                S,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                S,
+                D,
+                Change(vec![Write]), // WriterOpened.
+                O,
+                S,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                Change(vec![Resize]),
+                Change(vec![Write]), // Open publication.
+                O,
+                Change(vec![Write]), // WriterClosed.
+                O,
+                S,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                Change(vec![Resize]),
+                Change(vec![Write]),       // Final publication.
+                Change(vec![RemoveEntry]), // Successor marker unlink.
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                Change(vec![RemoveEntry]), // Predecessor marker unlink.
+            ],
+            "all 74 reclaim journal operations must complete in order"
+        );
+        fs.assert_all_cuts_covered(&states);
         assert!(states
             .iter()
             .any(|state| state.family == Family::SyncedOnly));
@@ -1288,12 +1375,6 @@ mod tests {
             .state
             .files
             .contains_key(&PathBuf::from("open-writers").join(marker.file_name().unwrap()))));
-        // Visibility publication adds sidecar writes and directory barriers to the trace.
-        assert_eq!(
-            states.len(),
-            2898,
-            "all reclaim crash/power-loss images must be exercised"
-        );
         for state in states {
             let recovery = Root::new();
             std::fs::remove_dir_all(&recovery.path).unwrap();

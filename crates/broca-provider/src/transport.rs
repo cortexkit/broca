@@ -94,17 +94,19 @@ mod request_gzip_tests;
 
 /// Shareable HTTP transport handle. Clones retain the same reqwest connection pools.
 ///
-/// It holds two reqwest clients because reqwest decides response decoding per client, and a
+/// Reqwest decides response decoding per client, and a
 /// client that decodes also adds an `accept-encoding` header to every request it sends.
 /// Anthropic's first-party API gets Claude Code's `accept-encoding` and a client that decodes
 /// what comes back; every other host gets a client without decoding, so its requests go out
-/// exactly as they did before decoding existed.
+/// exactly as they did before decoding existed. Journaled model requests use separate pools
+/// with redirects disabled: a redirect must not re-POST under the original reservation.
 #[derive(Clone, Debug)]
 pub struct ProviderHttpClient {
     /// Every host except `api.anthropic.com`. No response decoding and no `accept-encoding`.
     identity: reqwest::Client,
     /// `api.anthropic.com` only. Decodes gzip, deflate, brotli and zstd responses as they stream.
     decoding: reqwest::Client,
+    journaled: Arc<JournaledHttpClients>,
     request_gzip: request_gzip::RequestGzipPolicy,
     chatgpt_connections: ChatgptConnections,
     /// Tests only: when set, every send fails at once with a refused connection, without
@@ -116,23 +118,42 @@ pub struct ProviderHttpClient {
     fail_connects: bool,
 }
 
+struct JournaledHttpClients {
+    clients: OnceLock<(reqwest::Client, reqwest::Client)>,
+    builder: Box<dyn Fn() -> reqwest::ClientBuilder + Send + Sync>,
+}
+
+impl std::fmt::Debug for JournaledHttpClients {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JournaledHttpClients")
+            .field("initialized", &self.clients.get().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+fn build_http_pool(builder: reqwest::ClientBuilder, decode: bool) -> reqwest::Client {
+    builder
+        .gzip(decode)
+        .deflate(decode)
+        .brotli(decode)
+        .zstd(decode)
+        .build()
+        .expect("the provider HTTP client configuration is valid")
+}
+
 impl ProviderHttpClient {
     fn build(
-        builder: impl Fn() -> reqwest::ClientBuilder,
+        builder: impl Fn() -> reqwest::ClientBuilder + Send + Sync + 'static,
         request_gzip: request_gzip::RequestGzipPolicy,
     ) -> Self {
-        let build = |decode: bool| {
-            builder()
-                .gzip(decode)
-                .deflate(decode)
-                .brotli(decode)
-                .zstd(decode)
-                .build()
-                .expect("the provider HTTP client configuration is valid")
-        };
         Self {
-            identity: build(false),
-            decoding: build(true),
+            identity: build_http_pool(builder(), false),
+            decoding: build_http_pool(builder(), true),
+            journaled: Arc::new(JournaledHttpClients {
+                clients: OnceLock::new(),
+                builder: Box::new(builder),
+            }),
             request_gzip,
             chatgpt_connections: ChatgptConnections::default(),
             #[cfg(test)]
@@ -141,11 +162,40 @@ impl ProviderHttpClient {
     }
 
     /// The client for a request: the decoding one only for Anthropic's first-party host.
-    fn for_host(&self, anthropic_api_host: bool) -> &reqwest::Client {
+    pub fn for_host(&self, anthropic_api_host: bool) -> &reqwest::Client {
         if anthropic_api_host {
             &self.decoding
         } else {
             &self.identity
+        }
+    }
+
+    fn for_model_host(&self, anthropic_api_host: bool, journaled: bool) -> &reqwest::Client {
+        if !journaled {
+            return self.for_host(anthropic_api_host);
+        }
+        // Legacy sends never initialize the no-redirect pools, even when using the
+        // HTTP/1.1 fallback client after a transient transport failure.
+        let (identity, decoding) = self.journaled.clients.get_or_init(|| {
+            (
+                build_http_pool(
+                    (self.journaled.builder)()
+                        .redirect(reqwest::redirect::Policy::none())
+                        .retry(reqwest::retry::never()),
+                    false,
+                ),
+                build_http_pool(
+                    (self.journaled.builder)()
+                        .redirect(reqwest::redirect::Policy::none())
+                        .retry(reqwest::retry::never()),
+                    true,
+                ),
+            )
+        });
+        if anthropic_api_host {
+            decoding
+        } else {
+            identity
         }
     }
 
@@ -184,7 +234,7 @@ impl ProviderHttpClient {
     #[cfg(test)]
     fn resolving_anthropic_api_to(address: std::net::SocketAddr, gzip_enabled: bool) -> Self {
         Self::build(
-            || provider_client_builder().resolve(request_gzip::ANTHROPIC_API_HOST, address),
+            move || provider_client_builder().resolve(request_gzip::ANTHROPIC_API_HOST, address),
             request_gzip::RequestGzipPolicy::isolated(gzip_enabled),
         )
     }
@@ -198,6 +248,10 @@ impl From<reqwest::Client> for ProviderHttpClient {
         Self {
             identity: client.clone(),
             decoding: client,
+            journaled: Arc::new(JournaledHttpClients {
+                clients: OnceLock::new(),
+                builder: Box::new(provider_client_builder),
+            }),
             request_gzip: request_gzip::RequestGzipPolicy::isolated(false),
             chatgpt_connections: ChatgptConnections::default(),
             #[cfg(test)]
@@ -364,7 +418,7 @@ struct AttemptTrace {
     attempt_id: Option<broca_wal::record::AttemptId>,
     attempt_ordinal: u32,
     send_index: u32,
-    attempt_cancel: CancellationToken,
+    attempt_cancel: Option<CancellationToken>,
     ephemeral_session: bool,
     transport: Option<String>,
     websocket_request: Option<Box<broca_protocol::provider::WebSocketRequestDigest>>,
@@ -436,7 +490,7 @@ impl AttemptTrace {
                         account_ref: self.served_account_ref.clone(),
                         speed_requested: request.speed_requested.clone(),
                     },
-                    self.attempt_cancel.clone(),
+                    self.attempt_cancel.clone().unwrap_or_default(),
                 )
                 .await
                 .map_err(|error| {
@@ -589,7 +643,6 @@ impl<F: WireFamily + 'static> RenderJob<F> {
             request.account_ref = context.account_ref.clone();
         }
         request.wire_model_id = Some(self.frozen.wire_model_id.clone());
-        request.speed_requested = self.frozen.speed.clone();
         maybe_dump_rendered_request(&request.body, &self.opts, self.step_id);
         let request_digest = RequestDigest::of(&request.body);
         RenderedRequest {
@@ -718,6 +771,19 @@ fn build_retry_normalizer<F: WireFamily>(
 pub fn build_provider_http_client() -> ProviderHttpClient {
     ProviderHttpClient::build(
         provider_client_builder,
+        request_gzip::RequestGzipPolicy::from_env(),
+    )
+}
+
+/// The provider client for bounded operator probes. Redirects and automatic HTTP retries
+/// would spend uncounted requests, so each explicit send must be a single attempt.
+pub fn build_single_attempt_http_client() -> ProviderHttpClient {
+    ProviderHttpClient::build(
+        || {
+            provider_client_builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
+        },
         request_gzip::RequestGzipPolicy::from_env(),
     )
 }
@@ -1248,6 +1314,7 @@ async fn send_warm(
                 &request.headers,
                 anthropic_api_host,
                 gzip.is_some(),
+                false,
             )
             .body(gzip.clone().unwrap_or_else(|| identity.clone()))
             .send()
@@ -1394,8 +1461,11 @@ fn attempt_request_builder(
     headers: &[(String, String)],
     anthropic_api_host: bool,
     gzip: bool,
+    journaled: bool,
 ) -> reqwest::RequestBuilder {
-    let mut builder = client.for_host(anthropic_api_host).post(url);
+    let mut builder = client
+        .for_model_host(anthropic_api_host, journaled)
+        .post(url);
     let mut has_accept_encoding = false;
     for (name, value) in headers {
         if gzip && name.eq_ignore_ascii_case("content-encoding") {
@@ -1609,6 +1679,8 @@ struct RetryClock {
     virtual_waits: Option<Arc<std::sync::Mutex<Vec<Duration>>>>,
     #[cfg(test)]
     virtual_retry_attempts: Option<Arc<std::sync::Mutex<std::collections::VecDeque<Duration>>>>,
+    #[cfg(test)]
+    virtual_wait_overhead: Option<Duration>,
 }
 
 /// A point on a [`RetryClock`] from which retry time is measured.
@@ -1644,6 +1716,8 @@ impl RetryClock {
 
     fn elapsed_since(&self, mark: RetryMark) -> Duration {
         let elapsed = mark.at.elapsed();
+        #[cfg(test)]
+        let elapsed = self.virtual_wait_overhead.unwrap_or(elapsed);
         #[cfg(any(test, feature = "test-harness"))]
         if let Some(waits) = &self.virtual_waits {
             let waited: Duration = waits.lock().unwrap()[mark.virtual_waits_before..]
@@ -2152,6 +2226,9 @@ fn spawn_transport_task<F: WireFamily + 'static>(
             }
         };
 
+        if attempt_hook.is_some() {
+            rendered.request.speed_requested = frozen.speed.clone();
+        }
         rendered.request.attempt_hook = attempt_hook;
 
         let mut attempt = first_attempt;
@@ -2400,7 +2477,7 @@ where
         let mut trace = AttemptTrace {
             attempt_hook: request.attempt_hook.clone(),
             attempt_ordinal: attempt_index as u32 + step_seal.first_attempt,
-            attempt_cancel: cancel.clone(),
+            attempt_cancel: request.attempt_hook.as_ref().map(|_| cancel.clone()),
             send_index: 1,
             transport: Some("https".into()),
             defer_failure_warning: true,
@@ -2435,12 +2512,14 @@ where
                 if let Some(websocket) = websocket {
                     websocket.close();
                 }
-                if let Err(error) = trace
-                    .settle_send(request_digest, AttemptOutcome::Cancelled, None)
-                    .await
-                {
-                    step_seal.end_attempt();
-                    return Err((error, attempt_index as u32));
+                if trace.attempt_hook.is_some() {
+                    if let Err(error) = trace
+                        .settle_send(request_digest, AttemptOutcome::Cancelled, None)
+                        .await
+                    {
+                        step_seal.end_attempt();
+                        return Err((error, attempt_index as u32));
+                    }
                 }
                 // A caller cancel is cooperative: the run loop keeps reading until this task
                 // ends, so the in-flight attempt is recorded before the run's Cancelled
@@ -2463,9 +2542,11 @@ where
                 }
                 // The seal keeps a fallback if its bound expires before the journal replies.
                 // Otherwise the billing outcome is queued before the seal takes the terminal.
-                let _ = trace
-                    .settle_send(request_digest, AttemptOutcome::SealedInFlight, None)
-                    .await;
+                if trace.attempt_hook.is_some() {
+                    let _ = trace
+                        .settle_send(request_digest, AttemptOutcome::SealedInFlight, None)
+                        .await;
+                }
                 // The seal, not the run loop, writes this record and then the run's
                 // Interrupted terminal. Nothing is sent on the stream, and the stream stays
                 // open until the aborted run task drops its receiver, so the run loop never
@@ -2488,9 +2569,11 @@ where
             // An empty completion means the receiver closed mid-stream: there is no one to
             // send a record to, and the attempt did not complete.
             Ok(completion) if completion.is_empty() => {
-                let _ = trace
-                    .settle_send(request_digest, AttemptOutcome::Cancelled, None)
-                    .await;
+                if trace.attempt_hook.is_some() {
+                    let _ = trace
+                        .settle_send(request_digest, AttemptOutcome::Cancelled, None)
+                        .await;
+                }
                 step_seal.end_attempt();
                 return Ok((Vec::new(), 0));
             }
@@ -2498,14 +2581,18 @@ where
             Ok(_) => AttemptOutcome::Complete,
             Err(failure) => failure.outcome.clone(),
         };
-        if let Err(error) = trace
-            .settle_send(request_digest, outcome.clone(), None)
-            .await
-        {
-            step_seal.end_attempt();
-            return Err((error, attempt_index as u32));
-        }
+        // Preserve the pre-journal retry-policy sampling point. Local settlement time is
+        // not network-attempt time, and legacy sends need no settlement future at all.
         let attempt_elapsed = retry_clock.attempt_elapsed(attempt_started);
+        if trace.attempt_hook.is_some() {
+            if let Err(error) = trace
+                .settle_send(request_digest, outcome.clone(), None)
+                .await
+            {
+                step_seal.end_attempt();
+                return Err((error, attempt_index as u32));
+            }
+        }
         if result.is_err() && trace.response_len == 0 {
             retry_wait_spent += attempt_elapsed;
         }
@@ -3303,6 +3390,7 @@ async fn send_attempt(
         &request.headers,
         anthropic_api_host,
         gzip.is_some(),
+        trace.attempt_hook.is_some(),
     );
     let compressed = gzip.is_some();
     let body = gzip.unwrap_or_else(|| {
@@ -3314,7 +3402,9 @@ async fn send_attempt(
             request.body.clone()
         }
     });
-    trace.reserve_send(request, body.len(), compressed).await?;
+    if trace.attempt_hook.is_some() {
+        trace.reserve_send(request, body.len(), compressed).await?;
+    }
     // A deterministic connect refusal still reserves an attempt, but never stamps a send.
     #[cfg(test)]
     if client.fail_connects {
@@ -6049,6 +6139,362 @@ mod tests {
         assert_eq!(hook.finished.lock().unwrap()[0].1.sent_at_ms, None);
     }
 
+    async fn one_post_redirect(
+        status: u16,
+        location: String,
+    ) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let url = format!("http://{}/original", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let (head, body) = read_http_request(&mut socket).await;
+            assert!(head.starts_with("POST /original HTTP/1.1"));
+            write_http_response(&mut socket, status, &[("location", &location)], b"").await;
+            body
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn journaled_redirects_stop_before_second_post() {
+        for status in [307, 308] {
+            for journaled in [false, true] {
+                let target = ScriptedServer::start(vec![ScriptResponse::Http {
+                    status: 400,
+                    headers: vec![],
+                    body: b"second POST",
+                }])
+                .await;
+                let port = reqwest::Url::parse(&target.url).unwrap().port().unwrap();
+                let (url, source) =
+                    one_post_redirect(status, format!("http://localhost:{port}/redirected")).await;
+                let request = PreparedHttpRequest::from(HttpRequest {
+                    method: HttpMethod::Post,
+                    url,
+                    headers: vec![],
+                    body: b"model request".to_vec(),
+                });
+                let hook = Arc::new(TestAttemptHook::new(Default::default()));
+                let mut trace = AttemptTrace {
+                    attempt_hook: journaled
+                        .then(|| hook.clone() as Arc<dyn broca_core::run::AttemptHook>),
+                    ..Default::default()
+                };
+                let response = send_attempt(
+                    &build_provider_http_client(),
+                    &request,
+                    false,
+                    None,
+                    Duration::from_secs(5),
+                    &mut trace,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    response.status().as_u16(),
+                    if journaled { status } else { 400 }
+                );
+                assert_eq!(source.await.unwrap(), b"model request");
+                assert_eq!(target.request_bodies().len(), usize::from(!journaled));
+                if !journaled {
+                    assert_eq!(target.request_bodies()[0], b"model request");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn journaled_redirect_to_refused_connection_keeps_sent_evidence() {
+        for status in [307, 308] {
+            let refused = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = refused.local_addr().unwrap();
+            drop(refused);
+            let (url, source) = one_post_redirect(
+                status,
+                format!("http://localhost:{}/redirected", address.port()),
+            )
+            .await;
+            let request = PreparedHttpRequest::from(HttpRequest {
+                method: HttpMethod::Post,
+                url,
+                headers: vec![],
+                body: b"model request".to_vec(),
+            });
+            let hook = Arc::new(TestAttemptHook::new(Default::default()));
+            let mut trace = AttemptTrace {
+                attempt_hook: Some(hook.clone()),
+                ..Default::default()
+            };
+            let response = send_attempt(
+                &build_provider_http_client(),
+                &request,
+                false,
+                None,
+                Duration::from_secs(5),
+                &mut trace,
+            )
+            .await;
+            assert!(
+                response.is_ok(),
+                "original POST received a redirect, not a connect refusal: {response:?}"
+            );
+            assert_eq!(response.unwrap().status().as_u16(), status);
+            assert_eq!(source.await.unwrap(), b"model request");
+            assert!(trace.sent_at_ms.is_some());
+            assert_eq!(hook.sends.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn legacy_render_keeps_billing_only_metadata_absent() {
+        let mut frozen = crate::families::anthropic_frozen_config("m");
+        frozen.speed = Some("fast".into());
+        let rendered = super::RenderJob {
+            auth_revision: 0,
+            family: Arc::new(AnthropicMessages),
+            frozen: Arc::new(frozen),
+            auth: Arc::new(AuthHandle::None),
+            opts: Arc::new(CallOptions::new(Vec::new())),
+            step_id: StepId(1),
+        }
+        .render();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&rendered.request.body).unwrap()["speed"],
+            "fast"
+        );
+        assert!(rendered.request.attempt_hook.is_none());
+        assert_eq!(
+            rendered.request.speed_requested, None,
+            "legacy render must not clone billing-only speed metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn journaled_render_attaches_speed_metadata_before_send() {
+        let server = ScriptedServer::start(vec![ScriptResponse::Http {
+            status: 400,
+            headers: vec![],
+            body: b"invalid",
+        }])
+        .await;
+        let mut frozen = crate::families::anthropic_frozen_config("m");
+        frozen.base_url = Some(server.url.clone());
+        frozen.speed = Some("fast".into());
+        let provider = LiveProvider::new(AnthropicMessages, frozen, AuthHandle::None);
+        let hook = Arc::new(TestAttemptHook::new(Default::default()));
+        let mut stream = broca_core::Provider::step_with_runtime(
+            &provider,
+            StepId(1),
+            Arc::new(CallOptions::new(Vec::new())),
+            broca_core::provider::StepRuntime {
+                cancel: CancellationToken::new(),
+                deadline: None,
+                seal: None,
+                progress: None,
+                first_attempt: 0,
+                attempt_hook: Some(hook.clone()),
+            },
+        )
+        .await;
+        while stream.recv().await.is_some() {}
+        assert_eq!(
+            hook.sends.lock().unwrap()[0].1.speed_requested.as_deref(),
+            Some("fast")
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&server.request_bodies()[0]).unwrap()["speed"],
+            "fast"
+        );
+    }
+
+    struct SettlementDelayHook {
+        inner: TestAttemptHook,
+        waits: Arc<Mutex<Vec<Duration>>>,
+    }
+    #[async_trait::async_trait]
+    impl broca_core::run::AttemptHook for SettlementDelayHook {
+        async fn before_send(
+            &self,
+            send: broca_core::run::PhysicalSend,
+            cancel: CancellationToken,
+        ) -> Result<broca_wal::record::AttemptId, ProviderError> {
+            broca_core::run::AttemptHook::before_send(&self.inner, send, cancel).await
+        }
+        async fn finished(
+            &self,
+            id: broca_wal::record::AttemptId,
+            attempt: ModelAttempt,
+            outcome: broca_wal::record::BillingAttemptOutcome,
+        ) -> Result<(), ProviderError> {
+            self.waits.lock().unwrap().push(Duration::from_secs(239));
+            broca_core::run::AttemptHook::finished(&self.inner, id, attempt, outcome).await
+        }
+    }
+
+    #[tokio::test]
+    async fn settlement_wait_preserves_legacy_retry_wall_decision() {
+        let server = ScriptedServer::start(vec![
+            ScriptResponse::Http {
+                status: 429,
+                headers: vec![("retry-after", "2")],
+                body: b"",
+            },
+            ScriptResponse::Http {
+                status: 200,
+                headers: vec![],
+                body: b"done",
+            },
+        ])
+        .await;
+        let mut provider = retry_test_provider(&server, 0);
+        let waits = use_virtual_retry_waits(&mut provider);
+        let hook = Arc::new(SettlementDelayHook {
+            inner: TestAttemptHook::new(Default::default()),
+            waits: waits.clone(),
+        });
+        let mut stream = broca_core::Provider::step_with_runtime(
+            &provider,
+            StepId(1),
+            Arc::new(CallOptions::new(vec![])),
+            broca_core::provider::StepRuntime {
+                cancel: CancellationToken::new(),
+                deadline: None,
+                seal: None,
+                progress: None,
+                first_attempt: 0,
+                attempt_hook: Some(hook),
+            },
+        )
+        .await;
+        let mut events = Vec::new();
+        while let Some(event) = stream.recv().await {
+            events.push(event);
+        }
+        assert_eq!(
+            server.request_bodies().len(),
+            2,
+            "settlement wait must not consume the legacy network retry budget"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            NormalizedEvent::Control(ProviderControl::Finished { .. })
+        )));
+        assert_eq!(
+            *waits.lock().unwrap(),
+            [
+                Duration::from_secs(239),
+                Duration::from_secs(2),
+                Duration::from_secs(239)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_retry_wall_boundary_matches_baseline_records() {
+        for (second_elapsed, expected_count) in [
+            (Duration::from_secs(18) - Duration::from_nanos(1), 3),
+            (Duration::from_secs(18), 3),
+            (Duration::from_secs(18) + Duration::from_nanos(1), 2),
+        ] {
+            let mut paths = Vec::new();
+            for runtime_entry in [false, true] {
+                let server = ScriptedServer::start(vec![
+                    ScriptResponse::Http {
+                        status: 429,
+                        headers: vec![("retry-after", "2")],
+                        body: b"",
+                    },
+                    ScriptResponse::Http {
+                        status: 429,
+                        headers: vec![("retry-after", "120")],
+                        body: b"",
+                    },
+                    ScriptResponse::Http {
+                        status: 429,
+                        headers: vec![("retry-after", "2")],
+                        body: b"",
+                    },
+                ])
+                .await;
+                let mut provider = retry_test_provider(&server, 0);
+                let waits = use_virtual_retry_waits(&mut provider);
+                provider.retry_clock.virtual_retry_attempts = Some(Arc::new(Mutex::new(
+                    [Duration::from_secs(100), second_elapsed, Duration::ZERO].into(),
+                )));
+                provider.retry_clock.virtual_wait_overhead = Some(Duration::ZERO);
+                let mut stream = if runtime_entry {
+                    broca_core::Provider::step_with_runtime(
+                        &provider,
+                        StepId(1),
+                        Arc::new(CallOptions::new(vec![])),
+                        broca_core::provider::StepRuntime {
+                            cancel: CancellationToken::new(),
+                            deadline: None,
+                            seal: None,
+                            progress: None,
+                            first_attempt: 0,
+                            attempt_hook: None,
+                        },
+                    )
+                    .await
+                } else {
+                    provider.start_step(
+                        StepId(1),
+                        Arc::new(CallOptions::new(Vec::new())),
+                        CancellationToken::new(),
+                        None,
+                    )
+                };
+                let mut records = Vec::new();
+                let mut retries_used = None;
+                while let Some(event) = stream.recv().await {
+                    if let NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }) =
+                        event
+                    {
+                        assert_eq!(attempt.attempt as usize, records.len());
+                        assert_eq!(attempt.outcome, AttemptOutcome::HttpError);
+                        assert_eq!(attempt.http_status, Some(429));
+                        assert_eq!(attempt.transport.as_deref(), Some("https"));
+                        assert_eq!(attempt.response_body_len, 0);
+                        assert_eq!(
+                            attempt.request_body_len as usize,
+                            br#"{"retry_test":"byte-identical"}"#.len()
+                        );
+                        let mut value = serde_json::to_value(attempt).unwrap();
+                        value.as_object_mut().unwrap().remove("ts_ms");
+                        value.as_object_mut().unwrap().remove("sent_at_ms");
+                        records.push(value);
+                    } else if let NormalizedEvent::Control(ProviderControl::Error {
+                        retries_used: retries,
+                        ..
+                    }) = event
+                    {
+                        retries_used = Some(retries);
+                    }
+                }
+                // The pre-journal policy permits equality at 240 s, but not one nanosecond
+                // beyond it: 100 s + 2 s + second_elapsed + the 120 s Retry-After.
+                assert_eq!(records.len(), expected_count);
+                assert_eq!(retries_used, Some(expected_count as u32 - 1));
+                assert_eq!(server.request_bodies().len(), expected_count);
+                assert!(
+                    provider.client.journaled.clients.get().is_none(),
+                    "legacy retry must not build journal-only HTTP pools"
+                );
+                assert_eq!(
+                    *waits.lock().unwrap(),
+                    if expected_count == 3 {
+                        vec![Duration::from_secs(2), Duration::from_secs(120)]
+                    } else {
+                        vec![Duration::from_secs(2)]
+                    }
+                );
+                paths.push(records);
+            }
+            assert_eq!(paths[0], paths[1], "legacy entry points must produce identical attempt records apart from wall-clock timestamps");
+        }
+    }
+
     fn attempt_scratch(label: &str) -> PathBuf {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/scratch")
@@ -6267,6 +6713,113 @@ mod tests {
         ) -> Box<dyn StreamNormalizer> {
             Box::new(SuccessAttemptNormalizer)
         }
+    }
+
+    #[tokio::test]
+    async fn compression_refusal_pair_is_accepted_by_billing_reader() {
+        use broca_wal::WalRecord;
+        use broca_wal_reader::billing::{self, AttemptStatus, BilledKind, Item};
+        let server = ScriptedServer::start(vec![
+            ScriptResponse::Http {
+                status: 415,
+                headers: vec![],
+                body: b"",
+            },
+            ScriptResponse::Http {
+                status: 400,
+                headers: vec![],
+                body: b"invalid",
+            },
+        ])
+        .await;
+        let address: std::net::SocketAddr =
+            server.url.strip_prefix("http://").unwrap().parse().unwrap();
+        let client = ProviderHttpClient::resolving_anthropic_api_to(address, true);
+        let mut frozen = crate::families::anthropic_frozen_config("m");
+        frozen.base_url = Some(format!("http://api.anthropic.com:{}", address.port()));
+        let provider = LiveProvider::with_client_and_clock(
+            client,
+            LargeAttemptFamily,
+            frozen,
+            AuthHandle::None,
+            Clock::default(),
+        );
+        let root = attempt_scratch("compression-billing-reader");
+        let recording = Arc::new(broca_crash_harness::power_loss::RecordingFs::new(&root).unwrap());
+        let frames = run_recorded_attempt(&root, &provider, Default::default(), recording).await;
+        let expected_ids: std::collections::BTreeSet<_> = frames
+            .iter()
+            .filter_map(|frame| match &frame.record {
+                WalRecord::AttemptReserved { attempt_id, .. } => {
+                    Some(attempt_id.as_str().to_owned())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(expected_ids.len(), 2);
+        let path =
+            broca_core::FileWalStore::with_config(root.join("wal"), broca_wal::WalConfig::OVERHAUL)
+                .resolve_live_path(&attempt_session())
+                .unwrap()
+                .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let sidecar = std::fs::read(broca_wal::head_proof::sidecar_path(&path)).unwrap();
+        let mut reader = billing::billed(&bytes[..], &sidecar, None).unwrap();
+        assert!(reader.checkpoint().is_none());
+        let items: Vec<_> = reader.by_ref().map(Result::unwrap).collect();
+        let billed: Vec<_> = items
+            .iter()
+            .map(|item| match item {
+                Item::Billed(attempt) => attempt,
+                other => panic!("real compression pair must be readable: {other:?}"),
+            })
+            .collect();
+        assert_eq!(billed.len(), 2);
+        assert_eq!(
+            billed
+                .iter()
+                .map(|attempt| attempt.attempt_id.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected_ids
+        );
+        for attempt in billed {
+            assert_eq!(attempt.kind, BilledKind::Finished);
+            assert_eq!(attempt.status, AttemptStatus::Failed);
+            let reservation = attempt.typed_reservation().unwrap();
+            let envelope = attempt.typed_envelope().unwrap().unwrap();
+            match reservation.send_index {
+                1 => {
+                    assert!(reservation.compressed);
+                    assert_eq!(
+                        serde_json::to_value(envelope.outcome).unwrap(),
+                        serde_json::json!("compression_refused")
+                    );
+                    assert_eq!(envelope.http_status, Some(415));
+                }
+                2 => {
+                    assert!(!reservation.compressed);
+                    assert_eq!(envelope.outcome, billing::Outcome::HttpError);
+                    assert_eq!(envelope.http_status, Some(400));
+                }
+                index => panic!("unexpected physical send index {index}"),
+            }
+        }
+        assert_eq!(reader.oldest_open_appended_ms(), None);
+        let checkpoint = reader.checkpoint().unwrap();
+        let checkpoint_json: Value = serde_json::from_slice(&checkpoint.to_bytes()).unwrap();
+        assert_eq!(checkpoint_json["version"], 2);
+        assert_eq!(
+            checkpoint.seq(),
+            broca_wal::head_proof::HeadProof::decode(&sidecar)
+                .unwrap()
+                .durable_seq
+        );
+        let resumed: Vec<_> = billing::billed(&bytes[..], &sidecar, Some(checkpoint))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(resumed.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn raw_attempt_frames(mut bytes: &[u8]) -> Vec<broca_wal::FramedRecord> {

@@ -1120,7 +1120,9 @@ async fn drive_socket(
     }
     // Reserve the actual response.create bytes, including continuation metadata, before
     // enqueueing the command. The pump cannot write a model request ahead of this receipt.
-    trace.reserve_send(request, text.len(), false).await?;
+    if trace.attempt_hook.is_some() {
+        trace.reserve_send(request, text.len(), false).await?;
+    }
     trace.sent_at_ms = Some(if request.codex_wire {
         send_started_at_ms
     } else {

@@ -16,7 +16,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const REGISTRATION_MARKER: &str = "late-results-registered";
-const REBUILD_REQUIRED_MARKER: &str = "late-results-rebuild-required";
+pub const REBUILD_REQUIRED_MARKER: &str = "late-results-rebuild-required";
 
 fn sync_marker(root: &Path, name: &str) -> Result<(), String> {
     let marker = root.join(name);
@@ -80,6 +80,7 @@ pub(crate) fn remove_retained_lineage(root: &Path, lineage: &str) -> Result<(), 
     LateResultsStore {
         connection: Mutex::new(connection),
         path,
+        held_history: std::sync::atomic::AtomicBool::new(false),
     }
     .remove_lineage(lineage)
 }
@@ -162,9 +163,29 @@ pub struct RegistrationRow {
 pub struct LateResultsStore {
     connection: Mutex<Connection>,
     path: PathBuf,
+    held_history: std::sync::atomic::AtomicBool,
 }
 
 impl LateResultsStore {
+    /// Publish completeness only after all rebuilt rows have committed with synchronous FULL.
+    /// A crash before the directory sync may leave the fence present, which safely repeats
+    /// the rebuild; it must never publish a partial scan as complete.
+    pub fn finish_rebuild(&self) -> Result<(), String> {
+        self.finish_rebuild_with_sync(crate::retention::sync_dir)
+    }
+
+    fn finish_rebuild_with_sync(
+        &self,
+        sync: impl FnOnce(&Path) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let root = self.path.parent().ok_or("intake store has no state root")?;
+        match std::fs::remove_file(root.join(REBUILD_REQUIRED_MARKER)) {
+            Ok(()) => sync(root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => sync(root),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     /// Open the intake projection in `path`, creating it when absent.
     ///
     /// The caller owns rebuilding a missing projection before enabling feed intake: a store that
@@ -203,7 +224,11 @@ impl LateResultsStore {
         // process umask.
         broca_store::create_private_sqlite(&path)
             .map_err(|error| format!("create {} owner-only: {error}", path.display()))?;
+        #[cfg(test)]
+        boot_io::record(|counts| counts.opens += 1);
         let connection = Connection::open(&path).map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        boot_io::record(|counts| counts.schema_batches += 1);
         connection
             .execute_batch(
                 "PRAGMA journal_mode = DELETE;
@@ -236,13 +261,43 @@ impl LateResultsStore {
         let store = Self {
             connection: Mutex::new(connection),
             path,
+            held_history: std::sync::atomic::AtomicBool::new(false),
         };
-        store.prune_tombstoned()?;
+        // Older projections may have registrations but no withdrawal outbox yet. Backfill
+        // only those rows; ordinary roots with no registration history remain write-free.
+        let calls: Vec<_> = store
+            .prune_tombstoned()?
+            .into_iter()
+            .map(|row| row.call)
+            .collect();
+        store.register_calls(&calls)?;
         Ok(store)
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Registration and feed snapshots already needed by boot discover history without a
+    /// second marker probe or schema query. Feed rows survive registration pruning.
+    pub fn has_held_history(&self) -> bool {
+        self.held_history.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn recovery_snapshot(
+        &self,
+    ) -> Result<
+        (
+            Vec<LateResultRegistration>,
+            std::collections::BTreeSet<String>,
+        ),
+        String,
+    > {
+        let calls = self.registrations()?;
+        let mut modules: std::collections::BTreeSet<_> =
+            self.feeds()?.into_iter().map(|feed| feed.module).collect();
+        modules.extend(calls.iter().map(|call| call.module.clone()));
+        Ok((calls, modules))
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, String> {
@@ -265,6 +320,8 @@ impl LateResultsStore {
     }
 
     fn unpruned_registration_rows(&self) -> Result<Vec<RegistrationRow>, String> {
+        #[cfg(test)]
+        boot_io::record(|counts| counts.reads += 1);
         let connection = self.lock()?;
         let mut statement = connection
             .prepare(
@@ -277,14 +334,20 @@ impl LateResultsStore {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|error| error.to_string())?;
-        rows.map(|row| {
-            let (json, state) = row.map_err(|error| error.to_string())?;
-            Ok(RegistrationRow {
-                call: serde_json::from_str(&json).map_err(|error| error.to_string())?,
-                state: RegistrationState::from_str(&state),
+        let rows: Vec<_> = rows
+            .map(|row| {
+                let (json, state) = row.map_err(|error| error.to_string())?;
+                Ok(RegistrationRow {
+                    call: serde_json::from_str(&json).map_err(|error| error.to_string())?,
+                    state: RegistrationState::from_str(&state),
+                })
             })
-        })
-        .collect()
+            .collect::<Result<_, String>>()?;
+        if !rows.is_empty() {
+            self.held_history
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(rows)
     }
 
     pub fn registration(
@@ -335,6 +398,8 @@ impl LateResultsStore {
 
     /// Every feed row, in module order.
     pub fn feeds(&self) -> Result<Vec<FeedRow>, String> {
+        #[cfg(test)]
+        boot_io::record(|counts| counts.reads += 1);
         let connection = self.lock()?;
         let mut statement = connection
             .prepare(
@@ -352,20 +417,27 @@ impl LateResultsStore {
                 ))
             })
             .map_err(|error| error.to_string())?;
-        rows.map(|row| {
-            let (module, incarnation, seq, ack_owed) = row.map_err(|error| error.to_string())?;
-            Ok(FeedRow {
-                module,
-                position: incarnation
-                    .zip(seq)
-                    .map(|(provider_incarnation, seq)| FeedPosition {
-                        provider_incarnation,
-                        seq: seq as u64,
+        let rows: Vec<_> = rows
+            .map(|row| {
+                let (module, incarnation, seq, ack_owed) =
+                    row.map_err(|error| error.to_string())?;
+                Ok(FeedRow {
+                    module,
+                    position: incarnation.zip(seq).map(|(provider_incarnation, seq)| {
+                        FeedPosition {
+                            provider_incarnation,
+                            seq: seq as u64,
+                        }
                     }),
-                ack_owed: ack_owed != 0,
+                    ack_owed: ack_owed != 0,
+                })
             })
-        })
-        .collect()
+            .collect::<Result<_, String>>()?;
+        if !rows.is_empty() {
+            self.held_history
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(rows)
     }
 
     pub fn feed(&self, module: &str) -> Result<Option<FeedRow>, String> {
@@ -520,6 +592,8 @@ impl LateResultsStore {
         let root = self.path.parent().ok_or("intake store has no state root")?;
         sync_marker(root, REGISTRATION_MARKER)?;
         let mut connection = self.lock()?;
+        #[cfg(test)]
+        boot_io::record(|counts| counts.writes += 1);
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
@@ -538,6 +612,22 @@ impl LateResultsStore {
                     "late-results key already registered to another session or scope".into(),
                 );
             }
+            // Keep the registration independently of intake pruning: a cancel seal can be
+            // durable just before a crash, before any withdrawal has been sent.
+            transaction
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS held_withdrawals (
+                module TEXT NOT NULL, call_key TEXT NOT NULL, registration TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'watching', attempts INTEGER NOT NULL DEFAULT 0,
+                detail TEXT, PRIMARY KEY (module, call_key));",
+                )
+                .map_err(|error| error.to_string())?;
+            let changed = transaction.execute("INSERT INTO held_withdrawals (module, call_key, registration) VALUES (?1, ?2, ?3)
+                ON CONFLICT (module, call_key) DO UPDATE SET registration = excluded.registration
+                WHERE held_withdrawals.registration = excluded.registration", params![call.module, call.call_key, json]).map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err("withdrawal key already registered to another session or scope".into());
+            }
             transaction
                 .execute(
                     "INSERT INTO feeds (module, ack_owed) VALUES (?1, 0)
@@ -546,7 +636,79 @@ impl LateResultsStore {
                 )
                 .map_err(|error| error.to_string())?;
         }
-        transaction.commit().map_err(|error| error.to_string())
+        transaction.commit().map_err(|error| error.to_string())?;
+        self.held_history
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    pub fn withdrawal_rows(&self) -> Result<Vec<(LateResultRegistration, String, u32)>, String> {
+        let connection = self.lock()?;
+        #[cfg(test)]
+        boot_io::record(|counts| counts.reads += 1);
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='held_withdrawals')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !exists {
+            return Ok(Vec::new());
+        }
+        #[cfg(test)]
+        boot_io::record(|counts| counts.reads += 1);
+        let mut query = connection
+            .prepare(
+                "SELECT registration, state, attempts FROM held_withdrawals WHERE state != 'done'",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = query
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u32>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            let (json, state, attempts) = row.map_err(|error| error.to_string())?;
+            Ok((
+                serde_json::from_str(&json).map_err(|error| error.to_string())?,
+                state,
+                attempts,
+            ))
+        })
+        .collect()
+    }
+
+    pub fn record_withdrawal(
+        &self,
+        call: &LateResultRegistration,
+        state: &str,
+        attempts: u32,
+        detail: &serde_json::Value,
+    ) -> Result<(), String> {
+        let changed = self.lock()?.execute("UPDATE held_withdrawals SET state=?3, attempts=?4, detail=?5 WHERE module=?1 AND call_key=?2",
+            params![call.module, call.call_key, state, attempts, detail.to_string()]).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("held withdrawal registration was removed".into());
+        }
+        Ok(())
+    }
+
+    pub fn withdrawal_failure_details(&self) -> Result<Vec<serde_json::Value>, String> {
+        let connection = self.lock()?;
+        let mut query = connection.prepare("SELECT detail FROM held_withdrawals WHERE state='failed' ORDER BY module, call_key LIMIT 10").map_err(|error| error.to_string())?;
+        let rows = query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            serde_json::from_str(&row.map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())
+        })
+        .collect()
     }
 
     /// Forget several registrations in one synced transaction. Each pair is `(module, call_key)`.
@@ -579,6 +741,16 @@ impl LateResultsStore {
         transaction
             .execute("DELETE FROM registrations WHERE lineage = ?1", [lineage])
             .map_err(|error| error.to_string())?;
+        let has_withdrawals: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='held_withdrawals')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if has_withdrawals {
+            transaction.execute("DELETE FROM held_withdrawals WHERE substr(call_key, 1, length(?1) + 1) = ?1 || ':'", [lineage]).map_err(|error| error.to_string())?;
+        }
         transaction
             .execute(
                 "DELETE FROM receipts WHERE substr(call_key, 1, length(?1) + 1) = ?1 || ':'",
@@ -588,13 +760,19 @@ impl LateResultsStore {
         transaction.commit().map_err(|error| error.to_string())
     }
 
-    /// A tombstone is durable before WAL removal. It is enough to retire intake ownership even
-    /// if deletion crashed before cleaning this projection; no session actor needs to open.
-    fn prune_tombstoned(&self) -> Result<(), String> {
+    /// A tombstone is durable before WAL removal. Reuse the surviving registration snapshot
+    /// for backfill, and inspect the outbox only after an existing registration/feed read
+    /// has proved history. An ordinary root performs no additional schema lookup.
+    pub(crate) fn prune_tombstoned(&self) -> Result<Vec<RegistrationRow>, String> {
         let root = self.path.parent().ok_or("intake store has no state root")?;
         let wal = broca_core::FileWalStore::new(root.join("wal"));
-        for row in self.unpruned_registration_rows()? {
-            let path = wal.tombstone_path(&row.call.bind, &row.call.lineage);
+        let mut rows = self.unpruned_registration_rows()?;
+        let mut calls: Vec<_> = rows.iter().map(|row| row.call.clone()).collect();
+        if self.has_held_history() {
+            calls.extend(self.withdrawal_rows()?.into_iter().map(|(call, _, _)| call));
+        }
+        for call in calls {
+            let path = wal.tombstone_path(&call.bind, &call.lineage);
             let bytes = match std::fs::read(path) {
                 Ok(bytes) => bytes,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -602,12 +780,13 @@ impl LateResultsStore {
             };
             let stone: crate::retention::Tombstone =
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-            if stone.lineage_id != row.call.lineage {
+            if stone.lineage_id != call.lineage {
                 return Err("intake retention tombstone identity mismatch".into());
             }
-            self.remove_lineage(&row.call.lineage)?;
+            self.remove_lineage(&call.lineage)?;
+            rows.retain(|row| row.call.lineage != call.lineage);
         }
-        Ok(())
+        Ok(rows)
     }
 }
 
@@ -637,6 +816,130 @@ mod tests {
 
     fn scratch(name: &str) -> PathBuf {
         broca_test_support::scratch_root().join(name)
+    }
+
+    struct NoWithdrawal;
+    #[async_trait::async_trait]
+    impl crate::held_withdrawals::WithdrawTransport for NoWithdrawal {
+        async fn withdraw(
+            &self,
+            _: &LateResultRegistration,
+        ) -> (
+            cortexkit_role_tool_provider::withdraw::WithdrawVerdict,
+            serde_json::Value,
+        ) {
+            panic!("a never-held root has no withdrawal work")
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn review_regression_dormant_boot_keeps_the_sqlite_transaction_budget() {
+        let root = scratch("dormant-boot-io");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("late-results.db");
+        drop(LateResultsStore::open(&path).unwrap());
+        boot_io::reset();
+        let store = std::sync::Arc::new(LateResultsStore::open(&path).unwrap());
+        let (calls, modules) = store.recovery_snapshot().unwrap();
+        assert!(calls.is_empty() && modules.is_empty());
+        let service = crate::held_withdrawals::HeldWithdrawals::new(
+            store,
+            std::sync::Arc::new(broca_core::FileWalStore::new(root.join("wal"))),
+            std::sync::Arc::new(NoWithdrawal),
+        );
+        service.bind_stopping_signal(tokio_util::sync::CancellationToken::new());
+        service.recover().await.unwrap();
+        // Fixture setup is excluded. Count SQLite connection opens and each SELECT's
+        // autocommit read-transaction boundary, not OS open/read/write syscalls.
+        assert_eq!(
+            boot_io::counts(),
+            boot_io::Counts {
+                opens: 1,
+                reads: 4,
+                writes: 0,
+                schema_batches: 1
+            }
+        );
+        assert!(!root.join(REGISTRATION_MARKER).exists());
+        assert!(!root.join(REBUILD_REQUIRED_MARKER).exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retained_feed_discovers_pruned_outbox_history_and_tombstones() {
+        let root = scratch("pruned-outbox-history");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("late-results.db");
+        let store = LateResultsStore::open(&path).unwrap();
+        let deleted = call("lineage:1");
+        store
+            .register_calls(std::slice::from_ref(&deleted))
+            .unwrap();
+        store.remove("provider", &deleted.call_key).unwrap();
+        drop(store);
+        let store = std::sync::Arc::new(LateResultsStore::open(&path).unwrap());
+        assert!(!store.has_held_history());
+        let (calls, modules) = store.recovery_snapshot().unwrap();
+        assert!(calls.is_empty());
+        assert!(modules.contains("provider"));
+        assert!(
+            store.has_held_history(),
+            "feed rows retain history when intake registrations are pruned"
+        );
+        assert_eq!(store.withdrawal_rows().unwrap().len(), 1);
+        let wal = std::sync::Arc::new(broca_core::FileWalStore::new(root.join("wal")));
+        let tombstone = wal.tombstone_path(&deleted.bind, &deleted.lineage);
+        std::fs::create_dir_all(tombstone.parent().unwrap()).unwrap();
+        std::fs::write(
+            tombstone,
+            serde_json::to_vec(&crate::retention::Tombstone {
+                lineage_id: deleted.lineage,
+                expired_at_ms: 1,
+                seq: 1,
+                completed_at_ms: None,
+                next_tag: None,
+                next_notice_seq: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let service = crate::held_withdrawals::HeldWithdrawals::new(
+            store.clone(),
+            wal,
+            std::sync::Arc::new(NoWithdrawal),
+        );
+        service.bind_stopping_signal(tokio_util::sync::CancellationToken::new());
+        service.recover().await.unwrap();
+        assert!(
+            store.withdrawal_rows().unwrap().is_empty(),
+            "expired calls are pruned before recovery reads any WAL or sends a withdrawal"
+        );
+    }
+
+    #[test]
+    fn review_regression_unlink_sync_failure_retries_the_directory_barrier() {
+        let root = scratch("unlink-sync-retry");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = LateResultsStore::open(&root.join("late-results.db")).unwrap();
+        std::fs::write(root.join(REBUILD_REQUIRED_MARKER), b"").unwrap();
+        let calls = std::cell::Cell::new(0);
+        assert!(store
+            .finish_rebuild_with_sync(|_| {
+                calls.set(calls.get() + 1);
+                Err("injected directory sync failure".into())
+            })
+            .is_err());
+        assert!(!root.join(REBUILD_REQUIRED_MARKER).exists());
+        store
+            .finish_rebuild_with_sync(|_| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            calls.get(),
+            2,
+            "an absent marker does not prove its unlink was synced"
+        );
     }
 
     fn intake_key(event: &str) -> IntakeKey {
@@ -891,5 +1194,30 @@ mod tests {
         );
         assert_eq!(reopened.receipt(&key).unwrap(), None);
         assert!(reopened.feed("provider").unwrap().unwrap().ack_owed);
+    }
+}
+
+#[cfg(test)]
+mod boot_io {
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Counts {
+        pub opens: usize,
+        pub reads: usize,
+        pub writes: usize,
+        pub schema_batches: usize,
+    }
+    thread_local! { static COUNTS: std::cell::Cell<Counts> = const { std::cell::Cell::new(Counts { opens: 0, reads: 0, writes: 0, schema_batches: 0 }) }; }
+    pub fn record(update: impl FnOnce(&mut Counts)) {
+        COUNTS.with(|counts| {
+            let mut value = counts.get();
+            update(&mut value);
+            counts.set(value);
+        });
+    }
+    pub fn reset() {
+        COUNTS.with(|counts| counts.set(Counts::default()));
+    }
+    pub fn counts() -> Counts {
+        COUNTS.with(std::cell::Cell::get)
     }
 }

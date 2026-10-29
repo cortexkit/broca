@@ -1,0 +1,8 @@
+[
+  {"family":"anthropic_messages","model":"claude-haiku-5-5","credential":"oauth:anthropic"},
+  {"family":"openai_responses","model":"gpt-6-luna","credential":"apikey:openai"},
+  {"family":"openai_responses_chatgpt","model":"gpt-6-luna","credential":"chatgpt:openai"},
+  {"family":"openai_chat","model":"gpt-6-luna","credential":"apikey:openai"},
+  {"family":"gemini","model":"gemini-3.8-flash","credential":"apikey:google"},
+  {"family":"google_codeassist","model":"gemini-3.8-flash-medium","credential":"antigravity:google"}
+]
