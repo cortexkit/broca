@@ -86,6 +86,9 @@ const ACCEPTED: &[[&str; 2]] = &[
     // 21-byte little-endian offsets and flags, and the same Frame::build implementation.
     // The new framed_body helper is not used by replay.
     ["0.32.4", "0.33.0"],
+    // 0.33.4: lib.rs, manifest.rs (flow_operations for flow-scopes/v1) and scope.rs only.
+    // frame.rs is byte-identical to 0.32.4 and to 0.33.0, so the replay framing is unchanged.
+    ["0.32.4", "0.33.4"],
 ];
 
 // 0.19.0 admitted 2026-09-06. The ENTIRE crate diff over the bump is `src/manifest.rs`, 208
