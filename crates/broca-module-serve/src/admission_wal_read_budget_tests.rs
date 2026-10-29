@@ -5,6 +5,30 @@ struct AdmissionWalReads {
     inner: FileWalStore,
     full: std::sync::atomic::AtomicUsize,
     ranged: std::sync::atomic::AtomicUsize,
+    identities: std::sync::atomic::AtomicUsize,
+    lengths: std::sync::atomic::AtomicUsize,
+    uploads: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WalReadObservation {
+    full: usize,
+    ranged: usize,
+    identities: usize,
+    lengths: usize,
+    uploads: usize,
+}
+
+impl AdmissionWalReads {
+    fn observe(&self) -> WalReadObservation {
+        WalReadObservation {
+            full: self.full.load(Ordering::SeqCst),
+            ranged: self.ranged.load(Ordering::SeqCst),
+            identities: self.identities.load(Ordering::SeqCst),
+            lengths: self.lengths.load(Ordering::SeqCst),
+            uploads: self.uploads.load(Ordering::SeqCst),
+        }
+    }
 }
 
 impl ExecutorWalStore for AdmissionWalReads {
@@ -15,12 +39,15 @@ impl ExecutorWalStore for AdmissionWalReads {
 
 impl WalStore for AdmissionWalReads {
     fn uploads(&self) -> Option<broca_core::media_uploads::Uploads> {
+        self.uploads.fetch_add(1, Ordering::SeqCst);
         self.inner.uploads()
     }
     fn file_identity(&self, session: &BindIdentity) -> Result<Option<u64>, broca_wal::WalError> {
+        self.identities.fetch_add(1, Ordering::SeqCst);
         self.inner.file_identity(session)
     }
     fn live_wal_bytes(&self, session: &BindIdentity) -> Result<Option<u64>, broca_wal::WalError> {
+        self.lengths.fetch_add(1, Ordering::SeqCst);
         self.inner.live_wal_bytes(session)
     }
     fn read_records_range_from_valid_anchor(
@@ -62,15 +89,17 @@ impl WalStore for AdmissionWalReads {
     }
 }
 
-#[tokio::test]
-async fn media_free_sparse_resume_keeps_master_request_bytes_and_zero_extra_wal_reads() {
-    let root = fresh_vault_root("media-free-sparse-resume");
+async fn assert_media_free_sparse_resume_legacy_render_and_decode(with_tools: bool) {
+    let root = fresh_vault_root(&format!("media-free-sparse-resume-tools-{with_tools}"));
     let (stand_in, subc_server) = stand_in_executor(&root).await;
     let http = resume_http_fixture().await;
     let store = Arc::new(AdmissionWalReads {
         inner: FileWalStore::new(root.join("wal")),
         full: Default::default(),
         ranged: Default::default(),
+        identities: Default::default(),
+        lengths: Default::default(),
+        uploads: Default::default(),
     });
     let materialized = stand_in.session_store.clone();
     let executor = LiveLoopExecutor::new(
@@ -81,6 +110,9 @@ async fn media_free_sparse_resume_keeps_master_request_bytes_and_zero_extra_wal_
     );
     let mut req = drift_request(&root);
     req.model = broca_protocol::ModelHandle::new("openai", "gpt-test");
+    if with_tools {
+        req.tools = vec![a_tool()];
+    }
     req.input = vec![broca_protocol::Message::new(
         broca_protocol::Role::User,
         vec![broca_protocol::ContentBlock::Text {
@@ -119,8 +151,8 @@ async fn media_free_sparse_resume_keeps_master_request_bytes_and_zero_extra_wal_
     for record in &records {
         wal.append(1, record, true).unwrap();
     }
+    let before_setup = store.observe();
     let prefix = store
-        .inner
         .read_records_range(&req.session, 0, Some(4), None)
         .unwrap();
     broca_core::Persister::project_range(materialized.as_ref(), &req.session, &prefix).unwrap();
@@ -137,8 +169,19 @@ async fn media_free_sparse_resume_keeps_master_request_bytes_and_zero_extra_wal_
         broca_module_serve::wal_render::render_step(&records, &config, &req.run_id.0, 1).unwrap();
     req.input.clear();
     let writer = Arc::new(broca_core::WalHandle::spawn(wal, 1).unwrap());
-    store.full.store(0, Ordering::SeqCst);
-    store.ranged.store(0, Ordering::SeqCst);
+    broca_core::run::seed_display_placement(
+        &writer,
+        &snapshot,
+        store.as_ref(),
+        Some(materialized.as_ref()),
+        &req.session,
+    );
+    let after_setup = store.observe();
+    assert_eq!(
+        after_setup.ranged - before_setup.ranged,
+        2,
+        "projection and admission snapshot setup each read a suffix"
+    );
     let (out, _events) = mpsc::channel(128);
     let summary = tokio::time::timeout(
         Duration::from_secs(15),
@@ -163,16 +206,31 @@ async fn media_free_sparse_resume_keeps_master_request_bytes_and_zero_extra_wal_
     .unwrap()
     .unwrap();
     assert_eq!(summary.reason, RunFinishReason::Completed);
+    let after_resume = store.observe();
+    println!("tools={with_tools}: before_setup={before_setup:?}, after_setup={after_setup:?}, after_resume={after_resume:?}");
     assert_eq!(
-        store.full.load(Ordering::SeqCst),
+        after_resume.full - after_setup.full,
         0,
         "a media-free sparse resume adds no prefix decode"
     );
     // The completed step is materialized by one tail read in the media-free executor too.
     assert_eq!(
-        store.ranged.load(Ordering::SeqCst),
+        after_resume.ranged - after_setup.ranged,
         1,
         "only the ordinary final materialization tail read is allowed"
+    );
+    let eager_media_setup = usize::from(cfg!(feature = "test-attachments") && with_tools);
+    assert_eq!(
+        after_resume.identities - after_setup.identities,
+        eager_media_setup
+    );
+    assert_eq!(
+        after_resume.lengths - after_setup.lengths,
+        eager_media_setup
+    );
+    assert_eq!(
+        after_resume.uploads - after_setup.uploads,
+        usize::from(cfg!(feature = "test-attachments"))
     );
     {
         let requests = http.requests.lock().unwrap();
@@ -188,6 +246,16 @@ async fn media_free_sparse_resume_keeps_master_request_bytes_and_zero_extra_wal_
 }
 
 #[tokio::test]
+async fn media_free_sparse_resume_matches_legacy_render_without_executor_prefix_decode() {
+    assert_media_free_sparse_resume_legacy_render_and_decode(false).await;
+}
+
+#[tokio::test]
+async fn media_free_tools_enabled_setup_and_resume_count_wal_and_metadata_access() {
+    assert_media_free_sparse_resume_legacy_render_and_decode(true).await;
+}
+
+#[tokio::test]
 async fn fresh_episode_admission_does_not_add_a_full_wal_read() {
     let root = fresh_vault_root("fresh-admission-read-budget");
     let (stand_in, server) = stand_in_executor(&root).await;
@@ -195,6 +263,9 @@ async fn fresh_episode_admission_does_not_add_a_full_wal_read() {
         inner: FileWalStore::new(root.join("wal")),
         full: Default::default(),
         ranged: Default::default(),
+        identities: Default::default(),
+        lengths: Default::default(),
+        uploads: Default::default(),
     });
     let executor = Arc::new(LiveLoopExecutor::new(
         store.clone(),

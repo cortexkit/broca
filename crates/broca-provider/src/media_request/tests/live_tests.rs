@@ -130,7 +130,7 @@ fn frozen(id: WireFamilyId) -> crate::wire::FrozenRenderConfig {
     frozen
 }
 
-fn assert_media_free_bytes_and_zero_tail_reads(id: WireFamilyId) {
+fn assert_media_free_legacy_render_parity_without_tail_requests(id: WireFamilyId) {
     let fixture = Fixture::new();
     let reads = Arc::new(Mutex::new(0));
     let count = reads.clone();
@@ -172,30 +172,36 @@ macro_rules! media_free_family {
     ($test:ident, $family:ident) => {
         #[test]
         fn $test() {
-            assert_media_free_bytes_and_zero_tail_reads(WireFamilyId::$family);
+            assert_media_free_legacy_render_parity_without_tail_requests(WireFamilyId::$family);
         }
     };
 }
 media_free_family!(
-    live_media_free_anthropic_bytes_and_zero_reads,
+    live_media_free_anthropic_legacy_render_parity_without_tail_requests,
     AnthropicMessages
 );
 media_free_family!(
-    live_media_free_bedrock_bytes_and_zero_reads,
+    live_media_free_bedrock_legacy_render_parity_without_tail_requests,
     BedrockConverse
 );
-media_free_family!(live_media_free_openai_chat_bytes_and_zero_reads, OpenAiChat);
 media_free_family!(
-    live_media_free_openai_responses_bytes_and_zero_reads,
+    live_media_free_openai_chat_legacy_render_parity_without_tail_requests,
+    OpenAiChat
+);
+media_free_family!(
+    live_media_free_openai_responses_legacy_render_parity_without_tail_requests,
     OpenAiResponses
 );
 media_free_family!(
-    live_media_free_chatgpt_bytes_and_zero_reads,
+    live_media_free_chatgpt_legacy_render_parity_without_tail_requests,
     OpenAiResponsesChatgpt
 );
-media_free_family!(live_media_free_gemini_bytes_and_zero_reads, Gemini);
 media_free_family!(
-    live_media_free_codeassist_bytes_and_zero_reads,
+    live_media_free_gemini_legacy_render_parity_without_tail_requests,
+    Gemini
+);
+media_free_family!(
+    live_media_free_codeassist_legacy_render_parity_without_tail_requests,
     GoogleCodeAssist
 );
 
