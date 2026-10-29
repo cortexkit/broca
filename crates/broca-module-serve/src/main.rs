@@ -334,6 +334,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| ServeIoError(format!("late-results consumer connect: {e}")))?,
     );
     let held_resumer = Arc::new(broca_module_serve::held_runtime::LateBoundResumer::default());
+    let held_routes = Arc::new(broca_module_serve::held_runtime::FeedRoutes::new(
+        Arc::clone(&feed_conn),
+        broca_module::late_results_puller::LateResultsIntake::feed_identity(&state_root),
+    ));
     let held_runtime = broca_module_serve::held_runtime::HeldRuntime::build(
         &state_root,
         wal_store.clone(),
@@ -341,13 +345,12 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             .consumer_module_id()
             .map(str::to_owned)
             .unwrap_or_default(),
-        Arc::new(broca_module_serve::held_runtime::FeedRoutes::new(
-            Arc::clone(&feed_conn),
-            broca_module::late_results_puller::LateResultsIntake::feed_identity(&state_root),
-        )),
+        held_routes.clone(),
+        held_routes,
         held_resumer.clone(),
     )
     .map_err(|e| ServeIoError(format!("open late-results store: {e}")))?;
+    held_runtime.publish_for_health();
     let plane =
         plane.with_provider_held_support(held_runtime.store.clone(), held_runtime.slots.clone());
     #[cfg(debug_assertions)]

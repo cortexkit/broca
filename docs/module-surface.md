@@ -1433,10 +1433,22 @@ start. A registration is pruned once its call's terminal and batch commit are du
 At boot tombstoned lineages are pruned from the intake without opening an actor. Every remaining
 session with a registration is opened so its open-time recovery runs, then each
 module that still needs its feed gets its puller. A missing or unreadable `late-results.db` is
-rebuilt off the startup path by scanning the live WALs, decoding only those holding a
-provider-held frame; until that scan completes no entry is delivered or acked. A state root
-whose WAL feature floor never named `provider-held/v1` holds no such frame, so its rebuild reads
-no WAL at all.
+rebuilt off the startup path by verifying every live WAL and every published archive member,
+including intent-only calls whose registration may precede their held reply. The rebuild
+retains each episode's original scope. Until that scan completes no entry is delivered or
+acked. Only roots with neither registration history nor a held feature floor may skip a
+rebuild scan. An existing unheld database starts no scan, reads no WAL and gains no writes;
+boot adds only a read-only probe of the rebuild fence.
+
+After a held run's cancel seal is synced, `tool.withdraw` is sent on the original provider's
+tool route with its frozen scope, under broca's carrier identity. The cancellation outcome
+does not wait for withdrawal. A private SQLite outbox retains registrations independently of
+intake pruning and records attempts and replies, so recovery retries the seal-to-send crash
+gap without reopening or dispatching the call. Transport failures and transient route refusals
+have at most three attempts across process restarts; final answers and terminal route refusals
+do not retry. Provider answers are idempotent under tool-provider 0.13.2 contract §5, including
+the ambiguous send-to-record crash gap. Planned shutdown and ordinary restart never withdraw
+an open held call. Health exposes pending/failed withdrawals and their refusal codes.
 
 Ack guarantee, narrowed: broca puts no bound of its own on a hold. A provider keeps at most
 1,000 unacked results per session and drops the oldest first; a held call whose entry was
@@ -1458,9 +1470,13 @@ marker; an unreadable store prevents deletion and counts in retention's unreadab
 health total. Before the first registration, `late-results-registered` is synced at the state
 root so losing the rebuildable database cannot erase that history. None of these guards changes
 ordinary expiry on roots that have never enabled held intake.
-Recreating a missing projection with held history leaves `late-results-rebuild-required` set;
-the current runtime cannot durably verify full-scan completion and does not clear this marker.
-Retention remains fenced pending that capability.
+Recreating a missing projection with held history leaves `late-results-rebuild-required` set.
+That fence also resumes a rebuild when a partial database exists after restart. It is removed
+and its directory synced only after a complete, stable log inventory has been verified and all
+rebuilt rows committed with SQLite synchronous FULL. An unreadable, truncated, conflicting or
+moving log keeps the fence; a crash after commit and before removal repeats the scan safely.
+Health names the fence and reports files scanned, files decoded, registrations and unreadables.
+This recovery support does not enable `held-reply/v1` declarations in release builds.
 
 ## 20. Persistence + storage
 

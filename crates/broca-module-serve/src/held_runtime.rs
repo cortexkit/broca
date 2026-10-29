@@ -14,20 +14,19 @@
 //!   cursor the provider returned, after the delivered terminal is synced.
 //! - **Boot recovery** ([`HeldRuntime::recover`]): every session with a registration is opened
 //!   so its open-time recovery runs, then a puller starts for every module that still needs its
-//!   feed. A store that is missing or unreadable is rebuilt from the live WALs first, off the
+//!   feed. A store that is missing or unreadable is rebuilt from live and archived WALs, off the
 //!   startup path; until that scan completes every pulled entry is Blocked and nothing is acked.
 //!
-//! The `held-reply/v1` route capability stays UNDECLARED in release builds:
-//! a held call cannot be cancelled or stopped yet, so no production provider may hold one. With
-//! held replies undeclared, no call carries a plain key and nothing is registered. Result-only
-//! negotiation is independent. Debug builds may declare held replies for tests (see
-//! [`declare_held_reply_for_tests`]).
+//! The `held-reply/v1` route capability stays UNDECLARED in release builds, so no production
+//! provider may hold a call. With held replies undeclared, no call carries a plain key and
+//! nothing is registered. Result-only negotiation is independent. Debug builds may declare
+//! held replies for tests (see [`declare_held_reply_for_tests`]).
 //!
 //! Known edge: a provider keeps at most 1,000 unacked results per session and drops the oldest
 //! first (contract §7). A held call whose entry was dropped that way (for example while broca was
 //! down long enough for more than 1,000 results to pile up) never receives an entry, and broca
 //! puts no bound of its own on a hold, so the run stays paused. Cancelling or stopping the run is
-//! its exit; that close-out arrives with the cancel and stop support for held calls.
+//! its exit; planned daemon shutdown instead preserves the provider's obligation.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -37,8 +36,10 @@ use std::{
 };
 
 use broca_module::held_slots::{EntryMapper, HeldRunResumer, HeldSlots, SlotDelivery};
+use broca_module::held_withdrawals::{HeldWithdrawals, WithdrawTransport};
 use broca_module::late_results_puller::{
-    rebuild_store_from_wals, FeedError, FeedReply, HeldDelivery, LateResultsFeed, LateResultsIntake,
+    rebuild_store_from_wals_with_progress, FeedError, FeedReply, HeldDelivery, LateResultsFeed,
+    LateResultsIntake, RebuildReport,
 };
 use broca_module::late_results_store::LateResultsStore;
 use broca_protocol::BindIdentity;
@@ -140,6 +141,19 @@ impl LateResultsFeed for FeedRoutes {
     }
 }
 
+#[async_trait::async_trait]
+impl WithdrawTransport for FeedRoutes {
+    async fn withdraw(
+        &self,
+        call: &broca_core::tool_plane::LateResultRegistration,
+    ) -> (
+        cortexkit_role_tool_provider::withdraw::WithdrawVerdict,
+        serde_json::Value,
+    ) {
+        broca_subc::late_results::withdraw_held_call(&self.conn, call).await
+    }
+}
+
 fn feed_error(error: broca_subc::LateResultsError) -> FeedError {
     if error.is_cursor_incarnation_changed() {
         return FeedError::CursorIncarnationChanged;
@@ -162,6 +176,49 @@ pub struct HeldRuntime {
     wal_root: PathBuf,
     /// The store was missing or unreadable when this process opened it.
     needs_rebuild: bool,
+    withdrawals: Arc<HeldWithdrawals>,
+    progress: Arc<Mutex<RebuildReport>>,
+}
+
+static HEALTH: std::sync::OnceLock<Mutex<std::sync::Weak<HeldRuntime>>> =
+    std::sync::OnceLock::new();
+
+/// Health never probes a file: boot and the rebuild worker publish the fence and progress.
+pub fn health_gauges() -> serde_json::Value {
+    let runtime = HEALTH
+        .get()
+        .and_then(|health| health.lock().ok()?.upgrade());
+    runtime.map_or_else(
+        || {
+            health_snapshot(
+                false,
+                &RebuildReport::default(),
+                serde_json::json!({"failed": 0, "pending": 0}),
+            )
+        },
+        |runtime| {
+            let progress = runtime.progress.lock().expect("rebuild progress");
+            health_snapshot(
+                runtime.intake.is_rebuilding(),
+                &progress,
+                runtime.withdrawals.health(),
+            )
+        },
+    )
+}
+
+fn health_snapshot(
+    rebuilding: bool,
+    progress: &RebuildReport,
+    withdrawals: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "rebuild_required": rebuilding,
+        "fence": if rebuilding { Some(broca_module::late_results_store::REBUILD_REQUIRED_MARKER) } else { None },
+        "scanned": progress.files, "decoded": progress.decoded,
+        "registered": progress.registered, "unreadable": progress.unreadable.len(),
+        "withdrawals": withdrawals,
+    })
 }
 
 impl HeldRuntime {
@@ -172,12 +229,15 @@ impl HeldRuntime {
         wal: Arc<broca_core::FileWalStore>,
         consumer_module: impl Into<String>,
         feed: Arc<dyn LateResultsFeed>,
+        withdraw: Arc<dyn WithdrawTransport>,
         resumer: Arc<dyn HeldRunResumer>,
     ) -> Result<Arc<Self>, String> {
         let path = state_root.join(LATE_RESULTS_DB);
         let (store, needs_rebuild) = open_or_recreate(&path)?;
         let store = Arc::new(store);
         let slots = HeldSlots::new();
+        let withdrawals = HeldWithdrawals::new(store.clone(), wal.clone(), withdraw);
+        slots.with_withdrawals(withdrawals.clone());
         let mapper: Arc<EntryMapper> = Arc::new(broca_subc::late_entry_tool_result);
         let delivery: Arc<dyn HeldDelivery> =
             Arc::new(SlotDelivery::new(Arc::clone(&slots), resumer, mapper));
@@ -207,7 +267,16 @@ impl HeldRuntime {
             store,
             wal_root,
             needs_rebuild,
+            withdrawals,
+            progress: Arc::new(Mutex::new(RebuildReport::default())),
         }))
+    }
+
+    pub fn publish_for_health(self: &Arc<Self>) {
+        *HEALTH
+            .get_or_init(Mutex::default)
+            .lock()
+            .expect("held runtime health") = Arc::downgrade(self);
     }
 
     /// Boot recovery, run off the startup path: rebuild a lost store from the live WALs, open
@@ -218,12 +287,20 @@ impl HeldRuntime {
             loop {
                 let store = Arc::clone(&self.store);
                 let root = self.wal_root.clone();
+                let progress = self.progress.clone();
                 let started = std::time::Instant::now();
-                let report =
-                    tokio::task::spawn_blocking(move || rebuild_store_from_wals(&store, &root))
-                        .await
-                        .map_err(|error| error.to_string())
-                        .and_then(|report| report);
+                let report = tokio::task::spawn_blocking(move || {
+                    let report = rebuild_store_from_wals_with_progress(&store, &root, |report| {
+                        *progress.lock().expect("rebuild progress") = report.clone();
+                    })?;
+                    if report.unreadable.is_empty() {
+                        store.finish_rebuild()?;
+                    }
+                    Ok::<_, String>(report)
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|report| report);
                 match report {
                     Ok(report) if report.unreadable.is_empty() => {
                         tracing::info!(
@@ -275,6 +352,9 @@ impl HeldRuntime {
         if opened > 0 || !failed.is_empty() {
             tracing::info!(target: "late_results", opened, failed = failed.len(), "late-results recovery opened registered sessions");
         }
+        if let Err(error) = self.withdrawals.recover().await {
+            tracing::warn!(target: "late_results", "provider-held withdrawal recovery failed: {error}");
+        }
         for module in self.modules() {
             if let Err(error) = self.intake.ensure_puller(&module) {
                 tracing::warn!(target: "late_results", module, "late-results puller did not start: {error}");
@@ -299,9 +379,17 @@ impl HeldRuntime {
 /// store that must be rebuilt from the WALs: the second value says so. An unreadable file is
 /// kept beside it for inspection rather than deleted.
 fn open_or_recreate(path: &Path) -> Result<(LateResultsStore, bool), String> {
+    open_or_recreate_with_probe(path, |marker| marker.try_exists())
+}
+
+fn open_or_recreate_with_probe(
+    path: &Path,
+    probe: impl FnOnce(&Path) -> std::io::Result<bool>,
+) -> Result<(LateResultsStore, bool), String> {
+    let fenced = rebuild_fence(path, probe);
     let existed = path.is_file();
     match LateResultsStore::open(path) {
-        Ok(store) if existed => Ok((store, false)),
+        Ok(store) if existed => Ok((store, fenced)),
         Ok(store) => Ok((store, true)),
         Err(error) => {
             let aside = path.with_extension(format!(
@@ -320,6 +408,12 @@ fn open_or_recreate(path: &Path) -> Result<(LateResultsStore, bool), String> {
             Ok((LateResultsStore::open(path)?, true))
         }
     }
+}
+
+fn rebuild_fence(path: &Path, probe: impl FnOnce(&Path) -> std::io::Result<bool>) -> bool {
+    path.parent().is_none_or(|root| {
+        probe(&root.join(broca_module::late_results_store::REBUILD_REQUIRED_MARKER)).unwrap_or(true)
+    })
 }
 
 /// The resumer the daemon delivers through: the registry, which opens the session's actor. The
@@ -341,5 +435,100 @@ impl HeldRunResumer for LateBoundResumer {
             Some(registry) => registry.resume_held_run(session).await,
             None => Err("the session registry is not running yet".into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn health_names_the_fence_and_reports_scan_progress() {
+        let report = RebuildReport {
+            files: 7,
+            decoded: 5,
+            registered: 3,
+            unreadable: vec![PathBuf::from("unreadable.wal")],
+            skipped_by_floor: false,
+        };
+        let health = health_snapshot(
+            true,
+            &report,
+            serde_json::json!({"failed": 1, "pending": 0}),
+        );
+        assert_eq!(health["fence"], "late-results-rebuild-required");
+        assert_eq!(health["rebuild_required"], true);
+        assert_eq!(health["scanned"], 7);
+        assert_eq!(health["decoded"], 5);
+        assert_eq!(health["registered"], 3);
+        assert_eq!(health["unreadable"], 1);
+        assert_eq!(health["withdrawals"]["failed"], 1);
+        assert_eq!(
+            health_snapshot(false, &report, serde_json::Value::Null)["fence"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn rebuild_fence_survives_an_existing_database_restart() {
+        let root = broca_test_support::scratch_root().join("held-runtime-fence-restart");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.as_path().join(LATE_RESULTS_DB);
+        drop(LateResultsStore::open(&path).unwrap());
+        std::fs::write(
+            root.as_path()
+                .join(broca_module::late_results_store::REBUILD_REQUIRED_MARKER),
+            b"",
+        )
+        .unwrap();
+        let (_, needs_rebuild) = open_or_recreate(&path).unwrap();
+        assert!(
+            needs_rebuild,
+            "a committed database is not proof the full scan was published"
+        );
+    }
+
+    #[test]
+    fn unheld_existing_root_only_probes_the_fence_once_and_does_not_rebuild() {
+        let root = broca_test_support::scratch_root().join("held-runtime-unheld-boot");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.as_path().join(LATE_RESULTS_DB);
+        drop(LateResultsStore::open(&path).unwrap());
+        let before = std::fs::read(&path).unwrap();
+        let probes = std::cell::Cell::new(0);
+        let (_, needs_rebuild) = open_or_recreate_with_probe(&path, |marker| {
+            probes.set(probes.get() + 1);
+            assert_eq!(
+                marker,
+                root.as_path()
+                    .join(broca_module::late_results_store::REBUILD_REQUIRED_MARKER)
+            );
+            marker.try_exists()
+        })
+        .unwrap();
+        assert_eq!(probes.get(), 1);
+        assert!(
+            !needs_rebuild,
+            "boot must not scan any WAL for an existing unheld root"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "boot adds no database writes"
+        );
+        assert!(!root
+            .as_path()
+            .join(broca_module::late_results_store::REBUILD_REQUIRED_MARKER)
+            .exists());
+        assert!(!root.as_path().join("late-results-registered").exists());
+    }
+
+    #[test]
+    fn rebuild_fence_probe_error_is_not_absence() {
+        assert!(rebuild_fence(Path::new("root/late-results.db"), |_| Err(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+        )));
     }
 }

@@ -16,7 +16,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const REGISTRATION_MARKER: &str = "late-results-registered";
-const REBUILD_REQUIRED_MARKER: &str = "late-results-rebuild-required";
+pub const REBUILD_REQUIRED_MARKER: &str = "late-results-rebuild-required";
 
 fn sync_marker(root: &Path, name: &str) -> Result<(), String> {
     let marker = root.join(name);
@@ -165,6 +165,18 @@ pub struct LateResultsStore {
 }
 
 impl LateResultsStore {
+    /// Publish completeness only after all rebuilt rows have committed with synchronous FULL.
+    /// A crash before the directory sync may leave the fence present, which safely repeats
+    /// the rebuild; it must never publish a partial scan as complete.
+    pub fn finish_rebuild(&self) -> Result<(), String> {
+        let root = self.path.parent().ok_or("intake store has no state root")?;
+        match std::fs::remove_file(root.join(REBUILD_REQUIRED_MARKER)) {
+            Ok(()) => crate::retention::sync_dir(root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     /// Open the intake projection in `path`, creating it when absent.
     ///
     /// The caller owns rebuilding a missing projection before enabling feed intake: a store that
@@ -238,6 +250,14 @@ impl LateResultsStore {
             path,
         };
         store.prune_tombstoned()?;
+        // Older projections may have registrations but no withdrawal outbox yet. Backfill
+        // only those rows; ordinary roots with no registration history remain write-free.
+        let calls: Vec<_> = store
+            .unpruned_registration_rows()?
+            .into_iter()
+            .map(|row| row.call)
+            .collect();
+        store.register_calls(&calls)?;
         Ok(store)
     }
 
@@ -538,6 +558,22 @@ impl LateResultsStore {
                     "late-results key already registered to another session or scope".into(),
                 );
             }
+            // Keep the registration independently of intake pruning: a cancel seal can be
+            // durable just before a crash, before any withdrawal has been sent.
+            transaction
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS held_withdrawals (
+                module TEXT NOT NULL, call_key TEXT NOT NULL, registration TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'watching', attempts INTEGER NOT NULL DEFAULT 0,
+                detail TEXT, PRIMARY KEY (module, call_key));",
+                )
+                .map_err(|error| error.to_string())?;
+            let changed = transaction.execute("INSERT INTO held_withdrawals (module, call_key, registration) VALUES (?1, ?2, ?3)
+                ON CONFLICT (module, call_key) DO UPDATE SET registration = excluded.registration
+                WHERE held_withdrawals.registration = excluded.registration", params![call.module, call.call_key, json]).map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err("withdrawal key already registered to another session or scope".into());
+            }
             transaction
                 .execute(
                     "INSERT INTO feeds (module, ack_owed) VALUES (?1, 0)
@@ -547,6 +583,71 @@ impl LateResultsStore {
                 .map_err(|error| error.to_string())?;
         }
         transaction.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn withdrawal_rows(&self) -> Result<Vec<(LateResultRegistration, String, u32)>, String> {
+        let connection = self.lock()?;
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='held_withdrawals')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !exists {
+            return Ok(Vec::new());
+        }
+        let mut query = connection
+            .prepare(
+                "SELECT registration, state, attempts FROM held_withdrawals WHERE state != 'done'",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = query
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u32>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            let (json, state, attempts) = row.map_err(|error| error.to_string())?;
+            Ok((
+                serde_json::from_str(&json).map_err(|error| error.to_string())?,
+                state,
+                attempts,
+            ))
+        })
+        .collect()
+    }
+
+    pub fn record_withdrawal(
+        &self,
+        call: &LateResultRegistration,
+        state: &str,
+        attempts: u32,
+        detail: &serde_json::Value,
+    ) -> Result<(), String> {
+        let changed = self.lock()?.execute("UPDATE held_withdrawals SET state=?3, attempts=?4, detail=?5 WHERE module=?1 AND call_key=?2",
+            params![call.module, call.call_key, state, attempts, detail.to_string()]).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("held withdrawal registration was removed".into());
+        }
+        Ok(())
+    }
+
+    pub fn withdrawal_failure_details(&self) -> Result<Vec<serde_json::Value>, String> {
+        let connection = self.lock()?;
+        let mut query = connection.prepare("SELECT detail FROM held_withdrawals WHERE state='failed' ORDER BY module, call_key LIMIT 10").map_err(|error| error.to_string())?;
+        let rows = query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            serde_json::from_str(&row.map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())
+        })
+        .collect()
     }
 
     /// Forget several registrations in one synced transaction. Each pair is `(module, call_key)`.
@@ -579,6 +680,16 @@ impl LateResultsStore {
         transaction
             .execute("DELETE FROM registrations WHERE lineage = ?1", [lineage])
             .map_err(|error| error.to_string())?;
+        let has_withdrawals: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='held_withdrawals')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if has_withdrawals {
+            transaction.execute("DELETE FROM held_withdrawals WHERE substr(call_key, 1, length(?1) + 1) = ?1 || ':'", [lineage]).map_err(|error| error.to_string())?;
+        }
         transaction
             .execute(
                 "DELETE FROM receipts WHERE substr(call_key, 1, length(?1) + 1) = ?1 || ':'",
@@ -593,8 +704,14 @@ impl LateResultsStore {
     fn prune_tombstoned(&self) -> Result<(), String> {
         let root = self.path.parent().ok_or("intake store has no state root")?;
         let wal = broca_core::FileWalStore::new(root.join("wal"));
-        for row in self.unpruned_registration_rows()? {
-            let path = wal.tombstone_path(&row.call.bind, &row.call.lineage);
+        let mut calls: Vec<_> = self
+            .unpruned_registration_rows()?
+            .into_iter()
+            .map(|row| row.call)
+            .collect();
+        calls.extend(self.withdrawal_rows()?.into_iter().map(|(call, _, _)| call));
+        for call in calls {
+            let path = wal.tombstone_path(&call.bind, &call.lineage);
             let bytes = match std::fs::read(path) {
                 Ok(bytes) => bytes,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -602,10 +719,10 @@ impl LateResultsStore {
             };
             let stone: crate::retention::Tombstone =
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-            if stone.lineage_id != row.call.lineage {
+            if stone.lineage_id != call.lineage {
                 return Err("intake retention tombstone identity mismatch".into());
             }
-            self.remove_lineage(&row.call.lineage)?;
+            self.remove_lineage(&call.lineage)?;
         }
         Ok(())
     }
