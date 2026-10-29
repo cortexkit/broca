@@ -67,7 +67,7 @@ pub(crate) fn warm_journal(
     run_id: &RunId,
     ttl_ms: Option<u64>,
     trigger: Option<String>,
-) -> Option<Arc<dyn broca_core::run::AttemptHook>> {
+) -> Option<Arc<broca_core::cache_warm::WarmJournal>> {
     if !writer.is_overhaul() {
         return None;
     }
@@ -183,6 +183,13 @@ impl KeepWarmDriver for AutomaticWarmer {
             self.costs(config).map(|costs| costs.warm)
         }
     }
+    fn failed_cost(
+        &self,
+        config: &RunConfig,
+        envelope: &broca_wal::record::AttemptEnvelope,
+    ) -> Result<f64, String> {
+        self.executor.failed_warm_cost(config, envelope)
+    }
     async fn warm(&self, config: &RunConfig, run_id: &RunId) -> WarmTick {
         if let Err(error) = self.writer.check_move() {
             let (reason, detail) = match error.into_move_refusal() {
@@ -248,28 +255,60 @@ impl KeepWarmDriver for AutomaticWarmer {
             base,
             attempt_hook: None,
         };
-        job.attempt_hook = warm_journal(
-            self.writer.clone(),
-            self.seal.clone(),
-            &job,
-            run_id,
-            Some(timing.ttl_ms),
-            Some("keep_warm".into()),
-        );
+        let journal = if self.writer.is_overhaul() {
+            warm_journal(
+                self.writer.clone(),
+                self.seal.clone(),
+                &job,
+                run_id,
+                Some(timing.ttl_ms),
+                Some("keep_warm".into()),
+            )
+        } else {
+            None
+        };
+        job.attempt_hook = journal
+            .as_ref()
+            .map(|journal| journal.clone() as Arc<dyn broca_core::run::AttemptHook>);
+        let success_estimate = journal
+            .as_ref()
+            .map(|_| self.costs(config).map(|c| c.warm).unwrap_or(f64::INFINITY));
+        let failed_cost = || {
+            journal
+                .as_ref()
+                .map(|j| {
+                    j.failed_attempts()
+                        .iter()
+                        .map(|envelope| self.failed_cost(config, envelope).unwrap_or(f64::INFINITY))
+                        .sum()
+                })
+                .unwrap_or(0.0)
+        };
+        let failed_tick = |reason: String, detail: Option<String>| {
+            if journal.is_some() {
+                WarmTick::StopWithCost {
+                    reason,
+                    detail,
+                    cost: failed_cost(),
+                }
+            } else {
+                WarmTick::Stop { reason, detail }
+            }
+        };
         let sent = match self.executor.warm(job).await {
             Ok(sent) => sent,
             Err(crate::executor::WarmError::Provider(error))
                 if error.provider_code.as_deref()
                     == Some(broca_protocol::error::ACCOUNT_LIMIT_EXHAUSTED) =>
             {
-                return WarmTick::Stop {
-                    reason: "quota".into(),
-                    detail: Some(if self.retention {
+                return failed_tick(
+                    "quota".into(),
+                    Some(if self.retention {
                         "Provider".into()
                     } else {
                         broca_protocol::error::ACCOUNT_LIMIT_EXHAUSTED.into()
                     }),
-                };
+                );
             }
             Err(error) => {
                 let detail = if self.retention {
@@ -277,10 +316,7 @@ impl KeepWarmDriver for AutomaticWarmer {
                 } else {
                     format!("{error:?}")
                 };
-                return WarmTick::Stop {
-                    reason: "unsupported".into(),
-                    detail: Some(detail),
-                };
+                return failed_tick("unsupported".into(), Some(detail));
             }
         };
         // Queue the provider's returned usage in CacheWarmed before awaiting disk sync.
@@ -331,10 +367,15 @@ impl KeepWarmDriver for AutomaticWarmer {
                 });
             WarmTick::ResponsesSent {
                 usage: sent.usage,
-                cost,
+                cost: cost + failed_cost(),
             }
         } else {
-            WarmTick::Sent
+            match success_estimate {
+                Some(cost) => WarmTick::SentWithCost {
+                    cost: cost + failed_cost(),
+                },
+                None => WarmTick::Sent,
+            }
         }
     }
 }
@@ -349,6 +390,274 @@ fn epoch_ms() -> u64 {
 mod retention_tests {
     use super::*;
     use broca_core::WalStore;
+
+    struct BudgetWarm {
+        attempts: Mutex<Vec<broca_wal::record::AttemptEnvelope>>,
+    }
+    #[async_trait::async_trait]
+    impl RunExecutor for BudgetWarm {
+        async fn execute(
+            &self,
+            _: crate::executor::RunJob,
+            _: tokio::sync::mpsc::Sender<broca_core::OutputEvent>,
+        ) -> Result<broca_core::RunSummary, broca_core::RunError> {
+            unreachable!()
+        }
+        fn warm_costs(
+            &self,
+            _: &RunConfig,
+            _: u64,
+            _: u64,
+        ) -> Result<broca_core::keep_warm::WarmCosts, String> {
+            Ok(broca_core::keep_warm::WarmCosts {
+                warm: 10.0,
+                bust: 100.0,
+            })
+        }
+        fn failed_warm_cost(
+            &self,
+            _: &RunConfig,
+            e: &broca_wal::record::AttemptEnvelope,
+        ) -> Result<f64, String> {
+            Ok(e.usage.and_then(|u| u.input_tokens).unwrap_or(0) as f64 * 2.0)
+        }
+        async fn warm(
+            &self,
+            job: WarmJob,
+        ) -> Result<broca_core::WarmSent, crate::executor::WarmError> {
+            let hook = job
+                .attempt_hook
+                .expect("overhaul warm must install the journal");
+            let attempts = std::mem::take(&mut *self.attempts.lock().unwrap());
+            let mut answer = None;
+            for (index, e) in attempts.into_iter().enumerate() {
+                let id = hook
+                    .before_send(
+                        broca_core::run::PhysicalSend {
+                            attempt: index as u32,
+                            send_index: index as u32 + 1,
+                            endpoint_host: "example.com".into(),
+                            model_sent: "m".into(),
+                            request_body_bytes: 100,
+                            compressed: index == 0,
+                            account_ref: None,
+                            speed_requested: None,
+                        },
+                        Default::default(),
+                    )
+                    .await
+                    .map_err(|e| crate::executor::WarmError::Provider(Box::new(e)))?;
+                let sent =
+                    (e.outcome == broca_wal::record::BillingAttemptOutcome::Complete).then(|| {
+                        broca_core::WarmSent {
+                            warm_body_sha256: "warm".into(),
+                            sent_at_ms: epoch_ms(),
+                            usage: e.usage.unwrap_or_default(),
+                            served_account_ref: None,
+                            ratelimit_headers: vec![],
+                            http_status: 200,
+                        }
+                    });
+                hook.warm_finished(id, e, sent.clone(), "warm".into())
+                    .await
+                    .map_err(|e| crate::executor::WarmError::Provider(Box::new(e)))?;
+                answer = sent;
+            }
+            answer.ok_or_else(|| {
+                crate::executor::WarmError::Provider(Box::new(
+                    serde_json::from_value(
+                        serde_json::json!({"class":"transient", "message":"warm failed"}),
+                    )
+                    .unwrap(),
+                ))
+            })
+        }
+    }
+
+    async fn restart_budget_case(
+        outcome: broca_wal::record::BillingAttemptOutcome,
+        usage: Option<u64>,
+        resend: bool,
+        expected: f64,
+    ) {
+        use broca_wal::record::{AttemptEnvelope, AttemptSent, BillingAttemptOutcome as Outcome};
+        let root = broca_test_support::scratch_root().join(format!(
+            "warm-budget-{}",
+            broca_core::attempt_id::mint_attempt_id().unwrap().as_str()
+        ));
+        let store = Arc::new(broca_core::FileWalStore::with_config(
+            root.join("wal"),
+            broca_wal::WalConfig::OVERHAUL,
+        ));
+        let key = BindIdentity::new("/p", "runner", "budget");
+        let tenure = broca_core::lease::WalLeaseDomain::new(root.join("leases"))
+            .acquire(&key)
+            .unwrap();
+        let writer = Arc::new(
+            WalHandle::open_and_spawn_owned(store.clone(), key.clone(), tenure, None)
+                .await
+                .unwrap(),
+        );
+        let mut attempts = vec![AttemptEnvelope {
+            sent: if outcome == Outcome::ConnectFailed {
+                AttemptSent::No
+            } else {
+                AttemptSent::Yes
+            },
+            http_status: if outcome == Outcome::ConnectFailed {
+                None
+            } else {
+                Some(415)
+            },
+            outcome,
+            usage: usage.map(|n| broca_protocol::Usage {
+                input_tokens: Some(n),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        if resend {
+            attempts.push(AttemptEnvelope {
+                sent: AttemptSent::Yes,
+                http_status: Some(200),
+                outcome: Outcome::Complete,
+                usage: Some(broca_protocol::Usage {
+                    cached_input_tokens: Some(1000),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        let WalRecord::RunStarted { config, .. } = crate::move_install::tests::started(&key, "r")
+        else {
+            unreachable!()
+        };
+        let clock = CacheClock::default();
+        let now = epoch_ms();
+        clock.note_sent(now, Some(600_000));
+        clock.note_usage(
+            now,
+            broca_protocol::Usage {
+                cached_input_tokens: Some(1000),
+                ..Default::default()
+            },
+        );
+        let warmer = AutomaticWarmer {
+            retention: false,
+            session: key.clone(),
+            writer: writer.clone(),
+            executor: Arc::new(BudgetWarm {
+                attempts: Mutex::new(attempts),
+            }),
+            clock,
+            seal: ShutdownSeal::new(),
+            slot: WarmSlot::default(),
+            declare: Arc::new(|_| {
+                Some(crate::cache::CacheDeclaration {
+                    ttl_ms: Some(600_000),
+                    ttl_options_ms: vec![],
+                    read_refreshes_ttl: Some(true),
+                    warm: Ok(()),
+                    basis: None,
+                })
+            }),
+            recorded: Mutex::new(Some(RecordedRequest {
+                run_id: RunId("r".into()),
+                step_id: broca_protocol::StepId(1),
+                config: *config.clone(),
+                opts: broca_protocol::CallOptions::new(vec![]),
+                request_body_sha256: "base".into(),
+                route: None,
+            })),
+        };
+        let run_id = RunId("r".into());
+        let tick = warmer.warm(&config, &run_id).await;
+        let live = match tick {
+            WarmTick::SentWithCost { cost } | WarmTick::StopWithCost { cost, .. } => cost,
+            _ => panic!("live warm must expose its budget charge"),
+        };
+        assert_eq!(live, expected);
+        let driver: Arc<dyn KeepWarmDriver> = Arc::new(warmer);
+        let unsupported = AtomicBool::new(false);
+        let missed = AtomicBool::new(false);
+        let wait = broca_core::keep_warm_wait::WarmWait {
+            driver: &driver,
+            config: &config,
+            run_id: &run_id,
+            cancel: None,
+            unsupported_logged: &unsupported,
+            warm_missed: &missed,
+        };
+        let frames = store.read_records(&key).unwrap();
+        assert_eq!(
+            broca_core::keep_warm_wait::batch_spend(
+                Some(&wait),
+                broca_protocol::StepId(1),
+                &frames
+            ),
+            expected
+        );
+        drop(driver);
+        Arc::try_unwrap(writer)
+            .ok()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_after_connect_failed_matches_live_warm_spend() {
+        restart_budget_case(
+            broca_wal::record::BillingAttemptOutcome::ConnectFailed,
+            None,
+            false,
+            0.0,
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn restart_after_http_refusal_matches_live_warm_spend() {
+        restart_budget_case(
+            broca_wal::record::BillingAttemptOutcome::HttpError,
+            None,
+            false,
+            0.0,
+        )
+        .await;
+        restart_budget_case(
+            broca_wal::record::BillingAttemptOutcome::HttpError,
+            Some(0),
+            false,
+            0.0,
+        )
+        .await;
+        restart_budget_case(
+            broca_wal::record::BillingAttemptOutcome::HttpError,
+            Some(3),
+            false,
+            6.0,
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn restart_after_compression_refusal_matches_live_warm_spend() {
+        restart_budget_case(
+            broca_wal::record::BillingAttemptOutcome::CompressionRefused,
+            None,
+            true,
+            10.0,
+        )
+        .await;
+        restart_budget_case(
+            broca_wal::record::BillingAttemptOutcome::CompressionRefused,
+            Some(2),
+            true,
+            14.0,
+        )
+        .await;
+    }
 
     struct FailingWarm;
     #[async_trait::async_trait]

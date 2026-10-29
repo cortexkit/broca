@@ -503,11 +503,13 @@ what it cost.
   its own export fact marked `warm: true`, priced from its own usage, whose id is taken over the
   record's WAL sequence so the run's ordinary facts keep their ids. Absent usage stays absent.
   On opted-in `broca-state/2` roots, every physical warm send is durably reserved before sending
-  and gets a `cache_warmed` terminal with its reservation and outcome envelope even when it fails;
+  and normally gets a `cache_warmed` terminal with its reservation and outcome envelope even
+  when it fails;
   those records require the `bill-attempts/v1` WAL feature. A compression refusal and
   uncompressed resend are separate attempts. The billing envelope distinguishes a failed send
   from a cache refresh. A failed warm never refreshes cache expiry on any root. If a crash loses
-  the outcome, reclaim lets the billing reader report the reserved attempt as possibly billed,
+  the outcome or a full WAL refuses its terminal, reclaim lets the billing reader report the
+  reserved attempt as possibly billed,
   without inventing usage, deduplicated by its random `attempt_id`.
 - **Head and declaration.** `session.head.cache` reports the clock from memory, with no WAL
   scan. The admitting send's `baseline` and `session.baseline` carry `cache {ttl_ms,

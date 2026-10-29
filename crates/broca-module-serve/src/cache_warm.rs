@@ -101,6 +101,119 @@ pub fn responses_warm_cost(
     .map_err(|error| error.to_string())
 }
 
+/// Charge failed warm attempts only for token counts the provider actually reported.
+/// Missing usage is never priced using the successful cache-refresh estimate, and an unsent
+/// attempt costs no warm budget.
+pub fn failed_warm_cost(
+    config: &broca_wal::RunConfig,
+    envelope: &broca_wal::record::AttemptEnvelope,
+) -> Result<f64, String> {
+    if !broca_core::cache_warm::warm_budget_needs_pricing(envelope) {
+        return Ok(0.0);
+    }
+    let catalog =
+        broca_catalog::runtime::catalog().map_err(|e| format!("pricing_unavailable: {e}"))?;
+    let schedule = catalog
+        .warm_cost_schedule(&config.model.provider_module_id, &config.model.model_id)
+        .ok_or("pricing_unavailable: model")?;
+    let (method, _) = frozen_credential(config).ok_or("pricing_unavailable: auth_method")?;
+    failed_cost_from_schedule(
+        &schedule,
+        envelope,
+        matches!(
+            method,
+            crate::auth_routing::AuthMethod::Oauth | crate::auth_routing::AuthMethod::Chatgpt
+        ),
+    )
+}
+
+fn failed_cost_from_schedule(
+    schedule: &broca_provider::spec::CostSchedule,
+    envelope: &broca_wal::record::AttemptEnvelope,
+    subscription: bool,
+) -> Result<f64, String> {
+    let Some(usage) = envelope
+        .usage
+        .filter(|_| envelope.sent != broca_wal::record::AttemptSent::No)
+    else {
+        return Ok(0.0);
+    };
+    let one_hour = envelope.cache_write_1h_tokens.unwrap_or(0);
+    let writes = usage.cache_write_tokens;
+    if writes.is_some_and(|writes| {
+        one_hour > writes
+            || envelope
+                .cache_write_5m_tokens
+                .is_some_and(|five| five > writes.saturating_sub(one_hour))
+            || envelope
+                .cache_write_5m_tokens
+                .zip(envelope.cache_write_1h_tokens)
+                .is_some_and(|(five, hour)| five.checked_add(hour) != Some(writes))
+    }) {
+        return Err("pricing_unavailable: inconsistent cache-write split".into());
+    }
+    let base_writes = writes
+        .map(|writes| writes - one_hour)
+        .or(envelope.cache_write_5m_tokens);
+    let context_writes =
+        writes.unwrap_or_else(|| base_writes.unwrap_or(0).saturating_add(one_hour));
+    let total = usage
+        .input_tokens
+        .unwrap_or(0)
+        .saturating_add(usage.cached_input_tokens.unwrap_or(0))
+        .saturating_add(context_writes);
+    let tier = schedule
+        .tiers
+        .iter()
+        .filter(|t| total >= t.min_context)
+        .max_by_key(|t| t.min_context);
+    let (input, read, write, output) = tier
+        .map(|t| (t.input, t.cache_read, t.cache_write, t.output))
+        .unwrap_or((
+            schedule.input,
+            schedule.cache_read,
+            schedule.cache_write,
+            schedule.output,
+        ));
+    let rate = |value: Option<f64>| {
+        value
+            .filter(|r| r.is_finite() && *r >= 0.0)
+            .ok_or_else(|| "pricing_unavailable: reported usage rate".to_owned())
+    };
+    let contribution = |tokens: Option<u64>, price: Option<f64>| -> Result<f64, String> {
+        match tokens {
+            Some(n) if n > 0 => Ok(n as f64 * rate(price)?),
+            _ => Ok(0.0),
+        }
+    };
+    let cost = contribution(usage.input_tokens, input)?
+        + contribution(usage.cached_input_tokens, read)?
+        + contribution(usage.output_tokens, output)?
+        + contribution(base_writes, write)?
+        + if one_hour > 0 {
+            one_hour as f64 * rate(input)? * 2.0
+        } else {
+            0.0
+        };
+    if cost == 0.0 {
+        return Ok(0.0);
+    }
+    let scale = if subscription {
+        let input = rate(input)?;
+        if input == 0.0 {
+            return Err("pricing_unavailable: reported usage ratio".into());
+        }
+        input
+    } else {
+        1.0
+    };
+    let cost = cost / scale;
+    if !cost.is_finite() {
+        return Err("pricing_unavailable: reported usage ratio".into());
+    }
+    Ok(cost)
+}
+
 /// The method and provider of the run's frozen credential selection, read as the selection
 /// froze them (see [`crate::auth_routing::frozen_selection_credential`]).
 fn frozen_credential(
@@ -145,6 +258,80 @@ pub async fn automatic_warm_quota_for_config(
 #[cfg(test)]
 mod automatic_tests {
     use super::*;
+
+    #[test]
+    fn failed_warm_prices_only_reported_usage_and_cache_write_splits() {
+        use broca_wal::record::{AttemptEnvelope, AttemptSent, BillingAttemptOutcome};
+        let rates = broca_provider::spec::CostSchedule {
+            input: Some(10.0),
+            output: Some(80.0),
+            cache_read: Some(0.5),
+            cache_write: Some(12.5),
+            ..Default::default()
+        };
+        let mut e = AttemptEnvelope {
+            sent: AttemptSent::Yes,
+            outcome: BillingAttemptOutcome::HttpError,
+            ..Default::default()
+        };
+        assert_eq!(
+            failed_warm_cost(&config(), &e).unwrap(),
+            0.0,
+            "absent usage requires no catalog lookup"
+        );
+        e.usage = Some(broca_protocol::Usage::default());
+        assert_eq!(
+            failed_warm_cost(&config(), &e).unwrap(),
+            0.0,
+            "an empty usage object reports no chargeable counts"
+        );
+        assert_eq!(failed_cost_from_schedule(&rates, &e, false).unwrap(), 0.0);
+        e.usage = Some(broca_protocol::Usage {
+            input_tokens: Some(3),
+            cached_input_tokens: Some(4),
+            cache_write_tokens: Some(5),
+            output_tokens: Some(1),
+            ..Default::default()
+        });
+        e.cache_write_5m_tokens = Some(3);
+        e.cache_write_1h_tokens = Some(2);
+        assert_eq!(failed_cost_from_schedule(&rates, &e, false).unwrap(), 189.5);
+        assert_eq!(failed_cost_from_schedule(&rates, &e, true).unwrap(), 18.95);
+        e.sent = AttemptSent::No;
+        assert_eq!(failed_cost_from_schedule(&rates, &e, false).unwrap(), 0.0);
+        e.sent = AttemptSent::Yes;
+        e.usage = Some(broca_protocol::Usage {
+            cached_input_tokens: Some(4),
+            ..Default::default()
+        });
+        e.cache_write_5m_tokens = None;
+        e.cache_write_1h_tokens = None;
+        let read_only = broca_provider::spec::CostSchedule {
+            cache_read: Some(0.5),
+            ..Default::default()
+        };
+        assert_eq!(
+            failed_cost_from_schedule(&read_only, &e, false).unwrap(),
+            2.0,
+            "missing, unreported counts require no rate and add no charge"
+        );
+        let mut tiered = rates;
+        tiered.tiers.push(broca_provider::spec::CostTier {
+            min_context: 4,
+            input: Some(20.0),
+            output: None,
+            cache_read: Some(2.0),
+            cache_write: None,
+        });
+        assert_eq!(failed_cost_from_schedule(&tiered, &e, false).unwrap(), 8.0);
+        e.usage = Some(broca_protocol::Usage::default());
+        e.cache_write_1h_tokens = Some(2);
+        assert_eq!(
+            failed_cost_from_schedule(&tiered, &e, false).unwrap(),
+            40.0,
+            "a reported split remains priceable without an aggregate write count"
+        );
+    }
     use crate::account_routing::{
         AccountSelectionConfig, RoutingClient, RoutingReply, RoutingTransport,
     };

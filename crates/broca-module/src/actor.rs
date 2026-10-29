@@ -6133,20 +6133,27 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 return;
             }
         };
-        let seal = match &self.state {
-            RunState::Active { shutdown_seal, .. } => shutdown_seal.clone(),
-            RunState::Idle => broca_core::ShutdownSeal::default(),
-        };
-        job.attempt_hook = crate::keep_warm::warm_journal(
-            self.writer
-                .clone()
-                .expect("warm preparation requires a writer"),
-            seal,
-            &job,
-            &pending.run_id,
-            Some(pending.ttl_ms),
-            None,
-        );
+        if self
+            .writer
+            .as_ref()
+            .is_some_and(|writer| writer.is_overhaul())
+        {
+            let seal = match &self.state {
+                RunState::Active { shutdown_seal, .. } => shutdown_seal.clone(),
+                RunState::Idle => broca_core::ShutdownSeal::default(),
+            };
+            job.attempt_hook = crate::keep_warm::warm_journal(
+                self.writer
+                    .clone()
+                    .expect("warm preparation requires a writer"),
+                seal,
+                &job,
+                &pending.run_id,
+                Some(pending.ttl_ms),
+                None,
+            )
+            .map(|journal| journal as Arc<dyn broca_core::run::AttemptHook>);
+        }
         let pending = PendingWarm::new(pending, reply, permit);
         let executor = Arc::clone(&self.executor);
         let terminal_tx = self.terminal_tx.clone();
@@ -6190,6 +6197,16 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let sent = match result {
             Ok(sent) => sent,
             Err(error) => {
+                if self
+                    .writer
+                    .as_ref()
+                    .is_some_and(|writer| writer.is_overhaul())
+                    && !matches!(&self.state, RunState::Active { run_id: active, .. } if *active == run_id)
+                {
+                    // A failed idle warm can report usage after the run was already exported.
+                    // Refresh that run's facts without treating the attempt as a cache refresh.
+                    self.spawn_live_usage_export(run_id);
+                }
                 if self.retention_lineage
                     || self
                         .writer

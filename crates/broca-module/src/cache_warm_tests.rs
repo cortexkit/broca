@@ -489,6 +489,8 @@ impl broca_core::keep_warm_wait::KeepWarmDriver for ObservedWarmer {
 /// Runs the real loop with one provider, and sends warms through another (the same one unless
 /// a test swaps in a different config or account).
 struct WarmExecutor {
+    #[cfg(feature = "test-clock")]
+    permission_gate: std::sync::Mutex<Option<Arc<broca_core::cache_warm::WarmPermissionGate>>>,
     held: HeldWarmTool,
     skips: Arc<AtomicU64>,
     hold_automatic: Arc<std::sync::atomic::AtomicBool>,
@@ -600,6 +602,13 @@ impl RunExecutor for WarmExecutor {
         &self,
         job: crate::executor::WarmJob,
     ) -> Result<broca_core::WarmSent, crate::executor::WarmError> {
+        #[cfg(feature = "test-clock")]
+        if let Some(gate) = self.permission_gate.lock().unwrap().take() {
+            job.attempt_hook
+                .as_ref()
+                .expect("overhaul hook must reach executor")
+                .set_warm_permission_gate_for_test(gate);
+        }
         crate::executor::send_warm_with_hook(
             self.warm_provider.as_ref(),
             job.base,
@@ -652,6 +661,8 @@ impl Fixture {
         let mut frozen = warmable(&server.url);
         run_config(&mut frozen);
         let executor = Arc::new(WarmExecutor {
+            #[cfg(feature = "test-clock")]
+            permission_gate: Default::default(),
             held: Default::default(),
             skips: Default::default(),
             hold_automatic: Default::default(),
@@ -1227,6 +1238,58 @@ async fn a_warm_on_an_exhausted_account_is_refused() {
         }
     );
     assert_eq!(fixture.server.bodies().len(), 1, "nothing is sent");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_overhaul_warm_does_not_clear_account_wall() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let fixture = Fixture::with_wal_config(
+        vec![
+            text_turn("hello"),
+            Reply::Gated(
+                release.clone(),
+                Box::new(Reply::Full {
+                    status: 529,
+                    headers: vec![],
+                    body: b"overloaded".to_vec(),
+                }),
+            ),
+            Reply::Full {
+                status: 429,
+                headers: vec![
+                    ("Content-Type", "application/json"),
+                    ("anthropic-ratelimit-unified-status", "rejected"),
+                    ("anthropic-ratelimit-unified-reset", "4102444800"),
+                ],
+                body: br#"{"type":"error","error":{"type":"rate_limit_error","message":"limit"}}"#
+                    .to_vec(),
+            },
+        ],
+        |_| {},
+        provider_for,
+        broca_wal::WalConfig::OVERHAUL,
+    )
+    .await;
+    fixture.turn("r1", "q", RunKind::FreshOrResume).await;
+    let registry = fixture.registry.clone();
+    let key = fixture.key.clone();
+    let warm = tokio::spawn(async move { ServeHandler::warm(&registry, &key, None).await });
+    fixture.server.wait_for(2).await;
+    fixture.turn("r2", "another", RunKind::AppendEpisode).await;
+    release.notify_one();
+    assert!(warm.await.unwrap().is_err());
+    assert_eq!(warm_records(&fixture.records()).len(), 1);
+    assert_eq!(
+        fixture.refused(None).await.detail,
+        broca_wire::WarmRefusalDetail::AccountWalled {
+            resets_at_ms: 4_102_444_800_000
+        }
+    );
+    assert_eq!(
+        fixture.server.bodies().len(),
+        3,
+        "the failed warm must not admit another request"
+    );
 }
 
 /// A credential that now belongs to another account is refused without sending.
@@ -2092,6 +2155,218 @@ async fn failed_warm_recorded() {
         2,
         "no duplicate success terminal"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_idle_warm_refreshes_export_with_outcome() {
+    use broca_wal::record::BillingAttemptOutcome as Outcome;
+    let fixture = Fixture::with_wal_config(
+        vec![
+            text_turn("hello"),
+            Reply::Full {
+                status: 529,
+                headers: vec![("Content-Type", "application/json")],
+                body:
+                    br#"{"usage":{"input_tokens":3,"cache_read_input_tokens":4,"output_tokens":1}}"#
+                        .to_vec(),
+            },
+            warm_answer(),
+        ],
+        |_| {},
+        provider_for,
+        broca_wal::WalConfig::OVERHAUL,
+    )
+    .await;
+    fixture.turn("r1", "q", RunKind::FreshOrResume).await;
+    broca_test_support::wait_until("ordinary run fact exported before failed warm", || async {
+        let present = !fixture
+            .export
+            .read_page(None, 100)
+            .unwrap()
+            .facts
+            .is_empty();
+        present
+            .then_some(())
+            .ok_or_else(|| "ordinary fact has not reached export index".to_owned())
+    })
+    .await;
+    let ordinary = fixture.export.read_page(None, 100).unwrap().facts;
+    let ordinary_bytes: Vec<_> = ordinary
+        .iter()
+        .map(|f| (f.export_seq, serde_json::to_vec(&f.segment).unwrap()))
+        .collect();
+    assert_eq!(fixture.refused(None).await.code, "warm_failed");
+    broca_test_support::wait_until("failed idle warm exported without another run", || async {
+        fixture
+            .export
+            .read_page(None, 100)
+            .unwrap()
+            .facts
+            .iter()
+            .any(|f| f.segment.as_session().unwrap().warm_outcome == Some(Outcome::HttpError))
+            .then_some(())
+            .ok_or_else(|| "failed warm has not reached export index".to_owned())
+    })
+    .await;
+    let failed_page = fixture.export.read_page(None, 100).unwrap();
+    let failed = failed_page
+        .facts
+        .iter()
+        .find(|f| f.segment.as_session().unwrap().warm)
+        .unwrap();
+    assert_eq!(
+        failed.segment.as_session().unwrap().usage.input_tokens,
+        Some(3)
+    );
+    assert_eq!(
+        failed.segment.as_session().unwrap().usage.output_tokens,
+        Some(1)
+    );
+    let old_facts: Vec<_> = failed_page
+        .facts
+        .iter()
+        .filter(|f| !f.segment.as_session().unwrap().warm)
+        .cloned()
+        .collect();
+    assert_eq!(
+        old_facts
+            .iter()
+            .map(|f| (f.export_seq, serde_json::to_vec(&f.segment).unwrap()))
+            .collect::<Vec<_>>(),
+        ordinary_bytes,
+        "re-emitting a run must not alter existing facts"
+    );
+    fixture.warm(None).await.unwrap();
+    broca_test_support::wait_until("successful overhaul warm exported", || async {
+        fixture
+            .export
+            .read_page(None, 100)
+            .unwrap()
+            .facts
+            .iter()
+            .any(|f| f.segment.as_session().unwrap().warm_outcome == Some(Outcome::Complete))
+            .then_some(())
+            .ok_or_else(|| "successful warm has not reached export index".to_owned())
+    })
+    .await;
+    if let Some(directory) = std::env::var_os("BROCA_WARM_EXPORT_SAMPLE_DIR") {
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let page = fixture.export.read_page(None, 100).unwrap();
+        for (name, outcome) in [
+            ("failed-overhaul-warm.json", Outcome::HttpError),
+            ("successful-overhaul-warm.json", Outcome::Complete),
+        ] {
+            let fact = page
+                .facts
+                .iter()
+                .find(|f| f.segment.as_session().unwrap().warm_outcome == Some(outcome))
+                .unwrap();
+            std::fs::write(
+                directory.join(name),
+                serde_json::to_vec_pretty(&fact.segment).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[cfg(feature = "test-clock")]
+fn assert_unsent_warm_released_once(records: &[WalRecord]) {
+    let ids: Vec<_> = records
+        .iter()
+        .filter_map(|r| match r {
+            WalRecord::AttemptReserved {
+                attempt_id,
+                reservation,
+            } if reservation.warm => Some(attempt_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids.len(), 1);
+    assert_eq!(records.iter().filter(|r| matches!(r, WalRecord::AttemptReleased { attempt_id, envelope, .. }
+        if attempt_id == ids[0] && envelope.sent == broca_wal::record::AttemptSent::No && envelope.usage.is_none())).count(), 1);
+    assert!(warm_records(records).is_empty());
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_warm_permission_denial_and_late_barrier_write_no_request() {
+    for shutdown in [false, true] {
+        let fixture = Fixture::with_wal_config(
+            vec![text_turn("hello")],
+            |_| {},
+            provider_for,
+            broca_wal::WalConfig::OVERHAUL,
+        )
+        .await;
+        fixture.turn("r1", "q", RunKind::FreshOrResume).await;
+        let before = fixture.registry.cache_clock_reading(&fixture.key).unwrap();
+        let gate = Arc::new(broca_core::cache_warm::WarmPermissionGate::default());
+        *fixture.executor.permission_gate.lock().unwrap() = Some(gate.clone());
+        let registry = fixture.registry.clone();
+        let key = fixture.key.clone();
+        let warm = tokio::spawn(async move { ServeHandler::warm(&registry, &key, None).await });
+        gate.entered.notified().await;
+        assert_eq!(
+            fixture.server.bodies().len(),
+            1,
+            "no HTTP bytes before durable permission"
+        );
+        if shutdown {
+            assert!(fixture.registry.stop_and_seal().await);
+            gate.release.cancel();
+        } else {
+            gate.release.cancel();
+        }
+        assert!(warm.await.unwrap().is_err());
+        assert_eq!(
+            fixture.registry.cache_clock_reading(&fixture.key).unwrap(),
+            before
+        );
+        if !shutdown {
+            assert!(fixture.registry.stop_and_seal().await);
+        }
+        assert_eq!(
+            fixture.server.bodies().len(),
+            1,
+            "denied or late permission must never send"
+        );
+        assert_unsent_warm_released_once(&fixture.records());
+    }
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test(flavor = "multi_thread")]
+async fn automatic_warm_permission_denial_writes_no_request() {
+    let fixture = Fixture::with_wal_config(
+        vec![held_tool_turn(), Reply::WarmOrText],
+        |_| {},
+        provider_for,
+        broca_wal::WalConfig::OVERHAUL,
+    )
+    .await;
+    let gate = Arc::new(broca_core::cache_warm::WarmPermissionGate::default());
+    *fixture.executor.permission_gate.lock().unwrap() = Some(gate.clone());
+    fixture
+        .start_automatic_held(Some(broca_protocol::request::KeepWarm::Auto))
+        .await;
+    gate.entered.notified().await;
+    assert_eq!(
+        fixture.server.bodies().len(),
+        1,
+        "automatic warm waits before any HTTP bytes"
+    );
+    gate.release.cancel();
+    fixture.wait_warm_stop("unsupported").await;
+    assert_eq!(
+        fixture.server.bodies().len(),
+        1,
+        "a refused barrier is not send permission"
+    );
+    fixture.finish_held().await;
+    assert!(fixture.registry.stop_and_seal().await);
+    assert_unsent_warm_released_once(&fixture.records());
 }
 
 #[tokio::test(flavor = "multi_thread")]

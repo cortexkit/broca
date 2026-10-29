@@ -8430,6 +8430,10 @@ pub struct PhysicalSend {
 /// Implementations must not hold writer locks across an await. Warms can use the same seam.
 #[async_trait::async_trait]
 pub trait AttemptHook: Send + Sync {
+    #[cfg(feature = "test-clock")]
+    fn set_warm_permission_gate_for_test(&self, _gate: Arc<crate::cache_warm::WarmPermissionGate>) {
+        panic!("permission gate requires a warm journal");
+    }
     async fn before_send(
         &self,
         send: PhysicalSend,

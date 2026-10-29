@@ -225,6 +225,15 @@ pub trait RunExecutor: Send + Sync + 'static {
         Err("pricing_unavailable".into())
     }
 
+    /// A failed warm consumes only provider-reported usage, not a cache-refresh estimate.
+    fn failed_warm_cost(
+        &self,
+        _config: &broca_wal::RunConfig,
+        _envelope: &broca_wal::record::AttemptEnvelope,
+    ) -> Result<f64, String> {
+        Err("reported warm usage pricing unavailable".into())
+    }
+
     /// Check quota before an automatic cache-refresh request. An error prevents the send;
     /// the tool-wait keep-warm scheduler logs the returned error code once and stops warming
     /// for the rest of this tool wait.
@@ -276,7 +285,8 @@ pub async fn send_warm(
     provider: &dyn broca_core::Provider,
     base: WarmBase,
 ) -> Result<broca_core::WarmSent, WarmError> {
-    send_warm_with_hook(provider, base, None).await
+    let bytes = prepare_warm_base(provider, base)?;
+    provider.warm(&bytes).await.map_err(warm_failure)
 }
 
 /// Render and check the warm prefix before granting the transport a billing hook.
@@ -285,6 +295,18 @@ pub async fn send_warm_with_hook(
     base: WarmBase,
     hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
 ) -> Result<broca_core::WarmSent, WarmError> {
+    let bytes = prepare_warm_base(provider, base)?;
+    let result = match hook {
+        Some(hook) => provider.warm_with_hook(&bytes, Some(hook)).await,
+        None => provider.warm(&bytes).await,
+    };
+    result.map_err(warm_failure)
+}
+
+fn prepare_warm_base(
+    provider: &dyn broca_core::Provider,
+    base: WarmBase,
+) -> Result<Vec<u8>, WarmError> {
     let bytes = match base {
         WarmBase::InFlight(sent) => {
             // The in-flight bytes are already the ones the transport sent, for whichever model
@@ -318,16 +340,17 @@ pub async fn send_warm_with_hook(
             rendered
         }
     };
-    provider
-        .warm_with_hook(&bytes, hook)
-        .await
-        .map_err(|failure| match failure {
-            broca_core::WarmFailure::Unsupported(reason) => WarmError::Unsupported(reason),
-            broca_core::WarmFailure::AccountChanged { frozen, served } => {
-                WarmError::AccountChanged { frozen, served }
-            }
-            broca_core::WarmFailure::Provider(error) => WarmError::Provider(Box::new(error)),
-        })
+    Ok(bytes)
+}
+
+fn warm_failure(failure: broca_core::WarmFailure) -> WarmError {
+    match failure {
+        broca_core::WarmFailure::Unsupported(reason) => WarmError::Unsupported(reason),
+        broca_core::WarmFailure::AccountChanged { frozen, served } => {
+            WarmError::AccountChanged { frozen, served }
+        }
+        broca_core::WarmFailure::Provider(error) => WarmError::Provider(Box::new(error)),
+    }
 }
 
 /// The request a cache warm re-sends.

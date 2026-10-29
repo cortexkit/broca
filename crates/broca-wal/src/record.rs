@@ -1437,9 +1437,11 @@ pub enum WalRecord {
 
     /// One warm of the session's provider prompt cache: broca re-sent the session's most recent
     /// model request shaped to refresh the cached prefix. Legacy roots write this only for a
-    /// successful warm. Overhaul roots write one billing terminal per reserved physical warm
-    /// send, including failed sends, through the session's own writer. Only a successful warm
-    /// restarts cache expiry; an unsuccessful terminal is evidence of an attempt, not a refresh.
+    /// successful warm. Roots using `bill-attempts/v1` normally write one billing terminal per
+    /// reserved physical warm send, including failures, through the session's own writer;
+    /// power loss or a full WAL can leave only the reservation, which reclaim exposes as possibly
+    /// billed. Only a successful warm restarts cache expiry; an unsuccessful terminal is evidence
+    /// of an attempt, not a refresh.
     ///
     /// PURELY INFORMATIONAL under the skip contract on this enum: replay, the reconstructed
     /// prompt, projection and the control stream skip it exactly as they skip

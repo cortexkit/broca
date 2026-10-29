@@ -794,6 +794,54 @@ fn provider_client_builder() -> reqwest::ClientBuilder {
 }
 
 impl<F: WireFamily + 'static> LiveProvider<F> {
+    /// Allocation-test reference for the original warm path, without async-trait delegation.
+    #[cfg(feature = "test-harness")]
+    pub async fn warm_legacy_reference_for_test(
+        &self,
+        base: &[u8],
+    ) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
+        let (request, account) = self.prepare_warm_request(base)?;
+        send_warm_legacy(
+            &self.client,
+            &self.clock,
+            request,
+            self.frozen.family_id,
+            account,
+        )
+        .await
+    }
+
+    fn prepare_warm_request(
+        &self,
+        base: &[u8],
+    ) -> Result<(HttpRequest, Option<String>), broca_core::WarmFailure> {
+        let served = self.current_auth();
+        if account_changed_error(
+            self.frozen_account_ref.as_deref(),
+            served.account_ref.as_deref(),
+        )
+        .is_some()
+        {
+            return Err(broca_core::WarmFailure::AccountChanged {
+                frozen: self.frozen_account_ref.clone(),
+                served: served.account_ref,
+            });
+        }
+        // Reuse the route of the request being warmed, including a refusal fallback.
+        let warm_frozen = match self.routed_fallback() {
+            Some(fallback) => Arc::clone(fallback),
+            None => Arc::clone(&self.frozen),
+        };
+        let body = self
+            .family
+            .warm_body(&warm_frozen, base)
+            .map_err(broca_core::WarmFailure::Unsupported)?;
+        Ok((
+            self.family.endpoint(&warm_frozen, &served.auth, body),
+            served.account_ref,
+        ))
+    }
+
     fn effective_frozen(&self) -> Arc<FrozenRenderConfig> {
         if !self.grammar_downgraded.load(Ordering::Acquire) {
             return Arc::clone(&self.frozen);
@@ -1234,7 +1282,15 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
     /// does, that the credential's account is still the one the session froze. Never retried: a
     /// warm that fails is reported, not repeated.
     async fn warm(&self, base: &[u8]) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
-        self.warm_with_hook(base, None).await
+        let (request, account) = self.prepare_warm_request(base)?;
+        send_warm_legacy(
+            &self.client,
+            &self.clock,
+            request,
+            self.frozen.family_id,
+            account,
+        )
+        .await
     }
 
     async fn warm_with_hook(
@@ -1242,33 +1298,13 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
         base: &[u8],
         hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
     ) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
-        let served = self.current_auth();
-        if account_changed_error(
-            self.frozen_account_ref.as_deref(),
-            served.account_ref.as_deref(),
-        )
-        .is_some()
-        {
-            return Err(broca_core::WarmFailure::AccountChanged {
-                frozen: self.frozen_account_ref.clone(),
-                served: served.account_ref,
-            });
-        }
-        // A warm of a request the fallback model answered is shaped and addressed for it.
-        let warm_frozen = match self.routed_fallback() {
-            Some(fallback) => Arc::clone(fallback),
-            None => Arc::clone(&self.frozen),
-        };
-        let body = self
-            .family
-            .warm_body(&warm_frozen, base)
-            .map_err(broca_core::WarmFailure::Unsupported)?;
+        let (request, account) = self.prepare_warm_request(base)?;
         send_warm(
             &self.client,
             &self.clock,
-            self.family.endpoint(&warm_frozen, &served.auth, body),
+            request,
             self.frozen.family_id,
-            served.account_ref,
+            account,
             hook,
         )
         .await
@@ -1286,6 +1322,174 @@ const MAX_WARM_RESPONSE_BYTES: usize = 1024 * 1024;
 /// A warm to `api.anthropic.com` has the same wire shape as the step it warms: a compressed
 /// body when the step's would be, and one uncompressed re-send if the compression is refused.
 async fn send_warm(
+    client: &ProviderHttpClient,
+    clock: &Clock,
+    request: HttpRequest,
+    family: crate::spec::WireFamilyId,
+    served_account_ref: Option<String>,
+    hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
+) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
+    match hook {
+        None => send_warm_legacy(client, clock, request, family, served_account_ref).await,
+        Some(hook) => {
+            send_warm_journaled(
+                client,
+                clock,
+                request,
+                family,
+                served_account_ref,
+                Some(hook),
+            )
+            .await
+        }
+    }
+}
+
+/// Keep legacy requests on the original path: no billing parse, envelope or extra boxed call.
+async fn send_warm_legacy(
+    client: &ProviderHttpClient,
+    clock: &Clock,
+    request: HttpRequest,
+    family: crate::spec::WireFamilyId,
+    served_account_ref: Option<String>,
+) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
+    let warm_body_sha256 = lower_hex(&Sha256::digest(&request.body));
+    let anthropic_api_host = request_gzip::is_anthropic_api_host(&request.url);
+    let identity = Bytes::from(request.body);
+    let failed = |message: String| {
+        broca_core::WarmFailure::Provider(ProviderError {
+            provider_details: None,
+            provider_subcode: None,
+            refusal: None,
+            class: ErrorClass::Transient,
+            message,
+            status: None,
+            retry_after_secs: None,
+            provider_code: None,
+            resets_at_ms: None,
+            resets_at_source: None,
+            limit_window: None,
+            account_ref: None,
+            credential_id: None,
+            affordable_max_tokens: None,
+        })
+    };
+    let exchange = async {
+        let mut gzip = encode_request_gzip(client, anthropic_api_host, &identity).await;
+        let (sent_at_ms, status, header_map, body) = loop {
+            let sent_at_ms = now_millis();
+            let response = attempt_request_builder(
+                client,
+                &request.url,
+                &request.headers,
+                anthropic_api_host,
+                gzip.is_some(),
+                false,
+            )
+            .body(gzip.clone().unwrap_or_else(|| identity.clone()))
+            .send()
+            .await
+            .map_err(|error| failed(format!("warm request failed: {error}")))?;
+            let status = response.status();
+            let header_map = response.headers().clone();
+            let body = read_warm_body_legacy(response, &failed).await?;
+            if gzip.is_some() {
+                if let Some(rejection) = request_gzip::classify_rejection(
+                    status.as_u16(),
+                    &header_map,
+                    &String::from_utf8_lossy(&body),
+                ) {
+                    client.request_gzip.latch(status.as_u16(), rejection);
+                    gzip = None;
+                    continue;
+                }
+            }
+            break (sent_at_ms, status, header_map, body);
+        };
+        let retry_after_secs = parse_retry_after_header(&header_map);
+        let headers = response_headers(&header_map);
+        let ratelimit_headers: Vec<(String, String)> = header_map
+            .iter()
+            .filter(|(name, _)| {
+                name.as_str()
+                    .starts_with(crate::cache_warm::RATELIMIT_HEADER_PREFIX)
+            })
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_owned(), value.to_owned()))
+            })
+            .collect();
+        if !status.is_success() {
+            let code = status.as_u16();
+            let text = String::from_utf8_lossy(&body);
+            log_opencode_go_refusal(&request.headers, code, &headers, &text);
+            let error = classify_http_error_in_family(
+                code,
+                &text,
+                retry_after_secs,
+                None,
+                Some(family),
+                None,
+            );
+            let error = classify_account_limit_exhausted(
+                family,
+                code,
+                &headers,
+                &text,
+                UNIX_EPOCH + Duration::from_millis(clock.now_ms()),
+                error,
+            );
+            let error = opencode_payment_required(&request.url, code, error);
+            let error = inception_payment_required(&request.url, code, error);
+            return Err(broca_core::WarmFailure::Provider(error));
+        }
+        let usage = match family {
+            crate::spec::WireFamilyId::OpenAiResponses
+            | crate::spec::WireFamilyId::OpenAiResponsesChatgpt => {
+                crate::cache_warm::responses_response_usage(&body)
+            }
+            _ => crate::cache_warm::anthropic_response_usage(&body),
+        };
+        if family == crate::spec::WireFamilyId::OpenAiResponsesChatgpt
+            && usage.cached_input_tokens == Some(0)
+        {
+            tracing::info!(
+                "Codex cache warm read zero cached tokens; best-effort re-prime, not retried"
+            );
+        }
+        Ok(broca_core::WarmSent {
+            warm_body_sha256,
+            sent_at_ms,
+            usage,
+            served_account_ref,
+            ratelimit_headers,
+            http_status: status.as_u16(),
+        })
+    };
+    tokio::time::timeout(WARM_TIMEOUT, exchange)
+        .await
+        .unwrap_or_else(|_| Err(failed("warm timed out waiting for its answer".into())))
+}
+
+async fn read_warm_body_legacy(
+    response: reqwest::Response,
+    failed: &impl Fn(String) -> broca_core::WarmFailure,
+) -> Result<Vec<u8>, broca_core::WarmFailure> {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| failed(format!("warm answer unreadable: {error}")))?;
+        if body.len() + chunk.len() > MAX_WARM_RESPONSE_BYTES {
+            return Err(failed("warm answer exceeded its size limit".into()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+async fn send_warm_journaled(
     client: &ProviderHttpClient,
     clock: &Clock,
     request: HttpRequest,

@@ -3777,6 +3777,14 @@ mod executor {
             broca_module_serve::cache_warm::responses_warm_cost(config, usage)
         }
 
+        fn failed_warm_cost(
+            &self,
+            config: &broca_wal::RunConfig,
+            envelope: &broca_wal::record::AttemptEnvelope,
+        ) -> Result<f64, String> {
+            broca_module_serve::cache_warm::failed_warm_cost(config, envelope)
+        }
+
         async fn warm_quota(
             &self,
             config: &broca_wal::RunConfig,
