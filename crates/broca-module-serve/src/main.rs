@@ -1511,8 +1511,14 @@ mod endpoint_connect_tests {
 
     #[tokio::test]
     async fn ipv6_endpoint_connects_after_failed_first() {
-        let first = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
+        // The first endpoint must refuse every connect for the whole test. A socket that is
+        // bound but never listening does that, and keeps the port reserved. Closing a listener
+        // instead frees its port, and a parallel test in this process can be handed that
+        // port: the client then connects to the other test's listener and fails the handshake
+        // with "Connection reset by peer" rather than falling back to IPv6.
+        let first = tokio::net::TcpSocket::new_v4().unwrap();
+        first
+            .bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
             .unwrap();
         let listener = tokio::net::TcpListener::bind(("::1", 0)).await.unwrap();
         let key = vec![0x5c; 32];
@@ -1540,7 +1546,6 @@ mod endpoint_connect_tests {
             },
         )
         .unwrap();
-        drop(first);
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             subc_transport::authenticate_server(
@@ -1559,6 +1564,7 @@ mod endpoint_connect_tests {
             .expect("module socket must fall back to raw IPv6");
         assert!(stream.peer_addr().unwrap().is_ipv6());
         server.await.unwrap();
+        drop(first);
         std::fs::remove_file(path).unwrap();
     }
 }
