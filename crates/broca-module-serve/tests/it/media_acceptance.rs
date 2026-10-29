@@ -26,6 +26,9 @@ const ANTHROPIC_SSE: &str = concat!(
     "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
 );
 
+#[path = "media_live_round_trip.rs"]
+mod media_live_round_trip;
+
 #[test]
 fn fixtures_are_capturable() {
     for (kind, mime, bytes) in [
@@ -259,8 +262,14 @@ async fn read_modes(rig: &Rig) {
             .iter()
             .filter(|block| block["type"] == "media")
             .count();
-        assert_eq!(inline["digest"], stored["digest"]);
-        assert_eq!(described["digest"], stored["digest"]);
+        // Content identities are descriptor-mode metadata, computed from the block-form
+        // message before inline markers or descriptor references replace its media.
+        assert!(inline.get("digest").is_none());
+        assert!(stored.get("digest").is_none());
+        assert_eq!(
+            described["digest"],
+            cortexkit_role_llm_runner::content_digest::content_digest(&stored["message"])
+        );
         cortexkit_role_llm_runner::read::descriptors::validate_references(&described["message"])
             .unwrap();
     }
@@ -311,7 +320,6 @@ async fn upload(rig: &Rig, mime: &str, bytes: &[u8]) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires live media integration: SessionMedia hydration and render_prepared in the module executor"]
 async fn jpeg_and_pdf_reach_claude_from_live_fusiform_and_switch_to_modality_markers() {
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let url = serve_model_sse(bodies.clone(), ANTHROPIC_SSE).await;

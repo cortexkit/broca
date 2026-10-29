@@ -40,6 +40,23 @@ impl LiveAnthropicProvider {
 
 #[async_trait]
 impl Provider for LiveAnthropicProvider {
+    #[cfg(feature = "test-attachments")]
+    fn supports_media_renderer(&self) -> bool {
+        self.inner.supports_media_renderer()
+    }
+
+    #[cfg(feature = "test-attachments")]
+    fn set_media_request_renderer(
+        &self,
+        renderer: Arc<broca_core::provider::MediaRequestRenderer>,
+    ) {
+        self.inner.set_media_request_renderer(renderer);
+    }
+
+    #[cfg(feature = "test-attachments")]
+    fn defer_media_tags(&self, render_tags: bool) -> bool {
+        self.inner.defer_media_tags(render_tags)
+    }
     fn reasoning_is_prefix_bound(&self) -> bool {
         self.inner.reasoning_is_prefix_bound()
     }
@@ -118,6 +135,13 @@ impl Provider for LiveAnthropicProvider {
 
     fn render_request(&self, opts: &CallOptions) -> Vec<u8> {
         self.inner.render_request(opts)
+    }
+
+    fn try_render_request(
+        &self,
+        opts: &CallOptions,
+    ) -> Result<Vec<u8>, Box<broca_protocol::ProviderError>> {
+        self.inner.try_render_request(opts)
     }
 
     fn output_limits(&self) -> Option<broca_core::output_reservation::OutputLimits> {

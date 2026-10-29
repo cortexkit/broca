@@ -12,6 +12,7 @@ name = "media-live-check"
 required-features = ["live"]
 
 [features]
+test-attachments = ["broca-core/test-attachments"]
 # E2E-only virtual retry waits; keeps transport retry decisions real without waiting out backoff.
 test-harness = []
 # The (A) cross-process bench fixture (arm3 producer). OFF by default so the

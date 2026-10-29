@@ -16,6 +16,20 @@ use tokio_util::sync::CancellationToken;
 
 pub type LiveStepProgress = Arc<Mutex<Option<broca_protocol::provider::InFlightStep>>>;
 
+/// Session-owned media rendering, installed only by the attachment test executor.
+/// The booleans select tag rendering and commit the durable step boundary to aging,
+/// respectively. That commit is not physical-send permission.
+/// Estimates must not age a not-yet-final view.
+#[cfg(feature = "test-attachments")]
+pub type MediaRequestRenderer = dyn Fn(
+        &serde_json::Value,
+        &CallOptions,
+        bool,
+        bool,
+    ) -> Result<Vec<u8>, Box<broca_protocol::ProviderError>>
+    + Send
+    + Sync;
+
 /// Per-call runtime state, kept out of the frozen request and rendering/cache domain.
 pub struct StepRuntime {
     pub cancel: CancellationToken,
@@ -26,12 +40,27 @@ pub struct StepRuntime {
     /// ordinary step; a live or resumed resend within the same step id starts after the
     /// largest durable attempt ordinal, so ordinals stay unique within the episode's step.
     pub first_attempt: u32,
-    /// Absent on legacy roots; a physical send must await the reservation's durable receipt.
+    /// This hook is absent on legacy roots. When present, it gates a physical send on
+    /// the reservation's durable receipt.
     pub attempt_hook: Option<Arc<dyn crate::run::AttemptHook>>,
 }
 
 #[async_trait]
 pub trait Provider: Send + Sync {
+    #[cfg(feature = "test-attachments")]
+    fn supports_media_renderer(&self) -> bool {
+        false
+    }
+
+    #[cfg(feature = "test-attachments")]
+    fn set_media_request_renderer(&self, _renderer: Arc<MediaRequestRenderer>) {}
+
+    /// Defer media-bearing messages' tags until preparation has fixed their part locations.
+    #[cfg(feature = "test-attachments")]
+    fn defer_media_tags(&self, _render_tags: bool) -> bool {
+        false
+    }
+
     /// Exclusively acquire any in-memory connection retained for this full session bind.
     fn bind_run_transport(&self, _session: &broca_protocol::BindIdentity) {}
 
@@ -163,6 +192,14 @@ pub trait Provider: Send + Sync {
         crate::render::canonical_request_bytes(opts)
     }
 
+    /// Fallible rendering for requests whose captured objects must be read before sizing.
+    fn try_render_request(
+        &self,
+        opts: &CallOptions,
+    ) -> Result<Vec<u8>, Box<broca_protocol::ProviderError>> {
+        Ok(self.render_request(opts))
+    }
+
     /// This provider's renderer version (recorded in `run_config`; a change busts
     /// resume). Defaults to the shared canonical renderer's version.
     fn renderer_version(&self) -> u32 {
@@ -246,6 +283,21 @@ pub trait Provider: Send + Sync {
 /// `run_loop` directly, without the loop needing to know the concrete type.
 #[async_trait]
 impl Provider for Box<dyn Provider> {
+    #[cfg(feature = "test-attachments")]
+    fn supports_media_renderer(&self) -> bool {
+        (**self).supports_media_renderer()
+    }
+
+    #[cfg(feature = "test-attachments")]
+    fn set_media_request_renderer(&self, renderer: Arc<MediaRequestRenderer>) {
+        (**self).set_media_request_renderer(renderer);
+    }
+
+    #[cfg(feature = "test-attachments")]
+    fn defer_media_tags(&self, render_tags: bool) -> bool {
+        (**self).defer_media_tags(render_tags)
+    }
+
     fn bind_run_transport(&self, session: &broca_protocol::BindIdentity) {
         (**self).bind_run_transport(session);
     }
@@ -341,6 +393,13 @@ impl Provider for Box<dyn Provider> {
 
     fn render_request(&self, opts: &CallOptions) -> Vec<u8> {
         (**self).render_request(opts)
+    }
+
+    fn try_render_request(
+        &self,
+        opts: &CallOptions,
+    ) -> Result<Vec<u8>, Box<broca_protocol::ProviderError>> {
+        (**self).try_render_request(opts)
     }
 
     fn output_limits(&self) -> Option<crate::output_reservation::OutputLimits> {
