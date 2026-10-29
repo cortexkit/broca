@@ -29,7 +29,7 @@
 //! its exit; planned daemon shutdown instead preserves the provider's obligation.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -279,26 +279,43 @@ impl HeldRuntime {
             .expect("held runtime health") = Arc::downgrade(self);
     }
 
+    pub fn bind_stopping_signal(&self, stopping: tokio_util::sync::CancellationToken) {
+        self.withdrawals.bind_stopping_signal(stopping);
+    }
+
     /// Boot recovery, run off the startup path: rebuild a lost store from the live WALs, open
     /// every registered session so its open-time recovery runs, then start a puller for every
     /// module whose feed is still needed.
     pub async fn recover(self: Arc<Self>, registry: Arc<broca_module::registry::LineageRegistry>) {
+        let stopping = registry.stopping_signal();
+        self.bind_stopping_signal(stopping.clone());
+        if stopping.is_cancelled() {
+            return;
+        }
         if self.needs_rebuild {
             loop {
                 let store = Arc::clone(&self.store);
                 let root = self.wal_root.clone();
                 let progress = self.progress.clone();
+                let scan_stop = stopping.clone();
                 let started = std::time::Instant::now();
-                let report = tokio::task::spawn_blocking(move || {
+                let scan = tokio::task::spawn_blocking(move || {
                     let report = rebuild_store_from_wals_with_progress(&store, &root, |report| {
                         *progress.lock().expect("rebuild progress") = report.clone();
                     })?;
+                    if scan_stop.is_cancelled() {
+                        return Err("late-results recovery is stopping".into());
+                    }
                     if report.unreadable.is_empty() {
                         store.finish_rebuild()?;
                     }
                     Ok::<_, String>(report)
-                })
-                .await
+                });
+                let report = tokio::select! {
+                    biased;
+                    _ = stopping.cancelled() => return,
+                    report = scan => report,
+                }
                 .map_err(|error| error.to_string())
                 .and_then(|report| report);
                 match report {
@@ -324,28 +341,35 @@ impl HeldRuntime {
                         "late-results rebuild failed; entries stay blocked: {error}"
                     ),
                 }
-                tokio::time::sleep(REBUILD_RETRY).await;
+                tokio::select! {
+                    biased;
+                    _ = stopping.cancelled() => return,
+                    _ = tokio::time::sleep(REBUILD_RETRY) => {}
+                }
             }
             self.intake.set_rebuilding(false);
         }
-        let sessions: Vec<BindIdentity> = match self.store.registrations() {
-            Ok(calls) => {
-                let mut sessions: Vec<BindIdentity> = Vec::new();
-                for call in calls {
-                    if !sessions.contains(&call.bind) {
-                        sessions.push(call.bind);
-                    }
-                }
-                sessions
-            }
+        let (calls, modules) = match self.store.recovery_snapshot() {
+            Ok(snapshot) => snapshot,
             Err(error) => {
-                tracing::warn!(target: "late_results", "late-results recovery could not read registrations: {error}");
-                Vec::new()
+                tracing::warn!(target: "late_results", "late-results recovery could not read registrations/feeds: {error}");
+                return;
             }
         };
-        let (opened, failed) = registry
-            .open_registered_sessions(sessions, RECOVERY_CONCURRENCY)
-            .await;
+        let sessions: Vec<BindIdentity> = {
+            let mut sessions: Vec<BindIdentity> = Vec::new();
+            for call in calls {
+                if !sessions.contains(&call.bind) {
+                    sessions.push(call.bind);
+                }
+            }
+            sessions
+        };
+        let (opened, failed) = tokio::select! {
+            biased;
+            _ = stopping.cancelled() => return,
+            opened = registry.open_registered_sessions(sessions, RECOVERY_CONCURRENCY) => opened,
+        };
         for (session, error) in &failed {
             tracing::warn!(target: "late_results", session = %session.session, "late-results recovery could not open a registered session: {error}");
         }
@@ -355,23 +379,14 @@ impl HeldRuntime {
         if let Err(error) = self.withdrawals.recover().await {
             tracing::warn!(target: "late_results", "provider-held withdrawal recovery failed: {error}");
         }
-        for module in self.modules() {
+        for module in modules {
+            if stopping.is_cancelled() {
+                return;
+            }
             if let Err(error) = self.intake.ensure_puller(&module) {
                 tracing::warn!(target: "late_results", module, "late-results puller did not start: {error}");
             }
         }
-    }
-
-    /// Every module the store names, by a registration or a feed row.
-    fn modules(&self) -> BTreeSet<String> {
-        let mut modules = BTreeSet::new();
-        if let Ok(feeds) = self.store.feeds() {
-            modules.extend(feeds.into_iter().map(|feed| feed.module));
-        }
-        if let Ok(calls) = self.store.registrations() {
-            modules.extend(calls.into_iter().map(|call| call.module));
-        }
-        modules
     }
 }
 
@@ -441,6 +456,17 @@ impl HeldRunResumer for LateBoundResumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_regression_activation_docs_do_not_promise_exactly_once_withdrawal_packets() {
+        let contract = include_str!("../../../docs/module-surface.md");
+        assert!(
+            !contract.contains("because a held call cannot be\ncancelled or stopped yet"),
+            "withdrawal support is no longer the reason release negotiation is disabled"
+        );
+        assert!(contract.contains("at-most-once dispatch"));
+        assert!(contract.contains("already-durably-cancelled"));
+    }
 
     #[test]
     fn health_names_the_fence_and_reports_scan_progress() {

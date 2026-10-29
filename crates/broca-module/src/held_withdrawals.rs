@@ -13,7 +13,7 @@ use broca_core::{
     FileWalStore, WalStore,
 };
 use broca_protocol::RunFinishReason;
-use broca_wal::{FramedRecord, WalRecord};
+use broca_wal::{DispatchOutcome, FramedRecord, WalRecord};
 use cortexkit_role_tool_provider::withdraw::WithdrawVerdict;
 use serde_json::{json, Value};
 
@@ -35,6 +35,7 @@ pub struct HeldWithdrawals {
     transport: Arc<dyn WithdrawTransport>,
     active: Mutex<HashSet<(String, String)>>,
     health: Mutex<Value>,
+    stopping: std::sync::OnceLock<tokio_util::sync::CancellationToken>,
 }
 
 impl HeldWithdrawals {
@@ -49,11 +50,16 @@ impl HeldWithdrawals {
             transport,
             active: Mutex::default(),
             health: Mutex::new(json!({"failed": 0, "pending": 0})),
+            stopping: std::sync::OnceLock::new(),
         })
     }
 
     pub fn health(&self) -> Value {
         self.health.lock().expect("withdrawal health").clone()
+    }
+
+    pub fn bind_stopping_signal(&self, stopping: tokio_util::sync::CancellationToken) {
+        let _ = self.stopping.set(stopping);
     }
 
     fn refresh_health(&self) {
@@ -70,8 +76,24 @@ impl HeldWithdrawals {
 
     /// Reconcile the seal-to-send crash gap, without opening a run or re-dispatching a call.
     pub async fn recover(&self) -> Result<(), String> {
+        // The runtime's existing registration/feed snapshot discovers history first. A
+        // never-held root must not open an extra SQLite read transaction for the outbox.
+        if !self.store.has_held_history() {
+            return Ok(());
+        }
+        let stopping = self
+            .stopping
+            .get()
+            .ok_or("held withdrawal stop signal is not installed")?;
+        if stopping.is_cancelled() {
+            return Ok(());
+        }
+        self.store.prune_tombstoned()?;
         let mut failure = None;
         for (call, state, attempts) in self.store.withdrawal_rows()? {
+            if stopping.is_cancelled() {
+                break;
+            }
             if state != "failed" {
                 if let Err(error) = self.drive(call, attempts).await {
                     failure = Some(error);
@@ -87,6 +109,13 @@ impl HeldWithdrawals {
     }
 
     async fn drive(&self, call: LateResultRegistration, mut attempts: u32) -> Result<(), String> {
+        let stopping = self
+            .stopping
+            .get()
+            .ok_or("held withdrawal stop signal is not installed")?;
+        if stopping.is_cancelled() {
+            return Ok(());
+        }
         let key = (call.module.clone(), call.call_key.clone());
         if !self
             .active
@@ -122,6 +151,9 @@ impl HeldWithdrawals {
             return Ok(());
         }
         while attempts < MAX_ATTEMPTS {
+            if stopping.is_cancelled() {
+                return Ok(());
+            }
             attempts += 1;
             self.store.record_withdrawal(
                 &call,
@@ -132,12 +164,12 @@ impl HeldWithdrawals {
             self.refresh_health();
             // tool-provider 0.13.2 CONTRACT.md §5: stored answers are byte-identical for
             // every repeat. A crash after send but before recording its reply is safe.
-            let (verdict, raw) = match tokio::time::timeout(
-                ATTEMPT_TIMEOUT,
-                self.transport.withdraw(&call),
-            )
-            .await
-            {
+            let reply = tokio::select! {
+                biased;
+                _ = stopping.cancelled() => return Ok(()),
+                reply = tokio::time::timeout(ATTEMPT_TIMEOUT, self.transport.withdraw(&call)) => reply,
+            };
+            let (verdict, raw) = match reply {
                 Ok(result) => result,
                 Err(_) => (
                     WithdrawVerdict::Retry(
@@ -168,7 +200,11 @@ impl HeldWithdrawals {
             if !retry || attempts == MAX_ATTEMPTS {
                 return Ok(());
             }
-            tokio::time::sleep(Duration::from_millis(100 * u64::from(attempts))).await;
+            tokio::select! {
+                biased;
+                _ = stopping.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(Duration::from_millis(100 * u64::from(attempts))) => {}
+            }
         }
         self.store.record_withdrawal(
             &call,
@@ -211,16 +247,49 @@ impl HeldWithdrawal for HeldWithdrawals {
 }
 
 fn cancelled_hold(records: &[FramedRecord], key: &str) -> bool {
-    let mut held = false;
+    let mut held = None;
     for frame in records {
         match &frame.record {
-            WalRecord::RunStarted { .. } => held = false,
-            WalRecord::ToolCallProviderHeld { call_key, .. } if call_key == key => held = true,
+            WalRecord::RunStarted { .. } => held = None,
+            WalRecord::ToolCallProviderHeld {
+                call_key,
+                batch_id,
+                tool_call_id,
+                ..
+            } if call_key == key => held = Some((batch_id, tool_call_id, true)),
+            WalRecord::ToolResult {
+                batch_id,
+                result,
+                outcome,
+                reason,
+                ..
+            } => {
+                if let Some((batch, call, eligible)) = &mut held {
+                    if *batch == batch_id && *call == &result.tool_call_id {
+                        // Only the typed synthetic cancellation terminal preserves the
+                        // withdrawal intent. A provider-delivered terminal settles this call,
+                        // even if a sibling later causes the whole run to be cancelled.
+                        *eligible = *outcome == DispatchOutcome::Interrupted
+                            && reason.as_deref() == Some("provider_held_cancelled");
+                    }
+                }
+            }
+            WalRecord::ToolNoDispatch {
+                batch_id,
+                tool_call_id,
+                ..
+            } => {
+                if let Some((batch, call, eligible)) = &mut held {
+                    if *batch == batch_id && *call == tool_call_id {
+                        *eligible = false;
+                    }
+                }
+            }
             WalRecord::RunFinished {
                 reason: RunFinishReason::Cancelled,
                 ..
-            } if held => return true,
-            WalRecord::RunFinished { .. } => held = false,
+            } if held.is_some_and(|(_, _, eligible)| eligible) => return true,
+            WalRecord::RunFinished { .. } => held = None,
             _ => {}
         }
     }

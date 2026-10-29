@@ -1395,10 +1395,11 @@ The daemon installs the provider-held runtime (`broca-module-serve/src/held_runt
 its tool plane: the waiting slots a held call's batch waits in, a late-results intake store
 (`late-results.db` under the state root, a projection of the WAL kept out of the backup
 catalog), one puller per provider module, and boot recovery. Release builds still leave
-`held-reply/v1` undeclared on every tool route, because a held call cannot be
-cancelled or stopped yet; with it undeclared no provider may hold a call, no plain call
-carries a key, and nothing is registered. Debug builds
-declare both when `BROCA_TEST_DECLARE_HELD_REPLY_V1=1`; that name is a non-shipping marker the
+`held-reply/v1` undeclared on every tool route. Shipping negotiation requires a separate,
+explicit release capability change; withdrawal and rebuild recovery do not enable it.
+With it undeclared no provider may hold a call, no plain call carries a key, and nothing is
+registered. Debug builds declare `content/v1` and `held-reply/v1` when
+`BROCA_TEST_DECLARE_HELD_REPLY_V1=1`; that name is a non-shipping marker the
 release fence refuses. Role and plan-fetch routes declare neither. A reply carrying `held` on
 an undeclared route becomes a malformed-reply error result with reason
 `malformed_provider_held_reply`, without pausing or exposing its interim content to the model.
@@ -1415,7 +1416,9 @@ when every remaining call is held the run pauses through `pause_run_impl` with
 `RunPaused {tool_held}` and sends nothing to the model. `provider-held/v1` is a known reader
 feature.
 
-A late result IS the held call's result: broca never sends a held call to its provider again.
+A late result IS the held call's result: held continuation preserves at-most-once dispatch
+of the original arguments. Withdrawal is a separate idempotent operation, not exactly-once
+delivery of withdrawal packets.
 The puller pulls `late_results` under broca's own principal on one unscoped route per module
 (the custodian is the carrier, tool-provider contract §7), every 3 s while the module needs
 its feed, backing off to 30 s after errors. Each entry is classed from the intake registrations
@@ -1445,15 +1448,20 @@ tool route with its frozen scope, under broca's carrier identity. The cancellati
 does not wait for withdrawal. A private SQLite outbox retains registrations independently of
 intake pruning and records attempts and replies, so recovery retries the seal-to-send crash
 gap without reopening or dispatching the call. Transport failures and transient route refusals
-have at most three attempts across process restarts; final answers and terminal route refusals
-do not retry. Provider answers are idempotent under tool-provider 0.13.2 contract §5, including
-the ambiguous send-to-record crash gap. Planned shutdown and ordinary restart never withdraw
-an open held call. Health exposes pending/failed withdrawals and their refusal codes.
+have at most three attempts across process restarts while that outbox is retained; a database
+loss/rebuild does not reconstruct prior attempt counts. Final answers and terminal route
+refusals do not retry. Provider answers are idempotent under tool-provider 0.13.2 contract §5,
+including the ambiguous send-to-record crash gap. Recovery may resend an outstanding withdrawal
+for an already-durably-cancelled call. Neither shutdown nor restart creates a withdrawal intent
+by itself, and a call that completed before its sibling was cancelled is not withdrawn. The
+registry's stop signal suppresses new withdrawal attempts and retries during drain; an earlier
+request may already have reached the provider. Health exposes pending/failed withdrawals and
+their refusal codes.
 
 Ack guarantee, narrowed: broca puts no bound of its own on a hold. A provider keeps at most
 1,000 unacked results per session and drops the oldest first; a held call whose entry was
-dropped that way never receives one and its run stays paused until it is cancelled or stopped,
-which arrives with cancel and stop support for held calls. A finished session that retention
+dropped that way never receives one and its run stays paused until caller cancellation;
+planned daemon shutdown preserves the hold. A finished session that retention
 deletes while its ack is still owed keeps its feed row, and entries for its lineage are then
 no-ops.
 
@@ -1472,9 +1480,18 @@ root so losing the rebuildable database cannot erase that history. None of these
 ordinary expiry on roots that have never enabled held intake.
 Recreating a missing projection with held history leaves `late-results-rebuild-required` set.
 That fence also resumes a rebuild when a partial database exists after restart. It is removed
-and its directory synced only after a complete, stable log inventory has been verified and all
-rebuilt rows committed with SQLite synchronous FULL. An unreadable, truncated, conflicting or
-moving log keeps the fence; a crash after commit and before removal repeats the scan safely.
+and its directory synced (including retries after an already-absent marker) only after a
+complete, stable log inventory has been verified and all rebuilt rows committed with SQLite
+synchronous FULL. An unreadable, truncated, conflicting or
+moving log keeps the fence, including every unsealed archive: a missing footer does not prove
+that its source logs are still live. Identities include length, full content SHA-256, and each
+archive's seal state and member inventory. Decode and hashing use the same open file, and a
+second pass reopens each pathname and compares its identity. Supported WAL writers append under
+the session lease; published archives are immutable, and folding preserves sources until a
+verified copy is sealed. Calls created after the final comparison register durably in this same
+database before dispatch. These invariants cover the publication gap, not an uncooperative
+writer changing and restoring bytes between comparisons. A crash after commit and before
+removal repeats the scan safely.
 Health names the fence and reports files scanned, files decoded, registrations and unreadables.
 This recovery support does not enable `held-reply/v1` declarations in release builds.
 

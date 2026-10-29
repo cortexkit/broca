@@ -716,6 +716,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         Some(store_reader),
         run_rows,
     ));
+    held_runtime.bind_stopping_signal(registry.stopping_signal());
     registry.set_retention_service(retention);
     // System One: decision models served in this process with no session. Its batch record
     // is its own file; `run-index.db` is a rebuildable projection and cannot hold an authority.
