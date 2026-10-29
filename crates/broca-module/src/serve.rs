@@ -1248,7 +1248,15 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             .as_str()
             .to_string()
     });
-    match state.state {
+    // A provider-held park is an implementation recovery boundary, not an owner pause.
+    let public_state = if state.state == State::Paused
+        && state.pause_reason == Some(broca_protocol::PauseReason::ToolHeld)
+    {
+        State::Active
+    } else {
+        state.state
+    };
+    match public_state {
         // Deadline waits and provider-held calls are independent runner-owned waits.
         // Consumers recognize them from their fields, never from the informational reason.
         State::Active => RunStatusResponse::Active {
@@ -3807,7 +3815,7 @@ mod held_status_tests {
     }
 
     #[test]
-    fn active_and_paused_status_map_open_provider_held_calls() {
+    fn provider_held_recovery_parks_report_active_status_with_open_calls() {
         let expected = serde_json::json!([{
             "call_key": "lineage:4", "tool": "ask", "provider": "tools",
             "reason": "running", "held_at_ms": 42
@@ -3834,10 +3842,9 @@ mod held_status_tests {
                 "open held calls must be reported on live and paused runs"
             );
             assert!(wire.get("deadline_ms").is_none());
-            if index == broca_core::RunIndexState::Paused {
-                assert_eq!(wire["pause_reason"], "tool_held");
-                assert_eq!(wire["reason"], "tool_held");
-            }
+            assert_eq!(wire["state"], "active");
+            assert!(wire.get("pause_reason").is_none());
+            assert!(wire.get("reason").is_none());
             let decoded: cortexkit_role_llm_runner::run::RunStatus =
                 serde_json::from_value(wire).unwrap();
             assert!(decoded.is_held_wait());

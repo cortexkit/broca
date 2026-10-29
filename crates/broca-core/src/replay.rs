@@ -357,6 +357,130 @@ impl ProviderHeldCall {
     }
 }
 
+/// One ordered held-call fold for status reads and durable subscribe status events.
+/// Keys include the batch because a model may reuse a call id in a later step.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct HeldCallsProjection {
+    tool_names: HashMap<ToolCallId, String>,
+    calls: Vec<(
+        BatchId,
+        ToolCallId,
+        cortexkit_role_llm_runner::run::HeldCall,
+    )>,
+    state: Option<String>,
+}
+
+impl HeldCallsProjection {
+    /// Only list changes return a snapshot, including the change to an empty list.
+    pub(crate) fn observe(
+        &mut self,
+        record: &WalRecord,
+    ) -> Option<cortexkit_role_llm_runner::run::RunStatus> {
+        match record {
+            WalRecord::RunStarted { .. } => *self = Self::default(),
+            WalRecord::StepStarted { .. } => self.state = None,
+            WalRecord::RunPaused { reason, .. }
+                if *reason != PauseReason::ToolHeld && !self.calls.is_empty() =>
+            {
+                self.state = Some("paused".into());
+            }
+            WalRecord::RunFinished { reason, .. } => {
+                self.state = Some(reason.as_str().into());
+                let changed = !self.calls.is_empty();
+                self.calls.clear();
+                let status = changed.then(|| self.status());
+                *self = Self::default();
+                return status;
+            }
+            WalRecord::ToolBatchFinished { .. } => {
+                self.tool_names.clear();
+            }
+            WalRecord::ModelStepFinished {
+                assistant_message, ..
+            } => {
+                self.tool_names.clear();
+                for call in assistant_message.tool_calls() {
+                    self.tool_names
+                        .insert(call.tool_call_id.clone(), call.tool_name.clone());
+                }
+            }
+            WalRecord::ToolDispatchIntent {
+                tool_call_id,
+                tool_name: Some(tool),
+                ..
+            } => {
+                self.tool_names
+                    .entry(tool_call_id.clone())
+                    .or_insert_with(|| tool.clone());
+            }
+            WalRecord::ToolCallProviderHeld {
+                batch_id,
+                tool_call_id,
+                call_key,
+                module,
+                reason,
+                held_at_ms,
+                ..
+            } => {
+                let held = cortexkit_role_llm_runner::run::HeldCall::new(
+                    call_key.clone(),
+                    self.tool_names
+                        .get(tool_call_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                    module.clone(),
+                    reason.clone(),
+                    *held_at_ms,
+                );
+                if let Some((_, _, previous)) = self
+                    .calls
+                    .iter_mut()
+                    .find(|(batch, call, _)| batch == batch_id && call == tool_call_id)
+                {
+                    if previous == &held {
+                        return None;
+                    }
+                    *previous = held;
+                } else {
+                    self.calls
+                        .push((batch_id.clone(), tool_call_id.clone(), held));
+                }
+                return Some(self.status());
+            }
+            WalRecord::ToolResult {
+                batch_id, result, ..
+            } => return self.remove(batch_id, &result.tool_call_id),
+            WalRecord::ToolNoDispatch {
+                batch_id,
+                tool_call_id,
+                ..
+            } => return self.remove(batch_id, tool_call_id),
+            _ => {}
+        }
+        None
+    }
+
+    fn remove(
+        &mut self,
+        batch_id: &BatchId,
+        tool_call_id: &ToolCallId,
+    ) -> Option<cortexkit_role_llm_runner::run::RunStatus> {
+        let previous = self.calls.len();
+        self.calls
+            .retain(|(batch, call, _)| batch != batch_id || call != tool_call_id);
+        let status = (previous != self.calls.len()).then(|| self.status());
+        if self.calls.is_empty() {
+            self.state = None;
+        }
+        status
+    }
+
+    pub(crate) fn status(&self) -> cortexkit_role_llm_runner::run::RunStatus {
+        cortexkit_role_llm_runner::run::RunStatus::new(self.state.as_deref().unwrap_or("active"))
+            .with_held_calls(self.calls.iter().map(|(_, _, held)| held.clone()).collect())
+    }
+}
+
 /// A closed Prepared call whose unanswered question still needs a withdrawal.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OwedWithdrawal {
@@ -3632,12 +3756,7 @@ pub fn reconcile_run_state<'a>(
     let mut title: Option<String> = None;
     let mut budget_detail = None;
     let mut context_ceiling = None;
-    let mut tool_names = HashMap::new();
-    let mut held_calls: Vec<(
-        BatchId,
-        ToolCallId,
-        cortexkit_role_llm_runner::run::HeldCall,
-    )> = Vec::new();
+    let mut held_calls = HeldCallsProjection::default();
     // The structured-output settings the target run froze, and the result it recorded.
     let mut frozen_structured_output = None;
     let mut structured_output_result = None;
@@ -3646,6 +3765,13 @@ pub fn reconcile_run_state<'a>(
     let queued_submission = format!("sub-{run_id}");
     for rec in records {
         run_usage.observe(rec);
+        let observes_held_calls = match rec {
+            WalRecord::RunStarted { run_id: rid, .. } => rid.0 == run_id,
+            _ => active_run.as_deref() == Some(run_id),
+        };
+        if observes_held_calls {
+            let _ = held_calls.observe(rec);
+        }
         match rec {
             WalRecord::RunStarted {
                 run_id: rid,
@@ -3655,7 +3781,6 @@ pub fn reconcile_run_state<'a>(
                 ..
             } => {
                 if rid.0 == run_id {
-                    held_calls.clear();
                     auth_selection = config.auth_selection.clone();
                     title = started_title.clone();
                     frozen_structured_output =
@@ -3664,7 +3789,6 @@ pub fn reconcile_run_state<'a>(
                         );
                 }
                 active_run = Some(rid.0.clone());
-                tool_names.clear();
                 budget_detail = None;
                 context_ceiling = None;
                 pending_steer_ids.clear();
@@ -3737,14 +3861,10 @@ pub fn reconcile_run_state<'a>(
                 result,
             } if rid.0 == run_id => structured_output_result = Some(result.clone()),
             WalRecord::ModelStepFinished {
-                assistant_message,
                 finish_reason,
                 retries_used,
                 ..
             } => {
-                for call in assistant_message.tool_calls() {
-                    tool_names.insert(call.tool_call_id.clone(), call.tool_name.clone());
-                }
                 active_zero_step_seed = false;
                 has_completed_step = true;
                 total_usage.accumulate(&crate::refusal_fallback::total_step_usage(rec).unwrap());
@@ -3761,60 +3881,15 @@ pub fn reconcile_run_state<'a>(
                 total_usage.accumulate(&crate::refusal_fallback::total_step_usage(rec).unwrap());
             }
             WalRecord::ToolBatchStarted { .. } => indeterminate_tool_calls.reset_batch(),
-            WalRecord::ToolDispatchIntent {
-                tool_call_id,
-                tool_name,
-                ..
-            } => {
-                if let Some(tool) = tool_name {
-                    tool_names
-                        .entry(tool_call_id.clone())
-                        .or_insert_with(|| tool.clone());
-                }
+            WalRecord::ToolDispatchIntent { tool_call_id, .. } => {
                 indeterminate_tool_calls.record_dispatch_intent(tool_call_id);
             }
-            WalRecord::ToolCallProviderHeld {
-                batch_id,
-                tool_call_id,
-                call_key,
-                module,
-                reason,
-                held_at_ms,
-                ..
-            } if active_run.as_deref() == Some(run_id) => {
-                held_calls.push((
-                    batch_id.clone(),
-                    tool_call_id.clone(),
-                    cortexkit_role_llm_runner::run::HeldCall::new(
-                        call_key.clone(),
-                        tool_names.get(tool_call_id).cloned().unwrap_or_default(),
-                        module.clone(),
-                        reason.clone(),
-                        *held_at_ms,
-                    ),
-                ));
-            }
-            WalRecord::ToolNoDispatch {
-                batch_id,
-                tool_call_id,
-                ..
-            } => {
-                if active_run.as_deref() == Some(run_id) {
-                    held_calls.retain(|(batch, call, _)| batch != batch_id || call != tool_call_id);
-                }
+            WalRecord::ToolNoDispatch { tool_call_id, .. } => {
                 indeterminate_tool_calls.record_dispatch_terminal(tool_call_id, false);
             }
             WalRecord::ToolResult {
-                batch_id,
-                result,
-                outcome,
-                ..
+                result, outcome, ..
             } => {
-                if active_run.as_deref() == Some(run_id) {
-                    held_calls.retain(|(batch, call, _)| {
-                        batch != batch_id || call != &result.tool_call_id
-                    });
-                }
                 indeterminate_tool_calls
                     .record_dispatch_terminal(&result.tool_call_id, outcome.is_indeterminate());
             }
@@ -3972,7 +4047,7 @@ pub fn reconcile_run_state<'a>(
     }
     found.map(|state| ReconciledRunState {
         held_calls: if matches!(state.state, RunIndexState::Active | RunIndexState::Paused) {
-            held_calls.into_iter().map(|(_, _, held)| held).collect()
+            held_calls.status().held_calls
         } else {
             Vec::new()
         },

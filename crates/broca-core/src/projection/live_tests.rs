@@ -104,6 +104,92 @@ fn reopen_stored_frames(records: &[WalRecord]) -> Vec<FramedRecord> {
 }
 
 #[test]
+fn held_status_changes_share_the_status_read_fold_and_replay_cursors() {
+    use crate::replay::provider_held_tests as held;
+    let mut records = held::prefix(false);
+    let mut second = held::held(false);
+    if let WalRecord::ToolCallProviderHeld {
+        tool_call_id,
+        call_key,
+        ..
+    } = &mut second
+    {
+        *tool_call_id = broca_protocol::ToolCallId("b".into());
+        *call_key = "lineage:5".into();
+    }
+    records.push(second.clone());
+    records.push(second); // Re-observing identical metadata does not change the list.
+    records.push(WalRecord::RunPaused {
+        ts_ms: Some(43),
+        run_id: RunId("r".into()),
+        reason: broca_protocol::PauseReason::ToolHeld,
+        error: None,
+    });
+    let mut other_batch = held::terminal("a", DispatchOutcome::Completed);
+    if let WalRecord::ToolResult { batch_id, .. } = &mut other_batch {
+        *batch_id = broca_protocol::BatchId("older-batch".into());
+    }
+    records.push(other_batch);
+    records.push(held::terminal("a", DispatchOutcome::Completed));
+    records.push(WalRecord::ToolNoDispatch {
+        batch_id: broca_protocol::BatchId("b".into()),
+        tool_call_id: broca_protocol::ToolCallId("b".into()),
+        reason: broca_wal::NoDispatchReason::Denied {
+            reason: "not sent".into(),
+        },
+        dispatched_at_ms: None,
+        hooks: None,
+        tags: None,
+    });
+    let framed = frames(&records);
+    let mut live_state = ControlProjectionState::default();
+    let mut live = Vec::new();
+    let mut lists = Vec::new();
+    for (index, record) in framed.iter().enumerate() {
+        let units =
+            project_control_with_mids(std::slice::from_ref(record), &mut live_state).unwrap();
+        for unit in &units {
+            if let ControlUnit::Status { status, .. } = &unit.unit {
+                assert_eq!(
+                    status.held_calls(),
+                    crate::reconcile_run_state(&records[..=index], "r")
+                        .unwrap()
+                        .held_calls
+                );
+                lists.push(
+                    status
+                        .held_calls()
+                        .iter()
+                        .map(|call| call.call_key().to_owned())
+                        .collect::<Vec<_>>(),
+                );
+            }
+            assert!(!matches!(unit.event, LiveEvent::RunPaused(_)));
+        }
+        live.extend(units);
+    }
+    assert_eq!(
+        lists,
+        [
+            vec!["lineage:4"],
+            vec!["lineage:4", "lineage:5"],
+            vec!["lineage:5"],
+            vec![]
+        ]
+    );
+    let replay =
+        project_control_with_mids(&reopen_stored_frames(&records), &mut Default::default())
+            .unwrap();
+    let comparable = |units: Vec<PlacedControlUnit>| {
+        units
+            .into_iter()
+            .map(|unit| (unit.cursor, unit.unit, unit.message_ordinal, unit.event))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(comparable(live), comparable(replay));
+}
+
+#[test]
 fn message_boundaries_complete_every_stored_message_without_moving_old_cursors() {
     let records = tool_turn();
     let projected = project_control_with_mids(&frames(&records), &mut Default::default()).unwrap();

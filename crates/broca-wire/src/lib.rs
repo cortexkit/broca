@@ -2904,12 +2904,99 @@ pub fn encode_live_subscribe_control(
     seq: u64,
     event: &cortexkit_role_llm_runner::live::LiveEvent,
 ) -> serde_json::Result<Vec<u8>> {
+    if let broca_protocol::caller::ControlUnit::Status { run_id, status } = unit {
+        return serde_json::to_vec(&status_subscribe_event(
+            wal_seq,
+            sub_index,
+            run_id,
+            status,
+            Some(seq),
+        ));
+    }
     serde_json::to_vec(&LiveSubscribeEventRef::Control {
         cursor: CursorWire { wal_seq, sub_index },
         unit,
         seq,
         event,
     })
+}
+
+/// Status changes use the shared envelope's held-call field, not a run-paused lifecycle.
+fn status_subscribe_event(
+    wal_seq: u64,
+    sub_index: u32,
+    run_id: &broca_protocol::RunId,
+    status: &cortexkit_role_llm_runner::run::RunStatus,
+    seq: Option<u64>,
+) -> cortexkit_role_llm_runner::subscribe::SubscribeEvent {
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "unit".into(),
+        serde_json::json!({"type":"status", "run_id":run_id}),
+    );
+    body.insert("state".into(), serde_json::json!(status.state));
+    if let Some(seq) = seq {
+        body.insert("seq".into(), seq.into());
+    }
+    cortexkit_role_llm_runner::subscribe::SubscribeEvent {
+        kind: "control".into(),
+        cursor: Some(
+            serde_json::from_value(serde_json::json!({"wal_seq":wal_seq, "sub_index":sub_index}))
+                .expect("cursor is an object"),
+        ),
+        body,
+    }
+    .with_held_calls(status.held_calls().to_vec())
+}
+
+#[cfg(test)]
+mod held_status_event_tests {
+    use super::*;
+
+    #[test]
+    fn held_status_control_uses_the_shared_envelope_without_a_live_lifecycle() {
+        use cortexkit_role_llm_runner::{
+            live::LiveEvent,
+            run::{HeldCall, RunStatus},
+        };
+        let held = HeldCall::new("lineage:6", "ask", "tools", "consent", 42);
+        for calls in [vec![held], vec![]] {
+            let unit = broca_protocol::caller::ControlUnit::Status {
+                run_id: broca_protocol::RunId("run-1".into()),
+                status: Box::new(RunStatus::new("active").with_held_calls(calls.clone())),
+            };
+            let bytes =
+                encode_live_subscribe_control(7, 0, &unit, 12, &LiveEvent::DisplayReset).unwrap();
+            let frame: cortexkit_role_llm_runner::subscribe::SubscribeEvent =
+                serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(frame.kind, "control");
+            assert_eq!(frame.seq(), Some(12));
+            assert_eq!(frame.live_event(), None);
+            assert!(!frame.body.contains_key("event"));
+            assert_eq!(frame.body["state"], "active");
+            assert_eq!(frame.held_calls().unwrap(), calls);
+            assert_eq!(frame.body.contains_key("held_calls"), !calls.is_empty());
+            let decoded = decode_subscribe_event(&bytes).unwrap();
+            assert_eq!(
+                decoded,
+                SubscribeEvent::Control {
+                    wal_seq: 7,
+                    sub_index: 0,
+                    unit
+                }
+            );
+            let replay = encode_subscribe_control(
+                7,
+                0,
+                match &decoded {
+                    SubscribeEvent::Control { unit, .. } => unit,
+                    _ => unreachable!(),
+                },
+            )
+            .unwrap();
+            assert_eq!(serde_json::to_vec(&decoded).unwrap(), replay);
+        }
+    }
 }
 
 /// A display frame already has its typed event; its stream sequence follows that payload.
@@ -2929,6 +3016,11 @@ pub fn encode_subscribe_control(
     sub_index: u32,
     unit: &broca_protocol::caller::ControlUnit,
 ) -> serde_json::Result<Vec<u8>> {
+    if let broca_protocol::caller::ControlUnit::Status { run_id, status } = unit {
+        return serde_json::to_vec(&status_subscribe_event(
+            wal_seq, sub_index, run_id, status, None,
+        ));
+    }
     serde_json::to_vec(&SubscribeEventRef::Control {
         cursor: CursorWire { wal_seq, sub_index },
         unit,
@@ -2953,6 +3045,10 @@ enum SubscribeEventOwned {
         // Kept as a JSON value so a unit with a newer pause or finish reason can be read again
         // as an unrecognized run state after the closed control unit refuses it.
         unit: serde_json::Value,
+        #[serde(default)]
+        state: Option<String>,
+        #[serde(default)]
+        held_calls: Vec<cortexkit_role_llm_runner::run::HeldCall>,
     },
     Display {
         event: DisplayEvent,
@@ -2967,6 +3063,17 @@ impl Serialize for SubscribeEvent {
         S: serde::Serializer,
     {
         match self {
+            Self::Control {
+                wal_seq,
+                sub_index,
+                unit,
+            } if matches!(unit, broca_protocol::caller::ControlUnit::Status { .. }) => {
+                let broca_protocol::caller::ControlUnit::Status { run_id, status } = unit else {
+                    unreachable!()
+                };
+                status_subscribe_event(*wal_seq, *sub_index, run_id, status, None)
+                    .serialize(serializer)
+            }
             Self::Control {
                 wal_seq,
                 sub_index,
@@ -3015,7 +3122,24 @@ impl<'de> Deserialize<'de> for SubscribeEvent {
         D: serde::Deserializer<'de>,
     {
         match SubscribeEventOwned::deserialize(deserializer)? {
-            SubscribeEventOwned::Control { cursor, unit } => {
+            SubscribeEventOwned::Control {
+                cursor,
+                mut unit,
+                state,
+                held_calls,
+            } => {
+                if unit.get("type").and_then(serde_json::Value::as_str) == Some("status") {
+                    if let Some(unit) = unit.as_object_mut() {
+                        unit.insert(
+                            "state".into(),
+                            state.map_or(serde_json::Value::Null, Into::into),
+                        );
+                        unit.insert(
+                            "held_calls".into(),
+                            serde_json::to_value(held_calls).map_err(serde::de::Error::custom)?,
+                        );
+                    }
+                }
                 match broca_protocol::caller::ControlUnit::deserialize(&unit) {
                     Ok(control) => {
                         let unknown_type =

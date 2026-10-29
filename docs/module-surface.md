@@ -1412,9 +1412,20 @@ connection; approved calls keep their deferred key and exact argument bytes. Rou
 decoding read only the provider declarations frozen into the session's plan manifest (on a
 fresh run the admitted manifest, on a resume the one its `RunStarted` recorded), never a live
 catalog. An accepted held reply first syncs `ToolCallProviderHeld`, then waits in its slot;
-when every remaining call is held the run pauses through `pause_run_impl` with
-`RunPaused {tool_held}` and sends nothing to the model. `provider-held/v1` is a known reader
-feature.
+when every remaining call is held the core parks through `pause_run_impl` with an internal
+`RunPaused {tool_held}` recovery boundary and sends nothing to the model. This provider-owned
+wait remains `active` on `run.status`; it does not emit `run_paused` on `session.subscribe`.
+`provider-held/v1` is a known reader feature.
+
+Each change to the ordered `held_calls` list emits a durable subscribe control frame from
+the existing held/terminal records. The frame has `unit: {type: "status", run_id}`, top-level
+`state`, a durable `cursor`, and the stream's next `seq`; it includes top-level `held_calls`
+only when that list is nonempty. It has no
+`event` member: this is a status snapshot, not a live lifecycle or display reset. The list
+uses the same WAL fold as `run.status`. Clearing the final held call emits another status
+frame with `held_calls` omitted; absence means none. Ordinary sessions acquire neither new
+frames nor new fields. Live display sequence numbers are not replayed, so a reconnect's
+`seq` starts again, while its durable units, cursors and status lists are unchanged.
 
 A late result IS the held call's result: held continuation preserves at-most-once dispatch
 of the original arguments. Withdrawal is a separate idempotent operation, not exactly-once

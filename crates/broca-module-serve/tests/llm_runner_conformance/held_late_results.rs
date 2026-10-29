@@ -298,6 +298,11 @@ impl HeldCase {
             .session_route(live, self.session, &self.subject.owner_stamp())
             .await
             .unwrap();
+        self.send_on(&route).await;
+        route
+    }
+
+    async fn send_on(&self, route: &BrocaRoute) {
         let mut fields = self
             .subject
             .send_fields_with_plan(self.session, true, &Map::new())
@@ -312,7 +317,6 @@ impl HeldCase {
             Reply::Response(_) => {}
             Reply::Error(error) => panic!("send refused: {} {}", error.code, error.message),
         }
-        route
     }
 
     /// Wait until the session's WAL satisfies `ready`, failing after a minute with `what`.
@@ -534,6 +538,256 @@ async fn a_held_call_pauses_then_its_late_result_completes_the_turn() {
     drop(route);
     drop(live);
     case.finish();
+}
+
+/// Preserve StreamData bodies exactly as served; decoding is only for finding the cut.
+async fn capture_through(
+    stream: &mut broca_subc::SubscribeStream,
+    frames: &mut Vec<Vec<u8>>,
+    ready: impl Fn(&Value) -> bool,
+) {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let body = stream
+                .next()
+                .await
+                .unwrap()
+                .expect("subscription stays open");
+            let decoded: Value = serde_json::from_slice(&body).unwrap();
+            frames.push(body);
+            if ready(&decoded) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the subscription reached the requested durable boundary");
+}
+
+fn save_status_sample(name: &str, frames: &[Vec<u8>]) {
+    if let Some(directory) = std::env::var_os("BROCA_HELD_STATUS_SAMPLES") {
+        let directory = PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut bytes = Vec::new();
+        for frame in frames {
+            bytes.extend(frame);
+            bytes.push(b'\n');
+        }
+        std::fs::write(directory.join(format!("{name}.jsonl")), bytes).unwrap();
+    }
+}
+
+fn durable_frames(frames: &[Vec<u8>]) -> Vec<Value> {
+    frames
+        .iter()
+        .map(|body| serde_json::from_slice::<Value>(body).unwrap())
+        .filter(|frame| frame["kind"] == "control")
+        .map(|mut frame| {
+            // Display deltas consume stream sequence numbers but are not replayed.
+            frame.as_object_mut().unwrap().remove("seq");
+            frame
+        })
+        .collect()
+}
+
+fn check_status_stream(frames: &[Vec<u8>]) {
+    for (index, body) in frames.iter().enumerate() {
+        let frame: cortexkit_role_llm_runner::subscribe::SubscribeEvent =
+            serde_json::from_slice(body).unwrap();
+        assert_eq!(frame.seq(), Some(index as u64 + 1));
+        assert!(!matches!(
+            frame.live_event(),
+            Some(cortexkit_role_llm_runner::live::LiveEvent::RunPaused(_))
+        ));
+        if frame
+            .body
+            .get("unit")
+            .is_some_and(|unit| unit["type"] == "status")
+        {
+            assert_eq!(frame.live_event(), None);
+            assert!(!frame.body.contains_key("event"));
+            assert_eq!(frame.body["state"], "active");
+            assert_eq!(
+                frame.body.contains_key("held_calls"),
+                !frame.held_calls().unwrap().is_empty()
+            );
+        }
+    }
+}
+
+/// The same real serve path supplies both the live reader and reconnecting readers.
+/// Set BROCA_HELD_STATUS_SAMPLES to retain the untouched bodies as JSONL reader fixtures.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_status_live_and_replay_samples() {
+    if !rig_ready() {
+        return;
+    }
+    for (session, kind) in [
+        ("status-late", Some(kinds::RESULT)),
+        ("status-expired", Some(kinds::EXPIRED)),
+        ("status-ordinary", None),
+    ] {
+        let case = HeldCase::new(session).await;
+        if kind.is_none() {
+            case.subject.shared.held_feed.lock().unwrap().hold.clear();
+        }
+        let live = case.subject.spawn(&case.root).await.unwrap();
+        let route = case
+            .subject
+            .session_route(&live, session, &case.subject.owner_stamp())
+            .await
+            .unwrap();
+        let subscription = route
+            .connection
+            .route_open_management("broca", &route.session)
+            .await
+            .unwrap();
+        let mut stream = route
+            .connection
+            .subscribe(
+                &subscription,
+                br#"{"method":"session.subscribe","params":{"from":"live"}}"#.to_vec(),
+            )
+            .await
+            .unwrap();
+        let mut frames = Vec::new();
+        capture_through(&mut stream, &mut frames, |frame| frame["kind"] == "display").await;
+        case.send_on(&route).await;
+        if let Some(kind) = kind {
+            let call_key = case.await_pause(&live).await;
+            capture_through(&mut stream, &mut frames, |frame| {
+                frame["unit"]["type"] == "status"
+            })
+            .await;
+            let frame: cortexkit_role_llm_runner::subscribe::SubscribeEvent =
+                serde_json::from_slice(frames.last().unwrap()).unwrap();
+            let Reply::Response(status) = route
+                .request(
+                    "run.status",
+                    json!({"run_id": frame.body["unit"]["run_id"]}),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("run.status refused");
+            };
+            let status: cortexkit_role_llm_runner::run::RunStatus =
+                serde_json::from_value(status).unwrap();
+            assert_eq!(status.state, "active");
+            assert_eq!(frame.held_calls().unwrap(), status.held_calls());
+            assert_eq!(status.held_calls().len(), 1);
+            assert_eq!(status.held_calls()[0].call_key(), call_key);
+            save_status_sample(&format!("{session}-listed-live"), &frames);
+            let replay_route = route
+                .connection
+                .route_open_management("broca", &route.session)
+                .await
+                .unwrap();
+            let mut replay = route
+                .connection
+                .subscribe(
+                    &replay_route,
+                    br#"{"method":"session.subscribe","params":{"from":"start"}}"#.to_vec(),
+                )
+                .await
+                .unwrap();
+            let mut replay_frames = Vec::new();
+            capture_through(&mut replay, &mut replay_frames, |frame| {
+                frame["unit"]["type"] == "status"
+            })
+            .await;
+            save_status_sample(&format!("{session}-listed-replay"), &replay_frames);
+            assert_eq!(durable_frames(&frames), durable_frames(&replay_frames));
+            drop(replay);
+            let _ = route.connection.route_close(&replay_route).await;
+            let entry = LateEntry::new(
+                kind,
+                "reserved:broca",
+                "none",
+                0,
+                "reserved:broca",
+                call_key,
+                "event-1",
+                1_761_220_000_000,
+            );
+            let entry = if kind == kinds::RESULT {
+                entry.with_result(json!({"content":[{"type":"text","text":case.late_text()}]}))
+            } else {
+                entry
+            };
+            case.subject.shared.held_feed.lock().unwrap().publish(entry);
+        }
+        capture_through(&mut stream, &mut frames, |frame| {
+            frame["unit"]["type"] == "run_finished"
+        })
+        .await;
+        save_status_sample(&format!("{session}-settled-live"), &frames);
+        let replay_route = route
+            .connection
+            .route_open_management("broca", &route.session)
+            .await
+            .unwrap();
+        let mut replay = route
+            .connection
+            .subscribe(
+                &replay_route,
+                br#"{"method":"session.subscribe","params":{"from":"start"}}"#.to_vec(),
+            )
+            .await
+            .unwrap();
+        let mut replay_frames = Vec::new();
+        capture_through(&mut replay, &mut replay_frames, |frame| {
+            frame["unit"]["type"] == "run_finished"
+        })
+        .await;
+        save_status_sample(&format!("{session}-settled-replay"), &replay_frames);
+        check_status_stream(&frames);
+        check_status_stream(&replay_frames);
+        let changes: Vec<cortexkit_role_llm_runner::subscribe::SubscribeEvent> = frames
+            .iter()
+            .map(|body| serde_json::from_slice(body).unwrap())
+            .filter(
+                |frame: &cortexkit_role_llm_runner::subscribe::SubscribeEvent| {
+                    frame
+                        .body
+                        .get("unit")
+                        .is_some_and(|unit| unit["type"] == "status")
+                },
+            )
+            .collect();
+        if kind.is_some() {
+            assert_eq!(changes.len(), 2, "listed then cleared, once each");
+            assert!(changes[1].held_calls().unwrap().is_empty());
+            let Reply::Response(status) = route
+                .request(
+                    "run.status",
+                    json!({"run_id": changes[1].body["unit"]["run_id"]}),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("run.status refused");
+            };
+            let status: cortexkit_role_llm_runner::run::RunStatus =
+                serde_json::from_value(status).unwrap();
+            assert_eq!(changes[1].held_calls().unwrap(), status.held_calls());
+        } else {
+            assert!(
+                changes.is_empty(),
+                "ordinary sessions gain no status frames"
+            );
+            assert!(frames
+                .iter()
+                .all(|body| !String::from_utf8_lossy(body).contains("held_calls")));
+        }
+        assert_eq!(durable_frames(&frames), durable_frames(&replay_frames));
+        assert_eq!(case.subject.tool_invocations(&case.call.arguments).await, 1);
+        drop(replay);
+        drop(stream);
+        drop(route);
+        drop(live);
+        case.finish();
+    }
 }
 
 /// Killed after the run paused and before the late result was pulled: the restarted daemon
