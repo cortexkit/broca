@@ -593,10 +593,12 @@ pub struct RunControl {
     /// this signal. Boundary cancellation uses the shared `steer` inbox instead, so it can
     /// forbid the next StepStarted without aborting this step's model or tool work.
     pub cancel: Option<CancellationToken>,
-    /// Per-model-call timeout (the provider watchdog). The model-stream await is
-    /// otherwise unbounded and would pin the lease until process death; on timeout the
-    /// loop cooperatively cancels at the same safe boundary as `cancel` and releases the
-    /// lease. `None` ⇒ unbounded (today's behavior).
+    /// Per-model-call timeout (the provider watchdog). Normal expiry closes Interrupted
+    /// and releases the lease after writer shutdown. On overhaul roots, a reservation
+    /// durability failure takes precedence and fails the step with a WAL error instead.
+    /// This does not bound public run completion: a kernel sync that never returns keeps
+    /// exclusive writer ownership and requires supervisor-level process recovery.
+    /// `None` leaves the model-stream await unbounded.
     pub provider_call_timeout: Option<std::time::Duration>,
     /// Whether to emit ordinary payload-bearing control units (`AssistantMessage`, `ToolCall`,
     /// and `ToolResult`) on `out`. Direct loop consumers use these units, so this defaults to
@@ -3713,6 +3715,7 @@ where
             .as_ref()
             .and_then(|config| config.work_class.as_deref()),
     );
+    let billing_work_class = writer.is_overhaul().then(|| work_class.clone()).flatten();
     // The requested reasoning variant follows the same frozen-on-resume rule as the workload
     // class: a resumed episode keeps what it was admitted with, whatever the retry sends.
     let variant = admitted_work_class(
@@ -4758,7 +4761,7 @@ where
                     tools_were_omitted: control.tools_were_omitted,
                     budget: cfg.budget.clone(),
                     context_limit,
-                    work_class: work_class.clone(),
+                    work_class,
                     variant: variant.clone(),
                     service_tier,
                     stop_when: cfg.stop_when.clone(),
@@ -5721,11 +5724,11 @@ where
         }
 
         // Run the model step, draining the normalized stream, under the optional
-        // provider-call watchdog. A timeout means the model stream didn't terminate in time:
-        // nothing durable was recorded for this step, so stop cooperatively as Interrupted at
-        // this safe boundary (a later episode re-runs the step). A caller cancellation uses the
-        // separate Cancelled terminal chosen at the watch site. This releases the lease that an
-        // unbounded await would pin until process death.
+        // provider-call watchdog. With healthy durability, timeout closes Interrupted at
+        // this safe boundary (a later episode re-runs the step); caller cancellation uses
+        // the separate Cancelled terminal. On overhaul roots, reservation durability failure
+        // instead propagates a WAL error. Writer shutdown can still wait on a stuck kernel
+        // sync: the lease must remain held until that writer exits.
         //
         // Failed attempts need their own durability barrier: a retry may remain open longer
         // than account reporting waits, or the process may crash before the step ends.
@@ -5743,7 +5746,9 @@ where
         // The body length of this step's latest attempt, for the output reservation's next
         // estimate (replay reads it from the same `ModelAttemptFinished` records).
         let last_attempt_bytes = std::sync::Mutex::new(None);
-        let journaled_attempts = std::sync::Mutex::new(std::collections::BTreeMap::new());
+        let journaled_attempts = writer
+            .is_overhaul()
+            .then(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
         let record_attempt = |attempt: broca_protocol::ModelAttempt| -> AttemptFuture<'_> {
             let journaled_attempts = &journaled_attempts;
             step_attempts.fetch_max(
@@ -5771,7 +5776,9 @@ where
                 }
                 let needs_sync = attempt.outcome != broca_protocol::AttemptOutcome::Complete;
                 report_input_transformations(session, attempt_run_id, step_id, &attempt);
-                let journaled_seq = journaled_attempts.lock().unwrap().remove(&attempt.attempt);
+                let journaled_seq = journaled_attempts
+                    .as_ref()
+                    .and_then(|recorded| recorded.lock().unwrap().remove(&attempt.attempt));
                 if let Some(seq) = journaled_seq {
                     // The physical-send journal already wrote the billing terminal. Keep the
                     // legacy sink for progress, but never append a second settlement here.
@@ -6000,7 +6007,7 @@ where
                     },
                     run: AttemptRun {
                         flow_id: req.scope.as_ref().and_then(|scope| scope.flow_id.clone()),
-                        work_class: work_class.clone(),
+                        work_class: billing_work_class.clone(),
                         context_limit: step_context_limit,
                         service_tier_requested: service_tier.map(|tier| tier.as_str().to_owned()),
                         ..Default::default()
@@ -6017,7 +6024,9 @@ where
                         seal: control.shutdown_seal.as_ref(),
                         template,
                         pending: Default::default(),
-                        recorded: &journaled_attempts,
+                        recorded: journaled_attempts
+                            .as_ref()
+                            .expect("overhaul attempt journal"),
                         #[cfg(test)]
                         before_start: None,
                     },
@@ -8451,7 +8460,9 @@ enum AttemptRequest {
 
 struct ChannelAttemptHook(tokio::sync::mpsc::UnboundedSender<AttemptRequest>);
 
-/// A stuck writer must never turn a reservation receipt into an unbounded send wait.
+/// Bounds cooperative reservation permission, not public run completion or writer teardown.
+/// A kernel fsync that never returns retains exclusive writer ownership and can still stall
+/// shutdown; the supervisor handles that process-level failure without releasing the lease early.
 const RESERVATION_PERMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn attempt_hook_error(detail: impl std::fmt::Display) -> ProviderError {
@@ -8595,6 +8606,11 @@ impl AttemptJournal<'_> {
                 cancel,
                 mut reply,
             } => {
+                if step_stopped.is_cancelled() {
+                    let _ =
+                        reply.send(Err(attempt_hook_error("step completed before reservation")));
+                    return Ok(());
+                }
                 let id = match crate::attempt_id::mint_attempt_id() {
                     Ok(id) => id,
                     Err(error) => {
@@ -8793,12 +8809,15 @@ async fn journal_model_step<F: std::future::Future>(
                         }
                     }
                 };
+                // A durability failure outranks the saved step/watchdog result. The log
+                // cannot safely commit the ordinary Interrupted close-out in that case.
                 if let Err(error) = handled { journal.close()?; return Err(error); }
                 if let Some(result) = completed { break result; }
             },
             result = &mut step => break result,
         }
     };
+    step_stopped.cancel();
     while let Ok(request) = requests.try_recv() {
         journal.handle(request, &step_stopped).await?;
     }
@@ -11837,6 +11856,114 @@ mod tests {
             reply.is_closed(),
             "a late handler must not grant send permission"
         );
+    }
+
+    #[tokio::test]
+    async fn completed_step_refuses_late_reservation_without_send_permission() {
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = WalHandle::spawn(
+            Box::new(RecordingWal {
+                records: records.clone(),
+            }),
+            1,
+        )
+        .unwrap();
+        let (tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let hook = ChannelAttemptHook(tx);
+        let recorded = Default::default();
+        let mut journal = AttemptJournal {
+            writer: &writer,
+            seal: None,
+            template: attempt_template(),
+            pending: Default::default(),
+            recorded: &recorded,
+            before_start: None,
+        };
+        let reservation = hook.before_send(physical_send(), CancellationToken::new());
+        tokio::pin!(reservation);
+        let step = async {
+            // Enqueue from the step's final poll, after the outer select has already
+            // polled the empty request queue. Keep the receipt alive after completion.
+            assert!(futures::poll!(&mut reservation).is_pending());
+            17
+        };
+        assert_eq!(
+            journal_model_step(step, &mut requests, &mut journal)
+                .await
+                .unwrap(),
+            17
+        );
+        let permission = reservation.await;
+        assert!(
+            permission.is_err(),
+            "a completed step must not grant a late send permission"
+        );
+        assert_eq!(
+            permission.unwrap_err().provider_code.as_deref(),
+            Some("attempt_durability_failed")
+        );
+        writer.sync().await.unwrap();
+        assert!(
+            records.lock().unwrap().is_empty(),
+            "a late reservation must not create a new send intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_step_still_settles_late_finish() {
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = WalHandle::spawn(
+            Box::new(RecordingWal {
+                records: records.clone(),
+            }),
+            1,
+        )
+        .unwrap();
+        let (tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let hook = ChannelAttemptHook(tx);
+        let recorded = Default::default();
+        let mut journal = AttemptJournal {
+            writer: &writer,
+            seal: None,
+            template: attempt_template(),
+            pending: Default::default(),
+            recorded: &recorded,
+            before_start: None,
+        };
+        let reservation = hook.before_send(physical_send(), CancellationToken::new());
+        tokio::pin!(reservation);
+        assert!(futures::poll!(&mut reservation).is_pending());
+        journal
+            .handle(requests.recv().await.unwrap(), &CancellationToken::new())
+            .await
+            .unwrap();
+        let id = reservation.await.unwrap();
+        let mut attempt = transformation_attempt(None, true);
+        attempt.sent_at_ms = Some(1);
+        let finish = hook.finished(
+            id.clone(),
+            attempt,
+            broca_wal::record::BillingAttemptOutcome::Complete,
+        );
+        tokio::pin!(finish);
+        let step = async {
+            assert!(futures::poll!(&mut finish).is_pending());
+            23
+        };
+        assert_eq!(
+            journal_model_step(step, &mut requests, &mut journal)
+                .await
+                .unwrap(),
+            23
+        );
+        finish.await.unwrap();
+        writer.sync().await.unwrap();
+        let records = records.lock().unwrap();
+        assert_eq!(records.iter().filter(|record| matches!(record, WalRecord::ModelAttemptFinished { attempt_id: Some(terminal_id), .. } if terminal_id == &id)).count(), 1);
+        assert!(!records.iter().any(|record| matches!(
+            record,
+            WalRecord::AttemptFinished { .. } | WalRecord::AttemptReleased { .. }
+        )));
     }
 
     #[tokio::test]

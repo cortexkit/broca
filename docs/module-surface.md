@@ -1125,7 +1125,10 @@ recorded and a crash left open is sealed on recovery with its recorded exit, wit
 provider or the model.
 
 The provider-call watchdog is separate from caller cancellation. A timed-out provider attempt
-ends `Interrupted`, not `Cancelled`, and releases the lease.
+ends `Interrupted`, not `Cancelled`, and releases the lease on legacy-format roots. On an overhaul
+root, a billing-reservation durability failure takes precedence: the step fails with a WAL
+durability error instead of `Interrupted`. A writer whose sync never returns remains a
+process-level failure for the supervisor, not a bounded close-out; ownership is not released early.
 
 ## 14. run.status enum + durable run index + busy-vs-stale
 

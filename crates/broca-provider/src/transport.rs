@@ -6269,6 +6269,38 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "manual measurement of retained HTTP-wrapper sharing overhead"]
+    fn legacy_http_wrapper_sharing_component_cost() {
+        const ITERATIONS: u128 = 100_000;
+        const SAMPLES: usize = 9;
+        let client = build_provider_http_client();
+        let mut allocation = Vec::with_capacity(SAMPLES);
+        let mut cloning = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let start = std::time::Instant::now();
+            for _ in 0..ITERATIONS {
+                std::hint::black_box(Arc::new(super::JournaledHttpClients {
+                    clients: std::sync::OnceLock::new(),
+                    builder: Box::new(super::provider_client_builder),
+                }));
+            }
+            allocation.push(start.elapsed().as_nanos() / ITERATIONS);
+            let start = std::time::Instant::now();
+            for _ in 0..ITERATIONS {
+                std::hint::black_box(Arc::clone(&client.journaled));
+            }
+            cloning.push(start.elapsed().as_nanos() / ITERATIONS);
+        }
+        allocation.sort_unstable();
+        cloning.sort_unstable();
+        assert!(client.journaled.clients.get().is_none());
+        // Isolate the retained sharing component, not TLS/client construction or a
+        // historical implementation. Each sample includes loop and drop overhead.
+        println!("legacy sharing component: os={} debug_assertions={} batches={SAMPLES} iterations_per_batch={ITERATIONS} arc_allocate_drop_median_batch_mean_ns={} arc_clone_drop_median_batch_mean_ns={}",
+            std::env::consts::OS, cfg!(debug_assertions), allocation[SAMPLES / 2], cloning[SAMPLES / 2]);
+    }
+
     #[tokio::test]
     async fn journaled_render_attaches_speed_metadata_before_send() {
         let server = ScriptedServer::start(vec![ScriptResponse::Http {
@@ -6332,7 +6364,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settlement_wait_preserves_legacy_retry_wall_decision() {
+    async fn settlement_wait_is_excluded_from_retry_wall_budget() {
         let server = ScriptedServer::start(vec![
             ScriptResponse::Http {
                 status: 429,
@@ -6390,7 +6422,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_retry_wall_boundary_matches_baseline_records() {
+    async fn legacy_entry_points_match_wall_boundary_expectations() {
         for (second_elapsed, expected_count) in [
             (Duration::from_secs(18) - Duration::from_nanos(1), 3),
             (Duration::from_secs(18), 3),
@@ -6472,7 +6504,7 @@ mod tests {
                         retries_used = Some(retries);
                     }
                 }
-                // The pre-journal policy permits equality at 240 s, but not one nanosecond
+                // The strict greater-than predicate permits equality at 240 s, but not one nanosecond
                 // beyond it: 100 s + 2 s + second_elapsed + the 120 s Retry-After.
                 assert_eq!(records.len(), expected_count);
                 assert_eq!(retries_used, Some(expected_count as u32 - 1));
