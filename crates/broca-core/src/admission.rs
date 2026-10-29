@@ -1346,9 +1346,7 @@ impl AdmissionSource {
         boundary: &AdmissionSource,
     ) -> Result<FramedRecord, crate::replay::SeedFallback> {
         use sha2::Digest;
-        let bad = || crate::replay::SeedFallback {
-            reason: "admission source identity mismatch",
-        };
+        let bad = || crate::replay::SeedFallback::new("admission source identity mismatch");
         if self.seq == 0 || self.seq > boundary.seq || self.end > boundary.end {
             return Err(bad());
         }
@@ -1357,11 +1355,12 @@ impl AdmissionSource {
             .checked_sub(self.off)
             .filter(|len| *len > 0)
             .ok_or_else(bad)?;
-        let bytes = read_at(self.off, len).map_err(|_| bad())?;
+        let bytes =
+            broca_wal::access_counter::read_at(read_at, self.off, len).map_err(|_| bad())?;
         if bytes.len() as u64 != len || sha2::Sha256::digest(&bytes).as_slice() != self.identity {
             return Err(bad());
         }
-        match broca_wal::framing::decode_next(&bytes) {
+        match broca_wal::access_counter::decode_next(&bytes) {
             broca_wal::framing::DecodeStep::Record { framed, consumed }
                 if consumed == bytes.len() && framed.seq == self.seq =>
             {
@@ -1427,9 +1426,7 @@ impl AdmissionSeed {
         prefix: &[crate::replay::PositionedFrame],
     ) -> Result<Self, crate::replay::SeedFallback> {
         use sha2::Digest;
-        let bad = || crate::replay::SeedFallback {
-            reason: "incomplete admission prefix",
-        };
+        let bad = || crate::replay::SeedFallback::new("incomplete admission prefix");
         if prefix.first().map(|p| p.framed.seq) != Some(1)
             || prefix.last().map(|p| (p.framed.seq, p.off))
                 != Some((boundary.seq, boundary.frame_off))
@@ -1451,17 +1448,20 @@ impl AdmissionSeed {
             || replay.open_tool_turn.is_some()
             || frames.iter().any(|p| matches!(&p.record, WalRecord::RunStarted { manifest: Some(manifest), .. } if crate::compaction::has_compaction(manifest)))
         {
-            return Err(crate::replay::SeedFallback {
-                reason: "admission prefix needs full replay",
-            });
+            return Err(crate::replay::SeedFallback::new("admission prefix needs full replay"));
         }
         let source = |i: usize| -> Result<AdmissionSource, crate::replay::SeedFallback> {
             let off = prefix[i].off;
             let limit = prefix.get(i + 1).map_or(boundary.frame_end, |p| p.off);
-            let bytes = read_at(off, limit.checked_sub(off).ok_or_else(bad)?).map_err(|_| bad())?;
+            let bytes = broca_wal::access_counter::read_at(
+                read_at,
+                off,
+                limit.checked_sub(off).ok_or_else(bad)?,
+            )
+            .map_err(|_| bad())?;
             // FileWal metadata follows each record. A source identifies only its own
             // frame, not the lineage bytes before the next positioned record.
-            let consumed = match broca_wal::framing::decode_next(&bytes) {
+            let consumed = match broca_wal::access_counter::decode_next(&bytes) {
                 broca_wal::framing::DecodeStep::Record { framed, consumed }
                     if *framed == prefix[i].framed =>
                 {
@@ -1582,9 +1582,7 @@ impl AdmissionSeed {
         let Some(seed) = &self.episode else {
             return Ok(None);
         };
-        let bad = || crate::replay::SeedFallback {
-            reason: "invalid admission episode sources",
-        };
+        let bad = || crate::replay::SeedFallback::new("invalid admission episode sources");
         let start = seed.start.read(read_at, &self.boundary)?;
         if !matches!(&start.record, WalRecord::RunStarted { run_id, .. } if run_id == &seed.run_id)
         {
@@ -1657,9 +1655,7 @@ impl AdmissionSeed {
             || crate::replay::tail_contains_compaction_setup(&tail.iter().map(|p| p.framed.clone()).collect::<Vec<_>>())
             || tail.iter().any(|p| matches!(&p.framed.record, WalRecord::RunStarted { manifest: Some(manifest), .. } if crate::compaction::has_compaction(manifest)))
         {
-            return Err(crate::replay::SeedFallback {
-                reason: "admission seed incomplete or head mismatch",
-            });
+            return Err(crate::replay::SeedFallback::new("admission seed incomplete or head mismatch"));
         }
         crate::replay::replay_seeded_at_validated_boundary(
             read_at,
@@ -1699,9 +1695,7 @@ impl AdmissionSeed {
     ) -> Result<(AdmissionCheckpointV1, AdmissionCheckpointV1), crate::replay::SeedFallback> {
         let episode = self.episode(read_at)?;
         self.validate(read_at, tail, safe_head, episode.as_ref())?;
-        let bad = || crate::replay::SeedFallback {
-            reason: "incomplete admission scalars",
-        };
+        let bad = || crate::replay::SeedFallback::new("incomplete admission scalars");
         if self.scalars.last_episode.is_some()
             || !self.scalars.pending_fifo.is_empty()
             || self.scalars.pending_order.is_some()
@@ -1818,9 +1812,7 @@ impl AdmissionSeed {
         checkpoint.last_episode = episode;
         checkpoint
             .fold_frames(&tail.iter().map(|p| p.framed.clone()).collect::<Vec<_>>())
-            .map_err(|_| crate::replay::SeedFallback {
-                reason: "paused admission tail refused",
-            })?;
+            .map_err(|_| crate::replay::SeedFallback::new("paused admission tail refused"))?;
         Ok(checkpoint
             .last_episode
             .filter(|e| e.disposition == EpisodeDisposition::Paused))
@@ -2556,24 +2548,50 @@ mod tests {
             file.take(len).read_to_end(&mut bytes)?;
             Ok(bytes)
         };
-        let seed = AdmissionSeed::capture(&read_at, &boundary, &positioned[..cut])
+        let counter = broca_wal::access_counter::WalAccessCounter::default();
+        let seed = counter
+            .operation("capture admission seed")
+            .run(|| AdmissionSeed::capture(&read_at, &boundary, &positioned[..cut]))
             .expect("a multi-record FileWal admission seed must capture exact source frames");
         assert_eq!(
             positioned.get(cut).map_or(bytes.len() as u64, |p| p.off) - boundary.frame_end,
             broca_wal::framing::LINEAGE_FRAME_LEN as u64
         );
         let full_reads = std::cell::Cell::new(0);
-        let snapshot = crate::run::load_prior_wal_snapshot_from_seed(
-            &read_at,
-            &seed,
-            &positioned[cut..],
-            positioned.last().unwrap().framed.seq,
-            || {
-                full_reads.set(full_reads.get() + 1);
-                panic!("a valid real FileWal admission seed must not read the full log")
-            },
-        )
-        .unwrap();
+        let snapshot = counter
+            .operation("hydrate admission seed")
+            .run(|| {
+                crate::run::load_prior_wal_snapshot_from_seed(
+                    &read_at,
+                    &seed,
+                    &positioned[cut..],
+                    positioned.last().unwrap().framed.seq,
+                    || {
+                        full_reads.set(full_reads.get() + 1);
+                        panic!("a valid real FileWal admission seed must not read the full log")
+                    },
+                )
+            })
+            .unwrap();
+        let measured = counter.snapshot();
+        // Capture authenticates the first and current RunStarted independently,
+        // plus RunConfigRefrozen and RunAuthRefrozen in the nonempty-tail corpus. Each
+        // locator is read once to find its extent and once to verify its hash.
+        let capture_reads = if empty_tail { 4 } else { 8 };
+        assert_eq!(measured[0].reads.len(), capture_reads);
+        assert_eq!(measured[0].frames_decoded, capture_reads as u64);
+        assert!(measured[1]
+            .reads
+            .iter()
+            .any(|read| read.class == broca_wal::access_counter::ReadClass::Source));
+        assert!(measured[1]
+            .reads
+            .iter()
+            .any(|read| read.class == broca_wal::access_counter::ReadClass::LineageHeader));
+        assert!(measured[1].frames_decoded > 0);
+        assert!(measured
+            .iter()
+            .all(|operation| operation.seed_fallbacks.is_empty()));
         assert_eq!(full_reads.get(), 0);
         assert_eq!(snapshot.base_watermark, cut as u64);
         assert_eq!(snapshot.tail.is_empty(), empty_tail);
@@ -2936,7 +2954,7 @@ mod tests {
             let reads = std::cell::Cell::new(0);
             let read_at = |off, len| {
                 let data = offset_reader(&bytes[..end_off])(off, len)?;
-                if matches!(broca_wal::framing::decode_next(&data), broca_wal::framing::DecodeStep::Record { consumed, .. } if consumed == data.len())
+                if matches!(broca_wal::access_counter::decode_next(&data), broca_wal::framing::DecodeStep::Record { consumed, .. } if consumed == data.len())
                 {
                     reads.set(reads.get() + 1);
                 }

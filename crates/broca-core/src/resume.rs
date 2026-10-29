@@ -73,7 +73,7 @@ pub fn reconstruct_from_offsets(
     use crate::replay::{
         replay_projection_tail, replay_seeded_at_validated_boundary, SeedFallback,
     };
-    let bad = |reason| SeedFallback { reason };
+    let bad = |reason| SeedFallback::new(reason);
     let mut seed = snapshot.projection;
     let window = snapshot.window;
     if seed.watermark_seq != snapshot.boundary.seq

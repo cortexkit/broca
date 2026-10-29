@@ -9,7 +9,8 @@ use broca_core::replay::{PositionedFrame, SeedBoundary};
 use broca_core::{FileWalStore, ReconciledRunState, ReplayState};
 use broca_protocol::{BindIdentity, RunId};
 use broca_store::db::{DbError, OverhaulDb};
-use broca_wal::framing::{decode_next, DecodeStep};
+use broca_wal::access_counter::{self, decode_next, ValidationRead};
+use broca_wal::framing::DecodeStep;
 use broca_wal::{FramedRecord, WalLineageId, WalRecord};
 use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
@@ -18,8 +19,6 @@ use sha2::{Digest, Sha256};
 pub struct OverhaulRunSource {
     db: Arc<OverhaulDb>,
     wal: Arc<FileWalStore>,
-    #[cfg(test)]
-    reads: std::sync::Mutex<Vec<(u64, u64)>>,
 }
 
 pub(crate) struct RunRead {
@@ -45,12 +44,7 @@ struct Row {
 
 impl OverhaulRunSource {
     pub fn new(db: Arc<OverhaulDb>, wal: Arc<FileWalStore>) -> Self {
-        Self {
-            db,
-            wal,
-            #[cfg(test)]
-            reads: Default::default(),
-        }
+        Self { db, wal }
     }
 
     fn row(&self, key: &BindIdentity, run_id: &RunId) -> Result<Option<Row>, DbError> {
@@ -109,13 +103,17 @@ impl OverhaulRunSource {
         key: &BindIdentity,
         run_id: &RunId,
     ) -> Result<Option<RunRead>, String> {
+        let fallback = |reason| {
+            access_counter::seed_fallback(reason);
+            Ok(None)
+        };
         let Some(row) = self.row(key, run_id).map_err(|e| e.to_string())? else {
-            return Ok(None);
+            return fallback("run row missing");
         };
         // Without a safe cut, only the first episode can replay at the actual log origin.
         // Later episodes fall back rather than inventing a seed from a bare run offset.
         if row.boundary.is_none() && !row.first_episode {
-            return Ok(None);
+            return fallback("run row has no historical boundary");
         }
         let path = self
             .wal
@@ -134,18 +132,18 @@ impl OverhaulRunSource {
         file.sync_all().map_err(|e| e.to_string())?;
         let file = RefCell::new(file);
         let read_at = |off: u64, count: u64| -> std::io::Result<Vec<u8>> {
-            #[cfg(test)]
-            self.reads.lock().unwrap().push((off, count));
             let mut file = file.borrow_mut();
             file.seek(SeekFrom::Start(off))?;
             let mut bytes = Vec::new();
-            file.by_ref()
-                .take(
+            access_counter::read_to_end(
+                file.by_ref().take(
                     count
                         .min(len.saturating_sub(off))
                         .min(self.wal.max_read_bytes()),
-                )
-                .read_to_end(&mut bytes)?;
+                ),
+                off,
+                &mut bytes,
+            )?;
             Ok(bytes)
         };
         let header =
@@ -155,17 +153,23 @@ impl OverhaulRunSource {
             _ => None,
         };
         if lineage_id.map(|id| id.to_string()) != row.lineage_id {
-            return Ok(None);
+            return fallback("run row lineage mismatch");
         }
         let off = row.boundary.as_ref().map_or(0, |b| b.frame_end);
         let end = row.next_off.unwrap_or(len).min(len);
         if off > row.start_off || row.start_off >= end {
-            return Ok(None);
+            return fallback("run row range outside log");
         }
         if let Some(next) = row.next_off {
             let mut count = 1024u64;
             loop {
-                let bytes = read_at(next, count).map_err(|e| e.to_string())?;
+                let bytes = access_counter::read_validation_at(
+                    ValidationRead::NextRunDelimiter,
+                    &read_at,
+                    next,
+                    count,
+                )
+                .map_err(|e| e.to_string())?;
                 match decode_next(&bytes) {
                     DecodeStep::Record { framed, .. }
                         if matches!(framed.record, WalRecord::RunStarted { .. }) =>
@@ -178,13 +182,13 @@ impl OverhaulRunSource {
                     {
                         count = count.saturating_mul(2).min(self.wal.max_read_bytes())
                     }
-                    _ => return Ok(None),
+                    _ => return fallback("run row next delimiter mismatch"),
                 }
             }
         }
         let bytes = read_at(off, end - off).map_err(|e| e.to_string())?;
         if bytes.len() as u64 != end - off {
-            return Ok(None);
+            return fallback("run row range truncated");
         }
         let mut tail = Vec::new();
         let mut at = 0;
@@ -244,13 +248,19 @@ impl OverhaulRunSource {
         }
         let records: Vec<_> = tail.iter().map(|p| p.framed.clone()).collect();
         if broca_core::replay::tail_contains_compaction_setup(&records) {
-            return Ok(None);
+            return fallback("run row tail contains compaction");
         }
         let replayed = if let Some(boundary) = &row.boundary {
             let Some(count) = boundary.frame_end.checked_sub(boundary.frame_off) else {
-                return Ok(None);
+                return fallback("run row boundary range reversed");
             };
-            let frame = read_at(boundary.frame_off, count).map_err(|e| e.to_string())?;
+            let frame = access_counter::read_validation_at(
+                ValidationRead::BoundaryFrame,
+                &read_at,
+                boundary.frame_off,
+                count,
+            )
+            .map_err(|e| e.to_string())?;
             let kind_matches = match (row.boundary_kind.as_deref(), decode_next(&frame)) {
                 (Some("turn_finished"), DecodeStep::Record { framed, .. }) => {
                     matches!(framed.record, WalRecord::TurnFinished { .. })
@@ -264,21 +274,27 @@ impl OverhaulRunSource {
                 _ => false,
             };
             if !kind_matches {
-                return Ok(None);
+                return fallback("run row boundary kind mismatch");
             }
             // No-tool and seed cuts are qualified by a later terminal. Validate that
             // frame too, so a restore before the qualifier cannot reuse the cut.
             if let Some((seq, lo, hi, hash)) = &row.qualifier {
                 let Some(count) = hi.checked_sub(*lo) else {
-                    return Ok(None);
+                    return fallback("run row qualifier range reversed");
                 };
-                let bytes = read_at(*lo, count).map_err(|e| e.to_string())?;
+                let bytes = access_counter::read_validation_at(
+                    ValidationRead::QualifierTerminal,
+                    &read_at,
+                    *lo,
+                    count,
+                )
+                .map_err(|e| e.to_string())?;
                 if Sha256::digest(&bytes).as_slice() != hash
                     || !matches!(decode_next(&bytes),
                     DecodeStep::Record { framed, consumed } if framed.seq == *seq
                         && consumed == bytes.len() && matches!(framed.record, WalRecord::RunFinished { .. }))
                 {
-                    return Ok(None);
+                    return fallback("run row qualifier mismatch");
                 }
             }
             match broca_core::replay::replay_seeded_at_validated_boundary(
@@ -654,8 +670,7 @@ mod tests {
                 let run = RunId(id.into());
                 assert!(
                     f.source.read(&f.key, &run).unwrap().is_some(),
-                    "indexed run {id} must have a usable read; ranges: {:?}",
-                    f.source.reads.lock().unwrap()
+                    "indexed run {id} must have a usable read"
                 );
                 let expected_status = legacy.run_status(&f.key, run.clone()).await.unwrap();
                 let expected_result = legacy.run_result(&f.key, run.clone()).await.unwrap();
@@ -689,19 +704,21 @@ mod tests {
                     "run-row reads must not issue even one sequence-zero range"
                 );
             }
-            f.source.reads.lock().unwrap().clear();
-            let read = f
-                .source
-                .read(&f.key, &RunId("target".into()))
-                .unwrap()
-                .unwrap();
+            let counter = access_counter::WalAccessCounter::default();
+            let read = counter.operation("target run").run(|| {
+                f.source
+                    .read(&f.key, &RunId("target".into()))
+                    .unwrap()
+                    .unwrap()
+            });
             assert_eq!(read.state.state.as_str(), reason_as_state(reason));
-            let reads = f.source.reads.lock().unwrap();
+            let measured = counter.snapshot();
+            let reads = &measured[0].reads;
             assert!(
                 reads
                     .iter()
-                    .filter(|(off, _)| *off == 0)
-                    .all(|(_, n)| *n == broca_wal::framing::LINEAGE_FRAME_LEN as u64),
+                    .filter(|read| read.offset == 0)
+                    .all(|read| read.class == access_counter::ReadClass::LineageHeader),
                 "only the fixed lineage header may be read at byte zero"
             );
         }
@@ -829,11 +846,21 @@ mod tests {
         f.finish(RunFinishReason::Completed);
         f.index();
         let legacy = f.registry(false);
-        let expected = legacy
-            .run_result(&f.key, RunId("target".into()))
+        let counter = access_counter::WalAccessCounter::default();
+        let expected = counter
+            .operation("legacy result")
+            .run_future(legacy.run_result(&f.key, RunId("target".into())))
             .await
             .unwrap();
-        assert!(f.source.reads.lock().unwrap().is_empty());
+        assert!(counter.snapshot()[0]
+            .reads
+            .iter()
+            .all(|read| !matches!(read.class, access_counter::ReadClass::Validation(_))));
+        assert!(counter.snapshot()[0]
+            .reads
+            .iter()
+            .any(|read| read.class == access_counter::ReadClass::Origin));
+        assert!(counter.snapshot()[0].frames_decoded > 0);
         assert!(legacy.overhaul_active_runs(&[]).is_none());
         f.source
             .db
@@ -846,9 +873,10 @@ mod tests {
             })
             .unwrap();
         let before = f.source.wal.range_reads_for_test();
-        let actual = f
-            .registry(true)
-            .run_result(&f.key, RunId("target".into()))
+        let indexed = f.registry(true);
+        let actual = counter
+            .operation("forced full replay")
+            .run_future(indexed.run_result(&f.key, RunId("target".into())))
             .await
             .unwrap();
         assert_eq!(
@@ -856,6 +884,21 @@ mod tests {
             serde_json::to_value(&expected).unwrap()
         );
         assert!(f.source.wal.range_reads_for_test() > before);
+        let measured = counter.snapshot();
+        let forced = &measured[1];
+        assert_eq!(forced.seed_fallbacks, ["boundary frame identity mismatch"]);
+        assert!(forced
+            .reads
+            .iter()
+            .any(|read| read.class == access_counter::ReadClass::Origin
+                && read.offset == 0
+                && read.length
+                    == std::fs::metadata(f.source.wal.wal_path(&f.key))
+                        .unwrap()
+                        .len()));
+        // Full replay decodes every record and lineage frame, in addition to the
+        // failed seed's validation work. An origin read alone cannot prove this.
+        assert!(forced.frames_decoded >= f.wal.last_seq() * 2);
         f.source
             .db
             .authoritative_transaction(|tx| {
@@ -917,13 +960,14 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(f
+        let counter = access_counter::WalAccessCounter::default();
+        assert!(counter.operation("missing historical boundary").run(|| f
             .source
             .read(&f.key, &RunId("target".into()))
             .unwrap()
-            .is_none());
+            .is_none()));
         assert!(
-            f.source.reads.lock().unwrap().is_empty(),
+            counter.snapshot()[0].reads.is_empty(),
             "there is no qualified preceding cut to read"
         );
         let before = f.source.wal.range_reads_for_test();
@@ -1036,17 +1080,19 @@ mod tests {
                 .run_tool_calls(&f.key, ToolCallsRequest::new(id))
                 .await
                 .unwrap();
-            f.source.reads.lock().unwrap().clear();
+            let counter = access_counter::WalAccessCounter::default();
             assert!(
-                f.source.read(&f.key, &run).unwrap().is_some(),
+                counter
+                    .operation("historical run")
+                    .run(|| f.source.read(&f.key, &run))
+                    .unwrap()
+                    .is_some(),
                 "run {id} needs a usable historical boundary"
             );
-            if f.source
+            if counter.snapshot()[0]
                 .reads
-                .lock()
-                .unwrap()
                 .iter()
-                .any(|(off, n)| *off == 0 && *n > broca_wal::framing::LINEAGE_FRAME_LEN as u64)
+                .any(|read| read.class == access_counter::ReadClass::Origin)
             {
                 origin_runs += 1;
             }

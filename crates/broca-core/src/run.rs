@@ -1887,11 +1887,15 @@ where
             .sync()
             .await
             .map_err(|e| RunError::Wal(e.to_string()))?;
-        let loaded = offsets.snapshot(safe_head).and_then(|snapshot| {
+        let loaded = broca_wal::access_counter::fallback_result(
+            || offsets.snapshot(safe_head),
+            |fallback| fallback.reason,
+        )
+        .and_then(|snapshot| {
             if writer.lineage_id().map(|id| id.to_string()) != snapshot.boundary.lineage_id {
-                return Err(crate::replay::SeedFallback {
-                    reason: "offset resume writer lineage mismatch",
-                });
+                return Err(crate::replay::SeedFallback::new(
+                    "offset resume writer lineage mismatch",
+                ));
             }
             crate::resume::reconstruct_from_offsets(
                 &|off, len| offsets.read_at(off, len),
@@ -8124,28 +8128,26 @@ pub(crate) fn restore_offset_prompt_guidance(
     window: &crate::context::OffsetPromptWindow,
 ) -> Result<(), crate::replay::SeedFallback> {
     use crate::replay::SeedFallback;
-    let missing = || SeedFallback {
-        reason: "offset prompt window lacks repetition checkpoint",
-    };
+    let missing = || SeedFallback::new("offset prompt window lacks repetition checkpoint");
     let seeded = |ordinal| -> Result<RepetitionFold, SeedFallback> {
         let at = window
             .guidance
             .binary_search_by_key(&ordinal, |g| g.ordinal)
             .map_err(|_| missing())?;
-        RepetitionFold::seeded(&window.guidance[at].fold).ok_or(SeedFallback {
-            reason: "offset prompt window repetition checkpoint is ambiguous",
+        RepetitionFold::seeded(&window.guidance[at].fold).ok_or_else(|| {
+            SeedFallback::new("offset prompt window repetition checkpoint is ambiguous")
         })
     };
     for checkpoint in &window.guidance {
         if checkpoint.fold.rules_version != crate::tool_repetition::REPETITION_RULES_VERSION {
-            return Err(SeedFallback {
-                reason: "offset prompt window repetition rules changed",
-            });
+            return Err(SeedFallback::new(
+                "offset prompt window repetition rules changed",
+            ));
         }
         if RepetitionFold::seeded(&checkpoint.fold).is_none() {
-            return Err(SeedFallback {
-                reason: "offset prompt window repetition checkpoint is ambiguous",
-            });
+            return Err(SeedFallback::new(
+                "offset prompt window repetition checkpoint is ambiguous",
+            ));
         }
     }
     let raw = state.prompt.clone();
