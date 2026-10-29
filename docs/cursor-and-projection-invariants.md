@@ -169,12 +169,15 @@ continues the same run_id:
   durability core's fail-to-doctor; NEVER a false `Cancelled` mid-batch that strands a
   tool_use). This threads through the same barrier discipline as everything else.
 - Provider watchdog: a per-run provider-call timeout must cooperatively
-  cancel at a safe boundary (the same path as cancel) and releases the lease. The tool
+  close `Interrupted` at a safe boundary and release the lease on legacy-format roots. On an overhaul
+  root, a billing-reservation durability failure takes precedence and fails the step with a WAL
+  durability error instead of `Interrupted`. A sync that never returns is a process-level failure
+  for the supervisor, not a bounded close-out; writer ownership is not released early. The tool
   path already has a 10s timeout (SubcToolPlane); this closes the model-stream gap.
 - Cancel/watchdog are ADDITIVE knobs with safe defaults (no token ⇒ no cancellation; no
   timeout ⇒ unbounded await), so every existing call site is unchanged.
   Conformance: cancel mid-loop → Interrupted at a safe boundary, no stranded tool_use,
-  resume sees a clean interrupt; watchdog expiry → same.
+  resume sees a clean interrupt; watchdog expiry → same unless overhaul reservation durability fails.
 
 ## 5. WAL lease-tenure stamp and file-integrity guard (§21.9, defense-in-depth)
 
