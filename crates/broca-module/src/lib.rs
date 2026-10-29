@@ -15,6 +15,7 @@ pub mod diagnostics;
 pub mod executor;
 pub mod fanout;
 pub mod held_slots;
+pub mod held_withdrawals;
 pub mod history;
 pub mod late_results_puller;
 pub mod late_results_store;

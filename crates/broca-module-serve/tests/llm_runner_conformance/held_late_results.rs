@@ -25,6 +25,7 @@ const INTERIM: &str = "HELD INTERIM: the answer comes later";
 /// The scripted provider's held calls and its `late_results` feed.
 #[derive(Default)]
 pub(super) struct FeedState {
+    withdrawals: Vec<Value>,
     /// The catalog declares `late_results` and `content/v1`, and calls in `hold` are held.
     enabled: bool,
     /// Arguments (as JSON text) of the calls the provider holds.
@@ -147,6 +148,21 @@ pub(super) async fn serve_feed(
     request: &Value,
 ) -> Option<subc_client_rs::HandlerOutcome> {
     match request["name"].as_str()? {
+        "tool.withdraw" => {
+            assert!(
+                request.get("call_key").is_none(),
+                "withdraw has no key of its own"
+            );
+            shared
+                .held_feed
+                .lock()
+                .unwrap()
+                .withdrawals
+                .push(request.clone());
+            Some(subc_client_rs::HandlerOutcome::Response(
+                br#"{"answer":"withdrawn"}"#.to_vec(),
+            ))
+        }
         "late_results" => {
             let feed = shared.held_feed.lock().unwrap();
             let since = &request["arguments"]["since"];
@@ -588,6 +604,153 @@ async fn a_kill_after_the_result_is_written_and_before_its_ack_never_writes_it_t
     // result was written once and the call never ran again.
     let live = case.subject.restart(&case.root).await.unwrap();
     case.assert_delivered_once(&live, false).await;
+    drop(live);
+    case.finish();
+}
+
+/// After the cancel seal is durable, broca withdraws the held call through a real tool route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_cancel_sends_one_real_withdraw_and_restart_does_not_repeat_it() {
+    if !rig_ready() {
+        return;
+    }
+    let case = HeldCase::new("held-cancel-withdraw").await;
+    let live = case.subject.spawn(&case.root).await.unwrap();
+    let route = case.send(&live).await;
+    let key = case.await_pause(&live).await;
+    let records = case
+        .wait_for(&live, "run start", |records| {
+            records
+                .iter()
+                .any(|record| matches!(record, broca_wal::WalRecord::RunStarted { .. }))
+        })
+        .await;
+    let run_id = records
+        .iter()
+        .find_map(|record| match record {
+            broca_wal::WalRecord::RunStarted { run_id, .. } => Some(run_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(matches!(
+        route
+            .request("run.cancel", json!({"run_id": run_id, "at": "now"}))
+            .await
+            .unwrap(),
+        Reply::Response(_)
+    ));
+    case.wait_for(&live, "cancel seal", |records| {
+        records.iter().any(|record| {
+            matches!(
+                record,
+                broca_wal::WalRecord::RunFinished {
+                    reason: broca_protocol::RunFinishReason::Cancelled,
+                    ..
+                }
+            )
+        })
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if !case
+                .subject
+                .shared
+                .held_feed
+                .lock()
+                .unwrap()
+                .withdrawals
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("cancel reaches tool.withdraw");
+    assert_eq!(
+        case.subject.shared.held_feed.lock().unwrap().withdrawals,
+        [json!({"name": "tool.withdraw", "arguments": {"call_key": key}})]
+    );
+    // Receipt at the provider is not a durable reply at broca. Restart only after the
+    // outbox committed completion; a lost reply is explicitly safe to withdraw again.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let done = broca_module::late_results_store::LateResultsStore::open(
+                &live.state_root.join("late-results.db"),
+            )
+            .and_then(|store| store.withdrawal_rows())
+            .is_ok_and(|rows| rows.iter().all(|(call, _, _)| call.call_key != key));
+            if done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("withdrawal completion commits before restart");
+    drop(route);
+    drop(live);
+    let live = case.subject.restart(&case.root).await.unwrap();
+    let route = case
+        .subject
+        .session_route(&live, case.session, &case.subject.owner_stamp())
+        .await
+        .unwrap();
+    assert!(matches!(
+        route
+            .request("run.result", json!({"run_id": run_id}))
+            .await
+            .unwrap(),
+        Reply::Response(_)
+    ));
+    assert_eq!(
+        case.subject
+            .shared
+            .held_feed
+            .lock()
+            .unwrap()
+            .withdrawals
+            .len(),
+        1
+    );
+    assert_eq!(case.model_requests(), 1);
+    drop(route);
+    drop(live);
+    case.finish();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_shutdown_and_restart_send_no_real_withdraw() {
+    if !rig_ready() {
+        return;
+    }
+    let case = HeldCase::new("held-shutdown-no-withdraw").await;
+    let live = case.subject.spawn(&case.root).await.unwrap();
+    let route = case.send(&live).await;
+    let key = case.await_pause(&live).await;
+    drop(route);
+    drop(live);
+    assert!(case
+        .subject
+        .shared
+        .held_feed
+        .lock()
+        .unwrap()
+        .withdrawals
+        .is_empty());
+    let live = case.subject.restart(&case.root).await.unwrap();
+    case.publish(&key);
+    case.assert_delivered_once(&live, true).await;
+    assert!(case
+        .subject
+        .shared
+        .held_feed
+        .lock()
+        .unwrap()
+        .withdrawals
+        .is_empty());
     drop(live);
     case.finish();
 }

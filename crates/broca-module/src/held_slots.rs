@@ -57,11 +57,20 @@ pub struct HeldSlots {
     /// Told the provider module each time a batch starts waiting on a held call, so that
     /// module's puller runs while the call waits.
     on_hold: std::sync::OnceLock<OnHold>,
+    withdrawals: std::sync::OnceLock<Arc<dyn HeldWithdrawal>>,
+}
+
+#[async_trait]
+pub trait HeldWithdrawal: Send + Sync {
+    async fn withdraw(&self, call: &ProviderHeldReply) -> Result<(), String>;
 }
 
 type OnHold = Box<dyn Fn(&str) + Send + Sync>;
 
 impl HeldSlots {
+    pub fn with_withdrawals(&self, withdrawals: Arc<dyn HeldWithdrawal>) {
+        let _ = self.withdrawals.set(withdrawals);
+    }
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
@@ -144,6 +153,12 @@ impl Drop for WaitGuard<'_> {
 
 #[async_trait]
 impl ProviderHeldLifecycle for HeldSlots {
+    async fn withdraw_held(&self, call: &ProviderHeldReply) -> Result<(), String> {
+        match self.withdrawals.get() {
+            Some(withdrawals) => withdrawals.withdraw(call).await,
+            None => Err("provider-held withdrawal transport is not installed".into()),
+        }
+    }
     async fn wait(
         &self,
         ctx: &BatchCtx,

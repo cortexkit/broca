@@ -986,82 +986,271 @@ fn registration_settled(call_key: &str, records: &[FramedRecord], facts: &HeldCa
     })
 }
 
-/// The bytes every frame carrying a `ToolCallProviderHeld` record (and every `tool_held` pause)
-/// holds verbatim: the feature its gated frame requires. A WAL without them has no held call,
-/// so the rebuild skips it without decoding a single frame.
-const HELD_FRAME_MARKER: &[u8] = b"provider-held/v1";
-
 /// How far the rebuild scanned, for the operator's log and for the measurement test.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RebuildReport {
     /// WAL files looked at.
     pub files: usize,
-    /// WAL files that held the marker and were decoded.
+    /// WAL files decoded, including logs with no held reply yet.
     pub decoded: usize,
     /// Registrations written.
     pub registered: usize,
-    /// Marked WALs that could not be decoded; the rebuild is incomplete while any remain.
+    /// WALs that could not be verified or registered; any one keeps the fence tripped.
     pub unreadable: Vec<std::path::PathBuf>,
     /// The state root's WAL feature floor shows no provider-held frame was ever written here,
     /// so no WAL was looked at.
     pub skipped_by_floor: bool,
 }
 
-/// Whether `path` holds `marker` anywhere, read in bounded chunks so a large WAL never sits in
-/// memory whole.
-fn file_contains(path: &Path, marker: &[u8]) -> std::io::Result<bool> {
-    use std::io::Read;
-    const CHUNK: usize = 1 << 20;
-    let mut file = std::fs::File::open(path)?;
-    let mut buffer = vec![0u8; CHUNK + marker.len()];
-    let mut kept = 0usize;
-    loop {
-        let read = file.read(&mut buffer[kept..])?;
-        if read == 0 {
-            return Ok(false);
-        }
-        let filled = kept + read;
-        if buffer[..filled]
-            .windows(marker.len())
-            .any(|window| window == marker)
-        {
-            return Ok(true);
-        }
-        // Keep the tail that could start a marker split across two reads.
-        kept = (marker.len() - 1).min(filled);
-        buffer.copy_within(filled - kept..filled, 0);
-    }
-}
-
-/// Rebuild a missing or unreadable intake store from the live WALs, never from the run index.
-///
-/// Every live WAL under the state root's `wal`, `wal-ephemeral` and `wal-durable` trees is
-/// looked at, but only those holding a provider-held frame are decoded. Each `ToolCallProviderHeld` found, open or closed,
-/// is registered under the session its `RunStarted` names, and its module's feed is marked as
-/// owing an ack whose position is unknown, so an ack owed before the store was lost is still
-/// made. Archives are not scanned: the fold never takes a range holding a held call.
-///
-/// Calls that were dispatched but never held are not registered. After a restart such a call
-/// is closed by recovery (an unknown outcome, never re-sent), so any entry for it can only be a
-/// no-op, and acking it unregistered is safe.
+/// Rebuild the intake from verified live WALs and every published archive member, never
+/// from the run index. Registration precedes dispatch, so intents without a held reply must
+/// also be reconstructed. Their original scope and lineage come from the log, not its path.
+/// Each reconstructed feed owes an ack whose previous position is unknown.
 pub fn rebuild_store_from_wals(
     store: &LateResultsStore,
     state_root: &Path,
 ) -> Result<RebuildReport, String> {
+    rebuild_store_from_wals_with_progress(store, state_root, |_| {})
+}
+
+pub fn rebuild_store_from_wals_with_progress(
+    store: &LateResultsStore,
+    state_root: &Path,
+    progress: impl Fn(&RebuildReport),
+) -> Result<RebuildReport, String> {
+    rebuild_with_publication_hook(store, state_root, progress, || {})
+}
+
+fn rebuild_with_publication_hook(
+    store: &LateResultsStore,
+    state_root: &Path,
+    progress: impl Fn(&RebuildReport),
+    after_verification: impl FnOnce(),
+) -> Result<RebuildReport, String> {
+    use std::io::{Read, Seek};
     let mut report = RebuildReport::default();
-    // A provider-held frame is gated, and the writer raises the state root's feature floor
-    // before the first gated frame reaches any file. A floor that is readable and lacks the
-    // feature therefore proves no WAL here holds a held call: there is nothing to scan. An
-    // unreadable floor proves nothing, so the scan runs.
-    let floor = state_root.join(broca_wal::FEATURE_FLOOR_FILENAME);
-    if broca_wal::read_floor(&floor)
-        .is_ok_and(|floor| !floor.contains(broca_wal::PROVIDER_HELD_FEATURE))
+    // Registration can precede the held feature floor. Only absence of both kinds of
+    // history permits skipping the log scan.
+    if !state_root
+        .join(crate::late_results_store::REGISTRATION_MARKER)
+        .try_exists()
+        .map_err(|error| error.to_string())?
+        && !state_root
+            .join(crate::late_results_store::REBUILD_REQUIRED_MARKER)
+            .try_exists()
+            .map_err(|error| error.to_string())?
+        && broca_wal::read_floor(&state_root.join(broca_wal::FEATURE_FLOOR_FILENAME))
+            .is_ok_and(|floor| !floor.contains(broca_wal::PROVIDER_HELD_FEATURE))
     {
         report.skipped_by_floor = true;
+        progress(&report);
         return Ok(report);
     }
-    for tree in ["wal", "wal-ephemeral", "wal-durable"] {
-        let directory = state_root.join(tree);
+    let paths = rebuild_inventory(state_root)?;
+    let mut identities = Vec::new();
+    for (path, archive) in &paths {
+        let scanned = (|| -> Result<(), String> {
+            let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+            let identity = input_identity(&mut file, path, *archive)?;
+            identities.push((path, *archive, identity.clone()));
+            if let Some(container) = &identity.archive {
+                use broca_wal::archive::{ArchiveReader, ContainerState};
+                if container.state == ContainerState::Unsealed {
+                    // Missing seal bytes can describe either an unfinished new archive or a
+                    // damaged published archive. Require a sealed archive with all members
+                    // verified; neither condition permits skipping this input.
+                    return Err("archive is unsealed or its published footer is truncated".into());
+                }
+                let mut reader = ArchiveReader::new(
+                    file.try_clone().map_err(|error| error.to_string())?,
+                    broca_wal::file_wal::DEFAULT_MAX_READ_BYTES,
+                )
+                .with_stamp(
+                    broca_wal::archive::fold_timestamp(path).map_err(|error| error.to_string())?,
+                );
+                for expected in &container.members {
+                    report.files += 1;
+                    progress(&report);
+                    let member = reader
+                        .read_member(&expected.address)
+                        .map_err(|error| error.to_string())?
+                        .ok_or("enumerated archive member disappeared")?;
+                    if ArchiveMemberIdentity::from(&member.info) != *expected {
+                        return Err("archive member identity changed during verification".into());
+                    }
+                    let range = broca_wal::file_wal::read_verified_member_range(
+                        &member.payload,
+                        1,
+                        0,
+                        None,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    if !verified_eof(&range, member.payload.len() as u64, || {
+                        Ok(member.payload.clone())
+                    }) {
+                        return Err("archive member has an unverified suffix".into());
+                    }
+                    rebuild_range(store, &range, Some(&expected.address), &mut report)?;
+                    progress(&report);
+                }
+            } else {
+                report.files += 1;
+                progress(&report);
+                file.rewind().map_err(|error| error.to_string())?;
+                let mut bytes = Vec::new();
+                (&mut file)
+                    .take(broca_wal::file_wal::DEFAULT_MAX_READ_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| error.to_string())?;
+                if bytes.len() as u64 > broca_wal::file_wal::DEFAULT_MAX_READ_BYTES {
+                    return Err("live WAL exceeds rebuild byte limit".into());
+                }
+                // Decode exactly the opened file's bytes, not another lookup by pathname.
+                // The constant member_identity only tags byte-anchor cache entries, which this
+                // scan never stores or reuses. The WAL lineage comes from the decoded log.
+                let range = broca_wal::file_wal::read_verified_member_range(&bytes, 1, 0, None)
+                    .map_err(|error| error.to_string())?;
+                if !verified_eof(&range, bytes.len() as u64, || Ok(bytes.clone())) {
+                    return Err("WAL has an unverified suffix".into());
+                }
+                rebuild_range(store, &range, None, &mut report)?;
+            }
+            // Hash/reader/hash operations are serial: try_clone may share a file cursor.
+            // Every member payload has been verified before its header digest is trusted.
+            if input_identity(&mut file, path, *archive)? != identity {
+                return Err("input content changed while it was being verified".into());
+            }
+            Ok(())
+        })();
+        if let Err(error) = scanned {
+            tracing::warn!(target: "late_results", wal = %path.display(), "late-results rebuild incomplete: {error}");
+            report.unreadable.push(path.clone());
+        }
+        progress(&report);
+    }
+    if rebuild_inventory(state_root)? != paths {
+        return Err("WAL inventory changed during late-results rebuild".into());
+    }
+    for (path, archive, expected) in identities {
+        let mut file =
+            std::fs::File::open(path).map_err(|error| format!("WAL inventory changed: {error}"))?;
+        if input_identity(&mut file, path, archive)? != expected {
+            return Err(format!(
+                "WAL inventory changed during late-results rebuild: {}",
+                path.display()
+            ));
+        }
+    }
+    // Supported writers append under the session lease; published archives are immutable.
+    // Folding seals/verifies its copy before retiring an unchanged source. Thus historical
+    // content cannot appear after this comparison without either a retained verified copy
+    // or a new registration committed to this same database before dispatch. This is not a
+    // snapshot against an uncooperative writer changing/restoring bytes between checks.
+    after_verification();
+    progress(&report);
+    Ok(report)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ArchiveMemberIdentity {
+    address: String,
+    offset: u64,
+    length: u64,
+    digest: [u8; 32],
+}
+
+impl From<&broca_wal::archive::MemberInfo> for ArchiveMemberIdentity {
+    fn from(member: &broca_wal::archive::MemberInfo) -> Self {
+        Self {
+            address: member.session_addr.clone(),
+            offset: member.offset,
+            length: member.payload_len,
+            digest: member.payload_sha256,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ArchiveScanIdentity {
+    state: broca_wal::archive::ContainerState,
+    members: Vec<ArchiveMemberIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InputIdentity {
+    length: u64,
+    digest: [u8; 32],
+    archive: Option<ArchiveScanIdentity>,
+}
+
+fn input_identity(
+    file: &mut std::fs::File,
+    path: &Path,
+    archive: bool,
+) -> Result<InputIdentity, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek};
+    let expected_length = file.metadata().map_err(|error| error.to_string())?.len();
+    if !archive && expected_length > broca_wal::file_wal::DEFAULT_MAX_READ_BYTES {
+        return Err("live WAL exceeds rebuild byte limit".into());
+    }
+    file.rewind().map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut length = 0;
+    let mut buffer = [0; 64 * 1024];
+    while length < expected_length {
+        let limit = (expected_length - length).min(buffer.len() as u64) as usize;
+        let bytes = file
+            .read(&mut buffer[..limit])
+            .map_err(|error| error.to_string())?;
+        if bytes == 0 {
+            return Err("input was truncated while hashing its identity".into());
+        }
+        hasher.update(&buffer[..bytes]);
+        length += bytes as u64;
+    }
+    if file.metadata().map_err(|error| error.to_string())?.len() != expected_length {
+        return Err("input length changed while hashing its identity".into());
+    }
+    let archive = if archive {
+        use broca_wal::archive::{ArchiveReader, ContainerState};
+        let mut reader = ArchiveReader::new(
+            file.try_clone().map_err(|error| error.to_string())?,
+            broca_wal::file_wal::DEFAULT_MAX_READ_BYTES,
+        )
+        .with_stamp(broca_wal::archive::fold_timestamp(path).map_err(|error| error.to_string())?);
+        let state = reader.state().map_err(|error| error.to_string())?;
+        let members = if state == ContainerState::Sealed {
+            reader
+                .rescan()
+                .map_err(|error| error.to_string())?
+                .iter()
+                .map(ArchiveMemberIdentity::from)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Some(ArchiveScanIdentity { state, members })
+    } else {
+        None
+    };
+    Ok(InputIdentity {
+        length,
+        digest: hasher.finalize().into(),
+        archive,
+    })
+}
+
+fn rebuild_inventory(root: &Path) -> Result<Vec<(std::path::PathBuf, bool)>, String> {
+    let mut files = Vec::new();
+    for (tree, archive) in [
+        ("wal", false),
+        ("wal-ephemeral", false),
+        ("wal-durable", false),
+        ("wal-archive", true),
+        ("wal-archive-durable", true),
+    ] {
+        let directory = root.join(tree);
         let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1069,61 +1258,79 @@ pub fn rebuild_store_from_wals(
         };
         for entry in entries {
             let path = entry.map_err(|error| error.to_string())?.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("wal") {
-                continue;
-            }
-            report.files += 1;
-            match file_contains(&path, HELD_FRAME_MARKER) {
-                Ok(false) => continue,
-                Ok(true) => {}
-                Err(_) => {
-                    report.unreadable.push(path);
-                    continue;
-                }
-            }
-            report.decoded += 1;
-            let range = match broca_wal::file_wal::read_records_range(
-                &path,
-                broca_wal::file_wal::DEFAULT_MAX_READ_BYTES,
-                0,
-                None,
-                None,
-            ) {
-                Ok(range) => range,
-                Err(_) => {
-                    report.unreadable.push(path);
-                    continue;
-                }
-            };
-            let records = match range.records() {
-                WalRangeRecords::Complete(records) => records,
-                _ => {
-                    report.unreadable.push(path);
-                    continue;
-                }
-            };
-            let Some(session) = records.iter().find_map(|frame| match &frame.record {
-                WalRecord::RunStarted { session, .. } => Some(session.clone()),
-                _ => None,
-            }) else {
-                continue;
-            };
-            let calls = held_registrations(records, &session);
-            for call in &calls {
-                store.ensure_feed(&call.module, true)?;
-            }
-            match store.register_calls(&calls) {
-                Ok(()) => report.registered += calls.len(),
-                // Two WALs naming one key cannot both own it; keep the first and say so.
-                Err(error) => tracing::warn!(
-                    target: "late_results",
-                    wal = %path.display(),
-                    "late-results rebuild skipped a WAL's held calls: {error}"
-                ),
+            if path.extension().and_then(|ext| ext.to_str())
+                == Some(if archive { "ark" } else { "wal" })
+            {
+                files.push((path, archive));
             }
         }
     }
-    Ok(report)
+    files.sort();
+    Ok(files)
+}
+
+fn verified_eof(
+    range: &broca_wal::WalRangeRead,
+    length: u64,
+    empty_bytes: impl FnOnce() -> std::io::Result<Vec<u8>>,
+) -> bool {
+    if range.complete_byte_end == Some(length) {
+        return true;
+    }
+    let WalRangeRecords::Complete(records) = range.records() else {
+        return false;
+    };
+    if !records.is_empty() {
+        return false;
+    }
+    let Ok(bytes) = empty_bytes() else {
+        return false;
+    };
+    if bytes.len() as u64 != length {
+        return false;
+    }
+    let mut remaining = bytes.as_slice();
+    while !remaining.is_empty() {
+        match broca_wal::framing::decode_next(remaining) {
+            broca_wal::framing::DecodeStep::Lineage { consumed, .. } => {
+                remaining = &remaining[consumed..]
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn rebuild_range(
+    store: &LateResultsStore,
+    range: &broca_wal::WalRangeRead,
+    address: Option<&str>,
+    report: &mut RebuildReport,
+) -> Result<(), String> {
+    let WalRangeRecords::Complete(records) = range.records() else {
+        return Err("incomplete WAL range".into());
+    };
+    report.decoded += 1;
+    let Some(session) = records.iter().find_map(|frame| match &frame.record {
+        WalRecord::RunStarted { session, .. } => Some(session.clone()),
+        _ => None,
+    }) else {
+        return if records.is_empty() {
+            Ok(())
+        } else {
+            Err("WAL has records but no session identity".into())
+        };
+    };
+    if address.is_some_and(|address| address != broca_core::session_addr(&session)) || records.iter().any(|frame| matches!(&frame.record, WalRecord::RunStarted { session: other, .. } if other != &session)) {
+        return Err("WAL session identity does not match its archive member or other episodes".into());
+    }
+    let calls = registration_candidates(records, &session, range.lineage_id)?;
+    for call in &calls {
+        store.ensure_feed(&call.module, true)?;
+    }
+    store.register_calls(&calls)?;
+    report.registered += calls.len();
+    Ok(())
 }
 
 /// The registrations a rebuilt store takes from one WAL: one per `ToolCallProviderHeld`, open or
@@ -1133,7 +1340,14 @@ pub fn held_registrations(
     session: &BindIdentity,
 ) -> Vec<LateResultRegistration> {
     let mut calls: Vec<LateResultRegistration> = Vec::new();
+    let mut scope = None;
     for frame in records {
+        if let WalRecord::RunStarted {
+            scope: recorded, ..
+        } = &frame.record
+        {
+            scope = recorded.clone();
+        }
         if let WalRecord::ToolCallProviderHeld {
             call_key, module, ..
         } = &frame.record
@@ -1149,11 +1363,70 @@ pub fn held_registrations(
                 call_key: call_key.clone(),
                 module: module.clone(),
                 bind: session.clone(),
-                scope: None,
+                scope: scope.clone(),
             });
         }
     }
     calls
+}
+
+/// Intents are durable before registration, but registration itself is not a WAL event.
+/// Rebuild a conservative superset, including calls whose provider never answered held.
+fn registration_candidates(
+    records: &[FramedRecord],
+    session: &BindIdentity,
+    lineage: Option<broca_wal::WalLineageId>,
+) -> Result<Vec<LateResultRegistration>, String> {
+    let mut calls: Vec<LateResultRegistration> = Vec::new();
+    let mut scope = None;
+    for frame in records {
+        let (module, key) = match &frame.record {
+            WalRecord::RunStarted {
+                scope: recorded, ..
+            } => {
+                scope = recorded.clone();
+                continue;
+            }
+            WalRecord::ToolCallProviderHeld {
+                call_key, module, ..
+            } => (module, call_key.clone()),
+            WalRecord::ToolDispatchIntent {
+                module_id: Some(module),
+                call_key,
+                ..
+            } => {
+                let key = call_key
+                    .clone()
+                    .or_else(|| lineage.map(|lineage| format!("{lineage}:{}", frame.seq)));
+                // Before lineage metadata existed a plain dispatch could not be registered.
+                let Some(key) = key else {
+                    continue;
+                };
+                (module, key)
+            }
+            _ => continue,
+        };
+        cortexkit_role_tool_provider::call::validate_call_key(&key)
+            .map_err(|error| error.to_string())?;
+        let (lineage, _) = key
+            .rsplit_once(':')
+            .ok_or("registered call key has no lineage")?;
+        let candidate = LateResultRegistration {
+            lineage: lineage.into(),
+            call_key: key.clone(),
+            module: module.clone(),
+            bind: session.clone(),
+            scope: scope.clone(),
+        };
+        if let Some(existing) = calls.iter().find(|call| call.call_key == key) {
+            if existing != &candidate {
+                return Err("WAL registration key has conflicting module or scope".into());
+            }
+        } else {
+            calls.push(candidate);
+        }
+    }
+    Ok(calls)
 }
 
 #[cfg(test)]
@@ -1162,7 +1435,7 @@ mod tests {
     use broca_protocol::content::{AssistantMessage, ContentBlock, ToolCall};
     use broca_protocol::{BatchId, MessageId, RunId, StepId};
     use cortexkit_role_tool_provider::late_results::kinds;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     /// One scripted feed: each pull answers the next reply and records what was asked.
     #[derive(Default)]
@@ -1922,8 +2195,798 @@ mod tests {
         assert_eq!(calls[0].bind, bind);
     }
 
+    struct WithdrawalRoute {
+        wal: Arc<FileWalStore>,
+        seen: Mutex<Vec<String>>,
+        mode: &'static str,
+    }
+
+    fn review_archive(root: &Path, bind: &BindIdentity, key: &str) -> std::path::PathBuf {
+        let wal = FileWalStore::new(root.join("wal"));
+        let mut records = held_records(key, "tools", bind);
+        records.truncate(4);
+        write_wal_gated(&wal, bind, &records);
+        let directory = root.join("wal-archive");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("fold-1.ark");
+        let mut archive = broca_wal::archive::ArchiveWriter::create(&path)
+            .unwrap()
+            .without_feature_floor();
+        archive
+            .append(
+                &broca_core::session_addr(bind),
+                &std::fs::read(wal.wal_path(bind)).unwrap(),
+            )
+            .unwrap();
+        archive.seal().unwrap();
+        std::fs::remove_file(wal.wal_path(bind)).unwrap();
+        path
+    }
+
+    fn review_store(root: &Path) -> LateResultsStore {
+        let _ = std::fs::remove_dir_all(root);
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(
+            root.join(crate::late_results_store::REGISTRATION_MARKER),
+            b"",
+        )
+        .unwrap();
+        LateResultsStore::open(&root.join("late-results.db")).unwrap()
+    }
+
+    #[test]
+    fn review_regression_truncated_published_archive_keeps_the_fence() {
+        let root = rig_root("review-truncated-footer");
+        let store = review_store(&root);
+        let path = review_archive(&root, &session("archived-only"), "lineage:4");
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(file.metadata().unwrap().len() - 8).unwrap();
+        file.sync_all().unwrap();
+        assert_eq!(std::fs::read_dir(root.join("wal")).unwrap().count(), 0);
+        let report = rebuild_store_from_wals(&store, &root).unwrap();
+        if report.unreadable.is_empty() {
+            store.finish_rebuild().unwrap();
+        }
+        assert!(
+            root.join(crate::late_results_store::REBUILD_REQUIRED_MARKER)
+                .exists(),
+            "a missing footer cannot prove an archive was never published"
+        );
+        assert_eq!(report.unreadable.as_slice(), std::slice::from_ref(&path));
+    }
+
+    #[test]
+    fn review_regression_same_name_archive_replacement_invalidates_inventory() {
+        let root = rig_root("review-archive-replace");
+        let store = review_store(&root);
+        let bind = session("replaced");
+        let path = review_archive(&root, &bind, "lineage:4");
+        let replacement = review_archive(&root.join("replacement"), &bind, "lineage:5");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            std::fs::metadata(&replacement).unwrap().len()
+        );
+        let replaced = std::cell::Cell::new(false);
+        let result = rebuild_store_from_wals_with_progress(&store, &root, |report| {
+            if report.registered > 0 && !replaced.replace(true) {
+                std::fs::rename(&replacement, &path).unwrap();
+            }
+        });
+        assert!(replaced.get());
+        assert!(
+            result.is_err(),
+            "the verified old inode must not certify a same-length replacement at its pathname"
+        );
+    }
+
+    #[test]
+    fn rebuild_rejects_a_same_length_live_log_replacement() {
+        let root = rig_root("live-content-identity");
+        let store = review_store(&root);
+        let wal = FileWalStore::new(root.join("wal"));
+        let mut sources = Vec::new();
+        for name in ["a", "b"] {
+            let bind = session(name);
+            let key = format!("lineage-{name}:4");
+            write_wal_gated(&wal, &bind, &held_records(&key, "tools", &bind));
+            sources.push((wal.wal_path(&bind), bind, key));
+        }
+        sources.sort_by(|left, right| left.0.cmp(&right.0));
+        let (first, bind, key) = &sources[0];
+        let length = std::fs::metadata(first).unwrap().len();
+        let replaced = std::cell::Cell::new(false);
+        let result = rebuild_store_from_wals_with_progress(&store, &root, |report| {
+            if report.decoded == 1 && !replaced.replace(true) {
+                write_wal_gated(
+                    &wal,
+                    bind,
+                    &held_records(&key.replace(":4", ":5"), "tools", bind),
+                );
+                assert_eq!(std::fs::metadata(first).unwrap().len(), length);
+            }
+        });
+        assert!(replaced.get());
+        assert!(result.is_err());
+        assert!(first.exists(), "rebuild never retires a changed source");
+    }
+
+    #[test]
+    fn rebuild_final_comparison_gap_keeps_new_registered_calls() {
+        let root = rig_root("rebuild-final-gap");
+        let store = review_store(&root);
+        let wal = FileWalStore::new(root.join("wal"));
+        let old = session("old");
+        write_wal_gated(&wal, &old, &held_records("old-lineage:4", "tools", &old));
+        let fresh = session("fresh-after-verification");
+        let fresh_records = held_records("new-lineage:4", "tools", &fresh);
+        let report = rebuild_with_publication_hook(
+            &store,
+            &root,
+            |_| {},
+            || {
+                // Normal dispatch syncs its intent and registers in this same database before
+                // a provider can return held. A new call cannot depend solely on this scan.
+                write_wal_gated(&wal, &fresh, &fresh_records[..4]);
+                store
+                    .register_calls(&held_registrations(&framed(fresh_records.clone()), &fresh))
+                    .unwrap();
+                write_wal_gated(&wal, &fresh, &fresh_records);
+            },
+        )
+        .unwrap();
+        assert!(report.unreadable.is_empty());
+        assert_eq!(report.registered, 1);
+        store.finish_rebuild().unwrap();
+        let reopened = LateResultsStore::open(&root.join("late-results.db")).unwrap();
+        let keys: Vec<_> = reopened
+            .registrations()
+            .unwrap()
+            .into_iter()
+            .map(|call| call.call_key)
+            .collect();
+        assert!(keys.contains(&"old-lineage:4".into()));
+        assert!(keys.contains(&"new-lineage:4".into()));
+        assert!(wal.wal_path(&fresh).exists());
+    }
+
+    #[test]
+    fn rebuild_final_comparison_gap_keeps_a_verified_fold_copy() {
+        let root = rig_root("rebuild-final-fold-gap");
+        let store = review_store(&root);
+        let wal = FileWalStore::new(root.join("wal"));
+        let bind = session("intent-folded-after-verification");
+        let mut records = held_records("fold-lineage:4", "tools", &bind);
+        records.truncate(4);
+        write_wal_gated(&wal, &bind, &records);
+        let source = wal.wal_path(&bind);
+        let bytes = std::fs::read(&source).unwrap();
+        let report = rebuild_with_publication_hook(
+            &store,
+            &root,
+            |_| {},
+            || {
+                // The folder's publication order preserves a verified copy before it retires
+                // an unchanged source. Moving the log after comparison cannot erase its rows.
+                let directory = root.join("wal-archive");
+                std::fs::create_dir_all(&directory).unwrap();
+                let path = directory.join("fold-1.ark");
+                let mut writer = broca_wal::archive::ArchiveWriter::create(&path)
+                    .unwrap()
+                    .with_feature_floor(root.join(broca_wal::FEATURE_FLOOR_FILENAME));
+                writer
+                    .append(&broca_core::session_addr(&bind), &bytes)
+                    .unwrap();
+                writer.seal().unwrap();
+                let mut reader = broca_wal::archive::ArchiveReader::open(
+                    &path,
+                    broca_wal::file_wal::DEFAULT_MAX_READ_BYTES,
+                )
+                .unwrap();
+                assert_eq!(
+                    reader
+                        .read_member(&broca_core::session_addr(&bind))
+                        .unwrap()
+                        .unwrap()
+                        .payload,
+                    bytes
+                );
+                assert_eq!(std::fs::read(&source).unwrap(), bytes);
+                std::fs::remove_file(&source).unwrap();
+            },
+        )
+        .unwrap();
+        assert!(report.unreadable.is_empty());
+        store.finish_rebuild().unwrap();
+        assert_eq!(store.registrations().unwrap()[0].call_key, "fold-lineage:4");
+        assert_eq!(wal.read_records(&bind).unwrap().len(), records.len());
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn review_regression_archive_publication_changes_inventory_identity() {
+        let root = rig_root("review-archive-publication");
+        let store = review_store(&root);
+        let bind = session("published");
+        let sealed = review_archive(&root.join("staged"), &bind, "lineage:4");
+        let path = root.join("wal-archive/fold-1.ark");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let unsealed = broca_wal::archive::ArchiveWriter::create(&path).unwrap();
+        drop(unsealed);
+        // The archive sorts before this live tree, so publication happens after the
+        // scanner has observed its unsealed state, not before its first archive read.
+        let wal = FileWalStore::new(root.join("wal-durable"));
+        write_wal_gated(
+            &wal,
+            &session("live"),
+            &held_records("another:4", "tools", &session("live")),
+        );
+        let published = std::cell::Cell::new(false);
+        let result = rebuild_store_from_wals_with_progress(&store, &root, |_| {
+            if !published.replace(true) {
+                std::fs::rename(&sealed, &path).unwrap();
+            }
+        });
+        assert!(published.get());
+        assert!(
+            result.is_err(),
+            "unsealed-to-sealed publication cannot pass a stable inventory check"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_regression_completed_sibling_is_not_withdrawn_on_recovery() {
+        let root = rig_root("review-completed-sibling");
+        let store = Arc::new(review_store(&root));
+        let bind = session("siblings");
+        let wal = Arc::new(FileWalStore::new(root.join("wal")));
+        let mut records = held_records("lineage:4", "tools", &bind);
+        if let WalRecord::ModelStepFinished {
+            assistant_message, ..
+        } = &mut records[1]
+        {
+            let mut message = (**assistant_message).clone();
+            let ContentBlock::ToolCall(mut call) = message.content[0].clone() else {
+                unreachable!()
+            };
+            call.tool_call_id = ToolCallId("b".into());
+            message.content.push(ContentBlock::ToolCall(call));
+            *assistant_message = Arc::new(message);
+        }
+        if let WalRecord::ToolBatchStarted { planned_calls, .. } = &mut records[2] {
+            planned_calls.push(ToolCallId("b".into()));
+        }
+        let mut intent = records[3].clone();
+        if let WalRecord::ToolDispatchIntent {
+            tool_call_id,
+            call_key,
+            ..
+        } = &mut intent
+        {
+            *tool_call_id = ToolCallId("b".into());
+            *call_key = Some("lineage:5".into());
+        }
+        let mut sibling = records[4].clone();
+        if let WalRecord::ToolCallProviderHeld {
+            tool_call_id,
+            call_key,
+            ..
+        } = &mut sibling
+        {
+            *tool_call_id = ToolCallId("b".into());
+            *call_key = "lineage:5".into();
+        }
+        records.insert(4, intent);
+        records.insert(6, sibling);
+        records.push(delivered_records("lineage:4", "tools", &bind)[6].clone());
+        let (closed, outcome, reason) = broca_core::resume::provider_held_close_result(
+            &ToolCallId("b".into()),
+            broca_protocol::RunFinishReason::Cancelled,
+        );
+        records.push(WalRecord::ToolResult {
+            finished_at_ms: None,
+            tags: None,
+            hooks: None,
+            batch_id: BatchId("b".into()),
+            result: Arc::new(closed),
+            outcome,
+            reason: Some(reason.into()),
+            withdraw_elicitation: None,
+            provider_held: None,
+        });
+        records.push(WalRecord::ToolBatchFinished {
+            batch_id: BatchId("b".into()),
+        });
+        records.push(WalRecord::TurnFinished { step_id: StepId(1) });
+        records.push(WalRecord::RunFinished {
+            reason: broca_protocol::RunFinishReason::Cancelled,
+            interrupt_reason: None,
+            ts_ms: Some(50),
+            usage: Default::default(),
+            error: None,
+            retries_used: 0,
+        });
+        write_wal_gated(&wal, &bind, &records);
+        store
+            .register_calls(&held_registrations(&framed(records), &bind))
+            .unwrap();
+        let route = Arc::new(WithdrawalRoute {
+            wal: wal.clone(),
+            seen: Mutex::default(),
+            mode: "ok",
+        });
+        let service = crate::held_withdrawals::HeldWithdrawals::new(store, wal, route.clone());
+        service.bind_stopping_signal(tokio_util::sync::CancellationToken::new());
+        service.recover().await.unwrap();
+        assert_eq!(
+            *route.seen.lock().unwrap(),
+            ["lineage:5"],
+            "A completed; only B's cancellation authorizes withdrawal"
+        );
+    }
+
+    struct DrainWithdrawalRoute {
+        seen: std::sync::atomic::AtomicUsize,
+        stopping: tokio_util::sync::CancellationToken,
+    }
+    #[async_trait]
+    impl crate::held_withdrawals::WithdrawTransport for DrainWithdrawalRoute {
+        async fn withdraw(
+            &self,
+            _: &LateResultRegistration,
+        ) -> (
+            cortexkit_role_tool_provider::withdraw::WithdrawVerdict,
+            Value,
+        ) {
+            self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.stopping.cancel();
+            let error =
+                serde_json::from_value(json!({"code": "target_unavailable", "message": "offline"}))
+                    .unwrap();
+            (
+                cortexkit_role_tool_provider::withdraw::caller_verdict(Err(&error)),
+                serde_json::to_value(error).unwrap(),
+            )
+        }
+    }
+
+    async fn review_drain(stopped_before_recovery: bool) {
+        let root = rig_root(if stopped_before_recovery {
+            "review-stop-before"
+        } else {
+            "review-stop-retry"
+        });
+        let store = Arc::new(review_store(&root));
+        let bind = session("cancelled-before-drain");
+        let wal = Arc::new(FileWalStore::new(root.join("wal")));
+        let mut records = held_records("lineage:4", "tools", &bind);
+        records.push(WalRecord::RunFinished {
+            reason: broca_protocol::RunFinishReason::Cancelled,
+            interrupt_reason: None,
+            ts_ms: Some(50),
+            usage: Default::default(),
+            error: None,
+            retries_used: 0,
+        });
+        write_wal_gated(&wal, &bind, &records);
+        store
+            .register_calls(&held_registrations(&framed(records), &bind))
+            .unwrap();
+        let stopping = tokio_util::sync::CancellationToken::new();
+        let route = Arc::new(DrainWithdrawalRoute {
+            seen: Default::default(),
+            stopping: stopping.clone(),
+        });
+        let service = crate::held_withdrawals::HeldWithdrawals::new(store, wal, route.clone());
+        service.bind_stopping_signal(stopping.clone());
+        if stopped_before_recovery {
+            stopping.cancel();
+        }
+        service.recover().await.unwrap();
+        assert_eq!(
+            route.seen.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(!stopped_before_recovery),
+            "drain must stop new withdrawal attempts, including retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_regression_drain_suppresses_recovered_withdrawals() {
+        review_drain(true).await;
+    }
+    #[tokio::test]
+    async fn review_regression_drain_suppresses_withdrawal_retries() {
+        review_drain(false).await;
+    }
+
+    #[test]
+    fn rebuild_commit_crash_keeps_the_fence_until_verified_publication() {
+        let root = rig_root("rebuild-commit-cut");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(crate::late_results_store::REGISTRATION_MARKER),
+            b"",
+        )
+        .unwrap();
+        let path = root.join("late-results.db");
+        let store = LateResultsStore::open(&path).unwrap();
+        let bind = session("rebuilt");
+        let wal = FileWalStore::new(root.join("wal"));
+        write_wal_gated(&wal, &bind, &held_records("lineage:4", "tools", &bind));
+        let report = rebuild_store_from_wals(&store, &root).unwrap();
+        assert!(report.unreadable.is_empty());
+        assert_eq!(report.registered, 1);
+        drop(store);
+        // The process stops after SQLite committed, before the fence's unlink and dir sync.
+        let store = LateResultsStore::open(&path).unwrap();
+        assert_eq!(store.registrations().unwrap().len(), 1);
+        assert!(
+            crate::late_results_store::retention_block_reason(&root, "other")
+                .unwrap()
+                .is_some()
+        );
+        let report = rebuild_store_from_wals(&store, &root).unwrap();
+        assert!(report.unreadable.is_empty());
+        store.finish_rebuild().unwrap();
+        assert!(!root
+            .join(crate::late_results_store::REBUILD_REQUIRED_MARKER)
+            .exists());
+        assert_eq!(
+            crate::late_results_store::retention_block_reason(&root, "other").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn rebuild_checks_intent_only_and_torn_logs_without_a_held_feature_floor() {
+        let root = rig_root("rebuild-intent");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(crate::late_results_store::REGISTRATION_MARKER),
+            b"",
+        )
+        .unwrap();
+        let store = LateResultsStore::open(&root.join("late-results.db")).unwrap();
+        let bind = session("intent-only");
+        let wal = FileWalStore::new(root.join("wal"));
+        let mut records = held_records("lineage:4", "tools", &bind);
+        records.truncate(4);
+        let scope = broca_protocol::SessionScope {
+            owner: broca_protocol::BindPrincipal::Reserved {
+                module_id: "core".into(),
+            },
+            scope_ref: "scope".into(),
+            scope_epoch: 2,
+            flow_id: None,
+            sender: None,
+            agent_id: None,
+            run_id: None,
+        };
+        if let WalRecord::RunStarted { scope: saved, .. } = &mut records[0] {
+            *saved = Some(scope.clone());
+        }
+        write_wal_gated(&wal, &bind, &records);
+        let broken = root.join("wal-ephemeral/broken.wal");
+        std::fs::create_dir_all(broken.parent().unwrap()).unwrap();
+        std::fs::write(&broken, b"torn").unwrap();
+        let report = rebuild_store_from_wals(&store, &root).unwrap();
+        assert!(!report.skipped_by_floor);
+        assert_eq!(report.files, 2);
+        assert_eq!(report.unreadable, [broken]);
+        assert_eq!(store.registrations().unwrap()[0].scope, Some(scope));
+        assert!(root
+            .join(crate::late_results_store::REBUILD_REQUIRED_MARKER)
+            .exists());
+    }
+
+    #[test]
+    fn rebuild_verifies_every_archive_member_including_intent_only_calls() {
+        let root = rig_root("rebuild-archives");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(crate::late_results_store::REGISTRATION_MARKER),
+            b"",
+        )
+        .unwrap();
+        let store = LateResultsStore::open(&root.join("late-results.db")).unwrap();
+        let wal = FileWalStore::new(root.join("wal"));
+        let mut expected = Vec::new();
+        for (index, tree) in ["wal-archive", "wal-archive-durable"].iter().enumerate() {
+            let directory = root.join(tree);
+            std::fs::create_dir_all(&directory).unwrap();
+            let mut archive = broca_wal::archive::ArchiveWriter::create(
+                directory.join(format!("fold-{}.ark", index + 1)),
+            )
+            .unwrap()
+            .with_feature_floor(root.join(broca_wal::FEATURE_FLOOR_FILENAME));
+            for item in 0..2 {
+                let name = format!("archived-{index}-{item}");
+                let bind = session(&name);
+                let key = format!("lineage-{index}-{item}:4");
+                let mut records = held_records(&key, "tools", &bind);
+                records.truncate(4);
+                write_wal_gated(&wal, &bind, &records);
+                archive
+                    .append(
+                        &broca_core::session_addr(&bind),
+                        &std::fs::read(wal.wal_path(&bind)).unwrap(),
+                    )
+                    .unwrap();
+                std::fs::remove_file(wal.wal_path(&bind)).unwrap();
+                expected.push(key);
+            }
+            archive.seal().unwrap();
+        }
+        let report = rebuild_store_from_wals(&store, &root).unwrap();
+        assert!(report.unreadable.is_empty(), "{report:?}");
+        assert_eq!(report.files, 4);
+        assert_eq!(report.decoded, 4);
+        let mut keys: Vec<_> = store
+            .registrations()
+            .unwrap()
+            .into_iter()
+            .map(|call| call.call_key)
+            .collect();
+        keys.sort();
+        expected.sort();
+        assert_eq!(keys, expected);
+        assert_eq!(
+            std::fs::read_dir(root.join("wal")).unwrap().count(),
+            0,
+            "rebuild never extracts an archive into the live tree"
+        );
+    }
+
+    #[test]
+    fn rebuild_rejects_a_torn_published_archive_and_an_inventory_move() {
+        let root = rig_root("rebuild-archive-torn");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("wal-archive")).unwrap();
+        std::fs::write(
+            root.join(crate::late_results_store::REGISTRATION_MARKER),
+            b"",
+        )
+        .unwrap();
+        let store = LateResultsStore::open(&root.join("late-results.db")).unwrap();
+        let path = root.join("wal-archive/fold-1.ark");
+        let mut archive = broca_wal::archive::ArchiveWriter::create(&path)
+            .unwrap()
+            .with_feature_floor(root.join(broca_wal::FEATURE_FLOOR_FILENAME));
+        archive.append("0123456789abcdef", b"torn").unwrap();
+        archive.seal().unwrap();
+        let report = rebuild_store_from_wals(&store, &root).unwrap();
+        assert_eq!(report.unreadable.as_slice(), std::slice::from_ref(&path));
+        assert!(root
+            .join(crate::late_results_store::REBUILD_REQUIRED_MARKER)
+            .exists());
+        std::fs::remove_file(path).unwrap();
+        let wal = FileWalStore::new(root.join("wal"));
+        let bind = session("moved");
+        write_wal_gated(&wal, &bind, &held_records("lineage:4", "tools", &bind));
+        let moved = std::cell::Cell::new(false);
+        let error = rebuild_store_from_wals_with_progress(&store, &root, |_| {
+            if !moved.replace(true) {
+                std::fs::write(root.join("wal/new.wal"), b"").unwrap();
+            }
+        })
+        .unwrap_err();
+        assert!(error.contains("inventory changed"), "{error}");
+    }
+
+    #[async_trait]
+    impl crate::held_withdrawals::WithdrawTransport for WithdrawalRoute {
+        async fn withdraw(
+            &self,
+            call: &LateResultRegistration,
+        ) -> (
+            cortexkit_role_tool_provider::withdraw::WithdrawVerdict,
+            Value,
+        ) {
+            use cortexkit_role_tool_provider::withdraw::caller_verdict;
+            assert!(
+                self.wal
+                    .read_records(&call.bind)
+                    .unwrap()
+                    .iter()
+                    .any(|frame| matches!(
+                        frame.record,
+                        WalRecord::RunFinished {
+                            reason: broca_protocol::RunFinishReason::Cancelled,
+                            ..
+                        }
+                    )),
+                "withdraw must follow the durable cancel seal"
+            );
+            self.seen.lock().unwrap().push(call.call_key.clone());
+            if self.mode == "offline" {
+                let error = serde_json::from_value(
+                    json!({"code": "target_unavailable", "message": "offline"}),
+                )
+                .unwrap();
+                (
+                    caller_verdict(Err(&error)),
+                    serde_json::to_value(error).unwrap(),
+                )
+            } else {
+                let raw = if self.mode == "refused" {
+                    json!({"answer": "refused", "reason": "denied"})
+                } else {
+                    json!({"answer": "withdrawn"})
+                };
+                (caller_verdict(Ok(&raw)), raw)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn held_withdrawal_cancel_seal_crash_cut_recovers_once_even_after_intake_prunes() {
+        use crate::held_slots::HeldWithdrawal;
+        let root = rig_root("withdraw-seal-cut");
+        let _ = std::fs::remove_dir_all(&root);
+        let bind = session("cancel-seal-cut");
+        let wal = Arc::new(FileWalStore::new(root.join("wal")));
+        let mut records = held_records("lineage:4", "tools", &bind);
+        write_wal_gated(&wal, &bind, &records);
+        let path = root.join("late-results.db");
+        let store = Arc::new(LateResultsStore::open(&path).unwrap());
+        store
+            .register_calls(&held_registrations(&framed(records.clone()), &bind))
+            .unwrap();
+        let route = Arc::new(WithdrawalRoute {
+            wal: wal.clone(),
+            seen: Mutex::default(),
+            mode: "ok",
+        });
+        let service = crate::held_withdrawals::HeldWithdrawals::new(
+            store.clone(),
+            wal.clone(),
+            route.clone(),
+        );
+        service.bind_stopping_signal(tokio_util::sync::CancellationToken::new());
+        let reply = broca_core::tool_plane::ProviderHeldReply {
+            tool_call_id: ToolCallId("a".into()),
+            call_key: "lineage:4".into(),
+            module: "tools".into(),
+            reason: "approval".into(),
+            detail_digest: None,
+        };
+        service.withdraw(&reply).await.unwrap();
+        assert!(
+            route.seen.lock().unwrap().is_empty(),
+            "an open hold is not a cancel"
+        );
+        records.push(WalRecord::RunFinished {
+            reason: broca_protocol::RunFinishReason::Cancelled,
+            interrupt_reason: None,
+            ts_ms: Some(50),
+            usage: Default::default(),
+            error: None,
+            retries_used: 0,
+        });
+        write_wal_gated(&wal, &bind, &records);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(wal.wal_path(&bind))
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        crate::retention::sync_dir(wal.root()).unwrap();
+        // The process stops after the synced seal and before invoking the withdrawal hook.
+        store.remove("tools", "lineage:4").unwrap();
+        drop(service);
+        drop(store);
+        let store = Arc::new(LateResultsStore::open(&path).unwrap());
+        store.recovery_snapshot().unwrap();
+        let service = crate::held_withdrawals::HeldWithdrawals::new(store, wal, route.clone());
+        service.bind_stopping_signal(tokio_util::sync::CancellationToken::new());
+        service.recover().await.unwrap();
+        service.withdraw(&reply).await.unwrap();
+        service.recover().await.unwrap();
+        assert_eq!(*route.seen.lock().unwrap(), ["lineage:4"]);
+        assert_eq!(service.health()["failed"], 0);
+    }
+
+    #[tokio::test]
+    async fn held_withdrawal_shutdown_and_restart_send_none() {
+        let root = rig_root("withdraw-shutdown");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let bind = session("shutdown");
+        let wal = Arc::new(FileWalStore::new(root.join("wal")));
+        let mut records = held_records("lineage:4", "tools", &bind);
+        let store = Arc::new(LateResultsStore::open(&root.join("late-results.db")).unwrap());
+        store
+            .register_calls(&held_registrations(&framed(records.clone()), &bind))
+            .unwrap();
+        let route = Arc::new(WithdrawalRoute {
+            wal: wal.clone(),
+            seen: Mutex::default(),
+            mode: "ok",
+        });
+        let service =
+            crate::held_withdrawals::HeldWithdrawals::new(store, wal.clone(), route.clone());
+        service.bind_stopping_signal(tokio_util::sync::CancellationToken::new());
+        write_wal_gated(&wal, &bind, &records);
+        service.recover().await.unwrap();
+        records.push(WalRecord::RunFinished {
+            reason: broca_protocol::RunFinishReason::Interrupted,
+            interrupt_reason: Some("runner_shutdown".into()),
+            ts_ms: Some(50),
+            usage: Default::default(),
+            error: None,
+            retries_used: 0,
+        });
+        write_wal_gated(&wal, &bind, &records);
+        service.recover().await.unwrap();
+        assert!(route.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn held_withdrawal_failures_are_bounded_durable_and_do_not_change_cancel() {
+        for (mode, expected) in [("offline", 3), ("refused", 1)] {
+            let root = rig_root(&format!("withdraw-{mode}"));
+            let _ = std::fs::remove_dir_all(&root);
+            let bind = session(mode);
+            let wal = Arc::new(FileWalStore::new(root.join("wal")));
+            let mut records = held_records("lineage:4", "tools", &bind);
+            records.push(WalRecord::RunFinished {
+                reason: broca_protocol::RunFinishReason::Cancelled,
+                interrupt_reason: None,
+                ts_ms: Some(50),
+                usage: Default::default(),
+                error: None,
+                retries_used: 0,
+            });
+            write_wal_gated(&wal, &bind, &records);
+            let path = root.join("late-results.db");
+            let store = Arc::new(LateResultsStore::open(&path).unwrap());
+            store
+                .register_calls(&held_registrations(&framed(records), &bind))
+                .unwrap();
+            let before = std::fs::read(wal.wal_path(&bind)).unwrap();
+            let route = Arc::new(WithdrawalRoute {
+                wal: wal.clone(),
+                seen: Mutex::default(),
+                mode,
+            });
+            let service =
+                crate::held_withdrawals::HeldWithdrawals::new(store, wal.clone(), route.clone());
+            service.bind_stopping_signal(tokio_util::sync::CancellationToken::new());
+            let slots = crate::held_slots::HeldSlots::new();
+            slots.with_withdrawals(service.clone());
+            broca_core::tool_plane::ProviderHeldLifecycle::withdraw_held(
+                &*slots,
+                &broca_core::tool_plane::ProviderHeldReply {
+                    tool_call_id: ToolCallId("a".into()),
+                    call_key: "lineage:4".into(),
+                    module: "tools".into(),
+                    reason: "approval".into(),
+                    detail_digest: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(service.health()["failed"], 1);
+            drop(slots);
+            drop(service);
+            let store = Arc::new(LateResultsStore::open(&path).unwrap());
+            let service =
+                crate::held_withdrawals::HeldWithdrawals::new(store, wal.clone(), route.clone());
+            service.bind_stopping_signal(tokio_util::sync::CancellationToken::new());
+            service.recover().await.unwrap();
+            assert_eq!(route.seen.lock().unwrap().len(), expected);
+            assert_eq!(
+                std::fs::read(wal.wal_path(&bind)).unwrap(),
+                before,
+                "withdraw never rewrites or reopens a cancelled run"
+            );
+        }
+    }
+
     /// A store rebuilt from the WAL trees registers the held calls it finds (open or closed),
-    /// marks their feeds as owing an ack, and decodes only the WALs that hold a held frame.
+    /// marks their feeds as owing an ack, and verifies ordinary WALs as well.
     #[test]
     fn a_rebuilt_store_registers_held_calls_and_owes_their_feeds_an_ack() {
         let root = rig_root("rebuild");
@@ -1950,8 +3013,8 @@ mod tests {
         assert!(!report.skipped_by_floor);
         assert_eq!(report.files, 3);
         assert_eq!(
-            report.decoded, 2,
-            "only WALs holding a held frame are decoded"
+            report.decoded, 3,
+            "registration precedes a held reply, so every WAL is verified"
         );
         assert!(report.unreadable.is_empty());
         let mut keys: Vec<String> = store
@@ -1982,7 +3045,7 @@ mod tests {
     }
 
     /// Write one session's records as a real writer frames them, gated frames included, so a
-    /// held frame carries the feature name the rebuild looks for.
+    /// held frame includes the reader feature its decoder requires.
     fn write_wal_gated(wal: &FileWalStore, bind: &BindIdentity, records: &[WalRecord]) {
         let path = wal.wal_path(bind);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2236,7 +3299,10 @@ mod tests {
             report.files, report.decoded, report.registered
         );
         assert_eq!(report.files, files);
-        assert_eq!(report.decoded, files.div_ceil(HELD_EVERY));
+        assert_eq!(
+            report.decoded, files,
+            "a complete rebuild verifies unheld logs too"
+        );
         assert!(report.unreadable.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }

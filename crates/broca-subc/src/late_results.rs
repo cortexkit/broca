@@ -19,6 +19,93 @@ use serde::Serialize;
 
 use crate::connection::{ConnError, RouteHandle, SubcConnection};
 
+/// Withdraw on the original call's frozen scope and carrier connection, not the unscoped
+/// late-results route. The provider rejects a scoped record reached through another scope.
+pub async fn withdraw_held_call(
+    conn: &SubcConnection,
+    call: &broca_core::tool_plane::LateResultRegistration,
+) -> (
+    cortexkit_role_tool_provider::withdraw::WithdrawVerdict,
+    serde_json::Value,
+) {
+    if conn.consumer_module_id().is_none() {
+        return withdraw_error(ConnError::Protocol(
+            "tool.withdraw requires the original carrier's consumer identity".into(),
+        ));
+    }
+    let selector = match call
+        .scope
+        .as_ref()
+        .map(crate::subc_plane::frozen_scope_selector)
+        .transpose()
+    {
+        Ok(selector) => selector,
+        Err(message) => return withdraw_error(ConnError::Protocol(message)),
+    };
+    let route = match conn
+        .route_open_tool_provider_v1(&call.module, &call.bind, selector)
+        .await
+    {
+        Ok(route) => route,
+        Err(error) => return withdraw_error(error),
+    };
+    let result = withdraw_on_route(conn, &route, &call.call_key).await;
+    let _ = conn.route_close(&route).await;
+    result
+}
+
+async fn withdraw_on_route(
+    conn: &SubcConnection,
+    route: &RouteHandle,
+    call_key: &str,
+) -> (
+    cortexkit_role_tool_provider::withdraw::WithdrawVerdict,
+    serde_json::Value,
+) {
+    use cortexkit_role_tool_provider::withdraw::{caller_verdict, WithdrawArguments};
+    let body = serde_json::to_vec(&WithdrawArguments::new(call_key).into_request())
+        .expect("withdraw request serializes");
+    match conn
+        .route_request_terminal_with_deadline(route, body, REPLY_TIMEOUT)
+        .await
+    {
+        Ok(Ok(bytes)) => {
+            let body = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| serde_json::json!({"unreadable_body": bytes}));
+            (caller_verdict(Ok(&body)), body)
+        }
+        Ok(Err(bytes)) => {
+            let raw = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| serde_json::json!({"unreadable_body": bytes}));
+            let error = serde_json::from_slice::<subc_protocol::ErrorBody>(&bytes).unwrap_or_else(
+                |error| subc_protocol::ErrorBody::new("invalid_withdraw_reply", error.to_string()),
+            );
+            (caller_verdict(Err(&error)), raw)
+        }
+        Err(error) => withdraw_error(error),
+    }
+}
+
+fn withdraw_error(
+    error: ConnError,
+) -> (
+    cortexkit_role_tool_provider::withdraw::WithdrawVerdict,
+    serde_json::Value,
+) {
+    use cortexkit_role_tool_provider::withdraw::caller_verdict;
+    let body = match error {
+        ConnError::Rejected(refusal) => {
+            subc_protocol::ErrorBody::new(refusal.code(), refusal.to_string())
+        }
+        ConnError::Protocol(message) => {
+            subc_protocol::ErrorBody::new("invalid_withdraw_reply", message)
+        }
+        other => subc_protocol::ErrorBody::new("target_unavailable", other.to_string()),
+    };
+    let raw = serde_json::to_value(&body).expect("error serializes");
+    (caller_verdict(Err(&body)), raw)
+}
+
 /// Pull once. Served by a provider that declares the `late_results` session capability.
 pub const LATE_RESULTS: &str = cortexkit_role_tool_provider::ops::LATE_RESULTS;
 /// Acknowledge entries through a cursor the provider returned.
@@ -303,6 +390,67 @@ mod tests {
             },
             module,
         )
+    }
+
+    #[tokio::test]
+    async fn withdraw_route_sends_the_pinned_request_and_reads_a_bare_answer() {
+        let (feed, mut module) = feed(Duration::from_millis(500));
+        let provider = tokio::spawn(async move {
+            let request = module.next_request().await;
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(
+                body,
+                json!({"name": "tool.withdraw", "arguments": {"call_key": "lineage:4"}})
+            );
+            module.reply(&request, br#"{"answer":"withdrawn"}"#.to_vec());
+        });
+        let (verdict, raw) = withdraw_on_route(&feed.conn, &feed.route, "lineage:4").await;
+        assert_eq!(
+            verdict,
+            cortexkit_role_tool_provider::withdraw::WithdrawVerdict::NeverRan
+        );
+        assert_eq!(raw, json!({"answer": "withdrawn"}));
+        provider.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn withdraw_route_preserves_final_unclassified_and_refused_answers() {
+        for raw in [
+            json!({"answer": "future_answer", "detail": 1}),
+            json!({"answer": "refused", "reason": "denied"}),
+            json!({"result": {"answer": "withdrawn"}}),
+        ] {
+            let (feed, mut module) = feed(Duration::from_millis(500));
+            let answer = raw.clone();
+            let provider = tokio::spawn(async move {
+                let request = module.next_request().await;
+                module.reply(&request, serde_json::to_vec(&answer).unwrap());
+            });
+            let (verdict, body) = withdraw_on_route(&feed.conn, &feed.route, "lineage:4").await;
+            assert!(!verdict.retries());
+            assert_eq!(body, raw);
+            provider.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn withdraw_route_retries_only_transient_refusals() {
+        for (code, retries) in [
+            ("scope_not_synced", true),
+            ("target_unavailable", true),
+            ("withdraw_not_permitted", false),
+            ("unknown_operation", false),
+        ] {
+            let (feed, mut module) = feed(Duration::from_millis(500));
+            let provider = tokio::spawn(async move {
+                let request = module.next_request().await;
+                module.refuse(&request, code);
+            });
+            let (verdict, raw) = withdraw_on_route(&feed.conn, &feed.route, "lineage:4").await;
+            assert_eq!(verdict.retries(), retries, "{code}");
+            assert_eq!(raw["code"], code);
+            provider.await.unwrap();
+        }
     }
 
     #[tokio::test]
