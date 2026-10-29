@@ -385,6 +385,52 @@ mod title_render_tests {
         ]
     }
 
+    #[test]
+    fn no_media_requests_use_legacy_bytes_on_every_family() {
+        use broca_provider::media_request::{render_prepared, PreparedBundle};
+        for mut frozen in every_family() {
+            let mut opts = CallOptions::new(vec![broca_protocol::Message::new(
+                broca_protocol::Role::User,
+                vec![broca_protocol::ContentBlock::Text {
+                    text: "An ordinary text-only request.".into(),
+                }],
+            )]);
+            opts.step_context = Some(StepContext {
+                session_address: None,
+                credential_id: None,
+                account_ref: None,
+                run_id: "no-media-acceptance".into(),
+                step_index: 1,
+                max_output_tokens: None,
+            });
+            let family = broca_provider::registry::wire_family(frozen.family_id).unwrap();
+            assert!(frozen.media.is_none());
+            let legacy = family.render(&frozen, &opts);
+            frozen.media = Some(broca_provider::media_profile::select_media_profile(
+                frozen.family_id,
+                None,
+                &frozen.wire_model_id,
+                broca_provider::spec::InputModalities::from_value(&json!(["text", "image", "pdf"])),
+                Some(200000),
+            ));
+            let mut bundle = PreparedBundle {
+                prompt: opts.prompt.clone(),
+                media: Vec::new(),
+            };
+            let rendered =
+                render_prepared(&*family, &frozen, &opts, Some(&mut bundle), &|prompt| {
+                    prompt.to_vec()
+                })
+                .unwrap();
+            assert!(!legacy.is_empty());
+            assert_eq!(
+                rendered, legacy,
+                "{:?}: a media profile changed a text-only request",
+                frozen.family_id
+            );
+        }
+    }
+
     /// A session's WAL with a title on every record a send writes, or on none: a first run, a
     /// queued send that the second run drains, and a steer into the second run that its first
     /// step renders.
