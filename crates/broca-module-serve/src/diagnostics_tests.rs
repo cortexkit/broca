@@ -552,6 +552,21 @@ fn diagnostics_seeded_checks_floor_and_restart_exclusion() {
 }
 
 #[test]
+fn a_catalog_aged_just_past_one_poll_interval_is_not_stale() {
+    // A healthy poller refreshes one interval after its last refresh finished, so the catalog
+    // is briefly older than one interval before every refresh. Only a missed poll is stale.
+    let interval = crate::CATALOG_POLL_INTERVAL.as_millis() as i64;
+    let store = broca_store::SqliteStore::open_in_memory().unwrap();
+    for (age, stale) in [(interval + 5_000, false), (2 * interval + 1, true)] {
+        let mut evidence = healthy(&store, NOW - DEFAULT_WINDOW_MS);
+        evidence.catalog_age_ms = Ok(age);
+        let reply = report(evidence, NOW, DEFAULT_WINDOW_MS);
+        let found = reply.findings.iter().any(|f| f.check == "catalog_stale");
+        assert_eq!(found, stale, "catalog aged {age} ms");
+    }
+}
+
+#[test]
 fn diagnostics_unreadable_sources_are_not_silent() {
     let store = broca_store::SqliteStore::open_in_memory().unwrap();
     seed_legacy(&store, "legacy", RunIndexState::Error);

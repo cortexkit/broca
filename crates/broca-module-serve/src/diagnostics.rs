@@ -285,6 +285,8 @@ fn error_floor(class: &str, code: &str, window: i64) -> (u64, Severity) {
             "billing_exhausted"
                 | "credit_balance_exhausted"
                 | "ENTITLEMENT_ERROR"
+                // Meta: the key belongs to a subscription that serves only Meta's own client.
+                | "client_attestation_denied"
                 | "upstream_api_key_rejected"
                 | "invalid_api_key"
                 | "incorrect_api_key"
@@ -478,7 +480,10 @@ pub fn report(mut evidence: Evidence, now: i64, window: i64) -> Reply {
         .get("catalog_stale")
         .and_then(|r| r.as_ref().ok());
     match evidence.catalog_age_ms {
-        Ok(age) if age > crate::CATALOG_POLL_INTERVAL.as_millis() as i64 => {
+        // A healthy poller lets the catalog age to slightly over one interval just before each
+        // refresh, since the next poll starts one interval after the last one finished. Only an
+        // age past two intervals means at least one refresh was missed.
+        Ok(age) if age > 2 * crate::CATALOG_POLL_INTERVAL.as_millis() as i64 => {
             let first = now.saturating_sub(age);
             let mut f = finding("catalog_stale","age".into(),if age>21_600_000 {Severity::Error}else{Severity::Warn},first,now,
                 "Broca's catalog is older than its refresh interval.",

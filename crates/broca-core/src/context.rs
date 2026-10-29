@@ -1175,6 +1175,7 @@ impl RunIndexAttribution {
                         | "request_invalid"
                         | "previous_response_not_found"
                         | "ENTITLEMENT_ERROR"
+                        | "client_attestation_denied"
                 )
             })
             .map(str::to_owned);
