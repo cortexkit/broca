@@ -1,20 +1,37 @@
 //! Billing is a projection of published attempt evidence, never of transcript usage.
 //!
 //! Consume the entire iterator before saving its checkpoint. In one transaction, persist each
-//! unreadable frame and record that its billing evidence could not be determined. Deduplicate by
-//! attempt_id: later terminal or correction evidence updates the existing possibly-billed item
-//! rather than charging the same attempt again.
+//! unreadable frame and record that its billing evidence could not be determined. A resumed read
+//! emits every item after the checkpoint boundary again, including terminals and corrections.
+//! Deduplicate by `attempt_id`, and by `correction_id` for corrections: later evidence updates the
+//! existing attempt rather than charging it again.
+//!
+//! After a crash, `writer_opened` emits `PossiblyBilled` for the abandoned reservation. A later
+//! recovery `attempt_finished` emits `Finished` with status `PossiblyBilled`. These are two items
+//! for one attempt, not two charges.
+//!
+//! A corrupt header inside the durable range fails closed with `Err(HeaderCorrupt)` and no
+//! checkpoint. Subsequent passes stall at the same corruption; operator intervention is required.
+//!
+//! Checkpoints retain full reservation facts only for open or possibly-billed attempts. Settled
+//! attempts retain fixed-size digests and phase to check later corrections and duplicate terminals,
+//! plus the record's `copied_in` flag to forward it on later correction items. State grows with the
+//! number of attempt IDs, not with the size of historical reservations. Version 1 checkpoints
+//! restart from the beginning with `Restart::StateVersion`.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::checkpoint::{self, Boundary, Checkpoint, Restart, KNOWN_FEATURES};
 use crate::frame::{self, DecodeStep, Metadata};
 use crate::proof::HeadProof;
 use crate::resolve::{self, ReadAt};
 use crate::unreadable::{Reason, Unreadable};
+
+pub use crate::billing_types::{Envelope, Outcome, Reservation, Sent, Usage, UsageByModel};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Position {
@@ -52,6 +69,21 @@ pub struct Billed {
     pub envelope: Option<Value>,
     pub correction_id: Option<String>,
     pub appended_ms: u64,
+}
+
+impl Billed {
+    /// Decode the same reservation shape used by the reader's validation, preserving extensions.
+    pub fn typed_reservation(&self) -> Result<Reservation, serde_json::Error> {
+        serde_json::from_value(self.reservation.clone())
+    }
+
+    /// Decode terminal evidence when present, without inferring absent usage fields.
+    pub fn typed_envelope(&self) -> Result<Option<Envelope>, serde_json::Error> {
+        self.envelope
+            .clone()
+            .map(serde_json::from_value)
+            .transpose()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -104,6 +136,7 @@ impl From<io::Error> for ReadError {
 pub struct BilledIter {
     items: VecDeque<Result<Item, ReadError>>,
     checkpoint: Option<Checkpoint>,
+    oldest_open_appended_ms: Option<u64>,
     head: HeadProof,
 }
 
@@ -123,6 +156,15 @@ impl BilledIter {
         } else {
             None
         }
+    }
+
+    /// The earliest frame write time among reservations still open at the published head.
+    /// Keep a read watermark below this time. Like `checkpoint()`, this returns `None` until
+    /// every item is consumed, or after an untrustworthy header. It also returns `None` when
+    /// no reservations remain open; possibly-billed reservations are already settled evidence.
+    pub fn oldest_open_appended_ms(&self) -> Option<u64> {
+        self.checkpoint()?;
+        self.oldest_open_appended_ms
     }
 
     pub fn head(&self) -> &HeadProof {
@@ -263,16 +305,18 @@ fn project(
                     match output {
                         Ok(output) => {
                             if reserving {
-                                before.insert(metadata.seq, previous.clone());
+                                before.insert(
+                                    record["attempt_id"].as_str().unwrap().to_owned(),
+                                    previous.clone(),
+                                );
                             }
                             for id in record["attempt_id"]
                                 .as_str()
                                 .into_iter()
                                 .chain(output.iter().map(|b| b.attempt_id.as_str()))
                             {
-                                if let Some(a) = fold.attempts.get(id).filter(|a| a.phase != "open")
-                                {
-                                    before.remove(&a.seq);
+                                if fold.attempts.get(id).is_some_and(|a| a.phase() != "open") {
+                                    before.remove(id);
                                 }
                             }
                             items.extend(output.into_iter().map(|b| Ok(Item::Billed(b))));
@@ -287,6 +331,7 @@ fn project(
         if let Some(reason) = bad {
             items.push_back(Ok(Item::Unreadable(Unreadable {
                 position,
+                appended_ms: Some(metadata.appended_ms),
                 raw_frame: frame.raw,
                 reason,
             })));
@@ -295,16 +340,27 @@ fn project(
     }
     let oldest = fold
         .attempts
+        .iter()
+        .filter_map(|(id, a)| {
+            a.pending()
+                .filter(|a| a.phase == "open")
+                .map(|a| (id, a.seq))
+        })
+        .min_by_key(|(_, seq)| *seq);
+    let oldest_open_appended_ms = fold
+        .attempts
         .values()
+        .filter_map(Attempt::pending)
         .filter(|a| a.phase == "open")
-        .map(|a| a.seq)
+        .map(|a| a.appended_ms)
         .min();
-    let reopened = oldest.is_some_and(|seq| seq <= start.seq());
-    let mut cp = match oldest.and_then(|seq| before.remove(&seq)) {
+    let reopened = oldest.is_some_and(|(_, seq)| seq <= start.seq());
+    let mut cp = match oldest.and_then(|(id, _)| before.remove(id)) {
         Some(boundary) => {
             // Undo only the tail's state changes so the saved fold describes the checkpoint,
             // without copying the whole attempt history at each reservation.
-            fold.rewind_from(oldest.expect("an open reservation selected the boundary"));
+            let seq = oldest.expect("an open reservation selected the boundary").1;
+            fold.rewind_from(seq);
             Some(make_checkpoint(head.lineage_id, boundary, &fold))
         }
         None if reopened => None,
@@ -316,6 +372,7 @@ fn project(
                 lineage_id: head.lineage_id,
                 seq: corrupt.seq,
             },
+            appended_ms: None,
             raw_frame: resolve::bytes(
                 source,
                 corrupt.offset,
@@ -333,6 +390,7 @@ fn project(
         BilledIter {
             items,
             checkpoint: cp,
+            oldest_open_appended_ms,
             head,
         },
         reopened,
@@ -356,7 +414,74 @@ struct Fold {
 }
 
 #[derive(Clone)]
-struct Attempt {
+enum Attempt {
+    Pending(Pending),
+    Settled {
+        digests: ReservationDigests,
+        phase: String,
+        copied_in: bool,
+    },
+}
+
+impl Attempt {
+    fn phase(&self) -> &str {
+        match self {
+            Self::Pending(a) => &a.phase,
+            Self::Settled { phase, .. } => phase,
+        }
+    }
+
+    fn pending(&self) -> Option<&Pending> {
+        match self {
+            Self::Pending(a) => Some(a),
+            Self::Settled { .. } => None,
+        }
+    }
+
+    fn copied_in(&self) -> bool {
+        match self {
+            Self::Pending(a) => a.copied_in,
+            Self::Settled { copied_in, .. } => *copied_in,
+        }
+    }
+
+    fn digests(&self) -> ReservationDigests {
+        match self {
+            Self::Pending(a) => ReservationDigests::new(&a.reservation),
+            Self::Settled { digests, .. } => digests.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ReservationDigests {
+    full: [u8; 32],
+    without_credential: [u8; 32],
+}
+
+impl ReservationDigests {
+    fn new(reservation: &Value) -> Self {
+        let hash = |v: &Value| {
+            let mut canonical = v.clone();
+            canonical.sort_all_objects();
+            Sha256::digest(serde_json::to_vec(&canonical).expect("JSON value")).into()
+        };
+        // Credential attribution is the only reservation fact a correction may replace.
+        // Keep a second digest so that exception cannot hide changes to other facts.
+        let mut without_credential = reservation.clone();
+        without_credential
+            .as_object_mut()
+            .expect("validated reservation")
+            .remove("credential");
+        Self {
+            full: hash(reservation),
+            without_credential: hash(&without_credential),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Pending {
     seq: u64,
     writer: [u8; 16],
     appended_ms: u64,
@@ -393,10 +518,17 @@ impl Fold {
                 .map(|(id, a)| {
                     (
                         id.clone(),
-                        json!({
-                            "seq": a.seq, "writer": a.writer, "appended_ms": a.appended_ms,
-                            "reservation": a.reservation, "copied_in": a.copied_in, "phase": a.phase
-                        }),
+                        match a {
+                            Attempt::Pending(a) => json!({
+                                "seq": a.seq, "writer": a.writer, "appended_ms": a.appended_ms,
+                                "reservation": a.reservation, "copied_in": a.copied_in, "phase": a.phase
+                            }),
+                            Attempt::Settled { digests, phase, copied_in } => json!({
+                                "phase": phase, "reservation_sha256": hex(&digests.full),
+                                "without_credential_sha256": hex(&digests.without_credential),
+                                "copied_in": copied_in
+                            }),
+                        },
                     )
                 })
                 .collect(),
@@ -406,11 +538,27 @@ impl Fold {
     fn load(value: &Value, boundary_seq: u64) -> Result<Self, Restart> {
         let mut fold = Self::default();
         for (id, v) in value.as_object().ok_or(Restart::FoldedState)? {
-            if !valid_id(id)
-                || !matches!(
-                    v["phase"].as_str(),
-                    Some("open" | "possible" | "terminal" | "released")
-                )
+            if !valid_id(id) {
+                return Err(Restart::FoldedState);
+            }
+            let phase = v["phase"].as_str().ok_or(Restart::FoldedState)?;
+            if matches!(phase, "terminal" | "released") {
+                fold.attempts.insert(
+                    id.clone(),
+                    Attempt::Settled {
+                        digests: ReservationDigests {
+                            full: parse_digest(&v["reservation_sha256"])
+                                .ok_or(Restart::FoldedState)?,
+                            without_credential: parse_digest(&v["without_credential_sha256"])
+                                .ok_or(Restart::FoldedState)?,
+                        },
+                        phase: phase.into(),
+                        copied_in: v["copied_in"].as_bool().ok_or(Restart::FoldedState)?,
+                    },
+                );
+                continue;
+            }
+            if !matches!(phase, "open" | "possible")
                 || validate_reservation(&v["reservation"]).is_err()
             {
                 return Err(Restart::FoldedState);
@@ -421,14 +569,14 @@ impl Fold {
             }
             fold.attempts.insert(
                 id.clone(),
-                Attempt {
+                Attempt::Pending(Pending {
                     seq,
                     writer: checkpoint::array(&v["writer"]).ok_or(Restart::FoldedState)?,
                     appended_ms: v["appended_ms"].as_u64().ok_or(Restart::FoldedState)?,
                     reservation: v["reservation"].clone(),
                     copied_in: v["copied_in"].as_bool().ok_or(Restart::FoldedState)?,
-                    phase: v["phase"].as_str().ok_or(Restart::FoldedState)?.into(),
-                },
+                    phase: phase.into(),
+                }),
             );
         }
         Ok(fold)
@@ -452,12 +600,16 @@ impl Fold {
                 return Err("writer recovery boundary differs from preceding sequence");
             }
             let mut output = Vec::new();
-            for (id, a) in &mut self.attempts {
+            for (id, attempt) in &mut self.attempts {
+                let Attempt::Pending(a) = attempt else {
+                    continue;
+                };
                 if a.phase == "open"
                     && ((kind == "writer_opened" && a.writer != writer)
                         || (kind == "writer_closed" && a.writer == writer))
                 {
-                    self.history.push((m.seq, id.clone(), Some(a.clone())));
+                    self.history
+                        .push((m.seq, id.clone(), Some(Attempt::Pending(a.clone()))));
                     a.phase = "possible".into();
                     output.push(billed_item(
                         id,
@@ -510,14 +662,14 @@ impl Fold {
             self.replace(
                 m.seq,
                 id,
-                Attempt {
+                Attempt::Pending(Pending {
                     seq: m.seq,
                     writer: m.writer_id,
                     appended_ms: m.appended_ms,
                     reservation: reservation.clone(),
                     copied_in,
                     phase: "open".into(),
-                },
+                }),
             );
             return Ok(vec![]);
         }
@@ -549,17 +701,19 @@ impl Fold {
             return Err("invalid correction reason");
         }
         if let Some(old) = previous {
-            let mut expected = old.reservation.clone();
-            if credential_correction {
-                expected["credential"] = reservation["credential"].clone();
-            }
-            if expected != *reservation {
+            let expected = old.digests();
+            let actual = ReservationDigests::new(reservation);
+            if if credential_correction {
+                expected.without_credential != actual.without_credential
+            } else {
+                expected.full != actual.full
+            } {
                 return Err("settlement changes immutable reservation facts");
             }
-            if !correction && matches!(old.phase.as_str(), "terminal" | "released") {
+            if !correction && matches!(old.phase(), "terminal" | "released") {
                 return Err("duplicate attempt terminal");
             }
-            if correction && old.phase == "open" {
+            if correction && old.phase() == "open" {
                 return Err("correction precedes settlement");
             }
         }
@@ -585,12 +739,13 @@ impl Fold {
         {
             return Err("recovery terminal claims measured usage");
         }
-        let a = Attempt {
-            seq: previous.map_or(m.seq, |a| a.seq),
-            writer: previous.map_or(m.writer_id, |a| a.writer),
-            appended_ms: previous.map_or(m.appended_ms, |a| a.appended_ms),
+        let pending = previous.and_then(Attempt::pending);
+        let a = Pending {
+            seq: pending.map_or(m.seq, |a| a.seq),
+            writer: pending.map_or(m.writer_id, |a| a.writer),
+            appended_ms: pending.map_or(m.appended_ms, |a| a.appended_ms),
             reservation: reservation.clone(),
-            copied_in: copied_in || previous.is_some_and(|a| a.copied_in),
+            copied_in: copied_in || previous.is_some_and(Attempt::copied_in),
             phase: if kind == "attempt_released" {
                 "released"
             } else {
@@ -618,14 +773,22 @@ impl Fold {
                 Some(m),
             )]
         };
-        self.replace(m.seq, id, a);
+        self.replace(
+            m.seq,
+            id,
+            Attempt::Settled {
+                digests: ReservationDigests::new(reservation),
+                phase: a.phase,
+                copied_in: a.copied_in,
+            },
+        );
         Ok(output)
     }
 }
 
 fn billed_item(
     id: &str,
-    a: &Attempt,
+    a: &Pending,
     lineage: [u8; 16],
     kind: BilledKind,
     envelope: Option<Value>,
@@ -658,6 +821,21 @@ fn billed_item(
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+fn parse_digest(v: &Value) -> Option<[u8; 32]> {
+    let text = v.as_str()?;
+    if text.len() != 64
+        || !text
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return None;
+    }
+    let mut digest = [0; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(digest)
 }
 fn valid_id(id: &str) -> bool {
     id.len() == 32
@@ -705,6 +883,7 @@ fn validate_reservation(v: &Value) -> Result<(), &'static str> {
     {
         return Err("incomplete reservation facts");
     }
+    serde_json::from_value::<Reservation>(v.clone()).map_err(|_| "invalid reservation shape")?;
     Ok(())
 }
 
@@ -789,6 +968,7 @@ fn validate_envelope(v: &Value) -> Result<(), &'static str> {
     if reasoning && v["reasoning_included_in_output"].as_bool().is_none() {
         return Err("reasoning usage has no output-inclusion evidence");
     }
+    serde_json::from_value::<Envelope>(v.clone()).map_err(|_| "invalid envelope shape")?;
     Ok(())
 }
 
@@ -1016,6 +1196,269 @@ mod tests {
     }
 
     #[test]
+    fn watermark_stays_below_oldest_open_frame_until_settlement() {
+        let mut log = Log::new();
+        log.open(W);
+        log.push(reserved(1, false), W);
+        log.push(reserved(2, true), W);
+        log.push(finished(2, true), W);
+        let mut read = billed(log.raw.as_slice(), &log.head.encode(), None).unwrap();
+        assert!(read.checkpoint().is_none());
+        assert_eq!(read.oldest_open_appended_ms(), None);
+        assert!(read.next().unwrap().is_ok());
+        assert_eq!(read.oldest_open_appended_ms(), Some(2));
+        assert_ne!(
+            read.oldest_open_appended_ms(),
+            Some(100),
+            "not reserved_at_ms"
+        );
+        let cp = read.checkpoint().unwrap().clone();
+        log.push(reserved(3, false), W);
+        let mut read = billed(log.raw.as_slice(), &log.head.encode(), Some(&cp)).unwrap();
+        read.by_ref().for_each(|item| {
+            item.unwrap();
+        });
+        assert_eq!(read.oldest_open_appended_ms(), Some(2));
+        log.push(finished(1, false), W);
+        let mut read = billed(log.raw.as_slice(), &log.head.encode(), Some(&cp)).unwrap();
+        read.by_ref().for_each(|item| {
+            item.unwrap();
+        });
+        assert_eq!(read.oldest_open_appended_ms(), Some(5));
+        let cp = read.checkpoint().unwrap().clone();
+        log.push(close(W), W);
+        let mut read = billed(log.raw.as_slice(), &log.head.encode(), Some(&cp)).unwrap();
+        assert_eq!(read.oldest_open_appended_ms(), None);
+        read.by_ref().for_each(|item| {
+            item.unwrap();
+        });
+        assert_eq!(
+            read.oldest_open_appended_ms(),
+            None,
+            "possible is no longer open"
+        );
+        assert!(read.checkpoint().is_some());
+    }
+
+    #[test]
+    fn crash_recovery_emits_two_items_for_one_attempt() {
+        let mut log = Log::new();
+        log.open(W);
+        log.push(reserved(1, false), W);
+        log.open(NEXT);
+        let mut recovery = finished(1, false);
+        recovery["type"] = json!("attempt_finished");
+        recovery["envelope"] = json!({"sent":"unknown", "response_bytes":0, "outcome":"unknown"});
+        log.push(recovery, NEXT);
+        let (items, _) = log.read(None);
+        let billed = charges(&items);
+        assert_eq!(billed.len(), 2);
+        assert_eq!(billed[0].attempt_id, billed[1].attempt_id);
+        assert_eq!(billed[0].kind, BilledKind::PossiblyBilled);
+        assert_eq!(billed[1].kind, BilledKind::Finished);
+        assert!(billed
+            .iter()
+            .all(|b| b.status == AttemptStatus::PossiblyBilled));
+        assert_eq!(billed[0].position.seq, 2);
+        assert_eq!(billed[1].position.seq, 4);
+    }
+
+    #[test]
+    fn settled_checkpoint_bytes_are_bounded_per_attempt() {
+        let mut fold = Fold::default();
+        let mut terminal = finished(1, false);
+        terminal["reservation"]["run"]["large_context"] = json!("x".repeat(4096));
+        for count in 1..=100_000 {
+            terminal["attempt_id"] = json!(format!("{count:032x}"));
+            if count % 2 == 0 {
+                terminal["type"] = json!("attempt_released");
+                terminal["envelope"] =
+                    json!({"sent":false, "response_bytes":0, "outcome":"cancelled"});
+            } else {
+                terminal["type"] = json!("model_attempt_finished");
+                terminal["envelope"] = finished(1, false)["envelope"].clone();
+            }
+            fold.apply(
+                &terminal,
+                Metadata {
+                    seq: count,
+                    writer_id: W,
+                    fence: 1,
+                    appended_ms: count,
+                },
+                [7; 16],
+            )
+            .unwrap();
+            // Each pass discards rewind history after saving its checkpoint.
+            fold.history.clear();
+            if [10, 1_000, 100_000].contains(&count) {
+                let cp = make_checkpoint([7; 16], None, &fold);
+                let size = cp.to_bytes().len();
+                println!("{count} settled attempts: {size} checkpoint bytes");
+                assert!(size <= count as usize * 280 + 1024, "{count}: {size}");
+                assert!(cp.state.as_object().unwrap().values().all(|v| {
+                    v.get("reservation").is_none()
+                        && matches!(v["phase"].as_str(), Some("terminal" | "released"))
+                }));
+                let restored = Fold::load(&cp.state, count).unwrap();
+                assert_eq!(restored.attempts.len(), count as usize);
+                assert!(restored.attempts.values().all(|a| a.pending().is_none()));
+            }
+        }
+    }
+
+    #[test]
+    fn compact_settled_state_still_rejects_duplicates_and_immutable_corrections() {
+        for released in [false, true] {
+            let mut log = Log::new();
+            log.open(W);
+            let mut terminal = finished(1, false);
+            terminal["copied_in"] = json!(true);
+            if released {
+                terminal["type"] = json!("attempt_released");
+                terminal["envelope"] =
+                    json!({"sent":false, "response_bytes":0, "outcome":"cancelled"});
+            }
+            log.push(terminal.clone(), W);
+            let (_, cp) = log.read(None);
+            let mut cp = Checkpoint::from_bytes(&cp.to_bytes()).unwrap();
+            let mut changed = terminal.clone();
+            changed["type"] = json!("attempt_corrected");
+            changed["correction_id"] = json!("ffeeddccbbaa99887766554433221100");
+            changed["reason"] = json!("credential_attribution_corrected");
+            changed["reservation"]["credential"]["account_ref"] = json!("new-account");
+            changed["reservation"]["model_sent"] = json!("different-model");
+            for (record, reason) in [
+                (terminal.clone(), "duplicate attempt terminal"),
+                (reserved(1, false), "attempt id reserved more than once"),
+                (
+                    changed.clone(),
+                    "settlement changes immutable reservation facts",
+                ),
+            ] {
+                log.push(record, W);
+                let (items, next) = log.read(Some(&cp));
+                assert!(
+                    matches!(&items[..], [Item::Unreadable(e)] if e.reason == Reason::BillingRecord(reason.into()))
+                );
+                cp = Checkpoint::from_bytes(&next.to_bytes()).unwrap();
+            }
+            changed["reservation"]["model_sent"] = json!("model");
+            changed.as_object_mut().unwrap().remove("copied_in");
+            log.push(changed.clone(), W);
+            let (items, next) = log.read(Some(&cp));
+            assert_eq!(charges(&items).len(), 1);
+            assert!(charges(&items)[0].copied_in);
+            cp = Checkpoint::from_bytes(&next.to_bytes()).unwrap();
+            changed["reason"] = json!("usage_reconciled");
+            changed["reservation"]["credential"] = reservation(false)["credential"].clone();
+            log.push(changed, W);
+            let (items, _) = log.read(Some(&cp));
+            assert!(
+                matches!(&items[..], [Item::Unreadable(e)] if e.reason == Reason::BillingRecord("settlement changes immutable reservation facts".into()))
+            );
+        }
+    }
+
+    #[test]
+    fn version_one_checkpoint_restarts_from_the_beginning_by_name() {
+        let mut log = Log::new();
+        log.open(W);
+        log.push(finished(1, false), W);
+        let (expected, cp) = log.read(None);
+        let mut old: Value = serde_json::from_slice(&cp.to_bytes()).unwrap();
+        old["version"] = json!(1);
+        old["state"] = json!({"obsolete":"state"});
+        let (items, cp) = drain(
+            billed_from_checkpoint_bytes(
+                log.raw.as_slice(),
+                &log.head.encode(),
+                Some(&serde_json::to_vec(&old).unwrap()),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            items[0],
+            Item::Restarted {
+                reason: Restart::StateVersion
+            }
+        );
+        assert_eq!(items[1..], expected);
+        assert_eq!(cp.version, 2);
+    }
+
+    #[test]
+    fn typed_billing_shapes_match_validated_evidence_and_preserve_extensions() {
+        let mut log = Log::new();
+        log.open(W);
+        let mut terminal = finished(1, false);
+        terminal["reservation"]["future_request_fact"] = json!({"nested":true});
+        terminal["envelope"]["future_response_fact"] = json!("opaque");
+        terminal["envelope"]["usage"]["future_counter"] = json!(7);
+        terminal["envelope"]["usage"]["input_tokens"] = json!(0);
+        log.push(terminal, W);
+        let (items, _) = log.read(None);
+        let billed = charges(&items)[0];
+        let reservation = billed.typed_reservation().unwrap();
+        assert_eq!(reservation.model_sent, "model");
+        assert_eq!(
+            reservation.extra["future_request_fact"],
+            json!({"nested":true})
+        );
+        let envelope = billed.typed_envelope().unwrap().unwrap();
+        assert_eq!(envelope.sent, Sent::Yes);
+        assert_eq!(envelope.outcome, Outcome::Complete);
+        let usage = envelope.usage.as_ref().unwrap();
+        assert_eq!(usage.input_tokens, Some(0));
+        assert_eq!(usage.reasoning_tokens, None);
+        assert_eq!(usage.extra["future_counter"], 7);
+        assert_eq!(envelope.extra["future_response_fact"], "opaque");
+        assert_eq!(
+            serde_json::to_value(&envelope).unwrap(),
+            billed.envelope.clone().unwrap()
+        );
+        for (wire, sent) in [
+            (json!(true), Sent::Yes),
+            (json!(false), Sent::No),
+            (json!("unknown"), Sent::Unknown),
+        ] {
+            assert_eq!(serde_json::from_value::<Sent>(wire.clone()).unwrap(), sent);
+            assert_eq!(serde_json::to_value(sent).unwrap(), wire);
+        }
+        let multi = json!({"sent":true, "response_bytes":9, "outcome":"complete",
+            "usage_by_model":[{"model_used":"a", "usage":{"output_tokens":1}},
+                {"model_used":"b", "usage":{"cache_write_tokens":3}, "cache_write_5m_tokens":1, "cache_write_1h_tokens":2}]});
+        validate_envelope(&multi).unwrap();
+        let envelope: Envelope = serde_json::from_value(multi).unwrap();
+        let models: Vec<UsageByModel> = envelope.usage_by_model.unwrap();
+        assert_eq!(models[1].usage.cache_write_tokens, Some(3));
+        assert_eq!(models[1].cache_write_1h_tokens, Some(2));
+    }
+
+    #[test]
+    fn malformed_typed_optional_facts_are_unreadable() {
+        for (section, name, value) in [
+            (
+                "reservation",
+                "input_tokens_estimate",
+                json!("not a number"),
+            ),
+            ("envelope", "http_status", json!(70000)),
+            ("envelope", "speed_used", json!(false)),
+        ] {
+            let mut log = Log::new();
+            log.open(W);
+            let mut terminal = finished(1, false);
+            terminal[section][name] = value;
+            log.push(terminal, W);
+            let (items, _) = log.read(None);
+            assert!(
+                matches!(&items[..], [Item::Unreadable(e)] if matches!(e.reason, Reason::BillingRecord(_)))
+            );
+        }
+    }
+
+    #[test]
     fn checkpoint_mismatch_restarts_from_seq_one() {
         let mut older = Log::new();
         older.open(W);
@@ -1086,6 +1529,7 @@ mod tests {
             panic!("missing evidence")
         };
         assert_eq!(evidence.position.seq, 3);
+        assert_eq!(evidence.appended_ms, Some(3));
         assert_eq!(evidence.raw_frame, log.raw[offset..offset + len]);
         assert_eq!(evidence.reason, Reason::PayloadDigest);
         assert_eq!(charges(&items)[0].kind, BilledKind::PossiblyBilled);
@@ -1183,12 +1627,19 @@ mod tests {
                 }
             );
             assert!(matches!(read.next().unwrap().unwrap(), Item::Billed(_)));
-            assert!(matches!(read.next().unwrap().unwrap(), Item::Unreadable(_)));
+            assert!(matches!(
+                read.next().unwrap().unwrap(),
+                Item::Unreadable(Unreadable {
+                    appended_ms: None,
+                    ..
+                })
+            ));
             assert!(matches!(
                 read.next().unwrap(),
                 Err(ReadError::HeaderCorrupt { .. })
             ));
             assert!(read.checkpoint().is_none());
+            assert_eq!(read.oldest_open_appended_ms(), None);
         }
     }
 

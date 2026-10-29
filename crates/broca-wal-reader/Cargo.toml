@@ -8,5 +8,6 @@ repository.workspace = true
 description = "Read-only version 4 broca WAL frame codec"
 
 [dependencies]
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
