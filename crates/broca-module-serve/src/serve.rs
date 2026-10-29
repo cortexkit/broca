@@ -3533,6 +3533,14 @@ where
                 crate::RETENTION_WRITER_ENABLED,
                 handler.hook_plane_available(),
             );
+            #[cfg(debug_assertions)]
+            if crate::held_runtime::declare_held_reply_for_tests() {
+                // Native conformance must discover the same support its tool routes negotiate.
+                describe
+                    .role
+                    .capabilities
+                    .push(cortexkit_role_llm_runner::capabilities::HELD_CALLS.into());
+            }
             describe.session_class.backup_classes = handler.backup_classes();
             trace_describe("response_ready", channel, epoch, corr);
             let sent = send_json_response(writer, ver, channel, epoch, corr, &describe).await;

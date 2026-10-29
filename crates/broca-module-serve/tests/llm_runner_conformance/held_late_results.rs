@@ -1,5 +1,5 @@
 //! Provider-held calls end to end: a real `ck-subc`, a supervised `ck-broca` whose tool routes
-//! declare `content/v1` and `held-reply/v1` (a debug-only switch), and the scripted tool
+//! declare `tool-result/v1` and `held-reply/v1` when a debug-build switch is enabled, and a scripted tool
 //! provider answering one call `held` and settling it later through its `late_results` feed.
 //!
 //! What these cases hold broca to:
@@ -26,10 +26,14 @@ const INTERIM: &str = "HELD INTERIM: the answer comes later";
 #[derive(Default)]
 pub(super) struct FeedState {
     withdrawals: Vec<Value>,
-    /// The catalog declares `late_results` and `content/v1`, and calls in `hold` are held.
+    /// The catalog declares `late_results` and `tool-result/v1`, and calls in `hold` are held.
     enabled: bool,
     /// Arguments (as JSON text) of the calls the provider holds.
     hold: BTreeSet<String>,
+    /// Sessions whose sends need a plan to record the provider's late-results declarations
+    /// in their session manifest.
+    sessions: BTreeSet<String>,
+    reasons: HashMap<String, String>,
     /// Route channels whose bind declared both `content/v1` and `held-reply/v1`.
     declared_routes: BTreeSet<(u16, u32)>,
     /// The call key each held call carried, by its arguments' JSON text.
@@ -82,7 +86,7 @@ impl FeedState {
 }
 
 /// Add the provider-held declarations to a catalog answer while the feed is enabled: the
-/// `late_results` session capability and the `content/v1` result format on every tool.
+/// `late_results` session capability and the `tool-result/v1` result format on every tool.
 pub(super) fn declare_in_catalog(shared: &Shared, answer: &mut Value) {
     if !shared.held_feed.lock().unwrap().enabled {
         return;
@@ -90,7 +94,7 @@ pub(super) fn declare_in_catalog(shared: &Shared, answer: &mut Value) {
     answer["capabilities"] = json!({"late_results": true});
     if let Some(tools) = answer["tools"].as_array_mut() {
         for tool in tools {
-            tool["result_format"] = json!("content/v1");
+            tool["result_format"] = json!("tool-result/v1");
         }
     }
 }
@@ -111,6 +115,79 @@ pub(super) fn note_bind(shared: &Shared, route: (u16, u32), capabilities: Option
     }
 }
 
+pub(super) fn install_held_reply(shared: &Shared, session: &str, arguments: &Value, reason: &str) {
+    let mut feed = shared.held_feed.lock().unwrap();
+    feed.enabled = true;
+    feed.sessions.insert(session.into());
+    feed.hold.insert(arguments.to_string());
+    feed.reasons.insert(arguments.to_string(), reason.into());
+}
+
+pub(super) fn needs_plan(shared: &Shared, session: &str) -> bool {
+    shared.held_feed.lock().unwrap().sessions.contains(session)
+}
+
+pub(super) async fn await_held_reply(
+    shared: &Shared,
+    arguments: &Value,
+) -> Result<String, HarnessError> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(key) = shared
+            .held_feed
+            .lock()
+            .unwrap()
+            .held_keys
+            .get(&arguments.to_string())
+            .cloned()
+        {
+            return Ok(key);
+        }
+        if Instant::now() >= deadline {
+            return Err(HarnessError::new(
+                "the provider never received the keyed held call",
+            ));
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+pub(super) fn publish_late_entry(
+    shared: &Shared,
+    arguments: &Value,
+    scripted: ScriptedLateEntry,
+) -> Result<(), HarnessError> {
+    let mut feed = shared.held_feed.lock().unwrap();
+    let key = feed
+        .held_keys
+        .get(&arguments.to_string())
+        .cloned()
+        .ok_or_else(|| HarnessError::new("the provider has not held these arguments"))?;
+    let number = feed.entries.len() + 1;
+    let mut entry = LateEntry::new(
+        scripted.kind(),
+        "reserved:broca",
+        "none",
+        0,
+        "reserved:broca",
+        key,
+        format!("event-{number}"),
+        1_761_220_000_000,
+    );
+    if let Some(result) = scripted.result_body() {
+        let text = match result {
+            Value::String(text) => text.clone(),
+            value => value.to_string(),
+        };
+        entry = entry.with_result(json!({"content":[{"type":"text","text":text}]}));
+    }
+    if let Some(reason) = scripted.reason() {
+        entry = entry.with_reason(reason);
+    }
+    feed.publish(entry);
+    Ok(())
+}
+
 /// Answer a call the provider holds with a held reply, counting it as an invocation. `None`
 /// for every other call, which the scripted provider answers as usual.
 pub(super) fn answer_held(
@@ -126,6 +203,11 @@ pub(super) fn answer_held(
     // A provider may hold only a call that carried a key (contract §4.1).
     let key = request["call_key"].as_str()?.to_owned();
     feed.held_keys.insert(arguments.to_owned(), key);
+    let reason = feed
+        .reasons
+        .get(arguments)
+        .cloned()
+        .unwrap_or_else(|| "running".into());
     drop(feed);
     *shared
         .invocations
@@ -136,7 +218,7 @@ pub(super) fn answer_held(
     Some(subc_client_rs::HandlerOutcome::Response(
         serde_json::to_vec(&json!({
             "content": [{"type": "text", "text": INTERIM}],
-            "held": {"reason": "running", "detail": {"ticket": "t-1"}}
+            "held": {"reason": reason, "detail": {"ticket": "t-1"}}
         }))
         .unwrap(),
     ))

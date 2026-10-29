@@ -37,7 +37,7 @@ use cortexkit_role_harness::{
 use cortexkit_role_llm_runner::points;
 use cortexkit_role_llm_runner_conformance::{
     run_suite, Capability, CaseOutcome, LlmRunnerSubject, Reply, RouteFailure, RunnerRoute, Script,
-    ScriptedPart, ScriptedUsage, SubscribeOutcome, SCRIPTED_TOOL,
+    ScriptedLateEntry, ScriptedPart, ScriptedUsage, SubscribeOutcome, SCRIPTED_TOOL,
 };
 use serde_json::{json, Map, Value};
 use subc_control::ConsumerIdentity;
@@ -2300,6 +2300,13 @@ impl LlmRunnerSubject for BrocaSubject {
     }
 
     fn send_fields(&self, session: &str, first: bool) -> Map<String, Value> {
+        if held_late_results::needs_plan(&self.shared, session)
+            && !self.shared.plan_sessions.lock().unwrap().contains(session)
+        {
+            return self
+                .send_fields_with_plan(session, first, &Map::new())
+                .unwrap();
+        }
         // The pin fixture uses an admitted provider catalog. Caller-declared
         // legacy tools intentionally have no provider semantics to pin.
         if session.starts_with("cf-call-identity-pin-")
@@ -2719,6 +2726,28 @@ impl LlmRunnerSubject for BrocaSubject {
                 Ok(observe_model_request(&request))
             })
             .collect()
+    }
+
+    async fn install_held_reply(
+        &self,
+        session: &str,
+        arguments: &Value,
+        reason: &str,
+    ) -> Result<(), HarnessError> {
+        held_late_results::install_held_reply(&self.shared, session, arguments, reason);
+        Ok(())
+    }
+
+    async fn await_held_reply(&self, arguments: &Value) -> Result<String, HarnessError> {
+        held_late_results::await_held_reply(&self.shared, arguments).await
+    }
+
+    async fn publish_late_entry(
+        &self,
+        arguments: &Value,
+        entry: ScriptedLateEntry,
+    ) -> Result<(), HarnessError> {
+        held_late_results::publish_late_entry(&self.shared, arguments, entry)
     }
 
     async fn install_script(&self, session: &str, script: Script) -> Result<(), HarnessError> {
@@ -3313,6 +3342,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
     std::fs::create_dir_all(&scratch).unwrap();
     #[cfg_attr(not(feature = "test-clock"), allow(unused_mut))]
     let mut subject = BrocaSubject::new(&scratch).await;
+    subject.declare_held_reply = true;
     #[cfg(feature = "test-clock")]
     attach_notice_bus(&mut subject, &scratch).await;
     let work_dir = scratch.join("suite");
@@ -3374,6 +3404,11 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "send_status_answers_as_a_resend_after_restart",
         "send_status_unknown_send_refused",
         "max_steps_seals_pending_calls",
+        "held_calls_lists_waiting_call",
+        "held_calls_applies_late_result",
+        "held_calls_not_started_becomes_tool_result",
+        "held_calls_expired_becomes_tool_result",
+        "held_calls_status_event_matches_run_status",
         "no_tools_offered_to_model",
         "no_tools_later_plan_send_refused",
         "send_id_retry_same_answer",
@@ -5067,6 +5102,73 @@ mod held_call_tests {
             #[cfg(feature = "test-clock")]
             mc: None,
         }
+    }
+
+    #[tokio::test]
+    async fn registered_held_reply_uses_a_plan_and_publishes_each_late_kind() {
+        let shared = Arc::new(Shared::default());
+        let subject = subject(shared.clone());
+        let arguments = json!({"nonce":"kit-held-reply"});
+        subject
+            .install_held_reply("held-kit", &arguments, "consent")
+            .await
+            .unwrap();
+        let fields = subject.send_fields("held-kit", true);
+        assert!(fields.contains_key("plan"));
+        assert!(fields["tools"].is_null());
+        assert_eq!(
+            subject.send_fields("ordinary", true)["system"],
+            format!("{SESSION_MARKER}ordinary")
+        );
+        held_late_results::note_bind(
+            &shared,
+            (4, 1),
+            Some(&["tool-result/v1".into(), "held-reply/v1".into()]),
+        );
+        let answer = held_late_results::answer_held(
+            &shared,
+            (4, 1),
+            &arguments.to_string(),
+            &json!({"call_key":"lineage:6"}),
+        )
+        .unwrap();
+        let subc_client_rs::HandlerOutcome::Response(body) = answer else {
+            panic!("held response expected")
+        };
+        let answer: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(answer["held"]["reason"], "consent");
+        assert_eq!(
+            subject.await_held_reply(&arguments).await.unwrap(),
+            "lineage:6"
+        );
+        for entry in [
+            ScriptedLateEntry::result(json!({"nonce":"late-result"})),
+            ScriptedLateEntry::not_started("restart_before_dispatch"),
+            ScriptedLateEntry::expired(),
+        ] {
+            subject.publish_late_entry(&arguments, entry).await.unwrap();
+        }
+        let feed = held_late_results::serve_feed(
+            &shared,
+            &json!({"name":"late_results", "arguments":{"since":null}}),
+        )
+        .await
+        .unwrap();
+        let subc_client_rs::HandlerOutcome::Response(body) = feed else {
+            panic!("feed response expected")
+        };
+        let feed: Value = serde_json::from_slice(&body).unwrap();
+        let entries = feed["entries"].as_array().unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["result", "not_started", "expired"]
+        );
+        assert_eq!(entries[1]["reason"], "restart_before_dispatch");
+        assert!(entries[0]["result"].to_string().contains("late-result"));
+        assert_eq!(subject.tool_invocations(&arguments).await, 1);
     }
 
     #[tokio::test]
