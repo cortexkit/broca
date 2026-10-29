@@ -11,6 +11,11 @@ from typing import NamedTuple
 from .archive_read import ArchiveRefusal, read_records
 
 
+# Cursor's vault record is read only by insula for quota; no broca model route uses it
+# for authentication. Mirror account_routing::NON_MODEL_REFRESH_ADAPTERS.
+NON_MODEL_REFRESH_ADAPTERS = ("cursor",)
+
+
 class CannotCompare(Exception):
     pass
 
@@ -45,6 +50,15 @@ def chooser_selects_accounts(selection: dict) -> bool:
     if method in ("apikey", "antigravity"):
         return False
     raise CannotCompare("a recent auth selection has an unknown authentication method")
+
+
+def metadata_in_chooser_scope(row: dict) -> bool:
+    method = row.get("auth_method")
+    try:
+        selected = method is None or chooser_selects_accounts({"auth_method": method})
+    except CannotCompare:
+        selected = True
+    return selected and row.get("refresh_adapter") not in NON_MODEL_REFRESH_ADAPTERS
 
 
 def os_error_detail(error: OSError) -> str:

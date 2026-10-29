@@ -174,10 +174,34 @@ class MetadataDeployGate(unittest.TestCase):
              "provider_ids": ["anthropic"], "auth_method": "oauth"},
         ]
         for credential in ("apikey:cline-pass", "apikey:muse", "oauth:cursor"):
-            rows.append({"id": credential, "categories": ["other", "llm-provider"], "auth_method": "apikey"})
+            rows.append({"id": credential, "categories": ["other", "llm-provider"],
+                         "auth_method": "oauth" if credential == "oauth:cursor" else "apikey"})
         self.assertEqual(GATE.flag_credentials({"v": 1, "credentials": rows}), {
-            credential: ("provider_ids",) for credential in ("apikey:cline-pass", "apikey:muse", "oauth:cursor")
+            "oauth:cursor": ("provider_ids",)
         })
+
+    def test_unknown_and_missing_methods_remain_flagged(self):
+        rows = [
+            {"id": "unknown", "auth_method": "future", "provider_ids": ["anthropic"]},
+            {"id": "missing", "provider_ids": ["anthropic"]},
+            {"id": "key", "auth_method": "apikey"},
+            {"id": "antigravity", "auth_method": "antigravity"},
+        ]
+        for row in rows:
+            row["categories"] = ["llm-provider"]
+        self.assertEqual(GATE.flag_credentials({"v": 1, "credentials": rows}), {
+            "unknown": ("recognized auth_method",), "missing": ("auth_method",)
+        })
+
+    def test_metadata_scope_agrees_with_rust_on_the_same_rows(self):
+        fixture = json.loads((ROOT / "crates/broca-module-serve/tests/vectors/diagnostics-findings-v1/credential-scope.json").read_text())
+        flagged = GATE.flag_credentials({"v": 1, "credentials": fixture["listing"]["credentials"]})
+        self.assertEqual(sorted(flagged), fixture["flagged"])
+        self.assertNotIn("oauth:cursor", flagged)
+        self.assertNotIn("apikey:cline-pass", flagged)
+        self.assertIn("opaque-claude", flagged)
+        self.assertIn("no-adapter", flagged)
+        self.assertIn("unknown-adapter", flagged)
 
     def test_non_model_and_missing_category_rows_do_not_trigger_a_log_scan(self):
         self.write_records([self.start("brave"), self.start("missing-category")])

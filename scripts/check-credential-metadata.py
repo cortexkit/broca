@@ -80,6 +80,8 @@ def flag_credentials(listing: object) -> dict[str, tuple[str, ...]]:
         categories = row.get("categories")
         if not isinstance(categories, list) or "llm-provider" not in categories:
             continue
+        if not scan.metadata_in_chooser_scope(row):
+            continue
         fields = []
         providers = row.get("provider_ids")
         if not isinstance(providers, list) or not providers or not all(
@@ -91,6 +93,11 @@ def flag_credentials(listing: object) -> dict[str, tuple[str, ...]]:
             fields.append("auth_method")
         elif not isinstance(method, str):
             raise CannotCompare("vault listing auth_method is not a string")
+        else:
+            try:
+                chooser_selects_accounts({"auth_method": method})
+            except CannotCompare:
+                fields.append("recognized auth_method")
         if fields:
             flagged[credential] = tuple(fields)
     # A used ID absent from this listing is an admission-resolution failure,
