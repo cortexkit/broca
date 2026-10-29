@@ -320,7 +320,6 @@ async fn upload(rig: &Rig, mime: &str, bytes: &[u8]) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires live media integration: SessionMedia hydration and render_prepared in the module executor"]
 async fn jpeg_and_pdf_reach_claude_from_live_fusiform_and_switch_to_modality_markers() {
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let url = serve_model_sse(bodies.clone(), ANTHROPIC_SSE).await;
