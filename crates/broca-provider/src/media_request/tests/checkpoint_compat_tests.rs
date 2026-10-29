@@ -1,11 +1,22 @@
 use super::*;
 use broca_core::AdmissionCheckpointV1;
 use broca_wal::FramedRecord;
-mod legacy;
-use legacy::LegacyAdmissionCheckpoint;
+mod surrogate;
+use surrogate::SurrogateAdmissionCheckpoint;
+
+fn decode_surrogate_envelope(value: serde_json::Value) -> SurrogateAdmissionCheckpoint {
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        version: u32,
+        checkpoint: SurrogateAdmissionCheckpoint,
+    }
+    let envelope: Envelope = serde_json::from_value(value).unwrap();
+    assert_eq!(envelope.version, 1);
+    envelope.checkpoint
+}
 
 #[test]
-fn media_checkpoint_rollback_decoder_ignores_seed_without_changing_render() {
+fn surrogate_0_3_284_envelope_ignores_seed_with_current_render_parity() {
     let mut seeded: serde_json::Value = serde_json::from_str(include_str!(
         "../../../tests/fixtures/media-checkpoint-v1.json"
     ))
@@ -19,9 +30,10 @@ fn media_checkpoint_rollback_decoder_ignores_seed_without_changing_render() {
     #[cfg(feature = "test-attachments")]
     broca_core::media_request::MediaCheckpoint::decode(&seed)
         .expect("fixture is a current valid media seed");
-    let legacy: LegacyAdmissionCheckpoint = serde_json::from_value(seeded.clone()).unwrap();
+    // The fixture is a bare payload; the public checkpoint decoder takes an envelope.
+    let legacy = decode_surrogate_envelope(json!({"version":1,"checkpoint":seeded.clone()}));
     seeded["media"] = seed;
-    let decoded: LegacyAdmissionCheckpoint = serde_json::from_value(seeded).unwrap();
+    let decoded = decode_surrogate_envelope(json!({"version":1,"checkpoint":seeded}));
     let episode = decoded.last_episode.as_ref().unwrap();
     let original = legacy.last_episode.as_ref().unwrap();
     let frozen: crate::wire::FrozenRenderConfig =
@@ -43,7 +55,7 @@ fn media_checkpoint_rollback_decoder_ignores_seed_without_changing_render() {
 }
 
 #[test]
-fn media_free_checkpoint_bytes_equal_0_3_284_decoder() {
+fn media_free_checkpoint_field_order_matches_surrogate_0_3_284_schema() {
     let mut input = Message::new(
         Role::User,
         vec![ContentBlock::Text {
@@ -63,6 +75,6 @@ fn media_free_checkpoint_bytes_equal_0_3_284_decoder() {
         .collect();
     let checkpoint = AdmissionCheckpointV1::from_frames(&frames).unwrap();
     let bytes = serde_json::to_vec(&checkpoint).unwrap();
-    let legacy: LegacyAdmissionCheckpoint = serde_json::from_slice(&bytes).unwrap();
+    let legacy: SurrogateAdmissionCheckpoint = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(bytes, serde_json::to_vec(&legacy).unwrap());
 }

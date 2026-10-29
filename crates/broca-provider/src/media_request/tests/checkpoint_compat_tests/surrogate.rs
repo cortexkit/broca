@@ -1,12 +1,13 @@
-//! Admission checkpoint decoder from broca 0.3.284 (75dbd49fd87e5edd4b91d122a9494b2decb9b756).
-//! Only the type name and crate qualifiers differ; its field order and serde rules are frozen.
+//! Surrogate of the 0.3.284 top-level admission schema; nested types and renderers are current.
+//! The envelope test uses a version-one envelope. These tests do not exercise the tagged
+//! release's decoder or establish whole-session rollback compatibility.
 use broca_core::admission::*;
 use broca_core::PendingSubmission;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct LegacyAdmissionCheckpoint {
+pub struct SurrogateAdmissionCheckpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head: Option<broca_core::head::HeadProjection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
