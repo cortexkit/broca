@@ -7446,6 +7446,8 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    // Only the Unix-only power-loss test below uses this check.
+    #[cfg(unix)]
     fn assert_warm_possibly_billed_once(root: &std::path::Path) {
         use broca_wal_reader::billing::{self, AttemptStatus, Item};
         let store =
@@ -7480,6 +7482,9 @@ mod tests {
         );
     }
 
+    // The power-loss recording models file identity, and so hard links, only on Unix, and it
+    // refuses a non-empty initial root elsewhere. This test records an existing overhaul root.
+    #[cfg(unix)]
     #[tokio::test]
     async fn warm_idle_crash_and_power_loss_reclaim_once() {
         use broca_core::run::AttemptHook;
