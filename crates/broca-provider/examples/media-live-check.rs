@@ -1,6 +1,8 @@
 //! Credential-safe media carrier probe. No flags (or `--dry-run`) renders but sends nothing.
 //! Live use is reserved for the Mac operator: see `docs/media-families.md`.
 
+#[path = "media-live/error_detail.rs"]
+mod error_detail;
 #[path = "media-live/plan.rs"]
 mod plan;
 
@@ -23,6 +25,7 @@ use broca_provider::{
     wire::{AuthHandle, FrozenRenderConfig, HttpRequest},
     ProviderHttpClient,
 };
+use error_detail::ErrorDetail;
 use plan::{Args, Route, MAX_REQUESTS};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -31,10 +34,6 @@ const RESPONSE_LIMIT: usize = 4 * 1024 * 1024;
 const TOOL_NAME: &str = "synthetic_media";
 const IMAGE: &[u8] = include_bytes!("media-live/fixtures/image.png");
 const PDF: &[u8] = include_bytes!("media-live/fixtures/document.pdf");
-const USER_WAV: &[u8] = include_bytes!("media-live/fixtures/user.wav");
-const TOOL_WAV: &[u8] = include_bytes!("media-live/fixtures/tool.wav");
-const USER_MP3: &[u8] = include_bytes!("media-live/fixtures/user.mp3");
-const TOOL_MP3: &[u8] = include_bytes!("media-live/fixtures/tool.mp3");
 const TOOL_IMAGE: &[u8] = include_bytes!("media-live/fixtures/tool-image.png");
 const TOOL_PDF: &[u8] = include_bytes!("media-live/fixtures/tool-document.pdf");
 
@@ -64,10 +63,6 @@ fn fixtures() -> Vec<Fixture> {
     vec![
         Fixture::new(MediaKind::Image, "image/png", IMAGE),
         Fixture::new(MediaKind::Document, "application/pdf", PDF),
-        Fixture::new(MediaKind::Audio, "audio/wav", USER_WAV),
-        Fixture::new(MediaKind::Audio, "audio/wav", TOOL_WAV),
-        Fixture::new(MediaKind::Audio, "audio/mpeg", USER_MP3),
-        Fixture::new(MediaKind::Audio, "audio/mpeg", TOOL_MP3),
         Fixture::new(MediaKind::Image, "image/png", TOOL_IMAGE),
         Fixture::new(MediaKind::Document, "application/pdf", TOOL_PDF),
     ]
@@ -106,17 +101,16 @@ fn add_exchange(
     stage: usize,
 ) -> BTreeMap<&'static str, &'static str> {
     let profile = frozen.media.as_ref().expect("probe profile");
-    let chatgpt = frozen.family_id == WireFamilyId::OpenAiResponsesChatgpt;
     let mut selected = vec![if stage == 0 {
         ("image", "VIOLET 73", 0)
     } else {
-        ("image", "ORANGE 19", 6)
+        ("image", "ORANGE 19", 2)
     }];
     if profile.document.user_message != MediaCarrier::Marker {
         selected.push(if stage == 0 {
             ("document", "COBALT 41", 1)
         } else {
-            ("document", "INDIGO 62", 7)
+            ("document", "INDIGO 62", 3)
         });
     }
     let mut user = vec![];
@@ -136,28 +130,13 @@ fn add_exchange(
         }
         checks.insert(label, answer);
     }
-    if chatgpt {
-        let index = if stage == 0 { 2 } else { 4 };
-        user.push(ContentBlock::Media(fixtures[index].reference.clone()));
-        parts.push(ToolOutputPart::Media {
-            media: fixtures[index + 1].reference.clone(),
-        });
-        checks.insert(
-            "user_audio",
-            if stage == 0 { "SILVER 26" } else { "GOLDEN 32" },
-        );
-        checks.insert(
-            "tool_audio",
-            if stage == 0 { "AMBER 58" } else { "SCARLET 84" },
-        );
-    }
     user.push(text(format!(
         "Inspect the {} media in this exchange. Reply only with {}. Fill each value from the matching media, not from previous answers.",
         if stage == 0 { "user" } else { "tool" },
         checks.keys().map(|label| format!("{label}=<value>")).collect::<Vec<_>>().join("; ")
     )));
     history.push(Message::new(Role::User, user));
-    if stage != 0 || chatgpt {
+    if stage != 0 {
         history.push(Message::new(
             Role::Assistant,
             vec![ContentBlock::ToolCall(ToolCall {
@@ -329,6 +308,8 @@ async fn send_once(
     frozen: &FrozenRenderConfig,
     request: HttpRequest,
     budget: &mut plan::Budget,
+    mut error_detail: Option<&mut ErrorDetail>,
+    secret: &str,
 ) -> Result<Observation, &'static str> {
     budget.take()?;
     let url = reqwest::Url::parse(&request.url).map_err(|_| "invalid_request_url")?;
@@ -359,8 +340,25 @@ async fn send_once(
     };
     if !(200..300).contains(&status) {
         observation.code = safe_code(&bytes);
+        if let Some(detail) = error_detail.as_deref_mut() {
+            detail
+                .record(
+                    &bytes,
+                    "http_error",
+                    Some(observation.code),
+                    "provider error fields unavailable",
+                    secret,
+                )
+                .map_err(|_| "error_detail_write_failed")?;
+        }
         return Ok(observation);
     }
+    let wire_errors_recorded = match error_detail.as_deref_mut() {
+        Some(detail) => detail
+            .record_wire_errors(&bytes, secret)
+            .map_err(|_| "error_detail_write_failed")?,
+        None => false,
+    };
     let family = wire_family(frozen.family_id).ok_or("wire family unavailable")?;
     let mut normalizer = family.normalizer(frozen, StepId(budget.sent as u64));
     let mut events = normalizer
@@ -379,9 +377,23 @@ async fn send_once(
                 observation.usage = usage;
                 observation.complete = true;
             }
-            NormalizedEvent::Control(ProviderControl::Error { .. }) => {
+            NormalizedEvent::Control(ProviderControl::Error { error, .. }) => {
                 observation.code = "stream_error_redacted";
                 observation.complete = false;
+                if let Some(detail) = error_detail
+                    .as_deref_mut()
+                    .filter(|_| !wire_errors_recorded)
+                {
+                    detail
+                        .record(
+                            &bytes,
+                            &format!("{:?}", error.class),
+                            error.provider_code.as_deref(),
+                            &error.message,
+                            secret,
+                        )
+                        .map_err(|_| "error_detail_write_failed")?;
+                }
             }
             _ => {}
         }
@@ -536,11 +548,12 @@ async fn run_live(
     route: &Route,
     frozen: &FrozenRenderConfig,
     fixtures: &[Fixture],
+    mut error_detail: Option<&mut ErrorDetail>,
 ) -> Result<(), &'static str> {
     if let Some(reason) = route.live_skip_reason(frozen) {
         println!(
             "{}",
-            json!({"mode":"live", "family":route.family,"model":route.model,"status":"skipped","reason":reason,"requests_sent":0,"production_gates_changed":false})
+            json!({"mode":"live", "family":route.family,"model":route.model,"status":"skipped","reason":reason,"missing_field":route.missing_live_field(frozen),"requests_sent":0,"production_gates_changed":false})
         );
         return Ok(());
     }
@@ -557,7 +570,7 @@ async fn run_live(
     let token = devtools::credential(&credential, &args.subc_path(), &identity)
         .await
         .map_err(|_| "named_credential_read_failed")?;
-    let auth = auth(route, token)?;
+    let auth = auth(route, token.clone())?;
     let family = wire_family(route.family).ok_or("wire family unavailable")?;
     let client = build_single_attempt_http_client();
     let mut budget = plan::Budget::default();
@@ -588,7 +601,14 @@ async fn run_live(
         }
         let observation = tokio::time::timeout(
             Duration::from_secs(args.timeout_secs),
-            send_once(&client, frozen, request, &mut budget),
+            send_once(
+                &client,
+                frozen,
+                request,
+                &mut budget,
+                error_detail.as_deref_mut(),
+                &token,
+            ),
         )
         .await
         .map_err(|_| "request_timeout")??;
@@ -632,8 +652,16 @@ async fn run() -> Result<(), &'static str> {
         })
         .collect::<Result<Vec<_>, &'static str>>()?;
     if args.live {
+        let mut error_detail = args
+            .error_detail
+            .as_deref()
+            .map(ErrorDetail::open)
+            .transpose()
+            .map_err(|_| "error_detail_open_failed")?;
         for (route, frozen) in routes.iter().zip(&prepared) {
-            if let Err(code) = run_live(&args, route, frozen, &fixtures).await {
+            if let Err(code) =
+                run_live(&args, route, frozen, &fixtures, error_detail.as_mut()).await
+            {
                 println!(
                     "{}",
                     json!({"family":route.family,"model":route.model,"provider_code":code,"result":"inconclusive","production_gates_changed":false})
@@ -658,7 +686,7 @@ fn plan_summary(routes: &[Route], live: bool) -> Result<Value, &'static str> {
         .filter_map(|route| match route.frozen() {
             Ok(frozen) => route
                 .live_skip_reason(&frozen)
-                .map(|reason| Ok(json!({"family":route.family,"reason":reason}))),
+                .map(|reason| Ok(json!({"family":route.family,"reason":reason,"missing_field":route.missing_live_field(&frozen)}))),
             Err(error) => Some(Err(error)),
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -697,7 +725,10 @@ mod tests {
         );
         assert_eq!(
             summary["live_skips"],
-            json!([{"family":"google_codeassist", "reason":"project_id_required"}])
+            json!([
+                {"family":"anthropic_messages", "reason":"oauth_account_metadata_unavailable", "missing_field":"account_uuid"},
+                {"family":"google_codeassist", "reason":"project_id_required", "missing_field":"project_id"}
+            ])
         );
     }
 
@@ -713,9 +744,101 @@ mod tests {
                 .unwrap();
         assert_eq!(preview["project"], "");
         assert!(frozen.project_id.is_none());
-        assert!(run_live(&Args::default(), &route, &frozen, &fixtures())
-            .await
-            .is_ok());
+        assert!(
+            run_live(&Args::default(), &route, &frozen, &fixtures(), None)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_oauth_skips_before_credential_parsing() {
+        let route: Route = serde_json::from_value(json!({
+            "family":"anthropic_messages", "model":"claude-haiku-5-5", "credential":"oauth:"
+        }))
+        .unwrap();
+        let frozen = route.frozen().unwrap();
+        assert_eq!(
+            route.live_skip_reason(&frozen),
+            Some("oauth_account_metadata_unavailable")
+        );
+        assert_eq!(route.missing_live_field(&frozen), Some("account_uuid"));
+        assert!(
+            run_live(&Args::default(), &route, &frozen, &fixtures(), None)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn resolved_oauth_uses_production_persona_headers_and_api_keys_still_work() {
+        use broca_provider::wire::ClaudeCodePersona;
+        let route: Route = serde_json::from_value(json!({
+            "family":"anthropic_messages", "model":"claude-haiku-5-5", "credential":"oauth:anthropic"
+        })).unwrap();
+        let mut frozen = route.frozen().unwrap();
+        frozen.claude_code_persona = Some(
+            serde_json::from_value(json!({
+                "version":ClaudeCodePersona::CURRENT_VERSION,
+                "device_id":"a".repeat(64),
+                "account_uuid":"00000000-0000-4000-8000-000000000001",
+                "session_id":"00000000-0000-4000-8000-000000000002",
+                "prompt_id":"00000000-0000-4000-8000-000000000003",
+                "prompt_ordinal":1
+            }))
+            .unwrap(),
+        );
+        assert_eq!(route.live_skip_reason(&frozen), None);
+        let family = wire_family(route.family).unwrap();
+        let fixtures = fixtures();
+        let mut history = initial_history();
+        add_exchange(&mut history, &frozen, &fixtures, 0);
+        let request = family.endpoint(
+            &frozen,
+            &auth(&route, "synthetic-oauth-token".into()).unwrap(),
+            render(&frozen, &history, &fixtures).unwrap(),
+        );
+        let header = |name: &str| {
+            request
+                .headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        };
+        assert!(request.url.ends_with("/v1/messages?beta=true"));
+        assert_eq!(
+            header("authorization"),
+            Some("Bearer synthetic-oauth-token")
+        );
+        assert_eq!(header("x-app"), Some("cli"));
+        assert!(header("anthropic-beta")
+            .unwrap()
+            .contains("oauth-2025-04-20"));
+        assert!(header("user-agent").unwrap().starts_with("claude-cli/"));
+        assert!(header("x-api-key").is_none());
+        assert!(
+            serde_json::from_slice::<Value>(&request.body).unwrap()["metadata"]["user_id"]
+                .is_string()
+        );
+
+        let api: Route = serde_json::from_value(json!({
+            "family":"anthropic_messages", "model":"claude-haiku-5-5", "credential":"apikey:anthropic"
+        })).unwrap();
+        let frozen = api.frozen().unwrap();
+        assert_eq!(api.live_skip_reason(&frozen), None);
+        let request = family.endpoint(
+            &frozen,
+            &auth(&api, "synthetic-api-key".into()).unwrap(),
+            render(&frozen, &history, &fixtures).unwrap(),
+        );
+        assert!(request
+            .headers
+            .iter()
+            .any(|(key, value)| key == "x-api-key" && value == "synthetic-api-key"));
+        assert!(!request
+            .headers
+            .iter()
+            .any(|(key, _)| key == "authorization"));
     }
 
     #[test]
@@ -735,7 +858,7 @@ mod tests {
                 );
                 if stage == 1 {
                     assert!(
-                        body.contains(&fixtures[6].base64),
+                        body.contains(&fixtures[2].base64),
                         "tool image must be new evidence"
                     );
                 }
@@ -753,14 +876,9 @@ mod tests {
                     );
                 }
                 if route.family == WireFamilyId::OpenAiResponsesChatgpt {
-                    for fixture in &fixtures[2..if stage == 0 { 4 } else { 6 }] {
-                        assert!(
-                            body.contains(&fixture.base64),
-                            "ChatGPT audio {}",
-                            fixture.reference.mime
-                        );
-                    }
-                    assert!(body.contains("input_audio"));
+                    assert!(!body.contains("input_audio"));
+                    assert!(!body.contains("audio/"));
+                    assert!(!body.contains("input_file"));
                 }
             }
         }
@@ -854,6 +972,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_error_detail_is_opt_in_and_console_code_stays_redacted() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let secret = "synthetic-private-token";
+        let body = json!({"headers":{"authorization":"header-secret"}, "error":{"type":"invalid_request_error","code":"private-code","message":format!("Rejected {secret}")}}).to_string();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                stream.read(&mut request).await.unwrap();
+                let reply = format!("HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nx-provider-private: header-secret\r\nConnection: close\r\n\r\n{body}", body.len());
+                stream.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let path = broca_test_support::scratch_root().join("media-http-error-detail.jsonl");
+        let mut detail = ErrorDetail::open(&path).unwrap();
+        let frozen = route(WireFamilyId::OpenAiChat).frozen().unwrap();
+        let request = || HttpRequest {
+            method: broca_provider::wire::HttpMethod::Post,
+            url: format!("http://{addr}/error"),
+            headers: vec![],
+            body: b"{}".to_vec(),
+        };
+        let client = build_single_attempt_http_client();
+        let mut budget = plan::Budget::default();
+        let default = send_once(&client, &frozen, request(), &mut budget, None, secret)
+            .await
+            .unwrap();
+        assert_eq!(default.status, Some(400));
+        assert_eq!(default.code, "other_redacted");
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        let opted_in = send_once(
+            &client,
+            &frozen,
+            request(),
+            &mut budget,
+            Some(&mut detail),
+            secret,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opted_in.code, "other_redacted");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let record: Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(record["type"], "invalid_request_error");
+        assert_eq!(record["code"], "private-code");
+        assert_eq!(record["message"], "Rejected [redacted]");
+        assert!(!text.contains("header-secret"));
+        assert!(!text.contains(secret));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn single_attempt_transport_does_not_follow_redirects_or_spend_a_fourth_slot() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -879,7 +1051,7 @@ mod tests {
         };
         let client = build_single_attempt_http_client();
         let mut budget = plan::Budget::default();
-        let observation = send_once(&client, &frozen, request(), &mut budget)
+        let observation = send_once(&client, &frozen, request(), &mut budget, None, "")
             .await
             .unwrap();
         assert_eq!(observation.status, Some(307));
@@ -887,7 +1059,7 @@ mod tests {
         budget.take().unwrap();
         budget.take().unwrap();
         assert_eq!(
-            send_once(&client, &frozen, request(), &mut budget)
+            send_once(&client, &frozen, request(), &mut budget, None, "")
                 .await
                 .err(),
             Some("family_request_cap")

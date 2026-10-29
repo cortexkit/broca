@@ -31,6 +31,7 @@ pub struct Args {
     pub live: bool,
     pub plan: Option<PathBuf>,
     pub subc: Option<PathBuf>,
+    pub error_detail: Option<PathBuf>,
     pub timeout_secs: u64,
 }
 
@@ -48,11 +49,12 @@ impl Args {
                 "--dry-run" => dry = true,
                 "--plan" => result.plan = Some(args.next().ok_or("plan_path_required")?.into()),
                 "--subc" => result.subc = Some(args.next().ok_or("subc_path_required")?.into()),
+                "--error-detail" => result.error_detail = Some(args.next().ok_or("error_detail_path_required")?.into()),
                 "--timeout-secs" => {
                     result.timeout_secs = args.next().ok_or("timeout_required")?.parse().map_err(|_| "invalid_timeout")?;
                     if !(1..=600).contains(&result.timeout_secs) { return Err("timeout_out_of_range"); }
                 }
-                _ => return Err("usage: media-live-check [--dry-run | --live --plan FILE] [--subc FILE] [--timeout-secs 1..600]"),
+                _ => return Err("usage: media-live-check [--dry-run | --live --plan FILE] [--subc FILE] [--error-detail FILE] [--timeout-secs 1..600]"),
             }
         }
         if dry && result.live {
@@ -164,9 +166,30 @@ fn validate_routes(routes: &[Route]) -> Result<(), &'static str> {
 
 impl Route {
     pub fn live_skip_reason(&self, frozen: &FrozenRenderConfig) -> Option<&'static str> {
+        if self.family == WireFamilyId::AnthropicMessages
+            && self
+                .credential
+                .as_deref()
+                .is_some_and(|name| name.starts_with("oauth:"))
+            && frozen
+                .claude_code_persona
+                .as_ref()
+                .and_then(|persona| persona.account_uuid.as_deref())
+                .is_none_or(str::is_empty)
+        {
+            return Some("oauth_account_metadata_unavailable");
+        }
         (self.family == WireFamilyId::GoogleCodeAssist
             && frozen.project_id.as_deref().is_none_or(str::is_empty))
         .then_some("project_id_required")
+    }
+
+    pub fn missing_live_field(&self, frozen: &FrozenRenderConfig) -> Option<&'static str> {
+        match self.live_skip_reason(frozen) {
+            Some("oauth_account_metadata_unavailable") => Some("account_uuid"),
+            Some("project_id_required") => Some("project_id"),
+            _ => None,
+        }
     }
 
     pub fn frozen(&self) -> Result<FrozenRenderConfig, &'static str> {
@@ -174,6 +197,17 @@ impl Route {
             .frozen
             .clone()
             .unwrap_or_else(|| frozen_config_for_family(self.family, &self.model));
+        if self.family == WireFamilyId::AnthropicMessages
+            && self
+                .credential
+                .as_deref()
+                .is_some_and(|name| name.starts_with("oauth:"))
+        {
+            frozen.system_prompt =
+                broca_provider::policy::SystemPromptPolicy::RequiredIdentityLead {
+                    identity: broca_provider::families::CLAUDE_CODE_IDENTITY.into(),
+                };
+        }
         frozen.max_output_tokens = 512;
         frozen.caller_max_output_tokens = Some(512);
         frozen.prompt_cache_key = Some("broca-synthetic-media-live".into());
@@ -237,12 +271,6 @@ impl Route {
                 profile.document.tool_result = Native;
             }
         }
-        if profile.profile == OpenaiResponsesChatgpt {
-            profile.live_gated.chatgpt_input_audio = true;
-            profile.chatgpt_audio_mime_types = vec!["audio/wav".into(), "audio/mpeg".into()];
-            profile.audio.user_message = Native;
-            profile.audio.tool_result = Native;
-        }
         // No video fixture is probed. A Code Assist pass cannot justify its coarse all-kind
         // production gate, and audio/video tool results on Gemini remain markers.
         profile.video.user_message = Marker;
@@ -258,10 +286,23 @@ mod tests {
 
     #[test]
     fn dry_run_is_default_and_live_requires_an_explicit_plan() {
-        assert!(!Args::parse(std::iter::empty()).unwrap().live);
+        let default = Args::parse(std::iter::empty()).unwrap();
+        assert!(!default.live);
+        assert!(default.error_detail.is_none());
         assert!(!Args::parse(["--dry-run".into()].into_iter()).unwrap().live);
         assert!(Args::parse(["--live".into()].into_iter()).is_err());
         assert!(Args::parse(["--dry-run".into(), "--live".into()].into_iter()).is_err());
+        let opted_in = Args::parse(
+            [
+                "--dry-run".into(),
+                "--error-detail".into(),
+                "private.jsonl".into(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(opted_in.error_detail, Some(PathBuf::from("private.jsonl")));
+        assert!(Args::parse(["--error-detail".into()].into_iter()).is_err());
     }
 
     #[test]
@@ -300,13 +341,13 @@ mod tests {
             (
                 WireFamilyId::AnthropicMessages,
                 "claude-haiku-5-5",
-                "apikey:anthropic:ufukaltinokgmail",
+                "oauth:anthropic",
             ),
             (WireFamilyId::OpenAiResponses, "gpt-6-luna", "apikey:openai"),
             (
                 WireFamilyId::OpenAiResponsesChatgpt,
                 "gpt-6-luna",
-                "chatgpt:openai:live",
+                "chatgpt:openai",
             ),
             (WireFamilyId::OpenAiChat, "gpt-6-luna", "apikey:openai"),
             (WireFamilyId::Gemini, "gemini-3.8-flash", "apikey:google"),

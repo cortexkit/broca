@@ -32,6 +32,12 @@ The bounded probe uses the explicit prepared-media renderer, the family's real
 endpoint and normalizer, and broca's HTTP client with redirects and automatic
 retries disabled. It never prints a credential, handle, request headers, response
 body or provider error message. Unknown provider codes are `other_redacted`.
+An optional `--error-detail <file>` appends only error type, code and message to
+a local owner-only file (Unix mode 0600), with each encoded JSON line capped at
+1 KiB including its newline. Existing non-private files and links are refused.
+No headers enter that file, known credential values are redacted, and its contents
+are never copied to stdout or stderr. Without the flag, no error-detail file is
+opened. The flag has no effect during a dry-run.
 
 ```sh
 # Default dry-run: 6 serving families, at most 18 planned requests; sends nothing.
@@ -54,6 +60,16 @@ token or capability handle belongs in the plan. Credentials are read by name onl
 through the dev-tools handle map and subc, and only after `--live` and
 `BROCA_LIVE_TESTS=1`. `--subc` and `--timeout-secs` are optional.
 
+The Anthropic route selects the long-standing `oauth:anthropic` subscription
+credential; ChatGPT selects `chatgpt:openai`. The temporary live-check handles
+have been revoked. API-key Anthropic routes remain supported for funded keys.
+OAuth uses the provider's identity-lead, persona, header and beta derivation,
+never a separate handwritten header list. The current token-only devtools helper
+does not expose the account UUID needed for the production persona. Unless an
+actual resolved persona is present in the non-secret frozen config, the OAuth
+route reports `skipped: oauth_account_metadata_unavailable`, naming
+`account_uuid`, before any credential access. The probe never guesses that fact.
+
 Bedrock is absent from the serving plan because the operator has no Bedrock
 credential; the summary records it as not live-checked with reason
 `no_credential`. Code Assist's account-project discovery is not part of this
@@ -67,9 +83,9 @@ One route consumes all three request slots for its family; duplicate families
 are refused before credential access. Request 1 checks person PNG/PDF input where
 the profile carries it. Request 2 checks a tool PNG/PDF with different readable
 values, using the candidate follow-up user carrier where necessary. Request 3
-extends the same history to measure cache stability. ChatGPT also checks user
-and tool audio in request 1 (`audio/wav`) and request 2 (`audio/mpeg`), with four
-different spoken values. Candidate MIME types are not claims of acceptance.
+extends the same history to measure cache stability. ChatGPT checks only a person
+image, a distinct tool image, and the cache follow-up. Its backend rejected audio
+live, so no audio fixtures are included in that route.
 Fixtures are synthetic and checked in beside the example; no session data is read.
 
 Dry-run JSON lines list family, wire model, profile, carrier, media kind, MIME,
@@ -90,10 +106,14 @@ request; use `not serving` for a family not exercised):
 | pending | pending | pending | pending | pending | pending | unmeasured | keep gate unset |
 
 Record refusals as well as passes. A pass for one compatible provider or Gemini
-generation does not enable another profile. A ChatGPT audio pass records exactly
-the accepted MIME set in the frozen profile, as well as the carrier flag. Code
-Assist's current all-kind flag must not be enabled from PNG/PDF-only evidence:
+generation does not enable another profile. ChatGPT audio is unavailable, even
+when old frozen flags or MIME lists are present. Code Assist's current all-kind
+flag must not be enabled from PNG/PDF-only evidence:
 audio/video remain unverified by those checks. Untested profiles retain markers.
+
+The dated results below are transcribed from the operator's local evidence file
+`.cortexkit/internal-docs/investigations/media-live-check-2026-10-29.md`, which is
+kept outside version control. No new provider requests are implied by this table.
 
 ## Kinds, MIME types and catalog modalities
 
@@ -193,9 +213,9 @@ of audio at Gemini's 32 tokens per second, and about four minutes of video at Ge
 ## Profile selection
 
 A profile is chosen from the frozen `WireFamilyId`, a frozen provider quirk, and a
-per-family wire-model-pattern table for documented generation splits. Two splits
-exist today: Gemini 3 versus earlier Gemini (tool results), and the ChatGPT backend's
-`input_audio` (live-gated flag).
+per-family wire-model-pattern table for documented generation splits. Gemini 3
+versus earlier Gemini controls tool-result carriers. The separate ChatGPT backend
+profile disables audio after its measured live refusal.
 
 Providers on `openai_chat` share one grammar, so the family entry below gives the
 grammar, and each provider profile is told apart by a frozen media quirk keyed by the
@@ -218,8 +238,10 @@ person's media is refused (`carrier`) and tool media renders as markers.
 
 ## `anthropic_messages` (Anthropic Messages API)
 
-**Live check:** pending operator-run results; native image/PDF carriers are documented,
-not yet verified by this probe.
+**Live check, 2026-10-28/29:** `claude-haiku-5-5` with the platform API key was not
+verified: HTTP 400, "Your credit balance is too low to access the Anthropic API."
+OAuth subscription media remains unverified; the token-only standalone probe
+skips it when the production persona's `account_uuid` is unavailable.
 
 Sources: https://platform.claude.com/docs/en/build-with-claude/vision ·
 https://platform.claude.com/docs/en/build-with-claude/pdf-support ·
@@ -292,9 +314,10 @@ https://platform.claude.com/docs/en/api/overview (Bedrock request size)
 
 ## `openai_responses` (OpenAI Responses API)
 
-**Live check:** pending operator-run results; native image/PDF carriers are documented,
-not yet verified by this probe. The Meta Responses profile is separately untested
-and its follow-up-user carrier remains a marker.
+**Live check, 2026-10-28/29:** `gpt-6-luna` with `apikey:openai` was not verified:
+HTTP 200 followed by a `billing_exhausted` stream error, "You have no credits
+remaining." The Meta Responses profile is separately untested and its
+follow-up-user carrier remains a marker.
 
 Sources: https://developers.openai.com/api/docs/guides/images-vision ·
 https://developers.openai.com/api/docs/guides/file-inputs ·
@@ -327,9 +350,13 @@ https://developers.openai.com/api/reference/resources/responses/methods/create
 
 ## `openai_responses_chatgpt` (ChatGPT / Codex backend)
 
-**Live check:** pending operator-run results. `input_audio` remains off and its frozen
-MIME allowlist empty. Probe candidates are `audio/wav` and `audio/mpeg`, in both user
-messages and tool results; neither is accepted until measured live.
+**Live check, 2026-10-28:** `gpt-6-luna` rejected audio with HTTP 400,
+`invalid_request_error`, parameter `input`: "Audio input is not available."
+Audio is refused before publication or send, naming `audio`; stored tool audio
+renders as a marker. Legacy audio flags and MIME lists cannot enable it.
+With audio removed, the person PNG passed (HTTP 200; 12,537 input tokens).
+Tool images and PDFs were not checked live. Image and PDF profile behavior is
+unchanged: images are native and PDFs remain unavailable on this backend.
 
 The ChatGPT backend takes the Responses body at the ChatGPT Codex endpoint and has no
 public reference. The primary source is OpenAI's own Codex client, which serializes
@@ -339,23 +366,25 @@ https://github.com/openai/codex/blob/ffda54f5b8d5595eb0963594de32e206f98cc77f/co
 
 | | image | document | audio | video |
 |---|---|---|---|---|
-| user-message shape | `{"type":"input_image","image_url":"data:M;base64,B64"}` | not evidenced (Codex sends no `input_file`) | `{"type":"input_audio","audio_url":"data:M;base64,B64"}`, **live-gated** | not supported |
-| MIME types | as `openai_responses` | — | not documented; the live check fixes the accepted types | — |
-| tool result | native: `input_image` in `function_call_output.output` | marker | `input_audio` in `function_call_output.output`, **live-gated** | marker |
+| user-message shape | `{"type":"input_image","image_url":"data:M;base64,B64"}` | not evidenced (Codex sends no `input_file`) | not supported (live HTTP 400) | not supported |
+| MIME types | as `openai_responses` | — | — | — |
+| tool result | native: `input_image` in `function_call_output.output` | marker | marker | marker |
 | per-item limit | as `openai_responses` | — | not documented | — |
 | count limit per request | as `openai_responses` | — | not documented | — |
 
-- **`input_audio` flag:** off until a live check against the real backend passes.
-  With the flag off, a person's audio is refused (`carrier`) and a tool's audio is a
-  marker.
+- **Audio:** a person's audio is refused (`carrier`) and a tool's audio is a
+  marker. The backend's measured refusal overrides the Codex client's unused
+  audio shape. No frozen flag or MIME entry enables audio.
 - **Count-dependent dimension limit:** none documented.
 - **Request cap:** not documented. **broca choice:** 50 MB, as `openai_responses`.
-- **Token estimate:** image: the `openai_responses` rule. Audio: fixed estimate.
+- **Token estimate:** image: the `openai_responses` rule. Audio is not carried.
 
 ## `openai_chat` (OpenAI Chat Completions grammar)
 
-**Live check:** pending operator-run acceptance and positive cache-stability results.
-OpenAI's tool-media follow-up-user carrier remains a marker.
+**Live check, 2026-10-28/29:** `gpt-6-luna` with `apikey:openai` was not verified:
+HTTP 429, `insufficient_quota` / `credit_balance_exhausted`. OpenAI's tool-media
+follow-up-user carrier remains a marker; acceptance and cache stability are
+unmeasured with a funded key.
 
 Sources: https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create ·
 https://developers.openai.com/api/docs/guides/images-vision ·
@@ -499,9 +528,10 @@ https://dev.meta.ai/docs/protocols/chat-completions
 
 ## `gemini` (Gemini API and Vertex AI `generateContent`)
 
-**Live check:** pending operator-run results. Gemini 3's native image/PDF tool carrier
-is documented but unverified here; earlier Gemini's follow-up-user carrier stays
-a marker until its own acceptance and cache-stability check passes.
+**Live check, 2026-10-28/29:** `gemini-3.8-flash` passed person PNG/PDF, tool PNG/PDF
+and the cache follow-up. Request 2 reported 15,286 cached input tokens; request 3
+reported 16,639, with the rendered prefix stable. This verifies the Gemini 3
+native carriers, not earlier Gemini's follow-up-user carrier, which stays a marker.
 
 Sources: https://ai.google.dev/gemini-api/docs/image-understanding ·
 https://ai.google.dev/gemini-api/docs/document-processing ·
