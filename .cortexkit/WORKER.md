@@ -13,6 +13,8 @@ them. Start with `CONTRIBUTING.md` and the public contracts under `docs/`.
 
 ## Gate before you deliver
 
+For the pre-push entry point, platform split and CI parity table, see [`scripts/prepush.sh`](../scripts/prepush.sh) and [`docs/prepush.md`](../docs/prepush.md).
+
 Filtered tests alone are never a gate. Before delivering, run on Linux:
 
 - `cargo fmt --all -- --check`, and clippy with `--all-targets --locked -- -D warnings` for every
