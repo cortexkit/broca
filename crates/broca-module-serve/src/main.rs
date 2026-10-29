@@ -3854,7 +3854,12 @@ mod executor {
                 &self.clock,
             )
             .map_err(WarmError::Unavailable)?;
-            broca_module::executor::send_warm(provider.as_ref(), job.base).await
+            broca_module::executor::send_warm_with_hook(
+                provider.as_ref(),
+                job.base,
+                job.attempt_hook,
+            )
+            .await
         }
 
         async fn execute(

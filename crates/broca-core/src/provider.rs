@@ -238,6 +238,21 @@ pub trait Provider: Send + Sync {
             "this provider cannot warm a prompt cache".into(),
         ))
     }
+
+    /// A billing-aware warm must reserve every physical send. Providers without that seam
+    /// refuse before sending; legacy callers continue through `warm` without a hook.
+    async fn warm_with_hook(
+        &self,
+        base: &[u8],
+        hook: Option<Arc<dyn crate::run::AttemptHook>>,
+    ) -> Result<crate::WarmSent, crate::WarmFailure> {
+        if hook.is_some() {
+            return Err(crate::WarmFailure::Unsupported(
+                "this provider cannot journal cache warm attempts".into(),
+            ));
+        }
+        self.warm(base).await
+    }
 }
 
 /// A boxed provider is itself a provider — it forwards every method to the inner
@@ -377,6 +392,14 @@ impl Provider for Box<dyn Provider> {
 
     async fn warm(&self, base: &[u8]) -> Result<crate::WarmSent, crate::WarmFailure> {
         (**self).warm(base).await
+    }
+
+    async fn warm_with_hook(
+        &self,
+        base: &[u8],
+        hook: Option<Arc<dyn crate::run::AttemptHook>>,
+    ) -> Result<crate::WarmSent, crate::WarmFailure> {
+        (**self).warm_with_hook(base, hook).await
     }
 }
 

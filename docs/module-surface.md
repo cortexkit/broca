@@ -497,11 +497,18 @@ what it cost.
   it at its own send start. `expiry_basis` is always `"estimated"`. The clock lives in memory, so
   after a restart it is unknown (and warms are refused `cache_expired`) until the session sends
   again.
-- **Records.** Each successful warm writes one informational, ungated `cache_warmed` WAL record
+- **Records.** On legacy roots, each successful warm writes one informational, ungated `cache_warmed` WAL record
   (digests, usage, account, the raw `anthropic-ratelimit-unified-*` headers, expiry). Replay,
   `session.read` and projection skip it; it is never a transcript message. Billing turns it into
   its own export fact marked `warm: true`, priced from its own usage, whose id is taken over the
   record's WAL sequence so the run's ordinary facts keep their ids. Absent usage stays absent.
+  On opted-in `broca-state/2` roots, every physical warm send is durably reserved before sending
+  and gets a `cache_warmed` terminal with its reservation and outcome envelope even when it fails;
+  those records require the `bill-attempts/v1` WAL feature. A compression refusal and
+  uncompressed resend are separate attempts. The billing envelope distinguishes a failed send
+  from a cache refresh. A failed warm never refreshes cache expiry on any root. If a crash loses
+  the outcome, reclaim lets the billing reader report the reserved attempt as possibly billed,
+  without inventing usage, deduplicated by its random `attempt_id`.
 - **Head and declaration.** `session.head.cache` reports the clock from memory, with no WAL
   scan. The admitting send's `baseline` and `session.baseline` carry `cache {ttl_ms,
   ttl_options_ms, read_refreshes_ttl, warm: "supported" | "unsupported", basis}`, every member

@@ -1234,6 +1234,14 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
     /// does, that the credential's account is still the one the session froze. Never retried: a
     /// warm that fails is reported, not repeated.
     async fn warm(&self, base: &[u8]) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
+        self.warm_with_hook(base, None).await
+    }
+
+    async fn warm_with_hook(
+        &self,
+        base: &[u8],
+        hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
+    ) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
         let served = self.current_auth();
         if account_changed_error(
             self.frozen_account_ref.as_deref(),
@@ -1261,6 +1269,7 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
             self.family.endpoint(&warm_frozen, &served.auth, body),
             self.frozen.family_id,
             served.account_ref,
+            hook,
         )
         .await
     }
@@ -1282,7 +1291,9 @@ async fn send_warm(
     request: HttpRequest,
     family: crate::spec::WireFamilyId,
     served_account_ref: Option<String>,
+    hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
 ) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
+    use broca_wal::record::{AttemptEnvelope, AttemptSent, BillingAttemptOutcome as Outcome};
     let warm_body_sha256 = lower_hex(&Sha256::digest(&request.body));
     let anthropic_api_host = request_gzip::is_anthropic_api_host(&request.url);
     let identity = Bytes::from(request.body);
@@ -1304,25 +1315,77 @@ async fn send_warm(
             affordable_max_tokens: None,
         })
     };
+    let mut id = None;
+    let mut envelope = AttemptEnvelope::default();
+    let mut send_index = 0;
+    let model_sent = serde_json::from_slice::<Value>(&identity)
+        .ok()
+        .and_then(|body| body.get("model").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_default();
     let exchange = async {
         let mut gzip = encode_request_gzip(client, anthropic_api_host, &identity).await;
         let (sent_at_ms, status, header_map, body) = loop {
+            send_index += 1;
+            envelope = AttemptEnvelope::default();
+            if let Some(hook) = &hook {
+                id = Some(
+                    tokio::time::timeout(
+                        Duration::from_secs(30),
+                        hook.before_send(
+                            broca_core::run::PhysicalSend {
+                                attempt: send_index - 1,
+                                send_index,
+                                endpoint_host: reqwest::Url::parse(&request.url)
+                                    .ok()
+                                    .and_then(|url| url.host_str().map(str::to_owned))
+                                    .unwrap_or_default(),
+                                model_sent: model_sent.clone(),
+                                request_body_bytes: gzip.as_ref().unwrap_or(&identity).len() as u64,
+                                compressed: gzip.is_some(),
+                                account_ref: served_account_ref.clone(),
+                                speed_requested: serde_json::from_slice::<Value>(&identity)
+                                    .ok()
+                                    .and_then(|body| {
+                                        body.get("speed").and_then(Value::as_str).map(str::to_owned)
+                                    }),
+                            },
+                            tokio_util::sync::CancellationToken::new(),
+                        ),
+                    )
+                    .await
+                    .map_err(|_| failed("warm reservation permission deadline expired".into()))?
+                    .map_err(broca_core::WarmFailure::Provider)?,
+                );
+            }
             let sent_at_ms = now_millis();
+            envelope.sent_at_ms = Some(sent_at_ms);
+            envelope.sent = AttemptSent::Yes;
             let response = attempt_request_builder(
                 client,
                 &request.url,
                 &request.headers,
                 anthropic_api_host,
                 gzip.is_some(),
-                false,
+                hook.is_some(),
             )
             .body(gzip.clone().unwrap_or_else(|| identity.clone()))
             .send()
             .await
-            .map_err(|error| failed(format!("warm request failed: {error}")))?;
+            .map_err(|error| {
+                envelope.outcome = if error.is_connect() {
+                    envelope.sent = AttemptSent::No;
+                    envelope.sent_at_ms = None;
+                    Outcome::ConnectFailed
+                } else {
+                    Outcome::NoStatus
+                };
+                failed(format!("warm request failed: {error}"))
+            })?;
             let status = response.status();
+            envelope.http_status = Some(status.as_u16());
             let header_map = response.headers().clone();
-            let body = read_warm_body(response, &failed).await?;
+            let body = read_warm_body(response, &failed, &mut envelope).await?;
+            warm_billing_usage(&body, family, &mut envelope);
             if gzip.is_some() {
                 if let Some(rejection) = request_gzip::classify_rejection(
                     status.as_u16(),
@@ -1330,6 +1393,13 @@ async fn send_warm(
                     &String::from_utf8_lossy(&body),
                 ) {
                     client.request_gzip.latch(status.as_u16(), rejection);
+                    envelope.outcome = Outcome::CompressionRefused;
+                    envelope.finished_at_ms = Some(now_millis());
+                    if let (Some(hook), Some(id)) = (&hook, id.take()) {
+                        hook.warm_finished(id, envelope.clone(), None, warm_body_sha256.clone())
+                            .await
+                            .map_err(broca_core::WarmFailure::Provider)?;
+                    }
                     gzip = None;
                     continue;
                 }
@@ -1352,6 +1422,7 @@ async fn send_warm(
             })
             .collect();
         if !status.is_success() {
+            envelope.outcome = Outcome::HttpError;
             let code = status.as_u16();
             let text = String::from_utf8_lossy(&body);
             log_opencode_go_refusal(&request.headers, code, &headers, &text);
@@ -1389,30 +1460,113 @@ async fn send_warm(
                 "Codex cache warm read zero cached tokens; best-effort re-prime, not retried"
             );
         }
+        envelope.outcome = Outcome::Complete;
         Ok(broca_core::WarmSent {
-            warm_body_sha256,
+            warm_body_sha256: warm_body_sha256.clone(),
             sent_at_ms,
             usage,
-            served_account_ref,
+            served_account_ref: served_account_ref.clone(),
             ratelimit_headers,
             http_status: status.as_u16(),
         })
     };
-    tokio::time::timeout(WARM_TIMEOUT, exchange)
+    let result = match tokio::time::timeout(WARM_TIMEOUT, exchange).await {
+        Ok(result) => result,
+        Err(_) => {
+            envelope.outcome = if envelope.http_status.is_some() {
+                Outcome::IdleTimeout
+            } else {
+                Outcome::HeaderTimeout
+            };
+            Err(failed("warm timed out waiting for its answer".into()))
+        }
+    };
+    envelope.finished_at_ms = Some(now_millis());
+    if let (Some(hook), Some(id)) = (&hook, id.take()) {
+        hook.warm_finished(
+            id,
+            envelope,
+            result.as_ref().ok().cloned(),
+            warm_body_sha256,
+        )
         .await
-        .unwrap_or_else(|_| Err(failed("warm timed out waiting for its answer".into())))
+        .map_err(broca_core::WarmFailure::Provider)?;
+    }
+    result
+}
+
+/// Retain reported usage even on an HTTP refusal. An absent usage object remains unknown,
+/// rather than turning a failed warm into a measured zero-token call.
+fn warm_billing_usage(
+    body: &[u8],
+    family: crate::spec::WireFamilyId,
+    envelope: &mut broca_wal::record::AttemptEnvelope,
+) {
+    let value = serde_json::from_slice::<Value>(body).ok().or_else(|| {
+        std::str::from_utf8(body)
+            .ok()?
+            .lines()
+            .filter_map(|line| {
+                let value =
+                    serde_json::from_str::<Value>(line.strip_prefix("data:")?.trim()).ok()?;
+                value
+                    .get("response")
+                    .cloned()
+                    .filter(|response| response.get("usage").is_some())
+            })
+            .next_back()
+    });
+    let Some(value) = value else {
+        return;
+    };
+    let Some(raw) = value.get("usage").filter(|u| u.is_object()) else {
+        return;
+    };
+    let usage = match family {
+        crate::spec::WireFamilyId::OpenAiResponses
+        | crate::spec::WireFamilyId::OpenAiResponsesChatgpt => {
+            crate::cache_warm::responses_response_usage(body)
+        }
+        _ => crate::cache_warm::anthropic_response_usage(body),
+    };
+    envelope.usage = Some(usage);
+    envelope.usage_raw = Some(raw.clone());
+    envelope.model_used = value
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    envelope.service_tier_used = value
+        .get("service_tier")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    envelope.speed_used = raw.get("speed").and_then(Value::as_str).map(str::to_owned);
+    envelope.cache_write_5m_tokens = raw
+        .pointer("/cache_creation/ephemeral_5m_input_tokens")
+        .and_then(Value::as_u64);
+    envelope.cache_write_1h_tokens = raw
+        .pointer("/cache_creation/ephemeral_1h_input_tokens")
+        .and_then(Value::as_u64);
+    if usage.reasoning_tokens.is_some() {
+        envelope.reasoning_included_in_output = Some(true);
+    }
 }
 
 /// Read a whole warm answer, up to its size limit.
 async fn read_warm_body(
     response: reqwest::Response,
     failed: &impl Fn(String) -> broca_core::WarmFailure,
+    envelope: &mut broca_wal::record::AttemptEnvelope,
 ) -> Result<Vec<u8>, broca_core::WarmFailure> {
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| failed(format!("warm answer unreadable: {error}")))?;
+        let chunk = chunk.map_err(|error| {
+            envelope.outcome = broca_wal::record::BillingAttemptOutcome::ChunkError;
+            failed(format!("warm answer unreadable: {error}"))
+        })?;
+        envelope.response_bytes += chunk.len() as u64;
         if body.len() + chunk.len() > MAX_WARM_RESPONSE_BYTES {
+            envelope.outcome = broca_wal::record::BillingAttemptOutcome::ByteLimit;
             return Err(failed("warm answer exceeded its size limit".into()));
         }
         body.extend_from_slice(&chunk);
@@ -6556,6 +6710,501 @@ mod tests {
 
     fn attempt_session() -> broca_protocol::BindIdentity {
         serde_json::from_value(serde_json::json!({"project_root":"/project", "harness":"runner", "session":"attempt-session"})).unwrap()
+    }
+
+    fn warm_template() -> broca_wal::record::AttemptReservation {
+        serde_json::from_value(serde_json::json!({
+            "run_id":"finished-run", "step_id":1, "attempt":0, "send_index":1, "warm":true,
+            "reserved_at_ms":100, "provider":"anthropic", "endpoint_host":"", "model_sent":"m",
+            "credential":{}, "run":{}, "session":{
+                "project_root":"/project", "harness":"runner", "session":"attempt-session", "session_ref":"ref"
+            }, "request_body_bytes":0, "compressed":false
+        })).unwrap()
+    }
+
+    fn warm_request(url: String, large: bool) -> HttpRequest {
+        HttpRequest {
+            method: crate::wire::HttpMethod::Post,
+            url,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
+                if large {
+                    "n".repeat(20_000)
+                } else {
+                    "q".into()
+                }
+            )
+            .into_bytes(),
+        }
+    }
+
+    async fn warm_writer(
+        root: &std::path::Path,
+    ) -> (Arc<broca_core::WalHandle>, broca_core::FileWalStore) {
+        use broca_core::WalStore;
+        let store =
+            broca_core::FileWalStore::with_config(root.join("wal"), broca_wal::WalConfig::OVERHAUL);
+        let writer = broca_core::WalHandle::spawn_in_store_with_fs_for_test(
+            store.open(&attempt_session()).unwrap(),
+            &store,
+            &attempt_session(),
+            1,
+            None,
+            Arc::new(broca_wal::fs_ops::RealFs),
+        )
+        .unwrap();
+        (Arc::new(writer), store)
+    }
+
+    #[tokio::test]
+    async fn warm_default_hook_refuses_settlement() {
+        use broca_core::run::AttemptHook;
+        let hook = TestAttemptHook::new(Default::default());
+        let error = hook
+            .warm_finished(
+                broca_core::attempt_id::mint_attempt_id().unwrap(),
+                Default::default(),
+                None,
+                "aa".into(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.provider_code.as_deref(),
+            Some("attempt_durability_failed")
+        );
+        assert!(hook.sends.lock().unwrap().is_empty());
+        assert!(hook.finished.lock().unwrap().is_empty());
+        assert!(hook.order.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn warm_compressed_refusal_is_two_attempts() {
+        use broca_core::WalStore;
+        use broca_wal::{record::BillingAttemptOutcome as Outcome, WalRecord};
+        let server = ScriptedServer::start(vec![
+            ScriptResponse::Http {
+                status: 415,
+                headers: vec![],
+                body: b"",
+            },
+            ScriptResponse::Http {
+                status: 200,
+                headers: vec![],
+                body: br#"{"usage":{"input_tokens":3,"cache_read_input_tokens":4000}}"#,
+            },
+        ])
+        .await;
+        let address: std::net::SocketAddr =
+            server.url.strip_prefix("http://").unwrap().parse().unwrap();
+        let client = ProviderHttpClient::resolving_anthropic_api_to(address, true);
+        let root = attempt_scratch("warm-compression");
+        let (writer, store) = warm_writer(&root).await;
+        let journal = Arc::new(broca_core::cache_warm::WarmJournal::new(
+            writer.clone(),
+            broca_core::ShutdownSeal::new(),
+            warm_template(),
+            "base".into(),
+            Some(300_000),
+            None,
+        ));
+        let sent = super::send_warm(
+            &client,
+            &Clock::default(),
+            warm_request(
+                format!("http://api.anthropic.com:{}/v1/messages", address.port()),
+                true,
+            ),
+            crate::spec::WireFamilyId::AnthropicMessages,
+            None,
+            Some(journal),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent.usage.cached_input_tokens, Some(4000));
+        Arc::try_unwrap(writer)
+            .ok()
+            .expect("warm journal released writer")
+            .shutdown()
+            .await
+            .unwrap();
+        let frames = store.read_records(&attempt_session()).unwrap();
+        let reservations: Vec<_> = frames
+            .iter()
+            .filter_map(|f| match &f.record {
+                WalRecord::AttemptReserved {
+                    attempt_id,
+                    reservation,
+                } => Some((attempt_id, reservation)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reservations.len(), 2);
+        assert_ne!(reservations[0].0, reservations[1].0);
+        for (i, (id, reservation)) in reservations.iter().enumerate() {
+            assert_eq!(id.as_str().len(), 32);
+            assert!(id
+                .as_str()
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+            assert_eq!(reservation.send_index, i as u32 + 1);
+            assert_eq!(reservation.compressed, i == 0);
+            assert!(reservation.warm);
+            let outcomes: Vec<_> = frames
+                .iter()
+                .filter_map(|f| match &f.record {
+                    WalRecord::CacheWarmed {
+                        attempt_id: Some(terminal_id),
+                        envelope: Some(envelope),
+                        ..
+                    } if terminal_id == *id => Some(envelope),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(
+                outcomes[0].outcome,
+                if i == 0 {
+                    Outcome::CompressionRefused
+                } else {
+                    Outcome::Complete
+                }
+            );
+            assert_eq!(outcomes[0].usage.is_some(), i == 1);
+        }
+        let kinds: Vec<_> = frames
+            .iter()
+            .filter_map(|f| match f.record {
+                WalRecord::AttemptReserved { .. } => Some("reserve"),
+                WalRecord::CacheWarmed { .. } => Some("finish"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds, ["reserve", "finish", "reserve", "finish"]);
+        assert_eq!(
+            server.request_header("content-encoding"),
+            [Some("gzip".into()), None]
+        );
+        let path = store
+            .resolve_live_path(&attempt_session())
+            .unwrap()
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let proof = std::fs::read(broca_wal::head_proof::sidecar_path(&path)).unwrap();
+        let items: Vec<_> = broca_wal_reader::billing::billed(&bytes[..], &proof, None)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            items.len(),
+            2,
+            "reader accepts every warm outcome, including compression refusal"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn warm_redirect_has_no_unreserved_followup() {
+        use broca_core::WalStore;
+        let server = ScriptedServer::start(vec![ScriptResponse::Http {
+            status: 307,
+            headers: vec![("location", "/followup")],
+            body: b"redirect",
+        }])
+        .await;
+        let root = attempt_scratch("warm-redirect");
+        let (writer, store) = warm_writer(&root).await;
+        let journal = Arc::new(broca_core::cache_warm::WarmJournal::new(
+            writer.clone(),
+            broca_core::ShutdownSeal::new(),
+            warm_template(),
+            "base".into(),
+            None,
+            None,
+        ));
+        assert!(super::send_warm(
+            &super::build_provider_http_client(),
+            &Clock::default(),
+            warm_request(server.url.clone(), false),
+            crate::spec::WireFamilyId::AnthropicMessages,
+            None,
+            Some(journal)
+        )
+        .await
+        .is_err());
+        Arc::try_unwrap(writer)
+            .ok()
+            .expect("warm journal released writer")
+            .shutdown()
+            .await
+            .unwrap();
+        assert_eq!(server.request_bodies().len(), 1);
+        assert_eq!(
+            store
+                .read_records(&attempt_session())
+                .unwrap()
+                .iter()
+                .filter(|f| matches!(f.record, broca_wal::WalRecord::CacheWarmed { .. }))
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn warm_timeout_after_send_records_once() {
+        use broca_core::WalStore;
+        let server = ScriptedServer::start(vec![ScriptResponse::Hold]).await;
+        let root = attempt_scratch("warm-timeout");
+        let (writer, store) = warm_writer(&root).await;
+        let journal = Arc::new(broca_core::cache_warm::WarmJournal::new(
+            writer.clone(),
+            broca_core::ShutdownSeal::new(),
+            warm_template(),
+            "base".into(),
+            None,
+            None,
+        ));
+        let url = server.url.clone();
+        let task = tokio::spawn(async move {
+            super::send_warm(
+                &super::build_provider_http_client(),
+                &Clock::default(),
+                warm_request(url, false),
+                crate::spec::WireFamilyId::AnthropicMessages,
+                None,
+                Some(journal),
+            )
+            .await
+        });
+        server.written.notified().await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        // Disk sync is real blocking I/O; restore real time before waiting for settlement.
+        tokio::time::resume();
+        assert!(task.await.unwrap().is_err());
+        Arc::try_unwrap(writer)
+            .ok()
+            .expect("warm released writer")
+            .shutdown()
+            .await
+            .unwrap();
+        let frames = store.read_records(&attempt_session()).unwrap();
+        let outcomes: Vec<_> = frames
+            .iter()
+            .filter_map(|f| match &f.record {
+                broca_wal::WalRecord::CacheWarmed {
+                    envelope: Some(envelope),
+                    ..
+                } => Some(envelope),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].outcome,
+            broca_wal::record::BillingAttemptOutcome::HeaderTimeout
+        );
+        assert_eq!(outcomes[0].sent, broca_wal::record::AttemptSent::Yes);
+        assert_eq!(outcomes[0].usage, None);
+        assert_eq!(server.request_bodies().len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn assert_warm_possibly_billed_once(root: &std::path::Path) {
+        use broca_wal_reader::billing::{self, AttemptStatus, Item};
+        let store =
+            broca_core::FileWalStore::with_config(root.join("wal"), broca_wal::WalConfig::OVERHAUL);
+        let path = store
+            .resolve_live_path(&attempt_session())
+            .unwrap()
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let proof = std::fs::read(broca_wal::head_proof::sidecar_path(&path)).unwrap();
+        let mut reader = billing::billed(&bytes[..], &proof, None).unwrap();
+        let items: Vec<_> = reader.by_ref().map(Result::unwrap).collect();
+        assert_eq!(
+            items.len(),
+            1,
+            "idle warm must produce exactly one billing item"
+        );
+        let Item::Billed(attempt) = &items[0] else {
+            panic!("expected possibly billed warm: {:?}", items[0]);
+        };
+        assert_eq!(attempt.status, AttemptStatus::PossiblyBilled);
+        assert!(attempt.typed_reservation().unwrap().warm);
+        assert!(attempt.typed_envelope().unwrap().is_none());
+        let checkpoint = reader
+            .checkpoint()
+            .expect("reclaim closed the outstanding warm");
+        assert_eq!(
+            billing::billed(&bytes[..], &proof, Some(checkpoint))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_idle_crash_and_power_loss_reclaim_once() {
+        use broca_core::run::AttemptHook;
+        use broca_crash_harness::power_loss::RecordingFs;
+        use broca_wal::{FileWal, PreparedV4Frame, Wal, WalRecord};
+        let root = attempt_scratch("warm-idle-cuts");
+        let capture = root.join("capture");
+        std::fs::create_dir_all(&capture).unwrap();
+        let (writer, _) = warm_writer(&capture).await;
+        let journal = broca_core::cache_warm::WarmJournal::new(
+            writer.clone(),
+            broca_core::ShutdownSeal::new(),
+            warm_template(),
+            "base".into(),
+            None,
+            None,
+        );
+        let id = journal
+            .before_send(
+                broca_core::run::PhysicalSend {
+                    attempt: 0,
+                    send_index: 1,
+                    endpoint_host: "example.com".into(),
+                    model_sent: "m".into(),
+                    request_body_bytes: 10,
+                    compressed: false,
+                    account_ref: None,
+                    speed_requested: None,
+                },
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        use broca_core::WalStore;
+        let store = broca_core::FileWalStore::with_config(
+            capture.join("wal"),
+            broca_wal::WalConfig::OVERHAUL,
+        );
+        let reservation = store
+            .read_records(&attempt_session())
+            .unwrap()
+            .into_iter()
+            .find_map(|f| match f.record {
+                r @ WalRecord::AttemptReserved { .. } => Some(r),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            matches!(&reservation, WalRecord::AttemptReserved { attempt_id, .. } if attempt_id == &id)
+        );
+        drop(journal);
+        Arc::try_unwrap(writer)
+            .ok()
+            .expect("warm journal released writer")
+            .shutdown()
+            .await
+            .unwrap();
+
+        let log = PathBuf::from("wal").join(format!(
+            "{}.wal",
+            broca_core::wal_writer::session_addr(&attempt_session())
+        ));
+        let phase = root.join("in-flight");
+        std::fs::create_dir_all(phase.join("wal")).unwrap();
+        let floor = phase.join(broca_wal::FEATURE_FLOOR_FILENAME);
+        broca_wal::floor::raise_floor(&floor, broca_wal::framing::KNOWN_FEATURES).unwrap();
+        {
+            let mut wal = FileWal::open(phase.join(&log))
+                .unwrap()
+                .with_feature_floor(floor.clone())
+                .with_wal_config(broca_wal::WalConfig::OVERHAUL)
+                .unwrap();
+            let opened = WalRecord::WriterOpened {
+                writer_id: wal.writer_id().unwrap(),
+                previous_writer_id: None,
+                recovered_through_seq: 0,
+                cause: "test".into(),
+            };
+            wal.append_v4(
+                1,
+                &opened,
+                true,
+                PreparedV4Frame::prepare(&opened).unwrap(),
+                1,
+            )
+            .unwrap();
+        }
+        let recording = Arc::new(RecordingFs::new(&phase).unwrap());
+        broca_wal::fs_ops::with_fs_ops(recording.clone(), || {
+            let mut wal = FileWal::open(phase.join(&log))
+                .unwrap()
+                .with_feature_floor(floor)
+                .with_wal_config(broca_wal::WalConfig::OVERHAUL)
+                .unwrap();
+            wal.append_v4(
+                1,
+                &reservation,
+                true,
+                PreparedV4Frame::prepare(&reservation).unwrap(),
+                2,
+            )
+            .unwrap();
+        });
+        // A crash after recording the reservation leaves it intact and writes no terminal
+        // attempt record, so reclaim must report that warm as possibly billed.
+        let images = recording.enumerate(100_000).unwrap();
+        assert!(!images.is_empty());
+        recording.assert_all_cuts_covered(&images);
+        reclaim_attempt_image(&phase, Arc::new(broca_wal::fs_ops::RealFs)).await;
+        assert_warm_possibly_billed_once(&phase);
+        reclaim_attempt_image(&phase, Arc::new(broca_wal::fs_ops::RealFs)).await;
+        assert_warm_possibly_billed_once(&phase);
+        let mut warm_images = 0;
+        let mut recovery_images = 0;
+        for (index, image) in images.iter().enumerate() {
+            let image_root = root.join(format!("power-{index}"));
+            image.state.install(&image_root).unwrap();
+            let recovery = Arc::new(RecordingFs::new(&image_root).unwrap());
+            // Enumerate recovery of the physical log separately from the writer lifecycle;
+            // separate tests cover interruptions during writer startup and shutdown while
+            // the session lease is held.
+            broca_wal::fs_ops::with_fs_ops(recovery.clone(), || {
+                FileWal::open(image_root.join(&log))
+                    .unwrap()
+                    .replay()
+                    .unwrap();
+            });
+            let second_images = recovery.enumerate(100_000).unwrap();
+            recovery.assert_all_cuts_covered(&second_images);
+            let recovered =
+                reclaim_attempt_image(&image_root, Arc::new(broca_wal::fs_ops::RealFs)).await;
+            let has_reservation = recovered
+                .iter()
+                .any(|f| matches!(f.record, WalRecord::AttemptReserved { .. }));
+            if has_reservation {
+                warm_images += 1;
+                assert_warm_possibly_billed_once(&image_root);
+            }
+            for (second_index, second) in second_images.iter().enumerate() {
+                recovery_images += 1;
+                assert!(recovery_images <= 100_000, "recovery cut budget exceeded");
+                let second_root = root.join(format!("recovery-{index}-{second_index}"));
+                second.state.install(&second_root).unwrap();
+                let frames =
+                    reclaim_attempt_image(&second_root, Arc::new(broca_wal::fs_ops::RealFs)).await;
+                if frames
+                    .iter()
+                    .any(|f| matches!(f.record, WalRecord::AttemptReserved { .. }))
+                {
+                    assert_warm_possibly_billed_once(&second_root);
+                }
+                std::fs::remove_dir_all(second_root).unwrap();
+            }
+            std::fs::remove_dir_all(image_root).unwrap();
+        }
+        assert!(warm_images > 0);
+        assert!(recovery_images > 0);
+        eprintln!("idle warm: {} power cuts, {warm_images} retained reservations, {recovery_images} recovery cuts", images.len());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     async fn run_recorded_attempt<P: broca_core::Provider>(

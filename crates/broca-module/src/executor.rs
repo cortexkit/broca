@@ -276,6 +276,15 @@ pub async fn send_warm(
     provider: &dyn broca_core::Provider,
     base: WarmBase,
 ) -> Result<broca_core::WarmSent, WarmError> {
+    send_warm_with_hook(provider, base, None).await
+}
+
+/// Render and check the warm prefix before granting the transport a billing hook.
+pub async fn send_warm_with_hook(
+    provider: &dyn broca_core::Provider,
+    base: WarmBase,
+    hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
+) -> Result<broca_core::WarmSent, WarmError> {
     let bytes = match base {
         WarmBase::InFlight(sent) => {
             // The in-flight bytes are already the ones the transport sent, for whichever model
@@ -310,7 +319,7 @@ pub async fn send_warm(
         }
     };
     provider
-        .warm(&bytes)
+        .warm_with_hook(&bytes, hook)
         .await
         .map_err(|failure| match failure {
             broca_core::WarmFailure::Unsupported(reason) => WarmError::Unsupported(reason),
@@ -346,6 +355,8 @@ pub struct WarmJob {
     /// The config the request was sent with: the provider is built from it.
     pub config: broca_wal::RunConfig,
     pub base: WarmBase,
+    /// Present only on overhaul roots; the transport must obtain permission before each send.
+    pub attempt_hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
 }
 
 /// Why an executor did not warm.

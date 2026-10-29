@@ -600,7 +600,12 @@ impl RunExecutor for WarmExecutor {
         &self,
         job: crate::executor::WarmJob,
     ) -> Result<broca_core::WarmSent, crate::executor::WarmError> {
-        crate::executor::send_warm(self.warm_provider.as_ref(), job.base).await
+        crate::executor::send_warm_with_hook(
+            self.warm_provider.as_ref(),
+            job.base,
+            job.attempt_hook,
+        )
+        .await
     }
 }
 
@@ -625,6 +630,15 @@ impl Fixture {
         run_config: impl FnOnce(&mut FrozenRenderConfig),
         warm: impl FnOnce(FrozenRenderConfig) -> P,
     ) -> Self {
+        Self::with_wal_config(script, run_config, warm, broca_wal::WalConfig::default()).await
+    }
+
+    async fn with_wal_config<P: broca_core::Provider + 'static>(
+        script: Vec<Reply>,
+        run_config: impl FnOnce(&mut FrozenRenderConfig),
+        warm: impl FnOnce(FrozenRenderConfig) -> P,
+        wal_config: broca_wal::WalConfig,
+    ) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let server = Server::start(script).await;
         let root = broca_test_support::scratch_root().join(format!(
@@ -634,7 +648,7 @@ impl Fixture {
         ));
         std::fs::create_dir_all(root.join("project")).unwrap();
         let key = BindIdentity::new(root.join("project"), "runner", "session");
-        let wal_store = Arc::new(FileWalStore::new(root.join("wal")));
+        let wal_store = Arc::new(FileWalStore::with_config(root.join("wal"), wal_config));
         let mut frozen = warmable(&server.url);
         run_config(&mut frozen);
         let executor = Arc::new(WarmExecutor {
@@ -673,16 +687,44 @@ impl Fixture {
         executor: &Arc<WarmExecutor>,
         export: &Arc<broca_store::SqliteStore>,
     ) -> LineageRegistry {
-        let opener = DefaultOpener::new(
-            Arc::new(FileLeaseStore::new(root.join("leases"))),
-            Arc::clone(&wal_store),
-            Arc::clone(executor) as Arc<dyn RunExecutor>,
-        )
+        let lease_root = root.join("leases");
+        let leases = Arc::new(FileLeaseStore::new(lease_root.clone()));
+        let overhaul = wal_store.wal_config().is_overhaul();
+        let opener = if overhaul {
+            DefaultOpener::with_file_leases(
+                lease_root.clone(),
+                Arc::clone(&wal_store),
+                Arc::clone(executor) as Arc<dyn RunExecutor>,
+            )
+            .with_lease_domain(broca_core::lease::WalLeaseDomain::new(lease_root))
+            .unwrap()
+        } else {
+            DefaultOpener::new(
+                leases.clone(),
+                Arc::clone(&wal_store),
+                Arc::clone(executor) as Arc<dyn RunExecutor>,
+            )
+        }
         .with_export_index(export.clone())
         .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| {
             (broca_core::ChargeBasis::MeteredApi, 1)
         }));
+        let retention = overhaul.then(|| {
+            Arc::new(
+                crate::retention::RetentionService::new(
+                    wal_store.clone(),
+                    export.clone(),
+                    leases,
+                    export.clone(),
+                    Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::MeteredApi, 1)),
+                )
+                .unwrap(),
+            )
+        });
         let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal_store, None);
+        if let Some(retention) = retention {
+            registry.set_retention_service(retention);
+        }
         registry.set_cache_declarer(Arc::new(ConfiguredDeclarer(Arc::clone(&executor.ttl_ms))));
         registry
     }
@@ -711,6 +753,9 @@ impl Fixture {
     fn request(&self, run: &str, text: &str) -> RunRequest {
         let mut req = super::tests::text_req(&self.key, run);
         req.model = broca_protocol::request::ModelHandle::new("anthropic", "claude-opus-4-8");
+        if self.executor.wal_store.wal_config().is_overhaul() {
+            req.retention = Some(7 * 24 * 60 * 60);
+        }
         req.input = vec![Message::new(
             Role::User,
             vec![ContentBlock::Text { text: text.into() }],
@@ -1975,7 +2020,7 @@ async fn an_in_flight_warm_of_a_source_step_is_unchanged_by_the_refusal_fallback
     }
 }
 
-/// A warm the provider refuses is reported with the provider's error and recorded nowhere.
+/// Legacy roots retain the success-only warm record contract.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_warm_the_provider_refuses_is_reported_and_not_recorded() {
     let fixture = Fixture::start(vec![
@@ -1992,6 +2037,133 @@ async fn a_warm_the_provider_refuses_is_reported_and_not_recorded() {
     let refusal = fixture.refused(None).await;
     assert_eq!(refusal.code, "warm_failed");
     assert!(warm_records(&fixture.records()).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_warm_recorded() {
+    use broca_wal::record::BillingAttemptOutcome;
+    let fixture = Fixture::with_wal_config(
+        vec![
+            text_turn("hello"),
+            Reply::Full {
+                status: 529,
+                headers: vec![],
+                body: b"overloaded".to_vec(),
+            },
+            Reply::WarmOrText,
+        ],
+        |_| {},
+        provider_for,
+        broca_wal::WalConfig::OVERHAUL,
+    )
+    .await;
+    fixture.turn("r1", "q", RunKind::FreshOrResume).await;
+    let before = fixture.registry.cache_clock_reading(&fixture.key).unwrap();
+    assert_eq!(fixture.refused(None).await.code, "warm_failed");
+    assert_eq!(
+        fixture.registry.cache_clock_reading(&fixture.key).unwrap(),
+        before
+    );
+    let records = fixture.records();
+    let warms = warm_records(&records);
+    assert_eq!(warms.len(), 1);
+    let WalRecord::CacheWarmed {
+        attempt_id: Some(id),
+        reservation: Some(reservation),
+        envelope: Some(envelope),
+        ..
+    } = &warms[0]
+    else {
+        panic!("missing warm billing envelope")
+    };
+    assert!(reservation.warm);
+    assert_eq!(envelope.http_status, Some(529));
+    assert_eq!(envelope.outcome, BillingAttemptOutcome::HttpError);
+    assert_eq!(envelope.usage, None);
+    assert!(records
+        .iter()
+        .any(|r| matches!(r, WalRecord::AttemptReserved { attempt_id, .. } if attempt_id == id)));
+    fixture
+        .warm(None)
+        .await
+        .expect("failure releases the manual warm slot");
+    assert_eq!(
+        warm_records(&fixture.records()).len(),
+        2,
+        "no duplicate success terminal"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn automatic_failed_warm_recorded() {
+    let fixture = Fixture::with_wal_config(
+        vec![
+            held_tool_turn(),
+            Reply::Full {
+                status: 529,
+                headers: vec![],
+                body: b"overloaded".to_vec(),
+            },
+            Reply::WarmOrText,
+        ],
+        |_| {},
+        provider_for,
+        broca_wal::WalConfig::OVERHAUL,
+    )
+    .await;
+    fixture
+        .start_automatic_held(Some(broca_protocol::request::KeepWarm::Auto))
+        .await;
+    fixture.wait_warms(1).await;
+    let records = fixture.records();
+    let warms = warm_records(&records);
+    assert_eq!(warms.len(), 1);
+    assert!(
+        matches!(&warms[0], WalRecord::CacheWarmed { trigger: Some(trigger), envelope: Some(envelope), .. }
+        if trigger == "keep_warm" && envelope.outcome == broca_wal::record::BillingAttemptOutcome::HttpError && envelope.usage.is_none())
+    );
+    fixture.finish_held().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn overhaul_idle_warm_shutdown_settles_before_writer_close() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let fixture = Fixture::with_wal_config(
+        vec![
+            text_turn("hello"),
+            Reply::Gated(release, Box::new(Reply::WarmOrText)),
+        ],
+        |_| {},
+        provider_for,
+        broca_wal::WalConfig::OVERHAUL,
+    )
+    .await;
+    fixture.turn("r1", "q", RunKind::FreshOrResume).await;
+    let registry = fixture.registry.clone();
+    let key = fixture.key.clone();
+    let warm = tokio::spawn(async move { ServeHandler::warm(&registry, &key, None).await });
+    fixture.server.wait_for(2).await;
+    assert!(fixture.registry.stop_and_seal().await);
+    assert!(
+        warm.await.unwrap().is_err(),
+        "shutdown closes the warm's reply"
+    );
+    let records = fixture.records();
+    let warms = warm_records(&records);
+    assert_eq!(warms.len(), 1);
+    assert!(
+        matches!(&warms[0], WalRecord::CacheWarmed { envelope: Some(envelope), .. }
+        if envelope.outcome == broca_wal::record::BillingAttemptOutcome::Unknown && envelope.usage.is_none())
+    );
+    let warm_seq = records
+        .iter()
+        .position(|r| matches!(r, WalRecord::CacheWarmed { .. }))
+        .unwrap();
+    let closed_seq = records
+        .iter()
+        .rposition(|r| matches!(r, WalRecord::WriterClosed { .. }))
+        .unwrap();
+    assert!(warm_seq < closed_seq);
 }
 
 /// The admission reply's baseline and `session.baseline` both carry the session's cache

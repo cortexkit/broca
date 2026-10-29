@@ -59,6 +59,66 @@ impl WarmSlot {
 }
 
 pub(crate) type Declare = Arc<dyn Fn(&RunConfig) -> Option<CacheDeclaration> + Send + Sync>;
+
+pub(crate) fn warm_journal(
+    writer: Arc<WalHandle>,
+    seal: ShutdownSeal,
+    job: &WarmJob,
+    run_id: &RunId,
+    ttl_ms: Option<u64>,
+    trigger: Option<String>,
+) -> Option<Arc<dyn broca_core::run::AttemptHook>> {
+    if !writer.is_overhaul() {
+        return None;
+    }
+    use broca_wal::record::{AttemptCredential, AttemptReservation, AttemptRun, AttemptSession};
+    let step_id = match &job.base {
+        WarmBase::InFlight(sent) => sent.step_id,
+        WarmBase::Recorded(recorded) => recorded.step_id,
+    };
+    let auth = job.config.auth_selection.clone();
+    let template = AttemptReservation {
+        run_id: run_id.clone(),
+        step_id,
+        attempt: 0,
+        send_index: 1,
+        warm: true,
+        reserved_at_ms: 0,
+        provider: job.config.model.provider_module_id.clone(),
+        endpoint_host: String::new(),
+        model_sent: String::new(),
+        credential: AttemptCredential {
+            credential_ref: None,
+            account_ref: None,
+            auth_method: auth.as_ref().and_then(|a| a.auth_method.clone()),
+            auth_selection: auth,
+            provider_ids: None,
+            plan_tier: None,
+            plan_tier_source: None,
+        },
+        session: AttemptSession {
+            bind: job.session.clone(),
+            session_ref: broca_core::agent_session_ref(&job.session),
+        },
+        run: AttemptRun {
+            work_class: job.config.work_class.clone(),
+            context_limit: job.config.context_limit,
+            service_tier_requested: job.config.service_tier.map(|t| t.as_str().to_owned()),
+            ..Default::default()
+        },
+        request_body_bytes: 0,
+        compressed: false,
+        input_tokens_estimate: None,
+    };
+    Some(Arc::new(broca_core::cache_warm::WarmJournal::new(
+        writer,
+        seal,
+        template,
+        job.base.request_body_sha256().to_owned(),
+        ttl_ms,
+        trigger,
+    )))
+}
 pub(crate) struct AutomaticWarmer {
     pub(crate) retention: bool,
     pub(crate) session: BindIdentity,
@@ -182,15 +242,21 @@ impl KeepWarmDriver for AutomaticWarmer {
             WarmBase::Recorded(recorded) => recorded.step_id,
         };
         let digest = base.request_body_sha256().to_owned();
-        let sent = match self
-            .executor
-            .warm(WarmJob {
-                session: self.session.clone(),
-                config: config.clone(),
-                base,
-            })
-            .await
-        {
+        let mut job = WarmJob {
+            session: self.session.clone(),
+            config: config.clone(),
+            base,
+            attempt_hook: None,
+        };
+        job.attempt_hook = warm_journal(
+            self.writer.clone(),
+            self.seal.clone(),
+            &job,
+            run_id,
+            Some(timing.ttl_ms),
+            Some("keep_warm".into()),
+        );
+        let sent = match self.executor.warm(job).await {
             Ok(sent) => sent,
             Err(crate::executor::WarmError::Provider(error))
                 if error.provider_code.as_deref()
@@ -224,22 +290,24 @@ impl KeepWarmDriver for AutomaticWarmer {
             sent.sent_at_ms,
             sent.ratelimit_headers.iter().cloned().collect(),
         );
-        self.writer.record(WalRecord::CacheWarmed {
-            attempt_id: None,
-            reservation: None,
-            envelope: None,
-            trigger: Some("keep_warm".into()),
-            run_id: run_id.clone(),
-            step_id,
-            request_body_sha256: digest,
-            warm_body_sha256: sent.warm_body_sha256,
-            usage: sent.usage,
-            served_account_ref: sent.served_account_ref,
-            ratelimit_headers: sent.ratelimit_headers.into_iter().collect(),
-            sent_at_ms: sent.sent_at_ms,
-            ttl_ms: Some(timing.ttl_ms),
-            expires_at_ms: Some(sent.sent_at_ms.saturating_add(timing.ttl_ms)),
-        });
+        if !self.writer.is_overhaul() {
+            self.writer.record(WalRecord::CacheWarmed {
+                attempt_id: None,
+                reservation: None,
+                envelope: None,
+                trigger: Some("keep_warm".into()),
+                run_id: run_id.clone(),
+                step_id,
+                request_body_sha256: digest,
+                warm_body_sha256: sent.warm_body_sha256,
+                usage: sent.usage,
+                served_account_ref: sent.served_account_ref,
+                ratelimit_headers: sent.ratelimit_headers.into_iter().collect(),
+                sent_at_ms: sent.sent_at_ms,
+                ttl_ms: Some(timing.ttl_ms),
+                expires_at_ms: Some(sent.sent_at_ms.saturating_add(timing.ttl_ms)),
+            });
+        }
         self.clock.note_sent(sent.sent_at_ms, Some(timing.ttl_ms));
         self.clock.note_usage(sent.sent_at_ms, sent.usage);
         if let Err(error) = self.writer.sync().await {

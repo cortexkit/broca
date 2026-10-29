@@ -8442,6 +8442,20 @@ pub trait AttemptHook: Send + Sync {
         attempt: ModelAttempt,
         outcome: broca_wal::record::BillingAttemptOutcome,
     ) -> Result<(), ProviderError>;
+
+    /// Warm usage is independent of model-step telemetry. A hook that cannot persist it must
+    /// refuse settlement rather than silently discard the provider's billing evidence.
+    async fn warm_finished(
+        &self,
+        _id: broca_wal::record::AttemptId,
+        _envelope: broca_wal::record::AttemptEnvelope,
+        _sent: Option<crate::WarmSent>,
+        _warm_body_sha256: String,
+    ) -> Result<(), ProviderError> {
+        Err(attempt_hook_error(
+            "warm settlement is unsupported by this attempt hook",
+        ))
+    }
 }
 
 enum AttemptRequest {

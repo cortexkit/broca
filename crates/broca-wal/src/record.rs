@@ -1436,16 +1436,18 @@ pub enum WalRecord {
     },
 
     /// One warm of the session's provider prompt cache: broca re-sent the session's most recent
-    /// model request shaped so the provider generates nothing, which reads the cached prefix and
-    /// restarts its lifetime. Written by the session's own writer, once per warm the provider
-    /// answered successfully.
+    /// model request shaped to refresh the cached prefix. Legacy roots write this only for a
+    /// successful warm. Overhaul roots write one billing terminal per reserved physical warm
+    /// send, including failed sends, through the session's own writer. Only a successful warm
+    /// restarts cache expiry; an unsuccessful terminal is evidence of an attempt, not a refresh.
     ///
     /// PURELY INFORMATIONAL under the skip contract on this enum: replay, the reconstructed
     /// prompt, projection and the control stream skip it exactly as they skip
     /// [`WalRecord::Unknown`]. It is never a transcript message. Records carrying billing
     /// evidence require `bill-attempts/v1`; legacy records remain ungated.
-    /// Billing reads it: each warm becomes its own export fact, marked `warm`, on the run whose
-    /// request it re-sent. An older build skips it and so exports no fact for it.
+    /// Legacy billing turns each successful warm into an export fact on the run whose request
+    /// it re-sent. Overhaul billing readers use the reservation and envelope, preserving absent
+    /// usage as unknown and joining all evidence by attempt_id.
     CacheWarmed {
         /// The only billing join key; absent on legacy warms.
         #[serde(
