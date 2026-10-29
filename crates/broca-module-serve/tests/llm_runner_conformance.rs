@@ -3322,6 +3322,147 @@ async fn describe_diagnostics_follow_each_call_across_two_routes_on_one_worker()
     broca_test_support::remove_rig_dir(&scratch);
 }
 
+const REQUIRED_INPUT_CAP_CASES: &[&str] = &[
+    "input_token_cap_at_limit",
+    "input_token_cap_crossing_tools",
+    "input_token_cap_restart_between_episodes",
+    "input_token_cap_raise_refused",
+    "input_token_cap_closed_members",
+    "input_token_cap_usage_unreported",
+];
+
+const REQUIRED_STRUCTURED_OUTPUT_CASES: &[&str] = &[
+    "structured_output_final_text_enforced_passed",
+    "structured_output_final_text_with_tools_refused",
+    "structured_output_submit_tool_ends_run",
+    "structured_output_reserved_name_refused",
+    "structured_output_absent_without_submit",
+    "structured_output_failed_validation_completes",
+    "structured_output_frozen_across_restart",
+    "structured_output_not_inherited",
+    "structured_output_external_ref_refused",
+    "structured_output_sibling_never_dispatched",
+];
+
+const STREAMED_SIBLINGS_INAPPLICABLE: &str = "submit_streamed_siblings is not declared; the strict rule is checked by structured_output_sibling_never_dispatched";
+
+/// Additive kit cases must not turn an undeclared capability into a required pass.
+/// Check the contracts this adapter implements by name, not by a shared name prefix's size.
+fn check_named_contract_cases(
+    cases: &[cortexkit_role_llm_runner_conformance::CaseReport],
+    crash_kills_disabled: bool,
+) -> Result<(), String> {
+    for name in REQUIRED_INPUT_CAP_CASES
+        .iter()
+        .chain(REQUIRED_STRUCTURED_OUTPUT_CASES)
+    {
+        let case = cases
+            .iter()
+            .find(|case| case.case == *name)
+            .ok_or_else(|| format!("the suite has no case {name}"))?;
+        let skipped_kill = crash_kills_disabled
+            && case
+                .requires
+                .iter()
+                .any(|cap| matches!(cap, Capability::KillAt(_)))
+            && matches!(case.outcome, CaseOutcome::Skipped { .. });
+        if case.outcome != CaseOutcome::Passed && !skipped_kill {
+            return Err(format!("{name}: {:?}", case.outcome));
+        }
+    }
+    let name = "structured_output_streamed_siblings";
+    let case = cases
+        .iter()
+        .find(|case| case.case == name)
+        .ok_or_else(|| format!("the suite has no case {name}"))?;
+    if !matches!(&case.outcome, CaseOutcome::Inapplicable { reason } if reason == STREAMED_SIBLINGS_INAPPLICABLE)
+    {
+        return Err(format!("{name}: {:?}", case.outcome));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod named_contract_case_tests {
+    use super::*;
+    use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
+
+    fn outcomes() -> Vec<CaseReport> {
+        CASES
+            .iter()
+            .filter(|case| {
+                case.name.starts_with("input_token_cap_")
+                    || case.name.starts_with("structured_output_")
+            })
+            .map(|case| CaseReport {
+                case: case.name,
+                requires: case.requires.to_vec(),
+                outcome: if case.name == "structured_output_streamed_siblings" {
+                    CaseOutcome::Inapplicable {
+                        reason: STREAMED_SIBLINGS_INAPPLICABLE.into(),
+                    }
+                } else {
+                    CaseOutcome::Passed
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn named_contract_cases_accept_the_undeclared_streamed_sibling_case() {
+        assert_eq!(check_named_contract_cases(&outcomes(), false), Ok(()));
+    }
+
+    #[test]
+    fn named_contract_cases_require_each_supported_case_and_the_explicit_inapplicable_case() {
+        for name in REQUIRED_INPUT_CAP_CASES
+            .iter()
+            .chain(REQUIRED_STRUCTURED_OUTPUT_CASES)
+            .copied()
+            .chain(std::iter::once("structured_output_streamed_siblings"))
+        {
+            let mut cases = outcomes();
+            cases.retain(|case| case.case != name);
+            assert!(check_named_contract_cases(&cases, false)
+                .unwrap_err()
+                .contains(name));
+            let mut cases = outcomes();
+            cases
+                .iter_mut()
+                .find(|case| case.case == name)
+                .unwrap()
+                .outcome = CaseOutcome::Skipped {
+                missing: Vec::new(),
+            };
+            assert!(check_named_contract_cases(&cases, false)
+                .unwrap_err()
+                .contains(name));
+        }
+    }
+
+    #[test]
+    fn named_contract_cases_skip_only_declared_kill_cases_when_kills_are_disabled() {
+        let mut cases = outcomes();
+        let frozen = cases
+            .iter_mut()
+            .find(|case| case.case == "structured_output_frozen_across_restart")
+            .unwrap();
+        frozen.outcome = CaseOutcome::Skipped {
+            missing: Vec::new(),
+        };
+        assert!(check_named_contract_cases(&cases, false).is_err());
+        assert_eq!(check_named_contract_cases(&cases, true), Ok(()));
+        cases
+            .iter_mut()
+            .find(|case| case.case == "input_token_cap_at_limit")
+            .unwrap()
+            .outcome = CaseOutcome::Skipped {
+            missing: Vec::new(),
+        };
+        assert!(check_named_contract_cases(&cases, true).is_err());
+    }
+}
+
 /// Every case required by this subject's advertised capabilities must run and pass.
 /// Other cases report their missing capability explicitly, and the kill ledger must
 /// include a real process kill rather than only simulated recovery.
@@ -3377,10 +3518,9 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         eprintln!("{}", subject.failure_evidence());
     }
     assert!(failed.is_empty(), "{}", report.render());
-    // The cases a `session.send` retry is held to. broca declares every capability they need,
-    // including hold_tool_calls for the two steer cases, so each one must have run and passed:
-    // a case that drifts to skipped or inapplicable would otherwise pass this test without
-    // checking anything.
+    // Broca declares these operations, so a case that drifts to skipped or inapplicable
+    // must not silently pass. Input-cap and structured-output outcomes are checked by name
+    // below, including the undeclared streamed-sibling behavior.
     for name in [
         "history_pages_back_to_the_first_message",
         "history_mid_matches_read",
@@ -3446,22 +3586,6 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "retention_above_max_refused",
         "retention_active_run_never_expires",
         "crash_at_RetentionTombstoned",
-        "input_token_cap_at_limit",
-        "input_token_cap_crossing_tools",
-        "input_token_cap_restart_between_episodes",
-        "input_token_cap_raise_refused",
-        "input_token_cap_closed_members",
-        "input_token_cap_usage_unreported",
-        "structured_output_final_text_enforced_passed",
-        "structured_output_final_text_with_tools_refused",
-        "structured_output_submit_tool_ends_run",
-        "structured_output_reserved_name_refused",
-        "structured_output_absent_without_submit",
-        "structured_output_failed_validation_completes",
-        "structured_output_frozen_across_restart",
-        "structured_output_not_inherited",
-        "structured_output_external_ref_refused",
-        "structured_output_sibling_never_dispatched",
         // broca declares `client_message_id` (llm-runner 0.5.1 §9.11).
         "client_message_id_resend_with_another_id_refused",
     ] {
@@ -3537,48 +3661,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
             case.outcome
         );
     }
-    let cap_cases: Vec<_> = report
-        .cases
-        .iter()
-        .filter(|case| case.case.starts_with("input_token_cap_"))
-        .collect();
-    assert_eq!(
-        cap_cases.len(),
-        6,
-        "all shared input-cap cases must be present"
-    );
-    assert!(cap_cases
-        .iter()
-        .all(|case| case.outcome == CaseOutcome::Passed));
-    println!(
-        "Shared input-token-cap cases: {} ran, {} passed",
-        cap_cases.len(),
-        cap_cases.len()
-    );
-    let structured_cases: Vec<_> = report
-        .cases
-        .iter()
-        .filter(|case| case.case.starts_with("structured_output_"))
-        .collect();
-    assert_eq!(
-        structured_cases.len(),
-        10,
-        "all ten shared structured-output cases must be present"
-    );
-    assert!(structured_cases
-        .iter()
-        .all(|case| case.outcome == CaseOutcome::Passed
-            || (skip_crash_kills()
-                && case.case == "structured_output_frozen_across_restart"
-                && matches!(case.outcome, CaseOutcome::Skipped { .. }))));
-    println!(
-        "Shared structured-output cases: {} total, {} passed",
-        structured_cases.len(),
-        structured_cases
-            .iter()
-            .filter(|case| case.outcome == CaseOutcome::Passed)
-            .count()
-    );
+    check_named_contract_cases(&report.cases, skip_crash_kills()).unwrap();
     if skip_crash_kills() {
         assert!(report.kills.is_empty());
         println!("Crash kills disabled: the kit's overall verdict remains non-conforming without a real kill; run natively without BROCA_CONFORMANCE_SKIP_CRASH_KILLS to verify durability.");
