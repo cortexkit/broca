@@ -107,7 +107,7 @@ fn live_media_sparse_view_seed_keeps_captured_payloads_without_prefix_reads() {
     }
 }
 
-fn frozen(id: WireFamilyId) -> crate::wire::FrozenRenderConfig {
+pub(super) fn frozen(id: WireFamilyId) -> crate::wire::FrozenRenderConfig {
     let mut frozen = crate::families::frozen_config_for_family(id, "gemini-3-test");
     if id == WireFamilyId::GoogleCodeAssist {
         frozen.project_id = Some("fixture-project".into());
@@ -205,7 +205,10 @@ media_free_family!(
     GoogleCodeAssist
 );
 
-fn history(fixture: &Fixture, frozen: &crate::wire::FrozenRenderConfig) -> Vec<WalRecord> {
+pub(super) fn history(
+    fixture: &Fixture,
+    frozen: &crate::wire::FrozenRenderConfig,
+) -> Vec<WalRecord> {
     let mut start = start(&[fixture.person()]);
     if let WalRecord::RunStarted { config, .. } = &mut start {
         config.frozen_render_config = serde_json::to_value(frozen).unwrap();

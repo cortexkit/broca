@@ -13,6 +13,8 @@ mod checkpoint_compat_tests;
 #[cfg(feature = "test-attachments")]
 mod live_tests;
 mod render_tests;
+#[cfg(feature = "test-attachments")]
+mod seed_repair_tests;
 
 struct Fixture {
     root: PathBuf,
