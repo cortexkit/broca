@@ -15,6 +15,8 @@ mod live_tests;
 mod render_tests;
 #[cfg(feature = "test-attachments")]
 mod seed_repair_tests;
+#[cfg(feature = "test-attachments")]
+mod transport_failure_tests;
 
 struct Fixture {
     root: PathBuf,
