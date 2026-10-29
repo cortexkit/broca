@@ -1,5 +1,8 @@
 //! Power-loss recovery at a published version 4 durability boundary.
 
+#[path = "v4_repair_tests.rs"]
+mod repair;
+
 use crate::power_loss::{ChangeKind, OperationKind, RecordingFs, State};
 use broca_protocol::StepId;
 use broca_wal::{
@@ -229,6 +232,64 @@ fn v4_recovery_refuses_damage_inside_proof() {
         );
         assert_eq!(std::fs::read(root.log()).unwrap(), data);
     }
+}
+
+#[test]
+fn v4_recovery_refuses_conflicting_lineage_after_damage() {
+    let root = Scratch::new();
+    let mut wal = published(&root);
+    let start = std::fs::metadata(root.log()).unwrap().len() as usize;
+    wal.append(1, &record(2), false).unwrap();
+    wal.append(1, &record(3), false).unwrap();
+    drop(wal);
+    let foreign = Scratch::new();
+    drop(published(&foreign));
+    let foreign_lineage = &std::fs::read(foreign.log()).unwrap()[..LINEAGE_FRAME_LEN];
+    let mut damaged = std::fs::read(root.log()).unwrap();
+    let pending_end = boundaries(&damaged)[3].0;
+    damaged[pending_end - 1] ^= 1;
+    damaged[pending_end..pending_end + LINEAGE_FRAME_LEN].copy_from_slice(foreign_lineage);
+    for image in [&damaged[..pending_end + LINEAGE_FRAME_LEN], &damaged[..]] {
+        std::fs::write(root.log(), image).unwrap();
+        assert!(
+            matches!(
+                FileWal::open(root.log()),
+                Err(WalError::ConflictingLineageIds { .. })
+            ),
+            "foreign lineage following damage at {start} must not be discarded"
+        );
+        assert_eq!(std::fs::read(root.log()).unwrap(), image);
+    }
+}
+
+#[test]
+fn v4_recovery_combined_lineage_and_covered_damage_uses_final_tail_fallback() {
+    let root = Scratch::new();
+    drop(published(&root));
+    let proof_bytes = std::fs::read(sidecar_path(&root.log())).unwrap();
+    let proof = HeadProof::decode(&proof_bytes).unwrap();
+    let original = std::fs::read(root.log()).unwrap();
+    let mut lost_lineage = original.clone();
+    lost_lineage[HEADER_LEN] ^= 1;
+    std::fs::write(root.log(), &lost_lineage).unwrap();
+    assert!(matches!(
+        FileWal::open(root.log()),
+        Err(WalError::Corrupt { .. })
+    ));
+    assert_eq!(std::fs::read(root.log()).unwrap(), lost_lineage);
+
+    // Without an intact record after the damaged lineage frame, the final-tail
+    // fallback cannot distinguish lost appends from corruption of synced data.
+    lost_lineage[proof.durable_end as usize - 1] ^= 1;
+    std::fs::write(root.log(), &lost_lineage).unwrap();
+    let reopened = FileWal::open(root.log()).unwrap();
+    assert_eq!(reopened.last_seq(), 0);
+    assert!(reopened.replay().unwrap().is_empty());
+    assert!(std::fs::read(root.log()).unwrap().is_empty());
+    assert_eq!(
+        std::fs::read(sidecar_path(&root.log())).unwrap(),
+        proof_bytes
+    );
 }
 
 #[test]

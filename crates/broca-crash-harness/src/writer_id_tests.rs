@@ -5,6 +5,8 @@ pub(super) mod actual_open_writers;
 
 #[cfg(feature = "writer-id-faults")]
 mod faults;
+#[cfg(feature = "writer-id-faults")]
+pub(crate) use faults::recovery_sync_fault;
 
 use crate::power_loss::{Family, RecordingFs, State};
 use actual_open_writers::WriterContext;

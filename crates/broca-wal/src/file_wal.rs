@@ -2026,15 +2026,8 @@ fn scan_prefix_with_proof<T>(
                 });
             }
             step @ (DecodeStep::Corrupt(_) | DecodeStep::TornTail) => {
-                if proven_end.is_some_and(|end| offset >= end)
-                    && !crate::framing::digest_verifies(&frame)
-                {
-                    // A proof follows fsync, so intact frames beyond an older proof may
-                    // already have caused effects (for example a dispatched tool intent).
-                    // Keep that contiguous prefix; only the first damaged frame and all
-                    // later pending bytes can be lost safely, even if later frames survived.
-                    return Ok(scan);
-                }
+                let repair_tail = proven_end.is_some_and(|end| offset >= end)
+                    && !crate::framing::digest_verifies(&frame);
                 if proof.as_ref().is_some_and(|head| {
                     offset < head.durable_end
                         && scan
@@ -2061,6 +2054,15 @@ fn scan_prefix_with_proof<T>(
                         max_bytes,
                         file_size: offset + frame.len() as u64,
                     });
+                }
+                if repair_tail {
+                    // A proof is only a durability lower bound: intact later frames may
+                    // already have caused effects, so retain the contiguous prefix. Treating
+                    // the damaged suffix as disposable assumes append-only power loss with
+                    // honest fsync; a stale proof cannot rule out post-sync corruption there.
+                    // Foreign lineage is replacement/splice evidence even under that model.
+                    reject_conflicting_lineage_after(&frame, scan.lineage_id)?;
+                    return Ok(scan);
                 }
                 decode_bytes_seeded(
                     &frame,
@@ -2591,6 +2593,24 @@ fn validate_contiguous_sequence(
     };
     if seq != expected_seq {
         return Err(WalError::SequenceGap { expected_seq, seq });
+    }
+    Ok(())
+}
+
+// Damage may hide the next boundary, so search every possible lineage envelope
+// rather than trusting the damaged frame's declared length.
+fn reject_conflicting_lineage_after(
+    bytes: &[u8],
+    mut expected_lineage: Option<WalLineageId>,
+) -> Result<(), WalError> {
+    for candidate in bytes.windows(crate::framing::LINEAGE_FRAME_LEN).skip(1) {
+        // Lineage uses a fixed 16-byte payload and version 2. Other frame types
+        // in the suffix are not evidence of a lineage conflict and need not be decoded.
+        if candidate[..4] == 16u32.to_le_bytes() && candidate[4] == 2 {
+            if let DecodeStep::Lineage { lineage_id, .. } = decode_next(candidate) {
+                fold_lineage_id(&mut expected_lineage, lineage_id)?;
+            }
+        }
     }
     Ok(())
 }

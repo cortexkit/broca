@@ -14,6 +14,25 @@ struct FaultFs {
     unlink_attempted: AtomicBool,
 }
 
+/// Reuse the log-sync injector for a repair whose resize must remain observable
+/// after the failed barrier. The caller clears the flag before retrying.
+pub(crate) fn recovery_sync_fault(
+    root: &Path,
+    log: PathBuf,
+) -> (Arc<dyn FsOps>, Arc<AtomicBool>, Arc<RecordingFs>) {
+    let inner = Arc::new(BatchFs::new());
+    let recording = inner.begin(root);
+    let fail_sync = Arc::new(AtomicBool::new(true));
+    let fs = Arc::new(FaultFs {
+        inner,
+        log,
+        fail_sync: fail_sync.clone(),
+        fail_unlink: AtomicBool::new(false),
+        unlink_attempted: AtomicBool::new(false),
+    });
+    (fs, fail_sync, recording)
+}
+
 impl FsOps for FaultFs {
     fn open(&self, path: &Path, options: &OpenOptions) -> io::Result<Box<dyn FileOps>> {
         let inner = self.inner.open(path, options)?;

@@ -54,22 +54,50 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
 - **Version 4 recovery uses a published durability lower bound.** A checksum-valid
   `.head` sidecar must belong to the embedded lineage, fit within the file, and
   match the covered final version 4 frame's identity, sequence, writer and stamp.
-  Recovery still validates every covered frame; damage within that region refuses
-  rather than discarding synced history. After validating the bound, recovery
-  retains complete, checksum-valid contiguous frames until the first damaged
-  frame, then truncates that frame and everything after it, even if later pending
-  frames persisted out of order. The truncation is file-synced before opening the
-  append handle, counted, and logged with offsets/lengths only, never content.
+  If recovery can read the initial embedded lineage and it matches the `.head`
+  lineage, recovery refuses damage before the proof's `durable_end`. This is not
+  unconditional protection for every byte once covered:
+  combined corruption of the initial lineage and covered data can prevent
+  establishing the binding and fall back to the existing final-tail heuristic.
+  A damaged final frame and corruption of a synced final frame are ambiguous to
+  that heuristic, both for legacy logs (unchanged) and v4 logs without a usable
+  binding. Ignoring an available v4 durability proof was a v4-specific gap;
+  the broader synced-final-frame ambiguity is not v4-specific.
+
+  After validating the lower bound, the current repair retains complete,
+  checksum-valid contiguous frames until the first damaged frame, then truncates
+  that frame and everything after it. It scans the suffix for intact conflicting
+  lineage and refuses to erase that replacement/splice evidence. Intact later
+  records with the same lineage do not themselves prevent this repair.
   A proof is a lower bound, not a deletion watermark: a crash after fsync but
   before proof publication can leave already-dispatched tool intents beyond an
   older proof. Keeping their intact prefix preserves indeterminate-call recovery
-  and prevents re-dispatch. The freshness stamp binds the proof to its frame;
-  elapsed wall-clock age does not invalidate an established durability barrier.
+  for that case. It does **not** prove that all bytes after the first damaged
+  frame are unsynced. Discarding that suffix is justified only in the append-only,
+  honest-fsync power-loss model, which tears pending writes but preserves all
+  successfully synced bytes. With post-sync storage corruption or a damaged
+  restore, an older proof can precede damaged acknowledged records and intact
+  later acknowledged records; this repair can delete both. This remains a
+  limitation against the public non-tail-corruption fail-loud contract; the
+  durability policy for that case is not decided in this change. The proof
+  matches the frame's `appended_ms` timestamp; elapsed wall-clock time alone
+  does not invalidate an established durability barrier.
   Missing, unreadable, torn, mismatched or overlong proofs cannot distinguish
   pending damage from synced corruption, so recovery does not use proof-based
   truncation there. Its availability cost is that an unsynced damaged tail
   followed by intact data can still refuse to open when the sidecar did not
-  survive. Legacy framing, bytes, and recovery policy remain unchanged.
+  survive; the old final-tail ambiguity still applies. Legacy framing, bytes,
+  and recovery policy remain unchanged.
+
+  On a successful repair, truncation is file-synced before opening the append
+  handle, counted, and logged with offsets/lengths only, never content. A failed
+  repair is **not transactional**: `set_len` may shorten the live file before
+  `sync_all` fails. Open returns the I/O error without an appendable handle but
+  does not roll the file back. A retry can observe the shortened clean file and
+  skip the repair branch; that open alone does not prove the earlier shrink
+  durable. Its next successful WAL sync is the durability barrier. Under the
+  power-loss model a cut between truncate and sync can retain either the original
+  damaged suffix or the shortened prefix, so recovery must handle both again.
 - **`len` is capped + header-validated before allocation** — never allocate
   on `len` alone.
 - **`fence`** = the writer's lease-tenure epoch (§5), recorded for forensic correlation only;
