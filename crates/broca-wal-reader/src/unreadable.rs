@@ -15,6 +15,8 @@ pub enum Reason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unreadable {
     pub position: Position,
+    /// Frame write time from validated metadata; unavailable for an untrustworthy header.
+    pub appended_ms: Option<u64>,
     pub raw_frame: Vec<u8>,
     pub reason: Reason,
 }
