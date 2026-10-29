@@ -85,10 +85,10 @@ impl FeedState {
     }
 }
 
-/// Add the provider-held declarations to a catalog answer while the feed is enabled: the
-/// `late_results` session capability and the `tool-result/v1` result format on every tool.
-pub(super) fn declare_in_catalog(shared: &Shared, answer: &mut Value) {
-    if !shared.held_feed.lock().unwrap().enabled {
+/// Only held-fixture sessions negotiate typed results. Other fixtures return legacy replies,
+/// even while this provider's feed remains available for an earlier held session.
+pub(super) fn declare_in_catalog(shared: &Shared, session: &str, answer: &mut Value) {
+    if !shared.held_feed.lock().unwrap().sessions.contains(session) {
         return;
     }
     answer["capabilities"] = json!({"late_results": true});
@@ -339,11 +339,7 @@ impl HeldCase {
             result: json!({"marker": "never answered synchronously"}),
             hold: false,
         };
-        {
-            let mut feed = held_subject.shared.held_feed.lock().unwrap();
-            feed.enabled = true;
-            feed.hold.insert(call.arguments.to_string());
-        }
+        install_held_reply(&held_subject.shared, session, &call.arguments, "running");
         let turn = |parts| {
             ScriptedTurn::new(parts).with_usage(
                 cortexkit_role_llm_runner_conformance::ScriptedUsage::new(1, 0, 0, 1),

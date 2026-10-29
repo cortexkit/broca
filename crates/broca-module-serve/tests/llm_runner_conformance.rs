@@ -809,6 +809,21 @@ struct ToolProvider {
     routes: Mutex<HashMap<(u16, u32), String>>,
 }
 
+impl ToolProvider {
+    fn catalog_for_route(&self, route: (u16, u32), request: &Value) -> Value {
+        let session = self
+            .routes
+            .lock()
+            .unwrap()
+            .get(&route)
+            .cloned()
+            .unwrap_or_default();
+        let mut answer = compaction::catalog(request);
+        held_late_results::declare_in_catalog(&self.shared, &session, &mut answer);
+        answer
+    }
+}
+
 #[async_trait]
 impl subc_client_rs::ModuleHandler for ToolProvider {
     async fn handle(
@@ -821,8 +836,8 @@ impl subc_client_rs::ModuleHandler for ToolProvider {
             return outcome;
         }
         if request["name"] == "tool.catalog" {
-            let mut answer = compaction::catalog(&request);
-            held_late_results::declare_in_catalog(&self.shared, &mut answer);
+            let handle = ctx.route_handle();
+            let answer = self.catalog_for_route((handle.channel, handle.epoch), &request);
             return subc_client_rs::HandlerOutcome::Response(serde_json::to_vec(&answer).unwrap());
         }
         let arguments = request["arguments"].to_string();
@@ -5101,6 +5116,53 @@ mod held_call_tests {
             bus: None,
             #[cfg(feature = "test-clock")]
             mc: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn held_catalog_declarations_do_not_leak_to_other_bound_sessions() {
+        let shared = Arc::new(Shared::default());
+        let provider = ToolProvider {
+            shared: shared.clone(),
+            routes: Mutex::new(HashMap::from([
+                ((11, 1), "held-catalog".into()),
+                ((12, 1), "structured-catalog".into()),
+                ((13, 1), "media-catalog".into()),
+            ])),
+        };
+        let request = json!({"name":"tool.catalog", "arguments":{"composition":{
+            "providers":[{"provider":TOOL_MODULE,"tools":[{"name":SCRIPTED_TOOL,"capabilities":[]}]}],
+            "step_transform_items":[]
+        }}});
+        let before = serde_json::to_vec(&provider.catalog_for_route((12, 1), &request)).unwrap();
+        assert!(serde_json::from_slice::<Value>(&before)
+            .unwrap()
+            .get("capabilities")
+            .is_none());
+        subject(shared.clone())
+            .install_held_reply("held-catalog", &json!({"nonce":"held-catalog"}), "consent")
+            .await
+            .unwrap();
+        let held = provider.catalog_for_route((11, 1), &request);
+        assert_eq!(held["capabilities"], json!({"late_results":true}));
+        assert_eq!(held["tools"].as_array().unwrap().len(), 1);
+        assert!(held["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool["result_format"] == "tool-result/v1"));
+        for route in [(12, 1), (13, 1), (11, 2), (14, 1)] {
+            let catalog = provider.catalog_for_route(route, &request);
+            assert!(catalog["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tool| tool.get("result_format").is_none()));
+            assert_eq!(
+                serde_json::to_vec(&catalog).unwrap(),
+                before,
+                "route {route:?} stays legacy after a held reply is installed"
+            );
         }
     }
 
