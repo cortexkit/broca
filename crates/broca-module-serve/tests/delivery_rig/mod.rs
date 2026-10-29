@@ -910,7 +910,9 @@ impl Rig {
             .await
     }
 
-    /// Release a held provider only after the requested display part actually crossed serve.
+    /// Release a held provider only after the requested display part actually crossed serve,
+    /// then collect through the run's `run_finished` control frame. A fixed quiet window alone
+    /// can close between two steps on a slow runner, dropping the rest of the run.
     pub async fn subscribe_release_after_part(&mut self, channel: u16, part: u64) -> Vec<Frame> {
         self.bind(channel).await;
         self.corr += 1;
@@ -955,11 +957,16 @@ impl Rig {
         .await;
         self.script.hold_stream(false);
         frames.extend(
-            collect_subscription_frames(
+            collect_subscription_frames_at(
                 &mut self.reader,
                 corr,
                 Duration::from_millis(300),
-                None::<fn()>,
+                Some(|| {}),
+                |frame| {
+                    serde_json::from_slice::<serde_json::Value>(&frame.body).is_ok_and(|body| {
+                        body["kind"] == "control" && body["unit"]["type"] == "run_finished"
+                    })
+                },
             )
             .await,
         );
