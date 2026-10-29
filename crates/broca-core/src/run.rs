@@ -8424,6 +8424,8 @@ pub struct PhysicalSend {
     pub compressed: bool,
     pub account_ref: Option<String>,
     pub speed_requested: Option<String>,
+    /// Present only for warms; derived from the selected frozen request's marker policy.
+    pub warm: Option<crate::cache_warm::WarmSendPolicy>,
 }
 
 /// A receipt is permission to send only after the reservation has crossed a durability barrier.
@@ -11512,6 +11514,7 @@ mod tests {
             compressed: false,
             account_ref: None,
             speed_requested: None,
+            warm: None,
         }
     }
 

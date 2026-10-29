@@ -185,3 +185,44 @@ async fn legacy_provider_warm_has_no_extra_boxed_delegation() {
     assert!(actual.1[0] > 0);
     assert_eq!(actual.1, reference.1);
 }
+
+#[tokio::test]
+async fn legacy_success_total_allocations_include_digest_and_all_boxes() {
+    let response = format!(
+        r#"{{"model":"{}","usage":{{"input_tokens":3,"cache_read_input_tokens":4000}}}}"#,
+        "s".repeat(25013)
+    );
+    let provider = provider("http://unused.test".into())
+        .with_warm_reply_for_allocation_test(response.into_bytes());
+    let base = format!(
+        r#"{{"model":"{}","max_tokens":64,"messages":[{{"role":"user","content":"q"}}]}}"#,
+        "r".repeat(17011)
+    );
+    let reference =
+        count(async { Box::pin(provider.warm_legacy_reference_for_test(base.as_bytes())).await })
+            .await;
+    let actual = count(async { provider.warm(base.as_bytes()).await }).await;
+    assert_eq!(reference.0.unwrap().usage.cached_input_tokens, Some(4000));
+    assert_eq!(actual.0.unwrap().usage.cached_input_tokens, Some(4000));
+    assert_eq!(
+        reference.1,
+        [66, 1, 1, 1],
+        "pin the original ready-success path, including its digest and box allocations"
+    );
+    assert_eq!(actual.1, reference.1, "with network scheduling removed, any digest clone or success-only box adds a counted allocation");
+}
+
+#[tokio::test]
+async fn success_allocation_counter_observes_a_digest_clone_and_heap_box() {
+    let digest = "d".repeat(64);
+    let (copy, allocations) = count(async {
+        let copy = digest.clone();
+        std::hint::black_box(Box::pin(std::future::ready(copy))).await
+    })
+    .await;
+    assert_eq!(copy, digest);
+    assert_eq!(
+        allocations[0], 2,
+        "both the unmarked 64-byte clone and the success-only heap box must be counted"
+    );
+}

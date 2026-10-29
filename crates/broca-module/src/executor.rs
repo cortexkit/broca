@@ -229,7 +229,9 @@ pub trait RunExecutor: Send + Sync + 'static {
     fn failed_warm_cost(
         &self,
         _config: &broca_wal::RunConfig,
+        _reservation: &broca_wal::record::AttemptReservation,
         _envelope: &broca_wal::record::AttemptEnvelope,
+        _ttl_ms: Option<u64>,
     ) -> Result<f64, String> {
         Err("reported warm usage pricing unavailable".into())
     }

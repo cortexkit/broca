@@ -109,6 +109,8 @@ pub struct ProviderHttpClient {
     journaled: Arc<JournaledHttpClients>,
     request_gzip: request_gzip::RequestGzipPolicy,
     chatgpt_connections: ChatgptConnections,
+    #[cfg(feature = "test-harness")]
+    warm_reply: Option<Bytes>,
     /// Tests only: when set, every send fails at once with a refused connection, without
     /// opening a socket. A refused localhost connect takes seconds on some platforms, so a
     /// test that needs many connect failures in a bounded window cannot dial a real closed
@@ -156,6 +158,8 @@ impl ProviderHttpClient {
             }),
             request_gzip,
             chatgpt_connections: ChatgptConnections::default(),
+            #[cfg(feature = "test-harness")]
+            warm_reply: None,
             #[cfg(test)]
             fail_connects: false,
         }
@@ -254,6 +258,8 @@ impl From<reqwest::Client> for ProviderHttpClient {
             }),
             request_gzip: request_gzip::RequestGzipPolicy::isolated(false),
             chatgpt_connections: ChatgptConnections::default(),
+            #[cfg(feature = "test-harness")]
+            warm_reply: None,
             #[cfg(test)]
             fail_connects: false,
         }
@@ -489,6 +495,7 @@ impl AttemptTrace {
                         compressed,
                         account_ref: self.served_account_ref.clone(),
                         speed_requested: request.speed_requested.clone(),
+                        warm: None,
                     },
                     self.attempt_cancel.clone().unwrap_or_default(),
                 )
@@ -794,13 +801,19 @@ fn provider_client_builder() -> reqwest::ClientBuilder {
 }
 
 impl<F: WireFamily + 'static> LiveProvider<F> {
+    /// Replace only legacy warm network I/O with a ready success for allocation accounting.
+    #[cfg(feature = "test-harness")]
+    pub fn with_warm_reply_for_allocation_test(mut self, body: Vec<u8>) -> Self {
+        self.client.warm_reply = Some(Bytes::from(body));
+        self
+    }
     /// Allocation-test reference for the original warm path, without async-trait delegation.
     #[cfg(feature = "test-harness")]
     pub async fn warm_legacy_reference_for_test(
         &self,
         base: &[u8],
     ) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
-        let (request, account) = self.prepare_warm_request(base)?;
+        let (request, account) = self.prepare_warm_request(base, None)?;
         send_warm_legacy(
             &self.client,
             &self.clock,
@@ -814,6 +827,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
     fn prepare_warm_request(
         &self,
         base: &[u8],
+        policy: Option<&mut broca_core::cache_warm::WarmSendPolicy>,
     ) -> Result<(HttpRequest, Option<String>), broca_core::WarmFailure> {
         let served = self.current_auth();
         if account_changed_error(
@@ -828,10 +842,33 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             });
         }
         // Reuse the route of the request being warmed, including a refusal fallback.
-        let warm_frozen = match self.routed_fallback() {
+        let fallback = self.routed_fallback();
+        let warm_frozen = match fallback {
             Some(fallback) => Arc::clone(fallback),
             None => Arc::clone(&self.frozen),
         };
+        if let Some(policy) = policy {
+            policy.provider = fallback.and_then(|_| {
+                self.frozen
+                    .refusal_fallback
+                    .as_ref()
+                    .map(|f| f.model.provider_module_id.clone())
+            });
+            policy.ttl_ms = warm_frozen
+                .cache
+                .as_ref()
+                .and_then(|cache| match &cache.class {
+                    crate::wire::CacheClass::Markers {
+                        ttl: crate::wire::CacheTtl::FiveMinutes,
+                        ..
+                    } => Some(300_000),
+                    crate::wire::CacheClass::Markers {
+                        ttl: crate::wire::CacheTtl::OneHour,
+                        ..
+                    } => Some(3_600_000),
+                    _ => None,
+                });
+        }
         let body = self
             .family
             .warm_body(&warm_frozen, base)
@@ -1282,7 +1319,7 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
     /// does, that the credential's account is still the one the session froze. Never retried: a
     /// warm that fails is reported, not repeated.
     async fn warm(&self, base: &[u8]) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
-        let (request, account) = self.prepare_warm_request(base)?;
+        let (request, account) = self.prepare_warm_request(base, None)?;
         send_warm_legacy(
             &self.client,
             &self.clock,
@@ -1298,7 +1335,10 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
         base: &[u8],
         hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
     ) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
-        let (request, account) = self.prepare_warm_request(base)?;
+        let mut policy = hook
+            .as_ref()
+            .map(|_| broca_core::cache_warm::WarmSendPolicy::default());
+        let (request, account) = self.prepare_warm_request(base, policy.as_mut())?;
         send_warm(
             &self.client,
             &self.clock,
@@ -1306,6 +1346,7 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
             self.frozen.family_id,
             account,
             hook,
+            policy,
         )
         .await
     }
@@ -1328,6 +1369,7 @@ async fn send_warm(
     family: crate::spec::WireFamilyId,
     served_account_ref: Option<String>,
     hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
+    policy: Option<broca_core::cache_warm::WarmSendPolicy>,
 ) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
     match hook {
         None => send_warm_legacy(client, clock, request, family, served_account_ref).await,
@@ -1339,6 +1381,7 @@ async fn send_warm(
                 family,
                 served_account_ref,
                 Some(hook),
+                policy,
             )
             .await
         }
@@ -1378,6 +1421,15 @@ async fn send_warm_legacy(
         let mut gzip = encode_request_gzip(client, anthropic_api_host, &identity).await;
         let (sent_at_ms, status, header_map, body) = loop {
             let sent_at_ms = now_millis();
+            #[cfg(feature = "test-harness")]
+            if let Some(body) = &client.warm_reply {
+                break (
+                    sent_at_ms,
+                    reqwest::StatusCode::OK,
+                    reqwest::header::HeaderMap::new(),
+                    body.to_vec(),
+                );
+            }
             let response = attempt_request_builder(
                 client,
                 &request.url,
@@ -1496,6 +1548,7 @@ async fn send_warm_journaled(
     family: crate::spec::WireFamilyId,
     served_account_ref: Option<String>,
     hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
+    policy: Option<broca_core::cache_warm::WarmSendPolicy>,
 ) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
     use broca_wal::record::{AttemptEnvelope, AttemptSent, BillingAttemptOutcome as Outcome};
     let warm_body_sha256 = lower_hex(&Sha256::digest(&request.body));
@@ -1552,6 +1605,7 @@ async fn send_warm_journaled(
                                     .and_then(|body| {
                                         body.get("speed").and_then(Value::as_str).map(str::to_owned)
                                     }),
+                                warm: policy.clone(),
                             },
                             tokio_util::sync::CancellationToken::new(),
                         ),
@@ -6207,6 +6261,10 @@ mod tests {
             send: broca_core::run::PhysicalSend,
             _cancel: CancellationToken,
         ) -> Result<broca_wal::record::AttemptId, ProviderError> {
+            assert!(
+                send.warm.is_none(),
+                "model-step sends must not carry warm policy"
+            );
             if self.deny {
                 let mut error = transport_error("reservation writer refused");
                 error.class = ErrorClass::Permanent;
@@ -7010,7 +7068,6 @@ mod tests {
             broca_core::ShutdownSeal::new(),
             warm_template(),
             "base".into(),
-            Some(300_000),
             None,
         ));
         let sent = super::send_warm(
@@ -7023,6 +7080,7 @@ mod tests {
             crate::spec::WireFamilyId::AnthropicMessages,
             None,
             Some(journal),
+            None,
         )
         .await
         .unwrap();
@@ -7109,6 +7167,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn warm_tariff_evidence_uses_the_selected_frozen_marker_policy() {
+        use crate::wire::{CacheClass, CachePolicy, CacheTtl, MarkerSyntax, RefusalFallbackConfig};
+        use broca_core::{Provider, WalStore};
+        let response = || ScriptResponse::Http {
+            status: 400,
+            headers: vec![],
+            body:
+                br#"{"usage":{"input_tokens":0,"cache_creation_input_tokens":2,"output_tokens":0}}"#,
+        };
+        let server = ScriptedServer::start(vec![response(), response()]).await;
+        let cache = |ttl| CachePolicy {
+            version: 1,
+            class: CacheClass::Markers {
+                syntax: MarkerSyntax::AnthropicCacheControl,
+                ttl,
+                max_breakpoints: 4,
+                lookback_blocks: 20,
+                tail: None,
+                omit_ttl: false,
+            },
+        };
+        let mut source = crate::families::anthropic_frozen_config("source");
+        source.base_url = Some(server.url.clone());
+        source.cache = Some(cache(CacheTtl::FiveMinutes));
+        let mut fallback = source.clone();
+        fallback.wire_model_id = "fallback".into();
+        fallback.cache = Some(cache(CacheTtl::OneHour));
+        source.refusal_fallback = Some(Box::new(RefusalFallbackConfig {
+            model: broca_protocol::request::ModelHandle::new("anthropic", "fallback"),
+            context_limit: None,
+            frozen: fallback,
+        }));
+        let provider =
+            LiveProvider::new(crate::families::AnthropicMessages, source, AuthHandle::None);
+        let root = attempt_scratch("warm-frozen-tariff");
+        let (writer, store) = warm_writer(&root).await;
+        for (route, model, ttl) in [
+            (
+                broca_core::refusal_fallback::StepRoute::Source,
+                "source",
+                "5m",
+            ),
+            (
+                broca_core::refusal_fallback::StepRoute::Fallback,
+                "fallback",
+                "1h",
+            ),
+        ] {
+            provider.set_step_route(route);
+            let journal = Arc::new(broca_core::cache_warm::WarmJournal::new(
+                writer.clone(),
+                broca_core::ShutdownSeal::new(),
+                warm_template(),
+                "base".into(),
+                None,
+            ));
+            let body = serde_json::to_vec(&serde_json::json!({"model":model,"max_tokens":64,"messages":[{"role":"user","content":[{"type":"text","text":"q","cache_control":{"type":"ephemeral","ttl":ttl}}]}]})).unwrap();
+            assert!(provider.warm_with_hook(&body, Some(journal)).await.is_err());
+        }
+        Arc::try_unwrap(writer)
+            .ok()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+        let records = store.read_records(&attempt_session()).unwrap();
+        let evidence: Vec<_> = records
+            .iter()
+            .filter_map(|f| match &f.record {
+                broca_wal::WalRecord::CacheWarmed {
+                    reservation: Some(r),
+                    ttl_ms,
+                    ..
+                } => Some((r.model_sent.as_str(), *ttl_ms)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            evidence,
+            [("source", Some(300_000)), ("fallback", Some(3_600_000))]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn warm_redirect_has_no_unreserved_followup() {
         use broca_core::WalStore;
         let server = ScriptedServer::start(vec![ScriptResponse::Http {
@@ -7125,7 +7268,6 @@ mod tests {
             warm_template(),
             "base".into(),
             None,
-            None,
         ));
         assert!(super::send_warm(
             &super::build_provider_http_client(),
@@ -7133,7 +7275,8 @@ mod tests {
             warm_request(server.url.clone(), false),
             crate::spec::WireFamilyId::AnthropicMessages,
             None,
-            Some(journal)
+            Some(journal),
+            None,
         )
         .await
         .is_err());
@@ -7168,7 +7311,6 @@ mod tests {
             warm_template(),
             "base".into(),
             None,
-            None,
         ));
         let url = server.url.clone();
         let task = tokio::spawn(async move {
@@ -7179,6 +7321,7 @@ mod tests {
                 crate::spec::WireFamilyId::AnthropicMessages,
                 None,
                 Some(journal),
+                None,
             )
             .await
         });
@@ -7265,7 +7408,6 @@ mod tests {
             warm_template(),
             "base".into(),
             None,
-            None,
         );
         let id = journal
             .before_send(
@@ -7278,6 +7420,7 @@ mod tests {
                     compressed: false,
                     account_ref: None,
                     speed_requested: None,
+                    warm: None,
                 },
                 Default::default(),
             )

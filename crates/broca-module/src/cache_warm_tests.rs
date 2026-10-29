@@ -53,6 +53,8 @@ struct Server {
     url: String,
     bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     task: tokio::task::JoinHandle<()>,
+    connections: Arc<AtomicU64>,
+    first_bytes: Arc<AtomicU64>,
 }
 
 impl Drop for Server {
@@ -67,13 +69,30 @@ impl Server {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = Arc::clone(&bodies);
+        let connections = Arc::new(AtomicU64::new(0));
+        let first_bytes = Arc::new(AtomicU64::new(0));
+        let accepted = connections.clone();
+        let observed_bytes = first_bytes.clone();
         let task = tokio::spawn(async move {
-            for reply in script {
+            let mut script = script.into_iter();
+            loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
+                accepted.fetch_add(1, Ordering::SeqCst);
+                let reply = script.next().unwrap_or_else(|| Reply::Full {
+                    status: 500,
+                    headers: vec![],
+                    body: b"unexpected request".to_vec(),
+                });
                 let recorded = Arc::clone(&recorded);
+                let observed_bytes = observed_bytes.clone();
                 // Each connection on its own task, so a stalled step does not keep a warm from
                 // being accepted.
                 tokio::spawn(async move {
+                    let mut first = [0];
+                    if socket.peek(&mut first).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    observed_bytes.fetch_add(1, Ordering::SeqCst);
                     let body = read_body(&mut socket).await;
                     let reply = match reply {
                         Reply::WarmOrText
@@ -100,7 +119,20 @@ impl Server {
                 });
             }
         });
-        Self { url, bodies, task }
+        Self {
+            url,
+            bodies,
+            task,
+            connections,
+            first_bytes,
+        }
+    }
+
+    fn network_activity(&self) -> (u64, u64) {
+        (
+            self.connections.load(Ordering::SeqCst),
+            self.first_bytes.load(Ordering::SeqCst),
+        )
     }
 
     fn bodies(&self) -> Vec<Vec<u8>> {
@@ -127,6 +159,30 @@ impl Server {
         )
         .await
     }
+}
+
+#[tokio::test]
+async fn listener_observes_connection_and_first_byte_before_a_complete_body() {
+    let server = Server::start(vec![]).await;
+    let mut socket = TcpStream::connect(server.url.strip_prefix("http://").unwrap())
+        .await
+        .unwrap();
+    socket.write_all(b"P").await.unwrap();
+    broca_test_support::wait_until("connection and first byte recorded", || async {
+        (server.network_activity() == (1, 1))
+            .then_some(())
+            .ok_or_else(|| format!("activity={:?}", server.network_activity()))
+    })
+    .await;
+    assert!(
+        server.bodies().is_empty(),
+        "the observation must precede full-body recording"
+    );
+    socket
+        .write_all(b"OST /probe HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\n\r\n")
+        .await
+        .unwrap();
+    server.wait_for(1).await;
 }
 
 async fn read_body(socket: &mut TcpStream) -> Vec<u8> {
@@ -2158,6 +2214,36 @@ async fn failed_warm_recorded() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn legacy_warm_record_bytes_keep_the_original_ttl_and_no_billing_fields() {
+    let fixture = Fixture::start(vec![text_turn("hello"), warm_answer()]).await;
+    fixture.turn("r1", "q", RunKind::FreshOrResume).await;
+    fixture.warm(None).await.unwrap();
+    let mut records = warm_records(&fixture.records());
+    assert_eq!(records.len(), 1);
+    let record = &mut records[0];
+    let WalRecord::CacheWarmed {
+        request_body_sha256,
+        warm_body_sha256,
+        sent_at_ms,
+        ttl_ms,
+        expires_at_ms,
+        ..
+    } = record
+    else {
+        unreachable!()
+    };
+    assert_eq!(*ttl_ms, Some(3_600_000));
+    assert_eq!(*expires_at_ms, Some(*sent_at_ms + 3_600_000));
+    // Only nondeterministic send time and request digests are normalized for the byte pin.
+    *request_body_sha256 = "aa".into();
+    *warm_body_sha256 = "bb".into();
+    *sent_at_ms = 100;
+    *expires_at_ms = Some(3_600_100);
+    const LEGACY: &str = r#"{"type":"cache_warmed","run_id":"r1","step_id":1,"request_body_sha256":"aa","warm_body_sha256":"bb","usage":{"input_tokens":3,"cached_input_tokens":4000,"cache_write_tokens":0,"output_tokens":0},"ratelimit_headers":{"anthropic-ratelimit-unified-status":"allowed"},"sent_at_ms":100,"ttl_ms":3600000,"expires_at_ms":3600100}"#;
+    assert_eq!(serde_json::to_string(record).unwrap(), LEGACY);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn failed_idle_warm_refreshes_export_with_outcome() {
     use broca_wal::record::BillingAttemptOutcome as Outcome;
     let fixture = Fixture::with_wal_config(
@@ -2290,11 +2376,26 @@ fn assert_unsent_warm_released_once(records: &[WalRecord]) {
 }
 
 #[cfg(feature = "test-clock")]
+async fn assert_late_success_was_ignored(gate: &broca_core::cache_warm::WarmPermissionGate) {
+    broca_test_support::wait_until(
+        "successful late barrier acknowledgement rejected",
+        || async {
+            let success = gate.successful_ack.load(Ordering::SeqCst);
+            let dropped = gate.receiver_dropped.load(Ordering::SeqCst);
+            (success && dropped).then_some(()).ok_or_else(|| {
+                format!("successful_sync={success}, receipt_receiver_dropped={dropped}")
+            })
+        },
+    )
+    .await;
+}
+
+#[cfg(feature = "test-clock")]
 #[tokio::test(flavor = "multi_thread")]
 async fn manual_warm_permission_denial_and_late_barrier_write_no_request() {
     for shutdown in [false, true] {
         let fixture = Fixture::with_wal_config(
-            vec![text_turn("hello")],
+            vec![text_turn("hello"), Reply::WarmOrText],
             |_| {},
             provider_for,
             broca_wal::WalConfig::OVERHAUL,
@@ -2302,12 +2403,21 @@ async fn manual_warm_permission_denial_and_late_barrier_write_no_request() {
         .await;
         fixture.turn("r1", "q", RunKind::FreshOrResume).await;
         let before = fixture.registry.cache_clock_reading(&fixture.key).unwrap();
-        let gate = Arc::new(broca_core::cache_warm::WarmPermissionGate::default());
+        let gate = Arc::new(if shutdown {
+            broca_core::cache_warm::WarmPermissionGate::successful()
+        } else {
+            broca_core::cache_warm::WarmPermissionGate::default()
+        });
         *fixture.executor.permission_gate.lock().unwrap() = Some(gate.clone());
         let registry = fixture.registry.clone();
         let key = fixture.key.clone();
         let warm = tokio::spawn(async move { ServeHandler::warm(&registry, &key, None).await });
         gate.entered.notified().await;
+        assert_eq!(
+            fixture.server.network_activity(),
+            (1, 1),
+            "no extra connection or first request byte before permission"
+        );
         assert_eq!(
             fixture.server.bodies().len(),
             1,
@@ -2316,6 +2426,7 @@ async fn manual_warm_permission_denial_and_late_barrier_write_no_request() {
         if shutdown {
             assert!(fixture.registry.stop_and_seal().await);
             gate.release.cancel();
+            assert_late_success_was_ignored(&gate).await;
         } else {
             gate.release.cancel();
         }
@@ -2333,6 +2444,7 @@ async fn manual_warm_permission_denial_and_late_barrier_write_no_request() {
             "denied or late permission must never send"
         );
         assert_unsent_warm_released_once(&fixture.records());
+        assert_eq!(fixture.server.network_activity(), (1, 1));
     }
 }
 
@@ -2352,6 +2464,7 @@ async fn automatic_warm_permission_denial_writes_no_request() {
         .start_automatic_held(Some(broca_protocol::request::KeepWarm::Auto))
         .await;
     gate.entered.notified().await;
+    assert_eq!(fixture.server.network_activity(), (1, 1));
     assert_eq!(
         fixture.server.bodies().len(),
         1,
@@ -2359,6 +2472,7 @@ async fn automatic_warm_permission_denial_writes_no_request() {
     );
     gate.release.cancel();
     fixture.wait_warm_stop("unsupported").await;
+    assert_eq!(fixture.server.network_activity(), (1, 1));
     assert_eq!(
         fixture.server.bodies().len(),
         1,
@@ -2366,6 +2480,43 @@ async fn automatic_warm_permission_denial_writes_no_request() {
     );
     fixture.finish_held().await;
     assert!(fixture.registry.stop_and_seal().await);
+    assert_unsent_warm_released_once(&fixture.records());
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_automatic_warm_ignores_late_successful_barrier_acknowledgement() {
+    let fixture = Fixture::with_wal_config(
+        vec![held_tool_turn(), Reply::WarmOrText],
+        |_| {},
+        provider_for,
+        broca_wal::WalConfig::OVERHAUL,
+    )
+    .await;
+    let gate = Arc::new(broca_core::cache_warm::WarmPermissionGate::successful());
+    *fixture.executor.permission_gate.lock().unwrap() = Some(gate.clone());
+    fixture
+        .start_automatic_held(Some(broca_protocol::request::KeepWarm::Auto))
+        .await;
+    gate.entered.notified().await;
+    assert_eq!(fixture.server.network_activity(), (1, 1));
+    assert_eq!(
+        fixture
+            .registry
+            .route_cancel(&fixture.key, RunId("held-auto".into()))
+            .await
+            .unwrap(),
+        CancelOutcome::Ack
+    );
+    fixture.finish_held().await;
+    assert!(fixture.registry.stop_and_seal().await);
+    gate.release.cancel();
+    assert_late_success_was_ignored(&gate).await;
+    assert_eq!(
+        fixture.server.network_activity(),
+        (1, 1),
+        "a successful receipt after cancellation must not start a connection"
+    );
     assert_unsent_warm_released_once(&fixture.records());
 }
 

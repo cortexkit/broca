@@ -6133,27 +6133,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 return;
             }
         };
-        if self
-            .writer
-            .as_ref()
-            .is_some_and(|writer| writer.is_overhaul())
-        {
-            let seal = match &self.state {
-                RunState::Active { shutdown_seal, .. } => shutdown_seal.clone(),
-                RunState::Idle => broca_core::ShutdownSeal::default(),
-            };
-            job.attempt_hook = crate::keep_warm::warm_journal(
-                self.writer
-                    .clone()
-                    .expect("warm preparation requires a writer"),
-                seal,
-                &job,
-                &pending.run_id,
-                Some(pending.ttl_ms),
-                None,
-            )
-            .map(|journal| journal as Arc<dyn broca_core::run::AttemptHook>);
-        }
+        let active_seal = match &self.state {
+            RunState::Active { shutdown_seal, .. } => Some(shutdown_seal),
+            RunState::Idle => None,
+        };
+        job.attempt_hook = crate::keep_warm::manual_warm_hook(
+            self.writer
+                .as_ref()
+                .expect("warm preparation requires a writer"),
+            active_seal,
+            &job,
+            &pending.run_id,
+        )
+        .map(|journal| journal as Arc<dyn broca_core::run::AttemptHook>);
         let pending = PendingWarm::new(pending, reply, permit);
         let executor = Arc::clone(&self.executor);
         let terminal_tx = self.terminal_tx.clone();

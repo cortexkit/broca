@@ -57,7 +57,9 @@ pub trait KeepWarmDriver: Send + Sync {
     fn failed_cost(
         &self,
         _config: &RunConfig,
+        _reservation: &broca_wal::record::AttemptReservation,
         _envelope: &broca_wal::record::AttemptEnvelope,
+        _ttl_ms: Option<u64>,
     ) -> Result<f64, String> {
         Err("reported warm usage pricing unavailable".into())
     }
@@ -250,6 +252,8 @@ pub(crate) fn batch_spend_iter<'a>(
                 step_id: warmed_step,
                 usage,
                 envelope,
+                reservation,
+                ttl_ms,
                 ..
             } if trigger.as_deref() == Some("keep_warm")
                 && run_id == warm.run_id
@@ -261,9 +265,13 @@ pub(crate) fn batch_spend_iter<'a>(
                         .recorded_cost(warm.config, usage)
                         .unwrap_or(f64::INFINITY),
                     Some(envelope) if crate::cache_warm::warm_budget_needs_pricing(envelope) => {
-                        warm.driver
-                            .failed_cost(warm.config, envelope)
-                            .unwrap_or(f64::INFINITY)
+                        match reservation.as_deref() {
+                            Some(reservation) => warm.driver.failed_cost(warm.config, reservation, envelope, *ttl_ms).unwrap_or(f64::INFINITY),
+                            None => {
+                                tracing::warn!(target: "cache_warm", stop = "pricing_unavailable", "warm budget exhausted: failed warm has no reservation identifying its model");
+                                f64::INFINITY
+                            }
+                        }
                     }
                     _ => 0.0,
                 })

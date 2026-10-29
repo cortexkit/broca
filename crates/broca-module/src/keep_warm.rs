@@ -60,12 +60,110 @@ impl WarmSlot {
 
 pub(crate) type Declare = Arc<dyn Fn(&RunConfig) -> Option<CacheDeclaration> + Send + Sync>;
 
+pub(crate) fn manual_warm_hook(
+    writer: &Arc<WalHandle>,
+    active_seal: Option<&ShutdownSeal>,
+    job: &WarmJob,
+    run_id: &RunId,
+) -> Option<Arc<broca_core::cache_warm::WarmJournal>> {
+    if !writer.is_overhaul() {
+        return None;
+    }
+    warm_journal(
+        writer.clone(),
+        active_seal.cloned().unwrap_or_default(),
+        job,
+        run_id,
+        None,
+    )
+}
+
+fn automatic_warm_hook(
+    writer: &Arc<WalHandle>,
+    seal: &ShutdownSeal,
+    job: &WarmJob,
+    run_id: &RunId,
+) -> Option<Arc<broca_core::cache_warm::WarmJournal>> {
+    if !writer.is_overhaul() {
+        return None;
+    }
+    warm_journal(
+        writer.clone(),
+        seal.clone(),
+        job,
+        run_id,
+        Some("keep_warm".into()),
+    )
+}
+
+/// Invoke the actual setup guards under an allocator-owning test executable.
+#[cfg(feature = "test-clock")]
+pub fn warm_setup_for_allocation_test(
+    writer: &Arc<WalHandle>,
+    seal: &ShutdownSeal,
+    job: &WarmJob,
+    run_id: &RunId,
+    automatic: bool,
+) -> bool {
+    if automatic {
+        automatic_warm_hook(writer, seal, job, run_id).is_some()
+    } else {
+        manual_warm_hook(writer, None, job, run_id).is_some()
+    }
+}
+
+/// Construct the real automatic driver for focused pricing and replay tests.
+#[cfg(feature = "test-clock")]
+pub fn automatic_warmer_for_test(
+    writer: Arc<WalHandle>,
+    executor: Arc<dyn RunExecutor>,
+    session: BindIdentity,
+    config: RunConfig,
+    ttl_ms: u64,
+) -> Arc<dyn KeepWarmDriver> {
+    let clock = CacheClock::default();
+    let now = epoch_ms();
+    clock.note_sent(now, Some(ttl_ms));
+    clock.note_usage(
+        now,
+        broca_protocol::Usage {
+            cached_input_tokens: Some(1000),
+            ..Default::default()
+        },
+    );
+    Arc::new(AutomaticWarmer {
+        retention: false,
+        session,
+        writer,
+        executor,
+        clock,
+        seal: ShutdownSeal::new(),
+        slot: WarmSlot::default(),
+        declare: Arc::new(move |_| {
+            Some(CacheDeclaration {
+                ttl_ms: Some(ttl_ms),
+                ttl_options_ms: vec![],
+                read_refreshes_ttl: Some(true),
+                warm: Ok(()),
+                basis: None,
+            })
+        }),
+        recorded: Mutex::new(Some(RecordedRequest {
+            run_id: RunId("r".into()),
+            step_id: broca_protocol::StepId(1),
+            config,
+            opts: broca_protocol::CallOptions::new(vec![]),
+            request_body_sha256: "base".into(),
+            route: None,
+        })),
+    })
+}
+
 pub(crate) fn warm_journal(
     writer: Arc<WalHandle>,
     seal: ShutdownSeal,
     job: &WarmJob,
     run_id: &RunId,
-    ttl_ms: Option<u64>,
     trigger: Option<String>,
 ) -> Option<Arc<broca_core::cache_warm::WarmJournal>> {
     if !writer.is_overhaul() {
@@ -115,7 +213,6 @@ pub(crate) fn warm_journal(
         seal,
         template,
         job.base.request_body_sha256().to_owned(),
-        ttl_ms,
         trigger,
     )))
 }
@@ -186,9 +283,19 @@ impl KeepWarmDriver for AutomaticWarmer {
     fn failed_cost(
         &self,
         config: &RunConfig,
+        reservation: &broca_wal::record::AttemptReservation,
         envelope: &broca_wal::record::AttemptEnvelope,
+        ttl_ms: Option<u64>,
     ) -> Result<f64, String> {
-        self.executor.failed_warm_cost(config, envelope)
+        let result = self
+            .executor
+            .failed_warm_cost(config, reservation, envelope, ttl_ms);
+        if let Err(detail) = &result {
+            tracing::warn!(target: "cache_warm", stop = "pricing_unavailable", detail = %detail,
+                provider = %reservation.provider, model = %reservation.model_sent,
+                "keep_warm budget exhausted by unavailable failed-attempt pricing");
+        }
+        result
     }
     async fn warm(&self, config: &RunConfig, run_id: &RunId) -> WarmTick {
         if let Err(error) = self.writer.check_move() {
@@ -255,18 +362,7 @@ impl KeepWarmDriver for AutomaticWarmer {
             base,
             attempt_hook: None,
         };
-        let journal = if self.writer.is_overhaul() {
-            warm_journal(
-                self.writer.clone(),
-                self.seal.clone(),
-                &job,
-                run_id,
-                Some(timing.ttl_ms),
-                Some("keep_warm".into()),
-            )
-        } else {
-            None
-        };
+        let journal = automatic_warm_hook(&self.writer, &self.seal, &job, run_id);
         job.attempt_hook = journal
             .as_ref()
             .map(|journal| journal.clone() as Arc<dyn broca_core::run::AttemptHook>);
@@ -279,7 +375,15 @@ impl KeepWarmDriver for AutomaticWarmer {
                 .map(|j| {
                     j.failed_attempts()
                         .iter()
-                        .map(|envelope| self.failed_cost(config, envelope).unwrap_or(f64::INFINITY))
+                        .map(|attempt| {
+                            self.failed_cost(
+                                config,
+                                &attempt.reservation,
+                                &attempt.envelope,
+                                attempt.ttl_ms,
+                            )
+                            .unwrap_or(f64::INFINITY)
+                        })
                         .sum()
                 })
                 .unwrap_or(0.0)
@@ -417,7 +521,9 @@ mod retention_tests {
         fn failed_warm_cost(
             &self,
             _: &RunConfig,
+            _: &broca_wal::record::AttemptReservation,
             e: &broca_wal::record::AttemptEnvelope,
+            _: Option<u64>,
         ) -> Result<f64, String> {
             Ok(e.usage.and_then(|u| u.input_tokens).unwrap_or(0) as f64 * 2.0)
         }
@@ -442,6 +548,7 @@ mod retention_tests {
                             compressed: index == 0,
                             account_ref: None,
                             speed_requested: None,
+                            warm: None,
                         },
                         Default::default(),
                     )

@@ -681,6 +681,7 @@ async fn a_refused_compressed_warm_is_resent_once_uncompressed() {
         crate::spec::WireFamilyId::AnthropicMessages,
         None,
         None,
+        None,
     )
     .await
     .expect("the uncompressed re-send is the warm's answer");

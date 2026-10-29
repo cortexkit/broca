@@ -356,6 +356,25 @@ pub fn warm_budget_needs_pricing(envelope: &broca_wal::record::AttemptEnvelope) 
         })
 }
 
+/// The same reservation and measured outcome used by live and restarted warm-budget pricing.
+/// The reservation identifies the actual model, which can differ from the episode's model.
+#[derive(Debug, Clone)]
+pub struct FailedWarmAttempt {
+    pub reservation: broca_wal::record::AttemptReservation,
+    pub envelope: broca_wal::record::AttemptEnvelope,
+    /// Marker TTL captured when the actual frozen route was prepared; absent means unknown.
+    pub ttl_ms: Option<u64>,
+}
+
+/// Warm-only send facts taken from the exact frozen render route used for the request.
+#[derive(Debug, Clone, Default)]
+pub struct WarmSendPolicy {
+    /// A routed fallback's catalog provider; the source provider is already in the reservation.
+    pub provider: Option<String>,
+    /// The selected frozen marker policy, never the episode's cache-clock estimate.
+    pub ttl_ms: Option<u64>,
+}
+
 /// A warm owns its journal even when no run is active. The seal orders permission and
 /// settlement against shutdown, while the writer's barrier precedes every physical send.
 /// A full WAL can refuse a terminal append even after permission was durable. Such a reservation
@@ -366,10 +385,9 @@ pub struct WarmJournal {
     seal: crate::ShutdownSeal,
     template: broca_wal::record::AttemptReservation,
     request_body_sha256: String,
-    ttl_ms: Option<u64>,
     trigger: Option<String>,
     pending: Mutex<std::collections::BTreeMap<broca_wal::record::AttemptId, WarmPending>>,
-    failed: Mutex<Vec<broca_wal::record::AttemptEnvelope>>,
+    failed: Mutex<Vec<FailedWarmAttempt>>,
     #[cfg(feature = "test-clock")]
     permission_gate: Mutex<Option<Arc<WarmPermissionGate>>>,
 }
@@ -380,11 +398,27 @@ pub struct WarmJournal {
 pub struct WarmPermissionGate {
     pub entered: tokio::sync::Notify,
     pub release: tokio_util::sync::CancellationToken,
+    pub acknowledged: tokio::sync::Notify,
+    pub successful_ack: std::sync::atomic::AtomicBool,
+    pub receiver_dropped: std::sync::atomic::AtomicBool,
+    late_success: bool,
+}
+
+#[cfg(feature = "test-clock")]
+impl WarmPermissionGate {
+    /// Hold a real successful sync receipt, then acknowledge it independently of the waiter.
+    pub fn successful() -> Self {
+        Self {
+            late_success: true,
+            ..Self::default()
+        }
+    }
 }
 
 struct WarmPending {
     reservation: broca_wal::record::AttemptReservation,
     started: bool,
+    ttl_ms: Option<u64>,
 }
 
 impl WarmJournal {
@@ -393,7 +427,6 @@ impl WarmJournal {
         seal: crate::ShutdownSeal,
         template: broca_wal::record::AttemptReservation,
         request_body_sha256: String,
-        ttl_ms: Option<u64>,
         trigger: Option<String>,
     ) -> Self {
         Self {
@@ -401,7 +434,6 @@ impl WarmJournal {
             seal,
             template,
             request_body_sha256,
-            ttl_ms,
             trigger,
             pending: Mutex::new(Default::default()),
             failed: Mutex::new(Vec::new()),
@@ -413,7 +445,7 @@ impl WarmJournal {
     /// Report only measured failed-attempt usage to the live warm budget. The WAL contains
     /// the same evidence for restart accounting; absent usage is never priced using the
     /// successful-refresh estimate.
-    pub fn failed_attempts(&self) -> Vec<broca_wal::record::AttemptEnvelope> {
+    pub fn failed_attempts(&self) -> Vec<FailedWarmAttempt> {
         self.failed.lock().unwrap().clone()
     }
 
@@ -441,10 +473,10 @@ impl WarmJournal {
                 .as_ref()
                 .map(|s| s.ratelimit_headers.iter().cloned().collect())
                 .unwrap_or_default(),
-            ttl_ms: self.ttl_ms,
+            ttl_ms: pending.ttl_ms,
             expires_at_ms: sent
                 .as_ref()
-                .and_then(|s| self.ttl_ms.map(|ttl| s.sent_at_ms.saturating_add(ttl))),
+                .and_then(|s| pending.ttl_ms.map(|ttl| s.sent_at_ms.saturating_add(ttl))),
         }
     }
 
@@ -553,6 +585,11 @@ impl crate::run::AttemptHook for WarmJournal {
                 model_sent: send.model_sent,
                 request_body_bytes: send.request_body_bytes,
                 compressed: send.compressed,
+                provider: send
+                    .warm
+                    .as_ref()
+                    .and_then(|policy| policy.provider.clone())
+                    .unwrap_or_else(|| self.template.provider.clone()),
                 credential: broca_wal::record::AttemptCredential {
                     account_ref: send.account_ref,
                     ..self.template.credential.clone()
@@ -564,6 +601,7 @@ impl crate::run::AttemptHook for WarmJournal {
                 ..self.template.clone()
             },
             started: false,
+            ttl_ms: send.warm.as_ref().and_then(|policy| policy.ttl_ms),
         };
         let record = WalRecord::AttemptReserved {
             attempt_id: id.clone(),
@@ -593,14 +631,32 @@ impl crate::run::AttemptHook for WarmJournal {
             {
                 let gate = self.permission_gate.lock().unwrap().clone();
                 if let Some(gate) = gate {
-                    gate.entered.notify_one();
-                    gate.release.cancelled().await;
-                    return Err(crate::WalWriteError::from(
-                        "warm durability barrier refused by test gate",
-                    ));
+                    if !gate.late_success {
+                        gate.entered.notify_one();
+                        gate.release.cancelled().await;
+                        return Err(crate::WalWriteError::from(
+                            "warm durability barrier refused by test gate",
+                        ));
+                    }
+                    let result = self.writer.sync().await.map(|_| ());
+                    let (ack, receipt) = tokio::sync::oneshot::channel();
+                    tokio::spawn(async move {
+                        gate.entered.notify_one();
+                        gate.release.cancelled().await;
+                        gate.successful_ack
+                            .store(result.is_ok(), std::sync::atomic::Ordering::SeqCst);
+                        gate.receiver_dropped.store(
+                            ack.send(result).is_err(),
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                        gate.acknowledged.notify_one();
+                    });
+                    return receipt.await.map_err(|_| {
+                        crate::WalWriteError::from("warm test acknowledgement task ended")
+                    })?;
                 }
             }
-            self.writer.sync().await
+            self.writer.sync().await.map(|_| ())
         };
         tokio::select! {
             biased;
@@ -623,6 +679,7 @@ impl crate::run::AttemptHook for WarmJournal {
             let started = WarmPending {
                 reservation: pending.reservation.clone(),
                 started: true,
+                ttl_ms: pending.ttl_ms,
             };
             if !self
                 .seal
@@ -666,17 +723,23 @@ impl crate::run::AttemptHook for WarmJournal {
             cache_write_1h_tokens: envelope.cache_write_1h_tokens,
             ..Default::default()
         });
-        {
+        let failed = {
             let mut pending = self.pending.lock().unwrap();
             let Some(entry) = pending.get(&id) else {
                 return Err(warm_journal_error("warm reservation already settled"));
             };
+            let failed = failed.map(|envelope| FailedWarmAttempt {
+                reservation: entry.reservation.clone(),
+                envelope,
+                ttl_ms: entry.ttl_ms,
+            });
             let record = self.terminal(id.clone(), entry, envelope, sent, warm_body_sha256);
             self.seal
                 .settle_billing_attempt(&self.writer, &id, record)
                 .map_err(warm_journal_error)?;
             pending.remove(&id);
-        }
+            failed
+        };
         if let Some(failed) = failed {
             self.failed.lock().unwrap().push(failed);
         }
@@ -1048,6 +1111,7 @@ mod tests {
             compressed: false,
             account_ref: None,
             speed_requested: None,
+            warm: None,
         }
     }
 
@@ -1076,14 +1140,8 @@ mod tests {
             } else {
                 cancel.cancel();
             }
-            let journal = WarmJournal::new(
-                writer.clone(),
-                seal,
-                warm_template(),
-                "base".into(),
-                None,
-                None,
-            );
+            let journal =
+                WarmJournal::new(writer.clone(), seal, warm_template(), "base".into(), None);
             assert!(journal
                 .before_send(warm_physical_send(), cancel)
                 .await
@@ -1119,7 +1177,6 @@ mod tests {
             seal.clone(),
             warm_template(),
             "aa".into(),
-            Some(300_000),
             None,
         ));
         let cancel = tokio_util::sync::CancellationToken::new();
