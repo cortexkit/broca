@@ -19,6 +19,7 @@ pub mod auth_routing;
 pub mod billing_routing;
 pub mod bus_events;
 pub mod bus_events_nats;
+pub mod cache_diagnose;
 pub mod cache_dump;
 pub mod cache_routing;
 pub mod cache_warm;

@@ -26,7 +26,7 @@ tool turns before dispatch, have null coordinates. Transcript rows
 stay at their source record's position, even when a later boundary places them.
 Treat transcript exports as sensitive conversation data.
 
-Task/session-name lookup is shared by trajectory, `cache-dump --session <id>`, and
+Task/session-name lookup is shared by trajectory, `cache-diagnose <id>`, `cache-dump --session <id>`, and
 `broca-session --subc CONNECTION read <id>` (also `--session <id> read`). It tries
 the supplied name first, then `alfonso:<id>` for an unprefixed name. The lookup
 scans only the compact session-ref inventory, with the name predicate in SQL;
@@ -45,7 +45,7 @@ read calls with only one bind flag use lookup and require that flag to match the
 recorded identity. Other daemon commands still accept their original bind flags.
 The connection file is
 only an argument; its path and contents are not printed on connection failures.
-Put the offline `trajectory` and `cache-dump` subcommands before their flags;
+Put the offline `trajectory`, `cache-diagnose`, and `cache-dump` subcommands before their flags;
 prefixed global flags are refused by command name before any session lookup.
 These commands refuse `--subc` by command name,
 whether the daemon flag appears before or after the subcommand, without binding.
