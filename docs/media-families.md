@@ -25,6 +25,123 @@ Rules every entry follows:
   hold a kind, the profile uses the follow-up user message (only after a live check
   shows the provider accepts it and prompt caching stays stable) or a marker.
 
+### Running the live checks
+
+Only an operator runs live checks, on the Mac outside a worker sandbox.
+The bounded probe uses the explicit prepared-media renderer, the family's real
+endpoint and normalizer, and broca's HTTP client with redirects and automatic
+retries disabled. It never prints a credential, handle, request headers, response
+body or provider error message. Unknown provider codes are `other_redacted`.
+An optional `--error-detail <file>` appends only error type, code and message to
+a local owner-only file (Unix mode 0600), with each encoded JSON line capped at
+1 KiB including its newline. Existing non-private files and links are refused.
+No headers enter that file, known token/account values are redacted, and its contents
+are never copied to stdout or stderr. Without the flag, no error-detail file is
+opened. The flag has no effect during a dry-run.
+
+```sh
+# Default dry-run: 6 serving families, at most 18 planned requests; sends nothing.
+cargo run --locked -p broca-provider --features live --example media-live-check -- --dry-run
+# The checked-in plan is crates/broca-provider/examples/media-live/plan.json.
+# Preview any operator edits before explicitly requesting live traffic.
+cargo run --locked -p broca-provider --features live --example media-live-check -- --dry-run --plan <plan.json>
+BROCA_LIVE_TESTS=1 cargo run --locked -p broca-provider --features live --example media-live-check -- --live --plan crates/broca-provider/examples/media-live/plan.json --subc "$HOME/.local/share/cortexkit/run/subc-connection.json"
+```
+
+The checked-in plan uses operator-confirmed serving models and vault credential
+names, not an automatically refreshed catalog snapshot: Anthropic Haiku 5.5,
+OpenAI GPT-6 Luna on Chat, Responses and ChatGPT, Gemini 3.8 Flash, and its
+Antigravity route. Recheck these selections when serving routes change. An
+operator override may set the wire model, named dev-tools credential, provider
+`quirk` (for a compatible endpoint), and any `base_url` or `aws_region`.
+An optional non-secret `frozen` object supplies a serving `FrozenRenderConfig`
+including provider-specific identity and quirks instead of family defaults. No
+token or capability handle belongs in the plan. Credentials are read by name only
+through the dev-tools handle map and subc, and only after `--live` and
+`BROCA_LIVE_TESTS=1`. `--subc` and `--timeout-secs` are optional.
+
+For Anthropic, a missing frozen cache policy is filled by
+`broca_module_serve::cache_routing::default_cache_policy` for the `anthropic`
+provider, with no caller override or declared tail. This is the same default
+used by production's `resolve_cache_policy`: five-minute markers with the `ttl`
+field omitted, as in production. An explicitly supplied frozen policy is kept.
+The provider renderer chooses every breakpoint; the probe does not place any.
+
+The Anthropic route selects the long-standing `oauth:anthropic` subscription
+credential; ChatGPT selects `chatgpt:openai`. The temporary live-check handles
+have been revoked. API-key Anthropic routes remain supported for funded keys.
+OAuth uses the provider's identity-lead, persona, header and beta derivation,
+never a separate handwritten header list. Its devtools metadata accessor preserves
+the optional `credential.get` reply's `account_id` beside the token. The probe
+passes that value to production's `claude_code_identity::fresh_persona`; the
+factory maps UUID account IDs to `account_uuid` and uses the selected credential
+ID when the vault has no account ID. There is no separate required vault
+`account_uuid` field, so OAuth no longer skips for absent account metadata.
+
+The reply contract and mapping are owned here: `GetOutcome::Success` and
+`decode_get_reply` in `crates/broca-subc/src/vault.rs:411-431,476-503` retain
+`account_id`; `fresh_persona` in
+`crates/broca-module-serve/src/claude_code_identity.rs:209-241` applies the
+production identity/fallback rules. These local definitions describe the vault
+reply contract this client consumes. Live setup uses the normal persisted
+install identity and probe session identity. Dry-run calls the same factory with
+an explicit synthetic install seed and no account ID; it reads no credential or
+install file.
+
+Bedrock is absent from the serving plan because the operator has no Bedrock
+credential; the summary records it as not live-checked with reason
+`no_credential`. Code Assist's account-project discovery is not part of this
+standalone probe. It still renders all three dry-run requests, but a live run
+without an explicit resolved `project_id` reports `skipped: project_id_required`
+before reading any credential or sending anything. The offline preview uses an
+empty project field only in its temporary render config; no account project ID
+is hard-coded or inferred, and the unresolved live config is unchanged.
+
+One route consumes all three request slots for its family; duplicate families
+are refused before credential access. Request 1 checks person PNG/PDF input where
+the profile carries it. Request 2 checks a tool PNG/PDF with different readable
+values, using the candidate follow-up user carrier where necessary. Request 3
+extends the same history to measure cache stability. ChatGPT checks only a person
+image, a distinct tool image, and the cache follow-up. Its backend rejected audio
+live, so no audio fixtures are included in that route.
+Fixtures are synthetic and checked in beside the example; no session data is read.
+
+Dry-run JSON lines list family, wire model, profile, carrier, media kind, MIME,
+decoded byte size, digest, and complete rendered request size/digest.
+`cache_control_paths` lists the JSONPath of each `cache_control` field in the
+actual rendered body, including tool-result wrappers; it never prints the
+marker-bearing object or content. Live lines
+report HTTP status, allowlisted provider code, usage including cached tokens, and
+fixed-string media-check booleans, never the answer. `cache_stable` requires a
+positive reported cache hit on request 2 and no decrease on request 3; missing
+usage, zero hits or interrupted runs are inconclusive, not passes. Media checks
+must also pass independently. A provider rejection spends a slot and is never
+retried. The probe only changes candidate profiles in memory, never the production
+registry or a running admission's frozen config.
+
+Prefix stability compares prior rendered message content. For Anthropic it
+ignores only block-level `cache_control` annotations, which the production
+planner may move as the tail grows; tool input and media bytes still must match.
+This comparison never changes the sent bodies or the reported breakpoint paths.
+
+Paste results beside the matching profile below in this format (one row per
+request; use `not serving` for a family not exercised):
+
+| operator-run UTC / revision | wire model / endpoint profile | request / carrier / MIME | HTTP / provider code | media checks | input / cached / cache-write / output tokens | cache stable | decision |
+|---|---|---|---|---|---|---|---|
+| pending | pending | pending | pending | pending | pending | unmeasured | keep gate unset |
+
+Record refusals as well as passes. A pass for one compatible provider or Gemini
+generation does not enable another profile. ChatGPT audio is unavailable, even
+when old frozen flags or MIME lists are present. Code Assist's current all-kind
+flag must not be enabled from PNG/PDF-only evidence:
+audio/video remain unverified by those checks. Untested profiles retain markers.
+
+The results below combine the operator's local evidence file
+`.cortexkit/internal-docs/investigations/media-live-check-2026-10-29.md` with
+subsequent operator-reported reruns. Evidence stays outside version control;
+recording these outcomes does not make any worker-run provider request.
+
 ## Kinds, MIME types and catalog modalities
 
 broca stores four kinds. The MIME type is detected from the bytes at capture.
@@ -123,9 +240,9 @@ of audio at Gemini's 32 tokens per second, and about four minutes of video at Ge
 ## Profile selection
 
 A profile is chosen from the frozen `WireFamilyId`, a frozen provider quirk, and a
-per-family wire-model-pattern table for documented generation splits. Two splits
-exist today: Gemini 3 versus earlier Gemini (tool results), and the ChatGPT backend's
-`input_audio` (live-gated flag).
+per-family wire-model-pattern table for documented generation splits. Gemini 3
+versus earlier Gemini controls tool-result carriers. The separate ChatGPT backend
+profile disables audio after its measured live refusal.
 
 Providers on `openai_chat` share one grammar, so the family entry below gives the
 grammar, and each provider profile is told apart by a frozen media quirk keyed by the
@@ -147,6 +264,14 @@ person's media is refused (`carrier`) and tool media renders as markers.
 ---
 
 ## `anthropic_messages` (Anthropic Messages API)
+
+**Live check, 2026-10-28/29:** `claude-haiku-5-5` with the platform API key was not
+verified: HTTP 400, "Your credit balance is too low to access the Anthropic API."
+The subsequent `oauth:anthropic` subscription check passed all three requests:
+person image/PDF, tool image/PDF and the follow-up. Cache writes and reads were
+zero on every request (`cache_stable: false`): that probe had no explicit
+`cache_control` policy. Media acceptance is verified; cache placement with the
+production policy still needs the operator's rerun.
 
 Sources: https://platform.claude.com/docs/en/build-with-claude/vision ·
 https://platform.claude.com/docs/en/build-with-claude/pdf-support ·
@@ -180,6 +305,10 @@ https://platform.claude.com/docs/en/api/overview (request size limits)
     page plus the page's image cost, which needs a page count broca does not extract.
 
 ## `bedrock_converse` (AWS Bedrock Converse)
+
+**Live check:** pending operator-run results; native image/PDF carriers are documented,
+not yet verified by this probe. The current serving plan omits Bedrock because
+there is no vault credential (`no_credential`); it is not live-checked.
 
 Sources: https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Message.html ·
 https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ContentBlock.html ·
@@ -215,6 +344,11 @@ https://platform.claude.com/docs/en/api/overview (Bedrock request size)
 
 ## `openai_responses` (OpenAI Responses API)
 
+**Live check, 2026-10-28/29:** `gpt-6-luna` with `apikey:openai` was not verified:
+HTTP 200 followed by a `billing_exhausted` stream error, "You have no credits
+remaining." The Meta Responses profile is separately untested and its
+follow-up-user carrier remains a marker.
+
 Sources: https://developers.openai.com/api/docs/guides/images-vision ·
 https://developers.openai.com/api/docs/guides/file-inputs ·
 https://developers.openai.com/api/docs/guides/function-calling ·
@@ -246,6 +380,16 @@ https://developers.openai.com/api/reference/resources/responses/methods/create
 
 ## `openai_responses_chatgpt` (ChatGPT / Codex backend)
 
+**Live check, 2026-10-28:** `gpt-6-luna` rejected audio with HTTP 400,
+`invalid_request_error`, parameter `input`: "Audio input is not available."
+Audio is refused before publication or send, naming `audio`; stored tool audio
+renders as a marker. Legacy audio flags and MIME lists cannot enable it.
+With audio removed, the person PNG passed (HTTP 200; 12,537 input tokens).
+The subsequent image-only rerun also passed the person image, tool image and
+cache follow-up, with `cache_stable: true`. PDFs were not checked live. Image
+and PDF profile behavior is unchanged: images are native and PDFs remain
+unavailable on this backend.
+
 The ChatGPT backend takes the Responses body at the ChatGPT Codex endpoint and has no
 public reference. The primary source is OpenAI's own Codex client, which serializes
 these items directly into that body:
@@ -254,20 +398,25 @@ https://github.com/openai/codex/blob/ffda54f5b8d5595eb0963594de32e206f98cc77f/co
 
 | | image | document | audio | video |
 |---|---|---|---|---|
-| user-message shape | `{"type":"input_image","image_url":"data:M;base64,B64"}` | not evidenced (Codex sends no `input_file`) | `{"type":"input_audio","audio_url":"data:M;base64,B64"}`, **live-gated** | not supported |
-| MIME types | as `openai_responses` | — | not documented; the live check fixes the accepted types | — |
-| tool result | native: `input_image` in `function_call_output.output` | marker | `input_audio` in `function_call_output.output`, **live-gated** | marker |
+| user-message shape | `{"type":"input_image","image_url":"data:M;base64,B64"}` | not evidenced (Codex sends no `input_file`) | not supported (live HTTP 400) | not supported |
+| MIME types | as `openai_responses` | — | — | — |
+| tool result | native: `input_image` in `function_call_output.output` | marker | marker | marker |
 | per-item limit | as `openai_responses` | — | not documented | — |
 | count limit per request | as `openai_responses` | — | not documented | — |
 
-- **`input_audio` flag:** off until a live check against the real backend passes.
-  With the flag off, a person's audio is refused (`carrier`) and a tool's audio is a
-  marker.
+- **Audio:** a person's audio is refused (`carrier`) and a tool's audio is a
+  marker. The backend's measured refusal overrides the Codex client's unused
+  audio shape. No frozen flag or MIME entry enables audio.
 - **Count-dependent dimension limit:** none documented.
 - **Request cap:** not documented. **broca choice:** 50 MB, as `openai_responses`.
-- **Token estimate:** image: the `openai_responses` rule. Audio: fixed estimate.
+- **Token estimate:** image: the `openai_responses` rule. Audio is not carried.
 
 ## `openai_chat` (OpenAI Chat Completions grammar)
+
+**Live check, 2026-10-28/29:** `gpt-6-luna` with `apikey:openai` was not verified:
+HTTP 429, `insufficient_quota` / `credit_balance_exhausted`. OpenAI's tool-media
+follow-up-user carrier remains a marker; acceptance and cache stability are
+unmeasured with a funded key.
 
 Sources: https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create ·
 https://developers.openai.com/api/docs/guides/images-vision ·
@@ -292,6 +441,9 @@ OpenAI's own Chat Completions endpoint.
 
 ### `openai_chat` profile: OpenRouter (quirk `openrouter`)
 
+**Live check:** pending operator-run acceptance and cache-stability results; tool media
+remain markers. Another provider's pass does not enable this profile.
+
 Sources: https://openrouter.ai/docs/guides/overview/multimodal/image-understanding ·
 https://openrouter.ai/docs/guides/overview/multimodal/pdfs ·
 https://openrouter.ai/docs/guides/overview/multimodal/audio ·
@@ -315,6 +467,9 @@ https://openrouter.ai/docs/api/reference/overview
 
 ### `openai_chat` profile: xAI (quirk `xai`)
 
+**Live check:** pending operator-run acceptance and cache-stability results; tool media
+remain markers. Another provider's pass does not enable this profile.
+
 Sources: https://docs.x.ai/developers/model-capabilities/images/understanding ·
 https://docs.x.ai/developers/rest-api-reference/inference/chat-completions
 
@@ -333,6 +488,9 @@ https://docs.x.ai/developers/rest-api-reference/inference/chat-completions
   the models the overlay overrides to `openai_chat`.
 
 ### `openai_chat` profile: DeepSeek (quirk `deepseek`)
+
+**Live check:** pending operator-run acceptance and cache-stability results; tool media
+remain markers. Another provider's pass does not enable this profile.
 
 Sources: https://api-docs.deepseek.com/guides/vision ·
 https://api-docs.deepseek.com/api/create-chat-completion
@@ -353,6 +511,9 @@ https://api-docs.deepseek.com/api/create-chat-completion
 
 ### `openai_chat` profile: Kimi (quirk `kimi`)
 
+**Live check:** pending operator-run acceptance and cache-stability results; tool media
+remain markers. Another provider's pass does not enable this profile.
+
 Sources: https://platform.kimi.ai/docs/guide/use-kimi-vision-model ·
 https://platform.kimi.ai/docs/api/chat
 
@@ -370,6 +531,9 @@ https://platform.kimi.ai/docs/api/chat
   estimate-tokens endpoint, not a formula).
 
 ### `openai_chat` profile: Meta (quirk `meta`)
+
+**Live check:** pending operator-run acceptance and cache-stability results; tool media
+remain markers. This does not cover the separate Meta Responses profile.
 
 The `llama` provider's Llama API documentation now redirects to the Meta Model API
 documentation, which covers both Chat Completions and Responses.
@@ -395,6 +559,11 @@ https://dev.meta.ai/docs/protocols/chat-completions
   endpoint.
 
 ## `gemini` (Gemini API and Vertex AI `generateContent`)
+
+**Live check, 2026-10-28/29:** `gemini-3.8-flash` passed person PNG/PDF, tool PNG/PDF
+and the cache follow-up. Request 2 reported 15,286 cached input tokens; request 3
+reported 16,639, with the rendered prefix stable. This verifies the Gemini 3
+native carriers, not earlier Gemini's follow-up-user carrier, which stays a marker.
 
 Sources: https://ai.google.dev/gemini-api/docs/image-understanding ·
 https://ai.google.dev/gemini-api/docs/document-processing ·
@@ -443,6 +612,12 @@ https://github.com/googleapis/python-genai/blob/main/google/genai/types.py
     a duration.
 
 ## `google_codeassist` (Antigravity / Code Assist)
+
+**Live check:** pending operator-run results for both generation profiles. All Code
+Assist production media gates remain unset; a PNG/PDF pass cannot enable untested
+audio/video carriers. Without a resolved project ID, the standalone probe reports
+`skipped: project_id_required` before credential access; its dry-run still renders
+the family's three planned requests.
 
 The Code Assist endpoint (`cloudcode-pa`) wraps a Gemini `generateContent` request in
 an envelope and has no public reference. The primary source is Google's own client,

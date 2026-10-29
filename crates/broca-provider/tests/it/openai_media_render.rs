@@ -122,7 +122,7 @@ fn responses_image_and_pdf_render_in_user_and_function_output() {
 }
 
 #[test]
-fn chatgpt_audio_remains_mime_blocked_until_live_types_are_known() {
+fn legacy_chatgpt_audio_flags_cannot_bypass_the_live_refusal() {
     let media = [reference(MediaKind::Audio, "audio/wav")];
     for tool in [false, true] {
         let mut frozen = frozen(WireFamilyId::OpenAiResponsesChatgpt, MediaQuirk::Openai);
@@ -132,9 +132,12 @@ fn chatgpt_audio_remains_mime_blocked_until_live_types_are_known() {
         assert!(!denied.to_string().contains("YWJj"));
         let profile = frozen.media.as_mut().unwrap();
         profile.live_gated.chatgpt_input_audio = true;
+        profile.chatgpt_audio_mime_types = vec!["audio/wav".into()];
         profile.audio.user_message = MediaCarrier::Native;
         profile.audio.tool_result = MediaCarrier::Native;
         let body = render(&OpenAiResponsesChatgpt, &frozen, &opts, &media, tool);
+        assert!(!body.to_string().contains("input_audio"));
+        assert!(!body.to_string().contains("YWJj"));
         let content = &body["input"][0][if tool { "output" } else { "content" }];
         assert!(content[1]["text"].as_str().unwrap().contains("reason=mime"));
         assert!(!body.to_string().contains("YWJj"));
@@ -148,6 +151,48 @@ fn chatgpt_audio_remains_mime_blocked_until_live_types_are_known() {
             .chatgpt_input_audio = false;
         let denied = render(&OpenAiResponsesChatgpt, &frozen, &opts, &media, tool);
         assert!(!denied.to_string().contains("YWJj"));
+    }
+}
+
+#[test]
+fn chatgpt_audio_refuses_before_sending_while_images_still_render() {
+    let media = [reference(MediaKind::Audio, "audio/wav")];
+    for tool in [false, true] {
+        let mut frozen = frozen(WireFamilyId::OpenAiResponsesChatgpt, MediaQuirk::Openai);
+        let opts = request(&media, tool);
+        let profile = frozen.media.as_mut().unwrap();
+        profile.live_gated.chatgpt_input_audio = true;
+        profile.chatgpt_audio_mime_types = vec!["audio/wav".into(), "audio/mpeg".into()];
+        for mime in ["audio/wav", "audio/mpeg"] {
+            let audio = reference(MediaKind::Audio, mime);
+            let refused = broca_provider::person_media::check_item(
+                frozen.media.as_ref(),
+                "gpt-6-luna",
+                &audio,
+            )
+            .unwrap_err();
+            assert_eq!(refused.reason, broca_protocol::MediaMarkerReason::Carrier);
+            assert_eq!(refused.modality, "audio");
+            assert!(refused.to_string().contains("audio"));
+            assert!(refused.to_string().contains("gpt-6-luna"));
+        }
+        let denied = render(&OpenAiResponsesChatgpt, &frozen, &opts, &media, tool);
+        assert!(denied.to_string().contains("reason=carrier"));
+        assert!(!denied.to_string().contains("YWJj"));
+        assert!(!denied.to_string().contains("input_audio"));
+        let image = [reference(MediaKind::Image, "image/png")];
+        let body = render(
+            &OpenAiResponsesChatgpt,
+            &frozen,
+            &request(&image, tool),
+            &image,
+            tool,
+        );
+        let content = &body["input"][0][if tool { "output" } else { "content" }];
+        assert_eq!(
+            content[1],
+            json!({"type":"input_image", "image_url":"data:image/png;base64,YWJj"})
+        );
     }
 }
 

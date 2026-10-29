@@ -3,7 +3,7 @@
 use broca_protocol::{MediaKind, MediaMarkerReason, MediaRef};
 use serde_json::{json, Value};
 
-use crate::{media_profile::MediaCarrier, media_render::MediaRender, spec::WireFamilyId};
+use crate::{media_profile::MediaCarrier, media_render::MediaRender};
 
 #[derive(Clone, Copy)]
 pub(super) enum Grammar {
@@ -68,16 +68,6 @@ impl Grammar {
             }
             (Self::Responses, MediaKind::Document) => {
                 Ok(json!({"type":"input_file", "filename":"document.pdf", "file_data":url}))
-            }
-            (Self::Responses, MediaKind::Audio)
-                if media.frozen.family_id == WireFamilyId::OpenAiResponsesChatgpt
-                    && media
-                        .frozen
-                        .media
-                        .as_ref()
-                        .is_some_and(|profile| profile.live_gated.chatgpt_input_audio) =>
-            {
-                Ok(json!({"type":"input_audio", "audio_url":url}))
             }
             (Self::Responses, MediaKind::Audio | MediaKind::Video) => {
                 Err(MediaMarkerReason::Carrier)

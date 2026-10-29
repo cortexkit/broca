@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 description = "broca provider module: owns one provider's SSE transport + auth, normalizes wire->canonical stream-parts, emits the two lanes over the direct runner<->provider socket."
 
+[[example]]
+name = "media-live-check"
+required-features = ["live"]
+
 [features]
 # E2E-only virtual retry waits; keeps transport retry decisions real without waiting out backoff.
 test-harness = []

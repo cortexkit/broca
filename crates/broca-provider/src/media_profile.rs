@@ -248,7 +248,8 @@ impl std::error::Error for MediaProfileError {}
 /// falls back to markers (tool media) and `carrier` refusals (a person's media).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct LiveGates {
-    /// The ChatGPT backend's `input_audio` part, in user messages and tool results.
+    /// Retained for recorded configs. The ChatGPT backend rejects audio, so this flag
+    /// no longer enables a carrier.
     #[serde(default, skip_serializing_if = "is_false")]
     pub chatgpt_input_audio: bool,
     /// Tool media carried as a follow-up user message where the tool result cannot hold it.
@@ -445,6 +446,10 @@ pub struct MediaProfile {
     /// The live-gated carriers that were enabled when this profile was frozen.
     #[serde(default, skip_serializing_if = "LiveGates::is_unset")]
     pub live_gated: LiveGates,
+    /// Retained for recorded configs; the live ChatGPT backend rejected audio input.
+    /// No MIME entry enables audio on this family.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chatgpt_audio_mime_types: Vec<String>,
 }
 
 impl MediaProfile {
@@ -695,16 +700,11 @@ fn profile_entry(
             request_cap_bytes: 50 * MB,
         },
         P::OpenaiResponsesChatgpt => {
-            let audio = if gates.chatgpt_input_audio {
-                KindProfile::new(Native, Native, None, None)
-            } else {
-                KindProfile::MARKER
-            };
             ProfileEntry {
                 image: KindProfile::new(Native, Native, None, Some(1_500)),
                 // The Codex client never sends `input_file`, so documents are not evidenced.
                 document: KindProfile::MARKER,
-                audio,
+                audio: KindProfile::MARKER,
                 video: KindProfile::MARKER,
                 dimension_limits: &[],
                 request_cap_bytes: 50 * MB,
@@ -818,6 +818,7 @@ fn build_profile(
         context_tokens: window,
         aging: AgingThresholds::derived(entry.request_cap_bytes, window),
         live_gated: gates,
+        chatgpt_audio_mime_types: Vec::new(),
     }
 }
 
@@ -1033,10 +1034,10 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_input_audio_defaults_to_unset() {
+    fn chatgpt_input_audio_stays_disabled_after_live_refusal() {
         assert!(
             !live_gates(MediaProfileId::OpenaiResponsesChatgpt).chatgpt_input_audio,
-            "the ChatGPT input_audio flag is set only after a live check passes"
+            "the ChatGPT backend rejected audio input"
         );
         let profile = select(WireFamilyId::OpenAiResponsesChatgpt, None, "gpt-5.5");
         assert_eq!(profile.audio.user_message, MediaCarrier::Marker);
@@ -1053,8 +1054,8 @@ mod tests {
             InputModalities::default(),
             None,
         );
-        assert_eq!(checked.audio.user_message, MediaCarrier::Native);
-        assert_eq!(checked.audio.tool_result, MediaCarrier::Native);
+        assert_eq!(checked.audio.user_message, MediaCarrier::Marker);
+        assert_eq!(checked.audio.tool_result, MediaCarrier::Marker);
         assert!(checked.live_gated.chatgpt_input_audio);
     }
 
