@@ -2232,6 +2232,11 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // project_root. Asserted below: its four counters exist, nothing here binds under a
         // stamp, and no session ever overflows the per-process dedupe set.
         "scoped_session_workdirs",
+        // Provider-held calls: whether the late-results intake still needs its verified rebuild,
+        // what that rebuild has scanned, and tool.withdraw outcomes. Asserted below: a root that
+        // never held a call needs no rebuild, scans nothing, and has no failed or pending
+        // withdrawal.
+        "provider_held",
         // This process's WAL fsyncs by cause. Asserted below: its four counters exist, and a
         // writer that lost its channel without a shutdown (`disconnect`) never happens here.
         "wal_fsyncs",
@@ -2299,6 +2304,21 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
             "sessions_same": 0,
             "sessions_untracked": 0,
             "sessions_without_workdir": 0,
+        })
+    );
+    // `rebuild_required: true` would mean late results may be missing from the intake, and a
+    // failed withdrawal is a held call whose provider was never told it was cancelled. Both
+    // degrade health; neither can happen on a root that never held a call.
+    assert_eq!(
+        metrics["provider_held"],
+        serde_json::json!({
+            "rebuild_required": false,
+            "fence": null,
+            "scanned": 0,
+            "decoded": 0,
+            "registered": 0,
+            "unreadable": 0,
+            "withdrawals": {"failed": 0, "pending": 0},
         })
     );
     assert_eq!(metrics["active_sessions"], serde_json::json!(1));
