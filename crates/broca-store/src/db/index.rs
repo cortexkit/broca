@@ -720,7 +720,9 @@ mod tests {
             (
                 "later_episode_terminal",
                 vec![start, step, text_step, next, terminal],
-                vec![],
+                // The earlier text step is still unqualified. Only the next episode's
+                // zero-step start can be used by the offset reader.
+                vec![4],
             ),
         ]
     }
@@ -889,9 +891,13 @@ mod tests {
                 .map(|(_, _, frame)| frame)
                 .collect();
             assert_eq!(
-                expected.last().copied(),
+                if name == "later_episode_terminal" {
+                    None
+                } else {
+                    expected.last().copied()
+                },
                 broca_core::latest_projection_boundary(&frames, 0),
-                "{name}"
+                "legacy projection eligibility for {name}"
             );
             let rebuilt = database();
             rebuilt

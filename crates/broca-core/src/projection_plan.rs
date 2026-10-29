@@ -693,6 +693,14 @@ impl ProjectionBoundaryState {
     }
 
     pub fn observe(&mut self, frame: &FramedRecord) -> Vec<ProjectionBoundaryFact> {
+        self.observe_inner(frame, false)
+    }
+
+    fn observe_inner(
+        &mut self,
+        frame: &FramedRecord,
+        ordinary_zero_step: bool,
+    ) -> Vec<ProjectionBoundaryFact> {
         if matches!(
             frame.record,
             WalRecord::WriterOpened { .. }
@@ -710,7 +718,9 @@ impl ProjectionBoundaryState {
                 self.batch_id = None;
                 self.pending_no_tool_steps.clear();
                 self.pending_zero_step_seed = None;
-                if matches!(origin, broca_wal::RunOrigin::SeededFrom { .. }) {
+                // The offset index needs a historical cut after an ordinary episode that
+                // closed without a step. Legacy materialization keeps its existing cuts.
+                if ordinary_zero_step || matches!(origin, broca_wal::RunOrigin::SeededFrom { .. }) {
                     let candidate = self.candidate(frame.seq, ProjectionBoundaryKind::ZeroStepSeed);
                     self.pending_zero_step_seed = Some(candidate.clone());
                     facts.push(candidate);
@@ -1224,7 +1234,7 @@ impl OffsetSeed {
         if let Some(ep) = &mut self.episode {
             ep.end_ord = head;
         }
-        delta.boundaries = self.boundary_state.observe(frame);
+        delta.boundaries = self.boundary_state.observe_inner(frame, true);
         Ok(delta)
     }
 }
