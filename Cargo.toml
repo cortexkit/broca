@@ -91,7 +91,7 @@ cortexkit-role-llm-runner-conformance = "=0.15.25"
 jsonschema = { version = "=0.58.6", default-features = false }
 cortexkit-role-agent-data = "=0.2.2"
 cortexkit-role-step-transform-provider = "=0.3.3"
-cortexkit-role-compaction-provider = "=0.7.8"
+cortexkit-role-compaction-provider = "=0.7.9"
 # System One: the one-pass decision-model role and the batch rules it shares with extraction.
 cortexkit-role-classifier = "=0.5.0"
 cortexkit-role-classifier-conformance = "=0.6.0"
