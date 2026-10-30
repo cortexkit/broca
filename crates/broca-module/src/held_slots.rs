@@ -2,7 +2,8 @@
 //!
 //! A held call's tool already ran (or is running inside its provider). Its answer arrives later
 //! as a `late_results` entry, and that entry IS the call's result: broca never sends the call to
-//! the provider again. The run's own batch stays the only writer of the call's terminal:
+//! the provider again. The session's batch owns the call's terminal, including recovery when
+//! continuation admission is refused:
 //!
 //! 1. The puller maps the entry to the call's tool result and deposits it here, under the
 //!    session and the call it answers.
@@ -12,6 +13,8 @@
 //! 3. The batch writes the result as the call's `ToolResult`, at the position a synchronous
 //!    reply would have taken, and syncs it. Only then is the deposit answered as delivered, so
 //!    only then may the provider's entry be acknowledged.
+//!    If continuation is refused, the idle actor records the deposited answer and seals the
+//!    batch instead; model admission is not a prerequisite for retaining the provider's result.
 //!
 //! A deposit nobody takes in time is answered as not delivered and stays in place. The entry
 //! is not acknowledged, so the next pull hands it over again, and a later resume still finds
@@ -153,6 +156,13 @@ impl Drop for WaitGuard<'_> {
 
 #[async_trait]
 impl ProviderHeldLifecycle for HeldSlots {
+    fn deposited_result(&self, ctx: &BatchCtx, reply: &ProviderHeldReply) -> Option<ToolResult> {
+        self.take_ready(
+            &(ctx.bind.clone(), reply.tool_call_id.clone()),
+            &reply.call_key,
+        )
+    }
+
     async fn withdraw_held(&self, call: &ProviderHeldReply) -> Result<(), String> {
         match self.withdrawals.get() {
             Some(withdrawals) => withdrawals.withdraw(call).await,
