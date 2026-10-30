@@ -50,3 +50,4 @@ mod durable_read;
 mod keep_warm;
 pub mod move_files;
 pub mod move_install;
+mod source_warm;

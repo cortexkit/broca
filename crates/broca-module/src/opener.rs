@@ -504,7 +504,11 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
         // 2. Build the control-stream fan-out FIRST — it produces the record observer the
         //    session writer publishes to (so the writer's appended records feed the
         //    projector → control ring).
-        let (fanout, observer) = crate::fanout::Fanout::new(self.wal_store.clone(), key.clone());
+        let (fanout, observer) = crate::fanout::Fanout::with_source_warm(
+            self.wal_store.clone(),
+            key.clone(),
+            self.executor.source_warm_enabled(),
+        );
 
         // 3. Open + recover + prove the SESSION WAL away from the async runtime, then spawn its
         //    writer with the fan-out observer. The lease moves through that blocking operation so
