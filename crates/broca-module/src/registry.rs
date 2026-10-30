@@ -1179,6 +1179,8 @@ impl LineageRegistry {
                     "cached_routes_per_provider": {}, "oldest_route_idle_secs": null,
                     "routes_for_closed_sessions": 0, "goodbye_failures_since_boot": 0,
                     "pending_goodbyes": 0,
+                    "goodbye_retry_overflows_since_boot": 0,
+                    "goodbye_giveups_since_boot": 0,
                 })
             },
             |health| health(&open),

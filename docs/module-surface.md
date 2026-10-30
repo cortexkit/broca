@@ -308,11 +308,19 @@ message and field; it does not invent a `preset_missing` difference for a nonexi
 `health.check.metrics.tool_routes` is an in-memory census of the shared tool-provider route
 cache. It reports `open_session_actors`, `cached_routes`, `cached_routes_per_provider`,
 `oldest_route_idle_secs` (null for an empty cache), `routes_for_closed_sessions` (normally zero),
-`goodbye_failures_since_boot` and `pending_goodbyes`. Idle age is time since a route was last
+`goodbye_failures_since_boot`, `pending_goodbyes`, `goodbye_retry_overflows_since_boot` and
+`goodbye_giveups_since_boot`. Idle age is time since a route was last
 acquired for a batch or warm bind, not time since the last provider frame. Close failures count
 failed or timed-out enqueue attempts, including retries; a successful enqueue is not a remote
 acknowledgement. Failed closes retry independently of tool calls, even after the actor's bounded
-close waiter ends. No session names, project paths, prompts or tool arguments appear in this
+close waiter ends. Session teardown and congested late/abandoned opens share one cleanup queue
+per consumer connection. It holds at most 1,024 route identities; overflow is counted and warned.
+Entries expire after 30 seconds with one give-up WARN and an increment to
+`goodbye_giveups_since_boot`. Retry passes run in parallel with one shared five-second budget,
+with a one-second pause between passes. Connection loss clears affected entries synchronously;
+cleanup tasks do not retain the connection owner. A give-up is not a remote acknowledgement:
+it stops local retries, and the daemon may retain that channel until the connection ends.
+No session names, project paths, prompts or tool arguments appear in this
 block. `open_actor_reasons` counts non-exclusive hold reasons observed at each actor-loop turn:
 active runs, held calls (or unknown held state), live subscribers, manual/source warming, pending
 work/cancellation, withdrawals and startup recovery. Actors with no observed hold are counted

@@ -298,6 +298,9 @@ pub struct RouteHandle {
 }
 
 impl RouteHandle {
+    pub(crate) fn generation(&self) -> u64 {
+        self.conn.0
+    }
     fn new(channel: u16, epoch: u32, conn: ConnToken) -> Self {
         Self {
             channel,
@@ -605,6 +608,7 @@ type WriteConfirmations = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Instant,
 type ClosingRoutes = Mutex<HashMap<(u16, u32), Arc<tokio::sync::Mutex<()>>>>;
 
 struct ConnectionRuntime {
+    close_observer: Mutex<Weak<crate::route_close::RouteCloser>>,
     capabilities: tokio::sync::OnceCell<Vec<String>>,
     write_tx: mpsc::Sender<Frame>,
     pending: PendingMap,
@@ -616,6 +620,120 @@ struct ConnectionRuntime {
     write_confirmations: WriteConfirmations,
     conn: ConnToken,
     shutdown: CancellationToken,
+}
+
+type PreparedGoodbye = (Arc<ConnectionRuntime>, Arc<tokio::sync::Mutex<()>>, Frame);
+
+struct ConnectionCloseTarget(Weak<ConnectionShared>);
+impl crate::route_close::CloseTarget for ConnectionCloseTarget {
+    fn attempt(&self, route: RouteHandle) -> futures::future::BoxFuture<'static, ConnResult<()>> {
+        // Retain only this socket generation while waiting, never the connection owner.
+        let prepared = self
+            .0
+            .upgrade()
+            .ok_or(ConnError::StaleRouteHandle(route))
+            .and_then(|shared| prepare_goodbye(&shared, route));
+        Box::pin(async move { finish_goodbye(prepared?, route).await })
+    }
+    fn abandon(&self, route: RouteHandle) {
+        let Some(shared) = self.0.upgrade() else {
+            return;
+        };
+        let state = shared.current.lock().unwrap();
+        if state.runtime.conn != route.conn {
+            return;
+        }
+        state
+            .runtime
+            .closing_routes
+            .lock()
+            .unwrap()
+            .remove(&(route.channel, route.epoch));
+        if let Ok(frame) = Frame::build(
+            FrameType::Goodbye,
+            data_flags(),
+            route.channel,
+            route.epoch,
+            0,
+            vec![],
+        ) {
+            finish_route(&state.runtime.pending, &state.runtime.route_epochs, &frame);
+        }
+    }
+}
+
+fn route_closer_for(shared: &Arc<ConnectionShared>) -> Arc<crate::route_close::RouteCloser> {
+    let closer = shared
+        .route_closer
+        .get_or_init(|| {
+            crate::route_close::RouteCloser::new(Arc::new(ConnectionCloseTarget(Arc::downgrade(
+                shared,
+            ))))
+        })
+        .clone();
+    *shared
+        .current
+        .lock()
+        .unwrap()
+        .runtime
+        .close_observer
+        .lock()
+        .unwrap() = Arc::downgrade(&closer);
+    closer
+}
+
+fn prepare_goodbye(shared: &ConnectionShared, route: RouteHandle) -> ConnResult<PreparedGoodbye> {
+    let frame = Frame::build(
+        FrameType::Goodbye,
+        data_flags(),
+        route.channel,
+        route.epoch,
+        shared.corr.fetch_add(1, Ordering::Relaxed),
+        vec![],
+    )
+    .map_err(|error| ConnError::Transport(error.to_string()))?;
+    let state = shared.current.lock().unwrap();
+    let runtime = &state.runtime;
+    if !state.active || runtime.conn != route.conn {
+        return Err(ConnError::StaleRouteHandle(route));
+    }
+    let mut closing = runtime.closing_routes.lock().unwrap();
+    let key = (route.channel, route.epoch);
+    if let std::collections::hash_map::Entry::Vacant(entry) = closing.entry(key) {
+        if runtime.route_epochs.lock().unwrap().get(&route.channel) != Some(&route.epoch) {
+            return Err(ConnError::StaleRouteHandle(route));
+        }
+        entry.insert(Arc::new(tokio::sync::Mutex::new(())));
+        finish_route(&runtime.pending, &runtime.route_epochs, &frame);
+    }
+    Ok((Arc::clone(runtime), Arc::clone(&closing[&key]), frame))
+}
+
+async fn finish_goodbye(
+    (runtime, serial, frame): PreparedGoodbye,
+    route: RouteHandle,
+) -> ConnResult<()> {
+    let _serial = tokio::select! { biased;
+        _ = runtime.shutdown.cancelled() => return Err(ConnError::StaleRouteHandle(route)),
+        serial = serial.lock() => serial,
+    };
+    let key = (route.channel, route.epoch);
+    if !runtime.closing_routes.lock().unwrap().contains_key(&key) {
+        return Ok(());
+    }
+    #[cfg(feature = "test-route-close")]
+    if runtime.fail_next_goodbye.swap(false, Ordering::Relaxed) {
+        return Err(ConnError::Transport(
+            "injected Goodbye enqueue failure".into(),
+        ));
+    }
+    let permit = tokio::select! { biased;
+        _ = runtime.shutdown.cancelled() => return Err(ConnError::StaleRouteHandle(route)),
+        permit = runtime.write_tx.reserve() => permit.map_err(|_| ConnError::Transport("writer task closed".into()))?,
+    };
+    permit.send(frame);
+    runtime.closing_routes.lock().unwrap().remove(&key);
+    Ok(())
 }
 
 struct GenerationState {
@@ -643,6 +761,7 @@ impl GenerationState {
 }
 
 struct ConnectionShared {
+    route_closer: std::sync::OnceLock<Arc<crate::route_close::RouteCloser>>,
     connection_file_path: PathBuf,
     current: Mutex<GenerationState>,
     corr: AtomicU64,
@@ -664,6 +783,9 @@ impl Drop for ConnectionShared {
         if let Ok(state) = self.current.get_mut() {
             let _ = deactivate_locked(state);
         }
+        if let Some(closer) = self.route_closer.get() {
+            closer.stop();
+        }
     }
 }
 
@@ -677,6 +799,25 @@ pub struct SubcConnection {
 }
 
 impl SubcConnection {
+    #[cfg(test)]
+    pub(crate) fn install_route_for_test(&self, route: RouteHandle) {
+        self.shared
+            .current
+            .lock()
+            .unwrap()
+            .runtime
+            .route_epochs
+            .lock()
+            .unwrap()
+            .insert(route.channel, route.epoch);
+    }
+    #[cfg(test)]
+    pub(crate) fn deactivate_for_test(&self) {
+        deactivate_locked(&mut self.shared.current.lock().unwrap());
+    }
+    pub(crate) fn route_closer(&self) -> Arc<crate::route_close::RouteCloser> {
+        route_closer_for(&self.shared)
+    }
     /// Read the connection file, connect, and authenticate as a CLIENT (no HELLO).
     ///
     /// Route opens present the consumer identity the daemon gave this process when it spawned
@@ -753,6 +894,7 @@ impl SubcConnection {
         let (runtime, write_rx) = new_runtime();
         let (reconnect_tx, reconnect_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(ConnectionShared {
+            route_closer: std::sync::OnceLock::new(),
             connection_file_path: connection_file_path.to_path_buf(),
             current: Mutex::new(GenerationState::new(Arc::clone(&runtime))),
             corr: AtomicU64::new(1),
@@ -1771,54 +1913,11 @@ impl SubcConnection {
         })
     }
 
-    /// Close a route channel: send a `Goodbye` frame on it so the daemon FREES the channel
-    /// (subc's router releases the route on a client GOODBYE). Used when a session's routes
-    /// are no longer needed (the session ended) so a long-lived SHARED consumer connection
-    /// doesn't accumulate stale channels across sessions. Failed enqueues keep the closing epoch
-    /// for a later close attempt, but calls cannot use it once teardown starts.
+    /// Invalidate a route before waiting for Goodbye capacity. Failed enqueues retain a
+    /// non-dispatchable closing identity, so only the Goodbye can be retried.
     pub async fn route_close(&self, route: &RouteHandle) -> ConnResult<()> {
-        let corr = self.next_corr();
-        let frame = Frame::build(
-            FrameType::Goodbye,
-            data_flags(),
-            route.channel,
-            route.epoch,
-            corr,
-            Vec::new(),
-        )
-        .map_err(|e| ConnError::Transport(e.to_string()))?;
-        let (runtime, serial) = {
-            let state = self.shared.current.lock().unwrap();
-            let runtime = &state.runtime;
-            if !state.active || runtime.conn != route.conn {
-                return Err(ConnError::StaleRouteHandle(*route));
-            }
-            let mut closing = runtime.closing_routes.lock().unwrap();
-            let key = (route.channel, route.epoch);
-            if let std::collections::hash_map::Entry::Vacant(entry) = closing.entry(key) {
-                if runtime.route_epochs.lock().unwrap().get(&route.channel) != Some(&route.epoch) {
-                    return Err(ConnError::StaleRouteHandle(*route));
-                }
-                entry.insert(Arc::new(tokio::sync::Mutex::new(())));
-                // Wake pending callers and prevent new registrations before waiting for egress.
-                finish_route(&runtime.pending, &runtime.route_epochs, &frame);
-            }
-            (Arc::clone(runtime), Arc::clone(&closing[&key]))
-        };
-        let _serial = serial.lock().await;
-        let key = (route.channel, route.epoch);
-        if !runtime.closing_routes.lock().unwrap().contains_key(&key) {
-            return Ok(());
-        }
-        #[cfg(feature = "test-route-close")]
-        if runtime.fail_next_goodbye.swap(false, Ordering::Relaxed) {
-            return Err(ConnError::Transport(
-                "injected Goodbye enqueue failure".into(),
-            ));
-        }
-        self.send(&runtime, frame).await?;
-        runtime.closing_routes.lock().unwrap().remove(&key);
-        Ok(())
+        let prepared = prepare_goodbye(&self.shared, *route)?;
+        finish_goodbye(prepared, *route).await
     }
 
     #[cfg(feature = "test-route-close")]
@@ -2393,6 +2492,7 @@ fn new_runtime() -> (Arc<ConnectionRuntime>, mpsc::Receiver<Frame>) {
     let (write_tx, write_rx) = mpsc::channel(256);
     (
         Arc::new(ConnectionRuntime {
+            close_observer: Mutex::new(Weak::new()),
             closing_routes: Mutex::new(HashMap::new()),
             #[cfg(feature = "test-route-close")]
             fail_next_goodbye: std::sync::atomic::AtomicBool::new(false),
@@ -2431,6 +2531,8 @@ fn spawn_generation_tasks(
     write_half: OwnedWriteHalf,
     write_rx: mpsc::Receiver<Frame>,
 ) {
+    let closer = route_closer_for(shared);
+    *runtime.close_observer.lock().unwrap() = Arc::downgrade(&closer);
     let generation = ReaderGeneration {
         shared: Arc::downgrade(shared),
         conn: runtime.conn,
@@ -2609,6 +2711,10 @@ fn deactivate_locked(state: &mut GenerationState) -> bool {
     state.deferred_probe_wake = None;
     state.runtime.shutdown.cancel();
     state.runtime.route_epochs.lock().unwrap().clear();
+    state.runtime.closing_routes.lock().unwrap().clear();
+    if let Some(closer) = state.runtime.close_observer.lock().unwrap().upgrade() {
+        closer.connection_lost(state.runtime.conn.0);
+    }
     state.runtime.pending.lock().unwrap().clear();
     for (_, confirmation) in state.runtime.write_confirmations.lock().unwrap().drain() {
         let _ = confirmation.send(Err("connection generation closed".into()));
@@ -2805,6 +2911,21 @@ async fn run_liveness_probe(
     }
 }
 
+fn retry_late_goodbye(generation: Option<&ReaderGeneration>, frame: Frame) {
+    let Some(binding) = generation else {
+        return;
+    };
+    let Some(shared) = binding.shared.upgrade() else {
+        return;
+    };
+    let route = RouteHandle::new(frame.header.channel, frame.header.epoch, binding.conn);
+    // Publish a non-dispatchable closing identity before the reader drops its live epoch.
+    // No await and no egress wait occurs on ingress.
+    if prepare_goodbye(&shared, route).is_ok() {
+        route_closer_for(&shared).enqueue_failed(route);
+    }
+}
+
 async fn reader_task<R>(
     mut read_half: R,
     pending: PendingMap,
@@ -2947,8 +3068,12 @@ async fn reader_task<R>(
                             break;
                         };
                         let late_cleanup = write_tx.try_send(goodbye);
-                        if matches!(late_cleanup, Err(mpsc::error::TrySendError::Closed(_))) {
-                            break;
+                        match late_cleanup {
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                            Err(mpsc::error::TrySendError::Full(frame)) => {
+                                retry_late_goodbye(generation.as_ref(), frame)
+                            }
+                            Ok(()) => {}
                         }
                         let mut routes = route_epochs.lock().unwrap();
                         if routes.get(&route_channel) == Some(&route_epoch) {
@@ -2994,8 +3119,12 @@ async fn reader_task<R>(
                             break;
                         };
                         let abandoned_cleanup = write_tx.try_send(goodbye);
-                        if matches!(abandoned_cleanup, Err(mpsc::error::TrySendError::Closed(_))) {
-                            break;
+                        match abandoned_cleanup {
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                            Err(mpsc::error::TrySendError::Full(frame)) => {
+                                retry_late_goodbye(generation.as_ref(), frame)
+                            }
+                            Ok(()) => {}
                         }
                         let mut routes = route_epochs.lock().unwrap();
                         if routes.get(&route_channel) == Some(&route_epoch) {
@@ -4334,6 +4463,7 @@ impl SubcConnection {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let conn_token = ConnToken(NEXT_CONNECTION_TOKEN.fetch_add(1, Ordering::Relaxed));
         let runtime = Arc::new(ConnectionRuntime {
+            close_observer: Mutex::new(Weak::new()),
             closing_routes: Mutex::new(HashMap::new()),
             #[cfg(feature = "test-route-close")]
             fail_next_goodbye: std::sync::atomic::AtomicBool::new(false),
@@ -4348,6 +4478,7 @@ impl SubcConnection {
         let (reconnect_tx, _reconnect_rx) = mpsc::unbounded_channel();
         let conn = SubcConnection {
             shared: Arc::new(ConnectionShared {
+                route_closer: std::sync::OnceLock::new(),
                 connection_file_path: PathBuf::new(),
                 current: Mutex::new(GenerationState::new(runtime)),
                 corr: AtomicU64::new(1),
@@ -4454,6 +4585,7 @@ impl InProcessModuleEnd {
 
 #[cfg(test)]
 mod tests {
+    include!("connection/route_close_followup_tests.rs");
     #[tokio::test]
     async fn a_registered_call_waiting_for_egress_cannot_use_a_closing_route() {
         for guarded in [false, true] {
@@ -5267,6 +5399,7 @@ mod tests {
         corr: u64,
     ) -> SubcConnection {
         let runtime = Arc::new(ConnectionRuntime {
+            close_observer: Mutex::new(Weak::new()),
             closing_routes: Mutex::new(HashMap::new()),
             #[cfg(feature = "test-route-close")]
             fail_next_goodbye: std::sync::atomic::AtomicBool::new(false),
@@ -5281,6 +5414,7 @@ mod tests {
         let (reconnect_tx, _reconnect_rx) = mpsc::unbounded_channel();
         SubcConnection {
             shared: Arc::new(ConnectionShared {
+                route_closer: std::sync::OnceLock::new(),
                 connection_file_path: PathBuf::new(),
                 current: Mutex::new(GenerationState::new(runtime)),
                 corr: AtomicU64::new(corr),
@@ -5902,6 +6036,7 @@ mod tests {
 
         let (replacement_write_tx, _replacement_write_rx) = mpsc::channel(4);
         let replacement = Arc::new(ConnectionRuntime {
+            close_observer: Mutex::new(Weak::new()),
             closing_routes: Mutex::new(HashMap::new()),
             #[cfg(feature = "test-route-close")]
             fail_next_goodbye: std::sync::atomic::AtomicBool::new(false),
@@ -7020,6 +7155,7 @@ mod tests {
 
         let (new_write_tx, mut new_write_rx) = mpsc::channel(4);
         let replacement = Arc::new(ConnectionRuntime {
+            close_observer: Mutex::new(Weak::new()),
             closing_routes: Mutex::new(HashMap::new()),
             #[cfg(feature = "test-route-close")]
             fail_next_goodbye: std::sync::atomic::AtomicBool::new(false),
@@ -7076,6 +7212,7 @@ mod tests {
 
         let (new_write_tx, mut new_write_rx) = mpsc::channel(4);
         let replacement = Arc::new(ConnectionRuntime {
+            close_observer: Mutex::new(Weak::new()),
             closing_routes: Mutex::new(HashMap::new()),
             #[cfg(feature = "test-route-close")]
             fail_next_goodbye: std::sync::atomic::AtomicBool::new(false),
@@ -7130,6 +7267,7 @@ mod tests {
     async fn unreachable_reconnect_attempts_back_off_instead_of_spinning() {
         let (write_tx, _write_rx) = mpsc::channel(1);
         let runtime = Arc::new(ConnectionRuntime {
+            close_observer: Mutex::new(Weak::new()),
             closing_routes: Mutex::new(HashMap::new()),
             #[cfg(feature = "test-route-close")]
             fail_next_goodbye: std::sync::atomic::AtomicBool::new(false),
@@ -7143,6 +7281,7 @@ mod tests {
         });
         let (reconnect_tx, reconnect_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(ConnectionShared {
+            route_closer: std::sync::OnceLock::new(),
             connection_file_path: broca_test_support::scratch_root().join(format!(
                 "broca-missing-connection-file-{}",
                 std::process::id()
