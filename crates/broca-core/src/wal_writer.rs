@@ -3959,6 +3959,32 @@ impl WalHandle {
         .await
     }
 
+    /// Trace ordinary owned admission without changing its writer-open cause.
+    #[cfg(feature = "test-clock")]
+    pub async fn open_and_spawn_owned_with_fs_for_test<W: WalStore + 'static>(
+        wal_store: Arc<W>,
+        session: BindIdentity,
+        tenure: OwnedWalTenure,
+        observer: Option<RecordObserver>,
+        retention: Option<u64>,
+        session_class: Option<String>,
+        fs: Arc<dyn broca_wal::fs_ops::FsOps>,
+    ) -> Result<WalHandle, WalOpenError> {
+        Self::open_and_spawn_owned_with_cause(
+            wal_store,
+            session,
+            tenure,
+            observer,
+            retention,
+            session_class,
+            OwnedWriterStartup {
+                cause: None,
+                fs: Some(fs),
+            },
+        )
+        .await
+    }
+
     /// Supersede a stopped writer under the same owned session tenure as ordinary admission.
     pub async fn open_and_spawn_owned_for_reclaim<W: WalStore + 'static>(
         wal_store: Arc<W>,
@@ -4117,7 +4143,13 @@ impl WalHandle {
             };
             #[cfg(feature = "test-clock")]
             {
-                with_writer_fs(startup.fs, spawn)
+                if let Some(fs) = startup.fs {
+                    with_writer_fs(Some(fs.clone()), || {
+                        broca_wal::fs_ops::with_fs_ops(fs, spawn)
+                    })
+                } else {
+                    with_writer_fs(None, spawn)
+                }
             }
             #[cfg(not(feature = "test-clock"))]
             {
@@ -7355,10 +7387,14 @@ mod head_proof_tests {
         handle.shutdown().await.unwrap();
         assert!(sidecar_path(&source).exists());
         let destination = root.0.join("wal-ephemeral/placed.wal");
-        let mut wal = FileWal::open(&source)
-            .unwrap()
-            .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-            .unwrap();
+        let mut wal = FileWal::open_with_recovery(
+            &source,
+            broca_wal::WalConfig::OVERHAUL,
+            store.feature_floor_path(),
+        )
+        .unwrap()
+        .with_wal_config(broca_wal::WalConfig::OVERHAUL)
+        .unwrap();
         assert_eq!(wal.log_path(), Some(source.as_path()));
         wal.relocate_unstarted(&destination).unwrap();
         assert_eq!(wal.log_path(), Some(destination.as_path()));

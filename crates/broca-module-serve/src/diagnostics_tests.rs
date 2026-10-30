@@ -172,6 +172,42 @@ fn wal_recovery_reports_unowned_call_evidence_as_unknown() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn legacy_diagnostics_never_reads_recovery_manifests() {
+    let root = broca_test_support::scratch_root()
+        .join(format!("legacy-diagnostics-io-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("wal")).unwrap();
+    drop(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
+    let path = root.join("wal/log.cut-1.json");
+    std::fs::write(&path, b"malformed sidecar on a legacy root").unwrap();
+    let recording =
+        std::sync::Arc::new(broca_crash_harness::power_loss::RecordingFs::new(&root).unwrap());
+    let trace = std::sync::Arc::new(broca_crash_harness::io_trace::IoTraceFs::new(
+        &root, recording,
+    ));
+    let evidence = broca_wal::fs_ops::with_fs_ops(trace.clone(), || {
+        gather(&root, Ok(100), 0, NOW, broca_wal::WalConfig::LEGACY)
+    })
+    .unwrap();
+    let reply = report(evidence, NOW, DEFAULT_WINDOW_MS);
+    assert!(
+        !reply
+            .findings
+            .iter()
+            .any(|finding| finding.check == "wal_recovery_cut"),
+        "legacy diagnostics must not inspect a recovery manifest"
+    );
+    assert!(
+        trace.attempts().is_empty(),
+        "master diagnostics performs no seam-visible WAL I/O"
+    );
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        b"malformed sidecar on a legacy root"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 type SeedDetails<'a> = (
     Option<&'a str>,
     Option<&'a str>,
@@ -722,7 +758,7 @@ fn diagnostics_unreadable_sources_are_not_silent() {
         Some(&principal()),
         &scope(principal(), ScopeKind::Head, false, true),
         NOW,
-        |since| gather(&root, Ok(0), since, NOW),
+        |since| gather(&root, Ok(0), since, NOW, broca_wal::WalConfig::LEGACY),
     );
     assert_eq!(result.unwrap_err().code, "store_error");
 }
@@ -929,7 +965,14 @@ fn diagnostics_reads_rebuild_marker_without_session_access() {
     std::fs::create_dir_all(&root).unwrap();
     let _store = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
     std::fs::write(root.join("late-results-rebuild-required"), b"").unwrap();
-    let evidence = gather(&root, Ok(0), 0, live::now_ms()).unwrap();
+    let evidence = gather(
+        &root,
+        Ok(0),
+        0,
+        live::now_ms(),
+        broca_wal::WalConfig::LEGACY,
+    )
+    .unwrap();
     let reply = report(evidence, live::now_ms(), DEFAULT_WINDOW_MS);
     assert!(reply
         .findings

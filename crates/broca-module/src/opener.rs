@@ -44,6 +44,8 @@ pub struct DefaultOpener<L: LeaseStore, W: WalStore> {
     /// directory; an opener built from an arbitrary `LeaseStore` cannot prove its root
     /// and therefore accepts none.
     lease_root: Option<PathBuf>,
+    #[cfg(feature = "test-clock")]
+    test_fs: Option<Arc<dyn broca_wal::fs_ops::FsOps>>,
 }
 
 /// [`DefaultOpener::with_lease_domain`] refused a domain that does not acquire in the
@@ -134,6 +136,8 @@ impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
             charge_basis_resolver: None,
             lease_domain: None,
             lease_root: None,
+            #[cfg(feature = "test-clock")]
+            test_fs: None,
         }
     }
 
@@ -154,6 +158,14 @@ impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
         }
         self.lease_domain = Some(domain);
         Ok(self)
+    }
+
+    /// Observe ordinary admission's WAL preflight and owned startup on every
+    /// filesystem thread without changing production authority or lifecycle cause.
+    #[cfg(feature = "test-clock")]
+    pub fn with_fs_for_test(mut self, fs: Arc<dyn broca_wal::fs_ops::FsOps>) -> Self {
+        self.test_fs = Some(fs);
+        self
     }
 
     /// Override the idle-close TTL (tests use a short one to exercise the close races).
@@ -407,102 +419,111 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
         let store = self.materialized_store.clone();
         let wal = self.wal_store.clone();
         let session = key.clone();
+        #[cfg(feature = "test-clock")]
+        let test_fs = self.test_fs.clone();
         // Moving the lease into recovery prevents cancellation from releasing it while
         // deletion or admission validation still touches this address.
         let authority = tokio::task::spawn_blocking(move || {
-            wal.recover_existing(&session)
-                .map_err(|e| OpenError::from_wal_read(e.to_string(), &e))?;
-            if wal.wal_config().is_overhaul() {
-                if let Some(service) = &service {
-                    if let Err(
-                        error @ crate::retention::RetentionReadError::RelocationIncomplete {
-                            ..
-                        },
-                    ) = service.live_path_for_retention(&session)
-                    {
-                        // Retention must not act on an unfinished placement. The
-                        // owned writer open verifies it is unstarted and repairs
-                        // it under this tenure before exposing any session state.
-                        return match &authority {
-                            OpenAuthority::Tenure(_) => Ok(authority),
-                            OpenAuthority::Lease(_) => Err(OpenError::from_retention(error)),
-                        };
-                    }
-                }
-            }
-            if status && service.is_some() {
-                let meta = store
-                    .as_ref()
-                    .map(|store| store.read_admission_snapshot(&session))
-                    .transpose()
-                    .map_err(OpenError::Open)?
-                    .flatten();
-                // A live file's first RunStarted decides whether it is retained; an older
-                // store checkpoint may describe a replaced file. When no WAL is present,
-                // checkpoint.lineage_retention identifies the stored first-run policy and
-                // a deletion tombstone can establish expiry without reading transcript data.
-                let checkpoint_policy = meta
-                    .as_ref()
-                    .and_then(|meta| meta.checkpoint.as_ref())
-                    .and_then(|checkpoint| checkpoint.lineage_retention);
-                let retained = if wal.wal_present(&session) == Some(false) {
-                    matches!(
-                        checkpoint_policy,
-                        Some(broca_core::LineageRetention::Retained { .. })
-                    )
-                } else {
-                    wal.is_retention_lineage(&session)
-                        .map_err(|e| OpenError::from_wal_read(e.to_string(), &e))?
-                };
-                if retained || wal.wal_present(&session) == Some(false) {
+            let work = || {
+                wal.recover_existing(&session)
+                    .map_err(|e| OpenError::from_wal_read(e.to_string(), &e))?;
+                if wal.wal_config().is_overhaul() {
                     if let Some(service) = &service {
-                        if let Some(expired_at_ms) = service
-                            .expired_typed(&session, None)
-                            .map_err(OpenError::from_retention)?
+                        if let Err(
+                            error @ crate::retention::RetentionReadError::RelocationIncomplete {
+                                ..
+                            },
+                        ) = service.live_path_for_retention(&session)
                         {
-                            return Err(OpenError::Expired { expired_at_ms });
+                            // Retention must not act on an unfinished placement. The
+                            // owned writer open verifies it is unstarted and repairs
+                            // it under this tenure before exposing any session state.
+                            return match &authority {
+                                OpenAuthority::Tenure(_) => Ok(authority),
+                                OpenAuthority::Lease(_) => Err(OpenError::from_retention(error)),
+                            };
                         }
-                    } else if retained {
-                        return Err(OpenError::Open(
-                            "retention status service is not configured".into(),
-                        ));
                     }
                 }
-            } else if let Some(service) = service {
-                service
-                    .delete_expired_typed(&session, service.clock.now_ms())
-                    .map_err(OpenError::from_retention)?;
-            } else if retention.is_some() {
-                return Err(OpenError::Open(
-                    "retention service is not configured".into(),
-                ));
-            }
-            if retention.is_some() {
-                let meta = store
-                    .as_ref()
-                    .map(|store| store.read_admission_snapshot(&session))
-                    .transpose()
-                    .map_err(OpenError::Open)?
-                    .flatten();
-                let exists = wal
-                    .lineage_exists(&session, meta.as_ref())
-                    .map_err(OpenError::relocation_or_open)?;
-                let records = match wal.read_records(&session) {
-                    Ok(records) => records,
-                    // A missing live WAL permits a first run only when lineage_exists also
-                    // rules out a log in an archive and session history kept only in the store.
-                    Err(broca_wal::WalError::Io(error))
-                        if error.kind() == std::io::ErrorKind::NotFound && !exists =>
-                    {
-                        Vec::new()
+                if status && service.is_some() {
+                    let meta = store
+                        .as_ref()
+                        .map(|store| store.read_admission_snapshot(&session))
+                        .transpose()
+                        .map_err(OpenError::Open)?
+                        .flatten();
+                    // A live file's first RunStarted decides whether it is retained; an older
+                    // store checkpoint may describe a replaced file. When no WAL is present,
+                    // checkpoint.lineage_retention identifies the stored first-run policy and
+                    // a deletion tombstone can establish expiry without reading transcript data.
+                    let checkpoint_policy = meta
+                        .as_ref()
+                        .and_then(|meta| meta.checkpoint.as_ref())
+                        .and_then(|checkpoint| checkpoint.lineage_retention);
+                    let retained = if wal.wal_present(&session) == Some(false) {
+                        matches!(
+                            checkpoint_policy,
+                            Some(broca_core::LineageRetention::Retained { .. })
+                        )
+                    } else {
+                        wal.is_retention_lineage(&session)
+                            .map_err(|e| OpenError::from_wal_read(e.to_string(), &e))?
+                    };
+                    if retained || wal.wal_present(&session) == Some(false) {
+                        if let Some(service) = &service {
+                            if let Some(expired_at_ms) = service
+                                .expired_typed(&session, None)
+                                .map_err(OpenError::from_retention)?
+                            {
+                                return Err(OpenError::Expired { expired_at_ms });
+                            }
+                        } else if retained {
+                            return Err(OpenError::Open(
+                                "retention status service is not configured".into(),
+                            ));
+                        }
                     }
-                    Err(error) => return Err(OpenError::relocation_or_open(error)),
-                };
-                let current = crate::retention::policy(&records).map(|(seconds, _, _)| seconds);
-                crate::retention::validate_retention(retention, current, exists)
-                    .map_err(OpenError::RetentionInvalid)?;
+                } else if let Some(service) = service {
+                    service
+                        .delete_expired_typed(&session, service.clock.now_ms())
+                        .map_err(OpenError::from_retention)?;
+                } else if retention.is_some() {
+                    return Err(OpenError::Open(
+                        "retention service is not configured".into(),
+                    ));
+                }
+                if retention.is_some() {
+                    let meta = store
+                        .as_ref()
+                        .map(|store| store.read_admission_snapshot(&session))
+                        .transpose()
+                        .map_err(OpenError::Open)?
+                        .flatten();
+                    let exists = wal
+                        .lineage_exists(&session, meta.as_ref())
+                        .map_err(OpenError::relocation_or_open)?;
+                    let records = match wal.read_records(&session) {
+                        Ok(records) => records,
+                        // A missing live WAL permits a first run only when lineage_exists also
+                        // rules out a log in an archive and session history kept only in the store.
+                        Err(broca_wal::WalError::Io(error))
+                            if error.kind() == std::io::ErrorKind::NotFound && !exists =>
+                        {
+                            Vec::new()
+                        }
+                        Err(error) => return Err(OpenError::relocation_or_open(error)),
+                    };
+                    let current = crate::retention::policy(&records).map(|(seconds, _, _)| seconds);
+                    crate::retention::validate_retention(retention, current, exists)
+                        .map_err(OpenError::RetentionInvalid)?;
+                }
+                Ok(authority)
+            };
+            #[cfg(feature = "test-clock")]
+            if let Some(fs) = test_fs {
+                return broca_wal::fs_ops::with_fs_ops(fs, work);
             }
-            Ok(authority)
+            work()
         })
         .await
         .map_err(|e| OpenError::Open(e.to_string()))??;
@@ -538,6 +559,31 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
                 (writer, Some(lease))
             }
             OpenAuthority::Tenure(tenure) => {
+                #[cfg(feature = "test-clock")]
+                let writer = if let Some(fs) = &self.test_fs {
+                    WalHandle::open_and_spawn_owned_with_fs_for_test(
+                        self.wal_store.clone(),
+                        key.clone(),
+                        tenure,
+                        Some(observer),
+                        retention,
+                        session_class,
+                        fs.clone(),
+                    )
+                    .await
+                } else {
+                    WalHandle::open_and_spawn_owned_with_class(
+                        self.wal_store.clone(),
+                        key.clone(),
+                        tenure,
+                        Some(observer),
+                        retention,
+                        session_class,
+                    )
+                    .await
+                }
+                .map_err(map_open_error)?;
+                #[cfg(not(feature = "test-clock"))]
                 let writer = WalHandle::open_and_spawn_owned_with_class(
                     self.wal_store.clone(),
                     key.clone(),
@@ -980,6 +1026,63 @@ mod tests {
                 .expect("the refused open released its tenure"),
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(feature = "test-clock", unix))]
+    #[tokio::test]
+    async fn legacy_owned_admission_keeps_exact_master_wal_io() {
+        use std::future::Future;
+        let root = broca_test_support::scratch_root()
+            .join(format!("legacy-owned-admission-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("wal")).unwrap();
+        let key = BindIdentity::new("/legacy-project", "runner", "legacy-admission");
+        let wal = Arc::new(broca_core::FileWalStore::with_config(
+            root.join("wal"),
+            broca_wal::WalConfig::LEGACY,
+        ));
+        drop(wal.open(&key).unwrap());
+        let recording = Arc::new(broca_crash_harness::power_loss::RecordingFs::new(&root).unwrap());
+        let fs = Arc::new(broca_crash_harness::io_trace::IoTraceFs::new(
+            &root, recording,
+        ));
+        let opener = Arc::new(
+            DefaultOpener::with_file_leases(root.join("leases"), wal, Arc::new(NeverExecutor))
+                .with_lease_domain(WalLeaseDomain::new(root.join("leases")))
+                .unwrap()
+                .with_fs_for_test(fs.clone())
+                .with_idle_ttl(Duration::from_secs(3600)),
+        );
+        let registry = LineageRegistry::new(opener);
+        let mut opening = Box::pin(registry.actor_for(&key));
+        let actor = std::future::poll_fn(|cx| {
+            broca_wal::fs_ops::with_fs_ops(fs.clone(), || opening.as_mut().poll(cx))
+        })
+        .await
+        .unwrap();
+        drop(opening);
+        let attempts = fs.attempts();
+        println!("master production-owned admission: {attempts:?}");
+        drop(actor);
+        let guard = registry
+            .lock_move_sessions_with_mode(
+                std::slice::from_ref(&key),
+                false,
+                crate::registry::CutLockMode::Mutate,
+            )
+            .await
+            .unwrap();
+        drop(guard);
+        wait_for_actor_close(&registry, &key).await;
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/legacy-owned-admission-master-io.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(attempts).unwrap(),
+            expected["attempts"],
+            "production legacy owned admission must retain independent master I/O"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

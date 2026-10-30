@@ -11,11 +11,11 @@ use subc_protocol::ErrorBody;
 
 pub use broca_wire::diagnostics::OP;
 pub const REPLY_LIMIT: usize = 65_536;
-static ROOT: OnceLock<PathBuf> = OnceLock::new();
+static ROOT: OnceLock<(PathBuf, broca_wal::WalConfig)> = OnceLock::new();
 
-pub fn install(root: PathBuf) {
+pub fn install(root: PathBuf, config: broca_wal::WalConfig) {
     live::initialize();
-    let _ = ROOT.set(root);
+    let _ = ROOT.set((root, config));
 }
 
 pub fn admit(principal: Option<&BindPrincipal>, scope: &SendScope) -> Result<(), ErrorBody> {
@@ -55,6 +55,7 @@ pub fn gather(
     catalog_age_ms: Result<i64, String>,
     since: i64,
     now: i64,
+    config: broca_wal::WalConfig,
 ) -> Result<Evidence, ErrorBody> {
     let store =
         broca_store::SqliteStore::open_read_only(root.join("run-index.db")).map_err(|_| {
@@ -86,7 +87,11 @@ pub fn gather(
         }
     };
     Ok(Evidence {
-        recovery_cuts: recovery_cut_findings(root, now),
+        recovery_cuts: if config.is_overhaul() {
+            recovery_cut_findings(root, now)
+        } else {
+            Vec::new()
+        },
         runs,
         late_fence_ms,
         catalog_age_ms,
@@ -134,13 +139,13 @@ pub fn serving_reply(
     now: i64,
 ) -> Result<Reply, ErrorBody> {
     answer(params, principal, scope, now, |since| {
-        let root = ROOT.get().ok_or_else(|| {
+        let (root, config) = ROOT.get().ok_or_else(|| {
             ErrorBody::new(
                 "store_error",
                 "diagnostics.findings run-index source is not configured",
             )
         })?;
-        gather(root, catalog_age, since, now)
+        gather(root, catalog_age, since, now, *config)
     })
 }
 
@@ -178,11 +183,13 @@ fn unavailable(check: &str, now: i64) -> Finding {
 /// traversal and file size; raw removed content never enters diagnostics.
 pub fn recovery_cut_findings(root: &Path, now: i64) -> Vec<Finding> {
     use std::io::Read;
-    let mut directories = vec![root.join("wal")];
+    let mut directories = ["wal", "wal-ephemeral", "wal-durable"]
+        .map(|name| root.join(name))
+        .to_vec();
     let mut findings = Vec::new();
     let mut scanned = 0;
     while let Some(directory) = directories.pop() {
-        let entries = match std::fs::read_dir(&directory) {
+        let entries = match broca_wal::fs_ops::read_dir(&directory) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => {
@@ -223,7 +230,7 @@ pub fn recovery_cut_findings(root: &Path, now: i64) -> Vec<Finding> {
             }
             let manifest = (|| {
                 let mut bytes = Vec::new();
-                std::fs::File::open(entry.path())
+                broca_wal::fs_ops::File::open(entry.path())
                     .ok()?
                     .take(1_048_577)
                     .read_to_end(&mut bytes)

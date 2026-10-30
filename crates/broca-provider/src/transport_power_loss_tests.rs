@@ -172,7 +172,7 @@ async fn capture_fixture() -> Arc<Fixture> {
         )
         .unwrap();
         let previous_writer_id = {
-            let mut wal = FileWal::open(phase_root.join(&log))
+            let mut wal = FileWal::open_with_recovery(phase_root.join(&log), broca_wal::WalConfig::OVERHAUL, phase_root.join(broca_wal::FEATURE_FLOOR_FILENAME))
                 .unwrap()
                 .with_feature_floor(phase_root.join(broca_wal::FEATURE_FLOOR_FILENAME))
                 .with_wal_config(broca_wal::WalConfig::OVERHAUL)
@@ -196,7 +196,7 @@ async fn capture_fixture() -> Arc<Fixture> {
         };
         let recording = Arc::new(RecordingFs::new(&phase_root).unwrap());
         broca_wal::fs_ops::with_fs_ops(recording.clone(), || {
-            let mut wal = FileWal::open(phase_root.join(&log))
+            let mut wal = FileWal::open_with_recovery(phase_root.join(&log), broca_wal::WalConfig::OVERHAUL, phase_root.join(broca_wal::FEATURE_FLOOR_FILENAME))
                 .unwrap()
                 .with_feature_floor(phase_root.join(broca_wal::FEATURE_FLOOR_FILENAME))
                 .with_wal_config(broca_wal::WalConfig::OVERHAUL)
@@ -400,7 +400,7 @@ async fn run_shard(shard: usize) {
         input.state.install(&first_root).unwrap();
         let recording = Arc::new(RecordingFs::new(&first_root).unwrap());
         let retained = broca_wal::fs_ops::with_fs_ops(recording.clone(), || {
-            let wal = FileWal::open(first_root.join(&log)).unwrap_or_else(|error| {
+            let wal = FileWal::open_with_recovery(first_root.join(&log), broca_wal::WalConfig::OVERHAUL, first_root.join(broca_wal::FEATURE_FLOOR_FILENAME)).unwrap_or_else(|error| {
                 panic!(
                     "phase={} input={index} operation={} family={:?}: {error:?}",
                     input.phase, input.cut, input.family

@@ -281,11 +281,15 @@ mod tests {
             broca_test_support::scratch_root().join(format!("proof-age-{}", std::process::id()));
         fs_ops::create_dir_all(&root).unwrap();
         let path = root.join("log.wal");
-        let mut wal = FileWal::open(&path)
-            .unwrap()
-            .with_feature_floor(root.join(crate::FEATURE_FLOOR_FILENAME))
-            .with_wal_config(WalConfig::OVERHAUL)
-            .unwrap();
+        let mut wal = FileWal::open_with_recovery(
+            &path,
+            WalConfig::OVERHAUL,
+            root.join(crate::FEATURE_FLOOR_FILENAME),
+        )
+        .unwrap()
+        .with_feature_floor(root.join(crate::FEATURE_FLOOR_FILENAME))
+        .with_wal_config(WalConfig::OVERHAUL)
+        .unwrap();
         let record = WalRecord::VisibilityLate {
             through_seq: 0,
             oldest_appended_ms: 1,
@@ -336,12 +340,16 @@ mod tests {
         fs_ops::create_dir_all(&root).unwrap();
         let path = root.join("log.wal");
         fs_ops::File::create(&path).unwrap();
-        let mut wal = FileWal::open(&path)
-            .unwrap()
-            .with_feature_floor(root.join(crate::FEATURE_FLOOR_FILENAME))
-            .with_wal_config(WalConfig::OVERHAUL)
-            .unwrap()
-            .with_append_budget(1_000_000);
+        let mut wal = FileWal::open_with_recovery(
+            &path,
+            WalConfig::OVERHAUL,
+            root.join(crate::FEATURE_FLOOR_FILENAME),
+        )
+        .unwrap()
+        .with_feature_floor(root.join(crate::FEATURE_FLOOR_FILENAME))
+        .with_wal_config(WalConfig::OVERHAUL)
+        .unwrap()
+        .with_append_budget(1_000_000);
         assert!(wal.lineage_id().is_none());
         let metadata = crate::framing::LINEAGE_FRAME_LEN as u64;
         assert_eq!(wal.append_budget().unwrap().1, 0);

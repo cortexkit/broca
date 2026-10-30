@@ -32,7 +32,7 @@ impl Scratch {
 
     /// An overhaul log at [`Self::log`] with the floor beside its state root.
     fn overhaul(&self) -> FileWal {
-        FileWal::open(self.log())
+        FileWal::open_with_recovery(self.log(), WalConfig::OVERHAUL, self.floor())
             .unwrap()
             .with_feature_floor(self.floor())
             .with_wal_config(WalConfig::OVERHAUL)
@@ -339,7 +339,7 @@ fn overhaul_repair_preserves_undecodable_payload_but_never_downgrades_unknown_fe
 fn an_overhaul_append_writes_nothing_when_the_floor_cannot_list_frame_stamps() {
     // No floor configured: refused by name, nothing written.
     let scratch = Scratch::new("no-floor");
-    let mut wal = FileWal::open(scratch.log())
+    let mut wal = FileWal::open_with_recovery(scratch.log(), WalConfig::OVERHAUL, scratch.floor())
         .unwrap()
         .with_wal_config(WalConfig::OVERHAUL)
         .unwrap();

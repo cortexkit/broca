@@ -42,11 +42,15 @@ impl Drop for Scratch {
 }
 
 fn open(root: &Path) -> FileWal {
-    FileWal::open(root.join("wal/log"))
-        .unwrap()
-        .with_feature_floor(root.join(broca_wal::FEATURE_FLOOR_FILENAME))
-        .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-        .unwrap()
+    FileWal::open_with_recovery(
+        root.join("wal/log"),
+        broca_wal::WalConfig::OVERHAUL,
+        root.join(broca_wal::FEATURE_FLOOR_FILENAME),
+    )
+    .unwrap()
+    .with_feature_floor(root.join(broca_wal::FEATURE_FLOOR_FILENAME))
+    .with_wal_config(broca_wal::WalConfig::OVERHAUL)
+    .unwrap()
 }
 
 fn record_lifecycle(close: bool) -> (Scratch, Arc<RecordingFs>, [u8; 16]) {

@@ -7870,11 +7870,15 @@ mod tests {
         let floor = phase.join(broca_wal::FEATURE_FLOOR_FILENAME);
         broca_wal::floor::raise_floor(&floor, broca_wal::framing::KNOWN_FEATURES).unwrap();
         {
-            let mut wal = FileWal::open(phase.join(&log))
-                .unwrap()
-                .with_feature_floor(floor.clone())
-                .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-                .unwrap();
+            let mut wal = FileWal::open_with_recovery(
+                phase.join(&log),
+                broca_wal::WalConfig::OVERHAUL,
+                floor.clone(),
+            )
+            .unwrap()
+            .with_feature_floor(floor.clone())
+            .with_wal_config(broca_wal::WalConfig::OVERHAUL)
+            .unwrap();
             let opened = WalRecord::WriterOpened {
                 writer_id: wal.writer_id().unwrap(),
                 previous_writer_id: None,
@@ -7892,11 +7896,15 @@ mod tests {
         }
         let recording = Arc::new(RecordingFs::new(&phase).unwrap());
         broca_wal::fs_ops::with_fs_ops(recording.clone(), || {
-            let mut wal = FileWal::open(phase.join(&log))
-                .unwrap()
-                .with_feature_floor(floor)
-                .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-                .unwrap();
+            let mut wal = FileWal::open_with_recovery(
+                phase.join(&log),
+                broca_wal::WalConfig::OVERHAUL,
+                floor.clone(),
+            )
+            .unwrap()
+            .with_feature_floor(floor)
+            .with_wal_config(broca_wal::WalConfig::OVERHAUL)
+            .unwrap();
             wal.append_v4(
                 1,
                 &reservation,

@@ -1256,6 +1256,20 @@ mod tests {
     fn legacy_store_starts_no_reclaimer() {
         let root = Root::new();
         let store = Arc::new(FileWalStore::new(root.path.join("wal")));
+        #[cfg(unix)]
+        {
+            let recording =
+                Arc::new(broca_crash_harness::power_loss::RecordingFs::new(&root.path).unwrap());
+            let trace = Arc::new(broca_crash_harness::io_trace::IoTraceFs::new(
+                &root.path, recording,
+            ));
+            broca_wal::fs_ops::with_fs_ops(trace.clone(), || assert!(spawn(store).is_none()));
+            assert!(
+                trace.attempts().is_empty(),
+                "legacy reclaim must retain master's no-I/O early return"
+            );
+        }
+        #[cfg(not(unix))]
         assert!(spawn(store).is_none());
         assert!(!root.path.join("open-writers").exists());
     }

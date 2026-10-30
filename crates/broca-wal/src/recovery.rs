@@ -680,33 +680,6 @@ fn next_sidecar(log: &Path) -> Result<PathBuf, WalError> {
     }
 }
 
-fn looks_overhaul(log: &Path) -> Result<bool, WalError> {
-    let mut bytes = Vec::new();
-    let file = match File::open(log) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(!manifests(log, crate::file_wal::DEFAULT_MAX_READ_BYTES)?.is_empty());
-        }
-        Err(e) => return Err(WalError::Io(e)),
-    };
-    file.take((framing::LINEAGE_FRAME_LEN + 83 + u16::MAX as usize) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(WalError::Io)?;
-    let start = match framing::decode_next(&bytes) {
-        DecodeStep::Lineage { consumed, .. } => consumed,
-        _ => 0,
-    };
-    if bytes.get(start + 4) == Some(&framing::V4_FRAMING_VERSION)
-        && framing::v4::decode_header(&bytes[start..])
-            .ok()
-            .flatten()
-            .is_some()
-    {
-        return Ok(true);
-    }
-    Ok(read_head(log).is_some())
-}
-
 fn read_head(log: &Path) -> Option<crate::head_proof::HeadProof> {
     let mut bytes = Vec::new();
     File::open(crate::head_proof::sidecar_path(log))
@@ -717,8 +690,8 @@ fn read_head(log: &Path) -> Option<crate::head_proof::HeadProof> {
     crate::head_proof::HeadProof::decode(&bytes)
 }
 
-/// Run before the append handle is opened. Explicit boot format wins; standalone
-/// callers can recognize an existing stamped log without reinterpreting legacy data.
+/// Run before the append handle is opened. Only a supplied boot decision enables
+/// overhaul recovery; unconfigured legacy opens must not probe recovery evidence.
 #[cfg(test)]
 pub(crate) fn before_open(
     log: &Path,
@@ -738,10 +711,7 @@ pub(crate) fn before_open_with_hooks(
     cap: u64,
     hooks: Option<&dyn RecoveryHooks>,
 ) -> Result<(), WalError> {
-    let overhaul = match config {
-        Some(config) => config.is_overhaul(),
-        None => looks_overhaul(log)?,
-    };
+    let overhaul = config.is_some_and(|config| config.is_overhaul());
     if !overhaul {
         return Ok(());
     }

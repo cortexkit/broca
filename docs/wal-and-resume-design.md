@@ -58,6 +58,14 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   recovery behavior are unchanged, including the existing ambiguity between a
   damaged final append and corruption of a synced final frame.
 
+  Recovery is enabled only by the state format decided at boot and supplied to
+  the opener. Unconfigured `FileWal::open` and the low-level
+  `OwnedWriterWal::open` wrapper are legacy-only:
+  they do not inspect `.head` or recovery manifests. Selecting overhaul format
+  after an unconfigured open is a typed boot-configuration error, not a second
+  recovery pass. Diagnostics receives the same boot decision and scans recovery
+  evidence only for overhaul roots.
+
   Repair retains every complete, checksum-valid contiguous record before the
   first damaged or undecodable record. It repairs both unpublished tails and
   damage within a published prefix. The `.head` proof is evidence for the WARN
