@@ -206,8 +206,8 @@ later reasons do not prevent an older broca from reading the WAL after rollback:
 | `new_connection_run_start_receipt_too_large` | This session's completed receipt alone exceeded that budget and was not retained. |
 | `previous_attempt_failed` | The preceding attempt errored, was cancelled/cut, or returned `response.incomplete`, leaving no usable receipt. This does not assert a provider cache eviction. |
 | `connection_limit` | The backend reported `websocket_connection_limit_reached`; applies to its failed socket and the same credential's idle sockets retired by that refusal, not local pool capacity. |
-| `account_or_credential_change` | Credential revision, credential/account reference, authorization, or account header changed on a socket that otherwise could have been considered for reuse. |
-| `no_completed_response` | No usable receipt and no more specific cause known. Endpoint/routing-only changes and unexplained peer closures are not guessed to be authentication failures. |
+| `account_or_credential_change` | Credential revision, credential/account reference, authorization value, or account header value changed on a socket that otherwise could have been considered for reuse. Header-name casing and ordering alone do not prove a credential change. |
+| `no_completed_response` | No usable saved `response.completed` state for continuing this socket, and no more specific cause known. Endpoint/routing-only changes, header-format-only drift and unexplained peer closures are not guessed to be authentication failures. |
 | `model_changed`, `tools_changed`, `tool_choice_changed`, `parallel_tool_calls_changed`, `reasoning_changed`, `store_changed`, `stream_changed`, `include_changed`, `service_tier_changed`, `prompt_cache_key_changed`, `text_changed` | A receipt exists but the named continuation property differs. |
 | `input_shape`, `input_shortened`, `input_mismatch`, `empty_response_id` | A receipt exists but cannot prove a compatible input prefix or usable response ID. |
 

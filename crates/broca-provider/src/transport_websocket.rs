@@ -670,16 +670,21 @@ fn connection_identity_matches(socket: &Socket, request: &PreparedHttpRequest) -
 }
 
 fn credential_identity_changed(socket: &Socket, request: &PreparedHttpRequest) -> bool {
-    fn auth(headers: &[(String, String)]) -> impl Iterator<Item = &(String, String)> {
-        headers.iter().filter(|(name, _)| {
-            name.eq_ignore_ascii_case("authorization")
-                || name.eq_ignore_ascii_case("chatgpt-account-id")
-        })
+    fn auth<'a>(
+        headers: &'a [(String, String)],
+        name: &'static str,
+    ) -> impl Iterator<Item = &'a str> {
+        headers
+            .iter()
+            .filter(move |(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
     }
     socket.auth_revision != request.auth_revision
         || socket.credential_id != request.credential_id
         || socket.account_ref != request.account_ref
-        || !auth(&socket.headers).eq(auth(&request.headers))
+        || ["authorization", "chatgpt-account-id"]
+            .into_iter()
+            .any(|name| !auth(&socket.headers, name).eq(auth(&request.headers, name)))
 }
 
 fn stable_turn_metadata_matches(saved: &str, current: &str) -> bool {
@@ -2413,5 +2418,54 @@ async fn codex_completed_write_is_counted_when_cancelled_before_acknowledgement(
             .unwrap()
             .physical_send_count,
         1
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn credential_identity_ignores_header_name_case_and_order() {
+    let headers: Vec<(String, String)> = vec![
+        ("authorization".into(), "Bearer test-token".into()),
+        ("chatgpt-account-id".into(), "test-account".into()),
+    ];
+    let socket = Socket {
+        auth_revision: 0,
+        credential_id: None,
+        account_ref: None,
+        url: "ws://synthetic.invalid".into(),
+        headers: headers.clone(),
+        continuation: Mutex::new(None),
+        send: mpsc::channel(1).0,
+        recv: tokio::sync::Mutex::new(mpsc::channel(1).1),
+        shutdown: CancellationToken::new(),
+        closed: Arc::new(AtomicBool::new(false)),
+        close_code: Arc::new(AtomicU16::new(0)),
+        frames: Arc::default(),
+        generation: 1,
+        established_at: Instant::now(),
+        last_completed_at: Mutex::new(None),
+        attempt_active: tokio::sync::watch::channel(false).0,
+    };
+    let mut request = PreparedHttpRequest::from(crate::wire::HttpRequest {
+        method: crate::wire::HttpMethod::Post,
+        url: socket.url.clone(),
+        headers,
+        body: Vec::new(),
+    });
+    request.codex_wire = true;
+    request.headers.reverse();
+    request.headers[1].0 = "Authorization".into();
+    assert!(
+        !connection_identity_matches(&socket, &request),
+        "header formatting still fences socket reuse"
+    );
+    assert!(
+        !credential_identity_changed(&socket, &request),
+        "header formatting cannot prove an account or credential change"
+    );
+    request.headers[1].1 = "Bearer changed-token".into();
+    assert!(
+        credential_identity_changed(&socket, &request),
+        "a changed authentication value is attributable"
     );
 }
