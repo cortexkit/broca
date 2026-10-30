@@ -41,7 +41,8 @@ foreach ($file in $manifest.files) {
     if ($length -ne $size) { Refuse $name 'has a size mismatch' }
     if ($actual -ne ([string]$file.sha256).ToLowerInvariant()) { Refuse $name 'has a SHA256 mismatch' }
 }
-foreach ($name in @('manifest.json', 'subconscious-source.bundle', 'claustrum-source.tar')) {
+foreach ($name in @('manifest.json', 'subconscious-source.bundle', 'claustrum-source.tar',
+                    'fixture-cargo-sources.tar.gz', 'fixture-cargo-subconscious.toml', 'fixture-cargo-claustrum.toml')) {
     if (-not $listed.ContainsKey($name)) { Refuse $name 'is missing from the transport manifest' }
 }
 try { $paths = @(Get-ChildItem -LiteralPath $InputsDirectory -Force) }

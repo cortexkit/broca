@@ -4,10 +4,13 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 from pathlib import Path
 import shlex
 import subprocess
 import tarfile
+import tempfile
+import tomllib
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -63,6 +66,8 @@ def checkout(repository, revision, destination, *, full_history=False, remote_ur
     actual = subprocess.check_output(['git', '-C', str(destination), 'rev-parse', 'HEAD'], text=True).strip()
     if actual != revision:
         raise ValueError(f'{repository}: expected {revision}, found {actual}')
+    if subprocess.check_output(['git', '-C', str(destination), 'status', '--porcelain'], text=True).strip():
+        raise ValueError(f'{repository}: refusing dirty pinned source cache: {destination}')
 
 
 def source_archive(source, revision, archive):
@@ -102,6 +107,118 @@ def extract_source(inputs, repository, revision, destination):
     print(f'verified and extracted {repository} source {revision}: {archive.stat().st_size} bytes')
 
 
+def locked_packages(lockfile):
+    return [package for package in tomllib.loads(lockfile.read_text())['package'] if package.get('source')]
+
+
+def verify_vendor_coverage(packages, vendor):
+    available = {}
+    for directory in sorted(vendor.iterdir()):
+        if not directory.is_dir():
+            continue
+        package = tomllib.loads((directory / 'Cargo.toml').read_text())['package']
+        checksum = json.loads((directory / '.cargo-checksum.json').read_text())['package']
+        key = (package['name'], package['version'], checksum)
+        if key in available:
+            raise ValueError(f'ambiguous vendored package: {key}')
+        available[key] = directory.name
+    inventory = []
+    for package in packages:
+        key = (package['name'], package['version'], package.get('checksum'))
+        if key not in available:
+            raise ValueError(f"missing vendored Cargo package: {package['name']} {package['version']} ({package['source']})")
+        inventory.append({'name': package['name'], 'version': package['version'],
+                          'source': package['source'], 'checksum': package.get('checksum'),
+                          'directory': available[key]})
+    return sorted(inventory, key=lambda package: (package['name'], package['version'], package['source']))
+
+
+def prepare_cargo_vendor(output, sources, source_cache):
+    graphs = {}
+    archive = output / 'fixture-cargo-sources.tar.gz'
+    # Separate graphs can patch the same crate/version to different Git revisions.
+    with tempfile.TemporaryDirectory(prefix='cargo-vendor-', dir=source_cache) as temporary:
+        root = Path(temporary)
+        for name, source in sources.items():
+            vendor = root / name
+            config = subprocess.check_output(['cargo', 'vendor', '--locked', '--versioned-dirs',
+                                              '--manifest-path', str(source / 'Cargo.toml'), str(vendor)],
+                                             cwd=ROOT, text=True,
+                                             env=dict(os.environ, CARGO_NET_OFFLINE='false'))
+            lockfile = source / 'Cargo.lock'
+            packages = verify_vendor_coverage(locked_packages(lockfile), vendor)
+            for path in vendor.rglob('*'):
+                if path.is_symlink():
+                    raise ValueError(f'unsupported Cargo vendor source symlink: {path}')
+            directory = tomllib.loads(config)['source']['vendored-sources']['directory']
+            if Path(directory).resolve() != vendor.resolve():
+                raise ValueError(f'{name}: Cargo vendor returned an unexpected source directory')
+            config = config.replace(json.dumps(directory), json.dumps('@BROCA_VENDOR_ROOT@/' + name))
+            config_file = output / f'fixture-cargo-{name}.toml'
+            config_file.write_text(config)
+            graphs[name] = {'config': config_file.name, 'packages': packages,
+                            'lock_sha256': hashlib.sha256(lockfile.read_bytes()).hexdigest()}
+            print(f'{name}: verified full locked Cargo source closure: {len(packages)} packages', flush=True)
+        with tarfile.open(archive, 'w:gz', dereference=True) as package:
+            for name in sources:
+                package.add(root / name, arcname=name)
+    return {'file': archive.name, 'sha256': hashlib.sha256(archive.read_bytes()).hexdigest(), 'graphs': graphs}
+
+
+def extract_cargo_vendor(inputs, destination, locks):
+    entry = json.loads((inputs / 'manifest.json').read_text())['cargo_vendor']
+    archive = inputs / entry['file']
+    if archive.name != entry['file'] or hashlib.sha256(archive.read_bytes()).hexdigest() != entry['sha256']:
+        raise ValueError('offline Cargo source archive checksum/name mismatch')
+    with tarfile.open(archive, 'r:gz') as package:
+        for member in package:
+            relative = Path(member.name)
+            if relative.is_absolute() or '..' in relative.parts or '.git' in relative.parts:
+                raise ValueError(f'unsafe Cargo source archive member: {member.name}')
+            path = destination / relative
+            if path.is_symlink():
+                raise ValueError(f'unsafe cached Cargo source symlink: {path}')
+            if member.isdir():
+                path.mkdir(parents=True, exist_ok=True)
+            elif member.isfile():
+                data = package.extractfile(member)
+                if data is None:
+                    raise ValueError(f'Cargo source archive member has no data: {member.name}')
+                path.parent.mkdir(parents=True, exist_ok=True)
+                content = data.read()
+                # Keep immutable source mtimes warm for Cargo's persistent target cache.
+                if not path.exists() or path.read_bytes() != content:
+                    path.write_bytes(content)
+                path.chmod(0o755 if member.mode & 0o111 else 0o644)
+            else:
+                raise ValueError(f'unsupported Cargo source archive member: {member.name}')
+    configs = destination / '.configs'
+    if configs.is_symlink():
+        raise ValueError('unsafe cached Cargo config directory symlink')
+    configs.mkdir(exist_ok=True)
+    for name, lockfile in locks.items():
+        graph = entry['graphs'][name]
+        if hashlib.sha256(lockfile.read_bytes()).hexdigest() != graph['lock_sha256']:
+            raise ValueError(f'{name}: offline Cargo closure does not match the pinned lockfile')
+        packages = verify_vendor_coverage(locked_packages(lockfile), destination / name)
+        if packages != graph['packages']:
+            raise ValueError(f'{name}: offline Cargo package inventory mismatch')
+        config_file = graph['config']
+        if Path(config_file).name != config_file:
+            raise ValueError(f'{name}: unsafe Cargo source config name')
+        config = (inputs / config_file).read_text()
+        token = json.dumps('@BROCA_VENDOR_ROOT@/' + name)
+        if token not in config:
+            raise ValueError(f'{name}: Cargo source replacement directory is missing')
+        config = config.replace(token, json.dumps((destination / name).as_posix()))
+        path = configs / f'{name}.toml'
+        if path.is_symlink():
+            raise ValueError(f'{name}: unsafe cached Cargo config symlink')
+        if not path.exists() or path.read_text() != config:
+            path.write_text(config)
+        print(f'{name}: verified extracted Cargo closure: {len(packages)} packages', flush=True)
+
+
 def prepare(output, source_cache, cache, *, snapshot_visible=False):
     # A fresh folder cannot accidentally ship stale runtime archives or user data.
     output.mkdir(parents=True)
@@ -135,6 +252,8 @@ def prepare(output, source_cache, cache, *, snapshot_visible=False):
                     str(history_bundle.resolve()), 'HEAD'], check=True)
     print(f'subconscious complete history bundle: {history_bundle.stat().st_size} bytes', flush=True)
     print(f'claustrum plain source archive: {vault_archive.stat().st_size} bytes sha256={vault_digest}', flush=True)
+    cargo_vendor = prepare_cargo_vendor(output, {name: source_cache / name for name in ('subconscious', 'claustrum')},
+                                        source_cache)
     (output / 'manifest.json').write_text(json.dumps({
         'package_lock_sha256': hashlib.sha256(lock_bytes).hexdigest(),
         'npm_archives': packages,
@@ -143,6 +262,7 @@ def prepare(output, source_cache, cache, *, snapshot_visible=False):
         'source_bundles': {'subconscious': {'revision': pins['SUBC_REV'],
                                           'file': history_bundle.name,
                                           'sha256': hashlib.sha256(history_bundle.read_bytes()).hexdigest()}},
+        'cargo_vendor': cargo_vendor,
     }) + '\n')
     files = []
     for path in sorted(output.iterdir()):
@@ -187,11 +307,19 @@ if __name__ == '__main__':
     parser.add_argument('--source-cache', type=Path)
     parser.add_argument('--cache', type=Path)
     parser.add_argument('--extract-source', choices=['claustrum'])
+    parser.add_argument('--extract-cargo-vendor', action='store_true')
+    parser.add_argument('--subconscious-lock', type=Path)
+    parser.add_argument('--claustrum-lock', type=Path)
     parser.add_argument('--inputs', type=Path)
     parser.add_argument('--revision')
     parser.add_argument('--require-snapshot-visible', action='store_true')
     args = parser.parse_args()
-    if args.extract_source:
+    if args.extract_cargo_vendor:
+        if args.inputs is None or args.subconscious_lock is None or args.claustrum_lock is None:
+            parser.error('--extract-cargo-vendor requires --inputs and both fixture lockfiles')
+        extract_cargo_vendor(args.inputs, args.output, {'subconscious': args.subconscious_lock,
+                                                      'claustrum': args.claustrum_lock})
+    elif args.extract_source:
         if args.inputs is None or args.revision is None:
             parser.error('--extract-source requires --inputs and --revision')
         extract_source(args.inputs, args.extract_source, args.revision, args.output)

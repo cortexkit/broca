@@ -129,7 +129,8 @@ checkout_pin() {
 
 fixtures() {
   source scripts/ci-fixture-revisions.conf
-  local subc_source vault_source
+  local subc_source vault_source vendor_source
+  local subc_config=() vault_config=()
   if [[ "$platform" == windows ]]; then
     subc_source="$scratch/subconscious-source"
     vault_source="$scratch/claustrum-source"
@@ -143,19 +144,26 @@ bundle = inputs / entry['file']
 if hashlib.sha256(bundle.read_bytes()).hexdigest() != entry['sha256']:
     sys.exit('offline Subc bundle checksum mismatch')
 subprocess.run(['git', 'init', '-q', str(destination)], check=True)
+subprocess.run(['git', '-C', str(destination), 'config', 'core.autocrlf', 'false'], check=True)
 subprocess.run(['git', '-C', str(destination), 'fetch', str(bundle.resolve()), 'HEAD'], check=True)
 subprocess.run(['git', '-C', str(destination), 'checkout', '-q', '--detach', revision], check=True)
 PY
     "$python_exec" scripts/prepare-prepush-windows.py --extract-source claustrum \
       --inputs "$BROCA_PREPUSH_INPUTS" --revision "$CLAUSTRUM_REV" --output "$vault_source"
+    vendor_source="$CARGO_TARGET_DIR/fixture-vendor/${SUBC_REV:0:12}-${CLAUSTRUM_REV:0:12}"
+    "$python_exec" scripts/prepare-prepush-windows.py --extract-cargo-vendor \
+      --inputs "$BROCA_PREPUSH_INPUTS" --output "$vendor_source" \
+      --subconscious-lock "$subc_source/Cargo.lock" --claustrum-lock "$vault_source/Cargo.lock"
+    subc_config=(--offline --config "$vendor_source/.configs/subconscious.toml")
+    vault_config=(--offline --config "$vendor_source/.configs/claustrum.toml")
   else
     subc_source="$CARGO_TARGET_DIR/fixture-sources/subconscious-$SUBC_REV"
     vault_source="$CARGO_TARGET_DIR/fixture-sources/claustrum-$CLAUSTRUM_REV"
     checkout_pin subconscious "$SUBC_REV" "$subc_source"
     checkout_pin claustrum "$CLAUSTRUM_REV" "$vault_source"
   fi
-  cargo build --locked --manifest-path "$subc_source/Cargo.toml" -p subc-core --bins
-  cargo build --locked --manifest-path "$vault_source/Cargo.toml" -p credentials-module --bins
+  cargo build --locked "${subc_config[@]}" --manifest-path "$subc_source/Cargo.toml" -p subc-core --bins
+  cargo build --locked "${vault_config[@]}" --manifest-path "$vault_source/Cargo.toml" -p credentials-module --bins
   suffix=''
   [[ "$lane" != windows ]] || suffix=.exe
   mkdir -p "$scratch/package/fixtures/bin" "$scratch/package/fixtures/claustrum/crates/credentials-module/tests/fixtures"
@@ -326,8 +334,7 @@ case "$lane" in
   linux|linux-*|windows)
     : "${CARGO_TARGET_DIR:?motor must supply its persistent target cache}"
     case "$lane" in
-      linux-production|linux-msrv|linux-unit|linux-integration-[134]|windows) export CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=4 ;;
-      linux-integration-2) export CARGO_BUILD_JOBS=6 RUST_TEST_THREADS=4 ;;
+      linux-production|linux-unit) export CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=4 ;;
       linux-wal|linux-small) export CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2 ;;
       *) export CARGO_BUILD_JOBS=8 RUST_TEST_THREADS=4 ;;
     esac
@@ -341,7 +348,7 @@ case "$lane" in
       linux-msrv) msrv=1 ;;
       linux-wal) wal=1 ;;
       linux-deploy) deployment=1 ;;
-      linux-small) msrv=1 wal=1 deployment=1 ;;
+      linux-small) wal=1 ;;
       windows) lint=1 unit=1 integration=1 wal=1 ;;
     esac
     if [[ "$platform" == windows ]]; then
@@ -352,11 +359,6 @@ case "$lane" in
     cargo nextest --version
     if [[ "$lane" == linux-small ]]; then
       operator_checks
-      # These checks do not need fixtures, so a fixture failure must not suppress them.
-      step MSRV cargo +1.96.0 check --locked --workspace --all-targets
-      step 'WAL reader' cargo test --locked -p broca-wal-reader
-      step 'v4 framing' cargo test --locked -p broca-wal --lib framing::tests::v4
-      msrv=0 wal=0
     fi
     if [[ "$platform" != windows && ( $unit == 1 || $integration == 1 || $production == 1 ) ]]; then
       step 'Node/Python runtimes' bash scripts/lib/prepush-tools.sh "$lane" "$scratch"

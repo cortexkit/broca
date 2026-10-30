@@ -33,25 +33,29 @@ plan_names=() plan_platforms=() plan_cpus=()
 queue_lane() {
   plan_names+=("$1") plan_platforms+=("$2") plan_cpus+=("$3")
 }
-# Portable's measured 934s includes both workspace clippies and test builds: eight workers.
+# Portable took 1333s at eight workers; reducing its CPU reservation cannot meet the target.
 queue_lane linux-portable linux 8
-# Windows builds/replays the whole workspace, but nextest can use only four slots.
-queue_lane windows windows 4
-# Shard 2 took 794s (372s replay), versus shard 1's 646s (247s replay): give its build six workers.
-queue_lane linux-integration-2 linux 6
-# Shard 1's 247s replay uses four slots, with four compiler workers for its archive.
-queue_lane linux-integration-1 linux 4
-# Shard 3 keeps its own archive and four execution/compiler slots, without an eight-CPU lease.
-queue_lane linux-integration-3 linux 4
-# Shard 4 keeps its own archive and four execution/compiler slots, without an eight-CPU lease.
-queue_lane linux-integration-4 linux 4
-# Native macOS runs only the targeted contention/WAL checks, under nice -n 10.
-queue_lane macos macos 2
-# Unit/doc took 479s; four execution/compiler workers leave capacity for the longer shards.
-queue_lane linux-unit linux 4
-# Production's three-package lint/tests took 449s and use four workers.
+# Shard 2 took 1347s on six CPUs, including 724s building its archive: restore eight workers.
+queue_lane linux-integration-2 linux 8
+# Windows builds fixtures/archive and runs all four CI integration partitions sequentially.
+queue_lane windows windows 8
+# Shard 3 took 782s on four CPUs, including 474s building its archive: eight workers.
+queue_lane linux-integration-3 linux 8
+# Shard 1 took 730s on four CPUs, including 482s building its archive: eight workers.
+queue_lane linux-integration-1 linux 8
+# Shard 4 took 729s on four CPUs, including 409s building its archive: eight workers.
+queue_lane linux-integration-4 linux 8
+# Production took 610s at four workers; retain its measured reservation.
 queue_lane linux-production linux 4
-# Operator/MSRV/WAL/deployment share two workers and one warm target instead of four reservations.
+# Deployment spent 222s on fixtures and 1091s in its release build/test at two CPUs: eight workers.
+queue_lane linux-deploy linux 8
+# Minimum supported Rust version (MSRV) checking took 584s at two CPUs: eight workers.
+queue_lane linux-msrv linux 8
+# Unit/doc took 367s at four workers; retain its measured reservation.
+queue_lane linux-unit linux 4
+# Native macOS's targeted contention/WAL checks took 88s; two workers under nice -n 10.
+queue_lane macos macos 2
+# Operator and WAL took 61s + 39s + 90s; share two workers without release/MSRV compilation.
 queue_lane linux-small linux 2
 cpu_budget=32
 planned_cpus=0
@@ -84,6 +88,18 @@ prepare_lane_worktree() {
 
 timestamp_ms() {
   python3 -c 'import time; print(time.time_ns() // 1000000)'
+}
+
+windows_input_python() {
+  local candidate
+  for candidate in python3 python3.14 python3.13 python3.12 python3.11 python; do
+    if command -v "$candidate" >/dev/null && "$candidate" -c 'import tomllib' >/dev/null 2>&1; then
+      command -v "$candidate"
+      return 0
+    fi
+  done
+  echo 'prepush: NOT-RUN windows: Cargo input preparation requires an installed Python 3.11+ with tomllib' >&2
+  return 1
 }
 
 launch() {
@@ -126,7 +142,7 @@ launch() {
     fi
     ended_ms="$(timestamp_ms)"
     python3 scripts/lib/prepush-motor-timing.py "$logs/$name.motor.jsonl" "$requested_ms" \
-      "$((requested_ms - begin_ms))" "$((ended_ms - begin_ms))" > "$logs/$name.timing.json"
+      "$((requested_ms - begin_ms))" "$((ended_ms - begin_ms))" --vcpus "$cpus" > "$logs/$name.timing.json"
     printf '%s\n' "$((SECONDS - begin))" > "$logs/$name.seconds"
     exit "$rc"
   ) > "$logs/$name.log" 2>&1 &
@@ -176,12 +192,14 @@ PY
     echo 'prepush: FAILED candidate identity: HEAD/worktree changed during the gate'
     failed=1
   fi
+  python3 scripts/lib/prepush-motor-timing.py --critical "$logs" "$gate_started_ms" "$(timestamp_ms)" "$cpu_budget" || failed=1
   echo "prepush: total wall $((SECONDS - started))s; logs: $logs"
   echo 'The integrating agent also runs the native release gates: see docs/prepush.md.'
   return "$failed"
 }
 
 # Metadata, formatting and static guards do not compile the workspace: two CPUs.
+gate_started_ms="$(timestamp_ms)"
 launch fast linux 2
 collect 0
 if [[ ${results[0]} != 0 ]]; then
@@ -195,7 +213,8 @@ windows_ready=0
 windows_inputs_owned=0
 if prepare_lane_worktree windows > "$logs/windows-inputs.log" 2>&1; then
   windows_inputs_owned=1
-  if python3 scripts/prepare-prepush-windows.py --output "$checkouts/windows/prepush-inputs" \
+  if windows_python="$(windows_input_python 2>> "$logs/windows-inputs.log")" &&
+     "$windows_python" scripts/prepare-prepush-windows.py --output "$checkouts/windows/prepush-inputs" \
      --source-cache "$checkouts/windows/target/prepush-source-cache" \
      --cache "$root/target/scratch/prepush-offline-cache" --require-snapshot-visible >> "$logs/windows-inputs.log" 2>&1; then
     windows_ready=1

@@ -148,9 +148,9 @@ barrier = os.open(root / 'target/barrier', os.O_RDWR) if os.environ.get('CPU_BAR
 starts = reserve(cpus)
 atexit.register(reserve, -cpus)
 if barrier is not None:
-    if starts <= 7:
-        if starts == 7:
-            os.write(barrier, b'x' * 7)
+    if starts <= 4:
+        if starts == 4:
+            os.write(barrier, b'x' * 4)
         os.read(barrier, 1)
     os.close(barrier)
 record = pathlib.Path(sys.argv[sys.argv.index('--record-file') + 1])
@@ -175,7 +175,7 @@ if lane == 'linux-unit':
             sys.exit('Windows was not launched in parallel')
         time.sleep(.01)
 if lane == os.environ.get('FAIL_LANE'):
-    if lane == 'linux-small':
+    if lane == 'linux-msrv':
         print('error[E0599]: fixture MSRV compiler error')
     print('FAIL broca-module::it permissions::warming_route')
     sys.exit(19)
@@ -204,26 +204,26 @@ print('Summary: 1 test run: 1 passed')
         result = self.run_prepush(FAIL_LANE='windows')
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         events = (self.root / 'events').read_text().splitlines()
-        self.assertEqual(len(events), 11)
+        self.assertEqual(len(events), 13)
         self.assertIn('--lane fast', events[0])
         self.assertTrue(any('--vcpus 8' in e and '--lane linux-portable' in e for e in events))
         self.assertTrue(any('--platform windows' in e and '--lane windows' in e for e in events))
         windows = next(e for e in events if '--platform windows' in e)
         self.assertNotIn('--net', windows)
         self.assertNotIn('--sibling', windows)
-        self.assertIn('--vcpus 4', windows)
+        self.assertIn('--vcpus 8', windows)
         requests = {e.split('--lane ')[-1].strip("'\""): shlex.split(e) for e in events}
         sizes = {'fast': 2, 'linux-small': 2, 'linux-production': 4, 'macos': 2,
-                 'linux-portable': 8, 'linux-unit': 4, 'windows': 4,
-                 **{f'linux-integration-{shard}': 6 if shard == 2 else 4 for shard in range(1, 5)}}
+                 'linux-portable': 8, 'linux-unit': 4, 'windows': 8, 'linux-msrv': 8, 'linux-deploy': 8,
+                 **{f'linux-integration-{shard}': 8 for shard in range(1, 5)}}
         for name, cpus in sizes.items():
             args = requests[name]
             self.assertEqual(args[args.index('--vcpus') + 1], str(cpus))
         linux = [shlex.split(e) for e in events if '--lane linux-' in e]
-        self.assertEqual(len(linux), 8)
-        self.assertEqual(len({e[e.index('--cwd') + 1] for e in linux}), 8)
+        self.assertEqual(len(linux), 10)
+        self.assertEqual(len({e[e.index('--cwd') + 1] for e in linux}), 10)
         self.assertTrue(any('--lane linux-small' in e for e in events))
-        for old in ('linux-operator', 'linux-msrv', 'linux-wal', 'linux-deploy'):
+        for old in ('linux-operator', 'linux-wal'):
             self.assertNotIn(old, requests)
         self.assertIn('FAILED windows', result.stdout)
         self.assertNotIn('FAILED linux', result.stdout)
@@ -239,6 +239,8 @@ print('Summary: 1 test run: 1 passed')
             self.assertRegex(result.stdout, rf'{lane}\s+PASS\s+exit=0\s+wall=\d+s')
         self.assertIn('request-to-start=', result.stdout)
         self.assertIn('run=0.017s', result.stdout)
+        self.assertIn('measured critical path ends at', result.stdout)
+        self.assertIn('known reservation-time floor at 32 vCPUs', result.stdout)
         common = subprocess.check_output(['git', '-C', str(self.root), 'rev-parse',
                                           '--path-format=absolute', '--git-common-dir'], text=True).strip()
         lane_common = subprocess.check_output(['git', '-C', str(self.root / 'lane-pool/linux-unit'),
@@ -253,7 +255,7 @@ print('Summary: 1 test run: 1 passed')
         state = json.loads((self.root / 'target/cpus.json').read_text())
         self.assertEqual(state['active'], 0)
         self.assertEqual(state['peak'], 32)
-        self.assertIn('at most 32 concurrent (42 across queued lanes)', result.stdout)
+        self.assertIn('at most 32 concurrent (76 across queued lanes)', result.stdout)
 
     def test_capacity_refusal_keeps_its_name_and_does_not_skip_other_lanes(self):
         result = self.run_prepush(REFUSE_LANE='linux-integration-3')
@@ -264,12 +266,42 @@ print('Summary: 1 test run: 1 passed')
         self.assertTrue((self.root / 'linux-unit.started').exists())
         self.assertTrue((self.root / 'linux-small.started').exists())
 
+    def test_caller_selects_installed_tomllib_python_over_old_default(self):
+        real_python = shlex.quote(sys.executable)
+        scripts = {
+            'python3': 'if [ "$1" = -c ] && [ "$2" = "import tomllib" ]; then exit 1; fi\n'
+                       f'exec {real_python} "$@"',
+            'python3.14': 'if [ "$1" = scripts/prepare-prepush-windows.py ]; then touch "$FIXTURE/selected-prepare.started"; fi\n'
+                          f'exec {real_python} "$@"',
+        }
+        for name, body in scripts.items():
+            path = self.bin / name
+            path.write_text('#!/bin/sh\n' + body + '\n')
+            path.chmod(0o755)
+        result = self.run_prepush()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.root / 'selected-prepare.started').exists())
+
+    def test_missing_tomllib_interpreter_is_named_not_run(self):
+        body = ('#!/bin/sh\nif [ "$1" = -c ] && [ "$2" = "import tomllib" ]; then exit 1; fi\n'
+                f'exec {shlex.quote(sys.executable)} "$@"\n')
+        for name in ('python3', 'python3.14', 'python3.13', 'python3.12', 'python3.11', 'python'):
+            path = self.bin / name
+            path.write_text(body)
+            path.chmod(0o755)
+        result = self.run_prepush()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertRegex(result.stdout, r'windows\s+NOT-RUN\s+exit=204')
+        self.assertIn('requires an installed Python 3.11+', result.stdout)
+        self.assertFalse((self.root / 'windows.started').exists())
+
     def test_unknown_jobs_do_not_release_cpu_budget_for_more_requests(self):
         result = self.run_prepush(UNKNOWN_ALL='1')
         self.assertNotEqual(result.returncode, 0)
         events = (self.root / 'events').read_text().splitlines()
-        self.assertEqual(len(events), 8)
-        for lane in ('linux-unit', 'linux-production', 'linux-small'):
+        self.assertEqual(len(events), 5)
+        for lane in ('linux-unit', 'linux-production', 'linux-small', 'linux-msrv', 'linux-deploy',
+                     'linux-integration-1', 'linux-integration-4', 'macos'):
             self.assertRegex(result.stdout, rf'{lane}\s+NOT-RUN\s+exit=204')
             self.assertFalse((self.root / (lane + '.started')).exists())
         self.assertIn('UNKNOWN jobs still hold the remaining vCPU budget', result.stdout)
@@ -300,12 +332,13 @@ print('Summary: 1 test run: 1 passed')
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         order = (self.root / 'order').read_text().splitlines()
         for command in ('cargo fetch --locked jobs=2',
-                        'cargo +1.96.0 check --locked --workspace --all-targets jobs=2',
                         'cargo test --locked -p broca-wal-reader jobs=2',
                         'cargo test --locked -p broca-wal --lib framing::tests::v4 jobs=2',
-                        'operator', 'fixtures', 'deploy'):
+                        'operator'):
             self.assertIn(command, order)
-        self.assertLess(order.index('operator'), order.index('deploy'))
+        self.assertNotIn('fixtures', order)
+        self.assertNotIn('deploy', order)
+        self.assertFalse(any('+1.96' in command for command in order))
         self.assertIn('operator scripts, pins and dependency guards', result.stdout)
 
     def test_dirty_persistent_worktree_is_not_checked_out_or_dispatched(self):
@@ -405,14 +438,16 @@ print('Summary: 1 test run: 1 passed')
         self.assertIn('FAILED linux-small', result.stdout)
         self.assertTrue((self.root / 'linux-unit.started').exists())
         self.assertTrue((self.root / 'windows.started').exists())
+        self.assertTrue((self.root / 'linux-msrv.started').exists())
+        self.assertTrue((self.root / 'linux-deploy.started').exists())
 
     def test_msrv_failure_summary_prints_first_error_and_complete_output(self):
-        result = self.run_prepush(FAIL_LANE='linux-small')
+        result = self.run_prepush(FAIL_LANE='linux-msrv')
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         summary = result.stdout.split('==> prepush lane summary', 1)[1]
-        self.assertIn('FIRST ERRORS linux-small', summary)
+        self.assertIn('FIRST ERRORS linux-msrv', summary)
         self.assertIn('error[E0599]: fixture MSRV compiler error', summary)
-        self.assertIn('FAILED linux-small: complete output', summary)
+        self.assertIn('FAILED linux-msrv: complete output', summary)
 
     def test_msrv_uses_installed_patch_toolchain_not_syncing_minor_alias(self):
         shutil.copy(ROOT / 'scripts/lib/prepush-lane.sh', self.root / 'scripts/lib/prepush-lane.sh')
@@ -422,6 +457,7 @@ import json, os, pathlib, sys
 with (pathlib.Path(os.environ['FIXTURE']) / 'cargo-calls').open('a') as out:
     out.write(json.dumps(sys.argv[1:]) + '\\n')
 (pathlib.Path(os.environ['FIXTURE']) / 'supplied-target').write_text(os.environ['CARGO_TARGET_DIR'])
+(pathlib.Path(os.environ['FIXTURE']) / 'supplied-jobs').write_text(os.environ['CARGO_BUILD_JOBS'])
 if '+1.96' in sys.argv:
     sys.exit('error: could not create temp file: Read-only file system')
 print('fixture cargo completed')
@@ -444,6 +480,7 @@ print('fixture cargo completed')
         self.assertIn(['+1.96.0', 'check', '--locked', '--workspace', '--all-targets'], calls)
         self.assertFalse(any('+1.96' in args for args in calls))
         self.assertEqual((self.root / 'supplied-target').read_text(), str(self.root / 'target-cache'))
+        self.assertEqual((self.root / 'supplied-jobs').read_text(), '8')
 
     def test_missing_file_tool_refuses_before_running_checks(self):
         lib = self.root / 'scripts/lib'
@@ -629,6 +666,37 @@ class MotorTiming(unittest.TestCase):
         result = self.timing.summarize(self.events, 1000, 0, 500)
         self.assertEqual(result['request_to_start_ms'], -100)
         self.assertIsNone(result['run_ms'])
+
+    def test_critical_path_reports_last_finish_longest_runner_and_cpu_floor(self):
+        directory = self.events.parent
+        for name, start, run, cpus in (('portable', 1000, 1_300_000, 8),
+                                       ('second-wave', 1_000_000, 600_000, 8),
+                                       ('refused', None, None, 8)):
+            (directory / f'{name}.timing.json').write_text(json.dumps(
+                {'started_at_ms': start, 'run_ms': run, 'vcpus': cpus}))
+        result = self.timing.critical_path(directory, 1000, 1_601_000, 32)
+        self.assertEqual(result['longest_runner']['lane'], 'portable')
+        self.assertEqual(result['last_runner']['lane'], 'second-wave')
+        self.assertEqual(result['last_runner']['finish_after_start_ms'], 1_599_000)
+        self.assertEqual(result['end_to_end_ms'], 1_600_000)
+        self.assertEqual(result['known_reservation_floor_ms'], 475_000)
+        self.assertEqual(result['incomplete_lanes'], ['refused'])
+        with patch('sys.stdout', new_callable=io.StringIO) as output:
+            self.timing.print_critical_path(directory, 1000, 1_601_000, 32)
+        self.assertIn('20-minute floor exceeded: portable alone took 1300.000s', output.getvalue())
+        self.assertIn('timing coverage INCOMPLETE: refused', output.getvalue())
+        self.assertTrue((directory / 'critical-path.json').exists())
+
+    def test_no_runner_completion_does_not_claim_a_measured_critical_path(self):
+        directory = self.events.parent
+        (directory / 'refused.timing.json').write_text(json.dumps(
+            {'started_at_ms': None, 'run_ms': None, 'vcpus': 8}))
+        result = self.timing.critical_path(directory, 1000, 2000, 32)
+        self.assertIsNone(result['longest_runner'])
+        self.assertIsNone(result['last_runner'])
+        with patch('sys.stdout', new_callable=io.StringIO) as output:
+            self.timing.print_critical_path(directory, 1000, 2000, 32)
+        self.assertIn('critical path UNKNOWN', output.getvalue())
 
 
 class ArchiveShards(unittest.TestCase):
@@ -1220,9 +1288,15 @@ class WindowsOfflineInputs(unittest.TestCase):
             destination.write_bytes(b'fixture')
             cache.mkdir(parents=True, exist_ok=True)
 
+        def cargo_vendor(output, sources, source_cache):
+            for name in ('fixture-cargo-sources.tar.gz', 'fixture-cargo-subconscious.toml', 'fixture-cargo-claustrum.toml'):
+                (output / name).write_bytes(b'fixture')
+            return {'file': 'fixture-cargo-sources.tar.gz', 'graphs': {}}
+
         with patch.object(self.inputs, 'settings', side_effect=settings), \
                 patch.object(self.inputs, 'checkout', side_effect=checkout), \
-                patch.object(self.inputs, 'download', side_effect=download):
+                patch.object(self.inputs, 'download', side_effect=download), \
+                patch.object(self.inputs, 'prepare_cargo_vendor', side_effect=cargo_vendor):
             self.inputs.prepare(output, siblings, cache)
         self.assertEqual(subprocess.check_output(['git', '-C', str(shallow), 'rev-parse',
                                                  '--is-shallow-repository'], text=True).strip(), 'false')
@@ -1242,8 +1316,10 @@ class WindowsOfflineInputs(unittest.TestCase):
         self.assertTrue(set(listed) - {'manifest.json', 'subconscious-source.bundle',
                                      'claustrum-source.tar'})
         tool_archives = {'node-v24.11.1-win-x64.zip', 'cmake-4.4.5-windows-x86_64.zip', 'ninja-win.zip'}
+        cargo_files = {'fixture-cargo-sources.tar.gz', 'fixture-cargo-subconscious.toml', 'fixture-cargo-claustrum.toml'}
         self.assertTrue(tool_archives <= set(listed))
-        self.assertTrue(all(name in {'manifest.json', 'subconscious-source.bundle', 'claustrum-source.tar'} | tool_archives
+        self.assertTrue(cargo_files <= set(listed))
+        self.assertTrue(all(name in {'manifest.json', 'subconscious-source.bundle', 'claustrum-source.tar'} | tool_archives | cargo_files
                             or name.endswith('.tgz') for name in listed))
         self.assertIn('manifest.json', listed)
         self.assertIn('subconscious-source.bundle', listed)
@@ -1270,6 +1346,127 @@ class WindowsOfflineInputs(unittest.TestCase):
         self.assertFalse(destination.exists())
 
 
+class CargoVendorInputs(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location('vendor_inputs', ROOT / 'scripts/prepare-prepush-windows.py')
+        assert spec is not None and spec.loader is not None
+        self.helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.helper)
+        self.tmp = tempfile.TemporaryDirectory(prefix='broca-vendor-inputs-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.vendor = self.root / 'vendor'
+        self.vendor.mkdir()
+        self.lock = self.root / 'Cargo.lock'
+        self.lock.write_text('''version = 4
+[[package]]
+name = "fixture"
+version = "0.1.0"
+[[package]]
+name = "registry-dependency"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "''' + '1' * 64 + '''"
+[[package]]
+name = "tryhard"
+version = "0.5.0"
+source = "git+https://example.invalid/commons?rev=012345#012345"
+[[package]]
+name = "windows-sys"
+version = "0.61.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "''' + '2' * 64 + '''"
+''')
+        for name, version, checksum in (('registry-dependency', '1.0.0', '1' * 64),
+                                         ('tryhard', '0.5.0', None), ('windows-sys', '0.61.0', '2' * 64)):
+            directory = self.vendor / f'{name}-{version}'
+            directory.mkdir()
+            (directory / 'Cargo.toml').write_text(f'[package]\nname = "{name}"\nversion = "{version}"\n')
+            (directory / '.cargo-checksum.json').write_text(json.dumps({'package': checksum, 'files': {}}))
+
+    def test_staged_registry_covers_every_locked_registry_git_and_windows_package(self):
+        packages = self.helper.locked_packages(self.lock)
+        inventory = self.helper.verify_vendor_coverage(packages, self.vendor)
+        self.assertEqual({package['name'] for package in inventory},
+                         {'registry-dependency', 'tryhard', 'windows-sys'})
+        self.assertTrue(next(package for package in inventory if package['name'] == 'tryhard')['source'].startswith('git+'))
+
+    def test_missing_git_or_target_specific_package_is_not_a_complete_closure(self):
+        for name in ('tryhard-0.5.0', 'windows-sys-0.61.0'):
+            with self.subTest(name=name):
+                path = self.vendor / name
+                removed = self.root / name
+                path.rename(removed)
+                try:
+                    with self.assertRaisesRegex(ValueError, 'missing vendored Cargo package'):
+                        self.helper.verify_vendor_coverage(self.helper.locked_packages(self.lock), self.vendor)
+                finally:
+                    removed.rename(path)
+
+    def test_registry_package_checksum_must_match_the_lockfile(self):
+        checksum = self.vendor / 'registry-dependency-1.0.0/.cargo-checksum.json'
+        checksum.write_text(json.dumps({'package': '9' * 64, 'files': {}}))
+        with self.assertRaisesRegex(ValueError, 'registry-dependency 1.0.0'):
+            self.helper.verify_vendor_coverage(self.helper.locked_packages(self.lock), self.vendor)
+
+    def stage(self):
+        output = self.root / 'inputs'
+        output.mkdir()
+        sources = {}
+        for name in ('subconscious', 'claustrum'):
+            source = self.root / name
+            source.mkdir()
+            shutil.copy(self.lock, source / 'Cargo.lock')
+            sources[name] = source
+
+        def vendor(command, **kwargs):
+            self.assertEqual(command[:4], ['cargo', 'vendor', '--locked', '--versioned-dirs'])
+            self.assertEqual(kwargs['env']['CARGO_NET_OFFLINE'], 'false')
+            destination = Path(command[-1])
+            shutil.copytree(self.vendor, destination)
+            return '[source.crates-io]\nreplace-with = "vendored-sources"\n[source.vendored-sources]\ndirectory = ' + json.dumps(str(destination)) + '\n'
+
+        with patch.object(self.helper.subprocess, 'check_output', side_effect=vendor):
+            entry = self.helper.prepare_cargo_vendor(output, sources, self.root)
+        (output / 'manifest.json').write_text(json.dumps({'cargo_vendor': entry}))
+        return output, entry, {name: source / 'Cargo.lock' for name, source in sources.items()}
+
+    def test_each_fixture_gets_an_independent_verified_offline_source_config(self):
+        output, entry, locks = self.stage()
+        destination = self.root / 'extracted'
+        self.helper.extract_cargo_vendor(output, destination, locks)
+        for name in ('subconscious', 'claustrum'):
+            config = tomllib.loads((destination / '.configs' / f'{name}.toml').read_text())
+            self.assertEqual(config['source']['vendored-sources']['directory'], (destination / name).as_posix())
+            self.assertEqual(len(entry['graphs'][name]['packages']), 3)
+            self.assertTrue((destination / name / 'tryhard-0.5.0/Cargo.toml').exists())
+
+    def test_changed_lockfile_cannot_use_a_different_staged_closure(self):
+        output, _, locks = self.stage()
+        locks['subconscious'].write_text(self.lock.read_text() + '\n# different lock\n')
+        with self.assertRaisesRegex(ValueError, 'pinned lockfile'):
+            self.helper.extract_cargo_vendor(output, self.root / 'extracted', locks)
+
+    def test_verified_source_cache_reuse_preserves_cargo_input_mtimes(self):
+        output, _, locks = self.stage()
+        destination = self.root / 'extracted'
+        self.helper.extract_cargo_vendor(output, destination, locks)
+        paths = [destination / 'subconscious/tryhard-0.5.0/Cargo.toml',
+                 destination / '.configs/subconscious.toml']
+        for path in paths:
+            os.utime(path, ns=(100_000_000, 100_000_000))
+        self.helper.extract_cargo_vendor(output, destination, locks)
+        self.assertEqual([path.stat().st_mtime_ns for path in paths], [100_000_000, 100_000_000])
+
+    def test_cargo_archive_checksum_is_checked_before_extraction(self):
+        output, entry, locks = self.stage()
+        (output / entry['file']).write_bytes(b'bad archive')
+        destination = self.root / 'extracted'
+        with self.assertRaisesRegex(ValueError, 'checksum/name mismatch'):
+            self.helper.extract_cargo_vendor(output, destination, locks)
+        self.assertFalse(destination.exists())
+
+
 class WindowsInputVerification(unittest.TestCase):
     def setUp(self):
         self.powershell = shutil.which('powershell.exe') or shutil.which('pwsh')
@@ -1281,7 +1478,8 @@ class WindowsInputVerification(unittest.TestCase):
         self.inputs = self.root / 'inputs'
         self.inputs.mkdir()
         self.files = []
-        for name in ('manifest.json', 'subconscious-source.bundle', 'claustrum-source.tar', 'package.tgz'):
+        for name in ('manifest.json', 'subconscious-source.bundle', 'claustrum-source.tar', 'package.tgz',
+                     'fixture-cargo-sources.tar.gz', 'fixture-cargo-subconscious.toml', 'fixture-cargo-claustrum.toml'):
             data = ('verified fixture ' + name).encode()
             (self.inputs / name).write_bytes(data)
             self.files.append({'name': name, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
@@ -1340,7 +1538,7 @@ class WindowsInputVerification(unittest.TestCase):
     def test_valid_inputs_check_every_image_tool(self):
         result = self.verify()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn('verified 7 offline input files', result.stdout)
+        self.assertIn('verified 10 offline input files', result.stdout)
         self.assertEqual(result.stdout.count('TOOL-CALLED'), 7)
         for name in self.tools:
             self.assertIn('TOOL-CALLED ' + name, result.stdout)

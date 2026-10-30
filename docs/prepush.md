@@ -10,25 +10,41 @@ The dispatcher uses `ck motor run` (the same build service as AFT's `runon`). It
 never builds on the Mac as a fallback. First it runs the fast Linux static guards.
 Only when those pass does it admit the remaining jobs through a **32-vCPU
 concurrent budget**, including Windows and macOS. The dispatcher prints that
-budget and the queued plan's total (42 vCPUs) before dispatch. Fast uses two
-alone. The initial wave is portable (8), Windows (4), integration shard 2 (6),
-shards 1/3/4 (4 each), and macOS (2): exactly 32. Unit/doc (4), production (4)
-and `linux-small` (2) use released slots as soon as they fit, rather than holding
+budget and the queued plan's total (76 vCPUs) before dispatch. Fast uses two
+alone. The initial wave is portable, integration shard 2, Windows and integration
+shard 3, each at eight CPUs: exactly 32. The remaining integration shards, minimum
+supported Rust version (MSRV) checking
+and deployment also get eight CPUs. Unit/doc and production retain four, while
+macOS and `linux-small` use two. Jobs use released slots as soon as they fit, rather than holding
 reservations in Motor's admission queue or waiting for a whole-wave barrier.
 An UNKNOWN job keeps its reservation because it may still be running. If those
 reservations prevent any remaining job from fitting, the remaining jobs are
 reported NOT-RUN rather than exceeding the budget or waiting indefinitely.
-The small lane runs the unchanged operator suite, MSRV, WAL and deployment checks
-in one job with a shared warm target. An operator failure is recorded but does
-not suppress the independent Rust checks; MSRV/WAL run before fixture setup.
+The small lane runs only the unchanged operator suite and WAL checks. An operator
+failure is recorded but does not suppress WAL. Full-workspace MSRV checking and
+the deployment release build are independent eight-CPU jobs. Fixture compilation
+stays with its consumers: unit, production, each integration job, Windows and
+deployment. It no longer occupies the small job.
 
-Measured runner times were 934s for portable, 794s for shard 2 (372s replay),
-646s for shard 1 (247s replay), 479s for unit and 449s for production. Shard 2
-gets two additional compiler workers; every shard still uses four nextest slots.
-The long lanes start first and the shorter jobs fill capacity behind them,
-targeting a warm, idle-pool critical path below 20 minutes. This is a scheduling
-target, not a claimed measurement: cold compilation, Windows's full sequential
-replay and external fleet contention can still dominate. A capacity refusal is
+Measured runner times exposed why compilation cannot be grouped with small
+scripts: the combined two-CPU job took 2094.547s, including 584s for MSRV,
+222s for fixtures and 1091s for release build/deployment. Shard 2 took 1347s
+on six CPUs (724s in archive preparation), and shard 3 took 782s on four
+(474s in archive preparation). Those builds now get eight workers; nextest
+execution still has four slots. The long jobs start first and shorter jobs
+backfill the released budget.
+
+Each summary writes `critical-path.json`: end-to-end time, the last runner's
+finish relative to gate start (including admission/queue delay), the longest
+runner, and the known reservation-time floor `sum(vCPUs * run_time) / 32`.
+Missing terminal records are named as incomplete, never invented. The floor is
+for observed work, including work before a failed job stopped; it is not a
+forecast of a green gate or a quieter pool. The measured preceding gate ended
+at 2329s, with the combined job's runner finish at approximately 2325.768s and
+a known reservation-time floor of 1173.088s. Portable alone took 1333s at eight
+CPUs, so that attempt already had a 22m13s single-lane floor. Earlier portable
+work completed in 934s at the same size: a quiet-pool target below 20 minutes
+still needs measurement, not a CPU-scaling promise. A capacity refusal is
 still NOT-RUN with its exact reason, never retried or counted as coverage.
 Each launch documents its size rather than reserving 12/16 CPUs to influence
 placement. Each remote lane has a persistent
@@ -95,6 +111,13 @@ banner; retain its exact refusal and event record instead of guessing a host.
 `LANE.timing.json` and the final table separately record checkout preparation,
 client request-to-start delay and actual runner execution. The runner's reported
 queue metric is retained but is not treated as the complete pre-start wait.
+
+The Linux ELF placement regression waits for a byte written by the fixture from
+`main` before capturing `/proc/PID/exe`. On the runner, an immediate post-Popen
+read sometimes still named the forked Python interpreter (inode 1528), not the
+ELF fixture. The runner's scratch was already on real XFS disk, not overlay or
+tmpfs. Readiness fixes that startup race; the running-image/rollback inode and
+byte assertions are unchanged, and no filesystem workaround hides them.
 
 ## Prerequisites and the fast boundary
 
@@ -164,11 +187,25 @@ archive commit before extracting it. The helper prints both transport sizes.
 The Windows lane imports the verified Subc Git bundle locally, extracts the
 checked Claustrum archive, seeds npm's cache
 from the verified local tarballs, runs `npm ci --offline`, and builds the pinned
-fixtures with `CARGO_NET_OFFLINE=true`. It never fetches fixture Git repositories
-or downloads runtimes/NATS inside the VM. Motor must stage the locked Cargo
-sources for the locked fixture graphs; a missing crate/revision fails with
-Cargo's exact offline diagnostic in the summary. No tests are skipped for a
-cache miss. Only Node/npm, CMake and Ninja have shipped offline fallbacks;
+fixtures with `CARGO_NET_OFFLINE=true`. The caller runs `cargo vendor --locked
+--versioned-dirs` separately for each pinned fixture graph, including registry
+packages, Git patches such as `tryhard` from commons, and target-specific packages
+in both committed lockfiles. Separate graphs preserve distinct patch revisions.
+Every non-path lockfile package must match a staged package's name/version and
+registry checksum; Git source identities are retained in the inventory. The
+source TAR and generated Cargo replacement configs join the transport manifest.
+On Windows the extracted inventory and pinned lockfile hashes are checked again,
+then each fixture build receives its own `--offline --config` source replacement.
+Extracted vendor sources live at a stable, revision-keyed path under Motor's
+target cache. Verified byte-identical files retain their mtimes, so source
+restaging does not by itself invalidate Cargo's warm dependency artifacts.
+No ambient Cargo registry/Git cache is required for those fixture graphs.
+The caller needs Cargo for source resolution/copying, not compilation, and an
+installed Python with `tomllib` (3.11+). The dispatcher selects a compatible
+interpreter even when the caller's default `python3` is older. Source staging
+may fetch missing locked packages on the caller; the VM builds remain offline.
+Windows never fetches fixture Git repositories or downloads runtimes/NATS.
+A cache miss never counts as a passing skip. Only Node/npm, CMake and Ninja have shipped offline fallbacks;
 Python, NATS and Bun are required image prerequisites.
 
 After the image-prerequisite check, the fast lane starts with fmt, file-only Rust
@@ -204,21 +241,21 @@ another job, dispatch the machine-side lanes from AFT instead. Do **not** put
 
 1. `bash scripts/prepush.sh --lane fast` with `runon: "linux,2c,net"`.
 2. Only on success, concurrently dispatch from **separate checkouts**:
-    - `--lane linux-portable` with `runon: "linux,8c,net"`;
-    - `--lane linux-integration-2` with `runon: "linux,6c,net"`;
-    - `--lane linux-unit`, `--lane linux-production` and integration shards 1/3/4
+    - `--lane linux-portable`, all four integration shards, `--lane linux-msrv`
+      and `--lane linux-deploy` with `runon: "linux,8c,net"`;
+    - `--lane linux-unit` and `--lane linux-production`
       with `runon: "linux,4c,net"`;
-    - `--lane linux-small` with `runon: "linux,2c,net"` (operator/MSRV/WAL/deploy);
+    - `--lane linux-small` with `runon: "linux,2c,net"` (operator/WAL);
    - `--lane windows` with `runon: "windows"`, after supplying the prepared input
      inside that worktree's non-ignored `prepush-inputs/`.
    - `bash scripts/prepush.sh --lane macos` with `runon: "macos"` (uses `nice -n 10`).
-3. Keep the sum of in-flight requests at or below 32, counting Windows as four
+3. Keep the sum of in-flight requests at or below 32, counting Windows as eight
    and macOS as two. Follow the dispatcher priority above and admit deferred
    jobs only as slots are released. Wait for **every** job, retain all exit statuses and print complete
    failure logs. A missing/refused/timed-out lane is a failure, not coverage.
 
-The individual `linux-operator`, `linux-msrv`, `linux-wal` and `linux-deploy` lanes
-remain available for diagnostics but are not separately dispatched.
+The individual `linux-operator` and `linux-wal` lanes remain available for
+diagnostics but are not separately dispatched.
 `--lane linux` remains an explicitly sequential diagnostic aggregate; it is not
 dispatched by the gate. It runs the same steps
 but cannot demonstrate the parallel wall-time budget. Direct AFT dispatch does

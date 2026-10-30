@@ -35,6 +35,7 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 PLACE = ROOT / "scripts" / "place-release.sh"
@@ -78,6 +79,12 @@ int main(int argc, char **argv) {
         puts("known-feature"); return 0;
     }
     if (getenv("NO_DUMP")) prctl(PR_SET_DUMPABLE, 0);
+    const char *ready = getenv("BROCA_FIXTURE_READY_FD");
+    if (ready) {
+        int fd = atoi(ready);
+        if (write(fd, "1", 1) != 1) return 1;
+        close(fd);
+    }
     for (;;) sleep(1);
 }
 ''')
@@ -103,9 +110,50 @@ int main(int argc, char **argv) {
         self.tmpdir.cleanup()
 
     def launch(self, **extra: str) -> subprocess.Popen:
-        process = subprocess.Popen([str(self.dest)], env=dict(self.env, **extra))
-        self.processes.append(process)
-        return process
+        # Popen can return while /proc still names the forked Python interpreter.
+        # Capture image identity only after the ELF fixture has reached main.
+        reader, writer = os.pipe()
+        try:
+            process = subprocess.Popen([str(self.dest)],
+                                       env=dict(self.env, **extra, BROCA_FIXTURE_READY_FD=str(writer)),
+                                       pass_fds=(writer,))
+            self.processes.append(process)
+            os.close(writer)
+            writer = -1
+            self.assertEqual(os.read(reader, 1), b"1", "ELF fixture exited before signalling readiness")
+            return process
+        finally:
+            os.close(reader)
+            if writer != -1:
+                os.close(writer)
+
+    def test_linux_launch_waits_for_fixture_main_before_capturing_identity(self) -> None:
+        gate_reader, gate_writer = os.pipe()
+        real_popen, real_read = subprocess.Popen, os.read
+        released = False
+
+        def delayed_exec(args, **kwargs):
+            wrapper = ('import os,sys; fd=int(sys.argv[1]); os.read(fd,1); os.close(fd); '
+                       'os.execve(sys.argv[2], [sys.argv[2]], os.environ)')
+            kwargs['pass_fds'] = (*kwargs.get('pass_fds', ()), gate_reader)
+            return real_popen([sys.executable, '-c', wrapper, str(gate_reader), args[0]], **kwargs)
+
+        def release_on_ready_read(fd, count):
+            nonlocal released
+            if count == 1 and not released:
+                os.write(gate_writer, b"1")
+                released = True
+            return real_read(fd, count)
+
+        try:
+            with patch.object(subprocess, 'Popen', side_effect=delayed_exec), \
+                    patch.object(os, 'read', side_effect=release_on_ready_read):
+                process = self.launch()
+            self.assertTrue(released)
+            self.assertEqual(os.stat(f"/proc/{process.pid}/exe").st_ino, self.dest.stat().st_ino)
+        finally:
+            os.close(gate_reader)
+            os.close(gate_writer)
 
     def shell(self, command: str, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["bash", "-c", 'source scripts/running-image.sh; ' + command,
