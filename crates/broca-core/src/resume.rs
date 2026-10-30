@@ -73,7 +73,7 @@ pub fn reconstruct_from_offsets(
     use crate::replay::{
         replay_projection_tail, replay_seeded_at_validated_boundary, SeedFallback,
     };
-    let bad = |reason| SeedFallback { reason };
+    let bad = |reason| SeedFallback::new(reason);
     let mut seed = snapshot.projection;
     if !seed.admission_checkpoint.recovery_cuts.is_empty() {
         return Err(bad("recovery tombstones require complete WAL replay"));
@@ -102,7 +102,6 @@ pub fn reconstruct_from_offsets(
     {
         return Err(bad("offset resume snapshot does not reach durable head"));
     }
-    #[cfg(feature = "test-attachments")]
     if !seed.admission_checkpoint.media_seed_complete() {
         return Err(bad("offset resume media seed needs full replay"));
     }
@@ -112,7 +111,7 @@ pub fn reconstruct_from_offsets(
         || seed.admission_checkpoint.output_reservation.is_none()
         || (window.is_none() && !matches!(
             seed.admission_checkpoint.compaction,
-            Some(crate::compaction::CompactionCheckpoint::None)
+            Some(crate::compaction::CompactionCheckpoint::None | crate::compaction::CompactionCheckpoint::Captures(_))
         ))
         || crate::replay::tail_contains_compaction_setup(
             &snapshot
@@ -175,14 +174,16 @@ pub fn reconstruct_from_offsets(
     let checkpoint = delta.admission_checkpoint;
     // A tail can introduce the first media capture into a previously media-free prefix.
     // Recheck its folded state: a valid selected window is not a media-state completeness proof.
-    #[cfg(feature = "test-attachments")]
     if !checkpoint.media_seed_complete() {
         return Err(bad("offset resume media seed needs full replay"));
     }
     if window.is_none()
         && !matches!(
             checkpoint.compaction,
-            Some(crate::compaction::CompactionCheckpoint::None)
+            Some(
+                crate::compaction::CompactionCheckpoint::None
+                    | crate::compaction::CompactionCheckpoint::Captures(_)
+            )
         )
     {
         return Err(bad("offset resume compaction needs full replay"));
@@ -276,11 +277,11 @@ pub fn reconstruct_from_offsets(
         .output_reservation
         .clone()
         .ok_or_else(|| bad("offset resume output reservation is incomplete"))?;
-    state.manifest = checkpoint
-        .ownership
-        .as_ref()
-        .and_then(|o| o.first_episode.as_ref())
-        .and_then(|e| e.manifest.clone());
+    state.manifest = checkpoint.ownership.as_ref().and_then(|o| {
+        o.latest_manifest
+            .clone()
+            .or_else(|| o.first_episode.as_ref().and_then(|e| e.manifest.clone()))
+    });
     Ok(OffsetResumeState {
         prior: state,
         snapshot: crate::run::PriorWalSnapshot {
@@ -920,7 +921,6 @@ mod offset_resume_tests {
     }
 
     #[test]
-    #[cfg(feature = "test-attachments")]
     fn offset_resume_window_rejects_incomplete_media_seed_before_reusing_prefix() {
         let mut records = compacted_tools(1, false);
         if let WalRecord::RunStarted { input, .. } = &mut records[0] {
@@ -971,7 +971,6 @@ mod offset_resume_tests {
     }
 
     #[test]
-    #[cfg(feature = "test-attachments")]
     fn offset_resume_window_checks_media_seed_after_tail_capture() {
         let mut records = compacted_tools(1, false);
         let boundary = records

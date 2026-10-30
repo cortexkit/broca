@@ -81,6 +81,80 @@ impl LlmToolsConfig {
     }
 }
 
+/// Boot-only media opt-in. Unknown settings refuse rather than silently disabling capture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MediaConfig {
+    pub enabled: bool,
+}
+
+impl MediaConfig {
+    pub fn load_default() -> Result<Self, String> {
+        use crate::config_home::ConfigHome;
+        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
+        {
+            ConfigHome::Resolved { path, .. } => match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    Self::parse(&text).map_err(|error| format!("{}: {error}", path.display()))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+                Err(error) => Err(format!("read media from {}: {error}", path.display())),
+            },
+            ConfigHome::Unresolvable => Ok(Self::default()),
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let text = crate::cache_routing::strip_trailing_commas(
+            &crate::cache_routing::strip_jsonc_comments(text),
+        );
+        let file: serde_json::Value =
+            serde_json::from_str(&text).map_err(|error| format!("parse media: {error}"))?;
+        match file.get("media") {
+            None => Ok(Self::default()),
+            Some(value) if !value.is_object() => Err("media must be an object".into()),
+            Some(value) => serde_json::from_value(value.clone())
+                .map_err(|error| format!("parse media: {error}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod media_config_tests {
+    use super::MediaConfig;
+
+    #[test]
+    fn media_defaults_off_and_requires_an_explicit_boolean() {
+        for text in ["{}", r#"{"media":{}}"#, r#"{"media":{"enabled":false}}"#] {
+            assert_eq!(MediaConfig::parse(text).unwrap(), MediaConfig::default());
+        }
+        assert!(
+            MediaConfig::parse(r#"{"media":{"enabled":true,},}"#)
+                .unwrap()
+                .enabled
+        );
+    }
+
+    #[test]
+    fn malformed_media_is_named_including_unknown_settings() {
+        for text in [
+            r#"{"media":null}"#,
+            r#"{"media":true}"#,
+            r#"{"media":[]}"#,
+            r#"{"media":{"enabled":"true"}}"#,
+            r#"{"media":{"enabled":null}}"#,
+        ] {
+            let error = MediaConfig::parse(text).unwrap_err();
+            assert!(error.contains("media"), "{error}");
+        }
+        let error = MediaConfig::parse(r#"{"media":{"enabeld":true}}"#).unwrap_err();
+        assert!(
+            error.contains("media") && error.contains("enabeld"),
+            "{error}"
+        );
+    }
+}
+
 /// The `state_format` key of `broca.jsonc`: whether a NEW state root (missing, empty, or holding
 /// only `state-format.tmp`) is created in the data overhaul's `broca-state/2` format. Absent
 /// means today's format. Nothing enforces who sets it: it is meant for tests and staging, and

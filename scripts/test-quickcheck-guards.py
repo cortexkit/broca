@@ -128,7 +128,9 @@ class QuickcheckGuards(unittest.TestCase):
                 raise AssertionError(f"{FEATURE_TESTS}:{line_number}: missing test target {package}::{target}")
             source = ROOT / source_name
             text = source.read_text()
-            function = re.search(rf"\bfn\s+{re.escape(symbol)}\s*\(", text)
+            # Include an `async` qualifier in the match, so the line above the function is its
+            # test attribute and not the `async` keyword of a `#[tokio::test]` function.
+            function = re.search(rf"(?:\basync\s+)?\bfn\s+{re.escape(symbol)}\s*\(", text)
             if function is None:
                 raise AssertionError(f"{FEATURE_TESTS}:{line_number}: missing test {symbol} in {source_name}")
             prior = [item.strip() for item in text[:function.start()].splitlines() if item.strip()]

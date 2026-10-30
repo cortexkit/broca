@@ -1273,6 +1273,13 @@ pub(super) fn wrapped_error(raw: &[u8], trace: &mut AttemptTrace) -> Option<Atte
     if value.get("type")?.as_str()? != "error" {
         return None;
     }
+    let journaled_headers = trace
+        .attempt_hook
+        .as_ref()
+        .map(|_| wrapped_response_headers(&value));
+    if let Some(headers) = &journaled_headers {
+        trace.vendor_request_id = super::vendor_request_id(headers);
+    }
     let code = value.pointer("/error/code").and_then(Value::as_str);
     if code == Some("websocket_connection_limit_reached") {
         return Some(AttemptFailure::transport(
@@ -1299,13 +1306,7 @@ pub(super) fn wrapped_error(raw: &[u8], trace: &mut AttemptTrace) -> Option<Atte
     if !(400..600).contains(&status) {
         return None;
     }
-    let mut headers = reqwest::header::HeaderMap::new();
-    for source in [value.get("headers"), value.pointer("/error/headers")]
-        .into_iter()
-        .flatten()
-    {
-        extend_wrapped_headers(&mut headers, source);
-    }
+    let headers = journaled_headers.unwrap_or_else(|| wrapped_response_headers(&value));
     let retry = codex_frame_retry_after(&value);
     trace.account_observation.ratelimit_headers = ratelimit_unified_headers(&headers);
     let headers = response_headers(&headers);
@@ -1329,6 +1330,17 @@ pub(super) fn wrapped_error(raw: &[u8], trace: &mut AttemptTrace) -> Option<Atte
             .get("x-should-retry")
             .is_some_and(|value| value.eq_ignore_ascii_case("false"));
     Some(AttemptFailure::http(error, forbidden))
+}
+
+fn wrapped_response_headers(value: &Value) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    for source in [value.get("headers"), value.pointer("/error/headers")]
+        .into_iter()
+        .flatten()
+    {
+        extend_wrapped_headers(&mut headers, source);
+    }
+    headers
 }
 
 /// A provider refusal the Responses websocket wrapped in an error frame (`{"type":"error",

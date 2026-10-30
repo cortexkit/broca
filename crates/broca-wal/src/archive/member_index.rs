@@ -82,6 +82,8 @@ impl Index {
         // The snapshot is ordered newest first; the first occurrence owns the address.
         for (container, item) in containers.iter().enumerate() {
             let mut reader = ArchiveReader::open(&item.path, u64::MAX)?;
+            #[cfg(any(test, feature = "test-io-trace"))]
+            super::expiry_io::statted();
             if Identity::of(reader.source.get_ref().metadata()?) != item.identity {
                 return Ok(None);
             }
@@ -162,6 +164,8 @@ fn snapshot(paths: &[PathBuf]) -> io::Result<Vec<Container>> {
     ordered
         .into_iter()
         .map(|(_, path)| {
+            #[cfg(any(test, feature = "test-io-trace"))]
+            super::expiry_io::statted();
             Ok(Container {
                 path: path.clone(),
                 identity: Identity::of(crate::fs_ops::metadata(path)?),
@@ -266,10 +270,14 @@ pub(super) fn lookup(
     let item = &index.containers[location.container];
     let answer: io::Result<Option<Option<ArchiveMember>>> = (|| {
         let mut reader = ArchiveReader::open(&item.path, max_bytes)?;
+        #[cfg(any(test, feature = "test-io-trace"))]
+        super::expiry_io::statted();
         if Identity::of(reader.source.get_ref().metadata()?) != item.identity {
             return Ok(None);
         }
         let member = reader.read_located(addr, location.offset, location.payload_len)?;
+        #[cfg(any(test, feature = "test-io-trace"))]
+        super::expiry_io::statted();
         if Identity::of(reader.source.get_ref().metadata()?) != item.identity {
             return Ok(None);
         }

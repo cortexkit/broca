@@ -22,6 +22,9 @@
 //!   refused `unknown_method`.
 //! - `SURFACE_REQUESTS`: a file this process appends one line to per request, so a test can
 //!   count how often broca asked.
+//! - `SURFACE_NONCE_PATH`: optional consumer credential, atomically published after HELLO_ACK.
+//!   A sibling `.hold` file pauses publication before writing the temporary file's contents;
+//!   the `.created` checkpoint lets the test observe that pause and remove `.hold` to release it.
 //! - `SURFACE_SCOPES`: optional full scope set to sync on this module's own connection
 //!   after HELLO_ACK. The file need not exist at startup; this process waits up to 60 seconds
 //!   for it to appear.
@@ -169,14 +172,21 @@ fn stand_in_value(name: &str) -> String {
 }
 
 async fn serve() -> Result<(), String> {
+    let consumer_nonce_path = std::env::args()
+        .any(|arg| arg.starts_with("--SURFACE_NONCE_PATH="))
+        .then(|| PathBuf::from(stand_in_value("SURFACE_NONCE_PATH")));
+    if let Some(path) = &consumer_nonce_path {
+        // A fresh launch must not advertise the preceding process's credential or checkpoint.
+        for stale in [path.clone(), path.with_extension("created")] {
+            match std::fs::remove_file(stale) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("clear the preceding consumer nonce: {error}")),
+            }
+        }
+    }
     let (module_id, nonce) = identity()?;
     let mut tool_routes = tool_result::Routes::default();
-    // A flow caller must connect under Basal's daemon-issued identity, not the scope owner's.
-    // The rig uses the optional nonce file to open that additional consumer connection.
-    if std::env::args().any(|arg| arg.starts_with("--SURFACE_NONCE_PATH=")) {
-        std::fs::write(stand_in_value("SURFACE_NONCE_PATH"), &nonce)
-            .map_err(|error| format!("write the consumer nonce: {error}"))?;
-    }
     let fixtures = PathBuf::from(stand_in_value("SURFACE_FIXTURES"));
     let requests = PathBuf::from(stand_in_value("SURFACE_REQUESTS"));
     let info = subc_transport::read_for_client(env("SUBC_CONNECTION"))
@@ -195,7 +205,7 @@ async fn serve() -> Result<(), String> {
         manifest: manifest(&module_id),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,
-        launch_nonce: Some(nonce),
+        launch_nonce: Some(nonce.clone()),
     };
     let body = serde_json::to_vec(&hello).map_err(|error| error.to_string())?;
     write(&mut stream, control(FrameType::Hello, 1, body)).await?;
@@ -211,6 +221,9 @@ async fn serve() -> Result<(), String> {
         &requests,
         &format!("hello-ack {:?} {}\n", ack.header.ty, String::from_utf8_lossy(&ack.body)),
     )?;
+    if let Some(path) = consumer_nonce_path {
+        publish_consumer_nonce(&path, &nonce).await?;
+    }
     if std::env::args().any(|arg| arg.starts_with("--SURFACE_SCOPES=")) {
         let path = PathBuf::from(stand_in_value("SURFACE_SCOPES"));
         let scopes = tokio::time::timeout(std::time::Duration::from_secs(60), async {
@@ -307,6 +320,35 @@ async fn serve() -> Result<(), String> {
         };
         write(&mut stream, reply_frame(&frame, ty, body, binary)).await?;
     }
+}
+
+/// The credential file is readiness for a second consumer acting as this module. Publish only
+/// an acknowledged launch, and never expose a readable but empty create-before-write window.
+async fn publish_consumer_nonce(path: &std::path::Path, nonce: &str) -> Result<(), String> {
+    if nonce.trim().is_empty() {
+        return Err("cannot publish an empty consumer nonce".to_owned());
+    }
+    let temporary = path.with_extension(format!("nonce.{}.tmp", std::process::id()));
+    let mut file = std::fs::File::create(&temporary)
+        .map_err(|error| format!("create the unpublished consumer nonce: {error}"))?;
+    hold_nonce_publication(path).await?;
+    file.write_all(nonce.as_bytes())
+        .map_err(|error| format!("write the consumer nonce: {error}"))?;
+    drop(file);
+    std::fs::rename(temporary, path)
+        .map_err(|error| format!("publish the consumer nonce: {error}"))
+}
+
+async fn hold_nonce_publication(path: &std::path::Path) -> Result<(), String> {
+    let hold = path.with_extension("hold");
+    if hold.exists() {
+        std::fs::write(path.with_extension("created"), b"")
+            .map_err(|error| format!("record the held nonce publication: {error}"))?;
+        while hold.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+    Ok(())
 }
 
 /// Whether this control-channel frame is a consumer's `route.bind`.

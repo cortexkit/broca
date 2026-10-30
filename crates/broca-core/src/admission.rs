@@ -14,6 +14,41 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{PendingSubmission, ReplayError};
 
+/// Reservation identity comes from the resolved credential ID in the frozen auth
+/// selection, never its spelling or a provider's pricing model. Unreported plan facts stay unknown.
+pub(crate) fn attempt_credential(
+    auth: Option<&broca_wal::AuthSelection>,
+) -> broca_wal::record::AttemptCredential {
+    broca_wal::record::AttemptCredential {
+        credential_ref: auth.and_then(|auth| auth.resolved_credential_id.clone()),
+        account_ref: None,
+        auth_selection: auth.cloned(),
+        auth_method: auth.and_then(|auth| auth.auth_method.clone()),
+        provider_ids: None,
+        plan_tier: None,
+        plan_tier_source: None,
+    }
+}
+
+pub(crate) fn attempt_credential_for_send(
+    frozen: &broca_wal::record::AttemptCredential,
+    served_account_ref: Option<String>,
+    auth_refreshed: bool,
+) -> broca_wal::record::AttemptCredential {
+    broca_wal::record::AttemptCredential {
+        credential_ref: if auth_refreshed {
+            None
+        } else {
+            frozen
+                .auth_selection
+                .as_ref()
+                .and_then(|auth| auth.resolved_credential_id.clone())
+        },
+        account_ref: served_account_ref,
+        ..frozen.clone()
+    }
+}
+
 fn logical_input(request: &SubmissionRequest) -> std::borrow::Cow<'_, [Message]> {
     if request.content.is_empty() {
         return std::borrow::Cow::Borrowed(&request.input);
@@ -499,6 +534,15 @@ pub struct SessionOwnershipV1 {
     /// member existed, which a reader then treats as unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_episode: Option<FirstEpisodeV1>,
+    /// The latest distinct episode manifest. Refreshes do not replace the first episode's
+    /// identity; unchanged sessions omit this field and retain their original checkpoint bytes.
+    /// Older summaries also omit it because their episodes shared the first manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_manifest: Option<Arc<broca_wal::PlanManifest>>,
+    /// Whether the WAL contains session-change facts. False is omitted so unrefreshed logs
+    /// retain their old checkpoint bytes and admission need not probe for change records.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_change_recorded: bool,
     /// Whether this summary was folded by a build that records the first episode's frozen
     /// plan manifest (`FirstEpisodeV1::manifest`). A summary stored by an older build, or
     /// re-stored by one after a rollback, lacks it and may have dropped a manifest, so it is
@@ -518,6 +562,8 @@ impl Default for SessionOwnershipV1 {
             any_unrecorded_principal: false,
             recorded_principals: Vec::new(),
             first_episode: None,
+            latest_manifest: None,
+            session_change_recorded: false,
             plan_manifest_folded: true,
         }
     }
@@ -530,7 +576,7 @@ pub struct FirstEpisodeV1 {
     /// The model-facing names of the tools the episode was admitted with, in their order.
     pub tool_names: Vec<String>,
     /// The plan manifest the episode froze, when the session was admitted with a fetch plan.
-    /// Every later episode renders its tools from it and carries it on its own `RunStarted`.
+    /// Later episodes retain it until a session refresh applies a new manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<Arc<broca_wal::PlanManifest>>,
 }
@@ -546,6 +592,8 @@ impl SessionOwnershipV1 {
             any_unrecorded_principal: self.any_unrecorded_principal,
             recorded_principals: self.recorded_principals.clone(),
             first_episode: None,
+            latest_manifest: None,
+            session_change_recorded: false,
             plan_manifest_folded: false,
         }
     }
@@ -554,6 +602,8 @@ impl SessionOwnershipV1 {
     /// are irrelevant to which principals may cancel or retract a session.
     pub fn fold_owner_records(&mut self, records: &[FramedRecord]) {
         self.first_episode = None;
+        self.latest_manifest = None;
+        self.session_change_recorded = false;
         self.plan_manifest_folded = false;
         for frame in records {
             if let WalRecord::RunStarted {
@@ -628,7 +678,6 @@ pub struct AdmissionCheckpointV1 {
     pub recovery_cuts: Vec<broca_wal::recovery::RecoveryCut>,
     /// Reference-only media resume state, omitted for media-free histories. A captured-reference
     /// index without a valid matching seed requires a named, counted full-replay repair.
-    #[cfg(feature = "test-attachments")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<crate::media_request::DurableMediaSeed>,
     /// Missing on older checkpoints: reconstruct from the full WAL before extending totals.
@@ -718,7 +767,6 @@ impl AdmissionCheckpointV1 {
         if !self.recovery_cuts.is_empty() {
             return false;
         }
-        #[cfg(feature = "test-attachments")]
         if !self.media_seed_complete() {
             return false;
         }
@@ -731,7 +779,6 @@ impl AdmissionCheckpointV1 {
     pub fn empty() -> Self {
         Self {
             recovery_cuts: Vec::new(),
-            #[cfg(feature = "test-attachments")]
             media: None,
             head: Some(crate::head::HeadProjection::default()),
             has_deferred_calls: Some(false),
@@ -786,7 +833,6 @@ impl AdmissionCheckpointV1 {
 
     /// Fold an ordered WAL suffix into this checkpoint.
     pub fn fold_frames(&mut self, records: &[FramedRecord]) -> Result<(), ReplayError> {
-        #[cfg(feature = "test-attachments")]
         if let Some(crate::media_request::DurableMediaSeed::Ready(media)) = &mut self.media {
             media.resume_budget(
                 self.last_episode
@@ -794,7 +840,6 @@ impl AdmissionCheckpointV1 {
                     .and_then(|episode| episode.config.budget.clone()),
             );
         }
-        #[cfg(feature = "test-attachments")]
         if self.at_seq == 0
             && records
                 .iter()
@@ -812,7 +857,6 @@ impl AdmissionCheckpointV1 {
 
     /// Fold one WAL record. The mutation is committed only after all corruption checks pass.
     pub fn fold_record(&mut self, seq: u64, record: &WalRecord) -> Result<(), ReplayError> {
-        #[cfg(feature = "test-attachments")]
         if self.at_seq == 0
             && self.media.is_none()
             && crate::compaction::CapturedMedia::captures_any(record)
@@ -821,7 +865,6 @@ impl AdmissionCheckpointV1 {
                 crate::media_request::MediaCheckpoint::empty(),
             )));
         }
-        #[cfg(feature = "test-attachments")]
         if let Some(crate::media_request::DurableMediaSeed::Ready(media)) = &mut self.media {
             media
                 .fold(seq, record)
@@ -920,6 +963,18 @@ impl AdmissionCheckpointV1 {
                             manifest: manifest.as_deref().cloned().map(Arc::new),
                         });
                     }
+                    // Unrefreshed sessions keep the original checkpoint bytes; only a distinct
+                    // episode manifest needs an additional copy in the checkpoint.
+                    let current = manifest.as_deref();
+                    let first = ownership
+                        .first_episode
+                        .as_ref()
+                        .and_then(|first| first.manifest.as_deref());
+                    ownership.latest_manifest = if current != first {
+                        current.cloned().map(Arc::new)
+                    } else {
+                        None
+                    };
                     ownership.fold_run_started(principal.as_ref(), scope.as_ref());
                 }
                 if self.lineage_retention == Some(crate::LineageRetention::Unstarted) {
@@ -1146,6 +1201,14 @@ impl AdmissionCheckpointV1 {
             | WalRecord::InputTokenBudgetExhausted { .. }
             | WalRecord::StructuredOutputResult { .. }
             | WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
+            // Only a presence bit is needed here; the session-change projection folds the payload.
+            WalRecord::SessionRefreshAccepted { .. }
+            | WalRecord::SessionRefreshPolicyChanged { .. }
+            | WalRecord::SessionPrefixFlushed { .. } => {
+                if let Some(ownership) = &mut self.ownership {
+                    ownership.session_change_recorded = true;
+                }
+            }
         }
         if let Some(episode) = self.last_episode.as_mut() {
             if let Some(facts) = episode.budget_replay_state.as_mut() {
@@ -1201,7 +1264,11 @@ impl AdmissionCheckpointV1 {
 }
 
 impl AdmissionCheckpointV1 {
-    #[cfg(feature = "test-attachments")]
+    /// Only media references recorded in captured history can authorize byte reads.
+    pub fn captured_media_reference(&self, sha256: &str) -> Option<&broca_protocol::MediaRef> {
+        self.compaction.as_ref()?.captured()?.by_digest(sha256)
+    }
+
     pub fn has_captured_media(&self) -> bool {
         self.compaction
             .as_ref()
@@ -1209,7 +1276,6 @@ impl AdmissionCheckpointV1 {
             .is_some_and(|captured| !captured.is_empty())
     }
 
-    #[cfg(feature = "test-attachments")]
     pub fn media_seed_complete(&self) -> bool {
         let has_media = self.has_captured_media();
         if !has_media {
@@ -1363,15 +1429,13 @@ pub struct AdmissionSource {
 }
 
 impl AdmissionSource {
-    fn read(
+    pub(crate) fn read(
         &self,
         read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
         boundary: &AdmissionSource,
     ) -> Result<FramedRecord, crate::replay::SeedFallback> {
         use sha2::Digest;
-        let bad = || crate::replay::SeedFallback {
-            reason: "admission source identity mismatch",
-        };
+        let bad = || crate::replay::SeedFallback::new("admission source identity mismatch");
         if self.seq == 0 || self.seq > boundary.seq || self.end > boundary.end {
             return Err(bad());
         }
@@ -1380,15 +1444,44 @@ impl AdmissionSource {
             .checked_sub(self.off)
             .filter(|len| *len > 0)
             .ok_or_else(bad)?;
-        let bytes = read_at(self.off, len).map_err(|_| bad())?;
+        let bytes =
+            broca_wal::access_counter::read_at(read_at, self.off, len).map_err(|_| bad())?;
         if bytes.len() as u64 != len || sha2::Sha256::digest(&bytes).as_slice() != self.identity {
             return Err(bad());
         }
-        match broca_wal::framing::decode_next(&bytes) {
+        match broca_wal::access_counter::decode_next(&bytes) {
             broca_wal::framing::DecodeStep::Record { framed, consumed }
                 if consumed == bytes.len() && framed.seq == self.seq =>
             {
                 Ok(*framed)
+            }
+            _ => Err(bad()),
+        }
+    }
+
+    pub(crate) fn capture(
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        frame: &crate::replay::PositionedFrame,
+        limit: u64,
+    ) -> Result<Self, crate::replay::SeedFallback> {
+        use sha2::Digest;
+        let bad = || crate::replay::SeedFallback::new("continuation source outside publication");
+        let bytes = broca_wal::access_counter::read_at(
+            read_at,
+            frame.off,
+            limit.checked_sub(frame.off).ok_or_else(bad)?,
+        )
+        .map_err(|_| bad())?;
+        match broca_wal::access_counter::decode_next(&bytes) {
+            broca_wal::framing::DecodeStep::Record { framed, consumed }
+                if *framed == frame.framed =>
+            {
+                Ok(Self {
+                    seq: framed.seq,
+                    off: frame.off,
+                    end: frame.off + consumed as u64,
+                    identity: sha2::Sha256::digest(&bytes[..consumed]).to_vec(),
+                })
             }
             _ => Err(bad()),
         }
@@ -1408,6 +1501,11 @@ struct AdmissionEpisodeSeed {
     usage: Option<Usage>,
     retries_used: u32,
     budget_replay_state: Option<BudgetReplayStateV1>,
+}
+
+struct HydratedAdmissionEpisode {
+    episode: LastEpisodeV1,
+    manifest: Option<Arc<broca_wal::PlanManifest>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1449,10 +1547,17 @@ impl AdmissionSeed {
         boundary: &crate::replay::SeedBoundary,
         prefix: &[crate::replay::PositionedFrame],
     ) -> Result<Self, crate::replay::SeedFallback> {
+        Self::capture_inner(read_at, boundary, prefix, false)
+    }
+
+    fn capture_inner(
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        boundary: &crate::replay::SeedBoundary,
+        prefix: &[crate::replay::PositionedFrame],
+        media_continuation: bool,
+    ) -> Result<Self, crate::replay::SeedFallback> {
         use sha2::Digest;
-        let bad = || crate::replay::SeedFallback {
-            reason: "incomplete admission prefix",
-        };
+        let bad = || crate::replay::SeedFallback::new("incomplete admission prefix");
         if prefix.first().map(|p| p.framed.seq) != Some(1)
             || prefix.last().map(|p| (p.framed.seq, p.off))
                 != Some((boundary.seq, boundary.frame_off))
@@ -1467,24 +1572,26 @@ impl AdmissionSeed {
         let replay =
             crate::replay::replay(&frames.iter().map(|p| p.record.clone()).collect::<Vec<_>>())
                 .map_err(|_| bad())?;
-        if !matches!(
-            scalars.compaction,
-            Some(crate::compaction::CompactionCheckpoint::None)
-        ) || !replay.pending_steers.is_empty()
+        if !(matches!(scalars.compaction, Some(crate::compaction::CompactionCheckpoint::None))
+            || (media_continuation && matches!(scalars.compaction, Some(crate::compaction::CompactionCheckpoint::Captures(_)))))
+            || !replay.pending_steers.is_empty()
             || replay.open_tool_turn.is_some()
             || frames.iter().any(|p| matches!(&p.record, WalRecord::RunStarted { manifest: Some(manifest), .. } if crate::compaction::has_compaction(manifest)))
         {
-            return Err(crate::replay::SeedFallback {
-                reason: "admission prefix needs full replay",
-            });
+            return Err(crate::replay::SeedFallback::new("admission prefix needs full replay"));
         }
         let source = |i: usize| -> Result<AdmissionSource, crate::replay::SeedFallback> {
             let off = prefix[i].off;
             let limit = prefix.get(i + 1).map_or(boundary.frame_end, |p| p.off);
-            let bytes = read_at(off, limit.checked_sub(off).ok_or_else(bad)?).map_err(|_| bad())?;
+            let bytes = broca_wal::access_counter::read_at(
+                read_at,
+                off,
+                limit.checked_sub(off).ok_or_else(bad)?,
+            )
+            .map_err(|_| bad())?;
             // FileWal metadata follows each record. A source identifies only its own
             // frame, not the lineage bytes before the next positioned record.
-            let consumed = match broca_wal::framing::decode_next(&bytes) {
+            let consumed = match broca_wal::access_counter::decode_next(&bytes) {
                 broca_wal::framing::DecodeStep::Record { framed, consumed }
                     if *framed == prefix[i].framed =>
                 {
@@ -1569,6 +1676,7 @@ impl AdmissionSeed {
             source(frames.iter().rposition(|p| matches!(&p.record, WalRecord::DeliveryOrdered { submission_id, .. } if submission_id == &staged.submission_id)).ok_or_else(bad)?)
         }).transpose()?;
         if let Some(ownership) = &mut scalars.ownership {
+            ownership.latest_manifest = None;
             if let Some(first) = &mut ownership.first_episode {
                 first.manifest = None;
             }
@@ -1602,12 +1710,19 @@ impl AdmissionSeed {
         &self,
         read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
     ) -> Result<Option<LastEpisodeV1>, crate::replay::SeedFallback> {
+        Ok(self
+            .episode_with_manifest(read_at)?
+            .map(|hydrated| hydrated.episode))
+    }
+
+    fn episode_with_manifest(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    ) -> Result<Option<HydratedAdmissionEpisode>, crate::replay::SeedFallback> {
         let Some(seed) = &self.episode else {
             return Ok(None);
         };
-        let bad = || crate::replay::SeedFallback {
-            reason: "invalid admission episode sources",
-        };
+        let bad = || crate::replay::SeedFallback::new("invalid admission episode sources");
         let start = seed.start.read(read_at, &self.boundary)?;
         if !matches!(&start.record, WalRecord::RunStarted { run_id, .. } if run_id == &seed.run_id)
         {
@@ -1638,6 +1753,10 @@ impl AdmissionSeed {
             return Err(bad());
         }
         checkpoint.fold_frames(&refs).map_err(|_| bad())?;
+        let manifest = checkpoint
+            .ownership
+            .and_then(|o| o.first_episode)
+            .and_then(|first| first.manifest);
         let mut episode = checkpoint.last_episode.ok_or_else(bad)?;
         if seed.structured_output_downgraded {
             broca_protocol::structured_output::FrozenStructuredOutput::downgrade_render_config(
@@ -1658,7 +1777,7 @@ impl AdmissionSeed {
         episode.usage = seed.usage;
         episode.retries_used = seed.retries_used;
         episode.budget_replay_state = seed.budget_replay_state.clone();
-        Ok(Some(episode))
+        Ok(Some(HydratedAdmissionEpisode { episode, manifest }))
     }
 
     fn validate(
@@ -1680,9 +1799,7 @@ impl AdmissionSeed {
             || crate::replay::tail_contains_compaction_setup(&tail.iter().map(|p| p.framed.clone()).collect::<Vec<_>>())
             || tail.iter().any(|p| matches!(&p.framed.record, WalRecord::RunStarted { manifest: Some(manifest), .. } if crate::compaction::has_compaction(manifest)))
         {
-            return Err(crate::replay::SeedFallback {
-                reason: "admission seed incomplete or head mismatch",
-            });
+            return Err(crate::replay::SeedFallback::new("admission seed incomplete or head mismatch"));
         }
         crate::replay::replay_seeded_at_validated_boundary(
             read_at,
@@ -1720,11 +1837,14 @@ impl AdmissionSeed {
         tail: &[crate::replay::PositionedFrame],
         safe_head: u64,
     ) -> Result<(AdmissionCheckpointV1, AdmissionCheckpointV1), crate::replay::SeedFallback> {
-        let episode = self.episode(read_at)?;
-        self.validate(read_at, tail, safe_head, episode.as_ref())?;
-        let bad = || crate::replay::SeedFallback {
-            reason: "incomplete admission scalars",
-        };
+        let hydrated = self.episode_with_manifest(read_at)?;
+        self.validate(
+            read_at,
+            tail,
+            safe_head,
+            hydrated.as_ref().map(|h| &h.episode),
+        )?;
+        let bad = || crate::replay::SeedFallback::new("incomplete admission scalars");
         if self.scalars.last_episode.is_some()
             || !self.scalars.pending_fifo.is_empty()
             || self.scalars.pending_order.is_some()
@@ -1742,13 +1862,23 @@ impl AdmissionSeed {
             || !self.scalars.ownership_complete()
             || !matches!(
                 self.scalars.compaction,
-                Some(crate::compaction::CompactionCheckpoint::None)
+                Some(
+                    crate::compaction::CompactionCheckpoint::None
+                        | crate::compaction::CompactionCheckpoint::Captures(_)
+                )
             )
         {
             return Err(bad());
         }
         let mut checkpoint = self.scalars.clone();
-        checkpoint.last_episode = episode;
+        if let Some(HydratedAdmissionEpisode { episode, manifest }) = hydrated {
+            checkpoint.last_episode = Some(episode);
+            // The episode's authenticated RunStarted already supplied this manifest.
+            // Reuse it rather than reading the same source again during hydration.
+            if let Some(ownership) = &mut checkpoint.ownership {
+                ownership.latest_manifest = manifest;
+            }
+        }
         if let Some(source) = &self.first_run {
             let first = source.read(read_at, &self.boundary)?;
             let WalRecord::RunStarted {
@@ -1774,6 +1904,16 @@ impl AdmissionSeed {
                 .as_mut()
                 .ok_or_else(bad)?
                 .first_config = config.frozen_render_config.clone();
+        }
+        if let Some(ownership) = &mut checkpoint.ownership {
+            if ownership.latest_manifest.as_deref()
+                == ownership
+                    .first_episode
+                    .as_ref()
+                    .and_then(|first| first.manifest.as_deref())
+            {
+                ownership.latest_manifest = None;
+            }
         }
         let pending = self.queued.iter().map(|seed| {
             let frame = seed.source.read(read_at, &self.boundary)?;
@@ -1841,12 +1981,432 @@ impl AdmissionSeed {
         checkpoint.last_episode = episode;
         checkpoint
             .fold_frames(&tail.iter().map(|p| p.framed.clone()).collect::<Vec<_>>())
-            .map_err(|_| crate::replay::SeedFallback {
-                reason: "paused admission tail refused",
-            })?;
+            .map_err(|_| crate::replay::SeedFallback::new("paused admission tail refused"))?;
         Ok(checkpoint
             .last_episode
             .filter(|e| e.disposition == EpisodeDisposition::Paused))
+    }
+}
+
+/// Durable admission continuation. Accounting remains in authenticated WAL sources rather
+/// than in the database: even cumulative token totals are not copied into this form.
+/// The existing `AdmissionSeed` is an in-memory hydration recipe, not its wire schema.
+#[derive(Debug, Clone)]
+pub struct AdmissionContinuation {
+    seed: AdmissionSeed,
+    sources: Vec<AdmissionSource>,
+}
+
+impl AdmissionContinuation {
+    pub fn encode(&self) -> Result<String, serde_json::Error> {
+        let mut state = serde_json::to_value(&self.seed)?;
+        let scalars = state["scalars"].as_object_mut().expect("checkpoint object");
+        // An allowlist keeps future checkpoint fields from becoming database content by
+        // accident. Missing optional checkpoint fields are supplied only during hydration.
+        scalars.retain(|field, _| {
+            matches!(
+                field.as_str(),
+                "at_seq"
+                    | "last_episode"
+                    | "pending_fifo"
+                    | "pending_order"
+                    | "session_class"
+                    | "has_deferred_calls"
+                    | "ownership"
+                    | "effort_history"
+                    | "lineage_retention"
+                    | "compaction"
+                    | "tags"
+                    | "media"
+            )
+        });
+        if let Some(episode) = state["episode"].as_object_mut() {
+            episode.remove("usage");
+        }
+        let mut encoded = serde_json::json!({
+            "version": 1, "state": state, "sources": self.sources,
+        });
+        // The wire capability follows recorded media state, not a build feature or
+        // the current opt-in setting. Media-free histories allocate no media field.
+        if self.seed.scalars.media.is_some() {
+            encoded["features"] = serde_json::json!(["media-metadata/v1"]);
+        }
+        serde_json::to_string(&encoded)
+    }
+
+    /// Unsupported versions and missing media metadata are cache misses, never partial state.
+    pub fn decode(encoded: &str) -> Result<Self, crate::replay::SeedFallback> {
+        let bad = || crate::replay::SeedFallback::new("unsupported admission continuation");
+        let value: serde_json::Value = serde_json::from_str(encoded).map_err(|_| bad())?;
+        if value["version"] != 1 {
+            return Err(bad());
+        }
+        if let Some(features) = value.get("features") {
+            if *features != serde_json::json!(["media-metadata/v1"]) {
+                return Err(bad());
+            }
+        }
+        let seed: AdmissionSeed =
+            serde_json::from_value(value["state"].clone()).map_err(|_| bad())?;
+        if seed.version != 1 {
+            return Err(bad());
+        }
+        let sources = serde_json::from_value(value["sources"].clone()).map_err(|_| bad())?;
+        if !seed.scalars.media_seed_complete() {
+            return Err(crate::replay::SeedFallback::new(
+                "admission continuation media metadata missing",
+            ));
+        }
+        Ok(Self { seed, sources })
+    }
+
+    pub fn boundary(&self) -> crate::replay::SeedBoundary {
+        crate::replay::SeedBoundary {
+            lineage_id: self.seed.lineage_id.clone(),
+            seq: self.seed.boundary.seq,
+            frame_off: self.seed.boundary.off,
+            frame_end: self.seed.boundary.end,
+            frame_identity: self.seed.boundary.identity.clone(),
+            qualified: self.seed.qualified,
+        }
+    }
+
+    pub(crate) fn source_boundary(&self) -> &AdmissionSource {
+        &self.seed.boundary
+    }
+
+    pub(crate) fn accounting_frames(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    ) -> Result<Vec<FramedRecord>, crate::replay::SeedFallback> {
+        self.sources
+            .iter()
+            .map(|s| s.read(read_at, &self.seed.boundary))
+            .collect()
+    }
+
+    fn accounting_source(record: &WalRecord) -> bool {
+        // These sources rebuild head facts, token budgets, output reservations, recovery
+        // evidence and media profile/boundary history. Every new record must choose whether its
+        // effects need a source; an implicit false would silently lose new fold inputs.
+        match record {
+            WalRecord::RunStarted { .. }
+            | WalRecord::RunConfigRefrozen { .. }
+            | WalRecord::Queued { .. }
+            | WalRecord::Retracted { .. }
+            | WalRecord::SendEnded { .. }
+            | WalRecord::SendDelivered { .. }
+            | WalRecord::ModelStepFinished { .. }
+            | WalRecord::ModelStepRefused { .. }
+            | WalRecord::ModelAttemptFinished { .. }
+            | WalRecord::InputTokenCapFrozen { .. }
+            | WalRecord::OutputReservationClamped { .. }
+            | WalRecord::RunFinished { .. }
+            | WalRecord::RecoveryCut { .. } => true,
+            // Session changes only set ownership.session_change_recorded, which is kept
+            // in the scalars. Capture/advance strip ownership.latest_manifest and hydration
+            // rebuilds it from the episode's RunStarted, not from these change records.
+            WalRecord::SessionRefreshAccepted { .. }
+            | WalRecord::SessionRefreshPolicyChanged { .. }
+            | WalRecord::SessionPrefixFlushed { .. } => false,
+            WalRecord::WriterOpened { .. }
+            | WalRecord::WriterClosed { .. }
+            | WalRecord::VisibilityLate { .. }
+            | WalRecord::AttemptReserved { .. }
+            | WalRecord::AttemptFinished { .. }
+            | WalRecord::AttemptReleased { .. }
+            | WalRecord::AttemptCorrected { .. }
+            | WalRecord::StepStarted { .. }
+            | WalRecord::ToolBatchStarted { .. }
+            | WalRecord::ToolDispatchIntent { .. }
+            | WalRecord::ToolNoDispatch { .. }
+            | WalRecord::ToolResult { .. }
+            | WalRecord::ToolBatchFinished { .. }
+            | WalRecord::TurnFinished { .. }
+            | WalRecord::BudgetFired { .. }
+            | WalRecord::InputTokenBudgetExhausted { .. }
+            | WalRecord::ContextCeilingWait { .. }
+            | WalRecord::ContextCeilingDecided { .. }
+            | WalRecord::CompactionRideWait { .. }
+            | WalRecord::CompactionRideWaitEnded { .. }
+            | WalRecord::StructuredOutputDowngraded { .. }
+            | WalRecord::StructuredOutputResult { .. }
+            | WalRecord::RunCancelRequested { .. }
+            | WalRecord::RunPaused { .. }
+            | WalRecord::RunAuthRefrozen { .. }
+            | WalRecord::Steered { .. }
+            | WalRecord::ApprovalRequested { .. }
+            | WalRecord::ApprovalResolved { .. }
+            | WalRecord::ResumeStarted { .. }
+            | WalRecord::CacheWarmed { .. }
+            | WalRecord::CompactionRequest { .. }
+            | WalRecord::CompactionMessage { .. }
+            | WalRecord::CompactionAnswer { .. }
+            | WalRecord::CompactionWait { .. }
+            | WalRecord::CompactionViewApplied { .. }
+            | WalRecord::CompactionNotice { .. }
+            | WalRecord::ToolCallDeferred { .. }
+            | WalRecord::ApprovalRecorded { .. }
+            | WalRecord::AwaitingApproval { .. }
+            | WalRecord::LateApprovalRecorded { .. }
+            | WalRecord::LateDispatchIntent { .. }
+            | WalRecord::LateResult { .. }
+            | WalRecord::QuestionWithdrawalAcknowledged { .. }
+            | WalRecord::ToolCallProviderHeld { .. }
+            | WalRecord::DeliveryOrdered { .. }
+            | WalRecord::Unknown => false,
+        }
+    }
+
+    pub fn capture(
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        boundary: &crate::replay::SeedBoundary,
+        prefix: &[crate::replay::PositionedFrame],
+    ) -> Result<Self, crate::replay::SeedFallback> {
+        let seed = AdmissionSeed::capture_inner(read_at, boundary, prefix, true)?;
+        let sources = prefix
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| Self::accounting_source(&p.framed.record))
+            .map(|(i, p)| {
+                AdmissionSource::capture(
+                    read_at,
+                    p,
+                    prefix.get(i + 1).map_or(boundary.frame_end, |p| p.off),
+                )
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self { seed, sources })
+    }
+
+    fn hydrated_seed(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    ) -> Result<AdmissionSeed, crate::replay::SeedFallback> {
+        let mut seed = self.seed.clone();
+        // Recovery evidence is reconstructed from authenticated log records, not
+        // trusted from copied checkpoint scalars in the content-free form.
+        seed.scalars.recovery_cuts.clear();
+        if let Some(crate::media_request::DurableMediaSeed::Ready(media)) = &mut seed.scalars.media
+        {
+            media.prepare_content_free_continuation();
+        }
+        let mut head = crate::head::HeadProjection::default();
+        let mut input = crate::input_budget::InputTokenBudget::default();
+        let mut output = crate::output_reservation::OutputReservationHistory::default();
+        for frame in self.accounting_frames(read_at)? {
+            if let WalRecord::RecoveryCut { recovery } = &frame.record {
+                if !seed
+                    .scalars
+                    .recovery_cuts
+                    .iter()
+                    .any(|cut| cut.cut_id == recovery.cut_id)
+                {
+                    seed.scalars.recovery_cuts.push((**recovery).clone());
+                }
+            }
+            head.observe(&frame.record);
+            input.fold(&frame.record).map_err(|_| {
+                crate::replay::SeedFallback::new("continuation input accounting invalid")
+            })?;
+            output.fold(&frame.record);
+            if let WalRecord::RunFinished { usage, .. } = frame.record {
+                if let Some(episode) = seed.episode.as_mut().filter(|e| frame.seq >= e.start.seq) {
+                    episode.usage = Some(usage);
+                }
+            }
+        }
+        seed.scalars.head = Some(head);
+        seed.scalars.input_budget = Some(input);
+        seed.scalars.output_reservation = Some(output);
+        Ok(seed)
+    }
+
+    pub fn hydrate(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        tail: &[crate::replay::PositionedFrame],
+        safe_head: u64,
+    ) -> Result<(AdmissionCheckpointV1, AdmissionCheckpointV1), crate::replay::SeedFallback> {
+        let mut seed = self.hydrated_seed(read_at)?;
+        if seed.scalars.media.is_none()
+            && tail
+                .iter()
+                .any(|p| crate::compaction::CapturedMedia::captures_any(&p.framed.record))
+        {
+            let episode = seed.episode(read_at)?.ok_or_else(|| {
+                crate::replay::SeedFallback::new("media continuation has no episode")
+            })?;
+            let placement = crate::placement::Placement::seeded(
+                seed.ordinal_base,
+                Some(episode.run_id),
+                episode.config.budget.clone(),
+                episode.budget_replay_state.unwrap_or_default(),
+                0,
+            );
+            seed.scalars.media = Some(crate::media_request::DurableMediaSeed::Ready(Box::new(
+                crate::media_request::MediaCheckpoint::after_media_free_prefix(
+                    placement,
+                    seed.boundary.seq,
+                    &self.accounting_frames(read_at)?,
+                )
+                .map_err(|_| {
+                    crate::replay::SeedFallback::new("media continuation initialization failed")
+                })?,
+            )));
+        }
+        seed.hydrate_with_base(read_at, tail, safe_head)
+    }
+
+    /// Consume the suffix after the stored boundary, with the position from the same
+    /// projection fold. Row cursors cannot substitute for either continuation position.
+    pub(crate) fn advance(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        boundary: &crate::replay::SeedBoundary,
+        tail: &[crate::replay::PositionedFrame],
+        position: (u64, crate::tags::TagSeed),
+    ) -> Result<Self, crate::replay::SeedFallback> {
+        if tail.last().map(|p| (p.framed.seq, p.off)) != Some((boundary.seq, boundary.frame_off))
+            || self.seed.lineage_id != boundary.lineage_id
+            || !boundary.qualified
+        {
+            return Err(crate::replay::SeedFallback::new(
+                "continuation advance boundary mismatch",
+            ));
+        }
+        let (_, mut scalars) = self.hydrate(read_at, tail, boundary.seq)?;
+        let mut next = self.clone();
+        let mut queued: std::collections::BTreeMap<_, _> = next
+            .seed
+            .queued
+            .iter()
+            .map(|q| (q.submission_id.0.clone(), q.clone()))
+            .collect();
+        let mut staged = next.seed.staged.clone();
+        for (i, p) in tail.iter().enumerate() {
+            let source = AdmissionSource::capture(
+                read_at,
+                p,
+                tail.get(i + 1).map_or(boundary.frame_end, |p| p.off),
+            )?;
+            if Self::accounting_source(&p.framed.record) {
+                next.sources.push(source.clone());
+            }
+            match &p.framed.record {
+                WalRecord::RunStarted { .. } => {
+                    next.seed.first_run.get_or_insert(source.clone());
+                    next.seed.episode = Some(AdmissionEpisodeSeed {
+                        start: source,
+                        run_id: scalars
+                            .last_episode
+                            .as_ref()
+                            .expect("folded run")
+                            .run_id
+                            .clone(),
+                        refreezes: Vec::new(),
+                        structured_output_downgraded: false,
+                        provider_call_started: false,
+                        disposition: EpisodeDisposition::Running,
+                        pause_reason: None,
+                        cancel_at: None,
+                        usage: None,
+                        retries_used: 0,
+                        budget_replay_state: None,
+                    });
+                    staged = None;
+                }
+                WalRecord::RunConfigRefrozen { .. } | WalRecord::RunAuthRefrozen { .. } => {
+                    if let Some(episode) = &mut next.seed.episode {
+                        episode.refreezes.push(source);
+                    }
+                    if matches!(p.framed.record, WalRecord::RunConfigRefrozen { .. }) {
+                        if let Some(episode) = &mut next.seed.episode {
+                            episode.structured_output_downgraded = false;
+                        }
+                    }
+                }
+                WalRecord::StructuredOutputDowngraded { .. } => {
+                    if let Some(episode) = &mut next.seed.episode {
+                        episode.structured_output_downgraded = true;
+                    }
+                }
+                WalRecord::DeliveryOrdered { .. } => staged = Some(source),
+                WalRecord::Queued { submission_id, .. } => {
+                    queued.insert(
+                        submission_id.0.clone(),
+                        AdmissionQueueSeed {
+                            source,
+                            submission_id: submission_id.clone(),
+                            order_source: staged.take(),
+                        },
+                    );
+                }
+                WalRecord::Retracted { .. } | WalRecord::Steered { .. } => staged = None,
+                _ => {}
+            }
+        }
+        next.seed.queued = scalars
+            .pending_fifo
+            .iter()
+            .map(|p| {
+                let mut queued = queued.get(&p.submission_id.0).cloned().ok_or_else(|| {
+                    crate::replay::SeedFallback::new("continuation queue source missing")
+                })?;
+                if p.order.is_none() {
+                    queued.order_source = None;
+                }
+                Ok(queued)
+            })
+            .collect::<Result<_, _>>()?;
+        next.seed.staged = scalars.pending_order.as_ref().and(staged);
+        if let (Some(episode), Some(current)) =
+            (&mut next.seed.episode, scalars.last_episode.take())
+        {
+            episode.run_id = current.run_id;
+            episode.provider_call_started = current.provider_call_started;
+            episode.disposition = current.disposition;
+            episode.pause_reason = current.pause_reason;
+            episode.cancel_at = current.cancel_at;
+            episode.usage = current.usage;
+            episode.retries_used = current.retries_used;
+            episode.budget_replay_state = current.budget_replay_state;
+        }
+        scalars.pending_fifo = Arc::new(Vec::new());
+        scalars.pending_order = None;
+        if let Some(ownership) = &mut scalars.ownership {
+            ownership.latest_manifest = None;
+            if let Some(first) = &mut ownership.first_episode {
+                first.manifest = None;
+            }
+        }
+        if let Some(effort) = &mut scalars.effort_history {
+            effort.first_config = serde_json::Value::Null;
+        }
+        if matches!(
+            scalars.compaction,
+            Some(crate::compaction::CompactionCheckpoint::State(_))
+        ) {
+            return Err(crate::replay::SeedFallback::new(
+                "compaction continuation needs source hydration",
+            ));
+        }
+        next.seed.scalars = scalars;
+        next.seed.boundary = AdmissionSource {
+            seq: boundary.seq,
+            off: boundary.frame_off,
+            end: boundary.frame_end,
+            identity: boundary.frame_identity.clone(),
+        };
+        next.seed.qualified = boundary.qualified;
+        next.set_projection_position(position.0, position.1);
+        Ok(next)
+    }
+
+    fn set_projection_position(&mut self, extent: u64, tags: crate::tags::TagSeed) {
+        self.seed.ordinal_base = extent;
+        self.seed.tag_high = tags.high;
+        self.seed.tag_rules = tags.rules.map(|r| (r.render, r.clean));
     }
 }
 
@@ -2430,6 +2990,821 @@ mod tests {
         assert_eq!(matched, 12);
     }
 
+    fn assert_content_free_form(encoded: &str) {
+        fn schema(value: &serde_json::Value) {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    for (name, value) in fields {
+                        assert!(
+                            ![
+                                "usage",
+                                "billing",
+                                "input_tokens",
+                                "output_tokens",
+                                "prompt",
+                                "title",
+                                "content",
+                                "input",
+                                "request",
+                                "frozen_render_config",
+                                "render_config",
+                                "head",
+                                "input_budget",
+                                "output_reservation"
+                            ]
+                            .contains(&name.as_str()),
+                            "forbidden seed field: {name}"
+                        );
+                        schema(value);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        schema(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        schema(&serde_json::from_str::<serde_json::Value>(encoded).unwrap());
+        for secret in [
+            "private first input",
+            "private second input",
+            "private assistant text",
+            "private refrozen setup",
+            "private queued input",
+            "private finalize text",
+            "second tool",
+            "PRIVATE-TITLE",
+        ] {
+            assert!(!encoded.contains(secret), "continuation copied {secret}");
+        }
+    }
+
+    fn exhaustive_checkpoint_fields(full: AdmissionCheckpointV1) -> AdmissionCheckpointV1 {
+        // A new checkpoint field must be added to this exhaustive literal and exercised
+        // by the populated roundtrip or an explicit unsupported-seed case.
+        AdmissionCheckpointV1 {
+            recovery_cuts: full.recovery_cuts,
+            media: full.media,
+            head: full.head,
+            has_deferred_calls: full.has_deferred_calls,
+            input_budget: full.input_budget,
+            session_class: full.session_class,
+            at_seq: full.at_seq,
+            last_episode: full.last_episode,
+            pending_fifo: full.pending_fifo,
+            ownership: full.ownership,
+            effort_history: full.effort_history,
+            lineage_retention: full.lineage_retention,
+            compaction: full.compaction,
+            tags: full.tags,
+            pending_order: full.pending_order,
+            output_reservation: full.output_reservation,
+        }
+    }
+
+    #[test]
+    fn continuation_exhaustive_checkpoint_fields_roundtrip() {
+        use crate::replay::deferred_tests;
+
+        let mut records = deferred_tests::batch(&["call"]);
+        if let WalRecord::RunStarted {
+            config,
+            input,
+            session_class,
+            ..
+        } = &mut records[0]
+        {
+            *session_class = Some("populated-checkpoint".into());
+            config.frozen_render_config =
+                serde_json::json!({"effort":"high","media":{"images":{"max":4}}});
+            let mut user = message("private checkpoint input");
+            user.content
+                .push(ContentBlock::Media(broca_protocol::MediaRef {
+                    kind: broca_protocol::MediaKind::Image,
+                    mime: "image/png".into(),
+                    byte_size: 69,
+                    sha256: "c".repeat(64),
+                    width: Some(1),
+                    height: Some(1),
+                }));
+            *input = Arc::new(vec![user]);
+        }
+        if let WalRecord::ModelStepFinished { usage, .. } = &mut records[1] {
+            *usage = Usage {
+                input_tokens: Some(23),
+                output_tokens: Some(7),
+                ..Usage::default()
+            };
+        }
+        records.insert(1, WalRecord::StepStarted { step_id: StepId(1) });
+        records.extend([
+            deferred_tests::prepared("call", "b"),
+            deferred_tests::approval("call", "legacy:5", broca_wal::DeferredDecision::Declined),
+            WalRecord::ToolBatchFinished {
+                batch_id: broca_protocol::BatchId("b".into()),
+            },
+        ]);
+        let queue = offset_corpus();
+        records.push(queue[4].record.clone());
+        let mut queued = queue[5].record.clone();
+        if let WalRecord::Queued { written_at_ms, .. } = &mut queued {
+            *written_at_ms = Some(17);
+        }
+        records.push(queued);
+        let mut staged = queue[4].record.clone();
+        if let WalRecord::DeliveryOrdered { submission_id, .. } = &mut staged {
+            submission_id.0 = "staged-submission".into();
+        }
+        records.extend([staged, WalRecord::TurnFinished { step_id: StepId(1) }]);
+        let frames: Vec<_> = records
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| frame(i as u64 + 1, r))
+            .collect();
+        let full = AdmissionCheckpointV1::from_frames(&frames).unwrap();
+        let checkpoint = exhaustive_checkpoint_fields(full.clone());
+
+        let empty = serde_json::to_value(AdmissionCheckpointV1::empty()).unwrap();
+        let populated = serde_json::to_value(&checkpoint).unwrap();
+        for (field, value) in populated.as_object().unwrap() {
+            assert_ne!(
+                value,
+                &serde_json::Value::Null,
+                "checkpoint field {field} is absent"
+            );
+            assert_ne!(
+                Some(value),
+                empty.get(field),
+                "checkpoint field {field} must differ from an empty checkpoint"
+            );
+        }
+        assert_eq!(checkpoint, full);
+
+        let (bytes, positions) = offset_log(&frames);
+        let read_at = offset_reader(&bytes);
+        let boundary = offset_boundary(&bytes, &positions, positions.len());
+        let mut stored = AdmissionContinuation::capture(&read_at, &boundary, &positions).unwrap();
+        // Remove only the payload-bearing parts represented by the capture's authenticated
+        // sources. The exhaustive checkpoint literal supplies every other input to encoding.
+        let mut scalars = checkpoint;
+        scalars.last_episode = None;
+        scalars.pending_fifo = Arc::new(Vec::new());
+        scalars.pending_order = None;
+        scalars
+            .ownership
+            .as_mut()
+            .unwrap()
+            .first_episode
+            .as_mut()
+            .unwrap()
+            .manifest = None;
+        scalars.effort_history.as_mut().unwrap().first_config = serde_json::Value::Null;
+        assert_eq!(stored.seed.scalars, scalars);
+        stored.seed.scalars = scalars;
+        let encoded = stored.encode().unwrap();
+        assert_content_free_form(&encoded);
+        let restored = AdmissionContinuation::decode(&encoded).unwrap();
+        let (base, head) = restored.hydrate(&read_at, &[], boundary.seq).unwrap();
+        assert_eq!(
+            base, full,
+            "stored continuation lost a populated checkpoint field"
+        );
+        assert_eq!(head, full);
+    }
+
+    #[test]
+    fn continuation_restores_recovery_evidence_and_requires_full_replay() {
+        let recovery = broca_wal::recovery::RecoveryCut {
+            cut_id: "private-recovery-cut".into(),
+            sidecar_basename: "private-recovery-sidecar".into(),
+            cut_offset: 42,
+            removed_len: 17,
+            removed_sha256: "d".repeat(64),
+            reason: broca_wal::recovery::CutReason::UnpublishedTail,
+            active_run: None,
+            runs: vec![broca_wal::recovery::RecoveryRun {
+                run_id: broca_protocol::RunId("earlier-recovery-run".into()),
+                calls: vec![broca_wal::recovery::RecoveryCall {
+                    tool_call_id: broca_protocol::ToolCallId("private-recovery-call".into()),
+                    step_id: Some(StepId(1)),
+                    batch_id: Some(broca_protocol::BatchId("earlier-batch".into())),
+                }],
+            }],
+            unattributed_tool_risk: false,
+        };
+        let mut frames = offset_corpus()[..4].to_vec();
+        for seq in [5, 6] {
+            frames.push(frame(
+                seq,
+                WalRecord::RecoveryCut {
+                    recovery: Box::new(recovery.clone()),
+                },
+            ));
+        }
+        let (bytes, positions) = offset_log(&frames);
+        let read_at = offset_reader(&bytes);
+        let boundary = offset_boundary(&bytes, &positions, positions.len());
+        let stored = AdmissionContinuation::capture(&read_at, &boundary, &positions).unwrap();
+        let encoded = stored.encode().unwrap();
+        assert_content_free_form(&encoded);
+        for secret in [
+            "private-recovery-cut",
+            "private-recovery-sidecar",
+            "private-recovery-call",
+        ] {
+            assert!(!encoded.contains(secret));
+        }
+        let restored = AdmissionContinuation::decode(&encoded).unwrap();
+        let hydrated = restored.hydrated_seed(&read_at).unwrap();
+        assert_eq!(hydrated.scalars.recovery_cuts, vec![recovery]);
+        assert!(
+            restored.hydrate(&read_at, &[], boundary.seq).is_err(),
+            "recovery-marked histories must still use canonical full replay"
+        );
+    }
+
+    fn continuation_oracle(records: &[FramedRecord]) {
+        use crate::projection_plan::ProjectionContinuation;
+        let (bytes, positions) = offset_log(records);
+        let read_at = offset_reader(&bytes);
+        let mut stored = ProjectionContinuation::capture(
+            &read_at,
+            &offset_boundary(&bytes, &positions, 4),
+            &positions[..4],
+        )
+        .unwrap();
+        for boundary_cut in [4, 12] {
+            if boundary_cut != 4 {
+                stored = ProjectionContinuation::decode(&stored.encode().unwrap())
+                    .unwrap()
+                    .advance(
+                        &read_at,
+                        &offset_boundary(&bytes, &positions, boundary_cut),
+                        &positions[4..boundary_cut],
+                    )
+                    .unwrap();
+            }
+            let encoded = stored.encode().unwrap();
+            assert_content_free_form(&encoded);
+            assert_content_free_form(&stored.admission().encode().unwrap());
+            let stored = ProjectionContinuation::decode(&encoded).unwrap();
+            for end in boundary_cut..=records.len() {
+                let end_off = positions.get(end).map_or(bytes.len(), |p| p.off as usize);
+                let read_at = offset_reader(&bytes[..end_off]);
+                let tail = &positions[boundary_cut..end];
+                let projection = stored.hydrate(&read_at, tail, end as u64).unwrap();
+                let prefix = crate::replay::replay(
+                    &records[..boundary_cut]
+                        .iter()
+                        .map(|p| p.record.clone())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+                let actual = crate::resume::reconstruct_from_offsets(
+                    &read_at,
+                    crate::resume::OffsetResumeSnapshot {
+                        boundary: stored.boundary(),
+                        projection,
+                        window: None,
+                        prefix: prefix.prompt,
+                        tail: tail.to_vec(),
+                    },
+                    end as u64,
+                )
+                .unwrap();
+                let full = crate::replay::replay(
+                    &records[..end]
+                        .iter()
+                        .map(|p| p.record.clone())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+                assert_eq!(
+                    actual.prior.prompt, full.prompt,
+                    "prompt at {boundary_cut}/{end}"
+                );
+                assert_eq!(actual.prior.extent, full.extent);
+                assert_eq!(actual.prior.usage, full.usage);
+                assert_eq!(actual.prior.retries_used, full.retries_used);
+                assert_eq!(actual.prior.completed_steps, full.completed_steps);
+                let expected = exhaustive_checkpoint_fields(
+                    AdmissionCheckpointV1::from_frames(&records[..end]).unwrap(),
+                );
+                fn compare(path: &str, actual: &serde_json::Value, expected: &serde_json::Value) {
+                    match (actual, expected) {
+                        (serde_json::Value::Object(a), serde_json::Value::Object(b)) => {
+                            assert_eq!(
+                                a.keys().collect::<Vec<_>>(),
+                                b.keys().collect::<Vec<_>>(),
+                                "fields at {path}"
+                            );
+                            for (key, value) in a {
+                                compare(&format!("{path}/{key}"), value, &b[key]);
+                            }
+                        }
+                        (serde_json::Value::Array(a), serde_json::Value::Array(b)) => {
+                            assert_eq!(a.len(), b.len(), "length at {path}");
+                            for (i, (a, b)) in a.iter().zip(b).enumerate() {
+                                compare(&format!("{path}/{i}"), a, b);
+                            }
+                        }
+                        _ => assert_eq!(actual, expected, "value at {path}"),
+                    }
+                }
+                compare(
+                    &format!("{boundary_cut}/{end}"),
+                    &serde_json::to_value(&actual.snapshot.checkpoint_at_head).unwrap(),
+                    &serde_json::to_value(&expected).unwrap(),
+                );
+                assert_eq!(
+                    actual.snapshot.checkpoint_at_head, expected,
+                    "admission/media at {boundary_cut}/{end}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn content_free_continuations_roundtrip_and_advance_at_every_publication_cut() {
+        let mut records = offset_corpus();
+        for frame in &mut records {
+            match &mut frame.record {
+                WalRecord::RunStarted { title, .. } | WalRecord::Queued { title, .. } => {
+                    *title = Some("PRIVATE-TITLE".into())
+                }
+                _ => {}
+            }
+            if let WalRecord::ModelStepFinished { usage, .. } = &mut frame.record {
+                *usage = Usage {
+                    input_tokens: Some(271828),
+                    output_tokens: Some(314159),
+                    ..Usage::default()
+                };
+            }
+        }
+        continuation_oracle(&records);
+    }
+
+    #[test]
+    fn content_free_continuations_media_free_wire_bytes_are_stable() {
+        use sha2::Digest;
+        let records = offset_corpus();
+        let (bytes, positions) = offset_log(&records);
+        let stored = crate::projection_plan::ProjectionContinuation::capture(
+            &offset_reader(&bytes),
+            &offset_boundary(&bytes, &positions, 4),
+            &positions[..4],
+        )
+        .unwrap();
+        // Available media support must not change established media-free wire bytes.
+        for (name, encoded, expected) in [
+            (
+                "admission",
+                stored.admission().encode().unwrap(),
+                "4d605d45dd8adacaa81e235b9f8e6c0e36f8cb86dc049c287bef694d1a57be35",
+            ),
+            (
+                "projection",
+                stored.encode().unwrap(),
+                "40507101edf7f7a83927fcc16d75126dc2190f39951e9b97823e6b87fb959552",
+            ),
+        ] {
+            assert!(!encoded.contains("\"media\""));
+            assert!(!encoded.contains("\"features\""));
+            assert_eq!(
+                format!("{:x}", sha2::Sha256::digest(encoded.as_bytes())),
+                expected,
+                "{name} wire bytes changed"
+            );
+        }
+    }
+
+    #[test]
+    fn content_free_continuations_include_media_reference_and_delta_history() {
+        let mut records = offset_corpus();
+        for frame in &mut records {
+            if let WalRecord::RunStarted { input, config, .. } = &mut frame.record {
+                Arc::make_mut(input)[0]
+                    .content
+                    .push(broca_protocol::ContentBlock::Media(
+                        broca_protocol::MediaRef {
+                            kind: broca_protocol::MediaKind::Image,
+                            mime: "image/png".into(),
+                            byte_size: 69,
+                            sha256: "a".repeat(64),
+                            width: Some(1),
+                            height: Some(1),
+                        },
+                    ));
+                config.frozen_render_config["media"] = serde_json::json!({"images":{"max":4}});
+            }
+        }
+        continuation_oracle(&records);
+        let (bytes, positions) = offset_log(&records);
+        let stored = crate::projection_plan::ProjectionContinuation::capture(
+            &offset_reader(&bytes),
+            &offset_boundary(&bytes, &positions, 4),
+            &positions[..4],
+        )
+        .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&stored.encode().unwrap()).unwrap();
+        let media = &value["admission"]["state"]["scalars"]["media"];
+        assert_eq!(media["version"], 1);
+        assert!(media["history"].as_array().unwrap().len() > 1);
+        assert!(!media["index"]["captures"].as_array().unwrap().is_empty());
+        value["admission"]["state"]["scalars"]
+            .as_object_mut()
+            .unwrap()
+            .remove("media");
+        assert!(
+            crate::projection_plan::ProjectionContinuation::decode(&value.to_string()).is_err()
+        );
+    }
+
+    #[test]
+    fn content_free_continuations_omit_media_until_first_tail_capture() {
+        let mut records = offset_corpus();
+        if let WalRecord::RunStarted { config, .. } = &mut records[0].record {
+            config.frozen_render_config["media"] = serde_json::json!({"images":{"max":2}});
+        }
+        if let WalRecord::RunStarted { input, config, .. } = &mut records[10].record {
+            Arc::make_mut(input)[0]
+                .content
+                .push(broca_protocol::ContentBlock::Media(
+                    broca_protocol::MediaRef {
+                        kind: broca_protocol::MediaKind::Image,
+                        mime: "image/png".into(),
+                        byte_size: 69,
+                        sha256: "b".repeat(64),
+                        width: Some(1),
+                        height: Some(1),
+                    },
+                ));
+            config.frozen_render_config["media"] = serde_json::json!({"images":{"max":4}});
+        }
+        let (bytes, positions) = offset_log(&records);
+        let stored = crate::projection_plan::ProjectionContinuation::capture(
+            &offset_reader(&bytes),
+            &offset_boundary(&bytes, &positions, 4),
+            &positions[..4],
+        )
+        .unwrap();
+        assert!(!stored.encode().unwrap().contains("\"media\""));
+        assert!(!stored
+            .admission()
+            .encode()
+            .unwrap()
+            .contains("\"features\""));
+        continuation_oracle(&records);
+    }
+
+    #[test]
+    fn content_free_continuations_preserve_refresh_before_stored_boundary() {
+        use crate::projection_plan::ProjectionContinuation;
+
+        fn manifest(identity: &str, system: &str) -> broca_wal::PlanManifest {
+            serde_json::from_value(serde_json::json!({
+                "plan":"{}", "plan_identity":identity, "composition_digest":"composition",
+                "fetches":[], "tools":[], "system_text":system, "system_digest":"system",
+                "join_version":1, "role_versions":{}
+            }))
+            .unwrap()
+        }
+        let baseline = manifest("baseline", "PRIVATE-BASELINE-MANIFEST");
+        let refreshed = manifest("refreshed", "PRIVATE-REFRESHED-MANIFEST");
+        let mut records = offset_corpus();
+        for frame in &mut records {
+            if let WalRecord::RunStarted {
+                run_id, manifest, ..
+            } = &mut frame.record
+            {
+                *manifest = Some(Box::new(if run_id.0 == "r1" {
+                    baseline.clone()
+                } else {
+                    refreshed.clone()
+                }));
+            }
+        }
+        let changes = [
+            WalRecord::SessionRefreshAccepted {
+                generation: 1,
+                policy: "immediately".into(),
+                run_in_progress: false,
+                applies_from_next_run: true,
+                manifest: Box::new(refreshed.clone()),
+            },
+            WalRecord::SessionRefreshPolicyChanged {
+                generation: 1,
+                policy: "immediately".into(),
+                send_id: "policy-change".into(),
+            },
+            WalRecord::SessionPrefixFlushed {
+                send_id: "prefix-flush".into(),
+                pending_generation: Some(1),
+            },
+        ];
+        for change in &changes {
+            assert!(!AdmissionContinuation::accounting_source(change));
+        }
+        records.splice(10..10, changes.into_iter().map(|r| frame(0, r)));
+        for (i, frame) in records.iter_mut().enumerate() {
+            frame.seq = i as u64 + 1;
+        }
+        let cut = records.len() - 1;
+        let (bytes, positions) = offset_log(&records);
+        let read_at = offset_reader(&bytes);
+        let boundary = offset_boundary(&bytes, &positions, cut);
+        let captured =
+            ProjectionContinuation::capture(&read_at, &boundary, &positions[..cut]).unwrap();
+        let advanced = ProjectionContinuation::capture(
+            &read_at,
+            &offset_boundary(&bytes, &positions, 4),
+            &positions[..4],
+        )
+        .unwrap()
+        .advance(&read_at, &boundary, &positions[4..cut])
+        .unwrap();
+        let full = AdmissionCheckpointV1::from_frames(&records).unwrap();
+        let ownership = full.ownership.as_ref().unwrap();
+        assert!(ownership.session_change_recorded);
+        assert_eq!(ownership.latest_manifest.as_deref(), Some(&refreshed));
+        assert_eq!(
+            ownership
+                .first_episode
+                .as_ref()
+                .unwrap()
+                .manifest
+                .as_deref(),
+            Some(&baseline)
+        );
+        let prefix = crate::replay::replay(
+            &records[..cut]
+                .iter()
+                .map(|f| f.record.clone())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let replayed =
+            crate::replay::replay(&records.iter().map(|f| f.record.clone()).collect::<Vec<_>>())
+                .unwrap();
+        for stored in [captured, advanced] {
+            let encoded = stored.encode().unwrap();
+            assert_content_free_form(&encoded);
+            for payload in ["PRIVATE-BASELINE-MANIFEST", "PRIVATE-REFRESHED-MANIFEST"] {
+                assert!(!encoded.contains(payload));
+            }
+            let wire: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(
+                wire["admission"]["state"]["scalars"]["ownership"]["session_change_recorded"],
+                true
+            );
+            assert!(wire["admission"]["state"]["scalars"]["ownership"]
+                .get("latest_manifest")
+                .is_none());
+            let restored = ProjectionContinuation::decode(&encoded).unwrap();
+            let projection = restored
+                .hydrate(&read_at, &positions[cut..], records.len() as u64)
+                .unwrap();
+            assert_eq!(
+                projection
+                    .admission_checkpoint
+                    .ownership
+                    .as_ref()
+                    .unwrap()
+                    .latest_manifest
+                    .as_deref(),
+                Some(&refreshed)
+            );
+            let actual = crate::resume::reconstruct_from_offsets(
+                &read_at,
+                crate::resume::OffsetResumeSnapshot {
+                    boundary: restored.boundary(),
+                    projection,
+                    window: None,
+                    prefix: prefix.prompt.clone(),
+                    tail: positions[cut..].to_vec(),
+                },
+                records.len() as u64,
+            )
+            .unwrap();
+            assert_eq!(actual.snapshot.checkpoint_at_head, full);
+            assert_eq!(actual.prior.manifest.as_deref(), Some(&refreshed));
+            assert_eq!(actual.prior.prompt, replayed.prompt);
+            assert_eq!(actual.prior.extent, replayed.extent);
+            assert_eq!(actual.prior.usage, replayed.usage);
+            assert_eq!(actual.prior.retries_used, replayed.retries_used);
+        }
+    }
+
+    #[test]
+    fn continuation_advance_drops_an_order_for_a_different_queued_submission() {
+        use crate::projection_plan::ProjectionContinuation;
+        let corpus = offset_corpus();
+        let mut records = corpus[..6].to_vec();
+        if let WalRecord::DeliveryOrdered { submission_id, .. } = &mut records[4].record {
+            submission_id.0 = "different-submission".into();
+        }
+        let mut step = offset_step(7);
+        if let WalRecord::ModelStepFinished { step_id, .. } = &mut step.record {
+            *step_id = StepId(2);
+        }
+        records.push(step);
+        records.push(frame(8, corpus[9].record.clone()));
+        let (bytes, positions) = offset_log(&records);
+        let read_at = offset_reader(&bytes);
+        let stored = ProjectionContinuation::capture(
+            &read_at,
+            &offset_boundary(&bytes, &positions, 4),
+            &positions[..4],
+        )
+        .unwrap()
+        .advance(
+            &read_at,
+            &offset_boundary(&bytes, &positions, 7),
+            &positions[4..7],
+        )
+        .unwrap();
+        let stored = ProjectionContinuation::decode(&stored.encode().unwrap()).unwrap();
+        let seed = stored.hydrate(&read_at, &positions[7..], 8).unwrap();
+        let actual = crate::replay::replay_projection_tail(&seed, &records[7..])
+            .unwrap()
+            .admission_checkpoint;
+        let expected = AdmissionCheckpointV1::from_frames(&records).unwrap();
+        assert!(expected.pending_fifo[0].order.is_none());
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn stored_continuation_advance_reads_only_fixed_sources_with_1k_and_150k_discarded_messages() {
+        use crate::projection_plan::ProjectionContinuation;
+        use crate::WalStore;
+        let root = broca_test_support::scratch_root()
+            .join(format!("continuation-header-{}", std::process::id()));
+        let store = crate::FileWalStore::with_config(root.clone(), broca_wal::WalConfig::OVERHAUL);
+        let key = match &offset_corpus()[0].record {
+            WalRecord::RunStarted { session, .. } => session.clone(),
+            _ => unreachable!(),
+        };
+        drop(store.open(&key).unwrap());
+        let header = std::fs::read(store.wal_path(&key)).unwrap();
+        assert_eq!(header.len(), broca_wal::framing::LINEAGE_FRAME_LEN);
+        let lineage = match broca_wal::framing::decode_next(&header) {
+            broca_wal::framing::DecodeStep::Lineage { lineage_id, .. } => lineage_id.to_string(),
+            _ => unreachable!(),
+        };
+        let mut measurements = Vec::new();
+        for count in [1_000, 150_000] {
+            let mut records = offset_corpus();
+            records.truncate(12);
+            let message = match &records[0].record {
+                WalRecord::RunStarted { input, .. } => input[0].clone(),
+                _ => unreachable!(),
+            };
+            let mut inserted = Vec::new();
+            for _ in 0..count / 1_000 {
+                let record: WalRecord = serde_json::from_value(
+                    serde_json::json!({"type":"steered", "input":vec![message.clone();1_000]}),
+                )
+                .unwrap();
+                inserted.push(frame(0, record));
+            }
+            let prefix_frames = inserted.len();
+            records.splice(3..3, inserted);
+            let cut = records.len();
+            let terminal = records
+                .iter()
+                .find(|p| matches!(p.record, WalRecord::RunFinished { .. }))
+                .unwrap()
+                .record
+                .clone();
+            let mut third = records
+                .iter()
+                .rev()
+                .find(|p| matches!(p.record, WalRecord::RunStarted { .. }))
+                .unwrap()
+                .record
+                .clone();
+            if let WalRecord::RunStarted { run_id, .. } = &mut third {
+                run_id.0 = "r3".into();
+            }
+            records.extend([
+                frame(0, terminal.clone()),
+                frame(0, third),
+                offset_step(0),
+                frame(0, terminal),
+            ]);
+            for (i, p) in records.iter_mut().enumerate() {
+                p.seq = i as u64 + 1;
+            }
+            let (encoded, mut positions) = offset_log(&records);
+            for p in &mut positions {
+                p.off += header.len() as u64;
+            }
+            let mut bytes = header.clone();
+            bytes.extend(encoded);
+            let boundary_for = |cut| {
+                let mut boundary = offset_boundary(&bytes, &positions, cut);
+                boundary.lineage_id = Some(lineage.clone());
+                boundary
+            };
+            let read_at = offset_reader(&bytes);
+            let seed =
+                ProjectionContinuation::capture(&read_at, &boundary_for(cut), &positions[..cut])
+                    .unwrap();
+            let seed = ProjectionContinuation::decode(&seed.encode().unwrap()).unwrap();
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            let next = counter
+                .operation("advance stored continuation")
+                .run(|| seed.advance(&read_at, &boundary_for(cut + 3), &positions[cut..cut + 3]))
+                .unwrap();
+            let measured = counter.snapshot().remove(0);
+            assert!(measured.seed_fallbacks.is_empty());
+            use broca_wal::access_counter::{ReadClass, ValidationRead};
+            let source_sequences: Vec<_> = measured
+                .reads
+                .iter()
+                .filter(|r| r.class == ReadClass::Source)
+                .map(|r| {
+                    positions
+                        .iter()
+                        .find(|p| p.off == r.offset)
+                        .map(|p| p.framed.seq)
+                })
+                .collect();
+            // Two validations (projection and admission) each read one boundary and
+            // one lineage header. Hydration and capture read only the fixed accounting,
+            // first/current episode, render-config and three new tail source frames.
+            assert_eq!(
+                measured
+                    .reads
+                    .iter()
+                    .filter(|r| r.class == ReadClass::Source)
+                    .count(),
+                35,
+                "source reads by WAL sequence: {source_sequences:?}"
+            );
+            assert_eq!(
+                measured
+                    .reads
+                    .iter()
+                    .filter(|r| r.class == ReadClass::Validation(ValidationRead::BoundaryFrame))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                measured
+                    .reads
+                    .iter()
+                    .filter(|r| r.class == ReadClass::LineageHeader)
+                    .count(),
+                2
+            );
+            assert_eq!(measured.reads.len(), 39);
+            assert_eq!(measured.frames_decoded, 39);
+            let current_start = positions[..cut]
+                .iter()
+                .rev()
+                .find(|p| matches!(p.framed.record, WalRecord::RunStarted { .. }))
+                .unwrap()
+                .framed
+                .seq;
+            // Three accounting folds, two episode folds and one render-input fold use
+            // this fixed source. Latest-manifest restoration reuses the episode decodes.
+            assert_eq!(
+                source_sequences
+                    .iter()
+                    .filter(|seq| **seq == Some(current_start))
+                    .count(),
+                6
+            );
+            let discarded = positions[3].off..positions[3 + prefix_frames].off;
+            assert!(
+                measured
+                    .reads
+                    .iter()
+                    .all(|r| !discarded.contains(&r.offset)),
+                "discarded message prefix was read"
+            );
+            assert_eq!(next.boundary().seq, (cut + 3) as u64);
+            measurements.push((
+                measured
+                    .reads
+                    .iter()
+                    .map(|r| (r.class, r.length))
+                    .collect::<Vec<_>>(),
+                measured.frames_decoded,
+            ));
+        }
+        assert_eq!(
+            measurements[0], measurements[1],
+            "prefix length changed the source/validation read or decode budget"
+        );
+        assert!(measurements[0].1 > 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn offset_admission_real_filewal_hydrates_without_full_read() {
         offset_admission_real_filewal_case(false);
@@ -2579,24 +3954,50 @@ mod tests {
             file.take(len).read_to_end(&mut bytes)?;
             Ok(bytes)
         };
-        let seed = AdmissionSeed::capture(&read_at, &boundary, &positioned[..cut])
+        let counter = broca_wal::access_counter::WalAccessCounter::default();
+        let seed = counter
+            .operation("capture admission seed")
+            .run(|| AdmissionSeed::capture(&read_at, &boundary, &positioned[..cut]))
             .expect("a multi-record FileWal admission seed must capture exact source frames");
         assert_eq!(
             positioned.get(cut).map_or(bytes.len() as u64, |p| p.off) - boundary.frame_end,
             broca_wal::framing::LINEAGE_FRAME_LEN as u64
         );
         let full_reads = std::cell::Cell::new(0);
-        let snapshot = crate::run::load_prior_wal_snapshot_from_seed(
-            &read_at,
-            &seed,
-            &positioned[cut..],
-            positioned.last().unwrap().framed.seq,
-            || {
-                full_reads.set(full_reads.get() + 1);
-                panic!("a valid real FileWal admission seed must not read the full log")
-            },
-        )
-        .unwrap();
+        let snapshot = counter
+            .operation("hydrate admission seed")
+            .run(|| {
+                crate::run::load_prior_wal_snapshot_from_seed(
+                    &read_at,
+                    &seed,
+                    &positioned[cut..],
+                    positioned.last().unwrap().framed.seq,
+                    || {
+                        full_reads.set(full_reads.get() + 1);
+                        panic!("a valid real FileWal admission seed must not read the full log")
+                    },
+                )
+            })
+            .unwrap();
+        let measured = counter.snapshot();
+        // Capture authenticates the first and current RunStarted independently,
+        // plus RunConfigRefrozen and RunAuthRefrozen in the nonempty-tail corpus. Each
+        // locator is read once to find its extent and once to verify its hash.
+        let capture_reads = if empty_tail { 4 } else { 8 };
+        assert_eq!(measured[0].reads.len(), capture_reads);
+        assert_eq!(measured[0].frames_decoded, capture_reads as u64);
+        assert!(measured[1]
+            .reads
+            .iter()
+            .any(|read| read.class == broca_wal::access_counter::ReadClass::Source));
+        assert!(measured[1]
+            .reads
+            .iter()
+            .any(|read| read.class == broca_wal::access_counter::ReadClass::LineageHeader));
+        assert!(measured[1].frames_decoded > 0);
+        assert!(measured
+            .iter()
+            .all(|operation| operation.seed_fallbacks.is_empty()));
         assert_eq!(full_reads.get(), 0);
         assert_eq!(snapshot.base_watermark, cut as u64);
         assert_eq!(snapshot.tail.is_empty(), empty_tail);
@@ -2959,7 +4360,7 @@ mod tests {
             let reads = std::cell::Cell::new(0);
             let read_at = |off, len| {
                 let data = offset_reader(&bytes[..end_off])(off, len)?;
-                if matches!(broca_wal::framing::decode_next(&data), broca_wal::framing::DecodeStep::Record { consumed, .. } if consumed == data.len())
+                if matches!(broca_wal::access_counter::decode_next(&data), broca_wal::framing::DecodeStep::Record { consumed, .. } if consumed == data.len())
                 {
                     reads.set(reads.get() + 1);
                 }
@@ -3184,6 +4585,57 @@ mod tests {
             output_tokens: Some(5),
             reasoning_tokens: Some(1),
         }
+    }
+
+    #[test]
+    fn checkpoint_retains_each_episodes_manifest_without_replacing_the_baseline() {
+        let mut records = corpus();
+        for frame in &mut records {
+            if let WalRecord::RunStarted {
+                run_id, manifest, ..
+            } = &mut frame.record
+            {
+                *manifest = Some(Box::new(
+                    serde_json::from_value(serde_json::json!({
+                        "plan": "{}", "plan_identity": run_id.0, "composition_digest": "c",
+                        "fetches": [], "tools": [], "system_text": run_id.0,
+                        "system_digest": "s", "join_version": 1, "role_versions": {}
+                    }))
+                    .unwrap(),
+                ));
+            }
+        }
+        let checkpoint = AdmissionCheckpointV1::from_frames(&records).unwrap();
+        let recovered =
+            decode_admission_checkpoint(&encode_admission_checkpoint(&checkpoint).unwrap())
+                .unwrap();
+        let ownership = recovered.ownership.unwrap();
+        assert_eq!(
+            ownership
+                .first_episode
+                .unwrap()
+                .manifest
+                .unwrap()
+                .plan_identity,
+            "r1"
+        );
+        assert_eq!(ownership.latest_manifest.unwrap().plan_identity, "r2");
+        let first = records
+            .iter()
+            .find_map(|frame| match &frame.record {
+                WalRecord::RunStarted { manifest, .. } => manifest.clone(),
+                _ => None,
+            })
+            .unwrap();
+        for frame in &mut records {
+            if let WalRecord::RunStarted { manifest, .. } = &mut frame.record {
+                *manifest = Some(first.clone());
+            }
+        }
+        let unchanged =
+            encode_admission_checkpoint(&AdmissionCheckpointV1::from_frames(&records).unwrap())
+                .unwrap();
+        assert!(!unchanged.contains("latest_manifest"));
     }
 
     fn corpus() -> Vec<FramedRecord> {
@@ -3926,7 +5378,6 @@ mod tests {
     fn checkpoint_json_with_pending_payload_is_byte_stable() {
         let checkpoint = AdmissionCheckpointV1 {
             recovery_cuts: Vec::new(),
-            #[cfg(feature = "test-attachments")]
             media: None,
             output_reservation: None,
             head: None,
@@ -4023,6 +5474,8 @@ mod tests {
                 // `fold_run_started` alone records no first-episode facts; the checkpoint's own
                 // `RunStarted` fold sets them, from the record's run id and tools.
                 first_episode: None,
+                latest_manifest: None,
+                session_change_recorded: false,
                 plan_manifest_folded: true,
             }
         );
@@ -4156,5 +5609,88 @@ mod tests {
             submission_identity_digest(&left),
             submission_identity_digest(&right)
         );
+    }
+}
+
+#[cfg(test)]
+mod credential_evidence_tests {
+    use super::{attempt_credential, attempt_credential_for_send};
+    use serde_json::json;
+
+    #[test]
+    fn reservation_credential_facts_never_classify_prefix_or_provider() {
+        for (credential_id, method) in [
+            ("apikey:opencode-go", "apikey"),
+            ("apikey:kimi-for-coding", "apikey"),
+            ("apikey:cline-pass", "apikey"),
+            ("oauth:xai", "oauth"),
+        ] {
+            let selection =
+                serde_json::from_value(json!({"credential_id":credential_id,"auth_method":method}))
+                    .unwrap();
+            let credential = attempt_credential(Some(&selection));
+            assert_eq!(credential.auth_method.as_deref(), Some(method));
+            assert_eq!(credential.credential_ref, None);
+            let value = serde_json::to_value(credential).unwrap();
+            for key in [
+                "provider_ids",
+                "plan_tier",
+                "plan_tier_source",
+                "kind",
+                "billing_model",
+            ] {
+                assert!(
+                    value.get(key).is_none(),
+                    "{credential_id}: {key} must remain unreported"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reservation_identity_and_auth_method_use_only_frozen_selection_witnesses() {
+        let mut selection = serde_json::from_value(json!({
+            "credential_id":"oauth:misleading-provider:lookup-only", "resolved_credential_id":"vault-opaque-row", "auth_method":"future-vault-method"
+        })).unwrap();
+        let credential = attempt_credential(Some(&selection));
+        assert_eq!(
+            credential.credential_ref.as_deref(),
+            Some("vault-opaque-row")
+        );
+        assert_eq!(
+            credential.auth_method.as_deref(),
+            Some("future-vault-method")
+        );
+        assert_eq!(credential.auth_selection.as_ref(), Some(&selection));
+        selection.resolved_credential_id = None;
+        selection.auth_method = None;
+        let unknown = attempt_credential(Some(&selection));
+        assert_eq!(unknown.credential_ref, None);
+        assert_eq!(unknown.auth_method, None);
+        assert_eq!(attempt_credential(None).auth_selection, None);
+    }
+
+    #[test]
+    fn refreshed_reservation_forgets_row_witness_but_keeps_served_account() {
+        let selection = serde_json::from_value(json!({
+            "credential_id":"lookup-not-a-witness", "resolved_credential_id":"frozen-row", "auth_method":"oauth", "account_ref":"frozen-account"
+        })).unwrap();
+        let frozen = attempt_credential(Some(&selection));
+        for refreshed in [false, true] {
+            let sent =
+                attempt_credential_for_send(&frozen, Some("served-account".into()), refreshed);
+            assert_eq!(
+                sent.credential_ref.as_deref(),
+                if refreshed { None } else { Some("frozen-row") }
+            );
+            assert_eq!(sent.account_ref.as_deref(), Some("served-account"));
+            assert_eq!(sent.auth_selection.as_ref(), Some(&selection));
+            assert_eq!(sent.auth_method.as_deref(), Some("oauth"));
+            assert!(
+                sent.provider_ids.is_none()
+                    && sent.plan_tier.is_none()
+                    && sent.plan_tier_source.is_none()
+            );
+        }
     }
 }

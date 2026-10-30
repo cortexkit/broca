@@ -2598,7 +2598,9 @@ where
         }
         let write = matches!(method, OP_SEND | OP_WARM | OP_IMPORT | OP_CANCEL | OP_RETRACT);
         let write = write || matches!(method, "session.upload_begin" | "session.upload_append" | "session.upload_commit");
-        let session_read = matches!(method, OP_READ | OP_RESOLVE | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_HISTORY | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ);
+        let session_read = matches!(method, OP_READ | OP_RESOLVE | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_HISTORY | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ)
+            || (broca_protocol::attachments_enabled()
+                && method == cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ);
         if write || session_read {
             if let Err(error) = handler.check_migration(&session, write).await {
                 return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
@@ -2709,6 +2711,14 @@ where
         }
     }
     match req.method.as_str() {
+        cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ
+            if broca_protocol::attachments_enabled() =>
+        {
+            match handler.media_read(session, req.params).await {
+                Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
+                Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
+            }
+        }
         "session.upload_begin"
         | "session.upload_append"
         | "session.upload_commit"
@@ -3532,7 +3542,8 @@ where
                 handler.compaction_supported(),
                 crate::RETENTION_WRITER_ENABLED,
                 handler.hook_plane_available(),
-            );
+            )
+            .with_media(broca_protocol::attachments_enabled());
             describe.session_class.backup_classes = handler.backup_classes();
             trace_describe("response_ready", channel, epoch, corr);
             let sent = send_json_response(writer, ver, channel, epoch, corr, &describe).await;
@@ -4686,7 +4697,23 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
     };
     match handler.plan_state(session).await {
         broca_module::serve::PlanState::Admitted { frozen } => {
-            broca_fetch_plan::check_later_plan(frozen.as_deref(), &parsed.identity)?;
+            // While a change is pending, a send whose plan is the effective plan or the latest
+            // accepted one is not drift. That replaces today's plain different-plan refusal for
+            // sessions with session_change state. Sessions that never received a refresh keep
+            // today's rule exactly.
+            if let Some((effective, accepted)) = handler.session_change_identities(session).await {
+                cortexkit_role_llm_runner::session_change::check_send_drift(
+                    effective.as_deref(),
+                    accepted.as_deref(),
+                    &parsed.identity,
+                )
+                .map_err(|detail| broca_fetch_plan::Refusal::PlanDrift {
+                    frozen: detail.frozen,
+                    sent: detail.sent,
+                })?;
+            } else {
+                broca_fetch_plan::check_later_plan(frozen.as_deref(), &parsed.identity)?;
+            }
             Ok(broca_module::actor::SendPlan {
                 identity: parsed.identity,
                 manifest: None,

@@ -11,6 +11,66 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const SOURCE: &str = "claude-opus-5-5";
 const FALLBACK: &str = "claude-opus-4-8";
 
+#[tokio::test]
+async fn source_warm_disables_server_fallback_without_changing_cached_prefix() {
+    use broca_protocol::{ContentBlock, Message, Role};
+    for enabled in [false, true] {
+        let mut frozen = anthropic_frozen_config(SOURCE);
+        frozen.variant = Some(crate::variant::FrozenVariant {
+            name: "none".into(),
+            request: crate::variant::VariantRequest::Anthropic {
+                thinking: None,
+                effort: None,
+            },
+        });
+        frozen.server_side_fallback = enabled;
+        frozen.renderer_version = crate::families::anthropic_renderer_version(enabled);
+        let opts = CallOptions::new(vec![Message::new(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "keep this prefix".into(),
+            }],
+        )]);
+        let base = AnthropicMessages.render(&frozen, &opts);
+        let provider = LiveProvider::new(
+            AnthropicMessages,
+            frozen.clone(),
+            AuthHandle::Bearer("token".into()),
+        );
+        let (warm, _) = provider.prepare_warm_request(&base, None).unwrap();
+        let base_fields: std::collections::BTreeMap<String, Box<serde_json::value::RawValue>> =
+            serde_json::from_slice(&base).unwrap();
+        let warm_fields: std::collections::BTreeMap<String, Box<serde_json::value::RawValue>> =
+            serde_json::from_slice(&warm.body).unwrap();
+        assert_eq!(base_fields.contains_key("fallbacks"), enabled);
+        assert!(!warm_fields.contains_key("fallbacks"));
+        assert!(!warm
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("anthropic-beta")
+                && value.contains("server-side-fallback")));
+        for key in ["messages", "system", "tools"] {
+            assert_eq!(
+                base_fields.get(key).map(|v| v.get().as_bytes()),
+                warm_fields.get(key).map(|v| v.get().as_bytes()),
+                "{key}, enabled={enabled}"
+            );
+        }
+        if !enabled {
+            let mut expected: serde_json::Value = serde_json::from_slice(&base).unwrap();
+            expected["max_tokens"] = serde_json::json!(0);
+            expected.as_object_mut().unwrap().remove("stream");
+            assert_eq!(warm.body, broca_protocol::canonical_json_bytes(&expected));
+            assert_eq!(
+                warm.headers,
+                AnthropicMessages
+                    .endpoint(&frozen, &AuthHandle::Bearer("token".into()), Vec::new())
+                    .headers
+            );
+        }
+    }
+}
+
 fn persona() -> ClaudeCodePersona {
     ClaudeCodePersona {
         version: ClaudeCodePersona::CURRENT_VERSION.to_string(),

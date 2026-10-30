@@ -53,9 +53,7 @@ impl Rig {
     fn plane(self: &Arc<Self>, installed: bool) -> SubcToolPlane {
         let plane = SubcToolPlane::with_connection(self.clone(), "provider");
         if installed {
-            plane
-                .with_provider_held_support(self.clone(), self.clone())
-                .declaring_held_reply_for_tests()
+            plane.with_provider_held_support(self.clone(), self.clone())
         } else {
             plane
         }
@@ -329,13 +327,10 @@ async fn plain_keys_require_late_results_identity_and_installed_seams() {
     }
 }
 
-/// Production installs the held runtime without the debug-only route declaration. Every call
-/// must then leave exactly as it did before the runtime existed, even to a provider whose frozen
-/// plan declares `late_results` and a `content/v1` tool: the route declares no capability, a
-/// plain call carries no key, nothing is registered with the intake, and the reply is read as
-/// the legacy body.
+/// Installing the runtime enables held negotiation and eligible plain-call keys on every build.
+/// Without it, calls stay unkeyed and unregistered. Ordinary terminal text stays unchanged.
 #[tokio::test]
-async fn an_installed_runtime_without_the_route_declaration_leaves_every_call_unchanged() {
+async fn installing_the_runtime_declares_held_replies_and_stages_eligible_calls() {
     for installed in [false, true] {
         let rig = Rig::new(true, true, true, true);
         let plane = SubcToolPlane::with_connection(rig.clone(), "provider");
@@ -372,17 +367,18 @@ async fn an_installed_runtime_without_the_route_declaration_leaves_every_call_un
         );
         assert_eq!(
             *rig.opened_declaring.lock().unwrap(),
-            [false],
-            "installed={installed}: the route must declare no held-reply capability"
+            [installed],
+            "installed={installed}: the route declaration follows runtime support"
         );
         assert_eq!(
             *rig.sent.lock().unwrap(),
-            [(None, None)],
-            "installed={installed}: a plain call must carry no key"
+            [(installed.then(|| "lineage:1".to_owned()), None)],
+            "installed={installed}: eligible plain calls carry their durable key"
         );
-        assert!(
-            rig.groups.lock().unwrap().is_empty(),
-            "installed={installed}: nothing may be registered"
+        assert_eq!(
+            rig.groups.lock().unwrap().len(),
+            usize::from(installed),
+            "installed={installed}: registration follows runtime support"
         );
         assert_eq!(
             result,
@@ -391,7 +387,7 @@ async fn an_installed_runtime_without_the_route_declaration_leaves_every_call_un
                 &json!({"content":[{"type":"text","text":"terminal"}]})
             )
             .0,
-            "installed={installed}: the reply is read as the legacy body"
+            "installed={installed}: ordinary terminal text keeps its legacy bytes"
         );
     }
 }

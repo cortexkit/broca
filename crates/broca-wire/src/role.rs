@@ -170,8 +170,8 @@ pub struct HeadResponse {
     /// steer, whichever the WAL holds last). Absent, never empty, when no send carried one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// What a send that names no model can carry (llm-runner 0.5.1 §4.3). A send's prompt is
-    /// text only, so broca states `attachments: "no"` on every written session's answer. A
+    /// What a send that names no model can carry (llm-runner 0.5.1 §4.3). With media disabled,
+    /// broca states `attachments: "no"`; enabled sessions use their frozen media profile. A
     /// never-written session's answer leaves it out with every other member, as the
     /// conformance kit requires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -190,10 +190,8 @@ pub struct HeadResponse {
     pub last_run_error: Option<cortexkit_role_llm_runner::read::LastRunError>,
 }
 
-/// `session.head.input` as broca states it: a send's prompt is text (`prompt` or text
-/// `prompt_blocks`) and broca's message schema has no image, document or file block, so no send
-/// can carry an attachment. That is a known fact, so it is `no`, not `unknown` (llm-runner 0.5.1
-/// §4.3). Modalities and MIME types are left out: with no attachments they say nothing more.
+/// Default-off `session.head.input`. Modalities and MIME types are omitted because
+/// they add no information when attachment admission is disabled.
 pub fn head_input() -> cortexkit_role_llm_runner::read::HeadInput {
     cortexkit_role_llm_runner::read::HeadInput::new(
         cortexkit_role_llm_runner::read::attachments::NO,
@@ -383,6 +381,7 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::OUTPUT_REFS,
         "run_ops",
         cortexkit_role_llm_runner::capabilities::RUN_STATUS,
+        cortexkit_role_llm_runner::capabilities::HELD_CALLS,
         cortexkit_role_llm_runner::capabilities::RUN_USAGE,
         cortexkit_role_llm_runner::capabilities::SESSION_USAGE,
         cortexkit_role_llm_runner::capabilities::HEAD_SENDER,
@@ -467,6 +466,25 @@ pub fn broca_role_describe_with_writers(
     }
 }
 
+impl RoleDescribeResponse {
+    /// Advertise the whole attachments group only after boot enables its serving paths.
+    pub fn with_media(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.role
+                .capabilities
+                .push(cortexkit_role_llm_runner::capabilities::ATTACHMENTS.into());
+            self.role.majors[0].ops.extend([
+                "session.upload_begin".into(),
+                "session.upload_append".into(),
+                "session.upload_status".into(),
+                "session.upload_commit".into(),
+                cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ.into(),
+            ]);
+        }
+        self
+    }
+}
+
 pub use cortexkit_role_llm_runner::tags::{
     CharRange, ResolveReply as ResolveResponse, ResolveRequest as ResolveParams, RANGE_FIELD,
 };
@@ -512,6 +530,16 @@ pub struct BaselineWire {
     pub tool_names: Vec<String>,
     pub accepted_generation: u64,
     pub applied_generation: u64,
+    /// The pending change and its latest policy, when one is pending. Absent when none is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<cortexkit_role_llm_runner::baseline::PendingChange>,
+    /// The latest applied change, absent while none applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective: Option<cortexkit_role_llm_runner::baseline::EffectiveBaseline>,
+    /// The change-policy rungs this session supports, per surface. Present in every ready
+    /// baseline on a runner declaring `session_change`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rungs: Option<cortexkit_role_llm_runner::baseline::Rungs>,
     /// What the session's frozen config declares about its prompt cache. Absent when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<crate::CacheDeclarationWire>,
@@ -527,6 +555,9 @@ impl BaselineWire {
             tool_names,
             accepted_generation: 0,
             applied_generation: 0,
+            pending: None,
+            effective: None,
+            rungs: None,
             cache: None,
         }
     }
@@ -545,6 +576,9 @@ impl BaselineWire {
             tool_names,
             accepted_generation: 0,
             applied_generation: 0,
+            pending: None,
+            effective: None,
+            rungs: None,
             cache: None,
         }
     }
@@ -995,6 +1029,15 @@ mod pinned_reply_bytes {
             )));
     }
 
+    #[test]
+    fn role_describe_advertises_held_calls_on_every_build() {
+        for compaction_writer in [false, true] {
+            let role = broca_role_describe_with_writers("test", compaction_writer, true, true);
+            assert!(role.declares(cortexkit_role_llm_runner::capabilities::RUN_STATUS));
+            assert!(role.declares(cortexkit_role_llm_runner::capabilities::HELD_CALLS));
+        }
+    }
+
     /// `role.describe` as this build answers it. The build identity is fixed here so a version
     /// bump does not move the pinned bytes.
     #[test]
@@ -1093,7 +1136,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "db369473affe16eb20048c5d70c066097183895adfbdb4ea51046cc1de6695a5",
+            "b3e767c2fc62d637090fd7a286fd19f92544f50743acc9695816ac8f6aa83f83",
         );
     }
 
@@ -1256,7 +1299,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "73bb145b2a54739de328488328b1bcb352fa743f63ff53320ffa6ea47e38db7e";
+        "a1f17d9bcd6f64639fdedea7e99b0684cc5338c5cffd314ea3577fd85bdf0ffe";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

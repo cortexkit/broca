@@ -59,6 +59,128 @@ unsafe impl GlobalAlloc for WarmAllocator {
 #[global_allocator]
 static ALLOCATOR: WarmAllocator = WarmAllocator;
 
+fn synthetic_bedrock_metadata(usage: serde_json::Value) -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+    let payload = serde_json::to_vec(&serde_json::json!({"usage":usage})).unwrap();
+    let mut headers = Vec::new();
+    for (name, value) in [
+        (":message-type", "event"),
+        (":event-type", "metadata"),
+        (":content-type", "application/json"),
+    ] {
+        headers.push(name.len() as u8);
+        headers.extend(name.as_bytes());
+        headers.push(7);
+        headers.extend((value.len() as u16).to_be_bytes());
+        headers.extend(value.as_bytes());
+    }
+    let mut frame = Vec::new();
+    frame.extend(((16 + headers.len() + payload.len()) as u32).to_be_bytes());
+    frame.extend((headers.len() as u32).to_be_bytes());
+    frame.extend(crc32(&frame).to_be_bytes());
+    frame.extend(headers);
+    frame.extend(payload);
+    frame.extend(crc32(&frame).to_be_bytes());
+    frame
+}
+
+#[tokio::test]
+async fn synthetic_usage_is_never_copied_for_envelopes_on_legacy_normalizers() {
+    use broca_protocol::StepId;
+    use broca_provider::{
+        families::*, normalize::SharedResponseEvidence, spec::WireFamilyId, wire::WireFamily,
+    };
+    use serde_json::json;
+    // Measured against the pre-envelope normalizers at 452151dc3 with these exact
+    // fixtures. SSE type inference and content telemetry already parse usage strings;
+    // an envelope must not add any allocation to that legacy profile.
+    let cases: [(WireFamilyId, &dyn WireFamily, [usize; 4]); 5] = [
+        (
+            WireFamilyId::AnthropicMessages,
+            &AnthropicMessages,
+            [49, 3, 0, 0],
+        ),
+        (WireFamilyId::OpenAiChat, &OpenAiChat, [38, 3, 0, 0]),
+        (
+            WireFamilyId::OpenAiResponses,
+            &OpenAiResponses,
+            [37, 2, 0, 0],
+        ),
+        (WireFamilyId::Gemini, &Gemini, [28, 3, 0, 0]),
+        (
+            WireFamilyId::BedrockConverse,
+            &BedrockConverse,
+            [19, 1, 0, 0],
+        ),
+    ];
+    for (id, family, baseline) in cases {
+        let usage = json!({"future_vendor_usage": "u".repeat(17011)});
+        let events = match id {
+            WireFamilyId::AnthropicMessages => {
+                vec![json!({"type":"message_start","message":{"id":"synthetic","usage":usage}})]
+            }
+            WireFamilyId::OpenAiChat => vec![json!({"id":"synthetic","choices":[],"usage":usage})],
+            WireFamilyId::OpenAiResponses => vec![
+                json!({"type":"response.completed","response":{"status":"completed","usage":usage}}),
+            ],
+            WireFamilyId::Gemini => vec![json!({"usageMetadata":usage})],
+            WireFamilyId::BedrockConverse => vec![],
+            _ => unreachable!(),
+        };
+        let bytes = if id == WireFamilyId::BedrockConverse {
+            synthetic_bedrock_metadata(usage)
+        } else {
+            events
+                .into_iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>()
+                .into_bytes()
+        };
+        for journaled in [false, true] {
+            let frozen = frozen_config_for_family(id, "synthetic-model");
+            let mut normalizer = family.normalizer(&frozen, StepId(1));
+            let evidence = SharedResponseEvidence::default();
+            if journaled {
+                normalizer.set_response_evidence(evidence);
+            }
+            let (result, copies) = count(async { normalizer.push(&bytes) }).await;
+            result.unwrap();
+            if journaled {
+                // Responses also builds a generic usage DOM when raw evidence is wanted;
+                // its legacy terminal parser skips unknown usage keys without owning them.
+                let extra = if id == WireFamilyId::OpenAiResponses {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(
+                    copies[1],
+                    baseline[1] + extra,
+                    "{id:?}: journaled raw usage"
+                );
+            } else {
+                assert_eq!(
+                    copies, baseline,
+                    "{id:?}: legacy allocation profile changed"
+                );
+            }
+        }
+    }
+}
+
 struct Counted<F> {
     future: Pin<Box<F>>,
 }

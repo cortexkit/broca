@@ -47,6 +47,10 @@ const NATIVE_FAMILIES: &[(&str, WireFamilyId)] = &[
     ("google", WireFamilyId::Gemini),
 ];
 
+#[cfg(all(test, feature = "live"))]
+#[path = "family_agreement_tests.rs"]
+mod agreement_tests;
+
 /// Which rule resolved a provider's family — recorded so the per-provider refresh
 /// report can show exactly why each provider routes where it does (and a
 /// reclassification surfaces as a reviewed row).

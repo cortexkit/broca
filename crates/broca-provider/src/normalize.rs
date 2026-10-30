@@ -26,6 +26,72 @@ use broca_protocol::{
 use crate::wire::UsageIteration;
 use serde_json::Value;
 
+/// Response-only billing evidence. Allocated and installed only for journaled attempts;
+/// ordinary normalization keeps its existing usage and event representation.
+#[derive(Debug, Default)]
+pub struct ResponseEvidence {
+    pub(crate) handoff_models: Vec<String>,
+    pub(crate) usage: Option<Usage>,
+    pub(crate) usage_raw: Option<Value>,
+    pub(crate) model_used: Option<String>,
+    pub(crate) finish_reason: Option<FinishReason>,
+    pub(crate) service_tier_used: Option<String>,
+    pub(crate) speed_used: Option<String>,
+}
+
+pub type SharedResponseEvidence = std::sync::Arc<std::sync::Mutex<ResponseEvidence>>;
+
+impl ResponseEvidence {
+    pub(crate) fn observe_handoff(&mut self, from: &str, to: &str) {
+        for model in [from, to] {
+            if !model.is_empty() && !self.handoff_models.iter().any(|known| known == model) {
+                self.handoff_models.push(model.to_owned());
+            }
+        }
+    }
+
+    pub(crate) fn observe_served_model(&mut self, served: &str) {
+        if let Some(source) = self.model_used.clone().filter(|source| source != served) {
+            self.observe_handoff(&source, served);
+        }
+    }
+
+    pub(crate) fn observe_response(&mut self, response: &Value) {
+        if let Some(model) = response
+            .get("model")
+            .or_else(|| response.get("modelVersion"))
+            .and_then(Value::as_str)
+        {
+            self.model_used = Some(model.to_owned());
+        }
+        if let Some(tier) = response.get("service_tier").and_then(Value::as_str) {
+            self.service_tier_used = Some(tier.to_owned());
+        }
+        if let Some(speed) = response.get("speed").and_then(Value::as_str) {
+            self.speed_used = Some(speed.to_owned());
+        }
+    }
+
+    pub(crate) fn observe_usage(&mut self, raw: &Value, canonical: Usage) {
+        // Usage snapshots can be partial, notably Anthropic's start/delta pair. Merge
+        // reported keys recursively so a terminal counter cannot erase earlier evidence.
+        fn merge(target: &mut Value, source: &Value) {
+            if let (Value::Object(target), Value::Object(source)) = (&mut *target, source) {
+                for (key, value) in source {
+                    merge(target.entry(key).or_insert(Value::Null), value);
+                }
+            } else {
+                *target = source.clone();
+            }
+        }
+        if raw.is_object() {
+            merge(self.usage_raw.get_or_insert(Value::Null), raw);
+            self.usage = Some(canonical);
+            self.observe_response(raw);
+        }
+    }
+}
+
 // NOTE: `redacted_thinking` is mapped to a DISTINCT `ContentBlock::RedactedReasoning`
 // (NOT `Reasoning.signature`); its encrypted `data` blob is preserved BYTE-VERBATIM
 // so it can be echoed back exactly on the next turn (Anthropic cache/multi-turn
@@ -113,6 +179,7 @@ enum BlockBuf {
 /// Streaming normalizer for ONE Anthropic message (= one step). Construct with
 /// the runner-assigned `step_id`; `push` each decoded event in order.
 pub struct AnthropicNormalizer {
+    response_evidence: Option<SharedResponseEvidence>,
     arguments_guard: crate::wire::ToolArgsGuard,
     completed: bool,
     completed_blocks: std::collections::HashSet<usize>,
@@ -148,8 +215,37 @@ pub struct AnthropicNormalizer {
 }
 
 impl AnthropicNormalizer {
+    pub(crate) fn set_response_evidence(&mut self, evidence: SharedResponseEvidence) {
+        self.response_evidence = Some(evidence);
+    }
+
+    pub(crate) fn observe_error_response(&mut self, response: &Value) {
+        if self.response_evidence.is_none() {
+            return;
+        }
+        let previous = (
+            self.usage,
+            self.service_tier_used.take(),
+            self.speed_used.take(),
+            self.usage_iterations.take(),
+        );
+        if let Some(usage) = response.get("usage") {
+            self.merge_usage(usage);
+        }
+        (
+            self.usage,
+            self.service_tier_used,
+            self.speed_used,
+            self.usage_iterations,
+        ) = previous;
+        if let Some(evidence) = &self.response_evidence {
+            evidence.lock().unwrap().observe_response(response);
+        }
+    }
+
     pub fn new(step_id: StepId) -> Self {
         Self {
+            response_evidence: None,
             arguments_guard: Default::default(),
             completed: false,
             completed_blocks: Default::default(),
@@ -244,6 +340,9 @@ impl AnthropicNormalizer {
         match ty {
             "message_start" => {
                 let msg = v.get("message");
+                if let (Some(evidence), Some(message)) = (&self.response_evidence, msg) {
+                    evidence.lock().unwrap().observe_response(message);
+                }
                 if let Some(id) = msg.and_then(|m| m.get("id")).and_then(Value::as_str) {
                     self.message_id = Some(MessageId(id.to_owned()));
                 }
@@ -347,6 +446,12 @@ impl AnthropicNormalizer {
                                     if is_fallback_wire_model(from_model)
                                         && is_fallback_wire_model(to_model) =>
                                 {
+                                    if let Some(evidence) = &self.response_evidence {
+                                        evidence
+                                            .lock()
+                                            .unwrap()
+                                            .observe_handoff(from_model, to_model);
+                                    }
                                     BlockBuf::Fallback {
                                         from_model: from_model.to_owned(),
                                         to_model: to_model.to_owned(),
@@ -467,6 +572,9 @@ impl AnthropicNormalizer {
                     .and_then(Value::as_str)
                 {
                     self.finish_reason = map_stop_reason(sr);
+                    if let Some(evidence) = &self.response_evidence {
+                        evidence.lock().unwrap().finish_reason = Some(self.finish_reason);
+                    }
                     self.stop_reason = Some(sr.to_owned());
                 }
                 if let Some(u) = v.get("usage") {
@@ -501,6 +609,7 @@ impl AnthropicNormalizer {
                 }));
             }
             "error" => {
+                self.observe_error_response(v);
                 let err = v.get("error");
                 let message = err
                     .and_then(|e| e.get("message"))
@@ -611,21 +720,8 @@ impl AnthropicNormalizer {
         if let Some(x) = g("cache_read_input_tokens") {
             self.usage.cached_input_tokens = Some(x);
         }
-        // Anthropic ALSO emits `cache_creation` as an object beside this flat total,
-        // splitting the write into `ephemeral_5m_input_tokens` and
-        // `ephemeral_1h_input_tokens` — which bill at DIFFERENT rates, 1h higher. We
-        // collapse to the flat total, so the split is lost at this boundary and cannot be
-        // recovered downstream; it is already present in captured SSE and simply unread.
-        //
-        // Deliberate for now because `Usage` has one field for it and the consuming ledger
-        // has one column, so preserving it here would store a number nothing can spend.
-        // The exposure today is nil rather than small: anthropic traffic on this fleet is
-        // subscription-included and never priced. A METERED 1h workload would be
-        // understated at whichever single rate the catalog holds, with no downstream
-        // instrument able to notice — the information stops existing here.
-        //
-        // Reverse this when a metered anthropic route appears or the ledger grows a second
-        // column; the field to read is already on the wire.
+        // Replay usage keeps its flat total. Journaled attempts separately retain the
+        // provider's TTL split and raw usage without changing the legacy step record.
         if let Some(x) = g("cache_creation_input_tokens") {
             self.usage.cache_write_tokens = Some(x);
         }
@@ -657,6 +753,9 @@ impl AnthropicNormalizer {
             .and_then(Value::as_u64)
         {
             self.usage.reasoning_tokens = Some(x);
+        }
+        if let Some(evidence) = &self.response_evidence {
+            evidence.lock().unwrap().observe_usage(u, self.usage);
         }
     }
 
@@ -834,7 +933,7 @@ fn block_index(v: &Value) -> usize {
     v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize
 }
 
-fn map_stop_reason(sr: &str) -> FinishReason {
+pub(crate) fn map_stop_reason(sr: &str) -> FinishReason {
     match sr {
         "end_turn" | "stop_sequence" => FinishReason::Stop,
         "max_tokens" => FinishReason::Length,

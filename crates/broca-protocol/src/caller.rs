@@ -86,6 +86,12 @@ pub enum ControlUnit {
     Error {
         error: SharedProviderError,
     },
+    /// A durable change to the run's provider-held wait, not a terminal or pause.
+    Status {
+        run_id: RunId,
+        #[serde(flatten)]
+        status: Box<cortexkit_role_llm_runner::run::RunStatus>,
+    },
     /// Terminal-for-this-attach PAUSE: the run is paused (not finished) awaiting a
     /// resolvable cause (re-auth). A subscriber from `start` sees this as the final
     /// projected event for a paused run, mirroring how `RunFinished` is terminal — but

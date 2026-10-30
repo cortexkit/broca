@@ -118,6 +118,23 @@ async fn serve_model_responses_paused(
     url
 }
 
+fn model_request_summary(bodies: &[Vec<u8>]) -> String {
+    bodies
+        .iter()
+        .enumerate()
+        .map(|(index, body)| {
+            let repeats = bodies[..index].iter().position(|earlier| earlier == body);
+            let value: Value = serde_json::from_slice(body).expect("model request JSON");
+            format!(
+                "#{index}: {} bytes, repeats {repeats:?}, max_tokens {}",
+                body.len(),
+                value["max_tokens"]
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 struct Rig {
     daemon: Child,
     dir: PathBuf,
@@ -151,6 +168,18 @@ impl Rig {
 
     // A caller may register a live catalog producer before opening the first broca route.
     async fn launch(model_url: &str, catalog: Option<Value>) -> Option<Self> {
+        Self::launch_configured(model_url, catalog, cfg!(feature = "test-attachments")).await
+    }
+
+    async fn launch_media(model_url: &str, catalog: Option<Value>) -> Option<Self> {
+        Self::launch_configured(model_url, catalog, true).await
+    }
+
+    async fn launch_configured(
+        model_url: &str,
+        catalog: Option<Value>,
+        media: bool,
+    ) -> Option<Self> {
         let subc_source = broca_test_support::subc_bin("ck-subc", "SUBC_CORE_BIN");
         let fake_aft = broca_test_support::subc_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN");
         for bin in [&subc_source, &fake_aft] {
@@ -184,6 +213,12 @@ impl Rig {
         let config_path = config_home.join("cortexkit").join("subc.jsonc");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&runtime_dir).unwrap();
+        let broca_config = dir.join("broca.jsonc");
+        std::fs::write(
+            &broca_config,
+            serde_json::to_vec(&serde_json::json!({"media":{"enabled":media}})).unwrap(),
+        )
+        .unwrap();
         // A seeded catalog keeps renderer-version tests offline. Leaving it absent
         // requires bootstrap to fetch facts from the live catalog module.
         if let Some(catalog) = catalog {
@@ -203,6 +238,7 @@ impl Rig {
                     "env": {
                         "BROCA_STATE_ROOT": runtime_dir.join("broca-state"),
                         "BROCA_PROVIDER_BASE_URL": model_url,
+                        "BROCA_CONFIG_PATH": broca_config,
                         "BROCA_TOOL_MODULE": "aft"
                     },
                     "enabled": true
@@ -300,7 +336,6 @@ impl Rig {
     }
 }
 
-#[cfg(feature = "test-attachments")]
 #[path = "media_acceptance.rs"]
 mod media_acceptance;
 
@@ -339,6 +374,86 @@ async fn wait_records(
             other => Err(format!("{other:?}")),
         }
     })
+    .await
+}
+
+async fn wait_send_finished(rig: &Rig, session: &str, send_id: &str) -> Vec<WalRecord> {
+    let conn = broca_subc::SubcConnection::connect(&rig.connection_file)
+        .await
+        .expect("connect for durable session head");
+    let route = conn
+        .route_open_management("broca", &rig.key(session))
+        .await
+        .expect("open durable session head route");
+    let path = broca_core::FileWalStore::new(rig.wal_dir()).wal_path(&rig.key(session));
+    // Raw log bytes may contain RunFinished before the writer has synced them.
+    // session.head supplies a durable control cursor: read assertion content only
+    // through that cursor. This still recognizes this send's terminal after a
+    // queued successor has become the latest run.
+    broca_test_support::wait_until(
+        &format!("the {session} send {send_id} has a durable terminal"),
+        || async {
+            let response = conn
+                .route_request(
+                    &route,
+                    serde_json::to_vec(&serde_json::json!({
+                        "method":"session.head", "params":{}
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .map_err(|error| format!("session.head: {error}"))?;
+            let head: broca_wire::HeadResponse = serde_json::from_value(response["result"].clone())
+                .map_err(|error| format!("decode session.head: {error}: {response}"))?;
+            let cursor = head
+                .head
+                .ok_or_else(|| format!("no durable head: {head:?}"))?;
+            let range = broca_wal::read_records_range(
+                &path,
+                broca_wal::DEFAULT_MAX_READ_BYTES,
+                0,
+                Some(cursor.wal_seq),
+                None,
+            )
+            .map_err(|error| format!("read durable assertion prefix: {error}"))?;
+            if range.lineage_id.map(|id| id.to_string()) != head.lineage_id {
+                return Err("session head and assertion WAL have different lineages".into());
+            }
+            let broca_wal::WalRangeRecords::Complete(frames) = range.records() else {
+                return Err("assertion WAL prefix is incomplete".into());
+            };
+            let records: Vec<_> = frames.iter().map(|frame| frame.record.clone()).collect();
+            let run_id = records
+                .iter()
+                .find_map(|record| match record {
+                    WalRecord::RunStarted {
+                        run_id,
+                        send_id: Some(id),
+                        ..
+                    } if id == send_id => Some(run_id),
+                    _ => None,
+                })
+                .ok_or_else(|| format!("send {send_id} has no durable RunStarted yet"))?;
+            if finished(episode(&records, &run_id.0)).is_none() {
+                return Err(format!(
+                    "send {send_id} has no terminal through public head {cursor:?}"
+                ));
+            }
+            if let Some(last) = head
+                .last_run_state
+                .as_ref()
+                .filter(|last| last.run_id == run_id.0)
+            {
+                if !cortexkit_role_llm_runner::run::RunState::parse(&last.state).is_terminal() {
+                    return Err(format!(
+                        "send {send_id} is still {} at the public head",
+                        last.state
+                    ));
+                }
+            }
+            Ok(records)
+        },
+    )
     .await
 }
 

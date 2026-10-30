@@ -750,14 +750,23 @@ impl RetentionService {
         &self,
         key: &BindIdentity,
     ) -> Result<Option<PathBuf>, RetentionReadError> {
-        self.wal.resolve_live_path(key).map_err(|error| {
-            if matches!(error, broca_wal::WalError::RelocationIncomplete { .. }) {
-                crate::diagnostics::retention_fenced(key, "wal_relocation_incomplete", self.clock.now_ms());
-                self.relocation_incomplete.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tracing::warn!(target: "retention", session = %broca_core::session_addr(key), "retention deferred: wal_relocation_incomplete; an owned open must finish placement");
-            }
-            RetentionReadError::from_wal(error)
-        })
+        self.wal
+            .resolve_live_path(key)
+            .map_err(|error| self.wal_read_error(key, error))
+    }
+
+    fn wal_read_error(&self, key: &BindIdentity, error: broca_wal::WalError) -> RetentionReadError {
+        if matches!(error, broca_wal::WalError::RelocationIncomplete { .. }) {
+            crate::diagnostics::retention_fenced(
+                key,
+                "wal_relocation_incomplete",
+                self.clock.now_ms(),
+            );
+            self.relocation_incomplete
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(target: "retention", session = %broca_core::session_addr(key), "retention deferred: wal_relocation_incomplete; an owned open must finish placement");
+        }
+        RetentionReadError::from_wal(error)
     }
 
     fn current_indexed(
@@ -891,10 +900,13 @@ impl RetentionService {
                 }
             }
         }
-        self.wal.check_move(key, false).map_err(|e| e.to_string())?;
+        let mut expiry_read = self
+            .wal
+            .expiry_read(key)
+            .map_err(|error| self.wal_read_error(key, error))?;
         let path = match overhaul_path {
             Some(path) => path,
-            None => self.live_path_for_retention(key)?,
+            None => expiry_read.live_path().map(Path::to_owned),
         };
         // Deletion may move the resolved path aside before it is opened. Let the
         // ordinary range reader resolve absence/tombstones instead of failing the read.
@@ -918,7 +930,7 @@ impl RetentionService {
         let stones = self.tombstones(key)?;
         let mut archived_read = None;
         if path.is_none() && head.is_none() {
-            let identity = self.wal.archive_identity().map_err(|e| e.to_string())?;
+            let identity = expiry_read.archive_identity().cloned();
             let mut cache = self.archived_expiry.lock().unwrap();
             if cache.identity != identity {
                 cache.lineages.clear();
@@ -934,7 +946,7 @@ impl RetentionService {
             }
             let archived = self
                 .wal
-                .read_archived_for_expiry(key)
+                .read_archived_for_expiry(key, &mut expiry_read)
                 .map_err(RetentionReadError::from_wal)?;
             if let Some((read, wal_bytes)) = archived {
                 // Archive indexes identify addresses, not lineages. Parse the member's WAL
@@ -957,24 +969,31 @@ impl RetentionService {
                             .collect(),
                     };
                     let verdict = self.expired_archived(key, run, &stones, &facts)?;
-                    if identity.is_some()
-                        && self.wal.archive_identity().map_err(|e| e.to_string())? == identity
-                        && self.live_path_for_retention(key)?.is_none()
-                    {
-                        // Bound memory even when a client probes arbitrarily many sessions.
-                        if cache.lineages.len() >= 16_384 {
-                            cache.lineages.clear();
+                    // Restoration can publish a live successor while archived facts are
+                    // decoded. Do not return the predecessor's verdict in that case.
+                    let identity_current = identity.is_some()
+                        && self
+                            .wal
+                            .expiry_identity_is_current(&expiry_read)
+                            .map_err(|e| e.to_string())?;
+                    if self.live_path_for_retention(key)?.is_none() {
+                        if identity_current {
+                            // Bound memory even when a client probes arbitrarily many sessions.
+                            if cache.lineages.len() >= 16_384 {
+                                cache.lineages.clear();
+                            }
+                            cache.lineages.insert(key.clone(), facts);
                         }
-                        cache.lineages.insert(key.clone(), facts);
+                        return Ok(verdict);
                     }
-                    return Ok(verdict);
+                } else if self.live_path_for_retention(key)?.is_none() {
+                    archived_read = Some(read);
                 }
-                archived_read = Some(read);
             }
         }
         if head.is_none() && archived_read.is_none() {
             self.wal
-                .flush_for_read(key)
+                .flush_for_expiry(key, &mut expiry_read)
                 .map_err(RetentionReadError::from_wal)?;
         }
         if let Some(file) = &file {
@@ -1013,7 +1032,7 @@ impl RetentionService {
             Some(read) => read,
             None => self
                 .wal
-                .read_records_range(key, 0, head, None)
+                .read_records_for_expiry(key, head, &mut expiry_read)
                 .map_err(RetentionReadError::from_wal)?,
         };
         if matches!(read.records(), broca_wal::WalRangeRecords::Complete(_)) {
@@ -1068,7 +1087,7 @@ impl RetentionService {
         }
         if self
             .wal
-            .lineage_exists(key, meta)
+            .lineage_exists_for_expiry(key, meta, &mut expiry_read)
             .map_err(RetentionReadError::from_wal)?
         {
             return Ok(None);

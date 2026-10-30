@@ -429,7 +429,8 @@ pub fn seed_fallback_count() -> u64 {
     SEED_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-pub(crate) fn count_seed_fallback(reason: &str) {
+/// Record a named repair when a media reader cannot trust its stored checkpoint.
+pub fn count_seed_fallback(reason: &str) {
     SEED_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     tracing::warn!(reason, "media checkpoint requires full durable replay");
 }

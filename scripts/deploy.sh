@@ -163,7 +163,7 @@ acceptance() {
   return 1
 }
 # stage-release builds both ck-broca and this client from the same committed HEAD.
-if [ ! -x ./target/release/broca-session ] || ! acceptance; then
+if [ ! -x "${CARGO_TARGET_DIR:-./target}/release/broca-session" ] || ! acceptance; then
   echo "deploy: LIVE ACCEPTANCE FAILED (including unavailable providers/client); not publishing." >&2
   rollback_command >&2
   exit 1

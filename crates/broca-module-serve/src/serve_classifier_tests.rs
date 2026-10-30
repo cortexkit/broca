@@ -106,6 +106,8 @@ struct HeldProvider {
     gate: Semaphore,
     entered: Notify,
     held: AtomicUsize,
+    // held counts every provider entry; waiting falls when a call finishes or is cancelled.
+    waiting: AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -117,6 +119,14 @@ impl ClassifierProvider for HeldProvider {
         None
     }
     async fn call(&self, _body: String) -> ProviderReply {
+        struct WaitingCall<'a>(&'a AtomicUsize);
+        impl Drop for WaitingCall<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        let _waiting = WaitingCall(&self.waiting);
         self.held.fetch_add(1, Ordering::SeqCst);
         self.entered.notify_waiters();
         let _permit = self.gate.acquire().await.unwrap();
@@ -165,6 +175,7 @@ async fn start_with_basis(table: crate::billing_routing::ChargeBasisTable) -> Ri
         gate: Semaphore::new(0),
         entered: Notify::new(),
         held: AtomicUsize::new(0),
+        waiting: AtomicUsize::new(0),
     });
     let store = Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap());
     static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -261,6 +272,18 @@ impl Rig {
         principal: Option<subc_protocol::Principal>,
         scope: Option<subc_protocol::scope::ScopeStamp>,
     ) -> Frame {
+        self.bind_in_project(channel, roles, principal, scope, "/tmp/project-a")
+            .await
+    }
+
+    async fn bind_in_project(
+        &mut self,
+        channel: u16,
+        roles: &[(&str, &str)],
+        principal: Option<subc_protocol::Principal>,
+        scope: Option<subc_protocol::scope::ScopeStamp>,
+        project_root: &str,
+    ) -> Frame {
         let role_versions: BTreeMap<String, String> = roles
             .iter()
             .map(|(role, version)| (role.to_string(), version.to_string()))
@@ -271,7 +294,7 @@ impl Rig {
             target: subc_protocol::RouteTarget::ManagementSurface {
                 module_id: "broca".into(),
             },
-            identity: SubcBindIdentity::new("/tmp/project-a", "runner", "classifier-test"),
+            identity: SubcBindIdentity::new(project_root, "runner", "classifier-test"),
             principal,
             consumer_capabilities: None,
             admission_facts: None,
@@ -644,85 +667,124 @@ async fn rig_has_route(rig: &mut Rig, channel: u16) -> bool {
 /// the provider is.
 #[tokio::test]
 async fn a_hung_classifier_provider_never_delays_session_work() {
-    let mut rig = start().await;
-    assert_eq!(rig.bind(7, &[]).await.header.ty, FrameType::Response);
-    assert_eq!(
-        rig.bind(9, &[broca_subc::CLASSIFIER_ROLE_VERSIONS])
-            .await
-            .header
-            .ty,
-        FrameType::Response
-    );
-    // Enough held batches to fill every one of the connection's request slots, were they
-    // taken: none may be.
-    let batches = MAX_INFLIGHT_ROUTE_REQUESTS as u64 + 4;
-    for n in 0..batches {
-        rig.request(
-            9,
-            100 + n,
-            "classify.run",
-            classify_params(&format!("held-{n}")),
-        )
-        .await;
-    }
+    let mut rig = broca_test_support::wait_for("classifier rig startup", start(), || {
+        "awaiting the serve hello; no requests sent or handlers reached".into()
+    })
+    .await;
     let provider = rig.provider.clone();
-    // A refusal can answer before the provider is called. Observe that reply as well as
-    // entry, otherwise an admission regression leaves the test waiting for an impossible event.
-    let entered = broca_test_support::event_timeout(
-        "the classifier provider to hold a call",
+    let handler = rig.handler.clone();
+    let phase = std::cell::Cell::new("binding the session route");
+    let sent = std::cell::Cell::new(0);
+    let answered = std::cell::RefCell::new(std::collections::BTreeSet::new());
+    let classified = std::cell::RefCell::new(std::collections::BTreeSet::new());
+    broca_test_support::wait_for(
+        "held classifier calls and independent session work",
         async {
+            let project_root = broca_test_support::scratch_root()
+                .join(format!("classifier-session-{}", std::process::id()));
+            std::fs::create_dir_all(&project_root).unwrap();
+            // session.send refuses a missing project root before invoking its handler.
+            assert_eq!(
+                rig.bind_in_project(
+                    7,
+                    &[],
+                    None,
+                    Some(run_stamp("run")),
+                    project_root.to_str().unwrap(),
+                )
+                .await
+                .header
+                .ty,
+                FrameType::Response
+            );
+            phase.set("binding the classifier route");
+            assert_eq!(
+                rig.bind(9, &[broca_subc::CLASSIFIER_ROLE_VERSIONS])
+                    .await
+                    .header
+                    .ty,
+                FrameType::Response
+            );
+            // Send more held batches than the connection has request slots. Classifier calls
+            // must not occupy those slots and prevent the session requests below from running.
+            let batches = MAX_INFLIGHT_ROUTE_REQUESTS as u64 + 4;
+            phase.set("sending classifier requests");
+            for n in 0..batches {
+                rig.request(
+                    9,
+                    100 + n,
+                    "classify.run",
+                    classify_params(&format!("held-{n}")),
+                )
+                .await;
+                sent.set(n + 1);
+            }
+            // A refusal can answer before the provider is called. Observe that reply as well as
+            // entry, otherwise an admission regression leaves the test waiting for an impossible event.
+            phase.set("waiting for provider entry");
             loop {
                 let notified = provider.entered.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
                 if provider.held.load(Ordering::SeqCst) > 0 {
-                    return Ok(());
+                    break;
                 }
                 tokio::select! {
                     _ = notified => {}
                     reply = read_frame(&mut rig.daemon) => {
-                        return Err(format!("classify.run answered before its provider was held: {reply:?}"));
+                        panic!("classify.run answered before its provider was held: {reply:?}");
                     }
                 }
             }
+            phase.set("sending session.read corr=1");
+            rig.request(7, 1, "session.read", json!({})).await;
+            phase.set("sending session.send corr=2");
+            rig.request(
+                7,
+                2,
+                "session.send",
+                json!({"prompt": "next", "send_id": "turn-1",
+                       "model": {"provider": "fake", "model": "fake"}}),
+            )
+            .await;
+            phase.set("waiting for session replies corr={1, 2}");
+            while answered.borrow().len() < 2 {
+                let frame = read_frame(&mut rig.daemon).await.unwrap().unwrap();
+                assert!(
+                    frame.header.corr < 100,
+                    "a classify.run answered while its provider was held: {frame:?}"
+                );
+                answered.borrow_mut().insert(frame.header.corr);
+            }
+            assert_eq!(rig.handler.reads.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                rig.handler.sends.load(Ordering::SeqCst),
+                1,
+                "session.send corr=2 must reach its handler while classifier calls are held"
+            );
+            assert!(rig.provider.held.load(Ordering::SeqCst) >= 1);
+            rig.provider.gate.add_permits(batches as usize);
+            phase.set("waiting for classifier replies after releasing the provider");
+            while classified.borrow().len() < batches as usize {
+                let frame = read_frame(&mut rig.daemon).await.unwrap().unwrap();
+                assert_eq!(frame.header.ty, FrameType::Response, "{frame:?}");
+                classified.borrow_mut().insert(frame.header.corr);
+            }
+            phase.set("finishing the connection");
+            rig.finish().await;
         },
-        || format!("{} provider calls held", provider.held.load(Ordering::SeqCst)),
+        || {
+            format!(
+                "phase={}; classifier requests sent={}; session corr ids answered={:?} (expected {{1, 2}}); classifier corr ids answered={:?} (expected 100..{}); provider calls held={}; provider calls entered={}; session.read handler reached={}; session.send handler reached={}",
+                phase.get(), sent.get(), answered.borrow(), classified.borrow(),
+                100 + MAX_INFLIGHT_ROUTE_REQUESTS as u64 + 4,
+                provider.waiting.load(Ordering::SeqCst),
+                provider.held.load(Ordering::SeqCst),
+                handler.reads.load(Ordering::SeqCst), handler.sends.load(Ordering::SeqCst),
+            )
+        },
     )
     .await;
-    if !matches!(entered, Ok(Ok(()))) {
-        provider.gate.add_permits(batches as usize);
-        rig.serve.abort();
-        let _ = rig.serve.await;
-        panic!("the classifier provider must hold a call before session work: {entered:?}");
-    }
-    rig.request(7, 1, "session.read", json!({})).await;
-    rig.request(
-        7,
-        2,
-        "session.send",
-        json!({"prompt": "next", "send_id": "turn-1",
-               "model": {"provider": "fake", "model": "fake"}}),
-    )
-    .await;
-    let mut answered = std::collections::BTreeSet::new();
-    while answered.len() < 2 {
-        let frame = rig.reply().await;
-        assert!(
-            frame.header.corr < 100,
-            "a classify.run answered while its provider was held: {frame:?}"
-        );
-        answered.insert(frame.header.corr);
-    }
-    assert_eq!(rig.handler.reads.load(Ordering::SeqCst), 1);
-    assert!(rig.provider.held.load(Ordering::SeqCst) >= 1);
-    rig.provider.gate.add_permits(batches as usize);
-    let mut classified = std::collections::BTreeSet::new();
-    while classified.len() < batches as usize {
-        let frame = rig.reply().await;
-        assert_eq!(frame.header.ty, FrameType::Response, "{frame:?}");
-        classified.insert(frame.header.corr);
-    }
-    rig.finish().await;
 }
 
 #[tokio::test]

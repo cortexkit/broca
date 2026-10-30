@@ -1,5 +1,5 @@
 //! Provider-held calls end to end: a real `ck-subc`, a supervised `ck-broca` whose tool routes
-//! declare `content/v1` and `held-reply/v1` (a debug-only switch), and the scripted tool
+//! declare `tool-result/v1` and `held-reply/v1`, and a scripted tool
 //! provider answering one call `held` and settling it later through its `late_results` feed.
 //!
 //! What these cases hold broca to:
@@ -26,11 +26,15 @@ const INTERIM: &str = "HELD INTERIM: the answer comes later";
 #[derive(Default)]
 pub(super) struct FeedState {
     withdrawals: Vec<Value>,
-    /// The catalog declares `late_results` and `content/v1`, and calls in `hold` are held.
+    /// The catalog declares `late_results` and `tool-result/v1`, and calls in `hold` are held.
     enabled: bool,
     /// Arguments (as JSON text) of the calls the provider holds.
     hold: BTreeSet<String>,
-    /// Route channels whose bind declared both `content/v1` and `held-reply/v1`.
+    /// Sessions whose sends need a plan to record the provider's late-results declarations
+    /// in their session manifest.
+    sessions: BTreeSet<String>,
+    reasons: HashMap<String, String>,
+    /// Route channels whose bind declared both `tool-result/v1` and `held-reply/v1`.
     declared_routes: BTreeSet<(u16, u32)>,
     /// The call key each held call carried, by its arguments' JSON text.
     held_keys: HashMap<String, String>,
@@ -81,16 +85,16 @@ impl FeedState {
     }
 }
 
-/// Add the provider-held declarations to a catalog answer while the feed is enabled: the
-/// `late_results` session capability and the `content/v1` result format on every tool.
-pub(super) fn declare_in_catalog(shared: &Shared, answer: &mut Value) {
-    if !shared.held_feed.lock().unwrap().enabled {
+/// Only held-fixture sessions negotiate typed results. Other fixtures return legacy replies,
+/// even while this provider's feed remains available for an earlier held session.
+pub(super) fn declare_in_catalog(shared: &Shared, session: &str, answer: &mut Value) {
+    if !shared.held_feed.lock().unwrap().sessions.contains(session) {
         return;
     }
     answer["capabilities"] = json!({"late_results": true});
     if let Some(tools) = answer["tools"].as_array_mut() {
         for tool in tools {
-            tool["result_format"] = json!("content/v1");
+            tool["result_format"] = json!("tool-result/v1");
         }
     }
 }
@@ -111,6 +115,79 @@ pub(super) fn note_bind(shared: &Shared, route: (u16, u32), capabilities: Option
     }
 }
 
+pub(super) fn install_held_reply(shared: &Shared, session: &str, arguments: &Value, reason: &str) {
+    let mut feed = shared.held_feed.lock().unwrap();
+    feed.enabled = true;
+    feed.sessions.insert(session.into());
+    feed.hold.insert(arguments.to_string());
+    feed.reasons.insert(arguments.to_string(), reason.into());
+}
+
+pub(super) fn needs_plan(shared: &Shared, session: &str) -> bool {
+    shared.held_feed.lock().unwrap().sessions.contains(session)
+}
+
+pub(super) async fn await_held_reply(
+    shared: &Shared,
+    arguments: &Value,
+) -> Result<String, HarnessError> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(key) = shared
+            .held_feed
+            .lock()
+            .unwrap()
+            .held_keys
+            .get(&arguments.to_string())
+            .cloned()
+        {
+            return Ok(key);
+        }
+        if Instant::now() >= deadline {
+            return Err(HarnessError::new(
+                "the provider never received the keyed held call",
+            ));
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+pub(super) fn publish_late_entry(
+    shared: &Shared,
+    arguments: &Value,
+    scripted: ScriptedLateEntry,
+) -> Result<(), HarnessError> {
+    let mut feed = shared.held_feed.lock().unwrap();
+    let key = feed
+        .held_keys
+        .get(&arguments.to_string())
+        .cloned()
+        .ok_or_else(|| HarnessError::new("the provider has not held these arguments"))?;
+    let number = feed.entries.len() + 1;
+    let mut entry = LateEntry::new(
+        scripted.kind(),
+        "reserved:broca",
+        "none",
+        0,
+        "reserved:broca",
+        key,
+        format!("event-{number}"),
+        1_761_220_000_000,
+    );
+    if let Some(result) = scripted.result_body() {
+        let text = match result {
+            Value::String(text) => text.clone(),
+            value => value.to_string(),
+        };
+        entry = entry.with_result(json!({"content":[{"type":"text","text":text}]}));
+    }
+    if let Some(reason) = scripted.reason() {
+        entry = entry.with_reason(reason);
+    }
+    feed.publish(entry);
+    Ok(())
+}
+
 /// Answer a call the provider holds with a held reply, counting it as an invocation. `None`
 /// for every other call, which the scripted provider answers as usual.
 pub(super) fn answer_held(
@@ -126,6 +203,11 @@ pub(super) fn answer_held(
     // A provider may hold only a call that carried a key (contract §4.1).
     let key = request["call_key"].as_str()?.to_owned();
     feed.held_keys.insert(arguments.to_owned(), key);
+    let reason = feed
+        .reasons
+        .get(arguments)
+        .cloned()
+        .unwrap_or_else(|| "running".into());
     drop(feed);
     *shared
         .invocations
@@ -136,7 +218,7 @@ pub(super) fn answer_held(
     Some(subc_client_rs::HandlerOutcome::Response(
         serde_json::to_vec(&json!({
             "content": [{"type": "text", "text": INTERIM}],
-            "held": {"reason": "running", "detail": {"ticket": "t-1"}}
+            "held": {"reason": reason, "detail": {"ticket": "t-1"}}
         }))
         .unwrap(),
     ))
@@ -246,8 +328,7 @@ impl HeldCase {
             .join(format!("broca-held-{session}-{}", std::process::id()));
         broca_test_support::remove_rig_dir(&scratch);
         std::fs::create_dir_all(&scratch).unwrap();
-        let mut held_subject = BrocaSubject::new(&scratch).await;
-        held_subject.declare_held_reply = true;
+        let held_subject = BrocaSubject::new(&scratch).await;
         let root = scratch.join("root");
         std::fs::create_dir_all(&root).unwrap();
         let call = ScriptedToolCall {
@@ -257,11 +338,7 @@ impl HeldCase {
             result: json!({"marker": "never answered synchronously"}),
             hold: false,
         };
-        {
-            let mut feed = held_subject.shared.held_feed.lock().unwrap();
-            feed.enabled = true;
-            feed.hold.insert(call.arguments.to_string());
-        }
+        install_held_reply(&held_subject.shared, session, &call.arguments, "running");
         let turn = |parts| {
             ScriptedTurn::new(parts).with_usage(
                 cortexkit_role_llm_runner_conformance::ScriptedUsage::new(1, 0, 0, 1),
@@ -298,6 +375,11 @@ impl HeldCase {
             .session_route(live, self.session, &self.subject.owner_stamp())
             .await
             .unwrap();
+        self.send_on(&route).await;
+        route
+    }
+
+    async fn send_on(&self, route: &BrocaRoute) {
         let mut fields = self
             .subject
             .send_fields_with_plan(self.session, true, &Map::new())
@@ -312,7 +394,6 @@ impl HeldCase {
             Reply::Response(_) => {}
             Reply::Error(error) => panic!("send refused: {} {}", error.code, error.message),
         }
-        route
     }
 
     /// Wait until the session's WAL satisfies `ready`, failing after a minute with `what`.
@@ -534,6 +615,256 @@ async fn a_held_call_pauses_then_its_late_result_completes_the_turn() {
     drop(route);
     drop(live);
     case.finish();
+}
+
+/// Preserve StreamData bodies exactly as served; decoding is only for finding the cut.
+async fn capture_through(
+    stream: &mut broca_subc::SubscribeStream,
+    frames: &mut Vec<Vec<u8>>,
+    ready: impl Fn(&Value) -> bool,
+) {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let body = stream
+                .next()
+                .await
+                .unwrap()
+                .expect("subscription stays open");
+            let decoded: Value = serde_json::from_slice(&body).unwrap();
+            frames.push(body);
+            if ready(&decoded) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the subscription reached the requested durable boundary");
+}
+
+fn save_status_sample(name: &str, frames: &[Vec<u8>]) {
+    if let Some(directory) = std::env::var_os("BROCA_HELD_STATUS_SAMPLES") {
+        let directory = PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut bytes = Vec::new();
+        for frame in frames {
+            bytes.extend(frame);
+            bytes.push(b'\n');
+        }
+        std::fs::write(directory.join(format!("{name}.jsonl")), bytes).unwrap();
+    }
+}
+
+fn durable_frames(frames: &[Vec<u8>]) -> Vec<Value> {
+    frames
+        .iter()
+        .map(|body| serde_json::from_slice::<Value>(body).unwrap())
+        .filter(|frame| frame["kind"] == "control")
+        .map(|mut frame| {
+            // Display deltas consume stream sequence numbers but are not replayed.
+            frame.as_object_mut().unwrap().remove("seq");
+            frame
+        })
+        .collect()
+}
+
+fn check_status_stream(frames: &[Vec<u8>]) {
+    for (index, body) in frames.iter().enumerate() {
+        let frame: cortexkit_role_llm_runner::subscribe::SubscribeEvent =
+            serde_json::from_slice(body).unwrap();
+        assert_eq!(frame.seq(), Some(index as u64 + 1));
+        assert!(!matches!(
+            frame.live_event(),
+            Some(cortexkit_role_llm_runner::live::LiveEvent::RunPaused(_))
+        ));
+        if frame
+            .body
+            .get("unit")
+            .is_some_and(|unit| unit["type"] == "status")
+        {
+            assert_eq!(frame.live_event(), None);
+            assert!(!frame.body.contains_key("event"));
+            assert_eq!(frame.body["state"], "active");
+            assert_eq!(
+                frame.body.contains_key("held_calls"),
+                !frame.held_calls().unwrap().is_empty()
+            );
+        }
+    }
+}
+
+/// The same real serve path supplies both the live reader and reconnecting readers.
+/// Set BROCA_HELD_STATUS_SAMPLES to retain the untouched bodies as JSONL reader fixtures.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_status_live_and_replay_samples() {
+    if !rig_ready() {
+        return;
+    }
+    for (session, kind) in [
+        ("status-late", Some(kinds::RESULT)),
+        ("status-expired", Some(kinds::EXPIRED)),
+        ("status-ordinary", None),
+    ] {
+        let case = HeldCase::new(session).await;
+        if kind.is_none() {
+            case.subject.shared.held_feed.lock().unwrap().hold.clear();
+        }
+        let live = case.subject.spawn(&case.root).await.unwrap();
+        let route = case
+            .subject
+            .session_route(&live, session, &case.subject.owner_stamp())
+            .await
+            .unwrap();
+        let subscription = route
+            .connection
+            .route_open_management("broca", &route.session)
+            .await
+            .unwrap();
+        let mut stream = route
+            .connection
+            .subscribe(
+                &subscription,
+                br#"{"method":"session.subscribe","params":{"from":"live"}}"#.to_vec(),
+            )
+            .await
+            .unwrap();
+        let mut frames = Vec::new();
+        capture_through(&mut stream, &mut frames, |frame| frame["kind"] == "display").await;
+        case.send_on(&route).await;
+        if let Some(kind) = kind {
+            let call_key = case.await_pause(&live).await;
+            capture_through(&mut stream, &mut frames, |frame| {
+                frame["unit"]["type"] == "status"
+            })
+            .await;
+            let frame: cortexkit_role_llm_runner::subscribe::SubscribeEvent =
+                serde_json::from_slice(frames.last().unwrap()).unwrap();
+            let Reply::Response(status) = route
+                .request(
+                    "run.status",
+                    json!({"run_id": frame.body["unit"]["run_id"]}),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("run.status refused");
+            };
+            let status: cortexkit_role_llm_runner::run::RunStatus =
+                serde_json::from_value(status).unwrap();
+            assert_eq!(status.state, "active");
+            assert_eq!(frame.held_calls().unwrap(), status.held_calls());
+            assert_eq!(status.held_calls().len(), 1);
+            assert_eq!(status.held_calls()[0].call_key(), call_key);
+            save_status_sample(&format!("{session}-listed-live"), &frames);
+            let replay_route = route
+                .connection
+                .route_open_management("broca", &route.session)
+                .await
+                .unwrap();
+            let mut replay = route
+                .connection
+                .subscribe(
+                    &replay_route,
+                    br#"{"method":"session.subscribe","params":{"from":"start"}}"#.to_vec(),
+                )
+                .await
+                .unwrap();
+            let mut replay_frames = Vec::new();
+            capture_through(&mut replay, &mut replay_frames, |frame| {
+                frame["unit"]["type"] == "status"
+            })
+            .await;
+            save_status_sample(&format!("{session}-listed-replay"), &replay_frames);
+            assert_eq!(durable_frames(&frames), durable_frames(&replay_frames));
+            drop(replay);
+            let _ = route.connection.route_close(&replay_route).await;
+            let entry = LateEntry::new(
+                kind,
+                "reserved:broca",
+                "none",
+                0,
+                "reserved:broca",
+                call_key,
+                "event-1",
+                1_761_220_000_000,
+            );
+            let entry = if kind == kinds::RESULT {
+                entry.with_result(json!({"content":[{"type":"text","text":case.late_text()}]}))
+            } else {
+                entry
+            };
+            case.subject.shared.held_feed.lock().unwrap().publish(entry);
+        }
+        capture_through(&mut stream, &mut frames, |frame| {
+            frame["unit"]["type"] == "run_finished"
+        })
+        .await;
+        save_status_sample(&format!("{session}-settled-live"), &frames);
+        let replay_route = route
+            .connection
+            .route_open_management("broca", &route.session)
+            .await
+            .unwrap();
+        let mut replay = route
+            .connection
+            .subscribe(
+                &replay_route,
+                br#"{"method":"session.subscribe","params":{"from":"start"}}"#.to_vec(),
+            )
+            .await
+            .unwrap();
+        let mut replay_frames = Vec::new();
+        capture_through(&mut replay, &mut replay_frames, |frame| {
+            frame["unit"]["type"] == "run_finished"
+        })
+        .await;
+        save_status_sample(&format!("{session}-settled-replay"), &replay_frames);
+        check_status_stream(&frames);
+        check_status_stream(&replay_frames);
+        let changes: Vec<cortexkit_role_llm_runner::subscribe::SubscribeEvent> = frames
+            .iter()
+            .map(|body| serde_json::from_slice(body).unwrap())
+            .filter(
+                |frame: &cortexkit_role_llm_runner::subscribe::SubscribeEvent| {
+                    frame
+                        .body
+                        .get("unit")
+                        .is_some_and(|unit| unit["type"] == "status")
+                },
+            )
+            .collect();
+        if kind.is_some() {
+            assert_eq!(changes.len(), 2, "listed then cleared, once each");
+            assert!(changes[1].held_calls().unwrap().is_empty());
+            let Reply::Response(status) = route
+                .request(
+                    "run.status",
+                    json!({"run_id": changes[1].body["unit"]["run_id"]}),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("run.status refused");
+            };
+            let status: cortexkit_role_llm_runner::run::RunStatus =
+                serde_json::from_value(status).unwrap();
+            assert_eq!(changes[1].held_calls().unwrap(), status.held_calls());
+        } else {
+            assert!(
+                changes.is_empty(),
+                "ordinary sessions gain no status frames"
+            );
+            assert!(frames
+                .iter()
+                .all(|body| !String::from_utf8_lossy(body).contains("held_calls")));
+        }
+        assert_eq!(durable_frames(&frames), durable_frames(&replay_frames));
+        assert_eq!(case.subject.tool_invocations(&case.call.arguments).await, 1);
+        drop(replay);
+        drop(stream);
+        drop(route);
+        drop(live);
+        case.finish();
+    }
 }
 
 /// Killed after the run paused and before the late result was pulled: the restarted daemon

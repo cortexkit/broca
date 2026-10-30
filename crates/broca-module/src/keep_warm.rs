@@ -83,6 +83,7 @@ fn automatic_warm_hook(
     seal: &ShutdownSeal,
     job: &WarmJob,
     run_id: &RunId,
+    trigger: &str,
 ) -> Option<Arc<broca_core::cache_warm::WarmJournal>> {
     if !writer.is_overhaul() {
         return None;
@@ -92,7 +93,7 @@ fn automatic_warm_hook(
         seal.clone(),
         job,
         run_id,
-        Some("keep_warm".into()),
+        Some(trigger.into()),
     )
 }
 
@@ -106,7 +107,7 @@ pub fn warm_setup_for_allocation_test(
     automatic: bool,
 ) -> bool {
     if automatic {
-        automatic_warm_hook(writer, seal, job, run_id).is_some()
+        automatic_warm_hook(writer, seal, job, run_id, "keep_warm").is_some()
     } else {
         manual_warm_hook(writer, None, job, run_id).is_some()
     }
@@ -132,6 +133,7 @@ pub fn automatic_warmer_for_test(
         },
     );
     Arc::new(AutomaticWarmer {
+        trigger: "keep_warm",
         retention: false,
         session,
         writer,
@@ -217,6 +219,7 @@ pub(crate) fn warm_journal(
     )))
 }
 pub(crate) struct AutomaticWarmer {
+    pub(crate) trigger: &'static str,
     pub(crate) retention: bool,
     pub(crate) session: BindIdentity,
     pub(crate) writer: Arc<WalHandle>,
@@ -362,7 +365,7 @@ impl KeepWarmDriver for AutomaticWarmer {
             base,
             attempt_hook: None,
         };
-        let journal = automatic_warm_hook(&self.writer, &self.seal, &job, run_id);
+        let journal = automatic_warm_hook(&self.writer, &self.seal, &job, run_id, self.trigger);
         job.attempt_hook = journal
             .as_ref()
             .map(|journal| journal.clone() as Arc<dyn broca_core::run::AttemptHook>);
@@ -435,7 +438,7 @@ impl KeepWarmDriver for AutomaticWarmer {
                 attempt_id: None,
                 reservation: None,
                 envelope: None,
-                trigger: Some("keep_warm".into()),
+                trigger: Some(self.trigger.into()),
                 run_id: run_id.clone(),
                 step_id,
                 request_body_sha256: digest,
@@ -549,6 +552,7 @@ mod retention_tests {
                             account_ref: None,
                             speed_requested: None,
                             warm: None,
+                            auth_refreshed: false,
                         },
                         Default::default(),
                     )
@@ -650,6 +654,7 @@ mod retention_tests {
             },
         );
         let warmer = AutomaticWarmer {
+            trigger: "keep_warm",
             retention: false,
             session: key.clone(),
             writer: writer.clone(),
@@ -807,6 +812,7 @@ mod retention_tests {
         let clock = CacheClock::default();
         clock.note_sent(epoch_ms(), Some(600_000));
         let warmer = AutomaticWarmer {
+            trigger: "keep_warm",
             retention: false,
             session: key.clone(),
             writer: writer.clone(),
@@ -887,6 +893,7 @@ mod retention_tests {
             let clock = CacheClock::default();
             clock.note_sent(epoch_ms(), Some(600_000));
             let warmer = AutomaticWarmer {
+                trigger: "keep_warm",
                 retention,
                 session: key.clone(),
                 writer: writer.clone(),

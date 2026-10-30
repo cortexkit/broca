@@ -119,17 +119,7 @@ async fn send_family(
         params["plan"] = plan();
     }
     request(rig, "media", "session.send", params).await.unwrap();
-    let records = wait_records(rig, "media", |records| {
-        records
-            .iter()
-            .filter(|record| matches!(record, WalRecord::RunStarted { .. }))
-            .count()
-            == records
-                .iter()
-                .filter(|record| matches!(record, WalRecord::RunFinished { .. }))
-                .count()
-    })
-    .await;
+    let records = super::super::wait_send_finished(rig, "media", id).await;
     for record in records {
         if let WalRecord::RunFinished { reason, error, .. } = record {
             assert_eq!(reason, RunFinishReason::Completed, "{error:?}");
@@ -243,7 +233,7 @@ async fn daemon_round_trip(id: WireFamilyId) {
         samples().into_iter().find(|sample| sample.0 == id).unwrap();
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let url = serve_model_responses(bodies.clone(), vec![text, tool, text]).await;
-    let Some(rig) = Rig::launch(&url, Some(catalog_for(provider, model, route))).await else {
+    let Some(rig) = Rig::launch_media(&url, Some(catalog_for(provider, model, route))).await else {
         return;
     };
     let _tool = image_tool(&rig).await;
@@ -348,7 +338,7 @@ async fn real_daemon_portable_media_recovery_after_kill_preserves_request_bytes(
     )
     .await;
     let catalog = catalog_for("anthropic", CLAUDE, "anthropic/claude-opus-5");
-    let Some(mut original) = Rig::launch(&url, Some(catalog.clone())).await else {
+    let Some(mut original) = Rig::launch_media(&url, Some(catalog.clone())).await else {
         return;
     };
     let _original_tool = image_tool(&original).await;
@@ -369,7 +359,7 @@ async fn real_daemon_portable_media_recovery_after_kill_preserves_request_bytes(
     gate.notify_waiters();
     // An active-run index intentionally seals interrupted runs. Omitting that disposable
     // index exercises recovery of the admitted step from its portable WAL, media and bind.
-    let Some(mut restored) = Rig::launch(&url, Some(catalog)).await else {
+    let Some(mut restored) = Rig::launch_media(&url, Some(catalog)).await else {
         return;
     };
     restored.project = original.project.clone();
@@ -379,28 +369,41 @@ async fn real_daemon_portable_media_recovery_after_kill_preserves_request_bytes(
     );
     let _restored_tool = image_tool(&restored).await;
     assert!(restored.wait_for_module_live().await);
-    request(
-        &restored,
-        "media",
-        "session.send",
-        json!({"prompt":"resume","send_id":"resume","on_restart":"resume",
-        "model":{"provider":"anthropic","model":CLAUDE}}),
-    )
-    .await
-    .unwrap();
-    wait_records(&restored, "media", |records| {
+    // Opening the session actor re-drives its unfinished episode before handling
+    // commands. Subscribe without sending a new prompt, which would queue another turn.
+    let conn = broca_subc::SubcConnection::connect(&restored.connection_file)
+        .await
+        .unwrap();
+    let route = conn
+        .route_open_management("broca", &restored.key("media"))
+        .await
+        .unwrap();
+    let _subscription = conn
+        .subscribe(
+            &route,
+            serde_json::to_vec(&json!({
+                "method":"session.subscribe", "params":{"from":"live"}
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let records = super::super::wait_send_finished(&restored, "media", "capture").await;
+    assert_eq!(
         records
             .iter()
             .filter(|record| matches!(record, WalRecord::RunStarted { .. }))
-            .count()
-            == records
-                .iter()
-                .filter(|record| matches!(record, WalRecord::RunFinished { .. }))
-                .count()
-    })
-    .await;
+            .count(),
+        2,
+        "recovery must continue the capture episode without starting another turn"
+    );
     let bodies = bodies.lock().unwrap();
-    assert_eq!(bodies.len(), 4);
+    assert_eq!(
+        bodies.len(),
+        4,
+        "{}",
+        super::super::model_request_summary(&bodies)
+    );
     assert_eq!(
         bodies[1], bodies[2],
         "the resumed request equals the request sent before SIGKILL"

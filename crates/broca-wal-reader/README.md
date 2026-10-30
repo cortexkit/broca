@@ -139,6 +139,8 @@ The low-level frame decoder's strict policy refuses any unknown required feature
 Use the billing API rather than a raw frame scan for billing ingestion. No reader
 release may be assumed to understand features merely because the writer does.
 
+A `usage_by_model` row with absent counters means "this model served part of the step, and its share is only in `usage_raw`"; normalized unattributed totals are not representable in `bill-attempts/v1`.
+
 ## Retention: the rule each record follows
 
 A record follows the retention policy of the session incarnation that contains

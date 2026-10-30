@@ -11,6 +11,7 @@
 mod index;
 mod rebuild;
 mod schema;
+mod seeds;
 
 use std::path::Path;
 use std::sync::Mutex;

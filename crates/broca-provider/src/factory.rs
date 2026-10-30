@@ -48,15 +48,7 @@ pub fn live_provider(
     frozen: FrozenRenderConfig,
     auth: AuthHandle,
 ) -> Result<Box<dyn Provider>, UnsupportedFamily> {
-    live_provider_inner(
-        None,
-        frozen,
-        auth,
-        None,
-        None,
-        None,
-        broca_core::clock::Clock::default(),
-    )
+    live_provider_with_options(None, frozen, auth, ProviderOptions::default())
 }
 
 /// Build a live provider with optional in-step credential refresh and the caller's shared clock.
@@ -69,39 +61,39 @@ pub fn live_provider_with_clock_and_refresher(
     served_account_ref: Option<String>,
     clock: broca_core::clock::Clock,
 ) -> Result<Box<dyn Provider>, UnsupportedFamily> {
-    live_provider_inner(
+    live_provider_with_options(
         client,
         frozen,
         auth,
-        refresher,
-        frozen_account_ref,
-        served_account_ref,
-        clock,
+        ProviderOptions {
+            refresher,
+            frozen_account_ref,
+            served_account_ref,
+            clock,
+            ..ProviderOptions::default()
+        },
     )
 }
 
-struct ProviderOptions {
-    clock: broca_core::clock::Clock,
-    refresher: Option<Arc<dyn CredentialRefresher>>,
-    frozen_account_ref: Option<String>,
-    served_account_ref: Option<String>,
+/// Runtime credential context, kept separate from the byte-affecting render configuration.
+#[derive(Default)]
+pub struct ProviderOptions {
+    pub clock: broca_core::clock::Clock,
+    pub refresher: Option<Arc<dyn CredentialRefresher>>,
+    pub frozen_account_ref: Option<String>,
+    pub served_account_ref: Option<String>,
+    /// The resolved auth method token, not the HTTP authorization scheme: API keys and OAuth
+    /// tokens can both use Bearer, but a subscription limit is not prepaid credit exhaustion.
+    pub auth_method: Option<String>,
 }
 
-fn live_provider_inner(
+/// Build a live provider with the resolved credential's method and account context.
+pub fn live_provider_with_options(
     client: Option<ProviderHttpClient>,
     frozen: FrozenRenderConfig,
     auth: AuthHandle,
-    refresher: Option<Arc<dyn CredentialRefresher>>,
-    frozen_account_ref: Option<String>,
-    served_account_ref: Option<String>,
-    clock: broca_core::clock::Clock,
+    options: ProviderOptions,
 ) -> Result<Box<dyn Provider>, UnsupportedFamily> {
-    let options = ProviderOptions {
-        clock,
-        refresher,
-        frozen_account_ref,
-        served_account_ref,
-    };
     Ok(match frozen.family_id {
         WireFamilyId::AnthropicMessages => {
             boxed_provider(client, AnthropicMessages, frozen, auth, options)
@@ -135,12 +127,15 @@ fn boxed_provider<F: WireFamily + 'static>(
         refresher,
         frozen_account_ref,
         served_account_ref,
+        auth_method,
     } = options;
     let provider = match client {
         Some(client) => LiveProvider::with_client_and_clock(client, family, frozen, auth, clock),
         None => LiveProvider::new_with_clock(family, frozen, auth, clock),
     };
-    let provider = provider.with_account_refs(frozen_account_ref, served_account_ref);
+    let provider = provider
+        .with_account_refs(frozen_account_ref, served_account_ref)
+        .with_auth_method(auth_method.as_deref());
     match refresher {
         Some(refresher) => Box::new(provider.with_credential_refresher(refresher)),
         None => Box::new(provider),

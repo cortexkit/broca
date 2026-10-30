@@ -373,7 +373,9 @@ if the manifests and lock disagree, re-resolve deliberately:
 DRIFT
     exit 2
 fi
-BUILT=target/release/ck-broca
+# Cargo builds into CARGO_TARGET_DIR when it is set (for example while the usual build drive
+# is unavailable), so read the artifacts from the folder cargo actually wrote.
+BUILT=${CARGO_TARGET_DIR:-target}/release/ck-broca
 [[ -f $BUILT ]] || { echo "stage-release: $BUILT missing after build" >&2; exit 2; }
 broca_refuse_nonshipping_markers "$BUILT" stage-release
 
@@ -675,7 +677,7 @@ fi
 # Clients are signed in private scratch too: publishing a build-tree copy would bypass both
 # the hardened signature and the sidecar-first hand-off used for the module.
 for client in broca-session broca-run; do
-    client_built="target/release/$client"
+    client_built="${CARGO_TARGET_DIR:-target}/release/$client"
     client_tmp="$BUILD_SCRATCH/$client.$COMMIT.incoming"
     client_staged="$SEAM/$client.$COMMIT"
     [[ -f $client_built ]] || { echo "stage-release: $client_built missing after build" >&2; exit 2; }

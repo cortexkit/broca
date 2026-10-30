@@ -43,6 +43,7 @@ impl AttemptHook for PermissionSequence {
         _: broca_wal::record::AttemptId,
         _: ModelAttempt,
         _: broca_wal::record::BillingAttemptOutcome,
+        _: Option<broca_wal::record::AttemptEnvelope>,
     ) -> Result<(), ProviderError> {
         self.settled.fetch_add(1, Ordering::SeqCst);
         Ok(())

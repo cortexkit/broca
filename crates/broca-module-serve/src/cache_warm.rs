@@ -578,7 +578,9 @@ mod automatic_tests {
                             compressed: self.resend && index == 0,
                             account_ref: None,
                             speed_requested: None,
+                            auth_refreshed: false,
                             warm: Some(broca_core::cache_warm::WarmSendPolicy {
+                                auth_refreshed: false,
                                 provider: Some("anthropic".into()),
                                 ttl_ms: self.ttl_ms,
                             }),
