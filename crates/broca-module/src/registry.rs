@@ -754,6 +754,8 @@ struct Inner {
     /// Raised and lowered by the System One batch service; read into `batches_in_flight`.
     batches_in_flight: Arc<AtomicUsize>,
     cut_gates: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    /// Serialize refresh fetches without blocking sends or the actor's running episode.
+    change_gates: Mutex<HashMap<LineageKey, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// Migration notices are deduplicated while the session remains in the bounded cache.
     attribution_notices: Mutex<BoundedSessionCache<()>>,
     retention: std::sync::OnceLock<Arc<crate::retention::RetentionService>>,
@@ -1245,6 +1247,23 @@ impl LineageRegistry {
         gate
     }
 
+    pub(crate) async fn lock_session_change(
+        &self,
+        key: &LineageKey,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = {
+            let mut gates = self.inner.change_gates.lock().unwrap();
+            gates.retain(|_, gate| gate.strong_count() != 0);
+            let gate = gates
+                .get(key)
+                .and_then(std::sync::Weak::upgrade)
+                .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
+            gates.insert(key.clone(), Arc::downgrade(&gate));
+            gate
+        };
+        gate.lock_owned().await
+    }
+
     /// Prevent opening absent actors and pause existing actors, in contract ref
     /// order. The returned guard remains held through the durable cut completion.
     /// This is the inspection mode: no actor closes and the guard takes no tenure.
@@ -1417,6 +1436,7 @@ impl LineageRegistry {
                 plan_admitter: std::sync::OnceLock::new(),
                 slots: Mutex::new(HashMap::new()),
                 cut_gates: Mutex::new(HashMap::new()),
+                change_gates: Mutex::new(HashMap::new()),
                 next_gen: AtomicU64::new(1),
                 opener,
                 reader: wal_store.map(|wal_store| ReadSources { wal_store, store }),
@@ -2700,6 +2720,96 @@ impl LineageRegistry {
             }
             match rx.await {
                 Ok(RetractOutcome::Reopen) => continue,
+                Ok(other) => return Ok(other),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Route a `session.refresh` acceptance through the lineage actor so it shares the lease
+    /// and writer with runs. The manifest was fetched by the serve layer.
+    pub async fn route_session_refresh(
+        &self,
+        key: &LineageKey,
+        generation: u64,
+        policy: String,
+        manifest: Box<broca_wal::PlanManifest>,
+    ) -> Result<crate::actor::SessionRefreshOutcome, OpenError> {
+        use crate::actor::{LineageCmd, SessionRefreshOutcome};
+        loop {
+            self.check_move(key, true)?;
+            self.check_expired(key, None).await?;
+            let handle = self.actor_for(key).await?;
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            let cmd = LineageCmd::SessionRefresh {
+                generation,
+                policy: policy.clone(),
+                manifest: manifest.clone(),
+                reply,
+            };
+            if handle.send(cmd).await.is_err() {
+                continue;
+            }
+            match rx.await {
+                Ok(SessionRefreshOutcome::Reopen) => continue,
+                Ok(other) => return Ok(other),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Route a `session.refresh_policy` change through the lineage actor.
+    pub async fn route_session_refresh_policy(
+        &self,
+        key: &LineageKey,
+        generation: u64,
+        policy: String,
+        send_id: String,
+    ) -> Result<crate::actor::SessionRefreshPolicyOutcome, OpenError> {
+        use crate::actor::{LineageCmd, SessionRefreshPolicyOutcome};
+        loop {
+            self.check_move(key, true)?;
+            self.check_expired(key, None).await?;
+            let handle = self.actor_for(key).await?;
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            let cmd = LineageCmd::SessionRefreshPolicy {
+                generation,
+                policy: policy.clone(),
+                send_id: send_id.clone(),
+                reply,
+            };
+            if handle.send(cmd).await.is_err() {
+                continue;
+            }
+            match rx.await {
+                Ok(SessionRefreshPolicyOutcome::Reopen) => continue,
+                Ok(other) => return Ok(other),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Route a `session.flush_prefix` through the lineage actor.
+    pub async fn route_session_flush_prefix(
+        &self,
+        key: &LineageKey,
+        send_id: String,
+    ) -> Result<crate::actor::SessionFlushPrefixOutcome, OpenError> {
+        use crate::actor::{LineageCmd, SessionFlushPrefixOutcome};
+        loop {
+            self.check_move(key, true)?;
+            self.check_expired(key, None).await?;
+            let handle = self.actor_for(key).await?;
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            let cmd = LineageCmd::SessionFlushPrefix {
+                send_id: send_id.clone(),
+                reply,
+            };
+            if handle.send(cmd).await.is_err() {
+                continue;
+            }
+            match rx.await {
+                Ok(SessionFlushPrefixOutcome::Reopen) => continue,
                 Ok(other) => return Ok(other),
                 Err(_) => continue,
             }
