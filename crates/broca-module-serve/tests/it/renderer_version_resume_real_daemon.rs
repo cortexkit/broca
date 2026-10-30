@@ -118,6 +118,24 @@ async fn serve_model_responses_paused(
     url
 }
 
+#[cfg(feature = "test-attachments")]
+fn model_request_summary(bodies: &[Vec<u8>]) -> String {
+    bodies
+        .iter()
+        .enumerate()
+        .map(|(index, body)| {
+            let repeats = bodies[..index].iter().position(|earlier| earlier == body);
+            let value: Value = serde_json::from_slice(body).expect("model request JSON");
+            format!(
+                "#{index}: {} bytes, repeats {repeats:?}, max_tokens {}",
+                body.len(),
+                value["max_tokens"]
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 struct Rig {
     daemon: Child,
     dir: PathBuf,
@@ -338,6 +356,26 @@ async fn wait_records(
             Some(records) if predicate(&records) => Ok(records),
             other => Err(format!("{other:?}")),
         }
+    })
+    .await
+}
+
+#[cfg(feature = "test-attachments")]
+async fn wait_send_finished(rig: &Rig, session: &str, send_id: &str) -> Vec<WalRecord> {
+    // A queued send has no RunStarted yet. Equal counts of starts and finishes may
+    // describe only preceding turns, so require this send's own episode and durable terminal.
+    wait_records(rig, session, |records| {
+        records
+            .iter()
+            .find_map(|record| match record {
+                WalRecord::RunStarted {
+                    run_id,
+                    send_id: Some(id),
+                    ..
+                } if id == send_id => Some(run_id),
+                _ => None,
+            })
+            .is_some_and(|run_id| finished(episode(records, &run_id.0)).is_some())
     })
     .await
 }
