@@ -2346,7 +2346,9 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
     );
     // `rebuild_required: true` would mean late results may be missing from the intake, and a
     // failed withdrawal is a held call whose provider was never told it was cancelled. Both
-    // degrade health; neither can happen on a root that never held a call.
+    // degrade health; neither can happen on a root that never held a call. A root that never
+    // held a call also has no boot withdrawal sweep (nothing running, no rows left to recover)
+    // and no late-results entry pinned past the five-minute warning.
     assert_eq!(
         metrics["provider_held"],
         serde_json::json!({
@@ -2356,7 +2358,13 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
             "decoded": 0,
             "registered": 0,
             "unreadable": 0,
-            "withdrawals": {"failed": 0, "pending": 0},
+            "withdrawals": {
+                "failed": 0,
+                "pending": 0,
+                "sweep_running": false,
+                "rows_remaining": 0,
+            },
+            "overdue_pins": 0,
         })
     );
     assert_eq!(metrics["active_sessions"], serde_json::json!(1));

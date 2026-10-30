@@ -176,10 +176,17 @@ pub fn health_gauges() -> serde_json::Value {
         .and_then(|health| health.lock().ok()?.upgrade());
     runtime.map_or_else(
         || {
+            // Same members as `HeldWithdrawals::health`, so a reader sees one shape whether or
+            // not the held runtime has registered yet.
             health_snapshot(
                 false,
                 &RebuildReport::default(),
-                serde_json::json!({"failed": 0, "pending": 0}),
+                serde_json::json!({
+                    "failed": 0,
+                    "pending": 0,
+                    "sweep_running": false,
+                    "rows_remaining": 0,
+                }),
                 0,
             )
         },
