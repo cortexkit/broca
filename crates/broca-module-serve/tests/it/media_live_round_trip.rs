@@ -233,7 +233,7 @@ async fn daemon_round_trip(id: WireFamilyId) {
         samples().into_iter().find(|sample| sample.0 == id).unwrap();
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let url = serve_model_responses(bodies.clone(), vec![text, tool, text]).await;
-    let Some(rig) = Rig::launch(&url, Some(catalog_for(provider, model, route))).await else {
+    let Some(rig) = Rig::launch_media(&url, Some(catalog_for(provider, model, route))).await else {
         return;
     };
     let _tool = image_tool(&rig).await;
@@ -338,7 +338,7 @@ async fn real_daemon_portable_media_recovery_after_kill_preserves_request_bytes(
     )
     .await;
     let catalog = catalog_for("anthropic", CLAUDE, "anthropic/claude-opus-5");
-    let Some(mut original) = Rig::launch(&url, Some(catalog.clone())).await else {
+    let Some(mut original) = Rig::launch_media(&url, Some(catalog.clone())).await else {
         return;
     };
     let _original_tool = image_tool(&original).await;
@@ -359,7 +359,7 @@ async fn real_daemon_portable_media_recovery_after_kill_preserves_request_bytes(
     gate.notify_waiters();
     // An active-run index intentionally seals interrupted runs. Omitting that disposable
     // index exercises recovery of the admitted step from its portable WAL, media and bind.
-    let Some(mut restored) = Rig::launch(&url, Some(catalog)).await else {
+    let Some(mut restored) = Rig::launch_media(&url, Some(catalog)).await else {
         return;
     };
     restored.project = original.project.clone();

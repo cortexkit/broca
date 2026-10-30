@@ -27,7 +27,7 @@ pub struct LiveMedia {
 }
 
 impl LiveMedia {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-attachments"))]
     pub(super) fn aging_for_test(&self) -> MediaAging {
         self.state.lock().unwrap().aging.clone()
     }

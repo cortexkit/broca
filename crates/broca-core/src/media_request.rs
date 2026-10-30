@@ -16,10 +16,8 @@ use serde::{Deserialize, Serialize};
 use crate::media_store::{MediaReadError, MediaStore};
 use crate::placement::{AppendKind, Placement, PlacementAction};
 
-#[cfg(feature = "test-attachments")]
 mod seed;
 
-#[cfg(feature = "test-attachments")]
 impl seed::MediaCheckpoint {
     pub(crate) fn prepare_content_free_continuation(&mut self) {
         // Without a replacement view, the saved media references and empty text slots
@@ -73,9 +71,7 @@ impl seed::MediaCheckpoint {
         Self::decode(&checkpoint.encode())
     }
 }
-#[cfg(feature = "test-attachments")]
-pub(crate) use seed::count_seed_fallback;
-#[cfg(feature = "test-attachments")]
+pub use seed::count_seed_fallback;
 pub use seed::{seed_fallback_count, DurableMediaSeed, MediaCheckpoint, MediaHistory};
 
 /// A capture occurrence, not a digest. Two admissions of identical bytes have different ids
@@ -685,7 +681,6 @@ impl SessionMedia {
             .as_ref()
             .expect("render session has a media store")
             .read_verified(reference)?;
-        #[cfg(feature = "test-attachments")]
         if crate::media_validation::validate_media(&bytes, &reference.mime).as_ref()
             != Ok(reference)
         {

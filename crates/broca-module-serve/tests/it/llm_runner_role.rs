@@ -2951,6 +2951,6 @@ async fn debug_pdf_send_is_refused_before_any_session_write() {
     }
     let describe = call(&mut rig, "role.describe", serde_json::json!({})).await;
     let checked = cortexkit_role_llm_runner::describe::check_describe(&result(&describe)).unwrap();
-    assert!(!checked.declares(cortexkit_role_llm_runner::capabilities::ATTACHMENTS));
+    assert!(checked.declares(cortexkit_role_llm_runner::capabilities::ATTACHMENTS));
     rig.finish().await;
 }

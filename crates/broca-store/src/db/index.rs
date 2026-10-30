@@ -1497,18 +1497,6 @@ mod tests {
         let bind = bind(&bytes);
         let db = database();
         let positions = decoded(&bytes);
-        let feature_enabled = serde_json::to_value(
-            broca_core::AdmissionCheckpointV1::from_frames(
-                &positions
-                    .iter()
-                    .map(|(_, _, f)| f.clone())
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap(),
-        )
-        .unwrap()
-        .get("media")
-        .is_some();
         let mut accepted = 0;
         for (cut, (_, end, _)) in positions.iter().enumerate() {
             let published = &bytes[..*end];
@@ -1525,10 +1513,6 @@ mod tests {
                     .map_err(Into::into)
                 })
                 .unwrap();
-            if !feature_enabled {
-                assert!(tail.contains("media continuation feature unavailable"));
-                continue;
-            }
             let stored = ProjectionContinuation::decode(&tail).unwrap();
             assert_eq!(admission, stored.admission().encode().unwrap());
             let boundary = stored.boundary();
@@ -1561,44 +1545,42 @@ mod tests {
                     .collect::<Vec<_>>(),
             )
             .unwrap();
+            assert!(expected.media.is_some());
             assert_eq!(
                 delta.admission_checkpoint, expected,
                 "stored media state at publication {cut}"
             );
             accepted += 1;
         }
-        if feature_enabled {
-            assert_eq!(accepted, 5);
-            let original = rows(&db.db, &["session"]);
-            let derived = rows(&db.db, schema::SESSION_TABLES);
-            db.db
-                .authoritative_transaction(|tx| {
-                    let (tail, admission): (String, String) =
-                        tx.query_row("SELECT tail_seed,admission_seed FROM session", [], |r| {
-                            Ok((r.get(0)?, r.get(1)?))
-                        })?;
-                    let mut tail: serde_json::Value = serde_json::from_str(&tail).unwrap();
-                    let mut admission: serde_json::Value =
-                        serde_json::from_str(&admission).unwrap();
-                    tail["admission"]["state"]["scalars"]
-                        .as_object_mut()
-                        .unwrap()
-                        .remove("media");
-                    admission["state"]["scalars"]
-                        .as_object_mut()
-                        .unwrap()
-                        .remove("media");
-                    tx.execute(
-                        "UPDATE session SET tail_seed=?1,admission_seed=?2",
-                        params![tail.to_string(), admission.to_string()],
-                    )?;
-                    Ok(())
-                })
-                .unwrap();
-            assert!(!db.db.index(&publication(&bind, &bytes)).unwrap().rebuilt);
-            assert_eq!(rows(&db.db, &["session"]), original);
-            assert_eq!(rows(&db.db, schema::SESSION_TABLES), derived);
-        }
+        assert_eq!(accepted, 5);
+        let original = rows(&db.db, &["session"]);
+        let derived = rows(&db.db, schema::SESSION_TABLES);
+        db.db
+            .authoritative_transaction(|tx| {
+                let (tail, admission): (String, String) =
+                    tx.query_row("SELECT tail_seed,admission_seed FROM session", [], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })?;
+                let mut tail: serde_json::Value = serde_json::from_str(&tail).unwrap();
+                let mut admission: serde_json::Value = serde_json::from_str(&admission).unwrap();
+                tail["admission"]["state"]["scalars"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("media");
+                admission["state"]["scalars"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("media");
+                tx.execute(
+                    "UPDATE session SET tail_seed=?1,admission_seed=?2",
+                    params![tail.to_string(), admission.to_string()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(!db.db.index(&publication(&bind, &bytes)).unwrap().rebuilt);
+        assert_eq!(rows(&db.db, &["session"]), original);
+        assert_eq!(rows(&db.db, schema::SESSION_TABLES), derived);
     }
 
     #[test]

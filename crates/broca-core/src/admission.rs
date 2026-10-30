@@ -676,7 +676,6 @@ impl EffortHistoryV1 {
 pub struct AdmissionCheckpointV1 {
     /// Reference-only media resume state, omitted for media-free histories. A captured-reference
     /// index without a valid matching seed requires a named, counted full-replay repair.
-    #[cfg(feature = "test-attachments")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<crate::media_request::DurableMediaSeed>,
     /// Missing on older checkpoints: reconstruct from the full WAL before extending totals.
@@ -761,7 +760,6 @@ impl AdmissionCheckpointV1 {
     /// A newly applied record in a tail needs canonical replay to recover its
     /// message count. Missing compaction state is checked separately at the seed.
     pub(crate) fn compaction_boundary_complete(&self) -> bool {
-        #[cfg(feature = "test-attachments")]
         if !self.media_seed_complete() {
             return false;
         }
@@ -773,7 +771,6 @@ impl AdmissionCheckpointV1 {
 
     pub fn empty() -> Self {
         Self {
-            #[cfg(feature = "test-attachments")]
             media: None,
             head: Some(crate::head::HeadProjection::default()),
             has_deferred_calls: Some(false),
@@ -828,7 +825,6 @@ impl AdmissionCheckpointV1 {
 
     /// Fold an ordered WAL suffix into this checkpoint.
     pub fn fold_frames(&mut self, records: &[FramedRecord]) -> Result<(), ReplayError> {
-        #[cfg(feature = "test-attachments")]
         if let Some(crate::media_request::DurableMediaSeed::Ready(media)) = &mut self.media {
             media.resume_budget(
                 self.last_episode
@@ -836,7 +832,6 @@ impl AdmissionCheckpointV1 {
                     .and_then(|episode| episode.config.budget.clone()),
             );
         }
-        #[cfg(feature = "test-attachments")]
         if self.at_seq == 0
             && records
                 .iter()
@@ -854,7 +849,6 @@ impl AdmissionCheckpointV1 {
 
     /// Fold one WAL record. The mutation is committed only after all corruption checks pass.
     pub fn fold_record(&mut self, seq: u64, record: &WalRecord) -> Result<(), ReplayError> {
-        #[cfg(feature = "test-attachments")]
         if self.at_seq == 0
             && self.media.is_none()
             && crate::compaction::CapturedMedia::captures_any(record)
@@ -863,7 +857,6 @@ impl AdmissionCheckpointV1 {
                 crate::media_request::MediaCheckpoint::empty(),
             )));
         }
-        #[cfg(feature = "test-attachments")]
         if let Some(crate::media_request::DurableMediaSeed::Ready(media)) = &mut self.media {
             media
                 .fold(seq, record)
@@ -1254,7 +1247,11 @@ impl AdmissionCheckpointV1 {
 }
 
 impl AdmissionCheckpointV1 {
-    #[cfg(feature = "test-attachments")]
+    /// Only media references recorded in captured history can authorize byte reads.
+    pub fn captured_media_reference(&self, sha256: &str) -> Option<&broca_protocol::MediaRef> {
+        self.compaction.as_ref()?.captured()?.by_digest(sha256)
+    }
+
     pub fn has_captured_media(&self) -> bool {
         self.compaction
             .as_ref()
@@ -1262,7 +1259,6 @@ impl AdmissionCheckpointV1 {
             .is_some_and(|captured| !captured.is_empty())
     }
 
-    #[cfg(feature = "test-attachments")]
     pub fn media_seed_complete(&self) -> bool {
         let has_media = self.has_captured_media();
         if !has_media {
@@ -2004,17 +2000,14 @@ impl AdmissionContinuation {
         if let Some(episode) = state["episode"].as_object_mut() {
             episode.remove("usage");
         }
-        let encoded = serde_json::json!({
+        let mut encoded = serde_json::json!({
             "version": 1, "state": state, "sources": self.sources,
         });
-        #[cfg(feature = "test-attachments")]
-        let encoded = {
-            let mut encoded = encoded;
-            if self.seed.scalars.media.is_some() {
-                encoded["features"] = serde_json::json!(["media-metadata/v1"]);
-            }
-            encoded
-        };
+        // The wire capability follows recorded media state, not a build feature or
+        // the current opt-in setting. Media-free histories allocate no media field.
+        if self.seed.scalars.media.is_some() {
+            encoded["features"] = serde_json::json!(["media-metadata/v1"]);
+        }
         serde_json::to_string(&encoded)
     }
 
@@ -2026,13 +2019,7 @@ impl AdmissionContinuation {
             return Err(bad());
         }
         if let Some(features) = value.get("features") {
-            #[cfg(feature = "test-attachments")]
             if *features != serde_json::json!(["media-metadata/v1"]) {
-                return Err(bad());
-            }
-            #[cfg(not(feature = "test-attachments"))]
-            {
-                let _ = features;
                 return Err(bad());
             }
         }
@@ -2041,20 +2028,7 @@ impl AdmissionContinuation {
         if seed.version != 1 {
             return Err(bad());
         }
-        #[cfg(not(feature = "test-attachments"))]
-        if seed
-            .scalars
-            .compaction
-            .as_ref()
-            .and_then(|c| c.captured())
-            .is_some_and(|c| !c.is_empty())
-        {
-            return Err(crate::replay::SeedFallback::new(
-                "media continuation feature unavailable",
-            ));
-        }
         let sources = serde_json::from_value(value["sources"].clone()).map_err(|_| bad())?;
-        #[cfg(feature = "test-attachments")]
         if !seed.scalars.media_seed_complete() {
             return Err(crate::replay::SeedFallback::new(
                 "admission continuation media metadata missing",
@@ -2166,18 +2140,6 @@ impl AdmissionContinuation {
         prefix: &[crate::replay::PositionedFrame],
     ) -> Result<Self, crate::replay::SeedFallback> {
         let seed = AdmissionSeed::capture_inner(read_at, boundary, prefix, true)?;
-        #[cfg(not(feature = "test-attachments"))]
-        if seed
-            .scalars
-            .compaction
-            .as_ref()
-            .and_then(|c| c.captured())
-            .is_some_and(|c| !c.is_empty())
-        {
-            return Err(crate::replay::SeedFallback::new(
-                "media continuation feature unavailable",
-            ));
-        }
         let sources = prefix
             .iter()
             .enumerate()
@@ -2198,7 +2160,6 @@ impl AdmissionContinuation {
         read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
     ) -> Result<AdmissionSeed, crate::replay::SeedFallback> {
         let mut seed = self.seed.clone();
-        #[cfg(feature = "test-attachments")]
         if let Some(crate::media_request::DurableMediaSeed::Ready(media)) = &mut seed.scalars.media
         {
             media.prepare_content_free_continuation();
@@ -2230,38 +2191,33 @@ impl AdmissionContinuation {
         tail: &[crate::replay::PositionedFrame],
         safe_head: u64,
     ) -> Result<(AdmissionCheckpointV1, AdmissionCheckpointV1), crate::replay::SeedFallback> {
-        let seed = self.hydrated_seed(read_at)?;
-        #[cfg(feature = "test-attachments")]
-        let seed = {
-            let mut seed = seed;
-            if seed.scalars.media.is_none()
-                && tail
-                    .iter()
-                    .any(|p| crate::compaction::CapturedMedia::captures_any(&p.framed.record))
-            {
-                let episode = seed.episode(read_at)?.ok_or_else(|| {
-                    crate::replay::SeedFallback::new("media continuation has no episode")
-                })?;
-                let placement = crate::placement::Placement::seeded(
-                    seed.ordinal_base,
-                    Some(episode.run_id),
-                    episode.config.budget.clone(),
-                    episode.budget_replay_state.unwrap_or_default(),
-                    0,
-                );
-                seed.scalars.media = Some(crate::media_request::DurableMediaSeed::Ready(Box::new(
-                    crate::media_request::MediaCheckpoint::after_media_free_prefix(
-                        placement,
-                        seed.boundary.seq,
-                        &self.accounting_frames(read_at)?,
-                    )
-                    .map_err(|_| {
-                        crate::replay::SeedFallback::new("media continuation initialization failed")
-                    })?,
-                )));
-            }
-            seed
-        };
+        let mut seed = self.hydrated_seed(read_at)?;
+        if seed.scalars.media.is_none()
+            && tail
+                .iter()
+                .any(|p| crate::compaction::CapturedMedia::captures_any(&p.framed.record))
+        {
+            let episode = seed.episode(read_at)?.ok_or_else(|| {
+                crate::replay::SeedFallback::new("media continuation has no episode")
+            })?;
+            let placement = crate::placement::Placement::seeded(
+                seed.ordinal_base,
+                Some(episode.run_id),
+                episode.config.budget.clone(),
+                episode.budget_replay_state.unwrap_or_default(),
+                0,
+            );
+            seed.scalars.media = Some(crate::media_request::DurableMediaSeed::Ready(Box::new(
+                crate::media_request::MediaCheckpoint::after_media_free_prefix(
+                    placement,
+                    seed.boundary.seq,
+                    &self.accounting_frames(read_at)?,
+                )
+                .map_err(|_| {
+                    crate::replay::SeedFallback::new("media continuation initialization failed")
+                })?,
+            )));
+        }
         seed.hydrate_with_base(read_at, tail, safe_head)
     }
 
@@ -3049,10 +3005,9 @@ mod tests {
     }
 
     fn exhaustive_checkpoint_fields(full: AdmissionCheckpointV1) -> AdmissionCheckpointV1 {
-        // Keep the literal exhaustive even in media-free test builds. A new checkpoint
-        // field must be added here and exercised by the populated roundtrip fixture.
+        // A new checkpoint field must be added to this exhaustive literal and exercised
+        // by the populated roundtrip fixture.
         AdmissionCheckpointV1 {
-            #[cfg(feature = "test-attachments")]
             media: full.media,
             head: full.head,
             has_deferred_calls: full.has_deferred_calls,
@@ -3072,7 +3027,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "test-attachments")]
     fn continuation_exhaustive_checkpoint_fields_roundtrip() {
         use crate::replay::deferred_tests;
 
@@ -3305,7 +3259,40 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "test-attachments")]
+    fn content_free_continuations_media_free_wire_bytes_are_stable() {
+        use sha2::Digest;
+        let records = offset_corpus();
+        let (bytes, positions) = offset_log(&records);
+        let stored = crate::projection_plan::ProjectionContinuation::capture(
+            &offset_reader(&bytes),
+            &offset_boundary(&bytes, &positions, 4),
+            &positions[..4],
+        )
+        .unwrap();
+        // Available media support must not change established media-free wire bytes.
+        for (name, encoded, expected) in [
+            (
+                "admission",
+                stored.admission().encode().unwrap(),
+                "4d605d45dd8adacaa81e235b9f8e6c0e36f8cb86dc049c287bef694d1a57be35",
+            ),
+            (
+                "projection",
+                stored.encode().unwrap(),
+                "40507101edf7f7a83927fcc16d75126dc2190f39951e9b97823e6b87fb959552",
+            ),
+        ] {
+            assert!(!encoded.contains("\"media\""));
+            assert!(!encoded.contains("\"features\""));
+            assert_eq!(
+                format!("{:x}", sha2::Sha256::digest(encoded.as_bytes())),
+                expected,
+                "{name} wire bytes changed"
+            );
+        }
+    }
+
+    #[test]
     fn content_free_continuations_include_media_reference_and_delta_history() {
         let mut records = offset_corpus();
         for frame in &mut records {
@@ -3348,7 +3335,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "test-attachments")]
     fn content_free_continuations_omit_media_until_first_tail_capture() {
         let mut records = offset_corpus();
         if let WalRecord::RunStarted { config, .. } = &mut records[0].record {
@@ -5302,7 +5288,6 @@ mod tests {
     #[test]
     fn checkpoint_json_with_pending_payload_is_byte_stable() {
         let checkpoint = AdmissionCheckpointV1 {
-            #[cfg(feature = "test-attachments")]
             media: None,
             output_reservation: None,
             head: None,

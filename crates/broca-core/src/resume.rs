@@ -99,7 +99,6 @@ pub fn reconstruct_from_offsets(
     {
         return Err(bad("offset resume snapshot does not reach durable head"));
     }
-    #[cfg(feature = "test-attachments")]
     if !seed.admission_checkpoint.media_seed_complete() {
         return Err(bad("offset resume media seed needs full replay"));
     }
@@ -172,7 +171,6 @@ pub fn reconstruct_from_offsets(
     let checkpoint = delta.admission_checkpoint;
     // A tail can introduce the first media capture into a previously media-free prefix.
     // Recheck its folded state: a valid selected window is not a media-state completeness proof.
-    #[cfg(feature = "test-attachments")]
     if !checkpoint.media_seed_complete() {
         return Err(bad("offset resume media seed needs full replay"));
     }
@@ -890,7 +888,6 @@ mod offset_resume_tests {
     }
 
     #[test]
-    #[cfg(feature = "test-attachments")]
     fn offset_resume_window_rejects_incomplete_media_seed_before_reusing_prefix() {
         let mut records = compacted_tools(1, false);
         if let WalRecord::RunStarted { input, .. } = &mut records[0] {
@@ -941,7 +938,6 @@ mod offset_resume_tests {
     }
 
     #[test]
-    #[cfg(feature = "test-attachments")]
     fn offset_resume_window_checks_media_seed_after_tail_capture() {
         let mut records = compacted_tools(1, false);
         let boundary = records
