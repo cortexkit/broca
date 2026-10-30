@@ -161,7 +161,7 @@ impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
     }
 
     /// Observe ordinary admission's WAL preflight and owned startup on every
-    /// filesystem thread without changing production authority or lifecycle cause.
+    /// filesystem thread while retaining the normal writer lease and open/close reasons.
     #[cfg(feature = "test-clock")]
     pub fn with_fs_for_test(mut self, fs: Arc<dyn broca_wal::fs_ops::FsOps>) -> Self {
         self.test_fs = Some(fs);

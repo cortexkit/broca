@@ -1322,6 +1322,10 @@ mod tests {
                 O,
                 S,
                 D,
+                O, // Startup replay on the blocking startup thread is now recorded too.
+                O,
+                O,
+                O,
                 D,
                 Change(vec![SetEntry]), // Successor temporary marker.
                 Change(vec![Write]),
@@ -1385,7 +1389,7 @@ mod tests {
                 O,
                 Change(vec![RemoveEntry]), // Predecessor marker unlink.
             ],
-            "all 83 reclaim journal operations must complete in order"
+            "all 87 reclaim journal operations must complete in order"
         );
         fs.assert_all_cuts_covered(&states);
         assert!(states
