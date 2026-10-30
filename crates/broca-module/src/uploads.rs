@@ -117,3 +117,57 @@ fn decode<T: DeserializeOwned>(params: serde_json::Value) -> Result<T, ServeErro
         message: error.to_string(),
     })
 }
+
+pub(crate) async fn media_read(
+    registry: &LineageRegistry,
+    session: &LineageKey,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, ServeError> {
+    let request: wire::MediaReadRequest = decode(params)?;
+    if request.length > wire::CHUNK_MAX as u64 {
+        return Err(ServeError::Upload(UploadError::invalid(
+            "length",
+            &request.sha256,
+        )));
+    }
+    // The object trees are shared. Authorize against durable capture records in this
+    // bound session before opening any object, including for metadata-only probes.
+    let (frames, _) = registry.read_durable_wal(session).await?;
+    let checkpoint = broca_core::AdmissionCheckpointV1::from_frames(&frames)
+        .map_err(|error| ServeError::Open(format!("read session media history: {error}"), None))?;
+    let reference = checkpoint
+        .captured_media_reference(&request.sha256)
+        .cloned()
+        .ok_or_else(|| ServeError::Upload(UploadError::new("unknown_media", &request.sha256)))?;
+    request
+        .check(reference.byte_size)
+        .map_err(|field| ServeError::Upload(UploadError::invalid(field, &request.sha256)))?;
+    let uploads = registry
+        .upload_store()
+        .ok_or_else(|| ServeError::Upload(UploadError::new("unknown_media", &request.sha256)))?;
+    let session = session.clone();
+    tokio::task::spawn_blocking(move || {
+        let bytes = uploads
+            .session_media_store(&session)
+            .and_then(|store| {
+                store
+                    .read_verified(&reference)
+                    .map_err(std::io::Error::other)
+            })
+            .map_err(|error| {
+                ServeError::Open(format!("read media {}: {error}", request.sha256), None)
+            })?;
+        let mut reply = wire::MediaReadReply::new(reference.byte_size, reference.mime);
+        if request.length != 0 {
+            let start = request.offset as usize;
+            let end = bytes
+                .len()
+                .min(start.saturating_add(request.length as usize));
+            reply = reply
+                .with_data(base64::engine::general_purpose::STANDARD.encode(&bytes[start..end]));
+        }
+        serde_json::to_value(reply).map_err(|error| ServeError::Open(error.to_string(), None))
+    })
+    .await
+    .map_err(|error| ServeError::Open(format!("media read worker failed: {error}"), None))?
+}

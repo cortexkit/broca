@@ -207,6 +207,7 @@ struct Shared {
     model_holds: Mutex<HashMap<String, Arc<HoldGate>>>,
     stream_holds: Mutex<HashMap<String, usize>>,
     raw_bodies: Mutex<HashMap<String, Vec<Vec<u8>>>>,
+    attachment_models: Mutex<HashMap<String, bool>>,
     compaction: Mutex<HashMap<String, compaction::Session>>,
     session_roots: Mutex<HashMap<String, PathBuf>>,
     session_bindings: Mutex<HashMap<String, broca_protocol::BindIdentity>>,
@@ -368,6 +369,15 @@ fn seed_structured_output_catalog(state_root: &Path) -> std::io::Result<()> {
             ),
             row(support),
         );
+    }
+    for accepts in [true, false] {
+        let mut facts = row(None);
+        facts["capability.input_modalities"] = if accepts {
+            json!(["text", "image"])
+        } else {
+            json!(["text"])
+        };
+        models.insert(format!("xai/conformance-media-{accepts}"), facts);
     }
     models.insert(
         format!("{}/{}", output_refs::PROVIDER, output_refs::MODEL),
@@ -1123,6 +1133,7 @@ struct BrocaSubject {
     backup_classes: Option<Vec<String>>,
     bus_events_enabled: bool,
     process_kills_disabled: bool,
+    media_enabled: bool,
     reserved_reader: bool,
     /// Start `ck-broca` with its tool routes declaring `content/v1` and `held-reply/v1`, which
     /// only a debug build honours (see `broca_module_serve::held_runtime`).
@@ -1149,6 +1160,8 @@ impl BrocaSubject {
             backup_classes: None,
             bus_events_enabled: true,
             process_kills_disabled: false,
+            media_enabled: std::env::var_os("BROCA_CONFORMANCE_MEDIA").is_some()
+                || cfg!(feature = "test-attachments"),
             reserved_reader: false,
             declare_held_reply: false,
             #[cfg(feature = "test-clock")]
@@ -1257,8 +1270,8 @@ impl BrocaSubject {
                 &self
                     .backup_classes
                     .as_ref()
-                    .map(|classes| json!({"backup_classes": classes,"bus_run_events_enabled":self.bus_events_enabled}))
-                    .unwrap_or_else(|| json!({"bus_run_events_enabled":self.bus_events_enabled})),
+                    .map(|classes| json!({"backup_classes": classes,"bus_run_events_enabled":self.bus_events_enabled,"media":{"enabled":self.media_enabled}}))
+                    .unwrap_or_else(|| json!({"bus_run_events_enabled":self.bus_events_enabled,"media":{"enabled":self.media_enabled}})),
             )
             .unwrap(),
         )
@@ -2007,6 +2020,53 @@ impl RunnerRoute for BrocaRoute {
 
 #[async_trait]
 impl LlmRunnerSubject for BrocaSubject {
+    fn attachment_model_fields(&self, session: &str, accepts: bool) -> Option<Map<String, Value>> {
+        self.shared
+            .attachment_models
+            .lock()
+            .unwrap()
+            .insert(session.into(), accepts);
+        Some(
+            json!({"model":{"provider":"xai","model":format!("conformance-media-{accepts}")}})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+    }
+
+    fn attachment_tool_result(&self, png: &[u8]) -> Option<Value> {
+        use base64::Engine;
+        let image = broca_core::media_validation::validate_media(png, "image/png").unwrap();
+        Some(json!({OWN_CONTENT:[{"type":"text","text":"before-media"},
+            {"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(png),"width":image.width,"height":image.height},
+            {"type":"text","text":"after-media"}]}))
+    }
+
+    async fn restart_attachments(
+        &self,
+        handle: &Live,
+        session: &str,
+    ) -> Result<BrocaRoute, HarnessError> {
+        // Model the permitted loss of unfinished staging, retaining committed uploads and
+        // captured objects. Process-kill recovery of captured media has its own native test.
+        let staging = handle.state_root.join("media-uploads");
+        for entry in
+            std::fs::read_dir(staging.join("refs")).map_err(|e| HarnessError::new(e.to_string()))?
+        {
+            let entry = entry.map_err(|e| HarnessError::new(e.to_string()))?;
+            let bytes =
+                std::fs::read(entry.path()).map_err(|e| HarnessError::new(e.to_string()))?;
+            let mut meta: Value =
+                serde_json::from_slice(&bytes).map_err(|e| HarnessError::new(e.to_string()))?;
+            if meta["committed"] == false {
+                meta["gone"] = json!(true);
+                std::fs::write(entry.path(), serde_json::to_vec(&meta).unwrap())
+                    .map_err(|e| HarnessError::new(e.to_string()))?;
+            }
+        }
+        self.session_route(handle, session, &self.owner_stamp())
+            .await
+    }
     fn supports_model_failure_fixture(&self) -> bool {
         true
     }
@@ -2206,6 +2266,9 @@ impl LlmRunnerSubject for BrocaSubject {
         if broca_module_serve::RETENTION_WRITER_ENABLED {
             capabilities.extend([Capability::Retention, Capability::RetentionClock]);
         }
+        if self.media_enabled {
+            capabilities.insert(Capability::Attachments);
+        }
         capabilities
     }
 
@@ -2300,6 +2363,23 @@ impl LlmRunnerSubject for BrocaSubject {
     }
 
     fn send_fields(&self, session: &str, first: bool) -> Map<String, Value> {
+        if let Some(accepts) = self
+            .shared
+            .attachment_models
+            .lock()
+            .unwrap()
+            .get(session)
+            .copied()
+            .or_else(|| (self.media_enabled && session.contains("attachments")).then_some(true))
+        {
+            let mut fields =
+                json!({"model":{"provider":"xai","model":format!("conformance-media-{accepts}")}});
+            if !self.shared.plan_sessions.lock().unwrap().contains(session) {
+                fields["system"] = json!(format!("{SESSION_MARKER}{session}"));
+                fields["tools"] = json!([{"name":SCRIPTED_TOOL,"description":"Answers each call with its scripted result.","input_schema":{"type":"object"},"module":TOOL_MODULE}]);
+            }
+            return fields.as_object().unwrap().clone();
+        }
         // The pin fixture uses an admitted provider catalog. Caller-declared
         // legacy tools intentionally have no provider semantics to pin.
         if session.starts_with("cf-call-identity-pin-")
@@ -2807,7 +2887,7 @@ impl LlmRunnerSubject for BrocaSubject {
     ) -> Option<Value> {
         use base64::{engine::general_purpose::STANDARD, Engine};
         use cortexkit_role_llm_runner::tags::ToolResultBlock;
-        if !broca_protocol::attachments_enabled()
+        if !self.media_enabled
             && blocks
                 .iter()
                 .any(|block| matches!(block, ToolResultBlock::Image | ToolResultBlock::Media))
@@ -2873,7 +2953,7 @@ impl LlmRunnerSubject for BrocaSubject {
     /// cannot carry arbitrary text; the marker-free numbering fixture checks those images.
     /// Without capture, the legacy placeholder's MIME type can carry the marker.
     fn image_tool_result(&self, marker: &str) -> Option<Value> {
-        if broca_protocol::attachments_enabled() {
+        if self.media_enabled {
             return None;
         }
         Some(json!({ OWN_CONTENT: [{
@@ -3332,6 +3412,15 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         eprintln!("{}", subject.failure_evidence());
     }
     assert!(failed.is_empty(), "{}", report.render());
+    if subject.media_enabled {
+        for case in report
+            .cases
+            .iter()
+            .filter(|case| case.case.starts_with("attachments_"))
+        {
+            assert_eq!(case.outcome, CaseOutcome::Passed, "{}", report.render());
+        }
+    }
     // The cases a `session.send` retry is held to. broca declares every capability they need,
     // including hold_tool_calls for the two steer cases, so each one must have run and passed:
     // a case that drifts to skipped or inapplicable would otherwise pass this test without
@@ -3360,10 +3449,11 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "output_refs_reference_limit",
         "output_refs_read_limits",
         "output_refs_snapshot_budget",
-        #[cfg(feature = "test-attachments")]
-        "tags_tool_result_blocks_share_one_number",
-        #[cfg(not(feature = "test-attachments"))]
-        "tags_count_only_parts_rendered_with_a_number",
+        if subject.media_enabled {
+            "tags_tool_result_blocks_share_one_number"
+        } else {
+            "tags_count_only_parts_rendered_with_a_number"
+        },
         "compaction_setup_durable_once",
         "model_view_half_open_ranges_and_travel",
         "compaction_unavailable_distinct_from_refuse",
@@ -5060,6 +5150,7 @@ mod held_call_tests {
             backup_classes: None,
             bus_events_enabled: false,
             process_kills_disabled: true,
+            media_enabled: false,
             reserved_reader: false,
             declare_held_reply: false,
             #[cfg(feature = "test-clock")]

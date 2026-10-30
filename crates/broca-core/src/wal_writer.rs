@@ -3137,7 +3137,6 @@ pub struct WalHandle {
 impl WalHandle {
     /// A media-free prefix has no captures or aging history to restore. Its already-seeded
     /// placement is sufficient to start tracking the first later capture without rereading it.
-    #[cfg(feature = "test-attachments")]
     pub fn empty_media_checkpoint(
         &self,
         at_seq: u64,
@@ -3198,7 +3197,7 @@ impl WalHandle {
     }
 
     pub(crate) fn bind_media_capture(&mut self, store: &impl WalStore, session: &BindIdentity) {
-        // Tool media shares attachment admission's debug-only, non-shipping opt-in.
+        // Tool and person media share the immutable boot decision.
         self.media_capture = if broca_protocol::attachments_enabled() {
             store
                 .uploads()

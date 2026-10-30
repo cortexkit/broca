@@ -131,7 +131,7 @@ pub fn manifest_with_archive(
 
 /// The management request list is also the source of `health.check` request-counter names.
 pub(crate) fn management_operations() -> Vec<ManagementOperation> {
-    vec![
+    let mut operations = vec![
         ManagementOperation {
             name: broca_wire::diagnostics::OP.into(),
             kind: ManagementOperationKind::Query,
@@ -327,7 +327,15 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
                     .to_string(),
             ),
         },
-    ]
+    ];
+    if broca_protocol::attachments_enabled() {
+        operations.push(ManagementOperation {
+            name: cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ.into(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Read bounded media bytes referenced by the bound session.".into()),
+        });
+    }
+    operations
 }
 
 pub(crate) fn registered_management_operation(method: &str) -> bool {

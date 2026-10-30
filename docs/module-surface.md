@@ -1400,9 +1400,40 @@ refusal is counted in `health.check` as `reverse_requests_refused`.
 
 **Tool result formats and provider-held calls.** Dispatch routes declare `tool-result/v1` only
 for providers whose frozen catalog declares that result format. Text and errors use the same
-stored bytes as legacy replies. Shipping builds append a notice for each omitted image; builds
-with the `test-attachments` feature capture the image instead when dispatch has a media-capture handle. Role discovery and management routes do not
+stored bytes as legacy replies. With media disabled, shipping builds append the existing
+"not shown to the model" notice for each omitted image. With media enabled, dispatch captures
+images and PDFs through the session's media-capture handle. Role discovery and management routes do not
 negotiate tool results.
+
+### Runtime media opt-in
+
+In `broca.jsonc`, `"media": {"enabled": true}` enables media for the process.
+The section is optional and `enabled` defaults to `false`. Only a boolean is accepted;
+unknown keys inside `media` refuse boot by name. The decision is read once before stores
+are opened: enabling or disabling media requires restarting broca. `test-attachments`
+remains a non-shipping feature for test seams, not a deployment prerequisite.
+
+When enabled, `role.describe` declares the llm-runner `attachments` group and its upload
+and `session.media_read` operations. When disabled, it declares neither the group nor
+`session.media_read`; existing upload staging remains available but cannot be sent.
+The operations follow the pinned llm-runner contract §9.12. In particular,
+`session.media_read {sha256, offset, length}` serves at most 2,097,152 decoded bytes as
+`{data, size, mime}`. Zero length omits `data`; EOF returns empty data, and an offset
+past EOF refuses by name. Only durable captures in the bound session authorize a digest:
+another session's objects and unreferenced committed uploads return `unknown_media`.
+Read admission is the same as `session.read`.
+
+Default reads keep media as text markers. `session.read` with `media: "blocks"` returns
+stored references; descriptors and history display rows expose refs rather than payload
+bytes. Provider rendering uses the frozen family's media profile; unsupported person input
+is refused before publication, including ChatGPT audio. Sessions holding media refuse
+agent-data moves before any cut or freeze because move transport currently carries WALs
+only. The existing Engram catalog already includes `media-durable` as a portable filetree
+and excludes temporary, retained and ephemeral media stores; enabling media needs no
+descriptor change.
+
+### Provider-held calls
+
 The daemon installs the provider-held runtime (`broca-module-serve/src/held_runtime.rs`) on
 its tool plane: the waiting slots a held call's batch waits in, a late-results intake store
 (`late-results.db` under the state root, a projection of the WAL kept out of the backup

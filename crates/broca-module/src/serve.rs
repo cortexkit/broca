@@ -1643,6 +1643,16 @@ impl std::error::Error for ServeError {}
 /// real outcome or a typed `ServeError`.
 #[async_trait]
 pub trait ServeHandler: Send + Sync {
+    async fn media_read(
+        &self,
+        _session: &LineageKey,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, ServeError> {
+        Err(ServeError::InvalidParams {
+            field: "sha256".into(),
+            message: "session.media_read unavailable".into(),
+        })
+    }
     async fn upload(
         &self,
         _session: &LineageKey,
@@ -2343,6 +2353,14 @@ impl ServeHandler for crate::LineageRegistry {
         params: serde_json::Value,
     ) -> Result<serde_json::Value, ServeError> {
         crate::uploads::upload(self, session, principal, scope, method, params).await
+    }
+
+    async fn media_read(
+        &self,
+        session: &LineageKey,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, ServeError> {
+        crate::uploads::media_read(self, session, params).await
     }
 
     async fn send(&self, mut req: SendRequest) -> Result<SendResponse, ServeError> {
@@ -3114,6 +3132,45 @@ impl ServeHandler for crate::LineageRegistry {
         } else {
             None
         };
+        let mut input = broca_wire::head_input();
+        if broca_protocol::attachments_enabled() {
+            let (frames, _) = self.read_durable_wal(session).await?;
+            let checkpoint =
+                broca_core::AdmissionCheckpointV1::from_frames(&frames).map_err(|error| {
+                    ServeError::Open(format!("read media input facts: {error}"), None)
+                })?;
+            if let Some(profile) = checkpoint
+                .last_episode
+                .as_ref()
+                .and_then(|episode| episode.config.frozen_render_config.get("media"))
+                .and_then(|value| {
+                    serde_json::from_value::<broca_provider::media_profile::MediaProfile>(
+                        value.clone(),
+                    )
+                    .ok()
+                })
+            {
+                use broca_protocol::MediaKind;
+                let modalities: Vec<String> = [
+                    MediaKind::Image,
+                    MediaKind::Document,
+                    MediaKind::Audio,
+                    MediaKind::Video,
+                ]
+                .into_iter()
+                .filter(|kind| {
+                    profile.accepts_modality(*kind)
+                        && profile.kind(*kind).user_message
+                            != broca_provider::media_profile::MediaCarrier::Marker
+                })
+                .map(|kind| broca_provider::person_media::modality(kind).into())
+                .collect();
+                if !modalities.is_empty() {
+                    input = cortexkit_role_llm_runner::read::HeadInput::new("yes")
+                        .with_modalities(modalities);
+                }
+            }
+        }
         Ok(broca_wire::HeadResponse {
             last_run_rich_ui: head_facts.last_run_rich_ui,
             last_run_error,
@@ -3153,7 +3210,7 @@ impl ServeHandler for crate::LineageRegistry {
                     expiry_basis: broca_wire::EXPIRY_BASIS_ESTIMATED.into(),
                 }),
             title: last_title,
-            input: Some(broca_wire::head_input()),
+            input: Some(input),
         })
     }
 

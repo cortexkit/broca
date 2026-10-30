@@ -151,6 +151,18 @@ impl Rig {
 
     // A caller may register a live catalog producer before opening the first broca route.
     async fn launch(model_url: &str, catalog: Option<Value>) -> Option<Self> {
+        Self::launch_configured(model_url, catalog, cfg!(feature = "test-attachments")).await
+    }
+
+    async fn launch_media(model_url: &str, catalog: Option<Value>) -> Option<Self> {
+        Self::launch_configured(model_url, catalog, true).await
+    }
+
+    async fn launch_configured(
+        model_url: &str,
+        catalog: Option<Value>,
+        media: bool,
+    ) -> Option<Self> {
         let subc_source = broca_test_support::subc_bin("ck-subc", "SUBC_CORE_BIN");
         let fake_aft = broca_test_support::subc_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN");
         for bin in [&subc_source, &fake_aft] {
@@ -184,6 +196,12 @@ impl Rig {
         let config_path = config_home.join("cortexkit").join("subc.jsonc");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&runtime_dir).unwrap();
+        let broca_config = dir.join("broca.jsonc");
+        std::fs::write(
+            &broca_config,
+            serde_json::to_vec(&serde_json::json!({"media":{"enabled":media}})).unwrap(),
+        )
+        .unwrap();
         // A seeded catalog keeps renderer-version tests offline. Leaving it absent
         // requires bootstrap to fetch facts from the live catalog module.
         if let Some(catalog) = catalog {
@@ -203,6 +221,7 @@ impl Rig {
                     "env": {
                         "BROCA_STATE_ROOT": runtime_dir.join("broca-state"),
                         "BROCA_PROVIDER_BASE_URL": model_url,
+                        "BROCA_CONFIG_PATH": broca_config,
                         "BROCA_TOOL_MODULE": "aft"
                     },
                     "enabled": true
@@ -300,7 +319,6 @@ impl Rig {
     }
 }
 
-#[cfg(feature = "test-attachments")]
 #[path = "media_acceptance.rs"]
 mod media_acceptance;
 

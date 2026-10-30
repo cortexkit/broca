@@ -99,7 +99,6 @@ pub fn reconstruct_from_offsets(
     {
         return Err(bad("offset resume snapshot does not reach durable head"));
     }
-    #[cfg(feature = "test-attachments")]
     if !seed.admission_checkpoint.media_seed_complete() {
         return Err(bad("offset resume media seed needs full replay"));
     }
@@ -172,7 +171,6 @@ pub fn reconstruct_from_offsets(
     let checkpoint = delta.admission_checkpoint;
     // A tail can introduce the first media capture into a previously media-free prefix.
     // Recheck its folded state: a valid selected window is not a media-state completeness proof.
-    #[cfg(feature = "test-attachments")]
     if !checkpoint.media_seed_complete() {
         return Err(bad("offset resume media seed needs full replay"));
     }

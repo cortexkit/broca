@@ -78,9 +78,7 @@ fn retention_request_dumps_are_suppressed_before_any_write() {
         let rendered = runtime.block_on(async {
             tokio::task::spawn_blocking(move || {
                 RenderJob {
-                    #[cfg(feature = "test-attachments")]
                     media_renderer: None,
-                    #[cfg(feature = "test-attachments")]
                     media_render_tags: false,
                     auth_revision: 0,
                     family: Arc::new(OpenAiResponses),
@@ -169,9 +167,7 @@ async fn retention_https_calls_private_diagnostics_on_every_retry() {
     let mut frozen = openai_responses_frozen_config("test-model");
     frozen.base_url = Some(url);
     let rendered = RenderJob {
-        #[cfg(feature = "test-attachments")]
         media_renderer: None,
-        #[cfg(feature = "test-attachments")]
         media_render_tags: false,
         auth_revision: 0,
         family: Arc::new(OpenAiResponses),
