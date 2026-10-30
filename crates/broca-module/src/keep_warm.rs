@@ -549,6 +549,7 @@ mod retention_tests {
                             account_ref: None,
                             speed_requested: None,
                             warm: None,
+                            auth_refreshed: false,
                         },
                         Default::default(),
                     )

@@ -435,6 +435,12 @@ struct CodeAssistNormalizer {
 }
 
 impl StreamNormalizer for CodeAssistNormalizer {
+    fn observe_error_response(&mut self, response: &Value) {
+        self.inner.observe_error_response(response);
+    }
+    fn set_response_evidence(&mut self, evidence: crate::normalize::SharedResponseEvidence) {
+        self.inner.set_response_evidence(evidence);
+    }
     fn content_progress(&self) -> broca_protocol::provider::ContentProgress {
         self.sse.content_progress()
     }

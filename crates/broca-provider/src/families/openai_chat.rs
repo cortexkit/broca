@@ -622,6 +622,7 @@ struct ToolCallBuf {
 /// finish reason or the `[DONE]` sentinel confirms the response completed. Usage is
 /// taken from the optional trailing usage chunk.
 pub struct OpenAiChatNormalizer {
+    response_evidence: Option<crate::normalize::SharedResponseEvidence>,
     display_parts: crate::display_parts::DisplayParts,
     arguments_guard: crate::wire::ToolArgsGuard,
     step_id: StepId,
@@ -651,6 +652,7 @@ pub struct OpenAiChatNormalizer {
 impl OpenAiChatNormalizer {
     pub fn new(step_id: StepId, usage_policy: UsagePolicy) -> Self {
         Self {
+            response_evidence: None,
             display_parts: Default::default(),
             arguments_guard: Default::default(),
             step_id,
@@ -693,8 +695,12 @@ impl OpenAiChatNormalizer {
     ) -> Result<(), NormalizeError> {
         let v: Value =
             serde_json::from_str(payload).map_err(|e| NormalizeError::Invalid(e.to_string()))?;
+        if let Some(evidence) = &self.response_evidence {
+            evidence.lock().unwrap().observe_response(&v);
+        }
 
         if let Some(error) = openai_chat_stream_error(&v) {
+            self.observe_error_response(&v);
             out.push(NormalizedEvent::Control(ProviderControl::Error {
                 error,
                 retries_used: 0,
@@ -735,6 +741,9 @@ impl OpenAiChatNormalizer {
 
         if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
             self.finish_reason = Some(map_finish_reason(fr));
+            if let Some(evidence) = &self.response_evidence {
+                evidence.lock().unwrap().finish_reason = self.finish_reason;
+            }
             self.raw_finish_reason = Some(fr.to_owned());
             self.terminal_observed = true;
         }
@@ -1040,6 +1049,9 @@ impl OpenAiChatNormalizer {
                 }
             }
         }
+        if let Some(evidence) = &self.response_evidence {
+            evidence.lock().unwrap().observe_usage(u, self.usage);
+        }
     }
 
     fn assemble_message(
@@ -1114,6 +1126,22 @@ impl OpenAiChatNormalizer {
 }
 
 impl StreamNormalizer for OpenAiChatNormalizer {
+    fn observe_error_response(&mut self, response: &Value) {
+        if self.response_evidence.is_none() {
+            return;
+        }
+        let previous = self.usage;
+        if let Some(usage) = response.get("usage") {
+            self.merge_usage(usage);
+        }
+        self.usage = previous;
+        if let Some(evidence) = &self.response_evidence {
+            evidence.lock().unwrap().observe_response(response);
+        }
+    }
+    fn set_response_evidence(&mut self, evidence: crate::normalize::SharedResponseEvidence) {
+        self.response_evidence = Some(evidence);
+    }
     fn content_progress(&self) -> broca_protocol::provider::ContentProgress {
         self.sse.content_progress()
     }

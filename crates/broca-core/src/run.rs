@@ -6074,9 +6074,7 @@ where
             // cancel, restart, or change the request already being streamed by the provider.
             let model_result = if writer.is_overhaul() {
                 let (_, mut hook_requests) = hook_channel.expect("overhaul hook channel");
-                use broca_wal::record::{
-                    AttemptCredential, AttemptReservation, AttemptRun, AttemptSession,
-                };
+                use broca_wal::record::{AttemptReservation, AttemptRun, AttemptSession};
                 let auth = control.auth_selection.clone().or_else(|| {
                     prior
                         .run_config
@@ -6093,15 +6091,7 @@ where
                     provider: step_model.provider_module_id.clone(),
                     endpoint_host: String::new(),
                     model_sent: String::new(),
-                    credential: AttemptCredential {
-                        credential_ref: None,
-                        account_ref: None,
-                        auth_method: auth.as_ref().and_then(|auth| auth.auth_method.clone()),
-                        auth_selection: auth,
-                        provider_ids: None,
-                        plan_tier: None,
-                        plan_tier_source: None,
-                    },
+                    credential: crate::admission::attempt_credential(auth.as_ref()),
                     session: AttemptSession {
                         bind: req.session.clone(),
                         session_ref: crate::agent_session_ref(&req.session),
@@ -8522,6 +8512,8 @@ pub struct PhysicalSend {
     pub request_body_bytes: u64,
     pub compressed: bool,
     pub account_ref: Option<String>,
+    /// Refresh replies carry account identity but do not include a resolved credential ID.
+    pub auth_refreshed: bool,
     pub speed_requested: Option<String>,
     /// Present only for warms; derived from the selected frozen request's marker policy.
     pub warm: Option<crate::cache_warm::WarmSendPolicy>,
@@ -8546,6 +8538,7 @@ pub trait AttemptHook: Send + Sync {
         id: broca_wal::record::AttemptId,
         attempt: ModelAttempt,
         outcome: broca_wal::record::BillingAttemptOutcome,
+        response: Option<broca_wal::record::AttemptEnvelope>,
     ) -> Result<(), ProviderError>;
 
     /// Warm usage is independent of model-step telemetry. A hook that cannot persist it must
@@ -8573,6 +8566,7 @@ enum AttemptRequest {
         id: broca_wal::record::AttemptId,
         attempt: ModelAttempt,
         outcome: broca_wal::record::BillingAttemptOutcome,
+        response: Option<Box<broca_wal::record::AttemptEnvelope>>,
         reply: tokio::sync::oneshot::Sender<Result<(), ProviderError>>,
     },
 }
@@ -8643,6 +8637,7 @@ impl AttemptHook for ChannelAttemptHook {
         id: broca_wal::record::AttemptId,
         attempt: ModelAttempt,
         outcome: broca_wal::record::BillingAttemptOutcome,
+        response: Option<broca_wal::record::AttemptEnvelope>,
     ) -> Result<(), ProviderError> {
         let (reply, receipt) = tokio::sync::oneshot::channel();
         self.0
@@ -8650,6 +8645,7 @@ impl AttemptHook for ChannelAttemptHook {
                 id,
                 attempt,
                 outcome,
+                response: response.map(Box::new),
                 reply,
             })
             .map_err(|_| attempt_hook_error("run stopped before settlement"))?;
@@ -8764,10 +8760,11 @@ impl AttemptJournal<'_> {
                             speed_requested: send.speed_requested,
                             ..self.template.run.clone()
                         },
-                        credential: broca_wal::record::AttemptCredential {
-                            account_ref: send.account_ref,
-                            ..self.template.credential.clone()
-                        },
+                        credential: crate::admission::attempt_credential_for_send(
+                            &self.template.credential,
+                            send.account_ref,
+                            send.auth_refreshed,
+                        ),
                         ..self.template.clone()
                     },
                     started: false,
@@ -8848,6 +8845,7 @@ impl AttemptJournal<'_> {
                 id,
                 attempt,
                 outcome,
+                response,
                 reply,
             } => {
                 let Some(pending) = self.pending.get(&id) else {
@@ -8870,7 +8868,7 @@ impl AttemptJournal<'_> {
                     response_bytes: attempt.response_body_len,
                     http_status: attempt.http_status,
                     outcome,
-                    ..Default::default()
+                    ..response.map(|response| *response).unwrap_or_default()
                 };
                 let ordinal = attempt.attempt;
                 let mut record =
@@ -11624,6 +11622,7 @@ mod tests {
             account_ref: None,
             speed_requested: None,
             warm: None,
+            auth_refreshed: false,
         }
     }
 
@@ -12070,10 +12069,23 @@ mod tests {
         let id = reservation.await.unwrap();
         let mut attempt = transformation_attempt(None, true);
         attempt.sent_at_ms = Some(1);
+        let response = broca_wal::record::AttemptEnvelope {
+            vendor_request_id: Some("reported-request".into()),
+            usage: Some(Usage {
+                input_tokens: Some(0),
+                output_tokens: Some(7),
+                ..Default::default()
+            }),
+            usage_raw: Some(
+                serde_json::json!({"input_tokens":0,"output_tokens":7,"future_key":false}),
+            ),
+            ..Default::default()
+        };
         let finish = hook.finished(
             id.clone(),
             attempt,
             broca_wal::record::BillingAttemptOutcome::Complete,
+            Some(response.clone()),
         );
         tokio::pin!(finish);
         let step = async {
@@ -12090,6 +12102,21 @@ mod tests {
         writer.sync().await.unwrap();
         let records = records.lock().unwrap();
         assert_eq!(records.iter().filter(|record| matches!(record, WalRecord::ModelAttemptFinished { attempt_id: Some(terminal_id), .. } if terminal_id == &id)).count(), 1);
+        let envelope = records
+            .iter()
+            .find_map(|record| match record {
+                WalRecord::ModelAttemptFinished { envelope, .. } => envelope.as_ref(),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(envelope.usage, response.usage);
+        assert_eq!(envelope.usage_raw, response.usage_raw);
+        assert_eq!(envelope.vendor_request_id, response.vendor_request_id);
+        assert_eq!(envelope.sent_at_ms, Some(1));
+        assert_eq!(
+            envelope.outcome,
+            broca_wal::record::BillingAttemptOutcome::Complete
+        );
         assert!(!records.iter().any(|record| matches!(
             record,
             WalRecord::AttemptFinished { .. } | WalRecord::AttemptReleased { .. }
@@ -12140,6 +12167,7 @@ mod tests {
                 first.clone(),
                 refusal,
                 BillingAttemptOutcome::CompressionRefused,
+                None,
             )
             .await
             .unwrap();
@@ -12155,6 +12183,7 @@ mod tests {
                 second,
                 transformation_attempt(None, true),
                 BillingAttemptOutcome::Complete,
+                None,
             )
             .await
             .unwrap();
@@ -12255,6 +12284,7 @@ mod tests {
                         id,
                         terminal,
                         broca_wal::record::BillingAttemptOutcome::Complete,
+                        None,
                     )
                     .await
                     .unwrap();
