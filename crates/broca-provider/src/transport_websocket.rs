@@ -487,13 +487,31 @@ impl Session {
         .expect("socket pump observes the peer close");
     }
 
-    fn forced_https(&self) -> bool {
+    pub(super) fn forced_https(&self) -> bool {
         let policy = Arc::clone(&self.policy.read().unwrap());
         // Evaluate on every attempt so config edits still take effect immediately. The
         // callback may read disk; it must not hold up socket teardown or failure accounting.
         let configured_https = policy();
         let state = self.state.lock().unwrap();
         configured_https || state.force_https || state.failures >= FAILURE_LIMIT
+    }
+
+    /// Retire an already-expired chain at the boundary, not after a view has rendered.
+    /// The missing-receipt cause is consumed by the ordinary send path exactly once.
+    pub(super) fn prepare_chain_reset(&self) -> bool {
+        let now = self.now();
+        let mut state = self.state.lock().unwrap();
+        if state
+            .socket
+            .as_ref()
+            .and_then(|socket| age_retirement(socket, now))
+            .is_some()
+        {
+            let socket = state.socket.take().expect("expired socket");
+            socket.shutdown.cancel();
+            state.missing_receipt = Some(MissingReceipt::Age);
+        }
+        state.socket.is_none() && state.missing_receipt.is_some()
     }
 
     async fn connection(
@@ -516,15 +534,13 @@ impl Session {
                 }
                 let open =
                     !socket.closed.load(Ordering::Acquire) && !socket.shutdown.is_cancelled();
-                socket.shutdown.cancel();
                 let auth_changed = !connection_identity_matches(socket, request);
                 let receipt_reason = if open && credential_identity_changed(socket, request) {
                     Some(MissingReceipt::AuthChanged)
-                } else if open && age >= MAX_SOCKET_AGE {
-                    Some(MissingReceipt::Age)
                 } else {
-                    None
+                    age_retirement(socket, now)
                 };
+                socket.shutdown.cancel();
                 state.socket = None;
                 state.missing_receipt = receipt_reason.or(state.missing_receipt);
                 if auth_changed {
@@ -606,6 +622,13 @@ impl Session {
             }
         }
     }
+}
+
+fn age_retirement(socket: &Socket, now: Instant) -> Option<MissingReceipt> {
+    (!socket.closed.load(Ordering::Acquire)
+        && !socket.shutdown.is_cancelled()
+        && now.saturating_duration_since(socket.established_at) >= MAX_SOCKET_AGE)
+        .then_some(MissingReceipt::Age)
 }
 
 impl Drop for Session {

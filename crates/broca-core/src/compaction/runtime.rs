@@ -429,6 +429,7 @@ pub async fn apply_idle_view(
         state,
         stored,
         view::NoticeFacts {
+            history_edit_cost: None,
             session_ref: ready.session_ref.clone(),
             lineage_id: &lineage,
             est_tokens: crate::compaction::request_estimate(
@@ -1081,6 +1082,7 @@ impl Runtime<'_> {
         lineage_id: &str,
         model: &str,
         prompt: &[Message],
+        chain_reset: bool,
         stored: super::StoredTranscript<'_>,
         prefix_bound: bool,
         run_start: bool,
@@ -1091,7 +1093,11 @@ impl Runtime<'_> {
         // Versions passed over at this boundary because a newer one was known by the time
         // each was decided; the newest is the only one applied.
         let mut superseded = Vec::new();
-        if let Some(cause) = view::rewrite_ride_cause(state, model) {
+        // Keep model/account changes first: their existing ride semantics may refresh
+        // model-specific TTLs. A chain reset adds an opportunity when neither changed.
+        if let Some(cause) = view::rewrite_ride_cause(state, model)
+            .or_else(|| chain_reset.then_some(RideCause::ChainReset))
+        {
             let step_id = broca_protocol::StepId(at.step);
             if let Some(view) = Box::pin(self.ride(state, step_id, session_ref, cause)).await? {
                 let ready = ViewReady::for_view(&view);

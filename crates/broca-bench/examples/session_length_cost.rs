@@ -2778,6 +2778,7 @@ fn step_parts(
             &compaction,
             &raw,
             view::NoticeFacts {
+                history_edit_cost: None,
                 session_ref: "bench".into(),
                 lineage_id: &lineage,
                 est_tokens: 1,

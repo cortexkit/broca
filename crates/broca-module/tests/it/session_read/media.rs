@@ -92,6 +92,7 @@ async fn notice_matches_descriptors(name: &str, state: Option<broca_protocol::Te
             &CompactionState::default(),
             std::slice::from_ref(&entry.message),
             NoticeFacts {
+                history_edit_cost: None,
                 session_ref: "0123456789abcdef0123456789abcdef".into(),
                 lineage_id: "lineage",
                 est_tokens: 10,

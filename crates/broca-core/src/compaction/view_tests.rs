@@ -324,6 +324,7 @@ fn sparse_originals_preserve_signed_authorship_and_notice_digests() {
         }
     }
     let facts = || NoticeFacts {
+        history_edit_cost: None,
         session_ref: SESSION_REF.into(),
         lineage_id: LINEAGE,
         est_tokens: 123,
@@ -879,6 +880,7 @@ async fn an_applied_view_renders_byte_identically_after_a_restart() {
 
 fn facts(lineage_id: &str) -> NoticeFacts<'_> {
     NoticeFacts {
+        history_edit_cost: None,
         session_ref: SESSION_REF.into(),
         lineage_id,
         est_tokens: 100,
@@ -1635,5 +1637,30 @@ fn only_an_account_change_since_the_last_notice_rides() {
     assert_eq!(
         switched.to_headers()["events"],
         format!("account_change:{label_b}")
+    );
+}
+
+#[test]
+fn pricing_route_changes_are_announced_without_a_transcript_change() {
+    use crate::compaction_provider::notice::HistoryEditCost;
+    let mut state = after_setup();
+    let prompt = conversation();
+    let legacy = next_notice(&state, &prompt, facts(LINEAGE)).unwrap();
+    record(&mut state, &legacy);
+    let mut next = facts(LINEAGE);
+    next.history_edit_cost = Some(HistoryEditCost::FullResend);
+    let chained = next_notice(&state, &prompt, next).unwrap();
+    assert_eq!(chained.to_headers()["history_edit_cost"], "full_resend");
+    record(&mut state, &chained);
+    let mut next = facts(LINEAGE);
+    next.history_edit_cost = Some(HistoryEditCost::Suffix);
+    let suffix = next_notice(&state, &prompt, next).unwrap();
+    assert_eq!(suffix.to_headers()["history_edit_cost"], "suffix");
+    assert_eq!(suffix.through_digest, chained.through_digest);
+    assert_eq!(suffix.seq, chained.seq + 1);
+    record(&mut state, &suffix);
+    assert!(
+        next_notice(&state, &prompt, facts(LINEAGE)).is_none(),
+        "disabling signals alone must not invent a legacy notice"
     );
 }

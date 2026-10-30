@@ -1225,6 +1225,24 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
 
 #[async_trait]
 impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
+    fn history_edit_cost(
+        &self,
+    ) -> Option<broca_core::compaction_provider::notice::HistoryEditCost> {
+        use broca_core::compaction_provider::notice::HistoryEditCost;
+        let route = self.route_frozen();
+        Some(
+            if route.chatgpt_wire.is_some() && !self.websocket.forced_https() {
+                HistoryEditCost::FullResend
+            } else {
+                HistoryEditCost::Suffix
+            },
+        )
+    }
+
+    fn prepare_chain_reset(&self) -> bool {
+        self.websocket.prepare_chain_reset()
+    }
+
     fn supports_media_renderer(&self) -> bool {
         broca_protocol::attachments_enabled()
     }

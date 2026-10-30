@@ -2386,6 +2386,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
             "enabled": false,
             "bus_events_published": 0,
             "bus_outbox_depth": 0,
+            "compaction_notice_outbox_pending": 0,
             "bus_publish_failures": 0,
             "bus_events_oversize": 0,
             "bus_outbox_dropped": 0,

@@ -1849,3 +1849,58 @@ never-written sessions carry no error summary.
 Compaction Setup continues to omit `ride_wait_max_ms`, `view_apply` and child-run
 `session_retention`: broca does not promise provider-chosen ride waits, marked
 next-step view application, or the per-session retention policy group.
+
+## Compaction pricing signals and rollback
+
+`broca.jsonc` accepts the boot-only boolean `compaction_signals` (default `true`).
+A config change takes effect after restarting broca; it is not frozen into a session.
+With it on, advance notices describe the next call's current route with
+`history_edit_cost`: `suffix` for prefix-byte prompt caches (Anthropic, Bedrock,
+Gemini/Code Assist, Chat Completions and ordinary Responses), or `full_resend`
+for ChatGPT's WebSocket response-chain route. A switch to HTTPS changes the hint
+on the next notice, even within the same session. Unknown routes omit the hint.
+The header is a pricing hint, never permission to rewrite history.
+
+Before rendering a ChatGPT step, a known missing chain can also request a bounded
+`compaction.ride` RPC with cause `chain_reset`. Age retirement uses the transport's 40-minute decision, and
+run-start acquisition supplies its existing idle/absent-socket decision. The
+transport records why the socket has no usable completion receipt in the attempt's
+`full_input_reason` (for example, `new_connection_age`). The pre-render request and
+the attempt use that same retirement decision, not an elapsed-gap guess.
+A retry or refusal discovered during sending does
+not re-enter this boundary and never announces a new chain-reset request. Cache
+warms, including warms of the original model after a fallback, neither produce
+these step signals nor replace the previous model request's
+[segment-hash fingerprint](cache-dump.md#offline-cache-diagnosis).
+
+Set `"compaction_signals": false` to omit both new signals from newly created
+notices and chain-reset requests. Disabled notices keep the old header encoding/digest. This does
+**not** strip, suppress or rewrite any notice already durable in the WAL, queued
+in the outbox, or accepted by the broker: notice sequence/headers/digest are immutable.
+Notice readers must support the `history_edit_cost` header and digest rules in
+`cortexkit-role-compaction-provider` 0.7.9 before signals are enabled.
+The reader-only pin ships in broca 0.3.290; the signal writer ships in 0.3.291.
+The writer's broca rollback floor is therefore 0.3.290. An older broca can read
+the WAL header map but cannot correctly re-encode this header's notice digest.
+
+**One-step Magic Context rollback:** the kept rollback build `34a40ebc`
+already accepts both signals. Rolling back to that build needs neither switch-off
+nor a compatibility drain.
+
+**Rollback to `4eac8781` or older:** these builds reject the new notice
+header and requires this order:
+
+1. Set `compaction_signals` to `false` and restart broca, leaving bus events enabled.
+2. Let bus recovery finish, then inspect
+   `health.check.metrics.bus_events.compaction_notice_outbox_pending` until zero
+   (and check that the bus loop is progressing without publication failures).
+   This count covers only unpublished notices in broca's outbox. Zero means only
+   that broca has published the queued notices, **never that Magic Context consumed
+   or acknowledged them**; it is not a substitute for completed WAL recovery.
+3. Separately pass Magic Context's own consumer-ACK drain check for advance notices.
+   This is an MC-owned operational check, not a broca API. Obtain its command or
+   dashboard procedure from the MC operator before attempting this rollback.
+   Broca's inbound `compaction_bus.acked` and JetStream publish receipts are not that
+   check. Do not proceed while the MC-owned check is unavailable or nonzero.
+4. Only then roll the Magic Context reader back. A rollback reader that itself
+   tolerates the new header does not need this compatibility drain.

@@ -48,6 +48,17 @@ pub struct StepRuntime {
 
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Pricing of edits on the route the next model call would use; unknown routes omit it.
+    fn history_edit_cost(&self) -> Option<crate::compaction_provider::notice::HistoryEditCost> {
+        None
+    }
+
+    /// Decide a known chain retirement before rendering, retaining its cause for the attempt.
+    /// Transport retries do not call this step-boundary hook.
+    fn prepare_chain_reset(&self) -> bool {
+        false
+    }
+
     fn supports_media_renderer(&self) -> bool {
         false
     }
@@ -312,6 +323,14 @@ pub trait Provider: Send + Sync {
 /// `run_loop` directly, without the loop needing to know the concrete type.
 #[async_trait]
 impl Provider for Box<dyn Provider> {
+    fn history_edit_cost(&self) -> Option<crate::compaction_provider::notice::HistoryEditCost> {
+        (**self).history_edit_cost()
+    }
+
+    fn prepare_chain_reset(&self) -> bool {
+        (**self).prepare_chain_reset()
+    }
+
     fn supports_media_renderer(&self) -> bool {
         (**self).supports_media_renderer()
     }

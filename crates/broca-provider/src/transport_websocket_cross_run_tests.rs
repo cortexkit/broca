@@ -932,3 +932,7 @@ async fn cache_evidence_captures_model_change_through_the_run_loop() {
         std::fs::write(directory.join("model-change.json"), bytes).unwrap();
     }
 }
+
+mod compaction_signals {
+    include!("transport_compaction_signals_tests.rs");
+}

@@ -687,6 +687,8 @@ pub struct RunControl {
     pub compaction_plane: Option<Arc<dyn crate::compaction::CompactionPlane>>,
     /// The budget for the compaction Setup call. Default uses COMPACTION_CALL_BUDGET_MS.
     pub compaction_config: crate::compaction::CompactionConfig,
+    /// Boot-only rollout gate for notice pricing and pre-render chain-reset requests.
+    pub compaction_signals: bool,
     /// Views fetched from the session's compaction provider, offered at each step boundary.
     /// Absent, the session renders Setup's message and the views it already applied.
     pub compaction_views: Option<Arc<dyn crate::compaction::CompactionViews>>,
@@ -793,6 +795,7 @@ impl Default for RunControl {
             compaction_plane: None,
             compaction_views: None,
             compaction_config: Default::default(),
+            compaction_signals: true,
             #[cfg(feature = "test-clock")]
             test_compaction: None,
             provider_call_timeout: None,
@@ -5575,6 +5578,10 @@ where
         });
         let mut model_opts = None;
         if let Some(runtime) = &compaction_runtime {
+            let history_edit_cost = notice_history_edit_cost(control, provider);
+            let chain_reset = history_edit_cost
+                == Some(crate::compaction_provider::notice::HistoryEditCost::FullResend)
+                && provider.prepare_chain_reset();
             // A legacy WAL mints its lineage on the first append. StepStarted is only
             // queued above, so wait for its barrier before reading the writer's identity.
             // A WAL backend that still cannot identify this lineage cannot host compaction.
@@ -5714,6 +5721,7 @@ where
                     // the model is sent (tags and loop guidance included); and the stored
                     // copy, against which the view's own bytes are judged.
                     &opts.prompt,
+                    chain_reset,
                     raw,
                     provider.reasoning_is_prefix_bound(),
                     // The run's first step, where a view deferred over an open turn ends.
@@ -5745,6 +5753,7 @@ where
                     state,
                     through,
                     crate::compaction::view::NoticeFacts {
+                        history_edit_cost: history_edit_cost.clone(),
                         session_ref: session_ref.clone(),
                         lineage_id: &lineage_id,
                         est_tokens: estimate,
@@ -5801,6 +5810,7 @@ where
                     state,
                     through,
                     crate::compaction::view::NoticeFacts {
+                        history_edit_cost: history_edit_cost.clone(),
                         session_ref,
                         lineage_id: &lineage_id,
                         est_tokens: crate::compaction::request_estimate(
@@ -6857,6 +6867,7 @@ where
                         &compaction_history,
                         notice_request_bytes,
                         compaction_notice_floor,
+                        notice_history_edit_cost(control, provider),
                     )
                     .map(|closing| (closing, assembled.content.as_slice())),
                 )
@@ -6914,6 +6925,7 @@ where
                     &compaction_history,
                     notice_request_bytes,
                     compaction_notice_floor,
+                    notice_history_edit_cost(control, provider),
                 )
                 .map(|closing| (closing, assembled.content.as_slice())),
             )
@@ -6957,6 +6969,7 @@ where
                         &compaction_history,
                         notice_request_bytes,
                         compaction_notice_floor,
+                        notice_history_edit_cost(control, provider),
                     )
                     .map(|closing| (closing, assembled.content.as_slice())),
                 )
@@ -7055,6 +7068,7 @@ where
                         &compaction_history,
                         notice_request_bytes,
                         compaction_notice_floor,
+                        notice_history_edit_cost(control, provider),
                     )
                     .map(|closing| (closing, assembled.content.as_slice())),
                 )
@@ -7288,6 +7302,7 @@ where
             &compaction_history,
             notice_request_bytes,
             compaction_notice_floor,
+            notice_history_edit_cost(control, provider),
         ),
     ) {
         if let Some((state, notice)) = closing.notice(&[], &[]) {
@@ -11197,6 +11212,16 @@ fn interrupted_result(id: &ToolCallId) -> ToolResult {
     }
 }
 
+fn notice_history_edit_cost(
+    control: &RunControl,
+    provider: &dyn Provider,
+) -> Option<crate::compaction_provider::notice::HistoryEditCost> {
+    control
+        .compaction_signals
+        .then(|| provider.history_edit_cost())
+        .flatten()
+}
+
 /// The advance notice a compaction session records when its run ends, announcing the writes
 /// after its last step boundary (the final answer, and the results of a hard stop) before the
 /// terminal (compaction-provider CONTRACT.md §5: a notice after each durable write). `None`
@@ -11213,6 +11238,7 @@ struct ClosingNotice<'a> {
     history: &'a crate::compaction::CompactionHistory,
     request_bytes: usize,
     floor: u64,
+    history_edit_cost: Option<crate::compaction_provider::notice::HistoryEditCost>,
 }
 
 impl<'a> ClosingNotice<'a> {
@@ -11229,6 +11255,7 @@ impl<'a> ClosingNotice<'a> {
         history: &'a crate::compaction::CompactionHistory,
         request_bytes: usize,
         floor: u64,
+        history_edit_cost: Option<crate::compaction_provider::notice::HistoryEditCost>,
     ) -> Option<Self> {
         Some(Self {
             state: state?,
@@ -11242,6 +11269,7 @@ impl<'a> ClosingNotice<'a> {
             history,
             request_bytes,
             floor,
+            history_edit_cost,
         })
     }
 
@@ -11309,6 +11337,7 @@ impl<'a> ClosingNotice<'a> {
             self.state,
             through,
             crate::compaction::view::NoticeFacts {
+                history_edit_cost: self.history_edit_cost,
                 session_ref: crate::wal_writer::agent_session_ref(self.session),
                 lineage_id: &self.lineage_id,
                 est_tokens: estimate,
