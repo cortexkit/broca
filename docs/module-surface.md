@@ -1398,21 +1398,21 @@ and "no reverse-request handler is registered for <family>", the same reply the 
 consumer SDK sends. It never reaches a pending call, even one with the same corr, and each
 refusal is counted in `health.check` as `reverse_requests_refused`.
 
-**Tool result formats and provider-held calls.** Dispatch routes declare `tool-result/v1` only
-for providers whose frozen catalog declares that result format. Text and errors use the same
+**Tool result formats and provider-held calls.** The daemon's dispatch routes declare
+`consumer_capabilities: ["tool-result/v1", "held-reply/v1"]` in every build. Typed result
+decoding still requires the result-format opt-in in the provider's frozen catalog. Text and errors use the same
 stored bytes as legacy replies. Shipping builds append a notice for each omitted image; builds
 with the `test-attachments` feature capture the image instead when dispatch has a media-capture handle. Role discovery and management routes do not
 negotiate tool results.
 The daemon installs the provider-held runtime (`broca-module-serve/src/held_runtime.rs`) on
 its tool plane: the waiting slots a held call's batch waits in, a late-results intake store
 (`late-results.db` under the state root, a projection of the WAL kept out of the backup
-catalog), one puller per provider module, and boot recovery. Release builds still leave
-`held-reply/v1` undeclared on every tool route. Shipping negotiation requires a separate,
-explicit release capability change; withdrawal and rebuild recovery do not enable it.
-With it undeclared no provider may hold a call, no plain call carries a key, and nothing is
-registered. Debug builds declare `content/v1` and `held-reply/v1` when
-`BROCA_TEST_DECLARE_HELD_REPLY_V1=1`; that name is a non-shipping marker the
-release fence refuses. Role and plan-fetch routes declare neither. A reply carrying `held` on
+catalog), one puller per provider module, and boot recovery. Installing that runtime enables
+held-reply negotiation without an environment switch, in release and debug builds alike.
+`role.describe` advertises `held_calls` beside `run_status`. Tool planes without the held
+runtime do not declare held replies or register plain-call keys with the late-results intake;
+result-only negotiation remains independent. Role and plan-fetch routes declare neither
+capability. A reply carrying `held` on
 an undeclared route becomes a malformed-reply error result with reason
 `malformed_provider_held_reply`, without pausing or exposing its interim content to the model.
 

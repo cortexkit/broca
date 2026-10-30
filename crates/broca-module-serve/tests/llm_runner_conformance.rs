@@ -1139,9 +1139,6 @@ struct BrocaSubject {
     bus_events_enabled: bool,
     process_kills_disabled: bool,
     reserved_reader: bool,
-    /// Start `ck-broca` with its tool routes declaring `content/v1` and `held-reply/v1`, which
-    /// only a debug build honours (see `broca_module_serve::held_runtime`).
-    declare_held_reply: bool,
     #[cfg(feature = "test-clock")]
     bus: Option<Arc<bus::BusRig>>,
     #[cfg(feature = "test-clock")]
@@ -1165,7 +1162,6 @@ impl BrocaSubject {
             bus_events_enabled: true,
             process_kills_disabled: false,
             reserved_reader: false,
-            declare_held_reply: false,
             #[cfg(feature = "test-clock")]
             bus: None,
             #[cfg(feature = "test-clock")]
@@ -1281,9 +1277,6 @@ impl BrocaSubject {
         config["modules"]["broca"]["env"]["BROCA_CONFIG_PATH"] = json!(broca_config);
         if let Some(dump_dir) = &self.dump_dir {
             config["modules"]["broca"]["env"]["BROCA_DUMP_REQUEST_DIR"] = json!(dump_dir);
-        }
-        if self.declare_held_reply {
-            config["modules"]["broca"]["env"]["BROCA_TEST_DECLARE_HELD_REPLY_V1"] = json!("1");
         }
         std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap())
             .map_err(|e| fail(e.to_string()))?;
@@ -3498,7 +3491,6 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
     std::fs::create_dir_all(&scratch).unwrap();
     #[cfg_attr(not(feature = "test-clock"), allow(unused_mut))]
     let mut subject = BrocaSubject::new(&scratch).await;
-    subject.declare_held_reply = true;
     #[cfg(feature = "test-clock")]
     attach_notice_bus(&mut subject, &scratch).await;
     let work_dir = scratch.join("suite");
@@ -5194,7 +5186,6 @@ mod held_call_tests {
             bus_events_enabled: false,
             process_kills_disabled: true,
             reserved_reader: false,
-            declare_held_reply: false,
             #[cfg(feature = "test-clock")]
             bus: None,
             #[cfg(feature = "test-clock")]

@@ -562,6 +562,7 @@ async fn role_describe_passes_the_roles_check_and_declares_what_broca_serves() {
         "transcript_reads",
         "run_ops",
         "run_status",
+        "held_calls",
         "run_usage",
         "run_cancel",
         "retract",

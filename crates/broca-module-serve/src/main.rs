@@ -325,9 +325,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The provider-held runtime: the slots a held call waits in, and the intake that pulls each
     // provider's late results under broca's own principal and hands them to the run's batch.
-    // Its feeds ride a consumer connection of their own, apart from the tool routes. Release
-    // builds leave `held-reply/v1` undeclared, so no call can be held and nothing is registered
-    // (see `held_runtime`).
+    // Its feeds ride a consumer connection of their own, apart from the tool routes. Installing
+    // this runtime declares held-reply support on dispatch routes in every build.
     let feed_conn = Arc::new(
         SubcConnection::connect(&conn_path)
             .await
@@ -353,12 +352,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     held_runtime.publish_for_health();
     let plane =
         plane.with_provider_held_support(held_runtime.store.clone(), held_runtime.slots.clone());
-    #[cfg(debug_assertions)]
-    let plane = if broca_module_serve::held_runtime::declare_held_reply_for_tests() {
-        plane.declaring_held_reply_for_tests()
-    } else {
-        plane
-    };
     let plane = Arc::new(plane);
     // The plane asks the daemon about a scope (`scope.describe`) over broca's own MODULE
     // connection, because the daemon answers it only on a registered module's connection. The

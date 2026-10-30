@@ -1,5 +1,5 @@
 //! Provider-held calls end to end: a real `ck-subc`, a supervised `ck-broca` whose tool routes
-//! declare `tool-result/v1` and `held-reply/v1` when a debug-build switch is enabled, and a scripted tool
+//! declare `tool-result/v1` and `held-reply/v1`, and a scripted tool
 //! provider answering one call `held` and settling it later through its `late_results` feed.
 //!
 //! What these cases hold broca to:
@@ -34,7 +34,7 @@ pub(super) struct FeedState {
     /// in their session manifest.
     sessions: BTreeSet<String>,
     reasons: HashMap<String, String>,
-    /// Route channels whose bind declared both `content/v1` and `held-reply/v1`.
+    /// Route channels whose bind declared both `tool-result/v1` and `held-reply/v1`.
     declared_routes: BTreeSet<(u16, u32)>,
     /// The call key each held call carried, by its arguments' JSON text.
     held_keys: HashMap<String, String>,
@@ -328,8 +328,7 @@ impl HeldCase {
             .join(format!("broca-held-{session}-{}", std::process::id()));
         broca_test_support::remove_rig_dir(&scratch);
         std::fs::create_dir_all(&scratch).unwrap();
-        let mut held_subject = BrocaSubject::new(&scratch).await;
-        held_subject.declare_held_reply = true;
+        let held_subject = BrocaSubject::new(&scratch).await;
         let root = scratch.join("root");
         std::fs::create_dir_all(&root).unwrap();
         let call = ScriptedToolCall {
