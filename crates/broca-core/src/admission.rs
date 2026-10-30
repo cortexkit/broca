@@ -2013,21 +2013,69 @@ impl AdmissionContinuation {
     }
 
     fn accounting_source(record: &WalRecord) -> bool {
-        matches!(
-            record,
+        // These sources rebuild head facts, token budgets, output reservations and media
+        // profile/boundary history. Every new record must explicitly choose whether its
+        // effects need a source; an implicit false would silently lose new fold inputs.
+        match record {
             WalRecord::RunStarted { .. }
-                | WalRecord::RunConfigRefrozen { .. }
-                | WalRecord::Queued { .. }
-                | WalRecord::Retracted { .. }
-                | WalRecord::SendEnded { .. }
-                | WalRecord::SendDelivered { .. }
-                | WalRecord::ModelStepFinished { .. }
-                | WalRecord::ModelStepRefused { .. }
-                | WalRecord::ModelAttemptFinished { .. }
-                | WalRecord::InputTokenCapFrozen { .. }
-                | WalRecord::OutputReservationClamped { .. }
-                | WalRecord::RunFinished { .. }
-        )
+            | WalRecord::RunConfigRefrozen { .. }
+            | WalRecord::Queued { .. }
+            | WalRecord::Retracted { .. }
+            | WalRecord::SendEnded { .. }
+            | WalRecord::SendDelivered { .. }
+            | WalRecord::ModelStepFinished { .. }
+            | WalRecord::ModelStepRefused { .. }
+            | WalRecord::ModelAttemptFinished { .. }
+            | WalRecord::InputTokenCapFrozen { .. }
+            | WalRecord::OutputReservationClamped { .. }
+            | WalRecord::RunFinished { .. } => true,
+            WalRecord::WriterOpened { .. }
+            | WalRecord::WriterClosed { .. }
+            | WalRecord::VisibilityLate { .. }
+            | WalRecord::AttemptReserved { .. }
+            | WalRecord::AttemptFinished { .. }
+            | WalRecord::AttemptReleased { .. }
+            | WalRecord::AttemptCorrected { .. }
+            | WalRecord::StepStarted { .. }
+            | WalRecord::ToolBatchStarted { .. }
+            | WalRecord::ToolDispatchIntent { .. }
+            | WalRecord::ToolNoDispatch { .. }
+            | WalRecord::ToolResult { .. }
+            | WalRecord::ToolBatchFinished { .. }
+            | WalRecord::TurnFinished { .. }
+            | WalRecord::BudgetFired { .. }
+            | WalRecord::InputTokenBudgetExhausted { .. }
+            | WalRecord::ContextCeilingWait { .. }
+            | WalRecord::ContextCeilingDecided { .. }
+            | WalRecord::CompactionRideWait { .. }
+            | WalRecord::CompactionRideWaitEnded { .. }
+            | WalRecord::StructuredOutputDowngraded { .. }
+            | WalRecord::StructuredOutputResult { .. }
+            | WalRecord::RunCancelRequested { .. }
+            | WalRecord::RunPaused { .. }
+            | WalRecord::RunAuthRefrozen { .. }
+            | WalRecord::Steered { .. }
+            | WalRecord::ApprovalRequested { .. }
+            | WalRecord::ApprovalResolved { .. }
+            | WalRecord::ResumeStarted { .. }
+            | WalRecord::CacheWarmed { .. }
+            | WalRecord::CompactionRequest { .. }
+            | WalRecord::CompactionMessage { .. }
+            | WalRecord::CompactionAnswer { .. }
+            | WalRecord::CompactionWait { .. }
+            | WalRecord::CompactionViewApplied { .. }
+            | WalRecord::CompactionNotice { .. }
+            | WalRecord::ToolCallDeferred { .. }
+            | WalRecord::ApprovalRecorded { .. }
+            | WalRecord::AwaitingApproval { .. }
+            | WalRecord::LateApprovalRecorded { .. }
+            | WalRecord::LateDispatchIntent { .. }
+            | WalRecord::LateResult { .. }
+            | WalRecord::QuestionWithdrawalAcknowledged { .. }
+            | WalRecord::ToolCallProviderHeld { .. }
+            | WalRecord::DeliveryOrdered { .. }
+            | WalRecord::Unknown => false,
+        }
     }
 
     pub fn capture(
@@ -2919,6 +2967,140 @@ mod tests {
         }
     }
 
+    fn exhaustive_checkpoint_fields(full: AdmissionCheckpointV1) -> AdmissionCheckpointV1 {
+        // Keep the literal exhaustive even in media-free test builds. A new checkpoint
+        // field must be added here and exercised by the populated roundtrip fixture.
+        AdmissionCheckpointV1 {
+            #[cfg(feature = "test-attachments")]
+            media: full.media,
+            head: full.head,
+            has_deferred_calls: full.has_deferred_calls,
+            input_budget: full.input_budget,
+            session_class: full.session_class,
+            at_seq: full.at_seq,
+            last_episode: full.last_episode,
+            pending_fifo: full.pending_fifo,
+            ownership: full.ownership,
+            effort_history: full.effort_history,
+            lineage_retention: full.lineage_retention,
+            compaction: full.compaction,
+            tags: full.tags,
+            pending_order: full.pending_order,
+            output_reservation: full.output_reservation,
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "test-attachments")]
+    fn continuation_exhaustive_checkpoint_fields_roundtrip() {
+        use crate::replay::deferred_tests;
+
+        let mut records = deferred_tests::batch(&["call"]);
+        if let WalRecord::RunStarted {
+            config,
+            input,
+            session_class,
+            ..
+        } = &mut records[0]
+        {
+            *session_class = Some("populated-checkpoint".into());
+            config.frozen_render_config =
+                serde_json::json!({"effort":"high","media":{"images":{"max":4}}});
+            let mut user = message("private checkpoint input");
+            user.content
+                .push(ContentBlock::Media(broca_protocol::MediaRef {
+                    kind: broca_protocol::MediaKind::Image,
+                    mime: "image/png".into(),
+                    byte_size: 69,
+                    sha256: "c".repeat(64),
+                    width: Some(1),
+                    height: Some(1),
+                }));
+            *input = Arc::new(vec![user]);
+        }
+        if let WalRecord::ModelStepFinished { usage, .. } = &mut records[1] {
+            *usage = Usage {
+                input_tokens: Some(23),
+                output_tokens: Some(7),
+                ..Usage::default()
+            };
+        }
+        records.insert(1, WalRecord::StepStarted { step_id: StepId(1) });
+        records.extend([
+            deferred_tests::prepared("call", "b"),
+            deferred_tests::approval("call", "legacy:5", broca_wal::DeferredDecision::Declined),
+            WalRecord::ToolBatchFinished {
+                batch_id: broca_protocol::BatchId("b".into()),
+            },
+        ]);
+        let queue = offset_corpus();
+        records.push(queue[4].record.clone());
+        let mut queued = queue[5].record.clone();
+        if let WalRecord::Queued { written_at_ms, .. } = &mut queued {
+            *written_at_ms = Some(17);
+        }
+        records.push(queued);
+        let mut staged = queue[4].record.clone();
+        if let WalRecord::DeliveryOrdered { submission_id, .. } = &mut staged {
+            submission_id.0 = "staged-submission".into();
+        }
+        records.extend([staged, WalRecord::TurnFinished { step_id: StepId(1) }]);
+        let frames: Vec<_> = records
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| frame(i as u64 + 1, r))
+            .collect();
+        let full = AdmissionCheckpointV1::from_frames(&frames).unwrap();
+        let checkpoint = exhaustive_checkpoint_fields(full.clone());
+
+        let empty = serde_json::to_value(AdmissionCheckpointV1::empty()).unwrap();
+        let populated = serde_json::to_value(&checkpoint).unwrap();
+        for (field, value) in populated.as_object().unwrap() {
+            assert_ne!(
+                value,
+                &serde_json::Value::Null,
+                "checkpoint field {field} is absent"
+            );
+            assert_ne!(
+                Some(value),
+                empty.get(field),
+                "checkpoint field {field} must differ from an empty checkpoint"
+            );
+        }
+        assert_eq!(checkpoint, full);
+
+        let (bytes, positions) = offset_log(&frames);
+        let read_at = offset_reader(&bytes);
+        let boundary = offset_boundary(&bytes, &positions, positions.len());
+        let mut stored = AdmissionContinuation::capture(&read_at, &boundary, &positions).unwrap();
+        // Remove only the payload-bearing parts represented by the capture's authenticated
+        // sources. The exhaustive checkpoint literal supplies every other input to encoding.
+        let mut scalars = checkpoint;
+        scalars.last_episode = None;
+        scalars.pending_fifo = Arc::new(Vec::new());
+        scalars.pending_order = None;
+        scalars
+            .ownership
+            .as_mut()
+            .unwrap()
+            .first_episode
+            .as_mut()
+            .unwrap()
+            .manifest = None;
+        scalars.effort_history.as_mut().unwrap().first_config = serde_json::Value::Null;
+        assert_eq!(stored.seed.scalars, scalars);
+        stored.seed.scalars = scalars;
+        let encoded = stored.encode().unwrap();
+        assert_content_free_form(&encoded);
+        let restored = AdmissionContinuation::decode(&encoded).unwrap();
+        let (base, head) = restored.hydrate(&read_at, &[], boundary.seq).unwrap();
+        assert_eq!(
+            base, full,
+            "stored continuation lost a populated checkpoint field"
+        );
+        assert_eq!(head, full);
+    }
+
     fn continuation_oracle(records: &[FramedRecord]) {
         use crate::projection_plan::ProjectionContinuation;
         let (bytes, positions) = offset_log(records);
@@ -2983,7 +3165,9 @@ mod tests {
                 assert_eq!(actual.prior.usage, full.usage);
                 assert_eq!(actual.prior.retries_used, full.retries_used);
                 assert_eq!(actual.prior.completed_steps, full.completed_steps);
-                let expected = AdmissionCheckpointV1::from_frames(&records[..end]).unwrap();
+                let expected = exhaustive_checkpoint_fields(
+                    AdmissionCheckpointV1::from_frames(&records[..end]).unwrap(),
+                );
                 fn compare(path: &str, actual: &serde_json::Value, expected: &serde_json::Value) {
                     match (actual, expected) {
                         (serde_json::Value::Object(a), serde_json::Value::Object(b)) => {
