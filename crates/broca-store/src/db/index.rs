@@ -569,6 +569,605 @@ mod tests {
         assert_eq!(r_rows(db), r_rows(&expected.db));
     }
 
+    fn boot_session<'a>(
+        bind: &'a BindIdentity,
+        path: &'a std::path::Path,
+    ) -> super::super::ReconcileSession<'a> {
+        super::super::ReconcileSession {
+            bind,
+            session_ref: "s-test",
+            location: LogLocation::Live,
+            path,
+        }
+    }
+
+    fn assert_boot_read_ranges(
+        op: &broca_wal::access_counter::OperationAccess,
+        prefix: &[u8],
+        complete: &[u8],
+    ) {
+        use broca_wal::access_counter::{ReadClass, ValidationRead};
+        use broca_wal::framing::LINEAGE_FRAME_LEN;
+        let old = decoded(prefix);
+        let all = decoded(complete);
+        let new = &all[old.len()..];
+        let start = &old[0];
+        let model = old
+            .iter()
+            .find(|(_, _, f)| matches!(f.record, WalRecord::ModelStepFinished { .. }))
+            .unwrap();
+        let boundary = old
+            .iter()
+            .find(|(_, _, f)| matches!(f.record, WalRecord::TurnFinished { .. }))
+            .unwrap();
+        let terminal = old.last().unwrap();
+        let header = (
+            "lineage header",
+            ReadClass::LineageHeader,
+            0,
+            LINEAGE_FRAME_LEN as u64,
+        );
+        let source = |name, f: &(usize, usize, FramedRecord), metadata: bool| {
+            (
+                name,
+                ReadClass::Source,
+                f.0 as u64,
+                (f.1 - f.0 + if metadata { LINEAGE_FRAME_LEN } else { 0 }) as u64,
+            )
+        };
+        let mut expected = vec![header];
+        if op.name == "unqualified boot catch-up" {
+            let row = source("prior row frame and lineage", terminal, true);
+            expected.push((
+                row.0,
+                ReadClass::Validation(ValidationRead::BoundaryFrame),
+                row.2,
+                row.3,
+            ));
+            expected.push(source("prior RunStarted budget", start, false));
+            let end = new[1].1 + LINEAGE_FRAME_LEN;
+            expected.push((
+                "recover new unqualified tail",
+                ReadClass::Source,
+                prefix.len() as u64,
+                (end - prefix.len()) as u64,
+            ));
+            expected.push((
+                "validate new row range",
+                ReadClass::Source,
+                prefix.len() as u64,
+                (end - prefix.len()) as u64,
+            ));
+        } else {
+            assert_eq!(op.name, "qualified boot catch-up");
+            let row = source("prior row frame and lineage", &new[1], true);
+            expected.push((
+                row.0,
+                ReadClass::Validation(ValidationRead::BoundaryFrame),
+                row.2,
+                row.3,
+            ));
+            expected.push(source("current RunStarted budget", &new[0], false));
+            let after_row = new[1].1 + LINEAGE_FRAME_LEN;
+            for name in ["recover qualified tail", "validate qualified row range"] {
+                expected.push((
+                    name,
+                    ReadClass::Source,
+                    after_row as u64,
+                    (complete.len() - after_row) as u64,
+                ));
+            }
+            expected.push((
+                "contiguous seed tail including unqualified event",
+                ReadClass::Source,
+                boundary.1 as u64,
+                (new[2].1 - boundary.1) as u64,
+            ));
+            expected.push(source("admission RunStarted source", start, false));
+            expected.push(source("admission model source", model, false));
+            expected.push(source("admission scalar source", start, false));
+            let gap = (
+                "seed lineage-gap validation",
+                ReadClass::Validation(ValidationRead::LineageGap),
+                boundary.1 as u64,
+                LINEAGE_FRAME_LEN as u64,
+            );
+            let boundary_read = (
+                "seed boundary-frame validation",
+                ReadClass::Validation(ValidationRead::BoundaryFrame),
+                boundary.0 as u64,
+                (boundary.1 - boundary.0) as u64,
+            );
+            expected.extend([gap, boundary_read, header]);
+            for name in [
+                "seed setup source",
+                "seed start source",
+                "seed config source",
+            ] {
+                expected.push(source(name, start, false));
+            }
+            expected.push(source("seed model source", model, false));
+            expected.push(source("seed admission source", start, false));
+            expected.push(source("projection model source", model, false));
+            expected.push(source("projection scalar source", start, false));
+            expected.extend([gap, boundary_read, header]);
+            expected.push(source("projection setup source", start, false));
+            expected.push(source("intervening terminal and lineage", terminal, true));
+            expected.push(source("intervening RunStarted and lineage", &new[0], true));
+            expected.push(source("intervening StepStarted and lineage", &new[1], true));
+            expected.push(source("qualifying ModelStepFinished", &new[2], false));
+            expected.push(source("new admission start and lineage", &new[0], true));
+        }
+        assert_eq!(
+            op.reads.len(),
+            expected.len(),
+            "{} has an unlisted or missing read",
+            op.name
+        );
+        for (actual, (name, class, off, len)) in op.reads.iter().zip(expected) {
+            assert_eq!(
+                (actual.class, actual.offset, actual.length),
+                (class, off, len),
+                "{}: {name}",
+                op.name
+            );
+        }
+    }
+
+    #[test]
+    fn boot_catch_up_fixed_tail_has_equal_bounded_reads_with_1k_and_150k_messages() {
+        use broca_wal::Wal;
+        let cases = boundary_cases();
+        let prefix = &cases
+            .iter()
+            .find(|(name, _, _)| *name == "committed_turn_without_episode_terminal")
+            .unwrap()
+            .1;
+        let next = &cases
+            .iter()
+            .find(|(name, _, _)| *name == "no_tool_terminal")
+            .unwrap()
+            .1;
+        let bind = bind(&encode_records(prefix));
+        let message = match &prefix[0] {
+            WalRecord::RunStarted { input, .. } => input[0].clone(),
+            _ => unreachable!(),
+        };
+        let steered: WalRecord = serde_json::from_value(
+            serde_json::json!({"type":"steered","input":vec![message;1_000]}),
+        )
+        .unwrap();
+        let mut measurements = Vec::new();
+        for count in [1_000, 150_000] {
+            let scratch = database();
+            let path = scratch._scratch.0.join("bounded-boot.wal");
+            let mut wal = broca_wal::FileWal::open(&path)
+                .unwrap()
+                .with_feature_floor(scratch._scratch.0.join("wal-floor"));
+            wal.append(1, &prefix[0], false).unwrap();
+            for _ in 0..count / 1_000 {
+                wal.append(1, &steered, false).unwrap();
+            }
+            for record in &prefix[1..] {
+                wal.append(1, record, false).unwrap();
+            }
+            wal.append(1, &next[3], true).unwrap();
+            publish_writer(&scratch.db, &bind, &wal);
+            let seed = tail_seed(&scratch.db);
+            let prefix_bytes = std::fs::read(&path).unwrap();
+            let mut next = next.clone();
+            if let WalRecord::RunStarted { run_id, .. } = &mut next[0] {
+                run_id.0 = "bounded-boot-next".into();
+            }
+            for record in &next[..2] {
+                wal.append(1, record, false).unwrap();
+            }
+            wal.sync().unwrap();
+            drop(wal);
+            let root = scratch._scratch.0.clone();
+            drop(scratch.db);
+            let db = OverhaulDb::open(&root).unwrap();
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            counter.operation("unqualified boot catch-up").run(|| {
+                let result = db.reconcile_boot([boot_session(&bind, &path)]).unwrap();
+                assert!(!result[0].index.rebuilt);
+                assert_eq!(result[0].ignored_suffix_bytes, 0);
+            });
+            assert_eq!(tail_seed(&db), seed);
+            db.read_snapshot(|tx| {
+                let active: String =
+                    tx.query_row("SELECT run_id FROM run WHERE state='active'", [], |r| {
+                        r.get(0)
+                    })?;
+                assert_eq!(active, "bounded-boot-next");
+                Ok(())
+            })
+            .unwrap();
+            let mut wal = broca_wal::FileWal::open(&path).unwrap();
+            for record in &next[2..] {
+                wal.append(1, record, false).unwrap();
+            }
+            wal.sync().unwrap();
+            drop(wal);
+            counter.operation("qualified boot catch-up").run(|| {
+                assert!(
+                    !db.catch_up_session(&boot_session(&bind, &path))
+                        .unwrap()
+                        .index
+                        .rebuilt
+                );
+            });
+            let complete = std::fs::read(&path).unwrap();
+            let costs: Vec<_> = counter
+                .snapshot()
+                .into_iter()
+                .map(|op| {
+                    assert_boot_read_ranges(&op, &prefix_bytes, &complete);
+                    assert!(
+                        op.seed_fallbacks.is_empty(),
+                        "{}: {:?}",
+                        op.name,
+                        op.seed_fallbacks
+                    );
+                    assert!(op.writer_opens.is_empty());
+                    assert!(op
+                        .reads
+                        .iter()
+                        .all(|read| read.class != broca_wal::access_counter::ReadClass::Origin));
+                    assert!(op.reads.iter().map(|read| read.length).sum::<u64>() < 100_000);
+                    assert!(op.reads.len() < 60 && op.frames_decoded < 60);
+                    eprintln!(
+                        "{count} messages, {}: {} reads, {} decodes",
+                        op.name,
+                        op.reads.len(),
+                        op.frames_decoded
+                    );
+                    (op.reads.len(), op.frames_decoded)
+                })
+                .collect();
+            measurements.push(costs);
+            publication_oracle(&db, &std::fs::read(&path).unwrap());
+        }
+        // Recovering the complete tail adds one read beyond publication's reads
+        // of the lineage header, indexed frame, RunStarted budget and row range.
+        // Once a projection boundary qualifies for seed capture, advancement
+        // rereads every frame since the stored seed, not just the new row range.
+        assert_eq!(measurements[0], vec![(5, 12), (28, 42)]);
+        assert_eq!(measurements[0], measurements[1]);
+    }
+
+    #[test]
+    fn boot_rebuild_counts_origin_work_and_preserves_authoritative_and_other_sessions() {
+        use broca_wal::access_counter::{ReadClass, WalAccessCounter};
+        use broca_wal::Wal;
+        let (_, records, _) = boundary_cases()
+            .into_iter()
+            .find(|(name, _, _)| *name == "no_tool_terminal")
+            .unwrap();
+        let bind = bind(&encode_records(&records));
+        let scratch = database();
+        let path = scratch._scratch.0.join("rebuild-boot.wal");
+        let mut wal = broca_wal::FileWal::open(&path).unwrap();
+        for record in &records {
+            wal.append(1, record, false).unwrap();
+        }
+        wal.sync().unwrap();
+        let full = std::fs::read(&path).unwrap();
+        let shorter = decoded(&full)[1].1;
+        drop(wal);
+        let mut other_records = records.clone();
+        let mut other_bind = bind.clone();
+        other_bind.session.push_str("-other");
+        if let WalRecord::RunStarted {
+            session, run_id, ..
+        } = &mut other_records[0]
+        {
+            *session = other_bind.clone();
+            run_id.0.push_str("-other");
+        }
+        let other_bytes = encode_records(&other_records);
+        let authoritative_tables = [
+            "log_reader",
+            "retention_job",
+            "withdrawal_debt",
+            "withdrawal_stop",
+            "compaction_view_receipt",
+            "bus_event_outbox",
+            "bus_event_ack",
+            "compaction_notice_outbox",
+            "classify_claim",
+        ];
+        scratch.db.authoritative_transaction(|tx| {
+            tx.execute("INSERT INTO log_reader VALUES ('reader',1,'declared')", [])?;
+            for table in &authoritative_tables[1..] {
+                tx.execute_batch(&format!("CREATE TABLE {table} (id TEXT PRIMARY KEY, payload BLOB NOT NULL); INSERT INTO {table} VALUES ('row',X'000102FF');"))?;
+            }
+            Ok(())
+        }).unwrap();
+        scratch
+            .db
+            .index(&publication(&other_bind, &other_bytes))
+            .unwrap();
+        let other_before = r_rows(&scratch.db);
+        let authoritative = rows(&scratch.db, &authoritative_tables);
+        let counter = WalAccessCounter::default();
+        counter.operation("boot rebuild missing index").run(|| {
+            assert!(
+                scratch
+                    .db
+                    .catch_up_session(&boot_session(&bind, &path))
+                    .unwrap()
+                    .index
+                    .rebuilt
+            );
+        });
+        let op = &counter.snapshot()[0];
+        assert_eq!(
+            op.seed_fallbacks,
+            [
+                "boot index missing or invalid",
+                "publication continuation rebuild"
+            ]
+        );
+        assert_eq!(
+            op.reads
+                .iter()
+                .filter(|r| r.class == ReadClass::Origin)
+                .count(),
+            2
+        );
+        assert!(op
+            .reads
+            .iter()
+            .any(|r| r.offset == 0 && r.length == full.len() as u64));
+        assert!(op.frames_decoded > decoded(&full).len() as u64);
+        assert_eq!((op.reads.len(), op.frames_decoded), (11, 31));
+        eprintln!(
+            "boot rebuild: {} reads, {} decodes, 2 origin reads, reasons {:?}",
+            op.reads.len(),
+            op.frames_decoded,
+            op.seed_fallbacks
+        );
+        assert_eq!(rows(&scratch.db, &authoritative_tables), authoritative);
+        scratch.db.forget_session(&bind).unwrap();
+        assert_eq!(r_rows(&scratch.db), other_before);
+
+        // Restore a shorter WAL after an index commit, then repair only its rows.
+        scratch
+            .db
+            .catch_up_session(&boot_session(&bind, &path))
+            .unwrap();
+        std::fs::write(&path, &full[..shorter]).unwrap();
+        let repaired = counter
+            .operation("boot rebuild index ahead of log")
+            .run(|| {
+                scratch
+                    .db
+                    .catch_up_session(&boot_session(&bind, &path))
+                    .unwrap()
+            });
+        assert!(repaired.index.rebuilt);
+        assert_eq!(repaired.index.indexed_end, shorter as u64);
+        let ahead_op = &counter.snapshot()[1];
+        assert_eq!(ahead_op.seed_fallbacks, ["boot index missing or invalid"]);
+        assert_eq!(
+            ahead_op
+                .reads
+                .iter()
+                .filter(|r| r.class == ReadClass::Origin)
+                .count(),
+            1
+        );
+        assert_eq!(rows(&scratch.db, &authoritative_tables), authoritative);
+        scratch.db.forget_session(&bind).unwrap();
+        assert_eq!(r_rows(&scratch.db), other_before);
+
+        scratch
+            .db
+            .rebuild_session_from_wal(&boot_session(&bind, &path))
+            .unwrap();
+        let expected = database();
+        expected
+            .db
+            .index(&publication(&other_bind, &other_bytes))
+            .unwrap();
+        expected
+            .db
+            .index(&publication(&bind, &full[..shorter]))
+            .unwrap();
+        assert_eq!(r_rows(&scratch.db), r_rows(&expected.db));
+        assert_eq!(rows(&scratch.db, &authoritative_tables), authoritative);
+    }
+
+    #[test]
+    fn boot_crash_cuts_exclude_torn_suffix_and_retry_atomic_index_commit() {
+        use broca_wal::Wal;
+        let (_, records, _) = boundary_cases()
+            .into_iter()
+            .find(|(name, _, _)| *name == "no_tool_terminal")
+            .unwrap();
+        let bind = bind(&encode_records(&records));
+        let source = database();
+        let path = source._scratch.0.join("crash-source.wal");
+        let mut wal = broca_wal::FileWal::open(&path).unwrap();
+        for record in &records {
+            wal.append(1, record, false).unwrap();
+        }
+        wal.sync().unwrap();
+        drop(wal);
+        let bytes = std::fs::read(&path).unwrap();
+        let frames = decoded(&bytes);
+        let baseline_end = frames[1].1;
+        let mut cuts = vec![baseline_end, bytes.len()];
+        for (off, end, _) in &frames[2..] {
+            cuts.extend([*off, *off + 1, *end - 1, *end, *end + 1]);
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        for cut in cuts {
+            let scratch = database();
+            let path = scratch._scratch.0.join("crash.wal");
+            std::fs::write(&path, &bytes[..cut]).unwrap();
+            scratch
+                .db
+                .index(&publication(&bind, &bytes[..baseline_end]))
+                .unwrap();
+            let before = r_rows(&scratch.db);
+            scratch.db.authoritative_transaction(|tx| {
+                tx.execute_batch("CREATE TRIGGER interrupt_boot BEFORE UPDATE OF indexed_end ON session BEGIN SELECT RAISE(ABORT,'boot commit interrupted'); END;")?;
+                Ok(())
+            }).unwrap();
+            let result = scratch.db.catch_up_session(&boot_session(&bind, &path));
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("boot commit interrupted"));
+            assert_eq!(
+                r_rows(&scratch.db),
+                before,
+                "cut {cut} exposed a partial index transaction"
+            );
+            scratch
+                .db
+                .authoritative_transaction(|tx| {
+                    tx.execute_batch("DROP TRIGGER interrupt_boot")?;
+                    Ok(())
+                })
+                .unwrap();
+            let recovered = scratch
+                .db
+                .catch_up_session(&boot_session(&bind, &path))
+                .unwrap();
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes[..cut],
+                "boot must not truncate a torn WAL"
+            );
+            // Writer recovery owns truncation; boot's independently recovered
+            // prefix must agree with the real writer's recovery.
+            let wal = broca_wal::FileWal::open(&path).unwrap();
+            wal.sync().unwrap();
+            let proof = wal.durable_publication().unwrap();
+            assert_eq!(recovered.index.indexed_end, proof.byte_end(), "cut {cut}");
+            assert_eq!(
+                recovered.ignored_suffix_bytes,
+                cut as u64 - proof.byte_end()
+            );
+            drop(wal);
+            let expected = database();
+            let complete = std::fs::read(&path).unwrap();
+            expected.db.index(&publication(&bind, &complete)).unwrap();
+            assert_eq!(r_rows(&scratch.db), r_rows(&expected.db), "cut {cut}");
+            let before = r_rows(&scratch.db);
+            scratch
+                .db
+                .reconcile_boot([boot_session(&bind, &path)])
+                .unwrap();
+            assert_eq!(r_rows(&scratch.db), before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn boot_power_loss_harness_recovers_torn_tail_and_boot_sync_cuts() {
+        use broca_crash_harness::power_loss::RecordingFs;
+        use broca_wal::fs_ops::with_fs_ops;
+        use broca_wal::{FileWal, Wal};
+        use std::sync::Arc;
+        let (_, records, _) = boundary_cases()
+            .into_iter()
+            .find(|(name, _, _)| *name == "no_tool_terminal")
+            .unwrap();
+        let bind = bind(&encode_records(&records));
+        let scratch = database();
+        let source = scratch._scratch.0.join("boot-power-source");
+        std::fs::create_dir(&source).unwrap();
+        {
+            let mut wal = FileWal::open(source.join("wal/log")).unwrap();
+            for record in &records[..2] {
+                wal.append(1, record, false).unwrap();
+            }
+            wal.sync().unwrap();
+        }
+        let prefix = std::fs::read(source.join("wal/log")).unwrap();
+        let recording = Arc::new(RecordingFs::new(&source).unwrap());
+        with_fs_ops(recording.clone(), || {
+            let mut wal = FileWal::open(source.join("wal/log")).unwrap();
+            wal.append(1, &records[2], false).unwrap();
+        });
+        let states = recording.enumerate(1_000_000).unwrap();
+        let final_cut = states.iter().map(|cut| cut.cut).max().unwrap();
+        let mut recovered = 0;
+        let mut torn = 0;
+        let mut retained = 0;
+        for cut in states.iter().filter(|cut| cut.cut == final_cut) {
+            let restored = scratch
+                ._scratch
+                .0
+                .join(format!("boot-restored-{recovered}"));
+            cut.state.install(&restored).unwrap();
+            let path = restored.join("wal/log");
+            let db = database();
+            db.db.index(&publication(&bind, &prefix)).unwrap();
+            let boot_recording = Arc::new(RecordingFs::new(&restored).unwrap());
+            let outcome = with_fs_ops(boot_recording.clone(), || {
+                db.db.catch_up_session(&boot_session(&bind, &path)).unwrap()
+            });
+            if outcome.ignored_suffix_bytes > 0 {
+                torn += 1;
+            }
+            if outcome.index.indexed_seq == Some(3) {
+                retained += 1;
+            }
+            // Enumerate loss of power during boot's descriptor sync as well.
+            // SQLite may retain either side of its atomic publication commit.
+            let sync = boot_recording
+                .operation_kinds()
+                .iter()
+                .position(|kind| *kind == broca_crash_harness::power_loss::OperationKind::SyncFile)
+                .unwrap();
+            // Reads cannot change the surviving image. Exercise both sides of
+            // boot's only WAL mutation barrier, without repeating identical
+            // recovery for every authentication/hydration read cut.
+            for (n, boot_cut) in boot_recording
+                .enumerate(1_000_000)
+                .unwrap()
+                .iter()
+                .filter(|cut| cut.cut == sync || cut.cut == sync + 1)
+                .enumerate()
+            {
+                let rebooted = restored.join(format!("reboot-{n}"));
+                boot_cut.state.install(&rebooted).unwrap();
+                let reboot_path = rebooted.join("wal/log");
+                let lagged = database();
+                lagged.db.index(&publication(&bind, &prefix)).unwrap();
+                for db in [&db.db, &lagged.db] {
+                    let result = db
+                        .catch_up_session(&boot_session(&bind, &reboot_path))
+                        .unwrap();
+                    let wal = FileWal::open(&reboot_path).unwrap();
+                    wal.sync().unwrap();
+                    assert_eq!(
+                        result.index.indexed_end,
+                        wal.durable_publication().unwrap().byte_end()
+                    );
+                    drop(wal);
+                    let expected = database();
+                    expected
+                        .db
+                        .index(&publication(&bind, &std::fs::read(&reboot_path).unwrap()))
+                        .unwrap();
+                    assert_eq!(r_rows(db), r_rows(&expected.db));
+                }
+            }
+            recovered += 1;
+        }
+        assert!(torn > 0 && retained > 0);
+        eprintln!(
+            "boot power cuts: {recovered} recovered, {torn} torn tails, {retained} retained tails"
+        );
+    }
+
     #[test]
     fn durable_publication_cursor_survives_unqualified_event_and_restart() {
         use broca_wal::Wal;
