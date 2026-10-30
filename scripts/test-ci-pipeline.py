@@ -42,6 +42,149 @@ else:
 '''
 
 
+class FastRustInvariants(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location('fast_invariants', ROOT / 'scripts/check-fast-rust-invariants.py')
+        assert spec is not None and spec.loader is not None
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        self.tmp = tempfile.TemporaryDirectory(prefix='broca-invariants-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        paths = (
+            'Cargo.lock',
+            'crates/broca-replay/tests/bench_envelope_is_representative.rs',
+            'crates/broca-wire/src/role.rs', 'crates/broca-wire/src/lib.rs',
+            'crates/broca-wal/src/framing.rs',
+            'crates/broca-wal/tests/fixtures/plan_manifest_run_started.json',
+        )
+        for name in paths:
+            destination = self.root / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(ROOT / name, destination)
+        shutil.copytree(ROOT / 'crates/broca-wire/tests/golden',
+                        self.root / 'crates/broca-wire/tests/golden')
+
+    def test_current_file_invariants(self):
+        self.module.check(self.root)
+
+    def test_unreviewed_protocol_pair_fails(self):
+        lock = self.root / 'Cargo.lock'
+        lock.write_text('[[package]]\nname="subc-protocol"\nversion="0.1.0"\n'
+                        '[[package]]\nname="subc-protocol"\nversion="9.9.9"\n')
+        with self.assertRaisesRegex(ValueError, 'needs replay envelope review'):
+            self.module.check(self.root)
+
+    def test_changed_golden_bytes_fail(self):
+        golden = self.root / 'crates/broca-wire/tests/golden/session_head.json'
+        golden.write_bytes(golden.read_bytes() + b'\n')
+        with self.assertRaisesRegex(ValueError, 'golden hash mismatch'):
+            self.module.check(self.root)
+
+    def test_missing_golden_inventory_fails(self):
+        for path in (self.root / 'crates/broca-wire/tests/golden').glob('run_status.*'):
+            path.unlink()
+        with self.assertRaisesRegex(ValueError, 'run.status golden inventory'):
+            self.module.check(self.root)
+
+    def test_manifest_count_drift_fails(self):
+        fixture = self.root / 'crates/broca-wal/tests/fixtures/plan_manifest_run_started.json'
+        record = json.loads(fixture.read_text())
+        record['manifest']['tools'].pop()
+        fixture.write_text(json.dumps(record))
+        with self.assertRaisesRegex(ValueError, 'manifest fixture tool count'):
+            self.module.check(self.root)
+
+
+class PrepushDispatch(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='broca-prepush-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        (self.root / 'scripts').mkdir()
+        shutil.copy(ROOT / 'scripts/prepush.sh', self.root / 'scripts/prepush.sh')
+        self.bin = self.root / 'bin'
+        self.bin.mkdir()
+        ck = self.bin / 'ck'
+        ck.write_text('''#!/usr/bin/env python3
+import os, pathlib, sys, time
+lane = sys.argv[-1].split()[-1]
+root = pathlib.Path(os.environ['FIXTURE'])
+with (root / 'events').open('a') as out:
+    out.write(' '.join(sys.argv[1:]) + '\\n')
+(root / (lane + '.started')).touch()
+if lane == 'linux':
+    deadline = time.monotonic() + 5
+    while not (root / 'windows.started').exists():
+        if time.monotonic() >= deadline:
+            sys.exit('Windows was not launched in parallel')
+        time.sleep(.01)
+if lane == os.environ.get('FAIL_LANE'):
+    print('FAIL broca-module::it permissions::warming_route')
+    sys.exit(19)
+print('Summary: 1 test run: 1 passed')
+''')
+        ck.chmod(0o755)
+
+    def run_prepush(self, **extra):
+        env = dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}',
+                   FIXTURE=str(self.root), **extra)
+        return subprocess.run(['bash', 'scripts/prepush.sh'], cwd=self.root,
+                              env=env, capture_output=True, text=True)
+
+    def test_fast_failure_prevents_heavy_dispatch_and_replays_failure(self):
+        result = self.run_prepush(FAIL_LANE='fast')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        events = (self.root / 'events').read_text().splitlines()
+        self.assertEqual(len(events), 1)
+        self.assertIn('--platform linux --net', events[0])
+        self.assertIn('--lane fast', events[0])
+        self.assertIn('heavy lanes NOT RUN', result.stdout)
+        self.assertIn('FAILED fast', result.stdout)
+        self.assertGreaterEqual(result.stdout.count('permissions::warming_route'), 2)
+
+    def test_heavy_lanes_parallel_and_windows_failure_not_hidden(self):
+        result = self.run_prepush(FAIL_LANE='windows')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        events = (self.root / 'events').read_text().splitlines()
+        self.assertEqual(len(events), 4)
+        self.assertIn('--lane fast', events[0])
+        self.assertTrue(any('--vcpus 16' in e and '--lane linux' in e for e in events))
+        self.assertTrue(any('--platform windows' in e and '--lane windows' in e for e in events))
+        self.assertIn('FAILED windows', result.stdout)
+        self.assertNotIn('FAILED linux', result.stdout)
+        self.assertGreaterEqual(result.stdout.count('permissions::warming_route'), 2)
+
+    def test_success_reports_every_lane_and_wall_time(self):
+        result = self.run_prepush()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('prepush lane summary', result.stdout)
+        self.assertIn('total wall', result.stdout)
+        for lane in ('fast', 'linux', 'windows', 'macos'):
+            self.assertRegex(result.stdout, rf'{lane}\s+exit=0\s+\d+s')
+
+    def test_missing_file_tool_refuses_before_running_checks(self):
+        lib = self.root / 'scripts/lib'
+        lib.mkdir()
+        shutil.copy(ROOT / 'scripts/lib/prepush-lane.sh', lib / 'prepush-lane.sh')
+        tools = self.root / 'minimal-tools'
+        tools.mkdir()
+        for tool in ('bash', 'dirname', 'mkdir', 'mktemp', 'cat'):
+            binary = shutil.which(tool)
+            assert binary is not None
+            (tools / tool).symlink_to(binary)
+        uname = tools / 'uname'
+        uname.write_text('#!/bin/sh\necho Linux\n')
+        uname.chmod(0o755)
+        env = dict(os.environ, PATH=str(tools))
+        result = subprocess.run([str(tools / 'bash'), 'scripts/prepush.sh', '--lane', 'fast'],
+                                cwd=self.root, env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('MOTOR Linux build image is missing file(1)', result.stdout)
+        self.assertNotIn('==> fast: fmt', result.stdout)
+        self.assertNotIn('operator scripts, pins and dependency guards', result.stdout)
+
+
 class ArchiveShards(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='broca-ci-archive-')

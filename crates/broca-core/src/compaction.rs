@@ -1002,6 +1002,31 @@ pub(crate) struct BoundaryRequest {
 }
 
 impl BoundaryRequest {
+    pub(crate) fn refresh_checked(
+        &mut self,
+        opts: &broca_protocol::CallOptions,
+        state: &CompactionState,
+        systems: &[usize],
+        render: impl FnOnce(
+            &broca_protocol::CallOptions,
+        ) -> Result<Vec<u8>, Box<broca_protocol::ProviderError>>,
+    ) -> Result<(), String> {
+        let mut failure = None;
+        self.refresh(opts, state, systems, |options| match render(options) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                failure = Some(error);
+                Vec::new()
+            }
+        })
+        .map_err(|error| error.to_string())?;
+        if let Some(error) = failure {
+            self.options = None;
+            return Err(error.message);
+        }
+        Ok(())
+    }
+
     pub(crate) fn refresh(
         &mut self,
         opts: &broca_protocol::CallOptions,

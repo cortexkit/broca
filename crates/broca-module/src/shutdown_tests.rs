@@ -524,8 +524,56 @@ async fn shutdown_idle_exits_promptly() {
     );
 }
 
-#[tokio::test]
+// Paused Tokio time otherwise auto-advances while filesystem work runs on blocking threads.
+// Keep a runnable task until the actor has joined its writer, so only explicit advances
+// consume the shutdown budget rather than the speed of the machine running the test.
+struct AdmissionClock(tokio::task::JoinHandle<()>);
+
+impl AdmissionClock {
+    fn new() -> Self {
+        Self(tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        }))
+    }
+
+    async fn finish_stop(&self, f: &Fixture, stopping: tokio::task::JoinHandle<bool>) {
+        *f.wal.blocked.lock().unwrap() = true;
+        let release_replay = ReleaseRead(f.wal.clone());
+        tokio::time::advance(Duration::from_millis(200)).await;
+        f.wal.entered.notified().await;
+        assert!(
+            !stopping.is_finished(),
+            "a held replay must retain the slot"
+        );
+        drop(release_replay);
+        loop {
+            let counts = f.registry.slot_counts();
+            if counts.open + counts.opening + counts.closing == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // Let the registry observe completed teardown on its next slot-count poll.
+        tokio::time::advance(Duration::from_millis(10)).await;
+        assert!(
+            stopping.await.unwrap(),
+            "{}",
+            f.registry.shutdown_report().unwrap()
+        );
+    }
+}
+
+impl Drop for AdmissionClock {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn shutdown_admits_queued_sends_before_stopping_and_stops_cleanly() {
+    let clock = AdmissionClock::new();
     let f = Fixture::for_admission();
     f.start().await;
     let handle = f.registry.actor_for(&f.key).await.unwrap();
@@ -577,8 +625,8 @@ async fn shutdown_admits_queued_sends_before_stopping_and_stops_cleanly() {
         "{route_result:?}"
     );
     release.send(()).unwrap();
-    let clean = stopping.await.unwrap();
-    assert!(clean, "{}", f.registry.shutdown_report().unwrap());
+    signal.cancelled().await;
+    clock.finish_stop(&f, stopping).await;
 }
 
 #[tokio::test]
@@ -609,8 +657,9 @@ async fn shutdown_slow_seal_sync_expires_admission_test_budget() {
     wait_for_closed(&f).await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn shutdown_rejects_new_admission() {
+    let clock = AdmissionClock::new();
     let f = Fixture::for_admission();
     f.start().await;
     let handle = f.registry.actor_for(&f.key).await.unwrap();
@@ -653,11 +702,7 @@ async fn shutdown_rejects_new_admission() {
             RunKind::FreshOrResume,
         )
         .await;
-    assert!(
-        stopping.await.unwrap(),
-        "{}",
-        f.registry.shutdown_report().unwrap()
-    );
+    clock.finish_stop(&f, stopping).await;
     assert!(
         matches!(result, SendOutcome::Transient(_)),
         "buffered Send admitted while stopping: {result:?}"

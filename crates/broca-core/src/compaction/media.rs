@@ -41,7 +41,7 @@ impl CapturedMedia {
             .is_some_and(|refs| refs.contains(reference))
     }
 
-    fn insert(&mut self, reference: &MediaRef) {
+    pub(crate) fn insert(&mut self, reference: &MediaRef) {
         if !self.contains(reference) {
             Arc::make_mut(&mut self.0)
                 .entry(reference.sha256.clone())

@@ -201,3 +201,255 @@ fn image_only_tag_label_does_not_detach_the_prepared_payload() {
             )));
     }
 }
+
+#[test]
+fn prepared_image_text_numbers_original_text_not_media_marker() {
+    let fixture = Fixture::new();
+    let mut tool = fixture.tool("call");
+    let ContentBlock::ToolResult(result) = &mut tool.content[0] else {
+        unreachable!()
+    };
+    let ToolOutput::Parts { parts } = &mut result.output else {
+        unreachable!()
+    };
+    parts.push(ToolOutputPart::Text {
+        text: "first exposed text".into(),
+    });
+    number_message(
+        &mut tool,
+        ComputedRules {
+            render: true,
+            clean: false,
+        },
+        &mut 6,
+    )
+    .unwrap();
+    let prompt = vec![tool];
+    let session = fixture.session(&[start(&[]), step(1), tool_record(&prompt[0]), step(2)]);
+    let id = WireFamilyId::OpenAiChat;
+    let mut frozen = frozen_config_for_family(id, "model");
+    let profile = select_media_profile(
+        id,
+        Some(crate::media_profile::MediaQuirk::Openai),
+        "model",
+        profile().modalities,
+        Some(1_000_000),
+    );
+    frozen.media = Some(profile.clone());
+    let (mut bundle, _) = planned(&session, &profile, &prompt, &mut MediaAging::default());
+    assert!(
+        bundle.media.is_empty(),
+        "unverified Chat tool carriers use markers"
+    );
+    let bytes = render_prepared(
+        &crate::families::OpenAiChat,
+        &frozen,
+        &CallOptions::new(prompt),
+        Some(&mut bundle),
+        &|prompt| {
+            let mut tagged = prompt.to_vec();
+            render_tags_into(&mut tagged, TagRendering::default());
+            tagged
+        },
+    )
+    .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let content = body["messages"][0]["content"].as_str().unwrap();
+    assert!(content.contains("reason=carrier"), "{content}");
+    assert!(content.contains("§7§ first exposed text"), "{content}");
+    assert_eq!(content.matches("§7§").count(), 1);
+}
+
+#[test]
+fn prepared_tool_tag_table_preserves_text_targets_and_image_labels_on_every_family() {
+    let fixture = Fixture::new();
+    for id in [
+        WireFamilyId::AnthropicMessages,
+        WireFamilyId::BedrockConverse,
+        WireFamilyId::OpenAiChat,
+        WireFamilyId::OpenAiResponses,
+        WireFamilyId::OpenAiResponsesChatgpt,
+        WireFamilyId::Gemini,
+        WireFamilyId::GoogleCodeAssist,
+    ] {
+        let family = crate::registry::wire_family(id).unwrap();
+        let quirk = match id {
+            WireFamilyId::AnthropicMessages => Some(crate::media_profile::MediaQuirk::Anthropic),
+            WireFamilyId::OpenAiChat | WireFamilyId::OpenAiResponses => {
+                Some(crate::media_profile::MediaQuirk::Openai)
+            }
+            WireFamilyId::Gemini => Some(crate::media_profile::MediaQuirk::Google),
+            _ => None,
+        };
+        for shape in ["text_image_text", "image_text", "image_empty", "image_only"] {
+            for mode in ["profile", "unavailable", "aged", "request_cap"] {
+                let mut tool = fixture.tool("call");
+                let ContentBlock::ToolResult(result) = &mut tool.content[0] else {
+                    unreachable!()
+                };
+                let ToolOutput::Parts { parts } = &mut result.output else {
+                    unreachable!()
+                };
+                match shape {
+                    "text_image_text" => {
+                        parts.insert(
+                            0,
+                            ToolOutputPart::Text {
+                                text: "first exposed text".into(),
+                            },
+                        );
+                        parts.push(ToolOutputPart::Text {
+                            text: "later text".into(),
+                        });
+                    }
+                    "image_text" => parts.push(ToolOutputPart::Text {
+                        text: "first exposed text".into(),
+                    }),
+                    "image_empty" => parts.push(ToolOutputPart::Text {
+                        text: String::new(),
+                    }),
+                    _ => {}
+                }
+                number_message(
+                    &mut tool,
+                    ComputedRules {
+                        render: true,
+                        clean: false,
+                    },
+                    &mut 6,
+                )
+                .unwrap();
+                let prompt = vec![tool];
+                let session =
+                    fixture.session(&[start(&[]), step(1), tool_record(&prompt[0]), step(2)]);
+                let mut frozen = frozen_config_for_family(id, "gemini-3.0-flash");
+                if id == WireFamilyId::GoogleCodeAssist {
+                    frozen.project_id = Some("tag-fixture".into());
+                }
+                let mut profile = select_media_profile(
+                    id,
+                    quirk,
+                    "gemini-3.0-flash",
+                    profile().modalities,
+                    Some(1_000_000),
+                );
+                if mode == "aged" {
+                    profile.aging.byte_trigger = 1;
+                    profile.aging.byte_target = 0;
+                    profile.aging.token_trigger = u64::MAX;
+                    profile.aging.token_target = u64::MAX;
+                }
+                frozen.media = (mode != "unavailable").then_some(profile.clone());
+                let mut aging = MediaAging::default();
+                aging.select_view(&profile, &session.bindings(&prompt));
+                let mut bundle = prepare(&session, frozen.media.as_ref(), &prompt, &aging).unwrap();
+                if mode == "request_cap" && !bundle.media.is_empty() {
+                    bundle.mark(0, MediaMarkerReason::RequestCap);
+                }
+                let shown = bundle.media.len();
+                let mut opts = CallOptions::new(prompt.clone());
+                opts.step_context = Some(broca_protocol::StepContext {
+                    run_id: "tags".into(),
+                    step_index: 2,
+                    session_address: None,
+                    credential_id: None,
+                    account_ref: None,
+                    max_output_tokens: None,
+                });
+                let tags = |prompt: &[Message]| {
+                    let mut tagged = prompt.to_vec();
+                    render_tags_into(&mut tagged, TagRendering::default());
+                    tagged
+                };
+                let bytes =
+                    render_prepared(&*family, &frozen, &opts, Some(&mut bundle), &tags).unwrap();
+                let rendered = String::from_utf8(bytes.clone()).unwrap();
+                let expected = if shape == "text_image_text" || shape == "image_text" {
+                    "§7§ first exposed text".to_string()
+                } else {
+                    "§7§ [image]".to_string()
+                };
+                assert!(
+                    rendered.contains(&expected),
+                    "{id:?}/{shape}/{mode}: {rendered}"
+                );
+                assert_eq!(rendered.matches("§7§").count(), 1, "{id:?}/{shape}/{mode}");
+                if shown != 0 {
+                    assert!(
+                        rendered.contains(&STANDARD.encode(&fixture.bytes)),
+                        "{id:?}/{shape}/{mode}: native payload remains attached"
+                    );
+                } else {
+                    assert!(
+                        !rendered.contains(&STANDARD.encode(&fixture.bytes)),
+                        "{id:?}/{shape}/{mode}"
+                    );
+                }
+                assert_eq!(
+                    render_prepared(&*family, &frozen, &opts, Some(&mut bundle), &tags).unwrap(),
+                    bytes,
+                    "{id:?}/{shape}/{mode}: repeated render"
+                );
+                assert_eq!(
+                    opts.prompt, prompt,
+                    "tag and marker projection must not mutate stored input"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn media_free_marker_looking_text_keeps_legacy_render_bytes() {
+    let fixture = Fixture::new();
+    let literal =
+        broca_protocol::content::media_not_shown_marker(&fixture.media, MediaMarkerReason::Carrier);
+    let mut tool = fixture.tool("call");
+    let ContentBlock::ToolResult(result) = &mut tool.content[0] else {
+        unreachable!()
+    };
+    result.output = ToolOutput::Parts {
+        parts: vec![
+            ToolOutputPart::Text {
+                text: literal.clone(),
+            },
+            ToolOutputPart::Text {
+                text: "later text".into(),
+            },
+        ],
+    };
+    number_message(
+        &mut tool,
+        ComputedRules {
+            render: true,
+            clean: false,
+        },
+        &mut 6,
+    )
+    .unwrap();
+    let prompt = vec![tool];
+    let session = fixture.session(&[start(&[]), step(1), tool_record(&prompt[0]), step(2)]);
+    let frozen = frozen_config_for_family(WireFamilyId::OpenAiChat, "model");
+    let mut opts = CallOptions::new(prompt.clone());
+    let tags = |prompt: &[Message]| {
+        let mut tagged = prompt.to_vec();
+        render_tags_into(&mut tagged, TagRendering::default());
+        tagged
+    };
+    render_tags_into(&mut opts.prompt, TagRendering::default());
+    let legacy = crate::families::OpenAiChat.render(&frozen, &opts);
+    opts.prompt = prompt.clone();
+    let mut prepared = prepare(&session, None, &prompt, &MediaAging::default()).unwrap();
+    let actual = render_prepared(
+        &crate::families::OpenAiChat,
+        &frozen,
+        &opts,
+        Some(&mut prepared),
+        &tags,
+    )
+    .unwrap();
+    assert_eq!(actual, legacy);
+    assert!(String::from_utf8(actual)
+        .unwrap()
+        .contains(&format!("§7§ {literal}")));
+}

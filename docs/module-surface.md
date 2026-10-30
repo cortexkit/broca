@@ -26,7 +26,7 @@ tool turns before dispatch, have null coordinates. Transcript rows
 stay at their source record's position, even when a later boundary places them.
 Treat transcript exports as sensitive conversation data.
 
-Task/session-name lookup is shared by trajectory, `cache-dump --session <id>`, and
+Task/session-name lookup is shared by trajectory, `cache-diagnose <id>`, `cache-dump --session <id>`, and
 `broca-session --subc CONNECTION read <id>` (also `--session <id> read`). It tries
 the supplied name first, then `alfonso:<id>` for an unprefixed name. The lookup
 scans only the compact session-ref inventory, with the name predicate in SQL;
@@ -45,7 +45,7 @@ read calls with only one bind flag use lookup and require that flag to match the
 recorded identity. Other daemon commands still accept their original bind flags.
 The connection file is
 only an argument; its path and contents are not printed on connection failures.
-Put the offline `trajectory` and `cache-dump` subcommands before their flags;
+Put the offline `trajectory`, `cache-diagnose`, and `cache-dump` subcommands before their flags;
 prefixed global flags are refused by command name before any session lookup.
 These commands refuse `--subc` by command name,
 whether the daemon flag appears before or after the subcommand, without binding.
@@ -497,11 +497,20 @@ what it cost.
   it at its own send start. `expiry_basis` is always `"estimated"`. The clock lives in memory, so
   after a restart it is unknown (and warms are refused `cache_expired`) until the session sends
   again.
-- **Records.** Each successful warm writes one informational, ungated `cache_warmed` WAL record
+- **Records.** On legacy roots, each successful warm writes one informational, ungated `cache_warmed` WAL record
   (digests, usage, account, the raw `anthropic-ratelimit-unified-*` headers, expiry). Replay,
   `session.read` and projection skip it; it is never a transcript message. Billing turns it into
   its own export fact marked `warm: true`, priced from its own usage, whose id is taken over the
   record's WAL sequence so the run's ordinary facts keep their ids. Absent usage stays absent.
+  On opted-in `broca-state/2` roots, every physical warm send is durably reserved before sending
+  and normally gets a `cache_warmed` terminal with its reservation and outcome envelope even
+  when it fails;
+  those records require the `bill-attempts/v1` WAL feature. A compression refusal and
+  uncompressed resend are separate attempts. The billing envelope distinguishes a failed send
+  from a cache refresh. A failed warm never refreshes cache expiry on any root. If a crash loses
+  the outcome or a full WAL refuses its terminal, reclaim lets the billing reader report the
+  reserved attempt as possibly billed,
+  without inventing usage, deduplicated by its random `attempt_id`.
 - **Head and declaration.** `session.head.cache` reports the clock from memory, with no WAL
   scan. The admitting send's `baseline` and `session.baseline` carry `cache {ttl_ms,
   ttl_options_ms, read_refreshes_ttl, warm: "supported" | "unsupported", basis}`, every member
@@ -1125,7 +1134,10 @@ recorded and a crash left open is sealed on recovery with its recorded exit, wit
 provider or the model.
 
 The provider-call watchdog is separate from caller cancellation. A timed-out provider attempt
-ends `Interrupted`, not `Cancelled`, and releases the lease.
+ends `Interrupted`, not `Cancelled`, and releases the lease on legacy-format roots. On an overhaul
+root, a billing-reservation durability failure takes precedence: the step fails with a WAL
+durability error instead of `Interrupted`. A writer whose sync never returns remains a
+process-level failure for the supervisor, not a bounded close-out; ownership is not released early.
 
 ## 14. run.status enum + durable run index + busy-vs-stale
 

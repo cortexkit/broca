@@ -437,8 +437,18 @@ async fn approved_preparation_key_matches_all_four_served_surfaces() {
         capture(name, &frame.body);
     }
     rig.bind_with_scope(8, Some(owner), Some(scope)).await;
+    // Replay sends tool_started before tool_finished, so waiting for tool_finished means both
+    // have arrived, however slow the runner is.
     let frames = rig
-        .subscribe_collect_bound(8, json!({"from":"start"}), Duration::from_millis(30))
+        .subscribe_collect_bound_until(
+            8,
+            json!({"from":"start"}),
+            Duration::from_millis(30),
+            |frame| {
+                serde_json::from_slice::<serde_json::Value>(&frame.body)
+                    .is_ok_and(|value| value["event"]["type"] == "tool_finished")
+            },
+        )
         .await;
     for kind in ["tool_started", "tool_finished"] {
         let frame = frames

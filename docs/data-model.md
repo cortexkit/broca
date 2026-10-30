@@ -966,6 +966,8 @@ expectation of how long a step or a tool call may take.
 
 ## 7. Stability
 
+New warm facts with `bill-attempts/v1` attempt evidence may include optional `warm_outcome` in `segment_json` to distinguish completed, failed and unknown attempts; legacy facts omit it and retain their original bytes and `fact_id`.
+
 **Stable** means external readers may rely on it: changes are additive (new optional
 fields, new skippable record types), or come with a new version marker. **Internal** means
 it may change without notice.

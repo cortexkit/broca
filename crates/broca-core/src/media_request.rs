@@ -11,13 +11,21 @@ use broca_protocol::{
     ContentBlock, MediaRef, Message, StepId, ToolCallId, ToolOutput, ToolOutputPart,
 };
 use broca_wal::WalRecord;
+use serde::{Deserialize, Serialize};
 
 use crate::media_store::{MediaReadError, MediaStore};
 use crate::placement::{AppendKind, Placement, PlacementAction};
 
+#[cfg(feature = "test-attachments")]
+mod seed;
+#[cfg(feature = "test-attachments")]
+pub(crate) use seed::count_seed_fallback;
+#[cfg(feature = "test-attachments")]
+pub use seed::{seed_fallback_count, DurableMediaSeed, MediaCheckpoint, MediaHistory};
+
 /// A capture occurrence, not a digest. Two admissions of identical bytes have different ids
 /// and can have different protection lifetimes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct MediaId {
     pub record: u64,
     pub message: usize,
@@ -25,14 +33,14 @@ pub struct MediaId {
     pub part: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaLocation {
     pub message: usize,
     pub block: usize,
     pub part: Option<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaBinding {
     pub id: MediaId,
     pub location: MediaLocation,
@@ -41,7 +49,7 @@ pub struct MediaBinding {
     pub protected: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Capture {
     id: MediaId,
     reference: MediaRef,
@@ -56,7 +64,7 @@ type Position = (u64, Option<ToolCallId>, String);
 
 /// Metadata deltas for an aging fold. A selected view changes rarely; its snapshot replaces
 /// the selected set. All other records emit only new captures and protection releases.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MediaChange {
     Show(MediaBinding),
     Release(MediaId),
@@ -65,8 +73,9 @@ pub enum MediaChange {
 
 /// Metadata-only projection paired with one session's media store. The caller must retain
 /// the session lease while reading, just as it does while registering captures.
+#[derive(Debug, Clone)]
 pub struct SessionMedia {
-    store: MediaStore,
+    store: Option<MediaStore>,
     placement: Placement,
     records: u64,
     boundary: u64,
@@ -85,10 +94,17 @@ pub struct SessionMedia {
     compaction: crate::compaction::CompactionState,
     batch_order: HashMap<ToolCallId, usize>,
     replacements: Vec<(Vec<MediaRef>, u64, u64)>,
+    restored_selection: Option<Vec<MediaBinding>>,
+    restored_covered: Option<u64>,
+    restored_view: bool,
 }
 
 impl SessionMedia {
     pub fn new(store: MediaStore) -> Self {
+        Self::metadata(Some(store))
+    }
+
+    fn metadata(store: Option<MediaStore>) -> Self {
         Self {
             store,
             placement: Placement::default(),
@@ -109,6 +125,9 @@ impl SessionMedia {
             compaction: Default::default(),
             batch_order: HashMap::new(),
             replacements: Vec::new(),
+            restored_selection: None,
+            restored_covered: None,
+            restored_view: false,
         }
     }
 
@@ -236,6 +255,11 @@ impl SessionMedia {
             if self.last_step != Some(*step_id) {
                 for id in std::mem::take(&mut self.protected) {
                     self.changes.push(MediaChange::Release(id));
+                    if let Some(selected) = &mut self.restored_selection {
+                        for binding in selected.iter_mut().filter(|binding| binding.id == id) {
+                            binding.protected = false;
+                        }
+                    }
                 }
                 self.boundary += 1;
                 self.last_step = Some(*step_id);
@@ -250,6 +274,11 @@ impl SessionMedia {
             record,
             WalRecord::CompactionMessage { .. } | WalRecord::CompactionViewApplied { .. }
         ) {
+            if matches!(record, WalRecord::CompactionViewApplied { .. }) || !self.restored_view {
+                self.restored_selection = None;
+                self.restored_covered = None;
+                self.restored_view = false;
+            }
             self.index_replacements();
             self.changes
                 .push(MediaChange::View(self.selected_bindings()));
@@ -259,6 +288,9 @@ impl SessionMedia {
 
     fn index_replacements(&mut self) {
         use crate::compaction_provider::view::ViewRange;
+        if self.restored_selection.is_some() {
+            return;
+        }
         self.replacements.clear();
         if let Some(applied) = &self.compaction.view {
             for range in &applied.view.ranges {
@@ -297,31 +329,39 @@ impl SessionMedia {
     /// Re-select only when a compaction view or the episode's frozen profile changes. The
     /// skeleton holds media references and empty text slots, not a second transcript copy.
     pub fn selected_bindings(&self) -> Vec<MediaBinding> {
+        if let Some(selected) = &self.restored_selection {
+            return selected.clone();
+        }
         let prompt: Vec<_> = self.skeleton.values().cloned().collect();
         let selected = crate::compaction::view::rendered_history(&self.compaction, &prompt);
         self.bindings(&selected)
     }
 
+    fn covered(&self) -> Option<u64> {
+        self.restored_covered.or_else(|| {
+            self.compaction
+                .view
+                .as_ref()
+                .map(|view| view.view.covers_through.ordinal)
+                .or_else(|| {
+                    self.compaction
+                        .applied
+                        .as_ref()
+                        .map(|applied| applied.range.to.saturating_sub(1))
+                })
+        })
+    }
+
     fn show(&mut self, id: MediaId) {
         let capture = &self.captures[&id];
-        let covered = self
-            .compaction
-            .view
-            .as_ref()
-            .map(|view| view.view.covers_through.ordinal)
-            .or_else(|| {
-                self.compaction
-                    .applied
-                    .as_ref()
-                    .map(|applied| applied.range.to.saturating_sub(1))
-            });
+        let covered = self.covered();
         if capture
             .ordinal
             .is_some_and(|ordinal| covered.is_some_and(|covered| ordinal <= covered))
         {
             return;
         }
-        self.changes.push(MediaChange::Show(MediaBinding {
+        let binding = MediaBinding {
             id,
             location: MediaLocation {
                 message: 0,
@@ -332,7 +372,11 @@ impl SessionMedia {
             tool: capture.tool_call.is_some(),
             protected: capture.person
                 && capture.first_step.is_none_or(|step| step == self.boundary),
-        }));
+        };
+        if let Some(selected) = &mut self.restored_selection {
+            selected.push(binding.clone());
+        }
+        self.changes.push(MediaChange::Show(binding));
     }
 
     fn insert(&mut self, capture: Capture, announce: bool) {
@@ -581,6 +625,17 @@ impl SessionMedia {
         }) {
             return Err(MediaReadError::Corrupt(reference.sha256.clone()));
         }
-        self.store.read_verified(reference)
+        let bytes = self
+            .store
+            .as_ref()
+            .expect("render session has a media store")
+            .read_verified(reference)?;
+        #[cfg(feature = "test-attachments")]
+        if crate::media_validation::validate_media(&bytes, &reference.mime).as_ref()
+            != Ok(reference)
+        {
+            return Err(MediaReadError::Corrupt(reference.sha256.clone()));
+        }
+        Ok(bytes)
     }
 }

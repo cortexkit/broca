@@ -242,4 +242,33 @@ mod protection_tests {
             )]
         );
     }
+
+    #[test]
+    fn media_bundle_remains_protected_after_record_replay_until_the_following_step() {
+        let media = broca_core::media_validation::validate_media(
+            b"%PDF-1.7\nprotected attachment\n%%EOF\n",
+            "application/pdf",
+        )
+        .unwrap();
+        let input = vec![Message::new(Role::User, vec![ContentBlock::Media(media)])];
+        let mut records: Vec<broca_wal::WalRecord> = vec![
+            serde_json::from_value(json!({"type":"steered","input":input})).unwrap(),
+            broca_wal::WalRecord::StepStarted {
+                step_id: broca_protocol::StepId(1),
+            },
+        ];
+        assert_eq!(protected_input(&records), input);
+        // A provider send is not a durable completion. Reconstructing from the same
+        // records and retrying the same step must not age the attachment bundle.
+        let persisted = serde_json::to_vec(&records).unwrap();
+        records = serde_json::from_slice(&persisted).unwrap();
+        records.push(broca_wal::WalRecord::StepStarted {
+            step_id: broca_protocol::StepId(1),
+        });
+        assert_eq!(protected_input(&records), input);
+        records.push(broca_wal::WalRecord::StepStarted {
+            step_id: broca_protocol::StepId(2),
+        });
+        assert!(protected_input(&records).is_empty());
+    }
 }

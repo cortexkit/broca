@@ -462,8 +462,54 @@ async fn approved_run() -> Rig {
 }
 
 #[cfg(feature = "test-clock")]
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn ordinary_crash_cuts_close_at_every_durable_step_and_owe_no_postresult_report() {
+    // WAL acknowledgments arrive from an OS thread. Neither host load nor Tokio's
+    // automatic clock advances should spend the replay's two-second virtual budget.
+    struct FileIoClock {
+        runnable: tokio::task::JoinHandle<()>,
+        finished: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Drop for FileIoClock {
+        fn drop(&mut self) {
+            self.finished.store(true, Ordering::SeqCst);
+            self.runnable.abort();
+        }
+    }
+    let clock = FileIoClock {
+        runnable: tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        }),
+        finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let finished = clock.finished.clone();
+    // The shared deadlock guard uses a real-time deadline even while Tokio time is
+    // paused. A blocking thread runs the guard; select! polls its JoinHandle below.
+    let mut guard = tokio::task::spawn_blocking(move || {
+        broca_test_support::wait_until_sync("ordinary consent crash cuts", || {
+            finished
+                .load(Ordering::SeqCst)
+                .then_some(())
+                .ok_or_else(|| "file-backed run or cut replay has not finished".into())
+        });
+    });
+    let started = tokio::time::Instant::now();
+    tokio::select! {
+        () = ordinary_crash_cuts() => {},
+        result = &mut guard => {
+            result.expect("consent crash-cut deadlock guard failed");
+            unreachable!("deadlock guard completes only after the clock is dropped");
+        }
+    }
+    assert_eq!(tokio::time::Instant::now(), started);
+    drop(clock);
+    guard.await.unwrap();
+}
+
+#[cfg(feature = "test-clock")]
+async fn ordinary_crash_cuts() {
     let rig = approved_run().await;
     let bytes = std::fs::read(rig.tools.store.wal_path(&rig.bind)).unwrap();
     let frames = rig.frames();

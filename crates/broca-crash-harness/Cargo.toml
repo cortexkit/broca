@@ -23,6 +23,7 @@ tokio-util.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+broca-core = { path = "../broca-core", features = ["test-clock"] }
 # The scope migration test drives the lineage registry the serve layer calls, over the state
 # roots the harness leaves.
 broca-module = { path = "../broca-module" }

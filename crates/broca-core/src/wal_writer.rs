@@ -2151,6 +2151,7 @@ impl RecordOutcome {
 
 struct AppendBudget {
     writer_close_reserve: u64,
+    reopen_reserve: u64,
     retained: bool,
     session_max_bytes: u64,
     max_bytes: u64,
@@ -2412,6 +2413,109 @@ pub struct RecordObserver {
     /// separate flag store a stale detach could overwrite.
     subscribers: Arc<AtomicUsize>,
     tap: Option<(Arc<DurableRecordTap>, Arc<std::sync::atomic::AtomicBool>)>,
+    step_events: Option<StepEventObserver>,
+}
+
+/// Terminal attempt evidence copied after durability for a best-effort live hint. The
+/// bounded receiver is independent of transcript subscribers and the metadata tap.
+#[derive(Clone, Debug)]
+pub struct DurableAttempt {
+    pub seq: u64,
+    pub lineage: Option<broca_wal::WalLineageId>,
+    pub writer_id: Option<[u8; 16]>,
+    pub interrupted_at_ms: Option<u64>,
+    pub attempt_id: broca_wal::record::AttemptId,
+    pub reservation: Box<broca_wal::record::AttemptReservation>,
+    pub envelope: Box<broca_wal::record::AttemptEnvelope>,
+}
+
+#[derive(Clone)]
+struct StepEventObserver {
+    tx: tokio::sync::mpsc::Sender<DurableAttempt>,
+    dropped: Arc<AtomicU64>,
+    open: std::collections::BTreeMap<broca_wal::record::AttemptId, DurableAttempt>,
+}
+
+impl StepEventObserver {
+    fn observe(
+        &mut self,
+        seq: u64,
+        lineage: Option<broca_wal::WalLineageId>,
+        writer_id: Option<[u8; 16]>,
+        record: &WalRecord,
+    ) {
+        match record {
+            WalRecord::AttemptReserved {
+                attempt_id,
+                reservation,
+            } => {
+                self.open.insert(
+                    attempt_id.clone(),
+                    DurableAttempt {
+                        seq,
+                        lineage,
+                        writer_id,
+                        interrupted_at_ms: None,
+                        attempt_id: attempt_id.clone(),
+                        reservation: reservation.clone(),
+                        envelope: Default::default(),
+                    },
+                );
+            }
+            WalRecord::ModelAttemptFinished {
+                attempt_id: Some(id),
+                reservation: Some(reservation),
+                envelope: Some(envelope),
+                ..
+            }
+            | WalRecord::CacheWarmed {
+                attempt_id: Some(id),
+                reservation: Some(reservation),
+                envelope: Some(envelope),
+                ..
+            }
+            | WalRecord::AttemptFinished {
+                attempt_id: id,
+                reservation,
+                envelope,
+            } => {
+                self.open.remove(id);
+                // Reserve before copying evidence: a full queue costs no record clone.
+                match self.tx.try_reserve() {
+                    Ok(slot) => slot.send(DurableAttempt {
+                        seq,
+                        lineage,
+                        writer_id,
+                        interrupted_at_ms: None,
+                        attempt_id: id.clone(),
+                        reservation: reservation.clone(),
+                        envelope: envelope.clone(),
+                    }),
+                    Err(_) => {
+                        self.dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            WalRecord::AttemptReleased { attempt_id, .. } => {
+                self.open.remove(attempt_id);
+            }
+            WalRecord::WriterClosed { .. } => {
+                let finished_at_ms = StampClock::wall().now_ms();
+                for (_, mut attempt) in std::mem::take(&mut self.open) {
+                    attempt.interrupted_at_ms = Some(finished_at_ms);
+                    if self.tx.try_send(attempt).is_err() {
+                        self.dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            // Opening must not replay the log just for best-effort hints. Retain only
+            // this writer's reservations; durable readers classify earlier writers'
+            // open reservations as possibly billed.
+            WalRecord::WriterOpened { .. } => self.open.clear(),
+            // Corrections are not another attempt and must not create another hint.
+            _ => {}
+        }
+    }
 }
 
 /// A bounded, non-I/O callback on the dedicated writer thread. Borrowed records are durable;
@@ -2459,7 +2563,23 @@ impl RecordObserver {
             tx,
             subscribers,
             tap: None,
+            step_events: None,
         }
+    }
+
+    /// Install a lossy live-hint queue, never a billing outbox. Reserving a slot without
+    /// waiting keeps a slow or disconnected publisher out of the WAL durability path.
+    pub fn with_step_events(
+        mut self,
+        tx: tokio::sync::mpsc::Sender<DurableAttempt>,
+        dropped: Arc<AtomicU64>,
+    ) -> Self {
+        self.step_events = Some(StepEventObserver {
+            tx,
+            dropped,
+            open: Default::default(),
+        });
+        self
     }
 
     /// Install optional durable metadata observation without cloning records or enabling fan-out.
@@ -2497,12 +2617,16 @@ impl RecordObserver {
     }
 
     fn observe_tap(
-        &self,
+        &mut self,
         seq: u64,
         fence: u64,
         lineage: Option<broca_wal::WalLineageId>,
+        writer_id: Option<[u8; 16]>,
         record: &WalRecord,
     ) {
+        if let Some(events) = &mut self.step_events {
+            events.observe(seq, lineage, writer_id, record);
+        }
         let Some((tap, healthy)) = &self.tap else {
             return;
         };
@@ -2522,6 +2646,352 @@ impl RecordObserver {
 
 #[cfg(test)]
 type AfterReserveProbe = Arc<dyn Fn(u64) + Send + Sync>;
+
+#[cfg(test)]
+mod step_event_tests {
+    use super::*;
+    use broca_wal::record::{AttemptEnvelope, AttemptId, AttemptReservation};
+
+    fn reserved(id: u64) -> WalRecord {
+        let attempt_id: AttemptId =
+            serde_json::from_value(serde_json::json!(format!("{id:032x}"))).unwrap();
+        let reservation: AttemptReservation = serde_json::from_value(serde_json::json!({
+            "run_id":"run", "step_id":1, "attempt":0, "send_index":1, "warm":false,
+            "reserved_at_ms":100, "provider":"provider", "endpoint_host":"example.com",
+            "model_sent":"model", "credential":{}, "run":{},
+            "session":{"project_root":"/private", "harness":"host", "session":"s", "session_ref":"ref"},
+            "request_body_bytes":10, "compressed":false
+        })).unwrap();
+        WalRecord::AttemptReserved {
+            attempt_id,
+            reservation: Box::new(reservation),
+        }
+    }
+
+    fn terminal(id: u64, released: bool) -> WalRecord {
+        let WalRecord::AttemptReserved {
+            attempt_id,
+            reservation,
+        } = reserved(id)
+        else {
+            unreachable!()
+        };
+        let envelope = Box::new(AttemptEnvelope {
+            finished_at_ms: Some(200),
+            ..Default::default()
+        });
+        if released {
+            WalRecord::AttemptReleased {
+                attempt_id,
+                reservation,
+                envelope,
+            }
+        } else {
+            WalRecord::AttemptFinished {
+                attempt_id,
+                reservation,
+                envelope,
+            }
+        }
+    }
+
+    struct CountingWal {
+        records: Vec<broca_wal::FramedRecord>,
+        replays: Arc<AtomicU64>,
+        fail_sync: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Wal for CountingWal {
+        fn append(&mut self, fence: u64, record: &WalRecord, _: bool) -> Result<u64, WalError> {
+            let seq = self.last_seq() + 1;
+            self.records.push(broca_wal::FramedRecord {
+                seq,
+                fence,
+                record: record.clone(),
+            });
+            Ok(seq)
+        }
+        fn sync(&self) -> Result<(), WalError> {
+            if self.fail_sync.load(Ordering::Relaxed) {
+                Err(WalError::Io(std::io::Error::other("injected sync failure")))
+            } else {
+                Ok(())
+            }
+        }
+        fn replay(&self) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
+            self.replays.fetch_add(1, Ordering::Relaxed);
+            Ok(self.records.clone())
+        }
+        fn tail_after_seq(&self, seq: u64) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
+            Ok(self
+                .replay()?
+                .into_iter()
+                .filter(|frame| frame.seq > seq)
+                .collect())
+        }
+        fn last_seq(&self) -> u64 {
+            self.records.last().map_or(0, |frame| frame.seq)
+        }
+    }
+
+    fn observer(
+        capacity: usize,
+    ) -> (
+        RecordObserver,
+        tokio::sync::mpsc::Receiver<DurableAttempt>,
+        Arc<AtomicU64>,
+    ) {
+        let (tx, _) = broadcast::channel(1);
+        let (events, inbox) = tokio::sync::mpsc::channel(capacity);
+        let dropped = Arc::new(AtomicU64::new(0));
+        (
+            RecordObserver::new(tx, Arc::new(AtomicUsize::new(0)))
+                .with_step_events(events, dropped.clone()),
+            inbox,
+            dropped,
+        )
+    }
+
+    async fn drained(handle: &WalHandle) {
+        let (tx, rx) = oneshot::channel();
+        handle.tx.send(WalCommand::AppendDrained(tx)).unwrap();
+        rx.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn step_event_failed_sync_publishes_nothing() {
+        let fail_sync = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (observer, mut inbox, _) = observer(8);
+        let handle = WalHandle::spawn_observed(
+            Box::new(CountingWal {
+                records: vec![],
+                replays: Default::default(),
+                fail_sync: fail_sync.clone(),
+            }),
+            7,
+            Some(observer),
+        )
+        .unwrap();
+        handle.record(terminal(1, false));
+        drained(&handle).await;
+        fail_sync.store(true, Ordering::Relaxed);
+        assert!(handle.sync().await.is_err());
+        assert!(handle.shutdown().await.is_err());
+        assert!(inbox.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn step_event_model_and_warm_terminals_emit_but_corrections_and_releases_do_not() {
+        let (observer, mut inbox, _) = observer(8);
+        let handle = WalHandle::spawn_observed(
+            Box::new(CountingWal {
+                records: vec![],
+                replays: Default::default(),
+                fail_sync: Default::default(),
+            }),
+            7,
+            Some(observer),
+        )
+        .unwrap();
+        let mut model = serde_json::to_value(terminal(1, false)).unwrap();
+        model["type"] = serde_json::json!("model_attempt_finished");
+        model.as_object_mut().unwrap().extend(serde_json::json!({
+            "step_id":1, "attempt":0, "request_body_len":10, "request_body_sha256":"a".repeat(64),
+            "response_body_len":0, "response_body_sha256":"b".repeat(64), "outcome":"complete", "ts_ms":200
+        }).as_object().unwrap().clone());
+        handle.record(serde_json::from_value(model).unwrap());
+        let mut warm = serde_json::to_value(terminal(2, false)).unwrap();
+        warm["type"] = serde_json::json!("cache_warmed");
+        warm.as_object_mut().unwrap().extend(
+            serde_json::json!({
+                "run_id":"run", "step_id":1, "request_body_sha256":"a".repeat(64),
+                "warm_body_sha256":"b".repeat(64), "usage":{}, "sent_at_ms":100
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        handle.record(serde_json::from_value(warm).unwrap());
+        let mut correction = serde_json::to_value(terminal(1, false)).unwrap();
+        correction["type"] = serde_json::json!("attempt_corrected");
+        correction["correction_id"] = serde_json::json!("ffffffffffffffffffffffffffffffff");
+        correction["reason"] = serde_json::json!("usage_reconciled");
+        handle.record(serde_json::from_value(correction).unwrap());
+        handle.record(terminal(3, true));
+        handle.sync().await.unwrap();
+        handle.shutdown().await.unwrap();
+        let mut ids = vec![];
+        while let Some(event) = inbox.recv().await {
+            ids.push(event.attempt_id.as_str().to_owned());
+        }
+        assert_eq!(ids, vec![format!("{:032x}", 1), format!("{:032x}", 2)]);
+    }
+
+    #[tokio::test]
+    async fn step_event_after_sync() {
+        let (observer, mut inbox, _) = observer(8);
+        let handle = WalHandle::spawn_observed(
+            Box::new(CountingWal {
+                records: vec![],
+                replays: Default::default(),
+                fail_sync: Default::default(),
+            }),
+            7,
+            Some(observer),
+        )
+        .unwrap();
+        handle.record(reserved(1));
+        handle.record(terminal(1, false));
+        drained(&handle).await;
+        assert!(
+            inbox.try_recv().is_err(),
+            "unsynced attempt produced a hint"
+        );
+        handle.sync().await.unwrap();
+        let event = broca_test_support::wait_for("durable attempt hint", inbox.recv(), || {
+            "no hint after sync".into()
+        })
+        .await
+        .unwrap();
+        assert_eq!(event.seq, 2);
+        assert_eq!(
+            event.attempt_id.as_str(),
+            "00000000000000000000000000000001"
+        );
+        handle.sync().await.unwrap();
+        drained(&handle).await;
+        assert!(inbox.try_recv().is_err(), "sync repeated the terminal hint");
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn step_event_never_blocks_writer() {
+        let (observer, inbox, dropped) = observer(1);
+        let handle = WalHandle::spawn_observed(
+            Box::new(CountingWal {
+                records: vec![],
+                replays: Default::default(),
+                fail_sync: Default::default(),
+            }),
+            7,
+            Some(observer),
+        )
+        .unwrap();
+        for id in 1..=3 {
+            handle.record(terminal(id, false));
+        }
+        let head = tokio::time::timeout(std::time::Duration::from_secs(5), handle.sync())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(head, 3);
+        drained(&handle).await;
+        assert_eq!(dropped.load(Ordering::Relaxed), 2);
+        drop(inbox);
+        handle.record(terminal(4, false));
+        assert_eq!(handle.sync().await.unwrap(), 4);
+        drained(&handle).await;
+        assert_eq!(dropped.load(Ordering::Relaxed), 3);
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn step_event_close_reports_exactly_this_tenures_open_reservations() {
+        let path = broca_test_support::scratch_root()
+            .join(format!("step-events-close-{}", std::process::id()));
+        let store = FileWalStore::with_config(path.join("wal"), broca_wal::WalConfig::OVERHAUL);
+        let session = BindIdentity::new("/private", "host", "s");
+        let (observer, mut inbox, _) = observer(8);
+        let (wal, seq) = WalHandle::prove_recovery(store.open(&session).unwrap()).unwrap();
+        let handle = WalHandle::spawn_proven_with_clock(
+            wal,
+            seq,
+            1,
+            Some(observer),
+            None,
+            (
+                StampClock::wall(),
+                Some(open_writers::WriterContext {
+                    root: path.clone(),
+                    address: session_addr(&session),
+                    identity: session.clone(),
+                    cause: None,
+                }),
+            ),
+        )
+        .unwrap();
+        // Two open reservations, one settled terminal, and one provably unsent release.
+        for id in 1..=4 {
+            handle.record(reserved(id)).into_result().unwrap();
+        }
+        handle.record(terminal(3, false)).into_result().unwrap();
+        let mut released = terminal(4, true);
+        if let WalRecord::AttemptReleased { envelope, .. } = &mut released {
+            envelope.sent = broca_wal::record::AttemptSent::No;
+        }
+        handle.record(released).into_result().unwrap();
+        handle.sync().await.unwrap();
+        let terminal = inbox.recv().await.unwrap();
+        assert_eq!(
+            terminal.attempt_id.as_str(),
+            "00000000000000000000000000000003"
+        );
+        assert!(terminal.interrupted_at_ms.is_none());
+        handle.shutdown().await.unwrap();
+        let mut interrupted = vec![];
+        while let Some(event) = inbox.recv().await {
+            assert!(event.interrupted_at_ms.is_some());
+            interrupted.push((event.attempt_id.as_str().to_owned(), event.seq));
+            assert_eq!(event.writer_id, terminal.writer_id);
+            assert_eq!(event.lineage, terminal.lineage);
+        }
+        assert_eq!(
+            interrupted,
+            vec![(format!("{:032x}", 1), 2), (format!("{:032x}", 2), 3)]
+        );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn step_event_writer_open_reads_no_log_for_predecessor_hints() {
+        let replays = Arc::new(AtomicU64::new(0));
+        let (observer, mut inbox, _) = observer(8);
+        let wal = CountingWal {
+            records: vec![broca_wal::FramedRecord {
+                seq: 1,
+                fence: 1,
+                record: reserved(1),
+            }],
+            replays: replays.clone(),
+            fail_sync: Default::default(),
+        };
+        let handle = WalHandle::spawn_observed(Box::new(wal), 2, Some(observer)).unwrap();
+        assert_eq!(
+            replays.load(Ordering::Relaxed),
+            0,
+            "opening read history for hints"
+        );
+        let before = replays.load(Ordering::Relaxed);
+        handle.record(WalRecord::WriterOpened {
+            writer_id: [2; 16],
+            previous_writer_id: Some([1; 16]),
+            recovered_through_seq: 1,
+            cause: "reclaim".into(),
+        });
+        handle.sync().await.unwrap();
+        drained(&handle).await;
+        assert_eq!(
+            replays.load(Ordering::Relaxed),
+            before,
+            "writer open replayed history for a hint"
+        );
+        assert!(
+            inbox.try_recv().is_err(),
+            "writer open emitted a predecessor hint"
+        );
+        handle.shutdown().await.unwrap();
+    }
+}
 
 #[cfg(test)]
 type EnqueueContentionProbe = Arc<dyn Fn() + Send + Sync>;
@@ -2665,6 +3135,35 @@ pub struct WalHandle {
 }
 
 impl WalHandle {
+    /// A media-free prefix has no captures or aging history to restore. Its already-seeded
+    /// placement is sufficient to start tracking the first later capture without rereading it.
+    #[cfg(feature = "test-attachments")]
+    pub fn empty_media_checkpoint(
+        &self,
+        at_seq: u64,
+    ) -> Result<crate::media_request::MediaCheckpoint, String> {
+        let _enqueue = self.lock_enqueue();
+        if self.durable_head.load(Ordering::Acquire) != at_seq
+            || self.next_seq.load(Ordering::Acquire) != at_seq + 1
+        {
+            return Err("media seed head changed before executor initialization".into());
+        }
+        let placement = self
+            .display_placement
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or("media seed has no validated placement")?;
+        Ok(crate::media_request::MediaCheckpoint::empty_at(
+            placement, at_seq,
+        ))
+    }
+
+    /// The boot-decided format of this writer, fixed for its lifetime.
+    pub fn is_overhaul(&self) -> bool {
+        self.v4
+    }
+
     /// Transfer only captures covered by a successful WAL barrier. Appends racing after that
     /// barrier wait for the next one, so an uncommitted steer cannot authorize rendered media.
     pub(crate) fn take_media_captures(&self) -> crate::compaction::CapturedMedia {
@@ -3210,7 +3709,7 @@ impl WalHandle {
         wal: Box<dyn Wal + Send>,
         last_seq: u64,
         fence: u64,
-        observer: Option<RecordObserver>,
+        mut observer: Option<RecordObserver>,
         lease: Option<Box<dyn LeaseHandle>>,
         startup: (StampClock, Option<open_writers::WriterContext>),
     ) -> Result<WalHandle, WalWriteError> {
@@ -3223,7 +3722,8 @@ impl WalHandle {
             lease,
         };
         let wal = owner.wal();
-        let v4 = wal.wal_config().is_overhaul();
+        let config = wal.wal_config();
+        let v4 = config.is_overhaul();
         if v4 && context.is_none() {
             return Err(WalWriteError::Failed(
                 "writer-id/v1: overhaul spawn requires a store marker root and session address"
@@ -3272,12 +3772,13 @@ impl WalHandle {
             budget.map(|(max_bytes, used_bytes, overhead)| {
                 Mutex::new(AppendBudget {
                     writer_close_reserve,
+                    reopen_reserve: retained_size::reopen_reserve_bytes(config),
                     retained: budget_scope == retained_size::SizeScope::RetainedSession,
                     session_max_bytes: recovery_cap.unwrap_or(max_bytes),
                     max_bytes,
                     used_bytes,
                     overhead,
-                    reserve: retained_size::reserve_bytes(overhead),
+                    reserve: retained_size::terminal_reserve_bytes(overhead, config),
                     refused: false,
                 })
             })
@@ -3324,10 +3825,16 @@ impl WalHandle {
                         }
                         writer_durable_head.store(wal.last_seq(), Ordering::Release);
                         *writer_lineage_id.lock().unwrap() = wal.lineage_id();
-                        if let Some(obs) = &observer {
+                        if let Some(obs) = &mut observer {
                             for (seq, record) in pending {
                                 obs.observe(seq, fence, &record, wal.lineage_id());
-                                obs.observe_tap(seq, fence, wal.lineage_id(), &record);
+                                obs.observe_tap(
+                                    seq,
+                                    fence,
+                                    wal.lineage_id(),
+                                    wal.writer_id(),
+                                    &record,
+                                );
                             }
                         }
                         Some(writer)
@@ -3786,6 +4293,7 @@ impl WalHandle {
                 if end
                     .saturating_add(self.publication_bytes.load(Ordering::SeqCst))
                     .saturating_add(reserve)
+                    .saturating_add(budget.reopen_reserve)
                     .saturating_add(budget.writer_close_reserve)
                     > budget.max_bytes
                 {
@@ -4366,7 +4874,7 @@ fn writer_loop_with_identity(
     mut wal: Box<dyn Wal + Send>,
     fence: u64,
     rx: std_mpsc::Receiver<WalCommand>,
-    observer: Option<RecordObserver>,
+    mut observer: Option<RecordObserver>,
     poisoned: Arc<Mutex<Option<WalWriteError>>>,
     durable_head: Arc<AtomicU64>,
     lineage_id: Arc<Mutex<Option<broca_wal::WalLineageId>>>,
@@ -4393,7 +4901,7 @@ fn writer_loop_with_identity(
     let mut pending_observed: Vec<(u64, Box<WalRecord>)> = Vec::new();
     let has_tap = observer
         .as_ref()
-        .is_some_and(|observer| observer.tap.is_some());
+        .is_some_and(|observer| observer.tap.is_some() || observer.step_events.is_some());
 
     // What the blocking wait below returned: a command, a bare timeout that
     // carried no command, or proof the handle is gone.
@@ -4430,7 +4938,7 @@ fn writer_loop_with_identity(
                         durable_head.store(last_fsynced_seq, Ordering::Release);
                         dirty = false;
                         deadline_at_ms = None;
-                        if let Some(obs) = &observer {
+                        if let Some(obs) = &mut observer {
                             if has_tap {
                                 for (seq, record) in &pending_observed {
                                     obs.observe(*seq, fence, record, wal.lineage_id());
@@ -4442,9 +4950,15 @@ fn writer_loop_with_identity(
                             }
                         }
                         if has_tap {
-                            if let Some(obs) = &observer {
+                            if let Some(obs) = &mut observer {
                                 for (seq, record) in pending_observed.drain(..) {
-                                    obs.observe_tap(seq, fence, wal.lineage_id(), &record);
+                                    obs.observe_tap(
+                                        seq,
+                                        fence,
+                                        wal.lineage_id(),
+                                        wal.writer_id(),
+                                        &record,
+                                    );
                                 }
                             }
                         }
@@ -4502,11 +5016,17 @@ fn writer_loop_with_identity(
                     Ok(()) => {
                         last_fsynced_seq = wal.last_seq();
                         durable_head.store(last_fsynced_seq, Ordering::Release);
-                        if let Some(obs) = &observer {
+                        if let Some(obs) = &mut observer {
                             for (seq, record) in pending_observed.drain(..) {
                                 obs.observe(seq, fence, &record, wal.lineage_id());
                                 if has_tap {
-                                    obs.observe_tap(seq, fence, wal.lineage_id(), &record);
+                                    obs.observe_tap(
+                                        seq,
+                                        fence,
+                                        wal.lineage_id(),
+                                        wal.writer_id(),
+                                        &record,
+                                    );
                                 }
                             }
                         }
@@ -4520,7 +5040,7 @@ fn writer_loop_with_identity(
                     writer.take(),
                     fence,
                     &stamp_clock,
-                    observer.as_ref(),
+                    observer.as_mut(),
                     &durable_head,
                     publication.publisher.as_mut(),
                 ) {
@@ -4590,7 +5110,7 @@ fn writer_loop_with_identity(
                             durable_head.store(last_fsynced_seq, Ordering::Release);
                             dirty = false;
                             deadline_at_ms = None;
-                            if let Some(obs) = &observer {
+                            if let Some(obs) = &mut observer {
                                 if has_tap {
                                     for (seq, record) in &pending_observed {
                                         obs.observe(*seq, fence, record, wal.lineage_id());
@@ -4615,9 +5135,9 @@ fn writer_loop_with_identity(
                 let durable = res.is_ok();
                 let _ = ack.send(res);
                 if durable && has_tap {
-                    if let Some(obs) = &observer {
+                    if let Some(obs) = &mut observer {
                         for (seq, record) in pending_observed.drain(..) {
-                            obs.observe_tap(seq, fence, wal.lineage_id(), &record);
+                            obs.observe_tap(seq, fence, wal.lineage_id(), wal.writer_id(), &record);
                         }
                     }
                 }
@@ -4637,11 +5157,17 @@ fn writer_loop_with_identity(
                 };
                 if result.is_ok() && dirty {
                     durable_head.store(wal.last_seq(), Ordering::Release);
-                    if let Some(obs) = &observer {
+                    if let Some(obs) = &mut observer {
                         for (seq, record) in pending_observed.drain(..) {
                             obs.observe(seq, fence, &record, wal.lineage_id());
                             if has_tap {
-                                obs.observe_tap(seq, fence, wal.lineage_id(), &record);
+                                obs.observe_tap(
+                                    seq,
+                                    fence,
+                                    wal.lineage_id(),
+                                    wal.writer_id(),
+                                    &record,
+                                );
                             }
                         }
                     }
@@ -4652,7 +5178,7 @@ fn writer_loop_with_identity(
                         writer.take(),
                         fence,
                         &stamp_clock,
-                        observer.as_ref(),
+                        observer.as_mut(),
                         &durable_head,
                         publication.publisher.as_mut(),
                     )
@@ -4681,7 +5207,7 @@ fn close_writer_identity(
     writer: Option<open_writers::OpenWriter>,
     fence: u64,
     clock: &StampClock,
-    observer: Option<&RecordObserver>,
+    observer: Option<&mut RecordObserver>,
     durable_head: &AtomicU64,
     publisher: Option<&mut broca_wal::head_proof::Publisher>,
 ) -> Result<(), WalWriteError> {
@@ -4713,7 +5239,7 @@ fn close_writer_identity(
             durable_head.store(seq, Ordering::Release);
             if let Some(obs) = observer {
                 obs.observe(seq, fence, &record, wal.lineage_id());
-                obs.observe_tap(seq, fence, wal.lineage_id(), &record);
+                obs.observe_tap(seq, fence, wal.lineage_id(), wal.writer_id(), &record);
             }
         }
         match writer.unlink() {

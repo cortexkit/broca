@@ -819,6 +819,33 @@ impl Rig {
         collect_subscription_frames_at(&mut self.reader, corr, quiet, None::<fn()>, |_| true).await
     }
 
+    /// `subscribe_collect_bound`, but first waiting under the shared hang guard for a frame
+    /// matching `until`. Only then does `quiet` start. A `{"from": "start"}` replay can take
+    /// longer than any fixed quiet window on a slow runner, so a test that needs a particular
+    /// replayed frame must wait for that frame rather than for the stream to go quiet.
+    pub async fn subscribe_collect_bound_until(
+        &mut self,
+        channel: u16,
+        params: serde_json::Value,
+        quiet: Duration,
+        until: impl Fn(&Frame) -> bool,
+    ) -> Vec<Frame> {
+        self.corr += 1;
+        let corr = self.corr;
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            1,
+            corr,
+            serde_json::to_vec(&serde_json::json!({"method":"session.subscribe","params":params}))
+                .unwrap(),
+        )
+        .unwrap();
+        write_frame(&mut self.writer, &frame).await.unwrap();
+        collect_subscription_frames_at(&mut self.reader, corr, quiet, Some(|| {}), until).await
+    }
+
     /// `subscribe_collect`, calling `on_attach` once the subscription's first frame arrives.
     /// Subscribed with `{"from": "start"}`, the control lane replays the lineage's durable
     /// records at attach, so its first control frame proves control replay has started, not
@@ -883,7 +910,9 @@ impl Rig {
             .await
     }
 
-    /// Release a held provider only after the requested display part actually crossed serve.
+    /// Release a held provider only after the requested display part actually crossed serve,
+    /// then collect through the run's `run_finished` control frame. A fixed quiet window alone
+    /// can close between two steps on a slow runner, dropping the rest of the run.
     pub async fn subscribe_release_after_part(&mut self, channel: u16, part: u64) -> Vec<Frame> {
         self.bind(channel).await;
         self.corr += 1;
@@ -928,11 +957,16 @@ impl Rig {
         .await;
         self.script.hold_stream(false);
         frames.extend(
-            collect_subscription_frames(
+            collect_subscription_frames_at(
                 &mut self.reader,
                 corr,
                 Duration::from_millis(300),
-                None::<fn()>,
+                Some(|| {}),
+                |frame| {
+                    serde_json::from_slice::<serde_json::Value>(&frame.body).is_ok_and(|body| {
+                        body["kind"] == "control" && body["unit"]["type"] == "run_finished"
+                    })
+                },
             )
             .await,
         );

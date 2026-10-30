@@ -18,6 +18,11 @@ use broca_protocol::{
 
 use crate::media_profile::{MediaCarrier, MediaProfile};
 
+#[cfg(feature = "test-attachments")]
+mod live;
+#[cfg(feature = "test-attachments")]
+pub use live::LiveMedia;
+
 /// An occurrence in the assembled prompt. Replacement messages can repeat a captured reference;
 /// each repetition counts against the budget even though the object is read from one digest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -55,7 +60,7 @@ pub enum AgingEvent {
 /// advancing an unchanged view touches only newly shown or newly unprotected media. Bytes
 /// and message text are never retained here. An aged occurrence never becomes young again
 /// merely because a compaction view temporarily hides it.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct MediaAging {
     shown: BTreeMap<Occurrence, (MediaCost, bool)>,
     unprotected: BTreeSet<Occurrence>,
@@ -165,43 +170,11 @@ impl MediaAging {
         let mut step_open = false;
         let mut active = profile.clone();
         for record in records {
-            session.fold(record)?;
-            let frozen = match record {
-                broca_wal::WalRecord::RunStarted { config, .. } => {
-                    Some(&config.frozen_render_config)
-                }
-                broca_wal::WalRecord::RunConfigRefrozen {
-                    frozen_render_config,
-                    ..
-                } => Some(frozen_render_config),
-                _ => None,
-            };
-            let next: Option<MediaProfile> = frozen
-                .and_then(|frozen| frozen.get("media"))
-                .filter(|value| !value.is_null())
-                .map(|value| {
-                    serde_json::from_value(value.clone())
-                        .map_err(|error| format!("invalid frozen media profile: {error}"))
-                })
-                .transpose()?;
-            if let Some(next) = next.filter(|next| next != &active) {
-                active = next;
-                state = Self::default();
-                state.reconcile_view(&active, &session.selected_bindings());
-                session.take_changes();
-            } else {
-                state.fold_changes(&active, session.take_changes());
-            }
+            state.fold_wal_record(&mut active, session, record)?;
             match record {
                 broca_wal::WalRecord::RunStarted { .. } => step_open = false,
                 broca_wal::WalRecord::StepStarted { .. } => step_open = true,
-                broca_wal::WalRecord::ModelAttemptFinished { .. } => {
-                    state.apply(&active, AgingEvent::Boundary)
-                }
-                broca_wal::WalRecord::ModelStepFinished { .. } => {
-                    state.apply(&active, AgingEvent::Boundary);
-                    step_open = false;
-                }
+                broca_wal::WalRecord::ModelStepFinished { .. } => step_open = false,
                 _ => {}
             }
         }
@@ -209,6 +182,50 @@ impl MediaAging {
             state.apply(&active, AgingEvent::Boundary);
         }
         Ok(state)
+    }
+
+    /// The incremental equivalent of replay, used by a live session after each durable tail.
+    pub fn fold_wal_record(
+        &mut self,
+        active: &mut MediaProfile,
+        session: &mut SessionMedia,
+        record: &broca_wal::WalRecord,
+    ) -> Result<(), String> {
+        session.fold(record)?;
+        let frozen = match record {
+            broca_wal::WalRecord::RunStarted { config, .. } => Some(&config.frozen_render_config),
+            broca_wal::WalRecord::RunConfigRefrozen {
+                frozen_render_config,
+                ..
+            } => Some(frozen_render_config),
+            _ => None,
+        };
+        let next: Option<MediaProfile> = frozen
+            .and_then(|frozen| frozen.get("media"))
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|error| format!("invalid frozen media profile: {error}"))
+            })
+            .transpose()?;
+        if let Some(next) = next.filter(|next| next != active) {
+            *active = next;
+            *self = Self::default();
+            self.reconcile_view(active, &session.selected_bindings());
+            session.take_changes();
+        } else {
+            self.fold_changes(active, session.take_changes());
+        }
+        match record {
+            broca_wal::WalRecord::ModelAttemptFinished { .. } => {
+                self.apply(active, AgingEvent::Boundary)
+            }
+            broca_wal::WalRecord::ModelStepFinished { .. } => {
+                self.apply(active, AgingEvent::Boundary);
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     pub fn replay(profile: &MediaProfile, events: impl IntoIterator<Item = AgingEvent>) -> Self {
@@ -541,8 +558,10 @@ pub fn fit_request(
 }
 
 /// Render an explicit prepared bundle and enforce limits on the complete bytes the family
-/// would send, including envelopes, tags and signatures. The tag projection must be pure:
-/// it is reapplied after each limit marker so stored part identities never change.
+/// would send, including envelopes, tags and signatures. The tag projection must be pure and
+/// preserve ordered media references: it is reapplied whenever request fitting replaces another
+/// media occurrence with a generated not-shown notice. `opts.prompt` supplies the original selected
+/// media layout; generated notices must not choose tag placement.
 /// With no bundle, use the original renderer verbatim (including legacy carrier markers).
 pub fn render_prepared(
     family: &dyn crate::wire::WireFamily,
@@ -556,7 +575,7 @@ pub fn render_prepared(
     };
     let render = |candidate: &PreparedBundle| {
         let mut options = opts.clone();
-        options.prompt = render_tags(&candidate.prompt);
+        options.prompt = tagged_prepared_prompt(&opts.prompt, &candidate.prompt, render_tags);
         let payloads: Vec<_> = candidate
             .media
             .iter()
@@ -572,6 +591,95 @@ pub fn render_prepared(
         fit_request(profile, bundle, |candidate| render(candidate).len() as u64)?;
     }
     Ok(render(bundle))
+}
+
+fn tagged_prepared_prompt(
+    original: &[Message],
+    prepared: &[Message],
+    render_tags: &dyn Fn(&[Message]) -> Vec<Message>,
+) -> Vec<Message> {
+    let originals = references(original);
+    let replacements: HashMap<_, _> = originals
+        .iter()
+        .filter_map(|(location, _, _)| {
+            prepared_text(prepared, *location).map(|text| {
+                (
+                    (location.message, location.block, location.part),
+                    text.to_owned(),
+                )
+            })
+        })
+        .collect();
+    if replacements.is_empty() {
+        return render_tags(prepared);
+    }
+    // A generated notice is not original tool text. Restore only original media slots while
+    // choosing tags, then overlay notices after an image-only label can shift the part indices.
+    let mut basis = prepared.to_vec();
+    for (location, reference, _) in originals {
+        if replacements.contains_key(&(location.message, location.block, location.part)) {
+            restore_reference(&mut basis, location, reference);
+        }
+    }
+    let before = references(&basis);
+    let mut tagged = render_tags(&basis);
+    let after = references(&tagged);
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "tag projection must retain media references"
+    );
+    let overlays: Vec<_> = before
+        .iter()
+        .zip(after.iter())
+        .filter_map(
+            |((location, reference, tool), (projected, projected_reference, projected_tool))| {
+                assert_eq!(
+                    (reference, tool),
+                    (projected_reference, projected_tool),
+                    "tag projection must preserve media order"
+                );
+                replacements
+                    .get(&(location.message, location.block, location.part))
+                    .map(|text| (*projected, text.clone()))
+            },
+        )
+        .collect();
+    for (location, text) in overlays {
+        replace_with_text(&mut tagged, location, text);
+    }
+    tagged
+}
+
+fn prepared_text(prompt: &[Message], location: MediaLocation) -> Option<&str> {
+    let block = prompt.get(location.message)?.content.get(location.block)?;
+    if let Some(part) = location.part {
+        if let ContentBlock::ToolResult(result) = block {
+            if let ToolOutput::Parts { parts } = &result.output {
+                if let ToolOutputPart::Text { text } = parts.get(part)? {
+                    return Some(text);
+                }
+            }
+        }
+    } else if let ContentBlock::Text { text } = block {
+        return Some(text);
+    }
+    None
+}
+
+fn restore_reference(prompt: &mut [Message], location: MediaLocation, reference: &MediaRef) {
+    let block = &mut prompt[location.message].content[location.block];
+    if let Some(part) = location.part {
+        if let ContentBlock::ToolResult(result) = block {
+            if let ToolOutput::Parts { parts } = &mut result.output {
+                parts[part] = ToolOutputPart::Media {
+                    media: reference.clone(),
+                };
+            }
+        }
+    } else {
+        *block = ContentBlock::Media(reference.clone());
+    }
 }
 
 fn breaks_counts(profile: &MediaProfile, bundle: &PreparedBundle) -> bool {
@@ -647,7 +755,10 @@ fn mark(
     media: &MediaRef,
     reason: MediaMarkerReason,
 ) {
-    let text = media_not_shown_marker(media, reason);
+    replace_with_text(prompt, location, media_not_shown_marker(media, reason));
+}
+
+fn replace_with_text(prompt: &mut [Message], location: MediaLocation, text: String) {
     let block = &mut prompt[location.message].content[location.block];
     if let Some(part) = location.part {
         if let ContentBlock::ToolResult(result) = block {

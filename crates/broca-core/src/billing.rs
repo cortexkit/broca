@@ -248,14 +248,20 @@ pub struct SpendSegment {
     pub occurred_at_precision: TimestampPrecision,
     /// Only the final segment carries the run's terminal reason.
     pub terminal_reason: Option<RunFinishReason>,
-    /// `true` only on the fact for one cache warm: a re-send of the run's most recent request
-    /// that generated nothing and kept the provider's cached prefix alive, priced like any
-    /// request from its own usage. Such a fact is derived from its own WAL record: its
+    /// `true` only on the fact for one cache warm attempt, priced from its own reported usage.
+    /// Legacy facts describe successful refreshes; new facts with `bill-attempts/v1` evidence
+    /// carry `warm_outcome` so a failed attempt is not mistaken for a refreshed cache.
+    /// Each fact uses its own WAL record: its
     /// `segment_ordinal` is that record's WAL sequence and its `fact_id` is taken over that
     /// sequence, so it never moves the ids or ordinals of the run's ordinary segments. Absent on
     /// every other fact, which keeps their bytes and ids exactly what they were.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub warm: bool,
+    /// Outcome of a warm attempt with `bill-attempts/v1` evidence. Absent on legacy success-only
+    /// warm facts, ordinary model-step facts and facts stored before this field existed;
+    /// a failure can still carry provider-reported billable usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_outcome: Option<broca_wal::record::BillingAttemptOutcome>,
 }
 
 #[derive(Debug)]
@@ -470,6 +476,7 @@ impl OpenRun {
             terminal_reason: terminal
                 .then_some(self.terminal_reason.unwrap_or(RunFinishReason::Interrupted)),
             warm: false,
+            warm_outcome: None,
         });
         self.usage = Usage::default();
         self.usage_by_service_tier.clear();
@@ -684,6 +691,7 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
                 step_id,
                 usage,
                 sent_at_ms,
+                envelope,
                 ..
             } => {
                 // A warm is billed under the run whose request it re-sent. A warm naming a run
@@ -701,9 +709,15 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
                             run_id,
                             session,
                             routed.as_ref().unwrap_or(config),
-                            *usage,
+                            envelope
+                                .as_deref()
+                                .map_or(*usage, |e| e.usage.unwrap_or_default()),
                             framed.seq,
-                            *sent_at_ms,
+                            envelope
+                                .as_deref()
+                                .and_then(|e| e.sent_at_ms.or(e.finished_at_ms))
+                                .unwrap_or(*sent_at_ms),
+                            envelope.as_deref().map(|e| e.outcome),
                             resolver,
                         );
                         segment.agent_id = scope.as_ref().and_then(|scope| scope.agent_id.clone());
@@ -814,6 +828,7 @@ fn warm_segment<R: ChargeBasisResolver>(
     usage: Usage,
     wal_seq: u64,
     sent_at_ms: u64,
+    outcome: Option<broca_wal::record::BillingAttemptOutcome>,
     resolver: &R,
 ) -> SpendSegment {
     let selection = config.auth_selection.as_ref();
@@ -852,6 +867,7 @@ fn warm_segment<R: ChargeBasisResolver>(
         occurred_at_precision: TimestampPrecision::Exact,
         terminal_reason: None,
         warm: true,
+        warm_outcome: outcome,
     }
 }
 
@@ -2136,6 +2152,61 @@ mod tests {
                 expires_at_ms: Some(sent_at_ms + 300_000),
             },
         )
+    }
+
+    #[test]
+    fn legacy_warm_fact_bytes_and_id_are_pinned() {
+        let records = vec![
+            started_with_account(
+                1,
+                "run",
+                Some(100),
+                Some("apikey:anthropic:work"),
+                Some("acct-1"),
+            ),
+            warmed(9, "run", Usage::default(), 500),
+        ];
+        let facts = compute_segments(&records, "instance-a", &resolver);
+        let warm = facts.iter().find(|f| f.warm).unwrap();
+        assert_eq!(warm.warm_outcome, None);
+        const LEGACY: &str = r#"{"run_id":"run","session":{"project_root":"/tmp/project","harness":"runner","session":"session"},"segment_ordinal":9,"fact_id":"39c0ab5977282739d341b597904e56d11ba8152121a7198e57a2672efdc10440","provider":"anthropic","model":"claude","auth_selection":"apikey:anthropic:work","account_ref":"acct-1","charge_basis":"metered_api","charge_basis_mapping_version":1,"charge_basis_overrides":"none","usage":{},"retries_used":0,"pricing_at_ms":500,"pricing_at_precision":"exact","occurred_at_ms":500,"occurred_at_precision":"exact","terminal_reason":null,"warm":true}"#;
+        assert_eq!(serde_json::to_string(warm).unwrap(), LEGACY);
+        assert_eq!(
+            warm.fact_id,
+            "39c0ab5977282739d341b597904e56d11ba8152121a7198e57a2672efdc10440"
+        );
+    }
+
+    #[test]
+    fn overhaul_warm_export_preserves_failure_outcome_and_reported_usage() {
+        use broca_wal::record::{AttemptEnvelope, AttemptSent, BillingAttemptOutcome as Outcome};
+        let mut failed = warmed(9, "run", usage(999, 999), 500);
+        if let WalRecord::CacheWarmed { envelope, .. } = &mut failed.record {
+            *envelope = Some(Box::new(AttemptEnvelope {
+                sent: AttemptSent::Yes,
+                outcome: Outcome::HttpError,
+                usage: Some(usage(3, 1)),
+                ..Default::default()
+            }));
+        }
+        let records = vec![
+            started_with_account(
+                1,
+                "run",
+                Some(100),
+                Some("apikey:anthropic:work"),
+                Some("acct-1"),
+            ),
+            failed,
+        ];
+        let facts = compute_segments(&records, "instance-a", &resolver);
+        let warm = facts.iter().find(|f| f.warm).unwrap();
+        assert_eq!(warm.warm_outcome, Some(Outcome::HttpError));
+        assert_eq!(
+            warm.usage,
+            usage(3, 1),
+            "the envelope, not the legacy usage copy, is authoritative"
+        );
     }
 
     /// A warm is its own fact, marked `warm`, priced from its own usage and dated by its own

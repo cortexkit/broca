@@ -4,7 +4,7 @@
 //! advance notices.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -33,6 +33,53 @@ use crate::{
 
 const PROVIDER: &str = "compactor";
 const APPLIED_HEAD: &str = "durable compacted head";
+
+const CEILING_NOW_MS: u64 = 1_000_000;
+const CEILING_WAIT_MS: u64 = 5;
+
+struct CeilingTime {
+    root: PathBuf,
+    clock: broca_core::Clock,
+}
+
+impl CeilingTime {
+    fn new() -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = broca_test_support::scratch_root().join(format!(
+            "ceiling-clock-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("test-clock"),
+            json!({"now_ms": CEILING_NOW_MS}).to_string(),
+        )
+        .unwrap();
+        Self {
+            clock: broca_core::Clock::for_state_root(&root).unwrap(),
+            root,
+        }
+    }
+
+    fn expire(&self) {
+        if self.clock.now_ms() == CEILING_NOW_MS + CEILING_WAIT_MS {
+            return;
+        }
+        std::fs::write(
+            self.root.join("test-clock"),
+            json!({"now_ms": CEILING_NOW_MS + CEILING_WAIT_MS}).to_string(),
+        )
+        .unwrap();
+        self.clock.refresh().unwrap();
+    }
+}
+
+impl Drop for CeilingTime {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
 
 #[tokio::test]
 async fn compaction_requests_match_the_pre_windowing_bytes() {
@@ -97,6 +144,9 @@ fn control() -> RunControl {
 /// `control` with `provider` as the session's compaction provider: the one scripted provider
 /// serves Setup and `view.get` and is the source of the run's `view_ready` events.
 fn with_compaction(mut control: RunControl, provider: Arc<ScriptedCompaction>) -> RunControl {
+    if let Some(time) = &provider.ceiling_time {
+        control.clock = Some(time.clock.clone());
+    }
     control.compaction_plane = Some(provider.clone());
     control.compaction_views = Some(provider);
     control
@@ -232,13 +282,7 @@ fn ceiling_timeout_control() -> RunControl {
 fn ceiling_control_with(view: bool) -> RunControl {
     let mut control = control();
     control.admitted_context_limit = Some(20_000);
-    with_compaction(
-        control,
-        Arc::new(ScriptedCompaction {
-            ceiling: Some(view),
-            ..Default::default()
-        }),
-    )
+    with_compaction(control, Arc::new(ScriptedCompaction::at_ceiling(view)))
 }
 const CEILING_SCENARIO: Scenario = Scenario {
     name: "compaction-ceiling",
@@ -364,6 +408,9 @@ fn replacement(version: u64, text: &str) -> Value {
 struct ScriptedCompaction {
     /// At the ceiling, return a smaller view or let the bound expire.
     ceiling: Option<bool>,
+    ceiling_time: Option<CeilingTime>,
+    ride_answered: AtomicBool,
+    late_ride: bool,
     block_ride: Option<std::path::PathBuf>,
     setups: AtomicUsize,
     /// `view.get` calls answered with a view.
@@ -377,6 +424,15 @@ struct ScriptedCompaction {
 }
 
 impl ScriptedCompaction {
+    fn at_ceiling(view: bool) -> Self {
+        Self {
+            ceiling: Some(view),
+            // Keep the five-millisecond policy, but spend none of it on scheduling or WAL I/O.
+            ceiling_time: (!view).then(CeilingTime::new),
+            ..Default::default()
+        }
+    }
+
     fn signed() -> Self {
         Self {
             signed: true,
@@ -412,7 +468,7 @@ impl CompactionPlane for ScriptedCompaction {
             return Ok(serde_json::from_value(
                 json!({"answer":"ready", "request_id":request.request_id,
                 "initial":replacement(1, &"large head ".repeat(800)),
-                "ceiling":{"at_share":0.1,"wait_ms":if view { 300_000 } else { 5 }}}),
+                "ceiling":{"at_share":0.1,"wait_ms":if view { 300_000 } else { CEILING_WAIT_MS }}}),
             )
             .unwrap());
         }
@@ -451,6 +507,11 @@ impl CompactionPlane for ScriptedCompaction {
             std::fs::write(marker, b"ceiling ride entered").unwrap();
             return std::future::pending().await;
         }
+        if self.late_ride {
+            // Make the response miss its absolute deadline even if select polls it first.
+            self.ceiling_time.as_ref().unwrap().expire();
+        }
+        self.ride_answered.store(true, Ordering::SeqCst);
         Ok(match self.ceiling {
             Some(true) => broca_core::compaction_provider::ride::RideAnswer::view(
                 self.published(&request.session_ref, 2).unwrap(),
@@ -516,6 +577,13 @@ impl CompactionViews for ScriptedCompaction {
         // A `view_ready` event names no lineage; the scripted provider learns the run's from
         // its first boundary, as a real provider learns it from the run's notices.
         *self.lineage.lock().unwrap() = Some(lineage_id.into());
+        if self.ride_answered.load(Ordering::SeqCst) {
+            if let Some(time) = &self.ceiling_time {
+                // The run queries announcements again only after recording the ride answer.
+                // Expire the wait here, not inside ride(), where Nothing would become late.
+                time.expire();
+            }
+        }
         if self.ceiling.is_some() {
             return None;
         }
@@ -536,6 +604,20 @@ async fn resume_with(
     kill: &KillReport,
     compaction: Arc<ScriptedCompaction>,
 ) -> Resumed {
+    // A recorded answer is not ridden again on replay. Give that prefix the same clock
+    // transition as a fresh timely Nothing, without changing its persisted deadline.
+    compaction.ride_answered.store(
+        kill.durable.records().iter().any(|record| {
+            matches!(
+                record,
+                WalRecord::ContextCeilingWait {
+                    unavailable: Some(false),
+                    ..
+                }
+            )
+        }),
+        Ordering::SeqCst,
+    );
     let provider = ScriptedProvider::for_scenario(&scenario);
     let plane = HarnessPlane::for_scenario(&scenario);
     let store = FileWalStore::new(kill.state_root.join("wal"));
@@ -856,6 +938,41 @@ async fn signed_reasoning_strip_and_a_second_view_replay_identical_bytes_at_ever
 }
 
 #[tokio::test]
+async fn ceiling_late_nothing_is_provider_unavailable() {
+    let compaction = Arc::new(ScriptedCompaction {
+        late_ride: true,
+        ..ScriptedCompaction::at_ceiling(false)
+    });
+    let root = compaction.ceiling_time.as_ref().unwrap().root.clone();
+    let provider = ScriptedProvider::for_scenario(&CEILING_TIMEOUT_SCENARIO);
+    let plane = HarnessPlane::for_scenario(&CEILING_TIMEOUT_SCENARIO);
+    let outcome = drive(
+        request(),
+        with_compaction(ceiling_timeout_control(), compaction.clone()),
+        &root,
+        &FileWalStore::new(root.join("wal")),
+        &provider,
+        &plane,
+    )
+    .await;
+    assert_eq!(outcome.reason, RunFinishReason::ContextCeiling);
+    assert_eq!(provider.request_count(), 0);
+    let log = LogImage::read(&wal_path(&root, &request().session));
+    assert!(log.records().iter().any(|record| matches!(
+        record,
+        WalRecord::ContextCeilingWait {
+            unavailable: Some(true),
+            ..
+        }
+    )));
+    let state = broca_core::reconcile_run_state(log.records().iter(), "compaction-run").unwrap();
+    let detail = state.context_ceiling.unwrap();
+    println!("late Nothing: {}", detail.cause);
+    assert_eq!(detail.cause, "provider_unavailable");
+    assert!(state.error.is_none());
+}
+
+#[tokio::test]
 async fn ceiling_wait_and_terminal_state_survive_every_record_and_torn_frame_cut() {
     for (scenario, sends_view) in [(CEILING_SCENARIO, true), (CEILING_TIMEOUT_SCENARIO, false)] {
         let handle = RunnerHandle::new(scenario).await;
@@ -871,9 +988,8 @@ async fn ceiling_wait_and_terminal_state_survive_every_record_and_torn_frame_cut
         for point in handle.record_boundaries(true) {
             let kill = handle.kill_at(point, KillTrigger::Truncate).await;
             let compaction = Arc::new(ScriptedCompaction {
-                ceiling: Some(sends_view),
                 lineage: Mutex::new(kill.durable.lineage_id().map(|id| id.to_string())),
-                ..Default::default()
+                ..ScriptedCompaction::at_ceiling(sends_view)
             });
             let resumed = resume_with(scenario, &kill, compaction).await;
             handle.check(&kill, &resumed);
@@ -905,7 +1021,9 @@ async fn ceiling_wait_and_terminal_state_survive_every_record_and_torn_frame_cut
                     broca_core::reconcile_run_state(after.iter(), "compaction-run").unwrap();
                 assert_eq!(
                     state.context_ceiling.as_ref().unwrap().cause,
-                    "view_timeout"
+                    "view_timeout",
+                    "{}",
+                    kill.label()
                 );
                 assert!(state.error.is_none());
             }

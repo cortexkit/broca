@@ -631,7 +631,9 @@ impl Runtime<'_> {
         }
         let mut estimate = |state: &CompactionState| -> Result<u64, crate::RunError> {
             request
-                .refresh(opts, state, systems, |model| provider.render_request(model))
+                .refresh_checked(opts, state, systems, |model| {
+                    provider.try_render_request(model)
+                })
                 .map_err(|e| crate::RunError::Wal(e.to_string()))?;
             Ok(request_estimate(request.bytes, &state.history).0)
         };

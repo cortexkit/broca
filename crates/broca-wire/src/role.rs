@@ -298,6 +298,22 @@ pub struct RoleDescribeResponse {
     pub role: cortexkit_role_llm_runner::describe::RoleDescribe,
     pub session_class: SessionClassCapability,
 }
+
+impl RoleDescribeResponse {
+    /// Advertise live attempt hints only when their publisher is installed. Decoding the
+    /// event type does not promise publication; shipping routes leave this switched off.
+    pub fn with_step_events(mut self, step_events_enabled: bool) -> Self {
+        use cortexkit_role_llm_runner::{capabilities::STEP_EVENTS, step_events::StepEvents};
+        self.role.capabilities.retain(|name| name != STEP_EVENTS);
+        self.role.step_events = if step_events_enabled {
+            self.role.capabilities.push(STEP_EVENTS.into());
+            Some(StepEvents::new("per_attempt", "step_ref"))
+        } else {
+            None
+        };
+        self
+    }
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionClassCapability {
     pub backup_classes: Vec<String>,
@@ -587,6 +603,51 @@ mod pinned_reply_bytes {
     use super::*;
     use crate::scope_refusal_golden::assert_golden;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn step_events_declaration_follows_only_the_publisher_switch() {
+        use cortexkit_role_llm_runner::{capabilities::STEP_EVENTS, describe::check_describe};
+        let shipping = broca_role_describe_with_writers("test", true, true, true);
+        assert!(shipping.role.step_events.is_none());
+        assert!(!shipping
+            .role
+            .capabilities
+            .iter()
+            .any(|name| name == STEP_EVENTS));
+        for enabled in [false, true] {
+            let describe = shipping
+                .clone()
+                .with_step_events(enabled)
+                .with_step_events(enabled);
+            let raw = serde_json::to_value(&describe).unwrap();
+            check_describe(&raw).unwrap();
+            assert_eq!(
+                describe
+                    .role
+                    .capabilities
+                    .iter()
+                    .filter(|name| *name == STEP_EVENTS)
+                    .count(),
+                usize::from(enabled)
+            );
+            if enabled {
+                let vectors: serde_json::Value = serde_json::from_str(
+                    cortexkit_role_llm_runner::vectors::file("step-events.json").unwrap(),
+                )
+                .unwrap();
+                assert_eq!(raw["step_events"], vectors["valid_policies"][0]);
+            } else {
+                assert!(raw.get("step_events").is_none());
+            }
+        }
+        assert_eq!(
+            shipping
+                .clone()
+                .with_step_events(true)
+                .with_step_events(false),
+            shipping
+        );
+    }
 
     fn golden(file: &str) -> Vec<u8> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

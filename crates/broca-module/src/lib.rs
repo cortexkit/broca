@@ -33,6 +33,8 @@ mod uploads;
 pub use cache::{CacheDeclaration, CacheDeclarer};
 pub use executor::{RunExecutor, RunJob, RunKind, SealedRun, WarmBase, WarmError, WarmJob};
 pub use fanout::{Delivery, FromCursor};
+#[cfg(feature = "test-clock")]
+pub use keep_warm::{automatic_warmer_for_test, warm_setup_for_allocation_test};
 pub use opener::DefaultOpener;
 pub use registry::{LineageKey, LineageRegistry};
 pub use serve::{
