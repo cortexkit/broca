@@ -290,16 +290,39 @@ async fn upload(rig: &Rig, mime: &str, bytes: &[u8]) -> String {
     let first = request(rig, "media", "session.upload_append", chunk.clone())
         .await
         .unwrap();
+    assert_eq!(first, json!({"received":bytes.len()}));
+    let staged = media_files(rig.wal_dir().parent().unwrap());
+    let retry = request(rig, "media", "session.upload_append", chunk)
+        .await
+        .unwrap_err();
+    assert!(
+        retry.starts_with("subc rejected: upload_offset_mismatch —"),
+        "{retry}"
+    );
     assert_eq!(
-        request(rig, "media", "session.upload_append", chunk)
-            .await
-            .unwrap(),
-        first
+        media_files(rig.wal_dir().parent().unwrap()),
+        staged,
+        "a lost-reply retry must not change staging"
+    );
+    assert_eq!(
+        request(
+            rig,
+            "media",
+            "session.upload_status",
+            json!({"upload_id":id})
+        )
+        .await
+        .unwrap(),
+        json!({"state":"open","received":bytes.len()})
     );
     let commit = json!({"upload_id":id});
     let first = request(rig, "media", "session.upload_commit", commit.clone())
         .await
         .unwrap();
+    assert_eq!(
+        first,
+        json!({"state":"committed","sha256":format!("{:x}",Sha256::digest(bytes)),"mime":mime,"bytes":bytes.len()})
+    );
     assert_eq!(
         request(rig, "media", "session.upload_commit", commit)
             .await

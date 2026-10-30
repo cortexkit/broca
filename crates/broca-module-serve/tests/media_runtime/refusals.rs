@@ -64,8 +64,31 @@ pub(super) async fn run(rig: &mut Rig, enabled: bool, case: &str) -> bool {
             assert_eq!(refusal(&replay)["code"], "upload_offset_mismatch");
             assert_eq!(refusal(&replay)["detail"]["received"], 3);
             assert_eq!(
-                std::fs::read(rig.dir.join("media-uploads/objects").join(id)).unwrap(),
+                std::fs::read(rig.dir.join("media-uploads/objects").join(&id)).unwrap(),
                 &PNG[..3]
+            );
+            assert_eq!(rig.wal_bytes(), before);
+            assert_eq!(
+                result(&call(rig, "session.upload_status", json!({"upload_id":id})).await),
+                json!({"state":"open","received":3})
+            );
+            assert_eq!(
+                result(&append(rig, &id, 3, &PNG[3..]).await)["received"],
+                PNG.len()
+            );
+            let committed =
+                result(&call(rig, "session.upload_commit", json!({"upload_id":id})).await);
+            assert_eq!(
+                committed,
+                json!({"state":"committed","sha256":digest(PNG),"mime":"image/png","bytes":PNG.len()})
+            );
+            assert_eq!(
+                result(&call(rig, "session.upload_commit", json!({"upload_id":id})).await),
+                committed
+            );
+            assert_eq!(
+                std::fs::read(rig.dir.join("media-uploads/objects").join(id)).unwrap(),
+                PNG
             );
             assert_eq!(rig.wal_bytes(), before);
         }
