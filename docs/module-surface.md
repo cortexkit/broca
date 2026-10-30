@@ -1446,6 +1446,12 @@ unknown keys inside `media` refuse boot by name. The decision is read once befor
 are opened: enabling or disabling media requires restarting broca. `test-attachments`
 remains a non-shipping feature for test seams, not a deployment prerequisite.
 
+Every fresh enabled episode whose model explicitly supports a non-text input modality
+freezes its adapter media profile, even for text-only input: a tool may return an image
+after the first model request. Requests without media retain their ordinary rendered bytes.
+Resume never adds a profile to an older recorded configuration; those runs keep their media
+markers until a fresh episode is admitted. Existing per-family carrier gates remain in force.
+
 When enabled, `role.describe` declares the llm-runner `attachments` group and its upload
 and `session.media_read` operations. When disabled, it declares neither the group nor
 `session.media_read`; existing upload staging remains available but cannot be sent.
@@ -1459,9 +1465,23 @@ Capture authorization uses the stored admission checkpoint and a strictly anchor
 WAL tail, not a replay of the transcript for every chunk. A missing or unusable checkpoint
 requires a named, counted full-replay repair through the shared media-seed fallback counter.
 
+Enabled upload appends are strictly contiguous; replaying a chunk refuses
+`upload_offset_mismatch` with the current `received` count. Disabled legacy staging keeps
+its existing identical-chunk retry behavior. Sends preserve the upload refusal codes
+(`unknown_upload`, `upload_gone`, `upload_not_committed`) instead of reporting a failed
+session open. A disabled send carrying an upload is still refused before admission.
+
+Enabled `session.head.input` quotes a finished episode's next model from the in-memory catalog
+and adapter MIME filter without changing the recorded config or fetching catalog data.
+Active resident heads use frozen facts published by the writer's durable metadata tap.
+Nonresident resumable heads cache the frozen facts by session, lineage and WAL sequence;
+only a cold position requires a historical read. No stored head-projection shape is added.
+
 Default reads keep media as text markers. `session.read` with `media: "blocks"` returns
 stored references; descriptors and history display rows expose refs rather than payload
-bytes. Provider rendering uses the frozen family's media profile; unsupported person input
+bytes. Enabled blocks reads include stored-content message/part identities for media-bearing
+entries. Default enabled model-view reads also use not-requested text markers; explicit
+blocks mode keeps native media references. Provider rendering uses the frozen family's media profile; unsupported person input
 is refused before publication, including ChatGPT audio. Sessions holding media refuse
 agent-data moves before any cut or freeze because move transport currently carries WALs
 only. The existing Engram catalog already includes `media-durable` as a portable filetree

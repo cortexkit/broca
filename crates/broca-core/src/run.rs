@@ -871,6 +871,8 @@ pub enum RunError {
     Config(String),
     /// Person media failed admission before a record could name it.
     MediaUnsupported(String),
+    /// Preserve the upload contract's refusal code and retry class before admission.
+    Upload(crate::media_uploads::UploadError),
     /// Unsupported reasoning variant, refused before durable admission.
     VariantUnsupported(VariantRefusal),
     /// Admission failed because a required dependency is temporarily unavailable. Nothing
@@ -993,6 +995,7 @@ impl RunError {
     /// failures may recover without changing the logical send.
     pub fn admission_error_class(&self) -> ErrorClass {
         match self {
+            Self::Upload(error) => error.error_class(),
             Self::Config(_)
             | Self::MediaUnsupported(_)
             | Self::VariantUnsupported(_)
@@ -1035,6 +1038,7 @@ impl std::fmt::Display for RunError {
             RunError::VariantUnsupported(s) => write!(f, "run resolution failed: {s}"),
             RunError::Config(s) => write!(f, "run resolution failed: {s}"),
             RunError::MediaUnsupported(s) => write!(f, "{s}"),
+            RunError::Upload(error) => write!(f, "{error}"),
             RunError::Transient(s) => write!(f, "run admission temporarily unavailable: {s}"),
             RunError::SendIdReuse { differing } => write!(
                 f,

@@ -3205,6 +3205,17 @@ where
                         refusal_delivery_mode,
                         &error,
                     );
+                    if let ServeError::Upload(upload) = &error {
+                        return send_error_body(
+                            writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            upload_error_body(upload, true),
+                        )
+                        .await;
+                    }
                     send_serve_error(writer, ver, channel, epoch, corr, &error).await
                 }
             }
@@ -4324,6 +4335,7 @@ fn shared_class_name(class: broca_protocol::ErrorClass) -> &'static str {
 
 fn refused_send_class(error: &ServeError) -> &'static str {
     match error {
+        ServeError::Upload(error) => shared_class_name(error.error_class()),
         ServeError::Open(_, Some(class)) => shared_class_name(*class),
         ServeError::AccountSelectionRefused(refusal) => shared_class_name(refusal.class),
         ServeError::RoutingUnavailable(_)
@@ -4357,6 +4369,20 @@ fn log_refused_send(
     );
 }
 
+fn upload_error_body(error: &broca_core::media_uploads::UploadError, for_send: bool) -> ErrorBody {
+    let mut detail = serde_json::json!({});
+    if let Some(field) = error.field {
+        detail["field"] = field.into();
+    }
+    if let Some(received) = error.received {
+        detail["received"] = received.into();
+    }
+    if for_send || error.error_class() == broca_protocol::ErrorClass::Transient {
+        detail["class"] = shared_class_name(error.error_class()).into();
+    }
+    ErrorBody::new(error.code, error.to_string()).with_detail(detail)
+}
+
 async fn send_serve_error(
     writer: &EgressSender<Frame>,
     ver: u8,
@@ -4383,20 +4409,7 @@ async fn send_serve_error(
     }
     let code = match err {
         ServeError::Upload(error) => {
-            let mut detail = serde_json::json!({});
-            if let Some(field) = error.field {
-                detail["field"] = field.into();
-            }
-            if let Some(received) = error.received {
-                detail["received"] = received.into();
-            }
-            if matches!(
-                error.code,
-                "upload_staging_full" | "upload_session_full" | "upload_store_failed"
-            ) {
-                detail["class"] = "transient".into();
-            }
-            let body = ErrorBody::new(error.code, error.to_string()).with_detail(detail);
+            let body = upload_error_body(error, false);
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
         ServeError::ReplyTooLarge(_) => unreachable!("reply_too_large returned above"),

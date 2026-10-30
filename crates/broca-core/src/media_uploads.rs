@@ -41,7 +41,7 @@ const fn largest_store_maximum() -> u64 {
     maximum
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadError {
     pub code: &'static str,
     pub subject: String,
@@ -61,6 +61,14 @@ impl From<io::Error> for UploadError {
     }
 }
 impl UploadError {
+    pub fn error_class(&self) -> broca_protocol::ErrorClass {
+        match self.code {
+            "upload_staging_full" | "upload_session_full" | "upload_store_failed" => {
+                broca_protocol::ErrorClass::Transient
+            }
+            _ => broca_protocol::ErrorClass::Permanent,
+        }
+    }
     pub fn new(code: &'static str, subject: impl Into<String>) -> Self {
         Self {
             code,
@@ -297,6 +305,31 @@ impl Uploads {
         bytes: &[u8],
         now: u64,
     ) -> Result<wire::UploadAppendReply, UploadError> {
+        self.append_inner(identity, id, offset, bytes, now, true)
+    }
+
+    /// Unlike `append`, reject an earlier chunk even if its bytes match. The refusal returns
+    /// the current byte count so the caller can resume from that offset.
+    pub fn append_strict(
+        &self,
+        identity: &BindIdentity,
+        id: &str,
+        offset: u64,
+        bytes: &[u8],
+        now: u64,
+    ) -> Result<wire::UploadAppendReply, UploadError> {
+        self.append_inner(identity, id, offset, bytes, now, false)
+    }
+
+    fn append_inner(
+        &self,
+        identity: &BindIdentity,
+        id: &str,
+        offset: u64,
+        bytes: &[u8],
+        now: u64,
+        replay_identical: bool,
+    ) -> Result<wire::UploadAppendReply, UploadError> {
         wire::check_chunk_size(bytes.len()).map_err(|code| UploadError::new(code, id))?;
         let _lock = self.lock()?;
         let meta = self.load(identity, id, now)?;
@@ -309,7 +342,7 @@ impl Uploads {
             .open(self.data_path(id))?;
         let received = file.metadata()?.len();
         let end = offset.checked_add(bytes.len() as u64);
-        if offset < received && end.is_some_and(|end| end <= received) {
+        if replay_identical && offset < received && end.is_some_and(|end| end <= received) {
             file.seek(SeekFrom::Start(offset))?;
             let mut previous = vec![0; bytes.len()];
             file.read_exact(&mut previous)?;

@@ -624,7 +624,7 @@ fn final_message_from_prompt(
     })
 }
 
-fn recorded_interrupt_reason(
+pub(crate) fn recorded_interrupt_reason(
     records: &[broca_wal::FramedRecord],
     run_id: &broca_protocol::RunId,
 ) -> Option<String> {
@@ -2317,12 +2317,17 @@ impl ServeHandler for crate::LineageRegistry {
                 requested: req.lineage_id.unwrap(),
             });
         }
-        let page: broca_wire::ModelPage = page.try_into().map_err(|error| {
+        let mut page: broca_wire::ModelPage = page.try_into().map_err(|error| {
             ServeError::Open(
                 format!("model page source: {error}"),
                 Some(broca_protocol::ErrorClass::Permanent),
             )
         })?;
+        if broca_protocol::attachments_enabled()
+            && req.media == cortexkit_role_llm_runner::read::MediaMode::Inline
+        {
+            page.render_inline_media();
+        }
         let subject = model_group_reply_too_large_subject(&page);
         if let Some(error) =
             reply_frame_limit_refusal(broca_wire::serialized_result_frame_bytes(&page), subject)
@@ -2556,6 +2561,7 @@ impl ServeHandler for crate::LineageRegistry {
                 message: format!("joining steer cannot change the active run's frozen {field}"),
             }),
             SendOutcome::VariantUnsupported(e) => Err(ServeError::VariantUnsupported(e)),
+            SendOutcome::Upload(error) => Err(ServeError::Upload(error)),
             // Actor errors can combine replay, storage and lifecycle failures after type erasure.
             SendOutcome::Error(e) => Err(ServeError::Open(e, None)),
             SendOutcome::ClassifiedError { reason, class } => {
@@ -3033,7 +3039,11 @@ impl ServeHandler for crate::LineageRegistry {
             .await?;
         if req.media == cortexkit_role_llm_runner::read::MediaMode::Blocks {
             for entry in &mut response.messages {
-                entry.show_media_blocks();
+                if broca_protocol::attachments_enabled() {
+                    entry.show_media_blocks_with_identity();
+                } else {
+                    entry.show_media_blocks();
+                }
             }
         }
         if req.media == cortexkit_role_llm_runner::read::MediaMode::Descriptors {
@@ -3075,6 +3085,7 @@ impl ServeHandler for crate::LineageRegistry {
         // so the cost follows what is not yet materialized, never the session's length.
         let crate::registry::RouteReadPage {
             page,
+            at_seq,
             head_facts,
             head_facts_complete,
             newest_record_ms,
@@ -3113,8 +3124,27 @@ impl ServeHandler for crate::LineageRegistry {
                 .find_map(|framed| broca_core::record_time_ms(&framed.record))
                 .unwrap_or(0),
         };
+        let media_facts = if broca_protocol::attachments_enabled() {
+            Some(
+                self.media_facts_for_head(
+                    session,
+                    crate::registry::media_head::Request {
+                        lineage: lineage_id,
+                        at_seq,
+                        run_id: page.lineage_state.last_run_id.as_ref(),
+                        state: page.lineage_state.state.as_str(),
+                        model: head_facts.model.as_ref(),
+                    },
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         let interrupted_reason = if page.lineage_state.state.as_str() == "interrupted" {
-            if let Some(run_id) = &page.lineage_state.last_run_id {
+            if let Some(facts) = &media_facts {
+                facts.interrupt_reason.clone()
+            } else if let Some(run_id) = &page.lineage_state.last_run_id {
                 recorded_interrupt_reason(&self.read_durable_wal(session).await?.0, run_id)
             } else {
                 None
@@ -3147,45 +3177,7 @@ impl ServeHandler for crate::LineageRegistry {
         } else {
             None
         };
-        let mut input = broca_wire::head_input();
-        if broca_protocol::attachments_enabled() {
-            let (frames, _) = self.read_durable_wal(session).await?;
-            let checkpoint =
-                broca_core::AdmissionCheckpointV1::from_frames(&frames).map_err(|error| {
-                    ServeError::Open(format!("read media input facts: {error}"), None)
-                })?;
-            if let Some(profile) = checkpoint
-                .last_episode
-                .as_ref()
-                .and_then(|episode| episode.config.frozen_render_config.get("media"))
-                .and_then(|value| {
-                    serde_json::from_value::<broca_provider::media_profile::MediaProfile>(
-                        value.clone(),
-                    )
-                    .ok()
-                })
-            {
-                use broca_protocol::MediaKind;
-                let modalities: Vec<String> = [
-                    MediaKind::Image,
-                    MediaKind::Document,
-                    MediaKind::Audio,
-                    MediaKind::Video,
-                ]
-                .into_iter()
-                .filter(|kind| {
-                    profile.accepts_modality(*kind)
-                        && profile.kind(*kind).user_message
-                            != broca_provider::media_profile::MediaCarrier::Marker
-                })
-                .map(|kind| broca_provider::person_media::modality(kind).into())
-                .collect();
-                if !modalities.is_empty() {
-                    input = cortexkit_role_llm_runner::read::HeadInput::new("yes")
-                        .with_modalities(modalities);
-                }
-            }
-        }
+        let input = media_facts.map_or_else(broca_wire::head_input, |facts| facts.input);
         Ok(broca_wire::HeadResponse {
             last_run_rich_ui: head_facts.last_run_rich_ui,
             last_run_error,
@@ -4156,6 +4148,7 @@ mod context_ceiling_tests {
 
 fn media_preflight_error(error: broca_core::RunError) -> ServeError {
     match error {
+        broca_core::RunError::Upload(error) => ServeError::Upload(error),
         broca_core::RunError::MediaUnsupported(message) => ServeError::DeliveryRefused {
             code: "media_unsupported",
             message,
