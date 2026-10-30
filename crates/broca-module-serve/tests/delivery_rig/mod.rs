@@ -36,6 +36,8 @@ use tokio::sync::{mpsc, Notify};
 
 #[path = "../../../broca-wire/tests/support/run_usage.rs"]
 mod usage_compat;
+use broca_core::WalStore;
+use std::sync::atomic::Ordering;
 pub use usage_compat::legacy_bytes;
 
 /// One scripted model step.
@@ -212,6 +214,8 @@ pub struct Script {
     /// Each model step's request as the OpenAI Chat family renders it from the run's frozen
     /// structured-output decision, in call order.
     pub rendered: Mutex<Vec<Vec<u8>>>,
+    /// Optional serving-family config for media tests; other scripts keep their legacy bytes.
+    pub media_frozen: Mutex<Option<broca_provider::wire::FrozenRenderConfig>>,
 }
 
 impl Script {
@@ -241,6 +245,7 @@ impl Script {
 struct ScriptedProvider(
     Arc<Script>,
     Option<broca_protocol::structured_output::FrozenStructuredOutput>,
+    std::sync::RwLock<Option<Arc<broca_core::provider::MediaRequestRenderer>>>,
 );
 
 impl ScriptedProvider {
@@ -254,6 +259,37 @@ impl ScriptedProvider {
 
 #[async_trait]
 impl Provider for ScriptedProvider {
+    fn supports_media_renderer(&self) -> bool {
+        broca_protocol::attachments_enabled() && self.0.media_frozen.lock().unwrap().is_some()
+    }
+
+    fn set_media_request_renderer(
+        &self,
+        renderer: Arc<broca_core::provider::MediaRequestRenderer>,
+    ) {
+        *self.2.write().unwrap() = Some(renderer);
+    }
+
+    fn try_render_request(
+        &self,
+        opts: &CallOptions,
+    ) -> Result<Vec<u8>, Box<broca_protocol::ProviderError>> {
+        if let Some(frozen) = self.0.media_frozen.lock().unwrap().as_ref() {
+            if let Some(renderer) = self.2.read().unwrap().as_ref() {
+                return renderer(
+                    &serde_json::to_value(frozen).unwrap(),
+                    opts,
+                    false,
+                    false,
+                    None,
+                );
+            }
+            return Ok(broca_provider::registry::wire_family(frozen.family_id)
+                .unwrap()
+                .render(frozen, opts));
+        }
+        Ok(self.render_request(opts))
+    }
     fn refusal_fallback_model(&self) -> Option<broca_protocol::ModelHandle> {
         self.0.refusal_fallback_model.lock().unwrap().clone()
     }
@@ -263,6 +299,9 @@ impl Provider for ScriptedProvider {
     }
 
     fn render_config_blob(&self) -> serde_json::Value {
+        if let Some(frozen) = self.0.media_frozen.lock().unwrap().as_ref() {
+            return serde_json::to_value(frozen).unwrap();
+        }
         match &self.1 {
             None => serde_json::json!({ "render_config": "stateless" }),
             Some(frozen) => serde_json::json!({
@@ -279,11 +318,16 @@ impl Provider for ScriptedProvider {
             step_id.0,
             *self.0.hold_model.lock().unwrap()
         ));
-        self.0
-            .rendered
-            .lock()
-            .unwrap()
-            .push(broca_provider::families::OpenAiChat.render(&self.frozen(), opts));
+        let rendered = if let Some(renderer) = self.2.read().unwrap().as_ref() {
+            renderer(&self.render_config_blob(), opts, false, true, None).unwrap()
+        } else if let Some(frozen) = self.0.media_frozen.lock().unwrap().as_ref() {
+            broca_provider::registry::wire_family(frozen.family_id)
+                .unwrap()
+                .render(frozen, opts)
+        } else {
+            broca_provider::families::OpenAiChat.render(&self.frozen(), opts)
+        };
+        self.0.rendered.lock().unwrap().push(rendered);
         self.0.prompts.lock().unwrap().push(opts.prompt.clone());
         self.0
             .offered_tools
@@ -473,6 +517,20 @@ struct CoreExec {
 
 #[async_trait]
 impl RunExecutor for CoreExec {
+    async fn media_profile(
+        &self,
+        _request: &broca_protocol::request::SubmissionRequest,
+    ) -> Result<Option<Box<broca_provider::media_profile::MediaProfile>>, RunError> {
+        Ok(self
+            .script
+            .media_frozen
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|frozen| frozen.media.as_ref())
+            .cloned()
+            .map(Box::new))
+    }
     fn compaction_plane(&self) -> Option<Arc<dyn broca_core::compaction::CompactionPlane>> {
         if *self.script.compaction_wired.lock().unwrap() {
             self.script.compaction_plane.lock().unwrap().clone()
@@ -496,6 +554,71 @@ impl RunExecutor for CoreExec {
         };
         let materialized_store =
             job.materialized_store(self.store.clone() as Arc<dyn broca_core::SessionStore>);
+        let provider = ScriptedProvider(self.script.clone(), None, std::sync::RwLock::new(None));
+        if job.has_media_input() {
+            if let Err(error) = job.admit_media(&provider, self.wal_store.uploads().as_ref()) {
+                if let Some(ack) = job.on_admitted {
+                    let _ = ack.send(Err(error.clone()));
+                }
+                return Err(error);
+            }
+        }
+        if provider.supports_media_renderer() {
+            let store = self
+                .wal_store
+                .uploads()
+                .unwrap()
+                .session_media_store(&job.req.session)
+                .unwrap();
+            let wal = self.wal_store.clone();
+            let session = job.req.session.clone();
+            let head = job.writer.durable_head();
+            let checkpoint = match &job.prior_snapshot.checkpoint_at_head.media {
+                Some(broca_core::media_request::DurableMediaSeed::Ready(seed)) => (**seed).clone(),
+                Some(broca_core::media_request::DurableMediaSeed::Unreadable(_)) => {
+                    panic!("media fixture seed is unreadable")
+                }
+                None => job
+                    .writer
+                    .empty_media_checkpoint(job.prior_snapshot.head_seq)
+                    .unwrap(),
+            };
+            let media = broca_provider::media_request::LiveMedia::from_checkpoint(
+                store,
+                checkpoint,
+                job.prior_snapshot
+                    .checkpoint_at_head
+                    .last_episode
+                    .as_ref()
+                    .and_then(|episode| episode.config.budget.clone()),
+                self.script
+                    .media_frozen
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|frozen| frozen.media.clone()),
+                Box::new(move |after| {
+                    wal.read_records_range(
+                        &session,
+                        after,
+                        Some(head.load(Ordering::Acquire)),
+                        None,
+                    )
+                    .map_err(|error| error.to_string())
+                    .and_then(|range| match range.into_records() {
+                        broca_wal::WalRangeRecords::Complete(records)
+                        | broca_wal::WalRangeRecords::Unknown(records) => Ok(records),
+                        _ => Err("incomplete media fixture WAL".into()),
+                    })
+                }),
+            )
+            .unwrap();
+            provider.set_media_request_renderer(Arc::new(
+                move |frozen, opts, tags, commit, provenance| {
+                    media.render_with_provenance(frozen, opts, tags, commit, provenance)
+                },
+            ));
+        }
         let mut control = job.control;
         control.hook_plane = self.hook_plane();
         control.compaction_plane = self.script.compaction_plane.lock().unwrap().clone();
@@ -551,7 +674,7 @@ impl RunExecutor for CoreExec {
                 })
             });
         let module_log = self.script.module_log.lock().unwrap().clone();
-        let provider = ScriptedProvider(self.script.clone(), structured_output);
+        let provider = ScriptedProvider(provider.0, structured_output, provider.2);
         let tools = ScriptedTools(self.script.clone());
         let approval = ScriptedApproval(self.script.clone());
         let run = run_loop_on_writer_admitted_with_prior_snapshot(

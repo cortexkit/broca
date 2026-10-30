@@ -4601,7 +4601,6 @@ pub(crate) mod projection_boundary_tests {
             last_run_id: Some(RunId("r1".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
                 has_model_attempt: None,
-                #[cfg(feature = "test-attachments")]
                 media: None,
                 head: None,
                 has_deferred_calls: None,

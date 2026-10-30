@@ -3850,7 +3850,6 @@ fn prior_snapshot_handoff_excludes_pending_payloads_and_shares_pending_storage()
         checkpoint_at_base: None,
         checkpoint_at_head: AdmissionCheckpointV1 {
             has_model_attempt: None,
-            #[cfg(feature = "test-attachments")]
             media: None,
             head: None,
             has_deferred_calls: None,

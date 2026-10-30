@@ -3824,10 +3824,8 @@ where
             }),
         )
     };
-    #[cfg(feature = "test-attachments")]
-    let defer_media_tags = provider.defer_media_tags(render_tags);
-    #[cfg(not(feature = "test-attachments"))]
-    let defer_media_tags = false;
+    let defer_media_tags =
+        broca_protocol::attachments_enabled() && provider.defer_media_tags(render_tags);
     writer.retain_live_tags(render_tags && computed_tags.is_none());
     let context_limit = if is_resume && !append_episode {
         prior
@@ -14841,7 +14839,6 @@ mod tests {
             last_run_id: Some(RunId("budget".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
                 has_model_attempt: None,
-                #[cfg(feature = "test-attachments")]
                 media: None,
                 head: None,
                 has_deferred_calls: None,

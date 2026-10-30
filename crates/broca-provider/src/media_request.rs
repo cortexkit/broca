@@ -18,9 +18,7 @@ use broca_protocol::{
 
 use crate::media_profile::{MediaCarrier, MediaProfile};
 
-#[cfg(feature = "test-attachments")]
 mod live;
-#[cfg(feature = "test-attachments")]
 pub use live::LiveMedia;
 
 /// An occurrence in the assembled prompt. Replacement messages can repeat a captured reference;

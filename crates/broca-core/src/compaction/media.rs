@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 pub struct CapturedMedia(Arc<BTreeMap<String, Vec<MediaRef>>>);
 
 impl CapturedMedia {
+    pub(crate) fn by_digest(&self, sha256: &str) -> Option<&MediaRef> {
+        self.0.get(sha256)?.first()
+    }
     /// Detect capture-bearing records before allocating an index. Most records, including
     /// every record in a media-free session, need no capture collection at all.
     pub(crate) fn captures_any(record: &WalRecord) -> bool {

@@ -16,12 +16,11 @@ use tokio_util::sync::CancellationToken;
 
 pub type LiveStepProgress = Arc<Mutex<Option<broca_protocol::provider::InFlightStep>>>;
 
-/// Session-owned media rendering, installed only by the attachment test executor.
+/// Session-owned media rendering, installed when media is enabled at boot.
 /// The booleans select tag rendering and commit the durable step boundary to aging,
 /// respectively. That commit is not physical-send permission.
 /// Estimates must not age a not-yet-final view.
 /// The optional sink records source ordinals for the final emitted request, not size probes.
-#[cfg(feature = "test-attachments")]
 pub type MediaRequestRenderer = dyn Fn(
         &serde_json::Value,
         &CallOptions,
@@ -49,16 +48,13 @@ pub struct StepRuntime {
 
 #[async_trait]
 pub trait Provider: Send + Sync {
-    #[cfg(feature = "test-attachments")]
     fn supports_media_renderer(&self) -> bool {
         false
     }
 
-    #[cfg(feature = "test-attachments")]
     fn set_media_request_renderer(&self, _renderer: Arc<MediaRequestRenderer>) {}
 
     /// Defer media-bearing messages' tags until preparation has fixed their part locations.
-    #[cfg(feature = "test-attachments")]
     fn defer_media_tags(&self, _render_tags: bool) -> bool {
         false
     }
@@ -316,17 +312,14 @@ pub trait Provider: Send + Sync {
 /// `run_loop` directly, without the loop needing to know the concrete type.
 #[async_trait]
 impl Provider for Box<dyn Provider> {
-    #[cfg(feature = "test-attachments")]
     fn supports_media_renderer(&self) -> bool {
         (**self).supports_media_renderer()
     }
 
-    #[cfg(feature = "test-attachments")]
     fn set_media_request_renderer(&self, renderer: Arc<MediaRequestRenderer>) {
         (**self).set_media_request_renderer(renderer);
     }
 
-    #[cfg(feature = "test-attachments")]
     fn defer_media_tags(&self, render_tags: bool) -> bool {
         (**self).defer_media_tags(render_tags)
     }

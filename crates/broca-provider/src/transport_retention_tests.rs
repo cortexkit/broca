@@ -81,9 +81,7 @@ fn retention_request_dumps_are_suppressed_before_any_write() {
                     cache_session: None,
                     cache_provider: None,
                     subscription_auth: false,
-                    #[cfg(feature = "test-attachments")]
                     media_renderer: None,
-                    #[cfg(feature = "test-attachments")]
                     media_render_tags: false,
                     auth_revision: 0,
                     family: Arc::new(OpenAiResponses),
@@ -175,9 +173,7 @@ async fn retention_https_calls_private_diagnostics_on_every_retry() {
         cache_session: None,
         cache_provider: None,
         subscription_auth: false,
-        #[cfg(feature = "test-attachments")]
         media_renderer: None,
-        #[cfg(feature = "test-attachments")]
         media_render_tags: false,
         auth_revision: 0,
         family: Arc::new(OpenAiResponses),

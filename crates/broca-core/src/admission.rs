@@ -676,7 +676,6 @@ impl EffortHistoryV1 {
 pub struct AdmissionCheckpointV1 {
     /// Reference-only media resume state, omitted for media-free histories. A captured-reference
     /// index without a valid matching seed requires a named, counted full-replay repair.
-    #[cfg(feature = "test-attachments")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<crate::media_request::DurableMediaSeed>,
     /// Missing on older checkpoints: reconstruct from the full WAL before extending totals.
@@ -765,7 +764,6 @@ impl AdmissionCheckpointV1 {
     /// A newly applied record in a tail needs canonical replay to recover its
     /// message count. Missing compaction state is checked separately at the seed.
     pub(crate) fn compaction_boundary_complete(&self) -> bool {
-        #[cfg(feature = "test-attachments")]
         if !self.media_seed_complete() {
             return false;
         }
@@ -777,7 +775,6 @@ impl AdmissionCheckpointV1 {
 
     pub fn empty() -> Self {
         Self {
-            #[cfg(feature = "test-attachments")]
             media: None,
             head: Some(crate::head::HeadProjection::default()),
             has_deferred_calls: Some(false),
@@ -834,7 +831,6 @@ impl AdmissionCheckpointV1 {
 
     /// Fold an ordered WAL suffix into this checkpoint.
     pub fn fold_frames(&mut self, records: &[FramedRecord]) -> Result<(), ReplayError> {
-        #[cfg(feature = "test-attachments")]
         if let Some(crate::media_request::DurableMediaSeed::Ready(media)) = &mut self.media {
             media.resume_budget(
                 self.last_episode
@@ -842,7 +838,6 @@ impl AdmissionCheckpointV1 {
                     .and_then(|episode| episode.config.budget.clone()),
             );
         }
-        #[cfg(feature = "test-attachments")]
         if self.at_seq == 0
             && records
                 .iter()
@@ -860,7 +855,6 @@ impl AdmissionCheckpointV1 {
 
     /// Fold one WAL record. The mutation is committed only after all corruption checks pass.
     pub fn fold_record(&mut self, seq: u64, record: &WalRecord) -> Result<(), ReplayError> {
-        #[cfg(feature = "test-attachments")]
         if self.at_seq == 0
             && self.media.is_none()
             && crate::compaction::CapturedMedia::captures_any(record)
@@ -869,7 +863,6 @@ impl AdmissionCheckpointV1 {
                 crate::media_request::MediaCheckpoint::empty(),
             )));
         }
-        #[cfg(feature = "test-attachments")]
         if let Some(crate::media_request::DurableMediaSeed::Ready(media)) = &mut self.media {
             media
                 .fold(seq, record)
@@ -1261,7 +1254,11 @@ impl AdmissionCheckpointV1 {
 }
 
 impl AdmissionCheckpointV1 {
-    #[cfg(feature = "test-attachments")]
+    /// Only media references recorded in captured history can authorize byte reads.
+    pub fn captured_media_reference(&self, sha256: &str) -> Option<&broca_protocol::MediaRef> {
+        self.compaction.as_ref()?.captured()?.by_digest(sha256)
+    }
+
     pub fn has_captured_media(&self) -> bool {
         self.compaction
             .as_ref()
@@ -1269,7 +1266,6 @@ impl AdmissionCheckpointV1 {
             .is_some_and(|captured| !captured.is_empty())
     }
 
-    #[cfg(feature = "test-attachments")]
     pub fn media_seed_complete(&self) -> bool {
         let has_media = self.has_captured_media();
         if !has_media {
@@ -4074,7 +4070,6 @@ mod tests {
     fn checkpoint_json_with_pending_payload_is_byte_stable() {
         let checkpoint = AdmissionCheckpointV1 {
             has_model_attempt: None,
-            #[cfg(feature = "test-attachments")]
             media: None,
             output_reservation: None,
             head: None,
