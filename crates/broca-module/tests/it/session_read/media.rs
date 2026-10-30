@@ -48,6 +48,149 @@ async fn read(rig: &Rig, key: &BindIdentity, mode: MediaMode) -> broca_wire::Ses
         .expect("session.read")
 }
 
+async fn notice_matches_descriptors(name: &str, state: Option<broca_protocol::TextProviderState>) {
+    use broca_core::compaction::{
+        view::{next_notice, NoticeFacts},
+        CompactionState,
+    };
+
+    let rig = Rig::new(name, Arc::new(NoopExec));
+    let key = rig.key(name);
+    let mut records = seed(&key, mixed_parts("before"));
+    let WalRecord::ModelStepFinished {
+        assistant_message, ..
+    } = &mut records[7]
+    else {
+        panic!("final assistant message");
+    };
+    let text = "§99§ done".to_owned();
+    Arc::make_mut(assistant_message).content = vec![match state {
+        Some(provider_state) => ContentBlock::TextWithState {
+            text,
+            provider_state,
+        },
+        None => ContentBlock::Text { text },
+    }];
+    write_legacy_seed(&rig.wal_store, &key, &records);
+
+    // Read native rows through the same snapshot as descriptors, not caller JSON decoded back
+    // into Message: decoding would already have erased the provider-only text state.
+    let native = read(&rig, &key, MediaMode::Blocks).await;
+    let caller = serde_json::to_value(&native).unwrap();
+    let descriptors = serde_json::to_value(read(&rig, &key, MediaMode::Descriptors).await).unwrap();
+    assert_eq!(
+        native.messages.len(),
+        4,
+        "media input, call, result, answer"
+    );
+    for (entry, described) in native
+        .messages
+        .iter()
+        .zip(descriptors["messages"].as_array().unwrap())
+    {
+        let notice = next_notice(
+            &CompactionState::default(),
+            std::slice::from_ref(&entry.message),
+            NoticeFacts {
+                session_ref: "0123456789abcdef0123456789abcdef".into(),
+                lineage_id: "lineage",
+                est_tokens: 10,
+                model: name,
+                window: None,
+                usage: None,
+                events: vec![],
+                seq_floor: 0,
+            },
+        )
+        .unwrap();
+        let headers = notice.to_headers();
+        assert_eq!(headers["through_ordinal"], entry.ordinal.to_string());
+        assert_eq!(described["ordinal"], entry.ordinal);
+        assert_eq!(
+            json!(headers["through_digest"]),
+            described["digest"],
+            "{name}: notice and descriptors identity for ordinal {}",
+            entry.ordinal
+        );
+        let served = &caller["messages"][entry.ordinal as usize]["message"];
+        assert_eq!(
+            described["digest"],
+            cortexkit_role_llm_runner::content_digest::content_digest(served),
+            "identity must hash the independently serialized caller message, not native state"
+        );
+        for (index, part) in served["content"].as_array().unwrap().iter().enumerate() {
+            assert_eq!(
+                described["part_digests"][index]["digest"],
+                cortexkit_role_llm_runner::content_digest::content_digest(part)
+            );
+        }
+    }
+    assert_eq!(
+        descriptors["messages"][3]["message"]["content"],
+        json!([{"type":"text","text":"done"}]),
+        "the writing run cleans tags and callers never see provider state"
+    );
+    materialize_all(&rig, &key);
+    assert_eq!(
+        serde_json::to_value(read(&rig, &key, MediaMode::Descriptors).await).unwrap(),
+        descriptors,
+        "materialization preserves caller content identity"
+    );
+}
+
+#[tokio::test]
+async fn notice_digest_matches_descriptors_openai_responses() {
+    notice_matches_descriptors(
+        "responses",
+        Some(broca_protocol::TextProviderState {
+            format: broca_protocol::TextProviderFormat::OpenAiResponses,
+            data: r#"{"id":"msg_test"}"#.into(),
+        }),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn notice_digest_matches_descriptors_chatgpt() {
+    notice_matches_descriptors(
+        "chatgpt",
+        Some(broca_protocol::TextProviderState {
+            format: broca_protocol::TextProviderFormat::OpenAiResponsesChatgpt,
+            data: r#"{"id":"msg_test","phase":"final_answer"}"#.into(),
+        }),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn notice_digest_matches_descriptors_gemini() {
+    notice_matches_descriptors(
+        "gemini",
+        Some(broca_protocol::TextProviderState {
+            format: broca_protocol::TextProviderFormat::Gemini,
+            data: "thought-signature".into(),
+        }),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn notice_digest_matches_descriptors_code_assist() {
+    notice_matches_descriptors(
+        "code-assist",
+        Some(broca_protocol::TextProviderState {
+            format: broca_protocol::TextProviderFormat::GoogleCodeAssist,
+            data: "thought-signature".into(),
+        }),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn notice_digest_matches_descriptors_plain_text() {
+    notice_matches_descriptors("plain-text", None).await;
+}
+
 // Deliberately closed enums model a reader deployed before media blocks and Parts existed.
 #[derive(serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
