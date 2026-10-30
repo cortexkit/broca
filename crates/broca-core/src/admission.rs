@@ -1975,6 +1975,40 @@ pub struct AdmissionContinuation {
 }
 
 impl AdmissionContinuation {
+    /// A full WAL read preserves unanswered deferred calls, late results and
+    /// requests to withdraw outstanding approval questions when the raw prefix
+    /// cannot reconstruct those actions.
+    pub fn raw_read_ownership(&self) -> Result<SessionOwnershipV1, crate::replay::SeedFallback> {
+        if self.seed.scalars.has_deferred_calls != Some(false) {
+            return Err(crate::replay::SeedFallback::new(
+                "raw page deferred prefix state",
+            ));
+        }
+        if self
+            .seed
+            .scalars
+            .compaction
+            .as_ref()
+            .and_then(|c| c.state())
+            .is_some_and(|state| {
+                matches!(
+                    state.ceiling_check,
+                    Some(crate::compaction::CeilingCheck::Waiting { .. })
+                ) || state.ride_wait.is_some()
+            })
+        {
+            return Err(crate::replay::SeedFallback::new(
+                "raw page compaction wait prefix state",
+            ));
+        }
+        self.seed
+            .scalars
+            .ownership
+            .as_ref()
+            .map(SessionOwnershipV1::for_owner_access)
+            .ok_or_else(|| crate::replay::SeedFallback::new("raw page ownership seed missing"))
+    }
+
     pub fn encode(&self) -> Result<String, serde_json::Error> {
         let mut state = serde_json::to_value(&self.seed)?;
         let scalars = state["scalars"].as_object_mut().expect("checkpoint object");

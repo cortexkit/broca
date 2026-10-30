@@ -524,6 +524,1042 @@ mod tests {
         .unwrap()
     }
 
+    fn raw_read(
+        db: &OverhaulDb,
+        bind: &BindIdentity,
+        wal: &broca_wal::FileWal,
+        from: Option<u64>,
+        limit: u64,
+    ) -> super::super::RawPageSnapshot {
+        use broca_wal::Wal;
+        db.read_raw_page(
+            bind,
+            "s-test",
+            LogLocation::Live,
+            &wal.durable_publication().unwrap(),
+            super::super::RawPageRequest {
+                from_ordinal: from,
+                limit: Some(limit),
+                include_tools: true,
+            },
+        )
+        .unwrap()
+    }
+
+    fn modern_raw_records(mut records: Vec<WalRecord>) -> Vec<WalRecord> {
+        for (n, record) in records.iter_mut().enumerate() {
+            match record {
+                WalRecord::ModelStepFinished { written_at_ms, .. }
+                | WalRecord::RunStarted { written_at_ms, .. }
+                | WalRecord::SendDelivered { written_at_ms, .. } => {
+                    *written_at_ms = Some(1_000 + n as u64)
+                }
+                _ => {}
+            }
+        }
+        records
+    }
+
+    fn assert_named_raw_reads(
+        db: &OverhaulDb,
+        bind: &BindIdentity,
+        bytes: &[u8],
+        from: Option<u64>,
+        limit: u64,
+        prompt_len: u64,
+        op: &broca_wal::access_counter::OperationAccess,
+    ) {
+        use broca_wal::access_counter::{ReadClass, ValidationRead};
+        assert!(
+            op.seed_fallbacks.is_empty(),
+            "{}: {:?}",
+            op.name,
+            op.seed_fallbacks
+        );
+        let key = sid(bind).unwrap();
+        let boundary = broca_core::projection_plan::ProjectionContinuation::decode(&tail_seed(db))
+            .unwrap()
+            .boundary();
+        let positions = decoded(bytes);
+        let cursor = positions.last().unwrap();
+        let mut sources = vec![
+            (
+                "row cursor",
+                cursor.0 as u64,
+                bytes.len() as u64 - cursor.0 as u64,
+            ),
+            (
+                "contiguous seed tail",
+                boundary.frame_end,
+                bytes.len() as u64 - boundary.frame_end,
+            ),
+        ];
+        let add_frame = |sources: &mut Vec<(&'static str, u64, u64)>, name, off| {
+            let frame = positions
+                .iter()
+                .find(|(lo, _, _)| *lo as u64 == off)
+                .unwrap();
+            sources.push((name, off, (frame.1 - frame.0) as u64));
+        };
+        let start = from
+            .unwrap_or_else(|| prompt_len.saturating_sub(limit))
+            .min(prompt_len);
+        let end = start.saturating_add(limit).min(prompt_len);
+        db.read_snapshot(|tx| {
+            for row in tx.prepare("SELECT lo_off,hi_off FROM message WHERE sid=?1 AND ord>=?2 AND ord<?3")?.query_map(params![key,start,end], |r| Ok((r.get::<_,u64>(0)?,r.get::<_,u64>(1)?)))? {
+                let (lo,hi) = row?; sources.push(("requested message span",lo,hi-lo));
+            }
+            let first: Option<u64> = tx.query_row("SELECT run_started_off FROM episode WHERE sid=?1 ORDER BY n LIMIT 1", [&key], |r| r.get(0))?;
+            let current: (Option<u64>,Option<u64>) = tx.query_row("SELECT run_started_off,terminal_off FROM episode WHERE sid=?1 ORDER BY n DESC LIMIT 1", [&key], |r| Ok((r.get(0)?,r.get(1)?)))?;
+            if let Some(off) = first { sources.push(("first RunStarted header",off,broca_wal::framing::HEADER_LEN as u64)); add_frame(&mut sources,"first RunStarted",off); }
+            if let Some(off) = current.0 { sources.push(("current RunStarted header",off,broca_wal::framing::HEADER_LEN as u64)); add_frame(&mut sources,"current RunStarted",off); }
+            for row in tx.prepare("SELECT run_started_off FROM episode WHERE sid=?1 AND first_ord<?3 AND end_ord>?2")?.query_map(params![key,start,end], |r| r.get::<_,Option<u64>>(0))? {
+                if let Some(off) = row? {
+                    sources.push(("covering episode header",off,broca_wal::framing::HEADER_LEN as u64));
+                    add_frame(&mut sources,"covering episode RunStarted",off);
+                }
+            }
+            if let Some(off) = current.1 {
+                sources.push(("current terminal header",off,broca_wal::framing::HEADER_LEN as u64));
+                add_frame(&mut sources,"current terminal",off);
+            }
+            let encoded: String = tx.query_row("SELECT locator_seed FROM session WHERE sid=?1", [&key], |r| r.get(0))?;
+            let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            if let Some(off) = value[1]["episode"]["last_step_off"].as_u64() { sources.push(("current last step header",off,broca_wal::framing::HEADER_LEN as u64)); add_frame(&mut sources,"current last step",off); }
+            if let Some(off) = value[1]["title_off"].as_u64() {
+                sources.push(("title header",off,broca_wal::framing::HEADER_LEN as u64)); add_frame(&mut sources,"title source",off);
+            }
+            if let Some(queued) = value[1]["admission"]["queued"].as_object() {
+                for off in queued.values().filter_map(|v| v.as_u64()) { sources.push(("queued time header",off,broca_wal::framing::HEADER_LEN as u64)); add_frame(&mut sources,"queued time source",off); }
+            }
+            Ok(())
+        }).unwrap();
+        let mut seen = Vec::new();
+        let mut named_counts = std::collections::BTreeMap::new();
+        let mut decodes = 0;
+        for read in &op.reads {
+            let name = match read.class {
+                ReadClass::Source => sources
+                    .iter()
+                    .find(|(_, off, len)| (*off, *len) == (read.offset, read.length))
+                    .map(|(name, _, _)| *name)
+                    .unwrap_or_else(|| panic!("unlisted source: {:?}", read)),
+                ReadClass::LineageHeader => {
+                    assert_eq!(
+                        (read.offset, read.length),
+                        (0, broca_wal::framing::LINEAGE_FRAME_LEN as u64)
+                    );
+                    "lineage header"
+                }
+                ReadClass::Validation(ValidationRead::BoundaryFrame) => {
+                    assert_eq!(
+                        (read.offset, read.length),
+                        (boundary.frame_off, boundary.frame_end - boundary.frame_off)
+                    );
+                    "qualified boundary"
+                }
+                ReadClass::Validation(ValidationRead::LineageGap) => {
+                    assert_eq!(
+                        (read.offset, read.length),
+                        (
+                            boundary.frame_end,
+                            broca_wal::framing::LINEAGE_FRAME_LEN as u64
+                        )
+                    );
+                    "lineage gap"
+                }
+                ReadClass::Validation(ValidationRead::DurableEnd) => "durable end probe",
+                _ => panic!("unlisted read: {:?}", read),
+            };
+            assert!(
+                !seen.contains(&(read.offset, read.length, read.class)),
+                "duplicate {name}: {read:?}"
+            );
+            seen.push((read.offset, read.length, read.class));
+            *named_counts.entry(name).or_insert(0) += 1;
+            if name == "row cursor" {
+                decodes += 1;
+                continue;
+            }
+            let mut at = read.offset as usize;
+            let end = at + read.length as usize;
+            while at < end {
+                match broca_wal::framing::decode_next(&bytes[at..end]) {
+                    DecodeStep::Record { consumed, .. } | DecodeStep::Lineage { consumed, .. } => {
+                        decodes += 1;
+                        at += consumed;
+                    }
+                    DecodeStep::TornTail => break,
+                    _ => panic!("invalid fixture source {name}"),
+                }
+            }
+        }
+        for name in [
+            "row cursor",
+            "contiguous seed tail",
+            "qualified boundary",
+            "lineage header",
+            "lineage gap",
+        ] {
+            assert_eq!(
+                named_counts.get(name),
+                Some(&1),
+                "missing {name}: {named_counts:?}"
+            );
+        }
+        let has_tail = positions.iter().any(|(_, _, f)| f.seq > boundary.seq);
+        assert_eq!(
+            named_counts.get("durable end probe").copied().unwrap_or(0),
+            if has_tail { 0 } else { 2 }
+        );
+        assert_eq!(op.frames_decoded, decodes, "{}: {named_counts:?}", op.name);
+    }
+
+    #[test]
+    fn raw_database_pages_and_head_match_full_wal_at_publication_cuts() {
+        use broca_wal::Wal;
+        let (_, base, _) = boundary_cases()
+            .into_iter()
+            .find(|(name, _, _)| *name == "no_tool_terminal")
+            .unwrap();
+        let base = modern_raw_records(base);
+        let bind = bind(&encode_records(&base));
+        let scratch = database();
+        let path = scratch._scratch.0.join("raw-pages.wal");
+        let mut wal = broca_wal::FileWal::open(&path)
+            .unwrap()
+            .with_feature_floor(scratch._scratch.0.join("wal-floor"));
+        let mut history = Vec::new();
+        for run in 0..3 {
+            let mut records = base.clone();
+            if let WalRecord::RunStarted {
+                run_id,
+                config,
+                title,
+                principal,
+                ..
+            } = &mut records[0]
+            {
+                run_id.0 = format!("raw-{run}");
+                config.model.model_id = format!("model-{run}");
+                *title = Some(format!("title-{run}"));
+                *principal = Some(broca_protocol::BindPrincipal::Reserved {
+                    module_id: format!("sender-{run}"),
+                });
+            }
+            let mut start = serde_json::to_value(&records[0]).unwrap();
+            start["manifest"] = serde_json::json!({
+                "rich_ui":{"dialect":format!("{run}.0"),"catalog_digest":"d".repeat(64)},
+                "plan":"{}","plan_identity":"plan","composition_digest":"composition",
+                "fetches":[],"tools":[],"system_text":"manifest-content-sentinel","system_digest":"system",
+                "join_version":1,"role_versions":{}
+            });
+            records[0] = serde_json::from_value(start).unwrap();
+            for record in records {
+                wal.append(1, &record, true).unwrap();
+                history.push(record);
+                publish_writer(&scratch.db, &bind, &wal);
+                let bytes = std::fs::read(&path).unwrap();
+                let frames: Vec<_> = decoded(&bytes).into_iter().map(|(_, _, f)| f).collect();
+                let expected_head = broca_core::AdmissionCheckpointV1::from_frames(&frames)
+                    .unwrap()
+                    .head
+                    .unwrap();
+                for from in [None, Some(0), Some(1), Some(u64::MAX)] {
+                    let counter = broca_wal::access_counter::WalAccessCounter::default();
+                    let actual = counter
+                        .operation("modern raw corpus page")
+                        .run(|| raw_read(&scratch.db, &bind, &wal, from, 2));
+                    if run > 0 {
+                        let op = counter.snapshot().remove(0);
+                        assert!(
+                            op.seed_fallbacks.is_empty(),
+                            "cut {}: {:?}",
+                            frames.len(),
+                            op.seed_fallbacks
+                        );
+                        assert!(op
+                            .reads
+                            .iter()
+                            .all(|r| r.class != broca_wal::access_counter::ReadClass::Origin));
+                        assert_named_raw_reads(
+                            &scratch.db,
+                            &bind,
+                            &bytes,
+                            from,
+                            2,
+                            actual.page.prompt_len,
+                            &op,
+                        );
+                    }
+                    let mut expected = broca_core::read_session_page(
+                        &broca_core::StorePageSnapshot::empty(),
+                        &frames,
+                        from,
+                        Some(2),
+                    )
+                    .unwrap();
+                    expected.lineage_id = Some(wal.durable_publication().unwrap().lineage());
+                    assert_eq!(
+                        actual.page,
+                        expected,
+                        "run {run}, {} frames, from {from:?}",
+                        frames.len()
+                    );
+                    assert_eq!(actual.head, expected_head, "head cut {}", frames.len());
+                    assert_eq!(
+                        actual.last_title.as_deref(),
+                        Some(format!("title-{run}").as_str())
+                    );
+                }
+            }
+        }
+        scratch
+            .db
+            .read_snapshot(|tx| {
+                let mut statement =
+                    tx.prepare("SELECT locator_seed,tail_seed,admission_seed FROM session")?;
+                for encoded in statement.query_map([], |r| {
+                    Ok(format!(
+                        "{}{}{}",
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?
+                    ))
+                })? {
+                    assert!(!encoded?.contains("manifest-content-sentinel"));
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(!scratch._scratch.0.join("run-index.db").exists());
+    }
+
+    #[test]
+    fn raw_database_tool_pages_match_legacy_including_split_turns_and_tags() {
+        use broca_wal::Wal;
+        for fixture_name in [
+            "scripts/fixtures/resume-close-out-sealed.wal",
+            "crates/broca-core/tests/fixtures/runner_tags_v1/steer_anthropic.wal",
+        ] {
+            let records = modern_raw_records(
+                decoded(&fixture(fixture_name))
+                    .into_iter()
+                    .map(|(_, _, f)| f.record)
+                    .collect(),
+            );
+            let bind = bind(&encode_records(&records));
+            let scratch = database();
+            let path = scratch._scratch.0.join("raw-tools.wal");
+            let mut wal = broca_wal::FileWal::open(&path)
+                .unwrap()
+                .with_feature_floor(scratch._scratch.0.join("wal-floor"));
+            for record in records {
+                wal.append(1, &record, false).unwrap();
+            }
+            wal.sync().unwrap();
+            publish_writer(&scratch.db, &bind, &wal);
+            let bytes = std::fs::read(path).unwrap();
+            let frames: Vec<_> = decoded(&bytes).into_iter().map(|(_, _, f)| f).collect();
+            let count = broca_core::read_session_page(
+                &broca_core::StorePageSnapshot::empty(),
+                &frames,
+                None,
+                None,
+            )
+            .unwrap()
+            .prompt_len;
+            for from in 0..=count {
+                for limit in [1, 2, 200] {
+                    let counter = broca_wal::access_counter::WalAccessCounter::default();
+                    let actual = counter
+                        .operation("modern tool corpus page")
+                        .run(|| raw_read(&scratch.db, &bind, &wal, Some(from), limit));
+                    let op = counter.snapshot().remove(0);
+                    assert!(
+                        op.seed_fallbacks.is_empty(),
+                        "{fixture_name}: {:?}",
+                        op.seed_fallbacks
+                    );
+                    assert!(op
+                        .reads
+                        .iter()
+                        .all(|r| r.class != broca_wal::access_counter::ReadClass::Origin));
+                    assert_named_raw_reads(
+                        &scratch.db,
+                        &bind,
+                        &bytes,
+                        Some(from),
+                        limit,
+                        actual.page.prompt_len,
+                        &op,
+                    );
+                    let mut expected = broca_core::read_session_page(
+                        &broca_core::StorePageSnapshot::empty(),
+                        &frames,
+                        Some(from),
+                        Some(limit),
+                    )
+                    .unwrap();
+                    expected.lineage_id = Some(wal.durable_publication().unwrap().lineage());
+                    assert_eq!(
+                        actual.page, expected,
+                        "{fixture_name}, from {from}, limit {limit}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_database_head_fold_versions_rebuild_only_the_session() {
+        use broca_wal::Wal;
+        let (_, records, _) = boundary_cases()
+            .into_iter()
+            .find(|(name, _, _)| *name == "no_tool_terminal")
+            .unwrap();
+        let records = modern_raw_records(records);
+        let bind = bind(&encode_records(&records));
+        let scratch = database();
+        let path = scratch._scratch.0.join("raw-fold.wal");
+        let mut wal = broca_wal::FileWal::open(path)
+            .unwrap()
+            .with_feature_floor(scratch._scratch.0.join("wal-floor"));
+        for record in records {
+            wal.append(1, &record, false).unwrap();
+        }
+        wal.sync().unwrap();
+        publish_writer(&scratch.db, &bind, &wal);
+        let expected = raw_read(&scratch.db, &bind, &wal, None, 1).head;
+        for version in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(u32::MAX),
+        ] {
+            scratch
+                .db
+                .authoritative_transaction(|tx| {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO log_reader VALUES ('keep-me',1,'config')",
+                        [],
+                    )?;
+                    let text: String =
+                        tx.query_row("SELECT locator_seed FROM session", [], |r| r.get(0))?;
+                    let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    value[1]["head_fold"]["version"] = version.clone();
+                    tx.execute("UPDATE session SET locator_seed=?1", [value.to_string()])?;
+                    Ok(())
+                })
+                .unwrap();
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            let actual = counter
+                .operation("head fold rebuild")
+                .run(|| raw_read(&scratch.db, &bind, &wal, None, 1));
+            assert_eq!(actual.head, expected);
+            let op = counter.snapshot().remove(0);
+            assert!(op
+                .seed_fallbacks
+                .contains(&"raw head fold missing or unsupported"));
+            assert!(op
+                .reads
+                .iter()
+                .any(|r| r.class == broca_wal::access_counter::ReadClass::Origin));
+            assert_eq!(rows(&scratch.db, &["log_reader"])[0].1.len(), 1);
+        }
+    }
+
+    #[test]
+    fn raw_database_head_and_page_reads_are_named_and_flat_at_1k_and_150k() {
+        use broca_wal::{
+            access_counter::{ReadClass, ValidationRead, WalAccessCounter},
+            Wal,
+        };
+        let cases = boundary_cases();
+        let prefix = modern_raw_records(
+            cases
+                .iter()
+                .find(|(name, _, _)| *name == "committed_turn_without_episode_terminal")
+                .unwrap()
+                .1
+                .clone(),
+        );
+        let base = modern_raw_records(
+            cases
+                .iter()
+                .find(|(name, _, _)| *name == "no_tool_terminal")
+                .unwrap()
+                .1
+                .clone(),
+        );
+        let bind = bind(&encode_records(&base));
+        let input = match &base[0] {
+            WalRecord::RunStarted { input, .. } => input[0].clone(),
+            _ => unreachable!(),
+        };
+        let steer: WalRecord =
+            serde_json::from_value(serde_json::json!({"type":"steered","input":vec![input;1_000]}))
+                .unwrap();
+        let mut costs = Vec::new();
+        for count in [1_000, 150_000] {
+            let scratch = database();
+            let path = scratch._scratch.0.join("raw-flat.wal");
+            let mut wal = broca_wal::FileWal::open(&path)
+                .unwrap()
+                .with_feature_floor(scratch._scratch.0.join("wal-floor"));
+            wal.append(1, &prefix[0], false).unwrap();
+            for _ in 0..count / 1_000 {
+                wal.append(1, &steer, false).unwrap();
+            }
+            for record in &prefix[1..] {
+                wal.append(1, record, false).unwrap();
+            }
+            wal.append(1, &base[3], false).unwrap();
+            for record in &base {
+                wal.append(1, record, false).unwrap();
+            }
+            wal.sync().unwrap();
+            publish_writer(&scratch.db, &bind, &wal);
+            let positions = decoded(&std::fs::read(&path).unwrap());
+            let n = positions.len();
+            let boundary = &positions[n - 2];
+            let current = &positions[n - 4];
+            let first = &positions[0];
+            let cursor = &positions[n - 1];
+            let durable_end = wal.durable_publication().unwrap().byte_end();
+            let expected = [
+                (
+                    "row cursor",
+                    cursor.0 as u64,
+                    durable_end - cursor.0 as u64,
+                    ReadClass::Source,
+                ),
+                (
+                    "contiguous seed tail",
+                    boundary.1 as u64,
+                    durable_end - boundary.1 as u64,
+                    ReadClass::Source,
+                ),
+                (
+                    "current RunStarted",
+                    current.0 as u64,
+                    (current.1 - current.0) as u64,
+                    ReadClass::Source,
+                ),
+                (
+                    "first RunStarted",
+                    first.0 as u64,
+                    (first.1 - first.0) as u64,
+                    ReadClass::Source,
+                ),
+                (
+                    "lineage gap",
+                    boundary.1 as u64,
+                    broca_wal::framing::LINEAGE_FRAME_LEN as u64,
+                    ReadClass::Validation(ValidationRead::LineageGap),
+                ),
+                (
+                    "qualified boundary",
+                    boundary.0 as u64,
+                    (boundary.1 - boundary.0) as u64,
+                    ReadClass::Validation(ValidationRead::BoundaryFrame),
+                ),
+                (
+                    "lineage header",
+                    0,
+                    broca_wal::framing::LINEAGE_FRAME_LEN as u64,
+                    ReadClass::LineageHeader,
+                ),
+                (
+                    "requested message",
+                    boundary.0 as u64,
+                    (boundary.1 - boundary.0) as u64,
+                    ReadClass::Source,
+                ),
+            ];
+            let counter = WalAccessCounter::default();
+            for name in ["raw newest page", "raw head"] {
+                counter
+                    .operation(name)
+                    .run(|| raw_read(&scratch.db, &bind, &wal, None, 1));
+            }
+            for op in counter.snapshot() {
+                assert!(
+                    op.seed_fallbacks.is_empty(),
+                    "{count}: {:?}",
+                    op.seed_fallbacks
+                );
+                assert_eq!(op.reads.len(), expected.len(), "{count}: {:?}", op.reads);
+                for (read, (name, off, len, class)) in op.reads.iter().zip(expected) {
+                    assert_eq!(
+                        (read.offset, read.length, read.class),
+                        (off, len, class),
+                        "{count}: {name}"
+                    );
+                }
+                assert_eq!(op.frames_decoded, 10);
+                assert!(!op.reads.iter().any(|r| r.class == ReadClass::Origin));
+                costs.push((
+                    op.reads.len(),
+                    op.frames_decoded,
+                    op.reads.iter().map(|r| r.length).sum::<u64>(),
+                ));
+            }
+        }
+        assert_eq!(costs[0], costs[2]);
+        assert_eq!(costs[1], costs[3]);
+    }
+
+    #[test]
+    fn raw_database_setup_catches_up_before_tag_lookup() {
+        use broca_wal::Wal;
+        let (_, records, _) = boundary_cases()
+            .into_iter()
+            .find(|(name, _, _)| *name == "no_tool_terminal")
+            .unwrap();
+        let mut records = modern_raw_records(records);
+        if let WalRecord::RunStarted { config, .. } = &mut records[0] {
+            config.render_tags = true;
+            config.computed_tags = Some(broca_wal::ComputedTagRules { checkpoint: 0 });
+        }
+        let bind = bind(&encode_records(&records));
+        let scratch = database();
+        let path = scratch._scratch.0.join("raw-setup.wal");
+        let mut wal = broca_wal::FileWal::open(&path)
+            .unwrap()
+            .with_feature_floor(scratch._scratch.0.join("wal-floor"));
+        for record in records {
+            wal.append(1, &record, false).unwrap();
+        }
+        wal.sync().unwrap();
+        publish_writer(&scratch.db, &bind, &wal);
+        let before = raw_read(&scratch.db, &bind, &wal, Some(0), 1).page.messages[0]
+            .message
+            .part_tags()
+            .unwrap()
+            .parts[0];
+        assert_eq!(before, Some(1));
+        let setup = WalRecord::CompactionMessage {
+            provider: "provider".into(),
+            kind: broca_wal::CompactionMessageKind::Setup,
+            compaction_id: "head".into(),
+            version: 1,
+            range: broca_wal::CompactionRange { from: 0, to: 0 },
+            replacement: std::sync::Arc::new(Vec::new()),
+            sha256: broca_wal::compaction_replacement_sha256(&[]).unwrap(),
+            request_id: None,
+            cursor: None,
+            call_when: None,
+            stability: None,
+            ceiling: None,
+            tag_checkpoint: Some(broca_wal::SetupTagCheckpoint {
+                tag_checkpoint: 500,
+                cut: "m0".into(),
+            }),
+            ride_wait_ms: None,
+        };
+        wal.append(1, &setup, true).unwrap();
+        let counter = broca_wal::access_counter::WalAccessCounter::default();
+        let location = counter.operation("Setup catch-up and tag lookup").run(|| {
+            scratch
+                .db
+                .read_raw_tag_location(
+                    &bind,
+                    "s-test",
+                    LogLocation::Live,
+                    &wal.durable_publication().unwrap(),
+                    501,
+                )
+                .unwrap()
+        });
+        assert_eq!(location.found, Some((0, 0)));
+        assert!(
+            counter.snapshot()[0].seed_fallbacks.is_empty(),
+            "{:?}",
+            counter.snapshot()[0].seed_fallbacks
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        let positions = decoded(&bytes);
+        let start = &positions[0];
+        let boundary = &positions[2];
+        let terminal = &positions[3];
+        let setup = &positions[4];
+        use broca_wal::access_counter::{ReadClass, ValidationRead};
+        let frame = |name, p: &(usize, usize, FramedRecord)| {
+            (name, p.0 as u64, (p.1 - p.0) as u64, ReadClass::Source)
+        };
+        let header = (
+            "lineage header",
+            0,
+            broca_wal::framing::LINEAGE_FRAME_LEN as u64,
+            ReadClass::LineageHeader,
+        );
+        let current = frame("current/first RunStarted", start);
+        let state = frame("current last step", boundary);
+        let terminal_header = (
+            "terminal header",
+            terminal.0 as u64,
+            broca_wal::framing::HEADER_LEN as u64,
+            ReadClass::Source,
+        );
+        let terminal_source = frame("terminal source", terminal);
+        let common = vec![
+            (
+                "row cursor",
+                setup.0 as u64,
+                (bytes.len() - setup.0) as u64,
+                ReadClass::Source,
+            ),
+            (
+                "seed tail",
+                boundary.1 as u64,
+                (bytes.len() - boundary.1) as u64,
+                ReadClass::Source,
+            ),
+            current,
+            (
+                "lineage gap",
+                boundary.1 as u64,
+                broca_wal::framing::LINEAGE_FRAME_LEN as u64,
+                ReadClass::Validation(ValidationRead::LineageGap),
+            ),
+            (
+                "qualified boundary",
+                boundary.0 as u64,
+                (boundary.1 - boundary.0) as u64,
+                ReadClass::Validation(ValidationRead::BoundaryFrame),
+            ),
+            header,
+        ];
+        let mut expected = vec![
+            header,
+            (
+                "publication row cursor",
+                terminal.0 as u64,
+                (setup.0 - terminal.0) as u64,
+                ReadClass::Validation(ValidationRead::BoundaryFrame),
+            ),
+            current,
+            (
+                "publication Setup range",
+                setup.0 as u64,
+                (bytes.len() - setup.0) as u64,
+                ReadClass::Source,
+            ),
+        ];
+        expected.extend(common.clone());
+        expected.extend([state, terminal_header, terminal_source]);
+        expected.extend(common);
+        expected.extend([terminal_header, terminal_source, state]);
+        let op = counter.snapshot().remove(0);
+        assert_eq!((op.reads.len(), op.frames_decoded), (22, 30));
+        for (read, (name, off, len, class)) in op.reads.iter().zip(expected) {
+            assert_eq!(
+                (read.offset, read.length, read.class),
+                (off, len, class),
+                "{name}"
+            );
+        }
+        let actual = raw_read(&scratch.db, &bind, &wal, Some(0), 2);
+        let frames: Vec<_> = decoded(&std::fs::read(path).unwrap())
+            .into_iter()
+            .map(|(_, _, f)| f)
+            .collect();
+        let mut expected = broca_core::read_session_page(
+            &broca_core::StorePageSnapshot::empty(),
+            &frames,
+            Some(0),
+            Some(2),
+        )
+        .unwrap();
+        expected.lineage_id = Some(wal.durable_publication().unwrap().lineage());
+        assert_eq!(actual.page, expected);
+    }
+
+    #[test]
+    fn raw_database_historical_timestamp_fallback_is_named_counted_and_noticed_once() {
+        use broca_wal::Wal;
+        for queued_source in [false, true] {
+            let (_, mut records, _) = boundary_cases()
+                .into_iter()
+                .find(|(name, _, _)| *name == "no_tool_terminal")
+                .unwrap();
+            let ordinal = if queued_source { 0 } else { 1 };
+            if queued_source {
+                if let WalRecord::RunStarted {
+                    written_at_ms,
+                    submission_id,
+                    ts_ms,
+                    ..
+                } = &mut records[0]
+                {
+                    *written_at_ms = None;
+                    *submission_id = Some(broca_protocol::SubmissionId("q".into()));
+                    *ts_ms = Some(999);
+                }
+                records.insert(0, serde_json::from_value(serde_json::json!({"type":"queued","submission_id":"q","ts_ms":123,
+                    "request":{"model":{"provider_module_id":"p","model_id":"m"},"input":[],"policy_allowed":[],"tool_choice":{"type":"auto"},"generation":{},"stop_when":[]}})).unwrap());
+            } else {
+                let step = match records[2] {
+                    WalRecord::ModelStepFinished { step_id, .. } => step_id,
+                    _ => unreachable!(),
+                };
+                records.insert(2, serde_json::from_value(serde_json::json!({"type":"model_attempt_finished","step_id":step,"attempt":0,"outcome":"complete","ts_ms":123,
+                    "request_body_len":0,"request_body_sha256":"a","response_body_len":0,"response_body_sha256":"b"})).unwrap());
+            }
+            let bind = bind(&encode_records(&records));
+            let scratch = database();
+            let path = scratch._scratch.0.join("raw-historical.wal");
+            let mut wal = broca_wal::FileWal::open(&path)
+                .unwrap()
+                .with_feature_floor(scratch._scratch.0.join("wal-floor"));
+            for record in records {
+                wal.append(1, &record, false).unwrap();
+            }
+            wal.sync().unwrap();
+            publish_writer(&scratch.db, &bind, &wal);
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            for _ in 0..2 {
+                let actual = counter
+                    .operation("historical timestamp source")
+                    .run(|| raw_read(&scratch.db, &bind, &wal, Some(ordinal), 1));
+                assert_eq!(actual.page.messages[0].written_at, Some(123));
+            }
+            assert_eq!(scratch.db.raw_fallback_notices.lock().unwrap().len(), 1);
+            for op in counter.snapshot() {
+                assert_eq!(op.seed_fallbacks, ["raw page historical timestamp source"]);
+                assert_eq!(
+                    op.reads
+                        .iter()
+                        .filter(|r| r.class == broca_wal::access_counter::ReadClass::Origin)
+                        .count(),
+                    1
+                );
+                assert_eq!(op.reads.len(), if queued_source { 7 } else { 8 });
+                assert_eq!(op.frames_decoded, if queued_source { 20 } else { 21 });
+            }
+        }
+    }
+
+    #[test]
+    fn raw_database_open_tool_turn_matches_full_read_at_every_durable_cut() {
+        use broca_wal::Wal;
+        let cases = boundary_cases();
+        let prefix = modern_raw_records(
+            cases
+                .iter()
+                .find(|(name, _, _)| *name == "no_tool_terminal")
+                .unwrap()
+                .1
+                .clone(),
+        );
+        let mut records = modern_raw_records(
+            cases
+                .iter()
+                .find(|(name, _, _)| *name == "committed_turn_without_episode_terminal")
+                .unwrap()
+                .1
+                .clone(),
+        );
+        if let WalRecord::RunStarted { run_id, .. } = &mut records[0] {
+            run_id.0.push_str("-tool-run");
+        }
+        let bind = bind(&encode_records(&prefix));
+        let scratch = database();
+        let path = scratch._scratch.0.join("raw-open-tool.wal");
+        let mut wal = broca_wal::FileWal::open(&path)
+            .unwrap()
+            .with_feature_floor(scratch._scratch.0.join("wal-floor"));
+        for record in prefix {
+            wal.append(1, &record, false).unwrap();
+        }
+        wal.sync().unwrap();
+        publish_writer(&scratch.db, &bind, &wal);
+        let mut open_cuts = 0;
+        for record in records {
+            wal.append(1, &record, true).unwrap();
+            publish_writer(&scratch.db, &bind, &wal);
+            let bytes = std::fs::read(&path).unwrap();
+            let frames: Vec<_> = decoded(&bytes).into_iter().map(|(_, _, f)| f).collect();
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            let actual = counter
+                .operation("raw tool publication cut")
+                .run(|| raw_read(&scratch.db, &bind, &wal, None, 2));
+            let mut expected = broca_core::read_session_page(
+                &broca_core::StorePageSnapshot::empty(),
+                &frames,
+                None,
+                Some(2),
+            )
+            .unwrap();
+            expected.lineage_id = Some(wal.durable_publication().unwrap().lineage());
+            assert_eq!(actual.page, expected, "cut {}", frames.len());
+            let replay =
+                broca_core::replay(&frames.iter().map(|f| f.record.clone()).collect::<Vec<_>>())
+                    .unwrap();
+            open_cuts += usize::from(replay.open_tool_turn.is_some());
+            let op = counter.snapshot().remove(0);
+            assert!(
+                op.seed_fallbacks.is_empty(),
+                "cut {}: {:?}",
+                frames.len(),
+                op.seed_fallbacks
+            );
+            assert!(op
+                .reads
+                .iter()
+                .all(|r| r.class != broca_wal::access_counter::ReadClass::Origin));
+            assert_named_raw_reads(
+                &scratch.db,
+                &bind,
+                &bytes,
+                None,
+                2,
+                actual.page.prompt_len,
+                &op,
+            );
+        }
+        assert!(
+            open_cuts > 0,
+            "the corpus must expose a dispatched, uncommitted assistant turn"
+        );
+    }
+
+    #[test]
+    fn raw_database_rejects_mismatched_lineage_and_message_sources_without_partial_pages() {
+        use broca_wal::Wal;
+        let (_, records, _) = boundary_cases()
+            .into_iter()
+            .find(|(name, _, _)| *name == "no_tool_terminal")
+            .unwrap();
+        let records = modern_raw_records(records);
+        let bind = bind(&encode_records(&records));
+        let scratch = database();
+        let path = scratch._scratch.0.join("raw-mismatch.wal");
+        let mut wal = broca_wal::FileWal::open(&path)
+            .unwrap()
+            .with_feature_floor(scratch._scratch.0.join("wal-floor"));
+        for record in records {
+            wal.append(1, &record, false).unwrap();
+        }
+        wal.sync().unwrap();
+        publish_writer(&scratch.db, &bind, &wal);
+        let expected = raw_read(&scratch.db, &bind, &wal, Some(0), 200).page;
+        for sql in [
+            "UPDATE session SET lineage_id='replaced-lineage'",
+            "UPDATE message SET lo_seq=lo_seq+10 WHERE ord=0",
+        ] {
+            scratch
+                .db
+                .authoritative_transaction(|tx| {
+                    tx.execute_batch(sql)?;
+                    Ok(())
+                })
+                .unwrap();
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            let actual = counter
+                .operation("invalid raw source")
+                .run(|| raw_read(&scratch.db, &bind, &wal, Some(0), 200));
+            assert_eq!(actual.page, expected);
+            let op = counter.snapshot().remove(0);
+            assert_eq!(op.seed_fallbacks, ["raw page index or source invalid"]);
+            assert_eq!(
+                op.reads
+                    .iter()
+                    .filter(|r| r.class == broca_wal::access_counter::ReadClass::Origin)
+                    .count(),
+                1
+            );
+            scratch.db.forget_session(&bind).unwrap();
+            publish_writer(&scratch.db, &bind, &wal);
+        }
+    }
+
+    #[test]
+    fn raw_database_restart_serves_media_and_zero_step_without_origin_reads() {
+        use broca_wal::Wal;
+        for zero_step in [false, true] {
+            let (_, records, _) = boundary_cases()
+                .into_iter()
+                .find(|(name, _, _)| *name == "no_tool_terminal")
+                .unwrap();
+            let mut records = modern_raw_records(records);
+            if let WalRecord::RunStarted { input, config, .. } = &mut records[0] {
+                std::sync::Arc::make_mut(input)[0].content.push(
+                    broca_protocol::ContentBlock::Media(broca_protocol::MediaRef {
+                        kind: broca_protocol::MediaKind::Image,
+                        mime: "image/png".into(),
+                        byte_size: 69,
+                        sha256: "a".repeat(64),
+                        width: Some(1),
+                        height: Some(1),
+                    }),
+                );
+                config.frozen_render_config["media"] = serde_json::json!({"images":{"max":4}});
+            }
+            if zero_step {
+                records = vec![records[0].clone(), records[3].clone()];
+            }
+            let bind = bind(&encode_records(&records));
+            let TestDb { db, _scratch } = database();
+            let path = _scratch.0.join("raw-restart.wal");
+            let mut wal = broca_wal::FileWal::open(&path)
+                .unwrap()
+                .with_feature_floor(_scratch.0.join("wal-floor"));
+            for record in &records {
+                wal.append(1, record, false).unwrap();
+            }
+            wal.sync().unwrap();
+            publish_writer(&db, &bind, &wal);
+            drop(db);
+            let db = OverhaulDb::open(&_scratch.0).unwrap();
+            if let WalRecord::RunStarted { run_id, .. } = &mut records[0] {
+                run_id.0.push_str("-after-restart");
+            }
+            for record in &records {
+                wal.append(1, record, false).unwrap();
+            }
+            wal.sync().unwrap();
+            publish_writer(&db, &bind, &wal);
+            let bytes = std::fs::read(&path).unwrap();
+            let frames: Vec<_> = decoded(&bytes).into_iter().map(|(_, _, f)| f).collect();
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            let actual = counter
+                .operation("restarted media raw page")
+                .run(|| raw_read(&db, &bind, &wal, None, 1));
+            let mut expected = broca_core::read_session_page(
+                &broca_core::StorePageSnapshot::empty(),
+                &frames,
+                None,
+                Some(1),
+            )
+            .unwrap();
+            expected.lineage_id = Some(wal.durable_publication().unwrap().lineage());
+            assert_eq!(actual.page, expected);
+            assert_eq!(
+                actual.head,
+                broca_core::AdmissionCheckpointV1::from_frames(&frames)
+                    .unwrap()
+                    .head
+                    .unwrap()
+            );
+            let op = counter.snapshot().remove(0);
+            assert!(
+                op.seed_fallbacks.is_empty(),
+                "{zero_step}: {:?}",
+                op.seed_fallbacks
+            );
+            assert!(op
+                .reads
+                .iter()
+                .all(|r| r.class != broca_wal::access_counter::ReadClass::Origin));
+            assert_eq!(
+                (op.reads.len(), op.frames_decoded),
+                if zero_step { (7, 9) } else { (8, 10) }
+            );
+            assert_named_raw_reads(&db, &bind, &bytes, None, 1, actual.page.prompt_len, &op);
+        }
+    }
+
     fn tail_seed(db: &OverhaulDb) -> String {
         db.read_snapshot(|tx| {
             tx.query_row("SELECT tail_seed FROM session", [], |r| r.get(0))
@@ -2439,6 +3475,23 @@ mod tests {
                 assert!(serde_json::from_str::<serde_json::Value>(&locator)
                     .unwrap()
                     .is_array());
+                let mut locator_value: serde_json::Value = serde_json::from_str(&locator).unwrap();
+                let fold = locator_value[1]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("head_fold")
+                    .unwrap();
+                assert_eq!(fold["version"], 1);
+                let _: broca_core::head::HeadReadFold =
+                    serde_json::from_value(fold.clone()).unwrap();
+                for field in ["title", "prompt", "payload", "content", "billing", "price"] {
+                    assert!(!locator.contains(&format!("\"{field}\"")));
+                    let mut poisoned = fold.clone();
+                    poisoned[field] = serde_json::json!("forbidden-content-sentinel");
+                    assert!(
+                        serde_json::from_value::<broca_core::head::HeadReadFold>(poisoned).is_err()
+                    );
+                }
                 for encoded in [&tail, &admission] {
                     let value: serde_json::Value = serde_json::from_str(encoded).unwrap();
                     assert_eq!(value["version"], 1);
