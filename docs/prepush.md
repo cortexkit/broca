@@ -48,7 +48,8 @@ the test temporary root, include the command/exit code even for silent errors,
 and are replayed before the remote job disappears. Run from a checkout on a
 healthy internal disk so the caller's retained logs are not lost to volume stalls.
 An integrating agent must use its own clean scratch checkout, not another
-agent's leased worktree (`lease_mismatch`). Each dispatched job prints
+agent's leased worktree, which Motor rejects with an ownership-authorization
+error named `lease_mismatch`. Each dispatched job prints
 `MOTOR_RUNNER_INSTANCE`; its motor event record is retained beside the lane log
 as `LANE.motor.jsonl`. A refusal before job start has no user-process instance
 banner; retain its exact refusal and event record instead of guessing a host.

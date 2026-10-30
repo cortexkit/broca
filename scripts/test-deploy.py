@@ -68,6 +68,8 @@ class Fixture(unittest.TestCase):
 class DeployTests(Fixture):
     def setUp(self):
         super().setUp()
+        # A caller's shared build cache is not part of this isolated release fixture.
+        self.env["CARGO_TARGET_DIR"] = str(self.root / "target/fixture output")
         shutil.copy2(ROOT / "scripts/deploy.sh", self.scripts)
         stub = self.scripts / "stub.py"
         stub.write_text(r'''
@@ -90,7 +92,7 @@ if name == "stage":
     seam.mkdir(parents=True)
     short = subprocess.check_output(["git", "rev-parse", "--short=8", "HEAD"], text=True).strip()
     (seam / ("ck-broca." + short)).write_bytes(b"signed release")
-    client = pathlib.Path("target/release/broca-session")
+    client = pathlib.Path(os.environ.get("CARGO_TARGET_DIR", "target")) / "release/broca-session"
     client.parent.mkdir(parents=True)
     if not os.environ.get("MISSING_CLIENT"):
         client.write_text("#!/bin/sh\nexit 0\n")
