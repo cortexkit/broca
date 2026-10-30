@@ -93,6 +93,17 @@ emitted: MC retains its shared attribution classifier.
   An edit, removal, insertion before the end, or changed setting is false with
   its first divergence, **even after the previous cache marker**. The classifier,
   not broca's comparison, decides whether that coordinate is inside cached input.
+- Message divergences additionally carry optional `message_ordinal`, the durable
+  transcript ordinal used by `session.read` and the `m<ordinal>` component of
+  compaction-view addresses. It comes from the actual emitted row/part's source
+  `Message.ordinal`, never from a rendered index or parsed prompt text. A view can
+  move `m2` to wire position zero; the ordinal stays 2. The current request's source
+  is reported when a current segment exists; a removed tail uses the previous
+  request's source. System, tools, provider settings, and content without a unique
+  durable source omit it. Grouped Gemini tool rows resolve part-level origins,
+  while their ambiguous row header has no single ordinal. The wire `part_index`
+  is still a provider-array position, not automatically a durable `#<part>` key.
+  The optional member is absent by default and older evidence readers ignore it.
 - `previous_last_breakpoint` uses the same coordinate space as `first_divergence`:
   `{region, message_index?, part_index?}`. Regions are `system`, `tools`,
   `messages`, and `provider_state`. There are no synthetic message indexes.
@@ -101,6 +112,16 @@ emitted: MC retains its shared attribution classifier.
   standalone `cachePoint` uses its own block index. Non-positional settings have
   a region and optional changed `field`. `prefix_tokens_before` is omitted:
   JSON segments do not establish tokenizer boundaries.
+
+The trace-aware render entry points accept an optional borrowed provenance sink.
+The existing entry points use the same builders and emitters with no sink. With
+provenance enabled, actual row/part emission records only integer coordinates and
+source ordinals in flat vectors, including filtering, tool-item splitting and
+grouping, synthetic instructions, and prepared-media rendering. No identity is
+inserted into request JSON, and fingerprints never retain transcript bodies.
+When an older recorded divergence has no ordinal, `cache-diagnose` can resolve it
+from the reconstructed current and preceding requests after their recorded SHA-256
+digests match, and marks `message_ordinal_resolved_offline`.
 - A null breakpoint with `ttl_kind: "explicit"` means the previous request had
   no explicit marker. With `ttl_kind: "implicit"`, a null breakpoint is normal.
   TTL policy is taken from the previous request's frozen config, including

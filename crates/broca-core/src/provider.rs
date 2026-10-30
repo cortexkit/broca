@@ -20,12 +20,14 @@ pub type LiveStepProgress = Arc<Mutex<Option<broca_protocol::provider::InFlightS
 /// The booleans select tag rendering and commit the durable step boundary to aging,
 /// respectively. That commit is not physical-send permission.
 /// Estimates must not age a not-yet-final view.
+/// The optional sink records source ordinals for the final emitted request, not size probes.
 #[cfg(feature = "test-attachments")]
 pub type MediaRequestRenderer = dyn Fn(
         &serde_json::Value,
         &CallOptions,
         bool,
         bool,
+        Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Result<Vec<u8>, Box<broca_protocol::ProviderError>>
     + Send
     + Sync;

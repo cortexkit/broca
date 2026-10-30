@@ -6092,9 +6092,8 @@ where
                 .as_ref()
                 .map(|(tx, _)| Arc::new(ChannelAttemptHook(tx.clone())) as Arc<dyn AttemptHook>);
             provider.set_cache_evidence_view(
-                prior
-                    .compaction
-                    .state()
+                compaction_state
+                    .as_ref()
                     .and_then(|state| state.view.as_ref())
                     .map(|applied| applied.view.view_version),
             );

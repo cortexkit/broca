@@ -129,6 +129,15 @@ fn build_request_body_with_media(
     opts: &CallOptions,
     media: Option<&crate::media_render::MediaRender<'_>>,
 ) -> serde_json::Value {
+    build_request_body_with_media_and_provenance(frozen, opts, media, None)
+}
+
+fn build_request_body_with_media_and_provenance(
+    frozen: &FrozenRenderConfig,
+    opts: &CallOptions,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+    mut provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+) -> serde_json::Value {
     // The body STARTS from the shared OpenAI-Responses builder, then applies the codex
     // backend's deltas — the ways the codex/responses backend is STRICTER than the
     // platform /responses API (mirrors opencode's codex transform exactly):
@@ -136,7 +145,12 @@ fn build_request_body_with_media(
         mut body,
         prepared,
         effort_anchor,
-    } = super::openai_responses::build_prepared_request_body_with_media(frozen, opts, media);
+    } = super::openai_responses::build_prepared_request_body_with_media_and_provenance(
+        frozen,
+        opts,
+        media,
+        provenance.as_deref_mut(),
+    );
     // store:false — the codex backend REJECTS a request without it ("Store must be set
     // to false"). The platform Responses API defaults store on the server side; codex
     // enforces it in the body.
@@ -177,7 +191,7 @@ fn build_request_body_with_media(
         body["service_tier"] = serde_json::Value::String(service_tier.clone());
     }
     if let Some(wire) = &frozen.chatgpt_wire {
-        wire.apply(&mut body, prepared.as_ref());
+        wire.apply_with_provenance(&mut body, prepared.as_ref(), provenance);
     }
     body
 }
@@ -191,14 +205,38 @@ impl WireFamily for OpenAiResponsesChatgpt {
         build_request_body_with_media(frozen, opts, None)
     }
 
+    fn shape_with_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> serde_json::Value {
+        build_request_body_with_media_and_provenance(frozen, opts, None, provenance)
+    }
+
     fn shape_with_media(
         &self,
         frozen: &FrozenRenderConfig,
         opts: &CallOptions,
         payloads: &[crate::media_render::InlineMedia<'_>],
     ) -> serde_json::Value {
+        self.shape_with_media_and_provenance(frozen, opts, payloads, None)
+    }
+
+    fn shape_with_media_and_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        payloads: &[crate::media_render::InlineMedia<'_>],
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> serde_json::Value {
         let media = crate::media_render::MediaRender { frozen, payloads };
-        build_request_body_with_media(frozen, opts, frozen.media.as_ref().map(|_| &media))
+        build_request_body_with_media_and_provenance(
+            frozen,
+            opts,
+            frozen.media.as_ref().map(|_| &media),
+            provenance,
+        )
     }
 
     fn endpoint(

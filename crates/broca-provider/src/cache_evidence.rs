@@ -31,6 +31,10 @@ pub struct Divergence {
     pub region: Region,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_index: Option<u32>,
+    /// Durable transcript ordinal, not the rendered array position. System/tool evidence
+    /// and messages without a durable ordinal leave this absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_ordinal: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub part_index: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -74,6 +78,34 @@ pub struct RequestFingerprint {
     family: WireFamilyId,
     segments: Vec<(Divergence, [u8; 32])>,
     breakpoint: Option<Breakpoint>,
+}
+
+impl RequestFingerprint {
+    /// Attach only identities reported by the renderer for this exact wire layout.
+    /// A custom renderer with no matching provenance leaves identities absent.
+    pub fn with_provenance(
+        mut self,
+        provenance: &broca_protocol::render_provenance::RenderProvenance,
+    ) -> Self {
+        let count = self
+            .segments
+            .iter()
+            .filter_map(|(location, _)| location.message_index)
+            .max()
+            .map_or(0, |n| n as usize + 1);
+        if count != provenance.message_count() {
+            return self;
+        }
+        for (location, _) in &mut self.segments {
+            if location.region == Region::Messages {
+                location.message_ordinal = location.message_index.and_then(|message| {
+                    provenance
+                        .message_ordinal(message as usize, location.part_index.map(|n| n as usize))
+                });
+            }
+        }
+        self
+    }
 }
 
 #[derive(Deserialize)]
@@ -235,6 +267,7 @@ fn location(region: Region, message: Option<usize>, part: Option<usize>) -> Dive
     Divergence {
         region,
         message_index: message.map(|n| n as u32),
+        message_ordinal: None,
         part_index: part.map(|n| n as u32),
         field: None,
         prefix_tokens_before: None,
@@ -463,10 +496,25 @@ pub fn compare_rendered_requests(
     previous: &[u8],
     current: &[u8],
 ) -> Result<CacheEvidence, String> {
-    let (mut evidence, index) = comparison(
-        &fingerprint(family, previous)?,
-        &fingerprint(family, current)?,
-    );
+    compare_rendered_requests_with_provenance(family, previous, current, None, None)
+}
+
+pub fn compare_rendered_requests_with_provenance(
+    family: WireFamilyId,
+    previous: &[u8],
+    current: &[u8],
+    previous_provenance: Option<&broca_protocol::render_provenance::RenderProvenance>,
+    current_provenance: Option<&broca_protocol::render_provenance::RenderProvenance>,
+) -> Result<CacheEvidence, String> {
+    let mut old = fingerprint(family, previous)?;
+    let mut new = fingerprint(family, current)?;
+    if let Some(provenance) = previous_provenance {
+        old = old.with_provenance(provenance);
+    }
+    if let Some(provenance) = current_provenance {
+        new = new.with_provenance(provenance);
+    }
+    let (mut evidence, index) = comparison(&old, &new);
     if let Some((at, index)) = evidence.first_divergence.as_mut().zip(index) {
         if let Some((old, new)) = divergent_value(family, previous, &at.region, index)?
             .zip(divergent_value(family, current, &at.region, index)?)
@@ -477,8 +525,12 @@ pub fn compare_rendered_requests(
     #[cfg(test)]
     {
         let reference = reference::compare_rendered_requests(family, previous, current)?;
+        let mut body_only = evidence.clone();
+        if let Some(divergence) = body_only.first_divergence.as_mut() {
+            divergence.message_ordinal = None;
+        }
         assert_eq!(
-            serde_json::to_value(&evidence).unwrap(),
+            serde_json::to_value(&body_only).unwrap(),
             serde_json::to_value(reference).unwrap(),
             "borrowed fingerprints must agree with the full-parse oracle"
         );

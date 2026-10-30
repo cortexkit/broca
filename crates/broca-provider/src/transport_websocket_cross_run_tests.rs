@@ -858,3 +858,77 @@ async fn cache_evidence_send_and_first_text_do_not_wait_for_fingerprint() {
         while rx.recv().await.is_some() {}
     }
 }
+
+#[tokio::test]
+async fn cache_evidence_captures_model_change_through_the_run_loop() {
+    let mut changed = text_events();
+    changed[1]["response"]["usage"]["input_tokens_details"]["cached_tokens"] = Value::from(0);
+    let mock = Mock::start(vec![text_events(), changed], false, false).await;
+    let client = build_provider_http_client();
+    let root = broca_test_support::scratch_root().join("cache-evidence-model-change");
+    let session = BindIdentity::new(
+        root.join("synthetic-project"),
+        "scripted-websocket",
+        "model-change-conversation",
+    );
+    let wal = FileWalStore::new(root.join("wal"));
+    let leases = FileLeaseStore::new(root.join("lease"));
+    for (index, model) in ["m", "changed-m"].into_iter().enumerate() {
+        let mut provider = run_provider(&mock, &client, &index.to_string());
+        let mut frozen = (*provider.frozen).clone();
+        frozen.wire_model_id = model.into();
+        provider.frozen = Arc::new(frozen);
+        let mut request = tool_run_request(&session);
+        request.run_id = RunId(format!("model-change-run-{index}"));
+        request.model.model_id = model.into();
+        request.tools.clear();
+        request.policy_allowed.clear();
+        request.input[0].content = vec![ContentBlock::Text {
+            text: format!("synthetic model question {index}"),
+        }];
+        let (tx, mut rx) = mpsc::channel(256);
+        let collect = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let summary = broca_test_support::wait_for(
+            "model-change capture run",
+            run_loop(
+                request,
+                &provider,
+                &StubToolPlane::new(),
+                &leases,
+                &AllowAll,
+                &wal,
+                &tx,
+            ),
+            || "scripted model did not finish".into(),
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        collect.await.unwrap();
+        assert_eq!(summary.reason, RunFinishReason::Completed);
+    }
+    let frames = wal.read_records(&session).unwrap();
+    let attempts: Vec<_> = frames
+        .iter()
+        .filter(|f| matches!(f.record, WalRecord::ModelAttemptFinished { .. }))
+        .collect();
+    assert_eq!(attempts.len(), 2);
+    let record = serde_json::to_value(&attempts[1].record).unwrap();
+    assert_eq!(record["cache_evidence"]["model_changed"], true);
+    assert_eq!(record["cache_evidence"]["extends_previous"], false);
+    assert_eq!(
+        record["websocket_request"]["codex"]["full_input_reason"],
+        "model_changed"
+    );
+    assert!(record["cache_evidence"]["compared_to"]
+        .as_str()
+        .unwrap()
+        .ends_with(&format!(":{}", attempts[0].seq)));
+    if let Some(directory) = std::env::var_os("BROCA_CACHE_EVIDENCE_SAMPLES") {
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut bytes = serde_json::to_vec_pretty(&attempts[1].record).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(directory.join("model-change.json"), bytes).unwrap();
+    }
+}

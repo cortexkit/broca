@@ -1408,8 +1408,8 @@ mod tests {
         let mut terminal = finished(1, false);
         let reservation = terminal["reservation"].clone();
         let envelope = terminal["envelope"].clone();
-        terminal["cache_evidence"] = json!({"compared_to":"lineage:2","extends_previous":true,
-            "first_divergence":null,"previous_last_breakpoint":null,"idle_gap_ms":123,
+        terminal["cache_evidence"] = json!({"compared_to":"lineage:2","extends_previous":false,
+            "first_divergence":{"region":"messages","message_index":2,"part_index":0,"message_ordinal":41},"previous_last_breakpoint":null,"idle_gap_ms":123,
             "cache_ttl_ms":null,"ttl_kind":"implicit","model_changed":false,
             "account_changed":false,"view":null,"future_evidence_member":true});
         terminal["websocket_request"] = json!({"len":10,"sha256":"digest","codex":{

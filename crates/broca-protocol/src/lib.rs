@@ -47,6 +47,7 @@ pub mod display;
 pub mod error;
 pub mod ids;
 pub mod provider;
+pub mod render_provenance;
 pub mod request;
 pub mod session;
 pub mod structured_output;

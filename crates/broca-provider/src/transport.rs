@@ -321,6 +321,7 @@ pub struct LiveProvider<F: WireFamily + 'static> {
 struct PreparedHttpRequest {
     cache_session: Option<(Arc<cache_runtime::Session>, Arc<FrozenRenderConfig>)>,
     cache_model: Option<String>,
+    cache_provenance: Option<Arc<broca_protocol::render_provenance::RenderProvenance>>,
     attempt_hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
     /// Local diagnostic policy, never part of the rendered request or its digest.
     ephemeral_session: bool,
@@ -356,6 +357,7 @@ impl From<HttpRequest> for PreparedHttpRequest {
             attempt_hook: None,
             cache_session: None,
             cache_model: None,
+            cache_provenance: None,
             ephemeral_session: false,
             codex_wire: false,
             auth_revision: 0,
@@ -638,6 +640,7 @@ fn ratelimit_unified_headers(
 
 impl<F: WireFamily + 'static> RenderJob<F> {
     fn render(self) -> Result<RenderedRequest, Box<ProviderError>> {
+        let mut provenance = broca_protocol::render_provenance::RenderProvenance::default();
         // This scan is deliberately in the same blocking job as rendering: it walks the entire
         // prompt to preserve aliases from historical tool calls on every resumed step.
         let name_map = Arc::new(crate::tool_name_alias::ToolNameMap::build(
@@ -651,15 +654,20 @@ impl<F: WireFamily + 'static> RenderJob<F> {
                 &self.opts,
                 self.media_render_tags,
                 true,
+                Some(&mut provenance),
             )?
         } else {
-            self.family.render(&self.frozen, &self.opts)
+            self.family
+                .render_with_provenance(&self.frozen, &self.opts, Some(&mut provenance))
         };
         #[cfg(not(feature = "test-attachments"))]
-        let body = self.family.render(&self.frozen, &self.opts);
+        let body =
+            self.family
+                .render_with_provenance(&self.frozen, &self.opts, Some(&mut provenance));
         let mut request =
             PreparedHttpRequest::from(self.family.endpoint(&self.frozen, &self.auth, body));
         request.ephemeral_session = self.opts.ephemeral_session;
+        request.cache_provenance = Some(Arc::new(provenance));
         request.cache_session = self
             .cache_session
             .map(|session| (session, Arc::clone(&self.frozen)));
@@ -1389,6 +1397,7 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
                 opts,
                 self.media_render_tags.load(Ordering::Relaxed),
                 false,
+                None,
             );
         }
         Ok(self.family.render(&frozen, opts))
@@ -2815,6 +2824,7 @@ fn spawn_transport_task<F: WireFamily + 'static>(
             PreparedHttpRequest {
                 cache_session: sent.cache_session.clone(),
                 cache_model: sent.cache_model.clone(),
+                cache_provenance: sent.cache_provenance.clone(),
                 attempt_hook: sent.attempt_hook.clone(),
                 ephemeral_session: sent.ephemeral_session,
                 codex_wire: sent.codex_wire,
@@ -5788,6 +5798,10 @@ mod tests {
 
     mod schema_fallback {
         include!("transport_schema_fallback_tests.rs");
+    }
+
+    mod cache_evidence_samples {
+        include!("transport_cache_evidence_samples.rs");
     }
 
     mod inception {

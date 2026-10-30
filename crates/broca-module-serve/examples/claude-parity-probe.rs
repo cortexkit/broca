@@ -121,7 +121,23 @@ impl WireFamily for ProbeFamily {
         AnthropicMessages.shape(frozen, opts)
     }
     fn render(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Vec<u8> {
-        AnthropicMessages.render(frozen, opts)
+        self.render_with_provenance(frozen, opts, None)
+    }
+    fn shape_with_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Value {
+        AnthropicMessages.shape_with_provenance(frozen, opts, provenance)
+    }
+    fn render_with_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Vec<u8> {
+        AnthropicMessages.render_with_provenance(frozen, opts, provenance)
     }
     fn endpoint(
         &self,

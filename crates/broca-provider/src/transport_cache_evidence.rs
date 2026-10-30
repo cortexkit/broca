@@ -134,28 +134,31 @@ impl Session {
                 _ => {}
             }
         }
-        let rebuilt = broca_core::cache_warm::last_recorded_request(&records)
-            .ok()
-            .and_then(|recorded| {
-                let provider = recorded
-                    .route
-                    .as_ref()
-                    .map_or(&recorded.config.model, |route| &route.model)
-                    .provider_module_id
-                    .clone();
-                let frozen: FrozenRenderConfig =
-                    serde_json::from_value(recorded.config.frozen_render_config).ok()?;
-                let frozen = if recorded.route.is_some() {
-                    frozen.refusal_fallback?.frozen
-                } else {
-                    frozen
-                };
-                let body =
-                    crate::registry::wire_family(frozen.family_id)?.render(&frozen, &recorded.opts);
-                (RequestDigest::of(&body).sha256 == recorded.request_body_sha256)
-                    .then_some((frozen, body, provider))
-            });
-        if let Some((frozen, body, provider)) = rebuilt {
+        let rebuilt =
+            broca_core::cache_warm::last_recorded_request(&records)
+                .ok()
+                .and_then(|recorded| {
+                    let provider = recorded
+                        .route
+                        .as_ref()
+                        .map_or(&recorded.config.model, |route| &route.model)
+                        .provider_module_id
+                        .clone();
+                    let frozen: FrozenRenderConfig =
+                        serde_json::from_value(recorded.config.frozen_render_config).ok()?;
+                    let frozen = if recorded.route.is_some() {
+                        frozen.refusal_fallback?.frozen
+                    } else {
+                        frozen
+                    };
+                    let mut provenance =
+                        broca_protocol::render_provenance::RenderProvenance::default();
+                    let body = crate::registry::wire_family(frozen.family_id)?
+                        .render_with_provenance(&frozen, &recorded.opts, Some(&mut provenance));
+                    (RequestDigest::of(&body).sha256 == recorded.request_body_sha256)
+                        .then_some((frozen, body, provider, provenance))
+                });
+        if let Some((frozen, body, provider, provenance)) = rebuilt {
             if let Some((sent, account)) =
                 frames.iter().rev().find_map(|frame| match &frame.record {
                     broca_wal::WalRecord::ModelAttemptFinished {
@@ -179,6 +182,7 @@ impl Session {
             {
                 previous = fingerprint(frozen.family_id, &body)
                     .ok()
+                    .map(|fingerprint| fingerprint.with_provenance(&provenance))
                     .map(|fingerprint| Previous {
                         fingerprint,
                         family: frozen.family_id,
@@ -300,6 +304,7 @@ impl Pending {
         if pending.work.is_none() {
             let body = request.body.clone();
             let family = frozen.family_id;
+            let provenance = request.cache_provenance.clone();
             // No fingerprint work runs before the transport has accepted the request. Even
             // small requests use the blocking pool so hashing cannot postpone stream polling.
             #[cfg(test)]
@@ -309,7 +314,10 @@ impl Pending {
                 if let Some(gate) = gate {
                     gate.wait();
                 }
-                fingerprint(family, &body)
+                fingerprint(family, &body).map(|fingerprint| match provenance {
+                    Some(provenance) => fingerprint.with_provenance(&provenance),
+                    None => fingerprint,
+                })
             }));
         }
     }

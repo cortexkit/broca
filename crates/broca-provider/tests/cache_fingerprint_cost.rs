@@ -59,23 +59,21 @@ fn measure(messages: usize, text: &str, repeats: usize) -> (usize, f64) {
     let opts = CallOptions::new(
         (0..messages)
             .map(|n| {
-                Message::new(
+                let mut message = Message::new(
                     if n % 2 == 0 {
                         Role::User
                     } else {
                         Role::Assistant
                     },
                     vec![ContentBlock::Text { text: text.into() }],
-                )
+                );
+                message.ordinal = Some(n as u64);
+                message
             })
             .collect(),
     );
     let frozen = frozen_config_for_family(family, "measurement-model");
     let renderer = wire_family(family).unwrap();
-    let render_start = Instant::now();
-    let body = renderer.render(&frozen, &opts);
-    let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
-    let previous = fingerprint(family, &body).unwrap();
     let ticks_per_second = std::process::Command::new("getconf")
         .arg("CLK_TCK")
         .output()
@@ -83,24 +81,42 @@ fn measure(messages: usize, text: &str, repeats: usize) -> (usize, f64) {
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| s.trim().parse::<f64>().ok());
-    let before = cpu_ticks();
-    let start = Instant::now();
-    ALLOCATIONS.with(|n| n.set(0));
-    ACTIVE.with(|active| active.set(true));
-    for _ in 0..repeats {
-        let current = fingerprint(family, &body).unwrap();
-        let evidence = compare_fingerprints(&previous, &current);
-        std::hint::black_box(serde_json::to_value(evidence).unwrap());
-    }
-    ACTIVE.with(|active| active.set(false));
-    let wall_ms = start.elapsed().as_secs_f64() * 1000.0 / repeats as f64;
-    let cpu_ms = before
-        .zip(cpu_ticks())
-        .zip(ticks_per_second)
-        .map(|((before, after), hz)| (after - before) as f64 * 1000.0 / hz / repeats as f64);
-    let allocations = ALLOCATIONS.with(Cell::get) / repeats;
-    println!("fingerprint_compare_and_serialize messages={messages} body_bytes={} approx_tokens={} render_ms={render_ms:.3} cpu_ms={cpu_ms:?} wall_ms={wall_ms:.3} allocations={allocations}", body.len(), messages * text.split_whitespace().count());
-    (allocations, cpu_ms.unwrap_or(wall_ms))
+    let baseline = time(repeats, ticks_per_second, || {
+        std::hint::black_box(renderer.render(&frozen, &opts));
+    });
+    let traced = time(repeats, ticks_per_second, || {
+        let mut provenance = broca_protocol::render_provenance::RenderProvenance::default();
+        std::hint::black_box(renderer.render_with_provenance(
+            &frozen,
+            &opts,
+            Some(&mut provenance),
+        ));
+        std::hint::black_box(provenance);
+    });
+    let mut provenance = broca_protocol::render_provenance::RenderProvenance::default();
+    let body = renderer.render_with_provenance(&frozen, &opts, Some(&mut provenance));
+    assert_eq!(body, renderer.render(&frozen, &opts));
+    let previous = fingerprint(family, &body)
+        .unwrap()
+        .with_provenance(&provenance);
+    let evidence = time(repeats, ticks_per_second, || {
+        let current = fingerprint(family, &body)
+            .unwrap()
+            .with_provenance(&provenance);
+        std::hint::black_box(
+            serde_json::to_value(compare_fingerprints(&previous, &current)).unwrap(),
+        );
+    });
+    let extra_render_allocations = traced
+        .allocations
+        .checked_sub(baseline.allocations)
+        .expect("trace-free rendering must not add allocations");
+    let allocations = extra_render_allocations + evidence.allocations;
+    let extra_render_cpu = (traced.cpu_ms - baseline.cpu_ms).max(0.0);
+    let cpu = extra_render_cpu + evidence.cpu_ms;
+    let wall = (traced.wall_ms - baseline.wall_ms).max(0.0) + evidence.wall_ms;
+    println!("provenance_and_evidence messages={messages} body_bytes={} approx_tokens={} baseline_render={baseline:?} traced_render={traced:?} evidence={evidence:?} extra_render_allocations={extra_render_allocations} total_added_allocations={allocations} total_added_cpu_ms={cpu:.3} total_added_wall_ms={wall:.3}", body.len(), messages * text.split_whitespace().count());
+    (allocations, cpu)
 }
 
 #[test]
@@ -126,5 +142,35 @@ fn fingerprint_cost_and_allocation_growth() {
             large.1 <= 50.0,
             "large fingerprint exceeds off-send CPU budget: {large:?}"
         );
+    }
+}
+
+#[derive(Debug)]
+struct Timing {
+    cpu_ms: f64,
+    wall_ms: f64,
+    allocations: usize,
+}
+
+fn time(repeats: usize, ticks_per_second: Option<f64>, mut operation: impl FnMut()) -> Timing {
+    let before = cpu_ticks();
+    let start = Instant::now();
+    ALLOCATIONS.with(|n| n.set(0));
+    ACTIVE.with(|active| active.set(true));
+    for _ in 0..repeats {
+        operation();
+    }
+    ACTIVE.with(|active| active.set(false));
+    let wall_ms = start.elapsed().as_secs_f64() * 1000.0 / repeats as f64;
+    let cpu_ms = before
+        .zip(cpu_ticks())
+        .zip(ticks_per_second)
+        .map_or(wall_ms, |((before, after), hz)| {
+            (after - before) as f64 * 1000.0 / hz / repeats as f64
+        });
+    Timing {
+        cpu_ms,
+        wall_ms,
+        allocations: ALLOCATIONS.with(Cell::get) / repeats,
     }
 }

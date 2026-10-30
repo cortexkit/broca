@@ -61,14 +61,38 @@ impl WireFamily for OpenAiChat {
         build_request_body(frozen, opts)
     }
 
+    fn shape_with_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Value {
+        build_request_body_with_media_and_provenance(frozen, opts, None, provenance)
+    }
+
     fn shape_with_media(
         &self,
         frozen: &FrozenRenderConfig,
         opts: &CallOptions,
         payloads: &[crate::media_render::InlineMedia<'_>],
     ) -> Value {
+        self.shape_with_media_and_provenance(frozen, opts, payloads, None)
+    }
+
+    fn shape_with_media_and_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        payloads: &[crate::media_render::InlineMedia<'_>],
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Value {
         let media = crate::media_render::MediaRender { frozen, payloads };
-        build_request_body_with_media(frozen, opts, frozen.media.as_ref().map(|_| &media))
+        build_request_body_with_media_and_provenance(
+            frozen,
+            opts,
+            frozen.media.as_ref().map(|_| &media),
+            provenance,
+        )
     }
 
     fn endpoint(
@@ -132,6 +156,15 @@ fn build_request_body_with_media(
     opts: &CallOptions,
     media: Option<&crate::media_render::MediaRender<'_>>,
 ) -> Value {
+    build_request_body_with_media_and_provenance(frozen, opts, media, None)
+}
+
+fn build_request_body_with_media_and_provenance(
+    frozen: &FrozenRenderConfig,
+    opts: &CallOptions,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+    provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+) -> Value {
     // A run with structured output adds its submit tool or schema instructions here; a run
     // without renders from `opts` unchanged.
     let prepared = crate::structured_output::prepare(frozen, opts);
@@ -139,7 +172,7 @@ fn build_request_body_with_media(
     let view = crate::families::compaction_view(frozen.family_id, opts);
     let opts = view.as_ref();
     let name_map = crate::tool_name_alias::ToolNameMap::build(&opts.tools, &opts.prompt);
-    let messages = convert_messages(
+    let messages = convert_messages_with_provenance(
         &opts.prompt,
         frozen.reasoning_echo.or(frozen
             .reasoning_content_required
@@ -148,6 +181,7 @@ fn build_request_body_with_media(
         frozen.opencode_go_reasoning_signature,
         &name_map,
         media,
+        provenance,
     );
 
     let mut body = json!({
@@ -239,25 +273,30 @@ fn apply_prompt_cache_hints(body: &mut Value, frozen: &FrozenRenderConfig) {
     }
 }
 
-/// Convert the canonical prompt to OpenAI chat messages. The system prompt is a
-/// leading `system` message; an assistant turn carries any tool calls in
-/// `tool_calls`; a tool turn becomes one `role:"tool"` message PER result (OpenAI
-/// requires a separate message per tool_call_id).
-fn convert_messages(
+fn convert_messages_with_provenance(
     prompt: &[Message],
     reasoning_echo: Option<ReasoningEchoPolicy>,
     tool_call_content_empty_string: bool,
     opencode_go: bool,
     name_map: &crate::tool_name_alias::ToolNameMap,
     media: Option<&crate::media_render::MediaRender<'_>>,
+    mut provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
 ) -> Vec<Value> {
     let mut out = Vec::new();
     let mut follow_up = Vec::new();
+    let mut follow_up_origins = Vec::new();
     for m in prompt {
         // Finish every result in a parallel tool round before inserting a synthetic user turn.
         if m.role != Role::Tool && !follow_up.is_empty() {
+            if let Some(sink) = provenance.as_deref_mut() {
+                sink.record_message(out.len(), None);
+                for (start, end, ordinal) in follow_up_origins.drain(..) {
+                    sink.record_parts(out.len(), start, end, ordinal);
+                }
+            }
             out.push(json!({"role":"user", "content":std::mem::take(&mut follow_up)}));
         }
+        let origin_start = provenance.as_ref().map(|_| out.len());
         match m.role {
             Role::System => {
                 out.push(json!({ "role": "system", "content": text_content(&m.content) }))
@@ -275,17 +314,30 @@ fn convert_messages(
             Role::Tool => {
                 for b in &m.content {
                     if let ContentBlock::ToolResult(tr) = b {
+                        let part_start = provenance.as_ref().map(|_| follow_up.len());
                         out.push(json!({
                             "role": "tool",
                             "tool_call_id": tr.tool_call_id.0,
                             "content": tool_output_with_media(tr, media, &mut follow_up),
                         }));
+                        if let Some(start) = part_start.filter(|start| *start < follow_up.len()) {
+                            follow_up_origins.push((start, follow_up.len(), m.ordinal));
+                        }
                     }
                 }
             }
         }
+        if let Some((sink, start)) = provenance.as_deref_mut().zip(origin_start) {
+            sink.record_messages(start, out.len(), m.ordinal);
+        }
     }
     if !follow_up.is_empty() {
+        if let Some(sink) = provenance {
+            sink.record_message(out.len(), None);
+            for (start, end, ordinal) in follow_up_origins {
+                sink.record_parts(out.len(), start, end, ordinal);
+            }
+        }
         out.push(json!({"role":"user", "content":follow_up}));
     }
     out

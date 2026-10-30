@@ -70,7 +70,12 @@ impl ChatgptWire {
         ascii
     }
 
-    pub(crate) fn apply(&self, body: &mut Value, opts: &broca_protocol::CallOptions) {
+    pub(crate) fn apply_with_provenance(
+        &self,
+        body: &mut Value,
+        opts: &broca_protocol::CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) {
         let instructions = body.as_object_mut().unwrap().remove("instructions");
         if let Some(text) = instructions
             .as_ref()
@@ -82,6 +87,9 @@ impl ChatgptWire {
                 "content":[{"type":"input_text","text":text}],
                 "internal_chat_message_metadata_passthrough":{"content_item_kinds":["model.base_instructions"]}
             }));
+            if let Some(sink) = provenance {
+                sink.prepend_synthetic_message();
+            }
         }
         typed_message_content(body["input"].as_array_mut().unwrap());
         body["parallel_tool_calls"] = json!(true);

@@ -171,7 +171,25 @@ impl<F: WireFamily> WireFamily for CapturingFamily<F> {
     }
 
     fn render(&self, frozen: &FrozenRenderConfig, opts: &broca_protocol::CallOptions) -> Vec<u8> {
-        self.inner.render(frozen, opts)
+        self.render_with_provenance(frozen, opts, None)
+    }
+
+    fn shape_with_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &broca_protocol::CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> serde_json::Value {
+        self.inner.shape_with_provenance(frozen, opts, provenance)
+    }
+
+    fn render_with_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &broca_protocol::CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Vec<u8> {
+        self.inner.render_with_provenance(frozen, opts, provenance)
     }
 
     fn endpoint(

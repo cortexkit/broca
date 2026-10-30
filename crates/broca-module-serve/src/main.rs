@@ -4465,7 +4465,9 @@ mod executor {
                     }
                 };
                 resolved.provider.set_media_request_renderer(Arc::new(
-                    move |frozen, opts, tags, commit| media.render(frozen, opts, tags, commit),
+                    move |frozen, opts, tags, commit, provenance| {
+                        media.render_with_provenance(frozen, opts, tags, commit, provenance)
+                    },
                 ));
             }
 

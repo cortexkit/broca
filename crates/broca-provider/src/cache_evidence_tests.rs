@@ -319,3 +319,191 @@ fn moved_bedrock_marker_and_edit_resolve_the_same_segment_by_ordinal() {
     assert_eq!(divergence.part_index, Some(1));
     assert_eq!(divergence.field.as_deref(), Some("text"));
 }
+
+#[test]
+fn message_ordinal_is_optional_and_the_old_evidence_decoder_ignores_it() {
+    let mut value =
+        json!({"region":"messages","message_index":2,"part_index":0,"message_ordinal":41});
+    let current: Divergence = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(current.message_ordinal, Some(41));
+    let old: reference::Divergence = serde_json::from_value(value.clone()).unwrap();
+    value.as_object_mut().unwrap().remove("message_ordinal");
+    assert_eq!(serde_json::to_value(old).unwrap(), value);
+    let absent: Divergence = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(absent.message_ordinal, None);
+    assert_eq!(serde_json::to_value(absent).unwrap(), value);
+}
+
+fn render_with_provenance(
+    id: WireFamilyId,
+    opts: &CallOptions,
+) -> (Vec<u8>, broca_protocol::render_provenance::RenderProvenance) {
+    let mut frozen = crate::families::frozen_config_for_family(id, "model");
+    frozen.project_id = Some("project".into());
+    if id == WireFamilyId::OpenAiResponsesChatgpt {
+        frozen.chatgpt_wire = Some(
+            serde_json::from_str(include_str!(
+                "../tests/fixtures/chatgpt_codex_0_163_identity.json"
+            ))
+            .unwrap(),
+        );
+    }
+    let family = crate::registry::wire_family(id).unwrap();
+    let plain = family.render(&frozen, opts);
+    let mut provenance = broca_protocol::render_provenance::RenderProvenance::default();
+    let traced = family.render_with_provenance(&frozen, opts, Some(&mut provenance));
+    assert_eq!(plain, traced, "provenance must not change {id:?} bytes");
+    (traced, provenance)
+}
+
+fn assert_durable_ordinal(id: WireFamilyId) {
+    let mut old = options();
+    old.prompt[0].ordinal = Some(7);
+    old.prompt[1].ordinal = Some(42);
+    old.prompt[2].ordinal = Some(90);
+    let mut filtered = Message::new(
+        Role::Assistant,
+        vec![ContentBlock::Reasoning {
+            text: "unsupported reasoning".into(),
+            signature: None,
+        }],
+    );
+    filtered.ordinal = Some(11);
+    old.prompt.insert(1, filtered);
+    let mut new = old.clone();
+    new.prompt[2].content = vec![ContentBlock::Text {
+        text: "edited A".into(),
+    }];
+    let (before, before_map) = render_with_provenance(id, &old);
+    let (after, after_map) = render_with_provenance(id, &new);
+    let evidence = compare_rendered_requests_with_provenance(
+        id,
+        &before,
+        &after,
+        Some(&before_map),
+        Some(&after_map),
+    )
+    .unwrap();
+    let divergence = evidence.first_divergence.unwrap();
+    assert_eq!(divergence.region, Region::Messages);
+    assert_eq!(divergence.message_ordinal, Some(42), "{id:?}");
+    old.prompt[2].ordinal = None;
+    new.prompt[2].ordinal = None;
+    let (before, before_map) = render_with_provenance(id, &old);
+    let (after, after_map) = render_with_provenance(id, &new);
+    assert_eq!(
+        compare_rendered_requests_with_provenance(
+            id,
+            &before,
+            &after,
+            Some(&before_map),
+            Some(&after_map)
+        )
+        .unwrap()
+        .first_divergence
+        .unwrap()
+        .message_ordinal,
+        None
+    );
+}
+
+macro_rules! ordinal_case {
+    ($name:ident, $family:ident) => {
+        #[test]
+        fn $name() {
+            assert_durable_ordinal(WireFamilyId::$family);
+        }
+    };
+}
+ordinal_case!(durable_ordinal_anthropic, AnthropicMessages);
+ordinal_case!(durable_ordinal_bedrock, BedrockConverse);
+ordinal_case!(durable_ordinal_chat, OpenAiChat);
+ordinal_case!(durable_ordinal_responses, OpenAiResponses);
+ordinal_case!(durable_ordinal_chatgpt, OpenAiResponsesChatgpt);
+ordinal_case!(durable_ordinal_gemini, Gemini);
+ordinal_case!(durable_ordinal_code_assist, GoogleCodeAssist);
+
+#[test]
+fn tool_result_splitting_and_grouping_preserve_the_actual_source_ordinal() {
+    for id in families() {
+        let mut opts = options();
+        let call = |call_id: &str| {
+            serde_json::from_value(
+                json!({"type":"tool_call","tool_call_id":call_id,"tool_name":"lookup","input":{}}),
+            )
+            .unwrap()
+        };
+        let result = |call_id: &str, text: &str| {
+            serde_json::from_value(json!({"type":"tool_result","tool_call_id":call_id,"tool_name":"lookup","output":{"kind":"text","text":text},"is_error":false})).unwrap()
+        };
+        let mut assistant = Message::new(Role::Assistant, vec![call("call-one"), call("call-two")]);
+        assistant.ordinal = Some(100);
+        opts.prompt.push(assistant);
+        let mut first = Message::new(Role::Tool, vec![result("call-one", "one")]);
+        first.ordinal = Some(101);
+        opts.prompt.push(first);
+        let mut second = Message::new(Role::Tool, vec![result("call-two", "two")]);
+        second.ordinal = Some(102);
+        opts.prompt.push(second);
+        let mut changed = opts.clone();
+        changed.prompt.last_mut().unwrap().content = vec![result("call-two", "edited two")];
+        let (before, old_map) = render_with_provenance(id, &opts);
+        let (after, new_map) = render_with_provenance(id, &changed);
+        let evidence = compare_rendered_requests_with_provenance(
+            id,
+            &before,
+            &after,
+            Some(&old_map),
+            Some(&new_map),
+        )
+        .unwrap();
+        assert_eq!(
+            evidence.first_divergence.unwrap().message_ordinal,
+            Some(102),
+            "{id:?}"
+        );
+    }
+}
+
+#[test]
+fn system_and_tools_never_claim_a_transcript_message_ordinal() {
+    for id in families() {
+        let mut old = options();
+        for (index, message) in old.prompt.iter_mut().enumerate() {
+            message.ordinal = Some(index as u64);
+        }
+        let (before, old_map) = render_with_provenance(id, &old);
+        let mut changed = old.clone();
+        changed.prompt[0].content = vec![ContentBlock::Text {
+            text: "changed system".into(),
+        }];
+        let (after, new_map) = render_with_provenance(id, &changed);
+        let d = compare_rendered_requests_with_provenance(
+            id,
+            &before,
+            &after,
+            Some(&old_map),
+            Some(&new_map),
+        )
+        .unwrap()
+        .first_divergence
+        .unwrap();
+        assert_eq!(d.region, Region::System);
+        assert_eq!(d.message_ordinal, None);
+        changed = old.clone();
+        changed.tools = std::sync::Arc::new(vec![serde_json::from_value(json!({"name":"lookup","description":"new tool","input_schema":{"type":"object","properties":{}}})).unwrap()]);
+        let (after, new_map) = render_with_provenance(id, &changed);
+        let d = compare_rendered_requests_with_provenance(
+            id,
+            &before,
+            &after,
+            Some(&old_map),
+            Some(&new_map),
+        )
+        .unwrap()
+        .first_divergence
+        .unwrap();
+        assert_eq!(d.region, Region::Tools);
+        assert_eq!(d.message_ordinal, None);
+    }
+}
