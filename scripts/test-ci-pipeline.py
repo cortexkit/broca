@@ -138,6 +138,9 @@ with (root / 'events').open('a') as out:
 if lane == os.environ.get('REFUSE_LANE'):
     print('ck motor run: refused before start: fixture admission refusal')
     sys.exit(200)
+if lane == os.environ.get('UNKNOWN_LANE'):
+    print('ck motor run: connection lost; outcome unknown')
+    sys.exit(201)
 (root / (lane + '.started')).touch()
 with record.open('a') as events:
     import json
@@ -188,8 +191,11 @@ print('Summary: 1 test run: 1 passed')
         self.assertNotIn('--sibling', windows)
         self.assertIn('--vcpus 8', windows)
         requests = {e.split('--lane ')[-1].strip("'\""): shlex.split(e) for e in events}
-        for name, cpus in {'fast': 2, 'linux-operator': 2, 'linux-production': 4,
-                           'linux-msrv': 4, 'linux-wal': 2, 'linux-deploy': 8}.items():
+        sizes = {'fast': 2, 'linux-operator': 2, 'linux-production': 4,
+                 'linux-msrv': 4, 'linux-wal': 2, 'linux-deploy': 8,
+                 'linux-portable': 8, 'linux-unit': 8, 'windows': 8,
+                 **{f'linux-integration-{shard}': 8 for shard in range(1, 5)}}
+        for name, cpus in sizes.items():
             args = requests[name]
             self.assertEqual(args[args.index('--vcpus') + 1], str(cpus))
         linux = [shlex.split(e) for e in events if '--lane linux-' in e]
@@ -245,6 +251,39 @@ print('Summary: 1 test run: 1 passed')
         self.assertIn('NOT-RUN windows', result.stdout)
         self.assertEqual((inputs / 'user-data').read_text(), 'do not delete')
         self.assertFalse((self.root / 'windows.started').exists())
+
+    def test_ignored_existing_windows_inputs_are_not_overwritten_or_deleted(self):
+        pool = self.root / 'lane-pool'
+        pool.mkdir()
+        lane = pool / 'windows'
+        subprocess.run(['git', '-C', str(self.root), 'worktree', 'add', '-q', '--detach', str(lane), 'HEAD'],
+                       check=True, capture_output=True)
+        exclude = Path(subprocess.check_output(['git', '-C', str(lane), 'rev-parse',
+                                               '--git-path', 'info/exclude'], text=True).strip())
+        with exclude.open('a') as out:
+            out.write('\n/prepush-inputs/\n')
+        inputs = lane / 'prepush-inputs'
+        inputs.mkdir()
+        (inputs / 'user-data').write_text('do not delete')
+        result = self.run_prepush()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((inputs / 'user-data').is_file(), 'ignored input data was deleted')
+        self.assertEqual((inputs / 'user-data').read_text(), 'do not delete')
+        self.assertIn('refusing existing Windows input path', result.stdout)
+        self.assertFalse((self.root / 'windows.started').exists())
+
+    def test_unknown_windows_outcome_retains_inputs_and_refuses_reuse(self):
+        result = self.run_prepush(UNKNOWN_LANE='windows')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertRegex(result.stdout, r'windows\s+UNKNOWN\s+exit=201')
+        inputs = self.root / 'lane-pool/windows/prepush-inputs'
+        self.assertEqual((inputs / 'fixture-input').read_text(), 'verified fixture')
+        (self.root / 'events').unlink()
+        result = self.run_prepush()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('NOT-RUN windows', result.stdout)
+        self.assertNotIn('--lane windows', (self.root / 'events').read_text())
+        self.assertTrue(inputs.is_dir())
 
     def test_clean_persistent_lane_is_reused_at_the_exact_new_candidate(self):
         pool = self.root / 'lane-pool'
@@ -430,6 +469,30 @@ print(scratch)
         self.assertTrue((self.root / 'native-helper-called').exists())
         self.assertTrue((self.root / 'toolchain-reached').exists())
         self.assertNotIn('POSIX', result.stderr)
+
+    def test_windows_input_refusal_precedes_any_cargo_bootstrap(self):
+        shutil.copy(ROOT / 'scripts/lib/prepush-lane.sh', self.root / 'scripts/lib/prepush-lane.sh')
+        stubs = {
+            'uname': 'echo MINGW64_NT',
+            'cygpath': 'for value; do :; done; printf "%s\\n" "$value"',
+            'powershell.exe': '''case "$*" in
+  *verify-prepush-inputs.ps1*"-InputsDirectory $PWD/prepush-inputs") ;;
+  *) echo 'wrong verifier invocation' >&2; exit 88;;
+esac
+echo 'prepush: NOT-RUN windows: offline input manifest.json is missing on the runner' >&2
+exit 200''',
+            'cargo': 'touch "$FIXTURE/cargo-reached"; exit 99',
+        }
+        for name, body in stubs.items():
+            path = self.bin / name
+            path.write_text('#!/bin/sh\n' + body + '\n')
+            path.chmod(0o755)
+        result = subprocess.run(['bash', 'scripts/prepush.sh', '--lane', 'windows'], cwd=self.root,
+                                env=dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}',
+                                         FIXTURE=str(self.root)), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 200, result.stdout + result.stderr)
+        self.assertIn('offline input manifest.json', result.stderr)
+        self.assertFalse((self.root / 'cargo-reached').exists())
 
     def test_windows_clean_check_allows_only_the_input_directory(self):
         import re
@@ -966,11 +1029,17 @@ class WindowsOfflineInputs(unittest.TestCase):
         self.assertFalse((self.root / 'output/asset').exists())
         download.assert_not_called()
 
-    def test_runtime_pins_are_literal_and_complete(self):
+    def test_linux_runtime_pin_is_literal_and_complete(self):
         assets = self.inputs.settings(ROOT / 'scripts/lib/prepush-assets.conf')
-        for prefix in ('PYTHON_WINDOWS', 'NODE_WINDOWS', 'NODE_LINUX'):
-            self.assertTrue(assets[prefix + '_URL'].startswith('https://'))
-            self.assertRegex(assets[prefix + '_SHA256'], r'^[a-f0-9]{64}$')
+        self.assertEqual(set(assets), {'NODE_LINUX_URL', 'NODE_LINUX_SHA256'})
+        self.assertTrue(assets['NODE_LINUX_URL'].startswith('https://'))
+        self.assertRegex(assets['NODE_LINUX_SHA256'], r'^[a-f0-9]{64}$')
+
+    def test_windows_runtime_download_helper_is_not_available(self):
+        result = subprocess.run(['bash', str(ROOT / 'scripts/lib/prepush-tools.sh'),
+                                 'windows', str(self.root)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('runtime downloads are Linux-only', result.stderr)
 
     def test_snapshot_visibility_rejects_ignored_inputs(self):
         repository = self.root / 'repo'
@@ -980,11 +1049,44 @@ class WindowsOfflineInputs(unittest.TestCase):
         inputs.mkdir()
         (inputs / 'manifest.json').write_text('{}')
         self.inputs.require_snapshot_visibility(inputs)
-        ignored = repository / 'target/prepush-inputs'
-        ignored.mkdir(parents=True)
-        (ignored / 'manifest.json').write_text('{}')
-        with self.assertRaisesRegex(ValueError, 'ignored or tracked'):
-            self.inputs.require_snapshot_visibility(ignored)
+        (repository / '.gitignore').write_text('/prepush-inputs/\n')
+        with self.assertRaisesRegex(ValueError, 'directory is ignored'):
+            self.inputs.require_snapshot_visibility(inputs)
+
+    def test_snapshot_visibility_rejects_motor_excluded_target_without_gitignore(self):
+        repository = self.root / 'repo'
+        subprocess.run(['git', 'init', '-q', str(repository)], check=True, capture_output=True)
+        inputs = repository / 'target/prepush-inputs'
+        inputs.mkdir(parents=True)
+        (inputs / 'manifest.json').write_text('{}')
+        with self.assertRaisesRegex(ValueError, 'worktree-root prepush-inputs/'):
+            self.inputs.require_snapshot_visibility(inputs)
+
+    def test_snapshot_visibility_checks_individual_files_against_git_excludes_and_index(self):
+        repository = self.root / 'repo'
+        subprocess.run(['git', 'init', '-q', str(repository)], check=True, capture_output=True)
+        inputs = repository / 'prepush-inputs'
+        inputs.mkdir()
+        (inputs / 'manifest.json').write_text('{}')
+        (inputs / 'package.tgz').write_bytes(b'package')
+        with (repository / '.git/info/exclude').open('a') as out:
+            out.write('\n*.tgz\n')
+        with self.assertRaisesRegex(ValueError, 'ignored or tracked.*package.tgz'):
+            self.inputs.require_snapshot_visibility(inputs)
+        (inputs / 'package.tgz').unlink()
+        subprocess.run(['git', '-C', str(repository), 'add', 'prepush-inputs/manifest.json'], check=True)
+        with self.assertRaisesRegex(ValueError, 'ignored or tracked.*manifest.json'):
+            self.inputs.require_snapshot_visibility(inputs)
+
+    def test_ignored_input_directory_is_refused_before_downloading(self):
+        repository = self.root / 'repo'
+        subprocess.run(['git', 'init', '-q', str(repository)], check=True, capture_output=True)
+        (repository / '.gitignore').write_text('/prepush-inputs/\n')
+        with patch.object(self.inputs, 'download') as download:
+            with self.assertRaisesRegex(ValueError, 'directory is ignored'):
+                self.inputs.prepare(repository / 'prepush-inputs', self.root / 'sources',
+                                    self.root / 'cache', snapshot_visible=True)
+        download.assert_not_called()
 
     def test_shallow_bundle_refusal_is_reproduced_then_staged_history_imports(self):
         origin = self.root / 'origin'
@@ -1047,6 +1149,11 @@ class WindowsOfflineInputs(unittest.TestCase):
         self.assertFalse((extracted / '.git').exists())
         transport = json.loads((output / 'transport-manifest.json').read_text())
         listed = {entry['name']: entry for entry in transport['files']}
+        self.assertEqual(set(listed), {path.name for path in output.iterdir()} - {'transport-manifest.json'})
+        self.assertTrue(set(listed) - {'manifest.json', 'subconscious-source.bundle',
+                                     'claustrum-source.tar'})
+        self.assertTrue(all(name in {'manifest.json', 'subconscious-source.bundle', 'claustrum-source.tar'}
+                            or name.endswith('.tgz') for name in listed))
         self.assertIn('manifest.json', listed)
         self.assertIn('subconscious-source.bundle', listed)
         self.assertIn('claustrum-source.tar', listed)
@@ -1070,6 +1177,123 @@ class WindowsOfflineInputs(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'pinned revision'):
             self.inputs.extract_source(inputs, 'claustrum', 'b' * 40, destination)
         self.assertFalse(destination.exists())
+
+
+class WindowsInputVerification(unittest.TestCase):
+    def setUp(self):
+        self.powershell = shutil.which('powershell.exe') or shutil.which('pwsh')
+        if self.powershell is None:
+            self.skipTest('PowerShell is required to execute the native Windows input verifier')
+        self.tmp = tempfile.TemporaryDirectory(prefix='broca-input-verification-')
+        self.addCleanup(self.tmp.cleanup)
+        self.inputs = Path(self.tmp.name)
+        self.files = []
+        for name in ('manifest.json', 'subconscious-source.bundle', 'claustrum-source.tar', 'package.tgz'):
+            data = ('verified fixture ' + name).encode()
+            (self.inputs / name).write_bytes(data)
+            self.files.append({'name': name, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+        self.write_manifest()
+        self.tools = {
+            'python.exe': 'Python 3.14.0', 'node.exe': 'v24.10.0', 'npm.cmd': '11.6.0',
+            'nats-server.exe': 'nats-server: v2.15.0',
+            'cmake.exe': 'cmake version 4.1.2\n\nCMake suite maintained and supported by Kitware',
+            'ninja.exe': '1.13.1', 'bun.exe': '1.4.4',
+        }
+
+    def write_manifest(self):
+        (self.inputs / 'transport-manifest.json').write_text(json.dumps({'version': 1, 'files': self.files}))
+
+    def verify(self, *, missing=None, bad_exit=None):
+        def quote(value):
+            return "'" + str(value).replace("'", "''") + "'"
+        functions = []
+        for name, version in self.tools.items():
+            body = "throw 'fixture tool is missing'" if name == missing else (
+                f"Write-Host 'TOOL-CALLED {name}'; Write-Output {quote(version)}; "
+                f"$global:LASTEXITCODE = {9 if name == bad_exit else 0}")
+            functions.append(f'function global:{name} {{ {body} }}')
+        command = '\n'.join(functions) + (
+            f"\n& {quote(ROOT / 'scripts/lib/verify-prepush-inputs.ps1')} -InputsDirectory {quote(self.inputs)}; "
+            'exit $LASTEXITCODE')
+        assert self.powershell is not None
+        return subprocess.run([self.powershell, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+                               '-Command', command], capture_output=True, text=True)
+
+    def assert_refused(self, result, name):
+        self.assertEqual(result.returncode, 200, result.stdout + result.stderr)
+        self.assertIn('NOT-RUN windows:', result.stderr)
+        self.assertIn(name.lower(), result.stderr.lower())
+
+    def test_valid_inputs_check_every_image_tool(self):
+        result = self.verify()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('verified 4 offline input files', result.stdout)
+        self.assertEqual(result.stdout.count('TOOL-CALLED'), 7)
+        for name in self.tools:
+            self.assertIn('TOOL-CALLED ' + name, result.stdout)
+
+    def test_missing_manifest_refuses_before_tools(self):
+        (self.inputs / 'transport-manifest.json').unlink()
+        result = self.verify()
+        self.assert_refused(result, 'transport-manifest.json')
+        self.assertNotIn('TOOL-CALLED', result.stdout)
+
+    def test_missing_size_or_digest_mismatch_refuses_before_tools(self):
+        path = self.inputs / 'package.tgz'
+        original = path.read_bytes()
+        for label, data in (('missing', None), ('size', b'truncated'), ('SHA256', b'x' * len(original))):
+            with self.subTest(label=label):
+                path.unlink(missing_ok=True)
+                if data is not None:
+                    path.write_bytes(data)
+                result = self.verify()
+                self.assert_refused(result, 'package.tgz')
+                self.assertIn(label, result.stderr)
+                self.assertNotIn('TOOL-CALLED', result.stdout)
+
+    def test_invalid_manifest_metadata_is_not_run(self):
+        self.files[0]['size'] = 'not a size'
+        self.write_manifest()
+        result = self.verify()
+        self.assert_refused(result, 'manifest.json')
+        self.assertNotIn('TOOL-CALLED', result.stdout)
+
+    def test_incomplete_or_duplicate_inventory_refuses(self):
+        self.files.pop(0)
+        self.write_manifest()
+        result = self.verify()
+        self.assert_refused(result, 'manifest.json')
+        self.files.append(dict(self.files[0], name=self.files[0]['name'].upper()))
+        self.write_manifest()
+        self.assert_refused(self.verify(), self.files[0]['name'].upper())
+
+    def test_unlisted_file_refuses(self):
+        (self.inputs / 'unlisted.zip').write_bytes(b'not inventoried')
+        result = self.verify()
+        self.assert_refused(result, 'unlisted.zip')
+        self.assertNotIn('TOOL-CALLED', result.stdout)
+
+    def test_each_missing_or_wrong_tool_is_not_run_and_named(self):
+        for name in self.tools:
+            with self.subTest(missing=name):
+                self.assert_refused(self.verify(missing=name), name.split('.')[0])
+            with self.subTest(wrong=name):
+                version = self.tools[name]
+                self.tools[name] = 'unsupported version'
+                self.assert_refused(self.verify(), name.split('.')[0])
+                self.tools[name] = version
+
+    def test_supported_format_but_wrong_pinned_tool_version_refuses(self):
+        for name, wrong in (('python.exe', 'Python 3.13.5'), ('node.exe', 'v20.20.2'),
+                            ('nats-server.exe', 'nats-server: v2.10.26'), ('bun.exe', '1.4.3')):
+            with self.subTest(name=name):
+                version = self.tools[name]
+                self.tools[name] = wrong
+                self.assert_refused(self.verify(), name.split('.')[0])
+                self.tools[name] = version
+
+    def test_tool_failure_is_not_hidden_by_valid_version_output(self):
+        self.assert_refused(self.verify(bad_exit='node.exe'), 'Node')
 
 
 class FixtureUnpack(unittest.TestCase):

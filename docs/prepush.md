@@ -110,12 +110,17 @@ for every file. No sibling is passed: older runners require siblings beside the
 main checkout, not beside a linked worktree. No runtime archives are committed.
 The exact input folder is removed after a known finished/refused run; an unknown
 outcome retains it and makes the next clean-tree check fail closed.
+An existing input path, including an ignored or empty directory, is never adopted
+or deleted. Input preparation requires a fresh folder, rejects an ignored folder
+before downloading, and rechecks every completed file against Git's index and
+excludes before dispatch.
 
 Motor deliberately excludes ignored files and top-level `target/`; there is no
 include option. Source/download caches may live under target, but shipped bytes
 must not. `transport-manifest.json` records each shipped name, size and SHA-256.
 The first remote action verifies every entry with native PowerShell and exits
 NOT-RUN (200), naming the first missing/mismatched file, before tests/bootstrap.
+Malformed or incomplete inventories and unlisted input files also refuse the lane.
 
 Windows uses the image's Python **3.14** (`python`), Node **24** with npm,
 nats-server **2.15.0**, CMake, Ninja and Bun **1.4.4**. Their version commands are
@@ -123,6 +128,8 @@ checked immediately after the manifest; a missing or unsupported tool is also
 NOT-RUN (200), not silently downloaded or substituted. Linux retains the CI's
 Node20/pinned-NATS setup. These approved image versions are an explicit Windows
 environment difference from GitHub's setup actions, not a claimed byte match.
+The runtime-download helper is Linux-only; Windows has no Python/Node archive
+fallback that could silently replace an unsupported image version.
 
 Subc stays a Git checkout because its selected `subc-core` and `subc-daemon`
 build scripts embed Git HEAD and dirty state without a supported override.

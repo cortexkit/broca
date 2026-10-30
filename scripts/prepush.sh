@@ -44,6 +44,11 @@ prepare_lane_worktree() {
     echo "prepush: lane worktree is dirty; refusing to update it: $destination" >&2
     return 1
   }
+  # Ignored or empty inputs are invisible to status, but are not ours to overwrite.
+  if [[ "$name" == windows && ( -e "$destination/prepush-inputs" || -L "$destination/prepush-inputs" ) ]]; then
+    echo "prepush: refusing existing Windows input path: $destination/prepush-inputs" >&2
+    return 1
+  fi
   git -C "$destination" checkout --quiet --detach "$candidate" || return 1
   [[ "$(git -C "$destination" rev-parse HEAD)" == "$candidate" ]]
 }
@@ -66,7 +71,7 @@ launch() {
     requested_ms="$begin_ms"
     ready=0
     if [[ "$prepared" == 1 && "$name" == windows ]]; then
-      status="$(git -C "$checkouts/windows" status --porcelain)"
+      status="$(git -C "$checkouts/windows" status --porcelain --untracked-files=normal)"
       if [[ "$(git -C "$checkouts/windows" rev-parse HEAD)" == "$candidate" && "$status" == '?? prepush-inputs/' ]]; then
         ready=1
       fi

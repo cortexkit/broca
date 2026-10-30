@@ -102,8 +102,11 @@ def extract_source(inputs, repository, revision, destination):
     print(f'verified and extracted {repository} source {revision}: {archive.stat().st_size} bytes')
 
 
-def prepare(output, source_cache, cache):
-    output.mkdir(parents=True, exist_ok=True)
+def prepare(output, source_cache, cache, *, snapshot_visible=False):
+    # A fresh folder cannot accidentally ship stale runtime archives or user data.
+    output.mkdir(parents=True)
+    if snapshot_visible:
+        require_snapshot_visibility(output)
     lock_bytes = (ROOT / 'package-lock.json').read_bytes()
     lock = json.loads(lock_bytes)
     packages = []
@@ -140,11 +143,13 @@ def prepare(output, source_cache, cache):
     for path in sorted(output.iterdir()):
         if path.name == 'transport-manifest.json':
             continue
-        if not path.is_file():
+        if path.is_symlink() or not path.is_file():
             raise ValueError(f'offline input is not a regular file: {path}')
         files.append({'name': path.name, 'size': path.stat().st_size,
                       'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
     (output / 'transport-manifest.json').write_text(json.dumps({'version': 1, 'files': files}) + '\n')
+    if snapshot_visible:
+        require_snapshot_visibility(output)
     print(f'Windows offline inputs ready: {output}', flush=True)
 
 
@@ -152,10 +157,20 @@ def require_snapshot_visibility(output):
     repository = Path(subprocess.check_output(['git', '-C', str(output), 'rev-parse',
                                                '--show-toplevel'], text=True).strip())
     relative = output.resolve().relative_to(repository.resolve())
+    if relative != Path('prepush-inputs') or output.is_symlink():
+        raise ValueError('offline inputs must be in the worktree-root prepush-inputs/ directory')
+    ignored = subprocess.run(['git', '-C', str(repository), 'check-ignore', '--no-index', '--quiet',
+                              '--', str(relative)])
+    if ignored.returncode == 0:
+        raise ValueError('offline input directory is ignored: prepush-inputs/')
+    if ignored.returncode != 1:
+        ignored.check_returncode()
     visible = set(subprocess.check_output(['git', '-C', str(repository), 'ls-files',
                                          '--others', '--exclude-standard', '--', str(relative)],
                                         text=True).splitlines())
     for path in output.iterdir():
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f'offline input is not a regular file: {path}')
         name = str(path.resolve().relative_to(repository.resolve()))
         if name not in visible:
             raise ValueError(f'offline input is ignored or tracked and cannot be sent as an untracked snapshot input: {name}')
@@ -178,6 +193,5 @@ if __name__ == '__main__':
     else:
         if args.source_cache is None or args.cache is None:
             parser.error('preparation requires --source-cache and --cache')
-        prepare(args.output, args.source_cache, args.cache)
-        if args.require_snapshot_visible:
-            require_snapshot_visibility(args.output)
+        prepare(args.output, args.source_cache, args.cache,
+                snapshot_visible=args.require_snapshot_visible)

@@ -20,6 +20,10 @@ esac
 if [[ "$lane" == windows ]]; then
   BROCA_PREPUSH_INPUTS="$(cygpath -m "$root/prepush-inputs")"
   export BROCA_PREPUSH_INPUTS
+  command -v powershell.exe >/dev/null || {
+    echo 'prepush: NOT-RUN windows: PowerShell is required to verify offline inputs' >&2
+    exit 200
+  }
   powershell.exe -NoProfile -NonInteractive -File \
     "$(cygpath -w "$root/scripts/lib/verify-prepush-inputs.ps1")" \
     -InputsDirectory "$(cygpath -w "$BROCA_PREPUSH_INPUTS")"
@@ -93,7 +97,7 @@ summary() {
 
 clean() {
   local dirty
-  dirty="$(git status --porcelain)"
+  dirty="$(git status --porcelain --untracked-files=normal)"
   if [[ "$platform" == windows && "$dirty" == '?? prepush-inputs/' ]]; then
     return 0
   fi
