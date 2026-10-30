@@ -18,14 +18,17 @@ ARCHIVES = {
 }
 
 
-def install(destination, os_name, machine):
+def install(destination, os_name, machine, archive_path=None):
     if machine.lower() not in ('amd64', 'x86_64') or os_name not in ARCHIVES:
         raise RuntimeError(f'no pinned NATS archive for {os_name}/{machine}')
     target, checksum = ARCHIVES[os_name]
     stem = f'nats-server-v{VERSION}-{target}'
     url = f'https://github.com/nats-io/nats-server/releases/download/v{VERSION}/{stem}.tar.gz'
-    with urllib.request.urlopen(url) as response:
-        archive = response.read()
+    if archive_path is None:
+        with urllib.request.urlopen(url) as response:
+            archive = response.read()
+    else:
+        archive = Path(archive_path).read_bytes()
     if hashlib.sha256(archive).hexdigest() != checksum:
         raise RuntimeError(f'NATS archive checksum mismatch: {url}')
     name = 'nats-server.exe' if os_name == 'Windows' else 'nats-server'
@@ -46,8 +49,12 @@ def install(destination, os_name, machine):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--archive', help='read a pre-staged archive; still verify checksum and version')
+    args = parser.parse_args()
     binary = install(Path(os.environ['RUNNER_TEMP']) / 'broca-nats',
-                     platform.system(), platform.machine())
+                     platform.system(), platform.machine(), args.archive)
     with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
         env.write(f'CK_NATS_SERVER_BIN={binary}\n')
     print(f'CK_NATS_SERVER_BIN={binary}')

@@ -103,6 +103,20 @@ class PrepushDispatch(unittest.TestCase):
         self.root = Path(self.tmp.name)
         (self.root / 'scripts').mkdir()
         shutil.copy(ROOT / 'scripts/prepush.sh', self.root / 'scripts/prepush.sh')
+        (self.root / 'scripts/lib').mkdir()
+        shutil.copy(ROOT / 'scripts/lib/prepush-report.sh', self.root / 'scripts/lib/prepush-report.sh')
+        (self.root / 'scripts/prepare-prepush-windows.py').write_text('''import argparse
+from pathlib import Path
+p=argparse.ArgumentParser()
+p.add_argument('--output'); p.add_argument('--siblings'); p.add_argument('--cache')
+a=p.parse_args(); Path(a.output).mkdir(parents=True, exist_ok=True)
+''')
+        (self.root / '.gitignore').write_text('target/\n.prepush-runtime/\nbin/\nevents\n*.started\n')
+        subprocess.run(['git', 'init', '-q', str(self.root)], check=True, capture_output=True)
+        subprocess.run(['git', '-C', str(self.root), 'add', 'scripts', '.gitignore'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', str(self.root), '-c', 'user.name=Test',
+                        '-c', 'user.email=test@example.invalid', '-c', 'core.hooksPath=/dev/null',
+                        'commit', '-qm', 'fixture'], check=True, capture_output=True)
         self.bin = self.root / 'bin'
         self.bin.mkdir()
         ck = self.bin / 'ck'
@@ -112,14 +126,19 @@ lane = sys.argv[-1].split()[-1]
 root = pathlib.Path(os.environ['FIXTURE'])
 with (root / 'events').open('a') as out:
     out.write(' '.join(sys.argv[1:]) + '\\n')
+if lane == os.environ.get('REFUSE_LANE'):
+    print('ck motor run: refused before start: fixture admission refusal')
+    sys.exit(200)
 (root / (lane + '.started')).touch()
-if lane == 'linux':
+if lane == 'linux-unit':
     deadline = time.monotonic() + 5
     while not (root / 'windows.started').exists():
         if time.monotonic() >= deadline:
             sys.exit('Windows was not launched in parallel')
         time.sleep(.01)
 if lane == os.environ.get('FAIL_LANE'):
+    if lane == 'linux-msrv':
+        print('error[E0599]: fixture MSRV compiler error')
     print('FAIL broca-module::it permissions::warming_route')
     sys.exit(19)
 print('Summary: 1 test run: 1 passed')
@@ -147,10 +166,16 @@ print('Summary: 1 test run: 1 passed')
         result = self.run_prepush(FAIL_LANE='windows')
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         events = (self.root / 'events').read_text().splitlines()
-        self.assertEqual(len(events), 4)
+        self.assertEqual(len(events), 13)
         self.assertIn('--lane fast', events[0])
-        self.assertTrue(any('--vcpus 16' in e and '--lane linux' in e for e in events))
+        self.assertTrue(any('--vcpus 16' in e and '--lane linux-portable' in e for e in events))
         self.assertTrue(any('--platform windows' in e and '--lane windows' in e for e in events))
+        windows = next(e for e in events if '--platform windows' in e)
+        self.assertNotIn('--net', windows)
+        self.assertEqual(windows.count('--sibling'), 3)
+        linux = [shlex.split(e) for e in events if '--lane linux-' in e]
+        self.assertEqual(len(linux), 10)
+        self.assertEqual(len({e[e.index('--cwd') + 1] for e in linux}), 10)
         self.assertIn('FAILED windows', result.stdout)
         self.assertNotIn('FAILED linux', result.stdout)
         self.assertGreaterEqual(result.stdout.count('permissions::warming_route'), 2)
@@ -160,12 +185,28 @@ print('Summary: 1 test run: 1 passed')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('prepush lane summary', result.stdout)
         self.assertIn('total wall', result.stdout)
-        for lane in ('fast', 'linux', 'windows', 'macos'):
-            self.assertRegex(result.stdout, rf'{lane}\s+exit=0\s+\d+s')
+        for lane in ('fast', 'linux-portable', 'linux-unit', 'linux-msrv', 'windows', 'macos'):
+            self.assertRegex(result.stdout, rf'{lane}\s+PASS\s+exit=0\s+\d+s')
+
+    def test_refused_windows_is_not_run_and_fails_gate_by_name(self):
+        result = self.run_prepush(REFUSE_LANE='windows')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertRegex(result.stdout, r'windows\s+NOT-RUN\s+exit=200')
+        self.assertIn('NOT-RUN windows: complete output', result.stdout)
+        self.assertNotIn('FAILED windows', result.stdout)
+        self.assertFalse((self.root / 'windows.started').exists())
+
+    def test_msrv_failure_summary_prints_first_error_and_complete_output(self):
+        result = self.run_prepush(FAIL_LANE='linux-msrv')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        summary = result.stdout.split('==> prepush lane summary', 1)[1]
+        self.assertIn('FIRST ERRORS linux-msrv', summary)
+        self.assertIn('error[E0599]: fixture MSRV compiler error', summary)
+        self.assertIn('FAILED linux-msrv: complete output', summary)
 
     def test_missing_file_tool_refuses_before_running_checks(self):
         lib = self.root / 'scripts/lib'
-        lib.mkdir()
+        lib.mkdir(exist_ok=True)
         shutil.copy(ROOT / 'scripts/lib/prepush-lane.sh', lib / 'prepush-lane.sh')
         tools = self.root / 'minimal-tools'
         tools.mkdir()
@@ -186,7 +227,7 @@ print('Summary: 1 test run: 1 passed')
 
     def test_daemon_tmpdir_is_private_and_outside_group_writable_log_root(self):
         lib = self.root / 'scripts/lib'
-        lib.mkdir()
+        lib.mkdir(exist_ok=True)
         shutil.copy(ROOT / 'scripts/lib/prepush-lane.sh', lib / 'prepush-lane.sh')
         logs = self.root / 'target/scratch'
         logs.mkdir(parents=True)
@@ -643,6 +684,68 @@ class NatsInstall(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'no pinned NATS archive'):
                 self.installer.install(self.destination, 'Linux', 'aarch64')
         download.assert_not_called()
+
+    def test_windows_staged_archive_is_verified_without_network(self):
+        archive = self.archive('Windows')
+        source = Path(self.tmp.name) / 'staged.tar.gz'
+        source.write_bytes(archive)
+        target = self.installer.ARCHIVES['Windows'][0]
+        with patch.dict(self.installer.ARCHIVES, {
+            'Windows': (target, hashlib.sha256(archive).hexdigest())
+        }), patch.object(self.installer.urllib.request, 'urlopen') as download, \
+                patch.object(self.installer.subprocess, 'run', return_value=
+                             subprocess.CompletedProcess([], 0, 'nats-server: v2.10.26\n')):
+            binary = self.installer.install(self.destination, 'Windows', 'AMD64', source)
+        self.assertEqual(binary.read_bytes(), b'broker fixture')
+        download.assert_not_called()
+
+    def test_corrupt_staged_archive_refuses_without_network_or_execution(self):
+        source = Path(self.tmp.name) / 'corrupt.tar.gz'
+        source.write_bytes(b'corrupt')
+        with patch.object(self.installer.urllib.request, 'urlopen') as download, \
+                patch.object(self.installer.subprocess, 'run') as run:
+            with self.assertRaisesRegex(RuntimeError, 'checksum mismatch'):
+                self.installer.install(self.destination, 'Windows', 'AMD64', source)
+        download.assert_not_called()
+        run.assert_not_called()
+
+
+class WindowsOfflineInputs(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location('prepush_inputs', ROOT / 'scripts/prepare-prepush-windows.py')
+        assert spec is not None and spec.loader is not None
+        self.inputs = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.inputs)
+        self.tmp = tempfile.TemporaryDirectory(prefix='broca-offline-inputs-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def test_input_cache_is_verified_before_use_without_downloading_again(self):
+        cache = self.root / 'cache'
+        cache.mkdir()
+        (cache / 'asset').write_bytes(b'fixture')
+        with patch.object(self.inputs.urllib.request, 'urlopen') as download:
+            self.inputs.download('https://example.invalid/asset', self.root / 'output/asset',
+                                 'sha256', hashlib.sha256(b'fixture').digest(), cache)
+        self.assertEqual((self.root / 'output/asset').read_bytes(), b'fixture')
+        download.assert_not_called()
+
+    def test_corrupt_offline_input_is_not_silently_replaced(self):
+        cache = self.root / 'cache'
+        cache.mkdir()
+        (cache / 'asset').write_bytes(b'bad')
+        with patch.object(self.inputs.urllib.request, 'urlopen') as download:
+            with self.assertRaisesRegex(ValueError, 'mismatch for offline input'):
+                self.inputs.download('https://example.invalid/asset', self.root / 'output/asset',
+                                     'sha256', hashlib.sha256(b'fixture').digest(), cache)
+        self.assertFalse((self.root / 'output/asset').exists())
+        download.assert_not_called()
+
+    def test_runtime_pins_are_literal_and_complete(self):
+        assets = self.inputs.settings(ROOT / 'scripts/lib/prepush-assets.conf')
+        for prefix in ('PYTHON_WINDOWS', 'NODE_WINDOWS', 'NODE_LINUX'):
+            self.assertTrue(assets[prefix + '_URL'].startswith('https://'))
+            self.assertRegex(assets[prefix + '_SHA256'], r'^[a-f0-9]{64}$')
 
 
 class FixtureUnpack(unittest.TestCase):

@@ -3,17 +3,23 @@
 set -euo pipefail
 lane="${1:?machine lane required}"
 scratch="${2:?scratch directory required}"
+source "$(dirname "$0")/prepush-assets.conf"
 fetch_tool() {
   local url="$1" checksum="$2" output="$3"
-  curl --fail --location --silent --show-error "$url" -o "$output"
+  if [[ "$lane" == windows ]]; then
+    local input="${BROCA_PREPUSH_INPUTS:?Windows offline input directory required}/${url##*/}"
+    [[ -s "$input" ]] || { echo "prepush: missing offline Windows input $input" >&2; return 1; }
+    cp "$input" "$output"
+  else
+    curl --fail --location --silent --show-error "$url" -o "$output"
+  fi
   printf '%s  %s\n' "$checksum" "$output" | sha256sum --check -
 }
 
 if [[ "$lane" == windows ]] && ! command -v python3 >/dev/null; then
   python_dir="$scratch/python"
   mkdir -p "$python_dir"
-  fetch_tool 'https://www.python.org/ftp/python/3.13.5/python-3.13.5-embed-amd64.zip' \
-    7d2650fd9d1b9d002d4a315d5f354247fd6a44f30517c7ef577b08f57a0fb6d9 "$scratch/python.zip"
+  fetch_tool "$PYTHON_WINDOWS_URL" "$PYTHON_WINDOWS_SHA256" "$scratch/python.zip"
   powershell.exe -NoProfile -NonInteractive -Command \
     "Expand-Archive -LiteralPath '$(cygpath -w "$scratch/python.zip")' -DestinationPath '$(cygpath -w "$python_dir")'"
   # Embeddable Python's isolation file would hide PYTHONPATH and sibling script modules.
@@ -25,15 +31,13 @@ fi
 
 if [[ "$(node --version 2>/dev/null || true)" != v20.* ]]; then
   if [[ "$lane" == windows ]]; then
-    fetch_tool 'https://nodejs.org/dist/v20.20.2/node-v20.20.2-win-x64.zip' \
-      dc3700fdd57a63eedb8fd7e3c7baaa32e6a740a1b904167ff4204bc68ed8bf77 "$scratch/node.zip"
+    fetch_tool "$NODE_WINDOWS_URL" "$NODE_WINDOWS_SHA256" "$scratch/node.zip"
     powershell.exe -NoProfile -NonInteractive -Command \
       "Expand-Archive -LiteralPath '$(cygpath -w "$scratch/node.zip")' -DestinationPath '$(cygpath -w "$scratch")'"
     node_path="$(cygpath -u "$scratch/node-v20.20.2-win-x64")"
     export PATH="$node_path:$PATH"
   else
-    fetch_tool 'https://nodejs.org/dist/v20.20.2/node-v20.20.2-linux-x64.tar.xz' \
-      df770b2a6f130ed8627c9782c988fda9669fa23898329a61a871e32f965e007d "$scratch/node.tar.xz"
+    fetch_tool "$NODE_LINUX_URL" "$NODE_LINUX_SHA256" "$scratch/node.tar.xz"
     tar -xJf "$scratch/node.tar.xz" -C "$scratch"
     export PATH="$scratch/node-v20.20.2-linux-x64/bin:$PATH"
   fi

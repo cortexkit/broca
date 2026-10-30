@@ -7,8 +7,14 @@ export PYTHONDONTWRITEBYTECODE=1
 export CARGO_PROFILE_DEV_DEBUG=line-tables-only
 export CARGO_TERM_COLOR=always CI=true
 lane="${1:-}"
-case "$lane:$(uname -s)" in
-  fast:Linux|linux:Linux|windows:MINGW*|windows:MSYS*|macos:Darwin) ;;
+case "$lane" in
+  fast|linux|linux-portable|linux-unit|linux-integration-[1234]|linux-production|linux-msrv|linux-wal|linux-deploy|windows|macos) ;;
+  *) echo "prepush: unknown lane $lane" >&2; exit 2 ;;
+esac
+platform="${lane%%-*}"
+[[ "$lane" != fast ]] || platform=linux
+case "$platform:$(uname -s)" in
+  linux:Linux|windows:MINGW*|windows:MSYS*|macos:Darwin) ;;
   *) echo "prepush: invalid lane/platform: $lane/$(uname -s)" >&2; exit 2 ;;
 esac
 mkdir -p target/scratch
@@ -30,6 +36,7 @@ export TMP="$scratch" TEMP="$scratch"
 labels=() codes=() times=() files=()
 last_rc=0
 begin=$SECONDS
+source scripts/lib/prepush-report.sh
 
 step() {
   local label="$1" start=$SECONDS pid rc=0 file
@@ -47,28 +54,6 @@ step() {
   cat "$file"
   labels+=("$label") codes+=("$rc") times+=("$((SECONDS - start))") files+=("$file")
   last_rc=$rc
-}
-
-first_errors() {
-  local path="$1" line count=0 found=0 context=0
-  local initial=()
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    count=$((count + 1))
-    [[ $count -gt 8 ]] || initial+=("$line")
-    if [[ $found == 0 ]]; then
-      case "$line" in
-        *error:*|*error\[*|*panicked*|*FAIL*|*refus*|*unsupported*|*not\ found*|*Traceback*) found=1 ;;
-      esac
-    fi
-    if [[ $found == 1 ]]; then
-      printf '%s\n' "$line"
-      context=$((context + 1))
-      [[ $context -lt 12 ]] || return 0
-    fi
-  done < "$path"
-  if [[ $found == 0 ]]; then
-    printf '%s\n' "${initial[@]}"
-  fi
 }
 
 summary() {
@@ -98,6 +83,7 @@ features=(-F broca-provider/live -F broca-provider/test-harness -F broca-catalog
 
 checkout_pin() {
   local repo="$1" rev="$2" dest="$3"
+  if [[ -d "$dest/.git" && "$(git -C "$dest" rev-parse HEAD)" == "$rev" ]]; then return 0; fi
   git init -q "$dest"
   git -C "$dest" fetch --depth 1 "https://github.com/cortexkit/$repo.git" "$rev"
   git -C "$dest" checkout -q --detach FETCH_HEAD
@@ -106,10 +92,20 @@ checkout_pin() {
 
 fixtures() {
   source scripts/ci-fixture-revisions.conf
-  checkout_pin subconscious "$SUBC_REV" "$scratch/subconscious"
-  checkout_pin claustrum "$CLAUSTRUM_REV" "$scratch/claustrum"
-  cargo build --locked --manifest-path "$scratch/subconscious/Cargo.toml" -p subc-core --bins
-  cargo build --locked --manifest-path "$scratch/claustrum/Cargo.toml" -p credentials-module --bins
+  local subc_source vault_source
+  if [[ "$platform" == windows ]]; then
+    subc_source="$root/../subconscious"
+    vault_source="$root/../claustrum"
+    [[ "$(git -C "$subc_source" rev-parse HEAD)" == "$SUBC_REV" ]] || return 1
+    [[ "$(git -C "$vault_source" rev-parse HEAD)" == "$CLAUSTRUM_REV" ]] || return 1
+  else
+    subc_source="$CARGO_TARGET_DIR/fixture-sources/subconscious-$SUBC_REV"
+    vault_source="$CARGO_TARGET_DIR/fixture-sources/claustrum-$CLAUSTRUM_REV"
+    checkout_pin subconscious "$SUBC_REV" "$subc_source"
+    checkout_pin claustrum "$CLAUSTRUM_REV" "$vault_source"
+  fi
+  cargo build --locked --manifest-path "$subc_source/Cargo.toml" -p subc-core --bins
+  cargo build --locked --manifest-path "$vault_source/Cargo.toml" -p credentials-module --bins
   suffix=''
   [[ "$lane" != windows ]] || suffix=.exe
   mkdir -p "$scratch/package/fixtures/bin" "$scratch/package/fixtures/claustrum/crates/credentials-module/tests/fixtures"
@@ -117,11 +113,11 @@ fixtures() {
     cp "$CARGO_TARGET_DIR/debug/$name$suffix" "$scratch/package/fixtures/bin/"
     test -s "$scratch/package/fixtures/bin/$name$suffix"
   done
-  if [[ "$lane" != windows ]]; then
-    cargo build --locked --manifest-path crates/broca-module-serve/tests/support/fake-surface/Cargo.toml --target-dir "$scratch/fake-surface-target"
-    cp "$scratch/fake-surface-target/debug/fake-surface" "$scratch/package/fixtures/bin/"
+  if [[ "$platform" != windows ]]; then
+    cargo build --locked --manifest-path crates/broca-module-serve/tests/support/fake-surface/Cargo.toml --target-dir "$CARGO_TARGET_DIR/fake-surface-target"
+    cp "$CARGO_TARGET_DIR/fake-surface-target/debug/fake-surface" "$scratch/package/fixtures/bin/"
   fi
-  cp "$scratch/claustrum/crates/credentials-module/tests/fixtures/enrollment_wire_contract.json" \
+  cp "$vault_source/crates/credentials-module/tests/fixtures/enrollment_wire_contract.json" \
     "$scratch/package/fixtures/claustrum/crates/credentials-module/tests/fixtures/"
   archive="$scratch/fixtures.tar.gz"
   [[ "$lane" != windows ]] || archive="$(cygpath -u "$archive")"
@@ -138,7 +134,7 @@ rig_environment() {
   export FAKE_AFT_STUB_BIN="$scratch/rigs/fixtures/bin/fake-aft-stub$suffix"
   export FAKE_SURFACE_BIN="$scratch/rigs/fixtures/bin/fake-surface$suffix"
   export BROCA_REQUIRE_VAULT='' CK_CLAUSTRUM_BIN='' CK_AUTH_BIN='' CK_CLAUSTRUM_CHECKOUT=''
-  if [[ "$lane" == linux ]]; then
+  if [[ "$platform" == linux ]]; then
     export BROCA_REQUIRE_VAULT=1
     export CK_CLAUSTRUM_BIN="$scratch/rigs/fixtures/bin/ck-claustrum"
     export CK_AUTH_BIN="$scratch/rigs/fixtures/bin/ck-auth"
@@ -149,7 +145,32 @@ rig_environment() {
 }
 
 broker() {
-  RUNNER_TEMP="$scratch" GITHUB_ENV="$scratch/nats.env" python3 scripts/install-ci-nats.py
+  local args=()
+  if [[ "$platform" == windows ]]; then
+    args+=(--archive "$BROCA_PREPUSH_INPUTS/nats-server-v2.10.26-windows-amd64.tar.gz")
+  fi
+  RUNNER_TEMP="$scratch" GITHUB_ENV="$scratch/nats.env" python3 scripts/install-ci-nats.py "${args[@]}"
+}
+
+aimock() {
+  if [[ "$platform" == windows ]]; then
+    python3 - "$root/package-lock.json" "$BROCA_PREPUSH_INPUTS/manifest.json" > "$scratch/npm-archives" <<'PY'
+import hashlib, json, pathlib, re, sys
+manifest = json.loads(pathlib.Path(sys.argv[2]).read_text())
+if hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest() != manifest['package_lock_sha256']:
+    sys.exit('offline npm inputs do not match package-lock.json')
+for name in manifest['npm_archives']:
+    if not re.fullmatch(r'[a-f0-9]{64}\.tgz', name):
+        sys.exit(f'unsafe offline npm input name: {name}')
+    print(name)
+PY
+    while IFS= read -r name; do
+      npm cache add --offline --cache "$scratch/npm-cache" "$BROCA_PREPUSH_INPUTS/$name"
+    done < "$scratch/npm-archives"
+    npm ci --offline --cache "$scratch/npm-cache"
+  else
+    npm ci
+  fi
 }
 
 lib_doc() {
@@ -228,61 +249,101 @@ case "$lane" in
     step 'v4 framing' nice -n 10 cargo test --locked -p broca-wal --lib framing::tests::v4
     step 'clean worktree' clean
     ;;
-  linux|windows)
+  linux|linux-*|windows)
     : "${CARGO_TARGET_DIR:?motor must supply its persistent target cache}"
+    # Distinct job workspaces must not serialize again on one writable Cargo target.
+    export CARGO_TARGET_DIR="$CARGO_TARGET_DIR/prepush/$lane"
+    portable=0 unit=0 integration=0 production=0 msrv=0 wal=0 deployment=0 lint=0
+    case "$lane" in
+      linux) portable=1 unit=1 integration=1 production=1 msrv=1 wal=1 deployment=1 ;;
+      linux-portable) portable=1 ;;
+      linux-unit) unit=1 ;;
+      linux-integration-*) integration=1 ;;
+      linux-production) production=1 ;;
+      linux-msrv) msrv=1 ;;
+      linux-wal) wal=1 ;;
+      linux-deploy) deployment=1 ;;
+      windows) lint=1 unit=1 integration=1 wal=1 ;;
+    esac
+    if [[ "$platform" == windows ]]; then
+      export CARGO_NET_OFFLINE=true
+      BROCA_PREPUSH_INPUTS="${BROCA_PREPUSH_INPUTS:-$root/../prepush-inputs/inputs}"
+      BROCA_PREPUSH_INPUTS="$(cygpath -m "$BROCA_PREPUSH_INPUTS")"
+      export BROCA_PREPUSH_INPUTS
+    fi
     rustc --version
     cargo --version
     cargo nextest --version
-    step 'Node/Python runtimes' bash scripts/lib/prepush-tools.sh "$lane" "$scratch"
-    if [[ $last_rc != 0 ]]; then
-      echo 'prepush: Rust and fixture lanes NOT RUN because runtime provisioning failed'
-      summary
+    if [[ $unit == 1 || $integration == 1 || $production == 1 ]]; then
+      step 'Node/Python runtimes' bash scripts/lib/prepush-tools.sh "$lane" "$scratch"
+      if [[ $last_rc != 0 ]]; then
+        echo 'prepush: Rust and fixture lanes NOT RUN because runtime provisioning failed'
+        summary
+      fi
+      IFS= read -r PATH < "$scratch/runtime.path"
+      export PATH
     fi
-    IFS= read -r PATH < "$scratch/runtime.path"
-    export PATH
-    if [[ "$lane" == linux ]]; then
+    if [[ $portable == 1 || $integration == 1 ]]; then
+      step 'pinned NATS broker' broker
+      if [[ $last_rc != 0 ]]; then summary; fi
+      # GITHUB_ENV is a file protocol; do not source unquoted Windows paths as shell code.
+      IFS= read -r nats_env < "$scratch/nats.env"
+      nats_env="${nats_env%$'\r'}"
+      export CK_NATS_SERVER_BIN="${nats_env#CK_NATS_SERVER_BIN=}"
+    fi
+    if [[ $portable == 1 ]]; then
       step 'Linux portable preflight' bash scripts/linux-preflight.sh
-    else
+    fi
+    if [[ $lint == 1 ]]; then
       step fmt cargo fmt --all -- --check
       step 'Windows native clippy' cargo clippy --locked --workspace --all-targets "${features[@]}" -- -D warnings
     fi
-    step 'pinned fixtures (build, package, unpack)' fixtures
-    if [[ $last_rc != 0 ]]; then
-      echo 'prepush: fixture-dependent lanes NOT RUN because fixture build failed'
-      summary
-    fi
-    rig_environment
-    step 'aimock install' npm ci
-    if [[ $last_rc != 0 ]]; then
-      echo 'prepush: fixture-dependent lanes NOT RUN because npm ci failed'
-      summary
-    fi
-    step 'pinned NATS broker' broker
-    if [[ $last_rc != 0 ]]; then summary; fi
-    # GITHUB_ENV is a file protocol; do not source unquoted Windows paths as shell code.
-    IFS= read -r nats_env < "$scratch/nats.env"
-    nats_env="${nats_env%$'\r'}"
-    export CK_NATS_SERVER_BIN="${nats_env#CK_NATS_SERVER_BIN=}"
-    step 'archive and independent inventories' env NEXTEST_PROFILE=ci bash scripts/ci-integration.sh build "$scratch/integration.tar.zst"
-    if [[ $last_rc == 0 ]]; then
-      if [[ "$lane" == linux ]]; then
-        step 'portable selection (built inventory)' python3 scripts/test-portable-test-selection.py
+    if [[ $unit == 1 || $integration == 1 || $production == 1 || $deployment == 1 ]]; then
+      step 'pinned fixtures (build, package, unpack)' fixtures
+      if [[ $last_rc != 0 ]]; then
+        echo 'prepush: fixture-dependent lanes NOT RUN because fixture build failed'
+        summary
       fi
-      for shard in 1 2 3 4; do
-        step "integration shard $shard/4" env CK_BUS_TESTKIT_REQUIRE=1 NEXTEST_TEST_THREADS=num-cpus bash scripts/ci-integration.sh run "$scratch/integration.tar.zst" "$shard/4"
-      done
-    else
-      echo 'prepush: integration shards NOT RUN because archive build failed'
+      rig_environment
     fi
-    step 'linked dependency sources' python3 scripts/check-path-deps.py
-    step 'linked dependency source tests' python3 scripts/test-check-path-deps.py
-    step 'CI lib/bin/doc' lib_doc
-    step 'WAL reader' cargo test --locked -p broca-wal-reader
-    step 'v4 framing' cargo test --locked -p broca-wal --lib framing::tests::v4
-    if [[ "$lane" == linux ]]; then
+    if [[ $unit == 1 || $integration == 1 || $production == 1 ]]; then
+      step 'aimock install' aimock
+      if [[ $last_rc != 0 ]]; then
+        echo 'prepush: fixture-dependent lanes NOT RUN because npm ci failed'
+        summary
+      fi
+    fi
+    if [[ $integration == 1 ]]; then
+      step 'archive and independent inventories' env NEXTEST_PROFILE=ci bash scripts/ci-integration.sh build "$scratch/integration.tar.zst"
+      if [[ $last_rc == 0 ]]; then
+        if [[ "$platform" == linux ]]; then
+          step 'portable selection (built inventory)' python3 scripts/test-portable-test-selection.py
+        fi
+        for shard in 1 2 3 4; do
+          [[ "$lane" != linux-integration-* || "$lane" == "linux-integration-$shard" ]] || continue
+          step "integration shard $shard/4" env CK_BUS_TESTKIT_REQUIRE=1 NEXTEST_TEST_THREADS=num-cpus bash scripts/ci-integration.sh run "$scratch/integration.tar.zst" "$shard/4"
+        done
+      else
+        echo 'prepush: integration shards NOT RUN because archive build failed'
+      fi
+    fi
+    if [[ $unit == 1 ]]; then
+      step 'linked dependency sources' python3 scripts/check-path-deps.py
+      step 'linked dependency source tests' python3 scripts/test-check-path-deps.py
+      step 'CI lib/bin/doc' lib_doc
+    fi
+    if [[ $wal == 1 ]]; then
+      step 'WAL reader' cargo test --locked -p broca-wal-reader
+      step 'v4 framing' cargo test --locked -p broca-wal --lib framing::tests::v4
+    fi
+    if [[ $production == 1 ]]; then
       step 'production clippy' cargo clippy --locked -p broca-core -p broca-module -p broca-module-serve --all-targets -- -D warnings
       step 'production lib/bin' cargo test --locked -p broca-core -p broca-module -p broca-module-serve --lib --bins --no-fail-fast
+    fi
+    if [[ $msrv == 1 ]]; then
       step MSRV cargo +1.96 check --locked --workspace --all-targets
+    fi
+    if [[ $deployment == 1 ]]; then
       step 'ELF deployment' deploy
     fi
     step 'clean worktree' clean
