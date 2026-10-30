@@ -428,6 +428,25 @@ print('Summary: 1 test run: 1 passed')
         self.assertEqual(actual, expected)
         self.assertEqual((lane / 'candidate.txt').read_text(), 'new candidate\n')
 
+    def test_lint_reuses_the_existing_portable_checkout_and_warm_target(self):
+        pool = self.root / 'lane-pool'
+        pool.mkdir()
+        lane = pool / 'linux-portable'
+        subprocess.run(['git', '-C', str(self.root), 'worktree', 'add', '-q', '--detach', str(lane), 'HEAD'],
+                       check=True, capture_output=True)
+        (lane / 'target').mkdir()
+        marker = lane / 'target/warm-marker'
+        marker.write_text('existing portable compiler cache')
+        inode = lane.stat().st_ino
+        result = self.run_prepush()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        event = next(shlex.split(line) for line in (self.root / 'events').read_text().splitlines()
+                     if '--lane linux-lint' in line)
+        self.assertEqual(event[event.index('--cwd')+1], str(lane))
+        self.assertEqual(lane.stat().st_ino, inode)
+        self.assertEqual(marker.read_text(), 'existing portable compiler cache')
+        self.assertFalse((pool / 'linux-lint').exists())
+
     def test_refused_windows_is_not_run_and_fails_gate_by_name(self):
         result = self.run_prepush(REFUSE_LANE='windows')
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)

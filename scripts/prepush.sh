@@ -62,8 +62,18 @@ planned_cpus=0
 for cpus in "${plan_cpus[@]}"; do planned_cpus=$((planned_cpus + cpus)); done
 echo "prepush: total requested vCPUs: at most $cpu_budget concurrent ($planned_cpus across queued lanes); fast uses 2 alone"
 
+lane_directory() {
+  # Lint replaces portable dispatch; retain that checkout's warm compiler cache.
+  if [[ "$1" == linux-lint ]]; then
+    printf '%s\n' "$checkouts/linux-portable"
+  else
+    printf '%s\n' "$checkouts/$1"
+  fi
+}
+
 prepare_lane_worktree() {
-  local name="$1" destination="$checkouts/$1" common expected
+  local name="$1" destination common expected
+  destination="$(lane_directory "$name")"
   if [[ ! -e "$destination" ]]; then
     git worktree add --quiet --detach "$destination" "$candidate" || return 1
   fi
@@ -104,9 +114,11 @@ windows_input_python() {
 
 launch() {
   local name="$1" platform="$2" cpus="$3" prepared="${4:-0}"
+  local destination
+  destination="$(lane_directory "$name")"
   local args=(--platform "$platform")
   [[ "$platform" != linux ]] || args+=(--net)
-  args+=(--timeout 7200 --cwd "$checkouts/$name" --record-file "$logs/$name.motor.jsonl")
+  args+=(--timeout 7200 --cwd "$destination" --record-file "$logs/$name.motor.jsonl")
   case "$name" in
     linux-unit|linux-integration-*)
       args+=(--return-path "$checkouts/$name/.cortexkit/internal-docs/investigations/prepush-portable-coverage-$name.json") ;;

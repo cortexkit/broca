@@ -94,7 +94,9 @@ after a fixed nextest passes the synthetic regression at eight slots.
 ## Portable deduplication coverage
 
 Normal dispatch uses `linux-lint` for fmt, native Linux clippy and Windows-GNU
-target clippy. The full standalone `--lane linux-portable` command and
+target clippy. It reuses the persistent `linux-portable` lane checkout so the
+measured warm clippy cache is not discarded merely by renaming the job.
+The full standalone `--lane linux-portable` command and
 `linux-preflight.sh` are unchanged and remain available for fixture-free
 diagnostics. CI's full unit/doc and four integration partitions still execute.
 
