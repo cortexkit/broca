@@ -823,6 +823,21 @@ impl ProjectionContinuation {
         &self.admission
     }
 
+    /// Raw readers hydrate only requested messages; the validated replay entry point
+    /// authenticates these coordinates before any stored state reaches the response.
+    pub fn raw_read_position(&self) -> (u64, crate::tags::TagSeed) {
+        (
+            self.position.prefix_len,
+            crate::tags::TagSeed {
+                high: self.position.tag_high,
+                rules: self
+                    .position
+                    .tag_rules
+                    .map(|(render, clean)| broca_protocol::tags::ComputedRules { render, clean }),
+            },
+        )
+    }
+
     pub fn encode(&self) -> Result<String, serde_json::Error> {
         let mut position = serde_json::to_value(&self.position)?;
         if let Some(episodes) = position["episodes"].as_array_mut() {
@@ -1115,6 +1130,19 @@ pub struct OffsetEpisode {
 /// retain source offsets and tag counts, never messages, arguments or results.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OffsetSeed {
+    /// Display counters are separate from accounting/export facts. Missing versions rebuild.
+    #[serde(default)]
+    pub head_fold: Option<crate::head::HeadReadFold>,
+    #[serde(default)]
+    pub qualified_control_head: Option<(u64, u32)>,
+    #[serde(default)]
+    candidate_control_head: Option<(u64, u32)>,
+    #[serde(default)]
+    candidate_boundary_seq: Option<u64>,
+    #[serde(default)]
+    last_tool_control_head: Option<(u64, u32)>,
+    #[serde(default)]
+    assistant_started: bool,
     placement: crate::placement::Placement,
     boundary_state: ProjectionBoundaryState,
     pub episode: Option<OffsetEpisode>,
@@ -1160,6 +1188,7 @@ impl OffsetSeed {
     ) -> Option<Self> {
         let (version, mut seed): (u32, Self) = serde_json::from_str(bytes).ok()?;
         if version != OFFSET_SEED_VERSION
+            || seed.head_fold.as_ref().is_none_or(|fold| fold.version != 1)
             || seed.budget_digest != offset_budget_digest(budget.as_ref()).ok()?
         {
             return None;
@@ -1200,6 +1229,35 @@ impl OffsetSeed {
     ) -> Result<OffsetDelta, ProjectionPlanError> {
         use crate::placement::{AppendKind, HoldKind, PlacementAction};
         let record = &frame.record;
+        self.head_fold
+            .get_or_insert_with(Default::default)
+            .observe(record);
+        // At a projection boundary with no unfinished tool batch, save its final
+        // control cursor; later controls come from the authenticated tail.
+        match record {
+            WalRecord::StepStarted { .. } => self.assistant_started = true,
+            WalRecord::RunStarted { .. } | WalRecord::ModelStepFinished { .. } => {
+                self.candidate_boundary_seq = Some(frame.seq);
+                if let Some(cursor) =
+                    crate::last_control_cursor_through(std::slice::from_ref(frame), None)
+                {
+                    let correction = u32::from(
+                        matches!(record, WalRecord::ModelStepFinished { .. })
+                            && self.assistant_started,
+                    );
+                    self.candidate_control_head =
+                        Some((cursor.wal_seq, cursor.sub_index - correction));
+                }
+                self.assistant_started = false;
+            }
+            WalRecord::TurnFinished { .. } => {
+                // ToolBatchFinished emitted the tool-message boundary; the later
+                // TurnFinished records the replay boundary but adds no control unit.
+                self.candidate_boundary_seq = Some(frame.seq);
+                self.candidate_control_head = self.last_tool_control_head;
+            }
+            _ => {}
+        }
         let mut delta = OffsetDelta::default();
         if let WalRecord::RunStarted {
             run_id,
@@ -1469,6 +1527,7 @@ impl OffsetSeed {
                 }
                 PlacementAction::Append { first, count, kind } => {
                     if kind == AppendKind::ToolTurn && count != 0 {
+                        self.last_tool_control_head = Some((frame.seq, 0));
                         let mut assistant = self.held_assistant.take().ok_or(
                             ProjectionPlanError::InconsistentSnapshot(
                                 "tool turn lacks assistant source",
@@ -1521,6 +1580,13 @@ impl OffsetSeed {
             ep.end_ord = head;
         }
         delta.boundaries = self.boundary_state.observe_inner(frame, true);
+        for boundary in &delta.boundaries {
+            if boundary.qualified {
+                self.qualified_control_head = self
+                    .candidate_control_head
+                    .filter(|_| self.candidate_boundary_seq == Some(boundary.seq));
+            }
+        }
         Ok(delta)
     }
 }

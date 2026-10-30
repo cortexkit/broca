@@ -752,6 +752,8 @@ pub enum CutLockMode {
 type ToolRouteHealth = dyn Fn(&[LineageKey]) -> serde_json::Value + Send + Sync;
 
 struct Inner {
+    #[cfg(test)]
+    raw_pages: std::sync::OnceLock<Arc<RawPageTestBundle>>,
     tool_route_health: std::sync::OnceLock<Arc<ToolRouteHealth>>,
     actor_idle_holds: Mutex<HashMap<LineageKey, (u64, Vec<&'static str>)>>,
     /// Raised and lowered by the System One batch service; read into `batches_in_flight`.
@@ -1093,6 +1095,78 @@ struct ReadSources {
     store: Option<Arc<dyn broca_core::MaterializedStore>>,
 }
 
+/// Explicitly supplied by tests; boot and all legacy constructors leave this absent.
+#[cfg(test)]
+pub(crate) struct RawPageTestBundle {
+    pub db: Arc<broca_store::db::OverhaulDb>,
+    pub publications: Mutex<HashMap<LineageKey, broca_wal::file_wal::DurablePublication>>,
+}
+
+#[cfg(test)]
+impl RawPageTestBundle {
+    fn page(
+        &self,
+        key: &LineageKey,
+        from: Option<u64>,
+        limit: Option<u64>,
+        tools: bool,
+    ) -> Result<Box<RouteReadPage>, OpenError> {
+        let publications = self.publications.lock().unwrap();
+        let publication = publications
+            .get(key)
+            .ok_or_else(|| OpenError::Open("raw page publication not supplied".into()))?;
+        let raw = self
+            .db
+            .read_raw_page(
+                key,
+                &broca_core::agent_session_ref(key),
+                broca_store::db::LogLocation::Live,
+                publication,
+                broca_store::db::RawPageRequest {
+                    from_ordinal: from,
+                    limit,
+                    include_tools: tools,
+                },
+            )
+            .map_err(|e| OpenError::Open(e.to_string()))?;
+        Ok(Box::new(RouteReadPage {
+            page: raw.page,
+            at_seq: raw.at_seq,
+            head_facts: raw.head,
+            head_facts_complete: true,
+            tools: raw
+                .tools
+                .map(|(run_id, tools)| SessionReadTools { run_id, tools }),
+            dispatches: raw.dispatches,
+            open_batch: None,
+            newest_record_ms: Some(raw.last_write_ms.unwrap_or(0)),
+            retention_activity_ms: raw.retention_activity_ms,
+            last_title: raw.last_title,
+        }))
+    }
+
+    fn tag_location(
+        &self,
+        key: &LineageKey,
+        tag: u64,
+    ) -> Result<Option<broca_core::TagLocation>, OpenError> {
+        let publications = self.publications.lock().unwrap();
+        let publication = publications
+            .get(key)
+            .ok_or_else(|| OpenError::Open("raw tag publication not supplied".into()))?;
+        self.db
+            .read_raw_tag_location(
+                key,
+                &broca_core::agent_session_ref(key),
+                broca_store::db::LogLocation::Live,
+                publication,
+                tag,
+            )
+            .map(Some)
+            .map_err(|e| OpenError::Open(e.to_string()))
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ReadPurpose {
     Session,
@@ -1137,6 +1211,11 @@ pub struct RegistryHandle {
 }
 
 impl LineageRegistry {
+    #[cfg(test)]
+    pub(crate) fn with_raw_pages_for_test(self, bundle: Arc<RawPageTestBundle>) -> Self {
+        assert!(self.inner.raw_pages.set(bundle).is_ok());
+        self
+    }
     pub(crate) fn upload_store(&self) -> Option<broca_core::media_uploads::Uploads> {
         self.inner.reader.as_ref()?.wal_store.uploads()
     }
@@ -1427,6 +1506,8 @@ impl LineageRegistry {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                #[cfg(test)]
+                raw_pages: std::sync::OnceLock::new(),
                 tool_route_health: std::sync::OnceLock::new(),
                 actor_idle_holds: Mutex::new(HashMap::new()),
                 batches_in_flight: Arc::new(AtomicUsize::new(0)),
@@ -3453,6 +3534,10 @@ impl LineageRegistry {
         tag: u64,
     ) -> Result<Option<broca_core::TagLocation>, OpenError> {
         self.check_expired(key, None).await?;
+        #[cfg(test)]
+        if let Some(bundle) = self.inner.raw_pages.get() {
+            return bundle.tag_location(key, tag);
+        }
         let Some(store) = self
             .inner
             .reader
@@ -3540,6 +3625,19 @@ impl LineageRegistry {
         model: Option<&broca_core::ModelPageRequest>,
     ) -> Result<RoutedPage, OpenError> {
         self.check_expired(key, None).await?;
+        #[cfg(test)]
+        if model.is_none() {
+            if let Some(bundle) = self.inner.raw_pages.get() {
+                let bundle = bundle.clone();
+                let key = key.clone();
+                return spawn_blocking(JobKind::StoreRead, move || {
+                    bundle.page(&key, from_ordinal, limit, include_tools)
+                })
+                .await
+                .map_err(|e| OpenError::Open(e.to_string()))?
+                .map(RoutedPage::Raw);
+            }
+        }
         let Some(reader) = &self.inner.reader else {
             return Err(OpenError::Open(
                 "session.read reader is not configured".into(),
