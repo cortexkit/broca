@@ -408,6 +408,7 @@ dependencies = [
  "broca-wire",
  "cortexkit-bus-trait",
  "cortexkit-role-llm-runner 0.7.14",
+ "cortexkit-role-step-transform-provider",
  "cortexkit-role-tool-provider",
  "futures",
  "getrandom 0.3.4",

@@ -40,6 +40,9 @@ pub const OP_RUN_RESULT: &str = broca_wire::OP_RUN_RESULT;
 pub const OP_RUN_TOOL_CALLS: &str = broca_wire::OP_RUN_TOOL_CALLS;
 pub const OP_BASELINE: &str = broca_wire::OP_SESSION_BASELINE;
 pub const OP_RESOLVE: &str = broca_wire::OP_SESSION_RESOLVE;
+pub const OP_REFRESH: &str = cortexkit_role_llm_runner::ops::SESSION_REFRESH;
+pub const OP_REFRESH_POLICY: &str = cortexkit_role_llm_runner::ops::SESSION_REFRESH_POLICY;
+pub const OP_FLUSH_PREFIX: &str = cortexkit_role_llm_runner::ops::SESSION_FLUSH_PREFIX;
 /// Re-send a session's most recent model request shaped to generate nothing, keeping the
 /// provider's cached prefix alive between a caller's rounds.
 pub const OP_WARM: &str = broca_wire::OP_SESSION_WARM;
@@ -308,6 +311,30 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             kind: ManagementOperationKind::Query,
             description: Some(
                 "Read what the session froze at admission. Answered only to the session's owner."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_REFRESH.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Accept a mid-session plan change and hold it pending, owner only."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_REFRESH_POLICY.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Change the pending change's rung, owner only, idempotent on send_id."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_FLUSH_PREFIX.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Drop the frozen prefix and apply any pending change at the next run, owner only."
                     .to_string(),
             ),
         },

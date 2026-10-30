@@ -573,15 +573,11 @@ async fn role_describe_passes_the_roles_check_and_declares_what_broca_serves() {
         "queue",
         "interrupt",
         "retention",
+        "session_change",
     ] {
         assert!(describe.declares(group), "{group}");
     }
-    for group in [
-        "model_view",
-        "compaction",
-        "session_change",
-        "call-modes/v1",
-    ] {
+    for group in ["model_view", "compaction", "call-modes/v1"] {
         assert!(!describe.declares(group), "{group}");
     }
     assert_eq!(raw["session_capabilities_from"], "admission");
@@ -1572,7 +1568,7 @@ async fn the_admitting_send_and_session_baseline_answer_the_same_baseline() {
     assert_eq!(
         result(&first)["baseline"],
         serde_json::json!({"items": [], "tool_names": ["work"], "accepted_generation": 0,
-            "applied_generation": 0})
+            "applied_generation": 0, "rungs":{"tools":["on_prefix_rebuild","immediately"],"system_text":["on_prefix_rebuild","immediately"]}})
     );
     rig.wait_for_finished(1).await;
     rig.wait_idle().await;

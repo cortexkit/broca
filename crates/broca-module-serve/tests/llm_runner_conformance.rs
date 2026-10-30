@@ -2194,6 +2194,11 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::Compaction,
             Capability::ModelView,
             Capability::ClientMessageId,
+            // The adapter implements the three session_change subject hooks (a tool-free
+            // refresh plan, model request observations and holdable tool calls), so the kit
+            // runs its cases. The host fixes no tool set, so the outside-host-set case
+            // reports inapplicable by name.
+            Capability::SessionChange,
             // role.describe declares system_text_default (tool-provider 0.12), and the
             // adapter implements both of its hooks, so the kit runs those cases.
             Capability::SystemTextDefault,
@@ -2402,6 +2407,40 @@ impl LlmRunnerSubject for BrocaSubject {
                 SENDER_MODULE,
             ),
         )
+    }
+
+    /// A plan for `session.refresh` of `session`. `ChangedTools` is a tool-free plan: the
+    /// session's first plan offers the scripted tool, so the next run offering no tools
+    /// differs and the cases can tell whether it applied. The host fixes no tool set at
+    /// start (broca never answers `tool_outside_host_set`), so both host-set variants are
+    /// inapplicable by name.
+    fn refresh_plan(
+        &self,
+        _session: &str,
+        variant: cortexkit_role_llm_runner_conformance::RefreshVariant,
+    ) -> Option<cortexkit_role_llm_runner_conformance::RefreshPlan> {
+        use cortexkit_role_llm_runner_conformance::{RefreshPlan, RefreshVariant};
+        match variant {
+            RefreshVariant::ChangedTools => {
+                let composition = serde_json::json!({"providers": [], "step_transform_items": []});
+                let composition_digest =
+                    cortexkit_role_tool_provider::catalog::composition_digest(&composition)
+                        .expect("empty composition digests");
+                let plan = serde_json::json!({
+                    "tool_items": [],
+                    "system_text_items": [],
+                    "step_transform_items": [],
+                    "composition_digest": composition_digest,
+                    "composition": composition,
+                });
+                Some(RefreshPlan::new(
+                    plan.as_object().unwrap().clone(),
+                    Vec::new(),
+                ))
+            }
+            RefreshVariant::OutsideHostSet | RefreshVariant::ChangedDefinition => None,
+            _ => None,
+        }
     }
 
     async fn rich_ui_plan_fields(
@@ -3377,6 +3416,12 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "no_tools_offered_to_model",
         "no_tools_later_plan_send_refused",
         "send_id_retry_same_answer",
+        "session_refresh_applies_from_next_run",
+        "session_refresh_waits_for_its_rung",
+        "session_refresh_repeat_same_answer",
+        "session_refresh_generation_stale_refused",
+        "session_refresh_never_changes_a_running_run",
+        "flush_prefix_applies_pending",
         "run_attribution_per_message",
         "send_id_reuse_refused_naming_field",
         "delivery_change_refused",
@@ -3440,7 +3485,18 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
             report.render()
         );
     }
-    // Broca has no replan operation; the kit cannot change a live session's frozen teaching.
+    let host_set = report
+        .cases
+        .iter()
+        .find(|case| case.case == "session_refresh_tool_outside_host_set_refused")
+        .unwrap();
+    assert_eq!(
+        host_set.outcome,
+        CaseOutcome::Inapplicable {
+            reason: "the adapter's host does not fix its tool set at start".into(),
+        }
+    );
+    // The kit's rich-UI hook is separate from its tool-refresh fixture.
     let follows = report
         .cases
         .iter()

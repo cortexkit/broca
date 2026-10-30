@@ -251,6 +251,28 @@ pub enum LineageCmd {
         submission_id: broca_protocol::SubmissionId,
         reply: oneshot::Sender<RetractOutcome>,
     },
+    /// Accept a mid-session plan change, durable before its reply. The manifest was fetched
+    /// by the serve layer with the same admission code as a first send. Applies at the start
+    /// of the first run at or after its rung's point, never inside a running episode.
+    SessionRefresh {
+        generation: u64,
+        policy: String,
+        manifest: Box<broca_wal::PlanManifest>,
+        reply: oneshot::Sender<SessionRefreshOutcome>,
+    },
+    /// Change the pending change's rung, durable before its reply. Idempotent on `send_id`.
+    SessionRefreshPolicy {
+        generation: u64,
+        policy: String,
+        send_id: String,
+        reply: oneshot::Sender<SessionRefreshPolicyOutcome>,
+    },
+    /// Drop the frozen prefix and apply any pending change at the next run, durable before
+    /// its reply. Idempotent on `send_id`.
+    SessionFlushPrefix {
+        send_id: String,
+        reply: oneshot::Sender<SessionFlushPrefixOutcome>,
+    },
     /// Report the actor's current status.
     Status {
         reply: oneshot::Sender<LineageStatus>,
@@ -568,6 +590,35 @@ pub enum RetractOutcome {
         max_bytes: u64,
     },
     /// Writing the retract tombstone failed durably.
+    Error(String),
+}
+
+/// The actor accepted a `session.refresh` and made it durable before its reply.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionRefreshOutcome {
+    Accepted {
+        run_in_progress: bool,
+        applies_from_next_run: bool,
+    },
+    Refused(crate::serve::SessionChangeError),
+    Reopen,
+    Error(String),
+}
+
+/// The actor changed the pending change's rung.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionRefreshPolicyOutcome {
+    Changed,
+    Refused(crate::serve::SessionChangeError),
+    Reopen,
+    Error(String),
+}
+
+/// The actor flushed the frozen prefix.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionFlushPrefixOutcome {
+    Flushed { pending_generation: Option<u64> },
+    Reopen,
     Error(String),
 }
 
@@ -2204,6 +2255,33 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 let _ = reply.send(outcome);
                 false
             }
+            LineageCmd::SessionRefresh {
+                generation,
+                policy,
+                manifest,
+                reply,
+            } => {
+                let outcome = self.on_session_refresh(generation, policy, manifest).await;
+                let _ = reply.send(outcome);
+                false
+            }
+            LineageCmd::SessionRefreshPolicy {
+                generation,
+                policy,
+                send_id,
+                reply,
+            } => {
+                let outcome = self
+                    .on_session_refresh_policy(generation, policy, send_id)
+                    .await;
+                let _ = reply.send(outcome);
+                false
+            }
+            LineageCmd::SessionFlushPrefix { send_id, reply } => {
+                let outcome = self.on_session_flush_prefix(send_id).await;
+                let _ = reply.send(outcome);
+                false
+            }
             LineageCmd::ResumeRestart { reply } => {
                 if self.restart_admitting {
                     self.restart_waiters.push(reply);
@@ -2388,6 +2466,15 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 } else {
                     RetractOutcome::Error(error)
                 });
+            }
+            LineageCmd::SessionRefresh { reply, .. } => {
+                let _ = reply.send(SessionRefreshOutcome::Reopen);
+            }
+            LineageCmd::SessionRefreshPolicy { reply, .. } => {
+                let _ = reply.send(SessionRefreshPolicyOutcome::Reopen);
+            }
+            LineageCmd::SessionFlushPrefix { reply, .. } => {
+                let _ = reply.send(SessionFlushPrefixOutcome::Reopen);
             }
             LineageCmd::ResumeRestart { reply } | LineageCmd::ResumeHeld { reply } => {
                 let _ = reply.send(Err("session actor is closing".into()));
@@ -6083,6 +6170,175 @@ impl<W: WalStore + 'static> LineageActor<W> {
         })
     }
 
+    /// Serialize acceptance against episode starts and other changes. The fetched manifest and
+    /// original reply flags reach the durability barrier before any success can leave the actor.
+    async fn on_session_refresh(
+        &mut self,
+        generation: u64,
+        policy: String,
+        manifest: Box<broca_wal::PlanManifest>,
+    ) -> SessionRefreshOutcome {
+        use crate::serve::SessionChangeError;
+        use cortexkit_role_llm_runner::session_change::{refresh_order, RefreshOrder};
+        if self.wal_store.check_move(&self.key, true).is_err() {
+            return SessionRefreshOutcome::Reopen;
+        }
+        if let Err(error) = self.sync_session_change_from_wal().await {
+            return SessionRefreshOutcome::Error(error);
+        }
+        match refresh_order(
+            self.session_change.accepted_generation,
+            generation,
+            &manifest.plan_identity,
+            &policy,
+            self.session_change.earlier(generation),
+        ) {
+            RefreshOrder::Repeat => {
+                let (run_in_progress, applies_from_next_run) =
+                    self.session_change.accepted_replies[&generation];
+                return SessionRefreshOutcome::Accepted {
+                    run_in_progress,
+                    applies_from_next_run,
+                };
+            }
+            RefreshOrder::Stale => {
+                return SessionRefreshOutcome::Refused(SessionChangeError::GenerationStale {
+                    accepted: self.session_change.accepted_generation,
+                })
+            }
+            RefreshOrder::New => {}
+        }
+        if let Some(surface) = broca_fetch_plan::session_change::unsupported_surface(
+            self.session_change.current_manifest.as_deref(),
+            &manifest,
+            &policy,
+        ) {
+            return SessionRefreshOutcome::Refused(SessionChangeError::RungUnsupported {
+                surface: surface.into(),
+                rung: policy,
+            });
+        }
+        let run_in_progress = matches!(self.state, RunState::Active { .. });
+        let applies_from_next_run = policy == "immediately" || self.session_change_flushed;
+        let writer = self
+            .writer
+            .as_ref()
+            .expect("writer live while open")
+            .clone();
+        if let Err(error) = writer
+            .record(WalRecord::SessionRefreshAccepted {
+                generation,
+                policy,
+                manifest,
+                run_in_progress,
+                applies_from_next_run,
+            })
+            .into_result()
+        {
+            return SessionRefreshOutcome::Error(error.to_string());
+        }
+        if let Err(error) = writer.sync().await {
+            return SessionRefreshOutcome::Error(error.to_string());
+        }
+        self.session_change_recorded = true;
+        self.prior_snapshot = None;
+        SessionRefreshOutcome::Accepted {
+            run_in_progress,
+            applies_from_next_run,
+        }
+    }
+
+    /// Recheck policy idempotency and pending state in the same actor turn as the durable write.
+    async fn on_session_refresh_policy(
+        &mut self,
+        generation: u64,
+        policy: String,
+        send_id: String,
+    ) -> SessionRefreshPolicyOutcome {
+        if self.wal_store.check_move(&self.key, true).is_err() {
+            return SessionRefreshPolicyOutcome::Reopen;
+        }
+        if let Err(error) = self.sync_session_change_from_wal().await {
+            return SessionRefreshPolicyOutcome::Error(error);
+        }
+        match crate::serve::check_session_policy(
+            &self.session_change,
+            generation,
+            &policy,
+            &send_id,
+        ) {
+            Ok(true) => return SessionRefreshPolicyOutcome::Changed,
+            Err(error) => return SessionRefreshPolicyOutcome::Refused(error),
+            Ok(false) => {}
+        }
+        let writer = self
+            .writer
+            .as_ref()
+            .expect("writer live while open")
+            .clone();
+        if let Err(error) = writer
+            .record(WalRecord::SessionRefreshPolicyChanged {
+                generation,
+                policy,
+                send_id,
+            })
+            .into_result()
+        {
+            return SessionRefreshPolicyOutcome::Error(error.to_string());
+        }
+        if let Err(error) = writer.sync().await {
+            return SessionRefreshPolicyOutcome::Error(error.to_string());
+        }
+        self.session_change_recorded = true;
+        self.prior_snapshot = None;
+        SessionRefreshPolicyOutcome::Changed
+    }
+
+    /// Drop the frozen prefix and apply any pending change at the next run, durable before
+    /// its reply.
+    async fn on_session_flush_prefix(&mut self, send_id: String) -> SessionFlushPrefixOutcome {
+        if let Err(error) = self.sync_session_change_from_wal().await {
+            return SessionFlushPrefixOutcome::Error(error);
+        }
+        if let Some(pending_generation) = self.session_change.flush_send_ids.get(&send_id) {
+            return SessionFlushPrefixOutcome::Flushed {
+                pending_generation: *pending_generation,
+            };
+        }
+        if let Err(error) = self.wal_store.check_move(&self.key, true) {
+            let _ = error;
+            return SessionFlushPrefixOutcome::Reopen;
+        }
+        let pending_generation = self
+            .session_change
+            .pending
+            .as_ref()
+            .map(|pending| pending.generation);
+        let writer = self
+            .writer
+            .as_ref()
+            .expect("writer live while open")
+            .clone();
+        let record = WalRecord::SessionPrefixFlushed {
+            send_id: send_id.clone(),
+            pending_generation,
+        };
+        if let Err(error) = writer.record(record).into_result() {
+            return SessionFlushPrefixOutcome::Error(error.to_string());
+        }
+        if let Err(error) = writer.sync().await {
+            return SessionFlushPrefixOutcome::Error(error.to_string());
+        }
+        self.session_change_recorded = true;
+        self.prior_snapshot = None;
+        self.session_change
+            .flush_send_ids
+            .insert(send_id, pending_generation);
+        self.session_change_rebuild = true;
+        self.session_change_flushed = true;
+        SessionFlushPrefixOutcome::Flushed { pending_generation }
+    }
+
     /// Decide every refusal for a warm from what the actor and the WAL already hold, and
     /// snapshot what sending it needs. Nothing is sent or written here.
     ///
@@ -7451,6 +7707,15 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 LineageCmd::Retract { reply, .. } => {
                     let _ = reply.send(RetractOutcome::Reopen);
                 }
+                LineageCmd::SessionRefresh { reply, .. } => {
+                    let _ = reply.send(SessionRefreshOutcome::Reopen);
+                }
+                LineageCmd::SessionRefreshPolicy { reply, .. } => {
+                    let _ = reply.send(SessionRefreshPolicyOutcome::Reopen);
+                }
+                LineageCmd::SessionFlushPrefix { reply, .. } => {
+                    let _ = reply.send(SessionFlushPrefixOutcome::Reopen);
+                }
                 LineageCmd::ResumeRestart { reply } | LineageCmd::ResumeHeld { reply } => {
                     let _ = reply.send(Err("session actor is closing".into()));
                 }
@@ -8388,6 +8653,15 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
             LineageCmd::Retract { reply, .. } => {
                 let _ = reply.send(RetractOutcome::Reopen);
+            }
+            LineageCmd::SessionRefresh { reply, .. } => {
+                let _ = reply.send(SessionRefreshOutcome::Reopen);
+            }
+            LineageCmd::SessionRefreshPolicy { reply, .. } => {
+                let _ = reply.send(SessionRefreshPolicyOutcome::Reopen);
+            }
+            LineageCmd::SessionFlushPrefix { reply, .. } => {
+                let _ = reply.send(SessionFlushPrefixOutcome::Reopen);
             }
             LineageCmd::ResumeRestart { reply } | LineageCmd::ResumeHeld { reply } => {
                 let _ = reply.send(Err("session actor is closing".into()));

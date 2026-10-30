@@ -29,7 +29,7 @@ const PLAN_LESS_RUN_STARTED: &str = r#"{"type":"run_started","written_at_ms":0,"
 
 /// The `session.baseline` reply of a session admitted without a plan, running the rig's one
 /// tool: no items, no composition digest, both generations 0.
-const PLAN_LESS_BASELINE_REPLY: &str = r#"{"result":{"state":"ready","baseline":{"items":[],"tool_names":["work"],"accepted_generation":0,"applied_generation":0}}}"#;
+const PLAN_LESS_BASELINE_REPLY: &str = r#"{"result":{"state":"ready","baseline":{"items":[],"tool_names":["work"],"accepted_generation":0,"applied_generation":0,"rungs":{"tools":["on_prefix_rebuild","immediately"],"system_text":["on_prefix_rebuild","immediately"]}}}}"#;
 
 /// `record` as JSON with the per-run parts replaced, so the rest can be compared byte for byte.
 fn normalized_run_started(record: &WalRecord, run_id: &str, root: &str) -> String {

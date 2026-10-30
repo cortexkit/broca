@@ -1359,7 +1359,7 @@ pub fn assert_golden(frame: &Frame, file: &str, run_id: &str) {
 /// The bytes the session's baseline adds to the reply of the send that admitted the session (and
 /// of every retry of that send): a session admitted without a fetch plan, running the rig's one
 /// tool.
-pub const ADMITTING_BASELINE: &str = r#","baseline":{"items":[],"tool_names":["work"],"accepted_generation":0,"applied_generation":0}"#;
+pub const ADMITTING_BASELINE: &str = r#","baseline":{"items":[],"tool_names":["work"],"accepted_generation":0,"applied_generation":0,"rungs":{"tools":["on_prefix_rebuild","immediately"],"system_text":["on_prefix_rebuild","immediately"]}}"#;
 
 /// [`assert_golden`] for the reply to the send that admitted the session: the pinned bytes of
 /// `file` with exactly [`ADMITTING_BASELINE`] added at the end of `result`.

@@ -575,10 +575,35 @@ tools is refused before it can freeze that list, even if it queues or steers; it
 retrofit a plan (the existing `plan_drift` rule still applies). Omitting tools does not
 revalidate or replace an older run's frozen tool list.
 
-A session freezes its fetch plan on its first episode, so compaction enrollment happens only on
-a session's first episode, before it has stored messages. A session whose first episode ran
-without a plan, including one seeded by `session.import`, refuses a later plan naming a
+A session freezes its fetch plan on its first episode unless its owner explicitly refreshes it.
+An ordinary later send cannot enroll compaction. A session whose first episode ran
+without a plan, including one seeded by `session.import`, refuses a later send's plan naming a
 compaction provider as `plan_drift`, and the refused send writes nothing.
+
+The `session_change` group serves the owner-only `session.refresh`, `session.refresh_policy`
+and `session.flush_prefix` operations defined by the [llm-runner contract](https://docs.rs/crate/cortexkit-role-llm-runner/0.7.14/source/CONTRACT.md)
+(§10.2). Every ready baseline
+states `rungs` for tools and system text, accepted/applied generations, and any pending/effective
+change. Both surfaces support `immediately` (the next run) and `on_prefix_rebuild` (the first
+run after an applied compaction view, model switch, or prefix flush). A new run alone is not a
+rebuild. A flush is a durable rebuild boundary; with nothing pending it does not change request
+bytes or promise a provider cache miss.
+
+Refresh admission uses the ordinary plan admitter and durably records the fetched manifest and
+original reply before answering. Identical retries fetch and write nothing, even after restart
+or application. Changes never alter a running episode: the applying `RunStarted` freezes its
+own manifest, and an earlier episode resumes from its own manifest. While a change is pending,
+sends may carry either the effective or latest accepted plan; any other identity is `plan_drift`
+against the latest accepted identity. Sessions never refreshed retain the first-plan drift rule.
+The three change records require the must-understand WAL feature `session-change/v1`; its
+reader must be deployed before enabling the writer in a later release.
+
+A refresh carries no model. Before an episode can apply it, broca checks its model-bearing
+items against that episode's resolved model, including an inherited model. A mismatch is
+`plan_model_mismatch`, permanent, with `detail.generation` naming the pending refresh and
+`detail.send_model` naming the resolved model. The refused send writes nothing and leaves the
+change pending. The owner can supersede it with a newer refresh or select the model it expects;
+carrying the old effective plan cannot bypass an immediately pending refresh.
 
 `role.describe.capabilities` includes `send_tool_reply_bound` (a broca extension). A tool
 declared directly in `session.send.tools` may carry `reply: {"max_ms": N}`, the longest one of
