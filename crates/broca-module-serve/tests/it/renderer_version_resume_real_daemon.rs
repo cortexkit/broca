@@ -362,21 +362,82 @@ async fn wait_records(
 
 #[cfg(feature = "test-attachments")]
 async fn wait_send_finished(rig: &Rig, session: &str, send_id: &str) -> Vec<WalRecord> {
-    // A queued send has no RunStarted yet. Equal counts of starts and finishes may
-    // describe only preceding turns, so require this send's own episode and durable terminal.
-    wait_records(rig, session, |records| {
-        records
-            .iter()
-            .find_map(|record| match record {
-                WalRecord::RunStarted {
-                    run_id,
-                    send_id: Some(id),
-                    ..
-                } if id == send_id => Some(run_id),
-                _ => None,
-            })
-            .is_some_and(|run_id| finished(episode(records, &run_id.0)).is_some())
-    })
+    let conn = broca_subc::SubcConnection::connect(&rig.connection_file)
+        .await
+        .expect("connect for durable session head");
+    let route = conn
+        .route_open_management("broca", &rig.key(session))
+        .await
+        .expect("open durable session head route");
+    let path = broca_core::FileWalStore::new(rig.wal_dir()).wal_path(&rig.key(session));
+    // Raw log bytes may contain RunFinished before the writer has synced them.
+    // session.head supplies a durable control cursor: read assertion content only
+    // through that cursor. This still recognizes this send's terminal after a
+    // queued successor has become the latest run.
+    broca_test_support::wait_until(
+        &format!("the {session} send {send_id} has a durable terminal"),
+        || async {
+            let response = conn
+                .route_request(
+                    &route,
+                    serde_json::to_vec(&serde_json::json!({
+                        "method":"session.head", "params":{}
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .map_err(|error| format!("session.head: {error}"))?;
+            let head: broca_wire::HeadResponse = serde_json::from_value(response["result"].clone())
+                .map_err(|error| format!("decode session.head: {error}: {response}"))?;
+            let cursor = head
+                .head
+                .ok_or_else(|| format!("no durable head: {head:?}"))?;
+            let range = broca_wal::read_records_range(
+                &path,
+                broca_wal::DEFAULT_MAX_READ_BYTES,
+                0,
+                Some(cursor.wal_seq),
+                None,
+            )
+            .map_err(|error| format!("read durable assertion prefix: {error}"))?;
+            if range.lineage_id.map(|id| id.to_string()) != head.lineage_id {
+                return Err("session head and assertion WAL have different lineages".into());
+            }
+            let broca_wal::WalRangeRecords::Complete(frames) = range.records() else {
+                return Err("assertion WAL prefix is incomplete".into());
+            };
+            let records: Vec<_> = frames.iter().map(|frame| frame.record.clone()).collect();
+            let run_id = records
+                .iter()
+                .find_map(|record| match record {
+                    WalRecord::RunStarted {
+                        run_id,
+                        send_id: Some(id),
+                        ..
+                    } if id == send_id => Some(run_id),
+                    _ => None,
+                })
+                .ok_or_else(|| format!("send {send_id} has no durable RunStarted yet"))?;
+            if finished(episode(&records, &run_id.0)).is_none() {
+                return Err(format!(
+                    "send {send_id} has no terminal through public head {cursor:?}"
+                ));
+            }
+            if let Some(last) = head
+                .last_run_state
+                .as_ref()
+                .filter(|last| last.run_id == run_id.0)
+            {
+                if !cortexkit_role_llm_runner::run::RunState::parse(&last.state).is_terminal() {
+                    return Err(format!(
+                        "send {send_id} is still {} at the public head",
+                        last.state
+                    ));
+                }
+            }
+            Ok(records)
+        },
+    )
     .await
 }
 
