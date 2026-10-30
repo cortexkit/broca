@@ -117,16 +117,17 @@ class ClientMarkerStaging(unittest.TestCase):
         block = source[start:source.index("# THE CURRENT-ARTIFACT MANIFEST.", start)]
         with tempfile.TemporaryDirectory(prefix="broca-client-marker-") as tmp:
             root = Path(tmp)
-            (root / "target/release").mkdir(parents=True)
+            target = root / "target/fixture output"
+            (target / "release").mkdir(parents=True)
             (root / "scratch").mkdir()
             (root / "seam").mkdir()
             for client in ("broca-session", "broca-run"):
-                (root / "target/release" / client).write_text(RETRY_MARKER + "\n")
+                (target / "release" / client).write_text(RETRY_MARKER + "\n")
             result = subprocess.run(
                 ["bash", "-c", 'set -euo pipefail; source "$ROOT/scripts/nonshipping-markers.sh"; '
                  'uname() { echo Linux; }; publish_verified() { cp "$1" "$2"; }; ' + block],
                 cwd=root, env=dict(os.environ, ROOT=str(ROOT), BUILD_SCRATCH=str(root / "scratch"),
-                                  SEAM=str(root / "seam"), COMMIT="fixture"),
+                                  SEAM=str(root / "seam"), COMMIT="fixture", CARGO_TARGET_DIR=str(target)),
                 capture_output=True, text=True, timeout=30,
             )
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
