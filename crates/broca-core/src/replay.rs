@@ -3316,6 +3316,12 @@ fn replay_seeded_with_compaction<'a>(
             | WalRecord::InputTokenBudgetExhausted { .. }
             | WalRecord::StructuredOutputResult { .. }
             | WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
+            // A mid-session change is folded by the session-change projection, not by replay:
+            // it contributes no message to the prompt, and earlier episodes keep resuming from
+            // their own manifests, byte-identical.
+            WalRecord::SessionRefreshAccepted { .. }
+            | WalRecord::SessionRefreshPolicyChanged { .. }
+            | WalRecord::SessionPrefixFlushed { .. } => {}
         }
         // Placement is the authority for transcript positions, including a seeded prefix and
         // steers held until a boundary. Assign its ordinals as each record places its messages.

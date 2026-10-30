@@ -7,8 +7,9 @@ bash scripts/prepush.sh
 ```
 
 The dispatcher uses `ck motor run` (the same build service as AFT's `runon`). It
-never builds on the Mac as a fallback. First it runs the fast Linux lane. Only
-when that passes does it launch independent Linux portable, unit/doc,
+never builds on the Mac as a fallback. First it runs the fast Linux static guards.
+Only when those pass does it launch the unchanged operator script suites in
+`linux-operator`, concurrently with independent Linux portable, unit/doc,
 integration-1 through integration-4, production, MSRV, WAL and deployment jobs,
 alongside native Windows and targeted macOS. Portable and deployment reserve
 16 vCPUs; the other Linux jobs reserve 8 each. Each job has a separate managed
@@ -36,14 +37,21 @@ gate. Setup failures explicitly mark dependent suites **NOT RUN** and return
 failure, never a passing skip. No retries or timeout increases mask tests.
 
 Daemon/test temporary files are separate from logs: the runner's
-`$HOME/.broca-prepush-runtime` and its per-job leaves are 0700, under umask 077.
-`TMPDIR`, `TMP` and `TEMP` point there,
+`$HOME/.broca-prepush-runtime` and its per-job leaves are explicitly 0700.
+Test processes use CI's **umask 022**, not 077: owner-only tests must distinguish
+an explicit private-file mode from the ambient default.
+`TMPDIR`, `TMP` and `TEMP` point at the private directory,
 so `broca_test_support::scratch_root()` and daemon connection files do not inherit
 `target/scratch`'s potentially group-writable ancestors, including when the
 entire managed checkout is nested below `target/scratch`. Step logs remain outside
 the test temporary root, include the command/exit code even for silent errors,
 and are replayed before the remote job disappears. Run from a checkout on a
 healthy internal disk so the caller's retained logs are not lost to volume stalls.
+An integrating agent must use its own clean scratch checkout, not another
+agent's leased worktree (`lease_mismatch`). Each dispatched job prints
+`MOTOR_RUNNER_INSTANCE`; its motor event record is retained beside the lane log
+as `LANE.motor.jsonl`. A refusal before job start has no user-process instance
+banner; retain its exact refusal and event record instead of guessing a host.
 
 ## Prerequisites and the fast boundary
 
@@ -72,24 +80,35 @@ Windows motor jobs do **not** support `--net`. The dispatcher runs
 `scripts/prepare-prepush-windows.py` on the caller to download and verify the
 Python/Node/NATS archives and every npm tarball in `package-lock.json`, and to
 check out the pinned fixture sources. It sends a separate `prepush-inputs`
-repository and the two source repositories with `--sibling`. Binary inputs are
+repository and Subconscious with `--sibling`. Binary inputs are
 untracked in that input repository, never committed or placed in broca's source
 tree. Download bytes are cached under `target/scratch/prepush-offline-cache` and
 revalidated, not silently replaced after checksum failure.
+
+Subc stays a Git checkout because its selected `subc-core` and `subc-daemon`
+build scripts embed Git HEAD and dirty state without a supported override.
+Plain sources would lose the CI build identity. Its complete pinned ancestry is
+staged: an existing shallow cache is deepened, so its Git bundle can be imported.
+Claustrum's selected packages require no Git metadata; only a checksummed
+`git archive` source tree is sent, and Windows verifies the digest and pinned
+archive commit before extracting it. The helper prints both transport sizes.
 
 The Windows lane only copies/verifies/extracts those archives, seeds npm's cache
 from the verified local tarballs, runs `npm ci --offline`, and builds the pinned
 fixtures with `CARGO_NET_OFFLINE=true`. It never fetches fixture Git repositories
 or downloads runtimes/NATS inside the VM. Motor must stage the locked Cargo
-sources for broca and its two siblings; a missing crate/revision fails with
+sources for the locked fixture graphs; a missing crate/revision fails with
 Cargo's exact offline diagnostic in the summary. No tests are skipped for a
 cache miss. Installed Python/Node 20 are reused when already present.
 
 After the image-prerequisite check, the fast lane starts with fmt, file-only Rust
 pins/counts/goldens, `cargo fetch --locked`, and an offline locked
-dependency resolution; the shared operator suites then check the fixture SHAs,
-consent pins, path dependencies, dependency-feature graphs, test-group lists,
-guard lists, workflow contracts and operator scripts. Those guards are read-only.
+dependency resolution. Train preconditions, path dependencies, dependency-feature
+graphs and the portable-selection fixture guard also finish before native jobs
+start. The unchanged shared operator suite runs in required `linux-operator`,
+overlapping the native jobs; it still checks fixture SHAs, consent pins,
+test-group/guard lists, workflow contracts and every operator script. Those
+guards are read-only, and a failed operator job fails the final gate.
 On a warm dependency cache a broken fmt, lock or static pin fails before any
 workspace test compilation; cold downloads and the complete operator suites are
 not promised to finish in seconds. `check-fast-rust-invariants.py` reads Rust's
@@ -116,7 +135,7 @@ another job, dispatch the machine-side lanes from AFT instead. Do **not** put
 1. `bash scripts/prepush.sh --lane fast` with `runon: "linux,8c,net"`.
 2. Only on success, concurrently dispatch from **separate checkouts**:
    - `--lane linux-portable` and `--lane linux-deploy` with `runon: "linux,16c,net"`;
-   - `--lane linux-unit`, `--lane linux-integration-1` through `-4`,
+   - `--lane linux-operator`, `--lane linux-unit`, `--lane linux-integration-1` through `-4`,
      `--lane linux-production`, `--lane linux-msrv` and `--lane linux-wal`
      with `runon: "linux,8c,net"`;
    - `--lane windows` with `runon: "windows"`, after supplying the prepared input
@@ -143,10 +162,10 @@ failure; Windows-target clippy on Linux is **not** native Windows coverage.
 
 | CI job / expanded lanes | Pre-push equivalent | Selection and remaining differences |
 | --- | --- | --- |
-| `fixtures` → `fixtures.yml: fixtures` (Linux, Windows) | Fixture setup in Linux unit/integration/production/deploy and Windows jobs | Same pinned sibling SHAs and locked build/package/unpack. Linux sources have stable per-job cache paths; Windows receives sources as siblings and builds offline. |
+| `fixtures` → `fixtures.yml: fixtures` (Linux, Windows) | Fixture setup in Linux unit/integration/production/deploy and Windows jobs | Same pinned source SHAs and locked build/package/unpack. Windows receives Subc's full Git source and a checked plain Claustrum archive, then builds offline. |
 | Scheduled fixture variant (Linux, Windows) | **Not part of the pre-push gate** | Schedule resolves both siblings' current `master` tips. A pre-push result cannot attest to future moving tips at 06:00 UTC. Daily compatibility remains CI-owned; push/PR fixtures are pinned. |
 | `lint` (Ubuntu, Windows) | `linux-portable` / Windows native clippy | `cargo fmt --all -- --check`; `cargo clippy --locked --workspace --all-targets` with the four features from `rust-test-gate.sh`, `-- -D warnings`. Linux preflight additionally cross-clippies `x86_64-pc-windows-gnu`. |
-| `scripts` (Ubuntu) | `bash scripts/prepush.sh --lane fast` | `python3 scripts/check-train-preconditions.py`, `cargo fetch --locked`, `bash scripts/script-suites.sh`; same shared suite inventory and self-tests. |
+| `scripts` (Ubuntu) | `fast` guards then concurrent, required `linux-operator` | Train preconditions and locked fetch remain before native jobs. `linux-operator` runs unchanged `bash scripts/script-suites.sh`; same shared inventory and self-tests. |
 | `store-contention-macos` | `bash scripts/prepush.sh --lane macos` | `nice -n 10 cargo test --locked -p broca-store-contention-tests --lib`. Native macOS; not substituted by Linux/Windows unit results. |
 | `wal-reader` (Ubuntu, Windows) | `linux-wal` / WAL steps in windows | `cargo test --locked -p broca-wal-reader`; `cargo test --locked -p broca-wal --lib framing::tests::v4`, including golden v4 codec and open-reader unlink semantics. |
 | `wal-reader` (macOS) | `bash scripts/prepush.sh --lane macos` | Same two commands under `nice -n 10`, on native macOS, alongside store contention. |
@@ -162,7 +181,7 @@ failure; Windows-target clippy on Linux is **not** native Windows coverage.
 Actions-only checkout/cache telemetry, wait/download/upload-artifact plumbing,
 GitHub status aggregation, permissions and concurrency scheduling have no local
 service equivalent: they operate on a workflow run that does not exist until
-push. `test-ci-pipeline.py` exercises those script/graph contracts in the fast
+push. `test-ci-pipeline.py` exercises those script/graph contracts in the operator
 lane. Building and replaying the archives locally tests the artifact content,
 not GitHub's transport/availability or hosted-image provisioning. A green gate
 does not predict a GitHub outage or a future stable compiler/image update.

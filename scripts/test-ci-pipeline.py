@@ -166,16 +166,17 @@ print('Summary: 1 test run: 1 passed')
         result = self.run_prepush(FAIL_LANE='windows')
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         events = (self.root / 'events').read_text().splitlines()
-        self.assertEqual(len(events), 13)
+        self.assertEqual(len(events), 14)
         self.assertIn('--lane fast', events[0])
         self.assertTrue(any('--vcpus 16' in e and '--lane linux-portable' in e for e in events))
         self.assertTrue(any('--platform windows' in e and '--lane windows' in e for e in events))
         windows = next(e for e in events if '--platform windows' in e)
         self.assertNotIn('--net', windows)
-        self.assertEqual(windows.count('--sibling'), 3)
+        self.assertEqual(windows.count('--sibling'), 2)
         linux = [shlex.split(e) for e in events if '--lane linux-' in e]
-        self.assertEqual(len(linux), 10)
-        self.assertEqual(len({e[e.index('--cwd') + 1] for e in linux}), 10)
+        self.assertEqual(len(linux), 11)
+        self.assertEqual(len({e[e.index('--cwd') + 1] for e in linux}), 11)
+        self.assertTrue(any('--lane linux-operator' in e for e in events))
         self.assertIn('FAILED windows', result.stdout)
         self.assertNotIn('FAILED linux', result.stdout)
         self.assertGreaterEqual(result.stdout.count('permissions::warming_route'), 2)
@@ -185,7 +186,7 @@ print('Summary: 1 test run: 1 passed')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('prepush lane summary', result.stdout)
         self.assertIn('total wall', result.stdout)
-        for lane in ('fast', 'linux-portable', 'linux-unit', 'linux-msrv', 'windows', 'macos'):
+        for lane in ('fast', 'linux-operator', 'linux-portable', 'linux-unit', 'linux-msrv', 'windows', 'macos'):
             self.assertRegex(result.stdout, rf'{lane}\s+PASS\s+exit=0\s+\d+s')
 
     def test_refused_windows_is_not_run_and_fails_gate_by_name(self):
@@ -195,6 +196,13 @@ print('Summary: 1 test run: 1 passed')
         self.assertIn('NOT-RUN windows: complete output', result.stdout)
         self.assertNotIn('FAILED windows', result.stdout)
         self.assertFalse((self.root / 'windows.started').exists())
+
+    def test_operator_failure_is_required_but_does_not_block_native_dispatch(self):
+        result = self.run_prepush(FAIL_LANE='linux-operator')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('FAILED linux-operator', result.stdout)
+        self.assertTrue((self.root / 'linux-unit.started').exists())
+        self.assertTrue((self.root / 'windows.started').exists())
 
     def test_msrv_failure_summary_prints_first_error_and_complete_output(self):
         result = self.run_prepush(FAIL_LANE='linux-msrv')
@@ -256,7 +264,7 @@ print('fixture cargo completed')
         self.assertNotIn('==> fast: fmt', result.stdout)
         self.assertNotIn('operator scripts, pins and dependency guards', result.stdout)
 
-    def test_daemon_tmpdir_is_private_and_outside_group_writable_log_root(self):
+    def run_private_scratch_probe(self):
         lib = self.root / 'scripts/lib'
         lib.mkdir(exist_ok=True)
         shutil.copy(ROOT / 'scripts/lib/prepush-lane.sh', lib / 'prepush-lane.sh')
@@ -278,7 +286,7 @@ print('fixture cargo completed')
         for name, body in {
             'uname': 'echo Linux',
             'cc': 'exit 0',
-            'file': 'printf "TEST_TMPDIR=%s\\n" "$TMPDIR"; exit 1',
+            'file': 'printf "TEST_TMPDIR=%s\\nTEST_UMASK=%s\\n" "$TMPDIR" "$(umask)"; exit 1',
         }.items():
             path = tools / name
             path.write_text('#!/bin/sh\n' + body + '\n')
@@ -287,6 +295,17 @@ print('fixture cargo completed')
         result = subprocess.run([str(tools / 'bash'), 'scripts/prepush.sh', '--lane', 'fast'],
                                 cwd=checkout, env=env, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result, logs
+
+    def test_test_processes_use_ci_umask_not_private_setup_umask(self):
+        result, _ = self.run_private_scratch_probe()
+        ambient = next(line.split('=', 1)[1] for line in result.stdout.splitlines()
+                       if line.startswith('TEST_UMASK='))
+        self.assertEqual(int(ambient, 8), 0o022,
+                         'owner-only tests must distinguish explicit modes from the ambient default')
+
+    def test_daemon_tmpdir_is_private_and_outside_group_writable_log_root(self):
+        result, logs = self.run_private_scratch_probe()
         temporary = Path(next(line.split('=', 1)[1] for line in result.stdout.splitlines()
                               if line.startswith('TEST_TMPDIR=')))
         self.assertNotIn(logs, temporary.parents,
@@ -783,6 +802,82 @@ class WindowsOfflineInputs(unittest.TestCase):
         for prefix in ('PYTHON_WINDOWS', 'NODE_WINDOWS', 'NODE_LINUX'):
             self.assertTrue(assets[prefix + '_URL'].startswith('https://'))
             self.assertRegex(assets[prefix + '_SHA256'], r'^[a-f0-9]{64}$')
+
+    def test_shallow_bundle_refusal_is_reproduced_then_staged_history_imports(self):
+        origin = self.root / 'origin'
+        subprocess.run(['git', 'init', '-q', str(origin)], check=True, capture_output=True)
+        for text in ('first\n', 'pinned\n'):
+            (origin / 'source.txt').write_text(text)
+            subprocess.run(['git', '-C', str(origin), 'add', 'source.txt'], check=True, capture_output=True)
+            subprocess.run(['git', '-C', str(origin), '-c', 'user.name=Test',
+                            '-c', 'user.email=test@example.invalid', '-c', 'core.hooksPath=/dev/null',
+                            'commit', '-qm', 'fixture'], check=True, capture_output=True)
+        pin = subprocess.check_output(['git', '-C', str(origin), 'rev-parse', 'HEAD'], text=True).strip()
+        parent = subprocess.check_output(['git', '-C', str(origin), 'rev-parse', 'HEAD^'], text=True).strip()
+        siblings = self.root / 'siblings'
+        siblings.mkdir()
+        shallow = siblings / 'subconscious'
+        subprocess.run(['git', 'clone', '-q', '--depth', '1', origin.as_uri(), str(shallow)],
+                       check=True, capture_output=True)
+        bad_bundle = self.root / 'shallow.bundle'
+        subprocess.run(['git', '-C', str(shallow), 'bundle', 'create', str(bad_bundle), 'HEAD'],
+                       check=True, capture_output=True)
+        receiver = self.root / 'receiver'
+        subprocess.run(['git', 'init', '-q', str(receiver)], check=True, capture_output=True)
+        refused = subprocess.run(['git', '-C', str(receiver), 'fetch', str(bad_bundle), 'HEAD'],
+                                 capture_output=True, text=True)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn(parent, refused.stderr)
+        self.assertIn('Failed to traverse parents of commit ' + pin, refused.stderr)
+        self.assertIn('did not send all necessary objects', refused.stderr)
+        print('reproduced shallow-input refusal:', refused.stderr.strip())
+
+        output, cache = self.root / 'inputs', self.root / 'cache'
+        real_settings, real_checkout = self.inputs.settings, self.inputs.checkout
+
+        def settings(path):
+            return {'SUBC_REV': pin, 'CLAUSTRUM_REV': pin} if path.name == 'ci-fixture-revisions.conf' else real_settings(path)
+
+        def checkout(repository, revision, destination, **kwargs):
+            return real_checkout(repository, revision, destination, remote_url=origin.as_uri(), **kwargs)
+
+        def download(url, destination, algorithm, expected, cache):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b'fixture')
+            cache.mkdir(parents=True, exist_ok=True)
+
+        with patch.object(self.inputs, 'settings', side_effect=settings), \
+                patch.object(self.inputs, 'checkout', side_effect=checkout), \
+                patch.object(self.inputs, 'download', side_effect=download):
+            self.inputs.prepare(output, siblings, cache)
+        self.assertEqual(subprocess.check_output(['git', '-C', str(shallow), 'rev-parse',
+                                                 '--is-shallow-repository'], text=True).strip(), 'false')
+        good_bundle = cache / f'subconscious-{pin}.bundle'
+        fetched = subprocess.run(['git', '-C', str(receiver), 'fetch', str(good_bundle), 'HEAD'],
+                                 capture_output=True, text=True)
+        self.assertEqual(fetched.returncode, 0, fetched.stderr)
+        self.assertEqual(subprocess.check_output(['git', '-C', str(receiver), 'show',
+                                                 'FETCH_HEAD:source.txt'], text=True), 'pinned\n')
+        extracted = self.root / 'plain-vault'
+        self.inputs.extract_source(output, 'claustrum', pin, extracted)
+        self.assertEqual((extracted / 'source.txt').read_text(), 'pinned\n')
+        self.assertFalse((extracted / '.git').exists())
+
+    def test_source_archive_checksum_and_pin_are_required_before_extracting(self):
+        inputs = self.root / 'inputs'
+        inputs.mkdir()
+        (inputs / 'source.tar').write_bytes(b'corrupt')
+        manifest = {'source_archives': {'claustrum': {
+            'revision': 'a' * 40, 'file': 'source.tar',
+            'sha256': hashlib.sha256(b'approved').hexdigest(),
+        }}}
+        (inputs / 'manifest.json').write_text(json.dumps(manifest))
+        destination = self.root / 'extracted'
+        with self.assertRaisesRegex(ValueError, 'checksum mismatch'):
+            self.inputs.extract_source(inputs, 'claustrum', 'a' * 40, destination)
+        with self.assertRaisesRegex(ValueError, 'pinned revision'):
+            self.inputs.extract_source(inputs, 'claustrum', 'b' * 40, destination)
+        self.assertFalse(destination.exists())
 
 
 class FixtureUnpack(unittest.TestCase):

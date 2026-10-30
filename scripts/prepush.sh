@@ -10,7 +10,7 @@ if [[ $# -gt 0 ]]; then
   if [[ $# == 2 && $1 == --lane ]]; then
     exec bash scripts/lib/prepush-lane.sh "$2"
   fi
-  echo 'usage: bash scripts/prepush.sh [--lane fast|linux|linux-portable|linux-unit|linux-integration-{1,2,3,4}|linux-production|linux-msrv|linux-wal|linux-deploy|windows|macos]' >&2
+  echo 'usage: bash scripts/prepush.sh [--lane fast|linux-operator|linux|linux-portable|linux-unit|linux-integration-{1,2,3,4}|linux-production|linux-msrv|linux-wal|linux-deploy|windows|macos]' >&2
   exit 2
 fi
 command -v ck >/dev/null || {
@@ -58,10 +58,10 @@ launch() {
   local name="$1" platform="$2" cpus="$3"
   local args=(--platform "$platform")
   [[ "$platform" != linux ]] || args+=(--net)
-  args+=(--timeout 7200 --cwd "$checkouts/$name")
+  args+=(--timeout 7200 --cwd "$checkouts/$name" --record-file "$logs/$name.motor.jsonl")
   [[ -z "$cpus" ]] || args+=(--vcpus "$cpus")
   if [[ "$platform" == windows ]]; then
-    args+=(--sibling "$checkouts/prepush-inputs" --sibling "$checkouts/subconscious" --sibling "$checkouts/claustrum")
+    args+=(--sibling "$checkouts/prepush-inputs" --sibling "$checkouts/subconscious")
   fi
   names+=("$name")
   (
@@ -122,6 +122,7 @@ if [[ ${results[0]} != 0 ]]; then
   exit 1
 fi
 # Each lane has a different checkout: motor serializes jobs from one workspace.
+launch linux-operator linux 8
 launch linux-portable linux 16
 launch linux-unit linux 8
 for shard in 1 2 3 4; do launch "linux-integration-$shard" linux 8; done

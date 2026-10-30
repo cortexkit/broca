@@ -171,7 +171,9 @@ def provider_refusal(terminal, observed_class):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--session-bin", type=Path, default=ROOT / "target/release/broca-session")
+    # The client stage-release built; CARGO_TARGET_DIR moves cargo's output folder when set.
+    target_dir = Path(os.environ.get("CARGO_TARGET_DIR") or ROOT / "target")
+    parser.add_argument("--session-bin", type=Path, default=target_dir / "release/broca-session")
     parser.add_argument("--subc", type=Path, default=Path.home() / ".local/share/cortexkit/run/subc-connection.json")
     parser.add_argument("--state-root", type=Path)
     parser.add_argument("--project-root", type=Path, default=ROOT)

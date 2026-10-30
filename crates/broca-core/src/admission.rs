@@ -534,6 +534,15 @@ pub struct SessionOwnershipV1 {
     /// member existed, which a reader then treats as unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_episode: Option<FirstEpisodeV1>,
+    /// The latest distinct episode manifest. Refreshes do not replace the first episode's
+    /// identity; unchanged sessions omit this field and retain their original checkpoint bytes.
+    /// Older summaries also omit it because their episodes shared the first manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_manifest: Option<Arc<broca_wal::PlanManifest>>,
+    /// Whether the WAL contains session-change facts. False is omitted so unrefreshed logs
+    /// retain their old checkpoint bytes and admission need not probe for change records.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_change_recorded: bool,
     /// Whether this summary was folded by a build that records the first episode's frozen
     /// plan manifest (`FirstEpisodeV1::manifest`). A summary stored by an older build, or
     /// re-stored by one after a rollback, lacks it and may have dropped a manifest, so it is
@@ -553,6 +562,8 @@ impl Default for SessionOwnershipV1 {
             any_unrecorded_principal: false,
             recorded_principals: Vec::new(),
             first_episode: None,
+            latest_manifest: None,
+            session_change_recorded: false,
             plan_manifest_folded: true,
         }
     }
@@ -565,7 +576,7 @@ pub struct FirstEpisodeV1 {
     /// The model-facing names of the tools the episode was admitted with, in their order.
     pub tool_names: Vec<String>,
     /// The plan manifest the episode froze, when the session was admitted with a fetch plan.
-    /// Every later episode renders its tools from it and carries it on its own `RunStarted`.
+    /// Later episodes retain it until a session refresh applies a new manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<Arc<broca_wal::PlanManifest>>,
 }
@@ -581,6 +592,8 @@ impl SessionOwnershipV1 {
             any_unrecorded_principal: self.any_unrecorded_principal,
             recorded_principals: self.recorded_principals.clone(),
             first_episode: None,
+            latest_manifest: None,
+            session_change_recorded: false,
             plan_manifest_folded: false,
         }
     }
@@ -589,6 +602,8 @@ impl SessionOwnershipV1 {
     /// are irrelevant to which principals may cancel or retract a session.
     pub fn fold_owner_records(&mut self, records: &[FramedRecord]) {
         self.first_episode = None;
+        self.latest_manifest = None;
+        self.session_change_recorded = false;
         self.plan_manifest_folded = false;
         for frame in records {
             if let WalRecord::RunStarted {
@@ -938,6 +953,18 @@ impl AdmissionCheckpointV1 {
                             manifest: manifest.as_deref().cloned().map(Arc::new),
                         });
                     }
+                    // Unrefreshed sessions keep the original checkpoint bytes; only a distinct
+                    // episode manifest needs an additional copy in the checkpoint.
+                    let current = manifest.as_deref();
+                    let first = ownership
+                        .first_episode
+                        .as_ref()
+                        .and_then(|first| first.manifest.as_deref());
+                    ownership.latest_manifest = if current != first {
+                        current.cloned().map(Arc::new)
+                    } else {
+                        None
+                    };
                     ownership.fold_run_started(principal.as_ref(), scope.as_ref());
                 }
                 if self.lineage_retention == Some(crate::LineageRetention::Unstarted) {
@@ -1164,6 +1191,14 @@ impl AdmissionCheckpointV1 {
             | WalRecord::InputTokenBudgetExhausted { .. }
             | WalRecord::StructuredOutputResult { .. }
             | WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
+            // Only a presence bit is needed here; the session-change projection folds the payload.
+            WalRecord::SessionRefreshAccepted { .. }
+            | WalRecord::SessionRefreshPolicyChanged { .. }
+            | WalRecord::SessionPrefixFlushed { .. } => {
+                if let Some(ownership) = &mut self.ownership {
+                    ownership.session_change_recorded = true;
+                }
+            }
         }
         if let Some(episode) = self.last_episode.as_mut() {
             if let Some(facts) = episode.budget_replay_state.as_mut() {
@@ -1581,6 +1616,7 @@ impl AdmissionSeed {
             source(frames.iter().rposition(|p| matches!(&p.record, WalRecord::DeliveryOrdered { submission_id, .. } if submission_id == &staged.submission_id)).ok_or_else(bad)?)
         }).transpose()?;
         if let Some(ownership) = &mut scalars.ownership {
+            ownership.latest_manifest = None;
             if let Some(first) = &mut ownership.first_episode {
                 first.manifest = None;
             }
@@ -1755,6 +1791,13 @@ impl AdmissionSeed {
         }
         let mut checkpoint = self.scalars.clone();
         checkpoint.last_episode = episode;
+        if let (Some(seed), Some(ownership)) = (&self.episode, &mut checkpoint.ownership) {
+            let started = seed.start.read(read_at, &self.boundary)?;
+            let WalRecord::RunStarted { manifest, .. } = started.record else {
+                return Err(bad());
+            };
+            ownership.latest_manifest = manifest.map(|manifest| Arc::new(*manifest));
+        }
         if let Some(source) = &self.first_run {
             let first = source.read(read_at, &self.boundary)?;
             let WalRecord::RunStarted {
@@ -1780,6 +1823,16 @@ impl AdmissionSeed {
                 .as_mut()
                 .ok_or_else(bad)?
                 .first_config = config.frozen_render_config.clone();
+        }
+        if let Some(ownership) = &mut checkpoint.ownership {
+            if ownership.latest_manifest.as_deref()
+                == ownership
+                    .first_episode
+                    .as_ref()
+                    .and_then(|first| first.manifest.as_deref())
+            {
+                ownership.latest_manifest = None;
+            }
         }
         let pending = self.queued.iter().map(|seed| {
             let frame = seed.source.read(read_at, &self.boundary)?;
@@ -3216,6 +3269,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn checkpoint_retains_each_episodes_manifest_without_replacing_the_baseline() {
+        let mut records = corpus();
+        for frame in &mut records {
+            if let WalRecord::RunStarted {
+                run_id, manifest, ..
+            } = &mut frame.record
+            {
+                *manifest = Some(Box::new(
+                    serde_json::from_value(serde_json::json!({
+                        "plan": "{}", "plan_identity": run_id.0, "composition_digest": "c",
+                        "fetches": [], "tools": [], "system_text": run_id.0,
+                        "system_digest": "s", "join_version": 1, "role_versions": {}
+                    }))
+                    .unwrap(),
+                ));
+            }
+        }
+        let checkpoint = AdmissionCheckpointV1::from_frames(&records).unwrap();
+        let recovered =
+            decode_admission_checkpoint(&encode_admission_checkpoint(&checkpoint).unwrap())
+                .unwrap();
+        let ownership = recovered.ownership.unwrap();
+        assert_eq!(
+            ownership
+                .first_episode
+                .unwrap()
+                .manifest
+                .unwrap()
+                .plan_identity,
+            "r1"
+        );
+        assert_eq!(ownership.latest_manifest.unwrap().plan_identity, "r2");
+        let first = records
+            .iter()
+            .find_map(|frame| match &frame.record {
+                WalRecord::RunStarted { manifest, .. } => manifest.clone(),
+                _ => None,
+            })
+            .unwrap();
+        for frame in &mut records {
+            if let WalRecord::RunStarted { manifest, .. } = &mut frame.record {
+                *manifest = Some(first.clone());
+            }
+        }
+        let unchanged =
+            encode_admission_checkpoint(&AdmissionCheckpointV1::from_frames(&records).unwrap())
+                .unwrap();
+        assert!(!unchanged.contains("latest_manifest"));
+    }
+
     fn corpus() -> Vec<FramedRecord> {
         let mut budget_start = started(11, "r2", Some("three"));
         let WalRecord::RunStarted { config, .. } = &mut budget_start.record else {
@@ -4052,6 +4156,8 @@ mod tests {
                 // `fold_run_started` alone records no first-episode facts; the checkpoint's own
                 // `RunStarted` fold sets them, from the record's run id and tools.
                 first_episode: None,
+                latest_manifest: None,
+                session_change_recorded: false,
                 plan_manifest_folded: true,
             }
         );

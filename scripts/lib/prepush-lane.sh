@@ -8,7 +8,7 @@ export CARGO_PROFILE_DEV_DEBUG=line-tables-only
 export CARGO_TERM_COLOR=always CI=true
 lane="${1:-}"
 case "$lane" in
-  fast|linux|linux-portable|linux-unit|linux-integration-[1234]|linux-production|linux-msrv|linux-wal|linux-deploy|windows|macos) ;;
+  fast|linux-operator|linux|linux-portable|linux-unit|linux-integration-[1234]|linux-production|linux-msrv|linux-wal|linux-deploy|windows|macos) ;;
   *) echo "prepush: unknown lane $lane" >&2; exit 2 ;;
 esac
 platform="${lane%%-*}"
@@ -17,15 +17,17 @@ case "$platform:$(uname -s)" in
   linux:Linux|windows:MINGW*|windows:MSYS*|macos:Darwin) ;;
   *) echo "prepush: invalid lane/platform: $lane/$(uname -s)" >&2; exit 2 ;;
 esac
+printf 'prepush: runner instance=%s lane=%s\n' "${MOTOR_RUNNER_INSTANCE:-unreported}" "$lane"
 mkdir -p target/scratch
 log_dir="$(mktemp -d "$root/target/scratch/prepush-$lane.XXXXXX")"
 # Connection-file publication rejects writable ancestors, even above a private leaf.
 # Keep daemon/test temporary files out of the shared, group-writable log directory.
-umask 077
+umask 022
 runtime_root="${HOME:?private runtime requires the runner home}/.broca-prepush-runtime"
-mkdir -p "$runtime_root"
+mkdir -p -m 700 "$runtime_root"
 chmod 700 "$runtime_root"
 scratch="$(mktemp -d "$runtime_root/$lane.XXXXXX")"
+chmod 700 "$scratch"
 if [[ "$lane" == windows ]]; then
   export RUNNER_OS=Windows
   scratch="$(cygpath -m "$scratch")"
@@ -96,9 +98,10 @@ fixtures() {
   local subc_source vault_source
   if [[ "$platform" == windows ]]; then
     subc_source="$root/../subconscious"
-    vault_source="$root/../claustrum"
+    vault_source="$scratch/claustrum-source"
     [[ "$(git -C "$subc_source" rev-parse HEAD)" == "$SUBC_REV" ]] || return 1
-    [[ "$(git -C "$vault_source" rev-parse HEAD)" == "$CLAUSTRUM_REV" ]] || return 1
+    python3 scripts/prepare-prepush-windows.py --extract-source claustrum \
+      --inputs "$BROCA_PREPUSH_INPUTS" --revision "$CLAUSTRUM_REV" --output "$vault_source"
   else
     subc_source="$CARGO_TARGET_DIR/fixture-sources/subconscious-$SUBC_REV"
     vault_source="$CARGO_TARGET_DIR/fixture-sources/claustrum-$CLAUSTRUM_REV"
@@ -241,6 +244,21 @@ case "$lane" in
       export PYTHONPATH="$scratch/python-modules${PYTHONPATH:+:$PYTHONPATH}"
     fi
     step 'train preconditions' python3 scripts/check-train-preconditions.py
+    step 'path dependencies' python3 scripts/check-path-deps.py
+    step 'dependency feature guards' python3 scripts/test-dependency-features.py
+    step 'portable selection guard fixture' python3 scripts/test-portable-test-selection.py PortableRigSelectionTests.test_exact_rig_test_exclusion_keeps_guard_test_selected
+    step 'clean worktree' clean
+    ;;
+  linux-operator)
+    step 'Linux image prerequisites' linux_image
+    [[ $last_rc == 0 ]] || summary
+    step 'locked script dependencies' cargo fetch --locked
+    [[ $last_rc == 0 ]] || summary
+    step 'Python script prerequisites' python_tools
+    [[ $last_rc == 0 ]] || summary
+    if ! python3 -c 'import tomllib, yaml' 2>/dev/null; then
+      export PYTHONPATH="$scratch/python-modules${PYTHONPATH:+:$PYTHONPATH}"
+    fi
     step 'operator scripts, pins and dependency guards' bash scripts/script-suites.sh
     step 'clean worktree' clean
     ;;

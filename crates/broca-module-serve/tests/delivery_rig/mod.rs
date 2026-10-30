@@ -634,6 +634,17 @@ impl Rig {
         Self::start_with_idle_ttl(tag, broca_module::actor::IDLE_TTL).await
     }
 
+    /// Open a stable test root so two independently built releases can replay the same WAL.
+    pub async fn open_fixture(dir: PathBuf) -> Self {
+        std::fs::create_dir_all(&dir).unwrap();
+        Self::open_existing(dir, Duration::from_millis(100), false).await
+    }
+
+    pub fn seed_fixture_wal(&self, bytes: &[u8]) {
+        std::fs::create_dir_all(self.wal_path.parent().unwrap()).unwrap();
+        std::fs::write(&self.wal_path, bytes).unwrap();
+    }
+
     pub async fn start_with_scopes(tag: &str) -> Self {
         Self::start_fresh(tag, broca_module::actor::IDLE_TTL, true).await
     }
