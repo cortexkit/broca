@@ -1472,6 +1472,54 @@ pub fn close_out_open_batch_for(
     close_out_open_batch(&closing, deferred_close)
 }
 
+/// Retain answers already delivered by a held-call provider before refusing continuation.
+/// The returned batch marks only the terminals actually synced here, so close-out cannot
+/// replace those answers or write a second terminal. No model or tool is called.
+pub async fn sync_deposited_held_results(
+    mut batch: Option<crate::replay::OpenToolBatch>,
+    pending: &crate::replay::PendingTurn,
+    ctx: &crate::BatchCtx,
+    writer: &crate::WalHandle,
+    lifecycle: Option<std::sync::Arc<dyn crate::tool_plane::ProviderHeldLifecycle>>,
+) -> Result<Option<crate::replay::OpenToolBatch>, crate::WalWriteError> {
+    let (Some(batch), Some(lifecycle)) = (&mut batch, lifecycle) else {
+        return Ok(batch);
+    };
+    let mut delivered = Vec::new();
+    for held in &pending.provider_held {
+        let Some((_, state)) = batch
+            .calls
+            .iter_mut()
+            .find(|(id, _)| id == &held.tool_call_id)
+        else {
+            continue;
+        };
+        if *state != OpenCallState::ProviderHeld {
+            continue;
+        }
+        if let Some(result) = lifecycle.deposited_result(ctx, &held.reply()) {
+            writer.record(WalRecord::ToolResult {
+                finished_at_ms: None,
+                tags: None,
+                hooks: None,
+                batch_id: ctx.batch_id.clone(),
+                result: Arc::new(result),
+                outcome: DispatchOutcome::Completed,
+                reason: None,
+                withdraw_elicitation: None,
+                provider_held: None,
+            });
+            *state = OpenCallState::Terminated;
+            delivered.push(&held.tool_call_id);
+        }
+    }
+    writer.sync().await?;
+    for id in delivered {
+        lifecycle.terminal_synced(ctx, id).await;
+    }
+    Ok(Some(batch.clone()))
+}
+
 /// The records that keep a tool turn whose remaining calls were never dispatched, written when a
 /// caller seals the episode `Interrupted` instead of resuming it.
 ///

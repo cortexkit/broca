@@ -2365,6 +2365,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
                 "rows_remaining": 0,
             },
             "overdue_pins": 0,
+            "late_results_delivery_stuck": [],
         })
     );
     assert_eq!(metrics["active_sessions"], serde_json::json!(1));
