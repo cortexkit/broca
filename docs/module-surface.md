@@ -1171,7 +1171,9 @@ extend `run.cancel`, which remains owner-only, or change sessions without a reco
 Plan-named senders may share a `send_id` without sharing a submission. The first sender
 keeps the legacy run ID; a later delegated sender colliding with another recorded sender
 uses `<legacy-run-id>-sender-<digest>`, where `digest` is the lowercase, 64-character
-SHA-256 of the JSON-serialized daemon `BindPrincipal`. Its submission ID remains `sub-`
+SHA-256 of the fixed bytes `v1\0reserved\0` followed by the daemon-stamped reserved
+principal's `module_id` in UTF-8 (`\0` is a NUL byte). This versioned identity encoding
+does not use serde or any other principal fields. Its submission ID remains `sub-`
 followed by that run ID. Retries and `send.status` resolve the same ID from durable
 attribution, including after restart. Owner IDs and the first episode's recorded model,
 tool configuration, owner scope and plan manifest are unchanged.

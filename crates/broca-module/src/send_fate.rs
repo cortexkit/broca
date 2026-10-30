@@ -64,6 +64,22 @@ fn run_sender(records: &[WalRecord], run: &RunId) -> Option<Option<BindPrincipal
     })
 }
 
+fn qualified_sender_run_id(base: &RunId, sender: &BindPrincipal) -> Result<RunId, String> {
+    use sha2::Digest;
+    let module_id = match sender {
+        BindPrincipal::Reserved { module_id } => module_id,
+        BindPrincipal::Direct | BindPrincipal::Unverified | BindPrincipal::Unknown(_) => {
+            return Err("a sender-qualified ID requires a reserved module principal".into());
+        }
+    };
+    // Retries recompute this ID across upgrades. Hash only the fixed version/kind tags
+    // and the module_id's UTF-8 bytes, never serde's evolving principal representation.
+    let mut digest = sha2::Sha256::new();
+    digest.update(b"v1\0reserved\0");
+    digest.update(module_id.as_bytes());
+    Ok(RunId(format!("{}-sender-{:x}", base.0, digest.finalize())))
+}
+
 /// Preserve legacy IDs, qualifying a delegated sender only when another sender already
 /// owns that ID. Both admission and send.status use the same durable attribution.
 pub(crate) fn resolve_sender_run_id(
@@ -72,12 +88,7 @@ pub(crate) fn resolve_sender_run_id(
     send_id: &str,
     sender: &BindPrincipal,
 ) -> Result<RunId, String> {
-    use sha2::Digest;
-    let qualified = RunId(format!(
-        "{}-sender-{:x}",
-        base.0,
-        sha2::Sha256::digest(serde_json::to_vec(sender).expect("a principal serializes"))
-    ));
+    let qualified = qualified_sender_run_id(base, sender)?;
     if let Some(recorded) = run_sender(records, &qualified) {
         return if recorded.as_ref() == Some(sender) {
             Ok(qualified)
@@ -170,6 +181,33 @@ fn run_outcome(
         SendOutcome::Active {
             run_id: run_id.clone(),
             delivered,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qualified_sender_run_id_encoding_is_pinned() {
+        assert_eq!(
+            qualified_sender_run_id(
+                &RunId("run-sid-shared".into()),
+                &BindPrincipal::Reserved { module_id: "ck-mc".into() },
+            ).unwrap(),
+            RunId("run-sid-shared-sender-efbcae06a66482a915f9cd18ad50e0e8d67996b2710ef552318a00b1d9906dff".into()),
+        );
+    }
+
+    #[test]
+    fn qualified_sender_run_id_refuses_unattested_principals() {
+        for principal in [
+            BindPrincipal::Direct,
+            BindPrincipal::Unverified,
+            BindPrincipal::Unknown(serde_json::json!({"kind":"future","module_id":"ck-mc"})),
+        ] {
+            assert!(qualified_sender_run_id(&RunId("run-sid-shared".into()), &principal).is_err());
         }
     }
 }
