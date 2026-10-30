@@ -696,6 +696,10 @@ async fn codex_continuation_age_reset_is_full() {
         assert_canonical(attempts(&second)[0], &canonical);
         let codex = codex_trace(&second, 0);
         assert!(!codex.continuation);
+        assert_eq!(
+            codex.full_input_reason.as_deref(),
+            Some("new_connection_age")
+        );
         assert_eq!(codex.suffix_item_count, 0);
         assert!(!codex.previous_response_id_present);
         assert_eq!(
@@ -845,6 +849,10 @@ async fn codex_continuation_failed_stream_retires_socket_and_retry_is_full() {
     assert_eq!(attempts(&second)[1].outcome, AttemptOutcome::Complete);
     assert!(codex_trace(&second, 0).continuation);
     assert!(!codex_trace(&second, 1).continuation);
+    assert_eq!(
+        codex_trace(&second, 1).full_input_reason.as_deref(),
+        Some("previous_attempt_failed")
+    );
     let canonical = provider.render_request(&next);
     for attempt in attempts(&second) {
         assert_canonical(attempt, &canonical);
@@ -876,6 +884,10 @@ async fn codex_continuation_incomplete_consumes_receipt_without_seeding_another(
         let third_options = follow_up(next, &second, "After incomplete");
         let third = step(&provider, 3, &third_options).await;
         assert!(!codex_trace(&third, 0).continuation, "{reason}");
+        assert_eq!(
+            codex_trace(&third, 0).full_input_reason.as_deref(),
+            Some("previous_attempt_failed")
+        );
         assert_eq!(mock.observed.lock().unwrap().handshakes, 1);
     }
 }

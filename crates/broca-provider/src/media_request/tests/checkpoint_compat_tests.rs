@@ -73,8 +73,15 @@ fn media_free_checkpoint_field_order_matches_surrogate_0_3_284_schema() {
             record,
         })
         .collect();
-    let checkpoint = AdmissionCheckpointV1::from_frames(&frames).unwrap();
+    let mut checkpoint = AdmissionCheckpointV1::from_frames(&frames).unwrap();
     let bytes = serde_json::to_vec(&checkpoint).unwrap();
     let legacy: SurrogateAdmissionCheckpoint = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(bytes, serde_json::to_vec(&legacy).unwrap());
+    assert_eq!(checkpoint.has_model_attempt, Some(false));
+    // The old decoder ignores the additive summary. Its known fields must still serialize
+    // in exactly their old order after removing only the member it does not know.
+    checkpoint.has_model_attempt = None;
+    assert_eq!(
+        serde_json::to_vec(&checkpoint).unwrap(),
+        serde_json::to_vec(&legacy).unwrap()
+    );
 }

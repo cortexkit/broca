@@ -1,8 +1,10 @@
-//! Pure request-prefix evidence. Attribution belongs to the consumer's shared classifier;
-//! this module neither changes rendered bytes nor guesses provider token boundaries.
+//! Request-prefix evidence without retaining prompt bytes. Consumers attribute cache misses.
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use std::{borrow::Cow, fmt};
+
+use serde::{de, Deserialize, Serialize};
+use serde_json::{value::RawValue, Value};
+use sha2::{Digest, Sha256};
 
 use crate::spec::WireFamilyId;
 
@@ -66,85 +68,239 @@ pub struct CacheEvidence {
     pub view: Option<View>,
 }
 
-#[derive(Debug, PartialEq)]
-struct Segment {
-    location: Divergence,
-    value: Value,
-}
-
-#[derive(Default)]
-struct Request {
-    segments: Vec<Segment>,
+/// Owned evidence contains only coordinates and hashes, never request or segment bytes.
+#[derive(Debug, Clone)]
+pub struct RequestFingerprint {
+    family: WireFamilyId,
+    segments: Vec<(Divergence, [u8; 32])>,
     breakpoint: Option<Breakpoint>,
 }
 
-impl Request {
-    fn push(&mut self, region: Region, message: Option<usize>, part: Option<usize>, value: Value) {
-        self.segments.push(Segment {
-            location: Divergence {
-                region,
-                message_index: message.map(|n| n as u32),
-                part_index: part.map(|n| n as u32),
-                field: None,
-                prefix_tokens_before: None,
-            },
-            value,
-        });
+#[derive(Deserialize)]
+struct Key<'a>(#[serde(borrow)] Cow<'a, str>);
+
+// Visitors borrow raw values and unescaped keys. They do not allocate a container per message
+// or content part; the fingerprint's single vector grows geometrically for the whole request.
+fn object<'a>(
+    raw: &'a RawValue,
+    mut field: impl FnMut(&str, &'a RawValue) -> Result<(), String>,
+) -> Result<(), String> {
+    struct Fields<F>(F);
+    impl<'de, F> de::Visitor<'de> for Fields<F>
+    where
+        F: FnMut(&str, &'de RawValue) -> Result<(), String>,
+    {
+        type Value = ();
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a rendered object")
+        }
+        fn visit_map<M: de::MapAccess<'de>>(mut self, mut map: M) -> Result<(), M::Error> {
+            while let Some(Key(key)) = map.next_key::<Key<'de>>()? {
+                (self.0)(&key, map.next_value()?).map_err(de::Error::custom)?;
+            }
+            Ok(())
+        }
+    }
+    let mut decoder = serde_json::Deserializer::from_str(raw.get());
+    de::Deserializer::deserialize_map(&mut decoder, Fields(&mut field)).map_err(|e| e.to_string())
+}
+
+fn array<'a>(
+    raw: &'a RawValue,
+    mut item: impl FnMut(usize, &'a RawValue) -> Result<(), String>,
+) -> Result<(), String> {
+    struct Items<F>(F);
+    impl<'de, F> de::Visitor<'de> for Items<F>
+    where
+        F: FnMut(usize, &'de RawValue) -> Result<(), String>,
+    {
+        type Value = ();
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a rendered array")
+        }
+        fn visit_seq<S: de::SeqAccess<'de>>(mut self, mut seq: S) -> Result<(), S::Error> {
+            let mut index = 0;
+            while let Some(raw) = seq.next_element::<&RawValue>()? {
+                (self.0)(index, raw).map_err(de::Error::custom)?;
+                index += 1;
+            }
+            Ok(())
+        }
+    }
+    let mut decoder = serde_json::Deserializer::from_str(raw.get());
+    de::Deserializer::deserialize_seq(&mut decoder, Items(&mut item)).map_err(|e| e.to_string())
+}
+
+fn get<'a>(raw: &'a RawValue, name: &str) -> Result<Option<&'a RawValue>, String> {
+    let mut found = None;
+    object(raw, |key, value| {
+        if key == name {
+            found = Some(value);
+        }
+        Ok(())
+    })?;
+    Ok(found)
+}
+
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    Raw(&'a RawValue),
+    Without(&'a RawValue, &'a [&'a str]),
+    Part(&'a RawValue, bool),
+    Settings(&'a RawValue, WireFamilyId, &'a [&'a str]),
+}
+
+impl Source<'_> {
+    fn value(self) -> Result<Value, String> {
+        if let Self::Without(raw, names) | Self::Settings(raw, _, names) = self {
+            let mut bytes = Vec::new();
+            object_without(raw, names, &mut bytes)?;
+            let mut value: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            if let Self::Settings(_, family, _) = self {
+                normalize_settings(family, value.as_object_mut().ok_or("invalid settings")?);
+            }
+            return Ok(value);
+        }
+        let raw = match self {
+            Self::Raw(raw)
+            | Self::Without(raw, _)
+            | Self::Part(raw, _)
+            | Self::Settings(raw, _, _) => raw,
+        };
+        let mut value: Value = serde_json::from_str(raw.get()).map_err(|e| e.to_string())?;
+        match self {
+            Self::Without(..) | Self::Settings(..) => unreachable!("handled above"),
+            Self::Part(_, system) => {
+                if let Some(map) = value.as_object_mut() {
+                    map.remove("cache_control");
+                }
+                if system {
+                    normalize_billing_text(&mut value);
+                }
+            }
+            Self::Raw(_) => {}
+        }
+        Ok(value)
     }
 
-    fn parts(&mut self, region: Region, message: Option<usize>, value: &Value, bedrock: bool) {
-        let parts: Vec<&Value> = match value.as_array() {
-            Some(parts) => parts.iter().collect(),
-            None => vec![value],
-        };
-        for (index, part) in parts.iter().enumerate() {
-            if part.get("cache_control").is_some() || (bedrock && part.get("cachePoint").is_some())
-            {
+    fn hash(self, scratch: &mut Vec<u8>) -> Result<[u8; 32], String> {
+        match self {
+            Self::Raw(raw) => Ok(Sha256::digest(raw.get().as_bytes()).into()),
+            Self::Part(raw, system) => {
+                let marker = raw.get().starts_with('{') && get(raw, "cache_control")?.is_some();
+                if !marker && !(system && raw.get().contains("x-anthropic-billing-header:")) {
+                    return Self::Raw(raw).hash(scratch);
+                }
+                scratch.clear();
+                serde_json::to_writer(&mut *scratch, &self.value()?).map_err(|e| e.to_string())?;
+                Ok(Sha256::digest(&*scratch).into())
+            }
+            Self::Without(raw, names) => {
+                object_without(raw, names, scratch)?;
+                Ok(Sha256::digest(&*scratch).into())
+            }
+            Self::Settings(raw, family, names) => {
+                // Remove the potentially huge arrays before parsing the few remaining settings.
+                object_without(raw, names, scratch)?;
+                let mut value: Value =
+                    serde_json::from_slice(scratch).map_err(|e| e.to_string())?;
+                normalize_settings(family, value.as_object_mut().ok_or("invalid settings")?);
+                scratch.clear();
+                serde_json::to_writer(&mut *scratch, &value).map_err(|e| e.to_string())?;
+                Ok(Sha256::digest(&*scratch).into())
+            }
+        }
+    }
+}
+
+fn object_without(raw: &RawValue, names: &[&str], bytes: &mut Vec<u8>) -> Result<(), String> {
+    bytes.clear();
+    bytes.push(b'{');
+    object(raw, |key, value| {
+        if !names.contains(&key) {
+            if bytes.len() > 1 {
+                bytes.push(b',');
+            }
+            serde_json::to_writer(&mut *bytes, key).map_err(|e| e.to_string())?;
+            bytes.push(b':');
+            bytes.extend_from_slice(value.get().as_bytes());
+        }
+        Ok(())
+    })?;
+    bytes.push(b'}');
+    Ok(())
+}
+
+fn location(region: Region, message: Option<usize>, part: Option<usize>) -> Divergence {
+    Divergence {
+        region,
+        message_index: message.map(|n| n as u32),
+        part_index: part.map(|n| n as u32),
+        field: None,
+        prefix_tokens_before: None,
+    }
+}
+
+struct Scanner<F> {
+    emit: F,
+    breakpoint: Option<Breakpoint>,
+}
+
+impl<F> Scanner<F>
+where
+    F: FnMut(Divergence, Source<'_>) -> Result<(), String>,
+{
+    fn parts(
+        &mut self,
+        region: Region,
+        message: Option<usize>,
+        raw: &RawValue,
+        bedrock: bool,
+    ) -> Result<(), String> {
+        let mut part = |index, raw: &RawValue| {
+            let is_object = raw.get().starts_with('{');
+            let cache_point = bedrock && is_object && get(raw, "cachePoint")?.is_some();
+            if cache_point || (is_object && get(raw, "cache_control")?.is_some()) {
                 self.breakpoint = Some(Breakpoint {
                     region: region.clone(),
                     message_index: message.map(|n| n as u32),
                     part_index: Some(index as u32),
                 });
             }
-            // Bedrock's cachePoint is a standalone marker, not a content segment.
-            if bedrock && part.get("cachePoint").is_some() {
-                continue;
+            if !cache_point {
+                (self.emit)(
+                    location(region.clone(), message, Some(index)),
+                    Source::Part(raw, region == Region::System),
+                )?;
             }
-            let mut part = (*part).clone();
-            // cache_control changes placement and TTL without changing the cached content.
-            if let Some(object) = part.as_object_mut() {
-                object.remove("cache_control");
-            }
-            if region == Region::System {
-                normalize_billing_text(&mut part);
-            }
-            self.push(region.clone(), message, Some(index), part);
+            Ok(())
+        };
+        if raw.get().starts_with('[') {
+            array(raw, part)
+        } else {
+            part(0, raw)
         }
     }
 }
 
-fn segments(family: WireFamilyId, body: &[u8]) -> Result<Request, String> {
-    let mut body: Value =
+fn scan(
+    family: WireFamilyId,
+    body: &[u8],
+    emit: impl FnMut(Divergence, Source<'_>) -> Result<(), String>,
+) -> Result<Option<Breakpoint>, String> {
+    let mut body: &RawValue =
         serde_json::from_slice(body).map_err(|_| "invalid rendered request JSON")?;
-    let mut request = Request::default();
+    let mut scanner = Scanner {
+        emit,
+        breakpoint: None,
+    };
     if family == WireFamilyId::GoogleCodeAssist {
-        let envelope = body.as_object_mut().ok_or("invalid Code Assist envelope")?;
-        let inner = envelope
-            .remove("request")
-            .ok_or("missing Code Assist request")?;
-        // requestId is a per-step tracing id, not model input. project/model stay evidence.
-        envelope.remove("requestId");
-        request.push(
-            Region::ProviderState,
-            None,
-            None,
-            Value::Object(envelope.clone()),
-        );
-        body = inner;
+        (scanner.emit)(
+            location(Region::ProviderState, None, None),
+            Source::Without(body, &["request", "requestId"]),
+        )?;
+        body = get(body, "request")?.ok_or("missing Code Assist request")?;
     }
-    let object = body
-        .as_object_mut()
-        .ok_or("rendered request is not an object")?;
     let (system, tools, messages, content, bedrock) = match family {
         WireFamilyId::AnthropicMessages => ("system", "tools", "messages", "content", false),
         WireFamilyId::BedrockConverse => ("system", "toolConfig", "messages", "content", true),
@@ -156,85 +312,200 @@ fn segments(family: WireFamilyId, body: &[u8]) -> Result<Request, String> {
             ("instructions", "tools", "input", "content", false)
         }
     };
-    if let Some(mut value) = object.remove(tools) {
-        if bedrock {
-            if let Some(config) = value.as_object_mut() {
-                let tools = config.remove("tools");
-                request.push(
-                    Region::ProviderState,
-                    None,
-                    None,
-                    json_field("toolConfig", Value::Object(config.clone())),
-                );
-                value = tools.unwrap_or(Value::Null);
-            }
+    if let Some(mut raw) = get(body, tools)? {
+        if bedrock && raw.get().starts_with('{') {
+            // toolConfig's non-tool settings occupy a separate provider-state segment.
+            let mut value: Value = serde_json::from_str("{}").expect("empty object");
+            value["toolConfig"] = Source::Without(raw, &["tools"]).value()?;
+            let bytes = serde_json::to_vec(&value).expect("settings serialize");
+            let wrapped: &RawValue = serde_json::from_slice(&bytes).expect("serialized settings");
+            (scanner.emit)(
+                location(Region::ProviderState, None, None),
+                Source::Raw(wrapped),
+            )?;
+            raw = get(raw, "tools")?.unwrap_or(RawValue::NULL);
         }
-        request.parts(Region::Tools, None, &value, bedrock);
+        scanner.parts(Region::Tools, None, raw, bedrock)?;
     }
-    if let Some(mut value) = object.remove(system) {
+    if let Some(mut raw) = get(body, system)? {
         if matches!(
             family,
             WireFamilyId::Gemini | WireFamilyId::GoogleCodeAssist
         ) {
-            if let Some(parts) = value.get_mut("parts") {
-                value = parts.take();
-            }
+            raw = get(raw, "parts")?.unwrap_or(raw);
         }
-        request.parts(Region::System, None, &value, bedrock);
+        scanner.parts(Region::System, None, raw, bedrock)?;
     }
-    if let Some(value) = object.remove(messages) {
-        let messages = value
-            .as_array()
-            .ok_or("rendered messages are not an array")?;
-        for (index, message) in messages.iter().enumerate() {
-            let mut message = message.clone();
-            let region = if matches!(message["role"].as_str(), Some("system" | "developer")) {
-                Region::System
-            } else {
-                Region::Messages
-            };
-            if let Some(object) = message.as_object_mut() {
-                let parts = object.remove(content);
-                request.push(
-                    region.clone(),
-                    Some(index),
-                    None,
-                    Value::Object(object.clone()),
-                );
-                if let Some(parts) = parts {
-                    request.parts(region, Some(index), &parts, bedrock);
+    if let Some(raw) = get(body, messages)? {
+        array(raw, |index, raw| {
+            if raw.get().starts_with('{') {
+                let system = get(raw, "role")?
+                    .is_some_and(|v| matches!(v.get(), "\"system\"" | "\"developer\""));
+                let region = if system {
+                    Region::System
+                } else {
+                    Region::Messages
+                };
+                (scanner.emit)(
+                    location(region.clone(), Some(index), None),
+                    Source::Without(raw, &[content]),
+                )?;
+                if let Some(raw) = get(raw, content)? {
+                    scanner.parts(region, Some(index), raw, bedrock)?;
                 }
             } else {
-                request.push(region, Some(index), None, message);
+                (scanner.emit)(
+                    location(Region::Messages, Some(index), None),
+                    Source::Raw(raw),
+                )?;
+            }
+            Ok(())
+        })?;
+    }
+    (scanner.emit)(
+        location(Region::ProviderState, None, None),
+        Source::Settings(body, family, &[tools, system, messages]),
+    )?;
+    Ok(scanner.breakpoint)
+}
+
+/// Hash deterministic renderer output. Only cache-marker and named rotating-field segments
+/// are normalized; ordinary text, signed reasoning and unknown settings stay byte-sensitive.
+pub fn fingerprint(family: WireFamilyId, body: &[u8]) -> Result<RequestFingerprint, String> {
+    let mut segments = Vec::new();
+    let mut scratch = Vec::new();
+    let breakpoint = scan(family, body, |location, source| {
+        segments.push((location, source.hash(&mut scratch)?));
+        Ok(())
+    })?;
+    Ok(RequestFingerprint {
+        family,
+        segments,
+        breakpoint,
+    })
+}
+
+/// Compare owned hashes. Live evidence deliberately omits object-field detail because the
+/// previous request bytes are not retained; offline readers can resolve the divergent segment.
+pub fn compare_fingerprints(
+    previous: &RequestFingerprint,
+    current: &RequestFingerprint,
+) -> CacheEvidence {
+    comparison(previous, current).0
+}
+
+fn comparison(
+    previous: &RequestFingerprint,
+    current: &RequestFingerprint,
+) -> (CacheEvidence, Option<usize>) {
+    let mut evidence = CacheEvidence {
+        extends_previous: true,
+        previous_last_breakpoint: previous.breakpoint.clone(),
+        ttl_kind: if matches!(
+            previous.family,
+            WireFamilyId::AnthropicMessages | WireFamilyId::BedrockConverse
+        ) {
+            TtlKind::Explicit
+        } else {
+            TtlKind::Implicit
+        },
+        ..Default::default()
+    };
+    for region in [
+        Region::Tools,
+        Region::System,
+        Region::Messages,
+        Region::ProviderState,
+    ] {
+        let mut old = previous.segments.iter().filter(|(l, _)| l.region == region);
+        let mut new = current.segments.iter().filter(|(l, _)| l.region == region);
+        for index in 0.. {
+            match (old.next(), new.next()) {
+                (None, None) => break,
+                (Some((_, a)), Some((_, b))) if a == b => {}
+                (None, Some(_)) if region == Region::Messages => break,
+                (a, b) => {
+                    evidence.extends_previous = false;
+                    evidence.first_divergence =
+                        Some(b.or(a).expect("one segment exists").0.clone());
+                    return (evidence, Some(index));
+                }
             }
         }
     }
-    normalize_settings(family, object);
-    request.push(
-        Region::ProviderState,
-        None,
-        None,
-        Value::Object(object.clone()),
+    (evidence, None)
+}
+
+fn divergent_value(
+    family: WireFamilyId,
+    body: &[u8],
+    region: &Region,
+    index: usize,
+) -> Result<Option<Value>, String> {
+    let mut value = None;
+    let mut ordinal = 0;
+    scan(family, body, |location, source| {
+        if location.region == *region {
+            if ordinal == index {
+                value = Some(source.value()?);
+            }
+            ordinal += 1;
+        }
+        Ok(())
+    })?;
+    Ok(value)
+}
+
+/// Compare canonical logical requests, not transport frames. Only the first divergent segment
+/// is parsed for field-level detail; the prefix comparison itself uses the shared fingerprints.
+pub fn compare_rendered_requests(
+    family: WireFamilyId,
+    previous: &[u8],
+    current: &[u8],
+) -> Result<CacheEvidence, String> {
+    let (mut evidence, index) = comparison(
+        &fingerprint(family, previous)?,
+        &fingerprint(family, current)?,
     );
-    Ok(request)
+    if let Some((at, index)) = evidence.first_divergence.as_mut().zip(index) {
+        if let Some((old, new)) = divergent_value(family, previous, &at.region, index)?
+            .zip(divergent_value(family, current, &at.region, index)?)
+        {
+            at.field = changed_field(&old, &new);
+        }
+    }
+    #[cfg(test)]
+    {
+        let reference = reference::compare_rendered_requests(family, previous, current)?;
+        assert_eq!(
+            serde_json::to_value(&evidence).unwrap(),
+            serde_json::to_value(reference).unwrap(),
+            "borrowed fingerprints must agree with the full-parse oracle"
+        );
+    }
+    Ok(evidence)
 }
 
 fn normalize_billing_text(value: &mut Value) {
     match value {
         Value::String(text) => {
-            // The persona's billing header rotates cch (body signature), cc_prev_req (receipt),
-            // cc_prompt_id and turn indexes (episode correlation), not model instructions.
-            *text = text
-                .split('\n')
-                .map(|line| {
-                    if line.trim_start().starts_with("x-anthropic-billing-header:") {
-                        "x-anthropic-billing-header: <rotating>"
-                    } else {
-                        line
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+            // The billing header identifies a request/episode, not model instructions.
+            if text
+                .lines()
+                .any(|line| line.trim_start().starts_with("x-anthropic-billing-header:"))
+            {
+                *text = text
+                    .split('\n')
+                    .map(|line| {
+                        if line.trim_start().starts_with("x-anthropic-billing-header:") {
+                            "x-anthropic-billing-header: <rotating>"
+                        } else {
+                            line
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
         }
         Value::Object(object) => {
             if let Some(text) = object.get_mut("text") {
@@ -246,9 +517,7 @@ fn normalize_billing_text(value: &mut Value) {
 }
 
 fn normalize_settings(family: WireFamilyId, object: &mut serde_json::Map<String, Value>) {
-    // Output reservation clamps rotate max_tokens/max_completion_tokens/max_output_tokens,
-    // inferenceConfig.maxTokens and generationConfig.maxOutputTokens near the context limit.
-    // Output caps are not cached prompt input; other generation/reasoning settings stay raw.
+    // Output reservation clamps change output caps, not cached prompt input.
     for key in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
         object.remove(key);
     }
@@ -270,8 +539,7 @@ fn normalize_settings(family: WireFamilyId, object: &mut serde_json::Map<String,
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
             {
                 if let Some(identity_object) = identity.as_object_mut() {
-                    // metadata.user_id's device_id and session_id identify an install/episode,
-                    // not the prompt. account_uuid stays raw because accounts scope caches.
+                    // Device/session IDs rotate per install/episode; account_uuid scopes caches.
                     identity_object.remove("device_id");
                     identity_object.remove("session_id");
                     *user = Value::String(identity.to_string());
@@ -281,8 +549,7 @@ fn normalize_settings(family: WireFamilyId, object: &mut serde_json::Map<String,
     }
     if family == WireFamilyId::OpenAiResponsesChatgpt {
         if let Some(Value::Object(metadata)) = object.get_mut("client_metadata") {
-            // These client_metadata keys rotate with the install, connection or turn. They
-            // route/trace the request rather than contributing to its model-visible prefix.
+            // These client_metadata fields route/trace a connection or turn, not prompt input.
             for key in [
                 "x-codex-installation-id",
                 "session_id",
@@ -299,91 +566,28 @@ fn normalize_settings(family: WireFamilyId, object: &mut serde_json::Map<String,
     }
 }
 
-fn json_field(field: &str, value: Value) -> Value {
-    let mut object = serde_json::Map::new();
-    object.insert(field.into(), value);
-    Value::Object(object)
-}
-
 fn changed_field(previous: &Value, current: &Value) -> Option<String> {
     let (Some(previous), Some(current)) = (previous.as_object(), current.as_object()) else {
         return None;
     };
-    for field in previous.keys().chain(current.keys()) {
-        if previous.get(field) != current.get(field) {
-            // Signed reasoning is prefix-bound input, not a rotating authentication field.
-            return Some(
-                if field == "signature"
-                    && previous.get("type").and_then(Value::as_str) == Some("thinking")
-                {
-                    "thinking.signature".into()
-                } else {
-                    field.clone()
-                },
-            );
-        }
-    }
-    None
-}
-
-/// Compare logical rendered requests, not transport frames. Only a clean message-tail append
-/// extends the previous request. Breakpoints locate the protected prefix but do not hide edits
-/// outside it; the dashboard decides which edits could account for a provider cache miss.
-pub fn compare_rendered_requests(
-    family: WireFamilyId,
-    previous: &[u8],
-    current: &[u8],
-) -> Result<CacheEvidence, String> {
-    let previous = segments(family, previous)?;
-    let current = segments(family, current)?;
-    let mut evidence = CacheEvidence {
-        extends_previous: true,
-        previous_last_breakpoint: previous.breakpoint,
-        ttl_kind: if matches!(
-            family,
-            WireFamilyId::AnthropicMessages | WireFamilyId::BedrockConverse
-        ) {
-            TtlKind::Explicit
-        } else {
-            TtlKind::Implicit
-        },
-        ..Default::default()
-    };
-    for region in [
-        Region::Tools,
-        Region::System,
-        Region::Messages,
-        Region::ProviderState,
-    ] {
-        let old: Vec<_> = previous
-            .segments
-            .iter()
-            .filter(|s| s.location.region == region)
-            .collect();
-        let new: Vec<_> = current
-            .segments
-            .iter()
-            .filter(|s| s.location.region == region)
-            .collect();
-        for index in 0..old.len().max(new.len()) {
-            match (old.get(index), new.get(index)) {
-                (Some(a), Some(b)) if a.value == b.value => {}
-                (None, Some(_)) if region == Region::Messages => break,
-                (a, b) => {
-                    let mut location = b.or(a).expect("one segment exists").location.clone();
-                    location.field = a
-                        .zip(b)
-                        .and_then(|(a, b)| changed_field(&a.value, &b.value));
-                    evidence.extends_previous = false;
-                    evidence.first_divergence = Some(location);
-                    return Ok(evidence);
-                }
+    previous
+        .keys()
+        .chain(current.keys())
+        .find(|key| previous.get(*key) != current.get(*key))
+        .map(|field| {
+            if field == "signature"
+                && previous.get("type").and_then(Value::as_str) == Some("thinking")
+            {
+                "thinking.signature".into()
+            } else {
+                field.clone()
             }
-        }
-    }
-    Ok(evidence)
+        })
 }
 
+#[cfg(test)]
+#[path = "cache_evidence_reference.rs"]
+mod reference;
 #[cfg(test)]
 #[path = "cache_evidence_tests.rs"]
 mod tests;

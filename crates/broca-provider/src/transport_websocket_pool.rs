@@ -10,6 +10,7 @@ const MAX_RECEIPT_BYTES: usize = 64 * 1024 * 1024;
 
 struct Entries {
     sessions: HashMap<BindIdentity, Entry>,
+    retired: HashMap<BindIdentity, (MissingReceipt, Instant)>,
     next_lease: u64,
     max_receipt_bytes: usize,
 }
@@ -18,8 +19,25 @@ impl Default for Entries {
     fn default() -> Self {
         Self {
             sessions: HashMap::new(),
+            retired: HashMap::new(),
             next_lease: 0,
             max_receipt_bytes: MAX_RECEIPT_BYTES,
+        }
+    }
+}
+
+impl Entries {
+    fn remember(&mut self, bind: BindIdentity, cause: MissingReceipt, at: Instant) {
+        self.retired.insert(bind, (cause, at));
+        if self.retired.len() > MAX_RETAINED {
+            let oldest = self
+                .retired
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(bind, _)| bind.clone());
+            if let Some(oldest) = oldest {
+                self.retired.remove(&oldest);
+            }
         }
     }
 }
@@ -88,6 +106,12 @@ impl Connections {
             .sessions
             .remove(bind)
             .and_then(|entry| entry.retained);
+        session.state.lock().unwrap().missing_receipt = Some(
+            entries
+                .retired
+                .remove(bind)
+                .map_or(MissingReceipt::RunStart, |(reason, _)| reason),
+        );
         if let Some(retained) = retained {
             let now = session.now();
             if now.saturating_duration_since(retained.since) < MAX_IDLE
@@ -98,7 +122,21 @@ impl Connections {
                 let mut state = session.state.lock().unwrap();
                 state.generation = retained.socket.generation;
                 state.socket = Some(Arc::clone(&retained.socket));
+                state.missing_receipt = None;
             } else {
+                let open = !retained.socket.closed.load(Ordering::Acquire)
+                    && !retained.socket.shutdown.is_cancelled();
+                let reason = if open
+                    && retained.socket.established_at + MAX_SOCKET_AGE <= retained.since + MAX_IDLE
+                    && now >= retained.socket.established_at + MAX_SOCKET_AGE
+                {
+                    MissingReceipt::Age
+                } else if open && now >= retained.since + MAX_IDLE {
+                    MissingReceipt::Idle
+                } else {
+                    MissingReceipt::RunStart
+                };
+                session.state.lock().unwrap().missing_receipt = Some(reason);
                 retained.socket.shutdown.cancel();
                 tracing::info!(target: "provider", reason = "expired_or_closed", "Retiring retained Responses websocket");
             }
@@ -122,7 +160,10 @@ impl Connections {
 
     /// Retire both idle and borrowed state for a deleted or moved session.
     pub fn retire_session(&self, bind: &BindIdentity) {
-        let entry = self.0.lock().unwrap().sessions.remove(bind);
+        let mut entries = self.0.lock().unwrap();
+        entries.retired.remove(bind);
+        let entry = entries.sessions.remove(bind);
+        drop(entries);
         if let Some(entry) = entry {
             close_entry(entry);
         }
@@ -174,6 +215,7 @@ impl Connections {
         for key in keys {
             if let Some(entry) = entries.sessions.remove(&key) {
                 close_entry(entry);
+                entries.remember(key, MissingReceipt::ConnectionLimit, Instant::now());
             }
         }
         tracing::info!(target: "provider", reason = "connection_limit", retired, "Retiring credential's idle Responses websockets before accounted retry");
@@ -181,7 +223,11 @@ impl Connections {
 
     /// Retire all authenticated state on credential revocation or executor shutdown.
     pub fn clear(&self) {
-        let entries = std::mem::take(&mut self.0.lock().unwrap().sessions);
+        let entries = {
+            let mut entries = self.0.lock().unwrap();
+            entries.retired.clear();
+            std::mem::take(&mut entries.sessions)
+        };
         for entry in entries.into_values() {
             close_entry(entry);
         }
@@ -214,10 +260,14 @@ impl Lease {
         }
         entries.sessions.remove(&self.bind);
         let Some(socket) = socket else {
+            if let Some(reason) = session.state.lock().unwrap().missing_receipt {
+                entries.remember(self.bind.clone(), reason, now);
+            }
             return;
         };
         if now.saturating_duration_since(socket.established_at) >= MAX_SOCKET_AGE {
             socket.shutdown.cancel();
+            entries.remember(self.bind.clone(), MissingReceipt::Age, now);
             return;
         }
         let receipt_bytes = socket.continuation.lock().unwrap().as_ref().map_or(
@@ -226,6 +276,7 @@ impl Lease {
         );
         if receipt_bytes > entries.max_receipt_bytes {
             socket.shutdown.cancel();
+            entries.remember(self.bind.clone(), MissingReceipt::ReceiptTooLarge, now);
             tracing::info!(target: "provider", reason = "receipt_too_large", "Retiring Responses websocket beyond retained receipt byte budget");
             return;
         }
@@ -258,11 +309,25 @@ impl Lease {
             if let Some(oldest) = oldest {
                 if let Some(entry) = entries.sessions.remove(&oldest) {
                     close_entry(entry);
+                    entries.remember(
+                        oldest,
+                        if reason == "capacity" {
+                            MissingReceipt::Capacity
+                        } else {
+                            MissingReceipt::ReceiptBytes
+                        },
+                        now,
+                    );
                 }
                 tracing::info!(target: "provider", reason, "Retiring retained Responses websocket");
             }
         }
         let deadline = (now + MAX_IDLE).min(socket.established_at + MAX_SOCKET_AGE);
+        let expiry_reason = if socket.established_at + MAX_SOCKET_AGE <= now + MAX_IDLE {
+            MissingReceipt::Age
+        } else {
+            MissingReceipt::Idle
+        };
         let owner = Arc::downgrade(&self.owner.0);
         let bind = self.bind.clone();
         let id = self.id;
@@ -276,7 +341,16 @@ impl Lease {
                     .is_some_and(|entry| entry.lease == id && entry.retained.is_some())
                 {
                     if let Some(entry) = entries.sessions.remove(&bind) {
+                        let cause = entry
+                            .retained
+                            .as_ref()
+                            .filter(|retained| {
+                                !retained.socket.closed.load(Ordering::Acquire)
+                                    && !retained.socket.shutdown.is_cancelled()
+                            })
+                            .map_or(MissingReceipt::RunStart, |_| expiry_reason);
                         close_entry(entry);
+                        entries.remember(bind.clone(), cause, deadline);
                     }
                     tracing::info!(target: "provider", reason = "idle_or_age", "Retiring retained Responses websocket");
                 }
@@ -308,7 +382,14 @@ impl Drop for Lease {
             .is_some_and(|entry| entry.lease == self.id && entry.retained.is_none())
         {
             if let Some(entry) = entries.sessions.remove(&self.bind) {
+                let reason = entry
+                    .active
+                    .upgrade()
+                    .and_then(|session| session.state.lock().unwrap().missing_receipt);
                 close_entry(entry);
+                if let Some(reason) = reason {
+                    entries.remember(self.bind.clone(), reason, Instant::now());
+                }
             }
         }
     }
@@ -317,6 +398,46 @@ impl Drop for Lease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upgrade_failure_without_a_socket_does_not_claim_a_failed_model_attempt() {
+        let session = Session::default();
+        session.state.lock().unwrap().missing_receipt = Some(MissingReceipt::RunStart);
+        session.fail();
+        let state = session.state.lock().unwrap();
+        assert_eq!(state.failures, 1);
+        assert_eq!(state.missing_receipt, Some(MissingReceipt::RunStart));
+    }
+
+    #[test]
+    fn retirement_ledger_is_bounded_and_forgotten_causes_are_only_run_start() {
+        let pool = Connections::default();
+        let now = Instant::now();
+        for n in 0..65 {
+            pool.0.lock().unwrap().remember(
+                BindIdentity::new("/project", "harness", n.to_string()),
+                MissingReceipt::Age,
+                now + Duration::from_secs(n),
+            );
+        }
+        assert_eq!(pool.0.lock().unwrap().retired.len(), MAX_RETAINED);
+        let forgotten = Arc::new(Session::default());
+        let _lease = pool
+            .acquire(&BindIdentity::new("/project", "harness", "0"), &forgotten)
+            .unwrap();
+        assert_eq!(
+            forgotten.state.lock().unwrap().missing_receipt,
+            Some(MissingReceipt::RunStart)
+        );
+        let known = Arc::new(Session::default());
+        let _known_lease = pool
+            .acquire(&BindIdentity::new("/project", "harness", "64"), &known)
+            .unwrap();
+        assert_eq!(
+            known.state.lock().unwrap().missing_receipt,
+            Some(MissingReceipt::Age)
+        );
+    }
 
     #[test]
     fn active_retirement_preserves_per_run_fallback_and_turn_state() {

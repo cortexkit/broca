@@ -36,9 +36,45 @@ broca-session cache-diagnose example --state-root ./copied-state --out ./diagnos
 `--project-root`/`--harness` binding, retention checks, and live/archive WAL reader.
 It prints one JSONL `cache_attempt` row for **every** `ModelAttemptFinished`, including
 failed retries, rather than selecting one response per step. No daemon, network,
-request-body export, or WAL changes are involved. `--out` creates a new owner-only
+request-body export, or WAL writes are involved. `--out` creates a new owner-only
 file; stdout is the default. The output contains account references and other
 diagnostic identifiers, but no prompt text, thinking text, signatures, or body bytes.
+
+Live `model_attempt_finished` records optionally carry `cache_evidence` in the
+same shape as the offline comparison. The first attempt, or one without a verified
+predecessor, omits it. Per-session memory keeps only the immediately preceding
+request's segment hashes/coordinates, breakpoint, send time, and diagnostic
+identity/policy/view metadata, never its body. On the first run after restart, or
+a run without a fingerprint, broca reconstructs the last request once through
+`last_recorded_request` and accepts it only if its canonical digest matches.
+Unavailable reconstruction is a gap, never a comparison against an older attempt.
+The optional admission-checkpoint fact `has_model_attempt` avoids reading an older
+prefix when a complete fold proves there were no attempts. Absent means unknown;
+that session rebuilds lazily once, not in a startup sweep. A proven attempt sets
+the fact to true permanently, across episode boundaries. Complete supplied
+snapshots are reused rather than read again; an unproven checkpoint tail never
+stands in for the missing prefix.
+Hashing runs on the blocking pool after transport handoff, concurrently with the
+response, and is joined before writing the attempt. It never changes request bytes.
+
+The shared `broca_provider::cache_evidence::fingerprint` API underlies both the
+live comparison and `compare_rendered_requests`. It borrows raw JSON segments
+from deterministic renderer output and hashes their bytes. Only segments with
+cache markers or the named rotating settings need owned JSON normalization.
+The segment vector grows geometrically; it does not allocate a JSON tree per
+message/content part. Bodies with different arbitrary whitespace/key order are
+not an input contract: these comparisons consume broca's canonical renderers.
+
+`cache-diagnose` prefers recorded evidence even when replay is unavailable;
+`evidence_source` is `recorded` or `offline`, while `verified` describes only the
+reconstruction. Live divergences omit the optional `field` detail because the
+previous bytes are not retained. **Absent means not recorded**, never "no field
+changed". When verified rebuilt bodies are available, the tool compares them and
+parses only the first divergent segment to fill that detail, marking a successful
+resolution with `field_resolved_offline: true`. Recorded coordinates and all other
+evidence remain authoritative. Legacy attempts without evidence still use the
+complete offline comparison below. `full_input_reason` is always the recorded,
+open-string transport reason, never inferred from elapsed time by the offline tool.
 
 The shared `broca_provider::cache_evidence::compare_rendered_requests` compares
 canonical logical requests reconstructed by `wal_render`, after checking their

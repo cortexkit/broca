@@ -607,6 +607,7 @@ mod gated {
                 sent_at_ms,
                 transport,
                 websocket_request,
+                cache_evidence: _,
                 websocket_close_code,
                 input_transformations: _,
                 input_transformations_unmeasured: _,

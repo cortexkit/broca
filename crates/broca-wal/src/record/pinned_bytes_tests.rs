@@ -919,6 +919,7 @@ fn attempt_transport_is_optional_and_needs_no_reader_feature() {
         WalRecord::ModelAttemptFinished {
             transport: None,
             websocket_request: None,
+            cache_evidence: None,
             websocket_close_code: None,
             ..
         }

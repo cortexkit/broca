@@ -303,3 +303,19 @@ fn chatgpt_continuation_compares_canonical_full_input_not_the_socket_suffix() {
         .extends_previous
     );
 }
+
+#[test]
+fn moved_bedrock_marker_and_edit_resolve_the_same_segment_by_ordinal() {
+    let old = json!({"messages":[{"role":"user","content":[{"text":"A"},{"cachePoint":{"type":"default"}},{"text":"B"}]}]});
+    let new = json!({"messages":[{"role":"user","content":[{"cachePoint":{"type":"default"}},{"text":"changed A"},{"text":"B"}]}]});
+    let evidence = compare_rendered_requests(
+        WireFamilyId::BedrockConverse,
+        &serde_json::to_vec(&old).unwrap(),
+        &serde_json::to_vec(&new).unwrap(),
+    )
+    .unwrap();
+    let divergence = evidence.first_divergence.unwrap();
+    assert_eq!(divergence.message_index, Some(0));
+    assert_eq!(divergence.part_index, Some(1));
+    assert_eq!(divergence.field.as_deref(), Some("text"));
+}

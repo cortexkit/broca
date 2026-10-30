@@ -158,6 +158,19 @@ async fn reset_case(trigger: &str) {
     }
     let events = step(&second, 1, &next).await;
     assert!(!codex_trace(&events, 0).continuation, "{trigger}");
+    let expected_reason = match trigger {
+        "account" | "token" | "revision" => "account_or_credential_change",
+        "idle" => "new_connection_idle",
+        "restart" | "delete" | "move" | "revoke" | "shutdown" => "new_connection_run_start",
+        "history" => "input_mismatch",
+        "compaction" => "input_mismatch",
+        _ => "no_completed_response",
+    };
+    assert_eq!(
+        codex_trace(&events, 0).full_input_reason.as_deref(),
+        Some(expected_reason),
+        "{trigger}"
+    );
     let canonical: Value = serde_json::from_slice(&second.render_request(&next)).unwrap();
     let seen = mock.observed.lock().unwrap();
     assert_eq!(
@@ -224,6 +237,12 @@ async fn codex_cross_run_age_cap_is_full_despite_recent_compatible_borrows() {
             codex_trace(&events, 0).continuation,
             index > 0 && minutes < 40
         );
+        if minutes == 41 {
+            assert_eq!(
+                codex_trace(&events, 0).full_input_reason.as_deref(),
+                Some("new_connection_age")
+            );
+        }
         options = follow_up(options, &events, "Next");
         provider.complete_run_transport();
     }
@@ -344,7 +363,7 @@ async fn codex_cross_run_full_bind_and_exclusive_borrow_fence_connections() {
 
 #[tokio::test]
 async fn codex_cross_run_idle_timer_closes_without_another_run() {
-    let mock = Mock::start(vec![text_events()], false, false).await;
+    let mock = Mock::start(vec![text_events(); 2], false, false).await;
     let client = build_provider_http_client();
     let first = run_provider(&mock, &client, "one");
     first.bind_run_transport(&bind("session"));
@@ -355,6 +374,13 @@ async fn codex_cross_run_idle_timer_closes_without_another_run() {
     tokio::task::yield_now().await;
     tokio::time::resume();
     mock.wait_closes(1).await;
+    let next = run_provider(&mock, &client, "two");
+    next.bind_run_transport(&bind("session"));
+    let events = step(&next, 1, &opts()).await;
+    assert_eq!(
+        codex_trace(&events, 0).full_input_reason.as_deref(),
+        Some("new_connection_idle")
+    );
 }
 
 #[tokio::test]
@@ -378,6 +404,10 @@ async fn codex_cross_run_capacity_evicts_oldest_idle_connection() {
     oldest.bind_run_transport(&bind("0"));
     let events = step(&oldest, 1, &opts()).await;
     assert!(!codex_trace(&events, 0).continuation);
+    assert_eq!(
+        codex_trace(&events, 0).full_input_reason.as_deref(),
+        Some("new_connection_run_start_capacity")
+    );
     assert_eq!(mock.observed.lock().unwrap().handshakes, 66);
 }
 
@@ -484,7 +514,12 @@ async fn codex_cross_run_receipt_byte_budget_evicts_oldest_idle_socket() {
     newest.complete_run_transport();
     let oldest = run_provider(&mock, &client, "two");
     oldest.bind_run_transport(&bind("first"));
-    assert!(!codex_trace(&step(&oldest, 1, &options).await, 0).continuation);
+    let events = step(&oldest, 1, &options).await;
+    assert!(!codex_trace(&events, 0).continuation);
+    assert_eq!(
+        codex_trace(&events, 0).full_input_reason.as_deref(),
+        Some("new_connection_run_start_receipt_bytes")
+    );
     assert_eq!(mock.observed.lock().unwrap().handshakes, 3);
 }
 
@@ -504,12 +539,11 @@ async fn codex_cross_run_single_receipt_over_byte_budget_is_not_retained() {
     mock.wait_closes(1).await;
     let second = run_provider(&mock, &client, "two");
     second.bind_run_transport(&bind("session"));
-    assert!(
-        !codex_trace(
-            &step(&second, 1, &follow_up(options, &events, "Next")).await,
-            0
-        )
-        .continuation
+    let events = step(&second, 1, &follow_up(options, &events, "Next")).await;
+    assert!(!codex_trace(&events, 0).continuation);
+    assert_eq!(
+        codex_trace(&events, 0).full_input_reason.as_deref(),
+        Some("new_connection_run_start_receipt_too_large")
     );
     assert_eq!(mock.observed.lock().unwrap().handshakes, 2);
 }
@@ -524,6 +558,7 @@ async fn codex_cross_run_connection_limit_retires_only_that_credentials_idle_soc
             text_events(),
             text_events(),
             vec![limit],
+            text_events(),
             text_events(),
             text_events(),
             text_events(),
@@ -560,6 +595,10 @@ async fn codex_cross_run_connection_limit_retires_only_that_credentials_idle_soc
     assert_eq!(attempts(&events).len(), 2);
     assert_eq!(attempts(&events)[0].outcome, AttemptOutcome::ChunkError);
     assert_eq!(attempts(&events)[1].outcome, AttemptOutcome::Complete);
+    assert_eq!(
+        codex_trace(&events, 1).full_input_reason.as_deref(),
+        Some("connection_limit")
+    );
     for attempt in attempts(&events) {
         assert_eq!(
             attempt
@@ -593,6 +632,13 @@ async fn codex_cross_run_connection_limit_retires_only_that_credentials_idle_soc
         .continuation
     );
     assert_eq!(mock.observed.lock().unwrap().handshakes, 5);
+    let idle_next = run_provider(&mock, &client, "two");
+    idle_next.bind_run_transport(&bind("idle"));
+    let events = step(&idle_next, 1, &opts()).await;
+    assert_eq!(
+        codex_trace(&events, 0).full_input_reason.as_deref(),
+        Some("connection_limit")
+    );
 }
 
 #[tokio::test]
@@ -649,5 +695,166 @@ async fn codex_cross_run_connection_limit_uses_identical_codex_counts_for_retain
         assert_eq!(seen.requests.len(), 7);
         assert_eq!(seen.http_bodies.len(), 1);
         assert_eq!(seen.handshakes, if reuse { 6 } else { 7 });
+    }
+}
+
+#[tokio::test]
+async fn cache_evidence_live_records_extension_age_resend_and_restart_restore() {
+    let mut replies = vec![text_events(); 8];
+    replies[5][1]["response"]["usage"]["input_tokens_details"]["cached_tokens"] = Value::from(0);
+    let mock = Mock::start(replies, false, false).await;
+    let mut client = build_provider_http_client();
+    let root = broca_test_support::scratch_root().join("cache-evidence-live-records");
+    let session = BindIdentity::new(
+        "/synthetic-cache-evidence-project",
+        "scripted-websocket",
+        "cache-evidence-conversation",
+    );
+    let wal = FileWalStore::new(root.join("wal"));
+    let leases = FileLeaseStore::new(root.join("lease"));
+    for (index, minutes) in [0, 9, 18, 27, 36, 41, 41, 41].into_iter().enumerate() {
+        // A new HTTP client models a process restart: no socket or fingerprint survives.
+        if index == 6 {
+            client = build_provider_http_client();
+        }
+        let provider = run_provider(&mock, &client, &index.to_string());
+        provider
+            .websocket
+            .advance_clock(Duration::from_secs(minutes * 60));
+        let mut request = tool_run_request(&session);
+        request.run_id = RunId(format!("cache-evidence-run-{index}"));
+        request.tools.clear();
+        request.policy_allowed.clear();
+        request.input[0].content = vec![ContentBlock::Text {
+            text: format!("synthetic question {index}"),
+        }];
+        let (tx, mut rx) = mpsc::channel(256);
+        let collect = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let summary = broca_test_support::wait_for(
+            "cache evidence run",
+            run_loop(
+                request,
+                &provider,
+                &StubToolPlane::new(),
+                &leases,
+                &AllowAll,
+                &wal,
+                &tx,
+            ),
+            || "scripted provider did not finish".into(),
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        collect.await.unwrap();
+        assert_eq!(summary.reason, RunFinishReason::Completed);
+        assert_eq!(summary.steps, 1);
+    }
+    let frames = wal.read_records(&session).unwrap();
+    let attempts: Vec<_> = frames
+        .iter()
+        .filter(|f| matches!(f.record, WalRecord::ModelAttemptFinished { .. }))
+        .collect();
+    assert_eq!(attempts.len(), 8);
+    let first = serde_json::to_value(&attempts[0].record).unwrap();
+    assert!(first.get("cache_evidence").is_none());
+    for pair in attempts.windows(2) {
+        let attempt = serde_json::to_value(&pair[1].record).unwrap();
+        let evidence = &attempt["cache_evidence"];
+        assert_eq!(evidence["extends_previous"], true, "{attempt}");
+        assert!(evidence["first_divergence"].is_null());
+        assert!(evidence["compared_to"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!(":{}", pair[0].seq)));
+    }
+    let extension = serde_json::to_value(&attempts[1].record).unwrap();
+    let bust = serde_json::to_value(&attempts[5].record).unwrap();
+    let restart = serde_json::to_value(&attempts[6].record).unwrap();
+    assert_eq!(
+        extension["websocket_request"]["codex"]["continuation"],
+        true
+    );
+    assert_eq!(bust["websocket_request"]["codex"]["continuation"], false);
+    assert_eq!(
+        bust["websocket_request"]["codex"]["full_input_reason"],
+        "new_connection_age"
+    );
+    assert_eq!(
+        restart["websocket_request"]["codex"]["full_input_reason"],
+        "new_connection_run_start"
+    );
+    if let Some(directory) = std::env::var_os("BROCA_CACHE_EVIDENCE_SAMPLES") {
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut sums = String::new();
+        for (name, record) in [
+            ("extension.json", extension),
+            ("full-input-bust.json", bust),
+        ] {
+            let mut bytes = serde_json::to_vec_pretty(&record).unwrap();
+            bytes.push(b'\n');
+            sums.push_str(&format!("{:x}  {name}\n", Sha256::digest(&bytes)));
+            std::fs::write(directory.join(name), bytes).unwrap();
+        }
+        std::fs::write(directory.join("SHA256SUMS"), sums).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cache_evidence_send_and_first_text_do_not_wait_for_fingerprint() {
+    for https in [false, true] {
+        let mock = Mock::start(vec![text_events()], false, false).await;
+        let provider = codex_provider(&mock);
+        provider.bind_run_transport(&bind("fingerprint-gate"));
+        if https {
+            provider.websocket.switch_to_https();
+        }
+        let session = provider.cache_session.lock().unwrap().clone().unwrap();
+        let gate = Arc::new(cache_runtime::Gate::default());
+        *session.1.lock().unwrap() = Some(Arc::clone(&gate));
+        let mut rx = provider.step(StepId(1), &opts()).await;
+        let observed = broca_test_support::event_timeout(
+            "first text while fingerprint is blocked",
+            async {
+                while let Some(event) = rx.recv().await {
+                    if matches!(
+                        event,
+                        NormalizedEvent::Display(broca_protocol::DisplayEvent::TextDelta { .. })
+                    ) {
+                        return;
+                    }
+                    assert!(
+                        !matches!(
+                            event,
+                            NormalizedEvent::Control(ProviderControl::AttemptFinished { .. })
+                        ),
+                        "attempt must join its fingerprint"
+                    );
+                }
+                panic!("provider closed without text");
+            },
+            || "fingerprint gate still closed".into(),
+        )
+        .await;
+        let received = {
+            let seen = mock.observed.lock().unwrap();
+            seen.requests.len() + seen.http_bodies.len()
+        };
+        let started = broca_test_support::event_timeout(
+            "fingerprint worker starts",
+            async {
+                while !gate.entered.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            },
+            || "worker has not started".into(),
+        )
+        .await;
+        gate.release();
+        assert!(observed.is_ok());
+        assert!(started.is_ok());
+        assert_eq!(received, 1, "send already reached the scripted transport");
+        while rx.recv().await.is_some() {}
     }
 }

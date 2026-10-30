@@ -728,6 +728,14 @@ holding `at_seq`, the last episode (run id, effective config, input, disposition
 queue. A version the running build does not recognise is treated as missing, and the
 checkpoint is rebuilt from the WAL.
 
+The optional `has_model_attempt` checkpoint member summarizes the entire folded
+prefix, not just its last episode. A complete fold with no attempts records false;
+any `model_attempt_finished` makes it true, and subsequent episodes cannot clear
+it. Missing on older checkpoints means unknown. Cache diagnostics use this fact
+to avoid an unnecessary prefix read when no predecessor exists; unknown history
+is rebuilt lazily for that session, never by a startup scan. The version-one
+envelope is unchanged, and older checkpoint decoders ignore this optional member.
+
 ### 4.3 `message`
 
 The materialized transcript prefix.

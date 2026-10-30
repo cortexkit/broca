@@ -64,6 +64,22 @@ pub trait Provider: Send + Sync {
     /// Exclusively acquire any in-memory connection retained for this full session bind.
     fn bind_run_transport(&self, _session: &broca_protocol::BindIdentity) {}
 
+    /// Restore the bound session's diagnostic predecessor once per WAL lineage, or after
+    /// an aborted in-flight attempt left its predecessor state unavailable.
+    fn cache_evidence_needs_seed(&self, _lineage: Option<&str>) -> bool {
+        false
+    }
+    async fn seed_cache_evidence(
+        &self,
+        _frames: Vec<broca_wal::FramedRecord>,
+        _lineage: Option<String>,
+    ) {
+    }
+    /// The applied Magic Context compaction view version is diagnostic, not rendered input.
+    fn set_cache_evidence_view(&self, _view: Option<u64>) {}
+    fn annotate_cache_evidence(&self, _attempt: &mut broca_protocol::ModelAttempt) {}
+    fn cache_attempt_recorded(&self, _locator: Option<String>) {}
+
     /// Pin the freshly resolved credential record version before acquiring run transport.
     fn set_credential_revision(&self, _revision: u64) {}
 
@@ -315,6 +331,26 @@ impl Provider for Box<dyn Provider> {
 
     fn bind_run_transport(&self, session: &broca_protocol::BindIdentity) {
         (**self).bind_run_transport(session);
+    }
+
+    fn cache_evidence_needs_seed(&self, lineage: Option<&str>) -> bool {
+        (**self).cache_evidence_needs_seed(lineage)
+    }
+    async fn seed_cache_evidence(
+        &self,
+        frames: Vec<broca_wal::FramedRecord>,
+        lineage: Option<String>,
+    ) {
+        (**self).seed_cache_evidence(frames, lineage).await
+    }
+    fn set_cache_evidence_view(&self, view: Option<u64>) {
+        (**self).set_cache_evidence_view(view)
+    }
+    fn annotate_cache_evidence(&self, attempt: &mut broca_protocol::ModelAttempt) {
+        (**self).annotate_cache_evidence(attempt)
+    }
+    fn cache_attempt_recorded(&self, locator: Option<String>) {
+        (**self).cache_attempt_recorded(locator)
     }
 
     fn set_credential_revision(&self, revision: u64) {

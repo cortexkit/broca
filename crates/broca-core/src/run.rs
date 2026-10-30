@@ -1770,6 +1770,30 @@ where
             return Err(e);
         }
     };
+    let evidence_lineage = writer.lineage_id().map(|id| id.to_string());
+    if provider.cache_evidence_needs_seed(evidence_lineage.as_deref()) {
+        let frames = if !is_resume
+            || prior_snapshot.is_some_and(|snapshot| {
+                prior_snapshot_matches_writer_head(writer, snapshot)
+                    && snapshot.checkpoint_at_head.has_model_attempt == Some(false)
+            }) {
+            Ok(Vec::new())
+        } else if let Some(snapshot) = prior_snapshot.filter(|snapshot| {
+            snapshot.base_watermark == 0 && prior_snapshot_matches_writer_head(writer, snapshot)
+        }) {
+            // A complete admission snapshot already contains the previous attempt. Reading
+            // the WAL again would make cold diagnostic state slow down ordinary admission.
+            Ok(snapshot.tail.as_ref().clone())
+        } else {
+            wal_store.read_records(&req.session)
+        };
+        match frames {
+            Ok(frames) => provider.seed_cache_evidence(frames, evidence_lineage).await,
+            Err(_) => {
+                tracing::warn!(target: "provider", "Cache evidence reconstruction unavailable; request execution is unchanged")
+            }
+        }
+    }
     // An applied view can leave the resumed prompt without the episode coordinates of earlier
     // episodes, which ChatGPT effort updates and per-episode repetition guidance render from.
     // The store projects them, so take them from there instead of replaying the whole WAL.
@@ -5844,7 +5868,7 @@ where
         let journaled_attempts = writer
             .is_overhaul()
             .then(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
-        let record_attempt = |attempt: broca_protocol::ModelAttempt| -> AttemptFuture<'_> {
+        let record_attempt = |mut attempt: broca_protocol::ModelAttempt| -> AttemptFuture<'_> {
             let journaled_attempts = &journaled_attempts;
             step_attempts.fetch_max(
                 attempt.attempt.saturating_add(1),
@@ -5882,15 +5906,28 @@ where
                     }
                     return Ok(());
                 }
+                provider.annotate_cache_evidence(&mut attempt);
                 match &control.account_reporter {
                     Some(reporter) => {
                         let seq = writer
                             .record(WalRecord::model_attempt_finished(step_id, attempt.clone()))
                             .into_result()?;
+                        provider.cache_attempt_recorded(
+                            writer.lineage_id().map(|id| format!("{id}:{seq}")),
+                        );
                         reporter.attempt_recorded(writer.lineage_id(), seq, &attempt);
                     }
                     None => {
-                        writer.record(WalRecord::model_attempt_finished(step_id, attempt));
+                        // Keep append failures on the run's existing error path instead of
+                        // returning earlier merely to collect the appended record's sequence.
+                        if let Ok(seq) = writer
+                            .record(WalRecord::model_attempt_finished(step_id, attempt))
+                            .into_result()
+                        {
+                            provider.cache_attempt_recorded(
+                                writer.lineage_id().map(|id| format!("{id}:{seq}")),
+                            );
+                        }
                     }
                 }
                 if needs_sync {
@@ -6054,6 +6091,13 @@ where
             let attempt_hook = hook_channel
                 .as_ref()
                 .map(|(tx, _)| Arc::new(ChannelAttemptHook(tx.clone())) as Arc<dyn AttemptHook>);
+            provider.set_cache_evidence_view(
+                prior
+                    .compaction
+                    .state()
+                    .and_then(|state| state.view.as_ref())
+                    .map(|applied| applied.view.view_version),
+            );
             let model_step = Box::pin(run_step_watched(
                 provider,
                 step_id,
@@ -6118,6 +6162,7 @@ where
                     &mut hook_requests,
                     &mut AttemptJournal {
                         writer,
+                        evidence: Some(provider),
                         seal: control.shutdown_seal.as_ref(),
                         template,
                         pending: Default::default(),
@@ -8698,6 +8743,7 @@ impl PendingAttempt {
 
 struct AttemptJournal<'a> {
     writer: &'a WalHandle,
+    evidence: Option<&'a dyn Provider>,
     seal: Option<&'a crate::ShutdownSeal>,
     template: broca_wal::record::AttemptReservation,
     pending: std::collections::BTreeMap<broca_wal::record::AttemptId, PendingAttempt>,
@@ -8844,7 +8890,7 @@ impl AttemptJournal<'_> {
             }
             AttemptRequest::Finish {
                 id,
-                attempt,
+                mut attempt,
                 outcome,
                 reply,
             } => {
@@ -8871,6 +8917,9 @@ impl AttemptJournal<'_> {
                     ..Default::default()
                 };
                 let ordinal = attempt.attempt;
+                if let Some(provider) = self.evidence {
+                    provider.annotate_cache_evidence(&mut attempt);
+                }
                 let mut record =
                     WalRecord::model_attempt_finished(pending.reservation.step_id, attempt);
                 if let WalRecord::ModelAttemptFinished {
@@ -8885,6 +8934,11 @@ impl AttemptJournal<'_> {
                     *slot = Some(Box::new(envelope));
                 }
                 if let Some(seq) = self.settle(&id, record)? {
+                    if let Some(provider) = self.evidence {
+                        provider.cache_attempt_recorded(
+                            self.writer.lineage_id().map(|id| format!("{id}:{seq}")),
+                        );
+                    }
                     // Compression refusal produces no stream event. Do not let its
                     // ordinal suppress telemetry for a resend cancelled before sending.
                     if outcome != BillingAttemptOutcome::CompressionRefused {
@@ -11727,6 +11781,7 @@ mod tests {
         let hook = Arc::new(ChannelAttemptHook(tx));
         let recorded = Default::default();
         let mut journal = AttemptJournal {
+            evidence: None,
             writer: &writer,
             seal: Some(&seal),
             template: attempt_template(),
@@ -11873,6 +11928,7 @@ mod tests {
         let recorded = Default::default();
         let seal = crate::ShutdownSeal::new();
         let mut journal = AttemptJournal {
+            evidence: None,
             writer: &writer,
             seal: Some(&seal),
             template: attempt_template(),
@@ -12000,6 +12056,7 @@ mod tests {
         let hook = ChannelAttemptHook(tx);
         let recorded = Default::default();
         let mut journal = AttemptJournal {
+            evidence: None,
             writer: &writer,
             seal: None,
             template: attempt_template(),
@@ -12051,6 +12108,7 @@ mod tests {
         let hook = ChannelAttemptHook(tx);
         let recorded = Default::default();
         let mut journal = AttemptJournal {
+            evidence: None,
             writer: &writer,
             seal: None,
             template: attempt_template(),
@@ -12116,6 +12174,7 @@ mod tests {
         let hook = ChannelAttemptHook(tx);
         let recorded = Default::default();
         let mut journal = AttemptJournal {
+            evidence: None,
             writer: &writer,
             seal: None,
             template: attempt_template(),
@@ -12198,6 +12257,7 @@ mod tests {
         assert!(writer.is_overhaul());
         let recorded = Default::default();
         let mut journal = AttemptJournal {
+            evidence: None,
             writer: &writer,
             seal: None,
             template,
@@ -12415,6 +12475,7 @@ mod tests {
         let hook = ChannelAttemptHook(tx);
         let recorded = Default::default();
         let mut journal = AttemptJournal {
+            evidence: None,
             writer: &writer,
             seal: Some(&seal),
             template: attempt_template(),
@@ -12479,6 +12540,7 @@ mod tests {
             sent_at_ms: None,
             transport: None,
             websocket_request: None,
+            cache_evidence: None,
             websocket_close_code: None,
             input_transformations: report,
             input_transformations_unmeasured: unmeasured,
@@ -14727,6 +14789,7 @@ mod tests {
             trailing_origin: None,
             last_run_id: Some(RunId("budget".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                has_model_attempt: None,
                 #[cfg(feature = "test-attachments")]
                 media: None,
                 head: None,
