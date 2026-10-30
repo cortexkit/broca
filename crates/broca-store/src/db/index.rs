@@ -12,7 +12,7 @@ pub enum LogLocation {
     Archived,
 }
 impl LogLocation {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Live => "live",
             Self::Archived => "archived",
@@ -227,43 +227,22 @@ pub(super) fn index_in_tx(
                 ));
             }
         }
-        let delta = seed.observe(&frame, offset, end)?;
-        if let Some(to) = delta.truncate {
-            tx.execute(
-                "DELETE FROM message WHERE sid=?1 AND ord>=?2",
-                params![key, u64_to_i64(to)?],
-            )?;
-        }
-        for (ord, source) in delta.messages {
-            tx.execute("INSERT INTO message (sid,ord,lo_seq,lo_off,hi_off,input_start,input_end,tag_base,tag_n,tag_high,flags) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
-                ON CONFLICT(sid,ord) DO UPDATE SET lo_seq=excluded.lo_seq,lo_off=excluded.lo_off,hi_off=excluded.hi_off,input_start=excluded.input_start,input_end=excluded.input_end,tag_base=excluded.tag_base,tag_n=excluded.tag_n,tag_high=excluded.tag_high,flags=excluded.flags",
-                params![key,u64_to_i64(ord)?,u64_to_i64(source.lo_seq)?,u64_to_i64(source.lo_off)?,u64_to_i64(source.hi_off)?,u64_to_i64(source.input_start)?,u64_to_i64(source.input_end)?,source.tag_base.map(u64_to_i64).transpose()?,u64_to_i64(source.tag_n)?,u64_to_i64(source.tag_high)?,source.flags])?;
-        }
-        if let Some(ep) = delta.closed_episode {
-            write_episode(tx, &key, &ep)?;
-        }
-        if let Some(ep) = &seed.episode {
-            write_episode(tx, &key, ep)?;
-        }
-        let frame_identity = Sha256::digest(&remaining[..consumed]);
-        for fact in &delta.boundaries {
-            write_boundary(
-                tx,
-                &key,
-                lineage_id.as_deref(),
-                fact,
-                &frame,
-                offset,
+        let frame_identity = Sha256::digest(&remaining[..consumed]).to_vec();
+        apply_frame(
+            tx,
+            &key,
+            lineage_id.as_deref(),
+            &mut seed,
+            &IndexedFrame {
+                off: offset,
                 end,
-                &frame_identity,
-            )?;
-        }
-        if let Some((cut, checkpoint)) = delta.reanchor {
-            reanchor(tx, &key, cut, checkpoint, &mut seed)?;
-        }
+                identity: frame_identity.clone(),
+                framed: *frame.clone(),
+            },
+        )?;
         last_seq = Some(frame.seq);
         last_off = offset;
-        identity = Some(frame_identity.to_vec());
+        identity = Some(frame_identity);
         offset = end;
     }
     if boundary_lineage != lineage_id {
@@ -283,20 +262,56 @@ pub(super) fn index_in_tx(
     })
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the scanner supplies one verified frame and its locator"
-)]
+pub(super) struct IndexedFrame {
+    pub off: u64,
+    pub end: u64,
+    pub identity: Vec<u8>,
+    pub framed: broca_wal::FramedRecord,
+}
+
+pub(super) fn apply_frame(
+    tx: &Transaction<'_>,
+    key: &str,
+    lineage: Option<&str>,
+    seed: &mut OffsetSeed,
+    frame: &IndexedFrame,
+) -> Result<(), DbError> {
+    let delta = seed.observe(&frame.framed, frame.off, frame.end)?;
+    if let Some(to) = delta.truncate {
+        tx.execute(
+            "DELETE FROM message WHERE sid=?1 AND ord>=?2",
+            params![key, u64_to_i64(to)?],
+        )?;
+    }
+    for (ord, source) in delta.messages {
+        tx.execute("INSERT INTO message (sid,ord,lo_seq,lo_off,hi_off,input_start,input_end,tag_base,tag_n,tag_high,flags) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+            ON CONFLICT(sid,ord) DO UPDATE SET lo_seq=excluded.lo_seq,lo_off=excluded.lo_off,hi_off=excluded.hi_off,input_start=excluded.input_start,input_end=excluded.input_end,tag_base=excluded.tag_base,tag_n=excluded.tag_n,tag_high=excluded.tag_high,flags=excluded.flags",
+            params![key,u64_to_i64(ord)?,u64_to_i64(source.lo_seq)?,u64_to_i64(source.lo_off)?,u64_to_i64(source.hi_off)?,u64_to_i64(source.input_start)?,u64_to_i64(source.input_end)?,source.tag_base.map(u64_to_i64).transpose()?,u64_to_i64(source.tag_n)?,u64_to_i64(source.tag_high)?,source.flags])?;
+    }
+    if let Some(ep) = delta.closed_episode {
+        write_episode(tx, key, &ep)?;
+    }
+    if let Some(ep) = &seed.episode {
+        write_episode(tx, key, ep)?;
+    }
+    for fact in &delta.boundaries {
+        write_boundary(tx, key, lineage, fact, frame)?;
+    }
+    if let Some((cut, checkpoint)) = delta.reanchor {
+        reanchor(tx, key, cut, checkpoint, seed)?;
+    }
+    Ok(())
+}
+
 fn write_boundary(
     tx: &Transaction<'_>,
     key: &str,
     lineage: Option<&str>,
     fact: &broca_core::projection_plan::ProjectionBoundaryFact,
-    frame: &broca_wal::FramedRecord,
-    off: u64,
-    end: u64,
-    identity: &[u8],
+    frame: &IndexedFrame,
 ) -> Result<(), DbError> {
+    let (off, end, identity) = (frame.off, frame.end, frame.identity.as_slice());
+    let frame = &frame.framed;
     if let Some(terminal_seq) = fact.terminal_seq {
         if terminal_seq != frame.seq {
             return Err(DbError::Invalid(
@@ -492,6 +507,390 @@ mod tests {
             .enumerate()
             .flat_map(|(n, record)| encode(n as u64 + 1, 1, record).unwrap())
             .collect()
+    }
+
+    fn publish_writer(
+        db: &OverhaulDb,
+        bind: &BindIdentity,
+        wal: &broca_wal::FileWal,
+    ) -> IndexOutcome {
+        use broca_wal::Wal;
+        db.publish(
+            bind,
+            "s-test",
+            LogLocation::Live,
+            &wal.durable_publication().unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn tail_seed(db: &OverhaulDb) -> String {
+        db.read_snapshot(|tx| {
+            tx.query_row("SELECT tail_seed FROM session", [], |r| r.get(0))
+                .map_err(Into::into)
+        })
+        .unwrap()
+    }
+
+    fn publication_oracle(db: &OverhaulDb, bytes: &[u8]) {
+        use broca_core::projection_plan::ProjectionContinuation;
+        let positions = decoded(bytes);
+        let stored = ProjectionContinuation::decode(&tail_seed(db)).unwrap();
+        let tail: Vec<_> = positions
+            .iter()
+            .filter(|(_, _, f)| f.seq > stored.boundary().seq)
+            .map(|(off, _, f)| broca_core::replay::PositionedFrame {
+                off: *off as u64,
+                framed: f.clone(),
+            })
+            .collect();
+        let read = |off: u64, len: u64| {
+            let off = (off as usize).min(bytes.len());
+            Ok(bytes[off..off.saturating_add(len as usize).min(bytes.len())].to_vec())
+        };
+        let seed = stored
+            .hydrate(&read, &tail, positions.last().unwrap().2.seq)
+            .unwrap();
+        let delta = broca_core::replay::replay_projection_tail(
+            &seed,
+            &tail.iter().map(|p| p.framed.clone()).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let frames: Vec<_> = positions.into_iter().map(|(_, _, f)| f).collect();
+        assert_eq!(
+            delta.admission_checkpoint,
+            broca_core::AdmissionCheckpointV1::from_frames(&frames).unwrap()
+        );
+        let expected = database();
+        expected
+            .db
+            .index(&publication(&bind(bytes), bytes))
+            .unwrap();
+        assert_eq!(r_rows(db), r_rows(&expected.db));
+    }
+
+    #[test]
+    fn durable_publication_cursor_survives_unqualified_event_and_restart() {
+        use broca_wal::Wal;
+        let (_, records, _) = boundary_cases()
+            .into_iter()
+            .find(|(name, _, _)| *name == "no_tool_terminal")
+            .unwrap();
+        let bind = bind(&encode_records(&records));
+        let scratch = database();
+        let path = scratch._scratch.0.join("publication.wal");
+        let mut wal = broca_wal::FileWal::open(&path)
+            .unwrap()
+            .with_feature_floor(scratch._scratch.0.join("wal-floor"));
+        for record in &records {
+            wal.append(1, record, false).unwrap();
+        }
+        wal.sync().unwrap();
+        publish_writer(&scratch.db, &bind, &wal);
+        let original = tail_seed(&scratch.db);
+        let mut next = records.clone();
+        for record in &mut next {
+            if let WalRecord::RunStarted { run_id, .. } = record {
+                run_id.0 = "publication-second-run".into();
+            }
+        }
+        for record in &next[..3] {
+            wal.append(1, record, false).unwrap();
+        }
+        wal.sync().unwrap();
+        let event = wal.durable_publication().unwrap();
+        let outcome = publish_writer(&scratch.db, &bind, &wal);
+        assert_eq!(outcome.indexed_end, event.byte_end());
+        assert_eq!(
+            tail_seed(&scratch.db),
+            original,
+            "unqualified rows must not advance the continuation"
+        );
+        scratch
+            .db
+            .read_snapshot(|tx| {
+                let active: (String, u64, Option<u64>) = tx.query_row(
+                    "SELECT run_id,state_seq,terminal_off FROM run WHERE state='active'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?;
+                assert_eq!(active, ("publication-second-run".into(), 6, None));
+                Ok(())
+            })
+            .unwrap();
+        publication_oracle(&scratch.db, &std::fs::read(&path).unwrap());
+        let root = scratch._scratch.0.clone();
+        drop(scratch.db);
+        let restarted = OverhaulDb::open(&root).unwrap();
+        // Re-delivery without a new boundary is idempotent after restart too.
+        publish_writer(&restarted, &bind, &wal);
+        assert_eq!(tail_seed(&restarted), original);
+        wal.append(1, &next[3], true).unwrap();
+        publish_writer(&restarted, &bind, &wal);
+        assert_ne!(tail_seed(&restarted), original);
+        publication_oracle(&restarted, &std::fs::read(path).unwrap());
+    }
+
+    #[test]
+    fn durable_publication_fixed_tail_has_equal_bounded_reads_with_1k_and_150k_messages() {
+        use broca_wal::Wal;
+        let cases = boundary_cases();
+        let prefix = &cases
+            .iter()
+            .find(|(name, _, _)| *name == "committed_turn_without_episode_terminal")
+            .unwrap()
+            .1;
+        let next = &cases
+            .iter()
+            .find(|(name, _, _)| *name == "no_tool_terminal")
+            .unwrap()
+            .1;
+        let bind = bind(&encode_records(prefix));
+        let message = match &prefix[0] {
+            WalRecord::RunStarted { input, .. } => input[0].clone(),
+            _ => unreachable!(),
+        };
+        let steered: WalRecord = serde_json::from_value(
+            serde_json::json!({"type":"steered","input":vec![message;1_000]}),
+        )
+        .unwrap();
+        let mut measurements = Vec::new();
+        for count in [1_000, 150_000] {
+            let scratch = database();
+            let path = scratch._scratch.0.join("bounded-publication.wal");
+            let mut wal = broca_wal::FileWal::open(path)
+                .unwrap()
+                .with_feature_floor(scratch._scratch.0.join("wal-floor"));
+            wal.append(1, &prefix[0], false).unwrap();
+            for _ in 0..count / 1_000 {
+                wal.append(1, &steered, false).unwrap();
+            }
+            for record in &prefix[1..] {
+                wal.append(1, record, false).unwrap();
+            }
+            wal.append(1, &next[3], true).unwrap();
+            publish_writer(&scratch.db, &bind, &wal);
+            let seed = tail_seed(&scratch.db);
+            assert!(broca_core::projection_plan::ProjectionContinuation::decode(&seed).is_ok());
+            let mut next = next.clone();
+            if let WalRecord::RunStarted { run_id, .. } = &mut next[0] {
+                run_id.0 = "bounded-publication-next".into();
+            }
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            for record in &next[..2] {
+                wal.append(1, record, false).unwrap();
+            }
+            wal.sync().unwrap();
+            counter
+                .operation("unqualified publication")
+                .run(|| publish_writer(&scratch.db, &bind, &wal));
+            assert_eq!(tail_seed(&scratch.db), seed);
+            for record in &next[2..] {
+                wal.append(1, record, false).unwrap();
+            }
+            wal.sync().unwrap();
+            counter
+                .operation("qualified publication")
+                .run(|| publish_writer(&scratch.db, &bind, &wal));
+            let costs: Vec<_> = counter
+                .snapshot()
+                .into_iter()
+                .map(|op| {
+                    assert!(
+                        op.seed_fallbacks.is_empty(),
+                        "{}: {:?}",
+                        op.name,
+                        op.seed_fallbacks
+                    );
+                    assert!(op
+                        .reads
+                        .iter()
+                        .all(|read| read.class != broca_wal::access_counter::ReadClass::Origin));
+                    assert!(
+                        op.reads.iter().map(|read| read.length).sum::<u64>() < 100_000,
+                        "{} read the discarded prefix",
+                        op.name
+                    );
+                    assert!(op.reads.len() < 60 && op.frames_decoded < 60);
+                    eprintln!(
+                        "{count} messages, {}: {} reads, {} decodes",
+                        op.name,
+                        op.reads.len(),
+                        op.frames_decoded
+                    );
+                    (op.reads.len(), op.frames_decoded)
+                })
+                .collect();
+            measurements.push(costs);
+        }
+        // Each event reads the lineage, row checkpoint, RunStarted budget source,
+        // and new row range. Qualification also hydrates the stored continuation
+        // and reads the contiguous seed tail, independently of the row cursor.
+        assert_eq!(measurements[0], vec![(4, 8), (27, 38)]);
+        assert_eq!(measurements[0], measurements[1]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_publication_power_cut_recovery_excludes_lost_tail() {
+        use broca_crash_harness::power_loss::RecordingFs;
+        use broca_wal::fs_ops::with_fs_ops;
+        use broca_wal::{FileWal, Wal};
+        use std::sync::Arc;
+        let (_, records, _) = boundary_cases()
+            .into_iter()
+            .find(|(name, _, _)| *name == "no_tool_terminal")
+            .unwrap();
+        let bind = bind(&encode_records(&records));
+        let scratch = database();
+        let source = scratch._scratch.0.join("power-source");
+        std::fs::create_dir(&source).unwrap();
+        // Start the cut exploration from a durable episode prefix, so its cuts
+        // isolate a writer sync/index-commit gap rather than initial file creation.
+        {
+            let mut wal = FileWal::open(source.join("wal/log")).unwrap();
+            for record in &records[..2] {
+                wal.append(1, record, false).unwrap();
+            }
+            wal.sync().unwrap();
+        }
+        let recording = Arc::new(RecordingFs::new(&source).unwrap());
+        let durable = with_fs_ops(recording.clone(), || {
+            let mut wal = FileWal::open(source.join("wal/log")).unwrap();
+            wal.sync().unwrap();
+            let durable = wal.durable_publication().unwrap();
+            wal.append(1, &records[2], false).unwrap();
+            durable
+        });
+        let before = std::fs::read(source.join("wal/log")).unwrap();
+        let states = recording.enumerate(1_000_000).unwrap();
+        let final_cut = states.iter().map(|cut| cut.cut).max().unwrap();
+        let mut recovered = 0;
+        let mut lost = 0;
+        let mut retained = 0;
+        for cut in states.iter().filter(|cut| cut.cut == final_cut) {
+            let restored = scratch._scratch.0.join(format!("restored-{recovered}"));
+            cut.state.install(&restored).unwrap();
+            let wal = FileWal::open(restored.join("wal/log")).unwrap();
+            wal.sync().unwrap();
+            let proof = wal.durable_publication().unwrap();
+            let db = database();
+            // Model an index commit that lagged the writer at the crash cut.
+            db.db
+                .index(&publication(&bind, &before[..durable.byte_end() as usize]))
+                .unwrap();
+            db.db
+                .publish(&bind, "s-test", LogLocation::Live, &proof)
+                .unwrap();
+            let bytes = std::fs::read(proof.path()).unwrap();
+            assert_eq!(proof.byte_end(), bytes.len() as u64);
+            let expected = database();
+            expected.db.index(&publication(&bind, &bytes)).unwrap();
+            assert_eq!(r_rows(&db.db), r_rows(&expected.db));
+            if proof.sequence() == 2 {
+                lost += 1;
+            } else {
+                assert_eq!(proof.sequence(), 3);
+                retained += 1;
+            }
+            recovered += 1;
+        }
+        assert!(lost > 0 && retained > 0);
+        eprintln!("durable publication power cuts: {recovered} recovered, {lost} lost tails, {retained} retained tails");
+    }
+
+    #[test]
+    fn durable_publication_coalesces_events_and_excludes_speculative_and_torn_suffix() {
+        use broca_wal::Wal;
+        use std::io::Write;
+        let (_, records, _) = boundary_cases()
+            .into_iter()
+            .find(|(name, _, _)| *name == "no_tool_terminal")
+            .unwrap();
+        let bind = bind(&encode_records(&records));
+        let scratch = database();
+        let path = scratch._scratch.0.join("coalesced.wal");
+        let mut wal = broca_wal::FileWal::open(&path)
+            .unwrap()
+            .with_feature_floor(scratch._scratch.0.join("wal-floor"));
+        wal.append(1, &records[0], true).unwrap();
+        let first = wal.durable_publication().unwrap();
+        for record in &records[1..] {
+            wal.append(1, record, true).unwrap();
+        }
+        let latest = wal.durable_publication().unwrap();
+        // A delayed subscriber sees just the latest event, not the intermediate cuts.
+        let outcome = scratch
+            .db
+            .publish(&bind, "s-test", LogLocation::Live, &latest)
+            .unwrap();
+        assert_eq!(outcome.indexed_seq, Some(4));
+        assert!(latest.byte_end() > first.byte_end());
+        let expected = r_rows(&scratch.db);
+        wal.append(1, &records[0], false).unwrap();
+        drop(wal);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&[255, 255, 255]).unwrap();
+        drop(file);
+        scratch
+            .db
+            .publish(&bind, "s-test", LogLocation::Live, &latest)
+            .unwrap();
+        assert_eq!(r_rows(&scratch.db), expected);
+        let bytes = std::fs::read(path).unwrap();
+        assert!(bytes.len() as u64 > latest.byte_end());
+        publication_oracle(&scratch.db, &bytes[..latest.byte_end() as usize]);
+        // A witness no longer proves a restored, shorter file. Failure must roll
+        // back any attempted session rebuild rather than expose a partial index.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(latest.path())
+            .unwrap()
+            .set_len(latest.byte_end() - 1)
+            .unwrap();
+        assert!(scratch
+            .db
+            .publish(&bind, "s-test", LogLocation::Live, &latest)
+            .is_err());
+        assert_eq!(r_rows(&scratch.db), expected);
+    }
+
+    #[test]
+    fn durable_publication_rejects_a_missing_complete_trailing_lineage() {
+        use broca_wal::Wal;
+        let (_, records, _) = boundary_cases()
+            .into_iter()
+            .find(|(name, _, _)| *name == "no_tool_terminal")
+            .unwrap();
+        let bind = bind(&encode_records(&records));
+        let scratch = database();
+        let path = scratch._scratch.0.join("short-lineage.wal");
+        let mut wal = broca_wal::FileWal::open(&path).unwrap();
+        for record in &records {
+            wal.append(1, record, false).unwrap();
+        }
+        wal.sync().unwrap();
+        let proof = wal.durable_publication().unwrap();
+        publish_writer(&scratch.db, &bind, &wal);
+        let expected = r_rows(&scratch.db);
+        drop(wal);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_len(proof.byte_end() - broca_wal::framing::LINEAGE_FRAME_LEN as u64)
+            .unwrap();
+        assert!(
+            scratch
+                .db
+                .publish(&bind, "s-test", LogLocation::Live, &proof)
+                .is_err(),
+            "a complete checkpoint record cannot authenticate a missing byte suffix"
+        );
+        assert_eq!(r_rows(&scratch.db), expected);
     }
     fn boundary_cases() -> Vec<(&'static str, Vec<WalRecord>, Vec<u64>)> {
         let source: Vec<_> = decoded(&fixture("scripts/fixtures/resume-close-out-sealed.wal"))
