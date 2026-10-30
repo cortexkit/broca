@@ -1,0 +1,30 @@
+{
+  "commit": "119258da721c5fac0e197d38f318e62100f8598e",
+  "family_counts": {
+    "absent": 1353,
+    "anthropic.messages": 240,
+    "aws.bedrock_converse": 186,
+    "google.code_assist": 5,
+    "google.generate_content": 56,
+    "openai.chat_completions": 6717,
+    "openai.chatgpt_responses": 52,
+    "openai.responses": 391
+  },
+  "output_sha256": {
+    "served-payloads.json": "ff2adc9493b0a390875b002197bec14218aa7c00789a0505e866940d61562ac2",
+    "wire-family-rows.jsonl": "7350e9ab518d73dd94d2942679258cbdbd83026bb3deb7ddebd91a2f9f0e6506"
+  },
+  "repository": "https://github.com/cortexkit/fusiform",
+  "row_count": 9000,
+  "source_sha256": {
+    "crates/fusiform-core/src/normalize/mod.rs": "e59a5c076feb4e1c2aa405258e12e0b88418e8e9bc5b1f8e1db38285597ad63d",
+    "crates/fusiform-module/data/billing-planes.json": "05f99c15525add0852542ddcef11f1f4cf1b09120932d6ee4b8d612f6a957596",
+    "crates/fusiform-module/data/curated-models.json": "5a47361d0c5e6614cc89c0dcc6718b3a88deb1816b0dd619e2fb17f0a4e3e44d",
+    "crates/fusiform-module/data/model-aliases.json": "2abd5557155a10332413e1e3bec9957294df051a0323f2fb41ac4e39271c6f06",
+    "crates/fusiform-module/data/models-dev-seed.json": "6505ad2cdfac4f0ec89ae1ccc2f83e8d925c8d56b84d71e44692ce48deb1088d",
+    "crates/fusiform-module/data/wire-families.json": "86c50ac86f5ae5cb7b4d27234805ed092e45bb4515d0d95716e5e9b88d85028b",
+    "crates/fusiform-module/fixtures/served-payloads.json": "ff2adc9493b0a390875b002197bec14218aa7c00789a0505e866940d61562ac2",
+    "crates/fusiform-module/src/route.rs": "9e4d8b1f6bad39615b6ae2cfa256a203cedaf35d0f0586fb247f68dda68ed17e",
+    "crates/fusiform-module/src/wire_families.rs": "bd04d7e435b4fa45982e6e74c80b689cf8c52b8b2fc0798f164fafb4fc075b15"
+  }
+}
