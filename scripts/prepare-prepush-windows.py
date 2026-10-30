@@ -3,7 +3,6 @@
 import argparse
 import base64
 import hashlib
-import importlib.util
 import json
 from pathlib import Path
 import shlex
@@ -103,20 +102,8 @@ def extract_source(inputs, repository, revision, destination):
     print(f'verified and extracted {repository} source {revision}: {archive.stat().st_size} bytes')
 
 
-def prepare(output, siblings, cache):
-    assets = settings(ROOT / 'scripts/lib/prepush-assets.conf')
-    for key in ('PYTHON_WINDOWS', 'NODE_WINDOWS'):
-        url = assets[key + '_URL']
-        download(url, output / url.rsplit('/', 1)[1], 'sha256',
-                 bytes.fromhex(assets[key + '_SHA256']), cache)
-    spec = importlib.util.spec_from_file_location('prepush_nats', ROOT / 'scripts/install-ci-nats.py')
-    assert spec is not None and spec.loader is not None
-    nats = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(nats)
-    target, checksum = nats.ARCHIVES['Windows']
-    nats_name = f'nats-server-v{nats.VERSION}-{target}.tar.gz'
-    download(f'https://github.com/nats-io/nats-server/releases/download/v{nats.VERSION}/{nats_name}',
-             output / nats_name, 'sha256', bytes.fromhex(checksum), cache)
+def prepare(output, source_cache, cache):
+    output.mkdir(parents=True, exist_ok=True)
     lock_bytes = (ROOT / 'package-lock.json').read_bytes()
     lock = json.loads(lock_bytes)
     packages = []
@@ -131,38 +118,66 @@ def prepare(output, siblings, cache):
     pins = settings(ROOT / 'scripts/ci-fixture-revisions.conf')
     # Subc's build scripts embed Git HEAD and dirty state, with no override. Keep
     # that CI identity, and provide a complete graph for motor's Git bundle import.
-    checkout('subconscious', pins['SUBC_REV'], siblings / 'subconscious', full_history=True)
-    checkout('claustrum', pins['CLAUSTRUM_REV'], siblings / 'claustrum')
+    checkout('subconscious', pins['SUBC_REV'], source_cache / 'subconscious', full_history=True)
+    checkout('claustrum', pins['CLAUSTRUM_REV'], source_cache / 'claustrum')
     vault_archive = output / 'claustrum-source.tar'
-    vault_digest = source_archive(siblings / 'claustrum', pins['CLAUSTRUM_REV'], vault_archive)
-    history_bundle = cache / f"subconscious-{pins['SUBC_REV']}.bundle"
-    subprocess.run(['git', '-C', str(siblings / 'subconscious'), 'bundle', 'create',
+    vault_digest = source_archive(source_cache / 'claustrum', pins['CLAUSTRUM_REV'], vault_archive)
+    history_bundle = output / 'subconscious-source.bundle'
+    subprocess.run(['git', '-C', str(source_cache / 'subconscious'), 'bundle', 'create',
                     str(history_bundle.resolve()), 'HEAD'], check=True)
     print(f'subconscious complete history bundle: {history_bundle.stat().st_size} bytes', flush=True)
     print(f'claustrum plain source archive: {vault_archive.stat().st_size} bytes sha256={vault_digest}', flush=True)
     (output / 'manifest.json').write_text(json.dumps({
         'package_lock_sha256': hashlib.sha256(lock_bytes).hexdigest(),
-        'npm_archives': packages, 'nats_archive': nats_name,
+        'npm_archives': packages,
         'source_archives': {'claustrum': {'revision': pins['CLAUSTRUM_REV'],
                                         'file': vault_archive.name, 'sha256': vault_digest}},
+        'source_bundles': {'subconscious': {'revision': pins['SUBC_REV'],
+                                          'file': history_bundle.name,
+                                          'sha256': hashlib.sha256(history_bundle.read_bytes()).hexdigest()}},
     }) + '\n')
+    files = []
+    for path in sorted(output.iterdir()):
+        if path.name == 'transport-manifest.json':
+            continue
+        if not path.is_file():
+            raise ValueError(f'offline input is not a regular file: {path}')
+        files.append({'name': path.name, 'size': path.stat().st_size,
+                      'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+    (output / 'transport-manifest.json').write_text(json.dumps({'version': 1, 'files': files}) + '\n')
     print(f'Windows offline inputs ready: {output}', flush=True)
+
+
+def require_snapshot_visibility(output):
+    repository = Path(subprocess.check_output(['git', '-C', str(output), 'rev-parse',
+                                               '--show-toplevel'], text=True).strip())
+    relative = output.resolve().relative_to(repository.resolve())
+    visible = set(subprocess.check_output(['git', '-C', str(repository), 'ls-files',
+                                         '--others', '--exclude-standard', '--', str(relative)],
+                                        text=True).splitlines())
+    for path in output.iterdir():
+        name = str(path.resolve().relative_to(repository.resolve()))
+        if name not in visible:
+            raise ValueError(f'offline input is ignored or tracked and cannot be sent as an untracked snapshot input: {name}')
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--siblings', type=Path)
+    parser.add_argument('--source-cache', type=Path)
     parser.add_argument('--cache', type=Path)
     parser.add_argument('--extract-source', choices=['claustrum'])
     parser.add_argument('--inputs', type=Path)
     parser.add_argument('--revision')
+    parser.add_argument('--require-snapshot-visible', action='store_true')
     args = parser.parse_args()
     if args.extract_source:
         if args.inputs is None or args.revision is None:
             parser.error('--extract-source requires --inputs and --revision')
         extract_source(args.inputs, args.extract_source, args.revision, args.output)
     else:
-        if args.siblings is None or args.cache is None:
-            parser.error('preparation requires --siblings and --cache')
-        prepare(args.output, args.siblings, args.cache)
+        if args.source_cache is None or args.cache is None:
+            parser.error('preparation requires --source-cache and --cache')
+        prepare(args.output, args.source_cache, args.cache)
+        if args.require_snapshot_visible:
+            require_snapshot_visibility(args.output)

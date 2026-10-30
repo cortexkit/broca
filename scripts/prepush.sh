@@ -29,31 +29,6 @@ mkdir -p "$checkouts"
 names=() pids=() results=() durations=()
 started=$SECONDS
 
-prepare_inputs_checkout() {
-  local name=prepush-inputs destination="$checkouts/prepush-inputs" origin
-  if [[ ! -e "$destination" ]]; then
-    git clone --quiet --shared "$root" "$destination" || return 1
-    printf 'managed by scripts/prepush.sh\n' > "$destination/.git/broca-prepush-managed" || return 1
-  fi
-  [[ -f "$destination/.git/broca-prepush-managed" ]] || {
-    echo "prepush: refusing unmanaged checkout $destination" >&2
-    return 1
-  }
-  origin="$(git -C "$root" config --get remote.origin.url || true)"
-  if [[ -n "$origin" ]]; then
-    git -C "$destination" remote set-url origin "$origin" || return 1
-  fi
-  git -C "$destination" fetch --quiet "$root" "$candidate" || return 1
-  git -C "$destination" checkout --quiet --detach "$candidate" || return 1
-  [[ "$(git -C "$destination" rev-parse HEAD)" == "$candidate" ]] || return 1
-  local dirty
-  dirty="$(git -C "$destination" status --porcelain)"
-  [[ -z "$dirty" || ( "$name" == prepush-inputs && "$dirty" == '?? inputs/' ) ]] || {
-    echo "prepush: managed checkout is dirty: $destination" >&2
-    return 1
-  }
-}
-
 prepare_lane_worktree() {
   local name="$1" destination="$checkouts/$1" common expected
   if [[ ! -e "$destination" ]]; then
@@ -78,26 +53,35 @@ timestamp_ms() {
 }
 
 launch() {
-  local name="$1" platform="$2" cpus="$3"
+  local name="$1" platform="$2" cpus="$3" prepared="${4:-0}"
   local args=(--platform "$platform")
   [[ "$platform" != linux ]] || args+=(--net)
   args+=(--timeout 7200 --cwd "$checkouts/$name" --record-file "$logs/$name.motor.jsonl")
   [[ -z "$cpus" ]] || args+=(--vcpus "$cpus")
-  if [[ "$platform" == windows ]]; then
-    args+=(--sibling "$checkouts/prepush-inputs" --sibling "$checkouts/subconscious")
-  fi
   names+=("$name")
   (
     begin=$SECONDS
     begin_ms="$(timestamp_ms)"
     rc=0
     requested_ms="$begin_ms"
-    if ! prepare_lane_worktree "$name"; then
+    ready=0
+    if [[ "$prepared" == 1 && "$name" == windows ]]; then
+      status="$(git -C "$checkouts/windows" status --porcelain)"
+      if [[ "$(git -C "$checkouts/windows" rev-parse HEAD)" == "$candidate" && "$status" == '?? prepush-inputs/' ]]; then
+        ready=1
+      fi
+    elif prepare_lane_worktree "$name"; then
+      ready=1
+    fi
+    if [[ "$ready" != 1 ]]; then
       echo "prepush: NOT-RUN $name: could not prepare its isolated checkout"
       rc=204
     else
       requested_ms="$(timestamp_ms)"
       ck motor run "${args[@]}" -- "bash scripts/prepush.sh --lane $name" || rc=$?
+    fi
+    if [[ "$name" == windows && "$prepared" == 1 && "$rc" != 201 ]]; then
+      rm -rf -- "$checkouts/windows/prepush-inputs"
     fi
     ended_ms="$(timestamp_ms)"
     python3 scripts/lib/prepush-motor-timing.py "$logs/$name.motor.jsonl" "$requested_ms" \
@@ -156,7 +140,8 @@ PY
   return "$failed"
 }
 
-launch fast linux 8
+# Metadata, formatting and static guards do not compile the workspace: two CPUs.
+launch fast linux 2
 collect 0
 if [[ ${results[0]} != 0 ]]; then
   echo 'prepush: heavy lanes NOT RUN because fast checks failed'
@@ -164,28 +149,42 @@ if [[ ${results[0]} != 0 ]]; then
   exit 1
 fi
 # Each lane has a different checkout: motor serializes jobs from one workspace.
-launch linux-operator linux 8
-launch linux-portable linux 16
+# Python/operator fixtures use at most two compiler workers, not a full build.
+launch linux-operator linux 2
+# Portable clippy plus lib/bin/integration compilation builds the full workspace.
+launch linux-portable linux 8
+# The unit lane builds all workspace lib/bin/doc targets with eight Cargo workers.
 launch linux-unit linux 8
+# Each shard compiles a full workspace archive; execution remains capped at four.
 for shard in 1 2 3 4; do launch "linux-integration-$shard" linux 8; done
-launch linux-production linux 8
-launch linux-msrv linux 8
-launch linux-wal linux 8
-launch linux-deploy linux 16
+# Three-package lint/lib tests use four workers and need no large-memory lease.
+launch linux-production linux 4
+# Workspace metadata/type checking uses four workers rather than release codegen.
+launch linux-msrv linux 4
+# Two small WAL libraries and their tests use two workers.
+launch linux-wal linux 2
+# Optimized module/session/run compilation is a real full-stack build: eight workers.
+launch linux-deploy linux 8
+# Native macOS capacity is provided by its runner; commands remain nice -n 10.
 launch macos macos ''
 
-# Stage downloads on the caller and send them as sibling inputs; Windows has no network.
+# All offline bytes stay inside the Windows worktree; no sibling-path capability.
 windows_begin=$SECONDS
 windows_ready=0
-if prepare_inputs_checkout > "$logs/windows-inputs.log" 2>&1 &&
-   python3 scripts/prepare-prepush-windows.py --output "$checkouts/prepush-inputs/inputs" \
-     --siblings "$checkouts" --cache "$root/target/scratch/prepush-offline-cache" >> "$logs/windows-inputs.log" 2>&1; then
-  windows_ready=1
+windows_inputs_owned=0
+if prepare_lane_worktree windows > "$logs/windows-inputs.log" 2>&1; then
+  windows_inputs_owned=1
+  if python3 scripts/prepare-prepush-windows.py --output "$checkouts/windows/prepush-inputs" \
+     --source-cache "$checkouts/windows/target/prepush-source-cache" \
+     --cache "$root/target/scratch/prepush-offline-cache" --require-snapshot-visible >> "$logs/windows-inputs.log" 2>&1; then
+    windows_ready=1
+  fi
 fi
 cat "$logs/windows-inputs.log"
 echo "prepush: Windows input preparation wall $((SECONDS - windows_begin))s"
 if [[ "$windows_ready" == 1 ]]; then
-  launch windows windows ''
+  # Windows compiles the full archive and workspace test binaries: eight workers.
+  launch windows windows 8 1
 else
   names+=(windows)
   pids+=(0)
@@ -193,6 +192,7 @@ else
   durations[${#names[@]}-1]="$((SECONDS - windows_begin))"
   cp "$logs/windows-inputs.log" "$logs/windows.log"
   echo 'prepush: NOT-RUN windows: offline input preparation failed'
+  [[ "$windows_inputs_owned" != 1 ]] || rm -rf -- "$checkouts/windows/prepush-inputs"
 fi
 for i in "${!names[@]}"; do
   [[ "$i" == 0 || "${pids[$i]}" == 0 ]] || collect "$i"

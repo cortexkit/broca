@@ -11,8 +11,10 @@ never builds on the Mac as a fallback. First it runs the fast Linux static guard
 Only when those pass does it launch the unchanged operator script suites in
 `linux-operator`, concurrently with independent Linux portable, unit/doc,
 integration-1 through integration-4, production, MSRV, WAL and deployment jobs,
-alongside native Windows and targeted macOS. Portable and deployment reserve
-16 vCPUs; the other Linux jobs reserve 8 each. Each remote lane has a persistent
+alongside native Windows and targeted macOS. Static/operator/WAL jobs reserve
+2 CPUs, production lint/tests and MSRV checking 4, and full workspace/archive or
+optimized module builds 8. Each launch documents its work rather than reserving
+12/16 CPUs to influence placement. Each remote lane has a persistent
 detached Git worktree in a pool beside the scratch checkout, by default
 `../broca-prepush-lanes/LANE`. Set `BROCA_PREPUSH_LANE_POOL` to choose another
 persistent pool. A lane is checked for dirtiness **before** checkout and must
@@ -92,22 +94,35 @@ Only Linux jobs request outbound network. No GitHub Actions
 token or artifact credentials are needed.
 If Linux's Python lacks PyYAML, the fast lane provisions checksum-pinned pure
 Python `PyYAML==6.0.3` under its scratch directory (no system pip needed).
-The unit, integration, production and Windows jobs provision checksum-pinned
-Node 20.20.2 when Node 20 is absent; Windows additionally provisions Python 3.13.5
-when `python3` is absent. These
+The Linux unit, integration and production jobs provision checksum-pinned
+Node 20.20.2 when Node 20 is absent. These
 are setup-action equivalents, not substitutes for checks. Cold tool downloads
 need network on the caller/Linux runner; no host installation is changed.
 
 ### Offline Windows inputs
 
 Windows motor jobs do **not** support `--net`. The dispatcher runs
-`scripts/prepare-prepush-windows.py` on the caller to download and verify the
-Python/Node/NATS archives and every npm tarball in `package-lock.json`, and to
-check out the pinned fixture sources. It sends a separate `prepush-inputs`
-repository and Subconscious with `--sibling`. Binary inputs are
-untracked in that input repository, never committed or placed in broca's source
-tree. Download bytes are cached under `target/scratch/prepush-offline-cache` and
-revalidated, not silently replaced after checksum failure.
+`scripts/prepare-prepush-windows.py` on the caller to download and verify every
+npm tarball in `package-lock.json` and prepare the pinned fixture sources. All
+bytes are staged after the clean-tree check in the Windows worktree's
+**untracked, non-ignored `prepush-inputs/`**. Git snapshot visibility is checked
+for every file. No sibling is passed: older runners require siblings beside the
+main checkout, not beside a linked worktree. No runtime archives are committed.
+The exact input folder is removed after a known finished/refused run; an unknown
+outcome retains it and makes the next clean-tree check fail closed.
+
+Motor deliberately excludes ignored files and top-level `target/`; there is no
+include option. Source/download caches may live under target, but shipped bytes
+must not. `transport-manifest.json` records each shipped name, size and SHA-256.
+The first remote action verifies every entry with native PowerShell and exits
+NOT-RUN (200), naming the first missing/mismatched file, before tests/bootstrap.
+
+Windows uses the image's Python **3.14** (`python`), Node **24** with npm,
+nats-server **2.15.0**, CMake, Ninja and Bun **1.4.4**. Their version commands are
+checked immediately after the manifest; a missing or unsupported tool is also
+NOT-RUN (200), not silently downloaded or substituted. Linux retains the CI's
+Node20/pinned-NATS setup. These approved image versions are an explicit Windows
+environment difference from GitHub's setup actions, not a claimed byte match.
 
 Subc stays a Git checkout because its selected `subc-core` and `subc-daemon`
 build scripts embed Git HEAD and dirty state without a supported override.
@@ -117,13 +132,14 @@ Claustrum's selected packages require no Git metadata; only a checksummed
 `git archive` source tree is sent, and Windows verifies the digest and pinned
 archive commit before extracting it. The helper prints both transport sizes.
 
-The Windows lane only copies/verifies/extracts those archives, seeds npm's cache
+The Windows lane imports the verified Subc Git bundle locally, extracts the
+checked Claustrum archive, seeds npm's cache
 from the verified local tarballs, runs `npm ci --offline`, and builds the pinned
 fixtures with `CARGO_NET_OFFLINE=true`. It never fetches fixture Git repositories
 or downloads runtimes/NATS inside the VM. Motor must stage the locked Cargo
 sources for the locked fixture graphs; a missing crate/revision fails with
 Cargo's exact offline diagnostic in the summary. No tests are skipped for a
-cache miss. Installed Python/Node 20 are reused when already present.
+cache miss. Existing image runtimes are required rather than shipped again.
 
 After the image-prerequisite check, the fast lane starts with fmt, file-only Rust
 pins/counts/goldens, `cargo fetch --locked`, and an offline locked
@@ -156,14 +172,14 @@ If the caller has no `ck`, or is already inside a runner that cannot launch
 another job, dispatch the machine-side lanes from AFT instead. Do **not** put
 `runon` on the outer dispatcher and expect nested dispatch to work:
 
-1. `bash scripts/prepush.sh --lane fast` with `runon: "linux,8c,net"`.
+1. `bash scripts/prepush.sh --lane fast` with `runon: "linux,2c,net"`.
 2. Only on success, concurrently dispatch from **separate checkouts**:
-   - `--lane linux-portable` and `--lane linux-deploy` with `runon: "linux,16c,net"`;
-   - `--lane linux-operator`, `--lane linux-unit`, `--lane linux-integration-1` through `-4`,
-     `--lane linux-production`, `--lane linux-msrv` and `--lane linux-wal`
-     with `runon: "linux,8c,net"`;
+   - `--lane linux-unit`, `--lane linux-portable`, `--lane linux-deploy` and
+     `--lane linux-integration-1` through `-4` with `runon: "linux,8c,net"`;
+   - `--lane linux-production` and `--lane linux-msrv` with `runon: "linux,4c,net"`;
+   - `--lane linux-operator` and `--lane linux-wal` with `runon: "linux,2c,net"`;
    - `--lane windows` with `runon: "windows"`, after supplying the prepared input
-     and fixture-source sibling repositories (or an equivalent provisioned image).
+     inside that worktree's non-ignored `prepush-inputs/`.
    - `bash scripts/prepush.sh --lane macos` with `runon: "macos"` (uses `nice -n 10`).
 3. Wait for **every** job, retain all exit statuses and print complete
    failure logs. A missing/refused/timed-out lane is a failure, not coverage.
@@ -171,7 +187,7 @@ another job, dispatch the machine-side lanes from AFT instead. Do **not** put
 `--lane linux` remains an explicitly sequential diagnostic aggregate; it is not
 dispatched by the gate. It runs the same steps
 but cannot demonstrate the parallel wall-time budget. Direct AFT dispatch does
-not expose `--sibling`: stage equivalent offline inputs separately or use the
+not add ignored files to snapshots: stage the explicit visible input folder or use the
 ordinary dispatcher from a machine with the daemon connection. Do not re-enable
 Windows network as a workaround.
 

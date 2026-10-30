@@ -17,6 +17,15 @@ case "$platform:$(uname -s)" in
   linux:Linux|windows:MINGW*|windows:MSYS*|macos:Darwin) ;;
   *) echo "prepush: invalid lane/platform: $lane/$(uname -s)" >&2; exit 2 ;;
 esac
+if [[ "$lane" == windows ]]; then
+  BROCA_PREPUSH_INPUTS="$(cygpath -m "$root/prepush-inputs")"
+  export BROCA_PREPUSH_INPUTS
+  powershell.exe -NoProfile -NonInteractive -File \
+    "$(cygpath -w "$root/scripts/lib/verify-prepush-inputs.ps1")" \
+    -InputsDirectory "$(cygpath -w "$BROCA_PREPUSH_INPUTS")"
+fi
+python_exec=python3
+[[ "$lane" != windows ]] || python_exec=python
 printf 'prepush: runner instance=%s lane=%s\n' "${MOTOR_RUNNER_INSTANCE:-unreported}" "$lane"
 mkdir -p target/scratch
 log_dir="$(mktemp -d "$root/target/scratch/prepush-$lane.XXXXXX")"
@@ -85,6 +94,9 @@ summary() {
 clean() {
   local dirty
   dirty="$(git status --porcelain)"
+  if [[ "$platform" == windows && "$dirty" == '?? prepush-inputs/' ]]; then
+    return 0
+  fi
   [[ -z "$dirty" ]] || { printf '%s\n' "$dirty"; git diff; return 1; }
 }
 
@@ -109,10 +121,22 @@ fixtures() {
   source scripts/ci-fixture-revisions.conf
   local subc_source vault_source
   if [[ "$platform" == windows ]]; then
-    subc_source="$root/../subconscious"
+    subc_source="$scratch/subconscious-source"
     vault_source="$scratch/claustrum-source"
-    [[ "$(git -C "$subc_source" rev-parse HEAD)" == "$SUBC_REV" ]] || return 1
-    python3 scripts/prepare-prepush-windows.py --extract-source claustrum \
+    "$python_exec" - "$BROCA_PREPUSH_INPUTS" "$SUBC_REV" "$subc_source" <<'PY'
+import hashlib, json, pathlib, subprocess, sys
+inputs, revision, destination = pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3])
+entry = json.loads((inputs / 'manifest.json').read_text())['source_bundles']['subconscious']
+if entry['revision'] != revision or pathlib.Path(entry['file']).name != entry['file']:
+    sys.exit('offline Subc bundle does not match the pinned revision')
+bundle = inputs / entry['file']
+if hashlib.sha256(bundle.read_bytes()).hexdigest() != entry['sha256']:
+    sys.exit('offline Subc bundle checksum mismatch')
+subprocess.run(['git', 'init', '-q', str(destination)], check=True)
+subprocess.run(['git', '-C', str(destination), 'fetch', str(bundle.resolve()), 'HEAD'], check=True)
+subprocess.run(['git', '-C', str(destination), 'checkout', '-q', '--detach', revision], check=True)
+PY
+    "$python_exec" scripts/prepare-prepush-windows.py --extract-source claustrum \
       --inputs "$BROCA_PREPUSH_INPUTS" --revision "$CLAUSTRUM_REV" --output "$vault_source"
   else
     subc_source="$CARGO_TARGET_DIR/fixture-sources/subconscious-$SUBC_REV"
@@ -163,14 +187,17 @@ rig_environment() {
 broker() {
   local args=()
   if [[ "$platform" == windows ]]; then
-    args+=(--archive "$BROCA_PREPUSH_INPUTS/nats-server-v2.10.26-windows-amd64.tar.gz")
+    CK_NATS_SERVER_BIN="$(cygpath -m "$(command -v nats-server)")"
+    export CK_NATS_SERVER_BIN
+    printf 'CK_NATS_SERVER_BIN=%s\n' "$CK_NATS_SERVER_BIN" > "$scratch/nats.env"
+    return
   fi
   RUNNER_TEMP="$scratch" GITHUB_ENV="$scratch/nats.env" python3 scripts/install-ci-nats.py "${args[@]}"
 }
 
 aimock() {
   if [[ "$platform" == windows ]]; then
-    python3 - "$root/package-lock.json" "$BROCA_PREPUSH_INPUTS/manifest.json" > "$scratch/npm-archives" <<'PY'
+    "$python_exec" - "$root/package-lock.json" "$BROCA_PREPUSH_INPUTS/manifest.json" > "$scratch/npm-archives" <<'PY'
 import hashlib, json, pathlib, re, sys
 manifest = json.loads(pathlib.Path(sys.argv[2]).read_text())
 if hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest() != manifest['package_lock_sha256']:
@@ -240,6 +267,7 @@ linux_image() {
 
 case "$lane" in
   fast)
+    export CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2
     step 'Linux image prerequisites' linux_image
     [[ $last_rc == 0 ]] || summary
     step fmt cargo fmt --all -- --check
@@ -262,6 +290,7 @@ case "$lane" in
     step 'clean worktree' clean
     ;;
   linux-operator)
+    export CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2
     step 'Linux image prerequisites' linux_image
     [[ $last_rc == 0 ]] || summary
     step 'locked script dependencies' cargo fetch --locked
@@ -282,6 +311,11 @@ case "$lane" in
     ;;
   linux|linux-*|windows)
     : "${CARGO_TARGET_DIR:?motor must supply its persistent target cache}"
+    case "$lane" in
+      linux-production|linux-msrv) export CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=4 ;;
+      linux-wal) export CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2 ;;
+      *) export CARGO_BUILD_JOBS=8 RUST_TEST_THREADS=4 ;;
+    esac
     portable=0 unit=0 integration=0 production=0 msrv=0 wal=0 deployment=0 lint=0
     case "$lane" in
       linux) portable=1 unit=1 integration=1 production=1 msrv=1 wal=1 deployment=1 ;;
@@ -296,14 +330,11 @@ case "$lane" in
     esac
     if [[ "$platform" == windows ]]; then
       export CARGO_NET_OFFLINE=true
-      BROCA_PREPUSH_INPUTS="${BROCA_PREPUSH_INPUTS:-$root/../prepush-inputs/inputs}"
-      BROCA_PREPUSH_INPUTS="$(cygpath -m "$BROCA_PREPUSH_INPUTS")"
-      export BROCA_PREPUSH_INPUTS
     fi
     rustc --version
     cargo --version
     cargo nextest --version
-    if [[ $unit == 1 || $integration == 1 || $production == 1 ]]; then
+    if [[ "$platform" != windows && ( $unit == 1 || $integration == 1 || $production == 1 ) ]]; then
       step 'Node/Python runtimes' bash scripts/lib/prepush-tools.sh "$lane" "$scratch"
       if [[ $last_rc != 0 ]]; then
         echo 'prepush: Rust and fixture lanes NOT RUN because runtime provisioning failed'
@@ -357,8 +388,8 @@ case "$lane" in
       fi
     fi
     if [[ $unit == 1 ]]; then
-      step 'linked dependency sources' python3 scripts/check-path-deps.py
-      step 'linked dependency source tests' python3 scripts/test-check-path-deps.py
+      step 'linked dependency sources' "$python_exec" scripts/check-path-deps.py
+      step 'linked dependency source tests' "$python_exec" scripts/test-check-path-deps.py
       step 'CI lib/bin/doc' lib_doc
     fi
     if [[ $wal == 1 ]]; then

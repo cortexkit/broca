@@ -113,8 +113,10 @@ class PrepushDispatch(unittest.TestCase):
         (self.root / 'scripts/prepare-prepush-windows.py').write_text('''import argparse
 from pathlib import Path
 p=argparse.ArgumentParser()
-p.add_argument('--output'); p.add_argument('--siblings'); p.add_argument('--cache')
+p.add_argument('--output'); p.add_argument('--source-cache'); p.add_argument('--cache')
+p.add_argument('--require-snapshot-visible',action='store_true')
 a=p.parse_args(); Path(a.output).mkdir(parents=True, exist_ok=True)
+(Path(a.output)/'fixture-input').write_text('verified fixture')
 ''')
         (self.root / '.gitignore').write_text('target/\nlane-pool/\n.prepush-runtime/\nbin/\nevents\n*.started\n')
         subprocess.run(['git', 'init', '-q', str(self.root)], check=True, capture_output=True)
@@ -179,11 +181,17 @@ print('Summary: 1 test run: 1 passed')
         events = (self.root / 'events').read_text().splitlines()
         self.assertEqual(len(events), 14)
         self.assertIn('--lane fast', events[0])
-        self.assertTrue(any('--vcpus 16' in e and '--lane linux-portable' in e for e in events))
+        self.assertTrue(any('--vcpus 8' in e and '--lane linux-portable' in e for e in events))
         self.assertTrue(any('--platform windows' in e and '--lane windows' in e for e in events))
         windows = next(e for e in events if '--platform windows' in e)
         self.assertNotIn('--net', windows)
-        self.assertEqual(windows.count('--sibling'), 2)
+        self.assertNotIn('--sibling', windows)
+        self.assertIn('--vcpus 8', windows)
+        requests = {e.split('--lane ')[-1].strip("'\""): shlex.split(e) for e in events}
+        for name, cpus in {'fast': 2, 'linux-operator': 2, 'linux-production': 4,
+                           'linux-msrv': 4, 'linux-wal': 2, 'linux-deploy': 8}.items():
+            args = requests[name]
+            self.assertEqual(args[args.index('--vcpus') + 1], str(cpus))
         linux = [shlex.split(e) for e in events if '--lane linux-' in e]
         self.assertEqual(len(linux), 11)
         self.assertEqual(len({e[e.index('--cwd') + 1] for e in linux}), 11)
@@ -191,6 +199,7 @@ print('Summary: 1 test run: 1 passed')
         self.assertIn('FAILED windows', result.stdout)
         self.assertNotIn('FAILED linux', result.stdout)
         self.assertGreaterEqual(result.stdout.count('permissions::warming_route'), 2)
+        self.assertFalse((self.root / 'lane-pool/windows/prepush-inputs').exists())
 
     def test_success_reports_every_lane_and_wall_time(self):
         result = self.run_prepush()
@@ -221,6 +230,21 @@ print('Summary: 1 test run: 1 passed')
         self.assertIn('NOT-RUN fast', result.stdout)
         self.assertTrue(dirty.read_text().endswith('# local work\n'))
         self.assertFalse((self.root / 'events').exists())
+
+    def test_existing_windows_inputs_are_not_adopted_or_deleted(self):
+        pool = self.root / 'lane-pool'
+        pool.mkdir()
+        lane = pool / 'windows'
+        subprocess.run(['git', '-C', str(self.root), 'worktree', 'add', '-q', '--detach', str(lane), 'HEAD'],
+                       check=True, capture_output=True)
+        inputs = lane / 'prepush-inputs'
+        inputs.mkdir()
+        (inputs / 'user-data').write_text('do not delete')
+        result = self.run_prepush()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('NOT-RUN windows', result.stdout)
+        self.assertEqual((inputs / 'user-data').read_text(), 'do not delete')
+        self.assertFalse((self.root / 'windows.started').exists())
 
     def test_clean_persistent_lane_is_reused_at_the_exact_new_candidate(self):
         pool = self.root / 'lane-pool'
@@ -382,6 +406,7 @@ print('fixture cargo completed')
                      f'exec {shlex.quote(real_mkdir)} "$@"',
             'chmod': 'echo "POSIX chmod refused" >&2; exit 77',
             'rustc': 'printf reached > "$FIXTURE/toolchain-reached"; exit 66',
+            'powershell.exe': 'exit 0',
         }
         for name, body in stubs.items():
             path = self.bin / name
@@ -405,6 +430,21 @@ print(scratch)
         self.assertTrue((self.root / 'native-helper-called').exists())
         self.assertTrue((self.root / 'toolchain-reached').exists())
         self.assertNotIn('POSIX', result.stderr)
+
+    def test_windows_clean_check_allows_only_the_input_directory(self):
+        import re
+        source = (ROOT / 'scripts/lib/prepush-lane.sh').read_text()
+        match = re.search(r'^clean\(\) \{.*?^\}', source, re.M | re.S)
+        assert match is not None
+        command = match.group(0) + '\nplatform=windows; git() { if [ "$1" = status ]; then printf "%s" "$STATUS"; fi; }; clean\n'
+        for status, passed in (
+            ('', True), ('?? prepush-inputs/', True), ('?? other/', False),
+            ('?? prepush-inputs/\n M scripts/prepush.sh', False),
+        ):
+            with self.subTest(status=status):
+                result = subprocess.run(['bash', '-c', command], env=dict(os.environ, STATUS=status),
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, passed)
 
 
 class MotorTiming(unittest.TestCase):
@@ -932,6 +972,20 @@ class WindowsOfflineInputs(unittest.TestCase):
             self.assertTrue(assets[prefix + '_URL'].startswith('https://'))
             self.assertRegex(assets[prefix + '_SHA256'], r'^[a-f0-9]{64}$')
 
+    def test_snapshot_visibility_rejects_ignored_inputs(self):
+        repository = self.root / 'repo'
+        subprocess.run(['git', 'init', '-q', str(repository)], check=True, capture_output=True)
+        (repository / '.gitignore').write_text('/target/\n')
+        inputs = repository / 'prepush-inputs'
+        inputs.mkdir()
+        (inputs / 'manifest.json').write_text('{}')
+        self.inputs.require_snapshot_visibility(inputs)
+        ignored = repository / 'target/prepush-inputs'
+        ignored.mkdir(parents=True)
+        (ignored / 'manifest.json').write_text('{}')
+        with self.assertRaisesRegex(ValueError, 'ignored or tracked'):
+            self.inputs.require_snapshot_visibility(ignored)
+
     def test_shallow_bundle_refusal_is_reproduced_then_staged_history_imports(self):
         origin = self.root / 'origin'
         subprocess.run(['git', 'init', '-q', str(origin)], check=True, capture_output=True)
@@ -981,7 +1035,7 @@ class WindowsOfflineInputs(unittest.TestCase):
             self.inputs.prepare(output, siblings, cache)
         self.assertEqual(subprocess.check_output(['git', '-C', str(shallow), 'rev-parse',
                                                  '--is-shallow-repository'], text=True).strip(), 'false')
-        good_bundle = cache / f'subconscious-{pin}.bundle'
+        good_bundle = output / 'subconscious-source.bundle'
         fetched = subprocess.run(['git', '-C', str(receiver), 'fetch', str(good_bundle), 'HEAD'],
                                  capture_output=True, text=True)
         self.assertEqual(fetched.returncode, 0, fetched.stderr)
@@ -991,6 +1045,15 @@ class WindowsOfflineInputs(unittest.TestCase):
         self.inputs.extract_source(output, 'claustrum', pin, extracted)
         self.assertEqual((extracted / 'source.txt').read_text(), 'pinned\n')
         self.assertFalse((extracted / '.git').exists())
+        transport = json.loads((output / 'transport-manifest.json').read_text())
+        listed = {entry['name']: entry for entry in transport['files']}
+        self.assertIn('manifest.json', listed)
+        self.assertIn('subconscious-source.bundle', listed)
+        self.assertIn('claustrum-source.tar', listed)
+        for name, entry in listed.items():
+            data = (output / name).read_bytes()
+            self.assertEqual(entry['size'], len(data))
+            self.assertEqual(entry['sha256'], hashlib.sha256(data).hexdigest())
 
     def test_source_archive_checksum_and_pin_are_required_before_extracting(self):
         inputs = self.root / 'inputs'
