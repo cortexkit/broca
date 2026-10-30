@@ -1159,6 +1159,23 @@ there, a newer writer's included, ends the stream with `subscribe_replay_failed`
   crash AFTER ⇒ that run is active/resumable, never double-consumed. FIFO; each queued
   prompt becomes its own episode.
 
+Broca declares `retract_own_send` with `retract`. On a session with a recorded owner,
+`session.retract {submission_id}` also admits the submission's recorded daemon-attested
+sender. Delegated sends retain that sender in `DeliveryOrdered.sent_by`; ordinary sends
+retain it in `Queued.principal`. Request-body sender claims never grant access. Missing,
+unverified or ambiguous attribution grants no exception to the owner's existing path.
+Answers and durable tombstones are identical to an owner's withdrawal: `retracted`,
+`already_started` or `not_pending`. A delivered steer is `not_pending`. This does not
+extend `run.cancel`, which remains owner-only, or change sessions without a recorded owner.
+
+Plan-named senders may share a `send_id` without sharing a submission. The first sender
+keeps the legacy run ID; a later delegated sender colliding with another recorded sender
+uses `<legacy-run-id>-sender-<digest>`, where `digest` is the lowercase, 64-character
+SHA-256 of the JSON-serialized daemon `BindPrincipal`. Its submission ID remains `sub-`
+followed by that run ID. Retries and `send.status` resolve the same ID from durable
+attribution, including after restart. Owner IDs and the first episode's recorded model,
+tool configuration, owner scope and plan manifest are unchanged.
+
 ## 12. Session coordinator = a lineage actor
 
 One in-process **lineage actor** per open session with states **`Opening | Open |
