@@ -1466,6 +1466,7 @@ pub struct LineageActor<W: WalStore> {
     run_index: Option<Arc<dyn RunIndex>>,
     /// Materialized reads and WAL projection are separate capabilities from the run index.
     materialized_store: Option<Arc<dyn SessionStore>>,
+    admission_reader: Option<Arc<dyn broca_core::context::AdmissionReader>>,
     /// Daemon-wide usage export is populated only after a durable terminal. It is optional so
     /// lightweight coordinator test openers and deployments can omit metering.
     export_index: Option<Arc<dyn broca_core::ExportIndex>>,
@@ -1700,6 +1701,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             materialized_store,
             export_index,
             charge_basis_resolver,
+            None,
         )
     }
 
@@ -1735,6 +1737,41 @@ impl<W: WalStore + 'static> LineageActor<W> {
             materialized_store,
             export_index,
             charge_basis_resolver,
+            None,
+        )
+    }
+
+    /// Opt-in composition for WAL-backed admission. Existing spawn paths keep their
+    /// materialized-store routing until boot selects a complete database-backed bundle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_admission_reader(
+        key: LineageKey,
+        gen: u64,
+        lease: Box<dyn LeaseHandle>,
+        writer: Arc<WalHandle>,
+        executor: Arc<dyn RunExecutor>,
+        wal_store: Arc<W>,
+        registry: RegistryHandle,
+        idle_ttl: Duration,
+        fanout: crate::fanout::Fanout<W>,
+        run_index: Option<Arc<dyn broca_core::RunIndex>>,
+        admission_reader: Arc<dyn broca_core::context::AdmissionReader>,
+    ) -> ActorHandle {
+        Self::spawn_holding(
+            key,
+            gen,
+            ActorTenure::Lease(lease),
+            writer,
+            executor,
+            wal_store,
+            registry,
+            idle_ttl,
+            fanout,
+            run_index,
+            None,
+            None,
+            None,
+            Some(admission_reader),
         )
     }
 
@@ -1753,6 +1790,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         materialized_store: Option<Arc<dyn broca_core::SessionStore>>,
         export_index: Option<Arc<dyn broca_core::ExportIndex>>,
         charge_basis_resolver: Option<Arc<dyn broca_core::ChargeBasisResolver + Send + Sync>>,
+        admission_reader: Option<Arc<dyn broca_core::context::AdmissionReader>>,
     ) -> ActorHandle {
         let (tx, rx) = mpsc::channel(64);
         let (terminal_tx, terminal_rx) = mpsc::unbounded_channel();
@@ -1798,6 +1836,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             fanout,
             run_index,
             materialized_store,
+            admission_reader,
             export_index,
             charge_basis_resolver,
             startup_recovery_pending: false,
@@ -7034,6 +7073,38 @@ impl<W: WalStore + 'static> LineageActor<W> {
         run_id: &RunId,
         skip_materialization: bool,
     ) -> Result<(), String> {
+        if let Some(reader) = self.admission_reader.clone() {
+            let safe_head = self
+                .writer
+                .as_ref()
+                .expect("writer live while open")
+                .sync()
+                .await
+                .map_err(|e| e.to_string())?;
+            let key = self.key.clone();
+            let target = run_id.clone();
+            let episode = spawn_blocking(
+                JobKind::WalRead,
+                broca_wal::access_counter::inherit(move || reader.paused_episode(&key, safe_head)),
+            )
+            .await
+            .map_err(|e| format!("paused admission task failed: {e}"))??;
+            let episode = episode
+                .filter(|e| e.run_id == target)
+                .ok_or_else(|| "run is no longer durably paused".to_string())?;
+            let mut request = submission_from_episode(&episode);
+            if episode.config.tools_were_omitted {
+                request.tools = None;
+            }
+            return self
+                .start_paused_cancel_request(
+                    run_id,
+                    request,
+                    episode.request_identity_digest,
+                    skip_materialization,
+                )
+                .await;
+        }
         // Rebuild the original episode from the durable admission view. This works both after a
         // same-process pause and after the actor has closed and reopened with no in-memory request.
         self.refresh_admission_view().await?;
@@ -7075,6 +7146,22 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 .and_then(|row| row.request_identity_digest),
         };
 
+        self.start_paused_cancel_request(
+            run_id,
+            request,
+            request_identity_digest,
+            skip_materialization,
+        )
+        .await
+    }
+
+    async fn start_paused_cancel_request(
+        &mut self,
+        run_id: &RunId,
+        request: SubmissionRequest,
+        request_identity_digest: Option<String>,
+        skip_materialization: bool,
+    ) -> Result<(), String> {
         // Core checks this pre-cancelled token before the auth-resolved branch. The ordinary
         // resume executor therefore reconstructs AuthRequired and seals the existing episode with
         // RunFinished::Cancelled without needing an auth-resolved signal or a second RunStarted.
@@ -8929,33 +9016,43 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .map_err(|error| error.to_string())?;
         let wal_store = self.wal_store.clone();
         let materialized_store = self.materialized_store.clone();
+        let admission_reader = self.admission_reader.clone();
         let key = self.key.clone();
-        let checkpoint = spawn_blocking(JobKind::WalRead, move || {
-            match broca_core::load_prior_wal_snapshot(
-                wal_store.as_ref(),
-                &key,
-                safe_head,
-                materialized_store.as_deref(),
-            ) {
-                Ok(snapshot) => Ok(snapshot.checkpoint_at_head),
-                // The snapshot's complete-WAL fallback insists the file ends exactly at the
-                // durable head, which an active run appending past it breaks. The owner check
-                // only needs the history through that head, so fold exactly that prefix.
-                Err(cause) => {
-                    let range = wal_store
-                        .read_records_range(&key, 0, Some(safe_head), None)
-                        .map_err(|error| {
-                            format!("{cause}; ownership prefix read failed: {error}")
-                        })?;
-                    let durable =
-                        crate::durable_read::DurableRead::classify(&range, 0, Some(safe_head))
-                            .records()
-                            .map_err(|error| format!("{cause}; ownership prefix: {error}"))?;
-                    broca_core::AdmissionCheckpointV1::from_frames(durable)
-                        .map_err(|error| format!("{cause}; ownership prefix fold failed: {error}"))
+        let checkpoint = spawn_blocking(
+            JobKind::WalRead,
+            broca_wal::access_counter::inherit(move || {
+                if let Some(reader) = admission_reader {
+                    return reader
+                        .prior_snapshot(&key, safe_head)
+                        .map(|snapshot| snapshot.checkpoint_at_head);
                 }
-            }
-        })
+                match broca_core::load_prior_wal_snapshot(
+                    wal_store.as_ref(),
+                    &key,
+                    safe_head,
+                    materialized_store.as_deref(),
+                ) {
+                    Ok(snapshot) => Ok(snapshot.checkpoint_at_head),
+                    // The snapshot's complete-WAL fallback insists the file ends exactly at the
+                    // durable head, which an active run appending past it breaks. The owner check
+                    // only needs the history through that head, so fold exactly that prefix.
+                    Err(cause) => {
+                        let range = wal_store
+                            .read_records_range(&key, 0, Some(safe_head), None)
+                            .map_err(|error| {
+                                format!("{cause}; ownership prefix read failed: {error}")
+                            })?;
+                        let durable =
+                            crate::durable_read::DurableRead::classify(&range, 0, Some(safe_head))
+                                .records()
+                                .map_err(|error| format!("{cause}; ownership prefix: {error}"))?;
+                        broca_core::AdmissionCheckpointV1::from_frames(durable).map_err(|error| {
+                            format!("{cause}; ownership prefix fold failed: {error}")
+                        })
+                    }
+                }
+            }),
+        )
         .await
         .map_err(|error| format!("ownership snapshot task failed: {error}"))??;
         self.registry
@@ -8999,15 +9096,22 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .map_err(|error| error.to_string())?;
         let wal_store = self.wal_store.clone();
         let materialized_store = self.materialized_store.clone();
+        let admission_reader = self.admission_reader.clone();
         let key = self.key.clone();
-        let mut snapshot = spawn_blocking(JobKind::WalRead, move || {
-            broca_core::load_prior_wal_snapshot(
-                wal_store.as_ref(),
-                &key,
-                safe_head,
-                materialized_store.as_deref(),
-            )
-        })
+        let mut snapshot = spawn_blocking(
+            JobKind::WalRead,
+            broca_wal::access_counter::inherit(move || {
+                if let Some(reader) = admission_reader {
+                    return reader.prior_snapshot(&key, safe_head);
+                }
+                broca_core::load_prior_wal_snapshot(
+                    wal_store.as_ref(),
+                    &key,
+                    safe_head,
+                    materialized_store.as_deref(),
+                )
+            }),
+        )
         .await
         .map_err(|error| format!("admission snapshot task failed: {error}"))??;
         // Run reconstruction never reads the durable pending queue. Move its allocation into the
@@ -10229,6 +10333,584 @@ mod tests {
         );
         assert_eq!(positioned[cut..].is_empty(), empty_tail);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    struct DatabaseAdmissionFixture {
+        root: std::path::PathBuf,
+        key: BindIdentity,
+        db: Arc<broca_store::db::OverhaulDb>,
+        wal: Box<dyn broca_wal::Wal + Send>,
+        witness: Arc<std::sync::Mutex<broca_wal::file_wal::DurablePublication>>,
+        reader: Arc<dyn broca_core::context::AdmissionReader>,
+    }
+
+    impl DatabaseAdmissionFixture {
+        fn new(records: &[WalRecord]) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let root = broca_test_support::scratch_root().join(format!(
+                "database-admission-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
+            let key = BindIdentity::new("/offset-admission", "h", "database");
+            let mut wal: Box<dyn broca_wal::Wal + Send> = Box::new(
+                broca_wal::FileWal::open(root.join("wal/log"))
+                    .unwrap()
+                    .with_wal_config(broca_wal::WalConfig::OVERHAUL)
+                    .unwrap()
+                    .with_feature_floor(root.join("wal-floor")),
+            );
+            for record in records {
+                wal.append(1, record, true).unwrap();
+            }
+            let witness = Arc::new(std::sync::Mutex::new(wal.durable_publication().unwrap()));
+            let db = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
+            db.publish(
+                &key,
+                "database-ref",
+                broca_store::db::LogLocation::Live,
+                &witness.lock().unwrap(),
+            )
+            .unwrap();
+            let source = witness.clone();
+            let reader = db.admission_reader(move |_| Ok(source.lock().unwrap().clone()));
+            Self {
+                root,
+                key,
+                db,
+                wal,
+                witness,
+                reader,
+            }
+        }
+
+        fn append(&mut self, record: &WalRecord, publish: bool) {
+            self.wal.append(1, record, true).unwrap();
+            *self.witness.lock().unwrap() = self.wal.durable_publication().unwrap();
+            if publish {
+                self.db
+                    .publish(
+                        &self.key,
+                        "database-ref",
+                        broca_store::db::LogLocation::Live,
+                        &self.witness.lock().unwrap(),
+                    )
+                    .unwrap();
+            }
+        }
+
+        fn head(&self) -> u64 {
+            self.witness.lock().unwrap().sequence()
+        }
+
+        fn full(&self) -> broca_core::AdmissionCheckpointV1 {
+            let frames = self.wal.replay().unwrap();
+            broca_core::AdmissionCheckpointV1::from_frames(&frames).unwrap()
+        }
+
+        fn edit_seed(&self, edit: impl FnOnce(&mut serde_json::Value)) {
+            self.db
+                .authoritative_transaction(|tx| {
+                    let encoded: String =
+                        tx.query_row("SELECT admission_seed FROM session", [], |r| r.get(0))?;
+                    let mut value = serde_json::from_str(&encoded).unwrap();
+                    edit(&mut value);
+                    tx.execute("UPDATE session SET admission_seed=?1", [value.to_string()])?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+
+    impl Drop for DatabaseAdmissionFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn database_paused_records(
+        config_refreeze: bool,
+        auth_refreezes: usize,
+        media: bool,
+    ) -> Vec<WalRecord> {
+        let key = BindIdentity::new("/offset-admission", "h", "database");
+        let mut records = held_close_seed(&key, false)[..5].to_vec();
+        if let WalRecord::RunStarted { config, .. } = &mut records[0] {
+            config.tools_were_omitted = true;
+            config.budget = Some(broca_protocol::request::BudgetConfig {
+                max_input_tokens: None,
+                nudges: Vec::new(),
+                finalize_at_tool_calls: 12,
+                finalize_text: "PRIVATE-BUDGET".into(),
+            });
+        }
+        if config_refreeze {
+            records.insert(
+                1,
+                WalRecord::RunConfigRefrozen {
+                    renderer_version: 2,
+                    ts_ms: None,
+                    frozen_render_config: serde_json::json!({"wire":"PRIVATE-REFREEZE"}),
+                },
+            );
+        }
+        for auth in 0..auth_refreezes {
+            records.insert(
+                1,
+                WalRecord::RunAuthRefrozen {
+                    ts_ms: None,
+                    auth_selection: broca_wal::AuthSelection {
+                        credential_id: format!("apikey:stub:{auth}"),
+                        account_ref: None,
+                        resolved_credential_id: None,
+                        vault_request: None,
+                        account_decision: None,
+                        auth_method: None,
+                    },
+                },
+            );
+        }
+        let (batch_id, step_id, calls) = records
+            .iter()
+            .find_map(|r| match r {
+                WalRecord::ToolBatchStarted {
+                    batch_id,
+                    step_id,
+                    planned_calls,
+                } => Some((batch_id.clone(), *step_id, planned_calls.clone())),
+                _ => None,
+            })
+            .unwrap();
+        records.push(WalRecord::RunPaused {
+            run_id: RunId("held".into()),
+            ts_ms: None,
+            reason: broca_protocol::PauseReason::AuthRequired,
+            error: None,
+        });
+        for (i, tool_call_id) in calls.into_iter().enumerate() {
+            let output = if media && i == 0 {
+                broca_protocol::ToolOutput::Parts {
+                    parts: vec![broca_protocol::ToolOutputPart::Media {
+                        media: broca_protocol::MediaRef {
+                            kind: broca_protocol::MediaKind::Image,
+                            mime: "image/png".into(),
+                            byte_size: 69,
+                            sha256: "a".repeat(64),
+                            width: Some(1),
+                            height: Some(1),
+                        },
+                    }],
+                }
+            } else {
+                broca_protocol::ToolOutput::Text {
+                    text: "PRIVATE-RESULT".into(),
+                }
+            };
+            records.push(WalRecord::ToolResult {
+                finished_at_ms: None,
+                batch_id: batch_id.clone(),
+                result: Arc::new(broca_protocol::ToolResult {
+                    tool_call_id,
+                    output,
+                    is_error: false,
+                }),
+                outcome: broca_wal::record::DispatchOutcome::Completed,
+                hooks: None,
+                reason: None,
+                withdraw_elicitation: None,
+                provider_held: None,
+                tags: None,
+            });
+        }
+        records.push(WalRecord::ToolBatchFinished { batch_id });
+        records.push(WalRecord::TurnFinished { step_id });
+        records
+    }
+
+    fn assert_database_paused_reads(
+        f: &DatabaseAdmissionFixture,
+        config: bool,
+        auth: usize,
+        media: bool,
+    ) -> (usize, u64) {
+        use broca_wal::access_counter::{ReadClass, ValidationRead, WalAccessCounter};
+        use broca_wal::framing::{decode_next, DecodeStep, LINEAGE_FRAME_LEN};
+        let bytes = std::fs::read(f.witness.lock().unwrap().path()).unwrap();
+        let mut expected = vec![(
+            "lineage header".to_string(),
+            0,
+            LINEAGE_FRAME_LEN as u64,
+            ReadClass::LineageHeader,
+        )];
+        let mut off = 0;
+        let mut latest_start = None;
+        while off < bytes.len() {
+            match decode_next(&bytes[off..]) {
+                DecodeStep::Record { framed, consumed } => {
+                    let name = match &framed.record {
+                        WalRecord::RunStarted { .. } => {
+                            latest_start = Some((off as u64, consumed as u64));
+                            None
+                        }
+                        WalRecord::RunConfigRefrozen { .. } => Some("config refreeze"),
+                        WalRecord::RunAuthRefrozen { .. } => Some("auth refreeze"),
+                        WalRecord::ToolResult { result, .. }
+                            if matches!(
+                                result.output,
+                                broca_protocol::ToolOutput::Parts { .. }
+                            ) =>
+                        {
+                            Some("authenticated media locator")
+                        }
+                        _ => None,
+                    };
+                    if let Some(name) = name {
+                        expected.push((
+                            name.to_string(),
+                            off as u64,
+                            consumed as u64,
+                            ReadClass::Source,
+                        ));
+                    }
+                    if matches!(framed.record, WalRecord::TurnFinished { .. }) {
+                        let end = (off + consumed) as u64;
+                        expected.push((
+                            "boundary frame".into(),
+                            off as u64,
+                            consumed as u64,
+                            ReadClass::Validation(ValidationRead::BoundaryFrame),
+                        ));
+                        expected.push((
+                            "durable-end trailer peek".into(),
+                            end,
+                            1,
+                            ReadClass::Validation(ValidationRead::DurableEnd),
+                        ));
+                        expected.push((
+                            "lineage gap".into(),
+                            end,
+                            LINEAGE_FRAME_LEN as u64,
+                            ReadClass::Validation(ValidationRead::LineageGap),
+                        ));
+                        expected.push((
+                            "durable-end EOF probe".into(),
+                            end + LINEAGE_FRAME_LEN as u64,
+                            0,
+                            ReadClass::Validation(ValidationRead::DurableEnd),
+                        ));
+                    }
+                    off += consumed;
+                }
+                DecodeStep::Lineage { consumed, .. } => off += consumed,
+                _ => panic!("fixture WAL did not decode"),
+            }
+        }
+        let (off, len) = latest_start.unwrap();
+        expected.push(("RunStarted source".into(), off, len, ReadClass::Source));
+        assert_eq!(
+            expected.len(),
+            6 + usize::from(config) + auth + usize::from(media)
+        );
+        let counter = WalAccessCounter::default();
+        let episode = counter
+            .operation("database paused cancellation")
+            .run(|| f.reader.paused_episode(&f.key, f.head()))
+            .unwrap()
+            .unwrap();
+        let full = f.full().last_episode.unwrap();
+        assert_eq!(episode.config, full.config);
+        assert_eq!(
+            episode.request_identity_digest,
+            full.request_identity_digest
+        );
+        assert_eq!(episode.disposition, full.disposition);
+        let mut request = submission_from_episode(&episode);
+        if episode.config.tools_were_omitted {
+            request.tools = None;
+        }
+        let mut legacy = submission_from_episode(&full);
+        legacy.tools = None;
+        assert_eq!(
+            serde_json::to_vec(&request).unwrap(),
+            serde_json::to_vec(&legacy).unwrap()
+        );
+        let access = counter.snapshot().pop().unwrap();
+        assert!(access.seed_fallbacks.is_empty(), "{access:?}");
+        assert_eq!(access.reads.len(), expected.len(), "{access:?}");
+        for (name, off, len, class) in expected {
+            assert_eq!(
+                access
+                    .reads
+                    .iter()
+                    .filter(|r| r.offset == off && r.length == len && r.class == class)
+                    .count(),
+                1,
+                "{name}: {access:?}"
+            );
+            eprintln!("{name}: 1 read at {off} length {len}");
+        }
+        assert!(!access.reads.iter().any(|r| r.class == ReadClass::Origin));
+        (access.reads.len(), access.frames_decoded)
+    }
+
+    #[test]
+    fn database_admission_paused_cancel_lists_every_read_for_each_inline_refreeze() {
+        for (config, auth) in [(false, 0), (true, 0), (false, 1), (true, 1), (true, 2)] {
+            let f = DatabaseAdmissionFixture::new(&database_paused_records(config, auth, false));
+            assert_database_paused_reads(&f, config, auth, false);
+        }
+    }
+
+    #[test]
+    fn database_admission_matches_legacy_at_every_publication_cut() {
+        use broca_wal::access_counter::WalAccessCounter;
+        for media in [false, true] {
+            let mut records = database_paused_records(true, 2, media);
+            records.push(WalRecord::RunAuthRefrozen {
+                ts_ms: None,
+                auth_selection: broca_wal::AuthSelection {
+                    credential_id: "apikey:stub:tail".into(),
+                    account_ref: None,
+                    resolved_credential_id: None,
+                    vault_request: None,
+                    account_decision: None,
+                    auth_method: None,
+                },
+            });
+            records.push(WalRecord::RunFinished {
+                interrupt_reason: None,
+                reason: broca_protocol::RunFinishReason::Cancelled,
+                usage: broca_protocol::Usage::default(),
+                retries_used: 0,
+                ts_ms: None,
+                error: None,
+            });
+            let later = database_paused_records(false, 0, false);
+            records.extend(later);
+            let mut f = DatabaseAdmissionFixture::new(&records[..1]);
+            let mut seeded = 0;
+            for record in records.iter().skip(1) {
+                f.append(record, true);
+                let counter = WalAccessCounter::default();
+                let snapshot = counter
+                    .operation("admission oracle")
+                    .run(|| f.reader.prior_snapshot(&f.key, f.head()))
+                    .unwrap();
+                assert_eq!(
+                    snapshot.checkpoint_at_head,
+                    f.full(),
+                    "media={media}, cut={}",
+                    f.head()
+                );
+                if snapshot.base_watermark != 0 {
+                    seeded += 1;
+                    let access = counter.snapshot().pop().unwrap();
+                    assert!(access.seed_fallbacks.is_empty(), "{access:?}");
+                    assert!(!access
+                        .reads
+                        .iter()
+                        .any(|r| r.class == broca_wal::access_counter::ReadClass::Origin));
+                }
+            }
+            assert!(seeded >= 5, "oracle must exercise the seeded route");
+        }
+    }
+
+    #[test]
+    fn database_admission_crash_after_wal_barrier_before_database_commit_uses_old_seed_and_tail() {
+        let mut f = DatabaseAdmissionFixture::new(&database_paused_records(true, 1, false));
+        let indexed_head = f.head();
+        f.append(
+            &WalRecord::RunAuthRefrozen {
+                ts_ms: None,
+                auth_selection: broca_wal::AuthSelection {
+                    credential_id: "apikey:stub:after-barrier".into(),
+                    account_ref: None,
+                    resolved_credential_id: None,
+                    vault_request: None,
+                    account_decision: None,
+                    auth_method: None,
+                },
+            },
+            false,
+        );
+        let reopened = Arc::new(broca_store::db::OverhaulDb::open(&f.root).unwrap());
+        let witness = f.witness.lock().unwrap().clone();
+        let reader = reopened.admission_reader(move |_| Ok(witness.clone()));
+        let counter = broca_wal::access_counter::WalAccessCounter::default();
+        let snapshot = counter
+            .operation("publication crash gap")
+            .run(|| reader.prior_snapshot(&f.key, f.head()))
+            .unwrap();
+        assert_eq!(snapshot.base_watermark, indexed_head);
+        assert_eq!(snapshot.checkpoint_at_head, f.full());
+        assert_eq!(snapshot.tail.len(), 1);
+        let access = counter.snapshot().pop().unwrap();
+        assert!(access.seed_fallbacks.is_empty(), "{access:?}");
+        assert!(!access
+            .reads
+            .iter()
+            .any(|r| r.class == broca_wal::access_counter::ReadClass::Origin));
+        reopened
+            .read_snapshot(|tx| {
+                let head: u64 =
+                    tx.query_row("SELECT indexed_seq FROM session", [], |r| r.get(0))?;
+                assert_eq!(
+                    head, indexed_head,
+                    "admission must not publish speculative database state"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn database_admission_source_mismatch_discards_partial_state_and_counts_one_full_repair() {
+        for paused in [false, true] {
+            let f = DatabaseAdmissionFixture::new(&database_paused_records(true, 2, false));
+            f.edit_seed(|v| {
+                let byte = &mut v["state"]["episode"]["refreezes"][1]["identity"][0];
+                *byte = serde_json::json!(byte.as_u64().unwrap() ^ 1);
+            });
+            let expected = f.full();
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            counter.operation("admission source mismatch").run(|| {
+                if paused {
+                    let actual = f.reader.paused_episode(&f.key, f.head()).unwrap().unwrap();
+                    assert_eq!(actual, expected.last_episode.clone().unwrap());
+                } else {
+                    let actual = f.reader.prior_snapshot(&f.key, f.head()).unwrap();
+                    assert_eq!(actual.base_watermark, 0);
+                    assert!(actual.checkpoint_at_base.is_none());
+                    assert_eq!(actual.checkpoint_at_head, expected);
+                }
+            });
+            let access = counter.snapshot().pop().unwrap();
+            assert_eq!(
+                access.seed_fallbacks,
+                ["admission source identity mismatch"]
+            );
+            assert_eq!(
+                access
+                    .reads
+                    .iter()
+                    .filter(|r| r.class == broca_wal::access_counter::ReadClass::Origin)
+                    .count(),
+                1,
+                "exactly one full repair: {access:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn database_admission_media_reads_only_authenticated_locators_with_1k_and_150k_prefixes() {
+        let mut costs = Vec::new();
+        for prefix in [1_000, 150_000] {
+            let mut records = database_paused_records(true, 2, true);
+            let mut first = records[0].clone();
+            if let WalRecord::RunStarted { run_id, input, .. } = &mut first {
+                *run_id = RunId("discarded".into());
+                *input = Arc::new(vec![input[0].clone(); prefix]);
+            }
+            records.splice(
+                0..0,
+                [
+                    first,
+                    WalRecord::RunFinished {
+                        interrupt_reason: None,
+                        reason: broca_protocol::RunFinishReason::Cancelled,
+                        usage: broca_protocol::Usage::default(),
+                        retries_used: 0,
+                        ts_ms: None,
+                        error: None,
+                    },
+                ],
+            );
+            let f = DatabaseAdmissionFixture::new(&records);
+            costs.push(assert_database_paused_reads(&f, true, 2, true));
+            f.db.read_snapshot(|tx| {
+                let encoded: String =
+                    tx.query_row("SELECT admission_seed FROM session", [], |r| r.get(0))?;
+                for forbidden in [
+                    "PRIVATE-RESULT",
+                    "PRIVATE-REFREEZE",
+                    "PRIVATE-BUDGET",
+                    "apikey:stub",
+                    "\"usage\"",
+                    "\"input\"",
+                ] {
+                    assert!(
+                        !encoded.contains(forbidden),
+                        "content persisted: {forbidden}"
+                    );
+                }
+                let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+                let sources = value["media_sources"].as_array().unwrap();
+                assert_eq!(sources.len(), 1);
+                assert!(sources[0]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .all(|k| ["seq", "off", "end", "identity"].contains(&k.as_str())));
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            costs[0], costs[1],
+            "discarded prefix must not affect reads or decodes"
+        );
+    }
+
+    #[test]
+    fn database_admission_missing_media_locator_and_unknown_version_have_named_repairs() {
+        for (mode, reason) in [
+            (0, "admission media locators missing"),
+            (1, "admission source identity mismatch"),
+            (2, "unsupported admission continuation"),
+            (3, "admission media locators incomplete"),
+            (4, "unsupported admission continuation"),
+        ] {
+            let f = DatabaseAdmissionFixture::new(&database_paused_records(false, 0, true));
+            f.edit_seed(|v| match mode {
+                0 => {
+                    v.as_object_mut().unwrap().remove("media_sources");
+                }
+                1 => {
+                    let byte = &mut v["media_sources"][0]["identity"][0];
+                    *byte = serde_json::json!(byte.as_u64().unwrap() ^ 1);
+                }
+                2 => {
+                    v["version"] = serde_json::json!(99);
+                }
+                3 => {
+                    v["media_sources"] = serde_json::json!([]);
+                }
+                _ => {
+                    v["version"] = serde_json::json!(0);
+                }
+            });
+            let expected = f.full().last_episode.unwrap();
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            let episode = counter
+                .operation("media or version repair")
+                .run(|| f.reader.paused_episode(&f.key, f.head()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(episode, expected);
+            let access = counter.snapshot().pop().unwrap();
+            assert_eq!(access.seed_fallbacks, [reason], "{access:?}");
+            assert_eq!(
+                access
+                    .reads
+                    .iter()
+                    .filter(|r| r.class == broca_wal::access_counter::ReadClass::Origin)
+                    .count(),
+                1
+            );
+        }
     }
 
     fn held_close_seed(key: &BindIdentity, sequential: bool) -> Vec<WalRecord> {

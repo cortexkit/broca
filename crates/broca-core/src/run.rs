@@ -470,14 +470,56 @@ where
 /// Staged offset-index admission loader. The store supplies one committed seed/boundary snapshot,
 /// a positioned durable tail and a full-read repair callback; legacy materialized-store readers
 /// continue to use `load_prior_wal_snapshot` until the offset store is wired into admission.
+pub trait AdmissionSnapshotSeed {
+    fn hydrate_admission(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        tail: &[crate::replay::PositionedFrame],
+        safe_head: u64,
+    ) -> Result<
+        (crate::AdmissionCheckpointV1, crate::AdmissionCheckpointV1),
+        crate::replay::SeedFallback,
+    >;
+}
+
+impl AdmissionSnapshotSeed for crate::admission::AdmissionSeed {
+    fn hydrate_admission(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        tail: &[crate::replay::PositionedFrame],
+        safe_head: u64,
+    ) -> Result<
+        (crate::AdmissionCheckpointV1, crate::AdmissionCheckpointV1),
+        crate::replay::SeedFallback,
+    > {
+        self.hydrate_with_base(read_at, tail, safe_head)
+    }
+}
+
+impl AdmissionSnapshotSeed for crate::admission::AdmissionContinuation {
+    fn hydrate_admission(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        tail: &[crate::replay::PositionedFrame],
+        safe_head: u64,
+    ) -> Result<
+        (crate::AdmissionCheckpointV1, crate::AdmissionCheckpointV1),
+        crate::replay::SeedFallback,
+    > {
+        self.hydrate(read_at, tail, safe_head)
+    }
+}
+
+/// Hydrate either an in-memory recipe or a stored content-free continuation. Both routes
+/// authenticate the boundary and discard all hydrated state before a full-read repair.
 pub fn load_prior_wal_snapshot_from_seed(
     read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
-    seed: &crate::admission::AdmissionSeed,
+    seed: &dyn AdmissionSnapshotSeed,
     tail: &[crate::replay::PositionedFrame],
     safe_head: u64,
     full_read: impl FnOnce() -> Result<Vec<broca_wal::FramedRecord>, String>,
 ) -> Result<PriorWalSnapshot, String> {
-    if let Ok((mut base, head)) = seed.hydrate_with_base(read_at, tail, safe_head) {
+    if let Ok((mut base, head)) = seed.hydrate_admission(read_at, tail, safe_head) {
         let watermark = base.at_seq;
         base.pending_fifo = Arc::new(Vec::new());
         return Ok(PriorWalSnapshot {
