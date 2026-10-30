@@ -5434,6 +5434,8 @@ mod tests {
                 tool_names: Vec::new(),
                 manifest: None,
             }),
+            latest_manifest: None,
+            session_change_recorded: false,
             plan_manifest_folded: true,
         };
         let snapshot =

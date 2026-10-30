@@ -1009,6 +1009,7 @@ struct StartRunFlags {
 }
 
 enum StartRunFailure {
+    PlanRefused(broca_fetch_plan::Refusal),
     ContextCeiling(broca_protocol::ContextCeilingDetail),
     Expired,
     Shutdown,
@@ -1196,6 +1197,7 @@ impl std::fmt::Display for StartRunFailure {
             Self::Infrastructure(message) => f.write_str(message),
             Self::Expired => f.write_str("lineage expired before admission"),
             Self::Admission(error) => error.fmt(f),
+            Self::PlanRefused(refusal) => f.write_str(&refusal.message()),
             Self::Scope(refusal) => write!(f, "scope refused: {refusal:?}"),
         }
     }
@@ -1472,6 +1474,22 @@ pub struct LineageActor<W: WalStore> {
     /// The manifest the send being handled froze for a session with no episode yet, held only
     /// while that send is handled so the episode it starts records it.
     admitting_manifest: Option<Arc<broca_wal::PlanManifest>>,
+    /// The session-change state folded from the WAL at open and kept current as this actor
+    /// writes refresh, policy and flush records: the accepted and applied generations, the
+    /// pending change and its manifest, and the send_id maps for idempotent repeats.
+    session_change: broca_fetch_plan::session_change::SessionChangeState,
+    /// Positive-only presence bit learned from existing admission reads or a successful write.
+    /// Unchanged logs never need an extra session-change WAL probe.
+    session_change_recorded: bool,
+    /// Whether a real frozen-prefix rebuild happened since the pending acceptance: a
+    /// compaction view applied, a model switch between episodes, or a prefix flush. A new
+    /// run alone is not a rebuild.
+    session_change_rebuild: bool,
+    /// Whether a flush arrived since the pending acceptance, forcing the next run to apply
+    /// whatever its policy.
+    session_change_flushed: bool,
+    /// The model of the latest episode, for switch detection between episodes.
+    session_change_last_model: Option<String>,
     /// The `delivery_order` group of the send being handled, held only while it is handled.
     admitting_order: Option<broca_protocol::DeliveryOrder>,
     /// The attested principal of the send being handled when it is a plan-named sender other
@@ -1748,6 +1766,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
             crash_orphan_candidates: None,
             first_episode: Arc::clone(&first_episode),
             admitting_manifest: None,
+            session_change: Default::default(),
+            session_change_recorded: false,
+            session_change_rebuild: false,
+            session_change_flushed: false,
+            session_change_last_model: None,
             admitting_order: None,
             admitting_sent_by: None,
             immediate_ordered_drain: None,
@@ -2336,6 +2359,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 } else {
                     Ok(false)
                 };
+                // An applied compaction view is a real frozen-prefix rebuild for a pending
+                // `on_prefix_rebuild` change: the next run applies it. A new run alone is not.
+                if matches!(result, Ok(true)) {
+                    self.session_change_rebuild = true;
+                }
                 let _ = reply.send(result);
                 false
             }
@@ -3149,6 +3177,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     ))
                 }
             };
+            self.session_change_recorded |= ownership.session_change_recorded;
             if let Some(first) = &ownership.first_episode {
                 let _ = self.first_episode.set(first.clone());
             }
@@ -3245,6 +3274,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     ))
                 }
             };
+            self.session_change_recorded |= ownership.session_change_recorded;
             if ownership.episodes == 0 {
                 match plan.manifest {
                     Some(manifest) => self.admitting_manifest = Some(manifest),
@@ -3265,7 +3295,33 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     .as_ref()
                     .and_then(|first| first.manifest.as_ref())
                     .map(|manifest| manifest.plan_identity.as_str());
-                if let Err(refusal) = broca_fetch_plan::check_later_plan(frozen, &plan.identity) {
+                if let Err(error) = self.sync_session_change_from_wal().await {
+                    return SendOutcome::Transient(error);
+                }
+                let drift = if self.session_change.accepted_generation > 0 {
+                    let effective = self
+                        .session_change
+                        .current_manifest
+                        .as_ref()
+                        .map(|m| m.plan_identity.as_str());
+                    let accepted = self
+                        .session_change
+                        .accepted
+                        .get(&self.session_change.accepted_generation)
+                        .map(|(identity, _)| identity.as_str());
+                    cortexkit_role_llm_runner::session_change::check_send_drift(
+                        effective,
+                        accepted,
+                        &plan.identity,
+                    )
+                    .map_err(|detail| broca_fetch_plan::Refusal::PlanDrift {
+                        frozen: detail.frozen,
+                        sent: detail.sent,
+                    })
+                } else {
+                    broca_fetch_plan::check_later_plan(frozen, &plan.identity)
+                };
+                if let Err(refusal) = drift {
                     return SendOutcome::PlanRefused(refusal);
                 }
             }
@@ -3606,6 +3662,31 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
         }
 
+        if !resume_indexed_run {
+            if let Err(error) = self.sync_session_change_from_wal().await {
+                return SendOutcome::Transient(error);
+            }
+            if self.session_change.pending.is_some() {
+                let checkpoint = match self.load_checkpoint_at_head().await {
+                    Ok(checkpoint) => checkpoint,
+                    Err(error) => return SendOutcome::Transient(error),
+                };
+                let mut resolved = request.clone();
+                if let Some(episode) = &checkpoint.last_episode {
+                    inherit_frozen_parameters(&mut resolved, &episode.config);
+                }
+                if let Some(pending) = self.pending_for_model(&resolved.model) {
+                    if let Err(refusal) = broca_fetch_plan::session_change::check_applying_model(
+                        pending,
+                        &resolved.model,
+                        resolved.variant.as_deref(),
+                    ) {
+                        return SendOutcome::PlanRefused(refusal);
+                    }
+                }
+            }
+        }
+
         // Same-key receipts above remain idempotent even when later work filled the context.
         // Only compaction sessions need an additional admission read for a joining send.
         let has_compaction = self
@@ -3783,6 +3864,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     delivered: None,
                 },
                 Err(StartRunFailure::Expired) => SendOutcome::Reopen,
+                Err(StartRunFailure::PlanRefused(refusal)) => SendOutcome::PlanRefused(refusal),
                 Err(StartRunFailure::ContextCeiling(detail)) => SendOutcome::ContextCeiling(detail),
                 Err(StartRunFailure::Admission(RunError::MediaUnsupported(message))) => {
                     crate::person_media::outcome(RunError::MediaUnsupported(message))
@@ -4549,13 +4631,40 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // A session admitted with a fetch plan runs with the tools its manifest froze, and its
         // first episode opens with the manifest's joined system text; nothing a later send
         // carries replaces either. The episode records the manifest on its `RunStarted`.
+        // A pending session-change applies at the start of the first run at or after its
+        // policy's trigger point, never inside a running episode: `immediately` at the next run, and
+        // `on_prefix_rebuild` once a compaction view applied, the model switched between
+        // episodes, or a prefix flush arrived since the acceptance. Earlier episodes keep
+        // resuming from their own manifests, byte-identical.
         let manifest = if admits_the_session {
             self.admitting_manifest.take()
         } else {
-            ownership
-                .first_episode
-                .as_ref()
-                .and_then(|first| first.manifest.clone())
+            self.session_change_recorded |= ownership.session_change_recorded;
+            self.sync_session_change_from_wal()
+                .await
+                .map_err(StartRunFailure::Infrastructure)?;
+            let current = self.session_change.current_manifest.clone().or_else(|| {
+                ownership
+                    .first_episode
+                    .as_ref()
+                    .and_then(|first| first.manifest.clone())
+            });
+            if resuming {
+                // A pending refresh cannot change an episode re-driven after a crash.
+                current
+            } else {
+                if let Some(pending) = self.pending_for_model(&resolved_request.model) {
+                    broca_fetch_plan::session_change::check_applying_model(
+                        pending,
+                        &resolved_request.model,
+                        resolved_request.variant.as_deref(),
+                    )
+                    .map_err(StartRunFailure::PlanRefused)?;
+                    Some(pending.manifest.clone())
+                } else {
+                    current
+                }
+            }
         };
         // Every path that starts an episode passes here (a direct send, a drained queue, a
         // queue rebuilt after a crash), so an episode whose plan asks a provider to confine its
@@ -4818,6 +4927,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
             stop_requested: Some(self.registry.stopping_signal()),
             steer: Some(Arc::clone(&steer)),
             manifest: manifest.clone(),
+            manifest_system_override: self.session_change.applied_generation > 0
+                || (!resuming && self.pending_for_model(&req.model).is_some()),
             input_hooks,
             pre_user_error,
             hook_plane: self.executor.hook_plane(),
@@ -5996,6 +6107,38 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 broca_core::RetractDecision::NotPending => RetractOutcome::NotPending,
             };
         }
+    }
+
+    /// Reconstruct change state before a command or run boundary so idle eviction and restart
+    /// cannot lose pending manifests, flushes, or the original replies.
+    async fn sync_session_change_from_wal(&mut self) -> Result<(), String> {
+        if !self.session_change_recorded {
+            return Ok(());
+        }
+        let framed = self.read_wal_framed_records().await?;
+        let state = broca_fetch_plan::session_change::SessionChangeState::fold(&framed);
+        self.session_change_rebuild = state.rebuild_pending;
+        self.session_change_flushed = state.flush_pending;
+        self.session_change_last_model = state.last_model.clone();
+        self.session_change = state;
+        Ok(())
+    }
+
+    fn pending_for_model(
+        &self,
+        model: &broca_protocol::ModelHandle,
+    ) -> Option<&broca_fetch_plan::session_change::PendingState> {
+        let model = format!("{}:{}", model.provider_module_id, model.model_id);
+        let switched = self
+            .session_change_last_model
+            .as_ref()
+            .is_some_and(|previous| previous != &model);
+        self.session_change.pending.as_ref().filter(|pending| {
+            pending.policy == "immediately"
+                || self.session_change_flushed
+                || (pending.policy == "on_prefix_rebuild"
+                    && (self.session_change_rebuild || switched))
+        })
     }
 
     /// Decide every refusal for a warm from what the actor and the WAL already hold, and
@@ -8679,6 +8822,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 &self.key,
             );
         }
+        self.session_change_recorded |= snapshot
+            .checkpoint_at_head
+            .ownership
+            .as_ref()
+            .is_some_and(|ownership| ownership.session_change_recorded);
         self.prior_snapshot = Some(snapshot);
         Ok(())
     }
