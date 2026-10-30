@@ -8,13 +8,30 @@ bash scripts/prepush.sh
 
 The dispatcher uses `ck motor run` (the same build service as AFT's `runon`). It
 never builds on the Mac as a fallback. First it runs the fast Linux static guards.
-Only when those pass does it launch the unchanged operator script suites in
-`linux-operator`, concurrently with independent Linux portable, unit/doc,
-integration-1 through integration-4, production, MSRV, WAL and deployment jobs,
-alongside native Windows and targeted macOS. Static/operator/WAL jobs reserve
-2 CPUs, production lint/tests and MSRV checking 4, and full workspace/archive or
-optimized module builds 8. Each launch documents its work rather than reserving
-12/16 CPUs to influence placement. Each remote lane has a persistent
+Only when those pass does it admit the remaining jobs through a **32-vCPU
+concurrent budget**, including Windows and macOS. The dispatcher prints that
+budget and the queued plan's total (42 vCPUs) before dispatch. Fast uses two
+alone. The initial wave is portable (8), Windows (4), integration shard 2 (6),
+shards 1/3/4 (4 each), and macOS (2): exactly 32. Unit/doc (4), production (4)
+and `linux-small` (2) use released slots as soon as they fit, rather than holding
+reservations in Motor's admission queue or waiting for a whole-wave barrier.
+An UNKNOWN job keeps its reservation because it may still be running. If those
+reservations prevent any remaining job from fitting, the remaining jobs are
+reported NOT-RUN rather than exceeding the budget or waiting indefinitely.
+The small lane runs the unchanged operator suite, MSRV, WAL and deployment checks
+in one job with a shared warm target. An operator failure is recorded but does
+not suppress the independent Rust checks; MSRV/WAL run before fixture setup.
+
+Measured runner times were 934s for portable, 794s for shard 2 (372s replay),
+646s for shard 1 (247s replay), 479s for unit and 449s for production. Shard 2
+gets two additional compiler workers; every shard still uses four nextest slots.
+The long lanes start first and the shorter jobs fill capacity behind them,
+targeting a warm, idle-pool critical path below 20 minutes. This is a scheduling
+target, not a claimed measurement: cold compilation, Windows's full sequential
+replay and external fleet contention can still dominate. A capacity refusal is
+still NOT-RUN with its exact reason, never retried or counted as coverage.
+Each launch documents its size rather than reserving 12/16 CPUs to influence
+placement. Each remote lane has a persistent
 detached Git worktree in a pool beside the scratch checkout, by default
 `../broca-prepush-lanes/LANE`. Set `BROCA_PREPUSH_LANE_POOL` to choose another
 persistent pool. A lane is checked for dirtiness **before** checkout and must
@@ -122,14 +139,19 @@ The first remote action verifies every entry with native PowerShell and exits
 NOT-RUN (200), naming the first missing/mismatched file, before tests/bootstrap.
 Malformed or incomplete inventories and unlisted input files also refuse the lane.
 
-Windows uses the image's Python **3.14** (`python`), Node **24** with npm,
-nats-server **2.15.0**, CMake, Ninja and Bun **1.4.4**. Their version commands are
-checked immediately after the manifest; a missing or unsupported tool is also
-NOT-RUN (200), not silently downloaded or substituted. Linux retains the CI's
+Windows requires the image's Python **3.14** (`python`), nats-server **2.15.0**
+and Bun **1.4.2**. After manifest verification it probes Node **24** with npm,
+CMake **4.4.5** and Ninja **1.13.2**, preferring matching image tools. Missing or
+unsupported tools use the checked offline ZIPs staged by the caller: Node
+**24.11.1** (including npm), CMake **4.4.5**, Ninja **1.13.2**. Node's image probe
+accepts the 24.x family; CMake and Ninja require the exact pins. Extracted tools
+are version-checked again and their paths are passed back to Git Bash before
+Cargo or any tests run. A missing/bad input or unusable fallback is NOT-RUN (exit 200).
+There are no runtime downloads on Windows. Linux retains the CI's
 Node20/pinned-NATS setup. These approved image versions are an explicit Windows
 environment difference from GitHub's setup actions, not a claimed byte match.
-The runtime-download helper is Linux-only; Windows has no Python/Node archive
-fallback that could silently replace an unsupported image version.
+The runtime-download helper remains Linux-only. Windows fallback extraction
+happens only after every input byte has passed manifest verification.
 
 Subc stays a Git checkout because its selected `subc-core` and `subc-daemon`
 build scripts embed Git HEAD and dirty state without a supported override.
@@ -146,13 +168,14 @@ fixtures with `CARGO_NET_OFFLINE=true`. It never fetches fixture Git repositorie
 or downloads runtimes/NATS inside the VM. Motor must stage the locked Cargo
 sources for the locked fixture graphs; a missing crate/revision fails with
 Cargo's exact offline diagnostic in the summary. No tests are skipped for a
-cache miss. Existing image runtimes are required rather than shipped again.
+cache miss. Only Node/npm, CMake and Ninja have shipped offline fallbacks;
+Python, NATS and Bun are required image prerequisites.
 
 After the image-prerequisite check, the fast lane starts with fmt, file-only Rust
 pins/counts/goldens, `cargo fetch --locked`, and an offline locked
 dependency resolution. Train preconditions, path dependencies, dependency-feature
 graphs and the portable-selection fixture guard also finish before native jobs
-start. The unchanged shared operator suite runs in required `linux-operator`,
+start. The unchanged shared operator suite runs in required `linux-small`,
 overlapping the native jobs; it still checks fixture SHAs, consent pins,
 test-group/guard lists, workflow contracts and every operator script. Those
 guards are read-only, and a failed operator job fails the final gate.
@@ -181,16 +204,21 @@ another job, dispatch the machine-side lanes from AFT instead. Do **not** put
 
 1. `bash scripts/prepush.sh --lane fast` with `runon: "linux,2c,net"`.
 2. Only on success, concurrently dispatch from **separate checkouts**:
-   - `--lane linux-unit`, `--lane linux-portable`, `--lane linux-deploy` and
-     `--lane linux-integration-1` through `-4` with `runon: "linux,8c,net"`;
-   - `--lane linux-production` and `--lane linux-msrv` with `runon: "linux,4c,net"`;
-   - `--lane linux-operator` and `--lane linux-wal` with `runon: "linux,2c,net"`;
+    - `--lane linux-portable` with `runon: "linux,8c,net"`;
+    - `--lane linux-integration-2` with `runon: "linux,6c,net"`;
+    - `--lane linux-unit`, `--lane linux-production` and integration shards 1/3/4
+      with `runon: "linux,4c,net"`;
+    - `--lane linux-small` with `runon: "linux,2c,net"` (operator/MSRV/WAL/deploy);
    - `--lane windows` with `runon: "windows"`, after supplying the prepared input
      inside that worktree's non-ignored `prepush-inputs/`.
    - `bash scripts/prepush.sh --lane macos` with `runon: "macos"` (uses `nice -n 10`).
-3. Wait for **every** job, retain all exit statuses and print complete
+3. Keep the sum of in-flight requests at or below 32, counting Windows as four
+   and macOS as two. Follow the dispatcher priority above and admit deferred
+   jobs only as slots are released. Wait for **every** job, retain all exit statuses and print complete
    failure logs. A missing/refused/timed-out lane is a failure, not coverage.
 
+The individual `linux-operator`, `linux-msrv`, `linux-wal` and `linux-deploy` lanes
+remain available for diagnostics but are not separately dispatched.
 `--lane linux` remains an explicitly sequential diagnostic aggregate; it is not
 dispatched by the gate. It runs the same steps
 but cannot demonstrate the parallel wall-time budget. Direct AFT dispatch does
@@ -209,20 +237,20 @@ failure; Windows-target clippy on Linux is **not** native Windows coverage.
 
 | CI job / expanded lanes | Pre-push equivalent | Selection and remaining differences |
 | --- | --- | --- |
-| `fixtures` → `fixtures.yml: fixtures` (Linux, Windows) | Fixture setup in Linux unit/integration/production/deploy and Windows jobs | Same pinned source SHAs and locked build/package/unpack. Windows receives Subc's full Git source and a checked plain Claustrum archive, then builds offline. |
+| `fixtures` → `fixtures.yml: fixtures` (Linux, Windows) | Fixture setup in Linux unit/integration/production/small and Windows jobs | Same pinned source SHAs and locked build/package/unpack. Windows receives Subc's full Git source and a checked plain Claustrum archive, then builds offline. |
 | Scheduled fixture variant (Linux, Windows) | **Not part of the pre-push gate** | Schedule resolves both siblings' current `master` tips. A pre-push result cannot attest to future moving tips at 06:00 UTC. Daily compatibility remains CI-owned; push/PR fixtures are pinned. |
 | `lint` (Ubuntu, Windows) | `linux-portable` / Windows native clippy | `cargo fmt --all -- --check`; `cargo clippy --locked --workspace --all-targets` with the four features from `rust-test-gate.sh`, `-- -D warnings`. Linux preflight additionally cross-clippies `x86_64-pc-windows-gnu`. |
-| `scripts` (Ubuntu) | `fast` guards then concurrent, required `linux-operator` | Train preconditions and locked fetch remain before native jobs. `linux-operator` runs unchanged `bash scripts/script-suites.sh`; same shared inventory and self-tests. |
+| `scripts` (Ubuntu) | `fast` guards then the required `linux-small` job | Train preconditions and locked fetch remain before native jobs. `linux-small` runs unchanged `bash scripts/script-suites.sh`; same shared inventory and self-tests. |
 | `store-contention-macos` | `bash scripts/prepush.sh --lane macos` | `nice -n 10 cargo test --locked -p broca-store-contention-tests --lib`. Native macOS; not substituted by Linux/Windows unit results. |
-| `wal-reader` (Ubuntu, Windows) | `linux-wal` / WAL steps in windows | `cargo test --locked -p broca-wal-reader`; `cargo test --locked -p broca-wal --lib framing::tests::v4`, including golden v4 codec and open-reader unlink semantics. |
+| `wal-reader` (Ubuntu, Windows) | WAL steps in `linux-small` / windows | `cargo test --locked -p broca-wal-reader`; `cargo test --locked -p broca-wal --lib framing::tests::v4`, including golden v4 codec and open-reader unlink semantics. |
 | `wal-reader` (macOS) | `bash scripts/prepush.sh --lane macos` | Same two commands under `nice -n 10`, on native macOS, alongside store contention. |
 | `integration-build` / Archive (Ubuntu, Windows) | Archive step in each `linux-integration-K` and windows | `bash scripts/ci-integration.sh build ARCHIVE`: independent libtest/nextest nonzero inventory equality, then archive with CI's four features. Linux also runs `python3 scripts/test-portable-test-selection.py` against built inventory. |
 | `integration` (Ubuntu shards 1–4/4; Windows shards 1–4/4) | `linux-integration-1` through `-4` / four Windows replays | `bash scripts/ci-integration.sh run ARCHIVE K/4`; unchanged full CI filter, hash partitioning, sentinel, profile, pinned NATS, aimock and required fixtures. Linux partitions are parallel, Windows sequential. No portable-only filter on Windows. |
 | `unit` / Lib/bin/doc (Ubuntu, Windows) | `linux-unit` / CI lib/bin/doc step in windows | Path-dependency checker + tests; `cargo test --locked --workspace --lib --bins --no-fail-fast` with the four features; independent doctest count and full doctests if positive. Includes store contention; no portable unit exclusions. |
 | `production-features`: stable clippy | `linux-production` | `cargo clippy --locked -p broca-core -p broca-module -p broca-module-serve --all-targets -- -D warnings`, without test-clock or other test-gate features. |
 | `production-features`: stable lib/bin | `linux-production` | `cargo test --locked -p broca-core -p broca-module -p broca-module-serve --lib --bins --no-fail-fast`, without test-clock, with required Linux fixtures/aimock. |
-| `production-features`: MSRV | `linux-msrv` | CI installs `1.96` and runs `cargo +1.96 check --locked --workspace --all-targets`. Motor runs the same check using its preinstalled `+1.96.0` compiler: the uninstalled minor alias tries to sync into read-only RUSTUP_HOME. This still checks the promised 1.96 MSRV, not the default compiler. |
-| `linux-deploy` / real ELF deployment | `linux-deploy` | Same locked release build of ck-broca, broca-session, broca-run; `BROCA_REQUIRE_LINUX_DEPLOY=1`, actual subc and `LinuxDeployTests.test_real_linux_subc_stage_place_restart_verify -v`; uses motor's target directory rather than checkout-local target. |
+| `production-features`: MSRV | MSRV step in `linux-small` | CI installs `1.96` and runs `cargo +1.96 check --locked --workspace --all-targets`. Motor runs the same check using its preinstalled `+1.96.0` compiler: the uninstalled minor alias tries to sync into read-only RUSTUP_HOME. This still checks the promised 1.96 MSRV, not the default compiler. |
+| `linux-deploy` / real ELF deployment | Deployment step in `linux-small` | Same locked release build of ck-broca, broca-session, broca-run; `BROCA_REQUIRE_LINUX_DEPLOY=1`, actual subc and `LinuxDeployTests.test_real_linux_subc_stage_place_restart_verify -v`; uses motor's target directory rather than checkout-local target. |
 | `test` aggregate (Ubuntu, Windows display names) | Dispatcher's nonzero result on any lane failure | Includes targeted macOS results as well as both full fixture platforms. A missing, cancelled or failed lane never counts as success. |
 
 Actions-only checkout/cache telemetry, wait/download/upload-artifact plumbing,

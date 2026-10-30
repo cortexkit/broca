@@ -14,6 +14,7 @@ import tempfile
 import tarfile
 import tomllib
 import unittest
+import zipfile
 from unittest.mock import patch
 
 import yaml
@@ -128,17 +129,38 @@ a=p.parse_args(); Path(a.output).mkdir(parents=True, exist_ok=True)
         self.bin.mkdir()
         ck = self.bin / 'ck'
         ck.write_text('''#!/usr/bin/env python3
-import os, pathlib, sys, time
+import atexit, fcntl, json, os, pathlib, sys, time
 lane = sys.argv[-1].split()[-1]
 root = pathlib.Path(os.environ['FIXTURE'])
+cpus = int(sys.argv[sys.argv.index('--vcpus') + 1]) if '--vcpus' in sys.argv else 2
+def reserve(delta):
+    with (root / 'target/cpu.lock').open('a+') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = root / 'target/cpus.json'
+        state = json.loads(path.read_text()) if path.exists() else {'active': 0, 'peak': 0, 'starts': 0}
+        state['active'] += delta
+        state['peak'] = max(state['peak'], state['active'])
+        if delta > 0 and lane != 'fast':
+            state['starts'] += 1
+        path.write_text(json.dumps(state))
+        return state['starts']
+barrier = os.open(root / 'target/barrier', os.O_RDWR) if os.environ.get('CPU_BARRIER') and lane != 'fast' else None
+starts = reserve(cpus)
+atexit.register(reserve, -cpus)
+if barrier is not None:
+    if starts <= 7:
+        if starts == 7:
+            os.write(barrier, b'x' * 7)
+        os.read(barrier, 1)
+    os.close(barrier)
 record = pathlib.Path(sys.argv[sys.argv.index('--record-file') + 1])
 record.write_text('{"type":"accepted"}\\n')
 with (root / 'events').open('a') as out:
     out.write(' '.join(sys.argv[1:]) + '\\n')
 if lane == os.environ.get('REFUSE_LANE'):
-    print('ck motor run: refused before start: fixture admission refusal')
+    print('ck motor run: refused before start: runner_full: hosted_capacity')
     sys.exit(200)
-if lane == os.environ.get('UNKNOWN_LANE'):
+if lane == os.environ.get('UNKNOWN_LANE') or (os.environ.get('UNKNOWN_ALL') and lane != 'fast'):
     print('ck motor run: connection lost; outcome unknown')
     sys.exit(201)
 (root / (lane + '.started')).touch()
@@ -153,7 +175,7 @@ if lane == 'linux-unit':
             sys.exit('Windows was not launched in parallel')
         time.sleep(.01)
 if lane == os.environ.get('FAIL_LANE'):
-    if lane == 'linux-msrv':
+    if lane == 'linux-small':
         print('error[E0599]: fixture MSRV compiler error')
     print('FAIL broca-module::it permissions::warming_route')
     sys.exit(19)
@@ -182,26 +204,27 @@ print('Summary: 1 test run: 1 passed')
         result = self.run_prepush(FAIL_LANE='windows')
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         events = (self.root / 'events').read_text().splitlines()
-        self.assertEqual(len(events), 14)
+        self.assertEqual(len(events), 11)
         self.assertIn('--lane fast', events[0])
         self.assertTrue(any('--vcpus 8' in e and '--lane linux-portable' in e for e in events))
         self.assertTrue(any('--platform windows' in e and '--lane windows' in e for e in events))
         windows = next(e for e in events if '--platform windows' in e)
         self.assertNotIn('--net', windows)
         self.assertNotIn('--sibling', windows)
-        self.assertIn('--vcpus 8', windows)
+        self.assertIn('--vcpus 4', windows)
         requests = {e.split('--lane ')[-1].strip("'\""): shlex.split(e) for e in events}
-        sizes = {'fast': 2, 'linux-operator': 2, 'linux-production': 4,
-                 'linux-msrv': 4, 'linux-wal': 2, 'linux-deploy': 8,
-                 'linux-portable': 8, 'linux-unit': 8, 'windows': 8,
-                 **{f'linux-integration-{shard}': 8 for shard in range(1, 5)}}
+        sizes = {'fast': 2, 'linux-small': 2, 'linux-production': 4, 'macos': 2,
+                 'linux-portable': 8, 'linux-unit': 4, 'windows': 4,
+                 **{f'linux-integration-{shard}': 6 if shard == 2 else 4 for shard in range(1, 5)}}
         for name, cpus in sizes.items():
             args = requests[name]
             self.assertEqual(args[args.index('--vcpus') + 1], str(cpus))
         linux = [shlex.split(e) for e in events if '--lane linux-' in e]
-        self.assertEqual(len(linux), 11)
-        self.assertEqual(len({e[e.index('--cwd') + 1] for e in linux}), 11)
-        self.assertTrue(any('--lane linux-operator' in e for e in events))
+        self.assertEqual(len(linux), 8)
+        self.assertEqual(len({e[e.index('--cwd') + 1] for e in linux}), 8)
+        self.assertTrue(any('--lane linux-small' in e for e in events))
+        for old in ('linux-operator', 'linux-msrv', 'linux-wal', 'linux-deploy'):
+            self.assertNotIn(old, requests)
         self.assertIn('FAILED windows', result.stdout)
         self.assertNotIn('FAILED linux', result.stdout)
         self.assertGreaterEqual(result.stdout.count('permissions::warming_route'), 2)
@@ -212,7 +235,7 @@ print('Summary: 1 test run: 1 passed')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('prepush lane summary', result.stdout)
         self.assertIn('total wall', result.stdout)
-        for lane in ('fast', 'linux-operator', 'linux-portable', 'linux-unit', 'linux-msrv', 'windows', 'macos'):
+        for lane in ('fast', 'linux-small', 'linux-portable', 'linux-unit', 'windows', 'macos'):
             self.assertRegex(result.stdout, rf'{lane}\s+PASS\s+exit=0\s+wall=\d+s')
         self.assertIn('request-to-start=', result.stdout)
         self.assertIn('run=0.017s', result.stdout)
@@ -221,6 +244,69 @@ print('Summary: 1 test run: 1 passed')
         lane_common = subprocess.check_output(['git', '-C', str(self.root / 'lane-pool/linux-unit'),
                                                'rev-parse', '--path-format=absolute', '--git-common-dir'], text=True).strip()
         self.assertEqual(lane_common, common)
+
+    def test_concurrent_cpu_requests_never_exceed_32(self):
+        (self.root / 'target').mkdir()
+        os.mkfifo(self.root / 'target/barrier')
+        result = self.run_prepush(CPU_BARRIER='1')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        state = json.loads((self.root / 'target/cpus.json').read_text())
+        self.assertEqual(state['active'], 0)
+        self.assertEqual(state['peak'], 32)
+        self.assertIn('at most 32 concurrent (42 across queued lanes)', result.stdout)
+
+    def test_capacity_refusal_keeps_its_name_and_does_not_skip_other_lanes(self):
+        result = self.run_prepush(REFUSE_LANE='linux-integration-3')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertRegex(result.stdout, r'linux-integration-3\s+NOT-RUN\s+exit=200')
+        self.assertIn('runner_full: hosted_capacity', result.stdout)
+        self.assertNotRegex(result.stdout, r'linux-integration-3\s+PASS')
+        self.assertTrue((self.root / 'linux-unit.started').exists())
+        self.assertTrue((self.root / 'linux-small.started').exists())
+
+    def test_unknown_jobs_do_not_release_cpu_budget_for_more_requests(self):
+        result = self.run_prepush(UNKNOWN_ALL='1')
+        self.assertNotEqual(result.returncode, 0)
+        events = (self.root / 'events').read_text().splitlines()
+        self.assertEqual(len(events), 8)
+        for lane in ('linux-unit', 'linux-production', 'linux-small'):
+            self.assertRegex(result.stdout, rf'{lane}\s+NOT-RUN\s+exit=204')
+            self.assertFalse((self.root / (lane + '.started')).exists())
+        self.assertIn('UNKNOWN jobs still hold the remaining vCPU budget', result.stdout)
+
+    def test_small_lane_keeps_independent_checks_after_operator_failure(self):
+        import re
+        source = (ROOT / 'scripts/lib/prepush-lane.sh').read_text()
+        for name in ('fixtures', 'deploy'):
+            source = re.sub(r'^' + name + r'\(\) \{.*?^\}',
+                            name + '() { echo ' + name + ' >> "$FIXTURE/order"; }',
+                            source, flags=re.M | re.S)
+        (self.root / 'scripts/lib/prepush-lane.sh').write_text(source)
+        (self.root / 'scripts/script-suites.sh').write_text('echo operator >> "$FIXTURE/order"; exit 19\n')
+        for name, body in {
+            'rustc': 'echo fixture rustc', 'git': 'exit 0', 'uname': 'echo Linux',
+            'cargo': 'echo "cargo $* jobs=$CARGO_BUILD_JOBS" >> "$FIXTURE/order"',
+        }.items():
+            path = self.bin / name
+            path.write_text('#!/bin/sh\n' + body + '\n')
+            path.chmod(0o755)
+        home = self.root / 'home'
+        home.mkdir(mode=0o700)
+        result = subprocess.run(['bash', 'scripts/prepush.sh', '--lane', 'linux-small'], cwd=self.root,
+                                env=dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}',
+                                         HOME=str(home), FIXTURE=str(self.root),
+                                         CARGO_TARGET_DIR=str(self.root / 'target-cache')),
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        order = (self.root / 'order').read_text().splitlines()
+        for command in ('cargo fetch --locked jobs=2',
+                        'cargo +1.96.0 check --locked --workspace --all-targets jobs=2',
+                        'cargo test --locked -p broca-wal-reader jobs=2',
+                        'cargo test --locked -p broca-wal --lib framing::tests::v4 jobs=2',
+                        'operator', 'fixtures', 'deploy'):
+            self.assertIn(command, order)
+        self.assertLess(order.index('operator'), order.index('deploy'))
+        self.assertIn('operator scripts, pins and dependency guards', result.stdout)
 
     def test_dirty_persistent_worktree_is_not_checked_out_or_dispatched(self):
         pool = self.root / 'lane-pool'
@@ -314,19 +400,19 @@ print('Summary: 1 test run: 1 passed')
         self.assertFalse((self.root / 'windows.started').exists())
 
     def test_operator_failure_is_required_but_does_not_block_native_dispatch(self):
-        result = self.run_prepush(FAIL_LANE='linux-operator')
+        result = self.run_prepush(FAIL_LANE='linux-small')
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn('FAILED linux-operator', result.stdout)
+        self.assertIn('FAILED linux-small', result.stdout)
         self.assertTrue((self.root / 'linux-unit.started').exists())
         self.assertTrue((self.root / 'windows.started').exists())
 
     def test_msrv_failure_summary_prints_first_error_and_complete_output(self):
-        result = self.run_prepush(FAIL_LANE='linux-msrv')
+        result = self.run_prepush(FAIL_LANE='linux-small')
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         summary = result.stdout.split('==> prepush lane summary', 1)[1]
-        self.assertIn('FIRST ERRORS linux-msrv', summary)
+        self.assertIn('FIRST ERRORS linux-small', summary)
         self.assertIn('error[E0599]: fixture MSRV compiler error', summary)
-        self.assertIn('FAILED linux-msrv: complete output', summary)
+        self.assertIn('FAILED linux-small: complete output', summary)
 
     def test_msrv_uses_installed_patch_toolchain_not_syncing_minor_alias(self):
         shutil.copy(ROOT / 'scripts/lib/prepush-lane.sh', self.root / 'scripts/lib/prepush-lane.sh')
@@ -445,7 +531,7 @@ print('fixture cargo completed')
                      f'exec {shlex.quote(real_mkdir)} "$@"',
             'chmod': 'echo "POSIX chmod refused" >&2; exit 77',
             'rustc': 'printf reached > "$FIXTURE/toolchain-reached"; exit 66',
-            'powershell.exe': 'exit 0',
+            'powershell.exe': 'mkdir -p "$FIXTURE/target/scratch"; printf "%s\\n" "$FIXTURE/offline tools" > "$FIXTURE/target/scratch/prepush-windows.paths"',
         }
         for name, body in stubs.items():
             path = self.bin / name
@@ -456,6 +542,7 @@ print('fixture cargo completed')
 import os,pathlib,sys
 assert 'prepush_scratch' in sys.argv and '--offline' in sys.argv
 root=pathlib.Path(os.environ['FIXTURE'])
+assert os.environ['PATH'].split(os.pathsep)[0] == str(root/'offline tools')
 (root/'native-helper-called').touch()
 scratch=root/'native-private-temp'; scratch.mkdir()
 print(scratch)
@@ -476,7 +563,7 @@ print(scratch)
             'uname': 'echo MINGW64_NT',
             'cygpath': 'for value; do :; done; printf "%s\\n" "$value"',
             'powershell.exe': '''case "$*" in
-  *verify-prepush-inputs.ps1*"-InputsDirectory $PWD/prepush-inputs") ;;
+  *verify-prepush-inputs.ps1*"-InputsDirectory $PWD/prepush-inputs "*"-ToolsDirectory "*"-PathFile "*) ;;
   *) echo 'wrong verifier invocation' >&2; exit 88;;
 esac
 echo 'prepush: NOT-RUN windows: offline input manifest.json is missing on the runner' >&2
@@ -1029,11 +1116,13 @@ class WindowsOfflineInputs(unittest.TestCase):
         self.assertFalse((self.root / 'output/asset').exists())
         download.assert_not_called()
 
-    def test_linux_runtime_pin_is_literal_and_complete(self):
+    def test_runtime_pins_are_literal_and_complete(self):
         assets = self.inputs.settings(ROOT / 'scripts/lib/prepush-assets.conf')
-        self.assertEqual(set(assets), {'NODE_LINUX_URL', 'NODE_LINUX_SHA256'})
-        self.assertTrue(assets['NODE_LINUX_URL'].startswith('https://'))
-        self.assertRegex(assets['NODE_LINUX_SHA256'], r'^[a-f0-9]{64}$')
+        prefixes = ('NODE_LINUX', 'NODE_WINDOWS', 'CMAKE_WINDOWS', 'NINJA_WINDOWS')
+        self.assertEqual(set(assets), {p + suffix for p in prefixes for suffix in ('_URL', '_SHA256')})
+        for prefix in prefixes:
+            self.assertTrue(assets[prefix + '_URL'].startswith('https://'))
+            self.assertRegex(assets[prefix + '_SHA256'], r'^[a-f0-9]{64}$')
 
     def test_windows_runtime_download_helper_is_not_available(self):
         result = subprocess.run(['bash', str(ROOT / 'scripts/lib/prepush-tools.sh'),
@@ -1152,7 +1241,9 @@ class WindowsOfflineInputs(unittest.TestCase):
         self.assertEqual(set(listed), {path.name for path in output.iterdir()} - {'transport-manifest.json'})
         self.assertTrue(set(listed) - {'manifest.json', 'subconscious-source.bundle',
                                      'claustrum-source.tar'})
-        self.assertTrue(all(name in {'manifest.json', 'subconscious-source.bundle', 'claustrum-source.tar'}
+        tool_archives = {'node-v24.11.1-win-x64.zip', 'cmake-4.4.5-windows-x86_64.zip', 'ninja-win.zip'}
+        self.assertTrue(tool_archives <= set(listed))
+        self.assertTrue(all(name in {'manifest.json', 'subconscious-source.bundle', 'claustrum-source.tar'} | tool_archives
                             or name.endswith('.tgz') for name in listed))
         self.assertIn('manifest.json', listed)
         self.assertIn('subconscious-source.bundle', listed)
@@ -1186,34 +1277,56 @@ class WindowsInputVerification(unittest.TestCase):
             self.skipTest('PowerShell is required to execute the native Windows input verifier')
         self.tmp = tempfile.TemporaryDirectory(prefix='broca-input-verification-')
         self.addCleanup(self.tmp.cleanup)
-        self.inputs = Path(self.tmp.name)
+        self.root = Path(self.tmp.name)
+        self.inputs = self.root / 'inputs'
+        self.inputs.mkdir()
         self.files = []
         for name in ('manifest.json', 'subconscious-source.bundle', 'claustrum-source.tar', 'package.tgz'):
             data = ('verified fixture ' + name).encode()
             (self.inputs / name).write_bytes(data)
             self.files.append({'name': name, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+        archives = {
+            'node-v24.11.1-win-x64.zip': ('node-v24.11.1-win-x64/node.exe', 'node-v24.11.1-win-x64/npm.cmd'),
+            'cmake-4.4.5-windows-x86_64.zip': ('cmake-4.4.5-windows-x86_64/bin/cmake.exe',),
+            'ninja-win.zip': ('ninja.exe',),
+        }
+        for name, members in archives.items():
+            data = io.BytesIO()
+            with zipfile.ZipFile(data, 'w') as archive:
+                for member in members:
+                    archive.writestr(member, b'fixture executable')
+            content = data.getvalue()
+            (self.inputs / name).write_bytes(content)
+            self.files.append({'name': name, 'size': len(content), 'sha256': hashlib.sha256(content).hexdigest()})
         self.write_manifest()
         self.tools = {
-            'python.exe': 'Python 3.14.0', 'node.exe': 'v24.10.0', 'npm.cmd': '11.6.0',
+            'python.exe': 'Python 3.14.0', 'node.exe': 'v24.11.1', 'npm.cmd': '11.6.0',
             'nats-server.exe': 'nats-server: v2.15.0',
-            'cmake.exe': 'cmake version 4.1.2\n\nCMake suite maintained and supported by Kitware',
-            'ninja.exe': '1.13.1', 'bun.exe': '1.4.4',
+            'cmake.exe': 'cmake version 4.4.5\n\nCMake suite maintained and supported by Kitware',
+            'ninja.exe': '1.13.2', 'bun.exe': '1.4.2',
         }
 
     def write_manifest(self):
         (self.inputs / 'transport-manifest.json').write_text(json.dumps({'version': 1, 'files': self.files}))
 
-    def verify(self, *, missing=None, bad_exit=None):
+    def verify(self, *, missing=None, bad_exit=None, usable_fallback=False):
         def quote(value):
             return "'" + str(value).replace("'", "''") + "'"
         functions = []
+        offline = {'node.exe': 'v24.11.1', 'npm.cmd': '11.6.0',
+                   'cmake.exe': 'cmake version 4.4.5', 'ninja.exe': '1.13.2'}
         for name, version in self.tools.items():
             body = "throw 'fixture tool is missing'" if name == missing else (
                 f"Write-Host 'TOOL-CALLED {name}'; Write-Output {quote(version)}; "
                 f"$global:LASTEXITCODE = {9 if name == bad_exit else 0}")
+            if usable_fallback and name in ('node.exe', 'npm.cmd', 'cmake.exe', 'ninja.exe'):
+                body = (f"if (Test-Path {quote(self.root / 'tools')}) {{ "
+                        f"if (Get-ChildItem -LiteralPath {quote(self.root / 'tools')} -Recurse -Filter {quote(name)}) {{ "
+                        f"Write-Output {quote(offline[name])}; $global:LASTEXITCODE = 0; return }} }}; " + body)
             functions.append(f'function global:{name} {{ {body} }}')
         command = '\n'.join(functions) + (
-            f"\n& {quote(ROOT / 'scripts/lib/verify-prepush-inputs.ps1')} -InputsDirectory {quote(self.inputs)}; "
+            f"\n& {quote(ROOT / 'scripts/lib/verify-prepush-inputs.ps1')} -InputsDirectory {quote(self.inputs)} "
+            f"-ToolsDirectory {quote(self.root / 'tools')} -PathFile {quote(self.root / 'paths')}; "
             'exit $LASTEXITCODE')
         assert self.powershell is not None
         return subprocess.run([self.powershell, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
@@ -1227,10 +1340,12 @@ class WindowsInputVerification(unittest.TestCase):
     def test_valid_inputs_check_every_image_tool(self):
         result = self.verify()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn('verified 4 offline input files', result.stdout)
+        self.assertIn('verified 7 offline input files', result.stdout)
         self.assertEqual(result.stdout.count('TOOL-CALLED'), 7)
         for name in self.tools:
             self.assertIn('TOOL-CALLED ' + name, result.stdout)
+        self.assertFalse((self.root / 'tools').exists())
+        self.assertEqual((self.root / 'paths').read_text(), '')
 
     def test_missing_manifest_refuses_before_tools(self):
         (self.inputs / 'transport-manifest.json').unlink()
@@ -1273,27 +1388,64 @@ class WindowsInputVerification(unittest.TestCase):
         self.assert_refused(result, 'unlisted.zip')
         self.assertNotIn('TOOL-CALLED', result.stdout)
 
-    def test_each_missing_or_wrong_tool_is_not_run_and_named(self):
+    def test_each_missing_or_wrong_tool_refuses_when_no_usable_fallback(self):
         for name in self.tools:
             with self.subTest(missing=name):
                 self.assert_refused(self.verify(missing=name), name.split('.')[0])
             with self.subTest(wrong=name):
                 version = self.tools[name]
                 self.tools[name] = 'unsupported version'
-                self.assert_refused(self.verify(), name.split('.')[0])
-                self.tools[name] = version
+                try:
+                    self.assert_refused(self.verify(), name.split('.')[0])
+                finally:
+                    self.tools[name] = version
 
     def test_supported_format_but_wrong_pinned_tool_version_refuses(self):
         for name, wrong in (('python.exe', 'Python 3.13.5'), ('node.exe', 'v20.20.2'),
-                            ('nats-server.exe', 'nats-server: v2.10.26'), ('bun.exe', '1.4.3')):
+                            ('nats-server.exe', 'nats-server: v2.10.26'), ('bun.exe', '1.4.4')):
             with self.subTest(name=name):
                 version = self.tools[name]
                 self.tools[name] = wrong
-                self.assert_refused(self.verify(), name.split('.')[0])
-                self.tools[name] = version
+                try:
+                    self.assert_refused(self.verify(), name.split('.')[0])
+                finally:
+                    self.tools[name] = version
 
     def test_tool_failure_is_not_hidden_by_valid_version_output(self):
         self.assert_refused(self.verify(bad_exit='node.exe'), 'Node')
+
+    def test_missing_node_and_wrong_cmake_ninja_use_verified_offline_tools(self):
+        self.tools['cmake.exe'] = 'cmake version 3.31.0'
+        self.tools['ninja.exe'] = '1.12.1'
+        result = self.verify(missing='node.exe', usable_fallback=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for archive in ('node-v24.11.1-win-x64.zip', 'cmake-4.4.5-windows-x86_64.zip', 'ninja-win.zip'):
+            self.assertIn('from ' + archive, result.stdout)
+        paths = (self.root / 'paths').read_text().splitlines()
+        self.assertEqual(len(paths), 3)
+        self.assertTrue(all(Path(path).is_dir() for path in paths))
+
+    def test_missing_npm_replaces_node_and_npm_together(self):
+        result = self.verify(missing='npm.cmd', usable_fallback=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('using verified offline Node/npm', result.stdout)
+        self.assertNotIn('using verified offline CMake', result.stdout)
+        self.assertNotIn('using verified offline Ninja', result.stdout)
+        self.assertEqual(len((self.root / 'paths').read_text().splitlines()), 1)
+
+    def test_runtime_archive_bytes_are_checked_even_when_image_tools_match(self):
+        for name in ('node-v24.11.1-win-x64.zip', 'cmake-4.4.5-windows-x86_64.zip', 'ninja-win.zip'):
+            path = self.inputs / name
+            data = path.read_bytes()
+            for broken in (None, b'x' * len(data)):
+                with self.subTest(name=name, missing=broken is None):
+                    path.unlink()
+                    if broken is not None:
+                        path.write_bytes(broken)
+                    result = self.verify(usable_fallback=True)
+                    self.assert_refused(result, name)
+                    self.assertNotIn('TOOL-CALLED', result.stdout)
+                    path.write_bytes(data)
 
 
 class FixtureUnpack(unittest.TestCase):

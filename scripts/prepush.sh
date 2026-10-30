@@ -10,7 +10,7 @@ if [[ $# -gt 0 ]]; then
   if [[ $# == 2 && $1 == --lane ]]; then
     exec bash scripts/lib/prepush-lane.sh "$2"
   fi
-  echo 'usage: bash scripts/prepush.sh [--lane fast|linux-operator|linux|linux-portable|linux-unit|linux-integration-{1,2,3,4}|linux-production|linux-msrv|linux-wal|linux-deploy|windows|macos]' >&2
+  echo 'usage: bash scripts/prepush.sh [--lane fast|linux-small|linux-operator|linux|linux-portable|linux-unit|linux-integration-{1,2,3,4}|linux-production|linux-msrv|linux-wal|linux-deploy|windows|macos]' >&2
   exit 2
 fi
 command -v ck >/dev/null || {
@@ -26,8 +26,37 @@ if [[ -n "$(git status --porcelain)" ]]; then
 fi
 checkouts="${BROCA_PREPUSH_LANE_POOL:-$(dirname "$root")/broca-prepush-lanes}"
 mkdir -p "$checkouts"
-names=() pids=() results=() durations=()
+names=() pids=() results=() durations=() requests=()
 started=$SECONDS
+# Long native/archive lanes start first; short jobs fill released slots, not Motor's queue.
+plan_names=() plan_platforms=() plan_cpus=()
+queue_lane() {
+  plan_names+=("$1") plan_platforms+=("$2") plan_cpus+=("$3")
+}
+# Portable's measured 934s includes both workspace clippies and test builds: eight workers.
+queue_lane linux-portable linux 8
+# Windows builds/replays the whole workspace, but nextest can use only four slots.
+queue_lane windows windows 4
+# Shard 2 took 794s (372s replay), versus shard 1's 646s (247s replay): give its build six workers.
+queue_lane linux-integration-2 linux 6
+# Shard 1's 247s replay uses four slots, with four compiler workers for its archive.
+queue_lane linux-integration-1 linux 4
+# Shard 3 keeps its own archive and four execution/compiler slots, without an eight-CPU lease.
+queue_lane linux-integration-3 linux 4
+# Shard 4 keeps its own archive and four execution/compiler slots, without an eight-CPU lease.
+queue_lane linux-integration-4 linux 4
+# Native macOS runs only the targeted contention/WAL checks, under nice -n 10.
+queue_lane macos macos 2
+# Unit/doc took 479s; four execution/compiler workers leave capacity for the longer shards.
+queue_lane linux-unit linux 4
+# Production's three-package lint/tests took 449s and use four workers.
+queue_lane linux-production linux 4
+# Operator/MSRV/WAL/deployment share two workers and one warm target instead of four reservations.
+queue_lane linux-small linux 2
+cpu_budget=32
+planned_cpus=0
+for cpus in "${plan_cpus[@]}"; do planned_cpus=$((planned_cpus + cpus)); done
+echo "prepush: total requested vCPUs: at most $cpu_budget concurrent ($planned_cpus across queued lanes); fast uses 2 alone"
 
 prepare_lane_worktree() {
   local name="$1" destination="$checkouts/$1" common expected
@@ -63,21 +92,28 @@ launch() {
   [[ "$platform" != linux ]] || args+=(--net)
   args+=(--timeout 7200 --cwd "$checkouts/$name" --record-file "$logs/$name.motor.jsonl")
   [[ -z "$cpus" ]] || args+=(--vcpus "$cpus")
-  names+=("$name")
-  (
-    begin=$SECONDS
-    begin_ms="$(timestamp_ms)"
-    rc=0
-    requested_ms="$begin_ms"
-    ready=0
+  local index="${#names[@]}"
+  local begin=$SECONDS begin_ms ready=0 status
+  begin_ms="$(timestamp_ms)"
+  # Worktrees share Git metadata; serialize checkout preparation on the caller.
+  {
     if [[ "$prepared" == 1 && "$name" == windows ]]; then
-      status="$(git -C "$checkouts/windows" status --porcelain --untracked-files=normal)"
+      status="$(git -C "$checkouts/windows" status --porcelain --untracked-files=normal)" || status=unreadable
       if [[ "$(git -C "$checkouts/windows" rev-parse HEAD)" == "$candidate" && "$status" == '?? prepush-inputs/' ]]; then
         ready=1
       fi
     elif prepare_lane_worktree "$name"; then
       ready=1
     fi
+  } > "$logs/$name.prepare.log" 2>&1
+  names+=("$name") requests+=("$cpus")
+  (
+    if [[ ${scheduling:-0} == 1 ]]; then
+      trap 'printf "%s\n" "$index" >&3' EXIT
+    fi
+    rc=0
+    requested_ms="$begin_ms"
+    cat "$logs/$name.prepare.log"
     if [[ "$ready" != 1 ]]; then
       echo "prepush: NOT-RUN $name: could not prepare its isolated checkout"
       rc=204
@@ -153,26 +189,6 @@ if [[ ${results[0]} != 0 ]]; then
   summarize
   exit 1
 fi
-# Each lane has a different checkout: motor serializes jobs from one workspace.
-# Python/operator fixtures use at most two compiler workers, not a full build.
-launch linux-operator linux 2
-# Portable clippy plus lib/bin/integration compilation builds the full workspace.
-launch linux-portable linux 8
-# The unit lane builds all workspace lib/bin/doc targets with eight Cargo workers.
-launch linux-unit linux 8
-# Each shard compiles a full workspace archive; execution remains capped at four.
-for shard in 1 2 3 4; do launch "linux-integration-$shard" linux 8; done
-# Three-package lint/lib tests use four workers and need no large-memory lease.
-launch linux-production linux 4
-# Workspace metadata/type checking uses four workers rather than release codegen.
-launch linux-msrv linux 4
-# Two small WAL libraries and their tests use two workers.
-launch linux-wal linux 2
-# Optimized module/session/run compilation is a real full-stack build: eight workers.
-launch linux-deploy linux 8
-# Native macOS capacity is provided by its runner; commands remain nice -n 10.
-launch macos macos ''
-
 # All offline bytes stay inside the Windows worktree; no sibling-path capability.
 windows_begin=$SECONDS
 windows_ready=0
@@ -187,11 +203,9 @@ if prepare_lane_worktree windows > "$logs/windows-inputs.log" 2>&1; then
 fi
 cat "$logs/windows-inputs.log"
 echo "prepush: Windows input preparation wall $((SECONDS - windows_begin))s"
-if [[ "$windows_ready" == 1 ]]; then
-  # Windows compiles the full archive and workspace test binaries: eight workers.
-  launch windows windows 8 1
-else
+if [[ "$windows_ready" != 1 ]]; then
   names+=(windows)
+  requests+=(0)
   pids+=(0)
   results[${#names[@]}-1]=204
   durations[${#names[@]}-1]="$((SECONDS - windows_begin))"
@@ -199,7 +213,47 @@ else
   echo 'prepush: NOT-RUN windows: offline input preparation failed'
   [[ "$windows_inputs_owned" != 1 ]] || rm -rf -- "$checkouts/windows/prepush-inputs"
 fi
-for i in "${!names[@]}"; do
-  [[ "$i" == 0 || "${pids[$i]}" == 0 ]] || collect "$i"
+# A completion FIFO works with macOS's Bash 3 as well as Linux, unlike wait -n.
+mkfifo "$logs/completed.fifo"
+exec 3<> "$logs/completed.fifo"
+trap 'exec 3>&-; rm -f "$logs/completed.fifo"' EXIT
+scheduling=1 in_flight=0 active=0 pending="${#plan_names[@]}"
+admitted=()
+while [[ "$pending" -gt 0 || "$active" -gt 0 ]]; do
+  for p in "${!plan_names[@]}"; do
+    [[ ${admitted[$p]:-0} == 0 ]] || continue
+    if [[ "${plan_names[$p]}" == windows && "$windows_ready" != 1 ]]; then
+      admitted[$p]=1
+      pending=$((pending - 1))
+      continue
+    fi
+    cpus="${plan_cpus[$p]}"
+    [[ $((in_flight + cpus)) -le "$cpu_budget" ]] || continue
+    prepared=0
+    [[ "${plan_names[$p]}" != windows ]] || prepared=1
+    launch "${plan_names[$p]}" "${plan_platforms[$p]}" "$cpus" "$prepared"
+    admitted[$p]=1
+    pending=$((pending - 1)) active=$((active + 1)) in_flight=$((in_flight + cpus))
+    echo "prepush: requested vCPUs in flight=$in_flight/$cpu_budget"
+  done
+  if [[ "$active" -gt 0 ]]; then
+    IFS= read -r completed <&3
+    collect "$completed"
+    # A lost connection does not prove that the server released its CPUs.
+    if [[ ${results[$completed]} != 201 ]]; then
+      in_flight=$((in_flight - requests[completed]))
+    fi
+    active=$((active - 1))
+  elif [[ "$pending" -gt 0 ]]; then
+    for p in "${!plan_names[@]}"; do
+      [[ ${admitted[$p]:-0} == 0 ]] || continue
+      name="${plan_names[$p]}"
+      names+=("$name") pids+=(0) requests+=(0)
+      results[${#names[@]}-1]=204 durations[${#names[@]}-1]=0
+      echo "prepush: NOT-RUN $name: UNKNOWN jobs still hold the remaining vCPU budget" > "$logs/$name.log"
+      admitted[$p]=1
+    done
+    pending=0
+  fi
 done
 summarize

@@ -107,6 +107,11 @@ def prepare(output, source_cache, cache, *, snapshot_visible=False):
     output.mkdir(parents=True)
     if snapshot_visible:
         require_snapshot_visibility(output)
+    assets = settings(ROOT / 'scripts/lib/prepush-assets.conf')
+    for tool in ('NODE_WINDOWS', 'CMAKE_WINDOWS', 'NINJA_WINDOWS'):
+        url = assets[tool + '_URL']
+        download(url, output / url.rsplit('/', 1)[1], 'sha256',
+                 bytes.fromhex(assets[tool + '_SHA256']), cache)
     lock_bytes = (ROOT / 'package-lock.json').read_bytes()
     lock = json.loads(lock_bytes)
     packages = []

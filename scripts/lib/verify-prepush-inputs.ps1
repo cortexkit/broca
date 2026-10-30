@@ -1,4 +1,8 @@
-param([Parameter(Mandatory=$true)][string]$InputsDirectory)
+param(
+    [Parameter(Mandatory=$true)][string]$InputsDirectory,
+    [Parameter(Mandatory=$true)][string]$ToolsDirectory,
+    [Parameter(Mandatory=$true)][string]$PathFile
+)
 $ErrorActionPreference = 'Stop'
 function Refuse([string]$Name, [string]$Reason) {
     [Console]::Error.WriteLine("prepush: NOT-RUN windows: offline input $Name $Reason")
@@ -50,17 +54,59 @@ foreach ($path in $paths) {
 }
 Write-Output "prepush: verified $(@($manifest.files).Count) offline input files on Windows"
 
-function CheckTool([string]$Name, [string]$Executable, [string[]]$Arguments, [string]$Pattern) {
+function ProbeTool([string]$Name, [string]$Executable, [string]$Pattern) {
     try {
-        $output = (& $Executable @Arguments 2>&1 | Out-String).Trim()
-        if ($LASTEXITCODE -ne 0 -or $output -notmatch $Pattern) { Refuse $Name "has an unsupported version: $output" }
-    } catch { Refuse $Name 'is missing or could not report its version' }
+        $output = (& $Executable --version 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or $output -notmatch $Pattern) { return $false }
+    } catch { return $false }
     Write-Output "prepush: tool $Name $output"
+    return $true
 }
-CheckTool 'Python' 'python.exe' @('--version') '^Python 3\.14\.\d+$'
-CheckTool 'Node' 'node.exe' @('--version') '^v24\.\d+\.\d+$'
-CheckTool 'npm' 'npm.cmd' @('--version') '^\d+\.\d+\.\d+$'
-CheckTool 'nats-server' 'nats-server.exe' @('--version') '^nats-server: v2\.15\.0$'
-CheckTool 'CMake' 'cmake.exe' @('--version') '^cmake version \d+\.\d+\.\d+(\r?\n|$)'
-CheckTool 'Ninja' 'ninja.exe' @('--version') '^\d+\.\d+(\.\d+)?$'
-CheckTool 'Bun' 'bun.exe' @('--version') '^1\.4\.4$'
+function CheckTool([string]$Name, [string]$Executable, [string]$Pattern) {
+    $result = @(ProbeTool $Name $Executable $Pattern)
+    if ($result[-1] -ne $true) { Refuse $Name 'is missing or has an unsupported version' }
+    $result | Select-Object -SkipLast 1 | Write-Output
+}
+CheckTool 'Python' 'python.exe' '^Python 3\.14\.\d+$'
+CheckTool 'nats-server' 'nats-server.exe' '^nats-server: v2\.15\.0$'
+CheckTool 'Bun' 'bun.exe' '^1\.4\.2$'
+
+$addedPaths = @()
+function UseOfflineTool([string]$Name, [string]$Archive, [string]$BinDirectory) {
+    if (-not $listed.ContainsKey($Archive)) { Refuse $Archive 'is missing from the transport manifest' }
+    $destination = Join-Path $ToolsDirectory ([Guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Path $destination -Force | Out-Null
+        Expand-Archive -LiteralPath (Join-Path $InputsDirectory $Archive) -DestinationPath $destination
+        $bin = if ($BinDirectory) { Join-Path $destination $BinDirectory } else { $destination }
+        $env:PATH = $bin + [IO.Path]::PathSeparator + $env:PATH
+        $script:addedPaths += $bin
+    } catch { Refuse $Archive 'could not be extracted' }
+    Write-Output "prepush: using verified offline $Name from $Archive"
+}
+
+$node = @(ProbeTool 'Node' 'node.exe' '^v24\.\d+\.\d+$')
+$npm = @(ProbeTool 'npm' 'npm.cmd' '^\d+\.\d+\.\d+$')
+if ($node[-1] -eq $true -and $npm[-1] -eq $true) {
+    $node | Select-Object -SkipLast 1 | Write-Output
+    $npm | Select-Object -SkipLast 1 | Write-Output
+} else {
+    UseOfflineTool 'Node/npm' 'node-v24.11.1-win-x64.zip' 'node-v24.11.1-win-x64'
+    CheckTool 'Node' 'node.exe' '^v24\.11\.1$'
+    CheckTool 'npm' 'npm.cmd' '^\d+\.\d+\.\d+$'
+}
+foreach ($tool in @(
+    @('CMake', 'cmake.exe', '^cmake version 4\.4\.5(\r?\n|$)', 'cmake-4.4.5-windows-x86_64.zip', 'cmake-4.4.5-windows-x86_64/bin'),
+    @('Ninja', 'ninja.exe', '^1\.13\.2$', 'ninja-win.zip', '')
+)) {
+    $result = @(ProbeTool $tool[0] $tool[1] $tool[2])
+    if ($result[-1] -eq $true) { $result | Select-Object -SkipLast 1 | Write-Output }
+    else {
+        UseOfflineTool $tool[0] $tool[3] $tool[4]
+        CheckTool $tool[0] $tool[1] $tool[2]
+    }
+}
+try {
+    New-Item -ItemType Directory -Path (Split-Path -Parent $PathFile) -Force | Out-Null
+    [IO.File]::WriteAllLines($PathFile, [string[]]$addedPaths, [Text.UTF8Encoding]::new($false))
+} catch { Refuse 'tool PATH' 'could not be recorded for Git Bash' }

@@ -8,7 +8,7 @@ export CARGO_PROFILE_DEV_DEBUG=line-tables-only
 export CARGO_TERM_COLOR=always CI=true
 lane="${1:-}"
 case "$lane" in
-  fast|linux-operator|linux|linux-portable|linux-unit|linux-integration-[1234]|linux-production|linux-msrv|linux-wal|linux-deploy|windows|macos) ;;
+  fast|linux-small|linux-operator|linux|linux-portable|linux-unit|linux-integration-[1234]|linux-production|linux-msrv|linux-wal|linux-deploy|windows|macos) ;;
   *) echo "prepush: unknown lane $lane" >&2; exit 2 ;;
 esac
 platform="${lane%%-*}"
@@ -26,7 +26,13 @@ if [[ "$lane" == windows ]]; then
   }
   powershell.exe -NoProfile -NonInteractive -File \
     "$(cygpath -w "$root/scripts/lib/verify-prepush-inputs.ps1")" \
-    -InputsDirectory "$(cygpath -w "$BROCA_PREPUSH_INPUTS")"
+    -InputsDirectory "$(cygpath -w "$BROCA_PREPUSH_INPUTS")" \
+    -ToolsDirectory "$(cygpath -w "$root/target/prepush-windows-tools")" \
+    -PathFile "$(cygpath -w "$root/target/scratch/prepush-windows.paths")"
+  while IFS= read -r tool_path || [[ -n "$tool_path" ]]; do
+    PATH="$(cygpath -u "${tool_path%$'\r'}"):$PATH"
+  done < "$root/target/scratch/prepush-windows.paths"
+  export PATH
 fi
 python_exec=python3
 [[ "$lane" != windows ]] || python_exec=python
@@ -269,6 +275,19 @@ linux_image() {
   cc --version
 }
 
+operator_checks() {
+  step 'Linux image prerequisites' linux_image
+  [[ $last_rc == 0 ]] || summary
+  step 'locked script dependencies' cargo fetch --locked
+  [[ $last_rc == 0 ]] || summary
+  step 'Python script prerequisites' python_tools
+  [[ $last_rc == 0 ]] || summary
+  if ! python3 -c 'import tomllib, yaml' 2>/dev/null; then
+    export PYTHONPATH="$scratch/python-modules${PYTHONPATH:+:$PYTHONPATH}"
+  fi
+  step 'operator scripts, pins and dependency guards' bash scripts/script-suites.sh
+}
+
 case "$lane" in
   fast)
     export CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2
@@ -295,16 +314,7 @@ case "$lane" in
     ;;
   linux-operator)
     export CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2
-    step 'Linux image prerequisites' linux_image
-    [[ $last_rc == 0 ]] || summary
-    step 'locked script dependencies' cargo fetch --locked
-    [[ $last_rc == 0 ]] || summary
-    step 'Python script prerequisites' python_tools
-    [[ $last_rc == 0 ]] || summary
-    if ! python3 -c 'import tomllib, yaml' 2>/dev/null; then
-      export PYTHONPATH="$scratch/python-modules${PYTHONPATH:+:$PYTHONPATH}"
-    fi
-    step 'operator scripts, pins and dependency guards' bash scripts/script-suites.sh
+    operator_checks
     step 'clean worktree' clean
     ;;
   macos)
@@ -316,8 +326,9 @@ case "$lane" in
   linux|linux-*|windows)
     : "${CARGO_TARGET_DIR:?motor must supply its persistent target cache}"
     case "$lane" in
-      linux-production|linux-msrv) export CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=4 ;;
-      linux-wal) export CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2 ;;
+      linux-production|linux-msrv|linux-unit|linux-integration-[134]|windows) export CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=4 ;;
+      linux-integration-2) export CARGO_BUILD_JOBS=6 RUST_TEST_THREADS=4 ;;
+      linux-wal|linux-small) export CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2 ;;
       *) export CARGO_BUILD_JOBS=8 RUST_TEST_THREADS=4 ;;
     esac
     portable=0 unit=0 integration=0 production=0 msrv=0 wal=0 deployment=0 lint=0
@@ -330,6 +341,7 @@ case "$lane" in
       linux-msrv) msrv=1 ;;
       linux-wal) wal=1 ;;
       linux-deploy) deployment=1 ;;
+      linux-small) msrv=1 wal=1 deployment=1 ;;
       windows) lint=1 unit=1 integration=1 wal=1 ;;
     esac
     if [[ "$platform" == windows ]]; then
@@ -338,6 +350,14 @@ case "$lane" in
     rustc --version
     cargo --version
     cargo nextest --version
+    if [[ "$lane" == linux-small ]]; then
+      operator_checks
+      # These checks do not need fixtures, so a fixture failure must not suppress them.
+      step MSRV cargo +1.96.0 check --locked --workspace --all-targets
+      step 'WAL reader' cargo test --locked -p broca-wal-reader
+      step 'v4 framing' cargo test --locked -p broca-wal --lib framing::tests::v4
+      msrv=0 wal=0
+    fi
     if [[ "$platform" != windows && ( $unit == 1 || $integration == 1 || $production == 1 ) ]]; then
       step 'Node/Python runtimes' bash scripts/lib/prepush-tools.sh "$lane" "$scratch"
       if [[ $last_rc != 0 ]]; then
