@@ -480,6 +480,11 @@ fn closed_error() -> WalError {
 
 /// The append-only WAL log. The loop depends on the trait, not the impl.
 pub trait Wal {
+    /// The last prefix synced on this writer's descriptor, never speculative EOF.
+    /// Memory logs and wrappers without a durable file witness return `None`.
+    fn durable_publication(&self) -> Option<DurablePublication> {
+        None
+    }
     /// Current file location, including first-send relocation; absent for memory logs.
     fn log_path(&self) -> Option<&Path> {
         None
@@ -587,6 +592,32 @@ struct SyncProbe {
     dir_sync_paths: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
 }
 
+/// An immutable publication witness minted only by a successful writer sync.
+/// Readers must still authenticate lineage, frame hashes and contiguous ranges;
+/// the witness bounds their reads, not the lifetime of the file at its path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurablePublication {
+    path: PathBuf,
+    lineage: WalLineageId,
+    seq: u64,
+    end: u64,
+}
+
+impl DurablePublication {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    pub fn lineage(&self) -> WalLineageId {
+        self.lineage
+    }
+    pub fn sequence(&self) -> u64 {
+        self.seq
+    }
+    pub fn byte_end(&self) -> u64 {
+        self.end
+    }
+}
+
 pub struct FileWal {
     path: PathBuf,
     file: File,
@@ -604,6 +635,7 @@ pub struct FileWal {
     /// compare it with an authority and does not use it to reject an append. The belt catches
     /// the residual case: a draining old writer appending AFTER a new writer already wrote.
     last_write_end: u64,
+    synced_prefix: Cell<Option<(u64, u64)>>,
     /// The first barrier after each open syncs the WAL's parent directory so the
     /// file's name is durable, including when an earlier process did not sync it.
     dir_needs_sync: Cell<bool>,
@@ -1048,6 +1080,7 @@ impl FileWal {
             file,
             next_seq,
             last_write_end,
+            synced_prefix: Cell::new(None),
             dir_needs_sync: Cell::new(true),
             newly_created_dirs: RefCell::new(newly_created_dirs),
             config: WalConfig::LEGACY,
@@ -1139,6 +1172,13 @@ impl FileWal {
             self.dir_needs_sync.set(false);
         }
         Ok(())
+    }
+
+    fn record_synced_prefix(&self) {
+        // Capture the writer's known end, not a path-based EOF that might include
+        // another descriptor's writes. Readers still authenticate this prefix.
+        self.synced_prefix
+            .set(Some((self.next_seq.saturating_sub(1), self.last_write_end)));
     }
 }
 
@@ -1396,11 +1436,23 @@ impl FileWal {
         // Advance our high-water mark past the bytes we just wrote. Only OUR appends move
         // this, so "size unchanged since our last append" ⟺ no foreign write.
         self.last_write_end = current + bytes.len() as u64;
+        if sync {
+            self.record_synced_prefix();
+        }
         Ok(seq)
     }
 }
 
 impl Wal for FileWal {
+    fn durable_publication(&self) -> Option<DurablePublication> {
+        let (seq, end) = self.synced_prefix.get()?;
+        Some(DurablePublication {
+            path: self.path.clone(),
+            lineage: self.lineage_id?,
+            seq,
+            end,
+        })
+    }
     fn log_path(&self) -> Option<&Path> {
         Some(&self.path)
     }
@@ -1471,7 +1523,9 @@ impl Wal for FileWal {
     }
 
     fn sync(&self) -> Result<(), WalError> {
-        self.fsync()
+        self.fsync()?;
+        self.record_synced_prefix();
+        Ok(())
     }
 
     fn replay(&self) -> Result<Vec<FramedRecord>, WalError> {
@@ -1999,14 +2053,7 @@ fn scan_prefix<T>(
                         file_size: offset + frame.len() as u64,
                     });
                 }
-                decode_bytes_seeded(
-                    &frame,
-                    offset,
-                    scan.last_seq,
-                    1,
-                    Vec::new(),
-                    scan.lineage_id,
-                )?;
+                recover_prefix(&frame, offset, scan.last_seq, scan.lineage_id)?;
                 return Ok(scan);
             }
         }
@@ -2383,6 +2430,37 @@ struct DecodedBytes {
     lineage_id: Option<WalLineageId>,
 }
 
+/// A verified prefix, not a durability witness. Only the caller's descriptor
+/// sync can make the returned end eligible for durable index publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalRecoveryPrefix {
+    pub valid_end: u64,
+    pub last_seq: Option<u64>,
+}
+
+/// Recover an already-read suffix using the writer's damage classification.
+/// `absolute_start`, `previous_seq` and `lineage` must describe an authenticated
+/// preceding boundary (or the origin of an unindexed log). An unidentified legacy
+/// log supplies `None` for lineage. Damage before intact data is a typed WAL error;
+/// an incomplete or damaged final append is excluded from the returned prefix.
+/// This function does no I/O, syncing or truncation.
+pub fn recover_prefix(
+    bytes: &[u8],
+    absolute_start: u64,
+    previous_seq: Option<u64>,
+    lineage: Option<WalLineageId>,
+) -> Result<WalRecoveryPrefix, WalError> {
+    let decoded = decode_bytes_seeded(bytes, absolute_start, previous_seq, 1, Vec::new(), lineage)?;
+    Ok(WalRecoveryPrefix {
+        valid_end: decoded.valid_end,
+        last_seq: decoded
+            .records
+            .last()
+            .map(|(framed, _)| framed.seq)
+            .or(previous_seq),
+    })
+}
+
 #[cfg(test)]
 std::thread_local! {
     static DECODED_BYTE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -2539,7 +2617,7 @@ fn validate_contiguous_sequence(
 fn has_intact_data_after(bytes: &[u8], mut expected_lineage: Option<WalLineageId>) -> bool {
     (1..bytes.len().saturating_sub(crate::framing::HEADER_LEN - 1)).any(|offset| {
         let suffix = &bytes[offset..];
-        match decode_next(suffix) {
+        match decode_next_counted(suffix) {
             DecodeStep::Record { .. } | DecodeStep::NewerWriter { .. } => true,
             DecodeStep::Corrupt(_) => crate::framing::digest_verifies(suffix),
             DecodeStep::Lineage {
@@ -2775,6 +2853,40 @@ fn read_file_capped(path: &Path, max_bytes: u64) -> Result<Vec<u8>, WalError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn durable_publication_is_frozen_at_the_descriptor_sync() {
+        let path = tmp("durable-publication");
+        let mut wal = FileWal::open(&path).unwrap();
+        assert!(wal.durable_publication().is_none());
+        wal.append(
+            1,
+            &WalRecord::StepStarted {
+                step_id: broca_protocol::StepId(1),
+            },
+            false,
+        )
+        .unwrap();
+        assert!(wal.durable_publication().is_none());
+        wal.sync().unwrap();
+        let first = wal.durable_publication().unwrap();
+        assert_eq!(first.sequence(), 1);
+        assert_eq!(first.byte_end(), std::fs::metadata(&path).unwrap().len());
+        wal.append(
+            1,
+            &WalRecord::StepStarted {
+                step_id: broca_protocol::StepId(2),
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(wal.durable_publication().as_ref(), Some(&first));
+        wal.sync().unwrap();
+        assert_eq!(wal.durable_publication().unwrap().sequence(), 2);
+        assert!(wal.durable_publication().unwrap().byte_end() > first.byte_end());
+        drop(wal);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn range_reads_do_not_restore_unused_feature_collection_api_or_pass() {
         let reader = include_str!("file_wal.rs");
@@ -3650,6 +3762,59 @@ mod tests {
         assert!(std::fs::metadata(&path).unwrap().len() <= cap);
         drop(wal);
         assert_eq!(FileWal::open(&path).unwrap().replay().unwrap().len(), 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn suffix_recovery_matches_writer_damage_policy_without_io() {
+        let path = tmp("suffix-recovery");
+        let mut wal = FileWal::open(&path).unwrap();
+        wal.append(1, &run_started(1), true).unwrap();
+        let start = std::fs::metadata(&path).unwrap().len();
+        let lineage = wal.lineage_id();
+        wal.append(1, &run_started(2), true).unwrap();
+        drop(wal);
+        let complete = std::fs::read(&path).unwrap();
+        let suffix = &complete[start as usize..];
+        for cut in [0, 1, suffix.len() / 2, suffix.len() - 1, suffix.len()] {
+            let recovered = recover_prefix(&suffix[..cut], start, Some(1), lineage).unwrap();
+            std::fs::write(&path, &complete[..start as usize + cut]).unwrap();
+            let wal = FileWal::open(&path).unwrap();
+            assert_eq!(wal.last_seq(), recovered.last_seq.unwrap());
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), recovered.valid_end);
+            drop(wal);
+        }
+        let mut damaged = suffix.to_vec();
+        damaged[crate::framing::HEADER_LEN] ^= 0xff;
+        let recovered = recover_prefix(&damaged, start, Some(1), lineage).unwrap();
+        assert_eq!(
+            recovered,
+            WalRecoveryPrefix {
+                valid_end: start,
+                last_seq: Some(1)
+            }
+        );
+        damaged.extend(encode(3, 1, &run_started(3)).unwrap());
+        assert!(matches!(
+            recover_prefix(&damaged, start, Some(1), lineage),
+            Err(WalError::Corrupt { .. })
+        ));
+        assert!(matches!(
+            recover_prefix(
+                &encode(3, 1, &run_started(3)).unwrap(),
+                start,
+                Some(1),
+                lineage
+            ),
+            Err(WalError::SequenceGap { .. })
+        ));
+        let mut conflicting = Vec::new();
+        let other = WalLineageId::from_bytes([0x55; 16]);
+        conflicting.extend(crate::framing::encode_lineage(other));
+        assert!(matches!(
+            recover_prefix(&conflicting, start, Some(1), lineage),
+            Err(WalError::ConflictingLineageIds { .. })
+        ));
         let _ = std::fs::remove_file(path);
     }
 

@@ -57,9 +57,9 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::manifest::{
-    OP_BASELINE, OP_CANCEL, OP_HEAD, OP_IMPORT, OP_READ, OP_RESOLVE, OP_RETRACT, OP_ROLE_DESCRIBE,
-    OP_RUN_EVENT_GET, OP_RUN_RESULT, OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS, OP_STATUS,
-    OP_SUBSCRIBE, OP_VAULT_AUDIT, OP_WARM,
+    OP_BASELINE, OP_CANCEL, OP_FLUSH_PREFIX, OP_HEAD, OP_IMPORT, OP_READ, OP_REFRESH,
+    OP_REFRESH_POLICY, OP_RESOLVE, OP_RETRACT, OP_ROLE_DESCRIBE, OP_RUN_EVENT_GET, OP_RUN_RESULT,
+    OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS, OP_STATUS, OP_SUBSCRIBE, OP_VAULT_AUDIT, OP_WARM,
 };
 use crate::wire::{
     CancelParams, FromWireExt, ImportParams, ImportResult, RetractParams, RouteRequest, SendParams,
@@ -2179,6 +2179,7 @@ async fn handle_control_request(
             // which asks routing nothing.
             "account_selection": crate::account_routing::published_metrics(),
             "system_one": routes.system_one.as_ref().map(|service| service.health()),
+            "tool_routes": health_registry.tool_routes_health(),
             // What the private-content check concluded for each llm_classify call and how the
             // calls it found marked ended: released by a standing grant, held behind a card,
             // denied, or refused. This is what tells "cerebellum said unmarked" apart from "a
@@ -2596,7 +2597,10 @@ where
         if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method).await {
             return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
         }
-        let write = matches!(method, OP_SEND | OP_WARM | OP_IMPORT | OP_CANCEL | OP_RETRACT);
+        let write = matches!(
+            method,
+            OP_SEND | OP_WARM | OP_IMPORT | OP_CANCEL | OP_RETRACT | OP_REFRESH | OP_REFRESH_POLICY | OP_FLUSH_PREFIX
+        );
         let write = write || matches!(method, "session.upload_begin" | "session.upload_append" | "session.upload_commit");
         let session_read = matches!(method, OP_READ | OP_RESOLVE | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_HISTORY | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ)
             || (broca_protocol::attachments_enabled()
@@ -3205,6 +3209,17 @@ where
                         refusal_delivery_mode,
                         &error,
                     );
+                    if let ServeError::Upload(upload) = &error {
+                        return send_error_body(
+                            writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            upload_error_body(upload, true),
+                        )
+                        .await;
+                    }
                     send_serve_error(writer, ver, channel, epoch, corr, &error).await
                 }
             }
@@ -3696,6 +3711,185 @@ where
             {
                 Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
                 Err(e) => send_serve_error(writer, ver, channel, epoch, corr, &e).await,
+            }
+        }
+        OP_REFRESH => {
+            let request: cortexkit_role_llm_runner::session_change::RefreshRequest =
+                match serde_json::from_value(req.params.clone()) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        let field = broca_wire::failing_field::<
+                            cortexkit_role_llm_runner::session_change::RefreshRequest,
+                        >(&req.params, &error);
+                        return send_invalid_params(
+                            writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            field,
+                            &error.to_string(),
+                        )
+                        .await;
+                    }
+                };
+            if let Err(field) = request.check_policy() {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some(field.into()),
+                    &format!(
+                        "policy must be one of {}",
+                        cortexkit_role_llm_runner::rungs::ALL.join(", ")
+                    ),
+                )
+                .await;
+            }
+            let advertised = handler
+                .plan_admitter()
+                .is_some_and(|admitter| admitter.admits_output_refs());
+            if let Err(field) = request.check_output_refs(advertised) {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some(field.into()),
+                    "a plan item carries output_refs on a runner without the group",
+                )
+                .await;
+            }
+            match handler
+                .session_refresh(
+                    session,
+                    bind.principal.as_ref(),
+                    &bind.scope,
+                    request.plan,
+                    request.policy,
+                    request.generation,
+                )
+                .await
+            {
+                Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
+                Err(error) => {
+                    send_session_change_error(writer, ver, channel, epoch, corr, error).await
+                }
+            }
+        }
+        OP_REFRESH_POLICY => {
+            let request: cortexkit_role_llm_runner::session_change::RefreshPolicyRequest =
+                match serde_json::from_value(req.params.clone()) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        let field = broca_wire::failing_field::<
+                            cortexkit_role_llm_runner::session_change::RefreshPolicyRequest,
+                        >(&req.params, &error);
+                        return send_invalid_params(
+                            writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            field,
+                            &error.to_string(),
+                        )
+                        .await;
+                    }
+                };
+            if let Err(field) = request.check_policy() {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some(field.into()),
+                    &format!(
+                        "policy must be one of {}",
+                        cortexkit_role_llm_runner::rungs::ALL.join(", ")
+                    ),
+                )
+                .await;
+            }
+            // `send_id` is required: a missing or empty key is `invalid_params`, not a reuse.
+            if request.send_id.is_empty() {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some("send_id".into()),
+                    "send_id is required",
+                )
+                .await;
+            }
+            match handler
+                .session_refresh_policy(
+                    session,
+                    bind.principal.as_ref(),
+                    &bind.scope,
+                    request.generation,
+                    request.policy,
+                    request.send_id,
+                )
+                .await
+            {
+                Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
+                Err(error) => {
+                    send_session_change_error(writer, ver, channel, epoch, corr, error).await
+                }
+            }
+        }
+        OP_FLUSH_PREFIX => {
+            let request: cortexkit_role_llm_runner::session_change::FlushPrefixRequest =
+                match serde_json::from_value(req.params.clone()) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        let field = broca_wire::failing_field::<
+                            cortexkit_role_llm_runner::session_change::FlushPrefixRequest,
+                        >(&req.params, &error);
+                        return send_invalid_params(
+                            writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            field,
+                            &error.to_string(),
+                        )
+                        .await;
+                    }
+                };
+            if request.send_id.is_empty() {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some("send_id".into()),
+                    "send_id is required",
+                )
+                .await;
+            }
+            match handler
+                .session_flush_prefix(
+                    session,
+                    bind.principal.as_ref(),
+                    &bind.scope,
+                    request.send_id,
+                )
+                .await
+            {
+                Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
+                Err(error) => {
+                    send_session_change_error(writer, ver, channel, epoch, corr, error).await
+                }
             }
         }
         OP_WARM => {
@@ -4324,6 +4518,7 @@ fn shared_class_name(class: broca_protocol::ErrorClass) -> &'static str {
 
 fn refused_send_class(error: &ServeError) -> &'static str {
     match error {
+        ServeError::Upload(error) => shared_class_name(error.error_class()),
         ServeError::Open(_, Some(class)) => shared_class_name(*class),
         ServeError::AccountSelectionRefused(refusal) => shared_class_name(refusal.class),
         ServeError::RoutingUnavailable(_)
@@ -4357,6 +4552,20 @@ fn log_refused_send(
     );
 }
 
+fn upload_error_body(error: &broca_core::media_uploads::UploadError, for_send: bool) -> ErrorBody {
+    let mut detail = serde_json::json!({});
+    if let Some(field) = error.field {
+        detail["field"] = field.into();
+    }
+    if let Some(received) = error.received {
+        detail["received"] = received.into();
+    }
+    if for_send || error.error_class() == broca_protocol::ErrorClass::Transient {
+        detail["class"] = shared_class_name(error.error_class()).into();
+    }
+    ErrorBody::new(error.code, error.to_string()).with_detail(detail)
+}
+
 async fn send_serve_error(
     writer: &EgressSender<Frame>,
     ver: u8,
@@ -4383,20 +4592,7 @@ async fn send_serve_error(
     }
     let code = match err {
         ServeError::Upload(error) => {
-            let mut detail = serde_json::json!({});
-            if let Some(field) = error.field {
-                detail["field"] = field.into();
-            }
-            if let Some(received) = error.received {
-                detail["received"] = received.into();
-            }
-            if matches!(
-                error.code,
-                "upload_staging_full" | "upload_session_full" | "upload_store_failed"
-            ) {
-                detail["class"] = "transient".into();
-            }
-            let body = ErrorBody::new(error.code, error.to_string()).with_detail(detail);
+            let body = upload_error_body(error, false);
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
         ServeError::ReplyTooLarge(_) => unreachable!("reply_too_large returned above"),
@@ -4974,6 +5170,107 @@ async fn send_invalid_params(
         );
     }
     send_error_body(writer, ver, channel, epoch, corr, body).await
+}
+
+/// Answer a `session.refresh`, `session.refresh_policy` or `session.flush_prefix` refusal.
+/// Every refusal writes nothing. Owner mismatches reuse the session-baseline owner check
+/// so a non-owner gets `scope_owner_mismatch` on all three ops.
+async fn send_session_change_error(
+    writer: &EgressSender<Frame>,
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    error: broca_module::serve::SessionChangeError,
+) -> Result<(), ServeIoError> {
+    use broca_module::serve::SessionChangeError;
+    match error {
+        SessionChangeError::OwnerMismatch(mismatch) => {
+            let serve = ServeError::ScopeRefused(broca_core::ScopeRefusal::OwnerMismatch(mismatch));
+            send_serve_error(writer, ver, channel, epoch, corr, &serve).await
+        }
+        SessionChangeError::InvalidParams { field, message } => {
+            send_invalid_params(writer, ver, channel, epoch, corr, Some(field), &message).await
+        }
+        SessionChangeError::SendIdReuse { field, message } => {
+            let body = ErrorBody::new(cortexkit_role_llm_runner::errors::SEND_ID_REUSE, message)
+                .with_detail(serde_json::json!({"field": field}));
+            send_error_body(writer, ver, channel, epoch, corr, body).await
+        }
+        SessionChangeError::RungUnsupported { surface, rung } => {
+            let detail = cortexkit_role_llm_runner::session_change::RungUnsupportedDetail::new(
+                surface.clone(),
+                rung.clone(),
+            );
+            let body = ErrorBody::new(
+                cortexkit_role_llm_runner::errors::RUNG_UNSUPPORTED,
+                format!("this session does not support {rung} for {surface}"),
+            )
+            .with_detail(serde_json::to_value(detail).map_err(|e| ServeIoError(e.to_string()))?);
+            send_error_body(writer, ver, channel, epoch, corr, body).await
+        }
+        SessionChangeError::GenerationStale { accepted } => {
+            let detail =
+                cortexkit_role_llm_runner::session_change::GenerationStaleDetail::new(accepted);
+            let body = ErrorBody::new(
+                cortexkit_role_llm_runner::errors::GENERATION_STALE,
+                format!("generation is at or below the accepted generation {accepted}: send a higher generation, or repeat the accepted plan and policy exactly"),
+            )
+            .with_detail(
+                serde_json::to_value(detail).map_err(|e| ServeIoError(e.to_string()))?,
+            );
+            send_error_body(writer, ver, channel, epoch, corr, body).await
+        }
+        SessionChangeError::PendingSuperseded {
+            generation,
+            pending,
+        } => {
+            let detail = cortexkit_role_llm_runner::session_change::PendingSupersededDetail::new(
+                generation, pending,
+            );
+            let body = ErrorBody::new(
+                cortexkit_role_llm_runner::errors::PENDING_SUPERSEDED,
+                format!("generation {generation} is no longer pending; generation {pending} is"),
+            )
+            .with_detail(serde_json::to_value(detail).map_err(|e| ServeIoError(e.to_string()))?);
+            send_error_body(writer, ver, channel, epoch, corr, body).await
+        }
+        SessionChangeError::AlreadyApplied {
+            generation,
+            applied_by,
+        } => {
+            let detail = cortexkit_role_llm_runner::session_change::AlreadyAppliedDetail::new(
+                generation,
+                applied_by.clone(),
+            );
+            let body = ErrorBody::new(
+                cortexkit_role_llm_runner::errors::ALREADY_APPLIED,
+                format!("generation {generation} was applied by {applied_by}"),
+            )
+            .with_detail(serde_json::to_value(detail).map_err(|e| ServeIoError(e.to_string()))?);
+            send_error_body(writer, ver, channel, epoch, corr, body).await
+        }
+        SessionChangeError::FetchRefused(refusal) => {
+            let body =
+                ErrorBody::new(refusal.code(), refusal.message()).with_detail(refusal.detail());
+            send_error_body(writer, ver, channel, epoch, corr, body).await
+        }
+        SessionChangeError::Transient(message) => {
+            let serve = ServeError::Transient(message);
+            send_serve_error(writer, ver, channel, epoch, corr, &serve).await
+        }
+        SessionChangeError::Unsupported(op) => {
+            send_error_body(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                ErrorBody::new("open_failed", format!("{op} is unsupported")),
+            )
+            .await
+        }
+    }
 }
 
 fn delivery_list_refusal(

@@ -216,6 +216,7 @@ pub struct Script {
     pub rendered: Mutex<Vec<Vec<u8>>>,
     /// Optional serving-family config for media tests; other scripts keep their legacy bytes.
     pub media_frozen: Mutex<Option<broca_provider::wire::FrozenRenderConfig>>,
+    pub omit_media_profile: Mutex<bool>,
 }
 
 impl Script {
@@ -300,6 +301,10 @@ impl Provider for ScriptedProvider {
 
     fn render_config_blob(&self) -> serde_json::Value {
         if let Some(frozen) = self.0.media_frozen.lock().unwrap().as_ref() {
+            let mut frozen = frozen.clone();
+            if *self.0.omit_media_profile.lock().unwrap() {
+                frozen.media = None;
+            }
             return serde_json::to_value(frozen).unwrap();
         }
         match &self.1 {
@@ -1482,7 +1487,7 @@ pub fn assert_golden(frame: &Frame, file: &str, run_id: &str) {
 /// The bytes the session's baseline adds to the reply of the send that admitted the session (and
 /// of every retry of that send): a session admitted without a fetch plan, running the rig's one
 /// tool.
-pub const ADMITTING_BASELINE: &str = r#","baseline":{"items":[],"tool_names":["work"],"accepted_generation":0,"applied_generation":0}"#;
+pub const ADMITTING_BASELINE: &str = r#","baseline":{"items":[],"tool_names":["work"],"accepted_generation":0,"applied_generation":0,"rungs":{"tools":["on_prefix_rebuild","immediately"],"system_text":["on_prefix_rebuild","immediately"]}}"#;
 
 /// [`assert_golden`] for the reply to the send that admitted the session: the pinned bytes of
 /// `file` with exactly [`ADMITTING_BASELINE`] added at the end of `result`.

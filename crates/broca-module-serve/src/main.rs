@@ -419,6 +419,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(|e| ServeIoError(format!("fetch-plan consumer connect: {e}")))?,
     );
+    let tool_route_health_plane = Arc::clone(&plane);
     let mut executor_impl = executor::LiveLoopExecutor::new(
         wal_store.clone(),
         run_index.clone(),
@@ -712,6 +713,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         run_rows,
     ));
     held_runtime.bind_stopping_signal(registry.stopping_signal());
+    registry.set_tool_route_health(Arc::new(move |open| {
+        tool_route_health_plane.tool_routes_health(open)
+    }));
     registry.set_retention_service(retention);
     // System One: decision models served in this process with no session. Its batch record
     // is its own file; `run-index.db` is a rebuildable projection and cannot hold an authority.
@@ -4170,7 +4174,7 @@ mod executor {
                 None
             };
             let resolve_options = broca_catalog::live::ResolveOptions {
-                media: fresh_episode && job.has_media_input(),
+                media: fresh_episode && broca_protocol::attachments_enabled(),
                 media_profile: job.media_profile.as_deref().filter(|_| fresh_episode),
                 claude_code_persona: fresh_persona.as_ref(),
                 auth_method: resolution.method,
@@ -4684,6 +4688,12 @@ mod executor {
             if let Some(plane) = &self.compaction_plane {
                 plane.close_session_routes(session).await;
             }
+        }
+
+        fn on_session_deleted(&self, session: &BindIdentity) {
+            // Route ownership is removed synchronously; wire teardown survives the sweeper.
+            let close = self.plane.close_session_routes(session);
+            tokio::spawn(close);
         }
 
         fn retire_session_transport(&self, session: &BindIdentity) {

@@ -294,9 +294,8 @@ pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
-/// Shipping builds refuse uploads by name before decoding a send. Debug builds
-/// must explicitly opt into the attachment admission path; neither path permits
-/// a client to supply stored media references inline.
+/// Disabled media admission refuses uploads by name before decoding a send. Neither
+/// runtime mode permits a client to supply stored media references inline.
 pub fn check_upload_references(params: &serde_json::Value) -> Result<(), String> {
     if let Some(content) = params.get("content").filter(|value| !value.is_null()) {
         // A content part is an upload reference and nothing else. A `media` block, or a tool
@@ -1097,79 +1096,7 @@ fn serialize_read_message<S: serde::Serializer>(
             }
         }
     }
-    let message: &broca_protocol::Message = &exposed;
-    if !message
-        .content
-        .iter()
-        .any(|block| matches!(block, ContentBlock::TextWithState { .. }))
-    {
-        return message.serialize(serializer);
-    }
-    CallerMessageRef(message).serialize(serializer)
-}
-
-struct CallerMessageRef<'a>(&'a broca_protocol::Message);
-
-impl serde::Serialize for CallerMessageRef<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeStruct;
-
-        let mut fields = 2;
-        fields += usize::from(self.0.cache_prefix_blocks.is_some());
-        fields += usize::from(self.0.origin.is_some());
-        let mut state = serializer.serialize_struct("Message", fields)?;
-        state.serialize_field("role", &self.0.role)?;
-        state.serialize_field("content", &CallerContentRef(&self.0.content))?;
-        if let Some(cache_prefix_blocks) = self.0.cache_prefix_blocks {
-            state.serialize_field("cache_prefix_blocks", &cache_prefix_blocks)?;
-        }
-        if let Some(origin) = &self.0.origin {
-            state.serialize_field("origin", origin)?;
-        }
-        state.end()
-    }
-}
-
-struct CallerContentRef<'a>(&'a [broca_protocol::ContentBlock]);
-
-impl serde::Serialize for CallerContentRef<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeSeq;
-
-        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
-        for block in self.0 {
-            sequence.serialize_element(&CallerBlockRef(block))?;
-        }
-        sequence.end()
-    }
-}
-
-struct CallerBlockRef<'a>(&'a broca_protocol::ContentBlock);
-
-impl serde::Serialize for CallerBlockRef<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use broca_protocol::ContentBlock;
-        use serde::ser::SerializeStruct;
-
-        match self.0 {
-            ContentBlock::TextWithState { text, .. } => {
-                let mut state = serializer.serialize_struct("ContentBlock", 2)?;
-                state.serialize_field("type", "text")?;
-                state.serialize_field("text", text)?;
-                state.end()
-            }
-            block => block.serialize(serializer),
-        }
-    }
+    broca_protocol::caller_message::CallerMessageRef(&exposed).serialize(serializer)
 }
 
 /// One message in a `session.read` page.
@@ -1296,6 +1223,34 @@ impl SessionReadMessage {
         }
     }
 
+    pub fn show_media_blocks_with_identity(&mut self) {
+        self.show_media_blocks();
+        if self.has_media_grammar() {
+            let inline = self.described.take().expect("blocks were serialized above");
+            self.identify_content(&inline);
+            self.described = Some(inline);
+        }
+    }
+
+    fn identify_content(&mut self, inline: &serde_json::Value) {
+        use cortexkit_role_llm_runner::read::descriptors::PartDigest;
+        self.digest = Some(cortexkit_role_llm_runner::content_digest::content_digest(
+            inline,
+        ));
+        self.part_digests = Some(
+            inline
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .map(|(index, part)| {
+                    PartDigest::new(broca_protocol::tags::part_key(self.ordinal, index), part)
+                })
+                .collect(),
+        );
+    }
+
     /// Serve this entry as a descriptors read does (llm-runner §4.2): its content identities
     /// before media markers or refs, and large payloads replaced by refs in place, largest first
     /// past the fixed per-message budget. Selection depends only on this message, so every
@@ -1303,28 +1258,19 @@ impl SessionReadMessage {
     /// exceeds the budget, which a descriptors read refuses `reply_too_large`.
     pub fn describe(&mut self) -> Result<(), u64> {
         use cortexkit_role_llm_runner::read::descriptors::{
-            describe, PartDigest, Payload, Reference, DESCRIPTOR_MESSAGE_MAX,
+            describe, Payload, Reference, DESCRIPTOR_MESSAGE_MAX,
         };
         self.described = None;
-        let inline = serde_json::to_value(CallerMessage(&self.message, true))
-            .expect("a stored message serializes");
-        self.digest = Some(cortexkit_role_llm_runner::content_digest::content_digest(
-            &inline,
-        ));
+        // `message_content_identity` is also what each compaction notice to the compaction
+        // provider anchors its `through_digest` on, so a notice's digest and this read's digest
+        // always agree. Part digests come from the same bytes.
+        let inline = broca_protocol::caller_message::message_content_identity(&self.message).inline;
+        self.identify_content(&inline);
         let parts = inline
             .get("content")
             .and_then(serde_json::Value::as_array)
             .cloned()
             .unwrap_or_default();
-        self.part_digests = Some(
-            parts
-                .iter()
-                .enumerate()
-                .map(|(index, part)| {
-                    PartDigest::new(broca_protocol::tags::part_key(self.ordinal, index), part)
-                })
-                .collect(),
-        );
         let mut payloads = Vec::new();
         for (index, part) in parts.iter().enumerate() {
             let at = |field: &str| format!("/content/{index}/{field}");
@@ -2833,7 +2779,7 @@ fn serialize_control_unit<S: serde::Serializer>(
     #[derive(Serialize)]
     struct MessageRef<'a> {
         message_id: &'a broca_protocol::MessageId,
-        content: CallerContentRef<'a>,
+        content: broca_protocol::caller_message::CallerContentRef<'a>,
     }
 
     #[derive(Serialize)]
@@ -2849,7 +2795,7 @@ fn serialize_control_unit<S: serde::Serializer>(
             UnitRef::AssistantMessage {
                 message: MessageRef {
                     message_id: &message.message_id,
-                    content: CallerContentRef(&message.content),
+                    content: broca_protocol::caller_message::CallerContentRef(&message.content),
                 },
             }
             .serialize(serializer)

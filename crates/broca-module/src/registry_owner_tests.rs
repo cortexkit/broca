@@ -791,6 +791,7 @@ fn install_live(
     let head = Arc::new(AtomicU64::new(checkpoint.at_seq));
     let (tx, _rx) = mpsc::channel(1);
     let handle = ActorHandle {
+        media_head: None,
         gen: 3,
         tx,
         durable_head: head.clone(),

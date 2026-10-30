@@ -70,7 +70,7 @@ pub fn stage(
             let id = part.upload_id();
             let (mime, bytes) = uploads
                 .read_committed(identity, id, now_seconds())
-                .map_err(|error| RunError::Config(error.to_string()))?;
+                .map_err(RunError::Upload)?;
             let reference =
                 broca_core::media_validation::validate_media(&bytes, &mime).map_err(|reason| {
                     let kind = if mime == "application/pdf" {
@@ -161,6 +161,7 @@ pub fn publish(
 
 pub(crate) fn outcome(error: RunError) -> crate::actor::SendOutcome {
     match error {
+        RunError::Upload(error) => crate::actor::SendOutcome::Upload(error),
         RunError::MediaUnsupported(message) => crate::actor::SendOutcome::DeliveryRefused {
             code: "media_unsupported",
             field: "content",

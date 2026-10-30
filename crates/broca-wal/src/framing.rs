@@ -1277,8 +1277,6 @@ mod tests {
     /// A `SessionRefreshAccepted` round-trips byte for byte and requires `session-change/v1`
     /// (with `plan-manifest/v1` for its manifest). A reader without the feature refuses the
     /// frame as a newer writer rather than running the next episode with the wrong tools.
-    /// Reader-first: this build decodes and folds these records; no production path writes
-    /// them yet.
     #[test]
     fn session_refresh_accepted_round_trips_and_is_must_understand() {
         use super::*;

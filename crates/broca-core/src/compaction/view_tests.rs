@@ -9,6 +9,7 @@ use crate::compaction::{
     CompactionCheckpoint,
 };
 use crate::compaction_provider::{
+    digest::content_digest,
     lineage::MessageRef,
     notice::ViewReady,
     view::{PartEdit, ViewRange},

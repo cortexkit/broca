@@ -108,7 +108,7 @@ pub fn reconstruct_from_offsets(
         || seed.admission_checkpoint.output_reservation.is_none()
         || (window.is_none() && !matches!(
             seed.admission_checkpoint.compaction,
-            Some(crate::compaction::CompactionCheckpoint::None)
+            Some(crate::compaction::CompactionCheckpoint::None | crate::compaction::CompactionCheckpoint::Captures(_))
         ))
         || crate::replay::tail_contains_compaction_setup(
             &snapshot
@@ -177,7 +177,10 @@ pub fn reconstruct_from_offsets(
     if window.is_none()
         && !matches!(
             checkpoint.compaction,
-            Some(crate::compaction::CompactionCheckpoint::None)
+            Some(
+                crate::compaction::CompactionCheckpoint::None
+                    | crate::compaction::CompactionCheckpoint::Captures(_)
+            )
         )
     {
         return Err(bad("offset resume compaction needs full replay"));
@@ -885,7 +888,6 @@ mod offset_resume_tests {
     }
 
     #[test]
-    #[cfg(feature = "test-attachments")]
     fn offset_resume_window_rejects_incomplete_media_seed_before_reusing_prefix() {
         let mut records = compacted_tools(1, false);
         if let WalRecord::RunStarted { input, .. } = &mut records[0] {
@@ -936,7 +938,6 @@ mod offset_resume_tests {
     }
 
     #[test]
-    #[cfg(feature = "test-attachments")]
     fn offset_resume_window_checks_media_seed_after_tail_capture() {
         let mut records = compacted_tools(1, false);
         let boundary = records

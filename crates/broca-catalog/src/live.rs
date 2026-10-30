@@ -93,7 +93,8 @@ impl CodeAssistRoute<'_> {
 /// policies within the same `AnthropicMessages` family.
 #[derive(Debug, Clone, Default)]
 pub struct ResolveOptions<'a> {
-    /// Freeze media only for an input that needs it; ordinary admissions keep their bytes.
+    /// Consider media facts for a fresh, media-enabled episode. A tool can return media even
+    /// when the caller's input is text; models with no known media modality keep no profile.
     pub media: bool,
     pub media_profile: Option<&'a broca_provider::media_profile::MediaProfile>,
     /// The selected credential method. Most providers use it only for credential lookup;
@@ -1151,6 +1152,9 @@ fn resolve_provider_inner(
             {
                 broca_provider::media_profile::freeze_media_profile(&mut frozen, &provider, &model);
             }
+            frozen.media = frozen
+                .media
+                .filter(|profile| profile.modalities.supports_media());
         }
         let frozen = episode_render.apply(frozen);
         let resolved_base_url = frozen
@@ -1344,6 +1348,9 @@ fn resolve_provider_inner(
                 &model_spec,
             );
         }
+        frozen.media = frozen
+            .media
+            .filter(|profile| profile.modalities.supports_media());
     }
     let mut frozen = episode_render.apply(frozen);
     if let Some(fallback_model) = opts.refusal_fallback_model {
