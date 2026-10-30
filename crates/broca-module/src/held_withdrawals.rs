@@ -2,7 +2,7 @@
 //! registration even after intake pruning, and bounds transport retries across restarts.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -21,6 +21,8 @@ use crate::{held_slots::HeldWithdrawal, late_results_store::LateResultsStore};
 
 const MAX_ATTEMPTS: u32 = 3;
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(25);
+const RECOVERY_SESSIONS_PER_BATCH: usize = 4;
+const RECOVERY_BATCH_INTERVAL: Duration = Duration::from_secs(3);
 
 #[async_trait]
 pub trait WithdrawTransport: Send + Sync {
@@ -36,6 +38,13 @@ pub struct HeldWithdrawals {
     active: Mutex<HashSet<(String, String)>>,
     health: Mutex<Value>,
     stopping: std::sync::OnceLock<tokio_util::sync::CancellationToken>,
+    sweep: Mutex<SweepProgress>,
+}
+
+#[derive(Default)]
+struct SweepProgress {
+    running: bool,
+    rows_remaining: usize,
 }
 
 impl HeldWithdrawals {
@@ -51,11 +60,16 @@ impl HeldWithdrawals {
             active: Mutex::default(),
             health: Mutex::new(json!({"failed": 0, "pending": 0})),
             stopping: std::sync::OnceLock::new(),
+            sweep: Mutex::default(),
         })
     }
 
     pub fn health(&self) -> Value {
-        self.health.lock().expect("withdrawal health").clone()
+        let mut health = self.health.lock().expect("withdrawal health").clone();
+        let sweep = self.sweep.lock().expect("withdrawal sweep");
+        health["sweep_running"] = json!(sweep.running);
+        health["rows_remaining"] = json!(sweep.rows_remaining);
+        health
     }
 
     pub fn bind_stopping_signal(&self, stopping: tokio_util::sync::CancellationToken) {
@@ -63,11 +77,10 @@ impl HeldWithdrawals {
     }
 
     fn refresh_health(&self) {
-        let health = match self.store.withdrawal_rows() {
-            Ok(rows) => json!({
-                "failed": rows.iter().filter(|(_, state, _)| state == "failed").count(),
-                "pending": rows.iter().filter(|(_, state, _)| state == "pending").count(),
-                "failure_details": if rows.iter().any(|(_, state, _)| state == "failed") { self.store.withdrawal_failure_details().unwrap_or_else(|error| vec![json!({"code": error})]).into_iter().map(|body| json!({"code": body.get("code"), "answer": body.get("answer"), "reason": body.get("reason")})).collect::<Vec<_>>() } else { Vec::new() },
+        let health = match self.store.withdrawal_counts() {
+            Ok((watching, pending, failed)) => json!({
+                "failed": failed, "pending": pending, "watching": watching,
+                "failure_details": if failed > 0 { self.store.withdrawal_failure_details().unwrap_or_else(|error| vec![json!({"code": error})]).into_iter().map(|body| json!({"code": body.get("code"), "answer": body.get("answer"), "reason": body.get("reason")})).collect::<Vec<_>>() } else { Vec::new() },
             }),
             Err(error) => json!({"error": error}),
         };
@@ -88,19 +101,86 @@ impl HeldWithdrawals {
         if stopping.is_cancelled() {
             return Ok(());
         }
+        {
+            let mut sweep = self.sweep.lock().expect("withdrawal sweep");
+            if sweep.running {
+                return Ok(());
+            }
+            sweep.running = true;
+        }
+        let _sweep = SweepGuard(&self.sweep);
         self.store.prune_tombstoned()?;
-        let mut failure = None;
+        let mut sessions: HashMap<_, Vec<_>> = HashMap::new();
         for (call, state, attempts) in self.store.withdrawal_rows()? {
+            if state != "failed" {
+                sessions
+                    .entry(call.bind.clone())
+                    .or_default()
+                    .push((call, state, attempts));
+            }
+        }
+        let mut sessions: Vec<_> = sessions.into_iter().collect();
+        sessions.sort_by(|(a, _), (b, _)| a.session.cmp(&b.session));
+        self.sweep.lock().expect("withdrawal sweep").rows_remaining =
+            sessions.iter().map(|(_, rows)| rows.len()).sum();
+        let started = std::time::Instant::now();
+        let mut sessions_read = 0;
+        let mut rows_settled = 0;
+        let mut withdrawals_sent = 0;
+        let mut failure = None;
+        for (index, (bind, rows)) in sessions.into_iter().enumerate() {
             if stopping.is_cancelled() {
                 break;
             }
-            if state != "failed" {
-                if let Err(error) = self.drive(call, attempts).await {
-                    failure = Some(error);
+            if index > 0 && index % RECOVERY_SESSIONS_PER_BATCH == 0 {
+                tokio::select! {
+                    biased;
+                    _ = stopping.cancelled() => break,
+                    _ = tokio::time::sleep(RECOVERY_BATCH_INTERVAL) => {}
                 }
             }
+            // One immutable WAL snapshot serves every row in the session, including cleanup.
+            // Never let the number of old inline calls multiply whole-log decoding at boot.
+            match self.wal.read_records(&bind) {
+                Ok(records) => {
+                    sessions_read += 1;
+                    let facts = broca_core::held_call_facts(&records, None);
+                    let inline: Vec<_> = rows
+                        .iter()
+                        .filter(|(call, state, _)| {
+                            state == "watching"
+                                && crate::late_results_puller::inline_registration_settled(
+                                    &call.call_key,
+                                    &records,
+                                    &facts,
+                                )
+                        })
+                        .map(|(call, _, _)| (call.module.clone(), call.call_key.clone()))
+                        .collect();
+                    match self.store.remove_inline_calls(&inline) {
+                        Ok(settled) => rows_settled += settled,
+                        Err(error) => failure = Some(error),
+                    }
+                    for (call, _, attempts) in &rows {
+                        if stopping.is_cancelled() {
+                            break;
+                        }
+                        if cancelled_hold(&records, &call.call_key) {
+                            match self.drive(call.clone(), *attempts, Some(&records)).await {
+                                Ok(sent) => withdrawals_sent += sent,
+                                Err(error) => failure = Some(error),
+                            }
+                        }
+                    }
+                }
+                Err(error) => failure = Some(error.to_string()),
+            }
+            self.sweep.lock().expect("withdrawal sweep").rows_remaining -= rows.len();
+            tokio::task::yield_now().await;
         }
         self.refresh_health();
+        tracing::info!(target: "late_results", sessions_read, rows_settled, withdrawals_sent,
+            elapsed_ms = started.elapsed().as_millis() as u64, "provider-held withdrawal recovery sweep finished");
         if let Some(error) = failure {
             self.health.lock().expect("withdrawal health")["error"] = json!(error);
             return Err(error);
@@ -108,13 +188,18 @@ impl HeldWithdrawals {
         Ok(())
     }
 
-    async fn drive(&self, call: LateResultRegistration, mut attempts: u32) -> Result<(), String> {
+    async fn drive(
+        &self,
+        call: LateResultRegistration,
+        mut attempts: u32,
+        snapshot: Option<&[FramedRecord]>,
+    ) -> Result<u32, String> {
         let stopping = self
             .stopping
             .get()
             .ok_or("held withdrawal stop signal is not installed")?;
         if stopping.is_cancelled() {
-            return Ok(());
+            return Ok(0);
         }
         let key = (call.module.clone(), call.call_key.clone());
         if !self
@@ -123,36 +208,41 @@ impl HeldWithdrawals {
             .expect("withdrawal active")
             .insert(key.clone())
         {
-            return Ok(());
+            return Ok(0);
         }
         let _guard = Active {
             set: &self.active,
             key,
         };
-        let Some((_, state, durable_attempts)) = self
-            .store
-            .withdrawal_rows()?
-            .into_iter()
-            .find(|(row, _, _)| row.module == call.module && row.call_key == call.call_key)
+        let Some((state, durable_attempts)) =
+            self.store.withdrawal_state(&call.module, &call.call_key)?
         else {
-            return Ok(());
+            return Ok(0);
         };
-        if state == "failed" {
-            return Ok(());
+        if state == "failed" || state == "done" {
+            return Ok(0);
         }
         attempts = attempts.max(durable_attempts);
         // Live callers arrive only after sync. Recovery reads the same sealed log: an open
         // hold, a shutdown pause, or an interrupted restart is never a withdrawal intent.
-        let records = self
-            .wal
-            .read_records(&call.bind)
-            .map_err(|error| error.to_string())?;
-        if !cancelled_hold(&records, &call.call_key) {
-            return Ok(());
+        let records;
+        let records = match snapshot {
+            Some(records) => records,
+            None => {
+                records = self
+                    .wal
+                    .read_records(&call.bind)
+                    .map_err(|error| error.to_string())?;
+                &records
+            }
+        };
+        if !cancelled_hold(records, &call.call_key) {
+            return Ok(0);
         }
+        let mut sent = 0;
         while attempts < MAX_ATTEMPTS {
             if stopping.is_cancelled() {
-                return Ok(());
+                return Ok(sent);
             }
             attempts += 1;
             self.store.record_withdrawal(
@@ -166,9 +256,10 @@ impl HeldWithdrawals {
             // every repeat. A crash after send but before recording its reply is safe.
             let reply = tokio::select! {
                 biased;
-                _ = stopping.cancelled() => return Ok(()),
+                _ = stopping.cancelled() => return Ok(sent),
                 reply = tokio::time::timeout(ATTEMPT_TIMEOUT, self.transport.withdraw(&call)) => reply,
             };
+            sent += 1;
             let (verdict, raw) = match reply {
                 Ok(result) => result,
                 Err(_) => (
@@ -198,11 +289,11 @@ impl HeldWithdrawals {
             self.store.record_withdrawal(&call, state, attempts, &raw)?;
             self.refresh_health();
             if !retry || attempts == MAX_ATTEMPTS {
-                return Ok(());
+                return Ok(sent);
             }
             tokio::select! {
                 biased;
-                _ = stopping.cancelled() => return Ok(()),
+                _ = stopping.cancelled() => return Ok(sent),
                 _ = tokio::time::sleep(Duration::from_millis(100 * u64::from(attempts))) => {}
             }
         }
@@ -213,7 +304,15 @@ impl HeldWithdrawals {
             &json!({"code": "withdrawal_retry_exhausted", "message": "withdrawal retry budget exhausted"}),
         )?;
         self.refresh_health();
-        Ok(())
+        Ok(sent)
+    }
+}
+
+struct SweepGuard<'a>(&'a Mutex<SweepProgress>);
+
+impl Drop for SweepGuard<'_> {
+    fn drop(&mut self) {
+        self.0.lock().expect("withdrawal sweep").running = false;
     }
 }
 
@@ -233,14 +332,12 @@ impl Drop for Active<'_> {
 #[async_trait]
 impl HeldWithdrawal for HeldWithdrawals {
     async fn withdraw(&self, reply: &ProviderHeldReply) -> Result<(), String> {
-        for (call, state, attempts) in self.store.withdrawal_rows()? {
-            if call.module == reply.module && call.call_key == reply.call_key && state != "failed" {
-                let result = self.drive(call, attempts).await;
-                if let Err(error) = &result {
-                    self.health.lock().expect("withdrawal health")["error"] = json!(error);
-                }
-                return result;
+        if let Some(call) = self.store.withdrawal_call(&reply.module, &reply.call_key)? {
+            let result = self.drive(call, 0, None).await.map(|_| ());
+            if let Err(error) = &result {
+                self.health.lock().expect("withdrawal health")["error"] = json!(error);
             }
+            return result;
         }
         Ok(())
     }

@@ -1589,11 +1589,22 @@ is mapped with the same `content/v1` mapper a synchronous reply uses (`not_start
 `expired` become error results whose text is pinned by golden), deposited in the call's slot,
 and the session's actor resumes a paused run into its original batch, which writes the result
 as the call's `ToolResult` at the call's position and syncs it. Only then is the entry acked,
-through exactly the cursor the provider returned. An entry whose call already has its terminal,
-an entry of an unknown kind, and an entry no registration names are acked as no-ops; an entry
-whose held record is not yet durable pins the ack. Entries are deduplicated on
+through exactly the cursor the provider returned. An entry whose call already has its terminal
+(including an inline answer), whose dispatching run has ended, whose kind is unknown, or which
+no registration names is acked as a no-op. A durable intent with no terminal or held record is
+pending only while its dispatching run is open; an unreadable WAL remains blocked. An answer
+for an indeterminate call in a sealed run never changes that call or enters a later run.
+Entries are deduplicated on
 `(provider, custodian, call_key, event_id)`, and `cursor_incarnation_changed` re-reads from the
-start. A registration is pruned once its call's terminal and batch commit are durable.
+start. The ack advances only over a settled prefix. An unsettled entry pins the ack: no ack may
+cover that entry until it settles. An entry that pins the ack for five minutes logs one WARN
+per entry with its module, call key and event id; `health.check`'s `provider_held.overdue_pins`
+counts currently pinned entries at least five minutes old, without reading any WAL.
+Batch completion prunes registrations after the terminals and commit are durable. The puller
+also retires old inline-terminal registrations as it encounters them. A maintenance sweep
+checks at most 64 registrations every 3 s, starting after recovery, even for modules without
+a running puller. It lazily retires stale terminal rows without scanning every log at startup;
+held calls that still owe a batch commit keep their registrations for recovery.
 
 At boot tombstoned lineages are pruned from the intake without opening an actor. Every remaining
 session with a registration is opened so its open-time recovery runs, then each
@@ -1619,6 +1630,18 @@ by itself, and a call that completed before its sibling was cancelled is not wit
 registry's stop signal suppresses new withdrawal attempts and retries during drain; an earlier
 request may already have reached the provider. Health exposes pending/failed withdrawals and
 their refusal codes.
+
+Late-result pullers start before withdrawal recovery, which runs independently and obeys the
+registry's stop signal. Withdrawal recovery snapshots the outbox once, groups rows by session,
+and reads each session's WAL once, in batches of at most four sessions separated by 3 s. As it
+reads, it retires inline-terminal watches and their registrations in one transaction; normal
+inline batch completion performs the same retirement without reading the WAL again. Ordinary
+intake pruning still preserves a held call's withdrawal watch if broca crashes after the run's
+cancellation seal is durable but before `tool.withdraw` is sent.
+Each sweep logs one summary with sessions read, rows settled, withdrawals sent and elapsed time.
+`provider_held.withdrawals.sweep_running` and `rows_remaining` report whether a sweep is running
+and how many snapshot rows remain to examine; `watching` counts retained watches at the last
+completed sweep or withdrawal attempt. All these health values are cached, not WAL probes.
 
 Ack guarantee, narrowed: broca puts no bound of its own on a hold. A provider keeps at most
 1,000 unacked results per session and drops the oldest first; a held call whose entry was

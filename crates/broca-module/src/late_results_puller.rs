@@ -21,7 +21,7 @@
 //! puller and the delivery hook that code is written against.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
@@ -42,6 +42,11 @@ use crate::late_results_store::{
 pub const PULL_INTERVAL: Duration = Duration::from_secs(3);
 /// The longest wait between attempts after a transport error or a refusal.
 pub const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// An entry that still prevents the feed's ack from advancing after this interval needs
+/// operator attention, even if the provider keeps returning successful feed replies.
+pub const PIN_WARN_AFTER: Duration = Duration::from_secs(5 * 60);
+/// Limit WAL reads for old registrations to one small page per maintenance pass.
+pub const REGISTRATION_SWEEP_LIMIT: usize = 64;
 /// The bind a feed's route is opened under. The custodian comes from the connection's consumer
 /// identity, so this only names the route; it is fixed so one feed keeps one route open.
 const FEED_HARNESS: &str = "broca";
@@ -89,7 +94,7 @@ pub enum Classified {
     /// dispatched elsewhere, its scope does not match, its kind is unknown, or no registration
     /// names its lineage. A no-op never closes an open call.
     NoOp,
-    /// The lineage is registered but the call's held record is not durable yet. It pins the ack.
+    /// The intent is durable in an open run, but neither terminal nor held record is synced yet.
     Pending,
     /// Nothing can be concluded yet, so the ack stops before it and the entry is retried.
     Blocked(String),
@@ -131,6 +136,12 @@ struct PullerState {
     /// Entries an earlier reply left unacked because one of them could not be settled, in reply
     /// order.
     pinned: Vec<IntakeKey>,
+    ages: HashMap<IntakeKey, PinAge>,
+}
+
+struct PinAge {
+    since: tokio::time::Instant,
+    warned: bool,
 }
 
 /// One running feed.
@@ -143,7 +154,10 @@ pub struct Puller {
 impl Puller {
     fn new() -> Self {
         Self {
-            state: Mutex::new(PullerState { pinned: Vec::new() }),
+            state: Mutex::new(PullerState {
+                pinned: Vec::new(),
+                ages: HashMap::new(),
+            }),
             interval: Mutex::new(PULL_INTERVAL),
             stopped: Mutex::new(false),
         }
@@ -155,7 +169,35 @@ impl Puller {
     }
 
     fn set_pinned(&self, pinned: Vec<IntakeKey>) {
-        self.state.lock().expect("puller state").pinned = pinned;
+        let mut state = self.state.lock().expect("puller state");
+        state.ages.retain(|key, _| pinned.contains(key));
+        for key in &pinned {
+            state.ages.entry(key.clone()).or_insert_with(|| PinAge {
+                since: tokio::time::Instant::now(),
+                warned: false,
+            });
+        }
+        state.pinned = pinned;
+    }
+
+    fn warn_overdue(&self, module: &str) {
+        for (key, age) in &mut self.state.lock().expect("puller state").ages {
+            if !age.warned && age.since.elapsed() >= PIN_WARN_AFTER {
+                age.warned = true;
+                tracing::warn!(target: "late_results", module, call_key = key.call_key,
+                    event_id = key.event_id, "late-results entry has pinned the feed for five minutes");
+            }
+        }
+    }
+
+    fn overdue_pins(&self) -> usize {
+        self.state
+            .lock()
+            .expect("puller state")
+            .ages
+            .values()
+            .filter(|age| age.since.elapsed() >= PIN_WARN_AFTER)
+            .count()
     }
 
     fn interval(&self) -> Duration {
@@ -196,6 +238,7 @@ pub struct LateResultsIntake {
     /// Set while the store is being rebuilt from the WALs. Until the rebuild completes, no
     /// registration can be trusted to be missing, so every entry is Blocked and nothing is acked.
     rebuilding: std::sync::atomic::AtomicBool,
+    sweep_after: Mutex<Option<(String, String)>>,
 }
 
 impl LateResultsIntake {
@@ -214,6 +257,7 @@ impl LateResultsIntake {
             feed,
             pullers: Mutex::new(HashMap::new()),
             rebuilding: std::sync::atomic::AtomicBool::new(false),
+            sweep_after: Mutex::new(None),
         })
     }
 
@@ -257,6 +301,58 @@ impl LateResultsIntake {
         modules
     }
 
+    /// In-memory only: health checks never open a WAL or the registration store.
+    pub fn overdue_pins(&self) -> usize {
+        self.pullers
+            .lock()
+            .expect("pullers")
+            .values()
+            .map(|puller| puller.overdue_pins())
+            .sum()
+    }
+
+    /// Revisit old rows even for providers with no running feed. Each pass reads at most one
+    /// page of registrations' WALs; unreadable and unfinished calls remain for the next cycle.
+    pub fn sweep_registrations(&self) -> Result<usize, String> {
+        if self.is_rebuilding() || !self.store.has_held_history() {
+            return Ok(0);
+        }
+        let mut after = self.sweep_after.lock().expect("registration sweep");
+        let rows = self
+            .store
+            .registration_page(after.as_ref(), REGISTRATION_SWEEP_LIMIT)?;
+        let mut views = HashMap::new();
+        let mut settled = Vec::new();
+        let mut inline = Vec::new();
+        for row in &rows {
+            let view = views
+                .entry(row.call.bind.clone())
+                .or_insert_with(|| self.lineage_view(&row.call));
+            // Retention can reuse a bind: the tombstone belongs to this row's lineage,
+            // not to every registration sharing the cached WAL snapshot.
+            if self.tombstoned(&row.call.bind, &row.call.lineage)
+                || (!view.facts.unreadable
+                    && registration_settled(&row.call.call_key, &view.records, &view.facts))
+            {
+                let key = (row.call.module.clone(), row.call.call_key.clone());
+                if inline_registration_settled(&row.call.call_key, &view.records, &view.facts) {
+                    inline.push(key);
+                } else {
+                    settled.push(key);
+                }
+            }
+        }
+        self.store.remove_calls(&settled)?;
+        self.store.remove_inline_calls(&inline)?;
+        *after = if rows.len() == REGISTRATION_SWEEP_LIMIT {
+            rows.last()
+                .map(|row| (row.call.module.clone(), row.call.call_key.clone()))
+        } else {
+            None
+        };
+        Ok(settled.len() + inline.len())
+    }
+
     fn puller(&self, module: &str) -> Option<Arc<Puller>> {
         self.pullers.lock().expect("pullers").get(module).cloned()
     }
@@ -265,10 +361,11 @@ impl LateResultsIntake {
     pub fn lineage_view(&self, registration: &LateResultRegistration) -> LineageView {
         let mut view = match self.readable(&registration.bind) {
             Some(records) => LineageView {
-                facts: broca_core::held_call_facts(&records, Some(&registration.call_key)),
+                facts: broca_core::held_call_facts(&records, None),
                 closing: closing_episode(&records),
                 records,
                 tombstoned: false,
+                delivered: HashSet::new(),
             },
             None => LineageView {
                 // A WAL the intake cannot read proves nothing: every entry for it is deferred.
@@ -279,6 +376,7 @@ impl LateResultsIntake {
                 closing: false,
                 records: Vec::new(),
                 tombstoned: false,
+                delivered: HashSet::new(),
             },
         };
         view.tombstoned = self.tombstoned(&registration.bind, &registration.lineage);
@@ -413,30 +511,35 @@ impl LateResultsIntake {
                 puller.back_off();
             }
         }
+        puller.warn_overdue(module);
     }
 
     /// Whether the module still has a held call or an owed barrier: the condition that outranks
     /// an abandoned ack. Prunes every registration whose call is settled for good on the way.
     pub fn module_holds_calls(&self, module: &str) -> Result<bool, String> {
         let mut holds = false;
+        let mut views = HashMap::new();
+        let mut inline = Vec::new();
+        let mut settled = Vec::new();
         for row in self.store.registrations_for(module)? {
-            match self.readable(&row.call.bind) {
-                Some(records) => {
-                    let facts = broca_core::held_call_facts(&records, Some(&row.call.call_key));
-                    if facts.needs_intake() {
-                        holds = true;
-                    } else if registration_settled(&row.call.call_key, &records, &facts) {
-                        self.store.remove(module, &row.call.call_key)?;
-                    }
+            let view = views
+                .entry(row.call.bind.clone())
+                .or_insert_with(|| self.lineage_view(&row.call));
+            if view.tombstoned
+                || (!view.facts.unreadable
+                    && registration_settled(&row.call.call_key, &view.records, &view.facts))
+            {
+                if inline_registration_settled(&row.call.call_key, &view.records, &view.facts) {
+                    inline.push((module.to_owned(), row.call.call_key));
+                } else {
+                    settled.push((module.to_owned(), row.call.call_key));
                 }
-                None if self.tombstoned(&row.call.bind, &row.call.lineage) => {
-                    // Retention deleted the session: nothing of it can be delivered any more.
-                    self.store.remove(module, &row.call.call_key)?;
-                }
-                // An unreadable registered WAL may hide a hold, so the feed stays.
-                None => holds = true,
+            } else if view.facts.unreadable || view.facts.needs_intake() {
+                holds = true;
             }
         }
+        self.store.remove_inline_calls(&inline)?;
+        self.store.remove_calls(&settled)?;
         Ok(holds)
     }
 
@@ -445,6 +548,7 @@ impl LateResultsIntake {
     /// delivered: the pinned entries are read from the start of the incarnation, and pages after
     /// that reply from its cursor, so no page is read twice.
     async fn pull_round(&self, module: &str, puller: &Puller) -> Result<(), FeedError> {
+        let mut views = HashMap::new();
         let mut read_from = self
             .store
             .feed(module)
@@ -458,7 +562,7 @@ impl LateResultsIntake {
             });
             // While anything in the pinned reply is unsettled it is never acked: any ack
             // covering it would pass the pin.
-            let (settled, still) = self.settle(module, &reply.entries).await?;
+            let (settled, still) = self.settle(module, &reply.entries, &mut views).await?;
             if still.is_empty() {
                 // Every entry of the reply settled, so nothing pins the ack any more. The reply
                 // was read from the acked position, so its cursor covers only settled entries.
@@ -495,7 +599,7 @@ impl LateResultsIntake {
             });
             // An entry delivered on a page is durable before anything can ack that page: a
             // delivery that could not be made pins the ack here instead.
-            let (settled, still) = self.settle(module, &reply.entries).await?;
+            let (settled, still) = self.settle(module, &reply.entries, &mut views).await?;
             if !still.is_empty() {
                 puller.set_pinned(still);
             }
@@ -514,7 +618,9 @@ impl LateResultsIntake {
                 // of that run returns exactly the cursor to ack. An entry pinned before it is
                 // not one of these, so the ack cannot pass it.
                 let prefix: Vec<LateEntry> = reply.entries[..settled].to_vec();
-                let _ = self.ack_prefix(module, from.as_ref(), &prefix).await?;
+                let _ = self
+                    .ack_prefix(module, from.as_ref(), &prefix, &mut views)
+                    .await?;
             }
             if !reply.more {
                 return Ok(());
@@ -539,12 +645,12 @@ impl LateResultsIntake {
         &self,
         module: &str,
         entries: &[LateEntry],
+        views: &mut HashMap<BindIdentity, LineageView>,
     ) -> Result<(usize, Vec<IntakeKey>), FeedError> {
         let rows = self
             .store
             .registration_rows()
             .map_err(FeedError::Retryable)?;
-        let mut views: HashMap<BindIdentity, LineageView> = HashMap::new();
         let mut settled = 0usize;
         let mut pinned = Vec::new();
         for entry in entries {
@@ -556,7 +662,7 @@ impl LateResultsIntake {
                 continue;
             }
             let kind = self
-                .classify_one(module, entry, &rows, &mut views)
+                .classify_one(module, entry, &rows, views)
                 .await
                 .map_err(FeedError::Retryable)?;
             if !kind.settles() {
@@ -568,7 +674,7 @@ impl LateResultsIntake {
                 // handed over before anything can ack the entry's position. A delivery that
                 // could not be made leaves the entry exactly where it was.
                 if let Err(reason) = self
-                    .deliver_settled(module, std::slice::from_ref(entry), &rows)
+                    .deliver_settled(module, std::slice::from_ref(entry), &rows, views)
                     .await
                 {
                     // The entry is retried from its pin on a later pull. The reason names the
@@ -693,6 +799,35 @@ impl LateResultsIntake {
         if view.facts.unreadable {
             return Ok(Classified::Blocked("wal_unreadable".into()));
         }
+        if view.delivered.contains(&entry.call_key) {
+            return Ok(Classified::NoOp);
+        }
+        let Some(dispatch) = dispatch_fact(&entry.call_key, &view.records) else {
+            // A registration without its intent is not evidence that the call is gone.
+            return Ok(Classified::Blocked("intent_missing".into()));
+        };
+        if dispatch.terminal {
+            if registration_settled(&entry.call_key, &view.records, &view.facts) {
+                if inline_registration_settled(&entry.call_key, &view.records, &view.facts) {
+                    self.store
+                        .remove_inline_calls(&[(module.to_owned(), entry.call_key.clone())])?;
+                } else {
+                    self.store.remove(module, &entry.call_key)?;
+                }
+            }
+            return Ok(Classified::NoOp);
+        }
+        if !dispatch.run_open {
+            // A sealed run cannot write a held record or accept a result. An indeterminate
+            // call stays indeterminate; a provider answer must never cross into another run.
+            return Ok(Classified::NoOp);
+        }
+        if dispatch
+            .module
+            .is_some_and(|dispatched| dispatched != module)
+        {
+            return Ok(Classified::NoOp);
+        }
         let Some(held) = view.facts.held_call(&entry.call_key) else {
             return Ok(if row.state == RegistrationState::Registered {
                 // Registered before the send, but no held record is durable yet: the ack stops
@@ -748,6 +883,7 @@ impl LateResultsIntake {
         module: &str,
         entries: &[LateEntry],
         rows: &[RegistrationRow],
+        views: &mut HashMap<BindIdentity, LineageView>,
     ) -> Result<(), String> {
         for entry in entries {
             let key = entry.intake_key(module);
@@ -760,7 +896,11 @@ impl LateResultsIntake {
             else {
                 continue;
             };
-            let held_call_id = match self.delivery_id(module, row, entry) {
+            let held_call_id = match views
+                .get(&row.call.bind)
+                .and_then(|view| view.facts.held_call(&entry.call_key))
+                .map(|held| held.tool_call_id.clone())
+            {
                 Some(id) => id,
                 None => {
                     // Nothing to deliver as a tool result: settle the entry as a no-op.
@@ -772,6 +912,11 @@ impl LateResultsIntake {
             self.delivery
                 .deliver(&row.call, &held_call_id, entry)
                 .await?;
+            // Later entries in this round share the snapshot. Remember the durable terminal
+            // without re-reading the WAL, so a second event cannot deliver the same call twice.
+            if let Some(view) = views.get_mut(&row.call.bind) {
+                view.delivered.insert(entry.call_key.clone());
+            }
             // The batch synced the call's terminal before `deliver` returned, so the WAL now
             // answers any re-read of this entry as already settled; the receipt only spares the
             // re-read until the ack lands.
@@ -779,18 +924,6 @@ impl LateResultsIntake {
                 .record_receipt(&key, &entry.kind, Disposition::Delivered)?;
         }
         Ok(())
-    }
-
-    fn delivery_id(
-        &self,
-        _module: &str,
-        registration: &RegistrationRow,
-        entry: &LateEntry,
-    ) -> Option<ToolCallId> {
-        let view = self.lineage_view(&registration.call);
-        view.facts
-            .held_call(&entry.call_key)
-            .map(|held| held.tool_call_id.clone())
     }
 
     /// Send one ack for a fully settled reply and store its cursor.
@@ -830,6 +963,7 @@ impl LateResultsIntake {
         module: &str,
         since: Option<&FeedPosition>,
         prefix: &[LateEntry],
+        views: &mut HashMap<BindIdentity, LineageView>,
     ) -> Result<bool, FeedError> {
         let since = since.map(FeedPosition::cursor);
         let reply = self
@@ -850,7 +984,7 @@ impl LateResultsIntake {
             .store
             .registration_rows()
             .map_err(FeedError::Retryable)?;
-        self.deliver_settled(module, &reply.entries, &rows)
+        self.deliver_settled(module, &reply.entries, &rows, views)
             .await
             .map_err(FeedError::Retryable)?;
         self.feed.ack(module, &reply.cursor).await?;
@@ -902,6 +1036,7 @@ pub struct LineageView {
     /// close-out terminal. Recognition never reads the result's reason.
     pub closing: bool,
     pub tombstoned: bool,
+    delivered: HashSet<String>,
 }
 
 fn closing_episode(records: &[FramedRecord]) -> bool {
@@ -947,43 +1082,90 @@ fn settles_a_call(entry: &LateEntry) -> bool {
     )
 }
 
-/// Whether a registered call is settled for good, so its registration may be pruned: the WAL
-/// holds a terminal for it and no batch in the WAL still owes its commit barrier.
-///
-/// The call is found by its key: a held record naming it, an approved call's intent carrying
-/// it, or a plain call's intent at the WAL sequence the key ends in (`<lineage>:<intent seq>`).
-/// A key that names nothing in the WAL is never pruned here: the registration is written right
-/// after the intent, and a read racing that write must not conclude the call is gone.
-fn registration_settled(call_key: &str, records: &[FramedRecord], facts: &HeldCallFacts) -> bool {
-    if facts.barrier_owed {
-        return false;
-    }
-    let held = facts
-        .held_call(call_key)
-        .map(|held| held.tool_call_id.clone());
+struct DispatchFact<'a> {
+    module: Option<&'a str>,
+    terminal: bool,
+    run_open: bool,
+}
+
+/// Intents with an explicit call key store it; intents without one are identified by their
+/// durable WAL sequence.
+/// Search only the dispatching run for its terminal: a later run may reuse a tool-call id.
+fn dispatch_fact<'a>(call_key: &str, records: &'a [FramedRecord]) -> Option<DispatchFact<'a>> {
     let intent_seq = call_key
         .rsplit_once(':')
         .and_then(|(_, seq)| seq.parse::<u64>().ok());
-    let call = held.or_else(|| {
-        records.iter().find_map(|frame| match &frame.record {
-            WalRecord::ToolDispatchIntent {
-                tool_call_id,
-                call_key: stored,
-                ..
-            } if stored.as_deref() == Some(call_key) || Some(frame.seq) == intent_seq => {
-                Some(tool_call_id.clone())
-            }
+    let (index, tool_call_id, module, batch_id) =
+        records
+            .iter()
+            .enumerate()
+            .find_map(|(index, frame)| match &frame.record {
+                WalRecord::ToolDispatchIntent {
+                    batch_id,
+                    tool_call_id,
+                    call_key: stored,
+                    module_id,
+                    ..
+                } if stored.as_deref() == Some(call_key)
+                    || (stored.is_none() && Some(frame.seq) == intent_seq) =>
+                {
+                    Some((index, tool_call_id, module_id.as_deref(), batch_id))
+                }
+                _ => None,
+            })?;
+    let mut run_open = records[..index]
+        .iter()
+        .rev()
+        .find_map(|frame| match frame.record {
+            WalRecord::RunStarted { .. } => Some(true),
+            WalRecord::RunFinished { .. } => Some(false),
             _ => None,
         })
-    });
-    let Some(call) = call else {
-        return false;
-    };
-    records.iter().any(|frame| match &frame.record {
-        WalRecord::ToolResult { result, .. } => result.tool_call_id == call,
-        WalRecord::ToolNoDispatch { tool_call_id, .. } => *tool_call_id == call,
-        _ => false,
+        .unwrap_or(false);
+    let mut terminal = false;
+    for frame in &records[index + 1..] {
+        match &frame.record {
+            WalRecord::RunStarted { .. } => {
+                run_open = false;
+                break;
+            }
+            WalRecord::RunFinished { .. } => run_open = false,
+            WalRecord::ToolResult {
+                batch_id: batch,
+                result,
+                ..
+            } if batch == batch_id && result.tool_call_id == *tool_call_id => terminal = true,
+            WalRecord::ToolNoDispatch {
+                batch_id: batch,
+                tool_call_id: id,
+                ..
+            } if batch == batch_id && id == tool_call_id => terminal = true,
+            _ => {}
+        }
+    }
+    Some(DispatchFact {
+        module,
+        terminal,
+        run_open,
     })
+}
+
+/// Inline terminals need no feed. Held terminals retain their registration until the batch's
+/// owed commit barrier is repaired, because recovery still needs to find that batch.
+fn registration_settled(call_key: &str, records: &[FramedRecord], facts: &HeldCallFacts) -> bool {
+    if facts.held_call(call_key).is_some() && facts.barrier_owed {
+        return false;
+    }
+    dispatch_fact(call_key, records).is_some_and(|dispatch| dispatch.terminal)
+}
+
+pub(crate) fn inline_registration_settled(
+    call_key: &str,
+    records: &[FramedRecord],
+    facts: &HeldCallFacts,
+) -> bool {
+    facts.held_call(call_key).is_none()
+        && dispatch_fact(call_key, records).is_some_and(|dispatch| dispatch.terminal)
 }
 
 /// How far the rebuild scanned, for the operator's log and for the measurement test.
@@ -1796,6 +1978,481 @@ mod tests {
             bind: session.clone(),
             scope: None,
         }
+    }
+
+    // Both calls share a batch and a lineage, as inline answers followed by a held answer do.
+    fn inline_then_held_records(bind: &BindIdentity) -> Vec<WalRecord> {
+        let mut records = held_records("lineage:6", "basal", bind);
+        if let WalRecord::ModelStepFinished {
+            assistant_message, ..
+        } = &mut records[1]
+        {
+            Arc::make_mut(assistant_message)
+                .content
+                .push(ContentBlock::ToolCall(ToolCall {
+                    tool_call_id: ToolCallId("b".into()),
+                    tool_name: "ask".into(),
+                    input: json!({}),
+                    thought_signature: None,
+                }));
+        }
+        if let WalRecord::ToolBatchStarted { planned_calls, .. } = &mut records[2] {
+            planned_calls.push(ToolCallId("b".into()));
+        }
+        if let WalRecord::ToolDispatchIntent { call_key, .. } = &mut records[3] {
+            *call_key = None; // Plain calls derive their key from the intent's WAL sequence.
+        }
+        let terminal = delivered_records("lineage:4", "basal", bind).remove(6);
+        let mut intent = records[3].clone();
+        if let WalRecord::ToolDispatchIntent { tool_call_id, .. } = &mut intent {
+            *tool_call_id = ToolCallId("b".into());
+        }
+        if let WalRecord::ToolCallProviderHeld { tool_call_id, .. } = &mut records[4] {
+            *tool_call_id = ToolCallId("b".into());
+        }
+        records.splice(4..4, [terminal, intent]);
+        records
+    }
+
+    async fn inline_duplicate_before_held(name: &str, restart: bool) {
+        let bind = session(name);
+        let rig = Rig::new(
+            name,
+            None,
+            vec![
+                registration("lineage:4", "basal", &bind),
+                registration("lineage:6", "basal", &bind),
+            ],
+        )
+        .await;
+        write_wal_root(
+            &rig.root.join("wal"),
+            &bind,
+            &inline_then_held_records(&bind),
+        );
+        let rig = if restart {
+            let root = rig.root.clone();
+            drop(rig);
+            let store = Arc::new(LateResultsStore::open(&root.join("late-results.db")).unwrap());
+            let feed = Arc::new(ScriptedFeed::default());
+            let delivery = Arc::new(RecordedDelivery::default());
+            let intake = LateResultsIntake::new(
+                store.clone(),
+                Arc::new(FileWalStore::new(root.join("wal"))),
+                "broca",
+                delivery.clone(),
+                feed.clone(),
+            );
+            Rig {
+                root,
+                store,
+                intake,
+                feed,
+                delivery,
+            }
+        } else {
+            rig
+        };
+        let _puller = rig.puller("basal");
+        let duplicate = entry(kinds::RESULT, "lineage:4", "inline-duplicate");
+        rig.feed.fail_ack_once();
+        rig.feed.replies(vec![reply(
+            vec![
+                duplicate.clone(),
+                entry(kinds::RESULT, "lineage:6", "held-result"),
+            ],
+            322,
+            false,
+        )]);
+        rig.intake.tick("basal").await.unwrap();
+        assert_eq!(
+            *rig.delivery.delivered.lock().unwrap(),
+            vec![("lineage:6".to_owned(), "held-result".to_owned())]
+        );
+        assert_eq!(
+            rig.store.receipt(&duplicate.intake_key("basal")).unwrap(),
+            Some(Disposition::NoOp)
+        );
+        rig.feed.replies(vec![reply(
+            vec![duplicate, entry(kinds::RESULT, "lineage:6", "held-result")],
+            322,
+            false,
+        )]);
+        rig.intake.tick("basal").await.unwrap();
+        assert_eq!(rig.delivery.delivered.lock().unwrap().len(), 1);
+        assert_eq!(rig.feed.acks(), vec![cursor(322)]);
+    }
+
+    #[tokio::test]
+    async fn inline_duplicate_does_not_pin_a_held_result() {
+        inline_duplicate_before_held("inline-duplicate", false).await;
+    }
+
+    #[tokio::test]
+    async fn inline_duplicate_does_not_pin_a_held_result_after_restart() {
+        inline_duplicate_before_held("inline-duplicate-restart", true).await;
+    }
+
+    #[tokio::test]
+    async fn pending_intent_delivers_only_after_its_held_record_syncs() {
+        let bind = session("pending-intent");
+        let rig = Rig::new(
+            "pending-intent",
+            None,
+            vec![registration("lineage:4", "basal", &bind)],
+        )
+        .await;
+        let records = held_records("lineage:4", "basal", &bind);
+        write_wal_root(&rig.root.join("wal"), &bind, &records[..4]);
+        let puller = rig.puller("basal");
+        let late = entry(kinds::RESULT, "lineage:4", "pending-result");
+        assert_eq!(
+            rig.intake
+                .classify(
+                    "basal",
+                    &late,
+                    &rig.store.registration_rows().unwrap(),
+                    &mut HashMap::new()
+                )
+                .unwrap(),
+            Classified::Pending
+        );
+        rig.feed.replies(vec![
+            reply(vec![late.clone()], 1, false),
+            reply(vec![late.clone()], 1, false),
+        ]);
+        rig.intake.tick("basal").await.unwrap();
+        assert!(rig.delivery.delivered.lock().unwrap().is_empty());
+        assert!(rig.feed.acks().is_empty());
+        assert_eq!(puller.pinned(), vec![late.intake_key("basal")]);
+        write_wal_root(&rig.root.join("wal"), &bind, &records);
+        rig.intake.tick("basal").await.unwrap();
+        assert_eq!(rig.delivery.delivered.lock().unwrap().len(), 1);
+        assert_eq!(rig.feed.acks(), vec![cursor(1)]);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_indeterminate_call_does_not_pin_a_held_result() {
+        let ended = session("indeterminate");
+        let held = session("after-indeterminate");
+        let rig = Rig::new(
+            "indeterminate",
+            Some(("held:4", "basal", held.clone())),
+            vec![
+                registration("ended:4", "basal", &ended),
+                registration("held:4", "basal", &held),
+            ],
+        )
+        .await;
+        let mut records = held_records("ended:4", "basal", &ended);
+        records.truncate(4);
+        records.push(WalRecord::RunFinished {
+            interrupt_reason: None,
+            reason: broca_protocol::RunFinishReason::Interrupted,
+            ts_ms: Some(44),
+            usage: Default::default(),
+            error: None,
+            retries_used: 0,
+        });
+        write_wal_root(&rig.root.join("wal"), &ended, &records);
+        let _puller = rig.puller("basal");
+        let stale = entry(kinds::RESULT, "ended:4", "indeterminate-result");
+        rig.feed.fail_ack_once();
+        rig.feed.replies(vec![reply(
+            vec![stale.clone(), entry(kinds::RESULT, "held:4", "held-result")],
+            2,
+            false,
+        )]);
+        rig.intake.tick("basal").await.unwrap();
+        assert_eq!(
+            *rig.delivery.delivered.lock().unwrap(),
+            vec![("held:4".to_owned(), "held-result".to_owned())]
+        );
+        assert_eq!(
+            rig.store.receipt(&stale.intake_key("basal")).unwrap(),
+            Some(Disposition::NoOp)
+        );
+        rig.feed.replies(vec![reply(
+            vec![stale, entry(kinds::RESULT, "held:4", "held-result")],
+            2,
+            false,
+        )]);
+        rig.intake.tick("basal").await.unwrap();
+        assert_eq!(rig.delivery.delivered.lock().unwrap().len(), 1);
+        assert_eq!(rig.feed.acks(), vec![cursor(2)]);
+        assert_eq!(
+            rig.intake.readable(&ended).unwrap().len(),
+            5,
+            "the indeterminate call stays untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_inline_registration_is_cleaned_even_while_its_sibling_is_held() {
+        let bind = session("inline-cleanup");
+        let rig = Rig::new(
+            "inline-cleanup",
+            None,
+            vec![
+                registration("lineage:4", "basal", &bind),
+                registration("lineage:6", "basal", &bind),
+            ],
+        )
+        .await;
+        write_wal_root(
+            &rig.root.join("wal"),
+            &bind,
+            &inline_then_held_records(&bind),
+        );
+        assert!(rig.intake.module_holds_calls("basal").unwrap());
+        assert!(rig
+            .store
+            .registration("basal", "lineage:4")
+            .unwrap()
+            .is_none());
+        assert!(rig
+            .store
+            .registration("basal", "lineage:6")
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn stale_inline_rows_are_swept_in_bounded_pages_without_a_feed() {
+        let bind = session("sweep-inline");
+        let rig = Rig::new("sweep-inline", None, Vec::new()).await;
+        let mut records = held_records("lineage:4", "aft", &bind);
+        records.truncate(3);
+        let mut calls = Vec::new();
+        for index in 0..REGISTRATION_SWEEP_LIMIT + 1 {
+            let key = format!("lineage:{}", records.len() + 1);
+            let mut intent = held_records(&key, "aft", &bind).remove(3);
+            let mut terminal = delivered_records(&key, "aft", &bind).remove(6);
+            if let WalRecord::ToolDispatchIntent {
+                tool_call_id,
+                call_key,
+                ..
+            } = &mut intent
+            {
+                *tool_call_id = ToolCallId(format!("call-{index}"));
+                *call_key = None;
+            }
+            if let WalRecord::ToolResult { result, .. } = &mut terminal {
+                Arc::make_mut(result).tool_call_id = ToolCallId(format!("call-{index}"));
+            }
+            records.extend([intent, terminal]);
+            calls.push(registration(&key, "aft", &bind));
+        }
+        write_wal_root(&rig.root.join("wal"), &bind, &records);
+        register_more(&rig.store, &calls).await;
+        assert!(rig.intake.running().is_empty());
+        assert_eq!(
+            rig.intake.sweep_registrations().unwrap(),
+            REGISTRATION_SWEEP_LIMIT
+        );
+        assert_eq!(rig.store.registrations().unwrap().len(), 1);
+        assert_eq!(rig.intake.sweep_registrations().unwrap(), 1);
+        assert_eq!(rig.intake.sweep_registrations().unwrap(), 0);
+        assert!(rig.store.registrations().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_sweep_keeps_a_new_held_lineage_when_the_same_bind_has_an_old_tombstone() {
+        let bind = session("sweep-reused-bind");
+        let rig = Rig::new(
+            "sweep-reused-bind",
+            Some(("zzz:4", "basal", bind.clone())),
+            vec![
+                registration("aaa:4", "basal", &bind),
+                registration("zzz:4", "basal", &bind),
+            ],
+        )
+        .await;
+        let wal = FileWalStore::new(rig.root.join("wal"));
+        let stone = wal.tombstone_path(&bind, "aaa");
+        std::fs::create_dir_all(stone.parent().unwrap()).unwrap();
+        std::fs::write(
+            stone,
+            serde_json::to_vec(&crate::retention::Tombstone {
+                lineage_id: "aaa".into(),
+                expired_at_ms: 1,
+                seq: 1,
+                completed_at_ms: None,
+                next_tag: None,
+                next_notice_seq: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rig.intake.sweep_registrations().unwrap(), 1);
+        assert!(rig.store.registration("basal", "zzz:4").unwrap().is_some());
+    }
+
+    struct NoInlineWithdrawal;
+
+    #[async_trait]
+    impl crate::held_withdrawals::WithdrawTransport for NoInlineWithdrawal {
+        async fn withdraw(
+            &self,
+            _: &LateResultRegistration,
+        ) -> (
+            cortexkit_role_tool_provider::withdraw::WithdrawVerdict,
+            Value,
+        ) {
+            panic!("an inline call must never be withdrawn")
+        }
+    }
+
+    fn plan_inline_calls(records: &mut [WalRecord], count: usize) {
+        if let WalRecord::ModelStepFinished {
+            assistant_message, ..
+        } = &mut records[1]
+        {
+            Arc::make_mut(assistant_message).content = (0..count)
+                .map(|index| {
+                    ContentBlock::ToolCall(ToolCall {
+                        tool_call_id: ToolCallId(format!("call-{index}")),
+                        tool_name: "ask".into(),
+                        input: json!({}),
+                        thought_signature: None,
+                    })
+                })
+                .collect();
+        }
+        if let WalRecord::ToolBatchStarted { planned_calls, .. } = &mut records[2] {
+            *planned_calls = (0..count)
+                .map(|index| ToolCallId(format!("call-{index}")))
+                .collect();
+        }
+    }
+
+    async fn measure_inline_outbox(name: &str, sessions: usize, calls_per_session: usize) {
+        let rig = Rig::new(name, None, Vec::new()).await;
+        let wal = Arc::new(FileWalStore::new(rig.root.join("wal")));
+        let mut calls = Vec::new();
+        let mut expected_frames = 0;
+        for session_index in 0..sessions {
+            let bind = session(&format!("{name}-{session_index:03}"));
+            let mut records = held_records("unused:4", "aft", &bind);
+            records.truncate(3);
+            plan_inline_calls(&mut records, calls_per_session);
+            for index in 0..calls_per_session {
+                let key = format!("lineage-{session_index}:{}", records.len() + 1);
+                let mut intent = held_records(&key, "aft", &bind).remove(3);
+                let mut terminal = delivered_records(&key, "aft", &bind).remove(6);
+                if let WalRecord::ToolDispatchIntent {
+                    tool_call_id,
+                    call_key,
+                    ..
+                } = &mut intent
+                {
+                    *tool_call_id = ToolCallId(format!("call-{index}"));
+                    *call_key = None;
+                }
+                if let WalRecord::ToolResult { result, .. } = &mut terminal {
+                    Arc::make_mut(result).tool_call_id = ToolCallId(format!("call-{index}"));
+                }
+                records.extend([intent, terminal]);
+                calls.push(registration(&key, "aft", &bind));
+            }
+            records.push(WalRecord::ToolBatchFinished {
+                batch_id: BatchId("b".into()),
+            });
+            expected_frames += records.len();
+            write_wal(&wal, &bind, &records);
+        }
+        register_more(&rig.store, &calls).await;
+        let withdrawals = crate::held_withdrawals::HeldWithdrawals::new(
+            rig.store.clone(),
+            wal.clone(),
+            Arc::new(NoInlineWithdrawal),
+        );
+        withdrawals.bind_stopping_signal(tokio_util::sync::CancellationToken::new());
+        let counter = broca_wal::access_counter::WalAccessCounter::default();
+        let started = std::time::Instant::now();
+        counter
+            .operation("withdrawal recovery")
+            .run_future(withdrawals.recover())
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        let measured = counter.snapshot();
+        let origin_reads = measured[0]
+            .reads
+            .iter()
+            .filter(|read| read.class == broca_wal::access_counter::ReadClass::Origin)
+            .count();
+        let remaining = rig.store.withdrawal_rows().unwrap().len();
+        eprintln!("outbox recovery: rows={} sessions={sessions} origin_reads={origin_reads} decoded={} expected_once={expected_frames} remaining={remaining} elapsed_ms={}", calls.len(), measured[0].frames_decoded, elapsed.as_millis());
+        assert_eq!(
+            origin_reads, sessions,
+            "one origin read per registered session"
+        );
+        assert_eq!(
+            measured[0].frames_decoded, expected_frames as u64,
+            "each session is decoded once"
+        );
+        assert_eq!(remaining, 0, "inline watches converge to zero in one sweep");
+        assert!(rig.store.registrations().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn withdrawal_recovery_decodes_each_session_once_and_retires_inline_watches() {
+        measure_inline_outbox("outbox-read-once", 2, 3).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[ignore = "production-shaped outbox cost measurement; run explicitly"]
+    async fn withdrawal_recovery_cost_on_a_production_shaped_outbox() {
+        measure_inline_outbox("outbox-production", 120, 174).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pin_warns_once_after_five_minutes() {
+        let bind = session("pin-warn");
+        let rig = Rig::new(
+            "pin-warn",
+            None,
+            vec![registration("lineage:4", "basal", &bind)],
+        )
+        .await;
+        let records = held_records("lineage:4", "basal", &bind);
+        write_wal_root(&rig.root.join("wal"), &bind, &records[..4]);
+        let _puller = rig.puller("basal");
+        let page = || reply(vec![entry(kinds::RESULT, "lineage:4", "waiting")], 1, false);
+        rig.feed
+            .replies(vec![page(), page(), page(), page(), page()]);
+        let ((), early) = broca_test_support::capture_logs(async {
+            rig.intake.tick("basal").await.unwrap();
+            tokio::time::advance(Duration::from_secs(299)).await;
+            rig.intake.tick("basal").await.unwrap();
+            assert_eq!(rig.intake.overdue_pins(), 0);
+        })
+        .await;
+        assert!(
+            !early
+                .iter()
+                .any(|event| event.target == "late_results" && event.level == tracing::Level::WARN),
+            "{early:?}"
+        );
+        let ((), logs) = broca_test_support::capture_logs(async {
+            tokio::time::advance(Duration::from_secs(2)).await;
+            rig.intake.tick("basal").await.unwrap();
+            assert_eq!(rig.intake.overdue_pins(), 1);
+            rig.intake.tick("basal").await.unwrap();
+        })
+        .await;
+        let warnings: Vec<_> = logs
+            .iter()
+            .filter(|event| event.target == "late_results" && event.level == tracing::Level::WARN)
+            .collect();
+        assert_eq!(warnings.len(), 1, "{logs:?}");
+        assert_eq!(warnings[0].fields["module"], "basal");
+        assert_eq!(warnings[0].fields["call_key"], "lineage:4");
+        assert_eq!(warnings[0].fields["event_id"], "waiting");
+        write_wal_root(&rig.root.join("wal"), &bind, &records);
+        rig.intake.tick("basal").await.unwrap();
+        assert_eq!(rig.intake.overdue_pins(), 0);
     }
 
     #[tokio::test]
