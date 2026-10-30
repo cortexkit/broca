@@ -17,7 +17,27 @@ use sha2::{Digest, Sha256};
 use super::index::{self, IndexedFrame};
 use super::{DbError, IndexOutcome, LogLocation, OverhaulDb};
 
-type ReadAt<'a> = dyn Fn(u64, u64) -> std::io::Result<Vec<u8>> + 'a;
+pub(super) type ReadAt<'a> = dyn Fn(u64, u64) -> std::io::Result<Vec<u8>> + 'a;
+
+/// A descriptor-synced prefix whose lineage and sequence have been checked.
+/// Boot recovery and writer publication supply this only after their own sync.
+pub(super) struct CheckedEnd<'a> {
+    pub lineage: &'a str,
+    pub end: u64,
+    pub seq: u64,
+}
+
+pub(super) struct PreparedCursor {
+    cp: Option<RowCursor>,
+    seed: Option<OffsetSeed>,
+    rebuilt: bool,
+}
+
+impl PreparedCursor {
+    pub fn start(&self) -> (u64, Option<u64>) {
+        self.cp.as_ref().map_or((0, None), |cp| (cp.end, cp.seq))
+    }
+}
 
 struct RowCursor {
     seq: Option<u64>,
@@ -242,34 +262,67 @@ fn publish_in_tx(
             ))
         }
     };
-    let cp = tx.query_row("SELECT indexed_seq,indexed_off,indexed_end,indexed_identity,lineage_id,locator_seed,lineage_off FROM session WHERE sid=?1", [&key], |r| Ok(RowCursor {
+    let checked = CheckedEnd {
+        lineage: &lineage,
+        end: publication.byte_end(),
+        seq: publication.sequence(),
+    };
+    let prepared = prepare_cursor(tx, &key, &lineage, checked.end, read, None, false)?;
+    publish_checked_in_tx(tx, bind, session_ref, location, &checked, read, prepared)
+}
+
+pub(super) fn prepare_cursor(
+    tx: &Transaction<'_>,
+    key: &str,
+    lineage: &str,
+    end: u64,
+    read: &ReadAt<'_>,
+    rebuild_reason: Option<&'static str>,
+    force: bool,
+) -> Result<PreparedCursor, DbError> {
+    let cp = tx.query_row("SELECT indexed_seq,indexed_off,indexed_end,indexed_identity,lineage_id,locator_seed,lineage_off FROM session WHERE sid=?1", [key], |r| Ok(RowCursor {
         seq: r.get(0)?, off: r.get(1)?, end: r.get(2)?, identity: r.get(3)?, lineage: r.get(4)?, locator: r.get(5)?, lineage_off: r.get(6)?,
     })).optional()?;
     let mut seed = None;
-    let mut rebuilt = false;
+    let mut rebuilt = force;
     if let Some(cp) = &cp {
-        if valid_cursor(cp, &lineage, publication.byte_end(), read)? {
-            seed = load_locator(tx, &key, &cp.locator, read)?;
+        if !force && valid_cursor(cp, lineage, end, read)? {
+            seed = load_locator(tx, key, &cp.locator, read)?;
         }
         rebuilt = seed.is_none();
     }
     if cp.is_none() || rebuilt {
-        SeedFallback::new(if cp.is_none() {
+        SeedFallback::new(rebuild_reason.unwrap_or(if cp.is_none() {
             "publication index missing"
         } else {
             "publication row cursor invalid"
-        });
-        index::clear_session(tx, &key)?;
+        }));
+        index::clear_session(tx, key)?;
     }
     let cp = if rebuilt { None } else { cp };
+    Ok(PreparedCursor { cp, seed, rebuilt })
+}
+
+pub(super) fn publish_checked_in_tx(
+    tx: &Transaction<'_>,
+    bind: &BindIdentity,
+    session_ref: &str,
+    location: LogLocation,
+    checked: &CheckedEnd<'_>,
+    read: &ReadAt<'_>,
+    prepared: PreparedCursor,
+) -> Result<IndexOutcome, DbError> {
+    let key = index::sid(bind)?;
+    let PreparedCursor { cp, seed, rebuilt } = prepared;
+    let lineage = checked.lineage;
     let start = cp.as_ref().map_or(LINEAGE_FRAME_LEN as u64, |cp| cp.end);
     let range = ValidatedRange::read(
         read,
         start,
-        publication.byte_end(),
+        checked.end,
         cp.as_ref().and_then(|cp| cp.seq),
-        publication.sequence(),
-        &lineage,
+        checked.seq,
+        lineage,
     )?;
     let mut seed = seed.unwrap_or_default();
     tx.execute("INSERT INTO session (sid,project_root,harness,session_key,session_ref,lineage_id,location,indexed_off,indexed_end,head_ord,tail_seed,admission_seed)
@@ -283,7 +336,7 @@ fn publish_in_tx(
                 ));
             }
         }
-        index::apply_frame(tx, &key, Some(&lineage), &mut seed, frame)?;
+        index::apply_frame(tx, &key, Some(lineage), &mut seed, frame)?;
     }
     let off = range
         .frames
