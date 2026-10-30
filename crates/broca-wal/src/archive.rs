@@ -846,6 +846,10 @@ pub fn read_newest_member(
     session_addr: &str,
     max_member_bytes: u64,
 ) -> io::Result<Option<ArchiveMember>> {
+    if paths.is_empty() {
+        address(session_addr)?;
+        return Ok(None);
+    }
     #[cfg(unix)]
     if let Some(answer) = member_index::lookup(paths, session_addr, max_member_bytes)? {
         return Ok(answer);
@@ -998,6 +1002,17 @@ pub mod expiry_io {
 
     thread_local! {
         static COUNTS: Cell<(u64, u64, u64)> = const { Cell::new((0, 0, 0)) };
+        static STATS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    #[cfg(unix)]
+    pub(super) fn statted() {
+        STATS.with(|count| count.set(count.get() + 1));
+    }
+
+    /// Archive membership metadata calls (path stats and selected-handle fstats).
+    pub fn metadata_count() -> u64 {
+        STATS.with(Cell::get)
     }
 
     pub(super) fn opened() {

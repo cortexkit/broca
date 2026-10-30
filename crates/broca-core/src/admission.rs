@@ -534,6 +534,15 @@ pub struct SessionOwnershipV1 {
     /// member existed, which a reader then treats as unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_episode: Option<FirstEpisodeV1>,
+    /// The latest distinct episode manifest. Refreshes do not replace the first episode's
+    /// identity; unchanged sessions omit this field and retain their original checkpoint bytes.
+    /// Older summaries also omit it because their episodes shared the first manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_manifest: Option<Arc<broca_wal::PlanManifest>>,
+    /// Whether the WAL contains session-change facts. False is omitted so unrefreshed logs
+    /// retain their old checkpoint bytes and admission need not probe for change records.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_change_recorded: bool,
     /// Whether this summary was folded by a build that records the first episode's frozen
     /// plan manifest (`FirstEpisodeV1::manifest`). A summary stored by an older build, or
     /// re-stored by one after a rollback, lacks it and may have dropped a manifest, so it is
@@ -553,6 +562,8 @@ impl Default for SessionOwnershipV1 {
             any_unrecorded_principal: false,
             recorded_principals: Vec::new(),
             first_episode: None,
+            latest_manifest: None,
+            session_change_recorded: false,
             plan_manifest_folded: true,
         }
     }
@@ -565,7 +576,7 @@ pub struct FirstEpisodeV1 {
     /// The model-facing names of the tools the episode was admitted with, in their order.
     pub tool_names: Vec<String>,
     /// The plan manifest the episode froze, when the session was admitted with a fetch plan.
-    /// Every later episode renders its tools from it and carries it on its own `RunStarted`.
+    /// Later episodes retain it until a session refresh applies a new manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<Arc<broca_wal::PlanManifest>>,
 }
@@ -581,6 +592,8 @@ impl SessionOwnershipV1 {
             any_unrecorded_principal: self.any_unrecorded_principal,
             recorded_principals: self.recorded_principals.clone(),
             first_episode: None,
+            latest_manifest: None,
+            session_change_recorded: false,
             plan_manifest_folded: false,
         }
     }
@@ -589,6 +602,8 @@ impl SessionOwnershipV1 {
     /// are irrelevant to which principals may cancel or retract a session.
     pub fn fold_owner_records(&mut self, records: &[FramedRecord]) {
         self.first_episode = None;
+        self.latest_manifest = None;
+        self.session_change_recorded = false;
         self.plan_manifest_folded = false;
         for frame in records {
             if let WalRecord::RunStarted {
@@ -938,6 +953,18 @@ impl AdmissionCheckpointV1 {
                             manifest: manifest.as_deref().cloned().map(Arc::new),
                         });
                     }
+                    // Unrefreshed sessions keep the original checkpoint bytes; only a distinct
+                    // episode manifest needs an additional copy in the checkpoint.
+                    let current = manifest.as_deref();
+                    let first = ownership
+                        .first_episode
+                        .as_ref()
+                        .and_then(|first| first.manifest.as_deref());
+                    ownership.latest_manifest = if current != first {
+                        current.cloned().map(Arc::new)
+                    } else {
+                        None
+                    };
                     ownership.fold_run_started(principal.as_ref(), scope.as_ref());
                 }
                 if self.lineage_retention == Some(crate::LineageRetention::Unstarted) {
@@ -1164,6 +1191,14 @@ impl AdmissionCheckpointV1 {
             | WalRecord::InputTokenBudgetExhausted { .. }
             | WalRecord::StructuredOutputResult { .. }
             | WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
+            // Only a presence bit is needed here; the session-change projection folds the payload.
+            WalRecord::SessionRefreshAccepted { .. }
+            | WalRecord::SessionRefreshPolicyChanged { .. }
+            | WalRecord::SessionPrefixFlushed { .. } => {
+                if let Some(ownership) = &mut self.ownership {
+                    ownership.session_change_recorded = true;
+                }
+            }
         }
         if let Some(episode) = self.last_episode.as_mut() {
             if let Some(facts) = episode.budget_replay_state.as_mut() {
@@ -1449,6 +1484,11 @@ struct AdmissionEpisodeSeed {
     budget_replay_state: Option<BudgetReplayStateV1>,
 }
 
+struct HydratedAdmissionEpisode {
+    episode: LastEpisodeV1,
+    manifest: Option<Arc<broca_wal::PlanManifest>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AdmissionQueueSeed {
     source: AdmissionSource,
@@ -1617,6 +1657,7 @@ impl AdmissionSeed {
             source(frames.iter().rposition(|p| matches!(&p.record, WalRecord::DeliveryOrdered { submission_id, .. } if submission_id == &staged.submission_id)).ok_or_else(bad)?)
         }).transpose()?;
         if let Some(ownership) = &mut scalars.ownership {
+            ownership.latest_manifest = None;
             if let Some(first) = &mut ownership.first_episode {
                 first.manifest = None;
             }
@@ -1650,6 +1691,15 @@ impl AdmissionSeed {
         &self,
         read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
     ) -> Result<Option<LastEpisodeV1>, crate::replay::SeedFallback> {
+        Ok(self
+            .episode_with_manifest(read_at)?
+            .map(|hydrated| hydrated.episode))
+    }
+
+    fn episode_with_manifest(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    ) -> Result<Option<HydratedAdmissionEpisode>, crate::replay::SeedFallback> {
         let Some(seed) = &self.episode else {
             return Ok(None);
         };
@@ -1684,6 +1734,10 @@ impl AdmissionSeed {
             return Err(bad());
         }
         checkpoint.fold_frames(&refs).map_err(|_| bad())?;
+        let manifest = checkpoint
+            .ownership
+            .and_then(|o| o.first_episode)
+            .and_then(|first| first.manifest);
         let mut episode = checkpoint.last_episode.ok_or_else(bad)?;
         if seed.structured_output_downgraded {
             broca_protocol::structured_output::FrozenStructuredOutput::downgrade_render_config(
@@ -1704,7 +1758,7 @@ impl AdmissionSeed {
         episode.usage = seed.usage;
         episode.retries_used = seed.retries_used;
         episode.budget_replay_state = seed.budget_replay_state.clone();
-        Ok(Some(episode))
+        Ok(Some(HydratedAdmissionEpisode { episode, manifest }))
     }
 
     fn validate(
@@ -1764,8 +1818,13 @@ impl AdmissionSeed {
         tail: &[crate::replay::PositionedFrame],
         safe_head: u64,
     ) -> Result<(AdmissionCheckpointV1, AdmissionCheckpointV1), crate::replay::SeedFallback> {
-        let episode = self.episode(read_at)?;
-        self.validate(read_at, tail, safe_head, episode.as_ref())?;
+        let hydrated = self.episode_with_manifest(read_at)?;
+        self.validate(
+            read_at,
+            tail,
+            safe_head,
+            hydrated.as_ref().map(|h| &h.episode),
+        )?;
         let bad = || crate::replay::SeedFallback::new("incomplete admission scalars");
         if self.scalars.last_episode.is_some()
             || !self.scalars.pending_fifo.is_empty()
@@ -1793,7 +1852,14 @@ impl AdmissionSeed {
             return Err(bad());
         }
         let mut checkpoint = self.scalars.clone();
-        checkpoint.last_episode = episode;
+        if let Some(HydratedAdmissionEpisode { episode, manifest }) = hydrated {
+            checkpoint.last_episode = Some(episode);
+            // The episode's authenticated RunStarted already supplied this manifest.
+            // Reuse it rather than reading the same source again during hydration.
+            if let Some(ownership) = &mut checkpoint.ownership {
+                ownership.latest_manifest = manifest;
+            }
+        }
         if let Some(source) = &self.first_run {
             let first = source.read(read_at, &self.boundary)?;
             let WalRecord::RunStarted {
@@ -1819,6 +1885,16 @@ impl AdmissionSeed {
                 .as_mut()
                 .ok_or_else(bad)?
                 .first_config = config.frozen_render_config.clone();
+        }
+        if let Some(ownership) = &mut checkpoint.ownership {
+            if ownership.latest_manifest.as_deref()
+                == ownership
+                    .first_episode
+                    .as_ref()
+                    .and_then(|first| first.manifest.as_deref())
+            {
+                ownership.latest_manifest = None;
+            }
         }
         let pending = self.queued.iter().map(|seed| {
             let frame = seed.source.read(read_at, &self.boundary)?;
@@ -2029,6 +2105,12 @@ impl AdmissionContinuation {
             | WalRecord::InputTokenCapFrozen { .. }
             | WalRecord::OutputReservationClamped { .. }
             | WalRecord::RunFinished { .. } => true,
+            // Session changes only set ownership.session_change_recorded, which is kept
+            // in the scalars. Capture/advance strip ownership.latest_manifest and hydration
+            // rebuilds it from the episode's RunStarted, not from these change records.
+            WalRecord::SessionRefreshAccepted { .. }
+            | WalRecord::SessionRefreshPolicyChanged { .. }
+            | WalRecord::SessionPrefixFlushed { .. } => false,
             WalRecord::WriterOpened { .. }
             | WalRecord::WriterClosed { .. }
             | WalRecord::VisibilityLate { .. }
@@ -2299,12 +2381,11 @@ impl AdmissionContinuation {
         }
         scalars.pending_fifo = Arc::new(Vec::new());
         scalars.pending_order = None;
-        if let Some(first) = scalars
-            .ownership
-            .as_mut()
-            .and_then(|o| o.first_episode.as_mut())
-        {
-            first.manifest = None;
+        if let Some(ownership) = &mut scalars.ownership {
+            ownership.latest_manifest = None;
+            if let Some(first) = &mut ownership.first_episode {
+                first.manifest = None;
+            }
         }
         if let Some(effort) = &mut scalars.effort_history {
             effort.first_config = serde_json::Value::Null;
@@ -3305,6 +3386,144 @@ mod tests {
     }
 
     #[test]
+    fn content_free_continuations_preserve_refresh_before_stored_boundary() {
+        use crate::projection_plan::ProjectionContinuation;
+
+        fn manifest(identity: &str, system: &str) -> broca_wal::PlanManifest {
+            serde_json::from_value(serde_json::json!({
+                "plan":"{}", "plan_identity":identity, "composition_digest":"composition",
+                "fetches":[], "tools":[], "system_text":system, "system_digest":"system",
+                "join_version":1, "role_versions":{}
+            }))
+            .unwrap()
+        }
+        let baseline = manifest("baseline", "PRIVATE-BASELINE-MANIFEST");
+        let refreshed = manifest("refreshed", "PRIVATE-REFRESHED-MANIFEST");
+        let mut records = offset_corpus();
+        for frame in &mut records {
+            if let WalRecord::RunStarted {
+                run_id, manifest, ..
+            } = &mut frame.record
+            {
+                *manifest = Some(Box::new(if run_id.0 == "r1" {
+                    baseline.clone()
+                } else {
+                    refreshed.clone()
+                }));
+            }
+        }
+        let changes = [
+            WalRecord::SessionRefreshAccepted {
+                generation: 1,
+                policy: "immediately".into(),
+                run_in_progress: false,
+                applies_from_next_run: true,
+                manifest: Box::new(refreshed.clone()),
+            },
+            WalRecord::SessionRefreshPolicyChanged {
+                generation: 1,
+                policy: "immediately".into(),
+                send_id: "policy-change".into(),
+            },
+            WalRecord::SessionPrefixFlushed {
+                send_id: "prefix-flush".into(),
+                pending_generation: Some(1),
+            },
+        ];
+        for change in &changes {
+            assert!(!AdmissionContinuation::accounting_source(change));
+        }
+        records.splice(10..10, changes.into_iter().map(|r| frame(0, r)));
+        for (i, frame) in records.iter_mut().enumerate() {
+            frame.seq = i as u64 + 1;
+        }
+        let cut = records.len() - 1;
+        let (bytes, positions) = offset_log(&records);
+        let read_at = offset_reader(&bytes);
+        let boundary = offset_boundary(&bytes, &positions, cut);
+        let captured =
+            ProjectionContinuation::capture(&read_at, &boundary, &positions[..cut]).unwrap();
+        let advanced = ProjectionContinuation::capture(
+            &read_at,
+            &offset_boundary(&bytes, &positions, 4),
+            &positions[..4],
+        )
+        .unwrap()
+        .advance(&read_at, &boundary, &positions[4..cut])
+        .unwrap();
+        let full = AdmissionCheckpointV1::from_frames(&records).unwrap();
+        let ownership = full.ownership.as_ref().unwrap();
+        assert!(ownership.session_change_recorded);
+        assert_eq!(ownership.latest_manifest.as_deref(), Some(&refreshed));
+        assert_eq!(
+            ownership
+                .first_episode
+                .as_ref()
+                .unwrap()
+                .manifest
+                .as_deref(),
+            Some(&baseline)
+        );
+        let prefix = crate::replay::replay(
+            &records[..cut]
+                .iter()
+                .map(|f| f.record.clone())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let replayed =
+            crate::replay::replay(&records.iter().map(|f| f.record.clone()).collect::<Vec<_>>())
+                .unwrap();
+        for stored in [captured, advanced] {
+            let encoded = stored.encode().unwrap();
+            assert_content_free_form(&encoded);
+            for payload in ["PRIVATE-BASELINE-MANIFEST", "PRIVATE-REFRESHED-MANIFEST"] {
+                assert!(!encoded.contains(payload));
+            }
+            let wire: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(
+                wire["admission"]["state"]["scalars"]["ownership"]["session_change_recorded"],
+                true
+            );
+            assert!(wire["admission"]["state"]["scalars"]["ownership"]
+                .get("latest_manifest")
+                .is_none());
+            let restored = ProjectionContinuation::decode(&encoded).unwrap();
+            let projection = restored
+                .hydrate(&read_at, &positions[cut..], records.len() as u64)
+                .unwrap();
+            assert_eq!(
+                projection
+                    .admission_checkpoint
+                    .ownership
+                    .as_ref()
+                    .unwrap()
+                    .latest_manifest
+                    .as_deref(),
+                Some(&refreshed)
+            );
+            let actual = crate::resume::reconstruct_from_offsets(
+                &read_at,
+                crate::resume::OffsetResumeSnapshot {
+                    boundary: restored.boundary(),
+                    projection,
+                    window: None,
+                    prefix: prefix.prompt.clone(),
+                    tail: positions[cut..].to_vec(),
+                },
+                records.len() as u64,
+            )
+            .unwrap();
+            assert_eq!(actual.snapshot.checkpoint_at_head, full);
+            assert_eq!(actual.prior.manifest.as_deref(), Some(&refreshed));
+            assert_eq!(actual.prior.prompt, replayed.prompt);
+            assert_eq!(actual.prior.extent, replayed.extent);
+            assert_eq!(actual.prior.usage, replayed.usage);
+            assert_eq!(actual.prior.retries_used, replayed.retries_used);
+        }
+    }
+
+    #[test]
     fn continuation_advance_drops_an_order_for_a_different_queued_submission() {
         use crate::projection_plan::ProjectionContinuation;
         let corpus = offset_corpus();
@@ -3428,6 +3647,17 @@ mod tests {
             let measured = counter.snapshot().remove(0);
             assert!(measured.seed_fallbacks.is_empty());
             use broca_wal::access_counter::{ReadClass, ValidationRead};
+            let source_sequences: Vec<_> = measured
+                .reads
+                .iter()
+                .filter(|r| r.class == ReadClass::Source)
+                .map(|r| {
+                    positions
+                        .iter()
+                        .find(|p| p.off == r.offset)
+                        .map(|p| p.framed.seq)
+                })
+                .collect();
             // Two validations (projection and admission) each read one boundary and
             // one lineage header. Hydration and capture read only the fixed accounting,
             // first/current episode, render-config and three new tail source frames.
@@ -3437,7 +3667,8 @@ mod tests {
                     .iter()
                     .filter(|r| r.class == ReadClass::Source)
                     .count(),
-                35
+                35,
+                "source reads by WAL sequence: {source_sequences:?}"
             );
             assert_eq!(
                 measured
@@ -3457,6 +3688,22 @@ mod tests {
             );
             assert_eq!(measured.reads.len(), 39);
             assert_eq!(measured.frames_decoded, 39);
+            let current_start = positions[..cut]
+                .iter()
+                .rev()
+                .find(|p| matches!(p.framed.record, WalRecord::RunStarted { .. }))
+                .unwrap()
+                .framed
+                .seq;
+            // Three accounting folds, two episode folds and one render-input fold use
+            // this fixed source. Latest-manifest restoration reuses the episode decodes.
+            assert_eq!(
+                source_sequences
+                    .iter()
+                    .filter(|seq| **seq == Some(current_start))
+                    .count(),
+                6
+            );
             let discarded = positions[3].off..positions[3 + prefix_frames].off;
             assert!(
                 measured
@@ -4263,6 +4510,57 @@ mod tests {
             output_tokens: Some(5),
             reasoning_tokens: Some(1),
         }
+    }
+
+    #[test]
+    fn checkpoint_retains_each_episodes_manifest_without_replacing_the_baseline() {
+        let mut records = corpus();
+        for frame in &mut records {
+            if let WalRecord::RunStarted {
+                run_id, manifest, ..
+            } = &mut frame.record
+            {
+                *manifest = Some(Box::new(
+                    serde_json::from_value(serde_json::json!({
+                        "plan": "{}", "plan_identity": run_id.0, "composition_digest": "c",
+                        "fetches": [], "tools": [], "system_text": run_id.0,
+                        "system_digest": "s", "join_version": 1, "role_versions": {}
+                    }))
+                    .unwrap(),
+                ));
+            }
+        }
+        let checkpoint = AdmissionCheckpointV1::from_frames(&records).unwrap();
+        let recovered =
+            decode_admission_checkpoint(&encode_admission_checkpoint(&checkpoint).unwrap())
+                .unwrap();
+        let ownership = recovered.ownership.unwrap();
+        assert_eq!(
+            ownership
+                .first_episode
+                .unwrap()
+                .manifest
+                .unwrap()
+                .plan_identity,
+            "r1"
+        );
+        assert_eq!(ownership.latest_manifest.unwrap().plan_identity, "r2");
+        let first = records
+            .iter()
+            .find_map(|frame| match &frame.record {
+                WalRecord::RunStarted { manifest, .. } => manifest.clone(),
+                _ => None,
+            })
+            .unwrap();
+        for frame in &mut records {
+            if let WalRecord::RunStarted { manifest, .. } = &mut frame.record {
+                *manifest = Some(first.clone());
+            }
+        }
+        let unchanged =
+            encode_admission_checkpoint(&AdmissionCheckpointV1::from_frames(&records).unwrap())
+                .unwrap();
+        assert!(!unchanged.contains("latest_manifest"));
     }
 
     fn corpus() -> Vec<FramedRecord> {
@@ -5101,6 +5399,8 @@ mod tests {
                 // `fold_run_started` alone records no first-episode facts; the checkpoint's own
                 // `RunStarted` fold sets them, from the record's run id and tools.
                 first_episode: None,
+                latest_manifest: None,
+                session_change_recorded: false,
                 plan_manifest_folded: true,
             }
         );

@@ -276,11 +276,11 @@ pub fn reconstruct_from_offsets(
         .output_reservation
         .clone()
         .ok_or_else(|| bad("offset resume output reservation is incomplete"))?;
-    state.manifest = checkpoint
-        .ownership
-        .as_ref()
-        .and_then(|o| o.first_episode.as_ref())
-        .and_then(|e| e.manifest.clone());
+    state.manifest = checkpoint.ownership.as_ref().and_then(|o| {
+        o.latest_manifest
+            .clone()
+            .or_else(|| o.first_episode.as_ref().and_then(|e| e.manifest.clone()))
+    });
     Ok(OffsetResumeState {
         prior: state,
         snapshot: crate::run::PriorWalSnapshot {

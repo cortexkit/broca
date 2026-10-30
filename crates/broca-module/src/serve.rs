@@ -2080,6 +2080,13 @@ pub trait ServeHandler: Send + Sync {
     async fn frozen_plan_requires_approval(&self, _session: &LineageKey) -> bool {
         false
     }
+
+    async fn session_change_identities(
+        &self,
+        _session: &LineageKey,
+    ) -> Option<(Option<String>, Option<String>)> {
+        None
+    }
 }
 
 impl crate::LineageRegistry {
@@ -3599,6 +3606,41 @@ impl ServeHandler for crate::LineageRegistry {
                 .cache_declaration(config)
                 .map(|declaration| declaration.to_wire());
         }
+        // Every ready baseline on a runner declaring `session_change` states the rungs it
+        // supports per surface, and the generations it accepted, applied and holds pending.
+        let change = broca_fetch_plan::session_change::SessionChangeState::fold(&records);
+        if let Some(manifest) = &change.prefix_manifest {
+            let cache = baseline.cache.take();
+            baseline = planned_baseline(manifest);
+            baseline.cache = cache;
+        }
+        baseline.accepted_generation = change.accepted_generation;
+        baseline.applied_generation = change.applied_generation;
+        baseline.pending = change.pending.as_ref().map(|pending| {
+            cortexkit_role_llm_runner::baseline::PendingChange {
+                generation: pending.generation,
+                policy: pending.policy.clone(),
+            }
+        });
+        baseline.effective = change.effective.as_ref().map(|effective| {
+            cortexkit_role_llm_runner::baseline::EffectiveBaseline {
+                generation: effective.generation,
+                applied_by: effective.applied_by.clone(),
+                manifest_digest: effective.manifest_digest.clone(),
+            }
+        });
+        if change.accepted_generation > 0 {
+            baseline.rungs = Some(cortexkit_role_llm_runner::baseline::Rungs {
+                tools: broca_fetch_plan::session_change::TOOLS_RUNGS
+                    .iter()
+                    .map(|rung| rung.to_string())
+                    .collect(),
+                system_text: broca_fetch_plan::session_change::SYSTEM_TEXT_RUNGS
+                    .iter()
+                    .map(|rung| rung.to_string())
+                    .collect(),
+            });
+        }
         Ok(broca_wire::BaselineReply::ready(baseline))
     }
 
@@ -3619,6 +3661,37 @@ impl ServeHandler for crate::LineageRegistry {
                     .map(|declaration| declaration.to_wire());
                 baseline
             })
+    }
+
+    async fn session_change_identities(
+        &self,
+        session: &LineageKey,
+    ) -> Option<(Option<String>, Option<String>)> {
+        let (records, _) = self.read_durable_wal(session).await.ok()?;
+        let change = broca_fetch_plan::session_change::SessionChangeState::fold(&records);
+        if change.accepted_generation == 0 {
+            return None;
+        }
+        let accepted = change
+            .accepted
+            .get(&change.accepted_generation)
+            .map(|(identity, _)| identity.clone());
+        let effective = if change.applied_generation > 0 {
+            change
+                .accepted
+                .get(&change.applied_generation)
+                .map(|(identity, _)| identity.clone())
+        } else {
+            first_run_started(&records).and_then(|start| match start {
+                broca_wal::WalRecord::RunStarted {
+                    manifest: Some(manifest),
+                    ..
+                } => Some(manifest.plan_identity.clone()),
+                broca_wal::WalRecord::RunStarted { .. } => None,
+                _ => None,
+            })
+        };
+        Some((effective, accepted))
     }
 
     fn session_written(&self, session: &LineageKey) -> Result<bool, ServeError> {

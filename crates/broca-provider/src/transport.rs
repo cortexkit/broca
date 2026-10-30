@@ -918,8 +918,20 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             .family
             .warm_body(&warm_frozen, base)
             .map_err(broca_core::WarmFailure::Unsupported)?;
+        // A zero-output cache read must stay on the addressed model, even when generation
+        // opted into server-side fallback. The warm body has already removed that opt-in;
+        // derive its headers without the matching beta as well, leaving prompt bytes alone.
+        let endpoint_frozen = warm_frozen.server_side_fallback.then(|| {
+            let mut frozen = (*warm_frozen).clone();
+            frozen.server_side_fallback = false;
+            frozen
+        });
         Ok((
-            self.family.endpoint(&warm_frozen, &served.auth, body),
+            self.family.endpoint(
+                endpoint_frozen.as_ref().unwrap_or(&warm_frozen),
+                &served.auth,
+                body,
+            ),
             served.account_ref,
         ))
     }

@@ -1092,6 +1092,11 @@ fn project_control_record<S: ControlProjectionSink>(
         | WalRecord::StructuredOutputResult { .. }
         | WalRecord::StructuredOutputDowngraded { .. }
         | WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
+        // A mid-session change emits no prompt or control unit: the next `RunStarted` that
+        // freezes its manifest renders the new tools, and earlier episodes resume byte-identical.
+        WalRecord::SessionRefreshAccepted { .. }
+        | WalRecord::SessionRefreshPolicyChanged { .. }
+        | WalRecord::SessionPrefixFlushed { .. } => {}
     }
     // Appending boundaries here keeps every older payload at its original sub_index.
     for action in actions {

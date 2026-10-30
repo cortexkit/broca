@@ -467,7 +467,8 @@ older readers refuse them by that name rather than run without the cap.
 A provider caches a request's prefix for a fixed lifetime from when the request was sent. A
 caller whose next round arrives later than that pays to write the whole prefix again. A warm
 re-sends the session's most recent model request changed only so the provider generates nothing
-(Anthropic: `max_tokens: 0`, no `stream`); everything that shapes the cached prefix (system,
+(Anthropic: `max_tokens: 0`, no `stream`, no server-side `fallbacks` opt-in or its beta);
+everything that shapes the cached prefix (system,
 tools, messages, `cache_control` markers and their TTLs, adaptive thinking, effort, speed) is
 byte-identical. The caller schedules and caps warms; broca performs each one exactly and reports
 what it cost.
@@ -516,6 +517,37 @@ what it cost.
   ttl_options_ms, read_refreshes_ttl, warm: "supported" | "unsupported", basis}`, every member
   absent when unknown; `basis` is `requested` when the session's cache request named the
   lifetime and `provider_default` when the provider's default applies.
+
+Source-cache maintenance additionally follows the current
+`anthropic_fallbacks.refusal_resend.enabled` switch read at module boot. When off, no source
+task, subscription or source-record tap is installed, even for a session with a frozen fallback.
+Its durable refusal routing still resumes unchanged; only source-cache maintenance is disabled.
+When enabled, broca keeps a separate clock for the refused source request of a run that froze
+the client-side fallback. While its allowance of 10, 20 or 40 successful fallback replies remains,
+broca refreshes that source prefix only
+near expiry: 30 seconds before a five-minute TTL, or two minutes before a one-hour TTL. The
+base is the source request that was actually sent, not a converted fallback request. Its
+rebuilt bytes must hash to that source request's recorded digest before the warm's output-only
+settings and server-fallback opt-out are applied. A source warm does not refresh the active
+fallback route's clock.
+
+Sessions whose frozen `session_class` is `head` may keep that source prefix warm between runs;
+other classes (including absent or unknown classes) warm only while a run is active. The same
+quota and rent-or-rewrite budget checks apply. Idle head warming stops before its cumulative
+cost reaches one source rewrite, using the source model's prices and frozen TTL; a new run
+resets this warming-cost allowance, whereas resuming the same run does not. Once the configured
+number of successful fallback replies has been served, broca stops keeping the old source prefix
+warm, before making
+the next source-model request. It does not wait for that source request to answer.
+Applied compaction messages/views, account or credential changes, model/config refreezes and
+the source answering again also invalidate the old prefix. Authentication pauses suspend warming;
+shutdown and restart pauses stop local IO, and a new process rebuilds eligible schedules from
+the WAL, including warm spend. No timer or new record type is persisted. These rules do not
+enable the default-off refusal fallback switch.
+
+New source-maintenance records use the existing optional `cache_warmed.trigger` string value
+`source_keep_warm` to select source-model attribution. Records without that discriminator,
+including historical late manual warms, keep their original attribution and export-fact bytes.
 
 A **cursor** is a durable `(wal_seq, sub_index)` (§7). `subscribe` and `read.head` share
 this one cursor domain. A cursor attach starts strictly after that unit, so

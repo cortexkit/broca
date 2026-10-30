@@ -88,6 +88,8 @@ struct Key {
 
 impl Key {
     fn of(path: &Path, stamp: u64, file: &File) -> io::Result<Self> {
+        #[cfg(any(test, feature = "test-io-trace"))]
+        super::expiry_io::statted();
         let metadata = file.metadata()?;
         Ok(Self {
             path: path.to_owned(),
@@ -259,6 +261,8 @@ impl Cache {
             // This removes a missing subject, not changed contents under a stable
             // key. Never broaden it to rebuild an entry for a live mutable file.
             // Stat outside the map lock; permission and other errors retain it.
+            #[cfg(any(test, feature = "test-io-trace"))]
+            super::expiry_io::statted();
             if !crate::fs_ops::metadata(&path)
                 .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
             {
@@ -735,9 +739,16 @@ fn build_from_headers<R: Read + Seek>(
 static CACHE: OnceLock<Cache> = OnceLock::new();
 
 pub(super) fn reap_missing() {
+    #[cfg(test)]
+    REAPS.with(|count| count.set(count.get() + 1));
     if let Some(cache) = CACHE.get() {
         cache.reap_missing();
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static REAPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub(super) fn cached(path: &Path) -> Option<CachedMembership> {

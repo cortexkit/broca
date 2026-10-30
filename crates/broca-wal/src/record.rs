@@ -1263,6 +1263,53 @@ pub enum WalRecord {
         ts_ms: Option<u64>,
         auth_selection: AuthSelection,
     },
+    /// A mid-session plan change the owner accepted, durable before its reply. The next run
+    /// that reaches its rung's point freezes this manifest on its `RunStarted` and applies it;
+    /// earlier episodes keep resuming from their own manifests, byte-identical. An identical
+    /// repeat (same generation, plan identity and policy) is answered from the durable record
+    /// without fetching again.
+    ///
+    /// MUST-UNDERSTAND (feature `session-change/v1`). A reader without it would lose the
+    /// pending generation, apply the wrong tools on the next run, or answer a repeat as stale.
+    /// Reader-first: this build decodes and folds it; no production path writes it yet.
+    SessionRefreshAccepted {
+        /// The owner's generation, strictly increasing per session.
+        generation: u64,
+        /// One rung name from the runner role's `rungs::ALL`.
+        policy: String,
+        /// Whether a run was active when this change was accepted. Kept for identical replies.
+        run_in_progress: bool,
+        /// Whether the next run could apply this change at acceptance, kept for identical replies.
+        applies_from_next_run: bool,
+        /// The refreshed plan's fetched manifest, frozen as at admission.
+        manifest: Box<PlanManifest>,
+    },
+    /// A new rung for the pending change, durable before its reply. Idempotent on `send_id`:
+    /// a repeat with the same key and the same generation and policy is answered from the
+    /// durable record without writing again.
+    ///
+    /// MUST-UNDERSTAND (feature `session-change/v1`), for the same reason as
+    /// `SessionRefreshAccepted`. Reader-first: decoded and folded, never written yet.
+    SessionRefreshPolicyChanged {
+        /// The generation the caller believes is pending.
+        generation: u64,
+        /// The pending change's new rung.
+        policy: String,
+        /// The caller's idempotency key.
+        send_id: String,
+    },
+    /// A prefix flush, durable before its reply. The next run applies any pending change,
+    /// whatever its policy, and drops the frozen prefix. Idempotent on `send_id`.
+    ///
+    /// MUST-UNDERSTAND (feature `session-change/v1`), for the same reason as
+    /// `SessionRefreshAccepted`. Reader-first: decoded and folded, never written yet.
+    SessionPrefixFlushed {
+        /// The caller's idempotency key.
+        send_id: String,
+        /// The generation that was pending when the flush was accepted, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pending_generation: Option<u64>,
+    },
 
     // ── durable submission queue (survives a crash, unlike a runtime-only queue) ──
     /// A prompt durably queued while a run was active. Carries the submission
@@ -2017,12 +2064,16 @@ impl WalRecord {
         // where this build refuses it `send_id_reuse`, so the record is must-understand.
         // A manifest that froze any provider declaration is must-understand: an older reader
         // would skip the fields and read replies by a catalog that may have changed since.
-        let base = if matches!(
-            self,
+        let manifest_for_declarations = match self {
             WalRecord::RunStarted {
                 manifest: Some(manifest),
                 ..
-            } if manifest.fetches.iter().any(|fetch| {
+            }
+            | WalRecord::SessionRefreshAccepted { manifest, .. } => Some(manifest.as_ref()),
+            _ => None,
+        };
+        let base = if manifest_for_declarations.is_some_and(|manifest| {
+            manifest.fetches.iter().any(|fetch| {
                 matches!(
                     &fetch.outcome,
                     FetchOutcome::Answered {
@@ -2031,16 +2082,22 @@ impl WalRecord {
                     } if !declarations.is_empty()
                 )
             })
-        ) {
+        }) {
             with_feature(base, crate::framing::PROVIDER_DECLARATIONS_FEATURE)
         } else {
             base
         };
-        let base = if matches!(self, WalRecord::RunStarted { manifest: Some(manifest), .. }
-            if manifest.fetches.iter().any(|fetch| matches!(&fetch.outcome,
-                FetchOutcome::Answered { declarations_frozen: Some(declarations), .. }
-                    if declarations.schema_pins.is_some())))
-        {
+        let base = if manifest_for_declarations.is_some_and(|manifest| {
+            manifest.fetches.iter().any(|fetch| {
+                matches!(
+                    &fetch.outcome,
+                    FetchOutcome::Answered {
+                        declarations_frozen: Some(declarations),
+                        ..
+                    } if declarations.schema_pins.is_some()
+                )
+            })
+        }) {
             with_feature(base, crate::framing::TOOL_SCHEMA_PINS_FEATURE)
         } else {
             base
@@ -2243,13 +2300,26 @@ impl WalRecord {
         }
     }
 
-    /// A `RunStarted` whose plan manifest froze a provider's catalog reference slots.
+    /// A `RunStarted` or `SessionRefreshAccepted` whose plan manifest froze a provider's
+    /// catalog reference slots.
     fn carries_reference_slots(&self) -> bool {
-        matches!(self, WalRecord::RunStarted { manifest: Some(manifest), .. }
-        if manifest.fetches.iter().any(|fetch| matches!(
-            fetch.outcome,
-            FetchOutcome::Answered { reference_slots: Some(_), .. }
-        )))
+        let manifest = match self {
+            WalRecord::RunStarted {
+                manifest: Some(manifest),
+                ..
+            }
+            | WalRecord::SessionRefreshAccepted { manifest, .. } => manifest.as_ref(),
+            _ => return false,
+        };
+        manifest.fetches.iter().any(|fetch| {
+            matches!(
+                fetch.outcome,
+                FetchOutcome::Answered {
+                    reference_slots: Some(_),
+                    ..
+                }
+            )
+        })
     }
 
     /// Whether a tool this record freezes or queues declares its own reply deadline, which an
@@ -2259,6 +2329,7 @@ impl WalRecord {
         match self {
             WalRecord::RunStarted { config, .. } => declares(&config.tools),
             WalRecord::Queued { request, .. } => request.tools.as_deref().is_some_and(declares),
+            WalRecord::SessionRefreshAccepted { manifest, .. } => declares(&manifest.tools),
             _ => false,
         }
     }
@@ -2390,6 +2461,9 @@ impl WalRecord {
             | Self::ApprovalResolved { .. }
             | Self::ResumeStarted { .. }
             | Self::CacheWarmed { .. }
+            | Self::SessionRefreshAccepted { .. }
+            | Self::SessionRefreshPolicyChanged { .. }
+            | Self::SessionPrefixFlushed { .. }
             | Self::CompactionRequest { .. }
             | Self::CompactionAnswer { .. }
             | Self::CompactionWait { .. }
@@ -2849,6 +2923,12 @@ impl WalRecord {
             WalRecord::DeliveryOrdered { .. }
             | WalRecord::SendEnded { .. }
             | WalRecord::SendDelivered { .. } => &[crate::framing::DELIVERY_ORDER_FEATURE],
+            WalRecord::SessionRefreshAccepted { .. } => &[
+                crate::framing::PLAN_MANIFEST_FEATURE,
+                crate::framing::SESSION_CHANGE_FEATURE,
+            ],
+            WalRecord::SessionRefreshPolicyChanged { .. }
+            | WalRecord::SessionPrefixFlushed { .. } => &[crate::framing::SESSION_CHANGE_FEATURE],
             // Informational: an older build may skip it, so it needs no feature.
             WalRecord::QuestionWithdrawalAcknowledged { .. } => &[],
             _ => &[],

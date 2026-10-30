@@ -4,7 +4,7 @@
 //! decoding a reply with the role's types; reply shape alone is not negotiation.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use broca_protocol::{ToolCallId, ToolOutput, ToolOutputPart, ToolResult};
+use broca_protocol::{ToolCallId, ToolResult};
 use cortexkit_role_tool_provider::result::{self, ContentPart};
 
 pub(crate) use broca_protocol::content::dropped_media_notice;
@@ -40,50 +40,19 @@ pub fn map_content_v1_result(
     if reply.held().is_some() {
         return Err(MapError::ProviderHeld);
     }
-
-    let raw = serde_json::to_value(reply).expect("tool results serialize as JSON");
-    if reply
-        .content
-        .iter()
-        .all(|part| matches!(part, ContentPart::Text { .. } | ContentPart::Image(_)))
-    {
-        for part in &reply.content {
-            if let ContentPart::Image(image) = part {
-                STANDARD.decode(&image.data).map_err(MapError::ImageData)?;
-            }
-        }
-        return Ok(crate::subc_plane::map_legacy_call_tool_result(id, &raw));
-    }
-    // Preserve the existing lossless fallback for future, unsupported content kinds.
-    let mut parts = Vec::new();
     for part in &reply.content {
-        let text = match part {
-            ContentPart::Text { text } => text.clone(),
-            ContentPart::Image(image) => {
-                STANDARD.decode(&image.data).map_err(MapError::ImageData)?;
-                // Dispatch replaces this notice with captured media before recording the result
-                // when a capture handle is available. Otherwise the omission is durable text.
-                dropped_media_notice(&image.mime_type)
-            }
-            // Unknown parts retain their JSON, escaped onto one line, instead of disappearing.
-            other => format!(
-                "[unsupported content: {}]",
-                serde_json::to_string(other).expect("content parts serialize as JSON")
-            ),
-        };
-        parts.push(ToolOutputPart::Text { text });
+        if let ContentPart::Image(image) = part {
+            STANDARD.decode(&image.data).map_err(MapError::ImageData)?;
+        }
     }
-    Ok(ToolResult {
-        tool_call_id: id.clone(),
-        output: ToolOutput::Parts { parts },
-        is_error: reply.is_error == Some(true),
-    })
+    let raw = serde_json::to_value(reply).expect("tool results serialize as JSON");
+    Ok(crate::subc_plane::map_legacy_call_tool_result(id, &raw))
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use broca_protocol::{CallOptions, ContentBlock, Message, Role};
+    use broca_protocol::{CallOptions, ContentBlock, Message, Role, ToolOutput};
     use broca_provider::{
         families::{anthropic_frozen_config, AnthropicMessages},
         wire::WireFamily,
@@ -168,6 +137,180 @@ pub(crate) mod tests {
         });
         assert!(map(raw.clone()).unwrap().is_error);
         assert_golden(raw, include_str!("../tests/fixtures/content_v1/error.json"));
+    }
+
+    const PDF_BLOB: &str = "JVBERi0xLjcKc3ludGhldGljIGRvY3VtZW50Cg==";
+    const PDF_NOTICE: &str =
+        "[application/pdf not shown to the model: this runner does not pass tool images to models yet]";
+
+    fn pdf_reply() -> serde_json::Value {
+        json!({"content": [{"type": "resource", "resource": {
+            "uri": "file:///report.pdf", "name": "report.pdf",
+            "mimeType": "application/pdf", "blob": PDF_BLOB
+        }}]})
+    }
+
+    #[test]
+    fn content_v1_shared_normalization_omits_resource_blobs_and_preserves_history() {
+        let result = map(pdf_reply()).unwrap();
+        let stored = serde_json::to_string(&result).unwrap();
+        let rendered = String::from_utf8(render_model_request(result.clone())).unwrap();
+        assert!(!stored.contains(&PDF_BLOB[..16]), "{stored}");
+        assert!(!rendered.contains(&PDF_BLOB[..16]), "{rendered}");
+        assert_eq!(
+            result.output,
+            ToolOutput::Text {
+                text: PDF_NOTICE.into()
+            }
+        );
+
+        let old_text = format!("[unsupported content: {}]", pdf_reply()["content"][0]);
+        let old_stored = json!({
+            "tool_call_id": "call_01", "is_error": false,
+            "output": {"kind": "parts", "parts": [{"kind": "text", "text": old_text}]}
+        });
+        let old_result: ToolResult = serde_json::from_value(old_stored.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&old_result).unwrap(), old_stored);
+        let old_rendered = String::from_utf8(render_model_request(old_result)).unwrap();
+        assert!(old_rendered.contains(&PDF_BLOB[..16]));
+    }
+
+    #[test]
+    fn content_v1_shared_normalization_pdf_notice_has_a_text_tag() {
+        use broca_protocol::tags::{number_message, render_tags_into, ComputedRules, TagRendering};
+
+        let mut message = Message::new(
+            Role::Tool,
+            vec![ContentBlock::ToolResult(map(pdf_reply()).unwrap())],
+        );
+        number_message(
+            &mut message,
+            ComputedRules {
+                render: true,
+                clean: true,
+            },
+            &mut 0,
+        )
+        .unwrap();
+        render_tags_into(std::slice::from_mut(&mut message), TagRendering::default());
+        let ContentBlock::ToolResult(result) = &message.content[0] else {
+            panic!("expected tool result")
+        };
+        assert_eq!(
+            result.output,
+            ToolOutput::Text {
+                text: format!("§1§ {PDF_NOTICE}")
+            }
+        );
+        assert!(!broca_protocol::content::is_image_only_notice(PDF_NOTICE));
+        let rendered = String::from_utf8(render_model_request(result.clone())).unwrap();
+        assert!(rendered.contains(&format!("§1§ {PDF_NOTICE}")));
+        assert!(!rendered.contains("[image]"));
+    }
+
+    #[test]
+    fn content_v1_shared_normalization_stores_legacy_bytes_without_parts() {
+        let cases = [
+            (
+                "text only",
+                json!({"content": [{"type": "text", "text": "12:"}, {"type": "text", "text": "00"}]}),
+                "12:00",
+            ),
+            (
+                "text and image",
+                json!({"content": [
+                    {"type": "text", "text": "before"},
+                    {"type": "image", "mimeType": "image/png", "data": "aGVsbG8=", "width": 1, "height": 1},
+                    {"type": "text", "text": "after"}
+                ]}),
+                "beforeafter\n[image/png not shown to the model: this runner does not pass tool images to models yet]",
+            ),
+            (
+                "text and binary resource",
+                json!({"content": [
+                    {"type": "text", "text": "read document"},
+                    pdf_reply()["content"][0].clone()
+                ]}),
+                "read document\n[application/pdf not shown to the model: this runner does not pass tool images to models yet]",
+            ),
+            (
+                "binary resource only",
+                pdf_reply(),
+                PDF_NOTICE,
+            ),
+            (
+                "text resource",
+                json!({"content": [{"type": "resource", "resource": {
+                    "uri": "file:///notes.txt", "mimeType": "text/plain", "text": "notes"
+                }}]}),
+                "[non-text tool content omitted: type=resource]",
+            ),
+            (
+                "unknown part",
+                json!({"content": [{"type": "future", "mimeType": "application/pdf", "data": PDF_BLOB,
+                    "nested": [{"blob": PDF_BLOB}]}]}),
+                "[non-text tool content omitted: type=future mimeType=application/pdf data≈40 bytes]",
+            ),
+            (
+                "mixed unknown and image",
+                json!({"content": [
+                    {"type": "text", "text": "before"},
+                    {"type": "image", "mimeType": "image/png", "data": "aGVsbG8=", "width": 1, "height": 1},
+                    {"type": "json", "value": {"answer": 42}},
+                    {"type": "text", "text": "after"}
+                ]}),
+                "before[non-text tool content omitted: type=json]after\n[image/png not shown to the model: this runner does not pass tool images to models yet]",
+            ),
+            (
+                "error with unknown part",
+                json!({"content": [
+                    {"type": "text", "text": "cannot read"},
+                    {"type": "future", "blob": PDF_BLOB}
+                ], "isError": true, "errorCode": "provider_error"}),
+                "cannot read[non-text tool content omitted: type=future]",
+            ),
+        ];
+        for (name, mut raw, expected_text) in cases {
+            raw["structuredContent"] = json!({"private": "PROGRAM_ONLY_SECRET"});
+            let legacy =
+                crate::subc_plane::map_legacy_call_tool_result(&ToolCallId("call_01".into()), &raw);
+            let v1 = map(raw).unwrap();
+            let stored = serde_json::to_vec(&v1).unwrap();
+            assert_eq!(stored, serde_json::to_vec(&legacy).unwrap(), "{name}");
+            match &v1.output {
+                ToolOutput::Text { text } => assert_eq!(text, expected_text, "{name}"),
+                ToolOutput::Error { message, .. } => assert_eq!(message, expected_text, "{name}"),
+                output => panic!("{name}: expected legacy text or error, never parts: {output:?}"),
+            }
+            let rendered = render_model_request(v1);
+            assert_eq!(rendered, render_model_request(legacy), "{name}");
+            for bytes in [&stored, &rendered] {
+                let text = std::str::from_utf8(bytes).unwrap();
+                assert!(!text.contains(&PDF_BLOB[..16]), "{name}: {text}");
+                assert!(!text.contains("aGVsbG8="), "{name}: {text}");
+                assert!(!text.contains("PROGRAM_ONLY_SECRET"), "{name}: {text}");
+            }
+        }
+
+        for width in [4_294_967_296_u64, u64::MAX] {
+            let raw = json!({"content": [{"type": "image", "mimeType": "image/png",
+                "data": PDF_BLOB, "width": width, "height": 1}]});
+            let reply: result::ToolResult = serde_json::from_value(raw.clone()).unwrap();
+            assert!(matches!(&reply.content[0], ContentPart::Image(image) if image.width == width));
+            let v1 = map(raw.clone()).unwrap();
+            let legacy =
+                crate::subc_plane::map_legacy_call_tool_result(&ToolCallId("call_01".into()), &raw);
+            assert_eq!(
+                serde_json::to_vec(&v1).unwrap(),
+                serde_json::to_vec(&legacy).unwrap()
+            );
+            assert_eq!(v1.output, ToolOutput::Text {
+                text: "[image/png not shown to the model: this runner does not pass tool images to models yet]".into()
+            });
+            assert!(!String::from_utf8(render_model_request(v1))
+                .unwrap()
+                .contains(&PDF_BLOB[..16]));
+        }
     }
 
     #[test]
