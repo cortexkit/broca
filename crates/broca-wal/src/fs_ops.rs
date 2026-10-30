@@ -21,6 +21,12 @@ use std::{cell::RefCell, sync::Arc};
 
 /// File-handle operations whose ordering matters to a power-loss model.
 pub trait FileOps: Read + Write + Seek + Send + Sync {
+    /// Native Windows volume serial number and file index for this opened handle.
+    /// Backends without a trustworthy native identity leave this unsupported.
+    #[cfg(windows)]
+    fn native_file_identity(&self) -> Option<(u32, u64)> {
+        None
+    }
     fn metadata(&self) -> io::Result<Metadata>;
     fn set_len(&self, len: u64) -> io::Result<()>;
     fn sync_all(&self) -> io::Result<()>;
@@ -33,6 +39,10 @@ pub trait FileOps: Read + Write + Seek + Send + Sync {
 }
 
 impl FileOps for std::fs::File {
+    #[cfg(windows)]
+    fn native_file_identity(&self) -> Option<(u32, u64)> {
+        broca_owner_only::file_identity(self).ok()
+    }
     fn metadata(&self) -> io::Result<Metadata> {
         self.metadata()
     }
@@ -331,6 +341,10 @@ pub fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
 pub struct File(Box<dyn FileOps>);
 
 impl File {
+    #[cfg(windows)]
+    pub fn native_file_identity(&self) -> Option<(u32, u64)> {
+        self.0.native_file_identity()
+    }
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         OpenOptions::new().read(true).open(path)
     }
