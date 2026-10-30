@@ -35,10 +35,12 @@ test failure or pass; connection-loss outcomes are **UNKNOWN**. Either fails the
 gate. Setup failures explicitly mark dependent suites **NOT RUN** and return
 failure, never a passing skip. No retries or timeout increases mask tests.
 
-Daemon/test temporary files are separate from logs: `.prepush-runtime` and its
-per-job leaves are 0700, under umask 077. `TMPDIR`, `TMP` and `TEMP` point there,
+Daemon/test temporary files are separate from logs: the runner's
+`$HOME/.broca-prepush-runtime` and its per-job leaves are 0700, under umask 077.
+`TMPDIR`, `TMP` and `TEMP` point there,
 so `broca_test_support::scratch_root()` and daemon connection files do not inherit
-`target/scratch`'s potentially group-writable ancestors. Step logs remain outside
+`target/scratch`'s potentially group-writable ancestors, including when the
+entire managed checkout is nested below `target/scratch`. Step logs remain outside
 the test temporary root, include the command/exit code even for silent errors,
 and are replayed before the remote job disappears. Run from a checkout on a
 healthy internal disk so the caller's retained logs are not lost to volume stalls.
@@ -52,7 +54,7 @@ with PyYAML, Node **20**, npm, and GNU tar. The MOTOR Linux image must provide
 checks. The fast lane refuses immediately, before running tests, if those image
 prerequisites are missing; it does not install OS packages or skip their tests.
 Linux additionally needs the
-`x86_64-pc-windows-gnu` Rust target/linker and toolchain `1.96` for the MSRV check.
+`x86_64-pc-windows-gnu` Rust target/linker and toolchain `1.96.0` for the MSRV check.
 Motor supplies `CARGO_TARGET_DIR`; concurrent lanes use different stable
 subdirectories. Only Linux jobs request outbound network. No GitHub Actions
 token or artifact credentials are needed.
@@ -153,7 +155,7 @@ failure; Windows-target clippy on Linux is **not** native Windows coverage.
 | `unit` / Lib/bin/doc (Ubuntu, Windows) | `linux-unit` / CI lib/bin/doc step in windows | Path-dependency checker + tests; `cargo test --locked --workspace --lib --bins --no-fail-fast` with the four features; independent doctest count and full doctests if positive. Includes store contention; no portable unit exclusions. |
 | `production-features`: stable clippy | `linux-production` | `cargo clippy --locked -p broca-core -p broca-module -p broca-module-serve --all-targets -- -D warnings`, without test-clock or other test-gate features. |
 | `production-features`: stable lib/bin | `linux-production` | `cargo test --locked -p broca-core -p broca-module -p broca-module-serve --lib --bins --no-fail-fast`, without test-clock, with required Linux fixtures/aimock. |
-| `production-features`: MSRV | `linux-msrv` | `cargo +1.96 check --locked --workspace --all-targets`. Toolchain must be provisioned, just as CI's install step does. |
+| `production-features`: MSRV | `linux-msrv` | CI installs `1.96` and runs `cargo +1.96 check --locked --workspace --all-targets`. Motor runs the same check using its preinstalled `+1.96.0` compiler: the uninstalled minor alias tries to sync into read-only RUSTUP_HOME. This still checks the promised 1.96 MSRV, not the default compiler. |
 | `linux-deploy` / real ELF deployment | `linux-deploy` | Same locked release build of ck-broca, broca-session, broca-run; `BROCA_REQUIRE_LINUX_DEPLOY=1`, actual subc and `LinuxDeployTests.test_real_linux_subc_stage_place_restart_verify -v`; uses motor's target directory rather than checkout-local target. |
 | `test` aggregate (Ubuntu, Windows display names) | Dispatcher's nonzero result on any lane failure | Includes targeted macOS results as well as both full fixture platforms. A missing, cancelled or failed lane never counts as success. |
 

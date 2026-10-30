@@ -204,6 +204,35 @@ print('Summary: 1 test run: 1 passed')
         self.assertIn('error[E0599]: fixture MSRV compiler error', summary)
         self.assertIn('FAILED linux-msrv: complete output', summary)
 
+    def test_msrv_uses_installed_patch_toolchain_not_syncing_minor_alias(self):
+        shutil.copy(ROOT / 'scripts/lib/prepush-lane.sh', self.root / 'scripts/lib/prepush-lane.sh')
+        cargo = self.bin / 'cargo'
+        cargo.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, sys
+with (pathlib.Path(os.environ['FIXTURE']) / 'cargo-calls').open('a') as out:
+    out.write(json.dumps(sys.argv[1:]) + '\\n')
+if '+1.96' in sys.argv:
+    sys.exit('error: could not create temp file: Read-only file system')
+print('fixture cargo completed')
+''')
+        cargo.chmod(0o755)
+        for name, body in {'rustc': 'echo fixture rustc', 'git': 'exit 0',
+                           'uname': 'echo Linux'}.items():
+            path = self.bin / name
+            path.write_text('#!/bin/sh\n' + body + '\n')
+            path.chmod(0o755)
+        home = self.root / 'home'
+        home.mkdir(mode=0o700)
+        env = dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}',
+                   HOME=str(home), FIXTURE=str(self.root),
+                   CARGO_TARGET_DIR=str(self.root / 'target-cache'))
+        result = subprocess.run(['bash', 'scripts/prepush.sh', '--lane', 'linux-msrv'],
+                                cwd=self.root, env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = [json.loads(line) for line in (self.root / 'cargo-calls').read_text().splitlines()]
+        self.assertIn(['+1.96.0', 'check', '--locked', '--workspace', '--all-targets'], calls)
+        self.assertFalse(any('+1.96' in args for args in calls))
+
     def test_missing_file_tool_refuses_before_running_checks(self):
         lib = self.root / 'scripts/lib'
         lib.mkdir(exist_ok=True)
@@ -217,7 +246,9 @@ print('Summary: 1 test run: 1 passed')
         uname = tools / 'uname'
         uname.write_text('#!/bin/sh\necho Linux\n')
         uname.chmod(0o755)
-        env = dict(os.environ, PATH=str(tools))
+        home = self.root / 'home'
+        home.mkdir(mode=0o700)
+        env = dict(os.environ, PATH=str(tools), HOME=str(home))
         result = subprocess.run([str(tools / 'bash'), 'scripts/prepush.sh', '--lane', 'fast'],
                                 cwd=self.root, env=env, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -232,6 +263,12 @@ print('Summary: 1 test run: 1 passed')
         logs = self.root / 'target/scratch'
         logs.mkdir(parents=True)
         logs.chmod(0o775)
+        checkout = logs / 'checkouts/worker'
+        (checkout / 'scripts/lib').mkdir(parents=True)
+        for name in ('scripts/prepush.sh', 'scripts/lib/prepush-lane.sh', 'scripts/lib/prepush-report.sh'):
+            shutil.copy(ROOT / name, checkout / name)
+        home = self.root / 'home'
+        home.mkdir(mode=0o700)
         tools = self.root / 'minimal-tools'
         tools.mkdir()
         for tool in ('bash', 'dirname', 'mkdir', 'mktemp', 'chmod', 'cat'):
@@ -246,9 +283,9 @@ print('Summary: 1 test run: 1 passed')
             path = tools / name
             path.write_text('#!/bin/sh\n' + body + '\n')
             path.chmod(0o755)
-        env = dict(os.environ, PATH=str(tools))
+        env = dict(os.environ, PATH=str(tools), HOME=str(home))
         result = subprocess.run([str(tools / 'bash'), 'scripts/prepush.sh', '--lane', 'fast'],
-                                cwd=self.root, env=env, capture_output=True, text=True)
+                                cwd=checkout, env=env, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         temporary = Path(next(line.split('=', 1)[1] for line in result.stdout.splitlines()
                               if line.startswith('TEST_TMPDIR=')))

@@ -22,9 +22,10 @@ log_dir="$(mktemp -d "$root/target/scratch/prepush-$lane.XXXXXX")"
 # Connection-file publication rejects writable ancestors, even above a private leaf.
 # Keep daemon/test temporary files out of the shared, group-writable log directory.
 umask 077
-mkdir -p "$root/.prepush-runtime"
-chmod 700 "$root/.prepush-runtime"
-scratch="$(mktemp -d "$root/.prepush-runtime/$lane.XXXXXX")"
+runtime_root="${HOME:?private runtime requires the runner home}/.broca-prepush-runtime"
+mkdir -p "$runtime_root"
+chmod 700 "$runtime_root"
+scratch="$(mktemp -d "$runtime_root/$lane.XXXXXX")"
 if [[ "$lane" == windows ]]; then
   export RUNNER_OS=Windows
   scratch="$(cygpath -m "$scratch")"
@@ -341,7 +342,9 @@ case "$lane" in
       step 'production lib/bin' cargo test --locked -p broca-core -p broca-module -p broca-module-serve --lib --bins --no-fail-fast
     fi
     if [[ $msrv == 1 ]]; then
-      step MSRV cargo +1.96 check --locked --workspace --all-targets
+      # Motor preinstalls the patch-named compiler in a read-only toolchain home.
+      # The floating 1.96 alias would try to sync/install instead of using it.
+      step MSRV cargo +1.96.0 check --locked --workspace --all-targets
     fi
     if [[ $deployment == 1 ]]; then
       step 'ELF deployment' deploy
