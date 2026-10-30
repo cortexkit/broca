@@ -806,9 +806,17 @@ pub struct SubcConnection {
     /// Each target module's availability gate; every route open on this connection passes
     /// its module's gate (see [`ModuleGate`]).
     module_gates: ModuleGates,
+    #[cfg(feature = "test-clock")]
+    route_open_attempts: Option<Arc<Mutex<Vec<time::Instant>>>>,
 }
 
 impl SubcConnection {
+    /// Record client attempt starts, independently of when the daemon receives their frames.
+    #[cfg(feature = "test-clock")]
+    pub fn record_route_open_attempts_for_test(&mut self, starts: Arc<Mutex<Vec<time::Instant>>>) {
+        self.route_open_attempts = Some(starts);
+    }
+
     #[cfg(test)]
     pub(crate) fn shared_owner_probe_for_test(&self) -> impl Fn() -> bool + Send + 'static {
         let weak = Arc::downgrade(&self.shared);
@@ -951,6 +959,8 @@ impl SubcConnection {
         Ok(Self {
             shared,
             module_gates: ModuleGates::default(),
+            #[cfg(feature = "test-clock")]
+            route_open_attempts: None,
         })
     }
 
@@ -1739,6 +1749,10 @@ impl SubcConnection {
         role_versions: Option<std::collections::BTreeMap<String, String>>,
         consumer_capabilities: Option<Vec<String>>,
     ) -> ConnResult<RouteHandle> {
+        #[cfg(feature = "test-clock")]
+        if let Some(starts) = &self.route_open_attempts {
+            starts.lock().unwrap().push(time::Instant::now());
+        }
         let reads_held_reply = cortexkit_role_tool_provider::consumer_reads_held_reply_v1(
             consumer_capabilities.as_deref(),
         );
@@ -4531,6 +4545,8 @@ impl SubcConnection {
                 probe_windows_started: AtomicU64::new(0),
             }),
             module_gates: ModuleGates::default(),
+            #[cfg(feature = "test-clock")]
+            route_open_attempts: None,
         };
         (
             conn,
@@ -4962,6 +4978,52 @@ mod tests {
                 return frame;
             }
         }
+    }
+
+    #[cfg(feature = "test-clock")]
+    #[tokio::test(start_paused = true)]
+    async fn route_open_start_is_recorded_before_a_delayed_receipt() {
+        let (mut conn, _route, mut daemon) = SubcConnection::in_process_for_test(9, 1);
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        conn.record_route_open_attempts_for_test(Arc::clone(&starts));
+        let identity = BindIdentity::new(".", "broca", "vault");
+        let budget = Duration::from_secs(3600);
+        let started = time::Instant::now();
+        let mut open = std::pin::pin!(conn.route_open_management_within(
+            "credentials",
+            &identity,
+            RouteOpenRetry::within(budget, Duration::from_secs(5)),
+        ));
+        assert!(futures::poll!(&mut open).is_pending());
+        assert_eq!(*starts.lock().unwrap(), vec![started]);
+        let first = daemon.next_request().await;
+        assert!(daemon.refuse(&first, "target_unavailable"));
+        assert!(futures::poll!(&mut open).is_pending());
+        time::advance(ROUTE_OPEN_RETRY_INTERVAL).await;
+        assert!(futures::poll!(&mut open).is_pending());
+        assert_eq!(starts.lock().unwrap().len(), 2);
+
+        // Leave the retry in the writer queue until readiness expires. Poll the client again
+        // only after delivering the refusal, so the independent reply timer cannot win the
+        // forced interleaving before the daemon handles the queued frame.
+        time::advance(budget).await;
+        let expired = time::Instant::now();
+        let retry = daemon.next_request().await;
+        let received = time::Instant::now();
+        assert!(daemon.refuse(&retry, "target_unavailable"));
+        assert!(matches!(open.await, Err(ConnError::Rejected(ref message))
+            if message.code() == "target_unavailable"));
+        assert_eq!(starts.lock().unwrap().len(), 2);
+        assert!(daemon.take_written_for_test().is_empty());
+        assert!(starts
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|at| *at < started + budget));
+        assert!(
+            received >= expired,
+            "receipt time is not the attempt's start time"
+        );
     }
 
     /// A BIND THE DAEMON COMPLETES AT 11s IS A SUCCESSFUL OPEN, on both route targets. The
@@ -5469,6 +5531,8 @@ mod tests {
                 probe_windows_started: AtomicU64::new(0),
             }),
             module_gates: ModuleGates::default(),
+            #[cfg(feature = "test-clock")]
+            route_open_attempts: None,
         }
     }
 
