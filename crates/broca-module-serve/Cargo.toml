@@ -146,6 +146,8 @@ flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 libc = "0.2"
 
 [features]
+# Opt-in only for the real-daemon Goodbye retry regression; never enabled in production.
+test-route-close = ["broca-subc/test-route-close"]
 test-attachments = ["broca-protocol/test-attachments", "broca-core/test-attachments", "broca-provider/test-attachments", "broca-module/test-attachments", "broca-subc/test-attachments"]
 heap-profile = ["dep:broca-heap-profile"]
 test-clock = ["broca-module/test-clock", "broca-core/test-clock"]

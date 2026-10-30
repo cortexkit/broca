@@ -267,6 +267,15 @@ async fn health_check_stream_chunks_session_reads_and_actor_opens_start_at_zero_
 
     let before = health_metrics(&mut client_reader, &mut client_writer, 1).await;
     assert_eq!(
+        before["tool_routes"],
+        serde_json::json!({
+            "open_session_actors": 0, "cached_routes": 0, "cached_routes_per_provider": {},
+            "oldest_route_idle_secs": null, "routes_for_closed_sessions": 0,
+            "goodbye_failures_since_boot": 0, "pending_goodbyes": 0, "open_actor_reasons": {},
+        }),
+        "tool route health must distinguish an empty census from missing instrumentation"
+    );
+    assert_eq!(
         before["stream_chunks"],
         serde_json::json!(0),
         "stream_chunks must start at zero"

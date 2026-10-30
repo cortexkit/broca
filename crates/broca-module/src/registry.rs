@@ -527,6 +527,8 @@ enum Entry {
 /// executor) so the admission concurrency is deterministically testable.
 #[async_trait]
 pub trait LineageOpener: Send + Sync {
+    /// Retire routes synchronously when retention deletes a session without an actor.
+    fn on_session_deleted(&self, _session: &LineageKey) {}
     fn retire_session_transport(&self, _session: &LineageKey) {}
     fn retire_idle_session_transport(&self, _session: &LineageKey) {}
     fn retire_all_transports(&self) {}
@@ -743,7 +745,11 @@ pub enum CutLockMode {
     Mutate,
 }
 
+type ToolRouteHealth = dyn Fn(&[LineageKey]) -> serde_json::Value + Send + Sync;
+
 struct Inner {
+    tool_route_health: std::sync::OnceLock<Arc<ToolRouteHealth>>,
+    actor_idle_holds: Mutex<HashMap<LineageKey, (u64, Vec<&'static str>)>>,
     /// Raised and lowered by the System One batch service; read into `batches_in_flight`.
     batches_in_flight: Arc<AtomicUsize>,
     cut_gates: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
@@ -1145,6 +1151,52 @@ impl LineageRegistry {
             })
             .collect()
     }
+
+    /// In-memory actor identities for route ownership diagnostics; never included in health JSON.
+    pub fn open_sessions(&self) -> Vec<LineageKey> {
+        self.inner
+            .slots
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(key, entry)| match entry {
+                Entry::Open { .. } => Some(key.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn set_tool_route_health(&self, health: Arc<ToolRouteHealth>) {
+        let _ = self.inner.tool_route_health.set(health);
+    }
+
+    pub fn tool_routes_health(&self) -> serde_json::Value {
+        let open = self.open_sessions();
+        let mut health = self.inner.tool_route_health.get().map_or_else(
+            || {
+                serde_json::json!({
+                    "open_session_actors": open.len(), "cached_routes": 0,
+                    "cached_routes_per_provider": {}, "oldest_route_idle_secs": null,
+                    "routes_for_closed_sessions": 0, "goodbye_failures_since_boot": 0,
+                    "pending_goodbyes": 0,
+                })
+            },
+            |health| health(&open),
+        );
+        let holds = self.inner.actor_idle_holds.lock().unwrap();
+        let mut reasons = std::collections::BTreeMap::<&str, usize>::new();
+        for key in &open {
+            if let Some((_, held)) = holds.get(key).filter(|(_, held)| !held.is_empty()) {
+                for reason in held {
+                    *reasons.entry(reason).or_default() += 1;
+                }
+            } else {
+                *reasons.entry("idle_ttl").or_default() += 1;
+            }
+        }
+        health["open_actor_reasons"] = serde_json::json!(reasons);
+        health
+    }
     pub async fn route_run_event(
         &self,
         session: &LineageKey,
@@ -1345,6 +1397,8 @@ impl LineageRegistry {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                tool_route_health: std::sync::OnceLock::new(),
+                actor_idle_holds: Mutex::new(HashMap::new()),
                 batches_in_flight: Arc::new(AtomicUsize::new(0)),
                 attribution_notices: Mutex::new(BoundedSessionCache::new(SESSION_CACHE_SESSIONS)),
                 retention: std::sync::OnceLock::new(),
@@ -4721,6 +4775,21 @@ impl RegistryHandle {
                 self.inner.live_ownership.lock().unwrap().remove(key);
             }
         }
+        let mut holds = self.inner.actor_idle_holds.lock().unwrap();
+        if holds.get(key).is_some_and(|(owner, _)| *owner == gen) {
+            holds.remove(key);
+        }
+    }
+
+    pub(crate) fn note_idle_holds(&self, key: &LineageKey, gen: u64, reasons: Vec<&'static str>) {
+        let slots = self.inner.slots.lock().unwrap();
+        if matches!(slots.get(key), Some(Entry::Open { gen: owner, .. }) if *owner == gen) {
+            self.inner
+                .actor_idle_holds
+                .lock()
+                .unwrap()
+                .insert(key.clone(), (gen, reasons));
+        }
     }
 }
 
@@ -4950,10 +5019,14 @@ mod tests {
     struct TransportOpener {
         retired: Mutex<Vec<LineageKey>>,
         shutdowns: AtomicUsize,
+        route_deletions: AtomicUsize,
     }
 
     #[async_trait]
     impl LineageOpener for TransportOpener {
+        fn on_session_deleted(&self, _: &LineageKey) {
+            self.route_deletions.fetch_add(1, Ordering::SeqCst);
+        }
         fn retire_session_transport(&self, session: &LineageKey) {
             self.retired.lock().unwrap().push(session.clone());
         }
@@ -4987,6 +5060,11 @@ mod tests {
             .unwrap();
         registry.evict_retention_caches(&key);
         assert_eq!(*opener.retired.lock().unwrap(), vec![key.clone(), key]);
+        assert_eq!(
+            opener.route_deletions.load(Ordering::SeqCst),
+            0,
+            "post-lease cache eviction cannot tear down a recreated actor's routes"
+        );
     }
 
     #[tokio::test]
@@ -6203,7 +6281,13 @@ impl LineageRegistry {
         let inner = Arc::downgrade(&self.inner);
         service.set_evictor(Arc::new(move |key| {
             if let Some(inner) = inner.upgrade() {
-                LineageRegistry { inner }.evict_retention_caches(key);
+                let registry = LineageRegistry { inner };
+                // Deletion invokes this callback while it still holds the session lease.
+                // Repeated cache eviction after that lease is released must not close routes
+                // belonging to a session recreated at the same address.
+                if registry.evict_retention_caches(key) {
+                    registry.inner.opener.on_session_deleted(key);
+                }
             }
         }));
         let _ = self.inner.retention.set(service);
@@ -6416,7 +6500,7 @@ impl LineageRegistry {
         Ok(())
     }
 
-    fn evict_retention_caches(&self, key: &LineageKey) {
+    fn evict_retention_caches(&self, key: &LineageKey) -> bool {
         // A live WAL, archive member or untombstoned meta row belongs to a newer lineage.
         // Address-keyed caches must survive completion of the older lineage's deletion.
         if self.inner.reader.as_ref().is_some_and(|reader| {
@@ -6434,7 +6518,7 @@ impl LineageRegistry {
                 .lineage_exists(key, meta.as_ref())
                 .unwrap_or(true)
         }) {
-            return;
+            return false;
         }
         self.inner.opener.retire_session_transport(key);
         self.inner.read_proofs.lock().unwrap().remove(key);
@@ -6444,6 +6528,7 @@ impl LineageRegistry {
         self.inner.live_ownership.lock().unwrap().remove(key);
         self.inner.owner_snapshots.lock().unwrap().remove(key);
         self.inner.cache.remove(key);
+        true
     }
 }
 
