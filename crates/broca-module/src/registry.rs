@@ -5752,7 +5752,7 @@ mod tests {
         (registry, session, wal_store)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn relocation_between_lookup_and_flush_keeps_its_named_retry_class() {
         static NEXT: AtomicU64 = AtomicU64::new(0);

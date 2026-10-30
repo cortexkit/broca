@@ -475,9 +475,29 @@ fn same_wal_file(left: &Path, right: &Path) -> Result<bool, WalError> {
     Ok(left.dev() == right.dev() && left.ino() == right.ino())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn same_wal_file(left: &Path, right: &Path) -> Result<bool, WalError> {
+    let left = broca_wal::fs_ops::File::open(left).map_err(WalError::Io)?;
+    let right = broca_wal::fs_ops::File::open(right).map_err(WalError::Io)?;
+    // Placement repair may remove an alias, so compare the complete handle identities,
+    // not the lossy hashes used to invalidate read caches.
+    Ok(same_native_file_identity(
+        left.native_file_identity(),
+        right.native_file_identity(),
+    ))
+}
+
+#[cfg(any(windows, test))]
+fn same_native_file_identity(left: Option<(u32, u64)>, right: Option<(u32, u64)>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn same_wal_file(_left: &Path, _right: &Path) -> Result<bool, WalError> {
-    // Never guess file identity on platforms without a safe device/inode pair.
+    // Never guess whether paths are aliases when native file identity is unavailable.
     Ok(false)
 }
 
@@ -1764,12 +1784,26 @@ impl FileWalStore {
         // Platforms without file identities still return None for an existing file.
         let path = self.read_path(session)?;
         std::fs::metadata(&path).map_err(WalError::Io)?;
-        let identity = broca_wal::file_identity(path)?;
-        if cfg!(unix) && identity.is_none() {
-            return Err(WalError::Io(io::Error::new(
-                io::ErrorKind::NotFound,
-                "live WAL disappeared again during identity retry",
-            )));
+        #[cfg(test)]
+        AFTER_RETRY_LIVE_STAT.with(|hook| {
+            if let Some(action) = hook.borrow_mut().take() {
+                action();
+            }
+        });
+        let identity = broca_wal::file_identity(&path)?;
+        if identity.is_none() {
+            // The identity helper also returns None when its open misses a disappearing
+            // path. Only an existing identityless backend may return a successful None here.
+            std::fs::metadata(&path).map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    WalError::Io(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "live WAL disappeared again during identity retry",
+                    ))
+                } else {
+                    WalError::Io(error)
+                }
+            })?;
         }
         Ok(identity)
     }
@@ -2357,6 +2391,7 @@ impl WalStore for FileWalStore {
 thread_local! {
     static AFTER_LIVE_STAT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
     static BEFORE_ARCHIVE_RETRY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+    static AFTER_RETRY_LIVE_STAT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
 }
 
 // Content identity invalidates cached proofs when a newer archive changes the payload.
