@@ -17,10 +17,9 @@
 //!   feed. A store that is missing or unreadable is rebuilt from live and archived WALs, off the
 //!   startup path; until that scan completes every pulled entry is Blocked and nothing is acked.
 //!
-//! The `held-reply/v1` route capability stays UNDECLARED in release builds, so no production
-//! provider may hold a call. With held replies undeclared, no call carries a plain key and
-//! nothing is registered. Result-only negotiation is independent. Debug builds may declare
-//! held replies for tests (see [`declare_held_reply_for_tests`]).
+//! Installing this runtime declares `tool-result/v1` and `held-reply/v1` on dispatch routes in
+//! every build. Plain-call keys and registrations still require a provider's frozen
+//! `late_results` declaration; role and plan-fetch routes do not negotiate held replies.
 //!
 //! Known edge: a provider keeps at most 1,000 unacked results per session and drops the oldest
 //! first (contract §7). A held call whose entry was dropped that way (for example while broca was
@@ -54,19 +53,6 @@ const RECOVERY_CONCURRENCY: usize = 8;
 
 /// How long a rebuild that met an unreadable WAL waits before scanning again.
 const REBUILD_RETRY: Duration = Duration::from_secs(30);
-
-/// Debug builds only: the environment variable that makes this daemon's tool routes declare
-/// `content/v1` and `held-reply/v1`, so a test provider may hold a call. Its name is a
-/// non-shipping marker: the release fence refuses any artifact that contains it.
-#[cfg(debug_assertions)]
-pub const DECLARE_HELD_REPLY_ENV: &str = "BROCA_TEST_DECLARE_HELD_REPLY_V1";
-
-/// Whether this (debug) process was asked to declare the held-reply capabilities on its tool
-/// routes. Release builds never declare them and do not contain this check.
-#[cfg(debug_assertions)]
-pub fn declare_held_reply_for_tests() -> bool {
-    std::env::var_os(DECLARE_HELD_REPLY_ENV).is_some_and(|value| value == "1")
-}
 
 /// One route per provider module, opened on the consumer-identity connection.
 pub struct FeedRoutes {

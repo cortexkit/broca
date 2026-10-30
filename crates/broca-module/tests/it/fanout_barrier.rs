@@ -416,6 +416,7 @@ fn tag(u: &ControlUnit) -> &'static str {
         ControlUnit::StepFinished { .. } => "StepFinished",
         ControlUnit::RunFinished { .. } => "RunFinished",
         ControlUnit::Paused { .. } => "Paused",
+        ControlUnit::Status { .. } => "Status",
         ControlUnit::Error { .. } => "Error",
         ControlUnit::DisplayReset => "DisplayReset",
         ControlUnit::ContextCeilingWait { .. } => "ContextCeilingWait",

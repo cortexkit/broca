@@ -671,9 +671,6 @@ pub struct SubcToolPlane {
     batch_presets: Mutex<HashMap<BatchRouteKey, ToolManifest>>,
     approved_args: Mutex<HashMap<BatchRouteKey, HashMap<ToolCallId, ApprovedArgs>>>,
     provider_held: Option<ProviderHeldSupport>,
-    /// Whether tool routes declare `held-reply/v1` alongside their result format; see
-    /// [`Self::held_reply_declared`]. Settable only in debug builds.
-    declares_held_reply: bool,
     /// The frozen tool manifest of each batch in progress. It is the only source of a
     /// provider's declarations: what its result format and `late_results` capability were when
     /// the session was admitted.
@@ -750,21 +747,12 @@ impl SubcToolPlane {
         self
     }
 
-    /// Debug builds only: declare `tool-result/v1` and `held-reply/v1` on every tool-dispatch route,
-    /// so a provider may answer `held`. Production negotiates result bodies independently,
-    /// but cannot declare held replies until held calls have cancel and stop close-out.
-    #[cfg(debug_assertions)]
-    pub fn declaring_held_reply_for_tests(mut self) -> Self {
-        self.declares_held_reply = true;
-        self
-    }
-
     /// Whether this plane's tool routes declare `held-reply/v1` (with `tool-result/v1`). Only then
     /// does a plain call carry its key to a `late_results` provider, and only then is any call
     /// registered with the intake: without the declaration no provider may hold a call, so a key
     /// or a registration would change the wire and the store for nothing.
     fn held_reply_declared(&self) -> bool {
-        self.provider_held.is_some() && self.declares_held_reply
+        self.provider_held.is_some()
     }
 
     fn frozen_contract(&self, ctx: &BatchCtx, module: &str) -> FrozenContract {
@@ -932,7 +920,6 @@ impl SubcToolPlane {
             batch_presets: Mutex::new(HashMap::new()),
             approved_args: Mutex::new(HashMap::new()),
             provider_held: None,
-            declares_held_reply: false,
             batch_manifests: Mutex::new(HashMap::new()),
             registered_keys: Mutex::new(HashMap::new()),
             #[cfg(debug_assertions)]
@@ -3404,11 +3391,7 @@ impl ToolPlane for SubcToolPlane {
         ctx: &BatchCtx,
         calls: &[broca_core::tool_plane::DispatchRegistration],
     ) -> Result<(), ToolPlaneError> {
-        let Some(support) = self
-            .provider_held
-            .as_ref()
-            .filter(|_| self.declares_held_reply)
-        else {
+        let Some(support) = self.provider_held.as_ref() else {
             return Ok(());
         };
         let mut registrations = Vec::new();

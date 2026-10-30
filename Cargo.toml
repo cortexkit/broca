@@ -81,17 +81,17 @@ cortexkit-role-harness = "=0.1.0"
 cortexkit-role-tool-provider = "=0.13.2"
 cortexkit-llm-tools = "=0.2.1"
 cortexkit-role-tool-provider-conformance = "=0.13.1"
-cortexkit-role-llm-runner = "=0.7.14"
+cortexkit-role-llm-runner = "=0.7.21"
 cortexkit-bus-naming = "=0.2.7"
 cortexkit-bus-trait = "=0.3.0"
 cortexkit-bus-nats = "=0.3.0"
-cortexkit-role-llm-runner-conformance = "=0.15.16"
+cortexkit-role-llm-runner-conformance = "=0.15.25"
 # Draft 2020-12 validation of structured-output values. Default features are off so the
 # validator has no HTTP or file retriever: a schema can never make broca fetch anything.
 jsonschema = { version = "=0.58.6", default-features = false }
 cortexkit-role-agent-data = "=0.2.2"
 cortexkit-role-step-transform-provider = "=0.3.3"
-cortexkit-role-compaction-provider = "=0.7.3"
+cortexkit-role-compaction-provider = "=0.7.8"
 # System One: the one-pass decision-model role and the batch rules it shares with extraction.
 cortexkit-role-classifier = "=0.5.0"
 cortexkit-role-classifier-conformance = "=0.6.0"

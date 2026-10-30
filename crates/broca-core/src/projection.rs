@@ -102,6 +102,7 @@ pub fn classify_control_unit(unit: &ControlUnit) -> ControlClass {
         | ControlUnit::MessageBoundary { .. }
         | ControlUnit::StepFinished { .. }
         | ControlUnit::Error { .. }
+        | ControlUnit::Status { .. }
         | ControlUnit::Paused { .. }
         | ControlUnit::RunFinished { .. } => ControlClass::ControlProjectable,
         // Display-state discard: paired with a display-lane reset, never a reliable unit.
@@ -205,6 +206,7 @@ pub struct ControlProjectionState {
     final_step_finish_reason: Option<FinishReason>,
     has_completed_step: bool,
     indeterminate_tool_calls: IndeterminateToolCalls,
+    held_calls: crate::replay::HeldCallsProjection,
 }
 
 impl ControlProjectionState {
@@ -227,6 +229,7 @@ impl ControlProjectionState {
             final_step_finish_reason,
             has_completed_step: completed_steps > 0,
             indeterminate_tool_calls: IndeterminateToolCalls::default(),
+            held_calls: Default::default(),
             placement: Default::default(),
             placement_error: None,
             assistant_ordinal: None,
@@ -310,6 +313,7 @@ impl ControlProjectionState {
         self.call_identities.clear();
         self.cancelled = false;
         self.pending_inputs.clear();
+        self.held_calls = Default::default();
     }
 }
 
@@ -811,7 +815,7 @@ fn project_control_record<S: ControlProjectionSink>(
             reason,
             error,
             ..
-        } => {
+        } if *reason != broca_protocol::PauseReason::ToolHeld => {
             push!(
                 ControlUnit::Paused {
                     run_id: run_id.clone(),
@@ -1079,10 +1083,9 @@ fn project_control_record<S: ControlProjectionSink>(
         | WalRecord::LateApprovalRecorded { .. }
         | WalRecord::LateDispatchIntent { .. }
         | WalRecord::LateResult { .. } => {}
-        // A held call's interim reply never reaches the model or the control lane: the run's
-        // `Paused {tool_held}` unit and, later, the call's ordinary `ToolResult` are what a
-        // subscriber sees.
-        WalRecord::ToolCallProviderHeld { .. } => {}
+        // The internal park preserves recovery's waiting slot; it is not a caller pause.
+        // The held record and its terminal below publish the provider-held status instead.
+        WalRecord::RunPaused { .. } | WalRecord::ToolCallProviderHeld { .. } => {}
         // An informational record, skipped exactly like `Unknown`.
         WalRecord::InputTokenCapFrozen { .. }
         | WalRecord::InputTokenBudgetExhausted { .. }
@@ -1137,6 +1140,16 @@ fn project_control_record<S: ControlProjectionSink>(
                 state.call_identities.clear();
             }
             _ => {}
+        }
+    }
+    // Append status after older units so their durable cursors stay unchanged, including
+    // a ToolResult's lifecycle boundaries when the final held call leaves the list.
+    if let Some(status) = state.held_calls.observe(&framed.record) {
+        if let Some(run_id) = &state.run_id {
+            push!(ControlUnit::Status {
+                run_id: run_id.clone(),
+                status: Box::new(status),
+            });
         }
     }
 }

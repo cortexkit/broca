@@ -37,7 +37,7 @@ use cortexkit_role_harness::{
 use cortexkit_role_llm_runner::points;
 use cortexkit_role_llm_runner_conformance::{
     run_suite, Capability, CaseOutcome, LlmRunnerSubject, Reply, RouteFailure, RunnerRoute, Script,
-    ScriptedPart, ScriptedUsage, SubscribeOutcome, SCRIPTED_TOOL,
+    ScriptedLateEntry, ScriptedPart, ScriptedUsage, SubscribeOutcome, SCRIPTED_TOOL,
 };
 use serde_json::{json, Map, Value};
 use subc_control::ConsumerIdentity;
@@ -809,6 +809,21 @@ struct ToolProvider {
     routes: Mutex<HashMap<(u16, u32), String>>,
 }
 
+impl ToolProvider {
+    fn catalog_for_route(&self, route: (u16, u32), request: &Value) -> Value {
+        let session = self
+            .routes
+            .lock()
+            .unwrap()
+            .get(&route)
+            .cloned()
+            .unwrap_or_default();
+        let mut answer = compaction::catalog(request);
+        held_late_results::declare_in_catalog(&self.shared, &session, &mut answer);
+        answer
+    }
+}
+
 #[async_trait]
 impl subc_client_rs::ModuleHandler for ToolProvider {
     async fn handle(
@@ -821,8 +836,8 @@ impl subc_client_rs::ModuleHandler for ToolProvider {
             return outcome;
         }
         if request["name"] == "tool.catalog" {
-            let mut answer = compaction::catalog(&request);
-            held_late_results::declare_in_catalog(&self.shared, &mut answer);
+            let handle = ctx.route_handle();
+            let answer = self.catalog_for_route((handle.channel, handle.epoch), &request);
             return subc_client_rs::HandlerOutcome::Response(serde_json::to_vec(&answer).unwrap());
         }
         let arguments = request["arguments"].to_string();
@@ -1124,9 +1139,6 @@ struct BrocaSubject {
     bus_events_enabled: bool,
     process_kills_disabled: bool,
     reserved_reader: bool,
-    /// Start `ck-broca` with its tool routes declaring `content/v1` and `held-reply/v1`, which
-    /// only a debug build honours (see `broca_module_serve::held_runtime`).
-    declare_held_reply: bool,
     #[cfg(feature = "test-clock")]
     bus: Option<Arc<bus::BusRig>>,
     #[cfg(feature = "test-clock")]
@@ -1150,7 +1162,6 @@ impl BrocaSubject {
             bus_events_enabled: true,
             process_kills_disabled: false,
             reserved_reader: false,
-            declare_held_reply: false,
             #[cfg(feature = "test-clock")]
             bus: None,
             #[cfg(feature = "test-clock")]
@@ -1266,9 +1277,6 @@ impl BrocaSubject {
         config["modules"]["broca"]["env"]["BROCA_CONFIG_PATH"] = json!(broca_config);
         if let Some(dump_dir) = &self.dump_dir {
             config["modules"]["broca"]["env"]["BROCA_DUMP_REQUEST_DIR"] = json!(dump_dir);
-        }
-        if self.declare_held_reply {
-            config["modules"]["broca"]["env"]["BROCA_TEST_DECLARE_HELD_REPLY_V1"] = json!("1");
         }
         std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap())
             .map_err(|e| fail(e.to_string()))?;
@@ -2300,6 +2308,13 @@ impl LlmRunnerSubject for BrocaSubject {
     }
 
     fn send_fields(&self, session: &str, first: bool) -> Map<String, Value> {
+        if held_late_results::needs_plan(&self.shared, session)
+            && !self.shared.plan_sessions.lock().unwrap().contains(session)
+        {
+            return self
+                .send_fields_with_plan(session, first, &Map::new())
+                .unwrap();
+        }
         // The pin fixture uses an admitted provider catalog. Caller-declared
         // legacy tools intentionally have no provider semantics to pin.
         if session.starts_with("cf-call-identity-pin-")
@@ -2719,6 +2734,28 @@ impl LlmRunnerSubject for BrocaSubject {
                 Ok(observe_model_request(&request))
             })
             .collect()
+    }
+
+    async fn install_held_reply(
+        &self,
+        session: &str,
+        arguments: &Value,
+        reason: &str,
+    ) -> Result<(), HarnessError> {
+        held_late_results::install_held_reply(&self.shared, session, arguments, reason);
+        Ok(())
+    }
+
+    async fn await_held_reply(&self, arguments: &Value) -> Result<String, HarnessError> {
+        held_late_results::await_held_reply(&self.shared, arguments).await
+    }
+
+    async fn publish_late_entry(
+        &self,
+        arguments: &Value,
+        entry: ScriptedLateEntry,
+    ) -> Result<(), HarnessError> {
+        held_late_results::publish_late_entry(&self.shared, arguments, entry)
     }
 
     async fn install_script(&self, session: &str, script: Script) -> Result<(), HarnessError> {
@@ -3278,6 +3315,147 @@ async fn describe_diagnostics_follow_each_call_across_two_routes_on_one_worker()
     broca_test_support::remove_rig_dir(&scratch);
 }
 
+const REQUIRED_INPUT_CAP_CASES: &[&str] = &[
+    "input_token_cap_at_limit",
+    "input_token_cap_crossing_tools",
+    "input_token_cap_restart_between_episodes",
+    "input_token_cap_raise_refused",
+    "input_token_cap_closed_members",
+    "input_token_cap_usage_unreported",
+];
+
+const REQUIRED_STRUCTURED_OUTPUT_CASES: &[&str] = &[
+    "structured_output_final_text_enforced_passed",
+    "structured_output_final_text_with_tools_refused",
+    "structured_output_submit_tool_ends_run",
+    "structured_output_reserved_name_refused",
+    "structured_output_absent_without_submit",
+    "structured_output_failed_validation_completes",
+    "structured_output_frozen_across_restart",
+    "structured_output_not_inherited",
+    "structured_output_external_ref_refused",
+    "structured_output_sibling_never_dispatched",
+];
+
+const STREAMED_SIBLINGS_INAPPLICABLE: &str = "submit_streamed_siblings is not declared; the strict rule is checked by structured_output_sibling_never_dispatched";
+
+/// Additive kit cases must not turn an undeclared capability into a required pass.
+/// Check the contracts this adapter implements by name, not by a shared name prefix's size.
+fn check_named_contract_cases(
+    cases: &[cortexkit_role_llm_runner_conformance::CaseReport],
+    crash_kills_disabled: bool,
+) -> Result<(), String> {
+    for name in REQUIRED_INPUT_CAP_CASES
+        .iter()
+        .chain(REQUIRED_STRUCTURED_OUTPUT_CASES)
+    {
+        let case = cases
+            .iter()
+            .find(|case| case.case == *name)
+            .ok_or_else(|| format!("the suite has no case {name}"))?;
+        let skipped_kill = crash_kills_disabled
+            && case
+                .requires
+                .iter()
+                .any(|cap| matches!(cap, Capability::KillAt(_)))
+            && matches!(case.outcome, CaseOutcome::Skipped { .. });
+        if case.outcome != CaseOutcome::Passed && !skipped_kill {
+            return Err(format!("{name}: {:?}", case.outcome));
+        }
+    }
+    let name = "structured_output_streamed_siblings";
+    let case = cases
+        .iter()
+        .find(|case| case.case == name)
+        .ok_or_else(|| format!("the suite has no case {name}"))?;
+    if !matches!(&case.outcome, CaseOutcome::Inapplicable { reason } if reason == STREAMED_SIBLINGS_INAPPLICABLE)
+    {
+        return Err(format!("{name}: {:?}", case.outcome));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod named_contract_case_tests {
+    use super::*;
+    use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
+
+    fn outcomes() -> Vec<CaseReport> {
+        CASES
+            .iter()
+            .filter(|case| {
+                case.name.starts_with("input_token_cap_")
+                    || case.name.starts_with("structured_output_")
+            })
+            .map(|case| CaseReport {
+                case: case.name,
+                requires: case.requires.to_vec(),
+                outcome: if case.name == "structured_output_streamed_siblings" {
+                    CaseOutcome::Inapplicable {
+                        reason: STREAMED_SIBLINGS_INAPPLICABLE.into(),
+                    }
+                } else {
+                    CaseOutcome::Passed
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn named_contract_cases_accept_the_undeclared_streamed_sibling_case() {
+        assert_eq!(check_named_contract_cases(&outcomes(), false), Ok(()));
+    }
+
+    #[test]
+    fn named_contract_cases_require_each_supported_case_and_the_explicit_inapplicable_case() {
+        for name in REQUIRED_INPUT_CAP_CASES
+            .iter()
+            .chain(REQUIRED_STRUCTURED_OUTPUT_CASES)
+            .copied()
+            .chain(std::iter::once("structured_output_streamed_siblings"))
+        {
+            let mut cases = outcomes();
+            cases.retain(|case| case.case != name);
+            assert!(check_named_contract_cases(&cases, false)
+                .unwrap_err()
+                .contains(name));
+            let mut cases = outcomes();
+            cases
+                .iter_mut()
+                .find(|case| case.case == name)
+                .unwrap()
+                .outcome = CaseOutcome::Skipped {
+                missing: Vec::new(),
+            };
+            assert!(check_named_contract_cases(&cases, false)
+                .unwrap_err()
+                .contains(name));
+        }
+    }
+
+    #[test]
+    fn named_contract_cases_skip_only_declared_kill_cases_when_kills_are_disabled() {
+        let mut cases = outcomes();
+        let frozen = cases
+            .iter_mut()
+            .find(|case| case.case == "structured_output_frozen_across_restart")
+            .unwrap();
+        frozen.outcome = CaseOutcome::Skipped {
+            missing: Vec::new(),
+        };
+        assert!(check_named_contract_cases(&cases, false).is_err());
+        assert_eq!(check_named_contract_cases(&cases, true), Ok(()));
+        cases
+            .iter_mut()
+            .find(|case| case.case == "input_token_cap_at_limit")
+            .unwrap()
+            .outcome = CaseOutcome::Skipped {
+            missing: Vec::new(),
+        };
+        assert!(check_named_contract_cases(&cases, true).is_err());
+    }
+}
+
 /// Every case required by this subject's advertised capabilities must run and pass.
 /// Other cases report their missing capability explicitly, and the kill ledger must
 /// include a real process kill rather than only simulated recovery.
@@ -3332,10 +3510,9 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         eprintln!("{}", subject.failure_evidence());
     }
     assert!(failed.is_empty(), "{}", report.render());
-    // The cases a `session.send` retry is held to. broca declares every capability they need,
-    // including hold_tool_calls for the two steer cases, so each one must have run and passed:
-    // a case that drifts to skipped or inapplicable would otherwise pass this test without
-    // checking anything.
+    // Broca declares these operations, so a case that drifts to skipped or inapplicable
+    // must not silently pass. Input-cap and structured-output outcomes are checked by name
+    // below, including the undeclared streamed-sibling behavior.
     for name in [
         "history_pages_back_to_the_first_message",
         "history_mid_matches_read",
@@ -3374,6 +3551,11 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "send_status_answers_as_a_resend_after_restart",
         "send_status_unknown_send_refused",
         "max_steps_seals_pending_calls",
+        "held_calls_lists_waiting_call",
+        "held_calls_applies_late_result",
+        "held_calls_not_started_becomes_tool_result",
+        "held_calls_expired_becomes_tool_result",
+        "held_calls_status_event_matches_run_status",
         "no_tools_offered_to_model",
         "no_tools_later_plan_send_refused",
         "send_id_retry_same_answer",
@@ -3396,22 +3578,6 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "retention_above_max_refused",
         "retention_active_run_never_expires",
         "crash_at_RetentionTombstoned",
-        "input_token_cap_at_limit",
-        "input_token_cap_crossing_tools",
-        "input_token_cap_restart_between_episodes",
-        "input_token_cap_raise_refused",
-        "input_token_cap_closed_members",
-        "input_token_cap_usage_unreported",
-        "structured_output_final_text_enforced_passed",
-        "structured_output_final_text_with_tools_refused",
-        "structured_output_submit_tool_ends_run",
-        "structured_output_reserved_name_refused",
-        "structured_output_absent_without_submit",
-        "structured_output_failed_validation_completes",
-        "structured_output_frozen_across_restart",
-        "structured_output_not_inherited",
-        "structured_output_external_ref_refused",
-        "structured_output_sibling_never_dispatched",
         // broca declares `client_message_id` (llm-runner 0.5.1 §9.11).
         "client_message_id_resend_with_another_id_refused",
     ] {
@@ -3487,48 +3653,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
             case.outcome
         );
     }
-    let cap_cases: Vec<_> = report
-        .cases
-        .iter()
-        .filter(|case| case.case.starts_with("input_token_cap_"))
-        .collect();
-    assert_eq!(
-        cap_cases.len(),
-        6,
-        "all shared input-cap cases must be present"
-    );
-    assert!(cap_cases
-        .iter()
-        .all(|case| case.outcome == CaseOutcome::Passed));
-    println!(
-        "Shared input-token-cap cases: {} ran, {} passed",
-        cap_cases.len(),
-        cap_cases.len()
-    );
-    let structured_cases: Vec<_> = report
-        .cases
-        .iter()
-        .filter(|case| case.case.starts_with("structured_output_"))
-        .collect();
-    assert_eq!(
-        structured_cases.len(),
-        10,
-        "all ten shared structured-output cases must be present"
-    );
-    assert!(structured_cases
-        .iter()
-        .all(|case| case.outcome == CaseOutcome::Passed
-            || (skip_crash_kills()
-                && case.case == "structured_output_frozen_across_restart"
-                && matches!(case.outcome, CaseOutcome::Skipped { .. }))));
-    println!(
-        "Shared structured-output cases: {} total, {} passed",
-        structured_cases.len(),
-        structured_cases
-            .iter()
-            .filter(|case| case.outcome == CaseOutcome::Passed)
-            .count()
-    );
+    check_named_contract_cases(&report.cases, skip_crash_kills()).unwrap();
     if skip_crash_kills() {
         assert!(report.kills.is_empty());
         println!("Crash kills disabled: the kit's overall verdict remains non-conforming without a real kill; run natively without BROCA_CONFORMANCE_SKIP_CRASH_KILLS to verify durability.");
@@ -5061,12 +5186,125 @@ mod held_call_tests {
             bus_events_enabled: false,
             process_kills_disabled: true,
             reserved_reader: false,
-            declare_held_reply: false,
             #[cfg(feature = "test-clock")]
             bus: None,
             #[cfg(feature = "test-clock")]
             mc: None,
         }
+    }
+
+    #[tokio::test]
+    async fn held_catalog_declarations_do_not_leak_to_other_bound_sessions() {
+        let shared = Arc::new(Shared::default());
+        let provider = ToolProvider {
+            shared: shared.clone(),
+            routes: Mutex::new(HashMap::from([
+                ((11, 1), "held-catalog".into()),
+                ((12, 1), "structured-catalog".into()),
+                ((13, 1), "media-catalog".into()),
+            ])),
+        };
+        let request = json!({"name":"tool.catalog", "arguments":{"composition":{
+            "providers":[{"provider":TOOL_MODULE,"tools":[{"name":SCRIPTED_TOOL,"capabilities":[]}]}],
+            "step_transform_items":[]
+        }}});
+        let before = serde_json::to_vec(&provider.catalog_for_route((12, 1), &request)).unwrap();
+        assert!(serde_json::from_slice::<Value>(&before)
+            .unwrap()
+            .get("capabilities")
+            .is_none());
+        subject(shared.clone())
+            .install_held_reply("held-catalog", &json!({"nonce":"held-catalog"}), "consent")
+            .await
+            .unwrap();
+        let held = provider.catalog_for_route((11, 1), &request);
+        assert_eq!(held["capabilities"], json!({"late_results":true}));
+        assert_eq!(held["tools"].as_array().unwrap().len(), 1);
+        assert!(held["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool["result_format"] == "tool-result/v1"));
+        for route in [(12, 1), (13, 1), (11, 2), (14, 1)] {
+            let catalog = provider.catalog_for_route(route, &request);
+            assert!(catalog["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tool| tool.get("result_format").is_none()));
+            assert_eq!(
+                serde_json::to_vec(&catalog).unwrap(),
+                before,
+                "route {route:?} stays legacy after a held reply is installed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_held_reply_uses_a_plan_and_publishes_each_late_kind() {
+        let shared = Arc::new(Shared::default());
+        let subject = subject(shared.clone());
+        let arguments = json!({"nonce":"kit-held-reply"});
+        subject
+            .install_held_reply("held-kit", &arguments, "consent")
+            .await
+            .unwrap();
+        let fields = subject.send_fields("held-kit", true);
+        assert!(fields.contains_key("plan"));
+        assert!(fields["tools"].is_null());
+        assert_eq!(
+            subject.send_fields("ordinary", true)["system"],
+            format!("{SESSION_MARKER}ordinary")
+        );
+        held_late_results::note_bind(
+            &shared,
+            (4, 1),
+            Some(&["tool-result/v1".into(), "held-reply/v1".into()]),
+        );
+        let answer = held_late_results::answer_held(
+            &shared,
+            (4, 1),
+            &arguments.to_string(),
+            &json!({"call_key":"lineage:6"}),
+        )
+        .unwrap();
+        let subc_client_rs::HandlerOutcome::Response(body) = answer else {
+            panic!("held response expected")
+        };
+        let answer: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(answer["held"]["reason"], "consent");
+        assert_eq!(
+            subject.await_held_reply(&arguments).await.unwrap(),
+            "lineage:6"
+        );
+        for entry in [
+            ScriptedLateEntry::result(json!({"nonce":"late-result"})),
+            ScriptedLateEntry::not_started("restart_before_dispatch"),
+            ScriptedLateEntry::expired(),
+        ] {
+            subject.publish_late_entry(&arguments, entry).await.unwrap();
+        }
+        let feed = held_late_results::serve_feed(
+            &shared,
+            &json!({"name":"late_results", "arguments":{"since":null}}),
+        )
+        .await
+        .unwrap();
+        let subc_client_rs::HandlerOutcome::Response(body) = feed else {
+            panic!("feed response expected")
+        };
+        let feed: Value = serde_json::from_slice(&body).unwrap();
+        let entries = feed["entries"].as_array().unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["result", "not_started", "expired"]
+        );
+        assert_eq!(entries[1]["reason"], "restart_before_dispatch");
+        assert!(entries[0]["result"].to_string().contains("late-result"));
+        assert_eq!(subject.tool_invocations(&arguments).await, 1);
     }
 
     #[tokio::test]
