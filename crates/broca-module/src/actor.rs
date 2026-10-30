@@ -1979,6 +1979,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .unwrap_or_default();
         let mut clock_changes = clock.subscribe();
         loop {
+            self.registry
+                .note_idle_holds(&self.key, self.gen, self.idle_close_reasons());
             let expiry_wait = self
                 .retention_deadline
                 .map(|deadline| Duration::from_millis(deadline.saturating_sub(clock.now_ms())));
@@ -7440,8 +7442,50 @@ impl<W: WalStore + 'static> LineageActor<W> {
         self.try_close().await
     }
 
-    /// Attempt the synchronous close teardown. Returns true if the actor closed (caller
-    /// returns), false if the close ABORTED (work raced in — keep serving).
+    /// Snapshot the in-memory reasons an actor cannot idle-close, without reading its WAL.
+    fn idle_close_reasons(&self) -> Vec<&'static str> {
+        let mut reasons = Vec::new();
+        if let RunState::Active { run_id, .. } = &self.state {
+            reasons.push("active_run");
+            match self.provider_held_episode(run_id) {
+                ProviderHeldPresence::Held => reasons.push("held_call"),
+                ProviderHeldPresence::Unknown => reasons.push("held_state_unknown"),
+                ProviderHeldPresence::NotHeld => {}
+            }
+        }
+        if self.fanout.has_live_subscribers() {
+            reasons.push("live_subscriber");
+        }
+        if self.warm_in_flight.occupied() {
+            reasons.push("manual_warm");
+        }
+        if self
+            .source_warm_task
+            .as_ref()
+            .is_some_and(|task| task.holds_idle.load(Ordering::Acquire))
+        {
+            reasons.push("source_warm");
+        }
+        if self
+            .withdrawal_task
+            .as_ref()
+            .is_some_and(|task| task.pending(0))
+        {
+            reasons.push("withdrawal");
+        }
+        if self.has_pending() {
+            reasons.push("pending_work");
+        }
+        if !self.pending_cancels.is_empty() {
+            reasons.push("pending_cancel");
+        }
+        if self.startup_recovery_pending {
+            reasons.push("startup_recovery");
+        }
+        reasons
+    }
+
+    /// Attempt synchronous teardown. Returns false when racing work aborts the close.
     async fn try_close(&mut self) -> bool {
         if let Err(error) = self.recover_startup_admission_view().await {
             tracing::warn!(
@@ -7596,8 +7640,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // wound down by the time the slot shows Closed. BOUNDED by a timeout: this awaits
         // external I/O (a wire send), and a stalled send must NOT hold the registry slot +
         // lease open indefinitely (which would block every re-open of the session). On timeout
-        // we proceed with the close — the route channel lingers until the connection drops,
-        // a bounded warm-resource cost, never a correctness issue.
+        // we proceed with the close. The tool plane owns any pending Goodbyes independently
+        // of this waiter, so its cleanup continues after the actor releases its lease.
         let _ = tokio::time::timeout(
             ON_SESSION_CLOSE_TIMEOUT,
             self.executor.on_session_close(&self.key),
@@ -13784,6 +13828,10 @@ mod tests {
             registry.slot_state(&key),
             Some("open"),
             "a subscriber still observing the session keeps a one-shot's actor open"
+        );
+        assert_eq!(
+            registry.tool_routes_health()["open_actor_reasons"]["live_subscriber"],
+            1
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

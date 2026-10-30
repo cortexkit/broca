@@ -305,6 +305,34 @@ message and field; it does not invent a `preset_missing` difference for a nonexi
 
 ### Health counters and per-request diagnostics
 
+`health.check.metrics.tool_routes` is an in-memory census of the shared tool-provider route
+cache. It reports `open_session_actors`, `cached_routes`, `cached_routes_per_provider`,
+`oldest_route_idle_secs` (null for an empty cache), `routes_for_closed_sessions` (normally zero),
+`goodbye_failures_since_boot`, `pending_goodbyes`, `goodbye_retry_overflows_since_boot` and
+`goodbye_giveups_since_boot`. Idle age is time since a route was last
+acquired for a batch or warm bind, not time since the last provider frame. Close failures count
+failed or timed-out enqueue attempts, including retries; a successful enqueue is not a remote
+acknowledgement. Failed closes retry independently of tool calls, even after the actor's bounded
+close waiter ends. Session teardown and congested late/abandoned opens share one cleanup queue
+per consumer connection. It holds at most 1,024 distinct route identities; overflow is counted and
+warned. Duplicate close requests can allocate additional waiters, so this identity cap is not a
+bound on total cleanup heap or task allocation.
+Entries expire after 30 seconds with one give-up WARN and an increment to
+`goodbye_giveups_since_boot`. Retry passes run in parallel with one shared five-second budget,
+with a one-second pause between passes, shortened to the earliest pending expiry. Connection loss
+synchronously removes entries for the lost connection generation and rejects later cleanup
+enqueues for that generation;
+cleanup tasks do not retain the connection owner. A give-up is not a remote acknowledgement:
+it stops local retries, and the daemon may retain that channel until the connection ends.
+No session names, project paths, prompts or tool arguments appear in this
+block. `open_actor_reasons` counts non-exclusive hold reasons observed at each actor-loop turn:
+active runs, held calls (or unknown held state), live subscribers, manual/source warming, pending
+work/cancellation, withdrawals and startup recovery. Actors with no observed hold are counted
+under `idle_ttl`; asynchronous holder changes become visible on the next actor turn, at latest
+its ordinary idle tick. A paused held episode alone does not prevent idle-close.
+Session-close INFO records use the hashed WAL address, provider module ids, successful
+Goodbye count and failure count; each failed or timed-out Goodbye also emits a WARN.
+
 `health.check` includes `metrics.management_ops`, a process-lifetime counter for every
 request/response operation in the management manifest and the `session.subscribe` stream. The
 object always contains every operation at zero or above; counts reset when broca restarts. A

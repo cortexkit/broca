@@ -54,6 +54,11 @@ use crate::connection::{
 use crate::scope_describe::{DescribedScope, ScopeDescriber};
 use crate::tool_deadline::tool_reply_deadline;
 
+use crate::route_close::{CloseTarget, RouteCloser};
+
+#[cfg(all(feature = "test-route-close", not(debug_assertions)))]
+compile_error!("test-route-close must never be enabled in a shipping build");
+
 /// How long a TOOL-call dispatch route open keeps retrying a module-availability
 /// refusal (`target_unavailable`, `module_reloading`, `module_warming`, `module_timeout`)
 /// before the call is refused as module-unavailable: 90 s from the first refusal, through
@@ -208,6 +213,12 @@ fn window_for(c: &Concurrency) -> usize {
     }
 }
 
+#[cfg(test)]
+struct RouteCacheGate {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
 struct RouteState {
     handle: RouteHandle,
     /// Bounds concurrent in-flight on this route to the provider's window.
@@ -216,11 +227,29 @@ struct RouteState {
     /// reported it identically just before and just after the open. `None` for an unscoped
     /// route.
     stamp: Option<ScopeStamp>,
+    last_used: Instant,
 }
 
 enum RouteEnsureError {
     Connection(ConnError),
     Plane(ToolPlaneError),
+}
+
+struct PlaneCloseTarget(std::sync::Weak<dyn ToolPlaneConnection>);
+impl CloseTarget for PlaneCloseTarget {
+    fn attempt(
+        &self,
+        handle: RouteHandle,
+    ) -> futures::future::BoxFuture<'static, Result<(), ConnError>> {
+        let conn = self.0.upgrade();
+        Box::pin(async move {
+            match conn {
+                Some(conn) => conn.route_close(&handle).await,
+                None => Err(ConnError::StaleRouteHandle(handle)),
+            }
+        })
+    }
+    fn abandon(&self, _handle: RouteHandle) {}
 }
 
 impl RouteEnsureError {
@@ -374,6 +403,9 @@ impl Fence {
 
 #[async_trait]
 trait ToolPlaneConnection: Send + Sync {
+    fn shared_route_closer(&self) -> Option<Arc<RouteCloser>> {
+        None
+    }
     fn consumer_module_id(&self) -> Option<&str> {
         None
     }
@@ -475,6 +507,9 @@ trait ToolPlaneConnection: Send + Sync {
 
 #[async_trait]
 impl ToolPlaneConnection for SubcConnection {
+    fn shared_route_closer(&self) -> Option<Arc<RouteCloser>> {
+        Some(self.route_closer())
+    }
     fn consumer_module_id(&self) -> Option<&str> {
         SubcConnection::consumer_module_id(self)
     }
@@ -664,7 +699,11 @@ type RegisteredKeys = HashMap<BatchRouteKey, HashMap<ToolCallId, (String, String
 /// close, and an idle sweeper could only add the risk of evicting a route belonging to a live
 /// session that is merely between tool batches.
 pub struct SubcToolPlane {
+    #[cfg(test)]
+    after_cache_gate: Mutex<Option<RouteCacheGate>>,
     conn: Arc<dyn ToolPlaneConnection>,
+    closer: Arc<RouteCloser>,
+    owns_closer: bool,
     default_module_id: Option<String>,
     routes: Mutex<HashMap<RouteKey, RouteState>>,
     batch_routes: Mutex<BatchRouteMap>,
@@ -716,6 +755,14 @@ pub struct SubcToolPlane {
     /// that was waiting for credit on the same route, and finds it replaced once it gets the
     /// credit, sends only after these have finished: on a serial route, batch order holds.
     resend_turns: Mutex<HashMap<RouteKey, Vec<CancellationToken>>>,
+}
+
+impl Drop for SubcToolPlane {
+    fn drop(&mut self) {
+        if self.owns_closer {
+            self.closer.stop();
+        }
+    }
 }
 
 /// What the batch's frozen plan declared about one provider: whether it serves the `content/v1`
@@ -912,7 +959,15 @@ impl SubcToolPlane {
     fn with_connection(conn: Arc<dyn ToolPlaneConnection>, module_id: impl Into<String>) -> Self {
         let module_id = module_id.into();
         let default_module_id = (!module_id.trim().is_empty()).then_some(module_id);
+        let shared = conn.shared_route_closer();
+        let owns_closer = shared.is_none();
+        let closer = shared
+            .unwrap_or_else(|| RouteCloser::new(Arc::new(PlaneCloseTarget(Arc::downgrade(&conn)))));
         Self {
+            #[cfg(test)]
+            after_cache_gate: Mutex::new(None),
+            closer,
+            owns_closer,
             conn,
             default_module_id,
             routes: Mutex::new(HashMap::new()),
@@ -1722,7 +1777,7 @@ impl SubcToolPlane {
                     == crate::connection::ToolRouteRefusal::OutcomeUnknown
                 {
                     self.remove_batch_call_route(ctx, &call.tool_call_id);
-                    let _ = self.invalidate_route_for_module(&ctx.bind, scope, module_id);
+                    let _ = self.invalidate_route_for_module(&ctx.bind, scope, module_id, sent_on);
                     return DispatchResult::SentButOutcomeUnknown {
                         reason: msg.to_string(),
                     };
@@ -1733,7 +1788,7 @@ impl SubcToolPlane {
                     // The transparent retry also lost its route. Keep the model-visible error,
                     // but discard the known-dead replacement so the next call opens afresh.
                     self.remove_batch_call_route(ctx, &call.tool_call_id);
-                    let _ = self.invalidate_route_for_module(&ctx.bind, scope, module_id);
+                    let _ = self.invalidate_route_for_module(&ctx.bind, scope, module_id, sent_on);
                 }
                 // `module_reloading` here answers the one re-send after a re-open: the module
                 // began draining again. The protocol refuses it before the request reaches the
@@ -1742,7 +1797,7 @@ impl SubcToolPlane {
                 // The route is forgotten, not closed, for the reason the first refusal's is.
                 if msg.code() == subc_protocol::error_codes::MODULE_RELOADING {
                     self.remove_batch_call_route(ctx, &call.tool_call_id);
-                    let _ = self.invalidate_route_for_module(&ctx.bind, scope, module_id);
+                    let _ = self.invalidate_route_for_module(&ctx.bind, scope, module_id, sent_on);
                     return self.module_unavailable_result(
                         ctx,
                         call,
@@ -1774,7 +1829,7 @@ impl SubcToolPlane {
                 // This can only be the replacement route after the first stale-route retry.
                 // It is already absent from the connection's live epoch map, so discard it.
                 self.remove_batch_call_route(ctx, &call.tool_call_id);
-                let _ = self.invalidate_route_for_module(&ctx.bind, scope, module_id);
+                let _ = self.invalidate_route_for_module(&ctx.bind, scope, module_id, sent_on);
                 DispatchResult::NotSent {
                     reason: "route handle became stale before send".into(),
                 }
@@ -1800,7 +1855,8 @@ impl SubcToolPlane {
                     return drained;
                 }
                 let known_dead = route_failure_is_known_dead(&e);
-                if let Some(handle) = self.invalidate_route_for_module(&ctx.bind, scope, module_id)
+                if let Some(handle) =
+                    self.invalidate_route_for_module(&ctx.bind, scope, module_id, sent_on)
                 {
                     if !known_dead {
                         // A timeout/protocol failure can leave the daemon route alive. Close it
@@ -2210,30 +2266,30 @@ impl SubcToolPlane {
                 // The run was cancelled or stopped while the describe held: the route opened
                 // but carries nothing, so close it.
                 ScopeReading::NotSynced | ScopeReading::Unverifiable(_) if guard.interrupted() => {
-                    let _ = self.conn.route_close(&handle).await;
+                    let _ = self.closer.close(handle).await;
                     return Err(cancelled());
                 }
                 ScopeReading::Live(_) => {
                     // The scope's stamp changed while the route was opening, so the route may
                     // be bound under either the earlier or the later stamp. Close it and retry.
-                    let _ = self.conn.route_close(&handle).await;
+                    let _ = self.closer.close(handle).await;
                 }
                 ScopeReading::Gone(reason) => {
-                    let _ = self.conn.route_close(&handle).await;
+                    let _ = self.closer.close(handle).await;
                     return Err(refused(
                         reason,
                         format!("scope.describe says the scope is gone ({reason})"),
                     ));
                 }
                 ScopeReading::NotSynced => {
-                    let _ = self.conn.route_close(&handle).await;
+                    let _ = self.closer.close(handle).await;
                     return Err(refused(
                         SCOPE_UNVERIFIABLE,
                         "the scope's owner has not synced since the daemon started".into(),
                     ));
                 }
                 ScopeReading::Unverifiable(detail) => {
-                    let _ = self.conn.route_close(&handle).await;
+                    let _ = self.closer.close(handle).await;
                     return Err(refused(
                         SCOPE_UNVERIFIABLE,
                         format!("could not confirm the scope after the open: {detail}"),
@@ -2309,8 +2365,9 @@ impl SubcToolPlane {
         // one route per key as before.
         let obsolete = {
             let mut routes = self.routes.lock().unwrap();
-            if let Some(r) = routes.get(&key) {
+            if let Some(r) = routes.get_mut(&key) {
                 if r.handle.reads_tool_result == (tool_result_v1 || self.held_reply_declared()) {
+                    r.last_used = Instant::now();
                     return Ok((r.handle, Arc::clone(&r.sem)));
                 }
             }
@@ -2342,22 +2399,48 @@ impl SubcToolPlane {
         let sem = Arc::new(Semaphore::new(window));
         let cached = {
             let mut routes = self.routes.lock().unwrap();
-            cache_route_state(&mut routes, key.clone(), handle, Arc::clone(&sem), stamp)
+            if lifecycle.is_cancelled() {
+                None
+            } else {
+                Some(cache_route_state(
+                    &mut routes,
+                    key.clone(),
+                    handle,
+                    Arc::clone(&sem),
+                    stamp,
+                ))
+            }
+        };
+
+        let Some(cached) = cached else {
+            self.closer.close(handle).await;
+            return Err(RouteEnsureError::Plane(ToolPlaneError::Unavailable(
+                "session closed during route open".into(),
+            )));
         };
 
         // If another task won the race to cache the session route, close the redundant daemon
         // channel we just opened. The lock is already released here, so the best-effort close
         // does not block unrelated route lookups.
         if let Some(loser_handle) = cached.loser_handle {
-            let _ = self.conn.route_close(&loser_handle).await;
+            let _ = self.closer.close(loser_handle).await;
+        }
+
+        #[cfg(test)]
+        {
+            let gate = self.after_cache_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
         }
 
         if lifecycle.is_cancelled() {
-            if let Some(loser) = cached.loser_handle {
-                let _ = self.conn.route_close(&loser).await;
-            } else {
-                self.routes.lock().unwrap().remove(&key);
-                let _ = self.conn.route_close(&cached.handle).await;
+            // Close only our own open. An old generation must not evict a fresh generation's
+            // route under the same key after the actor has reopened.
+            let removed = self.take_route_if_owned(&key, handle);
+            if removed.is_some() {
+                self.closer.close(handle).await;
             }
             return Err(RouteEnsureError::Plane(ToolPlaneError::Unavailable(
                 "session closed during route open".into(),
@@ -2418,13 +2501,11 @@ impl SubcToolPlane {
         bind: &BindIdentity,
         scope: Option<&SessionScope>,
         module_id: &str,
+        refused: RouteHandle,
     ) -> Option<RouteHandle> {
         let key = Self::route_key(bind, scope, module_id);
         let removed = self
-            .routes
-            .lock()
-            .unwrap()
-            .remove(&key)
+            .take_route_if_owned(&key, refused)
             .map(|route| route.handle);
         // A dead route usually means a module restarted or disappeared. The dispatch or external
         // invalidation path removes affected batch-local decisions separately; the next batch must
@@ -2434,10 +2515,19 @@ impl SubcToolPlane {
     }
 
     fn close_route_best_effort(&self, handle: RouteHandle) {
-        let conn = Arc::clone(&self.conn);
+        let closer = Arc::clone(&self.closer);
         tokio::spawn(async move {
-            let _ = conn.route_close(&handle).await;
+            closer.close(handle).await;
         });
+    }
+
+    fn take_route_if_owned(&self, key: &RouteKey, handle: RouteHandle) -> Option<RouteState> {
+        let mut routes = self.routes.lock().unwrap();
+        if routes.get(key).is_some_and(|route| route.handle == handle) {
+            routes.remove(key)
+        } else {
+            None
+        }
     }
 
     /// The cached route channel for `bind`, or `None` if no route is cached (so a test can
@@ -2478,14 +2568,36 @@ impl SubcToolPlane {
     /// so a long-lived SHARED consumer connection (one plane serving many sessions over one
     /// connection) doesn't accumulate stale channels across sessions. Unlike a per-session
     /// plane (where dropping the plane reclaims its routes), a SHARED plane is long-lived, so
-    /// the channel must be explicitly freed. Best-effort: a GOODBYE send failure just leaves
-    /// the channel until the connection closes (the local entry is dropped regardless, so a
-    /// future dispatch re-opens fresh).
-    pub async fn close_session_routes(&self, bind: &BindIdentity) {
+    /// the channel must be explicitly freed. Failed Goodbyes are retried separately; a later
+    /// dispatch opens a fresh route and is never retried by the teardown queue.
+    ///
+    /// This API is not a dispatch barrier by itself. The actor must stop and join its run
+    /// and dispatch futures before calling it; that ordering prevents old work from acquiring
+    /// a new lifecycle or committing a request during the asynchronous wire cleanup.
+    pub fn close_session_routes(
+        &self,
+        bind: &BindIdentity,
+    ) -> futures::future::BoxFuture<'static, ()> {
         let session = Self::session_key(bind);
-        if let Some(token) = self.session_cancel.lock().unwrap().remove(&session) {
-            token.cancel();
-        }
+        let mut lifecycles = self.session_cancel.lock().unwrap();
+        let channels = {
+            let mut routes = self.routes.lock().unwrap();
+            if let Some(token) = lifecycles.remove(&session) {
+                token.cancel();
+            }
+            let keys: Vec<RouteKey> = routes
+                .keys()
+                .filter(|key| key.session == session)
+                .cloned()
+                .collect();
+            keys.into_iter()
+                .filter_map(|key| {
+                    routes
+                        .remove(&key)
+                        .map(|route| (key.module_id, route.handle))
+                })
+                .collect::<Vec<_>>()
+        };
         self.fence.lock().unwrap().evict_session(&session);
         self.approved_args
             .lock()
@@ -2515,20 +2627,54 @@ impl SubcToolPlane {
             .lock()
             .unwrap()
             .retain(|(owner, _), _| owner != &session);
-        let channels = {
-            let mut routes = self.routes.lock().unwrap();
-            let keys: Vec<RouteKey> = routes
-                .keys()
-                .filter(|key| key.session == session)
-                .cloned()
-                .collect();
-            keys.into_iter()
-                .filter_map(|key| routes.remove(&key).map(|route| route.handle))
-                .collect::<Vec<_>>()
-        };
-        for handle in channels {
-            let _ = self.conn.route_close(&handle).await;
+        drop(lifecycles);
+        let count = channels.len();
+        if count == 0 {
+            return Box::pin(async {});
         }
+        let closer = Arc::clone(&self.closer);
+        let address = broca_core::session_addr(bind);
+        // The actor's bounded close may stop awaiting us. Teardown and its summary must
+        // survive that timeout rather than abandon the remaining provider channels.
+        let task = tokio::spawn(async move {
+            let modules: BTreeSet<_> = channels.iter().map(|(module, _)| module.clone()).collect();
+            let results =
+                join_all(channels.into_iter().map(|(_, handle)| closer.close(handle))).await;
+            let failures = results.iter().filter(|closed| !**closed).count();
+            tracing::info!(target: "broca.tool_routes", session = %address,
+                provider_modules = ?modules, routes_closed = count - failures,
+                goodbye_failures = failures, "session tool routes closed");
+        });
+        Box::pin(async move {
+            let _ = task.await;
+        })
+    }
+
+    /// Aggregate-only diagnostics: no session identity or tool content crosses the health surface.
+    pub fn tool_routes_health(&self, open_sessions: &[BindIdentity]) -> serde_json::Value {
+        let open: std::collections::HashSet<_> =
+            open_sessions.iter().map(Self::session_key).collect();
+        let routes = self.routes.lock().unwrap();
+        let mut providers = std::collections::BTreeMap::<&str, usize>::new();
+        let mut closed = 0;
+        let mut oldest = None::<u64>;
+        for (key, route) in routes.iter() {
+            *providers.entry(&key.module_id).or_default() += 1;
+            closed += usize::from(!open.contains(&key.session));
+            let age = route.last_used.elapsed().as_secs();
+            oldest = Some(oldest.map_or(age, |previous| previous.max(age)));
+        }
+        serde_json::json!({
+            "open_session_actors": open.len(),
+            "cached_routes": routes.len(),
+            "cached_routes_per_provider": providers,
+            "oldest_route_idle_secs": oldest,
+            "routes_for_closed_sessions": closed,
+            "goodbye_failures_since_boot": self.closer.failures(),
+            "pending_goodbyes": self.closer.pending(),
+            "goodbye_retry_overflows_since_boot": self.closer.overflows(),
+            "goodbye_giveups_since_boot": self.closer.giveups(),
+        })
     }
 }
 
@@ -2959,10 +3105,9 @@ impl SubcToolPlane {
         // the route, and closing it looks tidier -- but it is not safe. A sibling call in
         // the same batch may still be in flight on it (the drain is waiting for exactly
         // that call), and a GOODBYE would cut its reply off, turning a restart into an
-        // ambiguous outcome that stops the run. And eviction here is by key, so if a sibling
-        // already re-opened, this would close the FRESH route instead. The drain removes the
-        // old binding on its own; leaving it costs nothing but a dead entry until then.
-        let _ = self.invalidate_route_for_module(&ctx.bind, scope, &module_id);
+        // ambiguous outcome that stops the run. Evict only the refused handle: a sibling may
+        // already have cached its replacement. The drain owns the old binding's teardown.
+        let _ = self.invalidate_route_for_module(&ctx.bind, scope, &module_id, route_handle);
         let reopened = if endpoint_is_reloading {
             let lifecycle = self.capture_session_lifecycle_token(&ctx.bind);
             self.ensure_result_route_for_lifecycle_inner(
@@ -3242,7 +3387,7 @@ impl SubcToolPlane {
                 detail: format!("approval scope recheck failed: {error:?}"),
             }
         })?;
-        let _ = self.conn.route_close(&route).await;
+        let _ = self.closer.close(route).await;
         Ok(())
     }
 
@@ -3454,6 +3599,7 @@ fn cache_route_state(
                 handle,
                 sem: Arc::clone(&sem),
                 stamp,
+                last_used: Instant::now(),
             });
             CachedRoute {
                 handle,
@@ -3871,6 +4017,7 @@ fn legacy_non_text_tool_content_placeholder(block: &serde_json::Value) -> String
 
 #[cfg(test)]
 mod tests {
+    include!("subc_plane/route_close_followup_tests.rs");
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 
@@ -3971,6 +4118,8 @@ mod tests {
         /// id twice means it executed twice, and that is a defect rather than a retry.
         dispatched_ids: Mutex<Vec<Option<String>>>,
         closed_routes: Mutex<Vec<RouteHandle>>,
+        close_gate: Mutex<Option<RouteOpenGate>>,
+        close_failures: AtomicUsize,
         /// Every route.open attempt, in order: the session it was for and the scope it carried.
         open_attempts: Mutex<Vec<(String, Option<ScopeSelector>)>>,
         /// What `server.describe` advertises; `scopes/v1` unless a test removes it.
@@ -4020,6 +4169,8 @@ mod tests {
                 tool_calls: AtomicUsize::new(0),
                 dispatched_ids: Mutex::new(Vec::new()),
                 closed_routes: Mutex::new(Vec::new()),
+                close_gate: Mutex::new(None),
+                close_failures: AtomicUsize::new(0),
                 open_attempts: Mutex::new(Vec::new()),
                 capabilities: Mutex::new(vec![CAP_SCOPES_V1.to_owned()]),
                 closed: Mutex::new(Default::default()),
@@ -4156,6 +4307,18 @@ mod tests {
         }
 
         async fn route_close(&self, route: &RouteHandle) -> Result<(), ConnError> {
+            let gate = self.close_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+            if self
+                .close_failures
+                .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Err(ConnError::Transport("injected close failure".into()));
+            }
             self.closed_routes.lock().unwrap().push(*route);
             Ok(())
         }
@@ -4905,6 +5068,124 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(300));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn tool_route_health_counts_ownership_and_idle_age_without_names() {
+        let conn = ScriptedToolPlaneConnection::new(vec![Vec::new()], Vec::new());
+        let plane = SubcToolPlane::with_connection(conn, "aft");
+        let live = BindIdentity::new("/project", "alfonso", "live-private-name");
+        let orphan = BindIdentity::new("/project", "alfonso", "closed-private-name");
+        plane
+            .warm_bind(&live, Duration::from_secs(1))
+            .await
+            .unwrap();
+        plane
+            .warm_bind(&orphan, Duration::from_secs(1))
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(7)).await;
+        let health = plane.tool_routes_health(std::slice::from_ref(&live));
+        assert_eq!(health["open_session_actors"], 1);
+        assert_eq!(health["cached_routes"], 2);
+        assert_eq!(health["cached_routes_per_provider"]["aft"], 2);
+        assert_eq!(health["routes_for_closed_sessions"], 1);
+        assert_eq!(health["oldest_route_idle_secs"], 7);
+        assert!(!health.to_string().contains("private-name"));
+        plane.close_session_routes(&orphan).await;
+        assert_eq!(
+            plane.tool_routes_health(std::slice::from_ref(&live))["routes_for_closed_sessions"],
+            0
+        );
+        plane.close_session_routes(&live).await;
+        assert!(plane.tool_routes_health(&[])["oldest_route_idle_secs"].is_null());
+    }
+
+    #[tokio::test]
+    async fn late_open_cleanup_preserves_reopened_generation_route() {
+        let conn = ScriptedToolPlaneConnection::new(
+            vec![Vec::new(), Vec::new()],
+            vec![successful_tool_reply("fresh")],
+        );
+        let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+        let ctx = batch_ctx("reopened");
+        plane
+            .warm_bind(&ctx.bind, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let key = SubcToolPlane::route_key(&ctx.bind, None, "aft");
+        let old = plane.routes.lock().unwrap()[&key].handle;
+        plane.close_session_routes(&ctx.bind).await;
+        plane
+            .warm_bind(&ctx.bind, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let fresh = plane.routes.lock().unwrap()[&key].handle;
+        assert_ne!(fresh, old);
+        // A late old open finishes cleanup after the same session address has reopened.
+        assert!(plane.take_route_if_owned(&key, old).is_none());
+        assert_eq!(plane.routes.lock().unwrap()[&key].handle, fresh);
+        let call = call("echo");
+        plane
+            .batch_started(
+                &ctx,
+                std::slice::from_ref(&call),
+                &ToolManifest::from_tools(vec![]),
+            )
+            .await
+            .unwrap();
+        assert_completed_success(plane.dispatch(&ctx, &call).await);
+        assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            plane.tool_routes_health(std::slice::from_ref(&ctx.bind))["cached_routes"],
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_close_waiter_still_closes_every_provider_route() {
+        let conn = ScriptedToolPlaneConnection::new(vec![Vec::new()], Vec::new());
+        let gate = RouteOpenGate::new();
+        *conn.close_gate.lock().unwrap() = Some(gate.clone());
+        let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+        let bind = BindIdentity::new("/project", "alfonso", "timed-out-close");
+        plane
+            .warm_bind(&bind, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let close = plane.close_session_routes(&bind);
+        drop(close);
+        gate.entered.notified().await;
+        gate.release.notify_one();
+        wait_for_closed_routes(&conn, 1).await;
+        assert_eq!(plane.tool_routes_health(&[])["cached_routes"], 0);
+    }
+
+    #[tokio::test]
+    async fn failed_goodbye_retries_without_dispatching_a_call() {
+        let conn = ScriptedToolPlaneConnection::new(vec![Vec::new()], Vec::new());
+        conn.close_failures.store(1, Ordering::SeqCst);
+        let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+        let bind = BindIdentity::new("/project", "alfonso", "retry");
+        plane
+            .warm_bind(&bind, Duration::from_secs(1))
+            .await
+            .unwrap();
+        plane.close_session_routes(&bind).await;
+        assert_eq!(
+            plane.tool_routes_health(&[])["goodbye_failures_since_boot"],
+            1
+        );
+        broca_test_support::wait_until("Goodbye retry", || async {
+            if conn.closed_routes.lock().unwrap().len() == 1 {
+                Ok(())
+            } else {
+                Err(plane.tool_routes_health(&[]).to_string())
+            }
+        })
+        .await;
+        assert_eq!(plane.tool_routes_health(&[])["pending_goodbyes"], 0);
+        assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn captured_lifecycle_rejects_a_delayed_first_poll_after_close() {
         let conn = ScriptedToolPlaneConnection::new(Vec::new(), Vec::new());
@@ -4932,6 +5213,10 @@ mod tests {
         assert_eq!(conn.route_open_calls.load(Ordering::SeqCst), 0);
         assert_eq!(plane.cached_route_channel_for_module(&bind, "aft"), None);
         assert!(conn.closed_routes.lock().unwrap().is_empty());
+        assert_eq!(
+            plane.tool_routes_health(&[])["routes_for_closed_sessions"],
+            0
+        );
     }
 
     #[tokio::test]
@@ -6600,6 +6885,7 @@ mod tests {
                 handle: old_handle,
                 sem: Arc::clone(&old_sem),
                 stamp: None,
+                last_used: Instant::now(),
             },
         );
         routes.insert(
@@ -6608,6 +6894,7 @@ mod tests {
                 handle: new_handle,
                 sem: Arc::clone(&new_sem),
                 stamp: None,
+                last_used: Instant::now(),
             },
         );
 
@@ -7002,6 +7289,8 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(conn.route_open_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(plane.tool_routes_health(&[])["cached_routes"], 0);
+            assert_eq!(conn.closed_routes.lock().unwrap().len(), 1);
             conn.script_route_open_sequence(
                 "aft",
                 vec![RouteOpenScript::rejected("scope_ended — ended")],
@@ -7274,6 +7563,16 @@ mod tests {
                 .cached_route_channel_for_scope(&bind, Some(&head), "aft")
                 .is_some());
             assert_eq!(plane.cached_route_channel_for_module(&bind, "aft"), None);
+            assert_eq!(
+                plane.tool_routes_health(std::slice::from_ref(&bind))["cached_routes"],
+                1
+            );
+            plane.close_session_routes(&bind).await;
+            assert_eq!(
+                plane.tool_routes_health(&[])["routes_for_closed_sessions"],
+                0
+            );
+            assert_eq!(plane.tool_routes_health(&[])["cached_routes"], 0);
         }
 
         /// On a daemon without `scopes/v1` a scoped call is refused `scope_unsupported` and no
@@ -8010,6 +8309,7 @@ mod approved_queue_contract_tests {
                     handle: route,
                     sem: Arc::new(Semaphore::new(1)),
                     stamp: None,
+                    last_used: Instant::now(),
                 },
             );
             let call = ToolCall {
@@ -8108,6 +8408,7 @@ mod approved_queue_contract_tests {
                 handle: route,
                 sem: Arc::new(Semaphore::new(1)),
                 stamp: None,
+                last_used: Instant::now(),
             },
         );
         let call = ToolCall {
@@ -8149,6 +8450,7 @@ mod approved_queue_contract_tests {
                 handle: route,
                 sem: Arc::new(Semaphore::new(1)),
                 stamp: None,
+                last_used: Instant::now(),
             },
         );
         let call = ToolCall {
@@ -8186,6 +8488,7 @@ mod approved_queue_contract_tests {
                     handle: route,
                     sem: Arc::new(Semaphore::new(1)),
                     stamp: None,
+                    last_used: Instant::now(),
                 },
             );
             let call = ToolCall {
@@ -8250,6 +8553,7 @@ mod approved_queue_contract_tests {
                     handle: route,
                     sem: Arc::new(Semaphore::new(1)),
                     stamp: None,
+                    last_used: Instant::now(),
                 },
             );
             let call = ToolCall {
