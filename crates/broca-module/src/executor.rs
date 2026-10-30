@@ -191,6 +191,10 @@ pub trait RunExecutor: Send + Sync + 'static {
     /// a failure here must not block the close.
     async fn on_session_close(&self, _session: &BindIdentity) {}
 
+    /// Retention may delete a session with no actor to run the async close hook. Retire its
+    /// cached routes before returning so a later generation cannot inherit their teardown.
+    fn on_session_deleted(&self, _session: &BindIdentity) {}
+
     /// Discard authenticated connection state when a session is deleted or moved.
     fn retire_session_transport(&self, _session: &BindIdentity) {}
 

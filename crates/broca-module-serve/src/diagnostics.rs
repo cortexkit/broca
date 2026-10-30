@@ -247,6 +247,10 @@ pub fn recovery_cut_findings(root: &Path, now: i64) -> Vec<Finding> {
             warning.samples.push(json!({"session":manifest.session,"reason":manifest.recovery.reason.as_str(),
                 "cut_offset":manifest.recovery.cut_offset,"removed_bytes":manifest.recovery.removed_len,
                 "unattributed_tool_risk":manifest.recovery.unattributed_tool_risk}));
+            if !manifest.recovery.unowned_calls.is_empty() {
+                warning.samples.push(json!({"outcome":"unknown",
+                    "unowned_calls":manifest.recovery.unowned_calls}));
+            }
             findings.push(warning);
         }
     }

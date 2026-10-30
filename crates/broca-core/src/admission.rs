@@ -3190,9 +3190,11 @@ mod tests {
                     tool_call_id: broca_protocol::ToolCallId("private-recovery-call".into()),
                     step_id: Some(StepId(1)),
                     batch_id: Some(broca_protocol::BatchId("earlier-batch".into())),
+                    call_keys: Vec::new(),
                 }],
             }],
             unattributed_tool_risk: false,
+            unowned_calls: Vec::new(),
         };
         let mut frames = offset_corpus()[..4].to_vec();
         for seq in [5, 6] {

@@ -305,6 +305,34 @@ message and field; it does not invent a `preset_missing` difference for a nonexi
 
 ### Health counters and per-request diagnostics
 
+`health.check.metrics.tool_routes` is an in-memory census of the shared tool-provider route
+cache. It reports `open_session_actors`, `cached_routes`, `cached_routes_per_provider`,
+`oldest_route_idle_secs` (null for an empty cache), `routes_for_closed_sessions` (normally zero),
+`goodbye_failures_since_boot`, `pending_goodbyes`, `goodbye_retry_overflows_since_boot` and
+`goodbye_giveups_since_boot`. Idle age is time since a route was last
+acquired for a batch or warm bind, not time since the last provider frame. Close failures count
+failed or timed-out enqueue attempts, including retries; a successful enqueue is not a remote
+acknowledgement. Failed closes retry independently of tool calls, even after the actor's bounded
+close waiter ends. Session teardown and congested late/abandoned opens share one cleanup queue
+per consumer connection. It holds at most 1,024 distinct route identities; overflow is counted and
+warned. Duplicate close requests can allocate additional waiters, so this identity cap is not a
+bound on total cleanup heap or task allocation.
+Entries expire after 30 seconds with one give-up WARN and an increment to
+`goodbye_giveups_since_boot`. Retry passes run in parallel with one shared five-second budget,
+with a one-second pause between passes, shortened to the earliest pending expiry. Connection loss
+synchronously removes entries for the lost connection generation and rejects later cleanup
+enqueues for that generation;
+cleanup tasks do not retain the connection owner. A give-up is not a remote acknowledgement:
+it stops local retries, and the daemon may retain that channel until the connection ends.
+No session names, project paths, prompts or tool arguments appear in this
+block. `open_actor_reasons` counts non-exclusive hold reasons observed at each actor-loop turn:
+active runs, held calls (or unknown held state), live subscribers, manual/source warming, pending
+work/cancellation, withdrawals and startup recovery. Actors with no observed hold are counted
+under `idle_ttl`; asynchronous holder changes become visible on the next actor turn, at latest
+its ordinary idle tick. A paused held episode alone does not prevent idle-close.
+Session-close INFO records use the hashed WAL address, provider module ids, successful
+Goodbye count and failure count; each failed or timed-out Goodbye also emits a WARN.
+
 `health.check` includes `metrics.management_ops`, a process-lifetime counter for every
 request/response operation in the management manifest and the `session.subscribe` stream. The
 object always contains every operation at zero or above; counts reset when broca restarts. A
@@ -607,10 +635,35 @@ tools is refused before it can freeze that list, even if it queues or steers; it
 retrofit a plan (the existing `plan_drift` rule still applies). Omitting tools does not
 revalidate or replace an older run's frozen tool list.
 
-A session freezes its fetch plan on its first episode, so compaction enrollment happens only on
-a session's first episode, before it has stored messages. A session whose first episode ran
-without a plan, including one seeded by `session.import`, refuses a later plan naming a
+A session freezes its fetch plan on its first episode unless its owner explicitly refreshes it.
+An ordinary later send cannot enroll compaction. A session whose first episode ran
+without a plan, including one seeded by `session.import`, refuses a later send's plan naming a
 compaction provider as `plan_drift`, and the refused send writes nothing.
+
+The `session_change` group serves the owner-only `session.refresh`, `session.refresh_policy`
+and `session.flush_prefix` operations defined by the [llm-runner contract](https://docs.rs/crate/cortexkit-role-llm-runner/0.7.14/source/CONTRACT.md)
+(§10.2). Every ready baseline
+states `rungs` for tools and system text, accepted/applied generations, and any pending/effective
+change. Both surfaces support `immediately` (the next run) and `on_prefix_rebuild` (the first
+run after an applied compaction view, model switch, or prefix flush). A new run alone is not a
+rebuild. A flush is a durable rebuild boundary; with nothing pending it does not change request
+bytes or promise a provider cache miss.
+
+Refresh admission uses the ordinary plan admitter and durably records the fetched manifest and
+original reply before answering. Identical retries fetch and write nothing, even after restart
+or application. Changes never alter a running episode: the applying `RunStarted` freezes its
+own manifest, and an earlier episode resumes from its own manifest. While a change is pending,
+sends may carry either the effective or latest accepted plan; any other identity is `plan_drift`
+against the latest accepted identity. Sessions never refreshed retain the first-plan drift rule.
+The three change records require the must-understand WAL feature `session-change/v1`; its
+reader must be deployed before enabling the writer in a later release.
+
+A refresh carries no model. Before an episode can apply it, broca checks its model-bearing
+items against that episode's resolved model, including an inherited model. A mismatch is
+`plan_model_mismatch`, permanent, with `detail.generation` naming the pending refresh and
+`detail.send_model` naming the resolved model. The refused send writes nothing and leaves the
+change pending. The owner can supersede it with a newer refresh or select the model it expects;
+carrying the old effective plan cannot bypass an immediately pending refresh.
 
 `role.describe.capabilities` includes `send_tool_reply_bound` (a broca extension). A tool
 declared directly in `session.send.tools` may carry `reply: {"max_ms": N}`, the longest one of

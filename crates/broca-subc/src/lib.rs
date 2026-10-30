@@ -27,6 +27,7 @@ pub mod late_results;
 pub mod plan_fetch;
 pub mod private_content;
 mod role_route;
+mod route_close;
 pub mod scope_describe;
 pub mod session_door;
 pub mod subc_plane;

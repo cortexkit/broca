@@ -40,6 +40,7 @@ pub fn serialized_json_bytes(value: &impl serde::Serialize) -> u64 {
 
 pub mod approval;
 pub mod caller;
+pub mod caller_message;
 pub mod canonical;
 pub mod content;
 mod diagnostic;

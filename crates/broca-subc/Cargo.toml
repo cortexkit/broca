@@ -9,6 +9,8 @@ description = "The real subc tool-plane: a SubcToolPlane (2nd ToolPlane impl) th
 
 [features]
 test-attachments = ["broca-core/test-attachments", "broca-protocol/test-attachments"]
+# Test-only one-shot Goodbye enqueue failure, to exercise cleanup against a real daemon.
+test-route-close = []
 
 [dependencies]
 broca-diagnostics = { path = "../broca-diagnostics" }

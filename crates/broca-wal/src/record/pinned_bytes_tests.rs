@@ -12,6 +12,21 @@
 
 use super::*;
 
+// Pin scoped execution identities and evidence whose run cannot be recovered.
+// An unowned entry's bare ID is evidence, not an executable identity.
+const RECOVERY_PINNED: &[&str] = &[
+    r#"{"type":"recovery_cut","cut_id":"cut-1","sidecar_basename":"log.cut-1","cut_offset":128,"removed_len":64,"removed_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","reason":"unpublished_tail","active_run":"r","runs":[{"run_id":"r","calls":[{"tool_call_id":"call_0","step_id":1,"batch_id":"b","call_keys":["lineage:4"]}]}],"unowned_calls":[{"outcome":"unknown","tool_call_id":"call_0","batch_id":"unknown-b","call_keys":["lineage:9"]},{"outcome":"unknown","tool_call_id":"call_0"}],"unattributed_tool_risk":true}"#,
+];
+
+#[test]
+fn recovery_identities_keep_pinned_bytes_and_require_the_recovery_feature() {
+    for bytes in RECOVERY_PINNED {
+        let record: WalRecord = serde_json::from_str(bytes).unwrap();
+        assert_eq!(serde_json::to_string(&record).unwrap(), *bytes);
+        assert_eq!(record.required_features(), &[crate::recovery::FEATURE]);
+    }
+}
+
 /// Messages written before durable envelope times retain their original payload and framing.
 #[test]
 fn pre_message_times_records_keep_exact_bytes() {
@@ -617,6 +632,7 @@ fn every_record_kind_keeps_its_pinned_bytes() {
         .chain(DELIVERY_ORDER_PINNED)
         .chain(INPUT_CAP_PINNED)
         .chain(STRUCTURED_OUTPUT_PINNED)
+        .chain(RECOVERY_PINNED)
     {
         let decoded: WalRecord = serde_json::from_str(pinned)
             .unwrap_or_else(|error| panic!("pinned record must decode: {error}\n{pinned}"));
@@ -743,6 +759,7 @@ fn the_pinned_bytes_cover_every_record_kind() {
         .chain(FALLBACK_PINNED.iter().map(|(bytes, _)| *bytes))
         .chain(OUTPUT_RESERVATION_PINNED.iter().copied())
         .chain(WRITER_ID_PINNED.iter().copied())
+        .chain(RECOVERY_PINNED.iter().copied())
         .chain(billing.iter().map(String::as_str))
         .map(|bytes| tag_of(&serde_json::from_str::<WalRecord>(bytes).unwrap()))
         .collect();
@@ -804,6 +821,7 @@ fn the_pinned_bytes_cover_every_record_kind() {
         "compaction_ride_wait",
         "compaction_ride_wait_ended",
         "output_reservation_clamped",
+        "recovery_cut",
     ];
     assert_eq!(pinned, every_kind.into_iter().collect());
     assert_eq!(tag_of(&WalRecord::Unknown), "unknown");

@@ -9753,7 +9753,12 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
             plan.push(CallPlan::Already(prior));
             continue;
         }
-        if writer.recovery_tombstoned(&call.tool_call_id) {
+        if writer.recovery_tombstoned(run_id, &call.tool_call_id)
+            || existing_intents
+                .get(&call.tool_call_id)
+                .and_then(|dispatch| dispatch.call_key.as_deref())
+                .is_some_and(|key| writer.recovery_tombstoned_key(key))
+        {
             plan.push(CallPlan::Recovered(call.tool_call_id.clone()));
             continue;
         }
@@ -17650,25 +17655,37 @@ mod approval_gate {
         Ok(())
     }
 
+    fn late_recovery_tombstoned(
+        projection: &crate::replay::DeferredCallProjection,
+        writer: &WalHandle,
+        call: &crate::replay::ProjectedDeferredCall,
+    ) -> bool {
+        projection.recovery_tombstoned(call)
+            || matches!(&*call.prepared, WalRecord::ToolCallDeferred { call_id, .. }
+                if call.run_id.as_ref().is_some_and(|run| writer.recovery_tombstoned(run, call_id)))
+            || writer.recovery_tombstoned_key(&format!(
+                "{}:{}",
+                projection.lineage_id, call.prepared_seq
+            ))
+    }
+
     async fn close_stopped_late(
         history: &mut History,
         writer: &WalHandle,
         bind: &BindIdentity,
         control: &RunControl,
     ) -> Result<(), RunError> {
-        let Some(stopped) = &history.projection.stopped_runs else {
-            return Ok(());
-        };
+        let stopped = history.projection.stopped_runs.as_ref();
         let calls: Vec<_> = history
             .projection
             .calls
             .iter()
             .filter(|(_, call)| {
                 crate::replay::DeferredCallProjection::late_open(call)
-                    && call
-                        .run_id
-                        .as_ref()
-                        .is_some_and(|run| stopped.contains(&run.0))
+                    && (late_recovery_tombstoned(&history.projection, writer, call)
+                        || call.run_id.as_ref().is_some_and(|run| {
+                            stopped.is_some_and(|stopped| stopped.contains(&run.0))
+                        }))
             })
             .map(|(key, call)| (key.clone(), call.clone()))
             .collect();
@@ -17682,7 +17699,9 @@ mod approval_gate {
             else {
                 unreachable!()
             };
-            let sent = projected.late_dispatch_intent.is_some() || history.frames.iter().any(|frame| matches!(&frame.record, WalRecord::ToolDispatchIntent { call_key: Some(anchor), .. } if anchor == &key));
+            let sent = late_recovery_tombstoned(&history.projection, writer, &projected)
+                || projected.late_dispatch_intent.is_some()
+                || history.frames.iter().any(|frame| matches!(&frame.record, WalRecord::ToolDispatchIntent { call_key: Some(anchor), .. } if anchor == &key));
             let outcome = if sent {
                 LateOutcome::Unknown
             } else {
@@ -17924,7 +17943,8 @@ mod approval_gate {
                     matches!(&frame.record,
                 WalRecord::ToolDispatchIntent { call_key: Some(anchor), .. } if anchor == &key)
                 });
-            if dispatch_exists {
+            if dispatch_exists || late_recovery_tombstoned(&history.projection, writer, &projected)
+            {
                 history.record(
                     writer,
                     WalRecord::LateResult {

@@ -8,8 +8,10 @@
 
 mod scenarios;
 
+use std::sync::Arc;
+
 use broca_core::{
-    outcome_unknown_result, reconcile_run_state, FileWalStore, RunControl, RunIndexState,
+    outcome_unknown_result, reconcile_run_state, FileWalStore, RunControl, RunIndexState, WalStore,
 };
 use broca_crash_harness::{
     drive, HarnessPlane, InFlight, KillPoint, KillReport, KillTrigger, LogImage, Render,
@@ -305,7 +307,8 @@ async fn a_removed_intent_is_unknown_on_real_resume_and_the_next_episode_runs() 
         assert!(provider.rejected().is_empty());
         assert!(plane.dispatched().is_empty());
 
-        // Even a later episode re-emitting the recovered call id cannot send it.
+        // Model-facing IDs are not session-global. Another run may issue its own
+        // call with the same ID without re-executing the recovered physical call.
         let mut repeated = (handle.scenario.request)();
         repeated.run_id = RunId("repeat-recovered-id".into());
         let provider = ScriptedProvider::for_scenario(&handle.scenario);
@@ -319,16 +322,290 @@ async fn a_removed_intent_is_unknown_on_real_resume_and_the_next_episode_runs() 
             &plane,
         )
         .await;
-        assert_eq!(repeated.reason, RunFinishReason::Interrupted);
-        assert!(plane.dispatched().is_empty());
+        assert_eq!(repeated.reason, RunFinishReason::Completed);
+        assert_eq!(plane.dispatched().len(), 1);
         let records = LogImage::read(&path).records();
-        assert_eq!(
-            reconcile_run_state(&records, "repeat-recovered-id")
-                .unwrap()
-                .indeterminate_tool_calls,
-            Some(vec![t("t1")])
-        );
+        assert!(reconcile_run_state(&records, "repeat-recovered-id")
+            .unwrap()
+            .indeterminate_tool_calls
+            .unwrap_or_default()
+            .is_empty());
     }
+}
+
+#[tokio::test]
+async fn readable_removed_result_is_unknown_for_its_owner_only() {
+    let handle = RunnerHandle::new(scenarios::ONE_EDIT).await;
+    let kill = kill_after_intent_of(&handle, "t1").await;
+    let path = broca_crash_harness::wal_path(&kill.state_root, &scenarios::session());
+    std::fs::write(&path, &kill.durable.bytes[..kill.durable.end_of_records(0)]).unwrap();
+    let floor = kill.state_root.join(broca_wal::FEATURE_FLOOR_FILENAME);
+    let mut wal = FileWal::open_with_recovery(&path, WalConfig::OVERHAUL, floor.clone())
+        .unwrap()
+        .with_feature_floor(floor)
+        .with_wal_config(WalConfig::OVERHAUL)
+        .unwrap();
+    let reference = handle.reference.log.records();
+    for record in &reference {
+        wal.append(1, record, true).unwrap();
+    }
+    let mut publisher = Publisher::from_synced(SyncedPrefix::sync(&wal).unwrap()).unwrap();
+    publisher.publish(|| 0).unwrap();
+    drop(wal);
+
+    let mut bytes = std::fs::read(&path).unwrap();
+    let image = LogImage::parse(bytes.clone());
+    let cut_at = reference
+        .iter()
+        .position(|record| matches!(record, WalRecord::ModelStepFinished { .. }))
+        .unwrap();
+    let cut_at = image.record_frame(cut_at).unwrap().start;
+    for (index, record) in reference.iter().enumerate() {
+        if matches!(
+            record,
+            WalRecord::ModelStepFinished { .. }
+                | WalRecord::ToolBatchStarted { .. }
+                | WalRecord::ToolDispatchIntent { .. }
+        ) {
+            let frame = image.record_frame(index).unwrap();
+            bytes[frame.start..frame.end].fill(0);
+        }
+    }
+    let result_index = reference
+        .iter()
+        .position(|record| {
+            matches!(record,
+        WalRecord::ToolResult { result, .. } if result.tool_call_id == t("t1"))
+        })
+        .unwrap();
+    let result_frame = image.record_frame(result_index).unwrap();
+    assert!(
+        matches!(broca_wal::framing::decode_next(&bytes[result_frame.start..]),
+        broca_wal::framing::DecodeStep::Record { framed, .. }
+        if matches!(&framed.record, WalRecord::ToolResult { result, .. } if result.tool_call_id == t("t1")))
+    );
+    let removed = bytes[cut_at..].to_vec();
+    std::fs::write(&path, bytes).unwrap();
+
+    let store = FileWalStore::with_config(kill.state_root.join("wal"), WalConfig::OVERHAUL);
+    let provider = ScriptedProvider::for_scenario(&handle.scenario);
+    let plane = HarnessPlane::for_scenario(&handle.scenario);
+    let outcome = drive(
+        (handle.scenario.request)(),
+        (handle.scenario.control)(),
+        &kill.state_root,
+        &store,
+        &provider,
+        &plane,
+    )
+    .await;
+    assert_eq!(outcome.reason, RunFinishReason::Interrupted);
+    assert!(plane.dispatched().is_empty());
+
+    // A readable result in discarded bytes proves possible execution, not a
+    // successful completion that can be copied back into the conversation.
+    let after_recovery = LogImage::read(&path).records();
+    let cut = after_recovery
+        .iter()
+        .find_map(|record| match record {
+            WalRecord::RecoveryCut { recovery } => Some(recovery),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(cut.cut_offset, cut_at as u64);
+    assert!(cut
+        .runs
+        .iter()
+        .flat_map(|run| &run.calls)
+        .any(|call| call.tool_call_id == t("t1")));
+    assert_eq!(
+        std::fs::read(path.parent().unwrap().join(&cut.sidecar_basename)).unwrap(),
+        removed
+    );
+    let outcomes: Vec<_> = after_recovery
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::ToolResult {
+                result, outcome, ..
+            } if result.tool_call_id == t("t1") => Some(*outcome),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(outcomes, [DispatchOutcome::Unknown]);
+    let mut repeated = (handle.scenario.request)();
+    repeated.run_id = RunId("new-run-same-model-id".into());
+    let provider = ScriptedProvider::for_scenario(&handle.scenario);
+    let plane = HarnessPlane::for_scenario(&handle.scenario);
+    let repeated = drive(
+        repeated,
+        RunControl::default(),
+        &kill.state_root,
+        &store,
+        &provider,
+        &plane,
+    )
+    .await;
+    assert_eq!(
+        plane.dispatched().len(),
+        1,
+        "a different run owns its own model-facing id"
+    );
+    assert_eq!(repeated.reason, RunFinishReason::Completed);
+}
+
+#[tokio::test]
+async fn unowned_result_evidence_does_not_reserve_gemini_call_ids() {
+    let handle = RunnerHandle::new(scenarios::ONE_EDIT).await;
+    let kill = kill_after_intent_of(&handle, "t1").await;
+    let path = broca_crash_harness::wal_path(&kill.state_root, &scenarios::session());
+    std::fs::write(&path, &kill.durable.bytes[..kill.durable.end_of_records(0)]).unwrap();
+    let floor = kill.state_root.join(broca_wal::FEATURE_FLOOR_FILENAME);
+    let mut wal = FileWal::open_with_recovery(&path, WalConfig::OVERHAUL, floor.clone())
+        .unwrap()
+        .with_feature_floor(floor)
+        .with_wal_config(WalConfig::OVERHAUL)
+        .unwrap();
+    let mut reference = handle.reference.log.records();
+    let mut call = reference
+        .iter()
+        .find_map(|record| match record {
+            WalRecord::ModelStepFinished {
+                assistant_message, ..
+            } => assistant_message.tool_calls().next().cloned(),
+            _ => None,
+        })
+        .unwrap();
+    call.tool_call_id = t("call_0");
+    for record in &mut reference {
+        if let WalRecord::ToolResult { result, .. } = record {
+            Arc::make_mut(result).tool_call_id = t("call_0");
+        }
+    }
+    let mut prior = reference
+        .iter()
+        .find(|record| matches!(record, WalRecord::RunStarted { .. }))
+        .unwrap()
+        .clone();
+    if let WalRecord::RunStarted {
+        run_id,
+        submission_id,
+        send_id,
+        request_identity_digest,
+        ..
+    } = &mut prior
+    {
+        *run_id = RunId("prior-complete-run".into());
+        *submission_id = None;
+        *send_id = None;
+        *request_identity_digest = None;
+    }
+    let mut records = vec![
+        prior,
+        WalRecord::RunFinished {
+            reason: RunFinishReason::Completed,
+            usage: Usage::default(),
+            retries_used: 0,
+            error: None,
+            interrupt_reason: None,
+            ts_ms: None,
+        },
+    ];
+    records.extend(reference);
+    for record in &records {
+        wal.append(1, record, true).unwrap();
+    }
+    drop(wal);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let image = LogImage::parse(bytes.clone());
+    let cut_at = image.record_frame(2).unwrap().start;
+    for (index, record) in records.iter().enumerate().skip(2) {
+        if matches!(
+            record,
+            WalRecord::RunStarted { .. }
+                | WalRecord::ModelStepFinished { .. }
+                | WalRecord::ToolBatchStarted { .. }
+                | WalRecord::ToolDispatchIntent { .. }
+        ) {
+            let frame = image.record_frame(index).unwrap();
+            bytes[frame.start..frame.end].fill(0);
+        }
+    }
+    std::fs::write(&path, bytes).unwrap();
+    let store = FileWalStore::with_config(kill.state_root.join("wal"), WalConfig::OVERHAUL);
+    drop(store.open(&scenarios::session()).unwrap());
+    let repaired = LogImage::read(&path).records();
+    let cut = repaired
+        .iter()
+        .find_map(|record| match record {
+            WalRecord::RecoveryCut { recovery } => Some(recovery),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(cut.cut_offset, cut_at as u64);
+
+    // This is a new physical call in another run, despite the provider reusing
+    // its common call_0 spelling. Run-less evidence must not reserve that name.
+    let mut request = (handle.scenario.request)();
+    request.run_id = RunId("gemini-new-call-zero".into());
+    let provider = ScriptedProvider::new(
+        vec![
+            vec![
+                NormalizedEvent::Control(ProviderControl::AssistantMessage {
+                    message: AssistantMessage {
+                        message_id: MessageId("new-call-zero".into()),
+                        content: vec![ContentBlock::ToolCall(call)],
+                    },
+                }),
+                NormalizedEvent::Control(ProviderControl::Finished {
+                    usage: Usage::default(),
+                    finish_reason: FinishReason::ToolCalls,
+                    retries_used: 0,
+                }),
+            ],
+            vec![
+                NormalizedEvent::Control(ProviderControl::AssistantMessage {
+                    message: AssistantMessage {
+                        message_id: MessageId("new-call-zero-done".into()),
+                        content: vec![ContentBlock::Text {
+                            text: "done".into(),
+                        }],
+                    },
+                }),
+                NormalizedEvent::Control(ProviderControl::Finished {
+                    usage: Usage::default(),
+                    finish_reason: FinishReason::Stop,
+                    retries_used: 0,
+                }),
+            ],
+        ],
+        Render::Canonical,
+    );
+    let plane = HarnessPlane::for_scenario(&handle.scenario);
+    let outcome = drive(
+        request,
+        RunControl::default(),
+        &kill.state_root,
+        &store,
+        &provider,
+        &plane,
+    )
+    .await;
+    assert_eq!(outcome.reason, RunFinishReason::Completed);
+    assert_eq!(plane.dispatched().len(), 1);
+    let encoded = serde_json::to_value(cut).unwrap();
+    let evidence = encoded
+        .get("unowned_calls")
+        .and_then(|value| value.as_array())
+        .expect("readable run-less call must be recorded");
+    assert!(evidence
+        .iter()
+        .any(|call| call["tool_call_id"] == "call_0" && call["outcome"] == "unknown"));
+    assert!(evidence.iter().all(|call| call.get("call_keys").is_none()));
+    assert!(cut
+        .runs
+        .iter()
+        .flat_map(|run| &run.calls)
+        .all(|call| call.tool_call_id != t("call_0")));
 }
 
 #[tokio::test]

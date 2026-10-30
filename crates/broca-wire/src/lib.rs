@@ -1097,79 +1097,7 @@ fn serialize_read_message<S: serde::Serializer>(
             }
         }
     }
-    let message: &broca_protocol::Message = &exposed;
-    if !message
-        .content
-        .iter()
-        .any(|block| matches!(block, ContentBlock::TextWithState { .. }))
-    {
-        return message.serialize(serializer);
-    }
-    CallerMessageRef(message).serialize(serializer)
-}
-
-struct CallerMessageRef<'a>(&'a broca_protocol::Message);
-
-impl serde::Serialize for CallerMessageRef<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeStruct;
-
-        let mut fields = 2;
-        fields += usize::from(self.0.cache_prefix_blocks.is_some());
-        fields += usize::from(self.0.origin.is_some());
-        let mut state = serializer.serialize_struct("Message", fields)?;
-        state.serialize_field("role", &self.0.role)?;
-        state.serialize_field("content", &CallerContentRef(&self.0.content))?;
-        if let Some(cache_prefix_blocks) = self.0.cache_prefix_blocks {
-            state.serialize_field("cache_prefix_blocks", &cache_prefix_blocks)?;
-        }
-        if let Some(origin) = &self.0.origin {
-            state.serialize_field("origin", origin)?;
-        }
-        state.end()
-    }
-}
-
-struct CallerContentRef<'a>(&'a [broca_protocol::ContentBlock]);
-
-impl serde::Serialize for CallerContentRef<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeSeq;
-
-        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
-        for block in self.0 {
-            sequence.serialize_element(&CallerBlockRef(block))?;
-        }
-        sequence.end()
-    }
-}
-
-struct CallerBlockRef<'a>(&'a broca_protocol::ContentBlock);
-
-impl serde::Serialize for CallerBlockRef<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use broca_protocol::ContentBlock;
-        use serde::ser::SerializeStruct;
-
-        match self.0 {
-            ContentBlock::TextWithState { text, .. } => {
-                let mut state = serializer.serialize_struct("ContentBlock", 2)?;
-                state.serialize_field("type", "text")?;
-                state.serialize_field("text", text)?;
-                state.end()
-            }
-            block => block.serialize(serializer),
-        }
-    }
+    broca_protocol::caller_message::CallerMessageRef(&exposed).serialize(serializer)
 }
 
 /// One message in a `session.read` page.
@@ -1306,11 +1234,9 @@ impl SessionReadMessage {
             describe, PartDigest, Payload, Reference, DESCRIPTOR_MESSAGE_MAX,
         };
         self.described = None;
-        let inline = serde_json::to_value(CallerMessage(&self.message, true))
-            .expect("a stored message serializes");
-        self.digest = Some(cortexkit_role_llm_runner::content_digest::content_digest(
-            &inline,
-        ));
+        let identity = broca_protocol::caller_message::message_content_identity(&self.message);
+        let inline = identity.inline;
+        self.digest = Some(identity.digest);
         let parts = inline
             .get("content")
             .and_then(serde_json::Value::as_array)
@@ -2833,7 +2759,7 @@ fn serialize_control_unit<S: serde::Serializer>(
     #[derive(Serialize)]
     struct MessageRef<'a> {
         message_id: &'a broca_protocol::MessageId,
-        content: CallerContentRef<'a>,
+        content: broca_protocol::caller_message::CallerContentRef<'a>,
     }
 
     #[derive(Serialize)]
@@ -2849,7 +2775,7 @@ fn serialize_control_unit<S: serde::Serializer>(
             UnitRef::AssistantMessage {
                 message: MessageRef {
                     message_id: &message.message_id,
-                    content: CallerContentRef(&message.content),
+                    content: broca_protocol::caller_message::CallerContentRef(&message.content),
                 },
             }
             .serialize(serializer)

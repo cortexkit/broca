@@ -104,6 +104,74 @@ fn wal_recovery_cut_finding_reports_unattributed_risk_without_removed_content() 
         .contains("private removed content"));
     std::fs::remove_dir_all(root).unwrap();
 }
+#[test]
+fn wal_recovery_reports_unowned_call_evidence_as_unknown() {
+    use broca_wal::{FileWal, Wal, WalConfig, WalRecord};
+    use std::io::Write;
+    let root = broca_test_support::scratch_root().join(format!(
+        "unowned-recovery-diagnostic-{}",
+        std::process::id()
+    ));
+    let log = root.join("wal/session.wal");
+    let floor = root.join(broca_wal::FEATURE_FLOOR_FILENAME);
+    let mut wal = FileWal::open_with_recovery(&log, WalConfig::OVERHAUL, floor.clone())
+        .unwrap()
+        .with_feature_floor(floor.clone())
+        .with_wal_config(WalConfig::OVERHAUL)
+        .unwrap();
+    wal.append(
+        1,
+        &WalRecord::StepStarted {
+            step_id: broca_protocol::StepId(1),
+        },
+        true,
+    )
+    .unwrap();
+    drop(wal);
+    let result = WalRecord::ToolResult {
+        finished_at_ms: None,
+        tags: None,
+        hooks: None,
+        batch_id: broca_protocol::BatchId("unowned-batch".into()),
+        result: std::sync::Arc::new(broca_core::outcome_unknown_result(
+            &broca_protocol::ToolCallId("call_0".into()),
+        )),
+        outcome: broca_wal::DispatchOutcome::Unknown,
+        reason: None,
+        withdraw_elicitation: None,
+        provider_held: None,
+    };
+    let bytes = broca_wal::framing::encode_v4(
+        broca_wal::framing::v4::Metadata {
+            seq: 3,
+            fence: 1,
+            appended_ms: 0,
+            writer_id: [3; 16],
+        },
+        &[broca_wal::framing::FRAME_STAMPS_FEATURE],
+        &result,
+    )
+    .unwrap();
+    let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+    file.write_all(&bytes).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    drop(FileWal::open_with_recovery(&log, WalConfig::OVERHAUL, floor).unwrap());
+    let warnings = recovery_cut_findings(&root, NOW);
+    let warning = warnings
+        .iter()
+        .find(|finding| finding.check == "wal_recovery_cut")
+        .unwrap();
+    assert!(warning
+        .samples
+        .iter()
+        .any(|sample| sample["outcome"] == "unknown"
+            && sample["unowned_calls"].as_array().is_some_and(|calls| calls
+                .iter()
+                .any(|call| call["tool_call_id"] == "call_0" && call["outcome"] == "unknown"))));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 type SeedDetails<'a> = (
     Option<&'a str>,
     Option<&'a str>,

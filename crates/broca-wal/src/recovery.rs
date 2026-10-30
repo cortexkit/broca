@@ -55,6 +55,29 @@ pub struct RecoveryCall {
     pub tool_call_id: ToolCallId,
     pub step_id: Option<StepId>,
     pub batch_id: Option<BatchId>,
+    /// Exact Prepared/intent keys recovered from the record or its frame identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub call_keys: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryOutcome {
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnownedRecoveryCall {
+    pub outcome: RecoveryOutcome,
+    /// Evidence only: a model-facing ID does not identify a later run's call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<ToolCallId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<StepId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<BatchId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub call_keys: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +96,8 @@ pub struct RecoveryCut {
     pub reason: CutReason,
     pub active_run: Option<RunId>,
     pub runs: Vec<RecoveryRun>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unowned_calls: Vec<UnownedRecoveryCall>,
     pub unattributed_tool_risk: bool,
 }
 
@@ -117,9 +142,70 @@ struct Calls {
     runs: Vec<RecoveryRun>,
     planned: Vec<RecoveryCall>,
     cut_ids: BTreeSet<String>,
+    prepared: std::collections::BTreeMap<String, (Option<RunId>, RecoveryCall)>,
+    unowned: Vec<UnownedRecoveryCall>,
 }
 
 impl Calls {
+    fn anchor_prepared(
+        &mut self,
+        frame: &crate::FramedRecord,
+        lineage: Option<framing::WalLineageId>,
+    ) {
+        let (
+            Some(lineage),
+            WalRecord::ToolCallDeferred {
+                call_id, batch_id, ..
+            },
+        ) = (lineage, &frame.record)
+        else {
+            return;
+        };
+        let mut call = self
+            .planned
+            .iter()
+            .find(|call| &call.tool_call_id == call_id)
+            .cloned()
+            .unwrap_or_else(|| RecoveryCall {
+                tool_call_id: call_id.clone(),
+                step_id: None,
+                batch_id: None,
+                call_keys: Vec::new(),
+            });
+        call.batch_id = Some(batch_id.clone());
+        let key = format!("{lineage}:{}", frame.seq);
+        call.call_keys.push(key.clone());
+        call.call_keys.sort();
+        call.call_keys.dedup();
+        // The Prepared frame owns late execution even after its run completes or
+        // another episode starts. Its sequence, not the active run, names the key.
+        self.prepared
+            .entry(key)
+            .or_insert((self.active.clone(), call));
+    }
+
+    fn remember_unowned(&mut self, mut call: UnownedRecoveryCall) {
+        call.call_keys.sort();
+        call.call_keys.dedup();
+        if !self.unowned.contains(&call) {
+            self.unowned.push(call);
+        }
+    }
+
+    fn remember(&mut self, run: Option<RunId>, call: RecoveryCall) {
+        if let Some(run) = run {
+            self.add(run, call);
+        } else {
+            self.remember_unowned(UnownedRecoveryCall {
+                outcome: RecoveryOutcome::Unknown,
+                tool_call_id: Some(call.tool_call_id),
+                step_id: call.step_id,
+                batch_id: call.batch_id,
+                call_keys: call.call_keys,
+            });
+        }
+    }
+
     fn merge_run(&mut self, run: &RecoveryRun) {
         if !self.runs.iter().any(|r| r.run_id == run.run_id) {
             self.runs.push(RecoveryRun {
@@ -154,11 +240,14 @@ impl Calls {
             if existing.batch_id.is_none() {
                 existing.batch_id = call.batch_id;
             }
+            existing.call_keys.extend(call.call_keys);
+            existing.call_keys.sort();
+            existing.call_keys.dedup();
         } else {
             self.runs[index].calls.push(call);
         }
     }
-    fn observe(&mut self, record: &WalRecord, removed: bool) {
+    fn observe(&mut self, record: &WalRecord, removed: bool, source_key: Option<String>) {
         match record {
             WalRecord::RunStarted { run_id, .. } => {
                 self.active = Some(run_id.clone());
@@ -181,6 +270,7 @@ impl Calls {
                         tool_call_id: call.tool_call_id.clone(),
                         step_id: Some(*step_id),
                         batch_id: None,
+                        call_keys: Vec::new(),
                     })
                     .collect();
             }
@@ -198,17 +288,96 @@ impl Calls {
             WalRecord::ToolDispatchIntent {
                 tool_call_id,
                 batch_id,
+                call_key,
                 ..
-            } if removed => {
-                if let Some(run) = &self.active {
-                    self.add(
-                        run.clone(),
+            } => {
+                let mut keys: Vec<_> = call_key.iter().cloned().chain(source_key).collect();
+                keys.sort();
+                keys.dedup();
+                if removed {
+                    self.remember(
+                        self.active.clone(),
                         RecoveryCall {
                             tool_call_id: tool_call_id.clone(),
                             step_id: None,
                             batch_id: Some(batch_id.clone()),
+                            call_keys: keys,
                         },
                     );
+                } else if let Some(call) = self
+                    .planned
+                    .iter_mut()
+                    .find(|call| &call.tool_call_id == tool_call_id)
+                {
+                    call.call_keys.extend(keys);
+                    call.call_keys.sort();
+                    call.call_keys.dedup();
+                }
+            }
+            WalRecord::ToolResult {
+                batch_id,
+                result,
+                provider_held,
+                ..
+            } if removed => {
+                self.remember(
+                    self.active.clone(),
+                    RecoveryCall {
+                        tool_call_id: result.tool_call_id.clone(),
+                        step_id: None,
+                        batch_id: Some(batch_id.clone()),
+                        call_keys: provider_held
+                            .iter()
+                            .map(|held| held.call_key.clone())
+                            .collect(),
+                    },
+                );
+            }
+            WalRecord::ToolNoDispatch {
+                batch_id,
+                tool_call_id,
+                ..
+            } if removed => {
+                self.remember(
+                    self.active.clone(),
+                    RecoveryCall {
+                        tool_call_id: tool_call_id.clone(),
+                        step_id: None,
+                        batch_id: Some(batch_id.clone()),
+                        call_keys: Vec::new(),
+                    },
+                );
+            }
+            WalRecord::ToolCallProviderHeld {
+                batch_id,
+                tool_call_id,
+                call_key,
+                ..
+            } if removed => {
+                self.remember(
+                    self.active.clone(),
+                    RecoveryCall {
+                        tool_call_id: tool_call_id.clone(),
+                        step_id: None,
+                        batch_id: Some(batch_id.clone()),
+                        call_keys: vec![call_key.clone()],
+                    },
+                );
+            }
+            WalRecord::LateDispatchIntent { call_key, .. }
+            | WalRecord::LateResult { call_key, .. }
+                if removed =>
+            {
+                if let Some((run, call)) = self.prepared.get(call_key).cloned() {
+                    self.remember(run, call);
+                } else {
+                    self.remember_unowned(UnownedRecoveryCall {
+                        outcome: RecoveryOutcome::Unknown,
+                        tool_call_id: None,
+                        step_id: None,
+                        batch_id: None,
+                        call_keys: vec![call_key.clone()],
+                    });
                 }
             }
             WalRecord::RecoveryCut { recovery } => {
@@ -218,9 +387,14 @@ impl Calls {
                 for run in &recovery.runs {
                     self.merge_run(run);
                 }
+                for call in &recovery.unowned_calls {
+                    self.remember_unowned(call.clone());
+                }
             }
-            WalRecord::ToolBatchFinished { .. } | WalRecord::RunFinished { .. } if !removed => {
-                self.planned.clear()
+            WalRecord::ToolBatchFinished { .. } if !removed => self.planned.clear(),
+            WalRecord::RunFinished { .. } => {
+                self.planned.clear();
+                self.active = None;
             }
             _ => {}
         }
@@ -264,7 +438,12 @@ fn prefix(bytes: &[u8]) -> Result<Prefix, WalError> {
                     break;
                 }
                 scan.seq = framed.seq;
-                scan.calls.observe(&framed.record, false);
+                scan.calls.anchor_prepared(&framed, scan.lineage);
+                scan.calls.observe(
+                    &framed.record,
+                    false,
+                    scan.lineage.map(|id| format!("{id}:{}", framed.seq)),
+                );
                 scan.end += consumed;
             }
             DecodeStep::Lineage {
@@ -305,7 +484,12 @@ fn inspect_removed(bytes: &[u8], scan: &mut Prefix) -> Result<(), WalError> {
     while offset < bytes.len() {
         match framing::decode_next(&bytes[offset..]) {
             DecodeStep::Record { framed, consumed } => {
-                scan.calls.observe(&framed.record, true);
+                scan.calls.anchor_prepared(&framed, lineage);
+                scan.calls.observe(
+                    &framed.record,
+                    true,
+                    lineage.map(|id| format!("{id}:{}", framed.seq)),
+                );
                 offset += consumed;
             }
             DecodeStep::Lineage {
@@ -344,10 +528,15 @@ fn inspect_removed(bytes: &[u8], scan: &mut Prefix) -> Result<(), WalError> {
                             {
                                 if let Ok(
                                     record @ (WalRecord::ToolDispatchIntent { .. }
+                                    | WalRecord::LateDispatchIntent { .. }
+                                    | WalRecord::ToolResult { .. }
+                                    | WalRecord::ToolNoDispatch { .. }
+                                    | WalRecord::LateResult { .. }
+                                    | WalRecord::ToolCallProviderHeld { .. }
                                     | WalRecord::RunStarted { .. }),
                                 ) = serde_json::from_slice::<WalRecord>(payload)
                                 {
-                                    scan.calls.observe(&record, true);
+                                    scan.calls.observe(&record, true, None);
                                 }
                             }
                         }
@@ -634,6 +823,9 @@ pub(crate) fn before_open_with_hooks(
             for run in &prior.runs {
                 scan.calls.merge_run(run);
             }
+            for call in &prior.unowned_calls {
+                scan.calls.remember_unowned(call.clone());
+            }
         }
         let proof = read_head(log);
         let reason = match proof {
@@ -664,6 +856,7 @@ pub(crate) fn before_open_with_hooks(
             reason,
             active_run,
             runs: std::mem::take(&mut scan.calls.runs),
+            unowned_calls: std::mem::take(&mut scan.calls.unowned),
             unattributed_tool_risk: true,
         };
         atomic_file(&raw, suffix)?;

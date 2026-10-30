@@ -837,6 +837,12 @@ pub struct DeferredCallProjection {
     /// WAL records from the lineage's origin before deciding whether a run stopped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stopped_runs: Option<std::collections::BTreeSet<String>>,
+    /// Physical recovery made these run/call identities outcome-unknown. A bare
+    /// model-facing ID remains usable by a different run.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub recovery_tombstones: std::collections::BTreeSet<(String, String)>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub recovery_call_keys: std::collections::BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -871,6 +877,8 @@ impl DeferredCallProjection {
             last_run_id: None,
             calls: BTreeMap::new(),
             stopped_runs: Some(std::collections::BTreeSet::new()),
+            recovery_tombstones: std::collections::BTreeSet::new(),
+            recovery_call_keys: std::collections::BTreeSet::new(),
         }
     }
 
@@ -1012,6 +1020,26 @@ impl DeferredCallProjection {
                         call.late_result = Some(Arc::new(frame.record.clone()));
                     }
                 }
+                WalRecord::RecoveryCut { recovery } => {
+                    for run in &recovery.runs {
+                        self.recovery_tombstones.extend(
+                            run.calls
+                                .iter()
+                                .map(|call| (run.run_id.0.clone(), call.tool_call_id.0.clone())),
+                        );
+                        self.recovery_call_keys.extend(
+                            run.calls
+                                .iter()
+                                .flat_map(|call| call.call_keys.iter().cloned()),
+                        );
+                    }
+                    self.recovery_call_keys.extend(
+                        recovery
+                            .unowned_calls
+                            .iter()
+                            .flat_map(|call| call.call_keys.iter().cloned()),
+                    );
+                }
                 _ => {}
             }
             let open_runs: std::collections::BTreeSet<_> = self
@@ -1045,11 +1073,19 @@ impl DeferredCallProjection {
     }
 
     pub fn late_allowed(&self, call: &ProjectedDeferredCall) -> bool {
-        self.stopped_runs.as_ref().is_some_and(|stopped| {
-            call.run_id
-                .as_ref()
-                .is_some_and(|run| !stopped.contains(&run.0))
-        })
+        !self.recovery_tombstoned(call)
+            && self.stopped_runs.as_ref().is_some_and(|stopped| {
+                call.run_id
+                    .as_ref()
+                    .is_some_and(|run| !stopped.contains(&run.0))
+            })
+    }
+
+    pub fn recovery_tombstoned(&self, call: &ProjectedDeferredCall) -> bool {
+        self.recovery_call_keys
+            .contains(&format!("{}:{}", self.lineage_id, call.prepared_seq))
+            || matches!(&*call.prepared, WalRecord::ToolCallDeferred { call_id, .. }
+                if call.run_id.as_ref().is_some_and(|run| self.recovery_tombstones.contains(&(run.0.clone(), call_id.0.clone()))))
     }
 
     fn anchor(&self, batch: &BatchId, id: &ToolCallId) -> Option<String> {
@@ -3401,9 +3437,8 @@ fn replay_seeded_with_compaction<'a>(
             | WalRecord::SessionRefreshPolicyChanged { .. }
             | WalRecord::SessionPrefixFlushed { .. } => {}
         }
-        // A provider can re-use an old call id in a later episode. Recovery
-        // tombstones remain conservative across that boundary, before NotSent
-        // can become a redispatch plan or a boot seal's never-sent result.
+        // A model-facing ID may be reused by another run. Only the owning run's
+        // recovered call can turn NotSent into an unknown dispatch here.
         if matches!(
             rec,
             WalRecord::ModelStepFinished { .. } | WalRecord::ToolBatchStarted { .. }
@@ -3418,6 +3453,7 @@ fn replay_seeded_with_compaction<'a>(
                     .filter(|id| {
                         recovered_calls
                             .iter()
+                            .filter(|run| &run.run_id == current_run)
                             .flat_map(|run| &run.calls)
                             .any(|call| &call.tool_call_id == *id)
                     })

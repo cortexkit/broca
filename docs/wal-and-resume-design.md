@@ -103,8 +103,8 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   `RecoveryCut` is overhaul-only and requires `wal-recovery/v1`, raised in the
   machine feature floor before writing recovery history. This durable list of
   required log features prevents rollback to a reader that cannot understand the
-  recovery tombstones. The record includes every
-  decodable removed dispatch intent and every unresolved tool call in a
+  recovery tombstones. The record includes readable removed ordinary/late
+  dispatch intents and results, and every unresolved tool call in a
   surviving `ModelStepFinished`, including a call whose intent was removed.
   These tombstones are consulted before `NotSent` can become a redispatch plan,
   and before actual dispatch. Close-out writes `outcome_unknown_result` with
@@ -112,8 +112,12 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   `ResumeStarted`/terminal projection and `run.status` report the indeterminate
   calls. If a model step was removed too, a close-out-only recovery batch records
   Unknown outcomes without inventing assistant prompt content. Recovery
-  tombstones conservatively suppress re-use of those call ids in later episodes
-  of the same log; ordinary dispatch deduplication still uses compound keys.
+  tombstones match exact Prepared/intent `call_key` values or an owning run and
+  call ID, never a bare model-facing ID across the session. A later run may use
+  its own Gemini-style `call_0`. Readable evidence without a recovered run is
+  recorded in `unowned_calls` as outcome unknown, including any readable or
+  derived keys. A bare ID there is diagnostic evidence only: without a readable
+  or derived key naming the old physical call, it suppresses nothing.
 
   Undecodable bytes set `unattributed_tool_risk: true`, interrupt the in-flight
   run and produce a session-named WARN plus a `diagnostics.findings` warning

@@ -9,6 +9,7 @@
 //! Reconciliation must still handle an index ahead of a restored or torn log.
 
 mod index;
+mod publication;
 mod rebuild;
 mod schema;
 mod seeds;
