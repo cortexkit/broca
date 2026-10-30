@@ -12,7 +12,13 @@ case "$lane:$(uname -s)" in
   *) echo "prepush: invalid lane/platform: $lane/$(uname -s)" >&2; exit 2 ;;
 esac
 mkdir -p target/scratch
-scratch="$(mktemp -d "$root/target/scratch/prepush-$lane.XXXXXX")"
+log_dir="$(mktemp -d "$root/target/scratch/prepush-$lane.XXXXXX")"
+# Connection-file publication rejects writable ancestors, even above a private leaf.
+# Keep daemon/test temporary files out of the shared, group-writable log directory.
+umask 077
+mkdir -p "$root/.prepush-runtime"
+chmod 700 "$root/.prepush-runtime"
+scratch="$(mktemp -d "$root/.prepush-runtime/$lane.XXXXXX")"
 if [[ "$lane" == windows ]]; then
   export RUNNER_OS=Windows
   scratch="$(cygpath -m "$scratch")"
@@ -20,6 +26,7 @@ if [[ "$lane" == windows ]]; then
   export CARGO_TARGET_DIR
 fi
 export TMPDIR="$scratch"
+export TMP="$scratch" TEMP="$scratch"
 labels=() codes=() times=() files=()
 last_rc=0
 begin=$SECONDS
@@ -27,15 +34,41 @@ begin=$SECONDS
 step() {
   local label="$1" start=$SECONDS pid rc=0 file
   shift
-  file="$scratch/${#labels[@]}.log"
+  file="$log_dir/${#labels[@]}.log"
   echo "==> $lane: $label"
+  printf 'command:' > "$file"
+  printf ' %q' "$@" >> "$file"
+  printf '\n' >> "$file"
   # Keep errexit active inside functions even when their result is being collected.
-  ( set -e; "$@" ) > "$file" 2>&1 &
+  ( set -e; "$@" ) >> "$file" 2>&1 &
   pid=$!
   wait "$pid" || rc=$?
+  printf '[step exit=%s wall=%ss]\n' "$rc" "$((SECONDS - start))" >> "$file"
   cat "$file"
   labels+=("$label") codes+=("$rc") times+=("$((SECONDS - start))") files+=("$file")
   last_rc=$rc
+}
+
+first_errors() {
+  local path="$1" line count=0 found=0 context=0
+  local initial=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    count=$((count + 1))
+    [[ $count -gt 8 ]] || initial+=("$line")
+    if [[ $found == 0 ]]; then
+      case "$line" in
+        *error:*|*error\[*|*panicked*|*FAIL*|*refus*|*unsupported*|*not\ found*|*Traceback*) found=1 ;;
+      esac
+    fi
+    if [[ $found == 1 ]]; then
+      printf '%s\n' "$line"
+      context=$((context + 1))
+      [[ $context -lt 12 ]] || return 0
+    fi
+  done < "$path"
+  if [[ $found == 0 ]]; then
+    printf '%s\n' "${initial[@]}"
+  fi
 }
 
 summary() {
@@ -45,11 +78,13 @@ summary() {
     printf '%-45s exit=%-3s %ss\n' "${labels[$i]}" "${codes[$i]}" "${times[$i]}"
     if [[ ${codes[$i]} != 0 ]]; then
       failed=1
+      echo "--- FIRST ERRORS ${labels[$i]} ---"
+      first_errors "${files[$i]}"
       echo "--- FAILED ${labels[$i]}: complete output ---"
       cat "${files[$i]}"
     fi
   done
-  echo "prepush: $lane wall $((SECONDS - begin))s; logs: $scratch"
+  echo "prepush: $lane wall $((SECONDS - begin))s; logs: $log_dir; private runtime: $scratch"
   exit "$failed"
 }
 

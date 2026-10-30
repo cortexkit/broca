@@ -1,5 +1,6 @@
 # Rust build output
 /target
+/.prepush-runtime/
 **/*.rs.bk
 
 # ENGINE RUNTIME STATE. `broca-run` writes its WAL and single-writer leases under

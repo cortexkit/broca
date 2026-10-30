@@ -169,7 +169,7 @@ print('Summary: 1 test run: 1 passed')
         shutil.copy(ROOT / 'scripts/lib/prepush-lane.sh', lib / 'prepush-lane.sh')
         tools = self.root / 'minimal-tools'
         tools.mkdir()
-        for tool in ('bash', 'dirname', 'mkdir', 'mktemp', 'cat'):
+        for tool in ('bash', 'dirname', 'mkdir', 'mktemp', 'chmod', 'cat'):
             binary = shutil.which(tool)
             assert binary is not None
             (tools / tool).symlink_to(binary)
@@ -183,6 +183,41 @@ print('Summary: 1 test run: 1 passed')
         self.assertIn('MOTOR Linux build image is missing file(1)', result.stdout)
         self.assertNotIn('==> fast: fmt', result.stdout)
         self.assertNotIn('operator scripts, pins and dependency guards', result.stdout)
+
+    def test_daemon_tmpdir_is_private_and_outside_group_writable_log_root(self):
+        lib = self.root / 'scripts/lib'
+        lib.mkdir()
+        shutil.copy(ROOT / 'scripts/lib/prepush-lane.sh', lib / 'prepush-lane.sh')
+        logs = self.root / 'target/scratch'
+        logs.mkdir(parents=True)
+        logs.chmod(0o775)
+        tools = self.root / 'minimal-tools'
+        tools.mkdir()
+        for tool in ('bash', 'dirname', 'mkdir', 'mktemp', 'chmod', 'cat'):
+            binary = shutil.which(tool)
+            assert binary is not None
+            (tools / tool).symlink_to(binary)
+        for name, body in {
+            'uname': 'echo Linux',
+            'cc': 'exit 0',
+            'file': 'printf "TEST_TMPDIR=%s\\n" "$TMPDIR"; exit 1',
+        }.items():
+            path = tools / name
+            path.write_text('#!/bin/sh\n' + body + '\n')
+            path.chmod(0o755)
+        env = dict(os.environ, PATH=str(tools))
+        result = subprocess.run([str(tools / 'bash'), 'scripts/prepush.sh', '--lane', 'fast'],
+                                cwd=self.root, env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        temporary = Path(next(line.split('=', 1)[1] for line in result.stdout.splitlines()
+                              if line.startswith('TEST_TMPDIR=')))
+        self.assertNotIn(logs, temporary.parents,
+                         'daemon connection files must not descend from the 0775 log directory')
+        self.assertEqual(temporary.stat().st_mode & 0o777, 0o700)
+        for parent in temporary.parents:
+            if parent == self.root:
+                break
+            self.assertEqual(parent.stat().st_mode & 0o022, 0, str(parent))
 
 
 class ArchiveShards(unittest.TestCase):
