@@ -286,6 +286,20 @@ const DISPATCH_INPUT_BYTES: usize = DISPATCH_ENTRY_COUNT * DISPATCH_ENTRY_BYTES;
 
 struct DispatchAllocationProbeProvider;
 
+struct AssistantAllocationProbeProvider;
+
+#[async_trait::async_trait]
+impl Provider for AssistantAllocationProbeProvider {
+    async fn step(&self, step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
+        if step_id.0 == 1 {
+            // Start tracking after the run task and boxed futures exist, but before building the
+            // assistant payload, so setup-frame allocations are not attributed to payload copying.
+            start_tracking();
+        }
+        DispatchAllocationProbeProvider.step(step_id, opts).await
+    }
+}
+
 #[async_trait::async_trait]
 impl Provider for DispatchAllocationProbeProvider {
     async fn step(&self, step_id: StepId, _opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
@@ -713,9 +727,8 @@ async fn tool_step_does_not_retain_a_second_assistant_message_copy() {
     // thread measures ModelStepFinished and observes every graph retained at the record seam.
     let (out, events) = mpsc::channel(2);
 
-    start_tracking();
     let run = tokio::spawn(async move {
-        let provider = DispatchAllocationProbeProvider;
+        let provider = AssistantAllocationProbeProvider;
         let tool_plane = DispatchAllocationProbePlane::default();
         let wal_store = TerminalAssistantSnapshotWalStore {
             snapshot: run_snapshot,

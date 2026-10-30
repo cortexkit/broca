@@ -94,19 +94,23 @@ mod request_gzip_tests;
 
 /// Shareable HTTP transport handle. Clones retain the same reqwest connection pools.
 ///
-/// It holds two reqwest clients because reqwest decides response decoding per client, and a
+/// Reqwest decides response decoding per client, and a
 /// client that decodes also adds an `accept-encoding` header to every request it sends.
 /// Anthropic's first-party API gets Claude Code's `accept-encoding` and a client that decodes
 /// what comes back; every other host gets a client without decoding, so its requests go out
-/// exactly as they did before decoding existed.
+/// exactly as they did before decoding existed. Journaled model requests use separate pools
+/// with redirects disabled: a redirect must not re-POST under the original reservation.
 #[derive(Clone, Debug)]
 pub struct ProviderHttpClient {
     /// Every host except `api.anthropic.com`. No response decoding and no `accept-encoding`.
     identity: reqwest::Client,
     /// `api.anthropic.com` only. Decodes gzip, deflate, brotli and zstd responses as they stream.
     decoding: reqwest::Client,
+    journaled: Arc<JournaledHttpClients>,
     request_gzip: request_gzip::RequestGzipPolicy,
     chatgpt_connections: ChatgptConnections,
+    #[cfg(feature = "test-harness")]
+    warm_reply: Option<Bytes>,
     /// Tests only: when set, every send fails at once with a refused connection, without
     /// opening a socket. A refused localhost connect takes seconds on some platforms, so a
     /// test that needs many connect failures in a bounded window cannot dial a real closed
@@ -116,25 +120,46 @@ pub struct ProviderHttpClient {
     fail_connects: bool,
 }
 
+struct JournaledHttpClients {
+    clients: OnceLock<(reqwest::Client, reqwest::Client)>,
+    builder: Box<dyn Fn() -> reqwest::ClientBuilder + Send + Sync>,
+}
+
+impl std::fmt::Debug for JournaledHttpClients {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JournaledHttpClients")
+            .field("initialized", &self.clients.get().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+fn build_http_pool(builder: reqwest::ClientBuilder, decode: bool) -> reqwest::Client {
+    builder
+        .gzip(decode)
+        .deflate(decode)
+        .brotli(decode)
+        .zstd(decode)
+        .build()
+        .expect("the provider HTTP client configuration is valid")
+}
+
 impl ProviderHttpClient {
     fn build(
-        builder: impl Fn() -> reqwest::ClientBuilder,
+        builder: impl Fn() -> reqwest::ClientBuilder + Send + Sync + 'static,
         request_gzip: request_gzip::RequestGzipPolicy,
     ) -> Self {
-        let build = |decode: bool| {
-            builder()
-                .gzip(decode)
-                .deflate(decode)
-                .brotli(decode)
-                .zstd(decode)
-                .build()
-                .expect("the provider HTTP client configuration is valid")
-        };
         Self {
-            identity: build(false),
-            decoding: build(true),
+            identity: build_http_pool(builder(), false),
+            decoding: build_http_pool(builder(), true),
+            journaled: Arc::new(JournaledHttpClients {
+                clients: OnceLock::new(),
+                builder: Box::new(builder),
+            }),
             request_gzip,
             chatgpt_connections: ChatgptConnections::default(),
+            #[cfg(feature = "test-harness")]
+            warm_reply: None,
             #[cfg(test)]
             fail_connects: false,
         }
@@ -146,6 +171,35 @@ impl ProviderHttpClient {
             &self.decoding
         } else {
             &self.identity
+        }
+    }
+
+    fn for_model_host(&self, anthropic_api_host: bool, journaled: bool) -> &reqwest::Client {
+        if !journaled {
+            return self.for_host(anthropic_api_host);
+        }
+        // Legacy sends never initialize the no-redirect pools, even when using the
+        // HTTP/1.1 fallback client after a transient transport failure.
+        let (identity, decoding) = self.journaled.clients.get_or_init(|| {
+            (
+                build_http_pool(
+                    (self.journaled.builder)()
+                        .redirect(reqwest::redirect::Policy::none())
+                        .retry(reqwest::retry::never()),
+                    false,
+                ),
+                build_http_pool(
+                    (self.journaled.builder)()
+                        .redirect(reqwest::redirect::Policy::none())
+                        .retry(reqwest::retry::never()),
+                    true,
+                ),
+            )
+        });
+        if anthropic_api_host {
+            decoding
+        } else {
+            identity
         }
     }
 
@@ -184,7 +238,7 @@ impl ProviderHttpClient {
     #[cfg(test)]
     fn resolving_anthropic_api_to(address: std::net::SocketAddr, gzip_enabled: bool) -> Self {
         Self::build(
-            || provider_client_builder().resolve(request_gzip::ANTHROPIC_API_HOST, address),
+            move || provider_client_builder().resolve(request_gzip::ANTHROPIC_API_HOST, address),
             request_gzip::RequestGzipPolicy::isolated(gzip_enabled),
         )
     }
@@ -198,8 +252,14 @@ impl From<reqwest::Client> for ProviderHttpClient {
         Self {
             identity: client.clone(),
             decoding: client,
+            journaled: Arc::new(JournaledHttpClients {
+                clients: OnceLock::new(),
+                builder: Box::new(provider_client_builder),
+            }),
             request_gzip: request_gzip::RequestGzipPolicy::isolated(false),
             chatgpt_connections: ChatgptConnections::default(),
+            #[cfg(feature = "test-harness")]
+            warm_reply: None,
             #[cfg(test)]
             fail_connects: false,
         }
@@ -214,12 +274,18 @@ const ROUTE_FALLBACK: u8 = 1;
 /// A live provider: any wire family + its frozen render config + a runtime auth
 /// credential, driven over reqwest. Generic over the family so the same transport
 /// loop runs every grammar.
+/// Live-media behavior is behind `test-attachments`; fallible-render plumbing also
+/// compiles in shipping builds and delegates to family rendering without that feature.
 pub struct LiveProvider<F: WireFamily + 'static> {
     pub(crate) client: ProviderHttpClient,
     clock: Clock,
     pub(crate) family: Arc<F>,
     pub(crate) frozen: Arc<FrozenRenderConfig>,
     grammar_downgraded: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "test-attachments")]
+    media_renderer: std::sync::RwLock<Option<Arc<broca_core::provider::MediaRequestRenderer>>>,
+    #[cfg(feature = "test-attachments")]
+    media_render_tags: std::sync::atomic::AtomicBool,
     /// The refusal-fallback model's render config, taken from `frozen.refusal_fallback` when
     /// the episode froze one.
     fallback: Option<Arc<FrozenRenderConfig>>,
@@ -246,6 +312,7 @@ pub struct LiveProvider<F: WireFamily + 'static> {
 /// Owns the rendered body behind a reference count so retry requests do not copy the prompt.
 #[derive(Clone)]
 struct PreparedHttpRequest {
+    attempt_hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
     /// Local diagnostic policy, never part of the rendered request or its digest.
     ephemeral_session: bool,
     codex_wire: bool,
@@ -268,6 +335,7 @@ struct PreparedHttpRequest {
     credential_id: Option<String>,
     account_ref: Option<String>,
     wire_model_id: Option<String>,
+    speed_requested: Option<String>,
 }
 
 type CompletedOutputRenderer =
@@ -276,6 +344,7 @@ type CompletedOutputRenderer =
 impl From<HttpRequest> for PreparedHttpRequest {
     fn from(request: HttpRequest) -> Self {
         Self {
+            attempt_hook: None,
             ephemeral_session: false,
             codex_wire: false,
             auth_revision: 0,
@@ -290,6 +359,7 @@ impl From<HttpRequest> for PreparedHttpRequest {
             credential_id: None,
             account_ref: None,
             wire_model_id: None,
+            speed_requested: None,
         }
     }
 }
@@ -297,6 +367,10 @@ impl From<HttpRequest> for PreparedHttpRequest {
 /// Immutable, whole-request input for one blocking render. All expensive input stays behind
 /// shared handles; the closure is the sole owner that releases its prompt snapshot.
 struct RenderJob<F: WireFamily + 'static> {
+    #[cfg(feature = "test-attachments")]
+    media_renderer: Option<Arc<broca_core::provider::MediaRequestRenderer>>,
+    #[cfg(feature = "test-attachments")]
+    media_render_tags: bool,
     auth_revision: u64,
     family: Arc<F>,
     frozen: Arc<FrozenRenderConfig>,
@@ -356,6 +430,11 @@ struct ChunkWarning {
 /// SSE adaptation, not compressed frames or control-frame payloads.
 #[derive(Clone, Default)]
 struct AttemptTrace {
+    attempt_hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
+    attempt_id: Option<broca_wal::record::AttemptId>,
+    attempt_ordinal: u32,
+    send_index: u32,
+    attempt_cancel: Option<CancellationToken>,
     ephemeral_session: bool,
     transport: Option<String>,
     websocket_request: Option<Box<broca_protocol::provider::WebSocketRequestDigest>>,
@@ -404,6 +483,65 @@ struct AttemptTrace {
 }
 
 impl AttemptTrace {
+    async fn reserve_send(
+        &mut self,
+        request: &PreparedHttpRequest,
+        body_bytes: usize,
+        compressed: bool,
+    ) -> Result<(), AttemptFailure> {
+        if let Some(hook) = &self.attempt_hook {
+            let endpoint_host = reqwest::Url::parse(&request.url)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .unwrap_or_default();
+            let id = hook
+                .before_send(
+                    broca_core::run::PhysicalSend {
+                        attempt: self.attempt_ordinal,
+                        send_index: self.send_index.max(1),
+                        endpoint_host,
+                        model_sent: request.wire_model_id.clone().unwrap_or_default(),
+                        request_body_bytes: body_bytes as u64,
+                        compressed,
+                        account_ref: self.served_account_ref.clone(),
+                        speed_requested: request.speed_requested.clone(),
+                        warm: None,
+                    },
+                    self.attempt_cancel.clone().unwrap_or_default(),
+                )
+                .await
+                .map_err(|error| {
+                    AttemptFailure::transport_without_reissue(error, AttemptOutcome::ProviderError)
+                })?;
+            self.attempt_id = Some(id);
+        }
+        Ok(())
+    }
+
+    async fn settle_send(
+        &mut self,
+        digest: &RequestDigest,
+        outcome: AttemptOutcome,
+        billing_outcome: Option<broca_wal::record::BillingAttemptOutcome>,
+    ) -> Result<(), ProviderError> {
+        if let (Some(hook), Some(id)) = (&self.attempt_hook, self.attempt_id.take()) {
+            let billing_outcome = billing_outcome.unwrap_or_else(|| {
+                // The forensic vocabulary is open; an unfamiliar transport outcome remains
+                // unknown billing evidence rather than being guessed as a successful call.
+                serde_json::from_value(serde_json::to_value(&outcome).expect("outcome serializes"))
+                    .unwrap_or_default()
+            });
+            hook.finished(
+                id,
+                self.clone()
+                    .into_attempt(self.attempt_ordinal as usize, digest, outcome),
+                billing_outcome,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     fn socket_age_ms(&self) -> Option<u64> {
         self.socket_age
             .map(|age| (age + self.elapsed_since_send().unwrap_or_default()).as_millis() as u64)
@@ -483,13 +621,25 @@ fn ratelimit_unified_headers(
 }
 
 impl<F: WireFamily + 'static> RenderJob<F> {
-    fn render(self) -> RenderedRequest {
+    fn render(self) -> Result<RenderedRequest, Box<ProviderError>> {
         // This scan is deliberately in the same blocking job as rendering: it walks the entire
         // prompt to preserve aliases from historical tool calls on every resumed step.
         let name_map = Arc::new(crate::tool_name_alias::ToolNameMap::build(
             &self.opts.tools,
             &self.opts.prompt,
         ));
+        #[cfg(feature = "test-attachments")]
+        let body = if let Some(renderer) = &self.media_renderer {
+            renderer(
+                &serde_json::to_value(&*self.frozen).expect("frozen render config serializes"),
+                &self.opts,
+                self.media_render_tags,
+                true,
+            )?
+        } else {
+            self.family.render(&self.frozen, &self.opts)
+        };
+        #[cfg(not(feature = "test-attachments"))]
         let body = self.family.render(&self.frozen, &self.opts);
         let mut request =
             PreparedHttpRequest::from(self.family.endpoint(&self.frozen, &self.auth, body));
@@ -524,11 +674,11 @@ impl<F: WireFamily + 'static> RenderJob<F> {
         request.wire_model_id = Some(self.frozen.wire_model_id.clone());
         maybe_dump_rendered_request(&request.body, &self.opts, self.step_id);
         let request_digest = RequestDigest::of(&request.body);
-        RenderedRequest {
+        Ok(RenderedRequest {
             request,
             name_map,
             request_digest,
-        }
+        })
     }
 }
 
@@ -673,6 +823,84 @@ fn provider_client_builder() -> reqwest::ClientBuilder {
 }
 
 impl<F: WireFamily + 'static> LiveProvider<F> {
+    /// Replace only legacy warm network I/O with a ready success for allocation accounting.
+    #[cfg(feature = "test-harness")]
+    pub fn with_warm_reply_for_allocation_test(mut self, body: Vec<u8>) -> Self {
+        self.client.warm_reply = Some(Bytes::from(body));
+        self
+    }
+    /// Allocation-test reference for the original warm path, without async-trait delegation.
+    #[cfg(feature = "test-harness")]
+    pub async fn warm_legacy_reference_for_test(
+        &self,
+        base: &[u8],
+    ) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
+        let (request, account) = self.prepare_warm_request(base, None)?;
+        send_warm_legacy(
+            &self.client,
+            &self.clock,
+            request,
+            self.frozen.family_id,
+            account,
+        )
+        .await
+    }
+
+    fn prepare_warm_request(
+        &self,
+        base: &[u8],
+        policy: Option<&mut broca_core::cache_warm::WarmSendPolicy>,
+    ) -> Result<(HttpRequest, Option<String>), broca_core::WarmFailure> {
+        let served = self.current_auth();
+        if account_changed_error(
+            self.frozen_account_ref.as_deref(),
+            served.account_ref.as_deref(),
+        )
+        .is_some()
+        {
+            return Err(broca_core::WarmFailure::AccountChanged {
+                frozen: self.frozen_account_ref.clone(),
+                served: served.account_ref,
+            });
+        }
+        // Reuse the route of the request being warmed, including a refusal fallback.
+        let fallback = self.routed_fallback();
+        let warm_frozen = match fallback {
+            Some(fallback) => Arc::clone(fallback),
+            None => Arc::clone(&self.frozen),
+        };
+        if let Some(policy) = policy {
+            policy.provider = fallback.and_then(|_| {
+                self.frozen
+                    .refusal_fallback
+                    .as_ref()
+                    .map(|f| f.model.provider_module_id.clone())
+            });
+            policy.ttl_ms = warm_frozen
+                .cache
+                .as_ref()
+                .and_then(|cache| match &cache.class {
+                    crate::wire::CacheClass::Markers {
+                        ttl: crate::wire::CacheTtl::FiveMinutes,
+                        ..
+                    } => Some(300_000),
+                    crate::wire::CacheClass::Markers {
+                        ttl: crate::wire::CacheTtl::OneHour,
+                        ..
+                    } => Some(3_600_000),
+                    _ => None,
+                });
+        }
+        let body = self
+            .family
+            .warm_body(&warm_frozen, base)
+            .map_err(broca_core::WarmFailure::Unsupported)?;
+        Ok((
+            self.family.endpoint(&warm_frozen, &served.auth, body),
+            served.account_ref,
+        ))
+    }
+
     fn effective_frozen(&self) -> Arc<FrozenRenderConfig> {
         if !self.grammar_downgraded.load(Ordering::Acquire) {
             return Arc::clone(&self.frozen);
@@ -740,6 +968,10 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             route: std::sync::atomic::AtomicU8::new(ROUTE_SOURCE),
             frozen: Arc::new(frozen),
             grammar_downgraded: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "test-attachments")]
+            media_renderer: std::sync::RwLock::new(None),
+            #[cfg(feature = "test-attachments")]
+            media_render_tags: std::sync::atomic::AtomicBool::new(false),
             // Wrapped HERE rather than taken as an Arc, so callers keep passing an owned
             // AuthHandle and the sharing stays inside this file. Each step takes a cheap Arc
             // snapshot of the current credential rather than a deep copy of the secret; only
@@ -805,7 +1037,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
         cancel: CancellationToken,
         deadline: Option<Instant>,
     ) -> mpsc::Receiver<NormalizedEvent> {
-        self.start_step_under_seal(step_id, opts, cancel, deadline, None, None, 0)
+        self.start_step_under_seal(step_id, opts, cancel, deadline, None, None, 0, None)
     }
 
     // The step's identity, its shared request, cancellation, deadline, seal, progress slot and
@@ -821,6 +1053,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
         seal: Option<ShutdownSeal>,
         progress: Option<broca_core::provider::LiveStepProgress>,
         first_attempt: u32,
+        attempt_hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
     ) -> mpsc::Receiver<NormalizedEvent> {
         let (tx, rx) = mpsc::channel::<NormalizedEvent>(256);
         let served = self.current_auth();
@@ -851,6 +1084,10 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             return rx;
         }
         let render_job = RenderJob {
+            #[cfg(feature = "test-attachments")]
+            media_renderer: self.media_renderer.read().unwrap().clone(),
+            #[cfg(feature = "test-attachments")]
+            media_render_tags: self.media_render_tags.load(Ordering::Relaxed),
             auth_revision: served.revision,
             family: Arc::clone(&self.family),
             frozen: step_frozen(self.route_frozen(), &opts),
@@ -896,6 +1133,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             deadline,
             seal,
             progress,
+            attempt_hook,
             retry_clock,
             Arc::clone(&self.websocket),
             #[cfg(test)]
@@ -907,6 +1145,24 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
 
 #[async_trait]
 impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
+    #[cfg(feature = "test-attachments")]
+    fn supports_media_renderer(&self) -> bool {
+        true
+    }
+
+    #[cfg(feature = "test-attachments")]
+    fn set_media_request_renderer(
+        &self,
+        renderer: Arc<broca_core::provider::MediaRequestRenderer>,
+    ) {
+        *self.media_renderer.write().unwrap() = Some(renderer);
+    }
+
+    #[cfg(feature = "test-attachments")]
+    fn defer_media_tags(&self, render_tags: bool) -> bool {
+        self.media_render_tags.store(render_tags, Ordering::Relaxed);
+        self.media_renderer.read().unwrap().is_some()
+    }
     fn set_credential_revision(&self, revision: u64) {
         self.auth.write().unwrap().revision = revision;
     }
@@ -961,6 +1217,7 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
             runtime.seal,
             runtime.progress,
             runtime.first_attempt,
+            runtime.attempt_hook,
         )
     }
     fn close_run_transport(&self) {
@@ -1042,12 +1299,27 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
         deadline: Option<Instant>,
         seal: ShutdownSeal,
     ) -> mpsc::Receiver<NormalizedEvent> {
-        self.start_step_under_seal(step_id, opts, cancel, deadline, Some(seal), None, 0)
+        self.start_step_under_seal(step_id, opts, cancel, deadline, Some(seal), None, 0, None)
     }
 
     fn render_request(&self, opts: &CallOptions) -> Vec<u8> {
-        self.family
-            .render(&self.route_frozen().for_step(opts), opts)
+        self.try_render_request(opts)
+            .expect("provider request could not be prepared")
+    }
+
+    fn try_render_request(&self, opts: &CallOptions) -> Result<Vec<u8>, Box<ProviderError>> {
+        let route = self.route_frozen();
+        let frozen = route.for_step(opts);
+        #[cfg(feature = "test-attachments")]
+        if let Some(renderer) = self.media_renderer.read().unwrap().as_ref() {
+            return renderer(
+                &serde_json::to_value(&frozen).expect("frozen render config serializes"),
+                opts,
+                self.media_render_tags.load(Ordering::Relaxed),
+                false,
+            );
+        }
+        Ok(self.family.render(&frozen, opts))
     }
 
     fn output_limits(&self) -> Option<broca_core::output_reservation::OutputLimits> {
@@ -1110,33 +1382,34 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
     /// does, that the credential's account is still the one the session froze. Never retried: a
     /// warm that fails is reported, not repeated.
     async fn warm(&self, base: &[u8]) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
-        let served = self.current_auth();
-        if account_changed_error(
-            self.frozen_account_ref.as_deref(),
-            served.account_ref.as_deref(),
+        let (request, account) = self.prepare_warm_request(base, None)?;
+        send_warm_legacy(
+            &self.client,
+            &self.clock,
+            request,
+            self.frozen.family_id,
+            account,
         )
-        .is_some()
-        {
-            return Err(broca_core::WarmFailure::AccountChanged {
-                frozen: self.frozen_account_ref.clone(),
-                served: served.account_ref,
-            });
-        }
-        // A warm of a request the fallback model answered is shaped and addressed for it.
-        let warm_frozen = match self.routed_fallback() {
-            Some(fallback) => Arc::clone(fallback),
-            None => Arc::clone(&self.frozen),
-        };
-        let body = self
-            .family
-            .warm_body(&warm_frozen, base)
-            .map_err(broca_core::WarmFailure::Unsupported)?;
+        .await
+    }
+
+    async fn warm_with_hook(
+        &self,
+        base: &[u8],
+        hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
+    ) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
+        let mut policy = hook
+            .as_ref()
+            .map(|_| broca_core::cache_warm::WarmSendPolicy::default());
+        let (request, account) = self.prepare_warm_request(base, policy.as_mut())?;
         send_warm(
             &self.client,
             &self.clock,
-            self.family.endpoint(&warm_frozen, &served.auth, body),
+            request,
             self.frozen.family_id,
-            served.account_ref,
+            account,
+            hook,
+            policy,
         )
         .await
     }
@@ -1153,6 +1426,33 @@ const MAX_WARM_RESPONSE_BYTES: usize = 1024 * 1024;
 /// A warm to `api.anthropic.com` has the same wire shape as the step it warms: a compressed
 /// body when the step's would be, and one uncompressed re-send if the compression is refused.
 async fn send_warm(
+    client: &ProviderHttpClient,
+    clock: &Clock,
+    request: HttpRequest,
+    family: crate::spec::WireFamilyId,
+    served_account_ref: Option<String>,
+    hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
+    policy: Option<broca_core::cache_warm::WarmSendPolicy>,
+) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
+    match hook {
+        None => send_warm_legacy(client, clock, request, family, served_account_ref).await,
+        Some(hook) => {
+            send_warm_journaled(
+                client,
+                clock,
+                request,
+                family,
+                served_account_ref,
+                Some(hook),
+                policy,
+            )
+            .await
+        }
+    }
+}
+
+/// Keep legacy requests on the original path: no billing parse, envelope or extra boxed call.
+async fn send_warm_legacy(
     client: &ProviderHttpClient,
     clock: &Clock,
     request: HttpRequest,
@@ -1184,12 +1484,22 @@ async fn send_warm(
         let mut gzip = encode_request_gzip(client, anthropic_api_host, &identity).await;
         let (sent_at_ms, status, header_map, body) = loop {
             let sent_at_ms = now_millis();
+            #[cfg(feature = "test-harness")]
+            if let Some(body) = &client.warm_reply {
+                break (
+                    sent_at_ms,
+                    reqwest::StatusCode::OK,
+                    reqwest::header::HeaderMap::new(),
+                    body.to_vec(),
+                );
+            }
             let response = attempt_request_builder(
                 client,
                 &request.url,
                 &request.headers,
                 anthropic_api_host,
                 gzip.is_some(),
+                false,
             )
             .body(gzip.clone().unwrap_or_else(|| identity.clone()))
             .send()
@@ -1197,7 +1507,7 @@ async fn send_warm(
             .map_err(|error| failed(format!("warm request failed: {error}")))?;
             let status = response.status();
             let header_map = response.headers().clone();
-            let body = read_warm_body(response, &failed).await?;
+            let body = read_warm_body_legacy(response, &failed).await?;
             if gzip.is_some() {
                 if let Some(rejection) = request_gzip::classify_rejection(
                     status.as_u16(),
@@ -1278,8 +1588,7 @@ async fn send_warm(
         .unwrap_or_else(|_| Err(failed("warm timed out waiting for its answer".into())))
 }
 
-/// Read a whole warm answer, up to its size limit.
-async fn read_warm_body(
+async fn read_warm_body_legacy(
     response: reqwest::Response,
     failed: &impl Fn(String) -> broca_core::WarmFailure,
 ) -> Result<Vec<u8>, broca_core::WarmFailure> {
@@ -1288,6 +1597,297 @@ async fn read_warm_body(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| failed(format!("warm answer unreadable: {error}")))?;
         if body.len() + chunk.len() > MAX_WARM_RESPONSE_BYTES {
+            return Err(failed("warm answer exceeded its size limit".into()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+async fn send_warm_journaled(
+    client: &ProviderHttpClient,
+    clock: &Clock,
+    request: HttpRequest,
+    family: crate::spec::WireFamilyId,
+    served_account_ref: Option<String>,
+    hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
+    policy: Option<broca_core::cache_warm::WarmSendPolicy>,
+) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
+    use broca_wal::record::{AttemptEnvelope, AttemptSent, BillingAttemptOutcome as Outcome};
+    let warm_body_sha256 = lower_hex(&Sha256::digest(&request.body));
+    let anthropic_api_host = request_gzip::is_anthropic_api_host(&request.url);
+    let identity = Bytes::from(request.body);
+    let failed = |message: String| {
+        broca_core::WarmFailure::Provider(ProviderError {
+            provider_details: None,
+            provider_subcode: None,
+            refusal: None,
+            class: ErrorClass::Transient,
+            message,
+            status: None,
+            retry_after_secs: None,
+            provider_code: None,
+            resets_at_ms: None,
+            resets_at_source: None,
+            limit_window: None,
+            account_ref: None,
+            credential_id: None,
+            affordable_max_tokens: None,
+        })
+    };
+    let mut id = None;
+    let mut envelope = AttemptEnvelope::default();
+    let mut send_index = 0;
+    let model_sent = serde_json::from_slice::<Value>(&identity)
+        .ok()
+        .and_then(|body| body.get("model").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_default();
+    let exchange = async {
+        let mut gzip = encode_request_gzip(client, anthropic_api_host, &identity).await;
+        let (sent_at_ms, status, header_map, body) = loop {
+            send_index += 1;
+            envelope = AttemptEnvelope::default();
+            if let Some(hook) = &hook {
+                id = Some(
+                    tokio::time::timeout(
+                        Duration::from_secs(30),
+                        hook.before_send(
+                            broca_core::run::PhysicalSend {
+                                attempt: send_index - 1,
+                                send_index,
+                                endpoint_host: reqwest::Url::parse(&request.url)
+                                    .ok()
+                                    .and_then(|url| url.host_str().map(str::to_owned))
+                                    .unwrap_or_default(),
+                                model_sent: model_sent.clone(),
+                                request_body_bytes: gzip.as_ref().unwrap_or(&identity).len() as u64,
+                                compressed: gzip.is_some(),
+                                account_ref: served_account_ref.clone(),
+                                speed_requested: serde_json::from_slice::<Value>(&identity)
+                                    .ok()
+                                    .and_then(|body| {
+                                        body.get("speed").and_then(Value::as_str).map(str::to_owned)
+                                    }),
+                                warm: policy.clone(),
+                            },
+                            tokio_util::sync::CancellationToken::new(),
+                        ),
+                    )
+                    .await
+                    .map_err(|_| failed("warm reservation permission deadline expired".into()))?
+                    .map_err(broca_core::WarmFailure::Provider)?,
+                );
+            }
+            let sent_at_ms = now_millis();
+            envelope.sent_at_ms = Some(sent_at_ms);
+            envelope.sent = AttemptSent::Yes;
+            let response = attempt_request_builder(
+                client,
+                &request.url,
+                &request.headers,
+                anthropic_api_host,
+                gzip.is_some(),
+                hook.is_some(),
+            )
+            .body(gzip.clone().unwrap_or_else(|| identity.clone()))
+            .send()
+            .await
+            .map_err(|error| {
+                envelope.outcome = if error.is_connect() {
+                    envelope.sent = AttemptSent::No;
+                    envelope.sent_at_ms = None;
+                    Outcome::ConnectFailed
+                } else {
+                    Outcome::NoStatus
+                };
+                failed(format!("warm request failed: {error}"))
+            })?;
+            let status = response.status();
+            envelope.http_status = Some(status.as_u16());
+            let header_map = response.headers().clone();
+            let body = read_warm_body(response, &failed, &mut envelope).await?;
+            warm_billing_usage(&body, family, &mut envelope);
+            if gzip.is_some() {
+                if let Some(rejection) = request_gzip::classify_rejection(
+                    status.as_u16(),
+                    &header_map,
+                    &String::from_utf8_lossy(&body),
+                ) {
+                    client.request_gzip.latch(status.as_u16(), rejection);
+                    envelope.outcome = Outcome::CompressionRefused;
+                    envelope.finished_at_ms = Some(now_millis());
+                    if let (Some(hook), Some(id)) = (&hook, id.take()) {
+                        hook.warm_finished(id, envelope.clone(), None, warm_body_sha256.clone())
+                            .await
+                            .map_err(broca_core::WarmFailure::Provider)?;
+                    }
+                    gzip = None;
+                    continue;
+                }
+            }
+            break (sent_at_ms, status, header_map, body);
+        };
+        let retry_after_secs = parse_retry_after_header(&header_map);
+        let headers = response_headers(&header_map);
+        let ratelimit_headers: Vec<(String, String)> = header_map
+            .iter()
+            .filter(|(name, _)| {
+                name.as_str()
+                    .starts_with(crate::cache_warm::RATELIMIT_HEADER_PREFIX)
+            })
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_owned(), value.to_owned()))
+            })
+            .collect();
+        if !status.is_success() {
+            envelope.outcome = Outcome::HttpError;
+            let code = status.as_u16();
+            let text = String::from_utf8_lossy(&body);
+            log_opencode_go_refusal(&request.headers, code, &headers, &text);
+            let error = classify_http_error_in_family(
+                code,
+                &text,
+                retry_after_secs,
+                None,
+                Some(family),
+                None,
+            );
+            let error = classify_account_limit_exhausted(
+                family,
+                code,
+                &headers,
+                &text,
+                UNIX_EPOCH + Duration::from_millis(clock.now_ms()),
+                error,
+            );
+            let error = opencode_payment_required(&request.url, code, error);
+            let error = inception_payment_required(&request.url, code, error);
+            return Err(broca_core::WarmFailure::Provider(error));
+        }
+        let usage = match family {
+            crate::spec::WireFamilyId::OpenAiResponses
+            | crate::spec::WireFamilyId::OpenAiResponsesChatgpt => {
+                crate::cache_warm::responses_response_usage(&body)
+            }
+            _ => crate::cache_warm::anthropic_response_usage(&body),
+        };
+        if family == crate::spec::WireFamilyId::OpenAiResponsesChatgpt
+            && usage.cached_input_tokens == Some(0)
+        {
+            tracing::info!(
+                "Codex cache warm read zero cached tokens; best-effort re-prime, not retried"
+            );
+        }
+        envelope.outcome = Outcome::Complete;
+        Ok(broca_core::WarmSent {
+            warm_body_sha256: warm_body_sha256.clone(),
+            sent_at_ms,
+            usage,
+            served_account_ref: served_account_ref.clone(),
+            ratelimit_headers,
+            http_status: status.as_u16(),
+        })
+    };
+    let result = match tokio::time::timeout(WARM_TIMEOUT, exchange).await {
+        Ok(result) => result,
+        Err(_) => {
+            envelope.outcome = if envelope.http_status.is_some() {
+                Outcome::IdleTimeout
+            } else {
+                Outcome::HeaderTimeout
+            };
+            Err(failed("warm timed out waiting for its answer".into()))
+        }
+    };
+    envelope.finished_at_ms = Some(now_millis());
+    if let (Some(hook), Some(id)) = (&hook, id.take()) {
+        hook.warm_finished(
+            id,
+            envelope,
+            result.as_ref().ok().cloned(),
+            warm_body_sha256,
+        )
+        .await
+        .map_err(broca_core::WarmFailure::Provider)?;
+    }
+    result
+}
+
+/// Retain reported usage even on an HTTP refusal. An absent usage object remains unknown,
+/// rather than turning a failed warm into a measured zero-token call.
+fn warm_billing_usage(
+    body: &[u8],
+    family: crate::spec::WireFamilyId,
+    envelope: &mut broca_wal::record::AttemptEnvelope,
+) {
+    let value = serde_json::from_slice::<Value>(body).ok().or_else(|| {
+        std::str::from_utf8(body)
+            .ok()?
+            .lines()
+            .filter_map(|line| {
+                let value =
+                    serde_json::from_str::<Value>(line.strip_prefix("data:")?.trim()).ok()?;
+                value
+                    .get("response")
+                    .cloned()
+                    .filter(|response| response.get("usage").is_some())
+            })
+            .next_back()
+    });
+    let Some(value) = value else {
+        return;
+    };
+    let Some(raw) = value.get("usage").filter(|u| u.is_object()) else {
+        return;
+    };
+    let usage = match family {
+        crate::spec::WireFamilyId::OpenAiResponses
+        | crate::spec::WireFamilyId::OpenAiResponsesChatgpt => {
+            crate::cache_warm::responses_response_usage(body)
+        }
+        _ => crate::cache_warm::anthropic_response_usage(body),
+    };
+    envelope.usage = Some(usage);
+    envelope.usage_raw = Some(raw.clone());
+    envelope.model_used = value
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    envelope.service_tier_used = value
+        .get("service_tier")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    envelope.speed_used = raw.get("speed").and_then(Value::as_str).map(str::to_owned);
+    envelope.cache_write_5m_tokens = raw
+        .pointer("/cache_creation/ephemeral_5m_input_tokens")
+        .and_then(Value::as_u64);
+    envelope.cache_write_1h_tokens = raw
+        .pointer("/cache_creation/ephemeral_1h_input_tokens")
+        .and_then(Value::as_u64);
+    if usage.reasoning_tokens.is_some() {
+        envelope.reasoning_included_in_output = Some(true);
+    }
+}
+
+/// Read a whole warm answer, up to its size limit.
+async fn read_warm_body(
+    response: reqwest::Response,
+    failed: &impl Fn(String) -> broca_core::WarmFailure,
+    envelope: &mut broca_wal::record::AttemptEnvelope,
+) -> Result<Vec<u8>, broca_core::WarmFailure> {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            envelope.outcome = broca_wal::record::BillingAttemptOutcome::ChunkError;
+            failed(format!("warm answer unreadable: {error}"))
+        })?;
+        envelope.response_bytes += chunk.len() as u64;
+        if body.len() + chunk.len() > MAX_WARM_RESPONSE_BYTES {
+            envelope.outcome = broca_wal::record::BillingAttemptOutcome::ByteLimit;
             return Err(failed("warm answer exceeded its size limit".into()));
         }
         body.extend_from_slice(&chunk);
@@ -1336,8 +1936,11 @@ fn attempt_request_builder(
     headers: &[(String, String)],
     anthropic_api_host: bool,
     gzip: bool,
+    journaled: bool,
 ) -> reqwest::RequestBuilder {
-    let mut builder = client.for_host(anthropic_api_host).post(url);
+    let mut builder = client
+        .for_model_host(anthropic_api_host, journaled)
+        .post(url);
     let mut has_accept_encoding = false;
     for (name, value) in headers {
         if gzip && name.eq_ignore_ascii_case("content-encoding") {
@@ -1551,6 +2154,8 @@ struct RetryClock {
     virtual_waits: Option<Arc<std::sync::Mutex<Vec<Duration>>>>,
     #[cfg(test)]
     virtual_retry_attempts: Option<Arc<std::sync::Mutex<std::collections::VecDeque<Duration>>>>,
+    #[cfg(test)]
+    virtual_wait_overhead: Option<Duration>,
 }
 
 /// A point on a [`RetryClock`] from which retry time is measured.
@@ -1586,6 +2191,8 @@ impl RetryClock {
 
     fn elapsed_since(&self, mark: RetryMark) -> Duration {
         let elapsed = mark.at.elapsed();
+        #[cfg(test)]
+        let elapsed = self.virtual_wait_overhead.unwrap_or(elapsed);
         #[cfg(any(test, feature = "test-harness"))]
         if let Some(waits) = &self.virtual_waits {
             let waited: Duration = waits.lock().unwrap()[mark.virtual_waits_before..]
@@ -1998,6 +2605,7 @@ fn spawn_transport_task<F: WireFamily + 'static>(
     deadline: Option<Instant>,
     seal: Option<ShutdownSeal>,
     progress: Option<broca_core::provider::LiveStepProgress>,
+    attempt_hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
     retry_clock: RetryClock,
     websocket: Arc<responses_websocket::Session>,
     #[cfg(test)] escape_client_builds: std::sync::Arc<AtomicUsize>,
@@ -2059,8 +2667,17 @@ fn spawn_transport_task<F: WireFamily + 'static>(
                 }
             }
         };
-        let rendered = match rendered {
-            Ok(rendered) => rendered,
+        let mut rendered = match rendered {
+            Ok(Ok(rendered)) => rendered,
+            Ok(Err(error)) => {
+                let _ = tx
+                    .send(NormalizedEvent::Control(ProviderControl::Error {
+                        error: *error,
+                        retries_used: 0,
+                    }))
+                    .await;
+                return;
+            }
             Err(join_error) => {
                 // Render assertions, including tool-name alias invariants, now unwind through
                 // the blocking handle. Keep that failure on the typed provider-error path instead
@@ -2093,6 +2710,11 @@ fn spawn_transport_task<F: WireFamily + 'static>(
             }
         };
 
+        if attempt_hook.is_some() {
+            rendered.request.speed_requested = frozen.speed.clone();
+        }
+        rendered.request.attempt_hook = attempt_hook;
+
         let mut attempt = first_attempt;
         let normalizer_factory = || {
             if let Some(progress) = &progress {
@@ -2119,6 +2741,7 @@ fn spawn_transport_task<F: WireFamily + 'static>(
         let rebuild = |auth: &AuthHandle, sent: &PreparedHttpRequest| {
             let fresh = family.endpoint(frozen.as_ref(), auth, sent.body.to_vec());
             PreparedHttpRequest {
+                attempt_hook: sent.attempt_hook.clone(),
                 ephemeral_session: sent.ephemeral_session,
                 codex_wire: sent.codex_wire,
                 auth_revision: sent.auth_revision,
@@ -2133,6 +2756,7 @@ fn spawn_transport_task<F: WireFamily + 'static>(
                 credential_id: sent.credential_id.clone(),
                 account_ref: sent.account_ref.clone(),
                 wire_model_id: sent.wire_model_id.clone(),
+                speed_requested: sent.speed_requested.clone(),
             }
         };
         let step_recovery = recovery.map(|recovery| StepAuthRecovery {
@@ -2335,6 +2959,10 @@ where
         number_attempt(&mut request.headers, attempt_index);
         step_seal.note_sent(&request.body, request_digest);
         let mut trace = AttemptTrace {
+            attempt_hook: request.attempt_hook.clone(),
+            attempt_ordinal: attempt_index as u32 + step_seal.first_attempt,
+            attempt_cancel: request.attempt_hook.as_ref().map(|_| cancel.clone()),
+            send_index: 1,
             transport: Some("https".into()),
             defer_failure_warning: true,
             #[cfg(test)]
@@ -2368,6 +2996,15 @@ where
                 if let Some(websocket) = websocket {
                     websocket.close();
                 }
+                if trace.attempt_hook.is_some() {
+                    if let Err(error) = trace
+                        .settle_send(request_digest, AttemptOutcome::Cancelled, None)
+                        .await
+                    {
+                        step_seal.end_attempt();
+                        return Err((error, attempt_index as u32));
+                    }
+                }
                 // A caller cancel is cooperative: the run loop keeps reading until this task
                 // ends, so the in-flight attempt is recorded before the run's Cancelled
                 // terminal.
@@ -2387,15 +3024,26 @@ where
                 if let Some(websocket) = websocket {
                     websocket.close();
                 }
+                // The seal keeps a fallback if its bound expires before the journal replies.
+                // Otherwise the billing outcome is queued before the seal takes the terminal.
+                if trace.attempt_hook.is_some() {
+                    let _ = trace
+                        .settle_send(request_digest, AttemptOutcome::SealedInFlight, None)
+                        .await;
+                }
                 // The seal, not the run loop, writes this record and then the run's
                 // Interrupted terminal. Nothing is sent on the stream, and the stream stays
                 // open until the aborted run task drops its receiver, so the run loop never
                 // observes the stop.
-                step_seal.hand_over(trace.into_attempt(
-                    attempt_index + step_seal.first_attempt as usize,
-                    request_digest,
-                    AttemptOutcome::SealedInFlight,
-                ));
+                if trace.attempt_hook.is_some() {
+                    step_seal.end_attempt();
+                } else {
+                    step_seal.hand_over(trace.into_attempt(
+                        attempt_index + step_seal.first_attempt as usize,
+                        request_digest,
+                        AttemptOutcome::SealedInFlight,
+                    ));
+                }
                 tx.closed().await;
                 return Ok((Vec::new(), 0));
             }
@@ -2405,6 +3053,11 @@ where
             // An empty completion means the receiver closed mid-stream: there is no one to
             // send a record to, and the attempt did not complete.
             Ok(completion) if completion.is_empty() => {
+                if trace.attempt_hook.is_some() {
+                    let _ = trace
+                        .settle_send(request_digest, AttemptOutcome::Cancelled, None)
+                        .await;
+                }
                 step_seal.end_attempt();
                 return Ok((Vec::new(), 0));
             }
@@ -2412,7 +3065,18 @@ where
             Ok(_) => AttemptOutcome::Complete,
             Err(failure) => failure.outcome.clone(),
         };
+        // Preserve the pre-journal retry-policy sampling point. Local settlement time is
+        // not network-attempt time, and legacy sends need no settlement future at all.
         let attempt_elapsed = retry_clock.attempt_elapsed(attempt_started);
+        if trace.attempt_hook.is_some() {
+            if let Err(error) = trace
+                .settle_send(request_digest, outcome.clone(), None)
+                .await
+            {
+                step_seal.end_attempt();
+                return Err((error, attempt_index as u32));
+            }
+        }
         if result.is_err() && trace.response_len == 0 {
             retry_wait_spent += attempt_elapsed;
         }
@@ -3027,8 +3691,8 @@ async fn drive_attempt(
     trace.transport = Some("https".into());
     let anthropic_api_host = request_gzip::is_anthropic_api_host(&request.url);
     let gzip = encode_request_gzip(client, anthropic_api_host, &request.body).await;
-    // What the trace held before anything was sent, so a refused compressed send leaves no
-    // trace of itself in the attempt's record: the uncompressed re-send is the attempt.
+    // Legacy telemetry treats the uncompressed retry as the attempt. The billing hook instead
+    // settles each physical send, preserving the compressed refusal before resetting the trace.
     let unsent_trace = gzip.is_some().then(|| trace.clone());
     let mut resp = send_attempt(
         client,
@@ -3065,7 +3729,24 @@ async fn drive_attempt(
             // network error on the compressed send never gets here: it fails the attempt.
             client.request_gzip.latch(status, rejection);
             drop(resp);
+            if trace.attempt_hook.is_some() {
+                trace.http_status = Some(status);
+                trace
+                    .settle_send(
+                        &RequestDigest::of(&request.body),
+                        AttemptOutcome::HttpError,
+                        Some(broca_wal::record::BillingAttemptOutcome::CompressionRefused),
+                    )
+                    .await
+                    .map_err(|error| {
+                        AttemptFailure::transport_without_reissue(
+                            error,
+                            AttemptOutcome::ProviderError,
+                        )
+                    })?;
+            }
             *trace = unsent_trace;
+            trace.send_index = 2;
             resp = send_attempt(
                 client,
                 request,
@@ -3187,23 +3868,15 @@ async fn send_attempt(
     header_timeout: Duration,
     trace: &mut AttemptTrace,
 ) -> Result<reqwest::Response, AttemptFailure> {
-    // Tests only: fail the connect before any socket opens, so a test that needs many
-    // connect failures is not timed by the operating system's refusal speed. The outcome
-    // and error are the production refusal's: `ConnectFailed` with a retryable class.
-    #[cfg(test)]
-    if client.fail_connects {
-        return Err(AttemptFailure::transport(
-            transport_error("refused test connection (no socket opened)"),
-            AttemptOutcome::ConnectFailed,
-        ));
-    }
     let builder = attempt_request_builder(
         client,
         &request.url,
         &request.headers,
         anthropic_api_host,
         gzip.is_some(),
+        trace.attempt_hook.is_some(),
     );
+    let compressed = gzip.is_some();
     let body = gzip.unwrap_or_else(|| {
         if request.codex_wire {
             let payload: Value =
@@ -3213,6 +3886,17 @@ async fn send_attempt(
             request.body.clone()
         }
     });
+    if trace.attempt_hook.is_some() {
+        trace.reserve_send(request, body.len(), compressed).await?;
+    }
+    // A deterministic connect refusal still reserves an attempt, but never stamps a send.
+    #[cfg(test)]
+    if client.fail_connects {
+        return Err(AttemptFailure::transport(
+            transport_error("refused test connection (no socket opened)"),
+            AttemptOutcome::ConnectFailed,
+        ));
+    }
     // Stamped as the request is handed to the client: a provider's prompt cache counts its
     // lifetime from the request, and after a restart this stamp is what dates it.
     trace.sent_at_ms = Some(now_millis());
@@ -3229,6 +3913,10 @@ async fn send_attempt(
             // A connect error means no request bytes reached a server. Anything else before a
             // status line leaves it unknown whether the body was written, so it is not guessed.
             let outcome = if e.is_connect() {
+                if trace.attempt_hook.is_some() {
+                    trace.sent_at_ms = None;
+                    trace.sent_at = None;
+                }
                 AttemptOutcome::ConnectFailed
             } else {
                 AttemptOutcome::NoStatus
@@ -4958,9 +5646,9 @@ mod tests {
     use broca_protocol::{
         content::{AssistantMessage, ContentBlock, Role, ToolCall},
         display::DisplayEvent,
-        AttemptOutcome, CallOptions, ErrorClass, FinishReason, Message, MessageId, ModelHandle,
-        NormalizedEvent, ProviderControl, ProviderError, StepContext, StepId, Tool, ToolCallId,
-        ToolChoice, Usage,
+        AttemptOutcome, CallOptions, ErrorClass, FinishReason, Message, MessageId, ModelAttempt,
+        ModelHandle, NormalizedEvent, ProviderControl, ProviderError, StepContext, StepId, Tool,
+        ToolCallId, ToolChoice, Usage,
     };
     use serde_json::{Map, Value};
 
@@ -4985,15 +5673,17 @@ mod tests {
 
     use super::{
         build_provider_http_client, classify_account_limit_exhausted, classify_http_error,
-        collect_error_body, drive_body_stream, drive_body_stream_with_limit, drive_stream,
-        drive_stream_with_header_timeout, dump_files_to_delete, extract_provider_code, http_error,
-        parse_retry_after_header, parse_retry_after_value, publish_completion,
-        request_dump_filename, retry_delay, write_dump_file, DumpFileMeta, DumpRetentionCaps,
-        LiveProvider, PreparedHttpRequest, GOOGLE_RPC_DIMENSIONS_MAX_KEYS,
+        collect_error_body, drive_attempt, drive_body_stream, drive_body_stream_with_limit,
+        drive_stream, drive_stream_with_header_timeout, dump_files_to_delete,
+        extract_provider_code, http_error, parse_retry_after_header, parse_retry_after_value,
+        publish_completion, request_dump_filename, retry_delay, send_attempt, transport_error,
+        write_dump_file, AttemptTrace, DumpFileMeta, DumpRetentionCaps, LiveProvider,
+        PreparedHttpRequest, ProviderHttpClient, RequestDigest, GOOGLE_RPC_DIMENSIONS_MAX_KEYS,
         GOOGLE_RPC_ERROR_INFO_TYPE, GOOGLE_RPC_METADATA_MAX_KEYS, GOOGLE_RPC_QUOTA_FAILURE_TYPE,
         GOOGLE_RPC_RETRY_INFO_TYPE, GOOGLE_RPC_VIOLATIONS_MAX, MAX_ERROR_BODY_BYTES,
         MAX_HTTP_ERROR_BODY_READ_BYTES, STREAM_CONTENT_TIMEOUT, STREAM_IDLE_TIMEOUT,
     };
+    use broca_core::Clock;
     // Directory mode is only asserted on Unix, so keep that helper import under the same cfg.
     #[cfg(unix)]
     use super::create_dump_dir;
@@ -5033,6 +5723,10 @@ mod tests {
     {
         let direct = family.render(&frozen, &opts);
         let job = super::RenderJob {
+            #[cfg(feature = "test-attachments")]
+            media_renderer: None,
+            #[cfg(feature = "test-attachments")]
+            media_render_tags: false,
             auth_revision: 0,
             family: Arc::new(family),
             frozen: Arc::new(frozen),
@@ -5042,7 +5736,8 @@ mod tests {
         };
         let offloaded = tokio::task::spawn_blocking(move || job.render())
             .await
-            .expect("render job joins");
+            .expect("render job joins")
+            .expect("render job succeeds");
         assert_eq!(
             offloaded.request.body,
             Bytes::from(direct),
@@ -5503,6 +6198,9 @@ mod tests {
 
     #[derive(Clone)]
     enum ScriptResponse {
+        // Only the Unix-only power-loss recording test holds a response open.
+        #[cfg_attr(not(unix), allow(dead_code))]
+        Hold,
         Http {
             status: u16,
             headers: Vec<(&'static str, &'static str)>,
@@ -5522,6 +6220,11 @@ mod tests {
         requests: Arc<Mutex<Vec<Vec<u8>>>>,
         heads: Arc<Mutex<Vec<String>>>,
         task: tokio::task::JoinHandle<()>,
+        order: Arc<Mutex<Vec<&'static str>>>,
+        // Read only by the Unix-only power-loss recording test, which cancels once a request
+        // has been written.
+        #[cfg_attr(not(unix), allow(dead_code))]
+        written: Arc<tokio::sync::Notify>,
     }
 
     impl Drop for ScriptedServer {
@@ -5538,11 +6241,17 @@ mod tests {
             let heads = Arc::new(Mutex::new(Vec::new()));
             let captured = requests.clone();
             let captured_heads = heads.clone();
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let wire_order = order.clone();
+            let written = Arc::new(tokio::sync::Notify::new());
+            let wire_written = written.clone();
             let task = tokio::spawn(async move {
                 let mut script = script.into_iter();
                 loop {
                     let (mut socket, _) = listener.accept().await.unwrap();
                     let (head, body) = read_http_request(&mut socket).await;
+                    wire_order.lock().unwrap().push("write");
+                    wire_written.notify_one();
                     captured.lock().unwrap().push(body);
                     captured_heads.lock().unwrap().push(head);
                     match script.next().unwrap_or(ScriptResponse::Http {
@@ -5550,6 +6259,7 @@ mod tests {
                         headers: Vec::new(),
                         body: br#"{"error":{"message":"unexpected extra attempt"}}"#,
                     }) {
+                        ScriptResponse::Hold => std::future::pending::<()>().await,
                         ScriptResponse::Http {
                             status,
                             headers,
@@ -5575,6 +6285,8 @@ mod tests {
                 requests,
                 heads,
                 task,
+                order,
+                written,
             }
         }
 
@@ -5598,6 +6310,1924 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    pub(super) struct TestAttemptHook {
+        pub(super) order: Arc<Mutex<Vec<&'static str>>>,
+        pub(super) sends: Mutex<Vec<(broca_wal::record::AttemptId, broca_core::run::PhysicalSend)>>,
+        pub(super) finished: Mutex<
+            Vec<(
+                broca_wal::record::AttemptId,
+                ModelAttempt,
+                broca_wal::record::BillingAttemptOutcome,
+            )>,
+        >,
+        pub(super) deny: bool,
+    }
+
+    impl TestAttemptHook {
+        pub(super) fn new(order: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                order,
+                sends: Default::default(),
+                finished: Default::default(),
+                deny: false,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl broca_core::run::AttemptHook for TestAttemptHook {
+        async fn before_send(
+            &self,
+            send: broca_core::run::PhysicalSend,
+            _cancel: CancellationToken,
+        ) -> Result<broca_wal::record::AttemptId, ProviderError> {
+            assert!(
+                send.warm.is_none(),
+                "model-step sends must not carry warm policy"
+            );
+            if self.deny {
+                let mut error = transport_error("reservation writer refused");
+                error.class = ErrorClass::Permanent;
+                error.provider_code = Some("attempt_durability_failed".into());
+                return Err(error);
+            }
+            let id = broca_core::attempt_id::mint_attempt_id().unwrap();
+            self.sends.lock().unwrap().push((id.clone(), send));
+            self.order.lock().unwrap().push("durable");
+            Ok(id)
+        }
+        async fn finished(
+            &self,
+            id: broca_wal::record::AttemptId,
+            attempt: ModelAttempt,
+            outcome: broca_wal::record::BillingAttemptOutcome,
+        ) -> Result<(), ProviderError> {
+            self.finished.lock().unwrap().push((id, attempt, outcome));
+            self.order.lock().unwrap().push("outcome");
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn attempt_reserved_before_every_send() {
+        let server = ScriptedServer::start(vec![
+            ScriptResponse::Http {
+                status: 503,
+                headers: vec![],
+                body: b"busy",
+            },
+            ScriptResponse::Http {
+                status: 503,
+                headers: vec![],
+                body: b"busy",
+            },
+            ScriptResponse::Http {
+                status: 200,
+                headers: vec![],
+                body: b"done",
+            },
+        ])
+        .await;
+        let mut provider = retry_test_provider(&server, 0);
+        use_virtual_retry_waits(&mut provider);
+        let hook = Arc::new(TestAttemptHook::new(server.order.clone()));
+        let mut stream = broca_core::Provider::step_with_runtime(
+            &provider,
+            StepId(1),
+            Arc::new(CallOptions::new(vec![])),
+            broca_core::provider::StepRuntime {
+                cancel: CancellationToken::new(),
+                deadline: None,
+                seal: None,
+                progress: None,
+                first_attempt: 0,
+                attempt_hook: Some(hook.clone()),
+            },
+        )
+        .await;
+        while stream.recv().await.is_some() {}
+        assert_eq!(
+            *server.order.lock().unwrap(),
+            [
+                "durable", "write", "outcome", "durable", "write", "outcome", "durable", "write",
+                "outcome"
+            ]
+        );
+        let sends = hook.sends.lock().unwrap();
+        assert_eq!(sends.len(), 3);
+        assert_eq!(
+            sends
+                .iter()
+                .map(|(_, send)| send.attempt)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        let ids: std::collections::BTreeSet<_> = sends.iter().map(|(id, _)| id).collect();
+        assert_eq!(ids.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn attempt_hook_failure_aborts_http_before_network_write() {
+        let server = ScriptedServer::start(vec![]).await;
+        let provider = retry_test_provider(&server, 0);
+        let hook = Arc::new(TestAttemptHook {
+            deny: true,
+            ..TestAttemptHook::new(server.order.clone())
+        });
+        let mut stream = broca_core::Provider::step_with_runtime(
+            &provider,
+            StepId(1),
+            Arc::new(CallOptions::new(vec![])),
+            broca_core::provider::StepRuntime {
+                cancel: CancellationToken::new(),
+                deadline: None,
+                seal: None,
+                progress: None,
+                first_attempt: 0,
+                attempt_hook: Some(hook),
+            },
+        )
+        .await;
+        let mut events = Vec::new();
+        while let Some(event) = stream.recv().await {
+            events.push(event);
+        }
+        assert_eq!(
+            terminal_error(&events).provider_code.as_deref(),
+            Some("attempt_durability_failed")
+        );
+        assert!(server.request_bodies().is_empty());
+    }
+
+    #[tokio::test]
+    async fn attempt_hook_reserves_websocket_retries_and_https_fallback() {
+        use futures::{SinkExt, StreamExt};
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let wire_order = order.clone();
+        let peer = tokio::spawn(async move {
+            for _ in 0..6 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut config = tungstenite::protocol::WebSocketConfig::default();
+                config.extensions.permessage_deflate =
+                    Some(tungstenite::extensions::compression::deflate::DeflateConfig::default());
+                let mut socket = tokio_tungstenite::accept_async_with_config(stream, Some(config))
+                    .await
+                    .unwrap();
+                let frame = socket.next().await.unwrap().unwrap();
+                assert!(frame.is_text());
+                wire_order.lock().unwrap().push("write");
+                socket
+                    .send(tungstenite::Message::Close(None))
+                    .await
+                    .unwrap();
+            }
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_request(&mut stream).await;
+            wire_order.lock().unwrap().push("write");
+            write_http_response(&mut stream, 200, &[], b"done").await;
+        });
+        let mut frozen = openai_chat_frozen_config("m");
+        frozen.family_id = crate::spec::WireFamilyId::OpenAiResponsesChatgpt;
+        frozen.base_url = Some(format!("http://{address}"));
+        let mut provider = LiveProvider::new(RetryTestFamily::new(0), frozen, AuthHandle::None);
+        use_virtual_retry_waits(&mut provider);
+        let hook = Arc::new(TestAttemptHook::new(order.clone()));
+        let mut stream = broca_core::Provider::step_with_runtime(
+            &provider,
+            StepId(1),
+            Arc::new(CallOptions::new(vec![])),
+            broca_core::provider::StepRuntime {
+                cancel: CancellationToken::new(),
+                deadline: None,
+                seal: None,
+                progress: None,
+                first_attempt: 0,
+                attempt_hook: Some(hook.clone()),
+            },
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while stream.recv().await.is_some() {}
+        })
+        .await
+        .unwrap();
+        peer.await.unwrap();
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["durable", "write", "outcome"].repeat(7)
+        );
+        assert_eq!(hook.sends.lock().unwrap().len(), 7);
+        let finished = hook.finished.lock().unwrap();
+        assert!(finished[..6]
+            .iter()
+            .all(|(_, attempt, _)| attempt.transport.as_deref() == Some("websocket")));
+        assert_eq!(finished[6].1.transport.as_deref(), Some("https"));
+    }
+
+    #[tokio::test]
+    async fn compressed_refusal_is_two_attempts() {
+        let server = ScriptedServer::start(vec![
+            ScriptResponse::Http {
+                status: 415,
+                headers: vec![],
+                body: b"",
+            },
+            ScriptResponse::Http {
+                status: 200,
+                headers: vec![],
+                body: b"done",
+            },
+        ])
+        .await;
+        let address: std::net::SocketAddr =
+            server.url.strip_prefix("http://").unwrap().parse().unwrap();
+        let client = ProviderHttpClient::resolving_anthropic_api_to(address, true);
+        let request = PreparedHttpRequest::from(HttpRequest {
+            method: HttpMethod::Post,
+            url: format!("http://api.anthropic.com:{}/messages", address.port()),
+            headers: vec![],
+            body: vec![b'x'; 100_000],
+        });
+        let hook = Arc::new(TestAttemptHook::new(server.order.clone()));
+        let mut trace = AttemptTrace {
+            attempt_hook: Some(hook.clone()),
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::channel(32);
+        drive_attempt(
+            &client,
+            &request,
+            &Clock::default(),
+            Box::new(SuccessAttemptNormalizer),
+            &tx,
+            Duration::from_secs(5),
+            &mut trace,
+        )
+        .await
+        .unwrap();
+        trace
+            .settle_send(
+                &RequestDigest::of(&request.body),
+                AttemptOutcome::Complete,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *server.order.lock().unwrap(),
+            ["durable", "write", "outcome", "durable", "write", "outcome"]
+        );
+        let sends = hook.sends.lock().unwrap();
+        assert_eq!(sends.len(), 2);
+        assert_ne!(sends[0].0, sends[1].0);
+        assert!(sends[0].1.compressed);
+        assert_eq!(sends[0].1.send_index, 1);
+        assert!(!sends[1].1.compressed);
+        assert_eq!(sends[1].1.send_index, 2);
+        let terminals = hook.finished.lock().unwrap();
+        assert_eq!(terminals[0].0, sends[0].0);
+        assert_eq!(
+            terminals[0].2,
+            broca_wal::record::BillingAttemptOutcome::CompressionRefused
+        );
+        assert_eq!(terminals[0].1.http_status, Some(415));
+        assert!(terminals[0].1.sent_at_ms.is_some());
+        assert_eq!(terminals[1].0, sends[1].0);
+    }
+
+    #[tokio::test]
+    async fn connect_failure_has_no_sent_at() {
+        // Bind and release a local port to get a real reqwest connect error, rather than
+        // exercising only the transport's synthetic fail-connect switch.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let request = PreparedHttpRequest::from(HttpRequest {
+            method: HttpMethod::Post,
+            url: format!("http://{address}"),
+            headers: vec![],
+            body: b"{}".to_vec(),
+        });
+        let hook = Arc::new(TestAttemptHook::new(Default::default()));
+        let mut trace = AttemptTrace {
+            attempt_hook: Some(hook.clone()),
+            ..Default::default()
+        };
+        let failure = send_attempt(
+            &build_provider_http_client(),
+            &request,
+            false,
+            None,
+            Duration::from_secs(5),
+            &mut trace,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure.outcome, AttemptOutcome::ConnectFailed);
+        assert_eq!(trace.sent_at_ms, None);
+        trace
+            .settle_send(&RequestDigest::of(&request.body), failure.outcome, None)
+            .await
+            .unwrap();
+        assert_eq!(hook.sends.lock().unwrap().len(), 1);
+        assert_eq!(hook.finished.lock().unwrap()[0].1.sent_at_ms, None);
+    }
+
+    async fn one_post_redirect(
+        status: u16,
+        location: String,
+    ) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let url = format!("http://{}/original", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let (head, body) = read_http_request(&mut socket).await;
+            assert!(head.starts_with("POST /original HTTP/1.1"));
+            write_http_response(&mut socket, status, &[("location", &location)], b"").await;
+            body
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn journaled_redirects_stop_before_second_post() {
+        for status in [307, 308] {
+            for journaled in [false, true] {
+                let target = ScriptedServer::start(vec![ScriptResponse::Http {
+                    status: 400,
+                    headers: vec![],
+                    body: b"second POST",
+                }])
+                .await;
+                let port = reqwest::Url::parse(&target.url).unwrap().port().unwrap();
+                let (url, source) =
+                    one_post_redirect(status, format!("http://localhost:{port}/redirected")).await;
+                let request = PreparedHttpRequest::from(HttpRequest {
+                    method: HttpMethod::Post,
+                    url,
+                    headers: vec![],
+                    body: b"model request".to_vec(),
+                });
+                let hook = Arc::new(TestAttemptHook::new(Default::default()));
+                let mut trace = AttemptTrace {
+                    attempt_hook: journaled
+                        .then(|| hook.clone() as Arc<dyn broca_core::run::AttemptHook>),
+                    ..Default::default()
+                };
+                let response = send_attempt(
+                    &build_provider_http_client(),
+                    &request,
+                    false,
+                    None,
+                    Duration::from_secs(5),
+                    &mut trace,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    response.status().as_u16(),
+                    if journaled { status } else { 400 }
+                );
+                assert_eq!(source.await.unwrap(), b"model request");
+                assert_eq!(target.request_bodies().len(), usize::from(!journaled));
+                if !journaled {
+                    assert_eq!(target.request_bodies()[0], b"model request");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn journaled_redirect_to_refused_connection_keeps_sent_evidence() {
+        for status in [307, 308] {
+            let refused = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = refused.local_addr().unwrap();
+            drop(refused);
+            let (url, source) = one_post_redirect(
+                status,
+                format!("http://localhost:{}/redirected", address.port()),
+            )
+            .await;
+            let request = PreparedHttpRequest::from(HttpRequest {
+                method: HttpMethod::Post,
+                url,
+                headers: vec![],
+                body: b"model request".to_vec(),
+            });
+            let hook = Arc::new(TestAttemptHook::new(Default::default()));
+            let mut trace = AttemptTrace {
+                attempt_hook: Some(hook.clone()),
+                ..Default::default()
+            };
+            let response = send_attempt(
+                &build_provider_http_client(),
+                &request,
+                false,
+                None,
+                Duration::from_secs(5),
+                &mut trace,
+            )
+            .await;
+            assert!(
+                response.is_ok(),
+                "original POST received a redirect, not a connect refusal: {response:?}"
+            );
+            assert_eq!(response.unwrap().status().as_u16(), status);
+            assert_eq!(source.await.unwrap(), b"model request");
+            assert!(trace.sent_at_ms.is_some());
+            assert_eq!(hook.sends.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn legacy_render_keeps_billing_only_metadata_absent() {
+        let mut frozen = crate::families::anthropic_frozen_config("m");
+        frozen.speed = Some("fast".into());
+        let rendered = super::RenderJob {
+            #[cfg(feature = "test-attachments")]
+            media_renderer: None,
+            #[cfg(feature = "test-attachments")]
+            media_render_tags: false,
+            auth_revision: 0,
+            family: Arc::new(AnthropicMessages),
+            frozen: Arc::new(frozen),
+            auth: Arc::new(AuthHandle::None),
+            opts: Arc::new(CallOptions::new(Vec::new())),
+            step_id: StepId(1),
+        }
+        .render()
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&rendered.request.body).unwrap()["speed"],
+            "fast"
+        );
+        assert!(rendered.request.attempt_hook.is_none());
+        assert_eq!(
+            rendered.request.speed_requested, None,
+            "legacy render must not clone billing-only speed metadata"
+        );
+    }
+
+    #[test]
+    #[ignore = "manual measurement of retained HTTP-wrapper sharing overhead"]
+    fn legacy_http_wrapper_sharing_component_cost() {
+        const ITERATIONS: u128 = 100_000;
+        const SAMPLES: usize = 9;
+        let client = build_provider_http_client();
+        let mut allocation = Vec::with_capacity(SAMPLES);
+        let mut cloning = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let start = std::time::Instant::now();
+            for _ in 0..ITERATIONS {
+                std::hint::black_box(Arc::new(super::JournaledHttpClients {
+                    clients: std::sync::OnceLock::new(),
+                    builder: Box::new(super::provider_client_builder),
+                }));
+            }
+            allocation.push(start.elapsed().as_nanos() / ITERATIONS);
+            let start = std::time::Instant::now();
+            for _ in 0..ITERATIONS {
+                std::hint::black_box(Arc::clone(&client.journaled));
+            }
+            cloning.push(start.elapsed().as_nanos() / ITERATIONS);
+        }
+        allocation.sort_unstable();
+        cloning.sort_unstable();
+        assert!(client.journaled.clients.get().is_none());
+        // Isolate the retained sharing component, not TLS/client construction or a
+        // historical implementation. Each sample includes loop and drop overhead.
+        println!("legacy sharing component: os={} debug_assertions={} batches={SAMPLES} iterations_per_batch={ITERATIONS} arc_allocate_drop_median_batch_mean_ns={} arc_clone_drop_median_batch_mean_ns={}",
+            std::env::consts::OS, cfg!(debug_assertions), allocation[SAMPLES / 2], cloning[SAMPLES / 2]);
+    }
+
+    #[tokio::test]
+    async fn journaled_render_attaches_speed_metadata_before_send() {
+        let server = ScriptedServer::start(vec![ScriptResponse::Http {
+            status: 400,
+            headers: vec![],
+            body: b"invalid",
+        }])
+        .await;
+        let mut frozen = crate::families::anthropic_frozen_config("m");
+        frozen.base_url = Some(server.url.clone());
+        frozen.speed = Some("fast".into());
+        let provider = LiveProvider::new(AnthropicMessages, frozen, AuthHandle::None);
+        let hook = Arc::new(TestAttemptHook::new(Default::default()));
+        let mut stream = broca_core::Provider::step_with_runtime(
+            &provider,
+            StepId(1),
+            Arc::new(CallOptions::new(Vec::new())),
+            broca_core::provider::StepRuntime {
+                cancel: CancellationToken::new(),
+                deadline: None,
+                seal: None,
+                progress: None,
+                first_attempt: 0,
+                attempt_hook: Some(hook.clone()),
+            },
+        )
+        .await;
+        while stream.recv().await.is_some() {}
+        assert_eq!(
+            hook.sends.lock().unwrap()[0].1.speed_requested.as_deref(),
+            Some("fast")
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&server.request_bodies()[0]).unwrap()["speed"],
+            "fast"
+        );
+    }
+
+    struct SettlementDelayHook {
+        inner: TestAttemptHook,
+        waits: Arc<Mutex<Vec<Duration>>>,
+    }
+    #[async_trait::async_trait]
+    impl broca_core::run::AttemptHook for SettlementDelayHook {
+        async fn before_send(
+            &self,
+            send: broca_core::run::PhysicalSend,
+            cancel: CancellationToken,
+        ) -> Result<broca_wal::record::AttemptId, ProviderError> {
+            broca_core::run::AttemptHook::before_send(&self.inner, send, cancel).await
+        }
+        async fn finished(
+            &self,
+            id: broca_wal::record::AttemptId,
+            attempt: ModelAttempt,
+            outcome: broca_wal::record::BillingAttemptOutcome,
+        ) -> Result<(), ProviderError> {
+            self.waits.lock().unwrap().push(Duration::from_secs(239));
+            broca_core::run::AttemptHook::finished(&self.inner, id, attempt, outcome).await
+        }
+    }
+
+    #[tokio::test]
+    async fn settlement_wait_is_excluded_from_retry_wall_budget() {
+        let server = ScriptedServer::start(vec![
+            ScriptResponse::Http {
+                status: 429,
+                headers: vec![("retry-after", "2")],
+                body: b"",
+            },
+            ScriptResponse::Http {
+                status: 200,
+                headers: vec![],
+                body: b"done",
+            },
+        ])
+        .await;
+        let mut provider = retry_test_provider(&server, 0);
+        let waits = use_virtual_retry_waits(&mut provider);
+        let hook = Arc::new(SettlementDelayHook {
+            inner: TestAttemptHook::new(Default::default()),
+            waits: waits.clone(),
+        });
+        let mut stream = broca_core::Provider::step_with_runtime(
+            &provider,
+            StepId(1),
+            Arc::new(CallOptions::new(vec![])),
+            broca_core::provider::StepRuntime {
+                cancel: CancellationToken::new(),
+                deadline: None,
+                seal: None,
+                progress: None,
+                first_attempt: 0,
+                attempt_hook: Some(hook),
+            },
+        )
+        .await;
+        let mut events = Vec::new();
+        while let Some(event) = stream.recv().await {
+            events.push(event);
+        }
+        assert_eq!(
+            server.request_bodies().len(),
+            2,
+            "settlement wait must not consume the legacy network retry budget"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            NormalizedEvent::Control(ProviderControl::Finished { .. })
+        )));
+        assert_eq!(
+            *waits.lock().unwrap(),
+            [
+                Duration::from_secs(239),
+                Duration::from_secs(2),
+                Duration::from_secs(239)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_entry_points_match_wall_boundary_expectations() {
+        for (second_elapsed, expected_count) in [
+            (Duration::from_secs(18) - Duration::from_nanos(1), 3),
+            (Duration::from_secs(18), 3),
+            (Duration::from_secs(18) + Duration::from_nanos(1), 2),
+        ] {
+            let mut paths = Vec::new();
+            for runtime_entry in [false, true] {
+                let server = ScriptedServer::start(vec![
+                    ScriptResponse::Http {
+                        status: 429,
+                        headers: vec![("retry-after", "2")],
+                        body: b"",
+                    },
+                    ScriptResponse::Http {
+                        status: 429,
+                        headers: vec![("retry-after", "120")],
+                        body: b"",
+                    },
+                    ScriptResponse::Http {
+                        status: 429,
+                        headers: vec![("retry-after", "2")],
+                        body: b"",
+                    },
+                ])
+                .await;
+                let mut provider = retry_test_provider(&server, 0);
+                let waits = use_virtual_retry_waits(&mut provider);
+                provider.retry_clock.virtual_retry_attempts = Some(Arc::new(Mutex::new(
+                    [Duration::from_secs(100), second_elapsed, Duration::ZERO].into(),
+                )));
+                provider.retry_clock.virtual_wait_overhead = Some(Duration::ZERO);
+                let mut stream = if runtime_entry {
+                    broca_core::Provider::step_with_runtime(
+                        &provider,
+                        StepId(1),
+                        Arc::new(CallOptions::new(vec![])),
+                        broca_core::provider::StepRuntime {
+                            cancel: CancellationToken::new(),
+                            deadline: None,
+                            seal: None,
+                            progress: None,
+                            first_attempt: 0,
+                            attempt_hook: None,
+                        },
+                    )
+                    .await
+                } else {
+                    provider.start_step(
+                        StepId(1),
+                        Arc::new(CallOptions::new(Vec::new())),
+                        CancellationToken::new(),
+                        None,
+                    )
+                };
+                let mut records = Vec::new();
+                let mut retries_used = None;
+                while let Some(event) = stream.recv().await {
+                    if let NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }) =
+                        event
+                    {
+                        assert_eq!(attempt.attempt as usize, records.len());
+                        assert_eq!(attempt.outcome, AttemptOutcome::HttpError);
+                        assert_eq!(attempt.http_status, Some(429));
+                        assert_eq!(attempt.transport.as_deref(), Some("https"));
+                        assert_eq!(attempt.response_body_len, 0);
+                        assert_eq!(
+                            attempt.request_body_len as usize,
+                            br#"{"retry_test":"byte-identical"}"#.len()
+                        );
+                        let mut value = serde_json::to_value(attempt).unwrap();
+                        value.as_object_mut().unwrap().remove("ts_ms");
+                        value.as_object_mut().unwrap().remove("sent_at_ms");
+                        records.push(value);
+                    } else if let NormalizedEvent::Control(ProviderControl::Error {
+                        retries_used: retries,
+                        ..
+                    }) = event
+                    {
+                        retries_used = Some(retries);
+                    }
+                }
+                // The strict greater-than predicate permits equality at 240 s, but not one nanosecond
+                // beyond it: 100 s + 2 s + second_elapsed + the 120 s Retry-After.
+                assert_eq!(records.len(), expected_count);
+                assert_eq!(retries_used, Some(expected_count as u32 - 1));
+                assert_eq!(server.request_bodies().len(), expected_count);
+                assert!(
+                    provider.client.journaled.clients.get().is_none(),
+                    "legacy retry must not build journal-only HTTP pools"
+                );
+                assert_eq!(
+                    *waits.lock().unwrap(),
+                    if expected_count == 3 {
+                        vec![Duration::from_secs(2), Duration::from_secs(120)]
+                    } else {
+                        vec![Duration::from_secs(2)]
+                    }
+                );
+                paths.push(records);
+            }
+            assert_eq!(paths[0], paths[1], "legacy entry points must produce identical attempt records apart from wall-clock timestamps");
+        }
+    }
+
+    fn attempt_scratch(label: &str) -> PathBuf {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/scratch")
+            .join(format!(
+                "{label}-{}",
+                broca_core::attempt_id::mint_attempt_id().unwrap().as_str()
+            ));
+        std::fs::create_dir_all(&root).unwrap();
+        root.canonicalize().unwrap()
+    }
+
+    fn attempt_run_request(session: broca_protocol::BindIdentity) -> broca_core::RunRequest {
+        let submission = serde_json::from_value(serde_json::json!({
+            "model":{"provider_module_id":"test","model_id":"m"}, "input":[], "tools":[]
+        }))
+        .unwrap();
+        let mut req = broca_core::RunRequest::from_submission(
+            submission,
+            broca_protocol::RunId("attempt-run".into()),
+            session,
+            broca_protocol::SubmissionId("unused".into()),
+        );
+        req.submission_id = None;
+        req.retention = Some(7 * DAY_MS);
+        req
+    }
+
+    fn attempt_session() -> broca_protocol::BindIdentity {
+        serde_json::from_value(serde_json::json!({"project_root":"/project", "harness":"runner", "session":"attempt-session"})).unwrap()
+    }
+
+    fn warm_template() -> broca_wal::record::AttemptReservation {
+        serde_json::from_value(serde_json::json!({
+            "run_id":"finished-run", "step_id":1, "attempt":0, "send_index":1, "warm":true,
+            "reserved_at_ms":100, "provider":"anthropic", "endpoint_host":"", "model_sent":"m",
+            "credential":{}, "run":{}, "session":{
+                "project_root":"/project", "harness":"runner", "session":"attempt-session", "session_ref":"ref"
+            }, "request_body_bytes":0, "compressed":false
+        })).unwrap()
+    }
+
+    fn warm_request(url: String, large: bool) -> HttpRequest {
+        HttpRequest {
+            method: crate::wire::HttpMethod::Post,
+            url,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
+                if large {
+                    "n".repeat(20_000)
+                } else {
+                    "q".into()
+                }
+            )
+            .into_bytes(),
+        }
+    }
+
+    async fn warm_writer(
+        root: &std::path::Path,
+    ) -> (Arc<broca_core::WalHandle>, broca_core::FileWalStore) {
+        use broca_core::WalStore;
+        let store =
+            broca_core::FileWalStore::with_config(root.join("wal"), broca_wal::WalConfig::OVERHAUL);
+        let writer = broca_core::WalHandle::spawn_in_store_with_fs_for_test(
+            store.open(&attempt_session()).unwrap(),
+            &store,
+            &attempt_session(),
+            1,
+            None,
+            Arc::new(broca_wal::fs_ops::RealFs),
+        )
+        .unwrap();
+        (Arc::new(writer), store)
+    }
+
+    #[tokio::test]
+    async fn warm_default_hook_refuses_settlement() {
+        use broca_core::run::AttemptHook;
+        let hook = TestAttemptHook::new(Default::default());
+        let error = hook
+            .warm_finished(
+                broca_core::attempt_id::mint_attempt_id().unwrap(),
+                Default::default(),
+                None,
+                "aa".into(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.provider_code.as_deref(),
+            Some("attempt_durability_failed")
+        );
+        assert!(hook.sends.lock().unwrap().is_empty());
+        assert!(hook.finished.lock().unwrap().is_empty());
+        assert!(hook.order.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn warm_compressed_refusal_is_two_attempts() {
+        use broca_core::WalStore;
+        use broca_wal::{record::BillingAttemptOutcome as Outcome, WalRecord};
+        let server = ScriptedServer::start(vec![
+            ScriptResponse::Http {
+                status: 415,
+                headers: vec![],
+                body: b"",
+            },
+            ScriptResponse::Http {
+                status: 200,
+                headers: vec![],
+                body: br#"{"usage":{"input_tokens":3,"cache_read_input_tokens":4000}}"#,
+            },
+        ])
+        .await;
+        let address: std::net::SocketAddr =
+            server.url.strip_prefix("http://").unwrap().parse().unwrap();
+        let client = ProviderHttpClient::resolving_anthropic_api_to(address, true);
+        let root = attempt_scratch("warm-compression");
+        let (writer, store) = warm_writer(&root).await;
+        let journal = Arc::new(broca_core::cache_warm::WarmJournal::new(
+            writer.clone(),
+            broca_core::ShutdownSeal::new(),
+            warm_template(),
+            "base".into(),
+            None,
+        ));
+        let sent = super::send_warm(
+            &client,
+            &Clock::default(),
+            warm_request(
+                format!("http://api.anthropic.com:{}/v1/messages", address.port()),
+                true,
+            ),
+            crate::spec::WireFamilyId::AnthropicMessages,
+            None,
+            Some(journal),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent.usage.cached_input_tokens, Some(4000));
+        Arc::try_unwrap(writer)
+            .ok()
+            .expect("warm journal released writer")
+            .shutdown()
+            .await
+            .unwrap();
+        let frames = store.read_records(&attempt_session()).unwrap();
+        let reservations: Vec<_> = frames
+            .iter()
+            .filter_map(|f| match &f.record {
+                WalRecord::AttemptReserved {
+                    attempt_id,
+                    reservation,
+                } => Some((attempt_id, reservation)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reservations.len(), 2);
+        assert_ne!(reservations[0].0, reservations[1].0);
+        for (i, (id, reservation)) in reservations.iter().enumerate() {
+            assert_eq!(id.as_str().len(), 32);
+            assert!(id
+                .as_str()
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+            assert_eq!(reservation.send_index, i as u32 + 1);
+            assert_eq!(reservation.compressed, i == 0);
+            assert!(reservation.warm);
+            let outcomes: Vec<_> = frames
+                .iter()
+                .filter_map(|f| match &f.record {
+                    WalRecord::CacheWarmed {
+                        attempt_id: Some(terminal_id),
+                        envelope: Some(envelope),
+                        ..
+                    } if terminal_id == *id => Some(envelope),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(
+                outcomes[0].outcome,
+                if i == 0 {
+                    Outcome::CompressionRefused
+                } else {
+                    Outcome::Complete
+                }
+            );
+            assert_eq!(outcomes[0].usage.is_some(), i == 1);
+        }
+        let kinds: Vec<_> = frames
+            .iter()
+            .filter_map(|f| match f.record {
+                WalRecord::AttemptReserved { .. } => Some("reserve"),
+                WalRecord::CacheWarmed { .. } => Some("finish"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds, ["reserve", "finish", "reserve", "finish"]);
+        assert_eq!(
+            server.request_header("content-encoding"),
+            [Some("gzip".into()), None]
+        );
+        let path = store
+            .resolve_live_path(&attempt_session())
+            .unwrap()
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let proof = std::fs::read(broca_wal::head_proof::sidecar_path(&path)).unwrap();
+        let items: Vec<_> = broca_wal_reader::billing::billed(&bytes[..], &proof, None)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            items.len(),
+            2,
+            "reader accepts every warm outcome, including compression refusal"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn warm_tariff_evidence_uses_the_selected_frozen_marker_policy() {
+        use crate::wire::{CacheClass, CachePolicy, CacheTtl, MarkerSyntax, RefusalFallbackConfig};
+        use broca_core::{Provider, WalStore};
+        let response = || ScriptResponse::Http {
+            status: 400,
+            headers: vec![],
+            body:
+                br#"{"usage":{"input_tokens":0,"cache_creation_input_tokens":2,"output_tokens":0}}"#,
+        };
+        let server = ScriptedServer::start(vec![response(), response()]).await;
+        let cache = |ttl| CachePolicy {
+            version: 1,
+            class: CacheClass::Markers {
+                syntax: MarkerSyntax::AnthropicCacheControl,
+                ttl,
+                max_breakpoints: 4,
+                lookback_blocks: 20,
+                tail: None,
+                omit_ttl: false,
+            },
+        };
+        let mut source = crate::families::anthropic_frozen_config("source");
+        source.base_url = Some(server.url.clone());
+        source.cache = Some(cache(CacheTtl::FiveMinutes));
+        let mut fallback = source.clone();
+        fallback.wire_model_id = "fallback".into();
+        fallback.cache = Some(cache(CacheTtl::OneHour));
+        source.refusal_fallback = Some(Box::new(RefusalFallbackConfig {
+            model: broca_protocol::request::ModelHandle::new("anthropic", "fallback"),
+            context_limit: None,
+            frozen: fallback,
+        }));
+        let provider =
+            LiveProvider::new(crate::families::AnthropicMessages, source, AuthHandle::None);
+        let root = attempt_scratch("warm-frozen-tariff");
+        let (writer, store) = warm_writer(&root).await;
+        for (route, model, ttl) in [
+            (
+                broca_core::refusal_fallback::StepRoute::Source,
+                "source",
+                "5m",
+            ),
+            (
+                broca_core::refusal_fallback::StepRoute::Fallback,
+                "fallback",
+                "1h",
+            ),
+        ] {
+            provider.set_step_route(route);
+            let journal = Arc::new(broca_core::cache_warm::WarmJournal::new(
+                writer.clone(),
+                broca_core::ShutdownSeal::new(),
+                warm_template(),
+                "base".into(),
+                None,
+            ));
+            let body = serde_json::to_vec(&serde_json::json!({"model":model,"max_tokens":64,"messages":[{"role":"user","content":[{"type":"text","text":"q","cache_control":{"type":"ephemeral","ttl":ttl}}]}]})).unwrap();
+            assert!(provider.warm_with_hook(&body, Some(journal)).await.is_err());
+        }
+        Arc::try_unwrap(writer)
+            .ok()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+        let records = store.read_records(&attempt_session()).unwrap();
+        let evidence: Vec<_> = records
+            .iter()
+            .filter_map(|f| match &f.record {
+                broca_wal::WalRecord::CacheWarmed {
+                    reservation: Some(r),
+                    ttl_ms,
+                    ..
+                } => Some((r.model_sent.as_str(), *ttl_ms)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            evidence,
+            [("source", Some(300_000)), ("fallback", Some(3_600_000))]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn warm_redirect_has_no_unreserved_followup() {
+        use broca_core::WalStore;
+        let server = ScriptedServer::start(vec![ScriptResponse::Http {
+            status: 307,
+            headers: vec![("location", "/followup")],
+            body: b"redirect",
+        }])
+        .await;
+        let root = attempt_scratch("warm-redirect");
+        let (writer, store) = warm_writer(&root).await;
+        let journal = Arc::new(broca_core::cache_warm::WarmJournal::new(
+            writer.clone(),
+            broca_core::ShutdownSeal::new(),
+            warm_template(),
+            "base".into(),
+            None,
+        ));
+        assert!(super::send_warm(
+            &super::build_provider_http_client(),
+            &Clock::default(),
+            warm_request(server.url.clone(), false),
+            crate::spec::WireFamilyId::AnthropicMessages,
+            None,
+            Some(journal),
+            None,
+        )
+        .await
+        .is_err());
+        Arc::try_unwrap(writer)
+            .ok()
+            .expect("warm journal released writer")
+            .shutdown()
+            .await
+            .unwrap();
+        assert_eq!(server.request_bodies().len(), 1);
+        assert_eq!(
+            store
+                .read_records(&attempt_session())
+                .unwrap()
+                .iter()
+                .filter(|f| matches!(f.record, broca_wal::WalRecord::CacheWarmed { .. }))
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn warm_timeout_after_send_records_once() {
+        use broca_core::WalStore;
+        let server = ScriptedServer::start(vec![ScriptResponse::Hold]).await;
+        let root = attempt_scratch("warm-timeout");
+        let (writer, store) = warm_writer(&root).await;
+        let journal = Arc::new(broca_core::cache_warm::WarmJournal::new(
+            writer.clone(),
+            broca_core::ShutdownSeal::new(),
+            warm_template(),
+            "base".into(),
+            None,
+        ));
+        let url = server.url.clone();
+        let task = tokio::spawn(async move {
+            super::send_warm(
+                &super::build_provider_http_client(),
+                &Clock::default(),
+                warm_request(url, false),
+                crate::spec::WireFamilyId::AnthropicMessages,
+                None,
+                Some(journal),
+                None,
+            )
+            .await
+        });
+        server.written.notified().await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        // Disk sync is real blocking I/O; restore real time before waiting for settlement.
+        tokio::time::resume();
+        assert!(task.await.unwrap().is_err());
+        Arc::try_unwrap(writer)
+            .ok()
+            .expect("warm released writer")
+            .shutdown()
+            .await
+            .unwrap();
+        let frames = store.read_records(&attempt_session()).unwrap();
+        let outcomes: Vec<_> = frames
+            .iter()
+            .filter_map(|f| match &f.record {
+                broca_wal::WalRecord::CacheWarmed {
+                    envelope: Some(envelope),
+                    ..
+                } => Some(envelope),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].outcome,
+            broca_wal::record::BillingAttemptOutcome::HeaderTimeout
+        );
+        assert_eq!(outcomes[0].sent, broca_wal::record::AttemptSent::Yes);
+        assert_eq!(outcomes[0].usage, None);
+        assert_eq!(server.request_bodies().len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Only the Unix-only power-loss test below uses this check.
+    #[cfg(unix)]
+    fn assert_warm_possibly_billed_once(root: &std::path::Path) {
+        use broca_wal_reader::billing::{self, AttemptStatus, Item};
+        let store =
+            broca_core::FileWalStore::with_config(root.join("wal"), broca_wal::WalConfig::OVERHAUL);
+        let path = store
+            .resolve_live_path(&attempt_session())
+            .unwrap()
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let proof = std::fs::read(broca_wal::head_proof::sidecar_path(&path)).unwrap();
+        let mut reader = billing::billed(&bytes[..], &proof, None).unwrap();
+        let items: Vec<_> = reader.by_ref().map(Result::unwrap).collect();
+        assert_eq!(
+            items.len(),
+            1,
+            "idle warm must produce exactly one billing item"
+        );
+        let Item::Billed(attempt) = &items[0] else {
+            panic!("expected possibly billed warm: {:?}", items[0]);
+        };
+        assert_eq!(attempt.status, AttemptStatus::PossiblyBilled);
+        assert!(attempt.typed_reservation().unwrap().warm);
+        assert!(attempt.typed_envelope().unwrap().is_none());
+        let checkpoint = reader
+            .checkpoint()
+            .expect("reclaim closed the outstanding warm");
+        assert_eq!(
+            billing::billed(&bytes[..], &proof, Some(checkpoint))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    // The power-loss recording models file identity, and so hard links, only on Unix, and it
+    // refuses a non-empty initial root elsewhere. This test records an existing overhaul root.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warm_idle_crash_and_power_loss_reclaim_once() {
+        use broca_core::run::AttemptHook;
+        use broca_crash_harness::power_loss::RecordingFs;
+        use broca_wal::{FileWal, PreparedV4Frame, Wal, WalRecord};
+        let root = attempt_scratch("warm-idle-cuts");
+        let capture = root.join("capture");
+        std::fs::create_dir_all(&capture).unwrap();
+        let (writer, _) = warm_writer(&capture).await;
+        let journal = broca_core::cache_warm::WarmJournal::new(
+            writer.clone(),
+            broca_core::ShutdownSeal::new(),
+            warm_template(),
+            "base".into(),
+            None,
+        );
+        let id = journal
+            .before_send(
+                broca_core::run::PhysicalSend {
+                    attempt: 0,
+                    send_index: 1,
+                    endpoint_host: "example.com".into(),
+                    model_sent: "m".into(),
+                    request_body_bytes: 10,
+                    compressed: false,
+                    account_ref: None,
+                    speed_requested: None,
+                    warm: None,
+                },
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        use broca_core::WalStore;
+        let store = broca_core::FileWalStore::with_config(
+            capture.join("wal"),
+            broca_wal::WalConfig::OVERHAUL,
+        );
+        let reservation = store
+            .read_records(&attempt_session())
+            .unwrap()
+            .into_iter()
+            .find_map(|f| match f.record {
+                r @ WalRecord::AttemptReserved { .. } => Some(r),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            matches!(&reservation, WalRecord::AttemptReserved { attempt_id, .. } if attempt_id == &id)
+        );
+        drop(journal);
+        Arc::try_unwrap(writer)
+            .ok()
+            .expect("warm journal released writer")
+            .shutdown()
+            .await
+            .unwrap();
+
+        let log = PathBuf::from("wal").join(format!(
+            "{}.wal",
+            broca_core::wal_writer::session_addr(&attempt_session())
+        ));
+        let phase = root.join("in-flight");
+        std::fs::create_dir_all(phase.join("wal")).unwrap();
+        let floor = phase.join(broca_wal::FEATURE_FLOOR_FILENAME);
+        broca_wal::floor::raise_floor(&floor, broca_wal::framing::KNOWN_FEATURES).unwrap();
+        {
+            let mut wal = FileWal::open(phase.join(&log))
+                .unwrap()
+                .with_feature_floor(floor.clone())
+                .with_wal_config(broca_wal::WalConfig::OVERHAUL)
+                .unwrap();
+            let opened = WalRecord::WriterOpened {
+                writer_id: wal.writer_id().unwrap(),
+                previous_writer_id: None,
+                recovered_through_seq: 0,
+                cause: "test".into(),
+            };
+            wal.append_v4(
+                1,
+                &opened,
+                true,
+                PreparedV4Frame::prepare(&opened).unwrap(),
+                1,
+            )
+            .unwrap();
+        }
+        let recording = Arc::new(RecordingFs::new(&phase).unwrap());
+        broca_wal::fs_ops::with_fs_ops(recording.clone(), || {
+            let mut wal = FileWal::open(phase.join(&log))
+                .unwrap()
+                .with_feature_floor(floor)
+                .with_wal_config(broca_wal::WalConfig::OVERHAUL)
+                .unwrap();
+            wal.append_v4(
+                1,
+                &reservation,
+                true,
+                PreparedV4Frame::prepare(&reservation).unwrap(),
+                2,
+            )
+            .unwrap();
+        });
+        // A crash after recording the reservation leaves it intact and writes no terminal
+        // attempt record, so reclaim must report that warm as possibly billed.
+        let images = recording.enumerate(100_000).unwrap();
+        assert!(!images.is_empty());
+        recording.assert_all_cuts_covered(&images);
+        reclaim_attempt_image(&phase, Arc::new(broca_wal::fs_ops::RealFs)).await;
+        assert_warm_possibly_billed_once(&phase);
+        reclaim_attempt_image(&phase, Arc::new(broca_wal::fs_ops::RealFs)).await;
+        assert_warm_possibly_billed_once(&phase);
+        let mut warm_images = 0;
+        let mut recovery_images = 0;
+        for (index, image) in images.iter().enumerate() {
+            let image_root = root.join(format!("power-{index}"));
+            image.state.install(&image_root).unwrap();
+            let recovery = Arc::new(RecordingFs::new(&image_root).unwrap());
+            // Enumerate recovery of the physical log separately from the writer lifecycle;
+            // separate tests cover interruptions during writer startup and shutdown while
+            // the session lease is held.
+            broca_wal::fs_ops::with_fs_ops(recovery.clone(), || {
+                FileWal::open(image_root.join(&log))
+                    .unwrap()
+                    .replay()
+                    .unwrap();
+            });
+            let second_images = recovery.enumerate(100_000).unwrap();
+            recovery.assert_all_cuts_covered(&second_images);
+            let recovered =
+                reclaim_attempt_image(&image_root, Arc::new(broca_wal::fs_ops::RealFs)).await;
+            let has_reservation = recovered
+                .iter()
+                .any(|f| matches!(f.record, WalRecord::AttemptReserved { .. }));
+            if has_reservation {
+                warm_images += 1;
+                assert_warm_possibly_billed_once(&image_root);
+            }
+            for (second_index, second) in second_images.iter().enumerate() {
+                recovery_images += 1;
+                assert!(recovery_images <= 100_000, "recovery cut budget exceeded");
+                let second_root = root.join(format!("recovery-{index}-{second_index}"));
+                second.state.install(&second_root).unwrap();
+                let frames =
+                    reclaim_attempt_image(&second_root, Arc::new(broca_wal::fs_ops::RealFs)).await;
+                if frames
+                    .iter()
+                    .any(|f| matches!(f.record, WalRecord::AttemptReserved { .. }))
+                {
+                    assert_warm_possibly_billed_once(&second_root);
+                }
+                std::fs::remove_dir_all(second_root).unwrap();
+            }
+            std::fs::remove_dir_all(image_root).unwrap();
+        }
+        assert!(warm_images > 0);
+        assert!(recovery_images > 0);
+        eprintln!("idle warm: {} power cuts, {warm_images} retained reservations, {recovery_images} recovery cuts", images.len());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    async fn run_recorded_attempt<P: broca_core::Provider>(
+        root: &std::path::Path,
+        provider: &P,
+        control: broca_core::RunControl,
+        recording: Arc<broca_crash_harness::power_loss::RecordingFs>,
+    ) -> Vec<broca_wal::FramedRecord> {
+        use broca_core::{FileWalStore, WalHandle, WalStore};
+        let session = attempt_session();
+        let store = FileWalStore::with_config(root.join("wal"), broca_wal::WalConfig::OVERHAUL);
+        let wal =
+            broca_wal::fs_ops::with_fs_ops(recording.clone(), || store.open(&session)).unwrap();
+        let writer =
+            WalHandle::spawn_in_store_with_fs_for_test(wal, &store, &session, 1, None, recording)
+                .unwrap();
+        let (out, _rx) = mpsc::channel(128);
+        broca_core::run::run_loop_on_writer(
+            attempt_run_request(session.clone()),
+            &writer,
+            broca_core::run::StartMode::FreshOrResume,
+            provider,
+            &broca_core::StubToolPlane::new(),
+            &broca_core::AllowAll,
+            &store,
+            None,
+            control,
+            &out,
+        )
+        .await
+        .unwrap();
+        writer.shutdown().await.unwrap();
+        store.read_records(&session).unwrap()
+    }
+
+    fn assert_attempts_settled_or_superseded(frames: &[broca_wal::FramedRecord]) -> usize {
+        use broca_wal::WalRecord;
+        let mut writer_id = None;
+        let mut reservations = std::collections::BTreeMap::new();
+        for frame in frames {
+            match &frame.record {
+                WalRecord::WriterOpened { writer_id: id, .. } => writer_id = Some(*id),
+                WalRecord::AttemptReserved { attempt_id, .. } => {
+                    assert!(reservations
+                        .insert(attempt_id.clone(), (frame.seq, writer_id.unwrap()))
+                        .is_none());
+                }
+                _ => {}
+            }
+        }
+        for (id, (reserved_seq, writer_id)) in &reservations {
+            let terminals: Vec<_> = frames
+                .iter()
+                .filter(|frame| match &frame.record {
+                    WalRecord::ModelAttemptFinished {
+                        attempt_id: Some(terminal_id),
+                        ..
+                    }
+                    | WalRecord::AttemptFinished {
+                        attempt_id: terminal_id,
+                        ..
+                    }
+                    | WalRecord::AttemptReleased {
+                        attempt_id: terminal_id,
+                        ..
+                    } => terminal_id == id,
+                    _ => false,
+                })
+                .collect();
+            assert!(terminals.len() <= 1, "duplicate settlement for {id:?}");
+            if let Some(terminal) = terminals.first() {
+                assert!(terminal.seq > *reserved_seq);
+                let boundary = frames.iter().find(|frame| {
+                    frame.seq > *reserved_seq
+                        && matches!(
+                            frame.record,
+                            WalRecord::RunFinished { .. } | WalRecord::RunPaused { .. }
+                        )
+                });
+                if let Some(boundary) = boundary {
+                    assert!(terminal.seq < boundary.seq, "outcome follows terminal");
+                }
+            } else {
+                assert!(
+                    frames.iter().any(|frame| frame.seq > *reserved_seq
+                        && match &frame.record {
+                            WalRecord::WriterOpened {
+                                writer_id: next,
+                                recovered_through_seq,
+                                ..
+                            } => next != writer_id && recovered_through_seq >= reserved_seq,
+                            WalRecord::WriterClosed { writer_id: closed } => closed == writer_id,
+                            _ => false,
+                        }),
+                    "reservation is still open after reclaim: {id:?}"
+                );
+            }
+        }
+        reservations.len()
+    }
+
+    // The power-loss recording models file identity, and so hard links, only on Unix. The
+    // overhaul writer relocates a log by hard link, so recording one is Unix-only too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attempt_hook_outcomes_before_terminal_on_run_loop_exits() {
+        for exit in [
+            "complete",
+            "permanent_error",
+            "auth_pause",
+            "cancel",
+            "watchdog",
+        ] {
+            let response = match exit {
+                "complete" => ScriptResponse::Http {
+                    status: 200,
+                    headers: vec![],
+                    body: b"done",
+                },
+                "permanent_error" => ScriptResponse::Http {
+                    status: 400,
+                    headers: vec![],
+                    body: b"invalid",
+                },
+                "auth_pause" => ScriptResponse::Http {
+                    status: 401,
+                    headers: vec![],
+                    body: b"no auth",
+                },
+                _ => ScriptResponse::Hold,
+            };
+            let server = ScriptedServer::start(vec![response]).await;
+            let provider = retry_test_provider(&server, 0);
+            let root = attempt_scratch(exit);
+            let recording =
+                Arc::new(broca_crash_harness::power_loss::RecordingFs::new(&root).unwrap());
+            let cancel = CancellationToken::new();
+            let control = broca_core::RunControl {
+                cancel: (exit == "cancel").then(|| cancel.clone()),
+                provider_call_timeout: (exit == "watchdog").then_some(Duration::from_millis(100)),
+                ..Default::default()
+            };
+            let cancel_when_written = async {
+                if exit == "cancel" {
+                    server.written.notified().await;
+                    cancel.cancel();
+                }
+            };
+            let (frames, ()) = tokio::join!(
+                run_recorded_attempt(&root, &provider, control, recording),
+                cancel_when_written
+            );
+            assert_eq!(assert_attempts_settled_or_superseded(&frames), 1, "{exit}");
+            assert!(
+                frames.iter().any(|frame| matches!(
+                    frame.record,
+                    broca_wal::WalRecord::ModelAttemptFinished {
+                        attempt_id: Some(_),
+                        ..
+                    }
+                )),
+                "{exit}"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    struct LargeAttemptFamily;
+    impl WireFamily for LargeAttemptFamily {
+        fn shape(&self, _frozen: &crate::wire::FrozenRenderConfig, _opts: &CallOptions) -> Value {
+            serde_json::json!({"model":"m", "padding":"x".repeat(100_000)})
+        }
+        fn endpoint(
+            &self,
+            frozen: &crate::wire::FrozenRenderConfig,
+            _auth: &AuthHandle,
+            body: Vec<u8>,
+        ) -> HttpRequest {
+            HttpRequest {
+                method: HttpMethod::Post,
+                url: format!("{}/messages", frozen.base_url.as_deref().unwrap()),
+                headers: vec![],
+                body,
+            }
+        }
+        fn normalizer(
+            &self,
+            _frozen: &crate::wire::FrozenRenderConfig,
+            _step_id: StepId,
+        ) -> Box<dyn StreamNormalizer> {
+            Box::new(SuccessAttemptNormalizer)
+        }
+    }
+
+    // Unix-only for the same reason: it records the overhaul writer's hard-link relocation.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compression_refusal_pair_is_accepted_by_billing_reader() {
+        use broca_wal::WalRecord;
+        use broca_wal_reader::billing::{self, AttemptStatus, BilledKind, Item};
+        let server = ScriptedServer::start(vec![
+            ScriptResponse::Http {
+                status: 415,
+                headers: vec![],
+                body: b"",
+            },
+            ScriptResponse::Http {
+                status: 400,
+                headers: vec![],
+                body: b"invalid",
+            },
+        ])
+        .await;
+        let address: std::net::SocketAddr =
+            server.url.strip_prefix("http://").unwrap().parse().unwrap();
+        let client = ProviderHttpClient::resolving_anthropic_api_to(address, true);
+        let mut frozen = crate::families::anthropic_frozen_config("m");
+        frozen.base_url = Some(format!("http://api.anthropic.com:{}", address.port()));
+        let provider = LiveProvider::with_client_and_clock(
+            client,
+            LargeAttemptFamily,
+            frozen,
+            AuthHandle::None,
+            Clock::default(),
+        );
+        let root = attempt_scratch("compression-billing-reader");
+        let recording = Arc::new(broca_crash_harness::power_loss::RecordingFs::new(&root).unwrap());
+        let frames = run_recorded_attempt(&root, &provider, Default::default(), recording).await;
+        let expected_ids: std::collections::BTreeSet<_> = frames
+            .iter()
+            .filter_map(|frame| match &frame.record {
+                WalRecord::AttemptReserved { attempt_id, .. } => {
+                    Some(attempt_id.as_str().to_owned())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(expected_ids.len(), 2);
+        let path =
+            broca_core::FileWalStore::with_config(root.join("wal"), broca_wal::WalConfig::OVERHAUL)
+                .resolve_live_path(&attempt_session())
+                .unwrap()
+                .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let sidecar = std::fs::read(broca_wal::head_proof::sidecar_path(&path)).unwrap();
+        let mut reader = billing::billed(&bytes[..], &sidecar, None).unwrap();
+        assert!(reader.checkpoint().is_none());
+        let items: Vec<_> = reader.by_ref().map(Result::unwrap).collect();
+        let billed: Vec<_> = items
+            .iter()
+            .map(|item| match item {
+                Item::Billed(attempt) => attempt,
+                other => panic!("real compression pair must be readable: {other:?}"),
+            })
+            .collect();
+        assert_eq!(billed.len(), 2);
+        assert_eq!(
+            billed
+                .iter()
+                .map(|attempt| attempt.attempt_id.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected_ids
+        );
+        for attempt in billed {
+            assert_eq!(attempt.kind, BilledKind::Finished);
+            assert_eq!(attempt.status, AttemptStatus::Failed);
+            let reservation = attempt.typed_reservation().unwrap();
+            let envelope = attempt.typed_envelope().unwrap().unwrap();
+            match reservation.send_index {
+                1 => {
+                    assert!(reservation.compressed);
+                    assert_eq!(
+                        serde_json::to_value(envelope.outcome).unwrap(),
+                        serde_json::json!("compression_refused")
+                    );
+                    assert_eq!(envelope.http_status, Some(415));
+                }
+                2 => {
+                    assert!(!reservation.compressed);
+                    assert_eq!(envelope.outcome, billing::Outcome::HttpError);
+                    assert_eq!(envelope.http_status, Some(400));
+                }
+                index => panic!("unexpected physical send index {index}"),
+            }
+        }
+        assert_eq!(reader.oldest_open_appended_ms(), None);
+        let checkpoint = reader.checkpoint().unwrap();
+        let checkpoint_json: Value = serde_json::from_slice(&checkpoint.to_bytes()).unwrap();
+        assert_eq!(checkpoint_json["version"], 2);
+        assert_eq!(
+            checkpoint.seq(),
+            broca_wal::head_proof::HeadProof::decode(&sidecar)
+                .unwrap()
+                .durable_seq
+        );
+        let resumed: Vec<_> = billing::billed(&bytes[..], &sidecar, Some(checkpoint))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(resumed.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn raw_attempt_frames(mut bytes: &[u8]) -> Vec<broca_wal::FramedRecord> {
+        use broca_wal::framing::{decode_next, DecodeStep};
+        let mut frames = Vec::new();
+        while !bytes.is_empty() {
+            match decode_next(bytes) {
+                DecodeStep::Record { framed, consumed } => {
+                    frames.push(*framed);
+                    bytes = &bytes[consumed..];
+                }
+                DecodeStep::Lineage { consumed, .. } => bytes = &bytes[consumed..],
+                DecodeStep::TornTail => break,
+                // Unsynced block holes can leave a zero version byte or a failed digest.
+                // Count only the intact prefix here; real FileWal recovery below must
+                // prove this is a repairable tail, not silently skip interior corruption.
+                DecodeStep::Corrupt(_) => break,
+                DecodeStep::NewerWriter { .. } => panic!("unsupported power-loss image"),
+            }
+        }
+        frames
+    }
+
+    async fn reclaim_attempt_image(
+        root: &std::path::Path,
+        fs: Arc<dyn broca_wal::fs_ops::FsOps>,
+    ) -> Vec<broca_wal::FramedRecord> {
+        use broca_core::{lease::WalLeaseDomain, FileWalStore, WalHandle, WalStore};
+        let session = attempt_session();
+        let store = Arc::new(FileWalStore::with_config(
+            root.join("wal"),
+            broca_wal::WalConfig::OVERHAUL,
+        ));
+        let tenure = WalLeaseDomain::new(root.join("leases"))
+            .acquire(&session)
+            .unwrap();
+        let writer = WalHandle::open_and_spawn_owned_for_reclaim_with_fs_for_test(
+            store.clone(),
+            session.clone(),
+            tenure,
+            fs,
+        )
+        .await
+        .unwrap();
+        writer.shutdown().await.unwrap();
+        store.read_records(&session).unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires v4 unsynced-tail recovery: FileWal refuses a zero-filled unsynced append tail"]
+    async fn attempt_hook_power_loss_send_refusal_outcome_terminal_and_reclaim() {
+        use broca_crash_harness::power_loss::RecordingFs;
+        use broca_wal::{FileWal, PreparedV4Frame, Wal, WalRecord};
+        let server = ScriptedServer::start(vec![
+            ScriptResponse::Http {
+                status: 415,
+                headers: vec![],
+                body: b"",
+            },
+            ScriptResponse::Http {
+                status: 400,
+                headers: vec![],
+                body: b"invalid",
+            },
+        ])
+        .await;
+        let address: std::net::SocketAddr =
+            server.url.strip_prefix("http://").unwrap().parse().unwrap();
+        let client = ProviderHttpClient::resolving_anthropic_api_to(address, true);
+        let mut frozen = crate::families::anthropic_frozen_config("m");
+        frozen.base_url = Some(format!("http://api.anthropic.com:{}", address.port()));
+        let provider = LiveProvider::with_client_and_clock(
+            client,
+            LargeAttemptFamily,
+            frozen,
+            AuthHandle::None,
+            Clock::default(),
+        );
+        let root = attempt_scratch("attempt-power-loss");
+        let capture = root.join("capture");
+        std::fs::create_dir_all(&capture).unwrap();
+        let recording = Arc::new(RecordingFs::new(&capture).unwrap());
+        let frames = run_recorded_attempt(&capture, &provider, Default::default(), recording).await;
+        assert_eq!(assert_attempts_settled_or_superseded(&frames), 2);
+        let records: Vec<_> = frames
+            .into_iter()
+            .map(|frame| frame.record)
+            .filter(|record| {
+                matches!(
+                    record,
+                    WalRecord::AttemptReserved { .. }
+                        | WalRecord::ModelAttemptFinished {
+                            attempt_id: Some(_),
+                            ..
+                        }
+                        | WalRecord::RunFinished { .. }
+                )
+            })
+            .collect();
+        assert_eq!(records.len(), 5);
+        let log = PathBuf::from("wal").join(format!(
+            "{}.wal",
+            broca_core::wal_writer::session_addr(&attempt_session())
+        ));
+        let mut first_cuts = 0;
+        let mut second_cuts = 0;
+        let mut phases = std::collections::BTreeSet::new();
+        // Replay the real transport's records through the unmodified filesystem harness in
+        // bounded durability intervals. The channel tests prove when these appends occur;
+        // these intervals exhaust loss/tearing of each append, including both paired barriers.
+        for (phase, prefix, end) in [
+            ("before_first_send", 0, 1),
+            ("send_to_outcome", 1, 2),
+            ("refusal_to_resend", 1, 3),
+            ("resend_to_outcome", 3, 4),
+            ("outcome_to_terminal", 3, 5),
+        ] {
+            let phase_root = root.join(phase);
+            std::fs::create_dir_all(phase_root.join("wal")).unwrap();
+            broca_wal::floor::raise_floor(
+                &phase_root.join(broca_wal::FEATURE_FLOOR_FILENAME),
+                broca_wal::framing::KNOWN_FEATURES,
+            )
+            .unwrap();
+            // Initial file creation/lineage recovery is covered separately. A send starts
+            // from a log with an authentic durable header, never a newly created zero hole.
+            let previous_writer_id = {
+                let mut wal = FileWal::open(phase_root.join(&log))
+                    .unwrap()
+                    .with_feature_floor(phase_root.join(broca_wal::FEATURE_FLOOR_FILENAME))
+                    .with_wal_config(broca_wal::WalConfig::OVERHAUL)
+                    .unwrap();
+                let id = wal.writer_id().unwrap();
+                let record = WalRecord::WriterOpened {
+                    writer_id: id,
+                    previous_writer_id: None,
+                    recovered_through_seq: 0,
+                    cause: "test".into(),
+                };
+                wal.append_v4(
+                    1,
+                    &record,
+                    true,
+                    PreparedV4Frame::prepare(&record).unwrap(),
+                    1,
+                )
+                .unwrap();
+                id
+            };
+            let recording = Arc::new(RecordingFs::new(&phase_root).unwrap());
+            broca_wal::fs_ops::with_fs_ops(recording.clone(), || {
+                let mut wal = FileWal::open(phase_root.join(&log))
+                    .unwrap()
+                    .with_feature_floor(phase_root.join(broca_wal::FEATURE_FLOOR_FILENAME))
+                    .with_wal_config(broca_wal::WalConfig::OVERHAUL)
+                    .unwrap();
+                let opened = WalRecord::WriterOpened {
+                    writer_id: wal.writer_id().unwrap(),
+                    previous_writer_id: Some(previous_writer_id),
+                    recovered_through_seq: wal.last_seq(),
+                    cause: "test".into(),
+                };
+                wal.append_v4(
+                    1,
+                    &opened,
+                    true,
+                    PreparedV4Frame::prepare(&opened).unwrap(),
+                    1,
+                )
+                .unwrap();
+                for (index, record) in records[..end].iter().enumerate() {
+                    let sync = index < prefix
+                        || index + 1 == end
+                            && matches!(
+                                record,
+                                WalRecord::AttemptReserved { .. } | WalRecord::RunFinished { .. }
+                            );
+                    wal.append_v4(
+                        1,
+                        record,
+                        sync,
+                        PreparedV4Frame::prepare(record).unwrap(),
+                        2 + index as u64,
+                    )
+                    .unwrap();
+                }
+            });
+            let cuts = recording.enumerate(100_000).unwrap();
+            first_cuts += cuts.len();
+            for (index, cut) in cuts.iter().enumerate() {
+                let bytes = cut
+                    .state
+                    .files
+                    .get(&log)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let raw = raw_attempt_frames(bytes);
+                let reserved = raw
+                    .iter()
+                    .filter(|frame| matches!(frame.record, WalRecord::AttemptReserved { .. }))
+                    .count();
+                let finished = raw
+                    .iter()
+                    .filter(|frame| {
+                        matches!(
+                            frame.record,
+                            WalRecord::ModelAttemptFinished {
+                                attempt_id: Some(_),
+                                ..
+                            }
+                        )
+                    })
+                    .count();
+                phases.insert((
+                    reserved,
+                    finished,
+                    raw.iter()
+                        .any(|frame| matches!(frame.record, WalRecord::RunFinished { .. })),
+                ));
+                let recovered_root = root.join(format!("first-{phase}-{index}"));
+                cut.state.install(&recovered_root).unwrap();
+                let recovery = Arc::new(RecordingFs::new(&recovered_root).unwrap());
+                // Enumerate a second loss while the physical WAL recovers its torn tail.
+                // Writer identity/publication cuts are proved by the writer lifecycle tests;
+                // every image here then goes through the real reclaim opener and close.
+                broca_wal::fs_ops::with_fs_ops(recovery.clone(), || {
+                    match FileWal::open(recovered_root.join(&log)) {
+                        Ok(wal) => {
+                            wal.replay().unwrap();
+                        }
+                        Err(error) => {
+                            if let Some(output) =
+                                std::env::var_os("BROCA_ATTEMPT_FAILURE_FIXTURE_DIR")
+                            {
+                                let output = PathBuf::from(output);
+                                std::fs::create_dir_all(&output).unwrap();
+                                std::fs::write(output.join("v4-unsynced-tail.wal"), bytes).unwrap();
+                                std::fs::write(output.join("README.md"), format!(
+                                    "# Unsynced v4 append-tail recovery fixture\n\nSynthetic billing records captured from the real HTTP gzip-refusal/resend path.\n\n- Durability interval: `{phase}`.\n- H1 image: index `{index}`, filesystem cut `{:?}`, persistence family `{:?}`.\n- Existing `FileWal::open` refuses with `{error:?}`.\n- The intact prefix contains {reserved} reservation(s) and {finished} settlement(s).\n\nThe bytes contain synthetic identities only. No real credentials or message content is present.\n\nReproduce the generating acceptance test on Linux:\n\n```sh\ncargo test --locked -p broca-provider -F live -F test-harness attempt_hook_power_loss --lib -- --ignored --nocapture\n```\n\nThe recovery fix must distinguish this unsynced append-tail loss from damage in the synced prefix. Do not skip refused images or relax the H1 harness. After physical recovery, the test uses the real reclaim writer opener/close and checks each reservation has exactly one settlement or a superseding writer, never both counted as separate attempts.\n", cut.cut, cut.family)).unwrap();
+                            }
+                            panic!("power-loss interval={phase} image={index} cut={:?} family={:?}: {error:?}", cut.cut, cut.family);
+                        }
+                    }
+                });
+                let second_images = recovery.enumerate(100_000).unwrap();
+                let recovered =
+                    reclaim_attempt_image(&recovered_root, Arc::new(broca_wal::fs_ops::RealFs))
+                        .await;
+                assert_eq!(assert_attempts_settled_or_superseded(&recovered), reserved);
+                for second in second_images {
+                    second_cuts += 1;
+                    assert!(second_cuts <= 100_000, "recovery cut budget exceeded");
+                    let again_root = root.join("second");
+                    second.state.install(&again_root).unwrap();
+                    let recovered =
+                        reclaim_attempt_image(&again_root, Arc::new(broca_wal::fs_ops::RealFs))
+                            .await;
+                    assert_eq!(assert_attempts_settled_or_superseded(&recovered), reserved);
+                    std::fs::remove_dir_all(again_root).unwrap();
+                }
+                std::fs::remove_dir_all(recovered_root).unwrap();
+            }
+        }
+        assert!(
+            phases.contains(&(1, 0, false)),
+            "cut after reservation, before outcome"
+        );
+        assert!(
+            phases.contains(&(1, 1, false)),
+            "cut between refusal outcome and resend reservation"
+        );
+        assert!(
+            phases.contains(&(2, 1, false)),
+            "cut before resend and before its outcome"
+        );
+        assert!(
+            phases.contains(&(2, 2, false)),
+            "cut between outcomes and terminal"
+        );
+        println!(
+            "attempt power-loss cuts: first={first_cuts} second={second_cuts} phases={phases:?}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     async fn read_http_request_body(socket: &mut tokio::net::TcpStream) -> Vec<u8> {

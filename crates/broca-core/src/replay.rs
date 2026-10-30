@@ -2126,6 +2126,15 @@ pub struct SeedFallback {
     pub reason: &'static str,
 }
 
+impl SeedFallback {
+    /// Record the decision when it is made, rather than when a propagated or
+    /// cloned error is observed by another layer. Call only on the error path.
+    pub fn new(reason: &'static str) -> Self {
+        broca_wal::access_counter::seed_fallback(reason);
+        Self { reason }
+    }
+}
+
 /// Replay a WAL tail seeded only at a validated, committed projection boundary.
 ///
 /// A bare sequence watermark cannot prove the log still holds the boundary it names:
@@ -2168,113 +2177,87 @@ pub fn replay_seeded_at_validated_boundary(
     held_steers: Vec<Message>,
 ) -> Result<ReplayState, SeedFallback> {
     if !boundary.qualified {
-        return Err(SeedFallback {
-            reason: "unqualified boundary",
-        });
+        return Err(SeedFallback::new("unqualified boundary"));
     }
     if let Some((first, rest)) = tail.split_first() {
         // The tail must continue the boundary with no gap: the first frame follows its
         // sequence and starts where it ends, and no later frame skips one. Anything
         // between them would silently vanish from the replay.
         if first.framed.seq != boundary.seq + 1 {
-            return Err(SeedFallback {
-                reason: "tail not contiguous with boundary",
-            });
+            return Err(SeedFallback::new("tail not contiguous with boundary"));
         }
         validate_boundary_lineage_gap(read_at, boundary, first.off)?;
         let mut seq = first.framed.seq;
         for positioned in rest {
             seq += 1;
             if positioned.framed.seq != seq {
-                return Err(SeedFallback {
-                    reason: "tail has a sequence gap",
-                });
+                return Err(SeedFallback::new("tail has a sequence gap"));
             }
         }
     } else if !durable_end_reached(read_at, boundary)? {
         // An empty tail cannot omit bytes after the boundary's optional trailing metadata.
-        return Err(SeedFallback {
-            reason: "empty tail before log end",
-        });
+        return Err(SeedFallback::new("empty tail before log end"));
     }
     let frame_len = boundary
         .frame_end
         .checked_sub(boundary.frame_off)
         .filter(|len| *len > 0)
-        .ok_or(SeedFallback {
-            reason: "boundary frame outside log",
-        })?;
+        .ok_or_else(|| SeedFallback::new("boundary frame outside log"))?;
     // A short read is a shorter log, not an error: fewer bytes than the committed frame
     // means the boundary was never durably written here (torn), and no bytes at all
     // means the log ends before it (missing or moved). Both fall back.
-    let frame_bytes = read_at(boundary.frame_off, frame_len).map_err(|_| SeedFallback {
-        reason: "log unreadable",
-    })?;
+    let frame_bytes = broca_wal::access_counter::read_validation_at(
+        broca_wal::access_counter::ValidationRead::BoundaryFrame,
+        read_at,
+        boundary.frame_off,
+        frame_len,
+    )
+    .map_err(|_| SeedFallback::new("log unreadable"))?;
     let frame_bytes = if frame_bytes.is_empty() {
-        return Err(SeedFallback {
-            reason: "boundary frame outside log",
-        });
+        return Err(SeedFallback::new("boundary frame outside log"));
     } else if (frame_bytes.len() as u64) < frame_len {
-        return Err(SeedFallback {
-            reason: "torn boundary frame",
-        });
+        return Err(SeedFallback::new("torn boundary frame"));
     } else {
         &frame_bytes[..frame_len as usize]
     };
-    let (framed, consumed) = match broca_wal::framing::decode_next(frame_bytes) {
+    let (framed, consumed) = match broca_wal::access_counter::decode_next(frame_bytes) {
         broca_wal::framing::DecodeStep::Record { framed, consumed } => (*framed, consumed),
         broca_wal::framing::DecodeStep::Lineage { .. } => {
-            return Err(SeedFallback {
-                reason: "boundary frame is not a record",
-            });
+            return Err(SeedFallback::new("boundary frame is not a record"));
         }
         broca_wal::framing::DecodeStep::TornTail => {
-            return Err(SeedFallback {
-                reason: "torn boundary frame",
-            });
+            return Err(SeedFallback::new("torn boundary frame"));
         }
         broca_wal::framing::DecodeStep::Corrupt(_) => {
-            return Err(SeedFallback {
-                reason: "corrupt boundary frame",
-            });
+            return Err(SeedFallback::new("corrupt boundary frame"));
         }
         broca_wal::framing::DecodeStep::NewerWriter { .. } => {
-            return Err(SeedFallback {
-                reason: "newer boundary frame",
-            });
+            return Err(SeedFallback::new("newer boundary frame"));
         }
     };
     if consumed != frame_bytes.len() {
-        return Err(SeedFallback {
-            reason: "boundary frame length changed",
-        });
+        return Err(SeedFallback::new("boundary frame length changed"));
     }
     if framed.seq != boundary.seq {
-        return Err(SeedFallback {
-            reason: "boundary sequence mismatch",
-        });
+        return Err(SeedFallback::new("boundary sequence mismatch"));
     }
     if sha2::Sha256::digest(frame_bytes).as_slice() != boundary.frame_identity {
-        return Err(SeedFallback {
-            reason: "boundary frame identity mismatch",
-        });
+        return Err(SeedFallback::new("boundary frame identity mismatch"));
     }
     // The log's header frame carries its lineage; only that fixed-size range is read.
     // A record-only byte string assembled in a test carries none, and an unreadable
     // header falls back the same as any other short log.
-    let header =
-        read_at(0, broca_wal::framing::LINEAGE_FRAME_LEN as u64).map_err(|_| SeedFallback {
-            reason: "log unreadable",
-        })?;
+    let header = broca_wal::access_counter::read_at(
+        read_at,
+        0,
+        broca_wal::framing::LINEAGE_FRAME_LEN as u64,
+    )
+    .map_err(|_| SeedFallback::new("log unreadable"))?;
     if log_lineage_id(&header) != boundary.lineage_id {
-        return Err(SeedFallback {
-            reason: "boundary lineage mismatch",
-        });
+        return Err(SeedFallback::new("boundary lineage mismatch"));
     }
     if !boundary_frame_is_seedable(&framed.record, tail) {
-        return Err(SeedFallback {
-            reason: "boundary frame cannot seed a tail",
-        });
+        return Err(SeedFallback::new("boundary frame cannot seed a tail"));
     }
     replay_seeded_with_held_steers(
         tail.iter().map(|positioned| &positioned.framed.record),
@@ -2287,9 +2270,7 @@ pub fn replay_seeded_at_validated_boundary(
         tag_seed,
         held_steers,
     )
-    .map_err(|_| SeedFallback {
-        reason: "tail replay refused the seeded records",
-    })
+    .map_err(|_| SeedFallback::new("tail replay refused the seeded records"))
 }
 
 /// `FileWal::append_frame` in broca-wal/src/file_wal.rs writes one trailing lineage
@@ -2304,33 +2285,29 @@ fn validate_boundary_lineage_gap(
 ) -> Result<(), SeedFallback> {
     let gap = first_off
         .checked_sub(boundary.frame_end)
-        .ok_or(SeedFallback {
-            reason: "tail byte offset mismatch",
-        })?;
+        .ok_or_else(|| SeedFallback::new("tail byte offset mismatch"))?;
     if gap == 0 {
         return Ok(());
     }
     let frame_len = broca_wal::framing::LINEAGE_FRAME_LEN as u64;
     if gap > frame_len * MAX_BOUNDARY_LINEAGE_FRAMES {
-        return Err(SeedFallback {
-            reason: "too many frames in boundary lineage gap",
-        });
+        return Err(SeedFallback::new("too many frames in boundary lineage gap"));
     }
     // A nonzero gap must be exactly one lineage frame, never a shifted record offset.
     if gap != frame_len {
-        return Err(SeedFallback {
-            reason: "tail byte offset mismatch",
-        });
+        return Err(SeedFallback::new("tail byte offset mismatch"));
     }
-    let bytes = read_at(boundary.frame_end, gap).map_err(|_| SeedFallback {
-        reason: "lineage gap unreadable",
-    })?;
+    let bytes = broca_wal::access_counter::read_validation_at(
+        broca_wal::access_counter::ValidationRead::LineageGap,
+        read_at,
+        boundary.frame_end,
+        gap,
+    )
+    .map_err(|_| SeedFallback::new("lineage gap unreadable"))?;
     if bytes.len() as u64 != gap {
-        return Err(SeedFallback {
-            reason: "short lineage gap read",
-        });
+        return Err(SeedFallback::new("short lineage gap read"));
     }
-    match broca_wal::framing::decode_next(&bytes) {
+    match broca_wal::access_counter::decode_next(&bytes) {
         broca_wal::framing::DecodeStep::Lineage {
             lineage_id,
             consumed,
@@ -2339,21 +2316,21 @@ fn validate_boundary_lineage_gap(
         {
             Ok(())
         }
-        broca_wal::framing::DecodeStep::Lineage { .. } => Err(SeedFallback {
-            reason: "boundary lineage gap mismatch",
-        }),
-        broca_wal::framing::DecodeStep::Record { .. } => Err(SeedFallback {
-            reason: "record in boundary lineage gap",
-        }),
-        broca_wal::framing::DecodeStep::TornTail => Err(SeedFallback {
-            reason: "torn boundary lineage gap",
-        }),
-        broca_wal::framing::DecodeStep::Corrupt(_) => Err(SeedFallback {
-            reason: "corrupt boundary lineage gap",
-        }),
-        broca_wal::framing::DecodeStep::NewerWriter { .. } => Err(SeedFallback {
-            reason: "newer frame in boundary lineage gap",
-        }),
+        broca_wal::framing::DecodeStep::Lineage { .. } => {
+            Err(SeedFallback::new("boundary lineage gap mismatch"))
+        }
+        broca_wal::framing::DecodeStep::Record { .. } => {
+            Err(SeedFallback::new("record in boundary lineage gap"))
+        }
+        broca_wal::framing::DecodeStep::TornTail => {
+            Err(SeedFallback::new("torn boundary lineage gap"))
+        }
+        broca_wal::framing::DecodeStep::Corrupt(_) => {
+            Err(SeedFallback::new("corrupt boundary lineage gap"))
+        }
+        broca_wal::framing::DecodeStep::NewerWriter { .. } => {
+            Err(SeedFallback::new("newer frame in boundary lineage gap"))
+        }
     }
 }
 
@@ -2365,11 +2342,14 @@ fn durable_end_reached(
     read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
     boundary: &SeedBoundary,
 ) -> Result<bool, SeedFallback> {
-    let eof_at = |off| match read_at(off, 1) {
+    let eof_at = |off| match broca_wal::access_counter::read_validation_at(
+        broca_wal::access_counter::ValidationRead::DurableEnd,
+        read_at,
+        off,
+        1,
+    ) {
         Ok(bytes) => Ok(bytes.is_empty()),
-        Err(_) => Err(SeedFallback {
-            reason: "log unreadable",
-        }),
+        Err(_) => Err(SeedFallback::new("log unreadable")),
     };
     if eof_at(boundary.frame_end)? {
         return Ok(true);
@@ -2382,9 +2362,7 @@ fn durable_end_reached(
     let metadata_end = boundary
         .frame_end
         .checked_add(broca_wal::framing::LINEAGE_FRAME_LEN as u64)
-        .ok_or(SeedFallback {
-            reason: "boundary frame outside log",
-        })?;
+        .ok_or_else(|| SeedFallback::new("boundary frame outside log"))?;
     validate_boundary_lineage_gap(read_at, boundary, metadata_end)?;
     eof_at(metadata_end)
 }
@@ -2395,7 +2373,7 @@ fn durable_end_reached(
 /// assembled in a test carries none. Either way the value is compared verbatim against
 /// the boundary's attested lineage, so a restored or replaced log cannot pass.
 fn log_lineage_id(header: &[u8]) -> Option<String> {
-    match broca_wal::framing::decode_next(header) {
+    match broca_wal::access_counter::decode_next(header) {
         broca_wal::framing::DecodeStep::Lineage { lineage_id, .. } => Some(lineage_id.to_string()),
         _ => None,
     }
@@ -4616,6 +4594,8 @@ pub(crate) mod projection_boundary_tests {
             trailing_origin: Some(ModelHandle::new("stub", "old-model")),
             last_run_id: Some(RunId("r1".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                #[cfg(feature = "test-attachments")]
+                media: None,
                 head: None,
                 has_deferred_calls: None,
                 tags: None,
@@ -6964,7 +6944,6 @@ mod offset_tail_tests {
         boundary: SeedBoundary,
         tail: Vec<PositionedFrame>,
         cut: usize,
-        reads: std::cell::RefCell<Vec<(u64, u64)>>,
     }
 
     impl RealBoundaryLog {
@@ -7021,7 +7000,6 @@ mod offset_tail_tests {
                 boundary,
                 tail,
                 cut,
-                reads: Default::default(),
             }
         }
 
@@ -7031,7 +7009,6 @@ mod offset_tail_tests {
         ) -> Result<super::ReplayState, super::SeedFallback> {
             use std::io::{Read, Seek, SeekFrom};
             let read_at = |off, len| {
-                self.reads.borrow_mut().push((off, len));
                 let mut file = std::fs::File::open(&self.path)?;
                 file.seek(SeekFrom::Start(off))?;
                 let mut bytes = Vec::new();
@@ -7153,21 +7130,62 @@ mod offset_tail_tests {
             log.bytes.len() as u64 - log.boundary.frame_end,
             broca_wal::framing::LINEAGE_FRAME_LEN as u64
         );
-        let seeded = log
-            .validate(&[])
+        let counter = broca_wal::access_counter::WalAccessCounter::default();
+        let seeded = counter
+            .operation("empty tail")
+            .run(|| log.validate(&[]))
             .expect("the last boundary's trailing metadata must not force full replay");
         assert_eq!(seeded.extent, replay(&log.records).unwrap().extent);
-        let reads = log.reads.borrow();
-        assert!(reads.iter().any(|&(off, len)| off == log.boundary.frame_end
-            && len == broca_wal::framing::LINEAGE_FRAME_LEN as u64));
+        let measured = counter.snapshot();
+        let reads = &measured[0].reads;
         assert!(reads
             .iter()
-            .all(|&(off, len)| off != 0 || len <= broca_wal::framing::LINEAGE_FRAME_LEN as u64));
+            .any(|read| read.offset == log.boundary.frame_end
+                && read.length == broca_wal::framing::LINEAGE_FRAME_LEN as u64));
+        assert!(reads
+            .iter()
+            .all(|read| read.class != broca_wal::access_counter::ReadClass::Origin));
         let frame_len = log.boundary.frame_end - log.boundary.frame_off;
         assert!(
-            reads.iter().map(|(_, len)| len).sum::<u64>()
+            reads.iter().map(|read| read.length).sum::<u64>()
                 <= frame_len + 2 * broca_wal::framing::LINEAGE_FRAME_LEN as u64 + 2
         );
+        use broca_wal::access_counter::{ReadClass, ValidationRead};
+        assert_eq!(
+            reads
+                .iter()
+                .map(|read| (read.class, read.offset, read.length))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    ReadClass::Validation(ValidationRead::DurableEnd),
+                    log.boundary.frame_end,
+                    1
+                ),
+                (
+                    ReadClass::Validation(ValidationRead::LineageGap),
+                    log.boundary.frame_end,
+                    broca_wal::framing::LINEAGE_FRAME_LEN as u64
+                ),
+                (
+                    ReadClass::Validation(ValidationRead::DurableEnd),
+                    log.bytes.len() as u64,
+                    0
+                ),
+                (
+                    ReadClass::Validation(ValidationRead::BoundaryFrame),
+                    log.boundary.frame_off,
+                    frame_len
+                ),
+                (
+                    ReadClass::LineageHeader,
+                    0,
+                    broca_wal::framing::LINEAGE_FRAME_LEN as u64
+                ),
+            ]
+        );
+        assert_eq!(measured[0].frames_decoded, 3);
+        assert!(measured[0].seed_fallbacks.is_empty());
     }
 
     #[test]

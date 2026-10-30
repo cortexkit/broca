@@ -166,6 +166,156 @@ async fn near_cap_writer_closes_and_reopens_without_paying_another_terminal_rese
     );
 }
 
+#[cfg(feature = "test-clock")]
+fn maximum_width_terminal() -> WalRecord {
+    let mut terminal = retained_size::terminal(
+        u64::MAX,
+        Some(u64::MAX),
+        broca_protocol::Usage {
+            input_tokens: Some(u64::MAX),
+            cached_input_tokens: Some(u64::MAX),
+            cache_write_tokens: Some(u64::MAX),
+            output_tokens: Some(u64::MAX),
+            reasoning_tokens: Some(u64::MAX),
+        },
+        u32::MAX,
+    );
+    if let WalRecord::RunFinished { reason, .. } = &mut terminal {
+        *reason = broca_protocol::RunFinishReason::Interrupted;
+    }
+    terminal
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn maximum_width_writer_reopens_at_cap_after_the_terminal() {
+    let mut root = Root::new(true);
+    root.store.max_read_bytes = 16_000;
+    let spawn = || broca_wal::file_wal::with_writer_id_for_test([u8::MAX; 16], || root.spawn());
+    let handle = spawn();
+    fill_ordinary_budget(&root, &handle);
+    handle.record_terminal(maximum_width_terminal()).unwrap();
+    handle.shutdown().await.unwrap();
+    assert!(root.markers().is_empty());
+    assert!(
+        std::fs::metadata(root.store.wal_path(&root.session))
+            .unwrap()
+            .len()
+            <= 16_000
+    );
+
+    spawn().shutdown().await.unwrap();
+    assert!(root.markers().is_empty());
+    assert!(
+        std::fs::metadata(root.store.wal_path(&root.session))
+            .unwrap()
+            .len()
+            <= 16_000
+    );
+    let records = root.records();
+    assert_eq!(records[records.len() - 4].record, maximum_width_terminal());
+    assert!(matches!(
+        records[records.len() - 3].record,
+        WalRecord::WriterClosed { .. }
+    ));
+    assert!(matches!(
+        records[records.len() - 2].record,
+        WalRecord::WriterOpened { writer_id, previous_writer_id, .. }
+            if writer_id == [u8::MAX; 16] && previous_writer_id == Some([u8::MAX; 16])
+    ));
+    assert!(matches!(
+        records.last().unwrap().record,
+        WalRecord::WriterClosed { .. }
+    ));
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn maximum_width_reclaim_at_cap_settles_a_resurrected_marker() {
+    struct MaximumIdStore(FileWalStore);
+    impl WalStore for MaximumIdStore {
+        fn wal_config(&self) -> broca_wal::WalConfig {
+            self.0.wal_config()
+        }
+        fn writer_marker_root(&self) -> Option<PathBuf> {
+            self.0.writer_marker_root()
+        }
+        fn open(&self, session: &BindIdentity) -> Result<Box<dyn Wal + Send>, WalError> {
+            broca_wal::file_wal::with_writer_id_for_test([u8::MAX; 16], || self.0.open(session))
+        }
+        fn read_records(
+            &self,
+            session: &BindIdentity,
+        ) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
+            self.0.read_records(session)
+        }
+        fn open_owned_writer(
+            &self,
+            session: &BindIdentity,
+            retention: Option<u64>,
+            session_class: Option<&str>,
+            lease: Box<dyn LeaseHandle>,
+        ) -> Result<WriterAndLease, WalError> {
+            broca_wal::file_wal::with_writer_id_for_test([u8::MAX; 16], || {
+                self.0
+                    .open_owned_writer(session, retention, session_class, lease)
+            })
+        }
+    }
+
+    let mut root = Root::new(true);
+    root.store.max_read_bytes = 16_000;
+    let handle = broca_wal::file_wal::with_writer_id_for_test([254; 16], || root.spawn());
+    let previous_marker = root.markers().pop().unwrap();
+    let marker_bytes = std::fs::read(&previous_marker).unwrap();
+    fill_ordinary_budget(&root, &handle);
+    handle.record_terminal(maximum_width_terminal()).unwrap();
+    handle.shutdown().await.unwrap();
+    // A crash can preserve the durable close while losing the later marker unlink.
+    std::fs::write(&previous_marker, marker_bytes).unwrap();
+
+    let mut store =
+        FileWalStore::with_config(root.path.join("wal"), broca_wal::WalConfig::OVERHAUL);
+    store.max_read_bytes = 16_000;
+    let domain = crate::lease::WalLeaseDomain::new(root.path.join("leases"));
+    let successor = WalHandle::open_and_spawn_owned_for_reclaim(
+        Arc::new(MaximumIdStore(store)),
+        root.session.clone(),
+        domain.acquire(&root.session).unwrap(),
+    )
+    .await
+    .expect("the successor's worst-width lifecycle must fit after a terminal and close");
+    assert!(
+        previous_marker.exists(),
+        "opening alone cannot retire a predecessor"
+    );
+    successor.shutdown().await.unwrap();
+    assert!(root.markers().is_empty());
+    assert!(
+        std::fs::metadata(root.store.wal_path(&root.session))
+            .unwrap()
+            .len()
+            <= 16_000
+    );
+    let records = root.records();
+    assert!(matches!(
+        &records[records.len() - 2].record,
+        WalRecord::WriterOpened { writer_id, previous_writer_id, cause, .. }
+            if *writer_id == [u8::MAX; 16]
+                && *previous_writer_id == Some([254; 16])
+                && cause == "reclaim"
+    ));
+    assert!(matches!(
+        records.last().unwrap().record,
+        WalRecord::WriterClosed { .. }
+    ));
+    drop(
+        domain
+            .acquire(&root.session)
+            .expect("reclaim must release its tenure after close"),
+    );
+}
+
 #[tokio::test]
 async fn run_terminal_cannot_spend_the_outstanding_writer_close_reserve() {
     let mut root = Root::new(true);
@@ -614,4 +764,66 @@ async fn published_successor_close_retires_only_verified_predecessor_markers() {
         "untrusted marker contents must remain for diagnosis"
     );
     assert_eq!(root.records().len(), 4);
+}
+
+#[tokio::test]
+async fn writer_open_counter_keeps_recovery_and_startup_replays_in_one_bucket() {
+    use broca_wal::access_counter::{ReadClass, WalAccessCounter};
+    for (prefix, retention) in [(1, None), (20, None), (20, Some(60))] {
+        let root = Root::new(true);
+        let wal = root
+            .store
+            .open_with_retention(&root.session, retention)
+            .unwrap();
+        let handle = WalHandle::spawn_in_store(wal, &root.store, &root.session, 1, None).unwrap();
+        handle
+            .record(first_send(&root, retention))
+            .into_result()
+            .unwrap();
+        for _ in 0..prefix {
+            handle.record(ordinary()).into_result().unwrap();
+        }
+        handle.shutdown().await.unwrap();
+        let path = root
+            .store
+            .resolve_live_path(&root.session)
+            .unwrap()
+            .unwrap();
+        let length = std::fs::metadata(&path).unwrap().len();
+        let frame_count = broca_wal::replay_file(&path, u64::MAX).unwrap().len() as u64;
+        let domain = crate::lease::WalLeaseDomain::new(root.path.join("leases"));
+        let counter = WalAccessCounter::default();
+        let owner = counter
+            .operation("writer reopen")
+            .run_future(WalHandle::open_and_spawn_owned_with_retention(
+                Arc::new(FileWalStore::with_config(
+                    root.path.join("wal"),
+                    broca_wal::WalConfig::OVERHAUL,
+                )),
+                root.session.clone(),
+                domain.acquire(&root.session).unwrap(),
+                None,
+                retention,
+            ))
+            .await
+            .unwrap();
+        let snapshot = counter.snapshot();
+        let measured = &snapshot[0];
+        assert_eq!(measured.writer_opens.len(), 1);
+        let open = &measured.writer_opens[0];
+        assert_eq!(open.opens, 1);
+        assert_eq!(open.session_length, length);
+        // Recovery, lifecycle-only classification and previous-writer lookup
+        // scan the log; retained logs also replay to recover retention policy.
+        let scans = if retention.is_some() { 4 } else { 3 };
+        assert_eq!(open.bytes, length * scans);
+        // One initial lineage and one trailing lineage per record in each scan.
+        assert_eq!(open.frames_decoded, (frame_count * 2 + 1) * scans);
+        assert_eq!(measured.frames_decoded, open.frames_decoded);
+        assert!(measured
+            .reads
+            .iter()
+            .all(|read| read.class == ReadClass::WriterOpen));
+        owner.shutdown().await.unwrap();
+    }
 }

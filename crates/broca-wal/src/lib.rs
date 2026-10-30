@@ -10,6 +10,7 @@
 // Test fixtures intentionally use direct I/O to prepare and inspect crash images.
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
+pub mod access_counter;
 pub mod archive;
 mod directory_sync;
 pub mod file_wal;

@@ -104,6 +104,7 @@ pub enum Outcome {
     Cancelled,
     SealedInFlight,
     HttpError,
+    CompressionRefused,
     ProviderError,
     ConnectFailed,
     HeaderTimeout,

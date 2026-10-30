@@ -62,6 +62,10 @@ pub fn terminal(max_bytes: u64, ts_ms: Option<u64>, usage: Usage, retries_used: 
 }
 
 pub fn reserve_bytes(overhead: u64) -> u64 {
+    terminal_reserve_bytes(overhead, crate::WalConfig::LEGACY)
+}
+
+pub fn terminal_reserve_bytes(overhead: u64, config: crate::WalConfig) -> u64 {
     // The size-refusal RunFinished record has bounded fields: fixed error text/code plus
     // integer accounting, timestamp and max_bytes in its message. Encode maximum-width
     // integers so refusing an append always leaves room to commit that complete record.
@@ -76,8 +80,92 @@ pub fn reserve_bytes(overhead: u64) -> u64 {
     if let WalRecord::RunFinished { reason, .. } = &mut largest {
         *reason = RunFinishReason::Interrupted;
     }
-    crate::framing::encode(u64::MAX, u64::MAX, &largest)
-        .expect("bounded terminal encodes")
-        .len() as u64
-        + overhead
+    let frame_len = if config.is_overhaul() {
+        crate::PreparedV4Frame::prepare(&largest)
+            .expect("bounded terminal encodes")
+            .frame_len()
+    } else {
+        crate::framing::encode(u64::MAX, u64::MAX, &largest)
+            .expect("bounded terminal encodes")
+            .len()
+    };
+    frame_len as u64 + overhead
+}
+
+pub fn reopen_reserve_bytes(config: crate::WalConfig) -> u64 {
+    if !config.is_overhaul() {
+        return 0;
+    }
+    // Lifecycle IDs are JSON byte arrays, so each byte needs up to three decimal digits.
+    // Reclaim has the longest cause emitted by the writer; sequence and IDs use their
+    // maximum widths. V4 stamped metadata and the two trailing lineage frames are fixed-size.
+    let writer_id = [u8::MAX; 16];
+    let opened = WalRecord::WriterOpened {
+        writer_id,
+        previous_writer_id: Some(writer_id),
+        recovered_through_seq: u64::MAX,
+        cause: "reclaim".into(),
+    };
+    let closed = WalRecord::WriterClosed { writer_id };
+    [&opened, &closed]
+        .into_iter()
+        .map(|record| {
+            crate::PreparedV4Frame::prepare(record)
+                .expect("bounded writer lifecycle encodes")
+                .frame_len() as u64
+                + crate::framing::LINEAGE_FRAME_LEN as u64
+        })
+        .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overhaul_reopen_reserve_bounds_maximum_width_lifecycle_frames() {
+        let config = crate::WalConfig::OVERHAUL;
+        let bound = reopen_reserve_bytes(config);
+        assert_eq!(bound, 726);
+        for byte in [0, 9, 10, 99, 100, u8::MAX] {
+            for cause in ["new", "reopen", "reclaim"] {
+                let writer_id = [byte; 16];
+                let records = [
+                    WalRecord::WriterOpened {
+                        writer_id,
+                        previous_writer_id: Some([u8::MAX; 16]),
+                        recovered_through_seq: u64::MAX,
+                        cause: cause.into(),
+                    },
+                    WalRecord::WriterClosed { writer_id },
+                ];
+                let mut bytes = 0;
+                for record in records {
+                    let frame = crate::PreparedV4Frame::prepare(&record)
+                        .unwrap()
+                        .stamp(crate::framing::v4::Metadata {
+                            seq: u64::MAX,
+                            fence: u64::MAX,
+                            appended_ms: u64::MAX,
+                            writer_id,
+                        })
+                        .unwrap();
+                    bytes += frame.len() as u64 + crate::framing::LINEAGE_FRAME_LEN as u64;
+                }
+                assert!(
+                    bytes <= bound,
+                    "ID byte {byte}, cause {cause}: {bytes} > {bound}"
+                );
+                if byte == u8::MAX && cause == "reclaim" {
+                    assert_eq!(bytes, bound);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_terminal_reserve_is_unchanged_and_has_no_reopen_reserve() {
+        assert_eq!(reserve_bytes(crate::framing::LINEAGE_FRAME_LEN as u64), 580);
+        assert_eq!(reopen_reserve_bytes(crate::WalConfig::LEGACY), 0);
+    }
 }

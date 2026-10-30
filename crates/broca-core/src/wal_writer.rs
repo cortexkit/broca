@@ -13,7 +13,17 @@
 //! The writer is the single owner of the [`Wal`]; the lease epoch is stamped on every append
 //! as forensic tenure metadata, not checked as an append gate.
 
-use broca_diagnostics::{spawn_blocking, JobKind};
+use broca_diagnostics::JobKind;
+
+// Writer recovery and the writer-marker replay must retain the opening
+// operation when their synchronous I/O moves to the blocking pool.
+fn spawn_blocking<F, T>(kind: JobKind, work: F) -> tokio::task::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    broca_diagnostics::spawn_blocking(kind, broca_wal::access_counter::inherit(work))
+}
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -1076,7 +1086,7 @@ impl FileWalStore {
         .with_feature_floor(self.feature_floor_path())
         .with_wal_config(self.config)?;
         let retained_policy = if retained {
-            let records = wal.replay()?;
+            let records = broca_wal::access_counter::writer_open(&path, false, || wal.replay())?;
             records
                 .iter()
                 .find_map(|frame| match &frame.record {
@@ -2151,6 +2161,7 @@ impl RecordOutcome {
 
 struct AppendBudget {
     writer_close_reserve: u64,
+    reopen_reserve: u64,
     retained: bool,
     session_max_bytes: u64,
     max_bytes: u64,
@@ -3134,6 +3145,35 @@ pub struct WalHandle {
 }
 
 impl WalHandle {
+    /// A media-free prefix has no captures or aging history to restore. Its already-seeded
+    /// placement is sufficient to start tracking the first later capture without rereading it.
+    #[cfg(feature = "test-attachments")]
+    pub fn empty_media_checkpoint(
+        &self,
+        at_seq: u64,
+    ) -> Result<crate::media_request::MediaCheckpoint, String> {
+        let _enqueue = self.lock_enqueue();
+        if self.durable_head.load(Ordering::Acquire) != at_seq
+            || self.next_seq.load(Ordering::Acquire) != at_seq + 1
+        {
+            return Err("media seed head changed before executor initialization".into());
+        }
+        let placement = self
+            .display_placement
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or("media seed has no validated placement")?;
+        Ok(crate::media_request::MediaCheckpoint::empty_at(
+            placement, at_seq,
+        ))
+    }
+
+    /// The boot-decided format of this writer, fixed for its lifetime.
+    pub fn is_overhaul(&self) -> bool {
+        self.v4
+    }
+
     /// Transfer only captures covered by a successful WAL barrier. Appends racing after that
     /// barrier wait for the next one, so an uncommitted steer cannot authorize rendered media.
     pub(crate) fn take_media_captures(&self) -> crate::compaction::CapturedMedia {
@@ -3692,7 +3732,8 @@ impl WalHandle {
             lease,
         };
         let wal = owner.wal();
-        let v4 = wal.wal_config().is_overhaul();
+        let config = wal.wal_config();
+        let v4 = config.is_overhaul();
         if v4 && context.is_none() {
             return Err(WalWriteError::Failed(
                 "writer-id/v1: overhaul spawn requires a store marker root and session address"
@@ -3706,18 +3747,21 @@ impl WalHandle {
         // the same first-send placement, retention and runner-tag state as an empty log.
         let unstarted = last_seq == 0
             || (v4
-                && wal
-                    .replay()
-                    .map_err(|error| WalWriteError::Failed(error.to_string()))?
-                    .iter()
-                    .all(|frame| {
-                        matches!(
-                            frame.record,
-                            WalRecord::WriterOpened { .. }
-                                | WalRecord::WriterClosed { .. }
-                                | WalRecord::VisibilityLate { .. }
-                        )
-                    }));
+                && broca_wal::access_counter::writer_open(
+                    wal.log_path().unwrap_or(std::path::Path::new("")),
+                    false,
+                    || wal.replay(),
+                )
+                .map_err(|error| WalWriteError::Failed(error.to_string()))?
+                .iter()
+                .all(|frame| {
+                    matches!(
+                        frame.record,
+                        WalRecord::WriterOpened { .. }
+                            | WalRecord::WriterClosed { .. }
+                            | WalRecord::VisibilityLate { .. }
+                    )
+                }));
         let last_seq = last_seq + u64::from(v4);
         // Seq is 1-based; the first record of an empty WAL is seq 1, so the next seq
         // after a durable head of `last_seq` is `last_seq + 1`.
@@ -3741,12 +3785,13 @@ impl WalHandle {
             budget.map(|(max_bytes, used_bytes, overhead)| {
                 Mutex::new(AppendBudget {
                     writer_close_reserve,
+                    reopen_reserve: retained_size::reopen_reserve_bytes(config),
                     retained: budget_scope == retained_size::SizeScope::RetainedSession,
                     session_max_bytes: recovery_cap.unwrap_or(max_bytes),
                     max_bytes,
                     used_bytes,
                     overhead,
-                    reserve: retained_size::reserve_bytes(overhead),
+                    reserve: retained_size::terminal_reserve_bytes(overhead, config),
                     refused: false,
                 })
             })
@@ -3863,7 +3908,7 @@ impl WalHandle {
         // resident writer must not consume a slot needed by finite blocking jobs.
         let join = std::thread::Builder::new()
             .name("broca-wal-writer".into())
-            .spawn(body)
+            .spawn(broca_wal::access_counter::inherit(body))
             .map_err(|error| {
                 WalWriteError::Failed(format!("WAL writer thread spawn failed: {error}"))
             })?;
@@ -4261,6 +4306,7 @@ impl WalHandle {
                 if end
                     .saturating_add(self.publication_bytes.load(Ordering::SeqCst))
                     .saturating_add(reserve)
+                    .saturating_add(budget.reopen_reserve)
                     .saturating_add(budget.writer_close_reserve)
                     > budget.max_bytes
                 {

@@ -3777,6 +3777,16 @@ mod executor {
             broca_module_serve::cache_warm::responses_warm_cost(config, usage)
         }
 
+        fn failed_warm_cost(
+            &self,
+            config: &broca_wal::RunConfig,
+            reservation: &broca_wal::record::AttemptReservation,
+            envelope: &broca_wal::record::AttemptEnvelope,
+            ttl_ms: Option<u64>,
+        ) -> Result<f64, String> {
+            broca_module_serve::cache_warm::failed_warm_cost(config, reservation, envelope, ttl_ms)
+        }
+
         async fn warm_quota(
             &self,
             config: &broca_wal::RunConfig,
@@ -3854,7 +3864,12 @@ mod executor {
                 &self.clock,
             )
             .map_err(WarmError::Unavailable)?;
-            broca_module::executor::send_warm(provider.as_ref(), job.base).await
+            broca_module::executor::send_warm_with_hook(
+                provider.as_ref(),
+                job.base,
+                job.attempt_hook,
+            )
+            .await
         }
 
         async fn execute(
@@ -4338,6 +4353,120 @@ mod executor {
                     }
                     return Err(error);
                 }
+            }
+
+            #[cfg(feature = "test-attachments")]
+            if let Some(uploads) = self.wal_store.uploads().filter(|_| {
+                resolved.provider.supports_media_renderer()
+                    && (job.has_media_input()
+                        || prior_snapshot.checkpoint_at_head.has_captured_media()
+                        || !job.req.tools.is_empty())
+            }) {
+                let store = match uploads.session_media_store(&job.req.session) {
+                    Ok(store) => store,
+                    Err(error) => {
+                        let error = RunError::Wal(format!("open session media store: {error}"));
+                        if let Some(ack) = job.on_admitted {
+                            let _ = ack.send(Err(error.clone()));
+                        }
+                        return Err(error);
+                    }
+                };
+                let wal = Arc::clone(&self.wal_store);
+                let session = job.req.session.clone();
+                let head = job.writer.durable_head();
+                // File identity and length are metadata reads, not a WAL decode. Capture them
+                // before this executor appends so the first media tail can be strictly anchored.
+                let initial_anchor = self
+                    .wal_store
+                    .file_identity(&session)
+                    .ok()
+                    .flatten()
+                    .zip(self.wal_store.live_wal_bytes(&session).ok().flatten())
+                    .map(|(file_id, byte_end)| broca_wal::WalByteAnchor {
+                        file_id,
+                        byte_end,
+                        seq: prior_snapshot.head_seq,
+                    });
+                let anchor = std::sync::Mutex::new(initial_anchor);
+                let checkpoint = match &prior_snapshot.checkpoint_at_head.media {
+                    Some(broca_core::media_request::DurableMediaSeed::Ready(seed)) => {
+                        Ok((**seed).clone())
+                    }
+                    Some(broca_core::media_request::DurableMediaSeed::Unreadable(_)) => {
+                        Err("media_seed_undecodable after admission replay".into())
+                    }
+                    None => job.writer.empty_media_checkpoint(prior_snapshot.head_seq),
+                };
+                let checkpoint = match checkpoint {
+                    Ok(checkpoint) => checkpoint,
+                    Err(error) => {
+                        let error = RunError::Wal(error);
+                        if let Some(ack) = job.on_admitted {
+                            let _ = ack.send(Err(error.clone()));
+                        }
+                        return Err(error);
+                    }
+                };
+                let frozen: broca_provider::wire::FrozenRenderConfig =
+                    serde_json::from_value(resolved.provider.render_config_blob())
+                        .expect("resolved provider has a frozen config");
+                let media = broca_provider::media_request::LiveMedia::from_checkpoint(
+                    store,
+                    checkpoint,
+                    prior_snapshot
+                        .checkpoint_at_head
+                        .last_episode
+                        .as_ref()
+                        .and_then(|episode| episode.config.budget.clone()),
+                    frozen.media,
+                    Box::new(move |after| {
+                        let through = head.load(Ordering::Acquire);
+                        if after == through {
+                            return Ok(Vec::new());
+                        }
+                        let mut anchor = anchor.lock().unwrap();
+                        let range = if after == 0 {
+                            wal.read_records_range(&session, after, Some(through), None)
+                                .map_err(|error| format!("read session media captures: {error}"))?
+                        } else {
+                            let anchor = anchor
+                                .as_ref()
+                                .ok_or("media capture tail has no byte anchor")?;
+                            wal.read_records_range_from_valid_anchor(
+                                &session,
+                                after,
+                                Some(through),
+                                anchor,
+                            )
+                            .map_err(|error| format!("read session media captures: {error}"))?
+                            .ok_or("media capture tail byte anchor is stale")?
+                        };
+                        *anchor = range.next_anchor;
+                        match range.into_records() {
+                            broca_wal::WalRangeRecords::Complete(records)
+                            | broca_wal::WalRangeRecords::Unknown(records)
+                                if records.last().is_some_and(|frame| frame.seq == through) =>
+                            {
+                                Ok(records)
+                            }
+                            _ => Err("session media capture WAL range is incomplete".into()),
+                        }
+                    }),
+                );
+                let media = match media {
+                    Ok(media) => Arc::new(media),
+                    Err(error) => {
+                        let error = RunError::Wal(error);
+                        if let Some(ack) = job.on_admitted {
+                            let _ = ack.send(Err(error.clone()));
+                        }
+                        return Err(error);
+                    }
+                };
+                resolved.provider.set_media_request_renderer(Arc::new(
+                    move |frozen, opts, tags, commit| media.render(frozen, opts, tags, commit),
+                ));
             }
 
             // Warm the tool route CONCURRENTLY with the loop (gives the tool provider time

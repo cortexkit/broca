@@ -45,6 +45,14 @@ does not poison the writer, and leaves room for a permanent `run_finished{reason
 error}` terminal: `session_too_large` for ordinary sessions, or the unchanged
 `retained_session_too_large` for retained sessions.
 
+On overhaul roots, admission also holds the current writer's exact close bytes and a
+maximum-width successor `writer_opened` plus `writer_closed`, including their lineage
+metadata. The terminal cannot spend that successor reserve. After exhausting the ordinary
+budget, writing the bounded terminal and closing the writer, exactly one more writer can
+open and close within the cap, for crash reclaim or the next session activation. This is
+not a promise of unlimited reopen cycles at the cap. Legacy roots retain their existing
+terminal-only admission reserve and unchanged record bytes.
+
 `tool-times/v1` gates optional Unix-millisecond observations on
 `tool_dispatch_intent.dispatched_at_ms`, `tool_no_dispatch.dispatched_at_ms`,
 `tool_result.finished_at_ms`, `tool_call_deferred.deferred_at_ms`, and

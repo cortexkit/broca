@@ -73,7 +73,7 @@ pub fn reconstruct_from_offsets(
     use crate::replay::{
         replay_projection_tail, replay_seeded_at_validated_boundary, SeedFallback,
     };
-    let bad = |reason| SeedFallback { reason };
+    let bad = |reason| SeedFallback::new(reason);
     let mut seed = snapshot.projection;
     let window = snapshot.window;
     if seed.watermark_seq != snapshot.boundary.seq
@@ -98,6 +98,10 @@ pub fn reconstruct_from_offsets(
             > 1
     {
         return Err(bad("offset resume snapshot does not reach durable head"));
+    }
+    #[cfg(feature = "test-attachments")]
+    if !seed.admission_checkpoint.media_seed_complete() {
+        return Err(bad("offset resume media seed needs full replay"));
     }
     if !seed.admission_checkpoint.ownership_complete()
         || seed.admission_checkpoint.has_deferred_calls != Some(false)
@@ -166,6 +170,12 @@ pub fn reconstruct_from_offsets(
     let delta = replay_projection_tail(&seed, &frames)
         .map_err(|_| bad("offset resume projection composition failed"))?;
     let checkpoint = delta.admission_checkpoint;
+    // A tail can introduce the first media capture into a previously media-free prefix.
+    // Recheck its folded state: a valid selected window is not a media-state completeness proof.
+    #[cfg(feature = "test-attachments")]
+    if !checkpoint.media_seed_complete() {
+        return Err(bad("offset resume media seed needs full replay"));
+    }
     if window.is_none()
         && !matches!(
             checkpoint.compaction,
@@ -874,6 +884,113 @@ mod offset_resume_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[cfg(feature = "test-attachments")]
+    fn offset_resume_window_rejects_incomplete_media_seed_before_reusing_prefix() {
+        let mut records = compacted_tools(1, false);
+        if let WalRecord::RunStarted { input, .. } = &mut records[0] {
+            Arc::make_mut(input)[1]
+                .content
+                .push(ContentBlock::Media(broca_protocol::MediaRef {
+                    kind: broca_protocol::MediaKind::Image,
+                    mime: "image/png".into(),
+                    byte_size: 69,
+                    sha256: "a".repeat(64),
+                    width: Some(1),
+                    height: Some(1),
+                }));
+        }
+        let boundary = records
+            .iter()
+            .position(|record| matches!(record, WalRecord::TurnFinished { .. }))
+            .unwrap();
+        let (bytes, positions, ends, lineage) = file_window(&records, "media-seed");
+        let make = || {
+            let mut candidate = window_snapshot(&bytes, &positions, &ends, boundary);
+            candidate.boundary.lineage_id = Some(lineage.clone());
+            candidate
+        };
+        let valid = make();
+        assert!(valid.window.is_some());
+        assert!(valid.projection.admission_checkpoint.media_seed_complete());
+        reconstruct_from_offsets(&reader(&bytes), valid, records.len() as u64).unwrap();
+        for case in 0..3 {
+            let mut candidate = make();
+            let seed = &mut candidate.projection.admission_checkpoint.media;
+            *seed = match case {
+                0 => None,
+                1 => Some(serde_json::from_value(serde_json::json!({"version":99})).unwrap()),
+                _ => {
+                    let mut value = serde_json::to_value(seed.as_ref().unwrap()).unwrap();
+                    value["index"]["boundary"] = serde_json::json!(999);
+                    Some(serde_json::from_value(value).unwrap())
+                }
+            };
+            let before = crate::media_request::seed_fallback_count();
+            let error = reconstruct_from_offsets(&reader(&bytes), candidate, records.len() as u64)
+                .err()
+                .expect("an incomplete media seed must request full replay");
+            assert_eq!(error.reason, "offset resume media seed needs full replay");
+            assert!(crate::media_request::seed_fallback_count() > before);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "test-attachments")]
+    fn offset_resume_window_checks_media_seed_after_tail_capture() {
+        let mut records = compacted_tools(1, false);
+        let boundary = records
+            .iter()
+            .position(|record| matches!(record, WalRecord::TurnFinished { .. }))
+            .unwrap();
+        let image = Message::new(
+            Role::User,
+            vec![ContentBlock::Media(broca_protocol::MediaRef {
+                kind: broca_protocol::MediaKind::Image,
+                mime: "image/png".into(),
+                byte_size: 69,
+                sha256: "b".repeat(64),
+                width: Some(1),
+                height: Some(1),
+            })],
+        );
+        records.push(
+            serde_json::from_value(serde_json::json!({"type":"steered","input":[image]})).unwrap(),
+        );
+        records.push(WalRecord::StepStarted { step_id: StepId(6) });
+        let (bytes, positions, ends, lineage) = file_window(&records, "media-tail-seed");
+        let make = || {
+            let mut candidate = window_snapshot(&bytes, &positions, &ends, boundary);
+            candidate.boundary.lineage_id = Some(lineage.clone());
+            candidate
+        };
+        let mut valid = make();
+        let mut metadata = crate::media_request::MediaCheckpoint::empty();
+        for frame in &positions[..=boundary] {
+            metadata
+                .fold(frame.framed.seq, &frame.framed.record)
+                .unwrap();
+        }
+        valid.projection.admission_checkpoint.media = Some(
+            crate::media_request::DurableMediaSeed::Ready(Box::new(metadata)),
+        );
+        reconstruct_from_offsets(&reader(&bytes), valid, records.len() as u64).unwrap();
+        let missing = make();
+        assert!(
+            missing
+                .projection
+                .admission_checkpoint
+                .media_seed_complete(),
+            "the prefix contains no captures yet"
+        );
+        let before = crate::media_request::seed_fallback_count();
+        let error = reconstruct_from_offsets(&reader(&bytes), missing, records.len() as u64)
+            .err()
+            .expect("a new tail capture needs a complete media seed");
+        assert_eq!(error.reason, "offset resume media seed needs full replay");
+        assert!(crate::media_request::seed_fallback_count() > before);
     }
 
     #[test]

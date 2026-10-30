@@ -51,6 +51,49 @@ fn plain(n: u64) -> WalRecord {
     WalRecord::TurnFinished { step_id: StepId(n) }
 }
 
+#[test]
+fn maximum_width_writer_lifecycle_reopens_at_the_ordinary_limit() {
+    let scratch = Scratch::new("lifecycle-limit");
+    let writer_id = [u8::MAX; 16];
+    let opened = WalRecord::WriterOpened {
+        writer_id,
+        previous_writer_id: None,
+        recovered_through_seq: 0,
+        cause: "new".into(),
+    };
+    let closed = WalRecord::WriterClosed { writer_id };
+    let mut wal = scratch.overhaul();
+    wal.writer_id = Some(writer_id);
+    wal = wal.with_append_budget(16_000);
+    wal.append(1, &opened, true).unwrap();
+    loop {
+        match wal.append(1, &plain(1), false) {
+            Ok(_) => {}
+            Err(WalError::TooLarge { .. }) => break,
+            other => panic!("unexpected append outcome: {other:?}"),
+        }
+    }
+    wal.append(1, &closed, true).unwrap();
+    let closed_bytes = std::fs::metadata(scratch.log()).unwrap().len();
+    assert!(closed_bytes <= 16_000);
+    let recovered_through_seq = wal.last_seq();
+    drop(wal);
+
+    let mut wal = scratch.overhaul().with_append_budget(16_000);
+    wal.writer_id = Some(writer_id);
+    let reopened = WalRecord::WriterOpened {
+        writer_id,
+        previous_writer_id: Some(writer_id),
+        recovered_through_seq,
+        cause: "reopen".into(),
+    };
+    wal.append(1, &reopened, true).unwrap_or_else(|error| {
+        panic!("closed log is {closed_bytes} bytes under cap 16000, but reopen failed: {error}")
+    });
+    wal.append(1, &closed, true).unwrap();
+    assert!(std::fs::metadata(scratch.log()).unwrap().len() <= 16_000);
+}
+
 /// Requires `input-token-cap/v1` besides, so its header's requirements array is longer.
 fn gated(limit: u64) -> WalRecord {
     WalRecord::InputTokenCapFrozen { limit }

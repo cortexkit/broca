@@ -11,19 +11,20 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::access_counter;
 use crate::fs_ops::{self, File, OpenOptions};
 
 use crate::writer_tenure::{OwnedWalTenure, TenureError};
 
 use crate::{
     framing::{
-        decode_next, encode, encode_lineage, DecodeStep, FrameError, FramedRecord, PreparedV4Frame,
-        WalLineageId,
+        encode, encode_lineage, DecodeStep, FrameError, FramedRecord, PreparedV4Frame, WalLineageId,
     },
     record::WalRecord,
     state_format::{StateRootError, WalConfig, WalFormat},
 };
 
+use crate::access_counter::decode_next;
 use broca_protocol::BindIdentity;
 
 pub const DEFAULT_MAX_READ_BYTES: u64 = 1024 * 1024 * 1024;
@@ -34,6 +35,25 @@ mod human_prompt_count;
 #[cfg(test)]
 #[path = "file_wal_v4_tests.rs"]
 mod v4_tests;
+
+#[cfg(feature = "fs-override")]
+thread_local! {
+    static WRITER_ID_FOR_TEST: std::cell::Cell<Option<[u8; 16]>> = const { std::cell::Cell::new(None) };
+}
+
+/// Fix IDs minted by overhaul opens in `work` on this thread, to exercise payload-width limits.
+#[cfg(feature = "fs-override")]
+pub fn with_writer_id_for_test<T>(writer_id: [u8; 16], work: impl FnOnce() -> T) -> T {
+    struct Restore(Option<[u8; 16]>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WRITER_ID_FOR_TEST.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(WRITER_ID_FOR_TEST.with(|slot| slot.replace(Some(writer_id))));
+    work()
+}
+
 pub use human_prompt_count::{
     count_human_prompts_in_bytes, read_human_prompt_count, HumanPromptCount,
 };
@@ -941,7 +961,7 @@ impl FileWal {
         let max_read_bytes = OPEN_READ_CAP.with(Cell::get);
         #[cfg(not(test))]
         let max_read_bytes = DEFAULT_MAX_READ_BYTES;
-        let recovered = match File::open(&path) {
+        let recovered = access_counter::writer_open(&path, true, || match File::open(&path) {
             Ok(file) => {
                 let size = file.metadata().map_err(WalError::Io)?.len();
                 if size > max_read_bytes {
@@ -954,13 +974,13 @@ impl FileWal {
                     std::io::BufReader::new(file),
                     max_read_bytes,
                     |_| None::<()>,
-                )?
+                )
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                scan_prefix(std::io::empty(), max_read_bytes, |_| None::<()>)?
+                scan_prefix(std::io::empty(), max_read_bytes, |_| None::<()>)
             }
-            Err(error) => return Err(WalError::Io(error)),
-        };
+            Err(error) => Err(WalError::Io(error)),
+        })?;
         let valid_end = recovered.valid_end;
         let recovered_lineage_id = recovered.lineage_id;
         // Seq is 1-BASED: the first record is seq 1, so a watermark of 0
@@ -1061,6 +1081,8 @@ impl FileWal {
             WalFormat::Overhaul => {
                 let mut id = [0u8; 16];
                 getrandom::fill(&mut id).map_err(WalError::Entropy)?;
+                #[cfg(feature = "fs-override")]
+                let id = WRITER_ID_FOR_TEST.with(|slot| slot.get().unwrap_or(id));
                 Some(id)
             }
         };
@@ -1295,15 +1317,21 @@ impl FileWal {
         };
         // Lifecycle barriers spend their own held bytes, not another run terminal's reserve.
         // Every ordinary append, including RunFinished, must leave the outstanding close intact.
-        let reserve = if lifecycle || matches!(record, WalRecord::RunFinished { .. }) {
+        let terminal_reserve = if lifecycle || matches!(record, WalRecord::RunFinished { .. }) {
             0
         } else {
-            crate::size_limit::reserve_bytes(overhead)
+            crate::size_limit::terminal_reserve_bytes(overhead, self.config)
+        };
+        let reopen_reserve = if lifecycle {
+            0
+        } else {
+            crate::size_limit::reopen_reserve_bytes(self.config)
         };
         let required = current
             .saturating_add(record_bytes.len() as u64)
             .saturating_add(overhead)
-            .saturating_add(reserve)
+            .saturating_add(terminal_reserve)
+            .saturating_add(reopen_reserve)
             .saturating_add(close_reserve);
         if required > self.append_budget {
             return Err(WalError::TooLarge {
@@ -1873,10 +1901,11 @@ fn read_up_to(file: &mut impl Read, bytes: &mut [u8]) -> Result<usize, WalError>
 /// Strictly decode one body at a time, retaining only the caller's selected value.
 /// Recovery needs the verified end and sequence, not all historical message bodies.
 fn scan_prefix<T>(
-    mut file: impl Read,
+    file: impl Read,
     max_bytes: u64,
     mut found: impl FnMut(&FramedRecord) -> Option<T>,
 ) -> Result<PrefixScan<T>, WalError> {
+    let mut file = access_counter::AccessReader::new(file, 0);
     let mut scan = PrefixScan {
         found: None,
         bytes_read: 0,
@@ -2276,8 +2305,7 @@ fn read_records_tail_snapshot(
     // the already size-checked window, keeping both the cap and tail bound intact.
     file.seek(SeekFrom::Start(start)).map_err(WalError::Io)?;
     let mut suffix = Vec::new();
-    file.take(file_size - start)
-        .read_to_end(&mut suffix)
+    access_counter::read_to_end(file.take(file_size - start), start, &mut suffix)
         .map_err(WalError::Io)?;
     let lineage = read_first_frame_lineage(file, max_bytes)?;
     let file_id = metadata_file_id(metadata);
@@ -2314,8 +2342,7 @@ fn read_first_frame_lineage(
 ) -> Result<Option<WalLineageId>, WalError> {
     file.seek(SeekFrom::Start(0)).map_err(WalError::Io)?;
     let mut head = Vec::new();
-    file.take(4096.min(max_bytes))
-        .read_to_end(&mut head)
+    access_counter::read_to_end(file.take(4096.min(max_bytes)), 0, &mut head)
         .map_err(WalError::Io)?;
     WAL_BYTES_READ.fetch_add(head.len() as u64, std::sync::atomic::Ordering::Relaxed);
     Ok(match decode_next(&head) {
@@ -2334,6 +2361,9 @@ pub fn read_verified_member_range(
     after_seq: u64,
     through_seq: Option<u64>,
 ) -> Result<WalRangeRead, WalError> {
+    // The archive adapter has loaded this member's WAL bytes. Container lookup
+    // metadata is not a WAL source range and is deliberately excluded.
+    access_counter::record_read(0, bytes.len() as u64);
     #[cfg(any(test, feature = "test-io-trace"))]
     crate::archive::expiry_io::decoded();
     let decoded = decode_bytes(bytes, 0, 1)?;
@@ -2509,7 +2539,7 @@ fn validate_contiguous_sequence(
 fn has_intact_data_after(bytes: &[u8], mut expected_lineage: Option<WalLineageId>) -> bool {
     (1..bytes.len().saturating_sub(crate::framing::HEADER_LEN - 1)).any(|offset| {
         let suffix = &bytes[offset..];
-        match crate::framing::decode_next(suffix) {
+        match decode_next(suffix) {
             DecodeStep::Record { .. } | DecodeStep::NewerWriter { .. } => true,
             DecodeStep::Corrupt(_) => crate::framing::digest_verifies(suffix),
             DecodeStep::Lineage {
@@ -2655,9 +2685,7 @@ fn read_open_file_capped(
     file.seek(SeekFrom::Start(start)).map_err(WalError::Io)?;
     let mut bytes = Vec::new();
     let read_cap = max_bytes.saturating_sub(start).saturating_add(1);
-    file.take(read_cap)
-        .read_to_end(&mut bytes)
-        .map_err(WalError::Io)?;
+    access_counter::read_to_end(file.take(read_cap), start, &mut bytes).map_err(WalError::Io)?;
     WAL_BYTES_READ.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
     if start.saturating_add(bytes.len() as u64) > max_bytes {
         return Err(WalError::TooLarge {
@@ -2730,8 +2758,8 @@ fn read_file_capped(path: &Path, max_bytes: u64) -> Result<Vec<u8>, WalError> {
                 });
             }
             let mut buf = Vec::with_capacity(file_size as usize);
-            let mut limited = f.take(max_bytes.saturating_add(1));
-            limited.read_to_end(&mut buf).map_err(WalError::Io)?;
+            let limited = f.take(max_bytes.saturating_add(1));
+            access_counter::read_to_end(limited, 0, &mut buf).map_err(WalError::Io)?;
             if buf.len() as u64 > max_bytes {
                 return Err(WalError::TooLarge {
                     max_bytes,

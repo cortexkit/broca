@@ -1364,8 +1364,12 @@ pub fn first_record_offset(
 pub fn log_header_info(
     read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
 ) -> std::io::Result<(u64, Option<broca_wal::WalLineageId>)> {
-    let header = read_at(0, broca_wal::framing::LINEAGE_FRAME_LEN as u64)?;
-    Ok(match broca_wal::framing::decode_next(&header) {
+    let header = broca_wal::access_counter::read_at(
+        read_at,
+        0,
+        broca_wal::framing::LINEAGE_FRAME_LEN as u64,
+    )?;
+    Ok(match broca_wal::access_counter::decode_next(&header) {
         broca_wal::framing::DecodeStep::Lineage {
             consumed,
             lineage_id,
@@ -1387,11 +1391,13 @@ pub fn decode_positioned_frames(
     to: u64,
     decode_counter: Option<&std::cell::Cell<u64>>,
 ) -> Result<Vec<crate::replay::PositionedFrame>, String> {
-    use broca_wal::framing::{decode_next, DecodeStep};
+    use broca_wal::access_counter::decode_next;
+    use broca_wal::framing::DecodeStep;
     let len = to
         .checked_sub(from)
         .ok_or_else(|| format!("WAL range {from}..{to} is reversed"))?;
-    let bytes = read_at(from, len).map_err(|error| format!("WAL read at {from}: {error}"))?;
+    let bytes = broca_wal::access_counter::read_at(read_at, from, len)
+        .map_err(|error| format!("WAL read at {from}: {error}"))?;
     if (bytes.len() as u64) < len {
         return Err(format!(
             "WAL ends at {} before the range end {to}",
@@ -1472,9 +1478,8 @@ pub fn replay_from_episode_start(
     frames: &[crate::replay::PositionedFrame],
 ) -> Result<EpisodeReplay, crate::replay::SeedFallback> {
     use crate::replay::SeedFallback;
-    let run_started = episode_start_index(episode, frames).ok_or(SeedFallback {
-        reason: "episode start not in the frames read",
-    })?;
+    let run_started = episode_start_index(episode, frames)
+        .ok_or_else(|| SeedFallback::new("episode start not in the frames read"))?;
     let (state, ordinal_base) = match seed {
         Some(seed) => (
             crate::replay::replay_seeded_at_validated_boundary(
@@ -1493,22 +1498,19 @@ pub fn replay_from_episode_start(
             seed.ordinal_base,
         ),
         None => {
-            let start = first_record_offset(read_at).map_err(|_| SeedFallback {
-                reason: "log unreadable",
-            })?;
+            let start =
+                first_record_offset(read_at).map_err(|_| SeedFallback::new("log unreadable"))?;
             // `run_started` was found, so `frames` is not empty.
             if frames[0].framed.seq != 1 || frames[0].off != start {
-                return Err(SeedFallback {
-                    reason: "frames do not start at the log's first record",
-                });
+                return Err(SeedFallback::new(
+                    "frames do not start at the log's first record",
+                ));
             }
             if frames
                 .windows(2)
                 .any(|pair| pair[0].framed.seq + 1 != pair[1].framed.seq)
             {
-                return Err(SeedFallback {
-                    reason: "frames have a sequence gap",
-                });
+                return Err(SeedFallback::new("frames have a sequence gap"));
             }
             let state = crate::replay::replay_seeded(
                 frames.iter().map(|positioned| &positioned.framed.record),
@@ -1520,9 +1522,7 @@ pub fn replay_from_episode_start(
                 false,
                 crate::tags::TagSeed::default(),
             )
-            .map_err(|_| SeedFallback {
-                reason: "replay refused the frames",
-            })?;
+            .map_err(|_| SeedFallback::new("replay refused the frames"))?;
             (state, 0)
         }
     };
@@ -1537,9 +1537,7 @@ pub fn replay_from_episode_start(
         .and_then(|episodes| episodes.get(starts_before))
         .map(|rendered| rendered.prompt_start as u64);
     if prompt_start != Some(episode.first_ord) {
-        return Err(SeedFallback {
-            reason: "episode first ordinal mismatch",
-        });
+        return Err(SeedFallback::new("episode first ordinal mismatch"));
     }
     Ok(EpisodeReplay {
         state,
@@ -1553,3 +1551,40 @@ mod placement_tests;
 
 #[cfg(test)]
 mod live_tests;
+
+#[cfg(test)]
+mod access_counter_tests {
+    #[test]
+    fn projection_source_reads_and_decodes_use_the_shared_counter() {
+        use broca_wal::access_counter::{ReadClass, WalAccessCounter};
+        let bytes = broca_wal::framing::encode(
+            1,
+            1,
+            &broca_wal::WalRecord::TurnFinished {
+                step_id: broca_protocol::StepId(1),
+            },
+        )
+        .unwrap();
+        let reader = |offset: u64, length: u64| {
+            Ok(bytes
+                .iter()
+                .skip(offset as usize)
+                .take(length as usize)
+                .copied()
+                .collect::<Vec<_>>())
+        };
+        let counter = WalAccessCounter::default();
+        counter.operation("projection source").run(|| {
+            assert_eq!(super::log_header_info(&reader).unwrap(), (0, None));
+            let frames =
+                super::decode_positioned_frames(&reader, 0, bytes.len() as u64, None).unwrap();
+            assert_eq!(frames.len(), 1);
+        });
+        let snapshot = counter.snapshot();
+        assert_eq!(snapshot[0].reads.len(), 2);
+        assert_eq!(snapshot[0].reads[0].class, ReadClass::LineageHeader);
+        assert_eq!(snapshot[0].reads[1].class, ReadClass::Origin);
+        assert_eq!(snapshot[0].reads[1].length, bytes.len() as u64);
+        assert_eq!(snapshot[0].frames_decoded, 1);
+    }
+}

@@ -624,6 +624,11 @@ impl EffortHistoryV1 {
 /// Version-one admission projection at an exact WAL sequence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdmissionCheckpointV1 {
+    /// Reference-only media resume state, omitted for media-free histories. A captured-reference
+    /// index without a valid matching seed requires a named, counted full-replay repair.
+    #[cfg(feature = "test-attachments")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<crate::media_request::DurableMediaSeed>,
     /// Missing on older checkpoints: reconstruct from the full WAL before extending totals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head: Option<crate::head::HeadProjection>,
@@ -706,6 +711,10 @@ impl AdmissionCheckpointV1 {
     /// A newly applied record in a tail needs canonical replay to recover its
     /// message count. Missing compaction state is checked separately at the seed.
     pub(crate) fn compaction_boundary_complete(&self) -> bool {
+        #[cfg(feature = "test-attachments")]
+        if !self.media_seed_complete() {
+            return false;
+        }
         self.compaction
             .as_ref()
             .and_then(|checkpoint| checkpoint.state())
@@ -714,6 +723,8 @@ impl AdmissionCheckpointV1 {
 
     pub fn empty() -> Self {
         Self {
+            #[cfg(feature = "test-attachments")]
+            media: None,
             head: Some(crate::head::HeadProjection::default()),
             has_deferred_calls: Some(false),
             input_budget: Some(crate::input_budget::InputTokenBudget::default()),
@@ -767,6 +778,24 @@ impl AdmissionCheckpointV1 {
 
     /// Fold an ordered WAL suffix into this checkpoint.
     pub fn fold_frames(&mut self, records: &[FramedRecord]) -> Result<(), ReplayError> {
+        #[cfg(feature = "test-attachments")]
+        if let Some(crate::media_request::DurableMediaSeed::Ready(media)) = &mut self.media {
+            media.resume_budget(
+                self.last_episode
+                    .as_ref()
+                    .and_then(|episode| episode.config.budget.clone()),
+            );
+        }
+        #[cfg(feature = "test-attachments")]
+        if self.at_seq == 0
+            && records
+                .iter()
+                .any(|frame| crate::compaction::CapturedMedia::captures_any(&frame.record))
+        {
+            self.media = Some(crate::media_request::DurableMediaSeed::Ready(Box::new(
+                crate::media_request::MediaCheckpoint::empty(),
+            )));
+        }
         for framed in records {
             self.fold_record(framed.seq, &framed.record)?;
         }
@@ -775,6 +804,28 @@ impl AdmissionCheckpointV1 {
 
     /// Fold one WAL record. The mutation is committed only after all corruption checks pass.
     pub fn fold_record(&mut self, seq: u64, record: &WalRecord) -> Result<(), ReplayError> {
+        #[cfg(feature = "test-attachments")]
+        if self.at_seq == 0
+            && self.media.is_none()
+            && crate::compaction::CapturedMedia::captures_any(record)
+        {
+            self.media = Some(crate::media_request::DurableMediaSeed::Ready(Box::new(
+                crate::media_request::MediaCheckpoint::empty(),
+            )));
+        }
+        #[cfg(feature = "test-attachments")]
+        if let Some(crate::media_request::DurableMediaSeed::Ready(media)) = &mut self.media {
+            media
+                .fold(seq, record)
+                .map_err(|reason| ReplayError::CorruptLineage {
+                    episode_run_id: self
+                        .last_episode
+                        .as_ref()
+                        .map(|episode| episode.run_id.clone())
+                        .unwrap_or_else(|| RunId(String::new())),
+                    reason,
+                })?;
+        }
         if let Some(history) = &mut self.output_reservation {
             history.fold(record);
         }
@@ -1133,6 +1184,38 @@ impl AdmissionCheckpointV1 {
 }
 
 impl AdmissionCheckpointV1 {
+    #[cfg(feature = "test-attachments")]
+    pub fn has_captured_media(&self) -> bool {
+        self.compaction
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.captured())
+            .is_some_and(|captured| !captured.is_empty())
+    }
+
+    #[cfg(feature = "test-attachments")]
+    pub fn media_seed_complete(&self) -> bool {
+        let has_media = self.has_captured_media();
+        if !has_media {
+            return true;
+        }
+        let reason = match &self.media {
+            Some(crate::media_request::DurableMediaSeed::Ready(seed))
+                if seed.at_seq == self.at_seq =>
+            {
+                return true
+            }
+            Some(crate::media_request::DurableMediaSeed::Ready(_)) => {
+                "media_seed_watermark_mismatch".to_string()
+            }
+            Some(crate::media_request::DurableMediaSeed::Unreadable(value)) => {
+                crate::media_request::MediaCheckpoint::decode(value).unwrap_err()
+            }
+            None => "media_seed_missing".to_string(),
+        };
+        crate::media_request::count_seed_fallback(&reason);
+        false
+    }
+
     pub fn compaction_complete(&self) -> bool {
         match &self.compaction {
             Some(_) => self.compaction_boundary_complete(),
@@ -1263,9 +1346,7 @@ impl AdmissionSource {
         boundary: &AdmissionSource,
     ) -> Result<FramedRecord, crate::replay::SeedFallback> {
         use sha2::Digest;
-        let bad = || crate::replay::SeedFallback {
-            reason: "admission source identity mismatch",
-        };
+        let bad = || crate::replay::SeedFallback::new("admission source identity mismatch");
         if self.seq == 0 || self.seq > boundary.seq || self.end > boundary.end {
             return Err(bad());
         }
@@ -1274,11 +1355,12 @@ impl AdmissionSource {
             .checked_sub(self.off)
             .filter(|len| *len > 0)
             .ok_or_else(bad)?;
-        let bytes = read_at(self.off, len).map_err(|_| bad())?;
+        let bytes =
+            broca_wal::access_counter::read_at(read_at, self.off, len).map_err(|_| bad())?;
         if bytes.len() as u64 != len || sha2::Sha256::digest(&bytes).as_slice() != self.identity {
             return Err(bad());
         }
-        match broca_wal::framing::decode_next(&bytes) {
+        match broca_wal::access_counter::decode_next(&bytes) {
             broca_wal::framing::DecodeStep::Record { framed, consumed }
                 if consumed == bytes.len() && framed.seq == self.seq =>
             {
@@ -1344,9 +1426,7 @@ impl AdmissionSeed {
         prefix: &[crate::replay::PositionedFrame],
     ) -> Result<Self, crate::replay::SeedFallback> {
         use sha2::Digest;
-        let bad = || crate::replay::SeedFallback {
-            reason: "incomplete admission prefix",
-        };
+        let bad = || crate::replay::SeedFallback::new("incomplete admission prefix");
         if prefix.first().map(|p| p.framed.seq) != Some(1)
             || prefix.last().map(|p| (p.framed.seq, p.off))
                 != Some((boundary.seq, boundary.frame_off))
@@ -1368,17 +1448,20 @@ impl AdmissionSeed {
             || replay.open_tool_turn.is_some()
             || frames.iter().any(|p| matches!(&p.record, WalRecord::RunStarted { manifest: Some(manifest), .. } if crate::compaction::has_compaction(manifest)))
         {
-            return Err(crate::replay::SeedFallback {
-                reason: "admission prefix needs full replay",
-            });
+            return Err(crate::replay::SeedFallback::new("admission prefix needs full replay"));
         }
         let source = |i: usize| -> Result<AdmissionSource, crate::replay::SeedFallback> {
             let off = prefix[i].off;
             let limit = prefix.get(i + 1).map_or(boundary.frame_end, |p| p.off);
-            let bytes = read_at(off, limit.checked_sub(off).ok_or_else(bad)?).map_err(|_| bad())?;
+            let bytes = broca_wal::access_counter::read_at(
+                read_at,
+                off,
+                limit.checked_sub(off).ok_or_else(bad)?,
+            )
+            .map_err(|_| bad())?;
             // FileWal metadata follows each record. A source identifies only its own
             // frame, not the lineage bytes before the next positioned record.
-            let consumed = match broca_wal::framing::decode_next(&bytes) {
+            let consumed = match broca_wal::access_counter::decode_next(&bytes) {
                 broca_wal::framing::DecodeStep::Record { framed, consumed }
                     if *framed == prefix[i].framed =>
                 {
@@ -1499,9 +1582,7 @@ impl AdmissionSeed {
         let Some(seed) = &self.episode else {
             return Ok(None);
         };
-        let bad = || crate::replay::SeedFallback {
-            reason: "invalid admission episode sources",
-        };
+        let bad = || crate::replay::SeedFallback::new("invalid admission episode sources");
         let start = seed.start.read(read_at, &self.boundary)?;
         if !matches!(&start.record, WalRecord::RunStarted { run_id, .. } if run_id == &seed.run_id)
         {
@@ -1574,9 +1655,7 @@ impl AdmissionSeed {
             || crate::replay::tail_contains_compaction_setup(&tail.iter().map(|p| p.framed.clone()).collect::<Vec<_>>())
             || tail.iter().any(|p| matches!(&p.framed.record, WalRecord::RunStarted { manifest: Some(manifest), .. } if crate::compaction::has_compaction(manifest)))
         {
-            return Err(crate::replay::SeedFallback {
-                reason: "admission seed incomplete or head mismatch",
-            });
+            return Err(crate::replay::SeedFallback::new("admission seed incomplete or head mismatch"));
         }
         crate::replay::replay_seeded_at_validated_boundary(
             read_at,
@@ -1616,9 +1695,7 @@ impl AdmissionSeed {
     ) -> Result<(AdmissionCheckpointV1, AdmissionCheckpointV1), crate::replay::SeedFallback> {
         let episode = self.episode(read_at)?;
         self.validate(read_at, tail, safe_head, episode.as_ref())?;
-        let bad = || crate::replay::SeedFallback {
-            reason: "incomplete admission scalars",
-        };
+        let bad = || crate::replay::SeedFallback::new("incomplete admission scalars");
         if self.scalars.last_episode.is_some()
             || !self.scalars.pending_fifo.is_empty()
             || self.scalars.pending_order.is_some()
@@ -1735,9 +1812,7 @@ impl AdmissionSeed {
         checkpoint.last_episode = episode;
         checkpoint
             .fold_frames(&tail.iter().map(|p| p.framed.clone()).collect::<Vec<_>>())
-            .map_err(|_| crate::replay::SeedFallback {
-                reason: "paused admission tail refused",
-            })?;
+            .map_err(|_| crate::replay::SeedFallback::new("paused admission tail refused"))?;
         Ok(checkpoint
             .last_episode
             .filter(|e| e.disposition == EpisodeDisposition::Paused))
@@ -2473,24 +2548,50 @@ mod tests {
             file.take(len).read_to_end(&mut bytes)?;
             Ok(bytes)
         };
-        let seed = AdmissionSeed::capture(&read_at, &boundary, &positioned[..cut])
+        let counter = broca_wal::access_counter::WalAccessCounter::default();
+        let seed = counter
+            .operation("capture admission seed")
+            .run(|| AdmissionSeed::capture(&read_at, &boundary, &positioned[..cut]))
             .expect("a multi-record FileWal admission seed must capture exact source frames");
         assert_eq!(
             positioned.get(cut).map_or(bytes.len() as u64, |p| p.off) - boundary.frame_end,
             broca_wal::framing::LINEAGE_FRAME_LEN as u64
         );
         let full_reads = std::cell::Cell::new(0);
-        let snapshot = crate::run::load_prior_wal_snapshot_from_seed(
-            &read_at,
-            &seed,
-            &positioned[cut..],
-            positioned.last().unwrap().framed.seq,
-            || {
-                full_reads.set(full_reads.get() + 1);
-                panic!("a valid real FileWal admission seed must not read the full log")
-            },
-        )
-        .unwrap();
+        let snapshot = counter
+            .operation("hydrate admission seed")
+            .run(|| {
+                crate::run::load_prior_wal_snapshot_from_seed(
+                    &read_at,
+                    &seed,
+                    &positioned[cut..],
+                    positioned.last().unwrap().framed.seq,
+                    || {
+                        full_reads.set(full_reads.get() + 1);
+                        panic!("a valid real FileWal admission seed must not read the full log")
+                    },
+                )
+            })
+            .unwrap();
+        let measured = counter.snapshot();
+        // Capture authenticates the first and current RunStarted independently,
+        // plus RunConfigRefrozen and RunAuthRefrozen in the nonempty-tail corpus. Each
+        // locator is read once to find its extent and once to verify its hash.
+        let capture_reads = if empty_tail { 4 } else { 8 };
+        assert_eq!(measured[0].reads.len(), capture_reads);
+        assert_eq!(measured[0].frames_decoded, capture_reads as u64);
+        assert!(measured[1]
+            .reads
+            .iter()
+            .any(|read| read.class == broca_wal::access_counter::ReadClass::Source));
+        assert!(measured[1]
+            .reads
+            .iter()
+            .any(|read| read.class == broca_wal::access_counter::ReadClass::LineageHeader));
+        assert!(measured[1].frames_decoded > 0);
+        assert!(measured
+            .iter()
+            .all(|operation| operation.seed_fallbacks.is_empty()));
         assert_eq!(full_reads.get(), 0);
         assert_eq!(snapshot.base_watermark, cut as u64);
         assert_eq!(snapshot.tail.is_empty(), empty_tail);
@@ -2853,7 +2954,7 @@ mod tests {
             let reads = std::cell::Cell::new(0);
             let read_at = |off, len| {
                 let data = offset_reader(&bytes[..end_off])(off, len)?;
-                if matches!(broca_wal::framing::decode_next(&data), broca_wal::framing::DecodeStep::Record { consumed, .. } if consumed == data.len())
+                if matches!(broca_wal::access_counter::decode_next(&data), broca_wal::framing::DecodeStep::Record { consumed, .. } if consumed == data.len())
                 {
                     reads.set(reads.get() + 1);
                 }
@@ -3819,6 +3920,8 @@ mod tests {
     #[test]
     fn checkpoint_json_with_pending_payload_is_byte_stable() {
         let checkpoint = AdmissionCheckpointV1 {
+            #[cfg(feature = "test-attachments")]
+            media: None,
             output_reservation: None,
             head: None,
             has_deferred_calls: None,

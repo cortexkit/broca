@@ -905,6 +905,7 @@ fn validate_envelope(v: &Value) -> Result<(), &'static str> {
                     | "cancelled"
                     | "sealed_in_flight"
                     | "http_error"
+                    | "compression_refused"
                     | "provider_error"
                     | "connect_failed"
                     | "header_timeout"
@@ -1018,6 +1019,19 @@ mod tests {
 
     const W: [u8; 16] = [1; 16];
     const NEXT: [u8; 16] = [2; 16];
+
+    #[test]
+    fn compression_refused_outcome_has_pinned_serde_name() {
+        assert_eq!(
+            serde_json::to_string(&Outcome::CompressionRefused).unwrap(),
+            r#""compression_refused""#
+        );
+        assert_eq!(
+            serde_json::from_str::<Outcome>(r#""compression_refused""#).unwrap(),
+            Outcome::CompressionRefused
+        );
+        validate_envelope(&serde_json::json!({"sent":true,"response_bytes":0,"outcome":"compression_refused","http_status":415})).unwrap();
+    }
 
     struct Log {
         raw: Vec<u8>,
