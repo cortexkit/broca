@@ -29,7 +29,7 @@ cargo clippy --locked --workspace --all-targets --target x86_64-pc-windows-gnu "
 # An accidentally selected fixture test must fail, not return a passing skip.
 unset SUBC_CORE_BIN FAKE_AFT_STUB_BIN CK_CLAUSTRUM_BIN CK_AUTH_BIN CK_CLAUSTRUM_CHECKOUT AIMOCK_CMD
 export BROCA_REQUIRE_SUBC=1 BROCA_REQUIRE_VAULT=1 BROCA_REQUIRE_AIMOCK=1
-export NEXTEST_TEST_THREADS=num-cpus
+export NEXTEST_TEST_THREADS="${NEXTEST_TEST_THREADS:-num-cpus}"
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
 unit_skips=()

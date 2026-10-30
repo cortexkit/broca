@@ -24,13 +24,13 @@ if [[ -n "$(git status --porcelain)" ]]; then
   echo 'prepush: NOT-RUN fast: commit the candidate and start from a clean worktree' >&2
   exit 1
 fi
-checkouts="$root/target/scratch/prepush-checkouts"
+checkouts="${BROCA_PREPUSH_LANE_POOL:-$(dirname "$root")/broca-prepush-lanes}"
 mkdir -p "$checkouts"
 names=() pids=() results=() durations=()
 started=$SECONDS
 
-prepare_checkout() {
-  local name="$1" destination="$checkouts/$1" origin
+prepare_inputs_checkout() {
+  local name=prepush-inputs destination="$checkouts/prepush-inputs" origin
   if [[ ! -e "$destination" ]]; then
     git clone --quiet --shared "$root" "$destination" || return 1
     printf 'managed by scripts/prepush.sh\n' > "$destination/.git/broca-prepush-managed" || return 1
@@ -54,6 +54,29 @@ prepare_checkout() {
   }
 }
 
+prepare_lane_worktree() {
+  local name="$1" destination="$checkouts/$1" common expected
+  if [[ ! -e "$destination" ]]; then
+    git worktree add --quiet --detach "$destination" "$candidate" || return 1
+  fi
+  common="$(git -C "$destination" rev-parse --path-format=absolute --git-common-dir)" || return 1
+  expected="$(git rev-parse --path-format=absolute --git-common-dir)" || return 1
+  [[ "$common" == "$expected" ]] || {
+    echo "prepush: lane pool entry belongs to another repository: $destination" >&2
+    return 1
+  }
+  [[ -z "$(git -C "$destination" status --porcelain)" ]] || {
+    echo "prepush: lane worktree is dirty; refusing to update it: $destination" >&2
+    return 1
+  }
+  git -C "$destination" checkout --quiet --detach "$candidate" || return 1
+  [[ "$(git -C "$destination" rev-parse HEAD)" == "$candidate" ]]
+}
+
+timestamp_ms() {
+  python3 -c 'import time; print(time.time_ns() // 1000000)'
+}
+
 launch() {
   local name="$1" platform="$2" cpus="$3"
   local args=(--platform "$platform")
@@ -66,13 +89,19 @@ launch() {
   names+=("$name")
   (
     begin=$SECONDS
+    begin_ms="$(timestamp_ms)"
     rc=0
-    if ! prepare_checkout "$name"; then
+    requested_ms="$begin_ms"
+    if ! prepare_lane_worktree "$name"; then
       echo "prepush: NOT-RUN $name: could not prepare its isolated checkout"
       rc=204
     else
+      requested_ms="$(timestamp_ms)"
       ck motor run "${args[@]}" -- "bash scripts/prepush.sh --lane $name" || rc=$?
     fi
+    ended_ms="$(timestamp_ms)"
+    python3 scripts/lib/prepush-motor-timing.py "$logs/$name.motor.jsonl" "$requested_ms" \
+      "$((requested_ms - begin_ms))" "$((ended_ms - begin_ms))" > "$logs/$name.timing.json"
     printf '%s\n' "$((SECONDS - begin))" > "$logs/$name.seconds"
     exit "$rc"
   ) > "$logs/$name.log" 2>&1 &
@@ -95,7 +124,20 @@ summarize() {
   echo '==> prepush lane summary (wall seconds, including dispatch)'
   for i in "${!names[@]}"; do
     state="$(dispatch_state "${results[$i]}")"
-    printf '%-24s %-10s exit=%-3s %ss\n' "${names[$i]}" "$state" "${results[$i]}" "${durations[$i]}"
+    printf '%-24s %-10s exit=%-3s wall=%ss' "${names[$i]}" "$state" "${results[$i]}" "${durations[$i]}"
+    if [[ -f "$logs/${names[$i]}.timing.json" ]]; then
+      python3 - "$logs/${names[$i]}.timing.json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as source:
+    timing = json.load(source)
+def seconds(key):
+    value = timing[key]
+    return '-' if value is None else f'{value / 1000:.3f}s'
+print(f" checkout={seconds('checkout_ms')} request-to-start={seconds('request_to_start_ms')} run={seconds('run_ms')}")
+PY
+    else
+      printf '\n'
+    fi
     if [[ ${results[$i]} != 0 ]]; then
       failed=1
       echo "--- FIRST ERRORS ${names[$i]} ($state) ---"
@@ -135,7 +177,7 @@ launch macos macos ''
 # Stage downloads on the caller and send them as sibling inputs; Windows has no network.
 windows_begin=$SECONDS
 windows_ready=0
-if prepare_checkout prepush-inputs > "$logs/windows-inputs.log" 2>&1 &&
+if prepare_inputs_checkout > "$logs/windows-inputs.log" 2>&1 &&
    python3 scripts/prepare-prepush-windows.py --output "$checkouts/prepush-inputs/inputs" \
      --siblings "$checkouts" --cache "$root/target/scratch/prepush-offline-cache" >> "$logs/windows-inputs.log" 2>&1; then
   windows_ready=1

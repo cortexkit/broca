@@ -12,10 +12,18 @@ Only when those pass does it launch the unchanged operator script suites in
 `linux-operator`, concurrently with independent Linux portable, unit/doc,
 integration-1 through integration-4, production, MSRV, WAL and deployment jobs,
 alongside native Windows and targeted macOS. Portable and deployment reserve
-16 vCPUs; the other Linux jobs reserve 8 each. Each job has a separate managed
-checkout under `target/scratch/prepush-checkouts` and a separate Cargo target
-namespace. Motor serializes jobs from one workspace: merely backgrounding
-several jobs against the original checkout would not parallelize the gate.
+16 vCPUs; the other Linux jobs reserve 8 each. Each remote lane has a persistent
+detached Git worktree in a pool beside the scratch checkout, by default
+`../broca-prepush-lanes/LANE`. Set `BROCA_PREPUSH_LANE_POOL` to choose another
+persistent pool. A lane is checked for dirtiness **before** checkout and must
+match the exact candidate SHA. Unrelated repositories or dirty lanes fail closed;
+the gate never resets or cleans them.
+
+MOTOR guarantees that each checkout (including a Git worktree) is its own host
+workspace, with its own target folder. It serializes jobs within a workspace;
+different workspaces never share a writable target. The gate therefore uses
+MOTOR's supplied `CARGO_TARGET_DIR` unchanged, rather than adding colder target
+subfolders. Keep the lane pool across runs so host-side caches remain warm.
 
 Each Linux integration job builds/checks its own archive and replays its one
 unchanged CI partition. Windows builds one archive and replays all four
@@ -25,6 +33,15 @@ controllable test-clock feature is enabled, not merely listed in the archive.
 A failing shard does not stop the other shards or unit job. These
 stable checkout/cache locations amortize compilation on subsequent pushes;
 cold compilation and build-server admission can still dominate wall time.
+
+Prepush caps nextest execution at four concurrent slots. nextest 0.9.138 has a
+reproduced mixed-group scheduling bug at eight slots: a weight-four aimock test
+never starts, yet every printed result is PASS and the run exits 100 with an
+unrun-test warning. The disposable positive-test fixture and commands for this
+mixed-group scheduling bug are kept under `.cortexkit/internal-docs/investigations/`.
+No broca test, partition, profile, group cap, timeout or retry policy changes.
+An unrun-test warning still fails the lane. Remove the concurrency cap only
+after a fixed nextest passes the synthetic regression at eight slots.
 
 Each check prints its complete output, exit status and wall time. The final
 summary prints the first error lines and replays complete failed-lane output,
@@ -36,8 +53,11 @@ test failure or pass; connection-loss outcomes are **UNKNOWN**. Either fails the
 gate. Setup failures explicitly mark dependent suites **NOT RUN** and return
 failure, never a passing skip. No retries or timeout increases mask tests.
 
-Daemon/test temporary files are separate from logs: the runner's
-`$HOME/.broca-prepush-runtime` and its per-job leaves are explicitly 0700.
+Daemon/test temporary files are separate from each lane worktree's logs and
+artifacts. On Unix, `$HOME/.broca-prepush-runtime` and its per-job leaves are
+explicitly 0700. Windows instead creates a fresh native-temp directory through
+`broca-owner-only`'s protected owner/SYSTEM ACL creator, then validates its
+inheritable ACL. It never applies Unix modes or adopts the old shared HOME path.
 Test processes use CI's **umask 022**, not 077: owner-only tests must distinguish
 an explicit private-file mode from the ambient default.
 `TMPDIR`, `TMP` and `TEMP` point at the private directory,
@@ -53,6 +73,9 @@ error named `lease_mismatch`. Each dispatched job prints
 `MOTOR_RUNNER_INSTANCE`; its motor event record is retained beside the lane log
 as `LANE.motor.jsonl`. A refusal before job start has no user-process instance
 banner; retain its exact refusal and event record instead of guessing a host.
+`LANE.timing.json` and the final table separately record checkout preparation,
+client request-to-start delay and actual runner execution. The runner's reported
+queue metric is retained but is not treated as the complete pre-start wait.
 
 ## Prerequisites and the fast boundary
 
@@ -64,8 +87,8 @@ checks. The fast lane refuses immediately, before running tests, if those image
 prerequisites are missing; it does not install OS packages or skip their tests.
 Linux additionally needs the
 `x86_64-pc-windows-gnu` Rust target/linker and toolchain `1.96.0` for the MSRV check.
-Motor supplies `CARGO_TARGET_DIR`; concurrent lanes use different stable
-subdirectories. Only Linux jobs request outbound network. No GitHub Actions
+Motor supplies `CARGO_TARGET_DIR` with the per-workspace isolation above.
+Only Linux jobs request outbound network. No GitHub Actions
 token or artifact credentials are needed.
 If Linux's Python lacks PyYAML, the fast lane provisions checksum-pinned pure
 Python `PyYAML==6.0.3` under its scratch directory (no system pip needed).

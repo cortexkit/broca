@@ -32,6 +32,10 @@ elif args[:2] == ['nextest', 'run']:
     if not os.environ.get('NO_CLOCK_PASS'):
         print('PASS [0.01s] ( 1/1) broca-module::it test_clock::test_clock_feature_is_enabled_for_retention_tests')
     print('Summary [0.01s] 1 test run: 1 passed')
+    if os.environ.get('UNRUN_SHARD') and '--partition' in args:
+        print('warning: 1/2 tests were not run')
+        print('error: test run failed')
+        sys.exit(100)
     sys.exit(int(os.environ.get('RUN_EXIT', '0')))
 elif args[0] == 'test' and '--list' in args:
     for binary in ('fixture', 'live', 'live_e2e'):
@@ -105,13 +109,14 @@ class PrepushDispatch(unittest.TestCase):
         shutil.copy(ROOT / 'scripts/prepush.sh', self.root / 'scripts/prepush.sh')
         (self.root / 'scripts/lib').mkdir()
         shutil.copy(ROOT / 'scripts/lib/prepush-report.sh', self.root / 'scripts/lib/prepush-report.sh')
+        shutil.copy(ROOT / 'scripts/lib/prepush-motor-timing.py', self.root / 'scripts/lib/prepush-motor-timing.py')
         (self.root / 'scripts/prepare-prepush-windows.py').write_text('''import argparse
 from pathlib import Path
 p=argparse.ArgumentParser()
 p.add_argument('--output'); p.add_argument('--siblings'); p.add_argument('--cache')
 a=p.parse_args(); Path(a.output).mkdir(parents=True, exist_ok=True)
 ''')
-        (self.root / '.gitignore').write_text('target/\n.prepush-runtime/\nbin/\nevents\n*.started\n')
+        (self.root / '.gitignore').write_text('target/\nlane-pool/\n.prepush-runtime/\nbin/\nevents\n*.started\n')
         subprocess.run(['git', 'init', '-q', str(self.root)], check=True, capture_output=True)
         subprocess.run(['git', '-C', str(self.root), 'add', 'scripts', '.gitignore'], check=True, capture_output=True)
         subprocess.run(['git', '-C', str(self.root), '-c', 'user.name=Test',
@@ -124,12 +129,18 @@ a=p.parse_args(); Path(a.output).mkdir(parents=True, exist_ok=True)
 import os, pathlib, sys, time
 lane = sys.argv[-1].split()[-1]
 root = pathlib.Path(os.environ['FIXTURE'])
+record = pathlib.Path(sys.argv[sys.argv.index('--record-file') + 1])
+record.write_text('{"type":"accepted"}\\n')
 with (root / 'events').open('a') as out:
     out.write(' '.join(sys.argv[1:]) + '\\n')
 if lane == os.environ.get('REFUSE_LANE'):
     print('ck motor run: refused before start: fixture admission refusal')
     sys.exit(200)
 (root / (lane + '.started')).touch()
+with record.open('a') as events:
+    import json
+    events.write(json.dumps({'type':'started','started_at_ms':time.time_ns()//1000000})+'\\n')
+    events.write(json.dumps({'type':'terminal','wall_ms':17,'queue_wait_ms':1})+'\\n')
 if lane == 'linux-unit':
     deadline = time.monotonic() + 5
     while not (root / 'windows.started').exists():
@@ -147,7 +158,7 @@ print('Summary: 1 test run: 1 passed')
 
     def run_prepush(self, **extra):
         env = dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}',
-                   FIXTURE=str(self.root), **extra)
+                   FIXTURE=str(self.root), BROCA_PREPUSH_LANE_POOL=str(self.root / 'lane-pool'), **extra)
         return subprocess.run(['bash', 'scripts/prepush.sh'], cwd=self.root,
                               env=env, capture_output=True, text=True)
 
@@ -187,7 +198,49 @@ print('Summary: 1 test run: 1 passed')
         self.assertIn('prepush lane summary', result.stdout)
         self.assertIn('total wall', result.stdout)
         for lane in ('fast', 'linux-operator', 'linux-portable', 'linux-unit', 'linux-msrv', 'windows', 'macos'):
-            self.assertRegex(result.stdout, rf'{lane}\s+PASS\s+exit=0\s+\d+s')
+            self.assertRegex(result.stdout, rf'{lane}\s+PASS\s+exit=0\s+wall=\d+s')
+        self.assertIn('request-to-start=', result.stdout)
+        self.assertIn('run=0.017s', result.stdout)
+        common = subprocess.check_output(['git', '-C', str(self.root), 'rev-parse',
+                                          '--path-format=absolute', '--git-common-dir'], text=True).strip()
+        lane_common = subprocess.check_output(['git', '-C', str(self.root / 'lane-pool/linux-unit'),
+                                               'rev-parse', '--path-format=absolute', '--git-common-dir'], text=True).strip()
+        self.assertEqual(lane_common, common)
+
+    def test_dirty_persistent_worktree_is_not_checked_out_or_dispatched(self):
+        pool = self.root / 'lane-pool'
+        pool.mkdir()
+        lane = pool / 'fast'
+        subprocess.run(['git', '-C', str(self.root), 'worktree', 'add', '-q', '--detach', str(lane), 'HEAD'],
+                       check=True, capture_output=True)
+        dirty = lane / 'scripts/prepush.sh'
+        dirty.write_text(dirty.read_text() + '\n# local work\n')
+        result = self.run_prepush()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('lane worktree is dirty', result.stdout)
+        self.assertIn('NOT-RUN fast', result.stdout)
+        self.assertTrue(dirty.read_text().endswith('# local work\n'))
+        self.assertFalse((self.root / 'events').exists())
+
+    def test_clean_persistent_lane_is_reused_at_the_exact_new_candidate(self):
+        pool = self.root / 'lane-pool'
+        pool.mkdir()
+        lane = pool / 'fast'
+        subprocess.run(['git', '-C', str(self.root), 'worktree', 'add', '-q', '--detach', str(lane), 'HEAD'],
+                       check=True, capture_output=True)
+        inode = lane.stat().st_ino
+        (self.root / 'candidate.txt').write_text('new candidate\n')
+        subprocess.run(['git', '-C', str(self.root), 'add', 'candidate.txt'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', str(self.root), '-c', 'user.name=Test',
+                        '-c', 'user.email=test@example.invalid', '-c', 'core.hooksPath=/dev/null',
+                        'commit', '-qm', 'new candidate'], check=True, capture_output=True)
+        expected = subprocess.check_output(['git', '-C', str(self.root), 'rev-parse', 'HEAD'], text=True).strip()
+        result = self.run_prepush()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(lane.stat().st_ino, inode)
+        actual = subprocess.check_output(['git', '-C', str(lane), 'rev-parse', 'HEAD'], text=True).strip()
+        self.assertEqual(actual, expected)
+        self.assertEqual((lane / 'candidate.txt').read_text(), 'new candidate\n')
 
     def test_refused_windows_is_not_run_and_fails_gate_by_name(self):
         result = self.run_prepush(REFUSE_LANE='windows')
@@ -219,6 +272,7 @@ print('Summary: 1 test run: 1 passed')
 import json, os, pathlib, sys
 with (pathlib.Path(os.environ['FIXTURE']) / 'cargo-calls').open('a') as out:
     out.write(json.dumps(sys.argv[1:]) + '\\n')
+(pathlib.Path(os.environ['FIXTURE']) / 'supplied-target').write_text(os.environ['CARGO_TARGET_DIR'])
 if '+1.96' in sys.argv:
     sys.exit('error: could not create temp file: Read-only file system')
 print('fixture cargo completed')
@@ -240,6 +294,7 @@ print('fixture cargo completed')
         calls = [json.loads(line) for line in (self.root / 'cargo-calls').read_text().splitlines()]
         self.assertIn(['+1.96.0', 'check', '--locked', '--workspace', '--all-targets'], calls)
         self.assertFalse(any('+1.96' in args for args in calls))
+        self.assertEqual((self.root / 'supplied-target').read_text(), str(self.root / 'target-cache'))
 
     def test_missing_file_tool_refuses_before_running_checks(self):
         lib = self.root / 'scripts/lib'
@@ -316,6 +371,75 @@ print('fixture cargo completed')
                 break
             self.assertEqual(parent.stat().st_mode & 0o022, 0, str(parent))
 
+    def test_windows_scratch_bootstrap_never_requests_unix_modes(self):
+        shutil.copy(ROOT / 'scripts/lib/prepush-lane.sh', self.root / 'scripts/lib/prepush-lane.sh')
+        real_mkdir = shutil.which('mkdir')
+        assert real_mkdir is not None
+        stubs = {
+            'uname': 'echo MINGW64_NT',
+            'cygpath': 'for value; do :; done; printf "%s\\n" "$value"',
+            'mkdir': 'for value; do case "$value" in -m|--mode*) echo "POSIX mode refused" >&2; exit 77;; esac; done\n'
+                     f'exec {shlex.quote(real_mkdir)} "$@"',
+            'chmod': 'echo "POSIX chmod refused" >&2; exit 77',
+            'rustc': 'printf reached > "$FIXTURE/toolchain-reached"; exit 66',
+        }
+        for name, body in stubs.items():
+            path = self.bin / name
+            path.write_text('#!/bin/sh\n' + body + '\n')
+            path.chmod(0o755)
+        cargo = self.bin / 'cargo'
+        cargo.write_text('''#!/usr/bin/env python3
+import os,pathlib,sys
+assert 'prepush_scratch' in sys.argv and '--offline' in sys.argv
+root=pathlib.Path(os.environ['FIXTURE'])
+(root/'native-helper-called').touch()
+scratch=root/'native-private-temp'; scratch.mkdir()
+print(scratch)
+''')
+        cargo.chmod(0o755)
+        env = dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}', FIXTURE=str(self.root),
+                   CARGO_TARGET_DIR=str(self.root / 'cargo-cache'))
+        result = subprocess.run(['bash', 'scripts/prepush.sh', '--lane', 'windows'],
+                                cwd=self.root, env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 66, result.stdout + result.stderr)
+        self.assertTrue((self.root / 'native-helper-called').exists())
+        self.assertTrue((self.root / 'toolchain-reached').exists())
+        self.assertNotIn('POSIX', result.stderr)
+
+
+class MotorTiming(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location('motor_timing', ROOT / 'scripts/lib/prepush-motor-timing.py')
+        assert spec is not None and spec.loader is not None
+        self.timing = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.timing)
+        self.tmp = tempfile.TemporaryDirectory(prefix='prepush-timing-')
+        self.addCleanup(self.tmp.cleanup)
+        self.events = Path(self.tmp.name) / 'events.jsonl'
+
+    def test_request_gap_is_not_the_runner_reported_queue(self):
+        self.events.write_text('\n'.join(json.dumps(event) for event in (
+            {'type': 'accepted'},
+            {'type': 'started', 'started_at_ms': 1_501_000},
+            {'type': 'terminal', 'wall_ms': 227_000, 'queue_wait_ms': 8},
+        )))
+        result = self.timing.summarize(self.events, 1000, 300, 1_728_000)
+        self.assertEqual(result['request_to_start_ms'], 1_500_000)
+        self.assertEqual(result['run_ms'], 227_000)
+        self.assertEqual(result['reported_queue_ms'], 8)
+
+    def test_refused_job_has_no_execution_time(self):
+        self.events.write_text('{"type":"accepted"}\n')
+        result = self.timing.summarize(self.events, 1000, 100, 500)
+        self.assertIsNone(result['request_to_start_ms'])
+        self.assertIsNone(result['run_ms'])
+
+    def test_partial_record_does_not_hide_known_metadata_or_clock_skew(self):
+        self.events.write_text('{"type":"started","started_at_ms":900}\n{"partial":')
+        result = self.timing.summarize(self.events, 1000, 0, 500)
+        self.assertEqual(result['request_to_start_ms'], -100)
+        self.assertIsNone(result['run_ms'])
+
 
 class ArchiveShards(unittest.TestCase):
     def setUp(self):
@@ -388,6 +512,11 @@ class ArchiveShards(unittest.TestCase):
     def test_test_failure_is_not_masked_by_tee(self):
         result = self.run_mode('run', str(self.archive), '1/4', RUN_EXIT='19')
         self.assertEqual(result.returncode, 19)
+
+    def test_unrun_warning_fails_shard_even_if_every_printed_test_passed(self):
+        result = self.run_mode('run', str(self.archive), '2/4', UNRUN_SHARD='1')
+        self.assertEqual(result.returncode, 100, result.stdout + result.stderr)
+        self.assertIn('tests were not run', result.stdout + result.stderr)
 
     def test_shard_reports_failure_output_immediately_without_stopping_other_tests(self):
         result = self.run_mode('run', str(self.archive), '1/4')

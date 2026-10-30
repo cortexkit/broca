@@ -23,16 +23,22 @@ log_dir="$(mktemp -d "$root/target/scratch/prepush-$lane.XXXXXX")"
 # Connection-file publication rejects writable ancestors, even above a private leaf.
 # Keep daemon/test temporary files out of the shared, group-writable log directory.
 umask 022
-runtime_root="${HOME:?private runtime requires the runner home}/.broca-prepush-runtime"
-mkdir -p -m 700 "$runtime_root"
-chmod 700 "$runtime_root"
-scratch="$(mktemp -d "$runtime_root/$lane.XXXXXX")"
-chmod 700 "$scratch"
 if [[ "$lane" == windows ]]; then
   export RUNNER_OS=Windows
+  : "${CARGO_TARGET_DIR:?motor must supply its persistent target cache}"
+  # Windows has ACLs, not Unix mode bits. Reuse the same native creator and
+  # validator as broca's stores before exporting the test temporary directory.
+  scratch="$(cargo run --quiet --locked --offline \
+    -p broca-owner-only --example prepush_scratch -- "$lane")"
   scratch="$(cygpath -m "$scratch")"
   CARGO_TARGET_DIR="$(cygpath -m "${CARGO_TARGET_DIR:?motor must supply its persistent target cache}")"
   export CARGO_TARGET_DIR
+else
+  runtime_root="${HOME:?private runtime requires the runner home}/.broca-prepush-runtime"
+  mkdir -p -m 700 "$runtime_root"
+  chmod 700 "$runtime_root"
+  scratch="$(mktemp -d "$runtime_root/$lane.XXXXXX")"
+  chmod 700 "$scratch"
 fi
 export TMPDIR="$scratch"
 export TMP="$scratch" TEMP="$scratch"
@@ -83,6 +89,12 @@ clean() {
 }
 
 features=(-F broca-provider/live -F broca-provider/test-harness -F broca-catalog/live -F broca-module-serve/test-clock)
+
+# nextest 0.9.138 can omit a full-weight test with mixed groups at 8 threads:
+# the aimock weight-4 test never starts, while every printed test is PASS.
+# Four slots pass the synthetic regression and match hosted CI's 2/4-core range.
+# Remove this cap once a fixed nextest passes that same regression at 8 threads.
+prepush_nextest_threads=4
 
 checkout_pin() {
   local repo="$1" rev="$2" dest="$3"
@@ -270,8 +282,6 @@ case "$lane" in
     ;;
   linux|linux-*|windows)
     : "${CARGO_TARGET_DIR:?motor must supply its persistent target cache}"
-    # Distinct job workspaces must not serialize again on one writable Cargo target.
-    export CARGO_TARGET_DIR="$CARGO_TARGET_DIR/prepush/$lane"
     portable=0 unit=0 integration=0 production=0 msrv=0 wal=0 deployment=0 lint=0
     case "$lane" in
       linux) portable=1 unit=1 integration=1 production=1 msrv=1 wal=1 deployment=1 ;;
@@ -311,7 +321,7 @@ case "$lane" in
       export CK_NATS_SERVER_BIN="${nats_env#CK_NATS_SERVER_BIN=}"
     fi
     if [[ $portable == 1 ]]; then
-      step 'Linux portable preflight' bash scripts/linux-preflight.sh
+      step 'Linux portable preflight' env NEXTEST_TEST_THREADS="$prepush_nextest_threads" bash scripts/linux-preflight.sh
     fi
     if [[ $lint == 1 ]]; then
       step fmt cargo fmt --all -- --check
@@ -340,7 +350,7 @@ case "$lane" in
         fi
         for shard in 1 2 3 4; do
           [[ "$lane" != linux-integration-* || "$lane" == "linux-integration-$shard" ]] || continue
-          step "integration shard $shard/4" env CK_BUS_TESTKIT_REQUIRE=1 NEXTEST_TEST_THREADS=num-cpus bash scripts/ci-integration.sh run "$scratch/integration.tar.zst" "$shard/4"
+          step "integration shard $shard/4" env CK_BUS_TESTKIT_REQUIRE=1 NEXTEST_TEST_THREADS="$prepush_nextest_threads" bash scripts/ci-integration.sh run "$scratch/integration.tar.zst" "$shard/4"
         done
       else
         echo 'prepush: integration shards NOT RUN because archive build failed'
