@@ -1,9 +1,9 @@
 //! Validation of person media before it can become durable input.
 //!
 //! The aggregate byte gate is an encoded-payload bound, not a whole-request
-//! measurement. Before attachments can ship, admission must share the real
-//! renderer's measurement of the would-be request, including history, tools and
-//! the new media. Payload bytes alone do not establish that the wire body fits.
+//! measurement. Admission also uses the prepared renderer's measurement of the
+//! would-be request, including history, tools and new media. Payload bytes alone
+//! do not establish that the wire body fits.
 
 use crate::media_profile::{base64_encoded_len, MediaCarrier, MediaProfile};
 use broca_protocol::content::{ContentBlock, MediaKind, MediaMarkerReason, MediaRef, Message};

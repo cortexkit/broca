@@ -170,8 +170,8 @@ pub struct HeadResponse {
     /// steer, whichever the WAL holds last). Absent, never empty, when no send carried one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// What a send that names no model can carry (llm-runner 0.5.1 §4.3). A send's prompt is
-    /// text only, so broca states `attachments: "no"` on every written session's answer. A
+    /// What a send that names no model can carry (llm-runner 0.5.1 §4.3). With media disabled,
+    /// broca states `attachments: "no"`; enabled sessions use their frozen media profile. A
     /// never-written session's answer leaves it out with every other member, as the
     /// conformance kit requires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -190,10 +190,8 @@ pub struct HeadResponse {
     pub last_run_error: Option<cortexkit_role_llm_runner::read::LastRunError>,
 }
 
-/// `session.head.input` as broca states it: a send's prompt is text (`prompt` or text
-/// `prompt_blocks`) and broca's message schema has no image, document or file block, so no send
-/// can carry an attachment. That is a known fact, so it is `no`, not `unknown` (llm-runner 0.5.1
-/// §4.3). Modalities and MIME types are left out: with no attachments they say nothing more.
+/// Default-off `session.head.input`. Modalities and MIME types are omitted because
+/// they add no information when attachment admission is disabled.
 pub fn head_input() -> cortexkit_role_llm_runner::read::HeadInput {
     cortexkit_role_llm_runner::read::HeadInput::new(
         cortexkit_role_llm_runner::read::attachments::NO,
@@ -465,6 +463,25 @@ pub fn broca_role_describe_with_writers(
         session_class: SessionClassCapability {
             backup_classes: vec!["head".into()],
         },
+    }
+}
+
+impl RoleDescribeResponse {
+    /// Advertise the whole attachments group only after boot enables its serving paths.
+    pub fn with_media(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.role
+                .capabilities
+                .push(cortexkit_role_llm_runner::capabilities::ATTACHMENTS.into());
+            self.role.majors[0].ops.extend([
+                "session.upload_begin".into(),
+                "session.upload_append".into(),
+                "session.upload_status".into(),
+                "session.upload_commit".into(),
+                cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ.into(),
+            ]);
+        }
+        self
     }
 }
 

@@ -313,7 +313,7 @@ async fn upload(rig: &Rig, mime: &str, bytes: &[u8]) -> String {
 async fn jpeg_and_pdf_reach_claude_from_live_fusiform_and_switch_to_modality_markers() {
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let url = serve_model_sse(bodies.clone(), ANTHROPIC_SSE).await;
-    let Some(rig) = Rig::launch(&url, None).await else {
+    let Some(rig) = Rig::launch_media(&url, None).await else {
         return;
     };
     let calls = Arc::new(Mutex::new(Vec::new()));
