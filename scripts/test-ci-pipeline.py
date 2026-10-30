@@ -142,15 +142,17 @@ def reserve(delta):
         state['peak'] = max(state['peak'], state['active'])
         if delta > 0 and lane != 'fast':
             state['starts'] += 1
+            if state['starts'] <= 5:
+                state.setdefault('first_wave', []).append(lane)
         path.write_text(json.dumps(state))
         return state['starts']
 barrier = os.open(root / 'target/barrier', os.O_RDWR) if os.environ.get('CPU_BARRIER') and lane != 'fast' else None
 starts = reserve(cpus)
 atexit.register(reserve, -cpus)
 if barrier is not None:
-    if starts <= 4:
-        if starts == 4:
-            os.write(barrier, b'x' * 4)
+    if starts <= 5:
+        if starts == 5:
+            os.write(barrier, b'x' * 5)
         os.read(barrier, 1)
     os.close(barrier)
 record = pathlib.Path(sys.argv[sys.argv.index('--record-file') + 1])
@@ -206,7 +208,7 @@ print('Summary: 1 test run: 1 passed')
         events = (self.root / 'events').read_text().splitlines()
         self.assertEqual(len(events), 13)
         self.assertIn('--lane fast', events[0])
-        self.assertTrue(any('--vcpus 8' in e and '--lane linux-portable' in e for e in events))
+        self.assertTrue(any('--vcpus 8' in e and '--lane linux-lint' in e for e in events))
         self.assertTrue(any('--platform windows' in e and '--lane windows' in e for e in events))
         windows = next(e for e in events if '--platform windows' in e)
         self.assertNotIn('--net', windows)
@@ -214,7 +216,7 @@ print('Summary: 1 test run: 1 passed')
         self.assertIn('--vcpus 8', windows)
         requests = {e.split('--lane ')[-1].strip("'\""): shlex.split(e) for e in events}
         sizes = {'fast': 2, 'linux-small': 2, 'linux-production': 4, 'macos': 2,
-                 'linux-portable': 8, 'linux-unit': 4, 'windows': 8, 'linux-msrv': 8, 'linux-deploy': 8,
+                 'linux-lint': 8, 'linux-unit': 4, 'windows': 8, 'linux-msrv': 8, 'linux-deploy': 8,
                  **{f'linux-integration-{shard}': 8 for shard in range(1, 5)}}
         for name, cpus in sizes.items():
             args = requests[name]
@@ -223,7 +225,7 @@ print('Summary: 1 test run: 1 passed')
         self.assertEqual(len(linux), 10)
         self.assertEqual(len({e[e.index('--cwd') + 1] for e in linux}), 10)
         self.assertTrue(any('--lane linux-small' in e for e in events))
-        for old in ('linux-operator', 'linux-wal'):
+        for old in ('linux-operator', 'linux-wal', 'linux-portable'):
             self.assertNotIn(old, requests)
         self.assertIn('FAILED windows', result.stdout)
         self.assertNotIn('FAILED linux', result.stdout)
@@ -235,7 +237,7 @@ print('Summary: 1 test run: 1 passed')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('prepush lane summary', result.stdout)
         self.assertIn('total wall', result.stdout)
-        for lane in ('fast', 'linux-small', 'linux-portable', 'linux-unit', 'windows', 'macos'):
+        for lane in ('fast', 'linux-small', 'linux-lint', 'linux-unit', 'windows', 'macos'):
             self.assertRegex(result.stdout, rf'{lane}\s+PASS\s+exit=0\s+wall=\d+s')
         self.assertIn('request-to-start=', result.stdout)
         self.assertIn('run=0.017s', result.stdout)
@@ -255,6 +257,8 @@ print('Summary: 1 test run: 1 passed')
         state = json.loads((self.root / 'target/cpus.json').read_text())
         self.assertEqual(state['active'], 0)
         self.assertEqual(state['peak'], 32)
+        self.assertEqual(set(state['first_wave']), {'linux-unit', 'linux-production', 'windows',
+                                                   'linux-integration-4', 'linux-integration-2'})
         self.assertIn('at most 32 concurrent (76 across queued lanes)', result.stdout)
 
     def test_capacity_refusal_keeps_its_name_and_does_not_skip_other_lanes(self):
@@ -299,9 +303,9 @@ print('Summary: 1 test run: 1 passed')
         result = self.run_prepush(UNKNOWN_ALL='1')
         self.assertNotEqual(result.returncode, 0)
         events = (self.root / 'events').read_text().splitlines()
-        self.assertEqual(len(events), 5)
-        for lane in ('linux-unit', 'linux-production', 'linux-small', 'linux-msrv', 'linux-deploy',
-                     'linux-integration-1', 'linux-integration-4', 'macos'):
+        self.assertEqual(len(events), 6)
+        for lane in ('linux-lint', 'linux-small', 'linux-msrv', 'linux-deploy',
+                     'linux-integration-1', 'linux-integration-3', 'macos'):
             self.assertRegex(result.stdout, rf'{lane}\s+NOT-RUN\s+exit=204')
             self.assertFalse((self.root / (lane + '.started')).exists())
         self.assertIn('UNKNOWN jobs still hold the remaining vCPU budget', result.stdout)
@@ -481,6 +485,38 @@ print('fixture cargo completed')
         self.assertFalse(any('+1.96' in args for args in calls))
         self.assertEqual((self.root / 'supplied-target').read_text(), str(self.root / 'target-cache'))
         self.assertEqual((self.root / 'supplied-jobs').read_text(), '8')
+
+    def test_lint_lane_retains_both_workspace_clippies_and_all_ci_features(self):
+        shutil.copy(ROOT / 'scripts/lib/prepush-lane.sh', self.root / 'scripts/lib/prepush-lane.sh')
+        cargo = self.bin / 'cargo'
+        cargo.write_text('''#!/usr/bin/env python3
+import json,os,pathlib,sys
+assert os.environ['CARGO_BUILD_JOBS']=='8'
+with (pathlib.Path(os.environ['FIXTURE'])/'lint-calls').open('a') as output:
+    output.write(json.dumps(sys.argv[1:])+'\\n')
+''')
+        cargo.chmod(0o755)
+        for name, body in {'git': 'exit 0', 'uname': 'echo Linux'}.items():
+            path = self.bin / name
+            path.write_text('#!/bin/sh\n' + body + '\n')
+            path.chmod(0o755)
+        home = self.root / 'home'
+        home.mkdir(mode=0o700)
+        result = subprocess.run(['bash', 'scripts/prepush.sh', '--lane', 'linux-lint'], cwd=self.root,
+                                env=dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}',
+                                         HOME=str(home), FIXTURE=str(self.root)), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = [json.loads(line) for line in (self.root / 'lint-calls').read_text().splitlines()]
+        self.assertEqual(calls[0], ['fmt', '--all', '--', '--check'])
+        self.assertEqual(len(calls), 3)
+        for command in calls[1:]:
+            self.assertEqual(command[:4], ['clippy', '--locked', '--workspace', '--all-targets'])
+            self.assertEqual(command[-3:], ['--', '-D', 'warnings'])
+            for feature in ('broca-provider/live', 'broca-provider/test-harness',
+                            'broca-catalog/live', 'broca-module-serve/test-clock'):
+                self.assertIn(feature, command)
+        self.assertNotIn('--target', calls[1])
+        self.assertEqual(calls[2][calls[2].index('--target')+1], 'x86_64-pc-windows-gnu')
 
     def test_missing_file_tool_refuses_before_running_checks(self):
         lib = self.root / 'scripts/lib'

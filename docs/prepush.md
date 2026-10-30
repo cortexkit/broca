@@ -11,11 +11,10 @@ never builds on the Mac as a fallback. First it runs the fast Linux static guard
 Only when those pass does it admit the remaining jobs through a **32-vCPU
 concurrent budget**, including Windows and macOS. The dispatcher prints that
 budget and the queued plan's total (76 vCPUs) before dispatch. Fast uses two
-alone. The initial wave is portable, integration shard 2, Windows and integration
-shard 3, each at eight CPUs: exactly 32. The remaining integration shards, minimum
-supported Rust version (MSRV) checking
-and deployment also get eight CPUs. Unit/doc and production retain four, while
-macOS and `linux-small` use two. Jobs use released slots as soon as they fit, rather than holding
+alone. The initial wave is full CI unit/doc (4), production (4), Windows (8),
+integration shard 4 (8) and shard 2 (8): exactly 32. The remaining integration
+jobs, lint, minimum supported Rust version (MSRV) checking and deployment get
+eight CPUs; macOS and `linux-small` use two. Jobs use released slots as soon as they fit, rather than holding
 reservations in Motor's admission queue or waiting for a whole-wave barrier.
 An UNKNOWN job keeps its reservation because it may still be running. If those
 reservations prevent any remaining job from fitting, the remaining jobs are
@@ -26,25 +25,39 @@ the deployment release build are independent eight-CPU jobs. Fixture compilation
 stays with its consumers: unit, production, each integration job, Windows and
 deployment. It no longer occupies the small job.
 
-Measured runner times exposed why compilation cannot be grouped with small
-scripts: the combined two-CPU job took 2094.547s, including 584s for MSRV,
-222s for fixtures and 1091s for release build/deployment. Shard 2 took 1347s
-on six CPUs (724s in archive preparation), and shard 3 took 782s on four
-(474s in archive preparation). Those builds now get eight workers; nextest
-execution still has four slots. The long jobs start first and shorter jobs
-backfill the released budget.
+The preceding full unit job took **981.169s at four CPUs**, not eight: about
+168s of setup, then an 813s lib/bin phase. Its reported libtest summaries total
+436.68s; about 376s is compilation/launch residual that the old quiet Cargo log
+does not attribute further. The largest binaries were:
+
+| Unit binary | Reported execution |
+| --- | ---: |
+| `broca-crash-harness` library | 115.12s |
+| `broca-module` library | 118.97s |
+| `broca-store` library | 120.52s |
+| Remaining binary summaries | 82.07s |
+
+Unit now starts in the first wave. Its compilation/discovery is a separate
+inventory step; Cargo's executable labels and successful test output remain
+visible, and the audit reports each binary's duration/counts. No crate-selection
+flags alter the full workspace feature graph. Nextest execution still has four
+slots.
 
 Each summary writes `critical-path.json`: end-to-end time, the last runner's
 finish relative to gate start (including admission/queue delay), the longest
 runner, and the known reservation-time floor `sum(vCPUs * run_time) / 32`.
 Missing terminal records are named as incomplete, never invented. The floor is
 for observed work, including work before a failed job stopped; it is not a
-forecast of a green gate or a quieter pool. The measured preceding gate ended
-at 2329s, with the combined job's runner finish at approximately 2325.768s and
-a known reservation-time floor of 1173.088s. Portable alone took 1333s at eight
-CPUs, so that attempt already had a 22m13s single-lane floor. Earlier portable
-work completed in 934s at the same size: a quiet-pool target below 20 minutes
-still needs measurement, not a CPU-scaling promise. A capacity refusal is
+forecast of a green gate or a quieter pool. The preceding gate ended at 1735s;
+its booked work alone gives a 1225.293s floor at 32 CPUs, before accounting for
+serial preparation. Splitting unit while duplicating its full-workspace build
+does not remove that floor. Deduplication removes portable's
+duplicate executions, retaining its lint in `linux-lint` and its tests in CI
+lanes as mapped below. A list-schedule model using the measured durations,
+166s for lint (73s + 88s clippies plus startup), and 82s quiet-pool preparation
+projects **1203.097s (20m03)**. Windows's 545.618s measurement stopped at npm;
+its remaining suites are unknown, so this is a known-prefix estimate, not a
+full-green under-20-minute claim. A capacity refusal is
 still NOT-RUN with its exact reason, never retried or counted as coverage.
 Each launch documents its size rather than reserving 12/16 CPUs to influence
 placement. Each remote lane has a persistent
@@ -77,6 +90,35 @@ mixed-group scheduling bug are kept under `.cortexkit/internal-docs/investigatio
 No broca test, partition, profile, group cap, timeout or retry policy changes.
 An unrun-test warning still fails the lane. Remove the concurrency cap only
 after a fixed nextest passes the synthetic regression at eight slots.
+
+## Portable deduplication coverage
+
+Normal dispatch uses `linux-lint` for fmt, native Linux clippy and Windows-GNU
+target clippy. The full standalone `--lane linux-portable` command and
+`linux-preflight.sh` are unchanged and remain available for fixture-free
+diagnostics. CI's full unit/doc and four integration partitions still execute.
+
+The compiled inventory maps every formerly executed portable test, with the
+same workspace feature combination (`broca-provider/live`,
+`broca-provider/test-harness`, `broca-catalog/live`,
+`broca-module-serve/test-clock`):
+
+| Former portable selection | Destination | Named tests |
+| --- | --- | ---: |
+| Nonignored lib/bin tests minus the two explicit fixture exclusions | `linux-unit` | 4816 |
+| Integration tests in hash partition 1/4 | `linux-integration-1` | 462 |
+| Integration tests in hash partition 2/4 | `linux-integration-2` | 484 |
+| Integration tests in hash partition 3/4 | `linux-integration-3` | 483 |
+| Integration tests in hash partition 4/4 | `linux-integration-4` | 428 |
+
+No test or feature combination is portable-only. Per-test names and destinations
+are in `prepush-portable-coverage-LANE.json` under each lane's
+`.cortexkit/internal-docs/investigations/`, returned by Motor to its lane checkout.
+The unit inventory still requires each explicit exclusion to exist exactly once.
+Runtime audits reject missing/filtered unit binaries, partition count/identity
+mismatches, missing clock execution and passing fixture skips from the former
+portable selection. Existing optional/live skips outside that selection keep
+their CI behavior; they are not mistaken for portable coverage.
 
 Each check prints its complete output, exit status and wall time. The final
 summary prints the first error lines and replays complete failed-lane output,
@@ -176,6 +218,13 @@ environment difference from GitHub's setup actions, not a claimed byte match.
 The runtime-download helper remains Linux-only. Windows fallback extraction
 happens only after every input byte has passed manifest verification.
 
+The npm archive-name file is written as binary ASCII with LF line endings, not
+through Windows text stdout. A retained CR after `.tgz` makes npm classify the
+otherwise valid pinned aimock tarball as a directory, producing the misleading
+`DirFetcher requires either a tree or an Arborist constructor to pack` error.
+The lockfile has no file/directory dependency to repack. Both the Windows branch
+and an empty-cache offline install are exercised by `test-prepush-npm.py`.
+
 Subc stays a Git checkout because its selected `subc-core` and `subc-daemon`
 build scripts embed Git HEAD and dirty state without a supported override.
 Plain sources would lose the CI build identity. Its complete pinned ancestry is
@@ -241,7 +290,7 @@ another job, dispatch the machine-side lanes from AFT instead. Do **not** put
 
 1. `bash scripts/prepush.sh --lane fast` with `runon: "linux,2c,net"`.
 2. Only on success, concurrently dispatch from **separate checkouts**:
-    - `--lane linux-portable`, all four integration shards, `--lane linux-msrv`
+    - `--lane linux-lint`, all four integration shards, `--lane linux-msrv`
       and `--lane linux-deploy` with `runon: "linux,8c,net"`;
     - `--lane linux-unit` and `--lane linux-production`
       with `runon: "linux,4c,net"`;
@@ -276,7 +325,7 @@ failure; Windows-target clippy on Linux is **not** native Windows coverage.
 | --- | --- | --- |
 | `fixtures` → `fixtures.yml: fixtures` (Linux, Windows) | Fixture setup in Linux unit/integration/production/small and Windows jobs | Same pinned source SHAs and locked build/package/unpack. Windows receives Subc's full Git source and a checked plain Claustrum archive, then builds offline. |
 | Scheduled fixture variant (Linux, Windows) | **Not part of the pre-push gate** | Schedule resolves both siblings' current `master` tips. A pre-push result cannot attest to future moving tips at 06:00 UTC. Daily compatibility remains CI-owned; push/PR fixtures are pinned. |
-| `lint` (Ubuntu, Windows) | `linux-portable` / Windows native clippy | `cargo fmt --all -- --check`; `cargo clippy --locked --workspace --all-targets` with the four features from `rust-test-gate.sh`, `-- -D warnings`. Linux preflight additionally cross-clippies `x86_64-pc-windows-gnu`. |
+| `lint` (Ubuntu, Windows) | `linux-lint` / Windows native clippy | `cargo fmt --all -- --check`; `cargo clippy --locked --workspace --all-targets` with the four features from `rust-test-gate.sh`, `-- -D warnings`. Linux preflight additionally cross-clippies `x86_64-pc-windows-gnu`. |
 | `scripts` (Ubuntu) | `fast` guards then the required `linux-small` job | Train preconditions and locked fetch remain before native jobs. `linux-small` runs unchanged `bash scripts/script-suites.sh`; same shared inventory and self-tests. |
 | `store-contention-macos` | `bash scripts/prepush.sh --lane macos` | `nice -n 10 cargo test --locked -p broca-store-contention-tests --lib`. Native macOS; not substituted by Linux/Windows unit results. |
 | `wal-reader` (Ubuntu, Windows) | WAL steps in `linux-small` / windows | `cargo test --locked -p broca-wal-reader`; `cargo test --locked -p broca-wal --lib framing::tests::v4`, including golden v4 codec and open-reader unlink semantics. |

@@ -72,6 +72,8 @@ suites=(
     # The gate's phase order (fmt, clippy, prewarm, tests) and its log, with cargo stubbed.
     scripts/test-gate-phases.py
     scripts/test-ci-pipeline.py
+    scripts/test-prepush-npm.py
+    scripts/test-prepush-coverage.py
     scripts/test-gated-commit.py
     scripts/tests/test_linux_quickcheck.py
     scripts/test-deploy.py

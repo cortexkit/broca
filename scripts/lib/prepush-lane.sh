@@ -8,7 +8,7 @@ export CARGO_PROFILE_DEV_DEBUG=line-tables-only
 export CARGO_TERM_COLOR=always CI=true
 lane="${1:-}"
 case "$lane" in
-  fast|linux-small|linux-operator|linux|linux-portable|linux-unit|linux-integration-[1234]|linux-production|linux-msrv|linux-wal|linux-deploy|windows|macos) ;;
+  fast|linux-small|linux-operator|linux|linux-lint|linux-portable|linux-unit|linux-integration-[1234]|linux-production|linux-msrv|linux-wal|linux-deploy|windows|macos) ;;
   *) echo "prepush: unknown lane $lane" >&2; exit 2 ;;
 esac
 platform="${lane%%-*}"
@@ -215,16 +215,8 @@ broker() {
 
 aimock() {
   if [[ "$platform" == windows ]]; then
-    "$python_exec" - "$root/package-lock.json" "$BROCA_PREPUSH_INPUTS/manifest.json" > "$scratch/npm-archives" <<'PY'
-import hashlib, json, pathlib, re, sys
-manifest = json.loads(pathlib.Path(sys.argv[2]).read_text())
-if hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest() != manifest['package_lock_sha256']:
-    sys.exit('offline npm inputs do not match package-lock.json')
-for name in manifest['npm_archives']:
-    if not re.fullmatch(r'[a-f0-9]{64}\.tgz', name):
-        sys.exit(f'unsafe offline npm input name: {name}')
-    print(name)
-PY
+    "$python_exec" scripts/prepare-prepush-windows.py --write-npm-archives \
+      --inputs "$BROCA_PREPUSH_INPUTS" --output "$scratch/npm-archives"
     while IFS= read -r name; do
       npm cache add --offline --cache "$scratch/npm-cache" "$BROCA_PREPUSH_INPUTS/$name"
     done < "$scratch/npm-archives"
@@ -237,12 +229,54 @@ PY
 lib_doc() {
   source scripts/rust-test-gate.sh
   trap - EXIT
-  run_phase 'lib/bin tests' cargo test --locked --workspace --lib --bins --no-fail-fast "${cargo_feature_args[@]}" --quiet
+  local output_args=(--quiet)
+  if [[ "$platform" == linux ]]; then
+    # Keep Cargo's binary labels and successful test output for timing/skip audits.
+    output_args=(-- --quiet --show-output)
+  fi
+  run_phase 'lib/bin tests' cargo test --locked --workspace --lib --bins --no-fail-fast "${cargo_feature_args[@]}" "${output_args[@]}"
   doc_count="$(count_doc_tests)"
   echo "doctests discovered: $doc_count"
   if [[ "$doc_count" -gt 0 ]]; then
     run_phase doctests cargo test --locked --workspace --doc "${cargo_feature_args[@]}" --quiet
   fi
+}
+
+coverage_report() {
+  local args=() index exclusion
+  for ((index=1; index<${#features[@]}; index+=2)); do
+    args+=(--feature "${features[$index]}")
+  done
+  if [[ "$1" == unit ]]; then
+    source scripts/portable-test-selection.conf
+    for exclusion in "${portable_unit_exclusions[@]}"; do args+=(--exclude "$exclusion"); done
+  fi
+  python3 scripts/lib/prepush-coverage.py "$@" --candidate "$(git rev-parse HEAD)" "${args[@]}"
+}
+
+unit_inventory() {
+  local rc=0
+  source scripts/portable-test-selection.conf
+  cargo test --locked --workspace --lib --bins --no-fail-fast "${features[@]}" -- --list > "$scratch/unit-list" 2>&1 || rc=$?
+  if [[ "$rc" != 0 ]]; then cat "$scratch/unit-list"; return "$rc"; fi
+  python3 scripts/preflight-test-report.py unit-list "$scratch/unit-list" "${portable_unit_exclusions[@]}"
+  cargo nextest list --locked --workspace "${features[@]}" --lib --bins --ignore-default-filter -T json > "$scratch/unit-inventory.json"
+  coverage_report unit --inventory "$scratch/unit-inventory.json" \
+    --output "$root/.cortexkit/internal-docs/investigations/prepush-portable-coverage-linux-unit.json"
+}
+
+partition_inventory() {
+  local shard="$1"
+  source scripts/rust-test-gate.sh
+  trap - EXIT
+  source scripts/portable-test-selection.conf
+  cargo nextest list --locked --workspace "${features[@]}" -P ci -E "$nextest_filter" \
+    --partition "hash:$shard/4" -T json > "$scratch/ci-partition-$shard.json"
+  cargo nextest list --locked --workspace "${features[@]}" -P ci -E "$portable_integration_filter" \
+    --partition "hash:$shard/4" -T json > "$scratch/portable-partition-$shard.json"
+  coverage_report integration --full "$scratch/ci-partition-$shard.json" \
+    --portable "$scratch/portable-partition-$shard.json" --partition "$shard/4" \
+    --output "$root/.cortexkit/internal-docs/investigations/prepush-portable-coverage-linux-integration-$shard.json"
 }
 
 deploy() {
@@ -297,6 +331,13 @@ operator_checks() {
 }
 
 case "$lane" in
+  linux-lint)
+    export CARGO_BUILD_JOBS=8
+    step fmt cargo fmt --all -- --check
+    step 'Linux native clippy' cargo clippy --locked --workspace --all-targets "${features[@]}" -- -D warnings
+    step 'Windows-target clippy' cargo clippy --locked --workspace --all-targets --target x86_64-pc-windows-gnu "${features[@]}" -- -D warnings
+    step 'clean worktree' clean
+    ;;
   fast)
     export CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2
     step 'Linux image prerequisites' linux_image
@@ -407,7 +448,21 @@ case "$lane" in
         fi
         for shard in 1 2 3 4; do
           [[ "$lane" != linux-integration-* || "$lane" == "linux-integration-$shard" ]] || continue
+          if [[ "$platform" == linux ]]; then
+            step "partition $shard/4 coverage inventory" partition_inventory "$shard"
+            if [[ "$last_rc" != 0 ]]; then
+              echo "prepush: integration shard $shard/4 NOT RUN because its coverage inventory failed"
+              continue
+            fi
+          fi
           step "integration shard $shard/4" env CK_BUS_TESTKIT_REQUIRE=1 NEXTEST_TEST_THREADS="$prepush_nextest_threads" bash scripts/ci-integration.sh run "$scratch/integration.tar.zst" "$shard/4"
+          if [[ "$platform" == linux ]]; then
+            shard_output="${files[${#files[@]}-1]}"
+            step "portable execution/skip guards $shard/4" coverage_report integration \
+              --full "$scratch/ci-partition-$shard.json" --portable "$scratch/portable-partition-$shard.json" \
+              --partition "$shard/4" --log "$shard_output" \
+              --output "$root/.cortexkit/internal-docs/investigations/prepush-portable-coverage-linux-integration-$shard.json"
+          fi
         done
       else
         echo 'prepush: integration shards NOT RUN because archive build failed'
@@ -416,7 +471,23 @@ case "$lane" in
     if [[ $unit == 1 ]]; then
       step 'linked dependency sources' "$python_exec" scripts/check-path-deps.py
       step 'linked dependency source tests' "$python_exec" scripts/test-check-path-deps.py
-      step 'CI lib/bin/doc' lib_doc
+      unit_ready=1
+      if [[ "$platform" == linux ]]; then
+        step 'unit lib/bin inventory and portable exclusions' unit_inventory
+        if [[ "$last_rc" != 0 ]]; then
+          echo 'prepush: CI lib/bin/doc NOT RUN because its unit inventory failed'
+          unit_ready=0
+        fi
+      fi
+      if [[ "$unit_ready" == 1 ]]; then
+        step 'CI lib/bin/doc' lib_doc
+        if [[ "$platform" == linux ]]; then
+          unit_output="${files[${#files[@]}-1]}"
+          step 'portable unit execution/skip guards' coverage_report unit \
+            --inventory "$scratch/unit-inventory.json" --log "$unit_output" \
+            --output "$root/.cortexkit/internal-docs/investigations/prepush-portable-coverage-linux-unit.json"
+        fi
+      fi
     fi
     if [[ $wal == 1 ]]; then
       step 'WAL reader' cargo test --locked -p broca-wal-reader

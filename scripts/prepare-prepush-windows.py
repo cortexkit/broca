@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import tarfile
@@ -105,6 +106,18 @@ def extract_source(inputs, repository, revision, destination):
             else:
                 raise ValueError(f'unsupported source archive member: {member.name}')
     print(f'verified and extracted {repository} source {revision}: {archive.stat().st_size} bytes')
+
+
+def write_npm_archive_list(inputs, lockfile, output):
+    manifest = json.loads((inputs / 'manifest.json').read_text())
+    if hashlib.sha256(lockfile.read_bytes()).hexdigest() != manifest['package_lock_sha256']:
+        raise ValueError('offline npm inputs do not match package-lock.json')
+    names = manifest['npm_archives']
+    for name in names:
+        if not re.fullmatch(r'[a-f0-9]{64}\.tgz', name):
+            raise ValueError(f'unsafe offline npm input name: {name}')
+    # Windows text stdout adds CRLF; a retained CR makes npm treat a tarball as a directory.
+    output.write_bytes(''.join(name + '\n' for name in names).encode('ascii'))
 
 
 def locked_packages(lockfile):
@@ -307,6 +320,7 @@ if __name__ == '__main__':
     parser.add_argument('--source-cache', type=Path)
     parser.add_argument('--cache', type=Path)
     parser.add_argument('--extract-source', choices=['claustrum'])
+    parser.add_argument('--write-npm-archives', action='store_true')
     parser.add_argument('--extract-cargo-vendor', action='store_true')
     parser.add_argument('--subconscious-lock', type=Path)
     parser.add_argument('--claustrum-lock', type=Path)
@@ -314,7 +328,11 @@ if __name__ == '__main__':
     parser.add_argument('--revision')
     parser.add_argument('--require-snapshot-visible', action='store_true')
     args = parser.parse_args()
-    if args.extract_cargo_vendor:
+    if args.write_npm_archives:
+        if args.inputs is None:
+            parser.error('--write-npm-archives requires --inputs')
+        write_npm_archive_list(args.inputs, ROOT / 'package-lock.json', args.output)
+    elif args.extract_cargo_vendor:
         if args.inputs is None or args.subconscious_lock is None or args.claustrum_lock is None:
             parser.error('--extract-cargo-vendor requires --inputs and both fixture lockfiles')
         extract_cargo_vendor(args.inputs, args.output, {'subconscious': args.subconscious_lock,

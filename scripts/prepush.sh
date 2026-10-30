@@ -10,7 +10,7 @@ if [[ $# -gt 0 ]]; then
   if [[ $# == 2 && $1 == --lane ]]; then
     exec bash scripts/lib/prepush-lane.sh "$2"
   fi
-  echo 'usage: bash scripts/prepush.sh [--lane fast|linux-small|linux-operator|linux|linux-portable|linux-unit|linux-integration-{1,2,3,4}|linux-production|linux-msrv|linux-wal|linux-deploy|windows|macos]' >&2
+  echo 'usage: bash scripts/prepush.sh [--lane fast|linux-small|linux-operator|linux|linux-lint|linux-portable|linux-unit|linux-integration-{1,2,3,4}|linux-production|linux-msrv|linux-wal|linux-deploy|windows|macos]' >&2
   exit 2
 fi
 command -v ck >/dev/null || {
@@ -33,30 +33,30 @@ plan_names=() plan_platforms=() plan_cpus=()
 queue_lane() {
   plan_names+=("$1") plan_platforms+=("$2") plan_cpus+=("$3")
 }
-# Portable took 1333s at eight workers; reducing its CPU reservation cannot meet the target.
-queue_lane linux-portable linux 8
-# Shard 2 took 1347s on six CPUs, including 724s building its archive: restore eight workers.
+# Full CI unit/doc took 981s at four workers; start it before shorter compilation jobs.
+queue_lane linux-unit linux 4
+# Shard 4 took 699s at eight workers and is the longest completed integration partition.
+queue_lane linux-integration-4 linux 8
+# Production took 603s at four workers; it shares the first wave with unit and three eight-CPU jobs.
+queue_lane linux-production linux 4
+# Shard 2 took 582s at eight workers; retain its compiler reservation in the initial wave.
 queue_lane linux-integration-2 linux 8
 # Windows builds fixtures/archive and runs all four CI integration partitions sequentially.
 queue_lane windows windows 8
-# Shard 3 took 782s on four CPUs, including 474s building its archive: eight workers.
+# Shard 3 took 575s at eight workers and is first in line for released full-build capacity.
 queue_lane linux-integration-3 linux 8
-# Shard 1 took 730s on four CPUs, including 482s building its archive: eight workers.
+# Shard 1 took 399s at eight workers; its archive still uses the full workspace graph.
 queue_lane linux-integration-1 linux 8
-# Shard 4 took 729s on four CPUs, including 409s building its archive: eight workers.
-queue_lane linux-integration-4 linux 8
-# Production took 610s at four workers; retain its measured reservation.
-queue_lane linux-production linux 4
-# Deployment spent 222s on fixtures and 1091s in its release build/test at two CPUs: eight workers.
-queue_lane linux-deploy linux 8
-# Minimum supported Rust version (MSRV) checking took 584s at two CPUs: eight workers.
-queue_lane linux-msrv linux 8
-# Unit/doc took 367s at four workers; retain its measured reservation.
-queue_lane linux-unit linux 4
-# Native macOS's targeted contention/WAL checks took 88s; two workers under nice -n 10.
-queue_lane macos macos 2
-# Operator and WAL took 61s + 39s + 90s; share two workers without release/MSRV compilation.
+# Operator/WAL took 316s at two workers and can backfill a partially released reservation.
 queue_lane linux-small linux 2
+# Deployment took 228s at eight workers, including its required native fixture build.
+queue_lane linux-deploy linux 8
+# Native and Windows-target clippy took 73s + 88s at eight workers; tests run in their CI lanes.
+queue_lane linux-lint linux 8
+# Native macOS's targeted contention/WAL checks took 114s; two workers under nice -n 10.
+queue_lane macos macos 2
+# Minimum supported Rust version (MSRV) checking took 81s at eight workers.
+queue_lane linux-msrv linux 8
 cpu_budget=32
 planned_cpus=0
 for cpus in "${plan_cpus[@]}"; do planned_cpus=$((planned_cpus + cpus)); done
@@ -107,6 +107,10 @@ launch() {
   local args=(--platform "$platform")
   [[ "$platform" != linux ]] || args+=(--net)
   args+=(--timeout 7200 --cwd "$checkouts/$name" --record-file "$logs/$name.motor.jsonl")
+  case "$name" in
+    linux-unit|linux-integration-*)
+      args+=(--return-path "$checkouts/$name/.cortexkit/internal-docs/investigations/prepush-portable-coverage-$name.json") ;;
+  esac
   [[ -z "$cpus" ]] || args+=(--vcpus "$cpus")
   local index="${#names[@]}"
   local begin=$SECONDS begin_ms ready=0 status
