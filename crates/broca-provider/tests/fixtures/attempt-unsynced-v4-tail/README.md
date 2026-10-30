@@ -3,8 +3,8 @@
 Synthetic billing records captured from the real HTTP gzip-refusal/resend path.
 
 - Durability interval: `refusal_to_resend`.
-- H1 image: index `678`, filesystem cut `21`, persistence family `PartialPersistence`.
-- Existing `FileWal::open` refuses with `Corrupt { offset: 1456, source: UnsupportedVersion { ver: 0 } }`.
+- Power-loss model image: index `678`, filesystem cut `21`, persistence family `PartialPersistence`.
+- Pre-repair `FileWal::open` refused with `Corrupt { offset: 1456, source: UnsupportedVersion { ver: 0 } }`.
 - The intact prefix contains 1 reservation(s) and 0 settlement(s).
 
 The bytes contain synthetic identities only. No real credentials or message content is present.
@@ -12,7 +12,17 @@ The bytes contain synthetic identities only. No real credentials or message cont
 Reproduce the generating acceptance test on Linux:
 
 ```sh
-cargo test --locked -p broca-provider -F live -F test-harness attempt_hook_power_loss --lib -- --ignored --nocapture
+cargo test --locked -p broca-provider -F portable-power-loss attempt_hook_power_loss_portable --lib -- --nocapture
 ```
 
-The recovery fix must distinguish this unsynced append-tail loss from damage in the synced prefix. Do not skip refused images or relax the H1 harness. After physical recovery, the test uses the real reclaim writer opener/close and checks each reservation has exactly one settlement or a superseding writer, never both counted as separate attempts.
+The acceptance covers five first-cut durability intervals, divided into shards in
+one shared libtest process. Each interval enumerates first-cut histories and
+second-loss images with `RecordingFs::enumerate_cut` at every recorded filesystem
+operation, as implemented in `crates/broca-provider/src/transport_power_loss_tests.rs`.
+After operation-cut coverage is checked, identical complete first and second
+filesystems are evaluated once; no distinct persistence outcome is skipped.
+Each reservation must have exactly one settlement or a superseding writer, never
+both counted as separate attempts. The default v4 recovery path preserves every
+removed byte in a durable sidecar and records recovery metadata. Its `.head`
+durability proof distinguishes damage in published bytes from an unpublished
+append tail; either kind is repairable with the same byte-preservation requirement.

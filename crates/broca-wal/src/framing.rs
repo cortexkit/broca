@@ -202,6 +202,7 @@ pub const TOOL_SCHEMA_PINS_FEATURE: &str = "tool-schema-pins/v1";
 /// as [`DecodeStep::NewerWriter`]. `ck-broca --wal-known-features` prints this list so
 /// placement tooling can refuse to install a build that cannot read what is already on disk.
 pub const KNOWN_FEATURES: &[&str] = &[
+    crate::recovery::FEATURE,
     BILL_ATTEMPTS_FEATURE,
     crate::head_proof::VISIBILITY_LATE_FEATURE,
     "writer-id/v1",
@@ -1416,6 +1417,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn recovery_cut_is_a_must_understand_overhaul_record() {
+        let record: WalRecord = serde_json::from_value(serde_json::json!({
+            "type":"recovery_cut", "cut_id":"cut", "sidecar_basename":"log.cut-1",
+            "cut_offset":69, "removed_len":1, "removed_sha256":"digest",
+            "reason":"unproven_corruption", "active_run":null, "runs":[], "unattributed_tool_risk":true
+        })).unwrap();
+        assert_eq!(record.required_features(), &[crate::recovery::FEATURE]);
+        let frame = PreparedV4Frame::prepare(&record)
+            .unwrap()
+            .stamp(v4::Metadata {
+                seq: 1,
+                fence: 1,
+                appended_ms: 1,
+                writer_id: [1; 16],
+            })
+            .unwrap();
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != crate::recovery::FEATURE)
+            .collect();
+        assert!(
+            matches!(decode_next_with(&frame, &older), DecodeStep::NewerWriter { missing, .. }
+            if missing == [crate::recovery::FEATURE])
+        );
+        assert!(
+            matches!(decode_next(&frame), DecodeStep::Record { framed, .. } if framed.record == record)
+        );
+    }
+
     /// The production `KNOWN_FEATURES` table holds exactly the features this build interprets.
     /// A name enters it only with the release that reads its records, so a build never claims
     /// to understand a frame it would misread; the test-only name is never in it.
@@ -1424,6 +1456,7 @@ mod tests {
         assert_eq!(
             KNOWN_FEATURES,
             &[
+                crate::recovery::FEATURE,
                 BILL_ATTEMPTS_FEATURE,
                 crate::head_proof::VISIBILITY_LATE_FEATURE,
                 "writer-id/v1",

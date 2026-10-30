@@ -1708,6 +1708,22 @@ where
     A: ApprovalPolicy,
     W: WalStore,
 {
+    if let Some(store) = &store {
+        wal_store.bind_recovery_projection(Some(&req.session), store.clone());
+        if !writer.recovery_cut_ids().is_empty()
+            && store
+                .needs_wal_recovery_projection(&req.session, writer.recovery_cut_ids())
+                .map_err(RunError::Wal)?
+        {
+            let head = writer
+                .durable_head()
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let full = wal_store.read_records_range(&req.session, 0, Some(head), None)?;
+            store
+                .reproject_wal_recovery(&req.session, &full)
+                .map_err(RunError::Wal)?;
+        }
+    }
     #[cfg(feature = "test-clock")]
     let test_control = {
         let mut control = control.clone();
@@ -2364,6 +2380,9 @@ where
     A: ApprovalPolicy,
     W: WalStore,
 {
+    if let Some(store) = &store {
+        wal_store.bind_recovery_projection(Some(&req.session), store.clone());
+    }
     // PER-RUN writer: spawn it, run the body on it, then `shutdown().await` it BEFORE the
     // caller drops the lease (so a superseded writer can never append after a new run
     // acquires the session). The coordinator uses `run_loop_on_writer` instead with a
@@ -9277,6 +9296,8 @@ async fn run_step<P: Provider>(
 /// gets a `tool_result` without reaching the plane; and a `Dispatch` call gets an intent
 /// followed by a `tool_result`.
 enum CallPlan {
+    /// Recovery retained attribution but removed the intent/result bytes.
+    Recovered(ToolCallId),
     /// Approved (input possibly narrowed) — dispatch through the plane.
     Dispatch(PlannedDispatch),
     /// Refused before dispatch (capability/denial/plane-down). Carries ONLY the
@@ -9319,9 +9340,9 @@ fn call_plan_id(plan: &CallPlan) -> ToolCallId {
         CallPlan::HookTerminal { result, .. } | CallPlan::Synthetic { result, .. } => {
             result.tool_call_id.clone()
         }
-        CallPlan::NoDispatch { tool_call_id, .. } | CallPlan::Stopped(tool_call_id) => {
-            tool_call_id.clone()
-        }
+        CallPlan::NoDispatch { tool_call_id, .. }
+        | CallPlan::Stopped(tool_call_id)
+        | CallPlan::Recovered(tool_call_id) => tool_call_id.clone(),
     }
 }
 
@@ -9714,6 +9735,10 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
             plan.push(CallPlan::Already(prior));
             continue;
         }
+        if writer.recovery_tombstoned(&call.tool_call_id) {
+            plan.push(CallPlan::Recovered(call.tool_call_id.clone()));
+            continue;
+        }
         if let Some(dispatch) = existing_intents.remove(&call.tool_call_id) {
             plan.push(CallPlan::Dispatch(dispatch));
             continue;
@@ -9957,7 +9982,10 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                         provider_held: None,
                     });
                 }
-                CallPlan::Synthetic { .. } | CallPlan::Already(_) | CallPlan::Stopped(_) => {}
+                CallPlan::Synthetic { .. }
+                | CallPlan::Already(_)
+                | CallPlan::Stopped(_)
+                | CallPlan::Recovered(_) => {}
             }
         }
         writer.sync().await?;
@@ -10025,6 +10053,19 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                         provider_held: None,
                     });
                 }
+                CallPlan::Recovered(tool_call_id) => {
+                    writer.record(WalRecord::ToolResult {
+                        finished_at_ms: None,
+                        tags: None,
+                        hooks: None,
+                        batch_id: batch_id.clone(),
+                        result: Arc::new(crate::resume::outcome_unknown_result(tool_call_id)),
+                        outcome: DispatchOutcome::Unknown,
+                        reason: Some("wal_recovery_cut".into()),
+                        withdraw_elicitation: None,
+                        provider_held: None,
+                    });
+                }
                 CallPlan::Dispatch(_) | CallPlan::Already(_) => {}
             }
         }
@@ -10042,17 +10083,20 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
 
         let mut resolutions: Vec<CallResolution> = Vec::with_capacity(plan.len());
         for p in plan {
-            resolutions.push(resolve(p, &ctx, tool_plane, cancel, stop).await);
+            let recovered = matches!(p, CallPlan::Recovered(_));
+            let resolution = resolve(p, &ctx, tool_plane, cancel, stop).await;
+            debug_assert!(
+                !resolution.ambiguous || recovered,
+                "a no-dispatch plan may be ambiguous only for a recovered call"
+            );
+            resolutions.push(resolution);
         }
-        debug_assert!(
-            !resolutions.iter().any(|r| r.ambiguous),
-            "a plan with no dispatches must not produce ambiguous results"
-        );
-        // No call of this batch was sent, so no result is ambiguous. A scope drain seen at batch
-        // start still stops the run: every later call in the run would meet the same closed
-        // scope. A call the stop request kept back stops it too: the run was asked to start
-        // nothing further.
-        let interruption = if scope_stopped {
+        // No new call was sent, but a recovery tombstone still represents an
+        // earlier dispatch with a lost outcome. Close that run as interrupted.
+        // Scope drains and stop requests retain their ordinary no-dispatch behavior.
+        let interruption = if resolutions.iter().any(|r| r.ambiguous) {
+            Some(BatchInterruption::Ambiguous)
+        } else if scope_stopped {
             Some(BatchInterruption::ScopeDrained)
         } else if let Some(cause) = gating_stop {
             Some(cause)
@@ -10917,6 +10961,15 @@ async fn resolve<T: ToolPlane>(
     stop: Option<&CancellationToken>,
 ) -> CallResolution {
     match plan {
+        CallPlan::Recovered(id) => {
+            let mut resolution = CallResolution::plain(
+                crate::resume::outcome_unknown_result(&id),
+                Some(DispatchOutcome::Unknown),
+            );
+            resolution.ambiguous = true;
+            resolution.reason = Some("wal_recovery_cut".into());
+            resolution
+        }
         CallPlan::Stopped(id) => stopped_resolution(&id),
         // A stop requested after this call's intent was written, but before the call was sent:
         // it is not sent. Calls of the batch already sent are left to finish.
@@ -14727,6 +14780,7 @@ mod tests {
             trailing_origin: None,
             last_run_id: Some(RunId("budget".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                recovery_cuts: Vec::new(),
                 #[cfg(feature = "test-attachments")]
                 media: None,
                 head: None,

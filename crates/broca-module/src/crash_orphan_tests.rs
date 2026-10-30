@@ -211,6 +211,7 @@ impl RunExecutor for CoreLoop {
 }
 
 struct Fixture {
+    wal_config: broca_wal::WalConfig,
     root: std::path::PathBuf,
     key: BindIdentity,
     index: Arc<broca_store::SqliteStore>,
@@ -281,6 +282,15 @@ impl Fixture {
         observer: Option<Arc<broca_core::wal_writer::DurableWalObserver>>,
         provider: Option<broca_core::StubProvider>,
     ) -> Self {
+        Self::build_with_config(wrap, observer, provider, broca_wal::WalConfig::LEGACY)
+    }
+
+    fn build_with_config(
+        wrap: impl FnOnce(Arc<broca_store::SqliteStore>) -> Arc<dyn RunIndex>,
+        observer: Option<Arc<broca_core::wal_writer::DurableWalObserver>>,
+        provider: Option<broca_core::StubProvider>,
+        wal_config: broca_wal::WalConfig,
+    ) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = broca_test_support::scratch_root().join(format!(
             "broca-crash-orphan-{}-{}",
@@ -291,7 +301,7 @@ impl Fixture {
         let key = BindIdentity::new(root.join("project"), "runner", "session");
         let index = Arc::new(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
         let executor = Arc::new(Recording::default());
-        let mut wal = FileWalStore::new(root.join("wal"));
+        let mut wal = FileWalStore::with_config(root.join("wal"), wal_config);
         if let Some(observer) = observer {
             wal = wal.with_durable_observer(observer);
         }
@@ -309,8 +319,14 @@ impl Fixture {
             runs,
         )
         .with_run_index(wrap(index.clone()));
+        let opener = if wal_config.is_overhaul() {
+            opener.with_materialized_store(index.clone())
+        } else {
+            opener
+        };
         let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal, None);
         Self {
+            wal_config,
             root,
             key,
             index,
@@ -320,7 +336,7 @@ impl Fixture {
     }
 
     fn wal_store(&self) -> FileWalStore {
-        FileWalStore::new(self.root.join("wal"))
+        FileWalStore::with_config(self.root.join("wal"), self.wal_config)
     }
 
     /// Leave the WAL and index exactly as a process killed mid-run leaves them: the records
@@ -621,6 +637,71 @@ async fn crash_orphan_seal_pairs_an_indeterminate_call_with_outcome_unknown_befo
                 |block| matches!(block, ContentBlock::ToolResult(r) if r.tool_call_id.0 == CALL)
             )),
         "the sealed conversation pairs the call with its result"
+    );
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn crash_orphan_seal_keeps_a_recovery_tombstone_unknown_when_its_intent_was_cut() {
+    let f = Fixture::build_with_config(|index| index, None, None, broca_wal::WalConfig::OVERHAUL);
+    f.seed(vec![
+        run_started(&f.key),
+        model_step_with_tool_call(),
+        batch_started(),
+        dispatch_intent(),
+    ]);
+    let path = f.wal_store().wal_path(&f.key);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let mut offset = 0;
+    loop {
+        match broca_wal::framing::decode_next(&bytes[offset..]) {
+            broca_wal::framing::DecodeStep::Record { framed, consumed } => {
+                if matches!(framed.record, WalRecord::ToolDispatchIntent { .. }) {
+                    bytes[offset + consumed - 1] ^= 1;
+                    break;
+                }
+                offset += consumed;
+            }
+            broca_wal::framing::DecodeStep::Lineage { consumed, .. } => offset += consumed,
+            _ => panic!("seeded log must decode"),
+        }
+    }
+    std::fs::write(&path, bytes).unwrap();
+    let sweep = f.sweep(Fixture::boot_after_seed()).await;
+    assert_eq!(sweep.sealed, 1, "{sweep:?}");
+    assert!(
+        f.executor.executed.lock().unwrap().is_empty(),
+        "boot sealing must not schedule dispatch"
+    );
+    let records = f.records();
+    assert!(records
+        .iter()
+        .any(|record| matches!(record, WalRecord::RecoveryCut { .. })));
+    assert!(records.iter().any(
+        |record| matches!(record, WalRecord::ResumeStarted { indeterminate, .. }
+        if indeterminate == &vec![ToolCallId(CALL.into())])
+    ));
+    let results: Vec<_> = records
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::ToolResult {
+                result, outcome, ..
+            } => Some((result.as_ref().clone(), *outcome)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        results,
+        [(
+            broca_core::outcome_unknown_result(&ToolCallId(CALL.into())),
+            broca_wal::DispatchOutcome::Unknown
+        )]
+    );
+    let state = broca_core::reconcile_run_state(&records, ORPHAN).unwrap();
+    assert_eq!(state.state, RunIndexState::Interrupted);
+    assert_eq!(
+        state.indeterminate_tool_calls,
+        Some(vec![ToolCallId(CALL.into())])
     );
     f.stop().await;
 }

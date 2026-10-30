@@ -102,6 +102,8 @@ impl std::error::Error for ReplayError {}
 /// The result of replaying a session's WAL — a LINEAGE of one or more episodes.
 #[derive(Debug, Clone)]
 pub struct ReplayState {
+    /// Session-scoped recovery tombstones survive episode boundaries.
+    pub recovered_calls: Vec<broca_wal::recovery::RecoveryRun>,
     /// Next absolute transcript ordinal, including messages not held in the prompt.
     pub extent: u64,
     /// The last episode renders tags under the computed rules on a compaction-managed session,
@@ -189,8 +191,8 @@ pub struct ReplayState {
     pub episode_step_spans: Option<Vec<std::ops::Range<usize>>>,
     /// All admitted episode render inputs; absent for a materialized prefix without WAL history.
     pub render_episodes: Option<Vec<broca_protocol::request::EpisodeRenderInput>>,
-    /// The last episode's tool batch that was opened (`tool_batch_started` is durable) but
-    /// never committed, with each planned call's durable state. `None` when no batch is open.
+    /// The last episode's uncommitted tool batch, backed by `tool_batch_started`
+    /// or recovery attribution, with each planned call's durable state.
     ///
     /// A resume that seals the episode because a call is indeterminate reads this to write the
     /// results that close the batch, so the next send renders every call paired with a result.
@@ -219,7 +221,7 @@ pub struct ReplayState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpenToolBatch {
     pub batch_id: BatchId,
-    /// The model step whose tool calls this batch runs.
+    /// The model step, or zero for close-out-only attribution whose step was lost.
     pub step_id: StepId,
     /// Every planned call in plan order, with its durable state.
     pub calls: Vec<(ToolCallId, OpenCallState)>,
@@ -231,13 +233,13 @@ pub struct OpenToolBatch {
 pub enum OpenCallState {
     /// A terminal is durable (a result of any outcome, or a no-dispatch record).
     Terminated,
-    /// A dispatch intent is durable and no terminal is: the call may or may not have run.
+    /// An intent or recovery tombstone is durable and no terminal is: the call may have run.
     Dispatched,
     /// The provider durably accepted responsibility for returning a late result.
     ProviderHeld,
     /// A sequential intent behind an open or closed-out held call; it was never sent.
     HeldSuccessor,
-    /// Neither Prepared, intent nor terminal is durable: the call never left the process.
+    /// No Prepared, intent, recovery tombstone or terminal: no attributed dispatch occurred.
     NotSent,
     /// Prepared arguments are durable, but no approval or terminal is durable.
     Deferred,
@@ -1122,6 +1124,7 @@ fn tagged(mut message: Message, tags: Option<&broca_protocol::tags::MessageTags>
 
 /// State of the currently-open tool batch during the linear walk.
 struct OpenBatch {
+    recovered: HashSet<ToolCallId>,
     /// The model step whose tool calls this batch runs, from its `tool_batch_started`.
     step_id: StepId,
     planned: Vec<ToolCallId>,
@@ -1134,6 +1137,7 @@ struct OpenBatch {
 impl OpenBatch {
     fn new(step_id: StepId, planned: Vec<ToolCallId>) -> Self {
         Self {
+            recovered: HashSet::new(),
             step_id,
             terminals: vec![None; planned.len()],
             prepared: vec![None; planned.len()],
@@ -1199,11 +1203,12 @@ impl OpenBatch {
 
     fn has_intent(&self, position: usize) -> bool {
         let id = &self.planned[position];
-        self.intents.contains(id) && !self.planned[..position].contains(id)
+        (self.intents.contains(id) || self.recovered.contains(id))
+            && !self.planned[..position].contains(id)
     }
 
-    /// Calls whose outcome is ambiguous: an `Unknown` terminal, or an intent with
-    /// no terminal at all (the result was lost in the crash).
+    /// Calls whose outcome is ambiguous: an `Unknown` terminal, or an intent or
+    /// recovery tombstone with no terminal (the result may have been lost).
     fn indeterminate(&self) -> Vec<ToolCallId> {
         self.planned
             .iter()
@@ -1227,6 +1232,8 @@ impl OpenBatch {
     fn call_state(&self, position: usize) -> OpenCallState {
         if self.terminals[position].is_some() {
             OpenCallState::Terminated
+        } else if self.recovered.contains(&self.planned[position]) {
+            OpenCallState::Dispatched
         } else if self.has_intent(position) {
             if self.provider_held.contains_key(&self.planned[position]) {
                 OpenCallState::ProviderHeld
@@ -1336,6 +1343,7 @@ impl OpenBatch {
 /// (`RunStarted`) opens. Only the lineage-cumulative `prompt` lives outside this.
 #[derive(Default)]
 struct Episode {
+    recovery_interrupted: bool,
     attributable: bool,
     seeded_last_ordinal: Option<u64>,
     /// The index among the replayed records of the step record holding the open tool turn.
@@ -1392,7 +1400,7 @@ struct Episode {
     /// Stop reason evaluated from the durable terminal assistant message and frozen policy.
     /// Kept only for natural-end recovery; other terminal classifications take precedence.
     natural_stop_reason: Option<RunFinishReason>,
-    /// Ambiguous calls (an `Unknown` terminal, or an intent with no terminal). Stays
+    /// Ambiguous calls (an `Unknown` terminal, or intent/recovery attribution without one). Stays
     /// set even after the batch commits, so it survives `batch_finished`.
     indeterminate: Vec<ToolCallId>,
     /// Set when a committed batch was a HARD-STOP repair (all synthetic stop terminals).
@@ -1529,6 +1537,15 @@ pub fn replay_projection_tail(
     seed: &ProjectionSeed,
     frames: &[FramedRecord],
 ) -> Result<ProjectionDelta, ReplayError> {
+    if !seed.admission_checkpoint.recovery_cuts.is_empty() {
+        return Err(ReplayError::CorruptLineage {
+            episode_run_id: seed
+                .last_run_id
+                .clone()
+                .unwrap_or_else(|| RunId(String::new())),
+            reason: "recovery tombstones require complete WAL replay".into(),
+        });
+    }
     let seeded_episode = seed.admission_checkpoint.last_episode.as_ref();
     let seeded_budget = seeded_episode.and_then(|episode| episode.config.budget.clone());
     let seeded_budget_state =
@@ -2421,6 +2438,7 @@ fn replay_seeded_with_compaction<'a>(
         pending_steers: held_steers,
         ..Episode::default()
     };
+    let mut recovered_calls: Vec<broca_wal::recovery::RecoveryRun> = Vec::new();
     let mut episode_step_spans: Vec<std::ops::Range<usize>> = Vec::new();
     let mut render_episodes = Vec::new();
     let mut committed_tool_turns: Vec<(usize, usize)> = Vec::new();
@@ -2729,6 +2747,66 @@ fn replay_seeded_with_compaction<'a>(
                             assistant_message,
                         )
                     });
+                }
+            }
+            WalRecord::RecoveryCut { recovery } => {
+                if recovery.unattributed_tool_risk
+                    && recovery.active_run.is_some()
+                    && recovery.active_run == run_id
+                    && ep.finished.is_none()
+                {
+                    ep.recovery_interrupted = true;
+                }
+                for recovered in &recovery.runs {
+                    recovered_calls.push(recovered.clone());
+                    if Some(&recovered.run_id) != run_id.as_ref() {
+                        continue;
+                    }
+                    for call in &recovered.calls {
+                        if !ep.indeterminate.contains(&call.tool_call_id) {
+                            ep.indeterminate.push(call.tool_call_id.clone());
+                        }
+                    }
+                    if ep.open_batch.is_none() {
+                        if let Some(assistant) = &ep.open_assistant {
+                            let step = ep.open_step.unwrap_or(StepId(0));
+                            ep.open_batch = Some(OpenBatch::new(
+                                step,
+                                assistant
+                                    .tool_calls()
+                                    .map(|c| c.tool_call_id.clone())
+                                    .collect(),
+                            ));
+                            ep.open_batch_id =
+                                Some(BatchId(format!("{}-b{}", recovered.run_id.0, step.0)));
+                        } else if !recovered.calls.is_empty() {
+                            // The model step may itself have been removed. Keep a
+                            // close-out-only batch so recovered intents still get
+                            // durable Unknown results without inventing prompt content.
+                            let step = recovered
+                                .calls
+                                .iter()
+                                .find_map(|call| call.step_id)
+                                .unwrap_or(StepId(0));
+                            ep.open_batch = Some(OpenBatch::new(
+                                step,
+                                recovered
+                                    .calls
+                                    .iter()
+                                    .map(|call| call.tool_call_id.clone())
+                                    .collect(),
+                            ));
+                            ep.open_batch_id = Some(BatchId(format!(
+                                "{}-recovery-{}",
+                                recovered.run_id.0, recovery.cut_id
+                            )));
+                        }
+                    }
+                    if let Some(batch) = &mut ep.open_batch {
+                        for call in &recovered.calls {
+                            batch.recovered.insert(call.tool_call_id.clone());
+                        }
+                    }
                 }
             }
             WalRecord::ToolBatchStarted {
@@ -3215,6 +3293,39 @@ fn replay_seeded_with_compaction<'a>(
             | WalRecord::StructuredOutputResult { .. }
             | WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
         }
+        // A provider can re-use an old call id in a later episode. Recovery
+        // tombstones remain conservative across that boundary, before NotSent
+        // can become a redispatch plan or a boot seal's never-sent result.
+        if matches!(
+            rec,
+            WalRecord::ModelStepFinished { .. } | WalRecord::ToolBatchStarted { .. }
+        ) {
+            if let (Some(assistant), Some(current_run)) = (&ep.open_assistant, &run_id) {
+                let planned: Vec<_> = assistant
+                    .tool_calls()
+                    .map(|call| call.tool_call_id.clone())
+                    .collect();
+                let recovered: Vec<_> = planned
+                    .iter()
+                    .filter(|id| {
+                        recovered_calls
+                            .iter()
+                            .flat_map(|run| &run.calls)
+                            .any(|call| &call.tool_call_id == *id)
+                    })
+                    .cloned()
+                    .collect();
+                if !recovered.is_empty() {
+                    let step = ep.open_step.unwrap_or(StepId(0));
+                    let batch = ep
+                        .open_batch
+                        .get_or_insert_with(|| OpenBatch::new(step, planned));
+                    batch.recovered.extend(recovered);
+                    ep.open_batch_id
+                        .get_or_insert_with(|| BatchId(format!("{}-b{}", current_run.0, step.0)));
+                }
+            }
+        }
         // Placement is the authority for transcript positions, including a seeded prefix and
         // steers held until a boundary. Assign its ordinals as each record places its messages.
         let placed = actions
@@ -3439,6 +3550,7 @@ fn replay_seeded_with_compaction<'a>(
             .as_ref()
             .is_some_and(|config| config.render_tags && config.computed_tags.is_some());
     Ok(ReplayState {
+        recovered_calls,
         extent: placement.next_ordinal(),
         tags_await_setup,
         input_budget,
@@ -3760,6 +3872,52 @@ pub fn reconcile_run_state<'a>(
             WalRecord::ModelStepRefused { .. } => {
                 total_usage.accumulate(&crate::refusal_fallback::total_step_usage(rec).unwrap());
             }
+            WalRecord::RecoveryCut { recovery } => {
+                let calls: Vec<_> = recovery
+                    .runs
+                    .iter()
+                    .filter(|run| run.run_id.0 == run_id)
+                    .flat_map(|run| run.calls.iter().map(|call| call.tool_call_id.clone()))
+                    .collect();
+                if recovery.runs.iter().any(|run| run.run_id.0 == run_id)
+                    || (recovery.unattributed_tool_risk
+                        && recovery
+                            .active_run
+                            .as_ref()
+                            .is_some_and(|run| run.0 == run_id))
+                {
+                    for call in &calls {
+                        indeterminate_tool_calls.record_dispatch_terminal(call, true);
+                    }
+                    let state = found.get_or_insert_with(|| ReconciledRunState {
+                        budget_detail: None,
+                        context_ceiling: None,
+                        ceiling_deadline_ms: None,
+                        ride_wait_deadline_ms: None,
+                        structured_output: None,
+                        live_step: None,
+                        held_calls: Vec::new(),
+                        state: RunIndexState::Interrupted,
+                        undelivered_steers: None,
+                        final_step_finish_reason: None,
+                        indeterminate_tool_calls: None,
+                        usage: None,
+                        run_usage: Default::default(),
+                        retries_used: 0,
+                        error: None,
+                        pause_reason: None,
+                        auth_selection: None,
+                        title: None,
+                    });
+                    state.state = RunIndexState::Interrupted;
+                    let known = state.indeterminate_tool_calls.get_or_insert_with(Vec::new);
+                    for call in calls {
+                        if !known.contains(&call) {
+                            known.push(call);
+                        }
+                    }
+                }
+            }
             WalRecord::ToolBatchStarted { .. } => indeterminate_tool_calls.reset_batch(),
             WalRecord::ToolDispatchIntent {
                 tool_call_id,
@@ -3990,6 +4148,11 @@ pub fn reconcile_run_state<'a>(
 /// pauses only at a step-entry boundary after the previous batch finished, but replay enforces this
 /// fail-closed rule as defense in depth.
 fn classify(ep: Episode, run_id: Option<&RunId>, cancelling: bool) -> ReplayResolution {
+    if ep.recovery_interrupted && ep.finished.is_none() {
+        return ReplayResolution::Interrupted {
+            indeterminate: ep.indeterminate,
+        };
+    }
     let closing = ep.open_batch.as_ref().is_some_and(|batch| {
         batch.provider_held.keys().any(|id| {
             batch
@@ -4541,6 +4704,7 @@ pub(crate) mod projection_boundary_tests {
             trailing_origin: Some(ModelHandle::new("stub", "old-model")),
             last_run_id: Some(RunId("r1".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                recovery_cuts: Vec::new(),
                 #[cfg(feature = "test-attachments")]
                 media: None,
                 head: None,

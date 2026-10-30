@@ -159,6 +159,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // Whether a NEW state root is created in the overhaul format; see `state_format`.
     let state_format_config =
         broca_module_serve::config::StateFormatConfig::load_default().map_err(ServeIoError)?;
+    let wal_recovery =
+        broca_module_serve::config::WalRecoveryConfig::load_default().map_err(ServeIoError)?;
     let stop_signal = shutdown_signal()?;
     // Where the WAL, leases and run index live. Resolved before any connection is made so a
     // machine that cannot place its durable state refuses to start by name instead of first
@@ -192,7 +194,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // version 4 frames on a `broca-state/2` root, today's frames everywhere else. A marker that
     // cannot be read, or an overhaul root whose `wal/` is a symbolic link or resolves outside the
     // root, refuses boot instead.
-    let wal_config = state_format::wal_config(&state_root, state_format).map_err(ServeIoError)?;
+    let mut wal_config =
+        state_format::wal_config(&state_root, state_format).map_err(ServeIoError)?;
+    wal_config.recovery = wal_recovery;
     let _stall_watchdog = broca_module_serve::stall::start(&state_root)?;
     // An optional provider base_url override (the mock/openai-compatible path; e.g. aimock).
     // When unset, the run's model id is resolved through the catalog.
@@ -370,6 +374,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| ServeIoError(format!("open run index: {e}")))?,
     );
     wal_store.set_session_ref_index(run_index.clone());
+    broca_core::WalStore::bind_recovery_projection(wal_store.as_ref(), None, run_index.clone());
     // Older builds kept spend caps in `caps.db` beside this file. Spend caps were removed, so the
     // file is no longer opened; it is left on disk untouched rather than deleted.
 

@@ -720,6 +720,29 @@ pub struct TagLocation {
 
 /// The materialized store read seam. The loop depends only on this trait.
 pub trait MaterializedStore: Send + Sync {
+    /// Invalidate rebuildable views durably before physical WAL recovery cuts.
+    /// Usage export facts are independent authority and must not be changed.
+    fn invalidate_wal_recovery(
+        &self,
+        _session: &BindIdentity,
+        _cut: &broca_wal::recovery::RecoveryCut,
+    ) -> Result<(), String> {
+        Err("materialized store cannot durably invalidate a WAL recovery".into())
+    }
+    fn needs_wal_recovery_projection(
+        &self,
+        _session: &BindIdentity,
+        _cut_ids: &std::collections::BTreeSet<String>,
+    ) -> Result<bool, String> {
+        Ok(true)
+    }
+    fn reproject_wal_recovery(
+        &self,
+        _session: &BindIdentity,
+        _range: &WalRangeRead,
+    ) -> Result<(), String> {
+        Err("materialized store cannot reproject a WAL recovery".into())
+    }
     fn read_retained_head(
         &self,
         _session: &BindIdentity,
@@ -2278,6 +2301,7 @@ pub(crate) fn merge_prefix_and_tail(
     };
     tail_episodes.render = tail_state.render_episodes.clone().unwrap_or_default();
     let state = crate::ReplayState {
+        recovered_calls: Vec::new(),
         extent: tail_state.extent,
         tags_await_setup: tail_state.tags_await_setup,
         input_budget: tail_state.input_budget,

@@ -624,6 +624,8 @@ impl EffortHistoryV1 {
 /// Version-one admission projection at an exact WAL sequence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdmissionCheckpointV1 {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recovery_cuts: Vec<broca_wal::recovery::RecoveryCut>,
     /// Reference-only media resume state, omitted for media-free histories. A captured-reference
     /// index without a valid matching seed requires a named, counted full-replay repair.
     #[cfg(feature = "test-attachments")]
@@ -711,6 +713,11 @@ impl AdmissionCheckpointV1 {
     /// A newly applied record in a tail needs canonical replay to recover its
     /// message count. Missing compaction state is checked separately at the seed.
     pub(crate) fn compaction_boundary_complete(&self) -> bool {
+        // Repaired histories must reconstruct call attribution from the whole WAL,
+        // not from a message seed predating physical suffix removal.
+        if !self.recovery_cuts.is_empty() {
+            return false;
+        }
         #[cfg(feature = "test-attachments")]
         if !self.media_seed_complete() {
             return false;
@@ -723,6 +730,7 @@ impl AdmissionCheckpointV1 {
 
     pub fn empty() -> Self {
         Self {
+            recovery_cuts: Vec::new(),
             #[cfg(feature = "test-attachments")]
             media: None,
             head: Some(crate::head::HeadProjection::default()),
@@ -868,6 +876,15 @@ impl AdmissionCheckpointV1 {
             None => (None, None),
         };
         match record {
+            WalRecord::RecoveryCut { recovery } => {
+                if !self
+                    .recovery_cuts
+                    .iter()
+                    .any(|cut| cut.cut_id == recovery.cut_id)
+                {
+                    self.recovery_cuts.push((**recovery).clone());
+                }
+            }
             WalRecord::RunStarted {
                 session_class,
                 retention,
@@ -1315,6 +1332,9 @@ pub fn encode_admission_checkpoint(
     })
 }
 
+/// A recovery fence is not an admission seed, even when it wraps a partial checkpoint.
+pub const WAL_RECOVERY_FENCE_PREFIX: &str = "{\"wal_recovery_fence\":";
+
 /// Decode a supported checkpoint. Unknown versions and malformed payloads are unavailable rather
 /// than an empty lineage, so callers take the full-WAL repair path.
 ///
@@ -1322,6 +1342,9 @@ pub fn encode_admission_checkpoint(
 /// the admission snapshot and the projection seed refuse to build on it (their full-WAL path
 /// repairs it), while readers that only want its last episode may still use it.
 pub fn decode_admission_checkpoint(encoded: &str) -> Option<AdmissionCheckpointV1> {
+    if encoded.starts_with(WAL_RECOVERY_FENCE_PREFIX) {
+        return None;
+    }
     let envelope: AdmissionCheckpointEnvelope = serde_json::from_str(encoded).ok()?;
     if envelope.version != 1 {
         return None;
@@ -3902,6 +3925,7 @@ mod tests {
     #[test]
     fn checkpoint_json_with_pending_payload_is_byte_stable() {
         let checkpoint = AdmissionCheckpointV1 {
+            recovery_cuts: Vec::new(),
             #[cfg(feature = "test-attachments")]
             media: None,
             output_reservation: None,

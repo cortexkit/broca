@@ -170,6 +170,7 @@ impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
 
     /// Configure materialized reads and WAL projection independently of the run-index capability.
     pub fn with_materialized_store(mut self, store: Arc<dyn broca_core::SessionStore>) -> Self {
+        self.wal_store.bind_recovery_projection(None, store.clone());
         self.materialized_store = Some(store);
         self
     }
@@ -406,6 +407,8 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
         // Moving the lease into recovery prevents cancellation from releasing it while
         // deletion or admission validation still touches this address.
         let authority = tokio::task::spawn_blocking(move || {
+            wal.recover_existing(&session)
+                .map_err(|e| OpenError::from_wal_read(e.to_string(), &e))?;
             if wal.wal_config().is_overhaul() {
                 if let Some(service) = &service {
                     if let Err(

@@ -49,55 +49,80 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   records are low-volume (off the hot path) so a strong digest is cheap. On replay,
   validate the digest + monotonic `seq` while retaining `fence` as forensic metadata.
   A torn/corrupt TRAILING
-  record (crash mid-append) is discarded (never committed); **non-tail
-  corruption FAILS LOUD**.
-- **Version 4 recovery uses a published durability lower bound.** A checksum-valid
-  `.head` sidecar must belong to the embedded lineage, fit within the file, and
-  match the covered final version 4 frame's identity, sequence, writer and stamp.
-  If recovery can read the initial embedded lineage and it matches the `.head`
-  lineage, recovery refuses damage before the proof's `durable_end`. This is not
-  unconditional protection for every byte once covered:
-  combined corruption of the initial lineage and covered data can prevent
-  establishing the binding and fall back to the existing final-tail heuristic.
-  A damaged final frame and corruption of a synced final frame are ambiguous to
-  that heuristic, both for legacy logs (unchanged) and v4 logs without a usable
-  binding. Ignoring an available v4 durability proof was a v4-specific gap;
-  the broader synced-final-frame ambiguity is not v4-specific.
+  record (crash mid-append) is discarded by legacy recovery and read-only replay;
+  their **non-tail corruption FAILS LOUD**. Overhaul writable recovery uses the
+  explicit policy below.
+- **Overhaul recovery policy is explicit.** `broca.jsonc` accepts
+  `"wal_recovery": "repair"` (default) or `"refuse"`; an unknown value refuses
+  boot by name. This setting affects only version 4 logs. Legacy bytes and
+  recovery behavior are unchanged, including the existing ambiguity between a
+  damaged final append and corruption of a synced final frame.
 
-  After validating the lower bound, the current repair retains complete,
-  checksum-valid contiguous frames until the first damaged frame, then truncates
-  that frame and everything after it. It scans the suffix for intact conflicting
-  lineage and refuses to erase that replacement/splice evidence. Intact later
-  records with the same lineage do not themselves prevent this repair.
-  A proof is a lower bound, not a deletion watermark: a crash after fsync but
-  before proof publication can leave already-dispatched tool intents beyond an
-  older proof. Keeping their intact prefix preserves indeterminate-call recovery
-  for that case. It does **not** prove that all bytes after the first damaged
-  frame are unsynced. Discarding that suffix is justified only in the append-only,
-  honest-fsync power-loss model, which tears pending writes but preserves all
-  successfully synced bytes. With post-sync storage corruption or a damaged
-  restore, an older proof can precede damaged acknowledged records and intact
-  later acknowledged records; this repair can delete both. This remains a
-  limitation against the public non-tail-corruption fail-loud contract; the
-  durability policy for that case is not decided in this change. The proof
-  matches the frame's `appended_ms` timestamp; elapsed wall-clock time alone
-  does not invalidate an established durability barrier.
-  Missing, unreadable, torn, mismatched or overlong proofs cannot distinguish
-  pending damage from synced corruption, so recovery does not use proof-based
-  truncation there. Its availability cost is that an unsynced damaged tail
-  followed by intact data can still refuse to open when the sidecar did not
-  survive; the old final-tail ambiguity still applies. Legacy framing, bytes,
-  and recovery policy remain unchanged.
+  Repair retains every complete, checksum-valid contiguous record before the
+  first damaged or undecodable record. It repairs both unpublished tails and
+  damage within a published prefix. The `.head` proof is evidence for the WARN
+  reason (`unpublished_tail`, `published_region_corruption`, or
+  `unproven_corruption`), never permission to destroy the only copy of a suffix.
+  A proof is only a durability lower bound: fsync acknowledgements can precede
+  its unsynced publication. No new proof sync is added to acknowledged batches.
+  Intact conflicting lineage or unknown must-understand features still refuse;
+  repair must not erase replacement evidence or downgrade a newer writer.
 
-  On a successful repair, truncation is file-synced before opening the append
-  handle, counted, and logged with offsets/lengths only, never content. A failed
-  repair is **not transactional**: `set_len` may shorten the live file before
-  `sync_all` fails. Open returns the I/O error without an appendable handle but
-  does not roll the file back. A retry can observe the shortened clean file and
-  skip the repair branch; that open alone does not prove the earlier shrink
-  durable. Its next successful WAL sync is the durability barrier. Under the
-  power-loss model a cut between truncate and sync can retain either the original
-  damaged suffix or the shortened prefix, so recovery must handle both again.
+  Before shortening the log, recovery writes **all removed bytes verbatim** to
+  `<log>.cut-<unix_ms>` through a uniquely named temporary file, file sync,
+  rename and directory sync. An immutable `.json` companion records the cut id,
+  retained-prefix hash, raw suffix hash/length, session and call attribution; it
+  follows the same durable publication sequence. Both must be durable before
+  truncate and file sync. Neither sidecars nor manifests are ever deleted.
+  A pending manifest is finished on the next writable open, even when the log
+  already looks clean after a failed or interrupted truncate. A successful
+  `RecoveryCut` append is synced before writable open completes. Retrying a
+  matching completed cut does not create duplicate recovery records. Later
+  damage that removes an earlier marker can recover its attributed calls from
+  the immutable session manifest. Failed repair is not transactional: an I/O
+  error can leave the live file shortened, but the durable backup and manifest
+  remain available for retry.
+
+  Bound materialized stores participate before the physical cut: an immediate
+  SQLite transaction durably invalidates the session's rebuildable transcript,
+  admission/head checkpoints, compaction views and run lifecycle summaries. A
+  pending fence lists required cut ids and advances the context epoch, so a
+  projection captured before the cut cannot restore the old state. If that
+  transaction fails, recovery refuses the writable open without shortening the
+  log. Already published usage export facts remain immutable during recovery;
+  rebuilding the transcript must not revise the billing history.
+
+  After the cut and synced recovery marker, recovery rebuilds the session from
+  the complete surviving WAL and publishes its checkpoints in one transaction.
+  A failed rebuild leaves the pending fence and invalidated views for the next
+  open to retry; a crash between invalidation and truncation resumes from the
+  durable manifest. A matching completed checkpoint avoids full reprojection on
+  subsequent opens. Logs without recovery markers do no recovery projection
+  reads or writes.
+
+  `RecoveryCut` is overhaul-only and requires `wal-recovery/v1`, raised in the
+  machine feature floor before writing recovery history. This durable list of
+  required log features prevents rollback to a reader that cannot understand the
+  recovery tombstones. The record includes every
+  decodable removed dispatch intent and every unresolved tool call in a
+  surviving `ModelStepFinished`, including a call whose intent was removed.
+  These tombstones are consulted before `NotSent` can become a redispatch plan,
+  and before actual dispatch. Close-out writes `outcome_unknown_result` with
+  `DispatchOutcome::Unknown`, never a never-executed result, and the existing
+  `ResumeStarted`/terminal projection and `run.status` report the indeterminate
+  calls. If a model step was removed too, a close-out-only recovery batch records
+  Unknown outcomes without inventing assistant prompt content. Recovery
+  tombstones conservatively suppress re-use of those call ids in later episodes
+  of the same log; ordinary dispatch deduplication still uses compound keys.
+
+  Undecodable bytes set `unattributed_tool_risk: true`, interrupt the in-flight
+  run and produce a session-named WARN plus a `diagnostics.findings` warning
+  under `wal_recovery_cut`; the flag never blocks later episodes. Broca prevents
+  repeats of attributed calls, not external effects whose identifiers were
+  destroyed by storage damage. Operators who require refusal rather than this
+  lost-attribution exposure set `"wal_recovery": "refuse"`.
+  Refuse opens no appendable handle on damage, names the file, and changes
+  neither the log nor recovery sidecars. Read-only replay does not repair.
 - **`len` is capped + header-validated before allocation** — never allocate
   on `len` alone.
 - **`fence`** = the writer's lease-tenure epoch (§5), recorded for forensic correlation only;

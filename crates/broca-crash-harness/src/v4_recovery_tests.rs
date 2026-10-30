@@ -32,11 +32,19 @@ impl Scratch {
     }
 
     fn open(&self) -> FileWal {
-        FileWal::open(self.log())
+        self.open_policy(broca_wal::recovery::RecoveryPolicy::Repair)
             .unwrap()
-            .with_feature_floor(self.0.join("floor"))
-            .with_wal_config(WalConfig::OVERHAUL)
-            .unwrap()
+    }
+
+    fn open_policy(
+        &self,
+        policy: broca_wal::recovery::RecoveryPolicy,
+    ) -> Result<FileWal, WalError> {
+        let mut config = WalConfig::OVERHAUL;
+        config.recovery = policy;
+        FileWal::open_with_recovery(self.log(), config, self.0.join("floor"))
+            .map(|wal| wal.with_feature_floor(self.0.join("floor")))?
+            .with_wal_config(config)
     }
 }
 
@@ -107,36 +115,62 @@ fn assert_recovery(source: &[u8], state: &State) {
         .take_while(|(end, _)| data.get(..*end) == Some(&source[..*end]))
         .last()
         .unwrap();
-    assert!(count >= 1, "the synced frame must survive every image");
+    assert!(count >= 1);
+    let refused = Scratch::new();
+    state.install(&refused.0).unwrap();
+    let result = refused.open_policy(broca_wal::recovery::RecoveryPolicy::Refuse);
+    if data.len() > end {
+        let error = result.err().expect("refuse must reject a damaged image");
+        assert!(error
+            .to_string()
+            .contains(&refused.log().display().to_string()));
+    } else {
+        assert!(result.is_ok());
+    }
+    assert_eq!(std::fs::read(refused.log()).unwrap(), *data);
+    assert!(broca_wal::recovery::manifests(&refused.log(), 1_000_000)
+        .unwrap()
+        .is_empty());
+
     let root = Scratch::new();
     state.install(&root.0).unwrap();
     let recording = Arc::new(RecordingFs::new(&root.0).unwrap());
-    with_fs_ops(recording.clone(), || {
-        let mut wal = root.open();
-        assert_eq!(std::fs::read(root.log()).unwrap(), source[..end]);
+    let recovered_seq = with_fs_ops(recording.clone(), || {
+        let wal = root.open();
+        let bytes = std::fs::read(root.log()).unwrap();
+        assert!(bytes.starts_with(&source[..end]));
+        let frames = wal.replay().unwrap();
+        let records: Vec<_> = frames
+            .iter()
+            .filter(|f| !matches!(f.record, WalRecord::RecoveryCut { .. }))
+            .map(|f| f.record.clone())
+            .collect();
+        assert_eq!(records, (1..=count as u64).map(record).collect::<Vec<_>>());
         if data.len() > end {
             let operations = recording.operation_kinds();
             let resize = operations
                 .iter()
                 .position(|op| *op == OperationKind::Change(vec![ChangeKind::Resize]))
-                .expect("repair must truncate through the recording backend");
-            assert!(
-                operations[resize + 1..].contains(&OperationKind::SyncFile),
-                "repair must sync before open returns, not rely on the next append's sync"
-            );
+                .unwrap();
+            assert!(operations[resize + 1..].contains(&OperationKind::SyncFile));
+            let manifests = broca_wal::recovery::manifests(&root.log(), 1_000_000).unwrap();
+            assert_eq!(manifests.len(), 1);
+            let raw = root
+                .log()
+                .parent()
+                .unwrap()
+                .join(&manifests[0].recovery.sidecar_basename);
+            assert_eq!(std::fs::read(raw).unwrap(), data[end..]);
+            assert!(frames.iter().any(|f| matches!(&f.record, WalRecord::RecoveryCut { recovery } if recovery.cut_id == manifests[0].recovery.cut_id)));
         }
-        assert_eq!(wal.last_seq(), count as u64);
-        let recovered: Vec<_> = wal
-            .replay()
-            .unwrap()
-            .into_iter()
-            .map(|f| f.record)
-            .collect();
-        assert_eq!(
-            recovered,
-            (1..=count as u64).map(record).collect::<Vec<_>>()
-        );
-        assert_eq!(wal.append(1, &record(99), true).unwrap(), count as u64 + 1);
+        wal.last_seq()
+    });
+    // Sidecar/manifest/marker cuts are enumerated separately. Start this history
+    // after the completed repair to isolate the next acknowledged append.
+    let recording = Arc::new(RecordingFs::new(&root.0).unwrap());
+    with_fs_ops(recording.clone(), || {
+        let mut wal = root.open();
+        assert_eq!(wal.append(1, &record(99), true).unwrap(), recovered_seq + 1);
     });
     let final_cut = recording.operation_kinds().len();
     for second in recording
@@ -147,30 +181,41 @@ fn assert_recovery(source: &[u8], state: &State) {
     {
         assert_eq!(
             second.state.files[&PathBuf::from("wal/log")],
-            std::fs::read(root.log()).unwrap(),
-            "repair and the new append must both be durable"
+            std::fs::read(root.log()).unwrap()
         );
-        let reopened = Scratch::new();
-        second.state.install(&reopened.0).unwrap();
-        let wal = reopened.open();
-        assert_eq!(wal.last_seq(), count as u64 + 1);
+        let next = Scratch::new();
+        second.state.install(&next.0).unwrap();
+        let wal = next.open();
+        assert_eq!(wal.last_seq(), recovered_seq + 1);
         assert_eq!(wal.replay().unwrap().last().unwrap().record, record(99));
     }
 }
 
-#[test]
-fn v4_recovery_all_power_loss_images_with_one_to_three_pending_appends() {
-    for pending in 1..=3 {
-        let (source, states) = images(pending);
-        assert!(states.len() > 1);
-        eprintln!(
-            "{pending} pending appends: {} distinct cut images",
-            states.len()
-        );
-        for state in states {
-            assert_recovery(&source, &state);
-        }
+fn all_pending_images(pending: u64) {
+    let started = std::time::Instant::now();
+    let (source, states) = images(pending);
+    assert!(states.len() > 1);
+    let count = states.len();
+    for state in states {
+        assert_recovery(&source, &state);
     }
+    eprintln!(
+        "{pending} pending appends: {count} distinct cut images; elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
+}
+
+#[test]
+fn v4_recovery_all_images_with_one_pending_append() {
+    all_pending_images(1);
+}
+#[test]
+fn v4_recovery_all_images_with_two_pending_appends() {
+    all_pending_images(2);
+}
+#[test]
+fn v4_recovery_all_images_with_three_pending_appends() {
+    all_pending_images(3);
 }
 
 #[test]
@@ -187,6 +232,48 @@ fn v4_recovery_zero_filled_unsynced_tail() {
         })
         .expect("the harness must persist length and a later frame without early pending data");
     assert_recovery(&source, state);
+}
+
+#[test]
+fn v4_recovery_keeps_the_supplied_billing_zero_tail_fixture() {
+    let fixture = include_bytes!(
+        "../../broca-provider/tests/fixtures/attempt-unsynced-v4-tail/v4-unsynced-tail.wal"
+    );
+    let root = Scratch::new();
+    std::fs::create_dir_all(root.log().parent().unwrap()).unwrap();
+    std::fs::write(root.log(), fixture).unwrap();
+    let wal = root.open();
+    let records = wal.replay().unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|f| matches!(f.record, WalRecord::AttemptReserved { .. }))
+            .count(),
+        1
+    );
+    assert!(!records
+        .iter()
+        .any(|f| matches!(f.record, WalRecord::ModelAttemptFinished { .. })));
+    let manifests = broca_wal::recovery::manifests(&root.log(), 1_000_000).unwrap();
+    assert_eq!(manifests.len(), 1);
+    assert_eq!(
+        manifests[0].recovery.reason,
+        broca_wal::recovery::CutReason::UnprovenCorruption
+    );
+    let cut = manifests[0].recovery.cut_offset as usize;
+    assert!(std::fs::read(root.log())
+        .unwrap()
+        .starts_with(&fixture[..cut]));
+    assert_eq!(
+        std::fs::read(
+            root.log()
+                .parent()
+                .unwrap()
+                .join(&manifests[0].recovery.sidecar_basename)
+        )
+        .unwrap(),
+        fixture[cut..]
+    );
 }
 
 #[test]
@@ -213,24 +300,43 @@ fn v4_recovery_torn_unsynced_tail_before_intact_later_frame() {
 }
 
 #[test]
-fn v4_recovery_refuses_damage_inside_proof() {
-    let root = Scratch::new();
-    drop(published(&root));
-    let proof = HeadProof::decode(&std::fs::read(sidecar_path(&root.log())).unwrap()).unwrap();
-    let source = std::fs::read(root.log()).unwrap();
-    for byte in [
-        proof.durable_end as usize - 1,
-        LINEAGE_FRAME_LEN + 5,
-        LINEAGE_FRAME_LEN + 4,
-    ] {
-        let mut data = source.clone();
-        data[byte] ^= 1;
-        std::fs::write(root.log(), &data).unwrap();
-        assert!(
-            matches!(FileWal::open(root.log()), Err(WalError::Corrupt { .. })),
-            "covered byte {byte}"
+fn v4_recovery_preserves_synced_region_damage_with_named_reason() {
+    for field in 0..3 {
+        let root = Scratch::new();
+        drop(published(&root));
+        let proof = HeadProof::decode(&std::fs::read(sidecar_path(&root.log())).unwrap()).unwrap();
+        let source = std::fs::read(root.log()).unwrap();
+        let byte = [
+            proof.durable_end as usize - 1,
+            LINEAGE_FRAME_LEN + 5,
+            LINEAGE_FRAME_LEN + 4,
+        ][field];
+        let mut damaged = source.clone();
+        damaged[byte] ^= 1;
+        std::fs::write(root.log(), &damaged).unwrap();
+        let wal = root.open();
+        let cuts = broca_wal::recovery::manifests(&root.log(), 1_000_000).unwrap();
+        assert_eq!(cuts.len(), 1);
+        assert_eq!(
+            cuts[0].recovery.reason,
+            broca_wal::recovery::CutReason::PublishedRegionCorruption
         );
-        assert_eq!(std::fs::read(root.log()).unwrap(), data);
+        assert_eq!(cuts[0].recovery.cut_offset, LINEAGE_FRAME_LEN as u64);
+        assert_eq!(
+            std::fs::read(
+                root.log()
+                    .parent()
+                    .unwrap()
+                    .join(&cuts[0].recovery.sidecar_basename)
+            )
+            .unwrap(),
+            damaged[LINEAGE_FRAME_LEN..]
+        );
+        assert!(wal
+            .replay()
+            .unwrap()
+            .iter()
+            .all(|f| matches!(f.record, WalRecord::RecoveryCut { .. })));
     }
 }
 
@@ -263,29 +369,39 @@ fn v4_recovery_refuses_conflicting_lineage_after_damage() {
 }
 
 #[test]
-fn v4_recovery_combined_lineage_and_covered_damage_uses_final_tail_fallback() {
+fn v4_recovery_preserves_combined_lineage_and_covered_damage() {
     let root = Scratch::new();
     drop(published(&root));
     let proof_bytes = std::fs::read(sidecar_path(&root.log())).unwrap();
     let proof = HeadProof::decode(&proof_bytes).unwrap();
-    let original = std::fs::read(root.log()).unwrap();
-    let mut lost_lineage = original.clone();
-    lost_lineage[HEADER_LEN] ^= 1;
-    std::fs::write(root.log(), &lost_lineage).unwrap();
-    assert!(matches!(
-        FileWal::open(root.log()),
-        Err(WalError::Corrupt { .. })
-    ));
-    assert_eq!(std::fs::read(root.log()).unwrap(), lost_lineage);
-
-    // Without an intact record after the damaged lineage frame, the final-tail
-    // fallback cannot distinguish lost appends from corruption of synced data.
-    lost_lineage[proof.durable_end as usize - 1] ^= 1;
-    std::fs::write(root.log(), &lost_lineage).unwrap();
-    let reopened = FileWal::open(root.log()).unwrap();
-    assert_eq!(reopened.last_seq(), 0);
-    assert!(reopened.replay().unwrap().is_empty());
-    assert!(std::fs::read(root.log()).unwrap().is_empty());
+    let mut damaged = std::fs::read(root.log()).unwrap();
+    damaged[HEADER_LEN] ^= 1;
+    damaged[proof.durable_end as usize - 1] ^= 1;
+    std::fs::write(root.log(), &damaged).unwrap();
+    let wal = root.open();
+    let cuts = broca_wal::recovery::manifests(&root.log(), 1_000_000).unwrap();
+    assert_eq!(cuts.len(), 1);
+    assert_eq!(cuts[0].recovery.cut_offset, 0);
+    assert!(cuts[0].recovery.unattributed_tool_risk);
+    assert_eq!(
+        cuts[0].recovery.reason,
+        broca_wal::recovery::CutReason::UnprovenCorruption
+    );
+    assert_eq!(
+        std::fs::read(
+            root.log()
+                .parent()
+                .unwrap()
+                .join(&cuts[0].recovery.sidecar_basename)
+        )
+        .unwrap(),
+        damaged
+    );
+    assert!(wal
+        .replay()
+        .unwrap()
+        .iter()
+        .all(|f| matches!(f.record, WalRecord::RecoveryCut { .. })));
     assert_eq!(
         std::fs::read(sidecar_path(&root.log())).unwrap(),
         proof_bytes
@@ -293,7 +409,7 @@ fn v4_recovery_combined_lineage_and_covered_damage_uses_final_tail_fallback() {
 }
 
 #[test]
-fn v4_recovery_missing_or_invalid_proof_keeps_strict_refusal() {
+fn v4_recovery_refuse_keeps_every_invalid_proof_image_unchanged() {
     let (source, states) = images(2);
     let ends = boundaries(&source);
     let state = states
@@ -352,7 +468,10 @@ fn v4_recovery_missing_or_invalid_proof_keeps_strict_refusal() {
             _ => unreachable!(),
         }
         assert!(
-            matches!(FileWal::open(root.log()), Err(WalError::Corrupt { .. })),
+            matches!(
+                root.open_policy(broca_wal::recovery::RecoveryPolicy::Refuse),
+                Err(WalError::Io(_))
+            ),
             "proof variant {variant}"
         );
         assert_eq!(
@@ -363,7 +482,7 @@ fn v4_recovery_missing_or_invalid_proof_keeps_strict_refusal() {
 }
 
 #[test]
-fn v4_recovery_disables_proof_policy_after_a_legacy_record() {
+fn v4_recovery_refuses_mixed_format_before_mutation() {
     let root = Scratch::new();
     drop(published(&root));
     let mut legacy = FileWal::open(root.log()).unwrap();
@@ -377,7 +496,7 @@ fn v4_recovery_disables_proof_policy_after_a_legacy_record() {
     std::fs::write(root.log(), &data).unwrap();
     assert!(matches!(
         FileWal::open(root.log()),
-        Err(WalError::Corrupt { .. })
+        Err(WalError::FrameFormat { .. })
     ));
     assert_eq!(std::fs::read(root.log()).unwrap(), data);
 }

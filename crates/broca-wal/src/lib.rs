@@ -18,6 +18,7 @@ pub mod framing;
 pub mod fs_ops;
 pub mod head_proof;
 pub mod record;
+pub mod recovery;
 pub mod state_format;
 
 pub use file_wal::{

@@ -92,6 +92,72 @@ pub struct StateFormatConfig {
     pub overhaul_opt_in: bool,
 }
 
+/// Physical recovery policy for overhaul logs. Legacy log policy is unaffected.
+pub struct WalRecoveryConfig;
+
+impl WalRecoveryConfig {
+    pub fn parse(text: &str) -> Result<broca_wal::recovery::RecoveryPolicy, String> {
+        let text = crate::cache_routing::strip_trailing_commas(
+            &crate::cache_routing::strip_jsonc_comments(text),
+        );
+        let file: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("parse wal_recovery: {e}"))?;
+        match file.get("wal_recovery") {
+            None => Ok(broca_wal::recovery::RecoveryPolicy::Repair),
+            Some(value) if value == "repair" => Ok(broca_wal::recovery::RecoveryPolicy::Repair),
+            Some(value) if value == "refuse" => Ok(broca_wal::recovery::RecoveryPolicy::Refuse),
+            Some(value) => Err(format!(
+                "wal_recovery accepts only \"repair\" or \"refuse\"; got {value}"
+            )),
+        }
+    }
+    pub fn load_default() -> Result<broca_wal::recovery::RecoveryPolicy, String> {
+        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
+        {
+            crate::config_home::ConfigHome::Unresolvable => {
+                Ok(broca_wal::recovery::RecoveryPolicy::Repair)
+            }
+            crate::config_home::ConfigHome::Resolved { path, .. } => {
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => Self::parse(&text).map_err(|e| format!("{}: {e}", path.display())),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(broca_wal::recovery::RecoveryPolicy::Repair)
+                    }
+                    Err(e) => Err(format!("read wal_recovery from {}: {e}", path.display())),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod wal_recovery_config_tests {
+    use super::*;
+    #[test]
+    fn wal_recovery_config_defaults_and_refuses_unknown_values_by_name() {
+        use broca_wal::recovery::RecoveryPolicy;
+        assert_eq!(
+            WalRecoveryConfig::parse("{}").unwrap(),
+            RecoveryPolicy::Repair
+        );
+        assert_eq!(
+            WalRecoveryConfig::parse("{\"wal_recovery\":\"repair\"}").unwrap(),
+            RecoveryPolicy::Repair
+        );
+        assert_eq!(
+            WalRecoveryConfig::parse("{\"wal_recovery\":\"refuse\"}").unwrap(),
+            RecoveryPolicy::Refuse
+        );
+        for value in ["null", "true", "0", "\"repairs\"", "{}"] {
+            assert!(
+                WalRecoveryConfig::parse(&format!("{{\"wal_recovery\":{value}}}"))
+                    .unwrap_err()
+                    .contains("wal_recovery")
+            );
+        }
+    }
+}
+
 impl StateFormatConfig {
     /// The only value the key accepts.
     pub const OVERHAUL: u64 = 2;

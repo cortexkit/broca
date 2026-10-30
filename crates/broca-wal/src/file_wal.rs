@@ -31,9 +31,14 @@ pub const DEFAULT_MAX_READ_BYTES: u64 = 1024 * 1024 * 1024;
 static RECOVERY_TAIL_TRUNCATIONS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Successful, file-synced recovery truncations in this process.
+/// File-synced overhaul truncations in this process; marker publication can
+/// still fail afterward and be completed from the durable manifest on retry.
 pub fn recovery_tail_truncations() -> u64 {
     RECOVERY_TAIL_TRUNCATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn recovery_truncated() {
+    RECOVERY_TAIL_TRUNCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[path = "human_prompt_count.rs"]
@@ -658,7 +663,7 @@ fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
     fs_ops::create_dir_all(dir)
 }
 
-fn mint_lineage_id() -> Result<WalLineageId, WalError> {
+pub(crate) fn mint_lineage_id() -> Result<WalLineageId, WalError> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(WalError::Entropy)?;
     // UUID-shaped presentation is only a convenient encoding; consumers treat the value as opaque.
@@ -861,7 +866,10 @@ impl FileWal {
     }
     /// Open (creating if absent) the WAL at `path`, recovering `next_seq` from the
     /// last committed record. Creation writes a fresh lineage identity; an existing legacy file
-    /// remains unidentified until its next append. A torn trailing frame (an append that crashed
+    /// remains unidentified until its next append. Existing stamped logs use loss-preserving
+    /// overhaul recovery; state-root callers supply the boot format and policy through
+    /// `open_with_recovery` or `open_with_manifest_and_recovery` rather than guessing from
+    /// damaged bytes. On legacy logs a torn trailing frame (an append that crashed
     /// mid-write, never fsynced as complete) is TRUNCATED away on open, so the file ends exactly at
     /// the last valid frame before any new append.
     ///
@@ -877,6 +885,8 @@ impl FileWal {
             String::new(),
             AccessMode::GuardEveryMutation,
             None,
+            None,
+            None,
         )
     }
 
@@ -891,6 +901,8 @@ impl FileWal {
             String::new(),
             AccessMode::GuardEveryMutation,
             Some(sync_probe),
+            None,
+            None,
         )
     }
 
@@ -933,6 +945,72 @@ impl FileWal {
             session_ref,
             AccessMode::GuardEveryMutation,
             None,
+            None,
+            None,
+        )
+    }
+
+    /// Supply the boot decision before recovery can mutate an overhaul log.
+    pub fn open_with_manifest_and_recovery(
+        path: impl Into<PathBuf>,
+        manifest_path: impl Into<PathBuf>,
+        session_addr: impl Into<String>,
+        identity: impl Into<String>,
+        session_ref: String,
+        recovery: (WalConfig, PathBuf),
+    ) -> Result<Self, WalError> {
+        Self::open_inner(
+            path.into(),
+            Some(ManifestAppend {
+                path: manifest_path.into(),
+                session_addr: session_addr.into(),
+                identity: identity.into(),
+            }),
+            session_ref,
+            AccessMode::GuardEveryMutation,
+            None,
+            Some(recovery),
+            None,
+        )
+    }
+
+    pub fn open_with_manifest_and_recovery_hooks(
+        path: impl Into<PathBuf>,
+        manifest_path: impl Into<PathBuf>,
+        session_addr: impl Into<String>,
+        identity: impl Into<String>,
+        session_ref: String,
+        recovery: (WalConfig, PathBuf),
+        hooks: std::sync::Arc<dyn crate::recovery::RecoveryHooks>,
+    ) -> Result<Self, WalError> {
+        Self::open_inner(
+            path.into(),
+            Some(ManifestAppend {
+                path: manifest_path.into(),
+                session_addr: session_addr.into(),
+                identity: identity.into(),
+            }),
+            session_ref,
+            AccessMode::GuardEveryMutation,
+            None,
+            Some(recovery),
+            Some(hooks),
+        )
+    }
+
+    pub fn open_with_recovery(
+        path: impl Into<PathBuf>,
+        config: WalConfig,
+        feature_floor: PathBuf,
+    ) -> Result<Self, WalError> {
+        Self::open_inner(
+            path.into(),
+            None,
+            String::new(),
+            AccessMode::GuardEveryMutation,
+            None,
+            Some((config, feature_floor)),
+            None,
         )
     }
 
@@ -943,6 +1021,8 @@ impl FileWal {
         access: AccessMode,
         #[cfg(test)] sync_probe: Option<SyncProbe>,
         #[cfg(not(test))] _sync_probe: Option<()>,
+        recovery: Option<(WalConfig, PathBuf)>,
+        hooks: Option<std::sync::Arc<dyn crate::recovery::RecoveryHooks>>,
     ) -> Result<Self, WalError> {
         crate::migration::guard(&path, &session_ref, true)?;
         #[cfg(windows)]
@@ -968,6 +1048,14 @@ impl FileWal {
         let max_read_bytes = OPEN_READ_CAP.with(Cell::get);
         #[cfg(not(test))]
         let max_read_bytes = DEFAULT_MAX_READ_BYTES;
+        crate::recovery::before_open_with_hooks(
+            &path,
+            recovery.as_ref().map(|r| r.0),
+            recovery.as_ref().map(|r| r.1.as_path()),
+            &session_ref,
+            max_read_bytes,
+            hooks.as_deref(),
+        )?;
         let recovered = match File::open(&path) {
             Ok(file) => {
                 let size = file.metadata().map_err(WalError::Io)?.len();
@@ -977,12 +1065,10 @@ impl FileWal {
                         file_size: size,
                     });
                 }
-                let proof = recovery_head_proof(&path, size);
-                scan_prefix_with_proof(
+                scan_prefix(
                     std::io::BufReader::new(file),
                     max_read_bytes,
                     |_| None::<()>,
-                    proof,
                 )?
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1012,15 +1098,6 @@ impl FileWal {
                     .map_err(WalError::Io)?;
                 trunc.set_len(valid_end).map_err(WalError::Io)?;
                 trunc.sync_all().map_err(WalError::Io)?; // durable before appending after it
-                let truncations = RECOVERY_TAIL_TRUNCATIONS
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    + 1;
-                tracing::warn!(
-                    valid_end,
-                    discarded_bytes = meta.len() - valid_end,
-                    truncations,
-                    "WAL recovery durably truncated an incomplete append tail"
-                );
             }
         }
         let mut create_opts = OpenOptions::new();
@@ -1210,6 +1287,12 @@ impl FileWal {
         sync: bool,
         source: FrameSource,
     ) -> Result<u64, WalError> {
+        if matches!(record, WalRecord::RecoveryCut { .. }) && !self.config.is_overhaul() {
+            return Err(WalError::FrameFormat {
+                log: WalFormat::Legacy,
+                offered: WalFormat::Overhaul,
+            });
+        }
         // One validation phase per tenure: the open-time guard cleared the
         // fenced path and reference under the held tenure, so owned appends
         // skip the repeated migration probes while that verdict still covers
@@ -1683,11 +1766,9 @@ impl OwnedWriterWal {
             fenced_path,
             fenced_ref,
         };
-        let wal =
-            FileWal::open_inner(path, manifest, session_ref, access, None).map_err(|error| {
-                OwnedOpenError {
-                    cause: OwnedOpenCause::Wal(error),
-                }
+        let wal = FileWal::open_inner(path, manifest, session_ref, access, None, None, None)
+            .map_err(|error| OwnedOpenError {
+                cause: OwnedOpenCause::Wal(error),
             })?;
         #[cfg(test)]
         OWNED_OPEN_PANIC_AFTER_RECOVERY.with(|flag| {
@@ -1919,30 +2000,10 @@ fn read_up_to(file: &mut impl Read, bytes: &mut [u8]) -> Result<usize, WalError>
 /// Strictly decode one body at a time, retaining only the caller's selected value.
 /// Recovery needs the verified end and sequence, not all historical message bodies.
 fn scan_prefix<T>(
-    file: impl Read,
-    max_bytes: u64,
-    found: impl FnMut(&FramedRecord) -> Option<T>,
-) -> Result<PrefixScan<T>, WalError> {
-    scan_prefix_with_proof(file, max_bytes, found, None)
-}
-
-fn recovery_head_proof(path: &Path, file_size: u64) -> Option<crate::head_proof::HeadProof> {
-    let mut bytes = Vec::new();
-    File::open(crate::head_proof::sidecar_path(path))
-        .ok()?
-        .take(broca_wal_reader::proof::PROOF_LEN as u64 + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    crate::head_proof::HeadProof::decode(&bytes).filter(|proof| proof.durable_end <= file_size)
-}
-
-fn scan_prefix_with_proof<T>(
     mut file: impl Read,
     max_bytes: u64,
     mut found: impl FnMut(&FramedRecord) -> Option<T>,
-    mut proof: Option<crate::head_proof::HeadProof>,
 ) -> Result<PrefixScan<T>, WalError> {
-    let mut proven_end = None;
     let mut scan = PrefixScan {
         found: None,
         bytes_read: 0,
@@ -2003,29 +2064,6 @@ fn scan_prefix_with_proof<T>(
                 validate_contiguous_sequence(scan.last_seq, 1, framed.seq)?;
                 scan.last_seq = Some(framed.seq);
                 scan.valid_end += consumed as u64;
-                if frame.get(4) != Some(&crate::framing::V4_FRAMING_VERSION) {
-                    // Legacy recovery must not acquire a different policy from a sidecar.
-                    proof = None;
-                    proven_end = None;
-                }
-                if let Some(head) = &proof {
-                    if scan.valid_end == head.durable_end
-                        && scan
-                            .lineage_id
-                            .is_some_and(|id| id.as_bytes() == head.lineage_id)
-                        && broca_wal_reader::frame::decode_header(&frame)
-                            .ok()
-                            .flatten()
-                            .is_some_and(|header| {
-                                header.identity == head.frame_identity
-                                    && header.metadata.seq == head.durable_seq
-                                    && header.metadata.writer_id == head.writer_id
-                                    && header.metadata.appended_ms == head.appended_ms
-                            })
-                    {
-                        proven_end = Some(head.durable_end);
-                    }
-                }
                 if let Some(value) = found(&framed) {
                     scan.found = Some(value);
                     return Ok(scan);
@@ -2037,13 +2075,6 @@ fn scan_prefix_with_proof<T>(
             } => {
                 fold_lineage_id(&mut scan.lineage_id, lineage_id)?;
                 scan.valid_end += consumed as u64;
-                if proof
-                    .as_ref()
-                    .is_some_and(|head| head.lineage_id != lineage_id.as_bytes())
-                {
-                    proof = None;
-                    proven_end = None;
-                }
             }
             DecodeStep::NewerWriter { ver, missing } => {
                 return Err(WalError::NewerWriter {
@@ -2052,23 +2083,7 @@ fn scan_prefix_with_proof<T>(
                     missing,
                 });
             }
-            step @ (DecodeStep::Corrupt(_) | DecodeStep::TornTail) => {
-                let repair_tail = proven_end.is_some_and(|end| offset >= end)
-                    && !crate::framing::digest_verifies(&frame);
-                if proof.as_ref().is_some_and(|head| {
-                    offset < head.durable_end
-                        && scan
-                            .lineage_id
-                            .is_some_and(|id| id.as_bytes() == head.lineage_id)
-                }) {
-                    return Err(WalError::Corrupt {
-                        offset: offset as usize,
-                        source: match step {
-                            DecodeStep::Corrupt(source) => source,
-                            _ => FrameError::NonTailIncompleteFrame,
-                        },
-                    });
-                }
+            DecodeStep::Corrupt(_) | DecodeStep::TornTail => {
                 // Only the exceptional path reads ahead. A damaged length cannot tell
                 // us whether intact records follow it, so inspect the bounded suffix.
                 let before = frame.len();
@@ -2081,15 +2096,6 @@ fn scan_prefix_with_proof<T>(
                         max_bytes,
                         file_size: offset + frame.len() as u64,
                     });
-                }
-                if repair_tail {
-                    // A proof is only a durability lower bound: intact later frames may
-                    // already have caused effects, so retain the contiguous prefix. Treating
-                    // the damaged suffix as disposable assumes append-only power loss with
-                    // honest fsync; a stale proof cannot rule out post-sync corruption there.
-                    // Foreign lineage is replacement/splice evidence even under that model.
-                    reject_conflicting_lineage_after(&frame, scan.lineage_id)?;
-                    return Ok(scan);
                 }
                 decode_bytes_seeded(
                     &frame,
@@ -2626,21 +2632,6 @@ fn validate_contiguous_sequence(
 
 // Damage may hide the next boundary, so search every possible lineage envelope
 // rather than trusting the damaged frame's declared length.
-fn reject_conflicting_lineage_after(
-    bytes: &[u8],
-    mut expected_lineage: Option<WalLineageId>,
-) -> Result<(), WalError> {
-    for candidate in bytes.windows(crate::framing::LINEAGE_FRAME_LEN).skip(1) {
-        // Lineage uses a fixed 16-byte payload and version 2. Other frame types
-        // in the suffix are not evidence of a lineage conflict and need not be decoded.
-        if candidate[..4] == 16u32.to_le_bytes() && candidate[4] == 2 {
-            if let DecodeStep::Lineage { lineage_id, .. } = decode_next(candidate) {
-                fold_lineage_id(&mut expected_lineage, lineage_id)?;
-            }
-        }
-    }
-    Ok(())
-}
 
 // A damaged length cannot identify the next boundary. Search for intact frames
 // instead; matching lineage-only metadata after a damaged last record is part

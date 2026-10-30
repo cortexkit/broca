@@ -50,6 +50,9 @@ pub fn u64_to_i64(value: u64) -> Result<i64, ProjectionPlanError> {
 
 #[derive(Debug, Clone)]
 pub struct ProjectionSnapshot {
+    pub context_epoch: i64,
+    /// A durable recovery fence rejects projections captured before the cut.
+    pub required_recovery_cuts: Vec<String>,
     pub attribution_complete: bool,
     pub seed: Option<ProjectionSeed>,
     pub watermark: u64,
@@ -197,7 +200,25 @@ pub fn plan_projection(
     let incoming_lineage_id = range
         .and_then(|range| range.lineage_id)
         .map(|lineage_id| lineage_id.to_string());
+    let incoming_cuts: std::collections::BTreeSet<_> = records
+        .iter()
+        .filter_map(|frame| match &frame.record {
+            WalRecord::RecoveryCut { recovery } => Some(recovery.cut_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    if snapshot
+        .required_recovery_cuts
+        .iter()
+        .any(|cut| !incoming_cuts.contains(cut.as_str()))
+    {
+        return Err(ProjectionPlanError::InconsistentSnapshot(
+            "recovery projection requires the complete post-cut WAL",
+        ));
+    }
     let reset = !snapshot.attribution_complete
+        || !snapshot.required_recovery_cuts.is_empty()
+        || !incoming_cuts.is_empty()
         || snapshot
             .seed
             .as_ref()

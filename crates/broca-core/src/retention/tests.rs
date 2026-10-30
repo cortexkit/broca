@@ -112,6 +112,8 @@ pub(crate) fn frames(retention: Option<u64>) -> Vec<FramedRecord> {
 
 fn snapshot(seed: Option<ProjectionSeed>, watermark: u64) -> ProjectionSnapshot {
     ProjectionSnapshot {
+        context_epoch: 0,
+        required_recovery_cuts: Vec::new(),
         attribution_complete: true,
         seed,
         watermark,

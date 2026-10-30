@@ -33,6 +33,27 @@ fn t(id: &str) -> ToolCallId {
     ToolCallId(id.into())
 }
 
+fn recovery_text_provider() -> ScriptedProvider {
+    ScriptedProvider::new(
+        vec![vec![
+            NormalizedEvent::Control(ProviderControl::AssistantMessage {
+                message: AssistantMessage {
+                    message_id: MessageId("after-recovery".into()),
+                    content: vec![ContentBlock::Text {
+                        text: "continued".into(),
+                    }],
+                },
+            }),
+            NormalizedEvent::Control(ProviderControl::Finished {
+                usage: Usage::default(),
+                finish_reason: FinishReason::Stop,
+                retries_used: 0,
+            }),
+        ]],
+        Render::Canonical,
+    )
+}
+
 /// The record count just after the dispatch intent of `call` in the reference log.
 fn after_intent_of(handle: &RunnerHandle, call: &str) -> usize {
     handle
@@ -115,14 +136,15 @@ async fn a_fsynced_intent_beyond_a_stale_head_proof_survives_open_and_resume_nev
     std::fs::write(&path, damaged).unwrap();
 
     let reopened = FileWal::open(&path).unwrap();
-    assert_eq!(reopened.last_seq(), intent_seq);
-    assert_eq!(std::fs::read(&path).unwrap(), through_intent);
+    assert_eq!(reopened.last_seq(), intent_seq + 1);
+    assert!(std::fs::read(&path).unwrap().starts_with(&through_intent));
     assert_eq!(std::fs::read(sidecar_path(&path)).unwrap(), sidecar);
     assert_eq!(
         reopened
             .replay()
             .unwrap()
             .into_iter()
+            .filter(|f| !matches!(f.record, WalRecord::RecoveryCut { .. }))
             .map(|f| f.record)
             .collect::<Vec<_>>(),
         prefix
@@ -152,6 +174,230 @@ async fn a_fsynced_intent_beyond_a_stale_head_proof_survives_open_and_resume_nev
     let status = reconcile_run_state(&records, "r").unwrap();
     assert_eq!(status.state, RunIndexState::Interrupted);
     assert_eq!(status.indeterminate_tool_calls, Some(vec![t("t1")]));
+}
+
+#[tokio::test]
+async fn a_removed_intent_is_unknown_on_real_resume_and_the_next_episode_runs() {
+    for remove_step in [false, true] {
+        let handle = RunnerHandle::new(scenarios::ONE_EDIT).await;
+        let kill = kill_after_intent_of(&handle, "t1").await;
+        let path = broca_crash_harness::wal_path(&kill.state_root, &scenarios::session());
+        std::fs::write(&path, &kill.durable.bytes[..kill.durable.end_of_records(0)]).unwrap();
+        let floor = kill.state_root.join(broca_wal::FEATURE_FLOOR_FILENAME);
+        let mut wal = FileWal::open_with_recovery(&path, WalConfig::OVERHAUL, floor.clone())
+            .unwrap()
+            .with_feature_floor(floor)
+            .with_wal_config(WalConfig::OVERHAUL)
+            .unwrap();
+        let reference = handle.reference.log.records();
+        for record in &reference {
+            wal.append(1, record, true).unwrap();
+        }
+        let mut publisher = Publisher::from_synced(SyncedPrefix::sync(&wal).unwrap()).unwrap();
+        publisher.publish(|| 0).unwrap();
+        drop(wal);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let target = reference
+            .iter()
+            .position(|record| {
+                if remove_step {
+                    matches!(record, WalRecord::ModelStepFinished { .. })
+                } else {
+                    matches!(record, WalRecord::ToolDispatchIntent { .. })
+                }
+            })
+            .unwrap();
+        let frame = LogImage::parse(bytes.clone())
+            .record_frame(target)
+            .unwrap()
+            .clone();
+        bytes[frame.end - 1] ^= 1;
+        let removed = bytes[frame.start..].to_vec();
+        std::fs::write(&path, bytes).unwrap();
+
+        let store = FileWalStore::with_config(kill.state_root.join("wal"), WalConfig::OVERHAUL);
+        let provider = ScriptedProvider::for_scenario(&handle.scenario);
+        let plane = HarnessPlane::for_scenario(&handle.scenario);
+        let outcome = drive(
+            (handle.scenario.request)(),
+            (handle.scenario.control)(),
+            &kill.state_root,
+            &store,
+            &provider,
+            &plane,
+        )
+        .await;
+        assert_eq!(outcome.reason, RunFinishReason::Interrupted);
+        assert_eq!(provider.request_count(), 0);
+        assert!(plane.dispatched().is_empty());
+        let records = LogImage::read(&path).records();
+        let recovery = records
+            .iter()
+            .find_map(|r| match r {
+                WalRecord::RecoveryCut { recovery } => Some(recovery),
+                _ => None,
+            })
+            .unwrap();
+        assert!(recovery.unattributed_tool_risk);
+        assert!(recovery
+            .runs
+            .iter()
+            .flat_map(|run| &run.calls)
+            .any(|call| call.tool_call_id == t("t1")));
+        assert_eq!(
+            std::fs::read(path.parent().unwrap().join(&recovery.sidecar_basename)).unwrap(),
+            removed
+        );
+        assert!(records.iter().any(|r| matches!(r, WalRecord::ResumeStarted { indeterminate, .. } if indeterminate == &vec![t("t1")])));
+        let unknown: Vec<_> = records
+            .iter()
+            .filter_map(|r| match r {
+                WalRecord::ToolResult {
+                    result,
+                    outcome: DispatchOutcome::Unknown,
+                    ..
+                } => Some(result.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(unknown, [&outcome_unknown_result(&t("t1"))]);
+        let state = reconcile_run_state(&records, "r").unwrap();
+        assert_eq!(state.indeterminate_tool_calls, Some(vec![t("t1")]));
+
+        let mut next = scenarios::edit_request();
+        next.run_id = RunId("after-cut".into());
+        next.input = vec![Message::new(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "continue after reviewing recovery".into(),
+            }],
+        )];
+        let provider = ScriptedProvider::new(
+            vec![vec![
+                NormalizedEvent::Control(ProviderControl::AssistantMessage {
+                    message: AssistantMessage {
+                        message_id: MessageId("after-cut-message".into()),
+                        content: vec![ContentBlock::Text {
+                            text: "continued".into(),
+                        }],
+                    },
+                }),
+                NormalizedEvent::Control(ProviderControl::Finished {
+                    usage: Usage::default(),
+                    finish_reason: FinishReason::Stop,
+                    retries_used: 0,
+                }),
+            ]],
+            Render::Canonical,
+        );
+        let plane = HarnessPlane::new(scenarios::edit_plane());
+        let next = drive(
+            next,
+            RunControl::default(),
+            &kill.state_root,
+            &store,
+            &provider,
+            &plane,
+        )
+        .await;
+        assert_eq!(next.reason, RunFinishReason::Completed);
+        assert_eq!(provider.request_count(), 1);
+        assert!(provider.rejected().is_empty());
+        assert!(plane.dispatched().is_empty());
+
+        // Even a later episode re-emitting the recovered call id cannot send it.
+        let mut repeated = (handle.scenario.request)();
+        repeated.run_id = RunId("repeat-recovered-id".into());
+        let provider = ScriptedProvider::for_scenario(&handle.scenario);
+        let plane = HarnessPlane::for_scenario(&handle.scenario);
+        let repeated = drive(
+            repeated,
+            RunControl::default(),
+            &kill.state_root,
+            &store,
+            &provider,
+            &plane,
+        )
+        .await;
+        assert_eq!(repeated.reason, RunFinishReason::Interrupted);
+        assert!(plane.dispatched().is_empty());
+        let records = LogImage::read(&path).records();
+        assert_eq!(
+            reconcile_run_state(&records, "repeat-recovered-id")
+                .unwrap()
+                .indeterminate_tool_calls,
+            Some(vec![t("t1")])
+        );
+    }
+}
+
+#[tokio::test]
+async fn unattributed_recovery_risk_interrupts_only_the_current_run() {
+    let handle = RunnerHandle::new(scenarios::ONE_EDIT).await;
+    let kill = kill_after_intent_of(&handle, "t1").await;
+    let path = broca_crash_harness::wal_path(&kill.state_root, &scenarios::session());
+    std::fs::write(&path, &kill.durable.bytes[..kill.durable.end_of_records(0)]).unwrap();
+    let floor = kill.state_root.join(broca_wal::FEATURE_FLOOR_FILENAME);
+    let mut wal = FileWal::open_with_recovery(&path, WalConfig::OVERHAUL, floor.clone())
+        .unwrap()
+        .with_feature_floor(floor)
+        .with_wal_config(WalConfig::OVERHAUL)
+        .unwrap();
+    let start = handle
+        .reference
+        .log
+        .records()
+        .into_iter()
+        .find(|record| matches!(record, WalRecord::RunStarted { .. }))
+        .unwrap();
+    wal.append(1, &start, true).unwrap();
+    drop(wal);
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"unattributed undecodable bytes")
+        .unwrap();
+    let store = FileWalStore::with_config(kill.state_root.join("wal"), WalConfig::OVERHAUL);
+    let provider = ScriptedProvider::for_scenario(&handle.scenario);
+    let plane = HarnessPlane::for_scenario(&handle.scenario);
+    let outcome = drive(
+        (handle.scenario.request)(),
+        RunControl::default(),
+        &kill.state_root,
+        &store,
+        &provider,
+        &plane,
+    )
+    .await;
+    assert_eq!(outcome.reason, RunFinishReason::Interrupted);
+    assert_eq!(provider.request_count(), 0);
+    assert!(plane.dispatched().is_empty());
+    let records = LogImage::read(&path).records();
+    assert!(records.iter().any(|record| matches!(record, WalRecord::RecoveryCut { recovery } if recovery.unattributed_tool_risk && recovery.runs.is_empty())));
+    assert_eq!(
+        reconcile_run_state(&records, "r")
+            .unwrap()
+            .indeterminate_tool_calls,
+        Some(vec![])
+    );
+    let mut next = scenarios::edit_request();
+    next.run_id = RunId("after-unattributed-cut".into());
+    let provider = recovery_text_provider();
+    let plane = HarnessPlane::new(scenarios::edit_plane());
+    let next = drive(
+        next,
+        RunControl::default(),
+        &kill.state_root,
+        &store,
+        &provider,
+        &plane,
+    )
+    .await;
+    assert_eq!(next.reason, RunFinishReason::Completed);
+    assert_eq!(provider.request_count(), 1);
+    assert!(plane.dispatched().is_empty());
 }
 
 #[tokio::test]

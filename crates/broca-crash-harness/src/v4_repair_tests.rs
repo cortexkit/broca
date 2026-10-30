@@ -23,16 +23,24 @@ fn assert_reopens(state: &State, expected: &[u8]) {
     let root = Scratch::new();
     state.install(&root.0).unwrap();
     let wal = root.open();
-    assert_eq!(wal.last_seq(), 1);
-    assert_eq!(
-        wal.replay()
-            .unwrap()
-            .into_iter()
-            .map(|f| f.record)
-            .collect::<Vec<_>>(),
-        [record(1)]
-    );
-    assert_eq!(std::fs::read(root.log()).unwrap(), expected);
+    let records: Vec<_> = wal
+        .replay()
+        .unwrap()
+        .into_iter()
+        .filter(|f| !matches!(f.record, WalRecord::RecoveryCut { .. }))
+        .map(|f| f.record)
+        .collect();
+    assert_eq!(records, [record(1)]);
+    assert!(std::fs::read(root.log()).unwrap().starts_with(expected));
+    for (path, bytes) in &state.files {
+        if path.to_string_lossy().contains(".cut-") {
+            assert_eq!(
+                std::fs::read(root.0.join(path)).unwrap(),
+                *bytes,
+                "recovery must never delete or overwrite preserved sidecars"
+            );
+        }
+    }
 }
 
 #[test]
@@ -61,15 +69,28 @@ fn v4_recovery_every_repair_cut_including_between_truncate_and_sync_reopens() {
     let mut persisted_shrink = false;
     for cut in cuts {
         let bytes = &cut.state.files[&PathBuf::from("wal/log")];
-        assert!(bytes == original || *bytes == repaired);
+        assert!(bytes.starts_with(&repaired));
         if cut.cut > resize && cut.cut <= sync {
             pending_shrink |= bytes == original;
             persisted_shrink |= *bytes == repaired;
         }
         if cut.cut > sync {
+            assert!(bytes.starts_with(&repaired));
+        }
+        if bytes != original {
+            let manifest = cut
+                .state
+                .files
+                .iter()
+                .filter(|(path, _)| path.to_string_lossy().ends_with(".json"))
+                .filter_map(|(_, bytes)| {
+                    serde_json::from_slice::<broca_wal::recovery::CutManifest>(bytes).ok()
+                })
+                .find(|manifest| manifest.recovery.cut_offset == repaired.len() as u64)
+                .expect("a persisted truncate requires a complete durable manifest first");
             assert_eq!(
-                *bytes, repaired,
-                "the successful repair sync protects the shrink"
+                cut.state.files[&PathBuf::from("wal").join(manifest.recovery.sidecar_basename)],
+                original[repaired.len()..]
             );
         }
         assert_reopens(&cut.state, &repaired);
@@ -82,62 +103,61 @@ fn v4_recovery_every_repair_cut_including_between_truncate_and_sync_reopens() {
 
 #[cfg(feature = "writer-id-faults")]
 #[test]
-fn v4_recovery_failed_truncate_sync_is_not_transactional_and_retry_needs_a_barrier() {
+fn v4_recovery_failed_truncate_sync_retries_from_durable_manifest() {
     let (state, repaired) = damaged_image();
     let original = &state.files[&PathBuf::from("wal/log")];
     let root = Scratch::new();
     state.install(&root.0).unwrap();
     let (fs, fail_sync, recording) =
         crate::writer_id_tests::recovery_sync_fault(&root.0, root.log());
-    let before_barrier = with_fs_ops(fs, || {
-        assert!(matches!(FileWal::open(root.log()), Err(WalError::Io(error))
-            if error.to_string() == "injected writer close sync failure"));
+    let failed_states = with_fs_ops(fs, || {
+        assert!(
+            matches!(FileWal::open_with_recovery(root.log(), WalConfig::OVERHAUL, root.0.join("floor")), Err(WalError::Io(error))
+            if error.to_string() == "injected writer close sync failure")
+        );
         assert_eq!(
             std::fs::read(root.log()).unwrap(),
             repaired,
             "a failed sync does not roll the live truncate back"
         );
-        assert!(!recording
-            .operation_kinds()
-            .contains(&OperationKind::SyncFile));
-
+        let failed_cut = recording.operation_kinds().len();
+        let failed_states: Vec<_> = recording
+            .enumerate(100_000)
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.cut == failed_cut)
+            .collect();
         fail_sync.store(false, Ordering::SeqCst);
         let retry_start = recording.operation_kinds().len();
         let mut retried = root.open();
-        assert_eq!(retried.last_seq(), 1);
-
+        let records = retried.replay().unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|f| matches!(f.record, WalRecord::RecoveryCut { .. }))
+                .count(),
+            1
+        );
         let retry_ops = recording.operation_kinds();
         assert!(
-            !retry_ops[retry_start..].contains(&OperationKind::SyncFile),
-            "a clean shortened file does not trigger another repair sync on retry"
+            retry_ops[retry_start..].contains(&OperationKind::SyncFile),
+            "retry must durably finish the pending recovery marker"
         );
         assert!(
             !retry_ops[retry_start..].contains(&OperationKind::Change(vec![ChangeKind::Resize]))
         );
-        let retry_cut = retry_ops.len();
-        let before_barrier: Vec<_> = recording
-            .enumerate(100_000)
-            .unwrap()
-            .into_iter()
-            .filter(|image| image.cut == retry_cut)
-            .collect();
-
         retried.append(1, &record(99), true).unwrap();
-        assert!(recording
-            .operation_kinds()
-            .contains(&OperationKind::SyncFile));
-        before_barrier
+        failed_states
     });
-    assert!(before_barrier
+    assert!(failed_states
         .iter()
-        .any(|image| image.state.files[&PathBuf::from("wal/log")] == *original));
-    assert!(before_barrier
+        .any(|s| s.state.files[&PathBuf::from("wal/log")] == *original));
+    assert!(failed_states
         .iter()
-        .any(|image| image.state.files[&PathBuf::from("wal/log")] == repaired));
-    for image in before_barrier {
+        .any(|s| s.state.files[&PathBuf::from("wal/log")] == repaired));
+    for image in failed_states {
         assert_reopens(&image.state, &repaired);
     }
-
     let final_cut = recording.operation_kinds().len();
     let synced = std::fs::read(root.log()).unwrap();
     for image in recording
@@ -150,7 +170,44 @@ fn v4_recovery_failed_truncate_sync_is_not_transactional_and_retry_needs_a_barri
         let next = Scratch::new();
         image.state.install(&next.0).unwrap();
         let wal = next.open();
-        assert_eq!(wal.last_seq(), 2);
         assert_eq!(wal.replay().unwrap().last().unwrap().record, record(99));
     }
+}
+
+#[cfg(feature = "writer-id-faults")]
+#[test]
+fn v4_recovery_marker_sync_failure_retries_the_visible_marker_barrier() {
+    let (state, retained) = damaged_image();
+    let root = Scratch::new();
+    state.install(&root.0).unwrap();
+    let (fs, recording) = crate::writer_id_tests::recovery_marker_sync_fault(&root.0, root.log());
+    with_fs_ops(fs, || {
+        assert!(
+            matches!(FileWal::open_with_recovery(root.log(), WalConfig::OVERHAUL, root.0.join("floor")), Err(WalError::Io(error))
+            if error.to_string() == "injected recovery marker sync failure")
+        );
+        let visible = std::fs::read(root.log()).unwrap();
+        assert!(visible.starts_with(&retained));
+        let retry_start = recording.operation_kinds().len();
+        let wal = root.open();
+        assert_eq!(std::fs::read(root.log()).unwrap(), visible);
+        assert_eq!(
+            wal.replay()
+                .unwrap()
+                .iter()
+                .filter(|f| matches!(f.record, WalRecord::RecoveryCut { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            recording.operation_kinds()[retry_start..].contains(&OperationKind::SyncFile),
+            "a complete visible marker still needs a successful retry barrier"
+        );
+        let after_retry = recording.operation_kinds().len();
+        let images = recording.enumerate(100_000).unwrap();
+        assert!(images.iter().any(|image| image.cut == after_retry));
+        for image in images.into_iter().filter(|image| image.cut == after_retry) {
+            assert_eq!(image.state.files[&PathBuf::from("wal/log")], visible);
+        }
+    });
 }

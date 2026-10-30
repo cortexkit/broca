@@ -7,6 +7,8 @@ use broca_wal::{FramedRecord, WalLineageId, WalRangeRead, WalRecord};
 
 fn stored_snapshot() -> ProjectionSnapshot {
     ProjectionSnapshot {
+        context_epoch: 0,
+        required_recovery_cuts: Vec::new(),
         attribution_complete: true,
         seed: Some(ProjectionSeed::empty()),
         watermark: 19,

@@ -55,6 +55,17 @@ pub type WriterAndLease = (Box<dyn Wal + Send>, Box<dyn LeaseHandle>);
 /// Opens the per-session WAL (mirrors `LeaseStore`, so the file impl swaps for a
 /// future store without touching the loop).
 pub trait WalStore: Send + Sync {
+    fn bind_recovery_projection(
+        &self,
+        _session: Option<&BindIdentity>,
+        _store: Arc<dyn crate::SessionStore>,
+    ) {
+    }
+    /// Called only under the writer lease, before retention/admission read the
+    /// physical log. Read-only store operations never initiate repair.
+    fn recover_existing(&self, _session: &BindIdentity) -> Result<(), WalError> {
+        Ok(())
+    }
     /// State-root location for the writer-id/v1 marker protocol. Legacy stores need none.
     fn writer_marker_root(&self) -> Option<PathBuf> {
         None
@@ -360,6 +371,7 @@ pub trait WalStore: Send + Sync {
 /// deterministic hash of the session's bind identity so the same session always maps
 /// to the same log across processes and restarts.
 pub struct FileWalStore {
+    recovery_views: Mutex<RecoveryViews>,
     root: PathBuf,
     /// The frame format every log this store opens writes, decided once at boot (see
     /// [`FileWalStore::with_config`]). [`FileWalStore::new`] is legacy only.
@@ -376,6 +388,94 @@ pub struct FileWalStore {
     durable_observer: Option<Arc<DurableWalObserver>>,
     #[cfg(any(test, feature = "test-clock"))]
     range_reads: AtomicU64,
+}
+
+#[derive(Default)]
+struct RecoveryViews {
+    global: Vec<std::sync::Weak<dyn crate::SessionStore>>,
+    sessions: std::collections::HashMap<String, Vec<std::sync::Weak<dyn crate::SessionStore>>>,
+}
+
+impl RecoveryViews {
+    fn bind(&mut self, session: Option<&BindIdentity>, store: Arc<dyn crate::SessionStore>) {
+        let list = match session {
+            Some(session) => self.sessions.entry(session_addr(session)).or_default(),
+            None => &mut self.global,
+        };
+        list.retain(|view| view.strong_count() > 0);
+        let view = Arc::downgrade(&store);
+        if !list.iter().any(|old| old.ptr_eq(&view)) {
+            list.push(view);
+        }
+    }
+    fn snapshot(&self, session: &BindIdentity) -> Vec<Arc<dyn crate::SessionStore>> {
+        let mut views = Vec::new();
+        for view in self.global.iter().chain(
+            self.sessions
+                .get(&session_addr(session))
+                .into_iter()
+                .flatten(),
+        ) {
+            if let Some(view) = view.upgrade() {
+                if !views.iter().any(|old| Arc::ptr_eq(old, &view)) {
+                    views.push(view);
+                }
+            }
+        }
+        views
+    }
+}
+
+struct ProjectionRecovery {
+    session: BindIdentity,
+    views: Vec<Arc<dyn crate::SessionStore>>,
+    max_bytes: u64,
+}
+
+impl ProjectionRecovery {
+    fn failed(&self, stage: &str, error: impl std::fmt::Display) -> WalError {
+        WalError::Io(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "WAL recovery {stage} for session {} ({}): {error}",
+                self.session.session,
+                agent_session_ref(&self.session)
+            ),
+        ))
+    }
+}
+
+impl broca_wal::recovery::RecoveryHooks for ProjectionRecovery {
+    fn before_cut(&self, cut: &broca_wal::recovery::RecoveryCut) -> Result<(), WalError> {
+        for view in &self.views {
+            view.invalidate_wal_recovery(&self.session, cut)
+                .map_err(|e| self.failed("invalidation refused before cut", e))?;
+        }
+        Ok(())
+    }
+    fn after_repair(
+        &self,
+        log: &Path,
+        cut_ids: &std::collections::BTreeSet<String>,
+    ) -> Result<(), WalError> {
+        let mut full = None;
+        for view in &self.views {
+            if view
+                .needs_wal_recovery_projection(&self.session, cut_ids)
+                .map_err(|e| self.failed("projection check", e))?
+            {
+                if full.is_none() {
+                    full = Some(
+                        broca_wal::file_wal::read_records_range(log, self.max_bytes, 0, None, None)
+                            .map_err(|e| self.failed("projection WAL read", e))?,
+                    );
+                }
+                view.reproject_wal_recovery(&self.session, full.as_ref().unwrap())
+                    .map_err(|e| self.failed("reprojection refused after cut", e))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Non-I/O notification of a successful WAL barrier, including raw maintenance writers.
@@ -735,6 +835,7 @@ impl FileWalStore {
         refusal: Option<broca_wal::StateRootError>,
     ) -> Self {
         Self {
+            recovery_views: Mutex::new(RecoveryViews::default()),
             root,
             config,
             refusal,
@@ -1065,13 +1166,25 @@ impl FileWalStore {
             session.session
         );
         let retained = path == self.ephemeral_wal_path(session);
-        let wal = FileWal::open_with_manifest_and_session_ref(
-            path.clone(),
-            self.manifest_path(),
-            session_addr(session),
-            identity,
-            agent_session_ref(session),
-        )?
+        let wal = match self.recovery_hooks(session) {
+            Some(hooks) => FileWal::open_with_manifest_and_recovery_hooks(
+                path.clone(),
+                self.manifest_path(),
+                session_addr(session),
+                identity,
+                agent_session_ref(session),
+                (self.config, self.feature_floor_path()),
+                hooks,
+            ),
+            None => FileWal::open_with_manifest_and_recovery(
+                path.clone(),
+                self.manifest_path(),
+                session_addr(session),
+                identity,
+                agent_session_ref(session),
+                (self.config, self.feature_floor_path()),
+            ),
+        }?
         .with_recovery_cap(self.max_read_bytes)
         .with_feature_floor(self.feature_floor_path())
         .with_wal_config(self.config)?;
@@ -1668,6 +1781,23 @@ impl FileWalStore {
             .join(broca_wal::FEATURE_FLOOR_FILENAME)
     }
 
+    fn recovery_hooks(
+        &self,
+        session: &BindIdentity,
+    ) -> Option<Arc<dyn broca_wal::recovery::RecoveryHooks>> {
+        if !self.config.is_overhaul() {
+            return None;
+        }
+        let views = self.recovery_views.lock().unwrap().snapshot(session);
+        (!views.is_empty()).then(|| {
+            Arc::new(ProjectionRecovery {
+                session: session.clone(),
+                views,
+                max_bytes: self.max_read_bytes,
+            }) as Arc<dyn broca_wal::recovery::RecoveryHooks>
+        })
+    }
+
     /// Path to the diagnostic index for this WAL tree.
     pub fn manifest_path(&self) -> PathBuf {
         self.root
@@ -1746,6 +1876,43 @@ pub fn session_addr(session: &BindIdentity) -> String {
 }
 
 impl WalStore for FileWalStore {
+    fn bind_recovery_projection(
+        &self,
+        session: Option<&BindIdentity>,
+        store: Arc<dyn crate::SessionStore>,
+    ) {
+        if self.config.is_overhaul() {
+            self.recovery_views.lock().unwrap().bind(session, store);
+        }
+    }
+    fn recover_existing(&self, session: &BindIdentity) -> Result<(), WalError> {
+        if !self.config.is_overhaul() {
+            return Ok(());
+        }
+        self.check_move(session, true)?;
+        if let Some(path) = self.resolve_live_path(session)? {
+            drop(match self.recovery_hooks(session) {
+                Some(hooks) => FileWal::open_with_manifest_and_recovery_hooks(
+                    path,
+                    self.manifest_path(),
+                    session_addr(session),
+                    String::new(),
+                    agent_session_ref(session),
+                    (self.config, self.feature_floor_path()),
+                    hooks,
+                ),
+                None => FileWal::open_with_manifest_and_recovery(
+                    path,
+                    self.manifest_path(),
+                    session_addr(session),
+                    String::new(),
+                    agent_session_ref(session),
+                    (self.config, self.feature_floor_path()),
+                ),
+            }?);
+        }
+        Ok(())
+    }
     fn writer_marker_root(&self) -> Option<PathBuf> {
         self.config
             .is_overhaul()
@@ -3074,6 +3241,8 @@ thread_local! {
 
 /// The loop's handle to the writer task.
 pub struct WalHandle {
+    recovery_cut_ids: std::collections::BTreeSet<String>,
+    recovery_calls: Vec<broca_wal::recovery::RecoveryRun>,
     /// Advisory display placement follows accepted queue order, not the lagging fsync head.
     display_placement: Mutex<Option<crate::placement::Placement>>,
     /// Zero means unlimited; finite limits only decrease over the writer's lifetime.
@@ -3135,6 +3304,17 @@ pub struct WalHandle {
 }
 
 impl WalHandle {
+    pub(crate) fn recovery_cut_ids(&self) -> &std::collections::BTreeSet<String> {
+        &self.recovery_cut_ids
+    }
+    /// A recovered id remains suppressed across later episodes of this log;
+    /// attribution is retained separately under its original run for status.
+    pub(crate) fn recovery_tombstoned(&self, call: &broca_protocol::ToolCallId) -> bool {
+        self.recovery_calls
+            .iter()
+            .flat_map(|r| &r.calls)
+            .any(|c| &c.tool_call_id == call)
+    }
     /// A media-free prefix has no captures or aging history to restore. Its already-seeded
     /// placement is sufficient to start tracking the first later capture without rereading it.
     #[cfg(feature = "test-attachments")]
@@ -3735,20 +3915,37 @@ impl WalHandle {
         }
         // Lifecycle records do not start a conversation. A warmed writer-only log still needs
         // the same first-send placement, retention and runner-tag state as an empty log.
+        let recovered_frames = if v4 {
+            wal.replay()
+                .map_err(|error| WalWriteError::Failed(error.to_string()))?
+        } else {
+            Vec::new()
+        };
+        let recovery_calls = recovered_frames
+            .iter()
+            .filter_map(|frame| match &frame.record {
+                WalRecord::RecoveryCut { recovery } => Some(recovery.runs.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let recovery_cut_ids = recovered_frames
+            .iter()
+            .filter_map(|frame| match &frame.record {
+                WalRecord::RecoveryCut { recovery } => Some(recovery.cut_id.clone()),
+                _ => None,
+            })
+            .collect();
         let unstarted = last_seq == 0
             || (v4
-                && wal
-                    .replay()
-                    .map_err(|error| WalWriteError::Failed(error.to_string()))?
-                    .iter()
-                    .all(|frame| {
-                        matches!(
-                            frame.record,
-                            WalRecord::WriterOpened { .. }
-                                | WalRecord::WriterClosed { .. }
-                                | WalRecord::VisibilityLate { .. }
-                        )
-                    }));
+                && recovered_frames.iter().all(|frame| {
+                    matches!(
+                        frame.record,
+                        WalRecord::WriterOpened { .. }
+                            | WalRecord::WriterClosed { .. }
+                            | WalRecord::VisibilityLate { .. }
+                    )
+                }));
         let last_seq = last_seq + u64::from(v4);
         // Seq is 1-based; the first record of an empty WAL is seq 1, so the next seq
         // after a durable head of `last_seq` is `last_seq + 1`.
@@ -3919,6 +4116,8 @@ impl WalHandle {
         // Only later publication markers need this separate enqueue-side charge.
         publication_bytes.store(0, Ordering::SeqCst);
         Ok(WalHandle {
+            recovery_cut_ids,
+            recovery_calls,
             display_placement: Mutex::new(unstarted.then(Default::default)),
             input_token_limit: AtomicU64::new(0),
             move_check: None,

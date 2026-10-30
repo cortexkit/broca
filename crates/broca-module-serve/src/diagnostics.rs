@@ -41,6 +41,7 @@ pub fn admit(principal: Option<&BindPrincipal>, scope: &SendScope) -> Result<(),
 }
 
 pub struct Evidence {
+    pub recovery_cuts: Vec<Finding>,
     pub runs: Runs,
     pub late_fence_ms: Option<i64>,
     pub retention: Result<Vec<Fence>, String>,
@@ -85,6 +86,7 @@ pub fn gather(
         }
     };
     Ok(Evidence {
+        recovery_cuts: recovery_cut_findings(root, now),
         runs,
         late_fence_ms,
         catalog_age_ms,
@@ -170,6 +172,85 @@ fn unavailable(check: &str, now: i64) -> Finding {
         "Inspect health.check and the broca daemon log for an unavailable diagnostic evidence source.");
     f.samples.push(json!({"code":"evidence_unavailable"}));
     f
+}
+
+/// Manifests are immutable recovery evidence. Read metadata only, with bounded
+/// traversal and file size; raw removed content never enters diagnostics.
+pub fn recovery_cut_findings(root: &Path, now: i64) -> Vec<Finding> {
+    use std::io::Read;
+    let mut directories = vec![root.join("wal")];
+    let mut findings = Vec::new();
+    let mut scanned = 0;
+    while let Some(directory) = directories.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                findings.push(unavailable("wal_recovery_cut", now));
+                break;
+            }
+        };
+        for entry in entries {
+            scanned += 1;
+            if scanned > SCAN_LIMIT {
+                findings.push(unavailable("wal_recovery_cut", now));
+                return findings;
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    findings.push(unavailable("wal_recovery_cut", now));
+                    continue;
+                }
+            };
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(_) => {
+                    findings.push(unavailable("wal_recovery_cut", now));
+                    continue;
+                }
+            };
+            if kind.is_dir() {
+                directories.push(entry.path());
+                continue;
+            }
+            if !kind.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.contains(".cut-") || !name.ends_with(".json") {
+                continue;
+            }
+            let manifest = (|| {
+                let mut bytes = Vec::new();
+                std::fs::File::open(entry.path())
+                    .ok()?
+                    .take(1_048_577)
+                    .read_to_end(&mut bytes)
+                    .ok()?;
+                if bytes.len() > 1_048_576 {
+                    return None;
+                }
+                serde_json::from_slice::<broca_wal::recovery::CutManifest>(&bytes).ok()
+            })();
+            let Some(manifest) = manifest else {
+                findings.push(unavailable("wal_recovery_cut", now));
+                continue;
+            };
+            if !manifest.integrity_valid() {
+                findings.push(unavailable("wal_recovery_cut", now));
+                continue;
+            }
+            let mut warning = finding("wal_recovery_cut", manifest.recovery.cut_id.clone(), Severity::Warn, now, now,
+                "WAL recovery preserved a damaged suffix; some tool-call attribution may have been lost.",
+                "Inspect the session and preserved .cut sidecar before manually repeating external effects. Set wal_recovery to refuse to disable automatic repair.");
+            warning.samples.push(json!({"session":manifest.session,"reason":manifest.recovery.reason.as_str(),
+                "cut_offset":manifest.recovery.cut_offset,"removed_bytes":manifest.recovery.removed_len,
+                "unattributed_tool_risk":manifest.recovery.unattributed_tool_risk}));
+            findings.push(warning);
+        }
+    }
+    findings
 }
 
 fn group(
@@ -328,7 +409,7 @@ fn error_floor(class: &str, code: &str, window: i64) -> (u64, Severity) {
 }
 
 pub fn report(mut evidence: Evidence, now: i64, window: i64) -> Reply {
-    let mut findings = Vec::new();
+    let mut findings = std::mem::take(&mut evidence.recovery_cuts);
     findings.extend(data_quality(&evidence.runs, now));
     let mut coverage = BTreeMap::new();
     let live_truncated = evidence.runs.live.len() > SCAN_LIMIT;

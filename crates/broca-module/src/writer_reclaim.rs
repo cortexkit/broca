@@ -1297,6 +1297,15 @@ mod tests {
                 O,
                 O,
                 O,
+                O, // Read-only version-4 WAL checks before publishing the successor writer.
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
+                O,
                 S,
                 D,
                 D,
@@ -1362,7 +1371,7 @@ mod tests {
                 O,
                 Change(vec![RemoveEntry]), // Predecessor marker unlink.
             ],
-            "all 74 reclaim journal operations must complete in order"
+            "all 83 reclaim journal operations must complete in order"
         );
         fs.assert_all_cuts_covered(&states);
         assert!(states

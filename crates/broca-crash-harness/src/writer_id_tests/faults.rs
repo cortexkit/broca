@@ -4,12 +4,13 @@ use broca_core::{FileWalStore, WalHandle, WalStore};
 use broca_wal::fs_ops::{FileOps, FsOps, OpenOptions, ReadDir};
 use std::fs::Metadata;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::sync::atomic::AtomicBool;
+use std::sync::{atomic::AtomicBool, Mutex};
 
 struct FaultFs {
     inner: Arc<BatchFs>,
     log: PathBuf,
     fail_sync: Arc<AtomicBool>,
+    fail_sync_after: Option<Arc<Mutex<usize>>>,
     fail_unlink: AtomicBool,
     unlink_attempted: AtomicBool,
 }
@@ -27,10 +28,30 @@ pub(crate) fn recovery_sync_fault(
         inner,
         log,
         fail_sync: fail_sync.clone(),
+        fail_sync_after: None,
         fail_unlink: AtomicBool::new(false),
         unlink_attempted: AtomicBool::new(false),
     });
     (fs, fail_sync, recording)
+}
+
+/// The first log barrier protects truncation; fail the next one after marker
+/// bytes are visible, so retry must not mistake visibility for durability.
+pub(crate) fn recovery_marker_sync_fault(
+    root: &Path,
+    log: PathBuf,
+) -> (Arc<dyn FsOps>, Arc<RecordingFs>) {
+    let inner = Arc::new(BatchFs::new());
+    let recording = inner.begin(root);
+    let fs = Arc::new(FaultFs {
+        inner,
+        log,
+        fail_sync: Arc::new(AtomicBool::new(false)),
+        fail_sync_after: Some(Arc::new(Mutex::new(2))),
+        fail_unlink: AtomicBool::new(false),
+        unlink_attempted: AtomicBool::new(false),
+    });
+    (fs, recording)
 }
 
 impl FsOps for FaultFs {
@@ -40,6 +61,7 @@ impl FsOps for FaultFs {
             Ok(Box::new(FaultFile {
                 inner,
                 fail_sync: self.fail_sync.clone(),
+                fail_sync_after: self.fail_sync_after.clone(),
             }))
         } else {
             Ok(inner)
@@ -89,6 +111,7 @@ impl FsOps for FaultFs {
 struct FaultFile {
     inner: Box<dyn FileOps>,
     fail_sync: Arc<AtomicBool>,
+    fail_sync_after: Option<Arc<Mutex<usize>>>,
 }
 impl Read for FaultFile {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
@@ -119,12 +142,21 @@ impl FileOps for FaultFile {
         if self.fail_sync.load(Ordering::SeqCst) {
             return Err(io::Error::other("injected writer close sync failure"));
         }
+        if self.fail_sync_after.as_ref().is_some_and(|remaining| {
+            let mut remaining = remaining.lock().unwrap();
+            let fail = *remaining == 1;
+            *remaining = remaining.saturating_sub(1);
+            fail
+        }) {
+            return Err(io::Error::other("injected recovery marker sync failure"));
+        }
         self.inner.sync_all()
     }
     fn try_clone(&self) -> io::Result<Box<dyn FileOps>> {
         Ok(Box::new(Self {
             inner: self.inner.try_clone()?,
             fail_sync: self.fail_sync.clone(),
+            fail_sync_after: self.fail_sync_after.clone(),
         }))
     }
     fn lock(&self) -> io::Result<()> {
@@ -148,6 +180,7 @@ fn spawn(root: &Scratch) -> (WalHandle, Arc<FaultFs>, Arc<RecordingFs>) {
         inner: Arc::new(BatchFs::new()),
         log: store.wal_path(&session),
         fail_sync: Arc::new(AtomicBool::new(false)),
+        fail_sync_after: None,
         fail_unlink: AtomicBool::new(false),
         unlink_attempted: AtomicBool::new(false),
     });

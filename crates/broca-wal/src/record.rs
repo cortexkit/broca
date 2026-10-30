@@ -580,6 +580,12 @@ fn released_envelope<'de, D: serde::Deserializer<'de>>(
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WalRecord {
+    /// Durable attribution of data removed by overhaul recovery. Readers must
+    /// retain these call tombstones even when a later episode starts.
+    RecoveryCut {
+        #[serde(flatten)]
+        recovery: Box<crate::recovery::RecoveryCut>,
+    },
     /// A new writer has durably taken responsibility for this log's recovered prefix.
     WriterOpened {
         writer_id: [u8; 16],
@@ -1924,6 +1930,9 @@ impl WalRecord {
     /// on its own, so no caller can write a must-understand value into a frame an older build
     /// would read without checking.
     pub fn required_features(&self) -> &'static [&'static str] {
+        if matches!(self, Self::RecoveryCut { .. }) {
+            return &[crate::recovery::FEATURE];
+        }
         if matches!(self, Self::VisibilityLate { .. }) {
             return &[crate::head_proof::VISIBILITY_LATE_FEATURE];
         }
@@ -2407,6 +2416,7 @@ impl WalRecord {
             | Self::WriterOpened { .. }
             | Self::WriterClosed { .. }
             | Self::VisibilityLate { .. }
+            | Self::RecoveryCut { .. }
             | Self::Unknown => false,
         }
     }

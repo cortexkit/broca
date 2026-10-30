@@ -60,6 +60,7 @@ a complete inventory or a pagination cursor.
 | `tool_outages` | Newly durable attributed unavailable tool results/no-dispatch records, grouped by module. Warn. Counts calls/results, not outage episodes. |
 | `interrupted_runs` | Indexed interrupted terminals with an interruption reason and observation time, other than explicit `runner_shutdown`/`runner_crash` seals, plus observed `transform_unavailable` terminals. Warn; a run is not classified as restart-related based only on its timestamp. |
 | `data_quality` | One info finding for indexed rows excluded from `paused_runs`, `run_errors` and `interrupted_runs` because classification fields or observation times are NULL. Counts do not contribute to operational severity. |
+| `wal_recovery_cut` | Immutable overhaul recovery manifests, scanned with bounded traversal and file size. Warn; samples name the session, reason, cut offset, removed length and `unattributed_tool_risk`, never removed content. The flag does not block later episodes. Evidence persists across restarts because recovery sidecars and manifests are never deleted. |
 
 `result.coverage` is additive. For each ring-backed check it gives `since_ms`
 (process start, or the oldest retained event after eviction) and `truncated`.

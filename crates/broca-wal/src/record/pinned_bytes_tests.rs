@@ -146,6 +146,7 @@ fn attempt_progress_fields_roundtrip_without_a_reader_feature() {
 /// The wire tag of each record kind. Exhaustive on purpose: see the module comment.
 fn tag_of(record: &WalRecord) -> &'static str {
     match record {
+        WalRecord::RecoveryCut { .. } => "recovery_cut",
         WalRecord::WriterOpened { .. } => "writer_opened",
         WalRecord::WriterClosed { .. } => "writer_closed",
         WalRecord::VisibilityLate { .. } => "visibility_late",

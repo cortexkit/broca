@@ -589,21 +589,30 @@ async fn crash_cut_inside_a_version_4_header_is_a_torn_tail() {
     let recovered = root.open();
     assert_eq!(
         recovered.last_seq(),
-        2,
-        "recovery discards the header that was cut short"
+        3,
+        "recovery replaces the cut-short header with a durable RecoveryCut"
     );
     assert_eq!(
         frames(&root).len(),
-        2,
-        "only the open and first application frames survive"
+        3,
+        "the open and first application frames survive before RecoveryCut"
     );
-    // Appending after recovery continues from the surviving frame.
+    let records = recovered.replay().unwrap();
+    assert_eq!(
+        serde_json::to_value(&records[1].record).unwrap(),
+        serde_json::to_value(record(1)).unwrap()
+    );
+    assert!(
+        matches!(&records[2].record, WalRecord::RecoveryCut { recovery }
+        if recovery.cut_offset == second_start as u64 && recovery.removed_len == 64)
+    );
+    // Appending after recovery continues after the durable RecoveryCut marker.
     let handle = root.spawn(recovered, 5, StampClock::wall());
     handle.record(record(3)).into_result().unwrap();
     handle.record(record(4)).into_result().unwrap();
     handle.shutdown().await.expect("shutdown");
     let landed = frames(&root);
-    assert_eq!(landed.len(), 6);
-    assert_eq!(landed[3].metadata.seq, 4);
+    assert_eq!(landed.len(), 7);
     assert_eq!(landed[4].metadata.seq, 5);
+    assert_eq!(landed[5].metadata.seq, 6);
 }

@@ -654,7 +654,7 @@ impl ExportIndex for SqliteStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A process-unique suffix for a test fixture path.
@@ -710,7 +710,7 @@ mod tests {
         });
     }
 
-    fn config(usage_policy: &str) -> RunConfig {
+    pub(crate) fn config(usage_policy: &str) -> RunConfig {
         RunConfig {
             turn_directives_v1: None,
             render_tags: false,

@@ -28,6 +28,7 @@ fn scope(owner: BindPrincipal, kind: ScopeKind, flow: bool, authorized: bool) ->
 }
 fn healthy(store: &broca_store::SqliteStore, since: i64) -> Evidence {
     Evidence {
+        recovery_cuts: Vec::new(),
         runs: store.diagnostic_evidence(since, NOW).unwrap(),
         late_fence_ms: None,
         retention: Ok(vec![]),
@@ -46,6 +47,62 @@ fn healthy(store: &broca_store::SqliteStore, since: i64) -> Evidence {
             })
             .into(),
     }
+}
+
+#[test]
+fn wal_recovery_cut_finding_reports_unattributed_risk_without_removed_content() {
+    use broca_wal::{FileWal, Wal, WalConfig, WalRecord};
+    use std::io::Write;
+    let root = broca_test_support::scratch_root().join(format!(
+        "diagnostic-recovery-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let log = root.join("wal/session.wal");
+    let floor = root.join(broca_wal::FEATURE_FLOOR_FILENAME);
+    let mut wal = FileWal::open_with_recovery(&log, WalConfig::OVERHAUL, floor.clone())
+        .unwrap()
+        .with_feature_floor(floor.clone())
+        .with_wal_config(WalConfig::OVERHAUL)
+        .unwrap();
+    wal.append(
+        1,
+        &WalRecord::StepStarted {
+            step_id: broca_protocol::StepId(1),
+        },
+        true,
+    )
+    .unwrap();
+    drop(wal);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log)
+        .unwrap()
+        .write_all(b"undecodable private removed content")
+        .unwrap();
+    drop(FileWal::open_with_recovery(&log, WalConfig::OVERHAUL, floor).unwrap());
+    let index = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
+    let mut evidence = healthy(&index, 0);
+    evidence.recovery_cuts = recovery_cut_findings(&root, NOW);
+    let reply = report(evidence, NOW, DEFAULT_WINDOW_MS);
+    let warning = reply
+        .findings
+        .iter()
+        .find(|finding| finding.check == "wal_recovery_cut")
+        .unwrap();
+    assert_eq!(warning.severity, Severity::Warn);
+    assert_eq!(warning.samples[0]["unattributed_tool_risk"], true);
+    assert!(warning.samples[0]["session"]
+        .as_str()
+        .unwrap()
+        .contains("session.wal"));
+    assert!(!serde_json::to_string(&reply)
+        .unwrap()
+        .contains("private removed content"));
+    std::fs::remove_dir_all(root).unwrap();
 }
 type SeedDetails<'a> = (
     Option<&'a str>,

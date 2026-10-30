@@ -75,6 +75,9 @@ pub fn reconstruct_from_offsets(
     };
     let bad = |reason| SeedFallback { reason };
     let mut seed = snapshot.projection;
+    if !seed.admission_checkpoint.recovery_cuts.is_empty() {
+        return Err(bad("recovery tombstones require complete WAL replay"));
+    }
     let window = snapshot.window;
     if seed.watermark_seq != snapshot.boundary.seq
         || seed.admission_checkpoint.at_seq != seed.watermark_seq
@@ -461,6 +464,36 @@ mod offset_resume_tests {
         assert_eq!(
             resume_started_record(actual, 8, planned_redo(actual)),
             resume_started_record(expected, 8, planned_redo(expected))
+        );
+    }
+
+    #[test]
+    fn recovery_cut_offset_seed_requires_complete_replay() {
+        let records = corpus();
+        let (bytes, positions, ends) = encode(&records);
+        let mut snap = snapshot(&bytes, &positions, &ends, 0);
+        snap.projection.admission_checkpoint.recovery_cuts.push(
+            serde_json::from_value(serde_json::json!({
+                "cut_id":"cut", "sidecar_basename":"log.cut-1", "cut_offset":69, "removed_len":1,
+                "removed_sha256":"digest", "reason":"unproven_corruption", "active_run":null,
+                "runs":[], "unattributed_tool_risk":true
+            }))
+            .unwrap(),
+        );
+        assert!(!snap
+            .projection
+            .admission_checkpoint
+            .compaction_boundary_complete());
+        assert!(crate::ControlProjectionState::from_projection_seed(&snap.projection).is_none());
+        assert!(crate::replay::replay_projection_tail(&snap.projection, &[]).is_err());
+        let result = reconstruct_from_offsets(
+            &|_, _| panic!("unsafe seed must refuse before offset reads"),
+            snap,
+            positions.last().unwrap().framed.seq,
+        );
+        assert_eq!(
+            result.err().expect("recovery seed must fall back").reason,
+            "recovery tombstones require complete WAL replay"
         );
     }
 
