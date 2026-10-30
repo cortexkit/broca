@@ -99,6 +99,70 @@ fn restored_live_log_wins_after_member_index_was_warmed() {
     assert_eq!(f.store.read_records(&f.session).unwrap(), restored);
 }
 
+#[test]
+fn expiry_inventory_restored_live_log_wins_before_and_after_member_resolution() {
+    for resolve_member in [false, true] {
+        let f = Fixture::new();
+        let records = f.live();
+        let live = f.store.wal_path(&f.session);
+        f.archive(1000, &std::fs::read(&live).unwrap());
+        std::fs::remove_file(&live).unwrap();
+        let mut read = f.store.expiry_read(&f.session).unwrap();
+        if resolve_member {
+            assert!(f
+                .store
+                .read_archived_for_expiry(&f.session, &mut read)
+                .unwrap()
+                .is_some());
+        }
+        let mut wal = f.store.open(&f.session).unwrap();
+        wal.append(1, &WalRecord::StepStarted { step_id: StepId(4) }, true)
+            .unwrap();
+        let restored = wal.replay().unwrap();
+        assert_eq!(restored.len(), records.len() + 1);
+        assert!(f
+            .store
+            .read_archived_for_expiry(&f.session, &mut read)
+            .unwrap()
+            .is_none());
+        f.store.flush_for_expiry(&f.session, &mut read).unwrap();
+        assert_eq!(
+            complete(
+                f.store
+                    .read_records_for_expiry(&f.session, None, &mut read)
+                    .unwrap()
+            ),
+            restored
+        );
+    }
+}
+
+#[test]
+fn expiry_inventory_does_not_keep_a_vanished_live_lineage_present() {
+    let f = Fixture::new();
+    f.live();
+    let mut read = f.store.expiry_read(&f.session).unwrap();
+    std::fs::remove_file(f.store.wal_path(&f.session)).unwrap();
+    assert!(!f
+        .store
+        .lineage_exists_for_expiry(&f.session, None, &mut read)
+        .unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn expiry_inventory_identity_detects_publication_in_a_previously_missing_directory() {
+    let f = Fixture::new();
+    f.live();
+    let live = f.store.wal_path(&f.session);
+    f.archive(1000, &std::fs::read(&live).unwrap());
+    std::fs::remove_file(&live).unwrap();
+    let read = f.store.expiry_read(&f.session).unwrap();
+    assert!(f.store.expiry_identity_is_current(&read).unwrap());
+    std::fs::create_dir(f.root.join("wal-archive-durable")).unwrap();
+    assert!(!f.store.expiry_identity_is_current(&read).unwrap());
+}
+
 /// The boot prewarm only fills the membership cache; it must not change any answer. With no
 /// archive it consults nothing. With one it consults every container, then an archived
 /// session still reads its archived transcript and a new session still reads as absent --
