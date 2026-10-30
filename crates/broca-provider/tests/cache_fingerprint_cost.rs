@@ -54,9 +54,9 @@ fn cpu_ticks() -> Option<u64> {
     Some(fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?)
 }
 
-fn measure(messages: usize, text: &str, repeats: usize) -> (usize, f64) {
+fn measure(messages: usize, text: &str, repeats: usize, images: usize) -> (usize, f64) {
     let family = WireFamilyId::OpenAiResponsesChatgpt;
-    let opts = CallOptions::new(
+    let mut opts = CallOptions::new(
         (0..messages)
             .map(|n| {
                 let mut message = Message::new(
@@ -72,8 +72,73 @@ fn measure(messages: usize, text: &str, repeats: usize) -> (usize, f64) {
             })
             .collect(),
     );
-    let frozen = frozen_config_for_family(family, "measurement-model");
+    let mut frozen = frozen_config_for_family(family, "measurement-model");
     let renderer = wire_family(family).unwrap();
+    let mut prepared = None;
+    let mut image_base64 = None;
+    if images != 0 {
+        use base64::Engine;
+        let bytes = include_bytes!("../examples/media-live/fixtures/image.png");
+        let reference = broca_core::media_validation::validate_media(bytes, "image/png").unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let profile = broca_provider::media_profile::select_media_profile(
+            family,
+            None,
+            "measurement-model",
+            broca_provider::spec::InputModalities::from_value(&serde_json::json!(["image"])),
+            Some(1_000_000),
+        );
+        let carrier = profile.image.user_message;
+        frozen.media = Some(profile);
+        let mut media = Vec::new();
+        for index in 0..images {
+            opts.prompt[0]
+                .content
+                .push(ContentBlock::Media(reference.clone()));
+            media.push(broca_provider::media_request::PreparedMedia {
+                id: broca_provider::media_request::Occurrence {
+                    capture: broca_core::media_request::MediaId {
+                        record: 1,
+                        message: 0,
+                        block: index + 1,
+                        part: None,
+                    },
+                    repetition: 0,
+                },
+                location: broca_core::media_request::MediaLocation {
+                    message: 0,
+                    block: index + 1,
+                    part: None,
+                },
+                reference: reference.clone(),
+                carrier,
+                protected: true,
+                tool: false,
+                base64: encoded.clone(),
+            });
+        }
+        prepared = Some(broca_provider::media_request::PreparedBundle {
+            prompt: opts.prompt.clone(),
+            media,
+        });
+        image_base64 = Some(encoded);
+    }
+    let mut render =
+        |provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>| {
+            if let Some(bundle) = prepared.as_mut() {
+                broca_provider::media_request::render_prepared_with_provenance(
+                    &*renderer,
+                    &frozen,
+                    &opts,
+                    Some(bundle),
+                    &|prompt| prompt.to_vec(),
+                    provenance,
+                )
+                .unwrap()
+            } else {
+                renderer.render_with_provenance(&frozen, &opts, provenance)
+            }
+        };
     let ticks_per_second = std::process::Command::new("getconf")
         .arg("CLK_TCK")
         .output()
@@ -82,20 +147,26 @@ fn measure(messages: usize, text: &str, repeats: usize) -> (usize, f64) {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| s.trim().parse::<f64>().ok());
     let baseline = time(repeats, ticks_per_second, || {
-        std::hint::black_box(renderer.render(&frozen, &opts));
+        std::hint::black_box(render(None));
     });
     let traced = time(repeats, ticks_per_second, || {
         let mut provenance = broca_protocol::render_provenance::RenderProvenance::default();
-        std::hint::black_box(renderer.render_with_provenance(
-            &frozen,
-            &opts,
-            Some(&mut provenance),
-        ));
+        std::hint::black_box(render(Some(&mut provenance)));
         std::hint::black_box(provenance);
     });
     let mut provenance = broca_protocol::render_provenance::RenderProvenance::default();
-    let body = renderer.render_with_provenance(&frozen, &opts, Some(&mut provenance));
-    assert_eq!(body, renderer.render(&frozen, &opts));
+    let body = render(Some(&mut provenance));
+    assert_eq!(body, render(None));
+    if let Some(encoded) = &image_base64 {
+        assert_eq!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .matches(encoded.as_str())
+                .count(),
+            images,
+            "the measured request must contain native image payloads, not markers"
+        );
+    }
     let previous = fingerprint(family, &body)
         .unwrap()
         .with_provenance(&provenance);
@@ -115,7 +186,7 @@ fn measure(messages: usize, text: &str, repeats: usize) -> (usize, f64) {
     let extra_render_cpu = (traced.cpu_ms - baseline.cpu_ms).max(0.0);
     let cpu = extra_render_cpu + evidence.cpu_ms;
     let wall = (traced.wall_ms - baseline.wall_ms).max(0.0) + evidence.wall_ms;
-    println!("provenance_and_evidence messages={messages} body_bytes={} approx_tokens={} baseline_render={baseline:?} traced_render={traced:?} evidence={evidence:?} extra_render_allocations={extra_render_allocations} total_added_allocations={allocations} total_added_cpu_ms={cpu:.3} total_added_wall_ms={wall:.3}", body.len(), messages * text.split_whitespace().count());
+    println!("provenance_and_evidence messages={messages} images={images} body_bytes={} approx_tokens={} baseline_render={baseline:?} traced_render={traced:?} evidence={evidence:?} extra_render_allocations={extra_render_allocations} total_added_allocations={allocations} total_added_cpu_ms={cpu:.3} total_added_wall_ms={wall:.3}", body.len(), messages * text.split_whitespace().count());
     (allocations, cpu)
 }
 
@@ -126,11 +197,13 @@ fn fingerprint_cost_and_allocation_growth() {
         20,
         &" hello".repeat(500),
         if measuring_cpu { 10_000 } else { 1 },
+        0,
     );
     let large = measure(
         2000,
         &" hello".repeat(500),
         if measuring_cpu { 20 } else { 1 },
+        0,
     );
     // The only growth is vector capacity: 100x more segments must not add 100x allocations.
     assert!(
@@ -172,5 +245,22 @@ fn time(repeats: usize, ticks_per_second: Option<f64>, mut operation: impl FnMut
         cpu_ms,
         wall_ms,
         allocations: ALLOCATIONS.with(Cell::get) / repeats,
+    }
+}
+
+#[test]
+fn fingerprint_cost_with_one_million_tokens_and_prepared_images() {
+    let measuring_cpu = std::env::var_os("BROCA_MEASURE_FINGERPRINT_CPU").is_some();
+    let media = measure(
+        2000,
+        &" hello".repeat(500),
+        if measuring_cpu { 20 } else { 1 },
+        4,
+    );
+    if measuring_cpu {
+        assert!(
+            media.1 <= 50.0,
+            "prepared-media evidence exceeds the CPU budget: {media:?}"
+        );
     }
 }

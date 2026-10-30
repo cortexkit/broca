@@ -297,11 +297,10 @@ impl<'de> Deserialize<'de> for ProviderFetch {
     }
 }
 
-/// Everything a session's first send fetched and froze: the plan as received, each provider's
+/// Everything a send or refresh fetched and froze: the plan as received, each provider's
 /// answer, the tools offered to the model, the joined system text, and the versions that decided
-/// how they were combined. Every `RunStarted` of a session admitted with a plan carries the same
-/// manifest, because a WAL fold can move the session's first `RunStarted` out of the live WAL
-/// into the archive, and the episodes left in the live WAL must still render from it.
+/// how they were combined. Each `RunStarted` carries its own manifest so replay keeps that
+/// episode's tools and text even after a session refresh or a WAL fold archives earlier episodes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanManifest {
     /// The agreed stamp from the fetched system-text answers, not from the caller's plan.

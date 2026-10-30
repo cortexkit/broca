@@ -181,17 +181,7 @@ async fn send(rig: &Rig, id: &str, model: &str, content: Value) {
     )
     .await
     .unwrap();
-    let records = wait_records(rig, "media", |records| {
-        records
-            .iter()
-            .filter(|record| matches!(record, WalRecord::RunStarted { .. }))
-            .count()
-            == records
-                .iter()
-                .filter(|record| matches!(record, WalRecord::RunFinished { .. }))
-                .count()
-    })
-    .await;
+    let records = super::wait_send_finished(rig, "media", id).await;
     for record in &records {
         if let WalRecord::RunFinished { reason, error, .. } = record {
             assert_eq!(*reason, RunFinishReason::Completed, "{record:?}");
@@ -385,7 +375,7 @@ async fn jpeg_and_pdf_reach_claude_from_live_fusiform_and_switch_to_modality_mar
     );
     {
         let bodies = bodies.lock().unwrap();
-        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies.len(), 2, "{}", model_request_summary(&bodies));
         let body: Value = serde_json::from_slice(&bodies[1]).unwrap();
         let parts = body["messages"]
             .as_array()
@@ -423,7 +413,7 @@ async fn jpeg_and_pdf_reach_claude_from_live_fusiform_and_switch_to_modality_mar
     send(&rig, "switch", TEXT_ONLY, json!([])).await;
     {
         let bodies = bodies.lock().unwrap();
-        assert_eq!(bodies.len(), 3);
+        assert_eq!(bodies.len(), 3, "{}", model_request_summary(&bodies));
         let body = String::from_utf8(bodies[2].clone()).unwrap();
         assert!(body.contains("kind=image mime=image/jpeg"), "{body}");
         assert!(body.contains("reason=modality"), "{body}");
@@ -450,5 +440,122 @@ async fn jpeg_and_pdf_reach_claude_from_live_fusiform_and_switch_to_modality_mar
         before
     );
     assert_eq!(media_files(&state), stores_before);
-    assert_eq!(bodies.lock().unwrap().len(), 3);
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 3, "{}", model_request_summary(&bodies));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn send_waits_for_its_queued_turn_after_the_previous_run_finishes() {
+    use crate::step_transform_rig::{plan, register, subscription, State};
+    use std::future::Future;
+    use std::task::Poll;
+
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let model_gate = Arc::new(tokio::sync::Notify::new());
+    let url = super::serve_model_responses_paused(
+        bodies.clone(),
+        vec![ANTHROPIC_SSE],
+        Some((1, model_gate.clone())),
+    )
+    .await;
+    let Some(rig) = Rig::launch(&url, Some(catalog_response())).await else {
+        return;
+    };
+    let rig = Arc::new(rig);
+    let subscriptions = vec![subscription("pre_user", None, "pass", 30_000)];
+    let state = State::new(subscriptions.clone());
+    let _hooks = LiveCatalog(register(&rig.connection_file, state.clone()).await);
+    assert!(rig.wait_for_module_live().await);
+    request(
+        &rig,
+        "media",
+        "session.send",
+        json!({
+            "prompt":"warmup", "send_id":"warmup", "plan":plan(&subscriptions, false),
+            "model":{"provider":"anthropic", "model":CLAUDE}
+        }),
+    )
+    .await
+    .unwrap();
+    super::wait_send_finished(&rig, "media", "warmup").await;
+    request(
+        &rig,
+        "media",
+        "session.send",
+        json!({
+            "prompt":"attached", "send_id":"attached",
+            "model":{"provider":"anthropic", "model":CLAUDE}
+        }),
+    )
+    .await
+    .unwrap();
+    broca_test_support::wait_until("the held second model request", || async {
+        let count = bodies.lock().unwrap().len();
+        if count == 2 {
+            Ok(())
+        } else {
+            Err(format!("received {count} requests"))
+        }
+    })
+    .await;
+    let queued = request(
+        &rig,
+        "media",
+        "session.send",
+        json!({
+            "prompt":"switch", "send_id":"switch",
+            "model":{"provider":"anthropic", "model":TEXT_ONLY}
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(queued["state"], "pending", "{queued}");
+
+    // Keep the actor in a later send's hook while the earlier run writes its terminal.
+    // The switch is durable in the queue but cannot start until the actor is released.
+    state.held.lock().unwrap().insert("pre_user".into());
+    let blocker_rig = rig.clone();
+    let blocker = tokio::spawn(async move {
+        request(
+            &blocker_rig,
+            "media",
+            "session.send",
+            json!({
+                "prompt":"blocker", "send_id":"blocker",
+                "model":{"provider":"anthropic", "model":TEXT_ONLY}
+            }),
+        )
+        .await
+        .unwrap()
+    });
+    broca_test_support::wait_until("the actor held in the later input hook", || async {
+        let count = state.hooks().len();
+        if count == 4 {
+            Ok(())
+        } else {
+            Err(format!("observed {count} hooks"))
+        }
+    })
+    .await;
+    model_gate.notify_one();
+    super::wait_send_finished(&rig, "media", "attached").await;
+    assert_eq!(bodies.lock().unwrap().len(), 2);
+    let mut waiting = Box::pin(super::wait_send_finished(&rig, "media", "switch"));
+    let pending =
+        std::future::poll_fn(|cx| Poll::Ready(waiting.as_mut().poll(cx).is_pending())).await;
+    assert!(
+        pending,
+        "the queued switch returned before request #2 arrived:\n{}",
+        super::model_request_summary(&bodies.lock().unwrap())
+    );
+
+    state.held.lock().unwrap().clear();
+    state.release.notify_waiters();
+    blocker.await.unwrap();
+    waiting.await;
+    super::wait_send_finished(&rig, "media", "blocker").await;
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 4, "{}", super::model_request_summary(&bodies));
+    let switched: Value = serde_json::from_slice(&bodies[2]).unwrap();
+    assert_eq!(switched["model"], TEXT_ONLY);
 }

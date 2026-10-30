@@ -810,6 +810,7 @@ enum GeminiPartBuf {
 }
 
 pub(crate) struct GeminiNormalizer {
+    response_evidence: Option<crate::normalize::SharedResponseEvidence>,
     step_id: StepId,
     tool_id_policy: ToolIdPolicy,
     text_state_format: Option<broca_protocol::content::TextProviderFormat>,
@@ -837,6 +838,7 @@ pub(crate) const GEMINI_SERVICE_TIER_HEADER: &str = "x-gemini-service-tier";
 impl GeminiNormalizer {
     pub(crate) fn new(step_id: StepId, tool_id_policy: ToolIdPolicy) -> Self {
         Self {
+            response_evidence: None,
             step_id,
             tool_id_policy,
             text_state_format: None,
@@ -915,7 +917,11 @@ impl GeminiNormalizer {
         v: &Value,
         out: &mut Vec<NormalizedEvent>,
     ) -> Result<(), NormalizeError> {
+        if let Some(evidence) = &self.response_evidence {
+            evidence.lock().unwrap().observe_response(v);
+        }
         if let Some(error) = v.get("error").filter(|error| error.is_object()) {
+            self.observe_error_response(v);
             let code = error.get("status").and_then(Value::as_str);
             let message = error.get("message").and_then(Value::as_str).unwrap_or("");
             let status = error
@@ -993,6 +999,9 @@ impl GeminiNormalizer {
                     .and_then(Value::as_str)
                 {
                     self.finish_reason = map_finish_reason(reason);
+                    if let Some(evidence) = &self.response_evidence {
+                        evidence.lock().unwrap().finish_reason = Some(self.finish_reason);
+                    }
                     self.terminal_observed = true;
                 }
                 return Ok(());
@@ -1001,6 +1010,9 @@ impl GeminiNormalizer {
 
         if let Some(fr) = candidate.get("finishReason").and_then(Value::as_str) {
             self.finish_reason = map_finish_reason(fr);
+            if let Some(evidence) = &self.response_evidence {
+                evidence.lock().unwrap().finish_reason = Some(self.finish_reason);
+            }
             self.terminal_observed = true;
         }
 
@@ -1131,6 +1143,17 @@ impl GeminiNormalizer {
             self.usage.output_tokens =
                 broca_protocol::usage::sum_reported(candidates, self.usage.reasoning_tokens);
         }
+        if let Some(evidence) = &self.response_evidence {
+            let mut evidence = evidence.lock().unwrap();
+            evidence.observe_usage(u, self.usage);
+            if let Some(tier) = self
+                .header_service_tier
+                .as_deref()
+                .or_else(|| u.get("serviceTier").and_then(Value::as_str))
+            {
+                evidence.service_tier_used = Some(tier.to_owned());
+            }
+        }
     }
 
     fn assemble_message(&mut self) -> AssistantMessage {
@@ -1178,6 +1201,23 @@ fn synthetic_inbound_id(index: u32, policy: ToolIdPolicy) -> String {
 }
 
 impl StreamNormalizer for GeminiNormalizer {
+    fn observe_error_response(&mut self, response: &Value) {
+        if self.response_evidence.is_none() {
+            return;
+        }
+        let previous = self.usage;
+        let response = response.get("response").unwrap_or(response);
+        if let Some(usage) = response.get("usageMetadata") {
+            self.merge_usage(usage);
+        }
+        self.usage = previous;
+        if let Some(evidence) = &self.response_evidence {
+            evidence.lock().unwrap().observe_response(response);
+        }
+    }
+    fn set_response_evidence(&mut self, evidence: crate::normalize::SharedResponseEvidence) {
+        self.response_evidence = Some(evidence);
+    }
     fn content_progress(&self) -> broca_protocol::provider::ContentProgress {
         self.sse.content_progress()
     }
@@ -1256,6 +1296,9 @@ impl StreamNormalizer for GeminiNormalizer {
 
     fn observe_response_headers(&mut self, headers: &crate::wire::ResponseHeaders) {
         self.header_service_tier = headers.get(GEMINI_SERVICE_TIER_HEADER).map(str::to_owned);
+        if let Some(evidence) = &self.response_evidence {
+            evidence.lock().unwrap().service_tier_used = self.header_service_tier.clone();
+        }
     }
 }
 

@@ -263,6 +263,9 @@ impl Session {
                 });
                 Box::new(serde_json::to_value(evidence).expect("cache evidence serializes"))
             });
+        // Evidence compares model attempts only. Ordinary warms and warms of the original
+        // source model after a fallback refresh provider caches, but record no evidence
+        // and never replace this predecessor.
         state.previous = current;
         state.seeded = state.previous.is_some();
         evidence

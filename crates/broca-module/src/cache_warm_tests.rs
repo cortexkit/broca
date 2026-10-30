@@ -545,6 +545,7 @@ impl broca_core::keep_warm_wait::KeepWarmDriver for ObservedWarmer {
 /// Runs the real loop with one provider, and sends warms through another (the same one unless
 /// a test swaps in a different config or account).
 struct WarmExecutor {
+    source_warm_enabled: std::sync::atomic::AtomicBool,
     #[cfg(feature = "test-clock")]
     permission_gate: std::sync::Mutex<Option<Arc<broca_core::cache_warm::WarmPermissionGate>>>,
     held: HeldWarmTool,
@@ -565,6 +566,9 @@ struct WarmExecutor {
 
 #[async_trait::async_trait]
 impl RunExecutor for WarmExecutor {
+    fn source_warm_enabled(&self) -> bool {
+        self.source_warm_enabled.load(Ordering::SeqCst)
+    }
     async fn execute(
         &self,
         job: RunJob,
@@ -717,6 +721,7 @@ impl Fixture {
         let mut frozen = warmable(&server.url);
         run_config(&mut frozen);
         let executor = Arc::new(WarmExecutor {
+            source_warm_enabled: Default::default(),
             #[cfg(feature = "test-clock")]
             permission_gate: Default::default(),
             held: Default::default(),
@@ -3349,4 +3354,269 @@ async fn automatic_keep_warm_quota_receives_the_latest_model_and_warm_headers() 
         "0.90"
     );
     fixture.finish_held().await;
+}
+
+async fn source_review_actor_turn(fixture: &Fixture, run: &str, kind: RunKind, model: &str) {
+    use crate::source_warm::tests::drive;
+    let mut request = fixture.request(run, "source switch coverage");
+    request.model = broca_protocol::ModelHandle::new("anthropic", model);
+    request.session_class = Some("head".into());
+    let outcome = drive(fixture.registry.route_send(&fixture.key, request, kind))
+        .await
+        .unwrap();
+    assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+    drive(async {
+        while fixture.registry.route_status(&fixture.key).await.unwrap() != LineageStatus::Idle {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+}
+
+fn source_review_work(stats: &crate::source_warm::TestStats) -> [u64; 4] {
+    [
+        &stats.tasks,
+        &stats.subscriptions,
+        &stats.tap_calls,
+        &stats.record_clones,
+    ]
+    .map(|counter| counter.load(Ordering::Relaxed))
+}
+
+#[tokio::test(start_paused = true)]
+async fn source_review_default_off_actor_has_no_task_subscription_or_tap_work() {
+    let fixture = Fixture::start(vec![text_turn("ordinary reply")]).await;
+    let stats = crate::source_warm::test_stats(&fixture.key);
+    source_review_actor_turn(&fixture, "off", RunKind::FreshOrResume, REFUSAL_FALLBACK).await;
+    assert_eq!(source_review_work(&stats), [0; 4]);
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    assert_eq!(fixture.warm_requests(), 0);
+    assert_eq!(source_review_work(&stats), [0; 4]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn source_review_frozen_round_routes_without_source_work_when_live_switch_is_off() {
+    use crate::source_warm::tests::drive;
+    let mut refusal = text_turn("refused source request");
+    if let Reply::Full { body, .. } = &mut refusal {
+        *body = String::from_utf8(body.clone())
+            .unwrap()
+            .replace("end_turn", "refusal")
+            .into_bytes();
+    }
+    let mut fixture = Fixture::with(
+        vec![
+            refusal,
+            text_turn("first fallback reply"),
+            text_turn("next fallback reply"),
+        ],
+        |frozen| *frozen = source_with_refusal_fallback(frozen.base_url.as_deref().unwrap()).0,
+        provider_for,
+    )
+    .await;
+    fixture
+        .executor
+        .source_warm_enabled
+        .store(true, Ordering::SeqCst);
+    let stats = crate::source_warm::test_stats(&fixture.key);
+    source_review_actor_turn(
+        &fixture,
+        "before-disable",
+        RunKind::FreshOrResume,
+        REFUSING_SOURCE,
+    )
+    .await;
+    assert_eq!(stats.tasks.load(Ordering::Relaxed), 1);
+    assert!(stats.record_clones.load(Ordering::Relaxed) > 0);
+    fixture
+        .executor
+        .source_warm_enabled
+        .store(false, Ordering::SeqCst);
+    let stopped = {
+        let stopping = fixture.registry.stop_and_seal();
+        tokio::pin!(stopping);
+        drive(async {
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut stopping => break result,
+                    _ = tokio::task::yield_now() => {
+                        let counts = fixture.registry.slot_counts();
+                        if counts.open + counts.opening + counts.closing == 0 {
+                            tokio::time::advance(Duration::from_millis(10)).await;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+    };
+    assert!(stopped);
+    fixture.registry = Fixture::registry(
+        &fixture.root,
+        fixture.executor.wal_store.clone(),
+        &fixture.executor,
+        &fixture.export,
+    );
+    for counter in [
+        &stats.tasks,
+        &stats.subscriptions,
+        &stats.tap_calls,
+        &stats.record_clones,
+    ] {
+        counter.store(0, Ordering::Relaxed);
+    }
+    source_review_actor_turn(
+        &fixture,
+        "after-disable",
+        RunKind::AppendEpisode,
+        REFUSING_SOURCE,
+    )
+    .await;
+    assert!(fixture
+        .records()
+        .iter()
+        .rev()
+        .find_map(|record| match record {
+            WalRecord::ModelStepFinished { fallback, .. } => Some(
+                fallback
+                    .route
+                    .as_ref()
+                    .is_some_and(|route| route.model.model_id == REFUSAL_FALLBACK)
+            ),
+            _ => None,
+        })
+        .unwrap());
+    let bodies = fixture.server.bodies();
+    assert_eq!(bodies.len(), 3);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bodies[2]).unwrap()["model"],
+        REFUSAL_FALLBACK
+    );
+    assert_eq!(source_review_work(&stats), [0; 4]);
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    assert_eq!(fixture.warm_requests(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn source_review_historical_manual_warm_can_finish_after_same_step_fallback() {
+    use crate::source_warm::tests::drive;
+    let source_release = Arc::new(tokio::sync::Notify::new());
+    let warm_release = Arc::new(tokio::sync::Notify::new());
+    let mut refusal = text_turn("refused source request");
+    if let Reply::Full { body, .. } = &mut refusal {
+        *body = String::from_utf8(body.clone())
+            .unwrap()
+            .replace("end_turn", "refusal")
+            .into_bytes();
+    }
+    let fixture = Fixture::with(
+        vec![
+            Reply::Gated(source_release.clone(), Box::new(refusal)),
+            Reply::Gated(warm_release.clone(), Box::new(warm_answer())),
+            text_turn("fallback answer"),
+        ],
+        |frozen| *frozen = source_with_refusal_fallback(frozen.base_url.as_deref().unwrap()).0,
+        provider_for,
+    )
+    .await;
+    let stats = crate::source_warm::test_stats(&fixture.key);
+    let mut request = fixture.request("late-manual", "warm while the source is pending");
+    request.model = broca_protocol::ModelHandle::new("anthropic", REFUSING_SOURCE);
+    request.session_class = Some("head".into());
+    assert!(matches!(
+        drive(
+            fixture
+                .registry
+                .route_send(&fixture.key, request, RunKind::FreshOrResume)
+        )
+        .await
+        .unwrap(),
+        SendOutcome::Active { .. }
+    ));
+    drive(async {
+        while fixture.server.bodies().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let pending = fixture.warm(None);
+    tokio::pin!(pending);
+    drive(async {
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut pending => panic!("the warm should still be held: {result:?}"),
+                _ = tokio::task::yield_now() => if fixture.server.bodies().len() >= 2 { break; },
+            }
+        }
+    })
+    .await;
+    source_release.notify_one();
+    drive(async {
+        while fixture.registry.route_status(&fixture.key).await.unwrap() != LineageStatus::Idle {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let before_warm = fixture.records();
+    assert!(before_warm.iter().any(|record| matches!(record, WalRecord::ModelStepFinished { fallback, .. } if fallback.route.as_ref().is_some_and(|route| route.model.model_id == REFUSAL_FALLBACK))));
+    assert!(warm_records(&before_warm).is_empty());
+    warm_release.notify_one();
+    let reply = drive(pending.as_mut()).await.unwrap();
+    let bodies = fixture.server.bodies();
+    assert_eq!(bodies.len(), 3);
+    assert_eq!(bodies[1], expected_warm_body(&bodies[0]));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bodies[1]).unwrap()["model"],
+        REFUSING_SOURCE
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bodies[2]).unwrap()["model"],
+        REFUSAL_FALLBACK
+    );
+    assert_eq!(reply.request_body_sha256, sha256_hex(&bodies[0]));
+    let records = fixture.records();
+    let warm_at = records
+        .iter()
+        .position(|record| matches!(record, WalRecord::CacheWarmed { .. }))
+        .unwrap();
+    let fallback_at = records
+        .iter()
+        .position(|record| matches!(record, WalRecord::ModelStepFinished { .. }))
+        .unwrap();
+    assert!(warm_at > fallback_at);
+    assert!(matches!(
+        &records[warm_at],
+        WalRecord::CacheWarmed {
+            trigger: None,
+            step_id: StepId(1),
+            ..
+        }
+    ));
+    let facts = drive(async {
+        loop {
+            let facts = fixture.export.read_page(None, 100).unwrap().facts;
+            if facts
+                .iter()
+                .any(|fact| fact.segment.as_session().unwrap().warm)
+            {
+                break facts;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let warm = facts
+        .iter()
+        .find(|fact| fact.segment.as_session().unwrap().warm)
+        .unwrap()
+        .segment
+        .as_session()
+        .unwrap();
+    assert_eq!(
+        warm.model, REFUSAL_FALLBACK,
+        "the unmarked old-shape record keeps the original projection"
+    );
+    assert_eq!(source_review_work(&stats), [0; 4]);
 }

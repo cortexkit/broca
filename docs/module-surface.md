@@ -467,7 +467,8 @@ older readers refuse them by that name rather than run without the cap.
 A provider caches a request's prefix for a fixed lifetime from when the request was sent. A
 caller whose next round arrives later than that pays to write the whole prefix again. A warm
 re-sends the session's most recent model request changed only so the provider generates nothing
-(Anthropic: `max_tokens: 0`, no `stream`); everything that shapes the cached prefix (system,
+(Anthropic: `max_tokens: 0`, no `stream`, no server-side `fallbacks` opt-in or its beta);
+everything that shapes the cached prefix (system,
 tools, messages, `cache_control` markers and their TTLs, adaptive thinking, effort, speed) is
 byte-identical. The caller schedules and caps warms; broca performs each one exactly and reports
 what it cost.
@@ -516,6 +517,37 @@ what it cost.
   ttl_options_ms, read_refreshes_ttl, warm: "supported" | "unsupported", basis}`, every member
   absent when unknown; `basis` is `requested` when the session's cache request named the
   lifetime and `provider_default` when the provider's default applies.
+
+Source-cache maintenance additionally follows the current
+`anthropic_fallbacks.refusal_resend.enabled` switch read at module boot. When off, no source
+task, subscription or source-record tap is installed, even for a session with a frozen fallback.
+Its durable refusal routing still resumes unchanged; only source-cache maintenance is disabled.
+When enabled, broca keeps a separate clock for the refused source request of a run that froze
+the client-side fallback. While its allowance of 10, 20 or 40 successful fallback replies remains,
+broca refreshes that source prefix only
+near expiry: 30 seconds before a five-minute TTL, or two minutes before a one-hour TTL. The
+base is the source request that was actually sent, not a converted fallback request. Its
+rebuilt bytes must hash to that source request's recorded digest before the warm's output-only
+settings and server-fallback opt-out are applied. A source warm does not refresh the active
+fallback route's clock.
+
+Sessions whose frozen `session_class` is `head` may keep that source prefix warm between runs;
+other classes (including absent or unknown classes) warm only while a run is active. The same
+quota and rent-or-rewrite budget checks apply. Idle head warming stops before its cumulative
+cost reaches one source rewrite, using the source model's prices and frozen TTL; a new run
+resets this warming-cost allowance, whereas resuming the same run does not. Once the configured
+number of successful fallback replies has been served, broca stops keeping the old source prefix
+warm, before making
+the next source-model request. It does not wait for that source request to answer.
+Applied compaction messages/views, account or credential changes, model/config refreezes and
+the source answering again also invalidate the old prefix. Authentication pauses suspend warming;
+shutdown and restart pauses stop local IO, and a new process rebuilds eligible schedules from
+the WAL, including warm spend. No timer or new record type is persisted. These rules do not
+enable the default-off refusal fallback switch.
+
+New source-maintenance records use the existing optional `cache_warmed.trigger` string value
+`source_keep_warm` to select source-model attribution. Records without that discriminator,
+including historical late manual warms, keep their original attribution and export-fact bytes.
 
 A **cursor** is a durable `(wal_seq, sub_index)` (§7). `subscribe` and `read.head` share
 this one cursor domain. A cursor attach starts strictly after that unit, so
@@ -1398,21 +1430,21 @@ and "no reverse-request handler is registered for <family>", the same reply the 
 consumer SDK sends. It never reaches a pending call, even one with the same corr, and each
 refusal is counted in `health.check` as `reverse_requests_refused`.
 
-**Tool result formats and provider-held calls.** Dispatch routes declare `tool-result/v1` only
-for providers whose frozen catalog declares that result format. Text and errors use the same
+**Tool result formats and provider-held calls.** The daemon's dispatch routes declare
+`consumer_capabilities: ["tool-result/v1", "held-reply/v1"]` in every build. Typed result
+decoding still requires the result-format opt-in in the provider's frozen catalog. Text and errors use the same
 stored bytes as legacy replies. Shipping builds append a notice for each omitted image; builds
 with the `test-attachments` feature capture the image instead when dispatch has a media-capture handle. Role discovery and management routes do not
 negotiate tool results.
 The daemon installs the provider-held runtime (`broca-module-serve/src/held_runtime.rs`) on
 its tool plane: the waiting slots a held call's batch waits in, a late-results intake store
 (`late-results.db` under the state root, a projection of the WAL kept out of the backup
-catalog), one puller per provider module, and boot recovery. Release builds still leave
-`held-reply/v1` undeclared on every tool route. Shipping negotiation requires a separate,
-explicit release capability change; withdrawal and rebuild recovery do not enable it.
-With it undeclared no provider may hold a call, no plain call carries a key, and nothing is
-registered. Debug builds declare `content/v1` and `held-reply/v1` when
-`BROCA_TEST_DECLARE_HELD_REPLY_V1=1`; that name is a non-shipping marker the
-release fence refuses. Role and plan-fetch routes declare neither. A reply carrying `held` on
+catalog), one puller per provider module, and boot recovery. Installing that runtime enables
+held-reply negotiation without an environment switch, in release and debug builds alike.
+`role.describe` advertises `held_calls` beside `run_status`. Tool planes without the held
+runtime do not declare held replies or register plain-call keys with the late-results intake;
+result-only negotiation remains independent. Role and plan-fetch routes declare neither
+capability. A reply carrying `held` on
 an undeclared route becomes a malformed-reply error result with reason
 `malformed_provider_held_reply`, without pausing or exposing its interim content to the model.
 
@@ -1424,9 +1456,20 @@ connection; approved calls keep their deferred key and exact argument bytes. Rou
 decoding read only the provider declarations frozen into the session's plan manifest (on a
 fresh run the admitted manifest, on a resume the one its `RunStarted` recorded), never a live
 catalog. An accepted held reply first syncs `ToolCallProviderHeld`, then waits in its slot;
-when every remaining call is held the run pauses through `pause_run_impl` with
-`RunPaused {tool_held}` and sends nothing to the model. `provider-held/v1` is a known reader
-feature.
+when every remaining call is held the core parks through `pause_run_impl` with an internal
+`RunPaused {tool_held}` recovery boundary and sends nothing to the model. This provider-owned
+wait remains `active` on `run.status`; it does not emit `run_paused` on `session.subscribe`.
+`provider-held/v1` is a known reader feature.
+
+Each change to the ordered `held_calls` list emits a durable subscribe control frame from
+the existing held/terminal records. The frame has `unit: {type: "status", run_id}`, top-level
+`state`, a durable `cursor`, and the stream's next `seq`; it includes top-level `held_calls`
+only when that list is nonempty. It has no
+`event` member: this is a status snapshot, not a live lifecycle or display reset. The list
+uses the same WAL fold as `run.status`. Clearing the final held call emits another status
+frame with `held_calls` omitted; absence means none. Ordinary sessions acquire neither new
+frames nor new fields. Live display sequence numbers are not replayed, so a reconnect's
+`seq` starts again, while its durable units, cursors and status lists are unchanged.
 
 A late result IS the held call's result: held continuation preserves at-most-once dispatch
 of the original arguments. Withdrawal is a separate idempotent operation, not exactly-once

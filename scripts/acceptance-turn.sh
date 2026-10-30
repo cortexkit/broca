@@ -52,7 +52,8 @@ command -v timeout >/dev/null 2>&1 || {
   echo "acceptance-turn: timeout is required; install GNU coreutils and put timeout on PATH (macOS: brew install coreutils, then add its libexec/gnubin)" >&2
   exit 2
 }
-BIN="./target/release/broca-session"
+# The client stage-release built; CARGO_TARGET_DIR moves cargo's output folder when set.
+BIN="${CARGO_TARGET_DIR:-./target}/release/broca-session"
 CONN="$HOME/.local/share/cortexkit/run/subc-connection.json"
 
 [ -x "$BIN" ] && [ -f "$CONN" ] || {

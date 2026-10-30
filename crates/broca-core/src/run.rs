@@ -660,6 +660,9 @@ pub struct RunControl {
     /// it is written as a gated frame that builds without `plan-manifest/v1` refuse to read.
     /// `None` for a session admitted without a plan, whose `RunStarted` any build reads.
     pub manifest: Option<Arc<broca_wal::PlanManifest>>,
+    /// Replace the provider-view system text only after a recorded refresh applies. A
+    /// difference between legacy transcript text and manifest metadata is not a refresh.
+    pub manifest_system_override: bool,
     /// Told the WAL position of a fresh run's `RunStarted` once it is durable, and of each
     /// provider attempt record as it is appended, so the caller can report them to the routing
     /// module that chooses provider accounts. `None` reports nothing; either way the loop writes
@@ -803,6 +806,7 @@ impl Default for RunControl {
             stop_requested: None,
             steer: None,
             manifest: None,
+            manifest_system_override: false,
             account_reporter: None,
             keep_warm: None,
             elicitation_plane: None,
@@ -1814,7 +1818,7 @@ where
     // yet numbers its first one past every notice of this session's earlier lineages that
     // retention deleted, as their tombstones recorded. Only a session whose plan names a
     // compaction provider reads the tombstones, so every other admission does no extra I/O.
-    let frozen_plan = if is_resume {
+    let frozen_plan = if is_resume && !append_episode {
         prior.manifest.as_ref()
     } else {
         control.manifest.as_ref()
@@ -1911,11 +1915,15 @@ where
             .sync()
             .await
             .map_err(|e| RunError::Wal(e.to_string()))?;
-        let loaded = offsets.snapshot(safe_head).and_then(|snapshot| {
+        let loaded = broca_wal::access_counter::fallback_result(
+            || offsets.snapshot(safe_head),
+            |fallback| fallback.reason,
+        )
+        .and_then(|snapshot| {
             if writer.lineage_id().map(|id| id.to_string()) != snapshot.boundary.lineage_id {
-                return Err(crate::replay::SeedFallback {
-                    reason: "offset resume writer lineage mismatch",
-                });
+                return Err(crate::replay::SeedFallback::new(
+                    "offset resume writer lineage mismatch",
+                ));
             }
             crate::resume::reconstruct_from_offsets(
                 &|off, len| offsets.read_at(off, len),
@@ -2157,8 +2165,14 @@ where
         .checkpoint_at_head
         .ownership
         .as_ref()
-        .and_then(|ownership| ownership.first_episode.as_ref())
-        .and_then(|first| first.manifest.clone());
+        .and_then(|ownership| {
+            ownership.latest_manifest.clone().or_else(|| {
+                ownership
+                    .first_episode
+                    .as_ref()
+                    .and_then(|first| first.manifest.clone())
+            })
+        });
     prior.marker_order_version = episode.and_then(|episode| episode.marker_order_version);
     prior.keep_warm = episode.and_then(|episode| episode.keep_warm);
     prior.cancel_at = episode.and_then(|episode| episode.cancel_at);
@@ -3969,7 +3983,7 @@ where
     let mut render_episodes = prior.render_episodes.take().unwrap_or_default();
     let tools = Arc::clone(&cfg.tools);
     let mut manifest = ToolManifest::from_shared_tools(Arc::clone(&tools));
-    let frozen_plan = if is_resume {
+    let frozen_plan = if is_resume && !append_episode {
         prior.manifest.as_ref()
     } else {
         control.manifest.as_ref()
@@ -3979,6 +3993,11 @@ where
             .with_plan_manifest(frozen_plan)
             .map_err(|error| RunError::Wal(error.to_string()))?;
     }
+    let plan_system_text = crate::plan_system::frozen_text(
+        control.manifest_system_override,
+        frozen_plan.map(AsRef::as_ref),
+    )
+    .map(str::to_owned);
     let mut stop_when = cfg.stop_when.clone();
     if stop_when.is_empty() {
         stop_when.push(StopCondition::StepCount {
@@ -5838,6 +5857,11 @@ where
             );
         }
         let sent_opts = model_opts.as_ref().unwrap_or(&opts);
+        let system_view = plan_system_text
+            .as_deref()
+            .and_then(|text| crate::plan_system::view(sent_opts, &opts.prompt, text))
+            .map(Arc::new);
+        let sent_opts = system_view.as_ref().unwrap_or(sent_opts);
         if boundary_cancelled(control) && compaction_runtime.is_some() {
             break RunFinishReason::Cancelled;
         }
@@ -6113,9 +6137,7 @@ where
             // cancel, restart, or change the request already being streamed by the provider.
             let model_result = if writer.is_overhaul() {
                 let (_, mut hook_requests) = hook_channel.expect("overhaul hook channel");
-                use broca_wal::record::{
-                    AttemptCredential, AttemptReservation, AttemptRun, AttemptSession,
-                };
+                use broca_wal::record::{AttemptReservation, AttemptRun, AttemptSession};
                 let auth = control.auth_selection.clone().or_else(|| {
                     prior
                         .run_config
@@ -6132,15 +6154,7 @@ where
                     provider: step_model.provider_module_id.clone(),
                     endpoint_host: String::new(),
                     model_sent: String::new(),
-                    credential: AttemptCredential {
-                        credential_ref: None,
-                        account_ref: None,
-                        auth_method: auth.as_ref().and_then(|auth| auth.auth_method.clone()),
-                        auth_selection: auth,
-                        provider_ids: None,
-                        plan_tier: None,
-                        plan_tier_source: None,
-                    },
+                    credential: crate::admission::attempt_credential(auth.as_ref()),
                     session: AttemptSession {
                         bind: req.session.clone(),
                         session_ref: crate::agent_session_ref(&req.session),
@@ -8168,28 +8182,26 @@ pub(crate) fn restore_offset_prompt_guidance(
     window: &crate::context::OffsetPromptWindow,
 ) -> Result<(), crate::replay::SeedFallback> {
     use crate::replay::SeedFallback;
-    let missing = || SeedFallback {
-        reason: "offset prompt window lacks repetition checkpoint",
-    };
+    let missing = || SeedFallback::new("offset prompt window lacks repetition checkpoint");
     let seeded = |ordinal| -> Result<RepetitionFold, SeedFallback> {
         let at = window
             .guidance
             .binary_search_by_key(&ordinal, |g| g.ordinal)
             .map_err(|_| missing())?;
-        RepetitionFold::seeded(&window.guidance[at].fold).ok_or(SeedFallback {
-            reason: "offset prompt window repetition checkpoint is ambiguous",
+        RepetitionFold::seeded(&window.guidance[at].fold).ok_or_else(|| {
+            SeedFallback::new("offset prompt window repetition checkpoint is ambiguous")
         })
     };
     for checkpoint in &window.guidance {
         if checkpoint.fold.rules_version != crate::tool_repetition::REPETITION_RULES_VERSION {
-            return Err(SeedFallback {
-                reason: "offset prompt window repetition rules changed",
-            });
+            return Err(SeedFallback::new(
+                "offset prompt window repetition rules changed",
+            ));
         }
         if RepetitionFold::seeded(&checkpoint.fold).is_none() {
-            return Err(SeedFallback {
-                reason: "offset prompt window repetition checkpoint is ambiguous",
-            });
+            return Err(SeedFallback::new(
+                "offset prompt window repetition checkpoint is ambiguous",
+            ));
         }
     }
     let raw = state.prompt.clone();
@@ -8564,6 +8576,8 @@ pub struct PhysicalSend {
     pub request_body_bytes: u64,
     pub compressed: bool,
     pub account_ref: Option<String>,
+    /// Refresh replies carry account identity but do not include a resolved credential ID.
+    pub auth_refreshed: bool,
     pub speed_requested: Option<String>,
     /// Present only for warms; derived from the selected frozen request's marker policy.
     pub warm: Option<crate::cache_warm::WarmSendPolicy>,
@@ -8588,6 +8602,7 @@ pub trait AttemptHook: Send + Sync {
         id: broca_wal::record::AttemptId,
         attempt: ModelAttempt,
         outcome: broca_wal::record::BillingAttemptOutcome,
+        response: Option<broca_wal::record::AttemptEnvelope>,
     ) -> Result<(), ProviderError>;
 
     /// Warm usage is independent of model-step telemetry. A hook that cannot persist it must
@@ -8615,6 +8630,7 @@ enum AttemptRequest {
         id: broca_wal::record::AttemptId,
         attempt: ModelAttempt,
         outcome: broca_wal::record::BillingAttemptOutcome,
+        response: Option<Box<broca_wal::record::AttemptEnvelope>>,
         reply: tokio::sync::oneshot::Sender<Result<(), ProviderError>>,
     },
 }
@@ -8685,6 +8701,7 @@ impl AttemptHook for ChannelAttemptHook {
         id: broca_wal::record::AttemptId,
         attempt: ModelAttempt,
         outcome: broca_wal::record::BillingAttemptOutcome,
+        response: Option<broca_wal::record::AttemptEnvelope>,
     ) -> Result<(), ProviderError> {
         let (reply, receipt) = tokio::sync::oneshot::channel();
         self.0
@@ -8692,6 +8709,7 @@ impl AttemptHook for ChannelAttemptHook {
                 id,
                 attempt,
                 outcome,
+                response: response.map(Box::new),
                 reply,
             })
             .map_err(|_| attempt_hook_error("run stopped before settlement"))?;
@@ -8807,10 +8825,11 @@ impl AttemptJournal<'_> {
                             speed_requested: send.speed_requested,
                             ..self.template.run.clone()
                         },
-                        credential: broca_wal::record::AttemptCredential {
-                            account_ref: send.account_ref,
-                            ..self.template.credential.clone()
-                        },
+                        credential: crate::admission::attempt_credential_for_send(
+                            &self.template.credential,
+                            send.account_ref,
+                            send.auth_refreshed,
+                        ),
                         ..self.template.clone()
                     },
                     started: false,
@@ -8891,6 +8910,7 @@ impl AttemptJournal<'_> {
                 id,
                 mut attempt,
                 outcome,
+                response,
                 reply,
             } => {
                 let Some(pending) = self.pending.get(&id) else {
@@ -8913,7 +8933,7 @@ impl AttemptJournal<'_> {
                     response_bytes: attempt.response_body_len,
                     http_status: attempt.http_status,
                     outcome,
-                    ..Default::default()
+                    ..response.map(|response| *response).unwrap_or_default()
                 };
                 let ordinal = attempt.attempt;
                 if let Some(provider) = self.evidence {
@@ -11675,6 +11695,7 @@ mod tests {
             account_ref: None,
             speed_requested: None,
             warm: None,
+            auth_refreshed: false,
         }
     }
 
@@ -12125,10 +12146,23 @@ mod tests {
         let id = reservation.await.unwrap();
         let mut attempt = transformation_attempt(None, true);
         attempt.sent_at_ms = Some(1);
+        let response = broca_wal::record::AttemptEnvelope {
+            vendor_request_id: Some("reported-request".into()),
+            usage: Some(Usage {
+                input_tokens: Some(0),
+                output_tokens: Some(7),
+                ..Default::default()
+            }),
+            usage_raw: Some(
+                serde_json::json!({"input_tokens":0,"output_tokens":7,"future_key":false}),
+            ),
+            ..Default::default()
+        };
         let finish = hook.finished(
             id.clone(),
             attempt,
             broca_wal::record::BillingAttemptOutcome::Complete,
+            Some(response.clone()),
         );
         tokio::pin!(finish);
         let step = async {
@@ -12145,6 +12179,21 @@ mod tests {
         writer.sync().await.unwrap();
         let records = records.lock().unwrap();
         assert_eq!(records.iter().filter(|record| matches!(record, WalRecord::ModelAttemptFinished { attempt_id: Some(terminal_id), .. } if terminal_id == &id)).count(), 1);
+        let envelope = records
+            .iter()
+            .find_map(|record| match record {
+                WalRecord::ModelAttemptFinished { envelope, .. } => envelope.as_ref(),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(envelope.usage, response.usage);
+        assert_eq!(envelope.usage_raw, response.usage_raw);
+        assert_eq!(envelope.vendor_request_id, response.vendor_request_id);
+        assert_eq!(envelope.sent_at_ms, Some(1));
+        assert_eq!(
+            envelope.outcome,
+            broca_wal::record::BillingAttemptOutcome::Complete
+        );
         assert!(!records.iter().any(|record| matches!(
             record,
             WalRecord::AttemptFinished { .. } | WalRecord::AttemptReleased { .. }
@@ -12196,6 +12245,7 @@ mod tests {
                 first.clone(),
                 refusal,
                 BillingAttemptOutcome::CompressionRefused,
+                None,
             )
             .await
             .unwrap();
@@ -12211,6 +12261,7 @@ mod tests {
                 second,
                 transformation_attempt(None, true),
                 BillingAttemptOutcome::Complete,
+                None,
             )
             .await
             .unwrap();
@@ -12312,6 +12363,7 @@ mod tests {
                         id,
                         terminal,
                         broca_wal::record::BillingAttemptOutcome::Complete,
+                        None,
                     )
                     .await
                     .unwrap();

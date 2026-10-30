@@ -124,6 +124,11 @@ pub enum Refusal {
         plan_model: Value,
         send_model: Value,
     },
+    /// The next episode cannot apply its pending refresh to the resolved model.
+    PendingPlanModelMismatch {
+        generation: u64,
+        mismatch: Box<Refusal>,
+    },
     /// The plan's compaction provider answered `role.describe`, and the answer lacks the
     /// `compaction-provider/v1` major or one of its required ops. The provider was reached and
     /// said what it serves, so sending the plan again cannot help: the code is the runner role's
@@ -152,6 +157,7 @@ impl Refusal {
     /// The refusal code.
     pub fn code(&self) -> &'static str {
         match self {
+            Self::PendingPlanModelMismatch { mismatch, .. } => mismatch.code(),
             Self::ScopedToolsRequirePlan => "scoped_tools_require_plan",
             Self::SystemTextPresetRequired { .. } => "system_text_preset_required",
             Self::InvalidParams { .. } | Self::CompactionRoleNotServed { .. } => {
@@ -168,6 +174,18 @@ impl Refusal {
     /// The refusal's detail object.
     pub fn detail(&self) -> Value {
         match self {
+            Self::PendingPlanModelMismatch {
+                generation,
+                mismatch,
+            } => {
+                let mut detail = mismatch.detail();
+                let fields = detail
+                    .as_object_mut()
+                    .expect("plan-model detail is an object");
+                fields.insert("generation".into(), json!(generation));
+                fields.insert("class".into(), json!("permanent"));
+                detail
+            }
             Self::ScopedToolsRequirePlan => json!({"class": "permanent"}),
             Self::SystemTextPresetRequired { provider } => json!({"provider": provider}),
             Self::InvalidParams { detail } => detail.clone(),
@@ -215,6 +233,7 @@ impl Refusal {
     /// the code: only a provider that did not answer may answer next time.
     pub fn retryable(&self) -> bool {
         match self {
+            Self::PendingPlanModelMismatch { .. } => false,
             Self::ScopedToolsRequirePlan | Self::PlanModelMismatch { .. } => false,
             Self::SystemTextPresetRequired { .. } => false,
             _ => errors::is_retryable(self.code()),
@@ -224,6 +243,7 @@ impl Refusal {
     /// A one-line human-readable account, for the error body's message.
     pub fn message(&self) -> String {
         match self {
+            Self::PendingPlanModelMismatch { generation, mismatch } => format!("pending refresh generation {generation}: {}", mismatch.message()),
             Self::ScopedToolsRequirePlan => "tools on a scoped session must come from a fetch plan, because tool providers require a per-call preset on scoped routes".into(),
             Self::SystemTextPresetRequired { provider } => format!("system-text provider {provider} requires a preset because it does not declare system-text-default/v1"),
             Self::PlanModelMismatch { provider, .. } => {

@@ -10,7 +10,7 @@
 //!
 //! See `docs/lineage-actor-coordinator.md` §1.
 
-use broca_diagnostics::{spawn_blocking, JobKind};
+use broca_diagnostics::JobKind;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -20,6 +20,16 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use broca_protocol::{BindIdentity, RunId};
 use tokio::sync::{broadcast, mpsc};
+
+// WAL reads may cross several blocking handoffs after a seed is refused. Keep
+// the caller's operation on every registry job, including the full-replay route.
+fn spawn_blocking<F, T>(kind: JobKind, work: F) -> tokio::task::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    broca_diagnostics::spawn_blocking(kind, broca_wal::access_counter::inherit(work))
+}
 
 const CLOSE_REOPEN_MAX_RETRIES: usize = 3;
 const CLOSE_REOPEN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
@@ -1145,13 +1155,12 @@ impl LineageRegistry {
         };
         let event_key = event_key.to_owned();
         let key = event_key.clone();
-        let row =
-            broca_diagnostics::spawn_blocking(broca_diagnostics::JobKind::StoreRead, move || {
-                store.read_run_event(&key)
-            })
-            .await
-            .map_err(|e| crate::serve::ServeError::Open(e.to_string(), None))?
-            .map_err(|e| crate::serve::ServeError::Open(e, None))?;
+        let row = spawn_blocking(broca_diagnostics::JobKind::StoreRead, move || {
+            store.read_run_event(&key)
+        })
+        .await
+        .map_err(|e| crate::serve::ServeError::Open(e.to_string(), None))?
+        .map_err(|e| crate::serve::ServeError::Open(e, None))?;
         match row {
             Some((owner, bytes)) if &owner == session => {
                 Ok(broca_wire::RunEventGetResponse::Found {
@@ -1392,10 +1401,14 @@ impl LineageRegistry {
         Ok(match read {
             Ok(Ok(read)) => read,
             Ok(Err(error)) => {
+                broca_wal::access_counter::seed_fallback("run row read failed");
                 tracing::debug!("run-row read fell back to WAL replay: {error}");
                 None
             }
-            Err(_) => None,
+            Err(_) => {
+                broca_wal::access_counter::seed_fallback("run row read task failed");
+                None
+            }
         })
     }
 
@@ -4857,7 +4870,7 @@ pub(crate) fn decode_frames_at_offsets(
         let slice = &bytes[lo_usize..hi_usize];
         let mut off = 0usize;
         while off < slice.len() {
-            match broca_wal::framing::decode_next(&slice[off..]) {
+            match broca_wal::access_counter::decode_next(&slice[off..]) {
                 broca_wal::framing::DecodeStep::Record { framed, consumed } => {
                     if let Some(counter) = decode_counter {
                         counter.set(counter.get() + 1);
@@ -6378,7 +6391,7 @@ impl LineageRegistry {
             .and_then(|reader| reader.store.clone());
         #[cfg(test)]
         let probe = self.inner.expiry_read_probe.lock().unwrap().take();
-        let expired = tokio::task::spawn_blocking(move || {
+        let expired = tokio::task::spawn_blocking(broca_wal::access_counter::inherit(move || {
             #[cfg(test)]
             if let Some(probe) = probe {
                 probe();
@@ -6393,7 +6406,7 @@ impl LineageRegistry {
                 None
             };
             service.expired_head_with_meta(&key, run.as_deref(), head, meta.as_ref())
-        })
+        }))
         .await
         .map_err(|e| OpenError::Open(e.to_string()))?
         .map_err(OpenError::from_retention)?;
@@ -7034,9 +7047,14 @@ mod offset_page_tests {
         // One small page: decode only the first frame's bytes.
         let (lo, hi) = offsets[0];
         let counter = Cell::new(0u64);
-        let one = decode_frames_at_offsets(&bytes, &[(lo, hi)], Some(&counter)).unwrap();
+        let accesses = broca_wal::access_counter::WalAccessCounter::default();
+        let one = accesses
+            .operation("raw page decode")
+            .run(|| decode_frames_at_offsets(&bytes, &[(lo, hi)], Some(&counter)))
+            .unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(counter.get(), 1);
+        assert_eq!(accesses.snapshot()[0].frames_decoded, 1);
         assert!(counter.get() < total);
         // Head: the newest message's row range only. The head never scans the prefix.
         let (last_lo, last_hi) = offsets[offsets.len() - 1];

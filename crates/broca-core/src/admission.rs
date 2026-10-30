@@ -14,6 +14,41 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{PendingSubmission, ReplayError};
 
+/// Reservation identity comes from the resolved credential ID in the frozen auth
+/// selection, never its spelling or a provider's pricing model. Unreported plan facts stay unknown.
+pub(crate) fn attempt_credential(
+    auth: Option<&broca_wal::AuthSelection>,
+) -> broca_wal::record::AttemptCredential {
+    broca_wal::record::AttemptCredential {
+        credential_ref: auth.and_then(|auth| auth.resolved_credential_id.clone()),
+        account_ref: None,
+        auth_selection: auth.cloned(),
+        auth_method: auth.and_then(|auth| auth.auth_method.clone()),
+        provider_ids: None,
+        plan_tier: None,
+        plan_tier_source: None,
+    }
+}
+
+pub(crate) fn attempt_credential_for_send(
+    frozen: &broca_wal::record::AttemptCredential,
+    served_account_ref: Option<String>,
+    auth_refreshed: bool,
+) -> broca_wal::record::AttemptCredential {
+    broca_wal::record::AttemptCredential {
+        credential_ref: if auth_refreshed {
+            None
+        } else {
+            frozen
+                .auth_selection
+                .as_ref()
+                .and_then(|auth| auth.resolved_credential_id.clone())
+        },
+        account_ref: served_account_ref,
+        ..frozen.clone()
+    }
+}
+
 fn logical_input(request: &SubmissionRequest) -> std::borrow::Cow<'_, [Message]> {
     if request.content.is_empty() {
         return std::borrow::Cow::Borrowed(&request.input);
@@ -499,6 +534,15 @@ pub struct SessionOwnershipV1 {
     /// member existed, which a reader then treats as unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_episode: Option<FirstEpisodeV1>,
+    /// The latest distinct episode manifest. Refreshes do not replace the first episode's
+    /// identity; unchanged sessions omit this field and retain their original checkpoint bytes.
+    /// Older summaries also omit it because their episodes shared the first manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_manifest: Option<Arc<broca_wal::PlanManifest>>,
+    /// Whether the WAL contains session-change facts. False is omitted so unrefreshed logs
+    /// retain their old checkpoint bytes and admission need not probe for change records.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_change_recorded: bool,
     /// Whether this summary was folded by a build that records the first episode's frozen
     /// plan manifest (`FirstEpisodeV1::manifest`). A summary stored by an older build, or
     /// re-stored by one after a rollback, lacks it and may have dropped a manifest, so it is
@@ -518,6 +562,8 @@ impl Default for SessionOwnershipV1 {
             any_unrecorded_principal: false,
             recorded_principals: Vec::new(),
             first_episode: None,
+            latest_manifest: None,
+            session_change_recorded: false,
             plan_manifest_folded: true,
         }
     }
@@ -530,7 +576,7 @@ pub struct FirstEpisodeV1 {
     /// The model-facing names of the tools the episode was admitted with, in their order.
     pub tool_names: Vec<String>,
     /// The plan manifest the episode froze, when the session was admitted with a fetch plan.
-    /// Every later episode renders its tools from it and carries it on its own `RunStarted`.
+    /// Later episodes retain it until a session refresh applies a new manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<Arc<broca_wal::PlanManifest>>,
 }
@@ -546,6 +592,8 @@ impl SessionOwnershipV1 {
             any_unrecorded_principal: self.any_unrecorded_principal,
             recorded_principals: self.recorded_principals.clone(),
             first_episode: None,
+            latest_manifest: None,
+            session_change_recorded: false,
             plan_manifest_folded: false,
         }
     }
@@ -554,6 +602,8 @@ impl SessionOwnershipV1 {
     /// are irrelevant to which principals may cancel or retract a session.
     pub fn fold_owner_records(&mut self, records: &[FramedRecord]) {
         self.first_episode = None;
+        self.latest_manifest = None;
+        self.session_change_recorded = false;
         self.plan_manifest_folded = false;
         for frame in records {
             if let WalRecord::RunStarted {
@@ -909,6 +959,18 @@ impl AdmissionCheckpointV1 {
                             manifest: manifest.as_deref().cloned().map(Arc::new),
                         });
                     }
+                    // Unrefreshed sessions keep the original checkpoint bytes; only a distinct
+                    // episode manifest needs an additional copy in the checkpoint.
+                    let current = manifest.as_deref();
+                    let first = ownership
+                        .first_episode
+                        .as_ref()
+                        .and_then(|first| first.manifest.as_deref());
+                    ownership.latest_manifest = if current != first {
+                        current.cloned().map(Arc::new)
+                    } else {
+                        None
+                    };
                     ownership.fold_run_started(principal.as_ref(), scope.as_ref());
                 }
                 if self.lineage_retention == Some(crate::LineageRetention::Unstarted) {
@@ -1136,6 +1198,14 @@ impl AdmissionCheckpointV1 {
             | WalRecord::InputTokenBudgetExhausted { .. }
             | WalRecord::StructuredOutputResult { .. }
             | WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
+            // Only a presence bit is needed here; the session-change projection folds the payload.
+            WalRecord::SessionRefreshAccepted { .. }
+            | WalRecord::SessionRefreshPolicyChanged { .. }
+            | WalRecord::SessionPrefixFlushed { .. } => {
+                if let Some(ownership) = &mut self.ownership {
+                    ownership.session_change_recorded = true;
+                }
+            }
         }
         if let Some(episode) = self.last_episode.as_mut() {
             if let Some(facts) = episode.budget_replay_state.as_mut() {
@@ -1356,9 +1426,7 @@ impl AdmissionSource {
         boundary: &AdmissionSource,
     ) -> Result<FramedRecord, crate::replay::SeedFallback> {
         use sha2::Digest;
-        let bad = || crate::replay::SeedFallback {
-            reason: "admission source identity mismatch",
-        };
+        let bad = || crate::replay::SeedFallback::new("admission source identity mismatch");
         if self.seq == 0 || self.seq > boundary.seq || self.end > boundary.end {
             return Err(bad());
         }
@@ -1367,11 +1435,12 @@ impl AdmissionSource {
             .checked_sub(self.off)
             .filter(|len| *len > 0)
             .ok_or_else(bad)?;
-        let bytes = read_at(self.off, len).map_err(|_| bad())?;
+        let bytes =
+            broca_wal::access_counter::read_at(read_at, self.off, len).map_err(|_| bad())?;
         if bytes.len() as u64 != len || sha2::Sha256::digest(&bytes).as_slice() != self.identity {
             return Err(bad());
         }
-        match broca_wal::framing::decode_next(&bytes) {
+        match broca_wal::access_counter::decode_next(&bytes) {
             broca_wal::framing::DecodeStep::Record { framed, consumed }
                 if consumed == bytes.len() && framed.seq == self.seq =>
             {
@@ -1437,9 +1506,7 @@ impl AdmissionSeed {
         prefix: &[crate::replay::PositionedFrame],
     ) -> Result<Self, crate::replay::SeedFallback> {
         use sha2::Digest;
-        let bad = || crate::replay::SeedFallback {
-            reason: "incomplete admission prefix",
-        };
+        let bad = || crate::replay::SeedFallback::new("incomplete admission prefix");
         if prefix.first().map(|p| p.framed.seq) != Some(1)
             || prefix.last().map(|p| (p.framed.seq, p.off))
                 != Some((boundary.seq, boundary.frame_off))
@@ -1461,17 +1528,20 @@ impl AdmissionSeed {
             || replay.open_tool_turn.is_some()
             || frames.iter().any(|p| matches!(&p.record, WalRecord::RunStarted { manifest: Some(manifest), .. } if crate::compaction::has_compaction(manifest)))
         {
-            return Err(crate::replay::SeedFallback {
-                reason: "admission prefix needs full replay",
-            });
+            return Err(crate::replay::SeedFallback::new("admission prefix needs full replay"));
         }
         let source = |i: usize| -> Result<AdmissionSource, crate::replay::SeedFallback> {
             let off = prefix[i].off;
             let limit = prefix.get(i + 1).map_or(boundary.frame_end, |p| p.off);
-            let bytes = read_at(off, limit.checked_sub(off).ok_or_else(bad)?).map_err(|_| bad())?;
+            let bytes = broca_wal::access_counter::read_at(
+                read_at,
+                off,
+                limit.checked_sub(off).ok_or_else(bad)?,
+            )
+            .map_err(|_| bad())?;
             // FileWal metadata follows each record. A source identifies only its own
             // frame, not the lineage bytes before the next positioned record.
-            let consumed = match broca_wal::framing::decode_next(&bytes) {
+            let consumed = match broca_wal::access_counter::decode_next(&bytes) {
                 broca_wal::framing::DecodeStep::Record { framed, consumed }
                     if *framed == prefix[i].framed =>
                 {
@@ -1556,6 +1626,7 @@ impl AdmissionSeed {
             source(frames.iter().rposition(|p| matches!(&p.record, WalRecord::DeliveryOrdered { submission_id, .. } if submission_id == &staged.submission_id)).ok_or_else(bad)?)
         }).transpose()?;
         if let Some(ownership) = &mut scalars.ownership {
+            ownership.latest_manifest = None;
             if let Some(first) = &mut ownership.first_episode {
                 first.manifest = None;
             }
@@ -1592,9 +1663,7 @@ impl AdmissionSeed {
         let Some(seed) = &self.episode else {
             return Ok(None);
         };
-        let bad = || crate::replay::SeedFallback {
-            reason: "invalid admission episode sources",
-        };
+        let bad = || crate::replay::SeedFallback::new("invalid admission episode sources");
         let start = seed.start.read(read_at, &self.boundary)?;
         if !matches!(&start.record, WalRecord::RunStarted { run_id, .. } if run_id == &seed.run_id)
         {
@@ -1667,9 +1736,7 @@ impl AdmissionSeed {
             || crate::replay::tail_contains_compaction_setup(&tail.iter().map(|p| p.framed.clone()).collect::<Vec<_>>())
             || tail.iter().any(|p| matches!(&p.framed.record, WalRecord::RunStarted { manifest: Some(manifest), .. } if crate::compaction::has_compaction(manifest)))
         {
-            return Err(crate::replay::SeedFallback {
-                reason: "admission seed incomplete or head mismatch",
-            });
+            return Err(crate::replay::SeedFallback::new("admission seed incomplete or head mismatch"));
         }
         crate::replay::replay_seeded_at_validated_boundary(
             read_at,
@@ -1709,9 +1776,7 @@ impl AdmissionSeed {
     ) -> Result<(AdmissionCheckpointV1, AdmissionCheckpointV1), crate::replay::SeedFallback> {
         let episode = self.episode(read_at)?;
         self.validate(read_at, tail, safe_head, episode.as_ref())?;
-        let bad = || crate::replay::SeedFallback {
-            reason: "incomplete admission scalars",
-        };
+        let bad = || crate::replay::SeedFallback::new("incomplete admission scalars");
         if self.scalars.last_episode.is_some()
             || !self.scalars.pending_fifo.is_empty()
             || self.scalars.pending_order.is_some()
@@ -1736,6 +1801,13 @@ impl AdmissionSeed {
         }
         let mut checkpoint = self.scalars.clone();
         checkpoint.last_episode = episode;
+        if let (Some(seed), Some(ownership)) = (&self.episode, &mut checkpoint.ownership) {
+            let started = seed.start.read(read_at, &self.boundary)?;
+            let WalRecord::RunStarted { manifest, .. } = started.record else {
+                return Err(bad());
+            };
+            ownership.latest_manifest = manifest.map(|manifest| Arc::new(*manifest));
+        }
         if let Some(source) = &self.first_run {
             let first = source.read(read_at, &self.boundary)?;
             let WalRecord::RunStarted {
@@ -1761,6 +1833,16 @@ impl AdmissionSeed {
                 .as_mut()
                 .ok_or_else(bad)?
                 .first_config = config.frozen_render_config.clone();
+        }
+        if let Some(ownership) = &mut checkpoint.ownership {
+            if ownership.latest_manifest.as_deref()
+                == ownership
+                    .first_episode
+                    .as_ref()
+                    .and_then(|first| first.manifest.as_deref())
+            {
+                ownership.latest_manifest = None;
+            }
         }
         let pending = self.queued.iter().map(|seed| {
             let frame = seed.source.read(read_at, &self.boundary)?;
@@ -1828,9 +1910,7 @@ impl AdmissionSeed {
         checkpoint.last_episode = episode;
         checkpoint
             .fold_frames(&tail.iter().map(|p| p.framed.clone()).collect::<Vec<_>>())
-            .map_err(|_| crate::replay::SeedFallback {
-                reason: "paused admission tail refused",
-            })?;
+            .map_err(|_| crate::replay::SeedFallback::new("paused admission tail refused"))?;
         Ok(checkpoint
             .last_episode
             .filter(|e| e.disposition == EpisodeDisposition::Paused))
@@ -2570,24 +2650,50 @@ mod tests {
             file.take(len).read_to_end(&mut bytes)?;
             Ok(bytes)
         };
-        let seed = AdmissionSeed::capture(&read_at, &boundary, &positioned[..cut])
+        let counter = broca_wal::access_counter::WalAccessCounter::default();
+        let seed = counter
+            .operation("capture admission seed")
+            .run(|| AdmissionSeed::capture(&read_at, &boundary, &positioned[..cut]))
             .expect("a multi-record FileWal admission seed must capture exact source frames");
         assert_eq!(
             positioned.get(cut).map_or(bytes.len() as u64, |p| p.off) - boundary.frame_end,
             broca_wal::framing::LINEAGE_FRAME_LEN as u64
         );
         let full_reads = std::cell::Cell::new(0);
-        let snapshot = crate::run::load_prior_wal_snapshot_from_seed(
-            &read_at,
-            &seed,
-            &positioned[cut..],
-            positioned.last().unwrap().framed.seq,
-            || {
-                full_reads.set(full_reads.get() + 1);
-                panic!("a valid real FileWal admission seed must not read the full log")
-            },
-        )
-        .unwrap();
+        let snapshot = counter
+            .operation("hydrate admission seed")
+            .run(|| {
+                crate::run::load_prior_wal_snapshot_from_seed(
+                    &read_at,
+                    &seed,
+                    &positioned[cut..],
+                    positioned.last().unwrap().framed.seq,
+                    || {
+                        full_reads.set(full_reads.get() + 1);
+                        panic!("a valid real FileWal admission seed must not read the full log")
+                    },
+                )
+            })
+            .unwrap();
+        let measured = counter.snapshot();
+        // Capture authenticates the first and current RunStarted independently,
+        // plus RunConfigRefrozen and RunAuthRefrozen in the nonempty-tail corpus. Each
+        // locator is read once to find its extent and once to verify its hash.
+        let capture_reads = if empty_tail { 4 } else { 8 };
+        assert_eq!(measured[0].reads.len(), capture_reads);
+        assert_eq!(measured[0].frames_decoded, capture_reads as u64);
+        assert!(measured[1]
+            .reads
+            .iter()
+            .any(|read| read.class == broca_wal::access_counter::ReadClass::Source));
+        assert!(measured[1]
+            .reads
+            .iter()
+            .any(|read| read.class == broca_wal::access_counter::ReadClass::LineageHeader));
+        assert!(measured[1].frames_decoded > 0);
+        assert!(measured
+            .iter()
+            .all(|operation| operation.seed_fallbacks.is_empty()));
         assert_eq!(full_reads.get(), 0);
         assert_eq!(snapshot.base_watermark, cut as u64);
         assert_eq!(snapshot.tail.is_empty(), empty_tail);
@@ -2950,7 +3056,7 @@ mod tests {
             let reads = std::cell::Cell::new(0);
             let read_at = |off, len| {
                 let data = offset_reader(&bytes[..end_off])(off, len)?;
-                if matches!(broca_wal::framing::decode_next(&data), broca_wal::framing::DecodeStep::Record { consumed, .. } if consumed == data.len())
+                if matches!(broca_wal::access_counter::decode_next(&data), broca_wal::framing::DecodeStep::Record { consumed, .. } if consumed == data.len())
                 {
                     reads.set(reads.get() + 1);
                 }
@@ -3175,6 +3281,57 @@ mod tests {
             output_tokens: Some(5),
             reasoning_tokens: Some(1),
         }
+    }
+
+    #[test]
+    fn checkpoint_retains_each_episodes_manifest_without_replacing_the_baseline() {
+        let mut records = corpus();
+        for frame in &mut records {
+            if let WalRecord::RunStarted {
+                run_id, manifest, ..
+            } = &mut frame.record
+            {
+                *manifest = Some(Box::new(
+                    serde_json::from_value(serde_json::json!({
+                        "plan": "{}", "plan_identity": run_id.0, "composition_digest": "c",
+                        "fetches": [], "tools": [], "system_text": run_id.0,
+                        "system_digest": "s", "join_version": 1, "role_versions": {}
+                    }))
+                    .unwrap(),
+                ));
+            }
+        }
+        let checkpoint = AdmissionCheckpointV1::from_frames(&records).unwrap();
+        let recovered =
+            decode_admission_checkpoint(&encode_admission_checkpoint(&checkpoint).unwrap())
+                .unwrap();
+        let ownership = recovered.ownership.unwrap();
+        assert_eq!(
+            ownership
+                .first_episode
+                .unwrap()
+                .manifest
+                .unwrap()
+                .plan_identity,
+            "r1"
+        );
+        assert_eq!(ownership.latest_manifest.unwrap().plan_identity, "r2");
+        let first = records
+            .iter()
+            .find_map(|frame| match &frame.record {
+                WalRecord::RunStarted { manifest, .. } => manifest.clone(),
+                _ => None,
+            })
+            .unwrap();
+        for frame in &mut records {
+            if let WalRecord::RunStarted { manifest, .. } = &mut frame.record {
+                *manifest = Some(first.clone());
+            }
+        }
+        let unchanged =
+            encode_admission_checkpoint(&AdmissionCheckpointV1::from_frames(&records).unwrap())
+                .unwrap();
+        assert!(!unchanged.contains("latest_manifest"));
     }
 
     fn corpus() -> Vec<FramedRecord> {
@@ -4014,6 +4171,8 @@ mod tests {
                 // `fold_run_started` alone records no first-episode facts; the checkpoint's own
                 // `RunStarted` fold sets them, from the record's run id and tools.
                 first_episode: None,
+                latest_manifest: None,
+                session_change_recorded: false,
                 plan_manifest_folded: true,
             }
         );
@@ -4247,5 +4406,88 @@ mod tests {
             submission_identity_digest(&left),
             submission_identity_digest(&right)
         );
+    }
+}
+
+#[cfg(test)]
+mod credential_evidence_tests {
+    use super::{attempt_credential, attempt_credential_for_send};
+    use serde_json::json;
+
+    #[test]
+    fn reservation_credential_facts_never_classify_prefix_or_provider() {
+        for (credential_id, method) in [
+            ("apikey:opencode-go", "apikey"),
+            ("apikey:kimi-for-coding", "apikey"),
+            ("apikey:cline-pass", "apikey"),
+            ("oauth:xai", "oauth"),
+        ] {
+            let selection =
+                serde_json::from_value(json!({"credential_id":credential_id,"auth_method":method}))
+                    .unwrap();
+            let credential = attempt_credential(Some(&selection));
+            assert_eq!(credential.auth_method.as_deref(), Some(method));
+            assert_eq!(credential.credential_ref, None);
+            let value = serde_json::to_value(credential).unwrap();
+            for key in [
+                "provider_ids",
+                "plan_tier",
+                "plan_tier_source",
+                "kind",
+                "billing_model",
+            ] {
+                assert!(
+                    value.get(key).is_none(),
+                    "{credential_id}: {key} must remain unreported"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reservation_identity_and_auth_method_use_only_frozen_selection_witnesses() {
+        let mut selection = serde_json::from_value(json!({
+            "credential_id":"oauth:misleading-provider:lookup-only", "resolved_credential_id":"vault-opaque-row", "auth_method":"future-vault-method"
+        })).unwrap();
+        let credential = attempt_credential(Some(&selection));
+        assert_eq!(
+            credential.credential_ref.as_deref(),
+            Some("vault-opaque-row")
+        );
+        assert_eq!(
+            credential.auth_method.as_deref(),
+            Some("future-vault-method")
+        );
+        assert_eq!(credential.auth_selection.as_ref(), Some(&selection));
+        selection.resolved_credential_id = None;
+        selection.auth_method = None;
+        let unknown = attempt_credential(Some(&selection));
+        assert_eq!(unknown.credential_ref, None);
+        assert_eq!(unknown.auth_method, None);
+        assert_eq!(attempt_credential(None).auth_selection, None);
+    }
+
+    #[test]
+    fn refreshed_reservation_forgets_row_witness_but_keeps_served_account() {
+        let selection = serde_json::from_value(json!({
+            "credential_id":"lookup-not-a-witness", "resolved_credential_id":"frozen-row", "auth_method":"oauth", "account_ref":"frozen-account"
+        })).unwrap();
+        let frozen = attempt_credential(Some(&selection));
+        for refreshed in [false, true] {
+            let sent =
+                attempt_credential_for_send(&frozen, Some("served-account".into()), refreshed);
+            assert_eq!(
+                sent.credential_ref.as_deref(),
+                if refreshed { None } else { Some("frozen-row") }
+            );
+            assert_eq!(sent.account_ref.as_deref(), Some("served-account"));
+            assert_eq!(sent.auth_selection.as_ref(), Some(&selection));
+            assert_eq!(sent.auth_method.as_deref(), Some("oauth"));
+            assert!(
+                sent.provider_ids.is_none()
+                    && sent.plan_tier.is_none()
+                    && sent.plan_tier_source.is_none()
+            );
+        }
     }
 }

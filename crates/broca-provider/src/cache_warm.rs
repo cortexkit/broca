@@ -221,7 +221,8 @@ fn is_manual_thinking(thinking: &Value) -> bool {
 }
 
 /// The warm body for an Anthropic Messages request `base`: the same request with `max_tokens` set
-/// to 0 and `stream` removed, nothing else changed. Refused, with nothing stripped, when `base`
+/// to 0 and `stream` removed. Server-side fallback is disabled so sticky routing cannot refresh
+/// another model's cache. Refused, with nothing stripped, when `base`
 /// carries a shape a zero-output request cannot (see [`warm_shape`]).
 ///
 /// The body is re-emitted with the same canonical JSON encoding every family renders with, so
@@ -255,6 +256,7 @@ pub fn anthropic_warm_body(base: &[u8]) -> Result<Vec<u8>, String> {
     }
     object.insert("max_tokens".into(), Value::from(0u32));
     object.remove("stream");
+    object.remove("fallbacks");
     Ok(canonical_json_bytes(&body))
 }
 

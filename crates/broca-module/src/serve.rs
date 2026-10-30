@@ -1248,7 +1248,15 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             .as_str()
             .to_string()
     });
-    match state.state {
+    // A provider-held park is an implementation recovery boundary, not an owner pause.
+    let public_state = if state.state == State::Paused
+        && state.pause_reason == Some(broca_protocol::PauseReason::ToolHeld)
+    {
+        State::Active
+    } else {
+        state.state
+    };
+    match public_state {
         // Deadline waits and provider-held calls are independent runner-owned waits.
         // Consumers recognize them from their fields, never from the informational reason.
         State::Active => RunStatusResponse::Active {
@@ -2071,6 +2079,13 @@ pub trait ServeHandler: Send + Sync {
     /// route to carry a scope identity supplied by the daemon.
     async fn frozen_plan_requires_approval(&self, _session: &LineageKey) -> bool {
         false
+    }
+
+    async fn session_change_identities(
+        &self,
+        _session: &LineageKey,
+    ) -> Option<(Option<String>, Option<String>)> {
+        None
     }
 }
 
@@ -3591,6 +3606,41 @@ impl ServeHandler for crate::LineageRegistry {
                 .cache_declaration(config)
                 .map(|declaration| declaration.to_wire());
         }
+        // Every ready baseline on a runner declaring `session_change` states the rungs it
+        // supports per surface, and the generations it accepted, applied and holds pending.
+        let change = broca_fetch_plan::session_change::SessionChangeState::fold(&records);
+        if let Some(manifest) = &change.prefix_manifest {
+            let cache = baseline.cache.take();
+            baseline = planned_baseline(manifest);
+            baseline.cache = cache;
+        }
+        baseline.accepted_generation = change.accepted_generation;
+        baseline.applied_generation = change.applied_generation;
+        baseline.pending = change.pending.as_ref().map(|pending| {
+            cortexkit_role_llm_runner::baseline::PendingChange {
+                generation: pending.generation,
+                policy: pending.policy.clone(),
+            }
+        });
+        baseline.effective = change.effective.as_ref().map(|effective| {
+            cortexkit_role_llm_runner::baseline::EffectiveBaseline {
+                generation: effective.generation,
+                applied_by: effective.applied_by.clone(),
+                manifest_digest: effective.manifest_digest.clone(),
+            }
+        });
+        if change.accepted_generation > 0 {
+            baseline.rungs = Some(cortexkit_role_llm_runner::baseline::Rungs {
+                tools: broca_fetch_plan::session_change::TOOLS_RUNGS
+                    .iter()
+                    .map(|rung| rung.to_string())
+                    .collect(),
+                system_text: broca_fetch_plan::session_change::SYSTEM_TEXT_RUNGS
+                    .iter()
+                    .map(|rung| rung.to_string())
+                    .collect(),
+            });
+        }
         Ok(broca_wire::BaselineReply::ready(baseline))
     }
 
@@ -3611,6 +3661,37 @@ impl ServeHandler for crate::LineageRegistry {
                     .map(|declaration| declaration.to_wire());
                 baseline
             })
+    }
+
+    async fn session_change_identities(
+        &self,
+        session: &LineageKey,
+    ) -> Option<(Option<String>, Option<String>)> {
+        let (records, _) = self.read_durable_wal(session).await.ok()?;
+        let change = broca_fetch_plan::session_change::SessionChangeState::fold(&records);
+        if change.accepted_generation == 0 {
+            return None;
+        }
+        let accepted = change
+            .accepted
+            .get(&change.accepted_generation)
+            .map(|(identity, _)| identity.clone());
+        let effective = if change.applied_generation > 0 {
+            change
+                .accepted
+                .get(&change.applied_generation)
+                .map(|(identity, _)| identity.clone())
+        } else {
+            first_run_started(&records).and_then(|start| match start {
+                broca_wal::WalRecord::RunStarted {
+                    manifest: Some(manifest),
+                    ..
+                } => Some(manifest.plan_identity.clone()),
+                broca_wal::WalRecord::RunStarted { .. } => None,
+                _ => None,
+            })
+        };
+        Some((effective, accepted))
     }
 
     fn session_written(&self, session: &LineageKey) -> Result<bool, ServeError> {
@@ -3807,7 +3888,7 @@ mod held_status_tests {
     }
 
     #[test]
-    fn active_and_paused_status_map_open_provider_held_calls() {
+    fn provider_held_recovery_parks_report_active_status_with_open_calls() {
         let expected = serde_json::json!([{
             "call_key": "lineage:4", "tool": "ask", "provider": "tools",
             "reason": "running", "held_at_ms": 42
@@ -3834,10 +3915,9 @@ mod held_status_tests {
                 "open held calls must be reported on live and paused runs"
             );
             assert!(wire.get("deadline_ms").is_none());
-            if index == broca_core::RunIndexState::Paused {
-                assert_eq!(wire["pause_reason"], "tool_held");
-                assert_eq!(wire["reason"], "tool_held");
-            }
+            assert_eq!(wire["state"], "active");
+            assert!(wire.get("pause_reason").is_none());
+            assert!(wire.get("reason").is_none());
             let decoded: cortexkit_role_llm_runner::run::RunStatus =
                 serde_json::from_value(wire).unwrap();
             assert!(decoded.is_held_wait());

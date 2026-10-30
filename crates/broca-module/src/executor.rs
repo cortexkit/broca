@@ -123,6 +123,10 @@ impl RunJob {
 /// fake.
 #[async_trait]
 pub trait RunExecutor: Send + Sync + 'static {
+    /// Current operator opt-in for source-cache maintenance, independent of durable routing.
+    fn source_warm_enabled(&self) -> bool {
+        false
+    }
     /// Quote current catalog media facts for enqueue and read-only fresh-send preflight.
     /// Actual admission checks again against the provider's frozen render config.
     async fn media_profile(

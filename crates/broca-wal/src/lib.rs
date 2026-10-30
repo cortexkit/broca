@@ -10,6 +10,7 @@
 // Test fixtures intentionally use direct I/O to prepare and inspect crash images.
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
+pub mod access_counter;
 pub mod archive;
 mod directory_sync;
 pub mod file_wal;
@@ -36,8 +37,8 @@ pub use framing::{
     HEADER_LEN, KNOWN_FEATURES, MAX_PAYLOAD_LEN, MESSAGE_TIMES_FEATURE, PLAN_MANIFEST_FEATURE,
     PLAN_REFERENCE_SLOTS_FEATURE, PROVIDER_DECLARATIONS_FEATURE, PROVIDER_FALLBACK_BLOCK_FEATURE,
     PROVIDER_HELD_FEATURE, REFUSAL_FALLBACK_FEATURE, RUNNER_TAGS_FEATURE, RUNNER_TAGS_V2_FEATURE,
-    SCOPE_FEATURE, STEER_QUEUE_FEATURE, STEP_TRANSFORMS_FEATURE, TOOL_REPLY_FEATURE,
-    TOOL_TIMES_FEATURE,
+    SCOPE_FEATURE, SESSION_CHANGE_FEATURE, STEER_QUEUE_FEATURE, STEP_TRANSFORMS_FEATURE,
+    TOOL_REPLY_FEATURE, TOOL_TIMES_FEATURE,
 };
 pub use record::{
     compaction_replacement_sha256, AccountDecision, ApprovalDecision, AuthSelection,

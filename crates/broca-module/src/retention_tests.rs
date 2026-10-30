@@ -63,6 +63,110 @@ fn archived_expiry_checks_bound_member_decodes() {
     assert!(opens <= keys.len() as u64 + 1, "{opens} archive opens");
 }
 
+#[cfg(feature = "test-clock")]
+#[test]
+fn archived_expiry_uses_one_lookup_and_inventory_listing() {
+    let rig = Rig::new();
+    let key = archive_forever_sessions(&rig, 1).pop().unwrap();
+    // A consulted miss needs the same reuse as a member hit, including the flush,
+    // absent-range and lineage-existence fallbacks used to resolve tombstones.
+    for key in [&rig.key, &key] {
+        let before = broca_core::FileWalStore::archive_lookup_counts();
+        assert_eq!(rig.service.expired(key, None).unwrap(), None);
+        let after = broca_core::FileWalStore::archive_lookup_counts();
+        assert_eq!((after.0 - before.0, after.1 - before.1), (1, 1));
+    }
+}
+
+/// Opt-in read-only measurement against a supplied archive copy, never a live store.
+#[cfg(all(unix, feature = "test-clock"))]
+#[test]
+#[ignore = "requires BROCA_EXPIRY_ARCHIVE_COPY pointing at a supplied archive copy"]
+fn production_archive_expiry_measurement() {
+    use broca_wal::archive::{expiry_io, read_newest_member, ArchiveReader};
+    let copy = PathBuf::from(std::env::var_os("BROCA_EXPIRY_ARCHIVE_COPY").expect("archive copy"));
+    let count: usize = std::env::var("BROCA_EXPIRY_CHECKS")
+        .unwrap_or_else(|_| "1000".into())
+        .parse()
+        .unwrap();
+    let rig = Rig::new();
+    fs::create_dir_all(rig.root.join("wal")).unwrap();
+    for name in ["wal-archive", "wal-archive-durable"] {
+        std::os::unix::fs::symlink(copy.join(name), rig.root.join(name)).unwrap();
+    }
+    let mut paths = fs::read_dir(copy.join("wal-archive"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "ark"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut addresses = std::collections::BTreeSet::new();
+    for path in &paths {
+        let mut reader = ArchiveReader::open(path, u64::MAX).unwrap();
+        let members = reader.verified_members().unwrap().unwrap_or_else(|| {
+            reader
+                .rescan()
+                .unwrap()
+                .into_iter()
+                .map(|info| broca_wal::archive::IndexedMember {
+                    session_addr: info.session_addr,
+                    offset: info.offset,
+                    payload_len: info.payload_len,
+                })
+                .collect()
+        });
+        addresses.extend(members.into_iter().map(|member| member.session_addr));
+    }
+    let mut keys = Vec::new();
+    let mut skipped = 0;
+    for address in &addresses {
+        let member = read_newest_member(&paths, address, u64::MAX)
+            .unwrap()
+            .unwrap();
+        let read =
+            broca_wal::file_wal::read_verified_member_range(&member.payload, 0, 0, None).unwrap();
+        let key = frames(&read).iter().find_map(|frame| match &frame.record {
+            WalRecord::RunStarted { session, .. }
+                if broca_core::session_addr(session) == *address =>
+            {
+                Some(session.clone())
+            }
+            _ => None,
+        });
+        let Some(key) = key else {
+            skipped += 1;
+            continue;
+        };
+        keys.push(key);
+        if keys.len() == count {
+            break;
+        }
+    }
+    assert_eq!(keys.len(), count);
+    eprintln!(
+        "archive_expiry inventory_addresses={} skipped_without_matching_bind={skipped}",
+        addresses.len()
+    );
+    // Production also prewarms archive membership before these expiry checks.
+    rig.service.wal.prewarm_archive_membership().unwrap();
+    for phase in ["cold-facts", "warm-facts"] {
+        let before = FileWalStore::archive_lookup_counts();
+        let stats = FileWalStore::archive_metadata_count() as u64 + expiry_io::metadata_count();
+        let io = expiry_io::counts();
+        let start = std::time::Instant::now();
+        for key in &keys {
+            rig.service.expired(key, None).unwrap();
+        }
+        let elapsed = start.elapsed();
+        let after = FileWalStore::archive_lookup_counts();
+        eprintln!("archive_expiry phase={phase} checks={} containers={} wall_us={} archive_stats={} inventory_listings={} directory_read_attempts={} archive_lookups={} opens={} decodes={}",
+            keys.len(), paths.len(), elapsed.as_micros(),
+            FileWalStore::archive_metadata_count() as u64 + expiry_io::metadata_count() - stats,
+            after.1 - before.1, 2 * (after.1 - before.1), after.0 - before.0,
+            expiry_io::counts().0 - io.0, expiry_io::counts().2 - io.2);
+    }
+}
+
 #[tokio::test]
 async fn archived_expiry_cache_keeps_tombstones_and_newer_lineages_authoritative() {
     let rig = Rig::new();

@@ -383,6 +383,7 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::OUTPUT_REFS,
         "run_ops",
         cortexkit_role_llm_runner::capabilities::RUN_STATUS,
+        cortexkit_role_llm_runner::capabilities::HELD_CALLS,
         cortexkit_role_llm_runner::capabilities::RUN_USAGE,
         cortexkit_role_llm_runner::capabilities::SESSION_USAGE,
         cortexkit_role_llm_runner::capabilities::HEAD_SENDER,
@@ -512,6 +513,16 @@ pub struct BaselineWire {
     pub tool_names: Vec<String>,
     pub accepted_generation: u64,
     pub applied_generation: u64,
+    /// The pending change and its latest policy, when one is pending. Absent when none is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<cortexkit_role_llm_runner::baseline::PendingChange>,
+    /// The latest applied change, absent while none applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective: Option<cortexkit_role_llm_runner::baseline::EffectiveBaseline>,
+    /// The change-policy rungs this session supports, per surface. Present in every ready
+    /// baseline on a runner declaring `session_change`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rungs: Option<cortexkit_role_llm_runner::baseline::Rungs>,
     /// What the session's frozen config declares about its prompt cache. Absent when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<crate::CacheDeclarationWire>,
@@ -527,6 +538,9 @@ impl BaselineWire {
             tool_names,
             accepted_generation: 0,
             applied_generation: 0,
+            pending: None,
+            effective: None,
+            rungs: None,
             cache: None,
         }
     }
@@ -545,6 +559,9 @@ impl BaselineWire {
             tool_names,
             accepted_generation: 0,
             applied_generation: 0,
+            pending: None,
+            effective: None,
+            rungs: None,
             cache: None,
         }
     }
@@ -995,6 +1012,15 @@ mod pinned_reply_bytes {
             )));
     }
 
+    #[test]
+    fn role_describe_advertises_held_calls_on_every_build() {
+        for compaction_writer in [false, true] {
+            let role = broca_role_describe_with_writers("test", compaction_writer, true, true);
+            assert!(role.declares(cortexkit_role_llm_runner::capabilities::RUN_STATUS));
+            assert!(role.declares(cortexkit_role_llm_runner::capabilities::HELD_CALLS));
+        }
+    }
+
     /// `role.describe` as this build answers it. The build identity is fixed here so a version
     /// bump does not move the pinned bytes.
     #[test]
@@ -1093,7 +1119,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "db369473affe16eb20048c5d70c066097183895adfbdb4ea51046cc1de6695a5",
+            "b3e767c2fc62d637090fd7a286fd19f92544f50743acc9695816ac8f6aa83f83",
         );
     }
 
@@ -1256,7 +1282,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "73bb145b2a54739de328488328b1bcb352fa743f63ff53320ffa6ea47e38db7e";
+        "a1f17d9bcd6f64639fdedea7e99b0684cc5338c5cffd314ea3577fd85bdf0ffe";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

@@ -80,6 +80,7 @@ fn retention_request_dumps_are_suppressed_before_any_write() {
                 RenderJob {
                     cache_session: None,
                     cache_provider: None,
+                    subscription_auth: false,
                     #[cfg(feature = "test-attachments")]
                     media_renderer: None,
                     #[cfg(feature = "test-attachments")]
@@ -173,6 +174,7 @@ async fn retention_https_calls_private_diagnostics_on_every_retry() {
     let rendered = RenderJob {
         cache_session: None,
         cache_provider: None,
+        subscription_auth: false,
         #[cfg(feature = "test-attachments")]
         media_renderer: None,
         #[cfg(feature = "test-attachments")]

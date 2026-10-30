@@ -13,7 +13,17 @@
 //! The writer is the single owner of the [`Wal`]; the lease epoch is stamped on every append
 //! as forensic tenure metadata, not checked as an append gate.
 
-use broca_diagnostics::{spawn_blocking, JobKind};
+use broca_diagnostics::JobKind;
+
+// Writer recovery and the writer-marker replay must retain the opening
+// operation when their synchronous I/O moves to the blocking pool.
+fn spawn_blocking<F, T>(kind: JobKind, work: F) -> tokio::task::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    broca_diagnostics::spawn_blocking(kind, broca_wal::access_counter::inherit(work))
+}
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -404,7 +414,29 @@ struct ArchiveLookup {
 /// expiry facts without retaining WAL record contents.
 /// Non-Unix stores cannot supply a stable identity and must not reuse those caches.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ArchiveIdentity(Vec<ArchiveFileIdentity>);
+pub struct ArchiveIdentity {
+    files: Vec<ArchiveFileIdentity>,
+    directories: Vec<(PathBuf, Option<ArchiveFileIdentity>)>,
+}
+
+/// One expiry decision's archive inventory and lazily resolved member. The inventory
+/// is never retained across decisions; only its metadata identity may be cached.
+pub struct ExpiryRead {
+    live_path: Option<PathBuf>,
+    paths: Option<Vec<PathBuf>>,
+    identity: Option<ArchiveIdentity>,
+    lookup: Option<ArchiveLookup>,
+}
+
+impl ExpiryRead {
+    pub fn live_path(&self) -> Option<&Path> {
+        self.live_path.as_deref()
+    }
+
+    pub fn archive_identity(&self) -> Option<&ArchiveIdentity> {
+        self.identity.as_ref()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ArchiveFileIdentity {
@@ -416,9 +448,11 @@ struct ArchiveFileIdentity {
     changed: (i64, i64),
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-clock"))]
 thread_local! {
     static ARCHIVE_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ARCHIVE_LISTINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ARCHIVE_STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Diagnostic sidecar stored next to the `wal/` directory.
@@ -904,6 +938,15 @@ impl FileWalStore {
         meta: Option<&crate::AdmissionStoreSnapshot>,
     ) -> Result<bool, WalError> {
         let lookup = self.archived_member(session)?;
+        self.lineage_exists_with_lookup(session, meta, &lookup)
+    }
+
+    fn lineage_exists_with_lookup(
+        &self,
+        session: &BindIdentity,
+        meta: Option<&crate::AdmissionStoreSnapshot>,
+        lookup: &ArchiveLookup,
+    ) -> Result<bool, WalError> {
         if lookup.live_present || lookup.member.is_some() {
             return Ok(true);
         }
@@ -1076,7 +1119,7 @@ impl FileWalStore {
         .with_feature_floor(self.feature_floor_path())
         .with_wal_config(self.config)?;
         let retained_policy = if retained {
-            let records = wal.replay()?;
+            let records = broca_wal::access_counter::writer_open(&path, false, || wal.replay())?;
             records
                 .iter()
                 .find_map(|frame| match &frame.record {
@@ -1248,13 +1291,22 @@ impl FileWalStore {
                 ..Default::default()
             });
         }
-        let Some(paths) = self.archive_containers()? else {
+        let paths = self.archive_containers()?;
+        self.archived_member_in_paths(address, paths.as_deref())
+    }
+
+    fn archived_member_in_paths(
+        &self,
+        address: &str,
+        paths: Option<&[PathBuf]>,
+    ) -> Result<ArchiveLookup, WalError> {
+        let Some(paths) = paths else {
             return Ok(ArchiveLookup::default());
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-clock"))]
         ARCHIVE_LOOKUPS.with(|count| count.set(count.get() + 1));
         let (durable_paths, ordinary_paths): (Vec<_>, Vec<_>) =
-            paths.into_iter().partition(|path| {
+            paths.iter().cloned().partition(|path| {
                 path.parent()
                     .and_then(Path::file_name)
                     .is_some_and(|name| name == "wal-archive-durable")
@@ -1284,6 +1336,8 @@ impl FileWalStore {
     /// Discovery is off the live hot path. Do not cache it: another process can publish a
     /// newer sealed pass, and a stale list would silently serve an older transcript.
     fn archive_containers(&self) -> Result<Option<Vec<PathBuf>>, WalError> {
+        #[cfg(any(test, feature = "test-clock"))]
+        ARCHIVE_LISTINGS.with(|count| count.set(count.get() + 1));
         let mut paths = Vec::new();
         let mut exists = false;
         for name in ["wal-archive", "wal-archive-durable"] {
@@ -1308,37 +1362,171 @@ impl FileWalStore {
         Ok(exists.then_some(paths))
     }
 
-    /// Expiry facts are reusable only while the archive inventory's metadata identity
-    /// is unchanged. Publication, removal and metadata-visible changes invalidate it.
-    /// This uses metadata only; it neither opens containers nor reads member payloads.
-    pub fn archive_identity(&self) -> Result<Option<ArchiveIdentity>, WalError> {
+    /// Returns (member lookups, two-directory inventory listings) on the calling thread.
+    #[cfg(any(test, feature = "test-clock"))]
+    #[doc(hidden)]
+    pub fn archive_lookup_counts() -> (usize, usize) {
+        (
+            ARCHIVE_LOOKUPS.with(std::cell::Cell::get),
+            ARCHIVE_LISTINGS.with(std::cell::Cell::get),
+        )
+    }
+
+    /// Archive inventory metadata calls on the calling thread, excluding live routing.
+    #[cfg(any(test, feature = "test-clock"))]
+    #[doc(hidden)]
+    pub fn archive_metadata_count() -> usize {
+        ARCHIVE_STATS.with(std::cell::Cell::get)
+    }
+
+    /// Resolve an expiry decision's inventory once. Member bytes are loaded only on a
+    /// cache miss, so warm expiry facts still avoid archive opens and WAL decoding.
+    pub fn expiry_read(&self, session: &BindIdentity) -> Result<ExpiryRead, WalError> {
+        self.check_move(session, false)?;
+        if let Some(path) = self.resolve_live_path(session)? {
+            return Ok(ExpiryRead {
+                live_path: Some(path),
+                paths: None,
+                identity: None,
+                lookup: Some(ArchiveLookup {
+                    live_present: true,
+                    ..Default::default()
+                }),
+            });
+        }
+        // Observe directories before listing: an archive published during discovery must
+        // invalidate the identity, even when its name was missed by read_dir.
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let Some(mut paths) = self.archive_containers()? else {
+        let directories = self.archive_directory_identity()?;
+        let paths = self.archive_containers()?;
+        #[cfg(unix)]
+        let identity = match paths.as_deref() {
+            Some(paths) => Self::archive_files_identity(paths)?
+                .map(|files| ArchiveIdentity { files, directories }),
+            None => None,
+        };
+        #[cfg(not(unix))]
+        let identity = None;
+        let read = ExpiryRead {
+            live_path: None,
+            paths,
+            identity,
+            lookup: None,
+        };
+        #[cfg(unix)]
+        let read = {
+            let mut read = read;
+            if let Some(identity) = &read.identity {
+                if self.archive_directory_identity()? != identity.directories {
+                    read.identity = None;
+                }
+            }
+            read
+        };
+        Ok(read)
+    }
+
+    #[cfg(unix)]
+    fn archive_file_identity(path: &Path) -> Result<Option<ArchiveFileIdentity>, WalError> {
+        use std::os::unix::fs::MetadataExt;
+        #[cfg(any(test, feature = "test-clock"))]
+        ARCHIVE_STATS.with(|count| count.set(count.get() + 1));
+        let meta = match std::fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(WalError::Io(e)),
+        };
+        Ok(Some(ArchiveFileIdentity {
+            path: path.to_owned(),
+            device: meta.dev(),
+            inode: meta.ino(),
+            bytes: meta.len(),
+            modified: (meta.mtime(), meta.mtime_nsec()),
+            changed: (meta.ctime(), meta.ctime_nsec()),
+        }))
+    }
+
+    #[cfg(unix)]
+    fn archive_directory_identity(
+        &self,
+    ) -> Result<Vec<(PathBuf, Option<ArchiveFileIdentity>)>, WalError> {
+        ["wal-archive", "wal-archive-durable"]
+            .into_iter()
+            .map(|name| {
+                let path = self
+                    .root
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""))
+                    .join(name);
+                let identity = Self::archive_file_identity(&path)?;
+                Ok((path, identity))
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn archive_files_identity(
+        paths: &[PathBuf],
+    ) -> Result<Option<Vec<ArchiveFileIdentity>>, WalError> {
+        let mut paths = paths.to_vec();
+        paths.sort();
+        let mut files = Vec::with_capacity(paths.len());
+        for path in paths {
+            let Some(identity) = Self::archive_file_identity(&path)? else {
                 return Ok(None);
             };
-            paths.sort();
-            let mut files = Vec::with_capacity(paths.len());
-            for path in paths {
-                let meta = match std::fs::metadata(&path) {
-                    Ok(meta) => meta,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-                    Err(e) => return Err(WalError::Io(e)),
-                };
-                files.push(ArchiveFileIdentity {
-                    path,
-                    device: meta.dev(),
-                    inode: meta.ino(),
-                    bytes: meta.len(),
-                    modified: (meta.mtime(), meta.mtime_nsec()),
-                    changed: (meta.ctime(), meta.ctime_nsec()),
-                });
-            }
-            Ok(Some(ArchiveIdentity(files)))
+            files.push(identity);
+        }
+        Ok(Some(files))
+    }
+
+    /// Revalidate the same files and directory metadata, without another listing.
+    /// Directory changes catch newly published archives; file changes catch in-place
+    /// rewrites that leave the directory unchanged. Missing directories are checked too.
+    pub fn expiry_identity_is_current(&self, read: &ExpiryRead) -> Result<bool, WalError> {
+        #[cfg(unix)]
+        {
+            let (Some(identity), Some(paths)) = (&read.identity, &read.paths) else {
+                return Ok(false);
+            };
+            Ok(self.archive_directory_identity()? == identity.directories
+                && Self::archive_files_identity(paths)?.as_ref() == Some(&identity.files))
         }
         #[cfg(not(unix))]
-        Ok(None)
+        {
+            let _ = read;
+            Ok(false)
+        }
+    }
+
+    fn expiry_lookup<'a>(
+        &self,
+        session: &BindIdentity,
+        read: &'a mut ExpiryRead,
+    ) -> Result<&'a ArchiveLookup, WalError> {
+        self.check_move(session, false)?;
+        if self.resolve_live_path(session)?.is_some() {
+            // Restoration after inventory discovery must beat older archive bytes.
+            read.lookup = Some(ArchiveLookup {
+                live_present: true,
+                ..Default::default()
+            });
+        } else if read
+            .lookup
+            .as_ref()
+            .is_some_and(|lookup| lookup.live_present)
+        {
+            // A previously observed live WAL vanished: deletion may have removed it,
+            // or archiving may have published a newer container after our inventory.
+            // The old live observation must not hide a tombstone or the new archive.
+            read.lookup = Some(self.archived_member_at_address(&session_addr(session))?);
+            read.identity = None;
+        }
+        if read.lookup.is_none() {
+            read.lookup =
+                Some(self.archived_member_in_paths(&session_addr(session), read.paths.as_deref())?);
+        }
+        Ok(read.lookup.as_ref().unwrap())
     }
 
     /// A sealed archive is already durable, so expiry needs no separate flush/read pair.
@@ -1347,14 +1535,49 @@ impl FileWalStore {
     pub fn read_archived_for_expiry(
         &self,
         session: &BindIdentity,
+        read: &mut ExpiryRead,
     ) -> Result<Option<(WalRangeRead, u64)>, WalError> {
-        self.check_move(session, false)?;
-        self.archived_member(session)?
+        self.expiry_lookup(session, read)?
             .member
-            .map(|member| {
-                member_range(&member, 0, None).map(|read| (read, member.info.payload_len))
-            })
+            .as_ref()
+            .map(|member| member_range(member, 0, None).map(|read| (read, member.info.payload_len)))
             .transpose()
+    }
+
+    pub fn flush_for_expiry(
+        &self,
+        session: &BindIdentity,
+        read: &mut ExpiryRead,
+    ) -> Result<Option<u64>, WalError> {
+        let lookup = self.expiry_lookup(session, read)?;
+        if !lookup.live_present {
+            return Ok(lookup.member.as_ref().map(member_identity));
+        }
+        self.flush_for_authorization_with_lookup(
+            session,
+            |path| broca_wal::file_identity(path),
+            lookup,
+        )
+    }
+
+    pub fn read_records_for_expiry(
+        &self,
+        session: &BindIdentity,
+        head: Option<u64>,
+        read: &mut ExpiryRead,
+    ) -> Result<WalRangeRead, WalError> {
+        let lookup = self.expiry_lookup(session, read)?;
+        self.read_address_range_with_lookup(&session_addr(session), 0, head, None, lookup)
+    }
+
+    pub fn lineage_exists_for_expiry(
+        &self,
+        session: &BindIdentity,
+        meta: Option<&crate::AdmissionStoreSnapshot>,
+        read: &mut ExpiryRead,
+    ) -> Result<bool, WalError> {
+        let lookup = self.expiry_lookup(session, read)?;
+        self.lineage_exists_with_lookup(session, meta, lookup)
     }
 
     /// Build the archive membership cache now, so the first new session after a restart
@@ -1493,10 +1716,21 @@ impl FileWalStore {
         read_identity: impl FnOnce(&Path) -> Result<Option<u64>, WalError>,
     ) -> Result<Option<u64>, WalError> {
         self.check_authorization_move(session)?;
-        if let Some(member) = self.archived_member(session)?.member {
+        let lookup = self.archived_member(session)?;
+        self.flush_for_authorization_with_lookup(session, read_identity, &lookup)
+    }
+
+    fn flush_for_authorization_with_lookup(
+        &self,
+        session: &BindIdentity,
+        read_identity: impl FnOnce(&Path) -> Result<Option<u64>, WalError>,
+        lookup: &ArchiveLookup,
+    ) -> Result<Option<u64>, WalError> {
+        self.check_authorization_move(session)?;
+        if let Some(member) = &lookup.member {
             // A sealed archive was fsynced before publication and its digest just verified.
             // Reads need no write handle or extraction to prove these immutable bytes.
-            return Ok(Some(member_identity(&member)));
+            return Ok(Some(member_identity(member)));
         }
         // This is deliberately not FileWal::open: recovery-open may truncate a torn tail, while
         // a read-side proof is allowed to fsync only. Write access is required by Windows
@@ -1505,6 +1739,8 @@ impl FileWalStore {
         let file = match std::fs::OpenOptions::new().write(true).open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // A live WAL observed above may have moved into an archive before open. Re-discover
+                // archives here; the expiry inventory predates that publication.
                 return self.retry_archived_member(
                     session,
                     |_consulted| None,
@@ -1620,11 +1856,22 @@ impl FileWalStore {
         through_seq: Option<u64>,
         anchor: Option<&WalByteAnchor>,
     ) -> Result<WalRangeRead, WalError> {
+        let lookup = self.archived_member_at_address(address)?;
+        self.read_address_range_with_lookup(address, after_seq, through_seq, anchor, &lookup)
+    }
+
+    fn read_address_range_with_lookup(
+        &self,
+        address: &str,
+        after_seq: u64,
+        through_seq: Option<u64>,
+        anchor: Option<&WalByteAnchor>,
+        lookup: &ArchiveLookup,
+    ) -> Result<WalRangeRead, WalError> {
         #[cfg(any(test, feature = "test-clock"))]
         self.range_reads.fetch_add(1, Ordering::Relaxed);
-        let lookup = self.archived_member_at_address(address)?;
-        if let Some(member) = lookup.member {
-            return member_range(&member, after_seq, through_seq);
+        if let Some(member) = &lookup.member {
+            return member_range(member, after_seq, through_seq);
         }
         if lookup.consulted {
             return Ok(WalRangeRead::absent_after_archive_lookup());
@@ -1637,6 +1884,8 @@ impl FileWalStore {
             anchor,
         )?;
         if matches!(range.records(), broca_wal::WalRangeRecords::Absent) {
+            // A live WAL may move into an archive before open, or a tree with no archive
+            // may gain one. Retry discovery only after a failed live read, not per step.
             return self.retry_archived_address(
                 address,
                 |consulted| {
@@ -3737,18 +3986,21 @@ impl WalHandle {
         // the same first-send placement, retention and runner-tag state as an empty log.
         let unstarted = last_seq == 0
             || (v4
-                && wal
-                    .replay()
-                    .map_err(|error| WalWriteError::Failed(error.to_string()))?
-                    .iter()
-                    .all(|frame| {
-                        matches!(
-                            frame.record,
-                            WalRecord::WriterOpened { .. }
-                                | WalRecord::WriterClosed { .. }
-                                | WalRecord::VisibilityLate { .. }
-                        )
-                    }));
+                && broca_wal::access_counter::writer_open(
+                    wal.log_path().unwrap_or(std::path::Path::new("")),
+                    false,
+                    || wal.replay(),
+                )
+                .map_err(|error| WalWriteError::Failed(error.to_string()))?
+                .iter()
+                .all(|frame| {
+                    matches!(
+                        frame.record,
+                        WalRecord::WriterOpened { .. }
+                            | WalRecord::WriterClosed { .. }
+                            | WalRecord::VisibilityLate { .. }
+                    )
+                }));
         let last_seq = last_seq + u64::from(v4);
         // Seq is 1-based; the first record of an empty WAL is seq 1, so the next seq
         // after a durable head of `last_seq` is `last_seq + 1`.
@@ -3895,7 +4147,7 @@ impl WalHandle {
         // resident writer must not consume a slot needed by finite blocking jobs.
         let join = std::thread::Builder::new()
             .name("broca-wal-writer".into())
-            .spawn(body)
+            .spawn(broca_wal::access_counter::inherit(body))
             .map_err(|error| {
                 WalWriteError::Failed(format!("WAL writer thread spawn failed: {error}"))
             })?;

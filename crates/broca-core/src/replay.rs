@@ -357,6 +357,130 @@ impl ProviderHeldCall {
     }
 }
 
+/// One ordered held-call fold for status reads and durable subscribe status events.
+/// Keys include the batch because a model may reuse a call id in a later step.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct HeldCallsProjection {
+    tool_names: HashMap<ToolCallId, String>,
+    calls: Vec<(
+        BatchId,
+        ToolCallId,
+        cortexkit_role_llm_runner::run::HeldCall,
+    )>,
+    state: Option<String>,
+}
+
+impl HeldCallsProjection {
+    /// Only list changes return a snapshot, including the change to an empty list.
+    pub(crate) fn observe(
+        &mut self,
+        record: &WalRecord,
+    ) -> Option<cortexkit_role_llm_runner::run::RunStatus> {
+        match record {
+            WalRecord::RunStarted { .. } => *self = Self::default(),
+            WalRecord::StepStarted { .. } => self.state = None,
+            WalRecord::RunPaused { reason, .. }
+                if *reason != PauseReason::ToolHeld && !self.calls.is_empty() =>
+            {
+                self.state = Some("paused".into());
+            }
+            WalRecord::RunFinished { reason, .. } => {
+                self.state = Some(reason.as_str().into());
+                let changed = !self.calls.is_empty();
+                self.calls.clear();
+                let status = changed.then(|| self.status());
+                *self = Self::default();
+                return status;
+            }
+            WalRecord::ToolBatchFinished { .. } => {
+                self.tool_names.clear();
+            }
+            WalRecord::ModelStepFinished {
+                assistant_message, ..
+            } => {
+                self.tool_names.clear();
+                for call in assistant_message.tool_calls() {
+                    self.tool_names
+                        .insert(call.tool_call_id.clone(), call.tool_name.clone());
+                }
+            }
+            WalRecord::ToolDispatchIntent {
+                tool_call_id,
+                tool_name: Some(tool),
+                ..
+            } => {
+                self.tool_names
+                    .entry(tool_call_id.clone())
+                    .or_insert_with(|| tool.clone());
+            }
+            WalRecord::ToolCallProviderHeld {
+                batch_id,
+                tool_call_id,
+                call_key,
+                module,
+                reason,
+                held_at_ms,
+                ..
+            } => {
+                let held = cortexkit_role_llm_runner::run::HeldCall::new(
+                    call_key.clone(),
+                    self.tool_names
+                        .get(tool_call_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                    module.clone(),
+                    reason.clone(),
+                    *held_at_ms,
+                );
+                if let Some((_, _, previous)) = self
+                    .calls
+                    .iter_mut()
+                    .find(|(batch, call, _)| batch == batch_id && call == tool_call_id)
+                {
+                    if previous == &held {
+                        return None;
+                    }
+                    *previous = held;
+                } else {
+                    self.calls
+                        .push((batch_id.clone(), tool_call_id.clone(), held));
+                }
+                return Some(self.status());
+            }
+            WalRecord::ToolResult {
+                batch_id, result, ..
+            } => return self.remove(batch_id, &result.tool_call_id),
+            WalRecord::ToolNoDispatch {
+                batch_id,
+                tool_call_id,
+                ..
+            } => return self.remove(batch_id, tool_call_id),
+            _ => {}
+        }
+        None
+    }
+
+    fn remove(
+        &mut self,
+        batch_id: &BatchId,
+        tool_call_id: &ToolCallId,
+    ) -> Option<cortexkit_role_llm_runner::run::RunStatus> {
+        let previous = self.calls.len();
+        self.calls
+            .retain(|(batch, call, _)| batch != batch_id || call != tool_call_id);
+        let status = (previous != self.calls.len()).then(|| self.status());
+        if self.calls.is_empty() {
+            self.state = None;
+        }
+        status
+    }
+
+    pub(crate) fn status(&self) -> cortexkit_role_llm_runner::run::RunStatus {
+        cortexkit_role_llm_runner::run::RunStatus::new(self.state.as_deref().unwrap_or("active"))
+            .with_held_calls(self.calls.iter().map(|(_, _, held)| held.clone()).collect())
+    }
+}
+
 /// A closed Prepared call whose unanswered question still needs a withdrawal.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OwedWithdrawal {
@@ -2002,6 +2126,15 @@ pub struct SeedFallback {
     pub reason: &'static str,
 }
 
+impl SeedFallback {
+    /// Record the decision when it is made, rather than when a propagated or
+    /// cloned error is observed by another layer. Call only on the error path.
+    pub fn new(reason: &'static str) -> Self {
+        broca_wal::access_counter::seed_fallback(reason);
+        Self { reason }
+    }
+}
+
 /// Replay a WAL tail seeded only at a validated, committed projection boundary.
 ///
 /// A bare sequence watermark cannot prove the log still holds the boundary it names:
@@ -2044,113 +2177,87 @@ pub fn replay_seeded_at_validated_boundary(
     held_steers: Vec<Message>,
 ) -> Result<ReplayState, SeedFallback> {
     if !boundary.qualified {
-        return Err(SeedFallback {
-            reason: "unqualified boundary",
-        });
+        return Err(SeedFallback::new("unqualified boundary"));
     }
     if let Some((first, rest)) = tail.split_first() {
         // The tail must continue the boundary with no gap: the first frame follows its
         // sequence and starts where it ends, and no later frame skips one. Anything
         // between them would silently vanish from the replay.
         if first.framed.seq != boundary.seq + 1 {
-            return Err(SeedFallback {
-                reason: "tail not contiguous with boundary",
-            });
+            return Err(SeedFallback::new("tail not contiguous with boundary"));
         }
         validate_boundary_lineage_gap(read_at, boundary, first.off)?;
         let mut seq = first.framed.seq;
         for positioned in rest {
             seq += 1;
             if positioned.framed.seq != seq {
-                return Err(SeedFallback {
-                    reason: "tail has a sequence gap",
-                });
+                return Err(SeedFallback::new("tail has a sequence gap"));
             }
         }
     } else if !durable_end_reached(read_at, boundary)? {
         // An empty tail cannot omit bytes after the boundary's optional trailing metadata.
-        return Err(SeedFallback {
-            reason: "empty tail before log end",
-        });
+        return Err(SeedFallback::new("empty tail before log end"));
     }
     let frame_len = boundary
         .frame_end
         .checked_sub(boundary.frame_off)
         .filter(|len| *len > 0)
-        .ok_or(SeedFallback {
-            reason: "boundary frame outside log",
-        })?;
+        .ok_or_else(|| SeedFallback::new("boundary frame outside log"))?;
     // A short read is a shorter log, not an error: fewer bytes than the committed frame
     // means the boundary was never durably written here (torn), and no bytes at all
     // means the log ends before it (missing or moved). Both fall back.
-    let frame_bytes = read_at(boundary.frame_off, frame_len).map_err(|_| SeedFallback {
-        reason: "log unreadable",
-    })?;
+    let frame_bytes = broca_wal::access_counter::read_validation_at(
+        broca_wal::access_counter::ValidationRead::BoundaryFrame,
+        read_at,
+        boundary.frame_off,
+        frame_len,
+    )
+    .map_err(|_| SeedFallback::new("log unreadable"))?;
     let frame_bytes = if frame_bytes.is_empty() {
-        return Err(SeedFallback {
-            reason: "boundary frame outside log",
-        });
+        return Err(SeedFallback::new("boundary frame outside log"));
     } else if (frame_bytes.len() as u64) < frame_len {
-        return Err(SeedFallback {
-            reason: "torn boundary frame",
-        });
+        return Err(SeedFallback::new("torn boundary frame"));
     } else {
         &frame_bytes[..frame_len as usize]
     };
-    let (framed, consumed) = match broca_wal::framing::decode_next(frame_bytes) {
+    let (framed, consumed) = match broca_wal::access_counter::decode_next(frame_bytes) {
         broca_wal::framing::DecodeStep::Record { framed, consumed } => (*framed, consumed),
         broca_wal::framing::DecodeStep::Lineage { .. } => {
-            return Err(SeedFallback {
-                reason: "boundary frame is not a record",
-            });
+            return Err(SeedFallback::new("boundary frame is not a record"));
         }
         broca_wal::framing::DecodeStep::TornTail => {
-            return Err(SeedFallback {
-                reason: "torn boundary frame",
-            });
+            return Err(SeedFallback::new("torn boundary frame"));
         }
         broca_wal::framing::DecodeStep::Corrupt(_) => {
-            return Err(SeedFallback {
-                reason: "corrupt boundary frame",
-            });
+            return Err(SeedFallback::new("corrupt boundary frame"));
         }
         broca_wal::framing::DecodeStep::NewerWriter { .. } => {
-            return Err(SeedFallback {
-                reason: "newer boundary frame",
-            });
+            return Err(SeedFallback::new("newer boundary frame"));
         }
     };
     if consumed != frame_bytes.len() {
-        return Err(SeedFallback {
-            reason: "boundary frame length changed",
-        });
+        return Err(SeedFallback::new("boundary frame length changed"));
     }
     if framed.seq != boundary.seq {
-        return Err(SeedFallback {
-            reason: "boundary sequence mismatch",
-        });
+        return Err(SeedFallback::new("boundary sequence mismatch"));
     }
     if sha2::Sha256::digest(frame_bytes).as_slice() != boundary.frame_identity {
-        return Err(SeedFallback {
-            reason: "boundary frame identity mismatch",
-        });
+        return Err(SeedFallback::new("boundary frame identity mismatch"));
     }
     // The log's header frame carries its lineage; only that fixed-size range is read.
     // A record-only byte string assembled in a test carries none, and an unreadable
     // header falls back the same as any other short log.
-    let header =
-        read_at(0, broca_wal::framing::LINEAGE_FRAME_LEN as u64).map_err(|_| SeedFallback {
-            reason: "log unreadable",
-        })?;
+    let header = broca_wal::access_counter::read_at(
+        read_at,
+        0,
+        broca_wal::framing::LINEAGE_FRAME_LEN as u64,
+    )
+    .map_err(|_| SeedFallback::new("log unreadable"))?;
     if log_lineage_id(&header) != boundary.lineage_id {
-        return Err(SeedFallback {
-            reason: "boundary lineage mismatch",
-        });
+        return Err(SeedFallback::new("boundary lineage mismatch"));
     }
     if !boundary_frame_is_seedable(&framed.record, tail) {
-        return Err(SeedFallback {
-            reason: "boundary frame cannot seed a tail",
-        });
+        return Err(SeedFallback::new("boundary frame cannot seed a tail"));
     }
     replay_seeded_with_held_steers(
         tail.iter().map(|positioned| &positioned.framed.record),
@@ -2163,9 +2270,7 @@ pub fn replay_seeded_at_validated_boundary(
         tag_seed,
         held_steers,
     )
-    .map_err(|_| SeedFallback {
-        reason: "tail replay refused the seeded records",
-    })
+    .map_err(|_| SeedFallback::new("tail replay refused the seeded records"))
 }
 
 /// `FileWal::append_frame` in broca-wal/src/file_wal.rs writes one trailing lineage
@@ -2180,33 +2285,29 @@ fn validate_boundary_lineage_gap(
 ) -> Result<(), SeedFallback> {
     let gap = first_off
         .checked_sub(boundary.frame_end)
-        .ok_or(SeedFallback {
-            reason: "tail byte offset mismatch",
-        })?;
+        .ok_or_else(|| SeedFallback::new("tail byte offset mismatch"))?;
     if gap == 0 {
         return Ok(());
     }
     let frame_len = broca_wal::framing::LINEAGE_FRAME_LEN as u64;
     if gap > frame_len * MAX_BOUNDARY_LINEAGE_FRAMES {
-        return Err(SeedFallback {
-            reason: "too many frames in boundary lineage gap",
-        });
+        return Err(SeedFallback::new("too many frames in boundary lineage gap"));
     }
     // A nonzero gap must be exactly one lineage frame, never a shifted record offset.
     if gap != frame_len {
-        return Err(SeedFallback {
-            reason: "tail byte offset mismatch",
-        });
+        return Err(SeedFallback::new("tail byte offset mismatch"));
     }
-    let bytes = read_at(boundary.frame_end, gap).map_err(|_| SeedFallback {
-        reason: "lineage gap unreadable",
-    })?;
+    let bytes = broca_wal::access_counter::read_validation_at(
+        broca_wal::access_counter::ValidationRead::LineageGap,
+        read_at,
+        boundary.frame_end,
+        gap,
+    )
+    .map_err(|_| SeedFallback::new("lineage gap unreadable"))?;
     if bytes.len() as u64 != gap {
-        return Err(SeedFallback {
-            reason: "short lineage gap read",
-        });
+        return Err(SeedFallback::new("short lineage gap read"));
     }
-    match broca_wal::framing::decode_next(&bytes) {
+    match broca_wal::access_counter::decode_next(&bytes) {
         broca_wal::framing::DecodeStep::Lineage {
             lineage_id,
             consumed,
@@ -2215,21 +2316,21 @@ fn validate_boundary_lineage_gap(
         {
             Ok(())
         }
-        broca_wal::framing::DecodeStep::Lineage { .. } => Err(SeedFallback {
-            reason: "boundary lineage gap mismatch",
-        }),
-        broca_wal::framing::DecodeStep::Record { .. } => Err(SeedFallback {
-            reason: "record in boundary lineage gap",
-        }),
-        broca_wal::framing::DecodeStep::TornTail => Err(SeedFallback {
-            reason: "torn boundary lineage gap",
-        }),
-        broca_wal::framing::DecodeStep::Corrupt(_) => Err(SeedFallback {
-            reason: "corrupt boundary lineage gap",
-        }),
-        broca_wal::framing::DecodeStep::NewerWriter { .. } => Err(SeedFallback {
-            reason: "newer frame in boundary lineage gap",
-        }),
+        broca_wal::framing::DecodeStep::Lineage { .. } => {
+            Err(SeedFallback::new("boundary lineage gap mismatch"))
+        }
+        broca_wal::framing::DecodeStep::Record { .. } => {
+            Err(SeedFallback::new("record in boundary lineage gap"))
+        }
+        broca_wal::framing::DecodeStep::TornTail => {
+            Err(SeedFallback::new("torn boundary lineage gap"))
+        }
+        broca_wal::framing::DecodeStep::Corrupt(_) => {
+            Err(SeedFallback::new("corrupt boundary lineage gap"))
+        }
+        broca_wal::framing::DecodeStep::NewerWriter { .. } => {
+            Err(SeedFallback::new("newer frame in boundary lineage gap"))
+        }
     }
 }
 
@@ -2241,11 +2342,14 @@ fn durable_end_reached(
     read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
     boundary: &SeedBoundary,
 ) -> Result<bool, SeedFallback> {
-    let eof_at = |off| match read_at(off, 1) {
+    let eof_at = |off| match broca_wal::access_counter::read_validation_at(
+        broca_wal::access_counter::ValidationRead::DurableEnd,
+        read_at,
+        off,
+        1,
+    ) {
         Ok(bytes) => Ok(bytes.is_empty()),
-        Err(_) => Err(SeedFallback {
-            reason: "log unreadable",
-        }),
+        Err(_) => Err(SeedFallback::new("log unreadable")),
     };
     if eof_at(boundary.frame_end)? {
         return Ok(true);
@@ -2258,9 +2362,7 @@ fn durable_end_reached(
     let metadata_end = boundary
         .frame_end
         .checked_add(broca_wal::framing::LINEAGE_FRAME_LEN as u64)
-        .ok_or(SeedFallback {
-            reason: "boundary frame outside log",
-        })?;
+        .ok_or_else(|| SeedFallback::new("boundary frame outside log"))?;
     validate_boundary_lineage_gap(read_at, boundary, metadata_end)?;
     eof_at(metadata_end)
 }
@@ -2271,7 +2373,7 @@ fn durable_end_reached(
 /// assembled in a test carries none. Either way the value is compared verbatim against
 /// the boundary's attested lineage, so a restored or replaced log cannot pass.
 fn log_lineage_id(header: &[u8]) -> Option<String> {
-    match broca_wal::framing::decode_next(header) {
+    match broca_wal::access_counter::decode_next(header) {
         broca_wal::framing::DecodeStep::Lineage { lineage_id, .. } => Some(lineage_id.to_string()),
         _ => None,
     }
@@ -3214,6 +3316,12 @@ fn replay_seeded_with_compaction<'a>(
             | WalRecord::InputTokenBudgetExhausted { .. }
             | WalRecord::StructuredOutputResult { .. }
             | WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
+            // A mid-session change is folded by the session-change projection, not by replay:
+            // it contributes no message to the prompt, and earlier episodes keep resuming from
+            // their own manifests, byte-identical.
+            WalRecord::SessionRefreshAccepted { .. }
+            | WalRecord::SessionRefreshPolicyChanged { .. }
+            | WalRecord::SessionPrefixFlushed { .. } => {}
         }
         // Placement is the authority for transcript positions, including a seeded prefix and
         // steers held until a boundary. Assign its ordinals as each record places its messages.
@@ -3632,12 +3740,7 @@ pub fn reconcile_run_state<'a>(
     let mut title: Option<String> = None;
     let mut budget_detail = None;
     let mut context_ceiling = None;
-    let mut tool_names = HashMap::new();
-    let mut held_calls: Vec<(
-        BatchId,
-        ToolCallId,
-        cortexkit_role_llm_runner::run::HeldCall,
-    )> = Vec::new();
+    let mut held_calls = HeldCallsProjection::default();
     // The structured-output settings the target run froze, and the result it recorded.
     let mut frozen_structured_output = None;
     let mut structured_output_result = None;
@@ -3646,6 +3749,13 @@ pub fn reconcile_run_state<'a>(
     let queued_submission = format!("sub-{run_id}");
     for rec in records {
         run_usage.observe(rec);
+        let observes_held_calls = match rec {
+            WalRecord::RunStarted { run_id: rid, .. } => rid.0 == run_id,
+            _ => active_run.as_deref() == Some(run_id),
+        };
+        if observes_held_calls {
+            let _ = held_calls.observe(rec);
+        }
         match rec {
             WalRecord::RunStarted {
                 run_id: rid,
@@ -3655,7 +3765,6 @@ pub fn reconcile_run_state<'a>(
                 ..
             } => {
                 if rid.0 == run_id {
-                    held_calls.clear();
                     auth_selection = config.auth_selection.clone();
                     title = started_title.clone();
                     frozen_structured_output =
@@ -3664,7 +3773,6 @@ pub fn reconcile_run_state<'a>(
                         );
                 }
                 active_run = Some(rid.0.clone());
-                tool_names.clear();
                 budget_detail = None;
                 context_ceiling = None;
                 pending_steer_ids.clear();
@@ -3737,14 +3845,10 @@ pub fn reconcile_run_state<'a>(
                 result,
             } if rid.0 == run_id => structured_output_result = Some(result.clone()),
             WalRecord::ModelStepFinished {
-                assistant_message,
                 finish_reason,
                 retries_used,
                 ..
             } => {
-                for call in assistant_message.tool_calls() {
-                    tool_names.insert(call.tool_call_id.clone(), call.tool_name.clone());
-                }
                 active_zero_step_seed = false;
                 has_completed_step = true;
                 total_usage.accumulate(&crate::refusal_fallback::total_step_usage(rec).unwrap());
@@ -3761,60 +3865,15 @@ pub fn reconcile_run_state<'a>(
                 total_usage.accumulate(&crate::refusal_fallback::total_step_usage(rec).unwrap());
             }
             WalRecord::ToolBatchStarted { .. } => indeterminate_tool_calls.reset_batch(),
-            WalRecord::ToolDispatchIntent {
-                tool_call_id,
-                tool_name,
-                ..
-            } => {
-                if let Some(tool) = tool_name {
-                    tool_names
-                        .entry(tool_call_id.clone())
-                        .or_insert_with(|| tool.clone());
-                }
+            WalRecord::ToolDispatchIntent { tool_call_id, .. } => {
                 indeterminate_tool_calls.record_dispatch_intent(tool_call_id);
             }
-            WalRecord::ToolCallProviderHeld {
-                batch_id,
-                tool_call_id,
-                call_key,
-                module,
-                reason,
-                held_at_ms,
-                ..
-            } if active_run.as_deref() == Some(run_id) => {
-                held_calls.push((
-                    batch_id.clone(),
-                    tool_call_id.clone(),
-                    cortexkit_role_llm_runner::run::HeldCall::new(
-                        call_key.clone(),
-                        tool_names.get(tool_call_id).cloned().unwrap_or_default(),
-                        module.clone(),
-                        reason.clone(),
-                        *held_at_ms,
-                    ),
-                ));
-            }
-            WalRecord::ToolNoDispatch {
-                batch_id,
-                tool_call_id,
-                ..
-            } => {
-                if active_run.as_deref() == Some(run_id) {
-                    held_calls.retain(|(batch, call, _)| batch != batch_id || call != tool_call_id);
-                }
+            WalRecord::ToolNoDispatch { tool_call_id, .. } => {
                 indeterminate_tool_calls.record_dispatch_terminal(tool_call_id, false);
             }
             WalRecord::ToolResult {
-                batch_id,
-                result,
-                outcome,
-                ..
+                result, outcome, ..
             } => {
-                if active_run.as_deref() == Some(run_id) {
-                    held_calls.retain(|(batch, call, _)| {
-                        batch != batch_id || call != &result.tool_call_id
-                    });
-                }
                 indeterminate_tool_calls
                     .record_dispatch_terminal(&result.tool_call_id, outcome.is_indeterminate());
             }
@@ -3972,7 +4031,7 @@ pub fn reconcile_run_state<'a>(
     }
     found.map(|state| ReconciledRunState {
         held_calls: if matches!(state.state, RunIndexState::Active | RunIndexState::Paused) {
-            held_calls.into_iter().map(|(_, _, held)| held).collect()
+            held_calls.status().held_calls
         } else {
             Vec::new()
         },
@@ -6892,7 +6951,6 @@ mod offset_tail_tests {
         boundary: SeedBoundary,
         tail: Vec<PositionedFrame>,
         cut: usize,
-        reads: std::cell::RefCell<Vec<(u64, u64)>>,
     }
 
     impl RealBoundaryLog {
@@ -6949,7 +7007,6 @@ mod offset_tail_tests {
                 boundary,
                 tail,
                 cut,
-                reads: Default::default(),
             }
         }
 
@@ -6959,7 +7016,6 @@ mod offset_tail_tests {
         ) -> Result<super::ReplayState, super::SeedFallback> {
             use std::io::{Read, Seek, SeekFrom};
             let read_at = |off, len| {
-                self.reads.borrow_mut().push((off, len));
                 let mut file = std::fs::File::open(&self.path)?;
                 file.seek(SeekFrom::Start(off))?;
                 let mut bytes = Vec::new();
@@ -7081,21 +7137,62 @@ mod offset_tail_tests {
             log.bytes.len() as u64 - log.boundary.frame_end,
             broca_wal::framing::LINEAGE_FRAME_LEN as u64
         );
-        let seeded = log
-            .validate(&[])
+        let counter = broca_wal::access_counter::WalAccessCounter::default();
+        let seeded = counter
+            .operation("empty tail")
+            .run(|| log.validate(&[]))
             .expect("the last boundary's trailing metadata must not force full replay");
         assert_eq!(seeded.extent, replay(&log.records).unwrap().extent);
-        let reads = log.reads.borrow();
-        assert!(reads.iter().any(|&(off, len)| off == log.boundary.frame_end
-            && len == broca_wal::framing::LINEAGE_FRAME_LEN as u64));
+        let measured = counter.snapshot();
+        let reads = &measured[0].reads;
         assert!(reads
             .iter()
-            .all(|&(off, len)| off != 0 || len <= broca_wal::framing::LINEAGE_FRAME_LEN as u64));
+            .any(|read| read.offset == log.boundary.frame_end
+                && read.length == broca_wal::framing::LINEAGE_FRAME_LEN as u64));
+        assert!(reads
+            .iter()
+            .all(|read| read.class != broca_wal::access_counter::ReadClass::Origin));
         let frame_len = log.boundary.frame_end - log.boundary.frame_off;
         assert!(
-            reads.iter().map(|(_, len)| len).sum::<u64>()
+            reads.iter().map(|read| read.length).sum::<u64>()
                 <= frame_len + 2 * broca_wal::framing::LINEAGE_FRAME_LEN as u64 + 2
         );
+        use broca_wal::access_counter::{ReadClass, ValidationRead};
+        assert_eq!(
+            reads
+                .iter()
+                .map(|read| (read.class, read.offset, read.length))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    ReadClass::Validation(ValidationRead::DurableEnd),
+                    log.boundary.frame_end,
+                    1
+                ),
+                (
+                    ReadClass::Validation(ValidationRead::LineageGap),
+                    log.boundary.frame_end,
+                    broca_wal::framing::LINEAGE_FRAME_LEN as u64
+                ),
+                (
+                    ReadClass::Validation(ValidationRead::DurableEnd),
+                    log.bytes.len() as u64,
+                    0
+                ),
+                (
+                    ReadClass::Validation(ValidationRead::BoundaryFrame),
+                    log.boundary.frame_off,
+                    frame_len
+                ),
+                (
+                    ReadClass::LineageHeader,
+                    0,
+                    broca_wal::framing::LINEAGE_FRAME_LEN as u64
+                ),
+            ]
+        );
+        assert_eq!(measured[0].frames_decoded, 3);
+        assert!(measured[0].seed_fallbacks.is_empty());
     }
 
     #[test]

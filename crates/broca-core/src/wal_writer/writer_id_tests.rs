@@ -765,3 +765,65 @@ async fn published_successor_close_retires_only_verified_predecessor_markers() {
     );
     assert_eq!(root.records().len(), 4);
 }
+
+#[tokio::test]
+async fn writer_open_counter_keeps_recovery_and_startup_replays_in_one_bucket() {
+    use broca_wal::access_counter::{ReadClass, WalAccessCounter};
+    for (prefix, retention) in [(1, None), (20, None), (20, Some(60))] {
+        let root = Root::new(true);
+        let wal = root
+            .store
+            .open_with_retention(&root.session, retention)
+            .unwrap();
+        let handle = WalHandle::spawn_in_store(wal, &root.store, &root.session, 1, None).unwrap();
+        handle
+            .record(first_send(&root, retention))
+            .into_result()
+            .unwrap();
+        for _ in 0..prefix {
+            handle.record(ordinary()).into_result().unwrap();
+        }
+        handle.shutdown().await.unwrap();
+        let path = root
+            .store
+            .resolve_live_path(&root.session)
+            .unwrap()
+            .unwrap();
+        let length = std::fs::metadata(&path).unwrap().len();
+        let frame_count = broca_wal::replay_file(&path, u64::MAX).unwrap().len() as u64;
+        let domain = crate::lease::WalLeaseDomain::new(root.path.join("leases"));
+        let counter = WalAccessCounter::default();
+        let owner = counter
+            .operation("writer reopen")
+            .run_future(WalHandle::open_and_spawn_owned_with_retention(
+                Arc::new(FileWalStore::with_config(
+                    root.path.join("wal"),
+                    broca_wal::WalConfig::OVERHAUL,
+                )),
+                root.session.clone(),
+                domain.acquire(&root.session).unwrap(),
+                None,
+                retention,
+            ))
+            .await
+            .unwrap();
+        let snapshot = counter.snapshot();
+        let measured = &snapshot[0];
+        assert_eq!(measured.writer_opens.len(), 1);
+        let open = &measured.writer_opens[0];
+        assert_eq!(open.opens, 1);
+        assert_eq!(open.session_length, length);
+        // Recovery, lifecycle-only classification and previous-writer lookup
+        // scan the log; retained logs also replay to recover retention policy.
+        let scans = if retention.is_some() { 4 } else { 3 };
+        assert_eq!(open.bytes, length * scans);
+        // One initial lineage and one trailing lineage per record in each scan.
+        assert_eq!(open.frames_decoded, (frame_count * 2 + 1) * scans);
+        assert_eq!(measured.frames_decoded, open.frames_decoded);
+        assert!(measured
+            .reads
+            .iter()
+            .all(|read| read.class == ReadClass::WriterOpen));
+        owner.shutdown().await.unwrap();
+    }
+}

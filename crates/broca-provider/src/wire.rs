@@ -716,6 +716,14 @@ pub trait WireFamily: Send + Sync {
 /// returns any newly-complete events; the wire framing is the implementor's
 /// concern, so this stays grammar-generic.
 pub trait StreamNormalizer: Send {
+    /// Enable envelope-only response facts for a journaled attempt. Wrappers forward
+    /// the shared sink; without it no additional usage objects are cloned or parsed.
+    fn set_response_evidence(&mut self, _evidence: crate::normalize::SharedResponseEvidence) {}
+
+    /// Capture provider-reported facts from an HTTP refusal, without interpreting it
+    /// as a successful stream or emitting replay usage.
+    fn observe_error_response(&mut self, _response: &Value) {}
+
     /// Socket ping/pong records have no exposed payload lengths; synthetic SSE framing is not
     /// measured data. Wrappers forward this setting without changing liveness counters.
     fn websocket_telemetry(&mut self) {}

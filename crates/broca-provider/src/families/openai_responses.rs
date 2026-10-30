@@ -865,6 +865,7 @@ struct ResponsesOutputTokenDetails {
 }
 
 pub struct OpenAiResponsesNormalizer {
+    response_evidence: Option<crate::normalize::SharedResponseEvidence>,
     display_parts: crate::display_parts::DisplayParts,
     arguments_guard: crate::wire::ToolArgsGuard,
     completed_items: std::collections::HashSet<u64>,
@@ -918,6 +919,7 @@ impl OpenAiResponsesNormalizer {
         reasoning_format: EncryptedReasoningFormat,
     ) -> Self {
         Self {
+            response_evidence: None,
             display_parts: Default::default(),
             arguments_guard: Default::default(),
             completed_items: Default::default(),
@@ -994,7 +996,9 @@ impl OpenAiResponsesNormalizer {
         // millisecond against a step measured in seconds; extending the typed path to cover them
         // is the obvious change if this file is open anyway, and must keep the created-before-delta
         // control ordering and fall back to the generic parser rather than skipping malformed JSON.
-        if payload.contains("response.completed") || payload.contains("response.incomplete") {
+        if self.response_evidence.is_none()
+            && (payload.contains("response.completed") || payload.contains("response.incomplete"))
+        {
             let response = serde_json::from_str::<ResponsesTerminalEvent>(payload)
                 .ok()
                 .and_then(ResponsesTerminalEvent::response);
@@ -1006,6 +1010,24 @@ impl OpenAiResponsesNormalizer {
         let v: Value =
             serde_json::from_str(payload).map_err(|e| NormalizeError::Invalid(e.to_string()))?;
         let event_type = v.get("type").and_then(Value::as_str).unwrap_or_default();
+        if event_type == "response.created" {
+            if let (Some(evidence), Some(response)) = (&self.response_evidence, v.get("response")) {
+                evidence.lock().unwrap().observe_response(response);
+            }
+        }
+        if self.response_evidence.is_some() && event_type == "response.failed" {
+            if let Some(response) = v.get("response") {
+                if let Some(usage) = response.get("usage") {
+                    self.merge_usage(usage);
+                }
+                self.response_evidence
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .observe_response(response);
+            }
+        }
 
         if !self.started && event_type == "response.created" {
             self.started = true;
@@ -1346,6 +1368,9 @@ impl OpenAiResponsesNormalizer {
             // still retain the previous permissive Value-based behavior.
             "response.completed" | "response.incomplete" => {
                 if let Some(resp) = v.get("response") {
+                    if let Some(evidence) = &self.response_evidence {
+                        evidence.lock().unwrap().observe_response(resp);
+                    }
                     if let Some(id) = resp.get("id").and_then(Value::as_str) {
                         self.response_id = Some(MessageId(id.to_owned()));
                     }
@@ -1362,6 +1387,20 @@ impl OpenAiResponsesNormalizer {
                         if let Some(reason) = details.get("reason").and_then(Value::as_str) {
                             self.finish_reason = map_incomplete_reason(reason);
                             self.incomplete_reason = Some(reason.to_owned());
+                        }
+                    }
+                    if let Some(evidence) = &self.response_evidence {
+                        let reason = resp
+                            .pointer("/incomplete_details/reason")
+                            .and_then(Value::as_str)
+                            .map(map_incomplete_reason)
+                            .or_else(|| {
+                                resp.get("status")
+                                    .and_then(Value::as_str)
+                                    .map(map_response_status)
+                            });
+                        if reason.is_some() {
+                            evidence.lock().unwrap().finish_reason = reason;
                         }
                     }
                 }
@@ -1480,6 +1519,9 @@ impl OpenAiResponsesNormalizer {
             .and_then(Value::as_u64)
         {
             self.usage.reasoning_tokens = Some(x);
+        }
+        if let Some(evidence) = &self.response_evidence {
+            evidence.lock().unwrap().observe_usage(u, self.usage);
         }
     }
 
@@ -1602,6 +1644,18 @@ impl OpenAiResponsesNormalizer {
 }
 
 impl StreamNormalizer for OpenAiResponsesNormalizer {
+    fn observe_error_response(&mut self, response: &Value) {
+        let response = response.get("response").unwrap_or(response);
+        if let Some(usage) = response.get("usage") {
+            self.merge_usage(usage);
+        }
+        if let Some(evidence) = &self.response_evidence {
+            evidence.lock().unwrap().observe_response(response);
+        }
+    }
+    fn set_response_evidence(&mut self, evidence: crate::normalize::SharedResponseEvidence) {
+        self.response_evidence = Some(evidence);
+    }
     fn websocket_telemetry(&mut self) {
         self.sse.websocket_telemetry();
     }
@@ -1812,7 +1866,7 @@ fn response_error_class(event: &Value, code: Option<&str>) -> ErrorClass {
     }
 }
 
-fn map_response_status(status: &str) -> FinishReason {
+pub(crate) fn map_response_status(status: &str) -> FinishReason {
     match status {
         "completed" => FinishReason::Stop,
         "incomplete" => FinishReason::Length,
@@ -1821,7 +1875,7 @@ fn map_response_status(status: &str) -> FinishReason {
     }
 }
 
-fn map_incomplete_reason(reason: &str) -> FinishReason {
+pub(crate) fn map_incomplete_reason(reason: &str) -> FinishReason {
     match reason {
         "max_output_tokens" => FinishReason::Length,
         "content_filter" => FinishReason::ContentFilter,

@@ -4686,7 +4686,23 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
     };
     match handler.plan_state(session).await {
         broca_module::serve::PlanState::Admitted { frozen } => {
-            broca_fetch_plan::check_later_plan(frozen.as_deref(), &parsed.identity)?;
+            // While a change is pending, a send whose plan is the effective plan or the latest
+            // accepted one is not drift. That replaces today's plain different-plan refusal for
+            // sessions with session_change state. Sessions that never received a refresh keep
+            // today's rule exactly.
+            if let Some((effective, accepted)) = handler.session_change_identities(session).await {
+                cortexkit_role_llm_runner::session_change::check_send_drift(
+                    effective.as_deref(),
+                    accepted.as_deref(),
+                    &parsed.identity,
+                )
+                .map_err(|detail| broca_fetch_plan::Refusal::PlanDrift {
+                    frozen: detail.frozen,
+                    sent: detail.sent,
+                })?;
+            } else {
+                broca_fetch_plan::check_later_plan(frozen.as_deref(), &parsed.identity)?;
+            }
             Ok(broca_module::actor::SendPlan {
                 identity: parsed.identity,
                 manifest: None,

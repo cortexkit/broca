@@ -14,6 +14,7 @@
 pub mod admit;
 pub mod plan;
 pub mod refusal;
+pub mod session_change;
 
 #[cfg(test)]
 mod compaction_tests;

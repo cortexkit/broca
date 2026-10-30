@@ -558,8 +558,10 @@ pub fn fit_request(
 }
 
 /// Render an explicit prepared bundle and enforce limits on the complete bytes the family
-/// would send, including envelopes, tags and signatures. The tag projection must be pure:
-/// it is reapplied after each limit marker so stored part identities never change.
+/// would send, including envelopes, tags and signatures. The tag projection must be pure and
+/// preserve ordered media references: it is reapplied whenever request fitting replaces another
+/// media occurrence with a generated not-shown notice. `opts.prompt` supplies the original selected
+/// media layout; generated notices must not choose tag placement.
 /// With no bundle, use the original renderer verbatim (including legacy carrier markers).
 pub fn render_prepared(
     family: &dyn crate::wire::WireFamily,
@@ -586,7 +588,7 @@ pub fn render_prepared_with_provenance(
         |candidate: &PreparedBundle,
          provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>| {
             let mut options = opts.clone();
-            options.prompt = render_tags(&candidate.prompt);
+            options.prompt = tagged_prepared_prompt(&opts.prompt, &candidate.prompt, render_tags);
             let payloads: Vec<_> = candidate
                 .media
                 .iter()
@@ -604,6 +606,95 @@ pub fn render_prepared_with_provenance(
         })?;
     }
     Ok(render(bundle, provenance))
+}
+
+fn tagged_prepared_prompt(
+    original: &[Message],
+    prepared: &[Message],
+    render_tags: &dyn Fn(&[Message]) -> Vec<Message>,
+) -> Vec<Message> {
+    let originals = references(original);
+    let replacements: HashMap<_, _> = originals
+        .iter()
+        .filter_map(|(location, _, _)| {
+            prepared_text(prepared, *location).map(|text| {
+                (
+                    (location.message, location.block, location.part),
+                    text.to_owned(),
+                )
+            })
+        })
+        .collect();
+    if replacements.is_empty() {
+        return render_tags(prepared);
+    }
+    // A generated notice is not original tool text. Restore only original media slots while
+    // choosing tags, then overlay notices after an image-only label can shift the part indices.
+    let mut basis = prepared.to_vec();
+    for (location, reference, _) in originals {
+        if replacements.contains_key(&(location.message, location.block, location.part)) {
+            restore_reference(&mut basis, location, reference);
+        }
+    }
+    let before = references(&basis);
+    let mut tagged = render_tags(&basis);
+    let after = references(&tagged);
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "tag projection must retain media references"
+    );
+    let overlays: Vec<_> = before
+        .iter()
+        .zip(after.iter())
+        .filter_map(
+            |((location, reference, tool), (projected, projected_reference, projected_tool))| {
+                assert_eq!(
+                    (reference, tool),
+                    (projected_reference, projected_tool),
+                    "tag projection must preserve media order"
+                );
+                replacements
+                    .get(&(location.message, location.block, location.part))
+                    .map(|text| (*projected, text.clone()))
+            },
+        )
+        .collect();
+    for (location, text) in overlays {
+        replace_with_text(&mut tagged, location, text);
+    }
+    tagged
+}
+
+fn prepared_text(prompt: &[Message], location: MediaLocation) -> Option<&str> {
+    let block = prompt.get(location.message)?.content.get(location.block)?;
+    if let Some(part) = location.part {
+        if let ContentBlock::ToolResult(result) = block {
+            if let ToolOutput::Parts { parts } = &result.output {
+                if let ToolOutputPart::Text { text } = parts.get(part)? {
+                    return Some(text);
+                }
+            }
+        }
+    } else if let ContentBlock::Text { text } = block {
+        return Some(text);
+    }
+    None
+}
+
+fn restore_reference(prompt: &mut [Message], location: MediaLocation, reference: &MediaRef) {
+    let block = &mut prompt[location.message].content[location.block];
+    if let Some(part) = location.part {
+        if let ContentBlock::ToolResult(result) = block {
+            if let ToolOutput::Parts { parts } = &mut result.output {
+                parts[part] = ToolOutputPart::Media {
+                    media: reference.clone(),
+                };
+            }
+        }
+    } else {
+        *block = ContentBlock::Media(reference.clone());
+    }
 }
 
 fn breaks_counts(profile: &MediaProfile, bundle: &PreparedBundle) -> bool {
@@ -679,7 +770,10 @@ fn mark(
     media: &MediaRef,
     reason: MediaMarkerReason,
 ) {
-    let text = media_not_shown_marker(media, reason);
+    replace_with_text(prompt, location, media_not_shown_marker(media, reason));
+}
+
+fn replace_with_text(prompt: &mut [Message], location: MediaLocation, text: String) {
     let block = &mut prompt[location.message].content[location.block];
     if let Some(part) = location.part {
         if let ContentBlock::ToolResult(result) = block {

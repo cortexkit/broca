@@ -174,3 +174,31 @@ async fn cache_evidence_captures_active_compaction_view_change_and_durable_ident
     capture("magic-context-view-change-previous.json", &attempts[1].record);
     capture("magic-context-view-change.json", &attempts[2].record);
 }
+
+#[tokio::test]
+async fn cache_evidence_warm_between_model_attempts_keeps_the_model_predecessor() {
+    use broca_core::Provider;
+    let warm = ScriptResponse::Http { status: 200, headers: vec![], body: br#"{"id":"synthetic-warm","type":"message","role":"assistant","model":"capture-model","content":[],"stop_reason":"end_turn","usage":{"input_tokens":20,"cache_read_input_tokens":1000,"output_tokens":1}}"# };
+    let server = ScriptedServer::start(vec![response(1000), warm, response(1000)]).await;
+    let client = build_provider_http_client();
+    let root = broca_test_support::scratch_root().join("warm-cache-evidence-predecessor");
+    let bind = BindIdentity::new(root.join("synthetic-project"), "scripted-http", "warm-predecessor-conversation");
+    let wal = FileWalStore::new(root.join("wal"));
+    let leases = FileLeaseStore::new(root.join("lease"));
+    let provider = provider(&server, &client);
+    for index in 0..2 {
+        run(request(&bind, index, json!([{"role":"user","content":[{"type":"text","text":format!("question {index}")}]}]), json!([])), &provider, &wal, &leases, &RunControl::default()).await;
+        if index == 0 { provider.warm(&server.request_bodies()[0]).await.unwrap(); }
+    }
+    let bodies = server.request_bodies();
+    assert_eq!(bodies.len(), 3);
+    let warm: Value = serde_json::from_slice(&bodies[1]).unwrap();
+    assert!(warm.get("stream").is_none(), "the established warm format omits streaming");
+    let frames = wal.read_records(&bind).unwrap();
+    let attempts: Vec<_> = frames.iter().filter(|f| matches!(f.record, WalRecord::ModelAttemptFinished { .. })).collect();
+    assert_eq!(attempts.len(), 2, "warming is not a model attempt");
+    let second = serde_json::to_value(&attempts[1].record).unwrap();
+    assert_eq!(second["cache_evidence"]["extends_previous"], true, "a warm's changed stream/output settings must not become the model predecessor");
+    assert!(second["cache_evidence"]["first_divergence"].is_null());
+    assert!(second["cache_evidence"]["compared_to"].as_str().unwrap().ends_with(&format!(":{}", attempts[0].seq)));
+}

@@ -151,8 +151,10 @@ pub struct OffsetGuidanceCheckpoint {
 fn offset_window_rows(
     checkpoint: &crate::compaction::CompactionCheckpoint,
 ) -> Result<HeldRowsRequest, crate::replay::SeedFallback> {
-    let bad = || crate::replay::SeedFallback {
-        reason: "offset prompt window has no complete compaction checkpoint",
+    let bad = || {
+        crate::replay::SeedFallback::new(
+            "offset prompt window has no complete compaction checkpoint",
+        )
     };
     let state = checkpoint
         .state()
@@ -206,9 +208,7 @@ pub(crate) fn validate_offset_prompt_window(
     seed: &crate::replay::ProjectionSeed,
     boundary: &crate::replay::SeedBoundary,
 ) -> Result<(), crate::replay::SeedFallback> {
-    let bad = || crate::replay::SeedFallback {
-        reason: "offset prompt window selection is incomplete",
-    };
+    let bad = || crate::replay::SeedFallback::new("offset prompt window selection is incomplete");
     let checkpoint = seed
         .admission_checkpoint
         .compaction
@@ -219,9 +219,9 @@ pub(crate) fn validate_offset_prompt_window(
         .and_then(|s| s.view.as_ref())
         .is_some_and(|v| Some(v.view.lineage_id.as_str()) != boundary.lineage_id.as_deref())
     {
-        return Err(crate::replay::SeedFallback {
-            reason: "offset prompt window belongs to another lineage",
-        });
+        return Err(crate::replay::SeedFallback::new(
+            "offset prompt window belongs to another lineage",
+        ));
     }
     let held = offset_window_rows(checkpoint)?;
     if window.base != held.suffix_from
@@ -294,9 +294,8 @@ pub(crate) fn finish_offset_prompt_window(
     checkpoint: &crate::AdmissionCheckpointV1,
     projected: &[EpisodeRenderProjection],
 ) -> Result<(), crate::replay::SeedFallback> {
-    let bad = || crate::replay::SeedFallback {
-        reason: "offset prompt window episode metadata is incomplete",
-    };
+    let bad =
+        || crate::replay::SeedFallback::new("offset prompt window episode metadata is incomplete");
     let before = seed
         .admission_checkpoint
         .compaction
@@ -310,9 +309,9 @@ pub(crate) fn finish_offset_prompt_window(
         .ok_or_else(bad)?;
     if before.applied != after.applied || before.view != after.view || before.strips != after.strips
     {
-        return Err(crate::replay::SeedFallback {
-            reason: "offset prompt window changed in the tail",
-        });
+        return Err(crate::replay::SeedFallback::new(
+            "offset prompt window changed in the tail",
+        ));
     }
     let render = crate::run::episode_render_inputs(projected)
         .map_err(|_| bad())?
@@ -1176,6 +1175,7 @@ impl RunIndexAttribution {
                         | "request_invalid"
                         | "previous_response_not_found"
                         | "ENTITLEMENT_ERROR"
+                        | "client_attestation_denied"
                 )
             })
             .map(str::to_owned);

@@ -31,6 +31,23 @@ impl Drop for TempDir {
 fn addr(n: u64) -> String {
     format!("{n:016x}")
 }
+
+#[test]
+fn empty_durable_paths_do_not_reap_membership() {
+    let stats = expiry_io::metadata_count();
+    let io = expiry_io::counts();
+    #[cfg(unix)]
+    let before = super::membership::REAPS.with(std::cell::Cell::get);
+    assert!(read_newest_member(&[], &addr(1), 1000).unwrap().is_none());
+    assert_eq!(expiry_io::metadata_count(), stats);
+    assert_eq!(expiry_io::counts(), io);
+    #[cfg(unix)]
+    assert_eq!(super::membership::REAPS.with(std::cell::Cell::get), before);
+    assert_eq!(
+        read_newest_member(&[], "invalid", 1000).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+}
 fn fixture(path: &Path, members: &[(String, Vec<u8>)]) {
     let mut writer = ArchiveWriter::create(path).unwrap().without_feature_floor();
     for (name, payload) in members {

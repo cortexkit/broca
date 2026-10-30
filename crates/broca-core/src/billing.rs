@@ -692,18 +692,26 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
                 usage,
                 sent_at_ms,
                 envelope,
+                trigger,
                 ..
             } => {
                 // A warm is billed under the run whose request it re-sent. A warm naming a run
                 // this WAL holds no start of has no config to bill it with, and yields no fact.
                 if let Some((session, config, scope)) = episodes.get(run_id) {
                     if target_run.is_none_or(|target| target == run_id) {
-                        // The re-sent request went to the model its step was routed to.
-                        let routed = routed_steps.get(&(run_id.clone(), *step_id)).map(|model| {
-                            let mut config = config.clone();
-                            config.model = model.clone();
-                            config
-                        });
+                        // A late manual source warm historically followed its step's committed
+                        // fallback route. Only explicitly tagged new source maintenance may
+                        // choose the source model; old records must retain their fact bytes.
+                        let source =
+                            trigger.as_deref() == Some(crate::cache_warm::SOURCE_KEEP_WARM_TRIGGER);
+                        let routed = routed_steps
+                            .get(&(run_id.clone(), *step_id))
+                            .filter(|_| !source)
+                            .map(|model| {
+                                let mut config = config.clone();
+                                config.model = model.clone();
+                                config
+                            });
                         let mut segment = warm_segment(
                             source_instance_id,
                             run_id,
@@ -2175,6 +2183,136 @@ mod tests {
         assert_eq!(
             warm.fact_id,
             "39c0ab5977282739d341b597904e56d11ba8152121a7198e57a2672efdc10440"
+        );
+    }
+
+    fn late_source_warm_records(trigger: Option<&str>) -> Vec<FramedRecord> {
+        let source = broca_protocol::ModelHandle::new("anthropic", "claude-opus-5-5");
+        let fallback = broca_protocol::ModelHandle::new("anthropic", "claude-opus-4-8");
+        let source_digest =
+            crate::render::request_digest_hex(br#"{"model":"claude-opus-5-5","messages":[]}"#);
+        let fallback_digest =
+            crate::render::request_digest_hex(br#"{"model":"claude-opus-4-8","messages":[]}"#);
+        let mut start = started_with_account(
+            1,
+            "run",
+            Some(100),
+            Some("apikey:anthropic:work"),
+            Some("acct-1"),
+        );
+        if let WalRecord::RunStarted { config, .. } = &mut start.record {
+            config.model = source.clone();
+        }
+        let attempt = |seq, digest: &str, attempt, sent_at_ms, ts_ms| {
+            frame(seq, serde_json::from_value(json!({
+            "type":"model_attempt_finished", "step_id":2, "attempt":attempt,
+            "request_body_len":64, "request_body_sha256":digest, "http_status":200,
+            "response_body_len":0, "response_body_sha256":crate::render::request_digest_hex(b""),
+            "outcome":"complete", "sent_at_ms":sent_at_ms, "ts_ms":ts_ms
+        })).unwrap())
+        };
+        let schedule =
+            crate::refusal_fallback::on_source_refusal(None, &source, &fallback, Some(200));
+        let refused = frame(
+            4,
+            WalRecord::ModelStepRefused {
+                step_id: StepId(2),
+                usage: usage(3, 0),
+                served_model: None,
+                usage_iterations: None,
+                discarded_blocks: 1,
+                schedule: schedule.clone(),
+                ts_ms: Some(200),
+            },
+        );
+        let mut answer = step(6, 2, usage(4, 1), 0);
+        if let WalRecord::ModelStepFinished {
+            fallback: facts, ..
+        } = &mut answer.record
+        {
+            facts.route = Some(broca_wal::StepRoute {
+                model: fallback,
+                reason: broca_wal::StepRouteReason::Refusal,
+            });
+            facts.refusal_fallback = crate::refusal_fallback::on_step_committed(
+                Some(&schedule),
+                crate::refusal_fallback::CommittedStep {
+                    route: crate::refusal_fallback::StepRoute::Fallback,
+                    refused: false,
+                    served_by_server_side_fallback: false,
+                },
+                Some(300),
+            );
+        }
+        // The warm starts while the source attempt is in flight, but its completion is
+        // recorded after the same-step fallback answer. The old writer could produce this.
+        let mut warm = warmed(
+            9,
+            "run",
+            Usage {
+                cached_input_tokens: Some(4000),
+                ..Default::default()
+            },
+            120,
+        );
+        if let WalRecord::CacheWarmed {
+            request_body_sha256,
+            trigger: recorded,
+            ..
+        } = &mut warm.record
+        {
+            *request_body_sha256 = source_digest.clone();
+            *recorded = trigger.map(str::to_owned);
+        }
+        vec![
+            start,
+            frame(2, WalRecord::StepStarted { step_id: StepId(2) }),
+            attempt(3, &source_digest, 0, 100, 200),
+            refused,
+            attempt(5, &fallback_digest, 1, 210, 300),
+            answer,
+            terminal(7, Some(400), usage(7, 1)),
+            warm,
+        ]
+    }
+
+    const LATE_SOURCE_BASE_FACT: &str = r#"{"run_id":"run","session":{"project_root":"/tmp/project","harness":"runner","session":"session"},"segment_ordinal":9,"fact_id":"39c0ab5977282739d341b597904e56d11ba8152121a7198e57a2672efdc10440","provider":"anthropic","model":"claude-opus-4-8","auth_selection":"apikey:anthropic:work","account_ref":"acct-1","charge_basis":"metered_api","charge_basis_mapping_version":1,"charge_basis_overrides":"none","usage":{"cached_input_tokens":4000},"retries_used":0,"pricing_at_ms":120,"pricing_at_precision":"exact","occurred_at_ms":120,"occurred_at_precision":"exact","terminal_reason":null,"warm":true}"#;
+    #[test]
+    fn source_review_historical_late_source_warm_keeps_original_fact_bytes() {
+        for trigger in [None, Some("keep_warm"), Some("future_unknown_trigger")] {
+            let facts =
+                compute_segments(&late_source_warm_records(trigger), "instance-a", &resolver);
+            let warm = facts.iter().find(|fact| fact.warm).unwrap();
+            assert_eq!(
+                serde_json::to_string(warm).unwrap(),
+                LATE_SOURCE_BASE_FACT,
+                "historical trigger {trigger:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_review_new_source_trigger_changes_only_the_warm_model() {
+        let old = compute_segments(&late_source_warm_records(None), "instance-a", &resolver);
+        let new = compute_segments(
+            &late_source_warm_records(Some("source_keep_warm")),
+            "instance-a",
+            &resolver,
+        );
+        let old_warm = old.iter().find(|fact| fact.warm).unwrap();
+        let new_warm = new.iter().find(|fact| fact.warm).unwrap();
+        assert_eq!(old_warm.model, "claude-opus-4-8");
+        assert_eq!(new_warm.fact_id, old_warm.fact_id);
+        assert_eq!(
+            serde_json::to_string(new_warm).unwrap(),
+            LATE_SOURCE_BASE_FACT.replace(
+                "\"model\":\"claude-opus-4-8\"",
+                "\"model\":\"claude-opus-5-5\""
+            )
+        );
+        assert_eq!(
+            old.iter().filter(|fact| !fact.warm).collect::<Vec<_>>(),
+            new.iter().filter(|fact| !fact.warm).collect::<Vec<_>>()
         );
     }
 

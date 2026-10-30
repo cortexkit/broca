@@ -1,6 +1,6 @@
-// A whole run against the OpenAI Responses API whose credential has no prepaid credit left. The
-// run must end `billing_exhausted`, permanent, naming the frozen credential, so routing's
-// credential fence can stop sending work to that key. An ordinary rate limit must still retry.
+// Whole runs against prepaid-credit and subscription refusals must name the frozen credential.
+// Prepaid exhaustion is permanent; subscription limits are transient until replenished. Neither
+// refusal retries within the run, while an ordinary rate limit must still retry.
 use super::*;
 use broca_core::{
     run_loop_with_control, AllowAll, AuthSelection, FileLeaseStore, FileWalStore, OutputEvent,
@@ -37,6 +37,28 @@ struct OpenAiRun {
 }
 
 async fn run_openai(label: &str, script: Vec<ScriptResponse>) -> OpenAiRun {
+    run_with_selection(
+        label,
+        script,
+        "openai",
+        AuthSelection {
+            auth_method: None,
+            credential_id: FROZEN_CREDENTIAL.into(),
+            account_ref: None,
+            resolved_credential_id: None,
+            vault_request: None,
+            account_decision: None,
+        },
+    )
+    .await
+}
+
+async fn run_with_selection(
+    label: &str,
+    script: Vec<ScriptResponse>,
+    provider_id: &str,
+    selection: AuthSelection,
+) -> OpenAiRun {
     let server = ScriptedServer::start(script).await;
     let mut frozen = openai_responses_frozen_config("gpt-4.1");
     frozen.base_url = Some(server.url.clone());
@@ -48,7 +70,8 @@ async fn run_openai(label: &str, script: Vec<ScriptResponse>) -> OpenAiRun {
         frozen,
         AuthHandle::Bearer("test-key".into()),
         broca_core::Clock::default(),
-    );
+    )
+    .with_auth_method(selection.auth_method.as_deref());
     provider.retry_clock.virtual_waits = Some(Arc::clone(&waits));
     let dir = broca_test_support::scratch_root().join(format!(
         "openai-billing-{label}-{}",
@@ -56,7 +79,7 @@ async fn run_openai(label: &str, script: Vec<ScriptResponse>) -> OpenAiRun {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("project")).unwrap();
-    let session = BindIdentity::new(dir.join("project"), "openai", label);
+    let session = BindIdentity::new(dir.join("project"), provider_id, label);
     let request = RunRequest {
         input_written_at_ms: None,
         directives: None,
@@ -72,7 +95,7 @@ async fn run_openai(label: &str, script: Vec<ScriptResponse>) -> OpenAiRun {
         principal: None,
         run_id: RunId(format!("openai-billing-{label}")),
         session: session.clone(),
-        model: ModelHandle::new("openai", "gpt-4.1"),
+        model: ModelHandle::new(provider_id, "gpt-4.1"),
         input: vec![Message {
             cache_prefix_blocks: None,
             origin: None,
@@ -98,14 +121,7 @@ async fn run_openai(label: &str, script: Vec<ScriptResponse>) -> OpenAiRun {
         structured_output: None,
     };
     let control = RunControl {
-        auth_selection: Some(AuthSelection {
-            auth_method: None,
-            credential_id: FROZEN_CREDENTIAL.into(),
-            account_ref: None,
-            resolved_credential_id: None,
-            vault_request: None,
-            account_decision: None,
-        }),
+        auth_selection: Some(selection),
         ..RunControl::default()
     };
     let lease = FileLeaseStore::new(dir.join("lease"));
@@ -179,6 +195,52 @@ fn assert_billing_exhausted_on_one_attempt(outcome: &OpenAiRun) {
         outcome.live.message
     );
     assert_eq!(outcome.live.resets_at_ms, None);
+}
+
+#[tokio::test]
+async fn xai_subscription_spending_limit_reaches_the_caller_as_an_untimed_account_wall() {
+    let outcome = run_with_selection(
+        "xai-subscription",
+        vec![ScriptResponse::Http {
+            status: 403,
+            headers: Vec::new(),
+            body: XAI_SPENDING_LIMIT_BODY.as_bytes(),
+        }; 6],
+        "xai",
+        AuthSelection {
+            auth_method: Some("oauth".into()),
+            credential_id: "oauth:xai".into(),
+            account_ref: Some("acct-x".into()),
+            resolved_credential_id: None,
+            vault_request: None,
+            account_decision: None,
+        },
+    )
+    .await;
+    assert_eq!(outcome.attempts, 1);
+    assert!(outcome.waits.is_empty());
+    assert_eq!(outcome.retries_used, 0);
+    assert_eq!(outcome.live, outcome.durable);
+    assert_eq!(outcome.live.provider_code.as_deref(), Some(ACCOUNT_LIMIT_EXHAUSTED));
+    assert_eq!(outcome.live.class, ErrorClass::Transient);
+    assert_eq!(outcome.live.status, Some(403));
+    assert_eq!(outcome.live.resets_at_ms, None);
+    assert_eq!(outcome.live.resets_at_source, None);
+    assert_eq!(outcome.live.limit_window, None);
+    assert_eq!(outcome.live.account_ref.as_deref(), Some("acct-x"));
+    assert_eq!(outcome.live.credential_id.as_deref(), Some("oauth:xai"));
+    let status = serde_json::json!({
+        "state": "error",
+        "auth_selection": "oauth:xai",
+        "undelivered_steers": [],
+        "retries_used": outcome.retries_used,
+        "error": outcome.live,
+    });
+    let golden: Value = serde_json::from_slice(include_bytes!(
+        "../../broca-wire/tests/golden/run_status.account_limit_exhausted_xai_subscription.json"
+    ))
+    .unwrap();
+    assert_eq!(status, golden);
 }
 
 #[tokio::test]

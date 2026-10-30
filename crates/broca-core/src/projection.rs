@@ -102,6 +102,7 @@ pub fn classify_control_unit(unit: &ControlUnit) -> ControlClass {
         | ControlUnit::MessageBoundary { .. }
         | ControlUnit::StepFinished { .. }
         | ControlUnit::Error { .. }
+        | ControlUnit::Status { .. }
         | ControlUnit::Paused { .. }
         | ControlUnit::RunFinished { .. } => ControlClass::ControlProjectable,
         // Display-state discard: paired with a display-lane reset, never a reliable unit.
@@ -205,6 +206,7 @@ pub struct ControlProjectionState {
     final_step_finish_reason: Option<FinishReason>,
     has_completed_step: bool,
     indeterminate_tool_calls: IndeterminateToolCalls,
+    held_calls: crate::replay::HeldCallsProjection,
 }
 
 impl ControlProjectionState {
@@ -227,6 +229,7 @@ impl ControlProjectionState {
             final_step_finish_reason,
             has_completed_step: completed_steps > 0,
             indeterminate_tool_calls: IndeterminateToolCalls::default(),
+            held_calls: Default::default(),
             placement: Default::default(),
             placement_error: None,
             assistant_ordinal: None,
@@ -310,6 +313,7 @@ impl ControlProjectionState {
         self.call_identities.clear();
         self.cancelled = false;
         self.pending_inputs.clear();
+        self.held_calls = Default::default();
     }
 }
 
@@ -811,7 +815,7 @@ fn project_control_record<S: ControlProjectionSink>(
             reason,
             error,
             ..
-        } => {
+        } if *reason != broca_protocol::PauseReason::ToolHeld => {
             push!(
                 ControlUnit::Paused {
                     run_id: run_id.clone(),
@@ -1079,16 +1083,20 @@ fn project_control_record<S: ControlProjectionSink>(
         | WalRecord::LateApprovalRecorded { .. }
         | WalRecord::LateDispatchIntent { .. }
         | WalRecord::LateResult { .. } => {}
-        // A held call's interim reply never reaches the model or the control lane: the run's
-        // `Paused {tool_held}` unit and, later, the call's ordinary `ToolResult` are what a
-        // subscriber sees.
-        WalRecord::ToolCallProviderHeld { .. } => {}
+        // The internal park preserves recovery's waiting slot; it is not a caller pause.
+        // The held record and its terminal below publish the provider-held status instead.
+        WalRecord::RunPaused { .. } | WalRecord::ToolCallProviderHeld { .. } => {}
         // An informational record, skipped exactly like `Unknown`.
         WalRecord::InputTokenCapFrozen { .. }
         | WalRecord::InputTokenBudgetExhausted { .. }
         | WalRecord::StructuredOutputResult { .. }
         | WalRecord::StructuredOutputDowngraded { .. }
         | WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
+        // A mid-session change emits no prompt or control unit: the next `RunStarted` that
+        // freezes its manifest renders the new tools, and earlier episodes resume byte-identical.
+        WalRecord::SessionRefreshAccepted { .. }
+        | WalRecord::SessionRefreshPolicyChanged { .. }
+        | WalRecord::SessionPrefixFlushed { .. } => {}
     }
     // Appending boundaries here keeps every older payload at its original sub_index.
     for action in actions {
@@ -1137,6 +1145,16 @@ fn project_control_record<S: ControlProjectionSink>(
                 state.call_identities.clear();
             }
             _ => {}
+        }
+    }
+    // Append status after older units so their durable cursors stay unchanged, including
+    // a ToolResult's lifecycle boundaries when the final held call leaves the list.
+    if let Some(status) = state.held_calls.observe(&framed.record) {
+        if let Some(run_id) = &state.run_id {
+            push!(ControlUnit::Status {
+                run_id: run_id.clone(),
+                status: Box::new(status),
+            });
         }
     }
 }
@@ -1351,8 +1369,12 @@ pub fn first_record_offset(
 pub fn log_header_info(
     read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
 ) -> std::io::Result<(u64, Option<broca_wal::WalLineageId>)> {
-    let header = read_at(0, broca_wal::framing::LINEAGE_FRAME_LEN as u64)?;
-    Ok(match broca_wal::framing::decode_next(&header) {
+    let header = broca_wal::access_counter::read_at(
+        read_at,
+        0,
+        broca_wal::framing::LINEAGE_FRAME_LEN as u64,
+    )?;
+    Ok(match broca_wal::access_counter::decode_next(&header) {
         broca_wal::framing::DecodeStep::Lineage {
             consumed,
             lineage_id,
@@ -1374,11 +1396,13 @@ pub fn decode_positioned_frames(
     to: u64,
     decode_counter: Option<&std::cell::Cell<u64>>,
 ) -> Result<Vec<crate::replay::PositionedFrame>, String> {
-    use broca_wal::framing::{decode_next, DecodeStep};
+    use broca_wal::access_counter::decode_next;
+    use broca_wal::framing::DecodeStep;
     let len = to
         .checked_sub(from)
         .ok_or_else(|| format!("WAL range {from}..{to} is reversed"))?;
-    let bytes = read_at(from, len).map_err(|error| format!("WAL read at {from}: {error}"))?;
+    let bytes = broca_wal::access_counter::read_at(read_at, from, len)
+        .map_err(|error| format!("WAL read at {from}: {error}"))?;
     if (bytes.len() as u64) < len {
         return Err(format!(
             "WAL ends at {} before the range end {to}",
@@ -1459,9 +1483,8 @@ pub fn replay_from_episode_start(
     frames: &[crate::replay::PositionedFrame],
 ) -> Result<EpisodeReplay, crate::replay::SeedFallback> {
     use crate::replay::SeedFallback;
-    let run_started = episode_start_index(episode, frames).ok_or(SeedFallback {
-        reason: "episode start not in the frames read",
-    })?;
+    let run_started = episode_start_index(episode, frames)
+        .ok_or_else(|| SeedFallback::new("episode start not in the frames read"))?;
     let (state, ordinal_base) = match seed {
         Some(seed) => (
             crate::replay::replay_seeded_at_validated_boundary(
@@ -1480,22 +1503,19 @@ pub fn replay_from_episode_start(
             seed.ordinal_base,
         ),
         None => {
-            let start = first_record_offset(read_at).map_err(|_| SeedFallback {
-                reason: "log unreadable",
-            })?;
+            let start =
+                first_record_offset(read_at).map_err(|_| SeedFallback::new("log unreadable"))?;
             // `run_started` was found, so `frames` is not empty.
             if frames[0].framed.seq != 1 || frames[0].off != start {
-                return Err(SeedFallback {
-                    reason: "frames do not start at the log's first record",
-                });
+                return Err(SeedFallback::new(
+                    "frames do not start at the log's first record",
+                ));
             }
             if frames
                 .windows(2)
                 .any(|pair| pair[0].framed.seq + 1 != pair[1].framed.seq)
             {
-                return Err(SeedFallback {
-                    reason: "frames have a sequence gap",
-                });
+                return Err(SeedFallback::new("frames have a sequence gap"));
             }
             let state = crate::replay::replay_seeded(
                 frames.iter().map(|positioned| &positioned.framed.record),
@@ -1507,9 +1527,7 @@ pub fn replay_from_episode_start(
                 false,
                 crate::tags::TagSeed::default(),
             )
-            .map_err(|_| SeedFallback {
-                reason: "replay refused the frames",
-            })?;
+            .map_err(|_| SeedFallback::new("replay refused the frames"))?;
             (state, 0)
         }
     };
@@ -1524,9 +1542,7 @@ pub fn replay_from_episode_start(
         .and_then(|episodes| episodes.get(starts_before))
         .map(|rendered| rendered.prompt_start as u64);
     if prompt_start != Some(episode.first_ord) {
-        return Err(SeedFallback {
-            reason: "episode first ordinal mismatch",
-        });
+        return Err(SeedFallback::new("episode first ordinal mismatch"));
     }
     Ok(EpisodeReplay {
         state,
@@ -1540,3 +1556,40 @@ mod placement_tests;
 
 #[cfg(test)]
 mod live_tests;
+
+#[cfg(test)]
+mod access_counter_tests {
+    #[test]
+    fn projection_source_reads_and_decodes_use_the_shared_counter() {
+        use broca_wal::access_counter::{ReadClass, WalAccessCounter};
+        let bytes = broca_wal::framing::encode(
+            1,
+            1,
+            &broca_wal::WalRecord::TurnFinished {
+                step_id: broca_protocol::StepId(1),
+            },
+        )
+        .unwrap();
+        let reader = |offset: u64, length: u64| {
+            Ok(bytes
+                .iter()
+                .skip(offset as usize)
+                .take(length as usize)
+                .copied()
+                .collect::<Vec<_>>())
+        };
+        let counter = WalAccessCounter::default();
+        counter.operation("projection source").run(|| {
+            assert_eq!(super::log_header_info(&reader).unwrap(), (0, None));
+            let frames =
+                super::decode_positioned_frames(&reader, 0, bytes.len() as u64, None).unwrap();
+            assert_eq!(frames.len(), 1);
+        });
+        let snapshot = counter.snapshot();
+        assert_eq!(snapshot[0].reads.len(), 2);
+        assert_eq!(snapshot[0].reads[0].class, ReadClass::LineageHeader);
+        assert_eq!(snapshot[0].reads[1].class, ReadClass::Origin);
+        assert_eq!(snapshot[0].reads[1].length, bytes.len() as u64);
+        assert_eq!(snapshot[0].frames_decoded, 1);
+    }
+}

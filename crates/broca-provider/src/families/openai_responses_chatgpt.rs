@@ -308,6 +308,12 @@ struct ChatgptNormalizer {
 }
 
 impl StreamNormalizer for ChatgptNormalizer {
+    fn observe_error_response(&mut self, response: &serde_json::Value) {
+        self.inner.observe_error_response(response);
+    }
+    fn set_response_evidence(&mut self, evidence: crate::normalize::SharedResponseEvidence) {
+        self.inner.set_response_evidence(evidence);
+    }
     fn websocket_telemetry(&mut self) {
         self.inner.websocket_telemetry();
     }
