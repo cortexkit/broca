@@ -241,6 +241,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     RUNNER_TAGS_V2_FEATURE,
     RUN_CANCEL_AT_FEATURE,
     SCOPE_FEATURE,
+    SESSION_CHANGE_FEATURE,
     SESSION_CLASS_FEATURE,
     STEER_QUEUE_FEATURE,
     STEP_TRANSFORMS_FEATURE,
@@ -415,6 +416,14 @@ pub const REFUSAL_FALLBACK_FEATURE: &str = "refusal-fallback/v1";
 /// (`WalRecord::RunStarted::scope`). A reader without it must refuse such a WAL: skipping the
 /// field would let any caller drive a session only its scope's owner may drive.
 pub const SCOPE_FEATURE: &str = "scope/v1";
+
+/// A mid-session plan change the owner accepted (`WalRecord::SessionRefreshAccepted`), its
+/// policy change (`WalRecord::SessionRefreshPolicyChanged`) or a prefix flush
+/// (`WalRecord::SessionPrefixFlushed`). A reader without it must refuse such a WAL: skipping
+/// the records would lose the pending generation, apply the wrong tools or system text on the
+/// next run, or answer an identical repeat as stale. Reader-first: this build decodes and folds
+/// them; no production path writes them yet.
+pub const SESSION_CHANGE_FEATURE: &str = "session-change/v1";
 
 /// Frozen automation identity affects admission. A scope-only reader would ignore the sender
 /// constraint and let the owner agent drive a carrier's session, so it must refuse this WAL.
@@ -1265,6 +1274,85 @@ mod tests {
         }
     }
 
+    /// A `SessionRefreshAccepted` round-trips byte for byte and requires `session-change/v1`
+    /// (with `plan-manifest/v1` for its manifest). A reader without the feature refuses the
+    /// frame as a newer writer rather than running the next episode with the wrong tools.
+    /// Reader-first: this build decodes and folds these records; no production path writes
+    /// them yet.
+    #[test]
+    fn session_refresh_accepted_round_trips_and_is_must_understand() {
+        use super::*;
+        let _guard = lock_feature_table_for_test();
+        let manifest = crate::record::PlanManifest {
+            rich_ui: None,
+            plan: crate::record::OpaqueJson::from_json_text(r#"{"id":"plan-a"}"#).unwrap(),
+            plan_identity: "plan-a".into(),
+            composition_digest: "c".into(),
+            fetches: Vec::new(),
+            tools: std::sync::Arc::new(Vec::new()),
+            system_text: String::new(),
+            system_digest: "s".into(),
+            join_version: 1,
+            role_versions: Default::default(),
+            declarations: Vec::new(),
+        };
+        let record = WalRecord::SessionRefreshAccepted {
+            generation: 1,
+            policy: "immediately".into(),
+            run_in_progress: true,
+            applies_from_next_run: true,
+            manifest: Box::new(manifest),
+        };
+        assert!(record.required_features().contains(&SESSION_CHANGE_FEATURE));
+        assert!(record.required_features().contains(&PLAN_MANIFEST_FEATURE));
+        let bytes = encode(7, 3, &record).unwrap();
+        match decode_next(&bytes) {
+            DecodeStep::Record { framed, .. } => assert_eq!(framed.record, record),
+            _ => panic!("a session-change reader decodes its own record"),
+        }
+        assert_eq!(
+            serde_json::to_string(&record).unwrap(),
+            r#"{"type":"session_refresh_accepted","generation":1,"policy":"immediately","run_in_progress":true,"applies_from_next_run":true,"manifest":{"plan":"{\"id\":\"plan-a\"}","plan_identity":"plan-a","composition_digest":"c","fetches":[],"tools":[],"system_text":"","system_digest":"s","join_version":1,"role_versions":{}}}"#,
+            "a session-change record keeps its exact bytes"
+        );
+        let missing: Vec<&str> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|feature| *feature != SESSION_CHANGE_FEATURE)
+            .collect();
+        match decode_next_with(&bytes, &missing) {
+            DecodeStep::NewerWriter { missing, .. } => {
+                assert_eq!(missing, vec![SESSION_CHANGE_FEATURE])
+            }
+            _ => panic!("a reader without session-change/v1 must refuse the frame"),
+        }
+    }
+
+    /// Policy changes and prefix flushes round-trip and require only `session-change/v1`.
+    #[test]
+    fn session_policy_and_flush_round_trip_and_require_the_feature() {
+        use super::*;
+        let _guard = lock_feature_table_for_test();
+        for record in [
+            WalRecord::SessionRefreshPolicyChanged {
+                generation: 1,
+                policy: "on_prefix_rebuild".into(),
+                send_id: "policy-1".into(),
+            },
+            WalRecord::SessionPrefixFlushed {
+                send_id: "flush-1".into(),
+                pending_generation: Some(1),
+            },
+        ] {
+            assert_eq!(record.required_features(), &[SESSION_CHANGE_FEATURE]);
+            let bytes = encode(7, 3, &record).unwrap();
+            match decode_next(&bytes) {
+                DecodeStep::Record { framed, .. } => assert_eq!(framed.record, record),
+                _ => panic!("a session-change reader decodes its own record"),
+            }
+        }
+    }
+
     /// A digest-valid frame carrying a record type from a newer build decodes as a record, not
     /// as corruption, and the framing refuses to write the lossy placeholder back out.
     #[test]
@@ -1463,6 +1551,7 @@ mod tests {
                 RUNNER_TAGS_V2_FEATURE,
                 RUN_CANCEL_AT_FEATURE,
                 SCOPE_FEATURE,
+                SESSION_CHANGE_FEATURE,
                 SESSION_CLASS_FEATURE,
                 STEER_QUEUE_FEATURE,
                 STEP_TRANSFORMS_FEATURE,
@@ -1500,6 +1589,7 @@ mod tests {
         assert_eq!(RESTART_PAUSE_FEATURE, "restart-pause/v1");
         assert_eq!(PROVIDER_HELD_FEATURE, "provider-held/v1");
         assert_eq!(SCOPE_FEATURE, "scope/v1");
+        assert_eq!(SESSION_CHANGE_FEATURE, "session-change/v1");
         assert_eq!(FLOW_SCOPE_FEATURE, "flow-scopes/v1");
         assert_eq!(
             GOOGLE_RPC_ERROR_DETAILS_FEATURE,

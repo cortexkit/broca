@@ -660,6 +660,9 @@ pub struct RunControl {
     /// it is written as a gated frame that builds without `plan-manifest/v1` refuse to read.
     /// `None` for a session admitted without a plan, whose `RunStarted` any build reads.
     pub manifest: Option<Arc<broca_wal::PlanManifest>>,
+    /// Replace the provider-view system text only after a recorded refresh applies. A
+    /// difference between legacy transcript text and manifest metadata is not a refresh.
+    pub manifest_system_override: bool,
     /// Told the WAL position of a fresh run's `RunStarted` once it is durable, and of each
     /// provider attempt record as it is appended, so the caller can report them to the routing
     /// module that chooses provider accounts. `None` reports nothing; either way the loop writes
@@ -803,6 +806,7 @@ impl Default for RunControl {
             stop_requested: None,
             steer: None,
             manifest: None,
+            manifest_system_override: false,
             account_reporter: None,
             keep_warm: None,
             elicitation_plane: None,
@@ -1790,7 +1794,7 @@ where
     // yet numbers its first one past every notice of this session's earlier lineages that
     // retention deleted, as their tombstones recorded. Only a session whose plan names a
     // compaction provider reads the tombstones, so every other admission does no extra I/O.
-    let frozen_plan = if is_resume {
+    let frozen_plan = if is_resume && !append_episode {
         prior.manifest.as_ref()
     } else {
         control.manifest.as_ref()
@@ -2133,8 +2137,14 @@ where
         .checkpoint_at_head
         .ownership
         .as_ref()
-        .and_then(|ownership| ownership.first_episode.as_ref())
-        .and_then(|first| first.manifest.clone());
+        .and_then(|ownership| {
+            ownership.latest_manifest.clone().or_else(|| {
+                ownership
+                    .first_episode
+                    .as_ref()
+                    .and_then(|first| first.manifest.clone())
+            })
+        });
     prior.marker_order_version = episode.and_then(|episode| episode.marker_order_version);
     prior.keep_warm = episode.and_then(|episode| episode.keep_warm);
     prior.cancel_at = episode.and_then(|episode| episode.cancel_at);
@@ -3945,7 +3955,7 @@ where
     let mut render_episodes = prior.render_episodes.take().unwrap_or_default();
     let tools = Arc::clone(&cfg.tools);
     let mut manifest = ToolManifest::from_shared_tools(Arc::clone(&tools));
-    let frozen_plan = if is_resume {
+    let frozen_plan = if is_resume && !append_episode {
         prior.manifest.as_ref()
     } else {
         control.manifest.as_ref()
@@ -3955,6 +3965,11 @@ where
             .with_plan_manifest(frozen_plan)
             .map_err(|error| RunError::Wal(error.to_string()))?;
     }
+    let plan_system_text = crate::plan_system::frozen_text(
+        control.manifest_system_override,
+        frozen_plan.map(AsRef::as_ref),
+    )
+    .map(str::to_owned);
     let mut stop_when = cfg.stop_when.clone();
     if stop_when.is_empty() {
         stop_when.push(StopCondition::StepCount {
@@ -5814,6 +5829,11 @@ where
             );
         }
         let sent_opts = model_opts.as_ref().unwrap_or(&opts);
+        let system_view = plan_system_text
+            .as_deref()
+            .and_then(|text| crate::plan_system::view(sent_opts, &opts.prompt, text))
+            .map(Arc::new);
+        let sent_opts = system_view.as_ref().unwrap_or(sent_opts);
         if boundary_cancelled(control) && compaction_runtime.is_some() {
             break RunFinishReason::Cancelled;
         }

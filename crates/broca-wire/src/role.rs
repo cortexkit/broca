@@ -512,6 +512,16 @@ pub struct BaselineWire {
     pub tool_names: Vec<String>,
     pub accepted_generation: u64,
     pub applied_generation: u64,
+    /// The pending change and its latest policy, when one is pending. Absent when none is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<cortexkit_role_llm_runner::baseline::PendingChange>,
+    /// The latest applied change, absent while none applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective: Option<cortexkit_role_llm_runner::baseline::EffectiveBaseline>,
+    /// The change-policy rungs this session supports, per surface. Present in every ready
+    /// baseline on a runner declaring `session_change`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rungs: Option<cortexkit_role_llm_runner::baseline::Rungs>,
     /// What the session's frozen config declares about its prompt cache. Absent when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<crate::CacheDeclarationWire>,
@@ -527,6 +537,9 @@ impl BaselineWire {
             tool_names,
             accepted_generation: 0,
             applied_generation: 0,
+            pending: None,
+            effective: None,
+            rungs: None,
             cache: None,
         }
     }
@@ -545,6 +558,9 @@ impl BaselineWire {
             tool_names,
             accepted_generation: 0,
             applied_generation: 0,
+            pending: None,
+            effective: None,
+            rungs: None,
             cache: None,
         }
     }
