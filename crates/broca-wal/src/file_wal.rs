@@ -3931,7 +3931,8 @@ mod tests {
                 ..
             })
         ));
-        // Live-file byte anchors require a stable file identity, available only on Unix.
+        // Live-file byte anchors require a stable file identity (Unix and Windows provide one);
+        // a platform without one has no anchor to check.
         if anchored {
             let anchor = anchor.expect("anchored corruption test requires a stable file identity");
             assert!(

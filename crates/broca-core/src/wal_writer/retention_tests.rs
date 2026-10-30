@@ -82,9 +82,9 @@ fn ephemeral_wal_resolves_through_every_store_reader() {
         .store
         .read_records_range(&f.session, 0, None, None)
         .unwrap();
-    // Byte anchors need a stable file identity, which only unix provides. Elsewhere the range
-    // has none and readers fall back to decoding from the start, so only unix checks the
-    // anchored read.
+    // Byte anchors need a stable file identity, which Unix and Windows provide. On a platform
+    // without one the range has no anchor and readers fall back to decoding from the start,
+    // so the anchored read is checked only where an anchor exists.
     match range.anchor_at(2) {
         Some(anchor) => {
             let anchored = f
