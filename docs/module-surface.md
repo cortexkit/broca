@@ -518,8 +518,13 @@ what it cost.
   absent when unknown; `basis` is `requested` when the session's cache request named the
   lifetime and `provider_default` when the provider's default applies.
 
-An episode that froze the client-side refusal fallback also maintains a separate clock for
-its refused source request. While the round survives, broca refreshes that source prefix only
+Source-cache maintenance additionally follows the current
+`anthropic_fallbacks.refusal_resend.enabled` switch read at module boot. When off, no source
+task, subscription or source-record tap is installed, even for a session with a frozen fallback.
+Its durable refusal routing still resumes unchanged; only source-cache maintenance is disabled.
+When enabled, broca keeps a separate clock for the refused source request of a run that froze
+the client-side fallback. While its allowance of 10, 20 or 40 successful fallback replies remains,
+broca refreshes that source prefix only
 near expiry: 30 seconds before a five-minute TTL, or two minutes before a one-hour TTL. The
 base is the source request that was actually sent, not a converted fallback request. Its
 rebuilt bytes must hash to that source request's recorded digest before the warm's output-only
@@ -530,11 +535,19 @@ Sessions whose frozen `session_class` is `head` may keep that source prefix warm
 other classes (including absent or unknown classes) warm only while a run is active. The same
 quota and rent-or-rewrite budget checks apply. Idle head warming stops before its cumulative
 cost reaches one source rewrite, using the source model's prices and frozen TTL; a new run
-resets the allowance. Compaction, account or credential changes, model/config refreezes and
-the source answering again invalidate the old prefix. Authentication pauses suspend warming;
+resets this warming-cost allowance, whereas resuming the same run does not. Once the configured
+number of successful fallback replies has been served, broca stops keeping the old source prefix
+warm, before making
+the next source-model request. It does not wait for that source request to answer.
+Applied compaction messages/views, account or credential changes, model/config refreezes and
+the source answering again also invalidate the old prefix. Authentication pauses suspend warming;
 shutdown and restart pauses stop local IO, and a new process rebuilds eligible schedules from
 the WAL, including warm spend. No timer or new record type is persisted. These rules do not
 enable the default-off refusal fallback switch.
+
+New source-maintenance records use the existing optional `cache_warmed.trigger` string value
+`source_keep_warm` to select source-model attribution. Records without that discriminator,
+including historical late manual warms, keep their original attribution and export-fact bytes.
 
 A **cursor** is a durable `(wal_seq, sub_index)` (§7). `subscribe` and `read.head` share
 this one cursor domain. A cursor attach starts strictly after that unit, so

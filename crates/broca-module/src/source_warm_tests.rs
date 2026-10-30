@@ -11,7 +11,7 @@ const FALLBACK: &str = "claude-opus-4-8";
 
 // Keep the test runnable while the WAL thread works. A paused runtime must not auto-advance
 // unrelated timers just because a filesystem operation is waiting on another OS thread.
-async fn drive<F: Future>(future: F) -> F::Output {
+pub(crate) async fn drive<F: Future>(future: F) -> F::Output {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     tokio::pin!(future);
     loop {
@@ -482,10 +482,28 @@ impl Fixture {
             *attempt = 1;
         }
         self.record(attempt).await;
+        let schedule = self
+            .records
+            .iter()
+            .find_map(|record| match record {
+                WalRecord::ModelStepRefused { schedule, .. } => Some(schedule),
+                _ => None,
+            })
+            .unwrap();
+        let schedule = broca_core::refusal_fallback::on_step_committed(
+            Some(schedule),
+            broca_core::refusal_fallback::CommittedStep {
+                route: broca_core::refusal_fallback::StepRoute::Fallback,
+                refused: false,
+                served_by_server_side_fallback: false,
+            },
+            Some(epoch_ms()),
+        );
         self.record(serde_json::from_value(serde_json::json!({
             "type":"model_step_finished", "step_id":1,
             "assistant_message":{"message_id":"fallback-answer","content":[{"type":"text","text":"ok"}]},
-            "usage":{}, "route":{"model":{"provider_module_id":"anthropic","model_id":FALLBACK},"reason":"refusal"}
+            "usage":{}, "route":{"model":{"provider_module_id":"anthropic","model_id":FALLBACK},"reason":"refusal"},
+            "refusal_fallback":schedule
         })).unwrap()).await;
     }
 }
@@ -620,12 +638,14 @@ async fn source_overhaul_warm_reservation_names_source_model() {
     let warms = f.warms();
     let WalRecord::CacheWarmed {
         reservation: Some(reservation),
+        trigger,
         ..
     } = &warms[0]
     else {
         panic!("missing billing reservation");
     };
     assert_eq!(reservation.model_sent, SOURCE);
+    assert_eq!(trigger.as_deref(), Some("source_keep_warm"));
     f.stop().await;
 }
 
@@ -640,6 +660,7 @@ async fn source_legacy_warm_and_export_follow_the_refused_digest_not_the_fallbac
     let WalRecord::CacheWarmed {
         request_body_sha256,
         reservation,
+        trigger,
         ..
     } = &warms[0]
     else {
@@ -654,6 +675,7 @@ async fn source_legacy_warm_and_export_follow_the_refused_digest_not_the_fallbac
     };
     assert_eq!(request_body_sha256, refused_digest);
     assert!(reservation.is_none());
+    assert_eq!(trigger.as_deref(), Some("source_keep_warm"));
     let facts = drive(async {
         loop {
             let facts = f.export.read_page(None, 100).unwrap().facts;
@@ -675,6 +697,11 @@ async fn source_legacy_warm_and_export_follow_the_refused_digest_not_the_fallbac
     assert!(facts
         .iter()
         .any(|f| f.segment.as_session().unwrap().model == FALLBACK));
+    let sample = serde_json::json!({"cache_warmed_record": &warms[0], "export_fact": warm});
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.cortexkit/internal-docs/investigations/source-warm-serializer-sample.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, serde_json::to_vec_pretty(&sample).unwrap()).unwrap();
     f.stop().await;
 }
 
@@ -752,6 +779,220 @@ async fn source_head_run_boundary_does_not_cancel_and_duplicate_an_in_flight_war
     gate.notify_one();
     f.await_warm(1).await;
     assert_eq!(f.executor.provider.bodies.lock().unwrap().len(), 1);
+    assert_eq!(f.warms().len(), 1);
+    f.stop().await;
+}
+
+impl Fixture {
+    async fn finish_fallback_round(&mut self) {
+        use broca_core::refusal_fallback::{on_step_committed, CommittedStep, StepRoute};
+        let mut schedule = self
+            .records
+            .iter()
+            .find_map(|record| match record {
+                WalRecord::ModelStepRefused { schedule, .. } => Some(schedule.clone()),
+                _ => None,
+            })
+            .unwrap();
+        for reply in 1..=10 {
+            if reply > 1 {
+                let mut started = self.records[0].clone();
+                if let WalRecord::RunStarted { run_id, input, .. } = &mut started {
+                    *run_id = RunId(format!("fallback-round-{reply}"));
+                    *input = Arc::new(vec![broca_protocol::Message::new(
+                        broca_protocol::Role::User,
+                        vec![broca_protocol::ContentBlock::Text {
+                            text: format!("reply {reply}"),
+                        }],
+                    )]);
+                }
+                self.record(started).await;
+                self.record(WalRecord::StepStarted { step_id: StepId(1) })
+                    .await;
+            }
+            let mut fallback = self.executor.provider.frozen.clone();
+            fallback.wire_model_id = FALLBACK.into();
+            let mut opts = CallOptions::new(broca_core::replay(&self.records).unwrap().prompt);
+            opts.target_model = Some(ModelHandle::new("anthropic", FALLBACK));
+            let digest =
+                broca_core::render::request_digest_hex(&AnthropicMessages.render(&fallback, &opts));
+            let mut attempt = self.records[2].clone();
+            if let WalRecord::ModelAttemptFinished {
+                request_body_sha256,
+                attempt,
+                ..
+            } = &mut attempt
+            {
+                *request_body_sha256 = digest;
+                *attempt = u32::from(reply == 1);
+            }
+            self.record(attempt).await;
+            schedule = on_step_committed(
+                Some(&schedule),
+                CommittedStep {
+                    route: StepRoute::Fallback,
+                    refused: false,
+                    served_by_server_side_fallback: false,
+                },
+                Some(epoch_ms()),
+            )
+            .unwrap();
+            self.record(serde_json::from_value(serde_json::json!({
+                "type":"model_step_finished", "step_id":1,
+                "assistant_message":{"message_id":format!("answer-{reply}"),"content":[{"type":"text","text":"fallback reply"}]},
+                "usage":{}, "route":{"model":{"provider_module_id":"anthropic","model_id":FALLBACK},"reason":"schedule"},
+                "refusal_fallback":schedule
+            })).unwrap()).await;
+            self.record(finished()).await;
+        }
+        assert!(matches!(
+            schedule.phase,
+            broca_wal::RefusalFallbackPhase::Probe { clean: 0 }
+        ));
+    }
+
+    async fn stopped_or_warmed(&self, previous_warms: usize) {
+        drive(async {
+            while self
+                .task
+                .as_ref()
+                .unwrap()
+                .holds_idle
+                .load(Ordering::Acquire)
+                && self
+                    .task
+                    .as_ref()
+                    .unwrap()
+                    .completed_warms
+                    .load(Ordering::Acquire)
+                    <= previous_warms as u64
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+    }
+
+    async fn pause_resume(&mut self) {
+        self.record(WalRecord::RunPaused {
+            run_id: RunId("r".into()),
+            reason: broca_protocol::PauseReason::Restart,
+            error: None,
+            ts_ms: Some(epoch_ms()),
+        })
+        .await;
+        self.record(WalRecord::ResumeStarted {
+            episode: RunId("r".into()),
+            resumed_from_seq: 0,
+            replayed: Default::default(),
+            redone: vec![],
+            indeterminate: vec![],
+        })
+        .await;
+        drive(async {
+            while !self
+                .task
+                .as_ref()
+                .unwrap()
+                .holds_idle
+                .load(Ordering::Acquire)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn source_review_final_fallback_reply_stops_a_round_before_first_expiry() {
+    let mut f = Fixture::new(true, false, 300_000, 1000.0).await;
+    f.start().await;
+    f.finish_fallback_round().await;
+    tokio::time::advance(Duration::from_secs(270)).await;
+    f.stopped_or_warmed(0).await;
+    assert!(
+        f.warms().is_empty(),
+        "the committed tenth fallback reply ended the round"
+    );
+    assert!(!f.task.as_ref().unwrap().holds_idle.load(Ordering::Acquire));
+    f.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn source_review_probe_phase_on_restart_does_not_rebuild_a_warm_candidate() {
+    let mut f = Fixture::new(true, false, 300_000, 1000.0).await;
+    f.start().await;
+    f.warm(1).await;
+    f.finish_fallback_round().await;
+    let mut f = f.restart().await;
+    f.start().await;
+    tokio::time::advance(Duration::from_secs(270)).await;
+    f.stopped_or_warmed(1).await;
+    assert_eq!(
+        f.warms().len(),
+        1,
+        "a durable Probe phase is not an active fallback round"
+    );
+    f.stop().await;
+}
+
+async fn source_review_resume_budget_case(restart: bool) {
+    let mut f = Fixture::new(true, false, 300_000, 3.0).await;
+    f.start().await;
+    f.warm(1).await;
+    f.pause_resume().await;
+    f.warm(2).await;
+    f.pause_resume().await;
+    if restart {
+        f = f.restart().await;
+        f.start().await;
+    }
+    tokio::time::advance(Duration::from_secs(270)).await;
+    f.stopped_or_warmed(2).await;
+    assert_eq!(
+        f.warms().len(),
+        2,
+        "resuming one episode cannot buy a fresh rewrite allowance"
+    );
+    assert!(!f.task.as_ref().unwrap().holds_idle.load(Ordering::Acquire));
+    f.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn source_review_repeated_resumes_do_not_replenish_live_rent_budget() {
+    source_review_resume_budget_case(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn source_review_repeated_resumes_do_not_replenish_replayed_rent_budget() {
+    source_review_resume_budget_case(true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn source_review_direct_compaction_message_permanently_stops_the_prefix() {
+    let mut f = Fixture::new(true, false, 300_000, 1000.0).await;
+    f.start().await;
+    f.warm(1).await;
+    let replacement = Arc::new(vec![broca_protocol::Message::new(
+        broca_protocol::Role::User,
+        vec![broca_protocol::ContentBlock::Text {
+            text: "replacement history".into(),
+        }],
+    )]);
+    let record = serde_json::from_value(serde_json::json!({
+        "type":"compaction_message", "provider":"compact", "kind":"step", "compaction_id":"history-replacement", "version":1,
+        "range":{"from":0,"to":2}, "replacement":replacement,
+        "sha256":broca_wal::record::compaction_replacement_sha256(&replacement).unwrap()
+    })).unwrap();
+    f.record(record).await;
+    tokio::time::advance(Duration::from_secs(270)).await;
+    f.stopped_or_warmed(1).await;
+    assert_eq!(f.warms().len(), 1);
+    let mut f = f.restart().await;
+    f.start().await;
+    tokio::time::advance(Duration::from_secs(270)).await;
+    f.stopped_or_warmed(1).await;
     assert_eq!(f.warms().len(), 1);
     f.stop().await;
 }

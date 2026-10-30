@@ -13,6 +13,29 @@ use std::sync::{
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestStats {
+    pub(crate) tasks: std::sync::atomic::AtomicU64,
+    pub(crate) subscriptions: std::sync::atomic::AtomicU64,
+    pub(crate) tap_calls: std::sync::atomic::AtomicU64,
+    pub(crate) record_clones: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+pub(crate) fn test_stats(session: &BindIdentity) -> Arc<TestStats> {
+    static STATS: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<BindIdentity, std::sync::Weak<TestStats>>>,
+    > = std::sync::OnceLock::new();
+    let mut stats = STATS.get_or_init(Mutex::default).lock().unwrap();
+    if let Some(stats) = stats.get(session).and_then(std::sync::Weak::upgrade) {
+        return stats;
+    }
+    let entry = Arc::new(TestStats::default());
+    stats.insert(session.clone(), Arc::downgrade(&entry));
+    entry
+}
+
 // Leave time for quota lookup and network delivery before a read becomes a cache rewrite.
 const FIVE_MINUTE_LEAD_MS: u64 = 30_000;
 const ONE_HOUR_LEAD_MS: u64 = 120_000;
@@ -33,7 +56,7 @@ impl Default for Events {
 }
 
 impl Events {
-    pub(crate) fn observe(&self, seq: u64, record: &WalRecord) {
+    pub(crate) fn observe(&self, seq: u64, record: &WalRecord) -> bool {
         let relevant = match record {
             WalRecord::RunStarted { .. }
             | WalRecord::ResumeStarted { .. }
@@ -43,9 +66,10 @@ impl Events {
             | WalRecord::RunCancelRequested { .. }
             | WalRecord::RunConfigRefrozen { .. }
             | WalRecord::RunAuthRefrozen { .. }
+            | WalRecord::CompactionMessage { .. }
             | WalRecord::CompactionViewApplied { .. }
             | WalRecord::WriterClosed { .. } => true,
-            WalRecord::ModelStepFinished { fallback, .. } => fallback.route.is_none(),
+            WalRecord::ModelStepFinished { .. } => true,
             WalRecord::ModelAttemptFinished {
                 credential_refresh,
                 served_account_ref,
@@ -55,7 +79,9 @@ impl Events {
         };
         if relevant && self.0.receiver_count() != 0 {
             let _ = self.0.send(Event::Record(seq, Box::new(record.clone())));
+            return true;
         }
+        false
     }
 
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<Event> {
@@ -107,12 +133,14 @@ impl State {
                 finish_reason,
                 ..
             } => {
+                let round_active = matches!(fallback.refusal_fallback.as_ref().map(|s| s.phase),
+                    Some(RefusalFallbackPhase::Fallback { remaining }) if remaining > 0);
+                if fallback.route.is_some() && !round_active {
+                    self.candidate = None;
+                }
                 if fallback.route.is_none() {
-                    self.candidate = if matches!(
-                        fallback.refusal_fallback.as_ref().map(|s| s.phase),
-                        Some(RefusalFallbackPhase::Fallback { .. })
-                    ) && *finish_reason
-                        == Some(broca_protocol::FinishReason::ContentFilter)
+                    self.candidate = if round_active
+                        && *finish_reason == Some(broca_protocol::FinishReason::ContentFilter)
                     {
                         Some(at)
                     } else {
@@ -146,7 +174,7 @@ impl State {
                     config.auth_selection = Some(auth_selection.clone());
                 }
             }
-            WalRecord::CompactionViewApplied { .. } => {
+            WalRecord::CompactionMessage { .. } | WalRecord::CompactionViewApplied { .. } => {
                 self.candidate = None;
             }
             WalRecord::ModelAttemptFinished {
@@ -257,6 +285,10 @@ pub(crate) fn spawn<W: WalStore + 'static>(
     records: Vec<WalRecord>,
     safe_head: u64,
 ) -> Task {
+    #[cfg(test)]
+    test_stats(&runtime.session)
+        .tasks
+        .fetch_add(1, Ordering::Relaxed);
     let cancel = CancellationToken::new();
     let holds_idle = Arc::new(AtomicBool::new(false));
     #[cfg(test)]
@@ -337,6 +369,7 @@ fn rebuild<W: WalStore>(
     }
     let last_sent = clock.read()?.last_sent_at_ms;
     let warmer = Arc::new(AutomaticWarmer {
+        trigger: broca_core::cache_warm::SOURCE_KEEP_WARM_TRIGGER,
         retention: records.iter().any(|record| {
             matches!(
                 record,
@@ -367,11 +400,12 @@ fn rebuild<W: WalStore>(
     let mut idle = false;
     for record in &records[at..] {
         match record {
-            WalRecord::RunStarted { .. } | WalRecord::ResumeStarted { .. } => {
+            WalRecord::RunStarted { .. } => {
                 idle = false;
                 prefix.spent = 0.0;
                 prefix.idle_spent = 0.0;
             }
+            WalRecord::ResumeStarted { .. } => idle = false,
             WalRecord::RunFinished { .. } => idle = true,
             WalRecord::CacheWarmed {
                 request_body_sha256,
@@ -466,7 +500,7 @@ async fn run<W: WalStore + 'static>(
                 state.observe(0, &record);
                 if state.candidate.is_none() { prefix = None; }
                 if prefix.is_none() || state.paused || (!state.head && !state.running) { tick = None; }
-                if matches!(record, WalRecord::RunStarted { .. } | WalRecord::ResumeStarted { .. }) {
+                if matches!(record, WalRecord::RunStarted { .. }) {
                     if let Some(prefix) = prefix.as_mut() {
                         prefix.idle_spent = 0.0;
                         prefix.spent = 0.0;
@@ -571,4 +605,4 @@ async fn run<W: WalStore + 'static>(
 
 #[cfg(test)]
 #[path = "source_warm_tests.rs"]
-mod tests;
+pub(crate) mod tests;

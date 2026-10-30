@@ -27,6 +27,10 @@ pub const WARM_EXPIRY_MARGIN_MS: u64 = 5_000;
 /// when broca started sending. No provider reports the expiry itself.
 pub const EXPIRY_BASIS_ESTIMATED: &str = "estimated";
 
+/// New source-maintenance records opt into source-model billing attribution. Other trigger
+/// values, including absence, retain the historical projection for the same WAL bytes.
+pub const SOURCE_KEEP_WARM_TRIGGER: &str = "source_keep_warm";
+
 /// The exact bytes of one rendered model request, as the transport sent them.
 #[derive(Clone)]
 pub struct SentRequest {
@@ -160,7 +164,6 @@ pub fn prefix_tokens(usage: Usage) -> Option<u64> {
 }
 
 fn last_cache_usage(records: &[WalRecord], last_sent_at_ms: u64) -> Option<Usage> {
-    let latest_digest = latest_cache_request_digest(records);
     let mut bound = SendLowerBound::default();
     let mut latest_step = None;
     let mut usage = None;
@@ -188,10 +191,13 @@ fn last_cache_usage(records: &[WalRecord], last_sent_at_ms: u64) -> Option<Usage
                 sent_at_ms,
                 usage: reported,
                 envelope,
+                trigger,
                 ..
             } if *sent_at_ms == last_sent_at_ms
                 && warm_reached_the_cache(envelope.as_deref())
-                && latest_digest.is_none_or(|digest| digest == request_body_sha256) =>
+                && (trigger.as_deref() != Some(SOURCE_KEEP_WARM_TRIGGER)
+                    || latest_cache_request_digest(records)
+                        .is_none_or(|digest| digest == request_body_sha256)) =>
             {
                 latest_step = None;
                 usage = Some(*reported);
@@ -217,8 +223,9 @@ fn last_cache_usage(records: &[WalRecord], last_sent_at_ms: u64) -> Option<Usage
 ///
 /// A warm counts from its own `sent_at_ms` only when its billing envelope records success.
 /// Legacy warm records have no envelope and were written only for answered warms.
+/// Only the new source-maintenance trigger opts into matching the latest request's digest;
+/// unmarked records retain their historical clock inference.
 pub fn last_cache_send_at_ms(records: &[WalRecord]) -> Option<u64> {
-    let latest_digest = latest_cache_request_digest(records);
     let mut latest: Option<u64> = None;
     let mut bound = SendLowerBound::default();
     for record in records {
@@ -233,9 +240,12 @@ pub fn last_cache_send_at_ms(records: &[WalRecord]) -> Option<u64> {
                 request_body_sha256,
                 sent_at_ms,
                 envelope,
+                trigger,
                 ..
             } if warm_reached_the_cache(envelope.as_deref())
-                && latest_digest.is_none_or(|digest| digest == request_body_sha256) =>
+                && (trigger.as_deref() != Some(SOURCE_KEEP_WARM_TRIGGER)
+                    || latest_cache_request_digest(records)
+                        .is_none_or(|digest| digest == request_body_sha256)) =>
             {
                 Some(*sent_at_ms)
             }
@@ -250,22 +260,6 @@ pub fn last_cache_send_at_ms(records: &[WalRecord]) -> Option<u64> {
 // A standby source warm can finish after a fallback request. Its digest identifies another
 // request and must not extend the active route's clock or replace its token-count evidence.
 fn latest_cache_request_digest(records: &[WalRecord]) -> Option<&str> {
-    let has_fallback = records
-        .iter()
-        .rev()
-        .find_map(|record| match record {
-            WalRecord::RunStarted { config, .. } => Some(
-                config
-                    .frozen_render_config
-                    .get("refusal_fallback")
-                    .is_some(),
-            ),
-            _ => None,
-        })
-        .unwrap_or(false);
-    if !has_fallback {
-        return None;
-    }
     records.iter().rev().find_map(|record| match record {
         WalRecord::ModelAttemptFinished {
             request_body_sha256,
@@ -1730,7 +1724,7 @@ mod tests {
         {
             *request_body_sha256 = "fallback-digest".into();
         }
-        let records = vec![
+        let mut records = vec![
             started,
             attempt(Some(200), "complete", Some(100), 150),
             fallback,
@@ -1742,6 +1736,14 @@ mod tests {
             .unwrap(),
             warmed(400),
         ];
+        assert_eq!(
+            last_cache_send_at_ms(&records),
+            Some(400),
+            "unmarked historical warms retain the legacy clock"
+        );
+        if let Some(WalRecord::CacheWarmed { trigger, .. }) = records.last_mut() {
+            *trigger = Some(SOURCE_KEEP_WARM_TRIGGER.into());
+        }
         assert_eq!(last_cache_send_at_ms(&records), Some(200));
         let clock = CacheClock::default();
         clock.seed_if_unknown(&records, Some(300_000));

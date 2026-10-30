@@ -3650,6 +3650,9 @@ mod executor {
 
     #[async_trait]
     impl<W: ExecutorWalStore + 'static> RunExecutor for LiveLoopExecutor<W> {
+        fn source_warm_enabled(&self) -> bool {
+            self.anthropic_fallbacks.refusal_resend.is_enabled()
+        }
         async fn media_profile(
             &self,
             request: &broca_protocol::request::SubmissionRequest,

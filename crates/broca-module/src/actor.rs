@@ -1895,54 +1895,60 @@ impl<W: WalStore + 'static> LineageActor<W> {
             ));
         }
         let mut idle_deadline = tokio::time::Instant::now() + self.idle_ttl;
-        let source_events = self.fanout.source_warm_events();
-        let has_frozen_fallback = self.prior_snapshot.as_ref().is_some_and(|snapshot| {
-            snapshot
-                .checkpoint_at_head
-                .last_episode
-                .as_ref()
-                .is_some_and(|episode| {
-                    episode
-                        .config
-                        .frozen_render_config
-                        .get("refusal_fallback")
-                        .is_some()
-                })
-        });
-        let source_frames = if has_frozen_fallback {
-            self.read_wal_framed_records().await.unwrap_or_default()
+        let source_events = if self.executor.source_warm_enabled() {
+            self.fanout.source_warm_events()
         } else {
-            Vec::new()
+            None
         };
-        let safe_head = source_frames.last().map_or(0, |frame| frame.seq);
-        let source_records = source_frames
-            .into_iter()
-            .map(|frame| frame.record)
-            .collect();
-        let writer = self
-            .writer
-            .as_ref()
-            .expect("writer live while serving")
-            .clone();
-        let registry = self.registry.clone();
-        self.source_warm_task = Some(crate::source_warm::spawn(
-            crate::source_warm::Runtime {
-                session: self.key.clone(),
-                writer,
-                store: self.wal_store.clone(),
-                executor: self.executor.clone(),
-                declare: Arc::new(move |config| registry.cache_declaration(config)),
-                slot: self.warm_in_flight.clone(),
-                stopping: self.registry.stopping_signal(),
-                export: self
-                    .export_index
-                    .clone()
-                    .zip(self.charge_basis_resolver.clone()),
-            },
-            source_events,
-            source_records,
-            safe_head,
-        ));
+        if let Some(source_events) = source_events {
+            let has_frozen_fallback = self.prior_snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot
+                    .checkpoint_at_head
+                    .last_episode
+                    .as_ref()
+                    .is_some_and(|episode| {
+                        episode
+                            .config
+                            .frozen_render_config
+                            .get("refusal_fallback")
+                            .is_some()
+                    })
+            });
+            let source_frames = if has_frozen_fallback {
+                self.read_wal_framed_records().await.unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let safe_head = source_frames.last().map_or(0, |frame| frame.seq);
+            let source_records = source_frames
+                .into_iter()
+                .map(|frame| frame.record)
+                .collect();
+            let writer = self
+                .writer
+                .as_ref()
+                .expect("writer live while serving")
+                .clone();
+            let registry = self.registry.clone();
+            self.source_warm_task = Some(crate::source_warm::spawn(
+                crate::source_warm::Runtime {
+                    session: self.key.clone(),
+                    writer,
+                    store: self.wal_store.clone(),
+                    executor: self.executor.clone(),
+                    declare: Arc::new(move |config| registry.cache_declaration(config)),
+                    slot: self.warm_in_flight.clone(),
+                    stopping: self.registry.stopping_signal(),
+                    export: self
+                        .export_index
+                        .clone()
+                        .zip(self.charge_basis_resolver.clone()),
+                },
+                source_events,
+                source_records,
+                safe_head,
+            ));
+        }
         let clock = self
             .registry
             .retention_service()
@@ -4752,6 +4758,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 Some(broca_core::LineageRetention::Retained { .. })
             );
         let warmer = Arc::new(crate::keep_warm::AutomaticWarmer {
+            trigger: "keep_warm",
             retention: self.retention_lineage,
             session: self.key.clone(),
             writer: self
