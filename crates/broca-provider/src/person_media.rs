@@ -143,69 +143,90 @@ pub fn check_protected_payload<'a>(
 }
 
 pub(crate) fn accepts_mime(profile: &MediaProfile, media: &MediaRef) -> bool {
+    accepted_mime_types(profile, media.kind).contains(&media.mime.as_str())
+}
+
+/// MIME types accepted by `check_item` for the modalities and user-message carriers in `profile`.
+pub fn input_mime_types(profile: &MediaProfile) -> Vec<String> {
+    [
+        MediaKind::Image,
+        MediaKind::Document,
+        MediaKind::Audio,
+        MediaKind::Video,
+    ]
+    .into_iter()
+    .filter(|kind| {
+        profile.accepts_modality(*kind) && profile.kind(*kind).user_message != MediaCarrier::Marker
+    })
+    .flat_map(|kind| {
+        accepted_mime_types(profile, kind)
+            .iter()
+            .map(|mime| (*mime).to_owned())
+    })
+    .collect()
+}
+
+fn accepted_mime_types(profile: &MediaProfile, kind: MediaKind) -> &'static [&'static str] {
     use crate::media_profile::MediaProfileId::*;
-    let mime = media.mime.as_str();
-    match media.kind {
+    match kind {
         MediaKind::Image => match profile.profile {
-            Xai => matches!(mime, "image/png" | "image/jpeg"),
+            Xai => &["image/png", "image/jpeg"],
             Gemini | Gemini3 | CodeAssistGemini | CodeAssistGemini3 => {
-                matches!(mime, "image/png" | "image/jpeg" | "image/webp")
+                &["image/png", "image/jpeg", "image/webp"]
             }
-            _ => matches!(
-                mime,
-                "image/png" | "image/jpeg" | "image/webp" | "image/gif"
-            ),
+            _ => &["image/png", "image/jpeg", "image/webp", "image/gif"],
         },
-        MediaKind::Document => mime == "application/pdf",
+        MediaKind::Document => &["application/pdf"],
         MediaKind::Audio => match profile.profile {
-            OpenaiChat | MetaChat | MetaResponses => matches!(mime, "audio/wav" | "audio/mpeg"),
-            Openrouter => mime == "audio/wav",
-            Bedrock => matches!(
-                mime,
-                "audio/wav" | "audio/mpeg" | "audio/aac" | "audio/ogg" | "audio/flac" | "audio/mp4"
-            ),
-            Gemini | Gemini3 | CodeAssistGemini | CodeAssistGemini3 => matches!(
-                mime,
-                "audio/wav"
-                    | "audio/mp3"
-                    | "audio/mpeg"
-                    | "audio/aiff"
-                    | "audio/aac"
-                    | "audio/ogg"
-                    | "audio/flac"
-                    | "audio/m4a"
-                    | "audio/mp4"
-            ),
-            _ => false,
+            OpenaiChat | MetaChat | MetaResponses => &["audio/wav", "audio/mpeg"],
+            Openrouter => &["audio/wav"],
+            Bedrock => &[
+                "audio/wav",
+                "audio/mpeg",
+                "audio/aac",
+                "audio/ogg",
+                "audio/flac",
+                "audio/mp4",
+            ],
+            Gemini | Gemini3 | CodeAssistGemini | CodeAssistGemini3 => &[
+                "audio/wav",
+                "audio/mp3",
+                "audio/mpeg",
+                "audio/aiff",
+                "audio/aac",
+                "audio/ogg",
+                "audio/flac",
+                "audio/m4a",
+                "audio/mp4",
+            ],
+            _ => &[],
         },
         MediaKind::Video => match profile.profile {
-            Openrouter | MetaChat | MetaResponses => mime == "video/mp4",
-            Bedrock => matches!(
-                mime,
-                "video/mp4"
-                    | "video/quicktime"
-                    | "video/webm"
-                    | "video/x-flv"
-                    | "video/mpeg"
-                    | "video/x-ms-wmv"
-                    | "video/3gpp"
-                    | "video/x-matroska"
-            ),
-            Kimi | Gemini | Gemini3 | CodeAssistGemini | CodeAssistGemini3 => matches!(
-                mime,
-                "video/mp4"
-                    | "video/mpeg"
-                    | "video/mov"
-                    | "video/quicktime"
-                    | "video/avi"
-                    | "video/x-msvideo"
-                    | "video/x-flv"
-                    | "video/mpg"
-                    | "video/webm"
-                    | "video/x-ms-wmv"
-                    | "video/3gpp"
-            ),
-            _ => false,
+            Openrouter | MetaChat | MetaResponses => &["video/mp4"],
+            Bedrock => &[
+                "video/mp4",
+                "video/quicktime",
+                "video/webm",
+                "video/x-flv",
+                "video/mpeg",
+                "video/x-ms-wmv",
+                "video/3gpp",
+                "video/x-matroska",
+            ],
+            Kimi | Gemini | Gemini3 | CodeAssistGemini | CodeAssistGemini3 => &[
+                "video/mp4",
+                "video/mpeg",
+                "video/mov",
+                "video/quicktime",
+                "video/avi",
+                "video/x-msvideo",
+                "video/x-flv",
+                "video/mpg",
+                "video/webm",
+                "video/x-ms-wmv",
+                "video/3gpp",
+            ],
+            _ => &[],
         },
     }
 }

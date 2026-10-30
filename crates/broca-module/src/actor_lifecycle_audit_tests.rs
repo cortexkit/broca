@@ -389,6 +389,7 @@ impl Fixture {
         actor.registry.publish_open_slot_for_test(
             &actor.key,
             ActorHandle {
+                media_head: actor.fanout.media_head(),
                 gen: actor.gen,
                 tx: actor.self_tx.clone(),
                 durable_head: actor.writer.as_ref().unwrap().durable_head(),

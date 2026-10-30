@@ -362,6 +362,7 @@ pub enum SendOutcome {
         field: String,
     },
     VariantUnsupported(broca_core::run::VariantRefusal),
+    Upload(broca_core::media_uploads::UploadError),
     /// The run started immediately (the lineage was idle).
     Active {
         run_id: RunId,
@@ -1760,6 +1761,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let retractions_complete = durable_head.load(Ordering::Acquire) == 0;
         let first_episode = Arc::new(std::sync::OnceLock::new());
         let approvals = fanout.approval_state();
+        let media_head = fanout.media_head();
         let mut actor = LineageActor {
             agent_run_scope: None,
             #[cfg(all(test, feature = "test-clock"))]
@@ -1862,6 +1864,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
         });
         ActorHandle {
+            media_head,
             gen,
             tx,
             durable_head,
@@ -3957,6 +3960,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 Err(StartRunFailure::ContextCeiling(detail)) => SendOutcome::ContextCeiling(detail),
                 Err(StartRunFailure::Admission(RunError::MediaUnsupported(message))) => {
                     crate::person_media::outcome(RunError::MediaUnsupported(message))
+                }
+                Err(StartRunFailure::Admission(RunError::Upload(error))) => {
+                    SendOutcome::Upload(error)
                 }
                 Err(StartRunFailure::Admission(RunError::Transient(message))) => {
                     SendOutcome::Transient(message)
@@ -8809,6 +8815,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// Re-arm: restore Open{gen} and keep serving.
     fn abort_close(&self, token: CloseToken) -> bool {
         token.abort(ActorHandle {
+            media_head: self.fanout.media_head(),
             approvals: self.approvals.clone(),
             gen: self.gen,
             tx: self.self_tx.clone(),
@@ -9145,6 +9152,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .ownership
             .as_ref()
             .is_some_and(|ownership| ownership.session_change_recorded);
+        if let (Some(head), Some(episode), Some(writer)) = (
+            self.fanout.media_head(),
+            snapshot.checkpoint_at_head.last_episode.as_ref(),
+            self.writer.as_ref(),
+        ) {
+            head.seed(writer.lineage_id(), snapshot.head_seq, episode);
+        }
         self.prior_snapshot = Some(snapshot);
         Ok(())
     }

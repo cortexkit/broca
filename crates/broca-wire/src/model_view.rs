@@ -1,5 +1,5 @@
-//! Model pages identify each message as replacement content or a transcript message,
-//! while retaining the exact broca protocol message serialized for the model request.
+//! Model pages retain transcript/replacement coordinates and native messages. The serving
+//! layer can render unrequested media as text without changing stored messages.
 
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +60,44 @@ pub struct ModelPage {
     pub compaction_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<u64>,
+}
+
+impl ModelPage {
+    /// Inline readers receive text placeholders, not stored media references. Other message
+    /// content stays native so a media-free model page retains its existing bytes.
+    pub fn render_inline_media(&mut self) {
+        use broca_protocol::{ContentBlock, MediaMarkerReason, ToolOutput, ToolOutputPart};
+        for entry in &mut self.messages {
+            for block in &mut entry.message.content {
+                match block {
+                    ContentBlock::Media(media) => {
+                        *block = ContentBlock::Text {
+                            text: broca_protocol::content::media_not_shown_marker(
+                                media,
+                                MediaMarkerReason::NotRequested,
+                            ),
+                        }
+                    }
+                    ContentBlock::ToolResult(result) => {
+                        if let ToolOutput::Parts { parts } = &result.output {
+                            if parts
+                                .iter()
+                                .any(|part| matches!(part, ToolOutputPart::Media { .. }))
+                            {
+                                result.output = ToolOutput::Text {
+                                    text: broca_protocol::content::media_parts_text(
+                                        parts,
+                                        MediaMarkerReason::NotRequested,
+                                    ),
+                                };
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 impl TryFrom<broca_core::ModelPage> for ModelPage {

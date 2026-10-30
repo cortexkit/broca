@@ -246,20 +246,42 @@ async fn read_modes(rig: &Rig) {
                 .expect("strict text reader accepts the default read");
             assert!(!text.is_empty());
         }
-        references += stored["message"]["content"]
+        let media_parts = stored["message"]["content"]
             .as_array()
             .unwrap()
             .iter()
             .filter(|block| block["type"] == "media")
             .count();
-        // Content identities are descriptor-mode metadata, computed from the block-form
-        // message before inline markers or descriptor references replace its media.
+        references += media_parts;
+        // Blocks hash the stored message with its image/PDF metadata. Descriptors replace media
+        // blocks with media_ref objects but keep that same digest. Default inline uses text
+        // placeholders and no digest; media-free blocks retain the legacy shape.
         assert!(inline.get("digest").is_none());
-        assert!(stored.get("digest").is_none());
-        assert_eq!(
-            described["digest"],
-            cortexkit_role_llm_runner::content_digest::content_digest(&stored["message"])
-        );
+        let digest = cortexkit_role_llm_runner::content_digest::content_digest(&stored["message"]);
+        if media_parts > 0 {
+            assert_eq!(stored["digest"], digest);
+            assert_eq!(described["digest"], stored["digest"]);
+            let expected: Vec<_> = stored["message"]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .map(|(index, part)| {
+                    cortexkit_role_llm_runner::read::descriptors::PartDigest::new(
+                        format!("{}#{index}", stored["mid"].as_str().unwrap()),
+                        part,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                stored["part_digests"],
+                serde_json::to_value(expected).unwrap()
+            );
+            assert_eq!(described["part_digests"], stored["part_digests"]);
+        } else {
+            assert!(stored.get("digest").is_none());
+        }
+        assert_eq!(described["digest"], digest);
         cortexkit_role_llm_runner::read::descriptors::validate_references(&described["message"])
             .unwrap();
     }
@@ -290,16 +312,39 @@ async fn upload(rig: &Rig, mime: &str, bytes: &[u8]) -> String {
     let first = request(rig, "media", "session.upload_append", chunk.clone())
         .await
         .unwrap();
+    assert_eq!(first, json!({"received":bytes.len()}));
+    let staged = media_files(rig.wal_dir().parent().unwrap());
+    let retry = request(rig, "media", "session.upload_append", chunk)
+        .await
+        .unwrap_err();
+    assert!(
+        retry.starts_with("subc rejected: upload_offset_mismatch —"),
+        "{retry}"
+    );
     assert_eq!(
-        request(rig, "media", "session.upload_append", chunk)
-            .await
-            .unwrap(),
-        first
+        media_files(rig.wal_dir().parent().unwrap()),
+        staged,
+        "a lost-reply retry must not change staging"
+    );
+    assert_eq!(
+        request(
+            rig,
+            "media",
+            "session.upload_status",
+            json!({"upload_id":id})
+        )
+        .await
+        .unwrap(),
+        json!({"state":"open","received":bytes.len()})
     );
     let commit = json!({"upload_id":id});
     let first = request(rig, "media", "session.upload_commit", commit.clone())
         .await
         .unwrap();
+    assert_eq!(
+        first,
+        json!({"state":"committed","sha256":format!("{:x}",Sha256::digest(bytes)),"mime":mime,"bytes":bytes.len()})
+    );
     assert_eq!(
         request(rig, "media", "session.upload_commit", commit)
             .await

@@ -4174,7 +4174,7 @@ mod executor {
                 None
             };
             let resolve_options = broca_catalog::live::ResolveOptions {
-                media: fresh_episode && job.has_media_input(),
+                media: fresh_episode && broca_protocol::attachments_enabled(),
                 media_profile: job.media_profile.as_deref().filter(|_| fresh_episode),
                 claude_code_persona: fresh_persona.as_ref(),
                 auth_method: resolution.method,

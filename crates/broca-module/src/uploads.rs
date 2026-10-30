@@ -78,11 +78,12 @@ fn apply(
                 .map_err(|_| {
                     ServeError::Upload(UploadError::invalid("data", &request.upload_id))
                 })?;
-            serde_json::to_value(
-                store
-                    .append(session, &request.upload_id, request.offset, &bytes, now)
-                    .map_err(ServeError::Upload)?,
-            )
+            let reply = if broca_protocol::attachments_enabled() {
+                store.append_strict(session, &request.upload_id, request.offset, &bytes, now)
+            } else {
+                store.append(session, &request.upload_id, request.offset, &bytes, now)
+            };
+            serde_json::to_value(reply.map_err(ServeError::Upload)?)
         }
         "session.upload_commit" => {
             let request: wire::UploadCommitRequest = decode(params)?;

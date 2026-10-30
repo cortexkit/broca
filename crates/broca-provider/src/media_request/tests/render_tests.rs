@@ -453,3 +453,95 @@ fn media_free_marker_looking_text_keeps_legacy_render_bytes() {
         .unwrap()
         .contains(&format!("§7§ {literal}")));
 }
+
+#[test]
+fn frozen_profiles_leave_text_only_request_bytes_unchanged_in_every_family() {
+    use crate::media_profile::MediaQuirk;
+    use broca_protocol::{
+        CallOptions, ContentBlock, Message, Role, ToolCall, ToolCallId, ToolOutput, ToolResult,
+    };
+    let fixture = Fixture::new();
+    let mut opts = CallOptions::new(vec![
+        Message::new(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "Inspect ordinary text".into(),
+            }],
+        ),
+        Message::new(
+            Role::Assistant,
+            vec![ContentBlock::ToolCall(ToolCall {
+                tool_call_id: ToolCallId("text-call".into()),
+                tool_name: "inspect".into(),
+                input: json!({}),
+                thought_signature: None,
+            })],
+        ),
+        Message::new(
+            Role::Tool,
+            vec![ContentBlock::ToolResult(ToolResult {
+                tool_call_id: ToolCallId("text-call".into()),
+                output: ToolOutput::Text {
+                    text: "[image/png not shown to the model] is ordinary text".into(),
+                },
+                is_error: false,
+            })],
+        ),
+        Message::new(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "Continue".into(),
+            }],
+        ),
+    ]);
+    opts.step_context = Some(broca_protocol::StepContext {
+        run_id: "plain-profile".into(),
+        step_index: 2,
+        session_address: None,
+        credential_id: None,
+        account_ref: None,
+        max_output_tokens: None,
+    });
+    for id in [
+        WireFamilyId::AnthropicMessages,
+        WireFamilyId::BedrockConverse,
+        WireFamilyId::OpenAiChat,
+        WireFamilyId::OpenAiResponses,
+        WireFamilyId::OpenAiResponsesChatgpt,
+        WireFamilyId::Gemini,
+        WireFamilyId::GoogleCodeAssist,
+    ] {
+        let mut legacy = crate::families::frozen_config_for_family(id, "gemini-3.0-flash");
+        legacy.media = None;
+        if id == WireFamilyId::GoogleCodeAssist {
+            legacy.project_id = Some("synthetic-project".into());
+        }
+        let family = crate::registry::wire_family(id).unwrap();
+        let expected = family.render(&legacy, &opts);
+        let mut with = legacy.clone();
+        let quirk = match id {
+            WireFamilyId::AnthropicMessages => Some(MediaQuirk::Anthropic),
+            WireFamilyId::OpenAiChat | WireFamilyId::OpenAiResponses => Some(MediaQuirk::Openai),
+            WireFamilyId::Gemini => Some(MediaQuirk::Google),
+            _ => None,
+        };
+        with.media = Some(select_media_profile(
+            id,
+            quirk,
+            &with.wire_model_id,
+            InputModalities::from_value(&json!(["text", "image", "pdf", "audio", "video"])),
+            Some(128000),
+        ));
+        let live = crate::media_request::LiveMedia::new(
+            fixture.store.clone(),
+            Box::new(|_| panic!("text-only rendering must not read WAL or media captures")),
+        );
+        let actual = live
+            .render(&serde_json::to_value(with).unwrap(), &opts, false, true)
+            .unwrap();
+        assert_eq!(
+            actual, expected,
+            "{id:?}: profile metadata changed text-only request bytes"
+        );
+    }
+}
