@@ -19,6 +19,7 @@ struct Rig {
     reply: Mutex<serde_json::Value>,
     sent: Mutex<Vec<(Option<String>, Option<String>)>>,
     groups: Mutex<Vec<Vec<LateResultRegistration>>>,
+    pruned: Mutex<Vec<(String, String)>>,
     held_synced: AtomicBool,
     waits: AtomicUsize,
     fail_sync: AtomicBool,
@@ -40,6 +41,7 @@ impl Rig {
             reply: Mutex::new(json!({"content":[{"type":"text","text":"terminal"}]})),
             sent: Mutex::new(Vec::new()),
             groups: Mutex::new(Vec::new()),
+            pruned: Mutex::new(Vec::new()),
             held_synced: AtomicBool::new(false),
             waits: AtomicUsize::new(0),
             fail_sync: AtomicBool::new(false),
@@ -156,6 +158,10 @@ impl LateResultsIntake for Rig {
             self.registering.notify_one();
             self.release_registration.notified().await;
         }
+        Ok(())
+    }
+    async fn prune(&self, calls: &[(String, String)]) -> Result<(), String> {
+        self.pruned.lock().unwrap().extend_from_slice(calls);
         Ok(())
     }
 }
@@ -325,6 +331,48 @@ async fn plain_keys_require_late_results_identity_and_installed_seams() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn an_inline_registration_is_pruned_after_the_durable_batch_finishes() {
+    let rig = Rig::new(true, true, true, true);
+    let plane = rig.plane(true);
+    let ctx = ctx();
+    let call = call("inline");
+    plane
+        .batch_started(
+            &ctx,
+            std::slice::from_ref(&call),
+            &manifest_declaring(true, true),
+        )
+        .await
+        .unwrap();
+    plane
+        .register_dispatch_group(&ctx, &[registration(&call, "lineage:1", false)])
+        .await
+        .unwrap();
+    completed(
+        plane
+            .dispatch_keyed(
+                &ctx,
+                &call,
+                DispatchKey {
+                    call_key: "lineage:1",
+                    held_recorder: Some(rig.as_ref()),
+                },
+            )
+            .await,
+    );
+    assert!(
+        rig.pruned.lock().unwrap().is_empty(),
+        "a provider reply alone is not durable"
+    );
+    // The run calls batch_finished only after syncing its terminals and batch commit.
+    plane.batch_finished(&ctx).await.unwrap();
+    assert_eq!(
+        *rig.pruned.lock().unwrap(),
+        vec![("provider".to_owned(), "lineage:1".to_owned())]
+    );
 }
 
 /// Installing the runtime enables held negotiation and eligible plain-call keys on every build.

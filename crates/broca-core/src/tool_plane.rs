@@ -73,6 +73,12 @@ pub trait LateResultsIntake: Send + Sync {
     async fn prune(&self, _calls: &[(String, String)]) -> Result<(), String> {
         Ok(())
     }
+
+    /// The batch committed these calls' inline terminals; none was ever provider-held.
+    /// Implementations may also retire the withdrawal watches created before dispatch.
+    async fn prune_inline(&self, calls: &[(String, String)]) -> Result<(), String> {
+        self.prune(calls).await
+    }
 }
 
 /// The first reply's durable metadata. Interim content is deliberately not representable here.
