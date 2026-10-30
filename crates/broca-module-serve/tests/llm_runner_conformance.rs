@@ -3486,6 +3486,12 @@ const REQUIRED_STRUCTURED_OUTPUT_CASES: &[&str] = &[
     "structured_output_sibling_never_dispatched",
 ];
 
+const REQUIRED_RETRACT_OWN_SEND_CASES: &[&str] = &[
+    "retract_own_send_sender_retracted",
+    "retract_own_send_other_sender_refused",
+    "retract_own_send_shared_send_id_isolated",
+];
+
 const STREAMED_SIBLINGS_INAPPLICABLE: &str = "submit_streamed_siblings is not declared; the strict rule is checked by structured_output_sibling_never_dispatched";
 
 /// Additive kit cases must not turn an undeclared capability into a required pass.
@@ -3497,6 +3503,7 @@ fn check_named_contract_cases(
     for name in REQUIRED_INPUT_CAP_CASES
         .iter()
         .chain(REQUIRED_STRUCTURED_OUTPUT_CASES)
+        .chain(REQUIRED_RETRACT_OWN_SEND_CASES)
     {
         let case = cases
             .iter()
@@ -3535,6 +3542,7 @@ mod named_contract_case_tests {
             .filter(|case| {
                 case.name.starts_with("input_token_cap_")
                     || case.name.starts_with("structured_output_")
+                    || case.name.starts_with("retract_own_send_")
             })
             .map(|case| CaseReport {
                 case: case.name,
@@ -3560,6 +3568,7 @@ mod named_contract_case_tests {
         for name in REQUIRED_INPUT_CAP_CASES
             .iter()
             .chain(REQUIRED_STRUCTURED_OUTPUT_CASES)
+            .chain(REQUIRED_RETRACT_OWN_SEND_CASES)
             .copied()
             .chain(std::iter::once("structured_output_streamed_siblings"))
         {
