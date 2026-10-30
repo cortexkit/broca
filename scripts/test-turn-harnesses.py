@@ -31,7 +31,8 @@ class TurnHarnesses(unittest.TestCase):
         self.state = self.root / "state"
         (self.state / "wal").mkdir(parents=True)
         (self.state / "run-index.db").touch()
-        client = self.root / "target/release/broca-session"
+        target = self.root / "target"
+        client = target / "release/broca-session"
         client.parent.mkdir(parents=True)
         self.executable(client, r'''#!/usr/bin/env python3
 import os, pathlib, sys
@@ -61,7 +62,8 @@ if dest.startswith("/tmp/specimen-original-"):
 shutil.copyfile(source, dest)
 ''')
         self.env = {**os.environ, "HOME": str(self.home), "BROCA_STATE_ROOT": str(self.state),
-                    "PATH": f"{self.bins}:{os.environ['PATH']}", "BACKUP_ROOT": str(self.root)}
+                    "PATH": f"{self.bins}:{os.environ['PATH']}", "BACKUP_ROOT": str(self.root),
+                    "CARGO_TARGET_DIR": str(target)}
 
     @staticmethod
     def executable(path, text):
