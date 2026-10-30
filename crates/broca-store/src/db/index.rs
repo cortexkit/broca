@@ -148,7 +148,7 @@ pub(super) fn index_in_tx(
     let (initial_lineage, origin_end) = lineage(log.bytes)?;
     let mut lineage_id = initial_lineage.clone();
     let checkpoint = tx.query_row(
-        "SELECT indexed_seq,indexed_off,indexed_end,indexed_identity,lineage_id,tail_seed,lineage_off FROM session WHERE sid=?1",
+        "SELECT indexed_seq,indexed_off,indexed_end,indexed_identity,lineage_id,locator_seed,lineage_off FROM session WHERE sid=?1",
         [&key], |r| Ok(Checkpoint { seq: r.get(0)?, off: r.get(1)?, end: r.get(2)?, identity: r.get(3)?, lineage: r.get(4)?,
             seed: load_seed(&r.get::<_, String>(5)?, log.bytes), lineage_off: r.get(6)? }))
         .optional()?;
@@ -272,8 +272,9 @@ pub(super) fn index_in_tx(
             params![key, lineage_id],
         )?;
     }
-    tx.execute("UPDATE session SET lineage_id=?2,indexed_seq=?3,indexed_off=?4,indexed_end=?5,indexed_identity=?6,head_ord=?7,tail_seed=?8,admission_seed=?9,frozen_policy=?10,last_activity_ms=?11,last_write_ms=?12,title_off=?13,lineage_off=?14 WHERE sid=?1",
-        params![key,lineage_id,last_seq.map(u64_to_i64).transpose()?,u64_to_i64(last_off)?,u64_to_i64(offset)?,identity,u64_to_i64(seed.head_ord())?,seed.encode()?,serde_json::to_string(&seed.admission).map_err(|e| DbError::Invalid(e.to_string()))?,seed.frozen_policy.map(u64_to_i64).transpose()?,seed.last_activity_ms.map(u64_to_i64).transpose()?,seed.last_write_ms.map(u64_to_i64).transpose()?,seed.title_off.map(u64_to_i64).transpose()?,lineage_off.map(u64_to_i64).transpose()?])?;
+    tx.execute("UPDATE session SET lineage_id=?2,indexed_seq=?3,indexed_off=?4,indexed_end=?5,indexed_identity=?6,head_ord=?7,locator_seed=?8,frozen_policy=?9,last_activity_ms=?10,last_write_ms=?11,title_off=?12,lineage_off=?13 WHERE sid=?1",
+        params![key,lineage_id,last_seq.map(u64_to_i64).transpose()?,u64_to_i64(last_off)?,u64_to_i64(offset)?,identity,u64_to_i64(seed.head_ord())?,seed.encode()?,seed.frozen_policy.map(u64_to_i64).transpose()?,seed.last_activity_ms.map(u64_to_i64).transpose()?,seed.last_write_ms.map(u64_to_i64).transpose()?,seed.title_off.map(u64_to_i64).transpose()?,lineage_off.map(u64_to_i64).transpose()?])?;
+    super::seeds::publish(tx, &key, &log.bytes[..offset as usize])?;
     Ok(IndexOutcome {
         rebuilt,
         indexed_seq: last_seq,
@@ -1310,7 +1311,7 @@ mod tests {
             db.db.index(&publication(&bind, &bytes)).unwrap();
             db.db
                 .authoritative_transaction(|tx| {
-                    tx.execute("UPDATE session SET tail_seed=?1", [invalid])?;
+                    tx.execute("UPDATE session SET locator_seed=?1", [invalid])?;
                     Ok(())
                 })
                 .unwrap();
@@ -1351,6 +1352,256 @@ mod tests {
     }
 
     #[test]
+    fn continuation_versions_repair_only_session_seeds_and_preserve_authoritative_rows() {
+        let (_, records, _) = boundary_cases()
+            .into_iter()
+            .find(|(name, _, _)| *name == "no_tool_terminal")
+            .unwrap();
+        let bytes = encode_records(&records);
+        let bind = bind(&bytes);
+        let db = database();
+        db.db.index(&publication(&bind, &bytes)).unwrap();
+        let mut other_records = records.clone();
+        let mut other_bind = bind.clone();
+        other_bind.session.push_str("-other");
+        if let WalRecord::RunStarted {
+            session, run_id, ..
+        } = &mut other_records[0]
+        {
+            *session = other_bind.clone();
+            run_id.0.push_str("-other");
+        }
+        db.db
+            .index(&publication(&other_bind, &encode_records(&other_records)))
+            .unwrap();
+        let key = sid(&bind).unwrap();
+        let original = rows(&db.db, &["session"]);
+        let derived = rows(&db.db, schema::SESSION_TABLES);
+        db.db.authoritative_transaction(|tx| {
+            tx.execute("INSERT INTO log_reader(module_id,first_seen_ms,source) VALUES ('authoritative-reader',17,'config')", [])?;
+            Ok(())
+        }).unwrap();
+        let authoritative = rows(&db.db, &["log_reader"]);
+        for column in ["admission_seed", "tail_seed"] {
+            for version in [0, u32::MAX] {
+                db.db
+                    .authoritative_transaction(|tx| {
+                        let encoded: String = tx.query_row(
+                            &format!("SELECT {column} FROM session WHERE sid=?1"),
+                            [&key],
+                            |r| r.get(0),
+                        )?;
+                        let mut value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+                        value["version"] = version.into();
+                        tx.execute(
+                            &format!("UPDATE session SET {column}=?1 WHERE sid=?2"),
+                            params![value.to_string(), key],
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap();
+                assert!(
+                    !db.db.index(&publication(&bind, &bytes)).unwrap().rebuilt,
+                    "stale continuations must not clear row indexes"
+                );
+                assert_eq!(rows(&db.db, &["session"]), original);
+                assert_eq!(rows(&db.db, schema::SESSION_TABLES), derived);
+                assert_eq!(rows(&db.db, &["log_reader"]), authoritative);
+            }
+        }
+    }
+
+    #[test]
+    fn continuation_columns_are_versioned_content_free_and_independent_of_row_cursor() {
+        use broca_core::projection_plan::ProjectionContinuation;
+        let (_, records, _) = boundary_cases()
+            .into_iter()
+            .find(|(name, _, _)| *name == "no_tool_terminal")
+            .unwrap();
+        let bytes = encode_records(&records);
+        let bind = bind(&bytes);
+        let db = database();
+        for (_, end, _) in decoded(&bytes) {
+            db.db.index(&publication(&bind, &bytes[..end])).unwrap();
+        }
+        db.db
+            .read_snapshot(|tx| {
+                let (tail, admission, locator, indexed): (String, String, String, u64) = tx
+                    .query_row(
+                        "SELECT tail_seed,admission_seed,locator_seed,indexed_seq FROM session",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )?;
+                let stored = ProjectionContinuation::decode(&tail).unwrap();
+                assert_eq!(stored.boundary().seq, 3);
+                assert_eq!(indexed, 4);
+                assert_eq!(admission, stored.admission().encode().unwrap());
+                assert!(serde_json::from_str::<serde_json::Value>(&locator)
+                    .unwrap()
+                    .is_array());
+                for encoded in [&tail, &admission] {
+                    let value: serde_json::Value = serde_json::from_str(encoded).unwrap();
+                    assert_eq!(value["version"], 1);
+                    for field in [
+                        "\"usage\"",
+                        "\"title\"",
+                        "\"prompt\"",
+                        "\"billing\"",
+                        "\"input_tokens\"",
+                        "\"output_tokens\"",
+                    ] {
+                        assert!(!encoded.contains(field), "forbidden stored field: {field}");
+                    }
+                }
+                let columns = tx
+                    .prepare("PRAGMA table_info(session)")?
+                    .query_map([], |r| r.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                assert!(columns.iter().all(|name| ![
+                    "usage", "billing", "title", "prompt", "payload", "content"
+                ]
+                .contains(&name.as_str())));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn stored_media_continuations_match_full_replay_and_repair_missing_media() {
+        use broca_core::projection_plan::ProjectionContinuation;
+        let (_, mut records, _) = boundary_cases()
+            .into_iter()
+            .find(|(name, _, _)| *name == "no_tool_terminal")
+            .unwrap();
+        if let WalRecord::RunStarted { input, config, .. } = &mut records[0] {
+            std::sync::Arc::make_mut(input)[0]
+                .content
+                .push(broca_protocol::ContentBlock::Media(
+                    broca_protocol::MediaRef {
+                        kind: broca_protocol::MediaKind::Image,
+                        mime: "image/png".into(),
+                        byte_size: 69,
+                        sha256: "a".repeat(64),
+                        width: Some(1),
+                        height: Some(1),
+                    },
+                ));
+            config.frozen_render_config["media"] = serde_json::json!({"images":{"max":4}});
+        }
+        let mut second = records.clone();
+        if let WalRecord::RunStarted { run_id, .. } = &mut second[0] {
+            run_id.0.push_str("-second");
+        }
+        records.extend(second);
+        let bytes = encode_records(&records);
+        let bind = bind(&bytes);
+        let db = database();
+        let positions = decoded(&bytes);
+        let feature_enabled = serde_json::to_value(
+            broca_core::AdmissionCheckpointV1::from_frames(
+                &positions
+                    .iter()
+                    .map(|(_, _, f)| f.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .get("media")
+        .is_some();
+        let mut accepted = 0;
+        for (cut, (_, end, _)) in positions.iter().enumerate() {
+            let published = &bytes[..*end];
+            db.db.index(&publication(&bind, published)).unwrap();
+            if qualified_boundaries(&db.db).is_empty() {
+                continue;
+            }
+            let (tail, admission): (String, String) = db
+                .db
+                .read_snapshot(|tx| {
+                    tx.query_row("SELECT tail_seed,admission_seed FROM session", [], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })
+                    .map_err(Into::into)
+                })
+                .unwrap();
+            if !feature_enabled {
+                assert!(tail.contains("media continuation feature unavailable"));
+                continue;
+            }
+            let stored = ProjectionContinuation::decode(&tail).unwrap();
+            assert_eq!(admission, stored.admission().encode().unwrap());
+            let boundary = stored.boundary();
+            let tail: Vec<_> = positions
+                .iter()
+                .take(cut + 1)
+                .filter(|(_, _, f)| f.seq > boundary.seq)
+                .map(|(off, _, f)| broca_core::replay::PositionedFrame {
+                    off: *off as u64,
+                    framed: f.clone(),
+                })
+                .collect();
+            let read_at = |off: u64, len: u64| {
+                let start = (off as usize).min(published.len());
+                Ok(
+                    published[start..start.saturating_add(len as usize).min(published.len())]
+                        .to_vec(),
+                )
+            };
+            let seed = stored.hydrate(&read_at, &tail, (cut + 1) as u64).unwrap();
+            let delta = broca_core::replay::replay_projection_tail(
+                &seed,
+                &tail.iter().map(|p| p.framed.clone()).collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let expected = broca_core::AdmissionCheckpointV1::from_frames(
+                &positions[..=cut]
+                    .iter()
+                    .map(|(_, _, f)| f.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            assert_eq!(
+                delta.admission_checkpoint, expected,
+                "stored media state at publication {cut}"
+            );
+            accepted += 1;
+        }
+        if feature_enabled {
+            assert_eq!(accepted, 5);
+            let original = rows(&db.db, &["session"]);
+            let derived = rows(&db.db, schema::SESSION_TABLES);
+            db.db
+                .authoritative_transaction(|tx| {
+                    let (tail, admission): (String, String) =
+                        tx.query_row("SELECT tail_seed,admission_seed FROM session", [], |r| {
+                            Ok((r.get(0)?, r.get(1)?))
+                        })?;
+                    let mut tail: serde_json::Value = serde_json::from_str(&tail).unwrap();
+                    let mut admission: serde_json::Value =
+                        serde_json::from_str(&admission).unwrap();
+                    tail["admission"]["state"]["scalars"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("media");
+                    admission["state"]["scalars"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("media");
+                    tx.execute(
+                        "UPDATE session SET tail_seed=?1,admission_seed=?2",
+                        params![tail.to_string(), admission.to_string()],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(!db.db.index(&publication(&bind, &bytes)).unwrap().rebuilt);
+            assert_eq!(rows(&db.db, &["session"]), original);
+            assert_eq!(rows(&db.db, schema::SESSION_TABLES), derived);
+        }
+    }
+
+    #[test]
     fn index_rebuilds_on_unsupported_inner_budget_version() {
         let logs = corpus();
         for budgeted in [false, true] {
@@ -1362,11 +1613,11 @@ mod tests {
             db.db
                 .authoritative_transaction(|tx| {
                     let encoded: String =
-                        tx.query_row("SELECT tail_seed FROM session", [], |row| row.get(0))?;
+                        tx.query_row("SELECT locator_seed FROM session", [], |row| row.get(0))?;
                     let mut seed: serde_json::Value = serde_json::from_str(&encoded).unwrap();
                     assert_eq!(seed[0], broca_core::projection_plan::OFFSET_SEED_VERSION);
                     seed[1]["placement"]["budget"]["version"] = u32::MAX.into();
-                    tx.execute("UPDATE session SET tail_seed=?1", [seed.to_string()])?;
+                    tx.execute("UPDATE session SET locator_seed=?1", [seed.to_string()])?;
                     Ok(())
                 })
                 .unwrap();

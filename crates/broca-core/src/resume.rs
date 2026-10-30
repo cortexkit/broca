@@ -109,7 +109,7 @@ pub fn reconstruct_from_offsets(
         || seed.admission_checkpoint.output_reservation.is_none()
         || (window.is_none() && !matches!(
             seed.admission_checkpoint.compaction,
-            Some(crate::compaction::CompactionCheckpoint::None)
+            Some(crate::compaction::CompactionCheckpoint::None | crate::compaction::CompactionCheckpoint::Captures(_))
         ))
         || crate::replay::tail_contains_compaction_setup(
             &snapshot
@@ -179,7 +179,10 @@ pub fn reconstruct_from_offsets(
     if window.is_none()
         && !matches!(
             checkpoint.compaction,
-            Some(crate::compaction::CompactionCheckpoint::None)
+            Some(
+                crate::compaction::CompactionCheckpoint::None
+                    | crate::compaction::CompactionCheckpoint::Captures(_)
+            )
         )
     {
         return Err(bad("offset resume compaction needs full replay"));

@@ -24,6 +24,7 @@ pub(super) fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             indexed_seq INTEGER, indexed_off INTEGER NOT NULL, indexed_end INTEGER NOT NULL,
             indexed_identity BLOB, head_ord INTEGER NOT NULL,
             tail_seed TEXT NOT NULL, admission_seed TEXT NOT NULL,
+            locator_seed TEXT NOT NULL DEFAULT '',
             frozen_policy INTEGER, last_activity_ms INTEGER, last_write_ms INTEGER,
             released_at_ms INTEGER, delete_after_ms INTEGER, title_off INTEGER,
             UNIQUE(project_root, harness, session_key)
@@ -85,5 +86,33 @@ pub(super) fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             module_id TEXT PRIMARY KEY, first_seen_ms INTEGER NOT NULL,
             source TEXT NOT NULL CHECK(source IN ('config','declared'))
         );",
-    )
+    )?;
+    let has_locator = conn
+        .prepare("PRAGMA table_info(session)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "locator_seed");
+    if !has_locator {
+        conn.execute_batch("ALTER TABLE session ADD COLUMN locator_seed TEXT NOT NULL DEFAULT ''; UPDATE session SET locator_seed=tail_seed;")?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn old_locator_seed_moves_without_changing_stored_rows() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE session(sid TEXT PRIMARY KEY, tail_seed TEXT NOT NULL, admission_seed TEXT NOT NULL); INSERT INTO session VALUES ('old','[1,{}]','{}');").unwrap();
+        super::initialize(&conn).unwrap();
+        let rows: (String, String, String) = conn
+            .query_row(
+                "SELECT tail_seed,admission_seed,locator_seed FROM session WHERE sid='old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, ("[1,{}]".into(), "{}".into(), "[1,{}]".into()));
+    }
 }

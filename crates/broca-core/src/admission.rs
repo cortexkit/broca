@@ -1375,7 +1375,7 @@ pub struct AdmissionSource {
 }
 
 impl AdmissionSource {
-    fn read(
+    pub(crate) fn read(
         &self,
         read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
         boundary: &AdmissionSource,
@@ -1400,6 +1400,34 @@ impl AdmissionSource {
                 if consumed == bytes.len() && framed.seq == self.seq =>
             {
                 Ok(*framed)
+            }
+            _ => Err(bad()),
+        }
+    }
+
+    pub(crate) fn capture(
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        frame: &crate::replay::PositionedFrame,
+        limit: u64,
+    ) -> Result<Self, crate::replay::SeedFallback> {
+        use sha2::Digest;
+        let bad = || crate::replay::SeedFallback::new("continuation source outside publication");
+        let bytes = broca_wal::access_counter::read_at(
+            read_at,
+            frame.off,
+            limit.checked_sub(frame.off).ok_or_else(bad)?,
+        )
+        .map_err(|_| bad())?;
+        match broca_wal::access_counter::decode_next(&bytes) {
+            broca_wal::framing::DecodeStep::Record { framed, consumed }
+                if *framed == frame.framed =>
+            {
+                Ok(Self {
+                    seq: framed.seq,
+                    off: frame.off,
+                    end: frame.off + consumed as u64,
+                    identity: sha2::Sha256::digest(&bytes[..consumed]).to_vec(),
+                })
             }
             _ => Err(bad()),
         }
@@ -1460,6 +1488,15 @@ impl AdmissionSeed {
         boundary: &crate::replay::SeedBoundary,
         prefix: &[crate::replay::PositionedFrame],
     ) -> Result<Self, crate::replay::SeedFallback> {
+        Self::capture_inner(read_at, boundary, prefix, false)
+    }
+
+    fn capture_inner(
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        boundary: &crate::replay::SeedBoundary,
+        prefix: &[crate::replay::PositionedFrame],
+        media_continuation: bool,
+    ) -> Result<Self, crate::replay::SeedFallback> {
         use sha2::Digest;
         let bad = || crate::replay::SeedFallback::new("incomplete admission prefix");
         if prefix.first().map(|p| p.framed.seq) != Some(1)
@@ -1476,10 +1513,9 @@ impl AdmissionSeed {
         let replay =
             crate::replay::replay(&frames.iter().map(|p| p.record.clone()).collect::<Vec<_>>())
                 .map_err(|_| bad())?;
-        if !matches!(
-            scalars.compaction,
-            Some(crate::compaction::CompactionCheckpoint::None)
-        ) || !replay.pending_steers.is_empty()
+        if !(matches!(scalars.compaction, Some(crate::compaction::CompactionCheckpoint::None))
+            || (media_continuation && matches!(scalars.compaction, Some(crate::compaction::CompactionCheckpoint::Captures(_)))))
+            || !replay.pending_steers.is_empty()
             || replay.open_tool_turn.is_some()
             || frames.iter().any(|p| matches!(&p.record, WalRecord::RunStarted { manifest: Some(manifest), .. } if crate::compaction::has_compaction(manifest)))
         {
@@ -1748,7 +1784,10 @@ impl AdmissionSeed {
             || !self.scalars.ownership_complete()
             || !matches!(
                 self.scalars.compaction,
-                Some(crate::compaction::CompactionCheckpoint::None)
+                Some(
+                    crate::compaction::CompactionCheckpoint::None
+                        | crate::compaction::CompactionCheckpoint::Captures(_)
+                )
             )
         {
             return Err(bad());
@@ -1851,6 +1890,401 @@ impl AdmissionSeed {
         Ok(checkpoint
             .last_episode
             .filter(|e| e.disposition == EpisodeDisposition::Paused))
+    }
+}
+
+/// Durable admission continuation. Accounting remains in authenticated WAL sources rather
+/// than in the database: even cumulative token totals are not copied into this form.
+/// The existing `AdmissionSeed` is an in-memory hydration recipe, not its wire schema.
+#[derive(Debug, Clone)]
+pub struct AdmissionContinuation {
+    seed: AdmissionSeed,
+    sources: Vec<AdmissionSource>,
+}
+
+impl AdmissionContinuation {
+    pub fn encode(&self) -> Result<String, serde_json::Error> {
+        let mut state = serde_json::to_value(&self.seed)?;
+        let scalars = state["scalars"].as_object_mut().expect("checkpoint object");
+        // An allowlist keeps future checkpoint fields from becoming database content by
+        // accident. Missing optional checkpoint fields are supplied only during hydration.
+        scalars.retain(|field, _| {
+            matches!(
+                field.as_str(),
+                "at_seq"
+                    | "last_episode"
+                    | "pending_fifo"
+                    | "pending_order"
+                    | "session_class"
+                    | "has_deferred_calls"
+                    | "ownership"
+                    | "effort_history"
+                    | "lineage_retention"
+                    | "compaction"
+                    | "tags"
+                    | "media"
+            )
+        });
+        if let Some(episode) = state["episode"].as_object_mut() {
+            episode.remove("usage");
+        }
+        let encoded = serde_json::json!({
+            "version": 1, "state": state, "sources": self.sources,
+        });
+        #[cfg(feature = "test-attachments")]
+        let encoded = {
+            let mut encoded = encoded;
+            if self.seed.scalars.media.is_some() {
+                encoded["features"] = serde_json::json!(["media-metadata/v1"]);
+            }
+            encoded
+        };
+        serde_json::to_string(&encoded)
+    }
+
+    /// Unsupported versions and missing media metadata are cache misses, never partial state.
+    pub fn decode(encoded: &str) -> Result<Self, crate::replay::SeedFallback> {
+        let bad = || crate::replay::SeedFallback::new("unsupported admission continuation");
+        let value: serde_json::Value = serde_json::from_str(encoded).map_err(|_| bad())?;
+        if value["version"] != 1 {
+            return Err(bad());
+        }
+        if let Some(features) = value.get("features") {
+            #[cfg(feature = "test-attachments")]
+            if *features != serde_json::json!(["media-metadata/v1"]) {
+                return Err(bad());
+            }
+            #[cfg(not(feature = "test-attachments"))]
+            {
+                let _ = features;
+                return Err(bad());
+            }
+        }
+        let seed: AdmissionSeed =
+            serde_json::from_value(value["state"].clone()).map_err(|_| bad())?;
+        if seed.version != 1 {
+            return Err(bad());
+        }
+        #[cfg(not(feature = "test-attachments"))]
+        if seed
+            .scalars
+            .compaction
+            .as_ref()
+            .and_then(|c| c.captured())
+            .is_some_and(|c| !c.is_empty())
+        {
+            return Err(crate::replay::SeedFallback::new(
+                "media continuation feature unavailable",
+            ));
+        }
+        let sources = serde_json::from_value(value["sources"].clone()).map_err(|_| bad())?;
+        #[cfg(feature = "test-attachments")]
+        if !seed.scalars.media_seed_complete() {
+            return Err(crate::replay::SeedFallback::new(
+                "admission continuation media metadata missing",
+            ));
+        }
+        Ok(Self { seed, sources })
+    }
+
+    pub fn boundary(&self) -> crate::replay::SeedBoundary {
+        crate::replay::SeedBoundary {
+            lineage_id: self.seed.lineage_id.clone(),
+            seq: self.seed.boundary.seq,
+            frame_off: self.seed.boundary.off,
+            frame_end: self.seed.boundary.end,
+            frame_identity: self.seed.boundary.identity.clone(),
+            qualified: self.seed.qualified,
+        }
+    }
+
+    pub(crate) fn source_boundary(&self) -> &AdmissionSource {
+        &self.seed.boundary
+    }
+
+    pub(crate) fn accounting_frames(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    ) -> Result<Vec<FramedRecord>, crate::replay::SeedFallback> {
+        self.sources
+            .iter()
+            .map(|s| s.read(read_at, &self.seed.boundary))
+            .collect()
+    }
+
+    fn accounting_source(record: &WalRecord) -> bool {
+        matches!(
+            record,
+            WalRecord::RunStarted { .. }
+                | WalRecord::RunConfigRefrozen { .. }
+                | WalRecord::Queued { .. }
+                | WalRecord::Retracted { .. }
+                | WalRecord::SendEnded { .. }
+                | WalRecord::SendDelivered { .. }
+                | WalRecord::ModelStepFinished { .. }
+                | WalRecord::ModelStepRefused { .. }
+                | WalRecord::ModelAttemptFinished { .. }
+                | WalRecord::InputTokenCapFrozen { .. }
+                | WalRecord::OutputReservationClamped { .. }
+                | WalRecord::RunFinished { .. }
+        )
+    }
+
+    pub fn capture(
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        boundary: &crate::replay::SeedBoundary,
+        prefix: &[crate::replay::PositionedFrame],
+    ) -> Result<Self, crate::replay::SeedFallback> {
+        let seed = AdmissionSeed::capture_inner(read_at, boundary, prefix, true)?;
+        #[cfg(not(feature = "test-attachments"))]
+        if seed
+            .scalars
+            .compaction
+            .as_ref()
+            .and_then(|c| c.captured())
+            .is_some_and(|c| !c.is_empty())
+        {
+            return Err(crate::replay::SeedFallback::new(
+                "media continuation feature unavailable",
+            ));
+        }
+        let sources = prefix
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| Self::accounting_source(&p.framed.record))
+            .map(|(i, p)| {
+                AdmissionSource::capture(
+                    read_at,
+                    p,
+                    prefix.get(i + 1).map_or(boundary.frame_end, |p| p.off),
+                )
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self { seed, sources })
+    }
+
+    fn hydrated_seed(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    ) -> Result<AdmissionSeed, crate::replay::SeedFallback> {
+        let mut seed = self.seed.clone();
+        #[cfg(feature = "test-attachments")]
+        if let Some(crate::media_request::DurableMediaSeed::Ready(media)) = &mut seed.scalars.media
+        {
+            media.prepare_content_free_continuation();
+        }
+        let mut head = crate::head::HeadProjection::default();
+        let mut input = crate::input_budget::InputTokenBudget::default();
+        let mut output = crate::output_reservation::OutputReservationHistory::default();
+        for frame in self.accounting_frames(read_at)? {
+            head.observe(&frame.record);
+            input.fold(&frame.record).map_err(|_| {
+                crate::replay::SeedFallback::new("continuation input accounting invalid")
+            })?;
+            output.fold(&frame.record);
+            if let WalRecord::RunFinished { usage, .. } = frame.record {
+                if let Some(episode) = seed.episode.as_mut().filter(|e| frame.seq >= e.start.seq) {
+                    episode.usage = Some(usage);
+                }
+            }
+        }
+        seed.scalars.head = Some(head);
+        seed.scalars.input_budget = Some(input);
+        seed.scalars.output_reservation = Some(output);
+        Ok(seed)
+    }
+
+    pub fn hydrate(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        tail: &[crate::replay::PositionedFrame],
+        safe_head: u64,
+    ) -> Result<(AdmissionCheckpointV1, AdmissionCheckpointV1), crate::replay::SeedFallback> {
+        let seed = self.hydrated_seed(read_at)?;
+        #[cfg(feature = "test-attachments")]
+        let seed = {
+            let mut seed = seed;
+            if seed.scalars.media.is_none()
+                && tail
+                    .iter()
+                    .any(|p| crate::compaction::CapturedMedia::captures_any(&p.framed.record))
+            {
+                let episode = seed.episode(read_at)?.ok_or_else(|| {
+                    crate::replay::SeedFallback::new("media continuation has no episode")
+                })?;
+                let placement = crate::placement::Placement::seeded(
+                    seed.ordinal_base,
+                    Some(episode.run_id),
+                    episode.config.budget.clone(),
+                    episode.budget_replay_state.unwrap_or_default(),
+                    0,
+                );
+                seed.scalars.media = Some(crate::media_request::DurableMediaSeed::Ready(Box::new(
+                    crate::media_request::MediaCheckpoint::after_media_free_prefix(
+                        placement,
+                        seed.boundary.seq,
+                        &self.accounting_frames(read_at)?,
+                    )
+                    .map_err(|_| {
+                        crate::replay::SeedFallback::new("media continuation initialization failed")
+                    })?,
+                )));
+            }
+            seed
+        };
+        seed.hydrate_with_base(read_at, tail, safe_head)
+    }
+
+    /// Consume the suffix after the stored boundary, with the position from the same
+    /// projection fold. Row cursors cannot substitute for either continuation position.
+    pub(crate) fn advance(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        boundary: &crate::replay::SeedBoundary,
+        tail: &[crate::replay::PositionedFrame],
+        position: (u64, crate::tags::TagSeed),
+    ) -> Result<Self, crate::replay::SeedFallback> {
+        if tail.last().map(|p| (p.framed.seq, p.off)) != Some((boundary.seq, boundary.frame_off))
+            || self.seed.lineage_id != boundary.lineage_id
+            || !boundary.qualified
+        {
+            return Err(crate::replay::SeedFallback::new(
+                "continuation advance boundary mismatch",
+            ));
+        }
+        let (_, mut scalars) = self.hydrate(read_at, tail, boundary.seq)?;
+        let mut next = self.clone();
+        let mut queued: std::collections::BTreeMap<_, _> = next
+            .seed
+            .queued
+            .iter()
+            .map(|q| (q.submission_id.0.clone(), q.clone()))
+            .collect();
+        let mut staged = next.seed.staged.clone();
+        for (i, p) in tail.iter().enumerate() {
+            let source = AdmissionSource::capture(
+                read_at,
+                p,
+                tail.get(i + 1).map_or(boundary.frame_end, |p| p.off),
+            )?;
+            if Self::accounting_source(&p.framed.record) {
+                next.sources.push(source.clone());
+            }
+            match &p.framed.record {
+                WalRecord::RunStarted { .. } => {
+                    next.seed.first_run.get_or_insert(source.clone());
+                    next.seed.episode = Some(AdmissionEpisodeSeed {
+                        start: source,
+                        run_id: scalars
+                            .last_episode
+                            .as_ref()
+                            .expect("folded run")
+                            .run_id
+                            .clone(),
+                        refreezes: Vec::new(),
+                        structured_output_downgraded: false,
+                        provider_call_started: false,
+                        disposition: EpisodeDisposition::Running,
+                        pause_reason: None,
+                        cancel_at: None,
+                        usage: None,
+                        retries_used: 0,
+                        budget_replay_state: None,
+                    });
+                    staged = None;
+                }
+                WalRecord::RunConfigRefrozen { .. } | WalRecord::RunAuthRefrozen { .. } => {
+                    if let Some(episode) = &mut next.seed.episode {
+                        episode.refreezes.push(source);
+                    }
+                    if matches!(p.framed.record, WalRecord::RunConfigRefrozen { .. }) {
+                        if let Some(episode) = &mut next.seed.episode {
+                            episode.structured_output_downgraded = false;
+                        }
+                    }
+                }
+                WalRecord::StructuredOutputDowngraded { .. } => {
+                    if let Some(episode) = &mut next.seed.episode {
+                        episode.structured_output_downgraded = true;
+                    }
+                }
+                WalRecord::DeliveryOrdered { .. } => staged = Some(source),
+                WalRecord::Queued { submission_id, .. } => {
+                    queued.insert(
+                        submission_id.0.clone(),
+                        AdmissionQueueSeed {
+                            source,
+                            submission_id: submission_id.clone(),
+                            order_source: staged.take(),
+                        },
+                    );
+                }
+                WalRecord::Retracted { .. } | WalRecord::Steered { .. } => staged = None,
+                _ => {}
+            }
+        }
+        next.seed.queued = scalars
+            .pending_fifo
+            .iter()
+            .map(|p| {
+                let mut queued = queued.get(&p.submission_id.0).cloned().ok_or_else(|| {
+                    crate::replay::SeedFallback::new("continuation queue source missing")
+                })?;
+                if p.order.is_none() {
+                    queued.order_source = None;
+                }
+                Ok(queued)
+            })
+            .collect::<Result<_, _>>()?;
+        next.seed.staged = scalars.pending_order.as_ref().and(staged);
+        if let (Some(episode), Some(current)) =
+            (&mut next.seed.episode, scalars.last_episode.take())
+        {
+            episode.run_id = current.run_id;
+            episode.provider_call_started = current.provider_call_started;
+            episode.disposition = current.disposition;
+            episode.pause_reason = current.pause_reason;
+            episode.cancel_at = current.cancel_at;
+            episode.usage = current.usage;
+            episode.retries_used = current.retries_used;
+            episode.budget_replay_state = current.budget_replay_state;
+        }
+        scalars.pending_fifo = Arc::new(Vec::new());
+        scalars.pending_order = None;
+        if let Some(first) = scalars
+            .ownership
+            .as_mut()
+            .and_then(|o| o.first_episode.as_mut())
+        {
+            first.manifest = None;
+        }
+        if let Some(effort) = &mut scalars.effort_history {
+            effort.first_config = serde_json::Value::Null;
+        }
+        if matches!(
+            scalars.compaction,
+            Some(crate::compaction::CompactionCheckpoint::State(_))
+        ) {
+            return Err(crate::replay::SeedFallback::new(
+                "compaction continuation needs source hydration",
+            ));
+        }
+        next.seed.scalars = scalars;
+        next.seed.boundary = AdmissionSource {
+            seq: boundary.seq,
+            off: boundary.frame_off,
+            end: boundary.frame_end,
+            identity: boundary.frame_identity.clone(),
+        };
+        next.seed.qualified = boundary.qualified;
+        next.set_projection_position(position.0, position.1);
+        Ok(next)
+    }
+
+    fn set_projection_position(&mut self, extent: u64, tags: crate::tags::TagSeed) {
+        self.seed.ordinal_base = extent;
+        self.seed.tag_high = tags.high;
+        self.seed.tag_rules = tags.rules.map(|r| (r.render, r.clean));
     }
 }
 
@@ -2432,6 +2866,437 @@ mod tests {
             }
         }
         assert_eq!(matched, 12);
+    }
+
+    fn assert_content_free_form(encoded: &str) {
+        fn schema(value: &serde_json::Value) {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    for (name, value) in fields {
+                        assert!(
+                            ![
+                                "usage",
+                                "billing",
+                                "input_tokens",
+                                "output_tokens",
+                                "prompt",
+                                "title",
+                                "content",
+                                "input",
+                                "request",
+                                "frozen_render_config",
+                                "render_config",
+                                "head",
+                                "input_budget",
+                                "output_reservation"
+                            ]
+                            .contains(&name.as_str()),
+                            "forbidden seed field: {name}"
+                        );
+                        schema(value);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        schema(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        schema(&serde_json::from_str::<serde_json::Value>(encoded).unwrap());
+        for secret in [
+            "private first input",
+            "private second input",
+            "private assistant text",
+            "private refrozen setup",
+            "private queued input",
+            "private finalize text",
+            "second tool",
+            "PRIVATE-TITLE",
+        ] {
+            assert!(!encoded.contains(secret), "continuation copied {secret}");
+        }
+    }
+
+    fn continuation_oracle(records: &[FramedRecord]) {
+        use crate::projection_plan::ProjectionContinuation;
+        let (bytes, positions) = offset_log(records);
+        let read_at = offset_reader(&bytes);
+        let mut stored = ProjectionContinuation::capture(
+            &read_at,
+            &offset_boundary(&bytes, &positions, 4),
+            &positions[..4],
+        )
+        .unwrap();
+        for boundary_cut in [4, 12] {
+            if boundary_cut != 4 {
+                stored = ProjectionContinuation::decode(&stored.encode().unwrap())
+                    .unwrap()
+                    .advance(
+                        &read_at,
+                        &offset_boundary(&bytes, &positions, boundary_cut),
+                        &positions[4..boundary_cut],
+                    )
+                    .unwrap();
+            }
+            let encoded = stored.encode().unwrap();
+            assert_content_free_form(&encoded);
+            assert_content_free_form(&stored.admission().encode().unwrap());
+            let stored = ProjectionContinuation::decode(&encoded).unwrap();
+            for end in boundary_cut..=records.len() {
+                let end_off = positions.get(end).map_or(bytes.len(), |p| p.off as usize);
+                let read_at = offset_reader(&bytes[..end_off]);
+                let tail = &positions[boundary_cut..end];
+                let projection = stored.hydrate(&read_at, tail, end as u64).unwrap();
+                let prefix = crate::replay::replay(
+                    &records[..boundary_cut]
+                        .iter()
+                        .map(|p| p.record.clone())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+                let actual = crate::resume::reconstruct_from_offsets(
+                    &read_at,
+                    crate::resume::OffsetResumeSnapshot {
+                        boundary: stored.boundary(),
+                        projection,
+                        window: None,
+                        prefix: prefix.prompt,
+                        tail: tail.to_vec(),
+                    },
+                    end as u64,
+                )
+                .unwrap();
+                let full = crate::replay::replay(
+                    &records[..end]
+                        .iter()
+                        .map(|p| p.record.clone())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+                assert_eq!(
+                    actual.prior.prompt, full.prompt,
+                    "prompt at {boundary_cut}/{end}"
+                );
+                assert_eq!(actual.prior.extent, full.extent);
+                assert_eq!(actual.prior.usage, full.usage);
+                assert_eq!(actual.prior.retries_used, full.retries_used);
+                assert_eq!(actual.prior.completed_steps, full.completed_steps);
+                let expected = AdmissionCheckpointV1::from_frames(&records[..end]).unwrap();
+                fn compare(path: &str, actual: &serde_json::Value, expected: &serde_json::Value) {
+                    match (actual, expected) {
+                        (serde_json::Value::Object(a), serde_json::Value::Object(b)) => {
+                            assert_eq!(
+                                a.keys().collect::<Vec<_>>(),
+                                b.keys().collect::<Vec<_>>(),
+                                "fields at {path}"
+                            );
+                            for (key, value) in a {
+                                compare(&format!("{path}/{key}"), value, &b[key]);
+                            }
+                        }
+                        (serde_json::Value::Array(a), serde_json::Value::Array(b)) => {
+                            assert_eq!(a.len(), b.len(), "length at {path}");
+                            for (i, (a, b)) in a.iter().zip(b).enumerate() {
+                                compare(&format!("{path}/{i}"), a, b);
+                            }
+                        }
+                        _ => assert_eq!(actual, expected, "value at {path}"),
+                    }
+                }
+                compare(
+                    &format!("{boundary_cut}/{end}"),
+                    &serde_json::to_value(&actual.snapshot.checkpoint_at_head).unwrap(),
+                    &serde_json::to_value(&expected).unwrap(),
+                );
+                assert_eq!(
+                    actual.snapshot.checkpoint_at_head, expected,
+                    "admission/media at {boundary_cut}/{end}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn content_free_continuations_roundtrip_and_advance_at_every_publication_cut() {
+        let mut records = offset_corpus();
+        for frame in &mut records {
+            match &mut frame.record {
+                WalRecord::RunStarted { title, .. } | WalRecord::Queued { title, .. } => {
+                    *title = Some("PRIVATE-TITLE".into())
+                }
+                _ => {}
+            }
+            if let WalRecord::ModelStepFinished { usage, .. } = &mut frame.record {
+                *usage = Usage {
+                    input_tokens: Some(271828),
+                    output_tokens: Some(314159),
+                    ..Usage::default()
+                };
+            }
+        }
+        continuation_oracle(&records);
+    }
+
+    #[test]
+    #[cfg(feature = "test-attachments")]
+    fn content_free_continuations_include_media_reference_and_delta_history() {
+        let mut records = offset_corpus();
+        for frame in &mut records {
+            if let WalRecord::RunStarted { input, config, .. } = &mut frame.record {
+                Arc::make_mut(input)[0]
+                    .content
+                    .push(broca_protocol::ContentBlock::Media(
+                        broca_protocol::MediaRef {
+                            kind: broca_protocol::MediaKind::Image,
+                            mime: "image/png".into(),
+                            byte_size: 69,
+                            sha256: "a".repeat(64),
+                            width: Some(1),
+                            height: Some(1),
+                        },
+                    ));
+                config.frozen_render_config["media"] = serde_json::json!({"images":{"max":4}});
+            }
+        }
+        continuation_oracle(&records);
+        let (bytes, positions) = offset_log(&records);
+        let stored = crate::projection_plan::ProjectionContinuation::capture(
+            &offset_reader(&bytes),
+            &offset_boundary(&bytes, &positions, 4),
+            &positions[..4],
+        )
+        .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&stored.encode().unwrap()).unwrap();
+        let media = &value["admission"]["state"]["scalars"]["media"];
+        assert_eq!(media["version"], 1);
+        assert!(media["history"].as_array().unwrap().len() > 1);
+        assert!(!media["index"]["captures"].as_array().unwrap().is_empty());
+        value["admission"]["state"]["scalars"]
+            .as_object_mut()
+            .unwrap()
+            .remove("media");
+        assert!(
+            crate::projection_plan::ProjectionContinuation::decode(&value.to_string()).is_err()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "test-attachments")]
+    fn content_free_continuations_omit_media_until_first_tail_capture() {
+        let mut records = offset_corpus();
+        if let WalRecord::RunStarted { config, .. } = &mut records[0].record {
+            config.frozen_render_config["media"] = serde_json::json!({"images":{"max":2}});
+        }
+        if let WalRecord::RunStarted { input, config, .. } = &mut records[10].record {
+            Arc::make_mut(input)[0]
+                .content
+                .push(broca_protocol::ContentBlock::Media(
+                    broca_protocol::MediaRef {
+                        kind: broca_protocol::MediaKind::Image,
+                        mime: "image/png".into(),
+                        byte_size: 69,
+                        sha256: "b".repeat(64),
+                        width: Some(1),
+                        height: Some(1),
+                    },
+                ));
+            config.frozen_render_config["media"] = serde_json::json!({"images":{"max":4}});
+        }
+        let (bytes, positions) = offset_log(&records);
+        let stored = crate::projection_plan::ProjectionContinuation::capture(
+            &offset_reader(&bytes),
+            &offset_boundary(&bytes, &positions, 4),
+            &positions[..4],
+        )
+        .unwrap();
+        assert!(!stored.encode().unwrap().contains("\"media\""));
+        assert!(!stored
+            .admission()
+            .encode()
+            .unwrap()
+            .contains("\"features\""));
+        continuation_oracle(&records);
+    }
+
+    #[test]
+    fn continuation_advance_drops_an_order_for_a_different_queued_submission() {
+        use crate::projection_plan::ProjectionContinuation;
+        let corpus = offset_corpus();
+        let mut records = corpus[..6].to_vec();
+        if let WalRecord::DeliveryOrdered { submission_id, .. } = &mut records[4].record {
+            submission_id.0 = "different-submission".into();
+        }
+        let mut step = offset_step(7);
+        if let WalRecord::ModelStepFinished { step_id, .. } = &mut step.record {
+            *step_id = StepId(2);
+        }
+        records.push(step);
+        records.push(frame(8, corpus[9].record.clone()));
+        let (bytes, positions) = offset_log(&records);
+        let read_at = offset_reader(&bytes);
+        let stored = ProjectionContinuation::capture(
+            &read_at,
+            &offset_boundary(&bytes, &positions, 4),
+            &positions[..4],
+        )
+        .unwrap()
+        .advance(
+            &read_at,
+            &offset_boundary(&bytes, &positions, 7),
+            &positions[4..7],
+        )
+        .unwrap();
+        let stored = ProjectionContinuation::decode(&stored.encode().unwrap()).unwrap();
+        let seed = stored.hydrate(&read_at, &positions[7..], 8).unwrap();
+        let actual = crate::replay::replay_projection_tail(&seed, &records[7..])
+            .unwrap()
+            .admission_checkpoint;
+        let expected = AdmissionCheckpointV1::from_frames(&records).unwrap();
+        assert!(expected.pending_fifo[0].order.is_none());
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn stored_continuation_advance_reads_only_fixed_sources_with_1k_and_150k_discarded_messages() {
+        use crate::projection_plan::ProjectionContinuation;
+        use crate::WalStore;
+        let root = broca_test_support::scratch_root()
+            .join(format!("continuation-header-{}", std::process::id()));
+        let store = crate::FileWalStore::with_config(root.clone(), broca_wal::WalConfig::OVERHAUL);
+        let key = match &offset_corpus()[0].record {
+            WalRecord::RunStarted { session, .. } => session.clone(),
+            _ => unreachable!(),
+        };
+        drop(store.open(&key).unwrap());
+        let header = std::fs::read(store.wal_path(&key)).unwrap();
+        assert_eq!(header.len(), broca_wal::framing::LINEAGE_FRAME_LEN);
+        let lineage = match broca_wal::framing::decode_next(&header) {
+            broca_wal::framing::DecodeStep::Lineage { lineage_id, .. } => lineage_id.to_string(),
+            _ => unreachable!(),
+        };
+        let mut measurements = Vec::new();
+        for count in [1_000, 150_000] {
+            let mut records = offset_corpus();
+            records.truncate(12);
+            let message = match &records[0].record {
+                WalRecord::RunStarted { input, .. } => input[0].clone(),
+                _ => unreachable!(),
+            };
+            let mut inserted = Vec::new();
+            for _ in 0..count / 1_000 {
+                let record: WalRecord = serde_json::from_value(
+                    serde_json::json!({"type":"steered", "input":vec![message.clone();1_000]}),
+                )
+                .unwrap();
+                inserted.push(frame(0, record));
+            }
+            let prefix_frames = inserted.len();
+            records.splice(3..3, inserted);
+            let cut = records.len();
+            let terminal = records
+                .iter()
+                .find(|p| matches!(p.record, WalRecord::RunFinished { .. }))
+                .unwrap()
+                .record
+                .clone();
+            let mut third = records
+                .iter()
+                .rev()
+                .find(|p| matches!(p.record, WalRecord::RunStarted { .. }))
+                .unwrap()
+                .record
+                .clone();
+            if let WalRecord::RunStarted { run_id, .. } = &mut third {
+                run_id.0 = "r3".into();
+            }
+            records.extend([
+                frame(0, terminal.clone()),
+                frame(0, third),
+                offset_step(0),
+                frame(0, terminal),
+            ]);
+            for (i, p) in records.iter_mut().enumerate() {
+                p.seq = i as u64 + 1;
+            }
+            let (encoded, mut positions) = offset_log(&records);
+            for p in &mut positions {
+                p.off += header.len() as u64;
+            }
+            let mut bytes = header.clone();
+            bytes.extend(encoded);
+            let boundary_for = |cut| {
+                let mut boundary = offset_boundary(&bytes, &positions, cut);
+                boundary.lineage_id = Some(lineage.clone());
+                boundary
+            };
+            let read_at = offset_reader(&bytes);
+            let seed =
+                ProjectionContinuation::capture(&read_at, &boundary_for(cut), &positions[..cut])
+                    .unwrap();
+            let seed = ProjectionContinuation::decode(&seed.encode().unwrap()).unwrap();
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            let next = counter
+                .operation("advance stored continuation")
+                .run(|| seed.advance(&read_at, &boundary_for(cut + 3), &positions[cut..cut + 3]))
+                .unwrap();
+            let measured = counter.snapshot().remove(0);
+            assert!(measured.seed_fallbacks.is_empty());
+            use broca_wal::access_counter::{ReadClass, ValidationRead};
+            // Two validations (projection and admission) each read one boundary and
+            // one lineage header. Hydration and capture read only the fixed accounting,
+            // first/current episode, render-config and three new tail source frames.
+            assert_eq!(
+                measured
+                    .reads
+                    .iter()
+                    .filter(|r| r.class == ReadClass::Source)
+                    .count(),
+                35
+            );
+            assert_eq!(
+                measured
+                    .reads
+                    .iter()
+                    .filter(|r| r.class == ReadClass::Validation(ValidationRead::BoundaryFrame))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                measured
+                    .reads
+                    .iter()
+                    .filter(|r| r.class == ReadClass::LineageHeader)
+                    .count(),
+                2
+            );
+            assert_eq!(measured.reads.len(), 39);
+            assert_eq!(measured.frames_decoded, 39);
+            let discarded = positions[3].off..positions[3 + prefix_frames].off;
+            assert!(
+                measured
+                    .reads
+                    .iter()
+                    .all(|r| !discarded.contains(&r.offset)),
+                "discarded message prefix was read"
+            );
+            assert_eq!(next.boundary().seq, (cut + 3) as u64);
+            measurements.push((
+                measured
+                    .reads
+                    .iter()
+                    .map(|r| (r.class, r.length))
+                    .collect::<Vec<_>>(),
+                measured.frames_decoded,
+            ));
+        }
+        assert_eq!(
+            measurements[0], measurements[1],
+            "prefix length changed the source/validation read or decode budget"
+        );
+        assert!(measurements[0].1 > 0);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
