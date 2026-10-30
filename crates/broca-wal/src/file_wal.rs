@@ -480,6 +480,11 @@ fn closed_error() -> WalError {
 
 /// The append-only WAL log. The loop depends on the trait, not the impl.
 pub trait Wal {
+    /// The last prefix synced on this writer's descriptor, never speculative EOF.
+    /// Memory logs and wrappers without a durable file witness return `None`.
+    fn durable_publication(&self) -> Option<DurablePublication> {
+        None
+    }
     /// Current file location, including first-send relocation; absent for memory logs.
     fn log_path(&self) -> Option<&Path> {
         None
@@ -587,6 +592,32 @@ struct SyncProbe {
     dir_sync_paths: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
 }
 
+/// An immutable publication witness minted only by a successful writer sync.
+/// Readers must still authenticate lineage, frame hashes and contiguous ranges;
+/// the witness bounds their reads, not the lifetime of the file at its path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurablePublication {
+    path: PathBuf,
+    lineage: WalLineageId,
+    seq: u64,
+    end: u64,
+}
+
+impl DurablePublication {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    pub fn lineage(&self) -> WalLineageId {
+        self.lineage
+    }
+    pub fn sequence(&self) -> u64 {
+        self.seq
+    }
+    pub fn byte_end(&self) -> u64 {
+        self.end
+    }
+}
+
 pub struct FileWal {
     path: PathBuf,
     file: File,
@@ -604,6 +635,7 @@ pub struct FileWal {
     /// compare it with an authority and does not use it to reject an append. The belt catches
     /// the residual case: a draining old writer appending AFTER a new writer already wrote.
     last_write_end: u64,
+    synced_prefix: Cell<Option<(u64, u64)>>,
     /// The first barrier after each open syncs the WAL's parent directory so the
     /// file's name is durable, including when an earlier process did not sync it.
     dir_needs_sync: Cell<bool>,
@@ -1048,6 +1080,7 @@ impl FileWal {
             file,
             next_seq,
             last_write_end,
+            synced_prefix: Cell::new(None),
             dir_needs_sync: Cell::new(true),
             newly_created_dirs: RefCell::new(newly_created_dirs),
             config: WalConfig::LEGACY,
@@ -1139,6 +1172,13 @@ impl FileWal {
             self.dir_needs_sync.set(false);
         }
         Ok(())
+    }
+
+    fn record_synced_prefix(&self) {
+        // Capture the writer's known end, not a path-based EOF that might include
+        // another descriptor's writes. Readers still authenticate this prefix.
+        self.synced_prefix
+            .set(Some((self.next_seq.saturating_sub(1), self.last_write_end)));
     }
 }
 
@@ -1396,11 +1436,23 @@ impl FileWal {
         // Advance our high-water mark past the bytes we just wrote. Only OUR appends move
         // this, so "size unchanged since our last append" ⟺ no foreign write.
         self.last_write_end = current + bytes.len() as u64;
+        if sync {
+            self.record_synced_prefix();
+        }
         Ok(seq)
     }
 }
 
 impl Wal for FileWal {
+    fn durable_publication(&self) -> Option<DurablePublication> {
+        let (seq, end) = self.synced_prefix.get()?;
+        Some(DurablePublication {
+            path: self.path.clone(),
+            lineage: self.lineage_id?,
+            seq,
+            end,
+        })
+    }
     fn log_path(&self) -> Option<&Path> {
         Some(&self.path)
     }
@@ -1471,7 +1523,9 @@ impl Wal for FileWal {
     }
 
     fn sync(&self) -> Result<(), WalError> {
-        self.fsync()
+        self.fsync()?;
+        self.record_synced_prefix();
+        Ok(())
     }
 
     fn replay(&self) -> Result<Vec<FramedRecord>, WalError> {
@@ -2775,6 +2829,40 @@ fn read_file_capped(path: &Path, max_bytes: u64) -> Result<Vec<u8>, WalError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn durable_publication_is_frozen_at_the_descriptor_sync() {
+        let path = tmp("durable-publication");
+        let mut wal = FileWal::open(&path).unwrap();
+        assert!(wal.durable_publication().is_none());
+        wal.append(
+            1,
+            &WalRecord::StepStarted {
+                step_id: broca_protocol::StepId(1),
+            },
+            false,
+        )
+        .unwrap();
+        assert!(wal.durable_publication().is_none());
+        wal.sync().unwrap();
+        let first = wal.durable_publication().unwrap();
+        assert_eq!(first.sequence(), 1);
+        assert_eq!(first.byte_end(), std::fs::metadata(&path).unwrap().len());
+        wal.append(
+            1,
+            &WalRecord::StepStarted {
+                step_id: broca_protocol::StepId(2),
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(wal.durable_publication().as_ref(), Some(&first));
+        wal.sync().unwrap();
+        assert_eq!(wal.durable_publication().unwrap().sequence(), 2);
+        assert!(wal.durable_publication().unwrap().byte_end() > first.byte_end());
+        drop(wal);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn range_reads_do_not_restore_unused_feature_collection_api_or_pass() {
         let reader = include_str!("file_wal.rs");

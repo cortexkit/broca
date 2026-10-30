@@ -2663,6 +2663,7 @@ pub struct RecordObserver {
     subscribers: Arc<AtomicUsize>,
     tap: Option<(Arc<DurableRecordTap>, Arc<std::sync::atomic::AtomicBool>)>,
     step_events: Option<StepEventObserver>,
+    publications: Vec<tokio::sync::watch::Sender<Option<broca_wal::file_wal::DurablePublication>>>,
 }
 
 /// Terminal attempt evidence copied after durability for a best-effort live hint. The
@@ -2813,6 +2814,7 @@ impl RecordObserver {
             subscribers,
             tap: None,
             step_events: None,
+            publications: Vec::new(),
         }
     }
 
@@ -2840,6 +2842,28 @@ impl RecordObserver {
     ) -> Self {
         self.tap = Some((tap, healthy));
         self
+    }
+
+    /// Subscribe independently of record fan-out and the bus tap. Watch receivers
+    /// may coalesce events: each witness covers the entire durable prefix, so an
+    /// index subscriber catches up from its own persisted cursor without gaps.
+    pub fn with_publications(
+        mut self,
+        tx: tokio::sync::watch::Sender<Option<broca_wal::file_wal::DurablePublication>>,
+    ) -> Self {
+        self.publications.push(tx);
+        self
+    }
+
+    fn observe_publication(&self, wal: &dyn Wal) {
+        if self.publications.is_empty() {
+            return;
+        }
+        if let Some(publication) = wal.durable_publication() {
+            for tx in &self.publications {
+                tx.send_replace(Some(publication.clone()));
+            }
+        }
     }
 
     fn observe(
@@ -5142,6 +5166,9 @@ fn writer_loop_with_identity(
     // last_seq can include coalesced appends that a crash would lose. Startup has
     // already proved and published the recovered prefix behind writer_opened.
     let mut last_fsynced_seq = wal.last_seq();
+    if let Some(obs) = &observer {
+        obs.observe_publication(&*wal);
+    }
     let mut dirty = false;
     // The sync deadline: the monotonic instant (in ms) by which dirty data must be
     // synced. Set when an append makes a clean writer dirty, and never slid while
@@ -5190,6 +5217,7 @@ fn writer_loop_with_identity(
                         dirty = false;
                         deadline_at_ms = None;
                         if let Some(obs) = &mut observer {
+                            obs.observe_publication(&*wal);
                             if has_tap {
                                 for (seq, record) in &pending_observed {
                                     obs.observe(*seq, fence, record, wal.lineage_id());
@@ -5268,6 +5296,7 @@ fn writer_loop_with_identity(
                         last_fsynced_seq = wal.last_seq();
                         durable_head.store(last_fsynced_seq, Ordering::Release);
                         if let Some(obs) = &mut observer {
+                            obs.observe_publication(&*wal);
                             for (seq, record) in pending_observed.drain(..) {
                                 obs.observe(seq, fence, &record, wal.lineage_id());
                                 if has_tap {
@@ -5362,6 +5391,7 @@ fn writer_loop_with_identity(
                             dirty = false;
                             deadline_at_ms = None;
                             if let Some(obs) = &mut observer {
+                                obs.observe_publication(&*wal);
                                 if has_tap {
                                     for (seq, record) in &pending_observed {
                                         obs.observe(*seq, fence, record, wal.lineage_id());
@@ -5409,6 +5439,7 @@ fn writer_loop_with_identity(
                 if result.is_ok() && dirty {
                     durable_head.store(wal.last_seq(), Ordering::Release);
                     if let Some(obs) = &mut observer {
+                        obs.observe_publication(&*wal);
                         for (seq, record) in pending_observed.drain(..) {
                             obs.observe(seq, fence, &record, wal.lineage_id());
                             if has_tap {
@@ -5489,6 +5520,7 @@ fn close_writer_identity(
         if published {
             durable_head.store(seq, Ordering::Release);
             if let Some(obs) = observer {
+                obs.observe_publication(wal);
                 obs.observe(seq, fence, &record, wal.lineage_id());
                 obs.observe_tap(seq, fence, wal.lineage_id(), wal.writer_id(), &record);
             }
@@ -6085,6 +6117,70 @@ mod tests {
             WalRecord::StepStarted { step_id: StepId(1) }
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn durable_publications_coexist_with_bus_tap_and_fanout() {
+        let path = tmp("publication-observers");
+        let _ = std::fs::remove_file(&path);
+        let wal = broca_wal::FileWal::open(&path).unwrap();
+        let (tx, mut records) = broadcast::channel(8);
+        let (bus, mut bus_inbox) = tokio::sync::mpsc::channel(8);
+        let (publications, mut index) = tokio::sync::watch::channel(None);
+        let mut independent = index.clone();
+        let observer = RecordObserver::new(tx, Arc::new(AtomicUsize::new(1)))
+            .with_durable_tap(
+                Arc::new(move |seq, _, _, _| bus.try_send(seq).unwrap()),
+                Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            )
+            .with_publications(publications);
+        let handle = WalHandle::spawn_observed(Box::new(wal), 7, Some(observer)).unwrap();
+        for step in 1..=2 {
+            handle.record(WalRecord::StepStarted {
+                step_id: StepId(step),
+            });
+        }
+        let (processed, ready) = oneshot::channel();
+        handle
+            .tx
+            .send(WalCommand::AppendDrained(processed))
+            .unwrap();
+        ready.await.unwrap();
+        assert!(index
+            .borrow()
+            .as_ref()
+            .is_none_or(|event| event.sequence() == 0));
+        index.borrow_and_update();
+        assert!(bus_inbox.try_recv().is_err());
+        assert!(records.try_recv().is_err());
+        assert_eq!(handle.sync().await.unwrap(), 2);
+        index.changed().await.unwrap();
+        let first = index.borrow_and_update().clone().unwrap();
+        assert_eq!(first.sequence(), 2);
+        assert_eq!(first.byte_end(), std::fs::metadata(&path).unwrap().len());
+        assert_eq!(independent.borrow_and_update().as_ref(), Some(&first));
+        for seq in 1..=2 {
+            assert_eq!(bus_inbox.recv().await.unwrap(), seq);
+            assert_eq!(records.recv().await.unwrap().seq, seq);
+        }
+        handle.record(WalRecord::StepStarted { step_id: StepId(3) });
+        handle.sync().await.unwrap();
+        index.changed().await.unwrap();
+        let second = index.borrow_and_update().clone().unwrap();
+        assert_eq!(second.sequence(), 3);
+        assert!(second.byte_end() > first.byte_end());
+        assert_eq!(
+            first.sequence(),
+            2,
+            "a witness cannot advance with its writer"
+        );
+        handle.sync().await.unwrap();
+        assert!(
+            !index.has_changed().unwrap(),
+            "clean barriers are not commits"
+        );
+        handle.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
