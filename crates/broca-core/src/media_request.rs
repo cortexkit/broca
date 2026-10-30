@@ -17,7 +17,7 @@ use crate::media_store::{MediaReadError, MediaStore};
 use crate::placement::{AppendKind, Placement, PlacementAction};
 
 mod seed;
-pub(crate) use seed::count_seed_fallback;
+pub use seed::count_seed_fallback;
 pub use seed::{seed_fallback_count, DurableMediaSeed, MediaCheckpoint, MediaHistory};
 
 /// A capture occurrence, not a digest. Two admissions of identical bytes have different ids

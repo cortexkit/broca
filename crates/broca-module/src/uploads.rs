@@ -132,12 +132,9 @@ pub(crate) async fn media_read(
     }
     // The object trees are shared. Authorize against durable capture records in this
     // bound session before opening any object, including for metadata-only probes.
-    let (frames, _) = registry.read_durable_wal(session).await?;
-    let checkpoint = broca_core::AdmissionCheckpointV1::from_frames(&frames)
-        .map_err(|error| ServeError::Open(format!("read session media history: {error}"), None))?;
-    let reference = checkpoint
-        .captured_media_reference(&request.sha256)
-        .cloned()
+    let reference = registry
+        .captured_media_reference(session, &request.sha256)
+        .await?
         .ok_or_else(|| ServeError::Upload(UploadError::new("unknown_media", &request.sha256)))?;
     request
         .check(reference.byte_size)

@@ -1422,6 +1422,9 @@ The operations follow the pinned llm-runner contract §9.12. In particular,
 past EOF refuses by name. Only durable captures in the bound session authorize a digest:
 another session's objects and unreferenced committed uploads return `unknown_media`.
 Read admission is the same as `session.read`.
+Capture authorization uses the stored admission checkpoint and a strictly anchored durable
+WAL tail, not a replay of the transcript for every chunk. A missing or unusable checkpoint
+requires a named, counted full-replay repair through the shared media-seed fallback counter.
 
 Default reads keep media as text markers. `session.read` with `media: "blocks"` returns
 stored references; descriptors and history display rows expose refs rather than payload

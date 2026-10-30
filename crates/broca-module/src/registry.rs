@@ -613,6 +613,7 @@ pub struct LineageRegistry {
     inner: Arc<Inner>,
 }
 
+mod media;
 #[path = "run_rows.rs"]
 mod run_rows;
 pub use run_rows::OverhaulRunSource;
@@ -1072,6 +1073,8 @@ struct ReadSources {
 enum ReadPurpose {
     Session,
     Authorization,
+    /// Require an anchor so an unusable media checkpoint cannot silently scan the prefix.
+    Media,
 }
 
 #[derive(Clone, Copy)]
@@ -2858,6 +2861,21 @@ impl LineageRegistry {
                     through_seq,
                     read_anchor.as_ref(),
                 ),
+                ReadPurpose::Media => match read_anchor {
+                    Some(anchor) if anchor.seq == after_seq => wal_store
+                        .read_records_range_from_valid_anchor(
+                            &session,
+                            after_seq,
+                            through_seq,
+                            &anchor,
+                        )
+                        .map(|range| {
+                            range.unwrap_or_else(|| {
+                                broca_wal::WalRangeRead::without_anchors(Vec::new())
+                            })
+                        }),
+                    _ => Ok(broca_wal::WalRangeRead::without_anchors(Vec::new())),
+                },
             })
         };
 
@@ -2878,7 +2896,7 @@ impl LineageRegistry {
             let wal_store = reader.wal_store.clone();
             let session = key.clone();
             move || match purpose {
-                ReadPurpose::Session => wal_store.file_identity(&session),
+                ReadPurpose::Session | ReadPurpose::Media => wal_store.file_identity(&session),
                 ReadPurpose::Authorization => wal_store.file_identity_for_authorization(&session),
             }
         })
@@ -2920,7 +2938,7 @@ impl LineageRegistry {
             let wal_store = reader.wal_store.clone();
             let session = key.clone();
             move || match purpose {
-                ReadPurpose::Session => wal_store.flush_for_read(&session),
+                ReadPurpose::Session | ReadPurpose::Media => wal_store.flush_for_read(&session),
                 ReadPurpose::Authorization => wal_store.flush_for_authorization(&session),
             }
         })
@@ -2970,7 +2988,7 @@ impl LineageRegistry {
             let wal_store = reader.wal_store.clone();
             let session = key.clone();
             move || match purpose {
-                ReadPurpose::Session => wal_store.file_identity(&session),
+                ReadPurpose::Session | ReadPurpose::Media => wal_store.file_identity(&session),
                 ReadPurpose::Authorization => wal_store.file_identity_for_authorization(&session),
             }
         })
@@ -3180,7 +3198,7 @@ impl LineageRegistry {
         OpenError,
     > {
         match purpose {
-            ReadPurpose::Session => self.check_expired(key, None).await?,
+            ReadPurpose::Session | ReadPurpose::Media => self.check_expired(key, None).await?,
             ReadPurpose::Authorization => self.check_authorization_expired(key).await?,
         }
         let Some(reader) = &self.inner.reader else {

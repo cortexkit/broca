@@ -302,9 +302,31 @@ async fn media_runtime_child() {
         assert!(read_json.contains("not shown to the model"));
     }
     sample(mode, "session-read", &[read]);
+    let descriptors = call(&mut rig, "session.read", json!({"media":"descriptors"})).await;
+    let descriptors_json = result(&descriptors).to_string();
+    assert_eq!(
+        descriptors_json.contains("media_ref"),
+        enabled,
+        "{descriptors_json}"
+    );
+    assert_eq!(
+        descriptors_json.contains(&digest(PERSON_PNG)),
+        enabled,
+        "{descriptors_json}"
+    );
+    assert_eq!(
+        descriptors_json.contains(&digest(PNG)),
+        enabled,
+        "{descriptors_json}"
+    );
+    assert!(!descriptors_json.contains(&STANDARD.encode(PNG)));
+    sample(mode, "session-read-descriptors", &[descriptors]);
     let history = call(&mut rig, "session.history", json!({"form":"display"})).await;
     result(&history);
     sample(mode, "session-history", &[history]);
+    if enabled {
+        default_reader_samples(&mut rig, &result(&sent)["run_id"]).await;
+    }
     let replay = rig
         .subscribe_collect(13, json!({"from":"start"}), Duration::from_millis(100))
         .await;
@@ -387,6 +409,45 @@ async fn media_runtime_child() {
     ] {
         family_roundtrip(family, enabled).await;
     }
+}
+
+async fn default_reader_samples(rig: &mut Rig, run_id: &Value) {
+    let read = call(rig, "session.read", json!({})).await;
+    let read_json = result(&read).to_string();
+    let mut markers = Vec::new();
+    for (kind, mime, bytes) in [
+        ("image", "image/png", PERSON_PNG),
+        ("image", "image/png", PNG),
+        ("document", "application/pdf", TOOL_PDF),
+    ] {
+        let marker = cortexkit_role_llm_runner::attachments::marker(
+            kind,
+            mime,
+            bytes.len() as u64,
+            &digest(bytes),
+            "not_requested",
+        );
+        assert!(read_json.contains(&marker), "{read_json}");
+        markers.push(marker);
+    }
+    sample("on", "session-read-default", &[read]);
+    let history = call(rig, "session.history", json!({})).await;
+    let history_json = result(&history).to_string();
+    assert!(
+        markers.iter().all(|marker| history_json.contains(marker)),
+        "{history_json}"
+    );
+    sample("on", "session-history-default", &[history]);
+    let status = call(rig, "run.status", json!({"run_id":run_id})).await;
+    let status_json = result(&status);
+    assert_eq!(status_json["state"], "completed");
+    assert!(!status_json.to_string().contains("media"));
+    sample("on", "run-status", &[status]);
+    let result_frame = call(rig, "run.result", json!({"run_id":run_id})).await;
+    let result_json = result(&result_frame);
+    assert_eq!(result_json["final_message"]["text"], "seen");
+    assert!(!result_json.to_string().contains("media"));
+    sample("on", "run-result", &[result_frame]);
 }
 
 async fn family_roundtrip(family: WireFamilyId, enabled: bool) {
