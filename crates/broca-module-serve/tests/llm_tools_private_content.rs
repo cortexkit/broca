@@ -104,6 +104,13 @@ enum Stub {
     Answering(&'static str),
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum StandInHold {
+    None,
+    Handoff,
+    BasalNoncePublication,
+}
+
 struct Rig {
     _daemon: broca_test_support::RigChild,
     root: PathBuf,
@@ -113,14 +120,14 @@ struct Rig {
 
 impl Rig {
     async fn start(name: &str, cerebellum: Stub, basal: Stub) -> Option<Self> {
-        Self::start_with_handoff_hold(name, cerebellum, basal, false).await
+        Self::start_with_hold(name, cerebellum, basal, StandInHold::None).await
     }
 
-    async fn start_with_handoff_hold(
+    async fn start_with_hold(
         name: &str,
         cerebellum: Stub,
         basal: Stub,
-        hold: bool,
+        hold: StandInHold,
     ) -> Option<Self> {
         let subc = broca_test_support::subc_bin("ck-subc", "SUBC_CORE_BIN");
         if !subc.exists() {
@@ -144,6 +151,11 @@ impl Rig {
             "state/catalog",
         ] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        if hold == StandInHold::BasalNoncePublication {
+            std::fs::write(root.join("basal.hold"), b"").unwrap();
+            // A new stand-in must retire the preceding launch's ready credential.
+            std::fs::write(root.join("basal.nonce"), b"previous-launch").unwrap();
         }
         let state = root.join("state");
         let priced = |units| json!({"currency":"USD","exponent":9,"state":"priced","units":units,"unit_provenance":{"kind":"stated"}});
@@ -206,7 +218,7 @@ impl Rig {
                 format!(
                     "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --subc) SUBC_CONNECTION=\"$2\"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\nexport SUBC_CONNECTION\nexport PRIVATE_CONTENT_ROOT='{root}'\nexport PRIVATE_CONTENT_HOLD_HANDOFF={hold}\nexport SURFACE_MODULE_ID={module_id}\nexport PRIVATE_CONTENT_SURFACE='{surface}'\nexport PRIVATE_CONTENT_FIXTURES={fixtures}\nexport PRIVATE_CONTENT_REQUESTS={requests}\nexec '{helper}' --exact private_content_handoff --nocapture >> '{ready}' 2>> '{stderr}'\n",
                     root = root.display(),
-                    hold = u8::from(hold),
+                    hold = u8::from(hold == StandInHold::Handoff),
                     helper = broca_test_support::ckdev_binary(std::env::current_exe().unwrap(), broca_test_support::scratch_root()).display(),
                     surface = fake_surface_bin().display(),
                     module_id = module_id,
@@ -308,16 +320,13 @@ impl Rig {
         // flow's scope.
         let caller = if flow { "basal" } else { "owner" };
         let nonce = self.root.join(format!("{caller}.nonce"));
-        broca_test_support::wait_until("caller nonce", || async {
-            std::fs::read_to_string(&nonce).map_err(|e| e.to_string())
-        })
-        .await;
+        let launch_nonce = consumer_nonce(&nonce).await;
         let connection = Arc::new(
             SubcConnection::connect_with_consumer_identity(
                 &self.root.join("runtime/subc-connection.json"),
                 Some(subc_control::ConsumerIdentity {
                     module_id: caller.into(),
-                    launch_nonce: std::fs::read_to_string(nonce).unwrap().trim().into(),
+                    launch_nonce,
                 }),
             )
             .await
@@ -480,6 +489,39 @@ fn cleanup_recorded_processes(root: &Path) -> std::io::Result<()> {
         ));
     }
     Ok(())
+}
+
+async fn consumer_nonce(path: &Path) -> String {
+    broca_test_support::wait_until("caller nonce", || async {
+        let contents = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+        let nonce = contents.trim();
+        if nonce.is_empty() {
+            Err("the consumer nonce is still empty".to_owned())
+        } else {
+            Ok(nonce.to_owned())
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn an_empty_consumer_nonce_is_not_readiness() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let path = broca_test_support::scratch_root().join("empty-consumer.nonce");
+    for empty in ["", " \n\t"] {
+        std::fs::write(&path, empty).unwrap();
+        let mut reader = Box::pin(consumer_nonce(&path));
+        let observed = std::future::poll_fn(|cx| Poll::Ready(reader.as_mut().poll(cx))).await;
+        assert!(
+            observed.is_pending(),
+            "an empty credential completed the reader"
+        );
+        std::fs::write(&path, " captured-nonce\n").unwrap();
+        assert_eq!(reader.await, "captured-nonce");
+    }
+    std::fs::remove_file(path).unwrap();
 }
 
 /// Open a tool-provider route to `target` and wait until that process answers a catalog.
@@ -1181,6 +1223,52 @@ async fn a_marked_flow_with_no_declared_providers_gets_no_extra_provider() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flow_waits_for_basals_acknowledged_nonce_publication() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let Some(rig) = Rig::start_with_hold(
+        "held-basal-nonce",
+        Stub::Answering(CEREBELLUM_MARKED),
+        Stub::Unreachable,
+        StandInHold::BasalNoncePublication,
+    )
+    .await
+    else {
+        return;
+    };
+    let nonce_path = rig.root.join("basal.nonce");
+    broca_test_support::wait_until("Basal paused before credential publication", || async {
+        if rig.root.join("basal.created").exists() {
+            Ok(())
+        } else {
+            Err("Basal has not created its unpublished nonce file".to_owned())
+        }
+    })
+    .await;
+
+    let mut reader = Box::pin(consumer_nonce(&nonce_path));
+    let observed = std::future::poll_fn(|cx| Poll::Ready(reader.as_mut().poll(cx))).await;
+    assert!(
+        observed.is_pending(),
+        "an unpublished nonce completed the reader"
+    );
+    assert!(
+        !nonce_path.exists(),
+        "a stale or partial credential was visible"
+    );
+    assert!(std::fs::read_to_string(rig.root.join("basal.requests"))
+        .unwrap()
+        .contains("hello-ack "));
+
+    std::fs::remove_file(rig.root.join("basal.hold")).unwrap();
+    let captured = reader.await;
+    assert!(!captured.is_empty());
+    let route = rig.open("flow", true).await;
+    assert_eq!(route.connection.consumer_module_id(), Some("basal"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn basal_error_frames_never_authorize_extra_providers_or_cache_a_failure() {
     for (name, fixture, expected) in [
         (
@@ -1326,6 +1414,12 @@ fn private_content_handoff() {
             record_process(&root, "helper", std::process::id());
             recorded_helper = true;
         }
+        // Retire readiness before starting another stand-in, including a helper's retries.
+        match std::fs::remove_file(root.join(format!("{module}.nonce"))) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("clear {module} consumer nonce: {error}"),
+        }
         let hold = std::env::var("PRIVATE_CONTENT_HOLD_HANDOFF").as_deref() == Ok("1");
         let mut command = if hold {
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
@@ -1405,8 +1499,13 @@ impl Drop for CleanupProbe {
 async fn cleanup_probe(name: &str, timeout: bool, orphan: bool) {
     use broca_test_support::RecordedProcess;
     use std::os::unix::fs::PermissionsExt;
-    let Some(rig) =
-        Rig::start_with_handoff_hold(name, Stub::Unreachable, Stub::Unreachable, true).await
+    let Some(rig) = Rig::start_with_hold(
+        name,
+        Stub::Unreachable,
+        Stub::Unreachable,
+        StandInHold::Handoff,
+    )
+    .await
     else {
         return;
     };
