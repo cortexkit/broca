@@ -179,12 +179,10 @@ impl WalStore for ZeroRangeCountingWalStore {
     }
 }
 
-/// A WAL store that reports no file identity, as `FileWalStore` does on Windows, where the
-/// standard library exposes no stable file id. The read path keys its cached flush proof on
-/// that identity, so without one an idle read that finds WAL records past the stored
-/// watermark must take a fresh flush barrier. Wrapping a real store lets a Unix run take the
-/// durability branch a Windows run takes; range reads still go to the Unix store, which can
-/// return byte anchors where Windows returns none.
+/// A WAL store that deliberately hides file identity to exercise an identityless backend.
+/// The read path keys its cached flush proof on that identity, so without one an idle read
+/// that finds WAL records past the stored watermark must take a fresh flush barrier.
+/// Range reads still go to the underlying store and retain any native byte anchors.
 struct NoFileIdentityWalStore {
     inner: Arc<dyn WalStore>,
 }
@@ -388,7 +386,7 @@ impl Rig {
     }
 
     /// [`Self::with_counting_zero_ranges`] whose session reads see no WAL file identity, which
-    /// is how every read runs on Windows.
+    /// exercises the identityless-reader branch on every platform.
     fn with_counting_zero_ranges_without_file_identity(tag: &str) -> (Self, Arc<AtomicUsize>) {
         Self::counting_zero_ranges(tag, |_, _| Arc::new(NoopExec), true)
     }
@@ -801,8 +799,8 @@ async fn unidentified_store_snapshot_replays_once_then_reads_incrementally() {
     let (rig, zero_range_reads) = Rig::with_counting_zero_ranges("legacy-store-lineage-unknown");
     let key = rig.key("legacy-store");
     seed_legacy_store_session(&rig, &key);
-    // Unix exposes a WAL file identity and Windows does not. Byte anchors are minted only
-    // under that identity, so the two are present or absent together on every platform.
+    // Byte anchors are minted only under a WAL file identity, so the two are present or
+    // absent together on every platform.
     let file_identity = WalStore::file_identity(rig.wal_store.as_ref(), &key)
         .expect("read WAL file identity")
         .is_some();
@@ -819,8 +817,8 @@ async fn unidentified_store_snapshot_replays_once_then_reads_incrementally() {
     assert_unidentified_store_snapshot_repair(&rig, &key, &zero_range_reads, file_identity).await;
 }
 
-/// The durability branch a Windows host takes, exercised on any host by hiding the WAL file
-/// identity from the registry's reader. The first read pays two sequence-zero range reads
+/// The identityless durability branch, exercised by hiding the WAL file identity from the
+/// registry's reader. The first read pays two sequence-zero range reads
 /// there; every later read requests only the WAL sequences after the repaired prefix's
 /// watermark.
 #[tokio::test]
@@ -902,7 +900,7 @@ async fn assert_unidentified_store_snapshot_repair(
         .expect("read legacy store snapshot");
     assert_eq!(legacy_snapshot.lineage_id, None);
     // The cached-proof path above needs a WAL record past the store's watermark; without one
-    // the suffix read takes no barrier and both platforms would pay the same replay cost.
+    // the suffix read takes no barrier and both identity-capability branches pay the same replay cost.
     assert!(
         records
             .last()
@@ -1581,7 +1579,7 @@ async fn idle_read_flushes_unproven_tail_once_then_reuses_the_proof() {
     let registry = LineageRegistry::new_with_reader(opener, reader.clone(), None);
 
     // The proven-head cache is scoped by stable file identity. Platforms without one
-    // (Windows) disable the cache by design: every idle page crossing unproven frames
+    // disable the cache by design: every idle page crossing unproven frames
     // takes its own conservative flush, so the expected counts shift by one per read.
     let cache_enabled = reader
         .inner
@@ -4431,8 +4429,8 @@ async fn tool_call_attribution_costs_follow_the_page_not_the_session() {
     }
     // One pass over the whole WAL, paid by the first read and never again. A pass with no
     // actor holding the session costs one range read where the WAL's file identity lets the
-    // reader reuse an earlier flush proof (unix), and two where it can't (a candidate read,
-    // then the read bounded by a fresh flush), so only the unix count is exact.
+    // reader reuse an earlier flush proof, and two without an identity (a candidate read,
+    // then the read bounded by a fresh flush).
     let first_pass = first_pass.unwrap();
     assert!(first_pass >= 1, "the first read paid for the pass");
     assert_eq!(
@@ -4440,8 +4438,10 @@ async fn tool_call_attribution_costs_follow_the_page_not_the_session() {
         first_pass,
         "later reads reuse what the pass found"
     );
-    #[cfg(unix)]
-    assert_eq!(first_pass, 1);
+    assert_eq!(
+        first_pass,
+        rig.wal_store.file_identity(&key).unwrap().map_or(2, |_| 1)
+    );
 }
 
 /// A message no recorded step produced (one an import brought in) is never given a real step's

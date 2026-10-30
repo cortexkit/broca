@@ -1753,7 +1753,7 @@ impl FileWalStore {
         file.sync_all().map_err(WalError::Io)?;
         let identity = read_identity(&path)?;
         // The open handle has already proved durability. A missing identity means the proof
-        // cannot be cached (always the case off Unix), not that another flush is needed.
+        // cannot be cached, not that another flush is needed.
         // Reopening by pathname could race retention deletion and flush a different lineage
         // or fail after the original WAL has moved to its deleting path.
         Ok(identity)

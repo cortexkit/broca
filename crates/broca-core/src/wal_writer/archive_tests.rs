@@ -303,17 +303,11 @@ fn live_wins_over_deliberately_different_archive_on_every_path() {
         .store
         .read_records_range(&f.session, 0, None, None)
         .unwrap();
-    // ANCHORS EXIST ONLY WHERE FILE IDENTITY DOES. `select_range` pushes one per record
-    // only when `metadata_file_id` returned `Some`, and that is `None` off unix. The archived
-    // reads below are unaffected because they take identity from the member's verified digest
-    // rather than from the OS; only this LIVE read depends on the platform.
-    //
-    // The assertion below makes the absence platform-explained rather than skipped: if anchors
-    // ever stop being produced ON UNIX, this fails instead of passing vacuously.
+    // Live anchors use native file identity; archive anchors use the verified member digest.
     let anchor = live.anchor_at(1);
-    assert!(
-        anchor.is_some() || cfg!(not(unix)),
-        "a platform with file identity must produce anchors"
+    assert_eq!(
+        anchor.map(|anchor| (anchor.file_id, anchor.seq)),
+        f.store.file_identity(&f.session).unwrap().map(|id| (id, 1))
     );
     let different = broca_wal::framing::encode(
         1,
@@ -423,18 +417,15 @@ fn archived_newer_writer_member_is_refused_by_name_on_every_decoding_read() {
     let f = Fixture::new();
     let records = f.live();
     let path = f.store.wal_path(&f.session);
-    // The anchor comes from a LIVE read, and a live anchor needs the OS's file identity, which
-    // exists only on unix. Without one the anchored read cannot be called at all, so that arm has
-    // nothing to refuse there. The assertion keeps the absence platform-explained: if unix ever
-    // stops producing anchors, this fails instead of skipping the arm.
+    // Require a live anchor whenever the backend exposes a native file identity.
     let anchor = f
         .store
         .read_records_range(&f.session, 0, Some(1), None)
         .unwrap()
         .anchor_at(1);
-    assert!(
-        anchor.is_some() || cfg!(not(unix)),
-        "a platform with file identity must produce anchors"
+    assert_eq!(
+        anchor.map(|anchor| (anchor.file_id, anchor.seq)),
+        f.store.file_identity(&f.session).unwrap().map(|id| (id, 1))
     );
     let mut bytes = std::fs::read(&path).unwrap();
     bytes.extend(
@@ -867,7 +858,7 @@ fn extraction_parent_sync_failure_aborts_admission() {
     assert_eq!(std::fs::read(path).unwrap(), payload);
 }
 
-// Keep the inode so a previously valid anchor remains usable after restoration. The
+// Keep the native file identity so a previously valid anchor remains usable after restoration. The
 // path still disappears before open and returns only after that open reports absence.
 fn restore_live_during_retry(f: &Fixture) -> std::rc::Rc<std::cell::Cell<usize>> {
     let path = f.store.wal_path(&f.session);
@@ -897,7 +888,10 @@ fn restoration_fixture() -> (Fixture, Vec<FramedRecord>, Option<WalByteAnchor>) 
         .read_records_range(&f.session, 0, None, None)
         .unwrap();
     let anchor = range.anchor_at(1);
-    assert!(anchor.is_some() || cfg!(not(unix)));
+    assert_eq!(
+        anchor.map(|anchor| (anchor.file_id, anchor.seq)),
+        f.store.file_identity(&f.session).unwrap().map(|id| (id, 1))
+    );
     // A retry that takes the archive instead of the restored live file must fail too.
     let different = broca_wal::framing::encode(
         1,
@@ -938,7 +932,7 @@ fn restored_live_retry_range_returns_original_records() {
     assert_eq!(actual, records);
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn restored_live_retry_valid_anchor_returns_original_suffix() {
     let (f, records, anchor) = restoration_fixture();
@@ -955,7 +949,6 @@ fn restored_live_retry_valid_anchor_returns_original_suffix() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn restored_live_retry_flush_returns_live_identity() {
     let (f, records, anchor) = restoration_fixture();

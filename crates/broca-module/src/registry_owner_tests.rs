@@ -287,7 +287,7 @@ async fn recreated_prefix_session_read(unidentified: bool, model: bool) {
     assert_eq!(repeated.messages, page.messages);
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[tokio::test]
 async fn bind_and_owner_checks_reuse_large_wal_ownership_without_prefix_reads() {
     let fixture = Fixture::new();
@@ -527,7 +527,7 @@ async fn bind_sources_preserve_frozen_plan_hooks_and_approval_answers() {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[tokio::test]
 async fn stale_first_episode_positions_revalidate_recreated_or_truncated_wals() {
     for replacement in ["recreated", "truncated"] {
@@ -1711,7 +1711,7 @@ async fn ownership_suffix_read_failure_never_tries_another_snapshot() {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[tokio::test]
 async fn ownership_first_episode_read_failure_never_tries_another_snapshot() {
     for fault in [7, 9] {

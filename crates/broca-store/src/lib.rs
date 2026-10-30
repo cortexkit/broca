@@ -4846,7 +4846,7 @@ mod tests {
         crate::conformance::wal_anchor_roundtrip_and_stale_filtering(sqlite_store());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn persisted_sqlite_anchor_drives_the_next_wal_range() {
         use broca_core::Persister;
@@ -4882,7 +4882,9 @@ mod tests {
                 },
             )
             .unwrap();
-        let anchor = first.anchor_at(watermark).expect("Unix range mints anchor");
+        let anchor = first
+            .anchor_at(watermark)
+            .expect("native file range mints anchor");
         Persister::persist_wal_anchor(&store, &session, Some(&anchor)).unwrap();
         let seed = Persister::projection_seed(&store, &session)
             .unwrap()

@@ -5466,6 +5466,7 @@ mod tests {
         inner: Arc<FileWalStore>,
         through_seq: Mutex<Vec<Option<u64>>>,
         flushes: AtomicU64,
+        hide_identity: std::sync::atomic::AtomicBool,
         alias_on_flush: Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>>,
     }
 
@@ -5533,11 +5534,22 @@ mod tests {
             if let Some((source, alias)) = self.alias_on_flush.lock().unwrap().take() {
                 std::fs::hard_link(source, alias).map_err(WalError::Io)?;
             }
-            self.inner.flush_for_read(session)
+            // Keep the real durability barrier even when simulating an identityless backend.
+            self.inner.flush_for_read(session).map(|identity| {
+                if self.hide_identity.load(Ordering::Relaxed) {
+                    None
+                } else {
+                    identity
+                }
+            })
         }
 
         fn file_identity(&self, session: &LineageKey) -> Result<Option<u64>, broca_wal::WalError> {
-            self.inner.file_identity(session)
+            if self.hide_identity.load(Ordering::Relaxed) {
+                Ok(None)
+            } else {
+                self.inner.file_identity(session)
+            }
         }
     }
 
@@ -5637,6 +5649,7 @@ mod tests {
                     inner: file_store,
                     through_seq: Mutex::new(Vec::new()),
                     flushes: AtomicU64::new(0),
+                    hide_identity: std::sync::atomic::AtomicBool::new(false),
                     alias_on_flush: Mutex::new(None),
                 });
                 let registry = LineageRegistry::new_with_reader(
@@ -5697,9 +5710,11 @@ mod tests {
     fn read_proof_fixture(
         archived: bool,
     ) -> (LineageRegistry, BindIdentity, Arc<RecordingWalStore>) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = broca_test_support::scratch_root().join(format!(
-            "broca-read-proof-eviction-{}-{archived}",
-            std::process::id()
+            "broca-read-proof-eviction-{}-{archived}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let session = BindIdentity::new(root.join("project"), "runner", "session");
         let file_store = Arc::new(FileWalStore::new(root.join("wal")));
@@ -5729,6 +5744,7 @@ mod tests {
             inner: file_store,
             through_seq: Mutex::new(Vec::new()),
             flushes: AtomicU64::new(0),
+            hide_identity: std::sync::atomic::AtomicBool::new(false),
             alias_on_flush: Mutex::new(None),
         });
         let registry =
@@ -5761,6 +5777,7 @@ mod tests {
             inner,
             through_seq: Mutex::new(Vec::new()),
             flushes: AtomicU64::new(0),
+            hide_identity: std::sync::atomic::AtomicBool::new(false),
             alias_on_flush: Mutex::new(Some((source.clone(), alias.clone()))),
         });
         let registry = LineageRegistry::new_with_reader(Arc::new(NeverOpener), store.clone(), None);
@@ -5794,10 +5811,10 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(windows)]
     #[tokio::test]
     async fn reads_without_file_identity_repeat_the_barrier_without_caching_proofs() {
         let (registry, session, wal_store) = read_proof_fixture(false);
+        wal_store.hide_identity.store(true, Ordering::Relaxed);
         assert_eq!(wal_store.file_identity(&session).unwrap(), None);
         let before = registry.route_read(&session, None, None).await.unwrap();
         let after = registry.route_read(&session, None, None).await.unwrap();
@@ -5816,10 +5833,9 @@ mod tests {
 
     #[tokio::test]
     async fn read_proof_eviction_repeats_the_barrier_and_preserves_the_page() {
-        // Archives have a content-based identity on every platform, including Windows,
-        // where live WALs do not populate the proof cache.
+        // Archive content identities and native live-file identities both key cached proofs.
         check_read_proof_eviction(true).await;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         check_read_proof_eviction(false).await;
     }
 
@@ -6299,6 +6315,7 @@ mod tests {
             inner: Arc::clone(&file_store),
             through_seq: Mutex::new(Vec::new()),
             flushes: AtomicU64::new(0),
+            hide_identity: std::sync::atomic::AtomicBool::new(false),
             alias_on_flush: Mutex::new(None),
         });
         let opener = Arc::new(GaugeOpener {
@@ -6398,9 +6415,9 @@ mod tests {
             .expect("idle read after slot close");
         assert_eq!(idle_read.messages.len(), 2);
         // The idle-read shape depends on whether the platform exposes a stable WAL file
-        // identity. With one (unix inode), the proof cached by the Closing read covers the
-        // candidate head, so the unbounded candidate read is served directly. Without one
-        // (Windows), the proven-head cache is disabled and every idle read takes a fresh
+        // identity. With one, the proof cached by the Closing read covers the candidate
+        // head, so the unbounded candidate read is served directly. Without one, the
+        // proven-head cache is disabled and every idle read takes a fresh
         // flush barrier, re-reading bounded at the candidate head observed before it.
         let expected_idle_bound = if file_store
             .file_identity(&session)
