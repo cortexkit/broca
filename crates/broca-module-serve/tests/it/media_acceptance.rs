@@ -538,7 +538,23 @@ async fn send_waits_for_its_queued_turn_after_the_previous_run_finishes() {
     })
     .await;
     model_gate.notify_one();
-    super::wait_send_finished(&rig, "media", "attached").await;
+    // Wait only for attached's terminal bytes here. The blocker send deliberately
+    // holds per-session request ordering while its input hook waits, so a public
+    // completion query would queue behind it. Confirm durability after release.
+    super::wait_records(&rig, "media", |records| {
+        records
+            .iter()
+            .find_map(|record| match record {
+                WalRecord::RunStarted {
+                    run_id,
+                    send_id: Some(id),
+                    ..
+                } if id == "attached" => Some(run_id),
+                _ => None,
+            })
+            .is_some_and(|run_id| super::finished(super::episode(records, &run_id.0)).is_some())
+    })
+    .await;
     assert_eq!(bodies.lock().unwrap().len(), 2);
     let mut waiting = Box::pin(super::wait_send_finished(&rig, "media", "switch"));
     let pending =
@@ -553,6 +569,7 @@ async fn send_waits_for_its_queued_turn_after_the_previous_run_finishes() {
     state.release.notify_waiters();
     blocker.await.unwrap();
     waiting.await;
+    super::wait_send_finished(&rig, "media", "attached").await;
     super::wait_send_finished(&rig, "media", "blocker").await;
     let bodies = bodies.lock().unwrap();
     assert_eq!(bodies.len(), 4, "{}", super::model_request_summary(&bodies));

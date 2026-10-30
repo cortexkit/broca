@@ -17,6 +17,60 @@ use crate::media_store::{MediaReadError, MediaStore};
 use crate::placement::{AppendKind, Placement, PlacementAction};
 
 mod seed;
+
+impl seed::MediaCheckpoint {
+    pub(crate) fn prepare_content_free_continuation(&mut self) {
+        // Without a replacement view, the saved media references and empty text slots
+        // suffice to recompute selection as the tail grows. A MediaChange::Show announces
+        // newly visible media at position zero; the selected index instead needs its
+        // full-fold position among all visible media.
+        if !self.session.restored_view {
+            self.session.restored_selection = None;
+            self.session.restored_covered = None;
+        }
+    }
+
+    /// A qualified media-free prefix has no captures or held media. Retain its current
+    /// profile and absolute placement when the first capture arrives in a later suffix.
+    pub(crate) fn after_media_free_prefix(
+        placement: crate::placement::Placement,
+        seq: u64,
+        frames: &[broca_wal::FramedRecord],
+    ) -> Result<Self, String> {
+        let mut checkpoint = Self::empty_at(placement, seq);
+        let mut profile = None;
+        for frame in frames {
+            let frozen = match &frame.record {
+                WalRecord::RunStarted { config, .. } => Some(&config.frozen_render_config),
+                WalRecord::RunConfigRefrozen {
+                    frozen_render_config,
+                    ..
+                } => Some(frozen_render_config),
+                _ => None,
+            };
+            if let Some(media) = frozen.and_then(|v| v.get("media")).filter(|v| !v.is_null()) {
+                if profile.as_ref() != Some(media) {
+                    profile = Some(media.clone());
+                    checkpoint.history.push(seed::MediaHistory::Profile {
+                        media: media.clone(),
+                        selected: Vec::new(),
+                    });
+                }
+            }
+            if matches!(
+                frame.record,
+                WalRecord::ModelAttemptFinished { .. } | WalRecord::ModelStepFinished { .. }
+            ) && !matches!(
+                checkpoint.history.last(),
+                Some(seed::MediaHistory::Boundary)
+            ) {
+                checkpoint.history.push(seed::MediaHistory::Boundary);
+            }
+        }
+        // Decoding preserves the last profile so later profiles can be compared with it.
+        Self::decode(&checkpoint.encode())
+    }
+}
 pub use seed::count_seed_fallback;
 pub use seed::{seed_fallback_count, DurableMediaSeed, MediaCheckpoint, MediaHistory};
 
