@@ -671,14 +671,13 @@ fn route_closer_for(shared: &Arc<ConnectionShared>) -> Arc<crate::route_close::R
             ))))
         })
         .clone();
-    *shared
-        .current
-        .lock()
-        .unwrap()
-        .runtime
-        .close_observer
-        .lock()
-        .unwrap() = Arc::downgrade(&closer);
+    let state = shared.current.lock().unwrap();
+    if state.active {
+        closer.connection_active(state.runtime.conn.0);
+    } else {
+        closer.connection_lost(state.runtime.conn.0);
+    }
+    *state.runtime.close_observer.lock().unwrap() = Arc::downgrade(&closer);
     closer
 }
 
@@ -760,7 +759,18 @@ impl GenerationState {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum LateGoodbyeHandoffStage {
+    Prepared,
+    Admitted(bool),
+}
+#[cfg(test)]
+type LateGoodbyeHandoffHook = Arc<dyn Fn(LateGoodbyeHandoffStage) + Send + Sync>;
+
 struct ConnectionShared {
+    #[cfg(test)]
+    late_goodbye_handoff: Mutex<Option<LateGoodbyeHandoffHook>>,
     route_closer: std::sync::OnceLock<Arc<crate::route_close::RouteCloser>>,
     connection_file_path: PathBuf,
     current: Mutex<GenerationState>,
@@ -799,6 +809,22 @@ pub struct SubcConnection {
 }
 
 impl SubcConnection {
+    #[cfg(test)]
+    pub(crate) fn shared_owner_probe_for_test(&self) -> impl Fn() -> bool + Send + 'static {
+        let weak = Arc::downgrade(&self.shared);
+        move || weak.strong_count() != 0
+    }
+    #[cfg(test)]
+    pub(crate) fn closing_route_exists_for_test(&self, route: RouteHandle) -> bool {
+        let state = self.shared.current.lock().unwrap();
+        state.runtime.conn == route.conn
+            && state
+                .runtime
+                .closing_routes
+                .lock()
+                .unwrap()
+                .contains_key(&(route.channel, route.epoch))
+    }
     #[cfg(test)]
     pub(crate) fn install_route_for_test(&self, route: RouteHandle) {
         self.shared
@@ -894,6 +920,8 @@ impl SubcConnection {
         let (runtime, write_rx) = new_runtime();
         let (reconnect_tx, reconnect_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(ConnectionShared {
+            #[cfg(test)]
+            late_goodbye_handoff: Mutex::new(None),
             route_closer: std::sync::OnceLock::new(),
             connection_file_path: connection_file_path.to_path_buf(),
             current: Mutex::new(GenerationState::new(Arc::clone(&runtime))),
@@ -2922,7 +2950,18 @@ fn retry_late_goodbye(generation: Option<&ReaderGeneration>, frame: Frame) {
     // Publish a non-dispatchable closing identity before the reader drops its live epoch.
     // No await and no egress wait occurs on ingress.
     if prepare_goodbye(&shared, route).is_ok() {
-        route_closer_for(&shared).enqueue_failed(route);
+        let closer = route_closer_for(&shared);
+        #[cfg(test)]
+        let hook = shared.late_goodbye_handoff.lock().unwrap().take();
+        #[cfg(test)]
+        if let Some(hook) = &hook {
+            hook(LateGoodbyeHandoffStage::Prepared);
+        }
+        let _admitted = closer.enqueue_failed(route);
+        #[cfg(test)]
+        if let Some(hook) = hook {
+            hook(LateGoodbyeHandoffStage::Admitted(_admitted));
+        }
     }
 }
 
@@ -4478,6 +4517,8 @@ impl SubcConnection {
         let (reconnect_tx, _reconnect_rx) = mpsc::unbounded_channel();
         let conn = SubcConnection {
             shared: Arc::new(ConnectionShared {
+                #[cfg(test)]
+                late_goodbye_handoff: Mutex::new(None),
                 route_closer: std::sync::OnceLock::new(),
                 connection_file_path: PathBuf::new(),
                 current: Mutex::new(GenerationState::new(runtime)),
@@ -5414,6 +5455,8 @@ mod tests {
         let (reconnect_tx, _reconnect_rx) = mpsc::unbounded_channel();
         SubcConnection {
             shared: Arc::new(ConnectionShared {
+                #[cfg(test)]
+                late_goodbye_handoff: Mutex::new(None),
                 route_closer: std::sync::OnceLock::new(),
                 connection_file_path: PathBuf::new(),
                 current: Mutex::new(GenerationState::new(runtime)),
@@ -7281,6 +7324,8 @@ mod tests {
         });
         let (reconnect_tx, reconnect_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(ConnectionShared {
+            #[cfg(test)]
+            late_goodbye_handoff: Mutex::new(None),
             route_closer: std::sync::OnceLock::new(),
             connection_file_path: broca_test_support::scratch_root().join(format!(
                 "broca-missing-connection-file-{}",

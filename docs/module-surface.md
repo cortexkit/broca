@@ -314,10 +314,14 @@ acquired for a batch or warm bind, not time since the last provider frame. Close
 failed or timed-out enqueue attempts, including retries; a successful enqueue is not a remote
 acknowledgement. Failed closes retry independently of tool calls, even after the actor's bounded
 close waiter ends. Session teardown and congested late/abandoned opens share one cleanup queue
-per consumer connection. It holds at most 1,024 route identities; overflow is counted and warned.
+per consumer connection. It holds at most 1,024 distinct route identities; overflow is counted and
+warned. Duplicate close requests can allocate additional waiters, so this identity cap is not a
+bound on total cleanup heap or task allocation.
 Entries expire after 30 seconds with one give-up WARN and an increment to
 `goodbye_giveups_since_boot`. Retry passes run in parallel with one shared five-second budget,
-with a one-second pause between passes. Connection loss clears affected entries synchronously;
+with a one-second pause between passes, shortened to the earliest pending expiry. Connection loss
+synchronously removes entries for the lost connection generation and rejects later cleanup
+enqueues for that generation;
 cleanup tasks do not retain the connection owner. A give-up is not a remote acknowledgement:
 it stops local retries, and the daemon may retain that channel until the connection ends.
 No session names, project paths, prompts or tool arguments appear in this

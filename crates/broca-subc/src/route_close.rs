@@ -10,7 +10,7 @@ use std::sync::{
 use std::time::Duration;
 use tokio::{
     sync::oneshot,
-    time::{sleep, timeout_at, Instant},
+    time::{sleep_until, timeout_at, Instant},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -29,10 +29,19 @@ struct Entry {
     since: Instant,
     waiters: Vec<oneshot::Sender<bool>>,
 }
+#[derive(Clone, Copy, Default)]
+enum Admission {
+    // Test adapters need not represent a socket generation.
+    #[default]
+    Unfenced,
+    Active(u64),
+    Retired,
+}
 #[derive(Default)]
 struct Pending {
     routes: HashMap<RouteHandle, Entry>,
     running: bool,
+    admission: Admission,
 }
 pub(crate) struct RouteCloser {
     target: Arc<dyn CloseTarget>,
@@ -60,14 +69,28 @@ impl RouteCloser {
     }
     /// The ingress reader has already tried and failed to enqueue this Goodbye. Only
     /// transfer ownership here: waiting for writer capacity would stop unrelated replies.
-    pub(crate) fn enqueue_failed(self: &Arc<Self>, handle: RouteHandle) {
+    pub(crate) fn enqueue_failed(self: &Arc<Self>, handle: RouteHandle) -> bool {
         self.failed(handle, false);
-        self.enqueue(handle, None);
+        self.enqueue(handle, None)
     }
-    fn enqueue(self: &Arc<Self>, handle: RouteHandle, waiter: Option<oneshot::Sender<bool>>) {
+    fn enqueue(
+        self: &Arc<Self>,
+        handle: RouteHandle,
+        waiter: Option<oneshot::Sender<bool>>,
+    ) -> bool {
         let mut pending = self.pending.lock().unwrap();
         if self.shutdown.is_cancelled() {
-            return;
+            return false;
+        }
+        // Admission and the loss hook use the same lock: a handoff that was prepared before
+        // deactivation cannot recreate retry ownership after that hook has returned.
+        if matches!(pending.admission, Admission::Retired)
+            || matches!(pending.admission, Admission::Active(generation) if generation != handle.generation())
+        {
+            if let Some(waiter) = waiter {
+                let _ = waiter.send(true);
+            }
+            return false;
         }
         if !pending.routes.contains_key(&handle) && pending.routes.len() == MAX_PENDING_GOODBYES {
             drop(pending);
@@ -75,7 +98,7 @@ impl RouteCloser {
             self.target.abandon(handle);
             tracing::warn!(target: "broca.tool_routes", channel = handle.channel,
                 "Goodbye retry queue full; giving up route cleanup");
-            return;
+            return false;
         }
         let entry = pending.routes.entry(handle).or_insert_with(|| Entry {
             since: Instant::now(),
@@ -85,7 +108,7 @@ impl RouteCloser {
             entry.waiters.push(waiter);
         }
         if pending.running {
-            return;
+            return true;
         }
         pending.running = true;
         drop(pending);
@@ -129,17 +152,25 @@ impl RouteCloser {
                         }
                     }
                 })).await;
-                {
+                let wake_at = {
                     let mut pending = closer.pending.lock().unwrap();
                     if pending.routes.is_empty() || closer.shutdown.is_cancelled() {
                         pending.running = false;
                         return;
                     }
-                }
+                    let expiry = pending
+                        .routes
+                        .values()
+                        .map(|entry| entry.since + MAX_CLOSE_AGE)
+                        .min()
+                        .expect("a nonempty cleanup queue has an expiry");
+                    (Instant::now() + RETRY_TICK).min(expiry)
+                };
                 drop(closer);
-                tokio::select! { biased; _ = shutdown.cancelled() => return, _ = sleep(RETRY_TICK) => {} }
+                tokio::select! { biased; _ = shutdown.cancelled() => return, _ = sleep_until(wake_at) => {} }
             }
         });
+        true
     }
 }
 
@@ -164,7 +195,11 @@ impl RouteCloser {
     }
     /// Called synchronously by generation deactivation, before any later retry can run.
     pub(crate) fn connection_lost(&self, generation: u64) {
-        self.pending.lock().unwrap().routes.retain(|handle, entry| {
+        let mut pending = self.pending.lock().unwrap();
+        if !matches!(pending.admission, Admission::Active(active) if active != generation) {
+            pending.admission = Admission::Retired;
+        }
+        pending.routes.retain(|handle, entry| {
             if handle.generation() != generation {
                 return true;
             }
@@ -173,6 +208,11 @@ impl RouteCloser {
             }
             false
         });
+    }
+    /// Called under the connection generation lock, never while holding a queue guard.
+    pub(crate) fn connection_active(&self, generation: u64) {
+        let mut pending = self.pending.lock().unwrap();
+        pending.admission = Admission::Active(generation);
     }
     pub(crate) fn stop(&self) {
         self.shutdown.cancel();

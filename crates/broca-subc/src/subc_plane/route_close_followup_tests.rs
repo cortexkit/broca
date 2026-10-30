@@ -20,7 +20,7 @@ async fn followup_advance(seconds: u64) {
 
 #[tokio::test(start_paused = true)]
 async fn followup_permanent_full_writer_has_a_counted_age_giveup() {
-    let (_conn, plane, route, _module) = followup_congested_plane();
+    let (conn, plane, route, _module) = followup_congested_plane();
     assert!(!plane.closer.close(route).await);
     assert_eq!(plane.closer.pending(), 1);
     for _ in 0..26 {
@@ -35,6 +35,11 @@ async fn followup_permanent_full_writer_has_a_counted_age_giveup() {
         plane.tool_routes_health(&[])["goodbye_giveups_since_boot"],
         1
     );
+    assert!(
+        !conn.closing_route_exists_for_test(route),
+        "age give-up must abandon the closing identity"
+    );
+    assert!(!conn.route_is_open(&route));
 }
 
 #[tokio::test(start_paused = true)]
@@ -53,14 +58,33 @@ async fn followup_connection_loss_clears_retry_ownership_synchronously() {
 #[tokio::test(start_paused = true)]
 async fn followup_retry_task_does_not_keep_the_connection_alive() {
     let (conn, plane, route, _module) = followup_congested_plane();
-    assert!(!plane.closer.close(route).await);
+    let closer = Arc::clone(&plane.closer);
+    let close = {
+        let closer = Arc::clone(&closer);
+        tokio::spawn(async move { closer.close(route).await })
+    };
+    broca_test_support::wait_until("close prepares its blocked writer attempt", || async {
+        if conn.closing_route_exists_for_test(route) {
+            Ok(())
+        } else {
+            Err("no closing identity yet".into())
+        }
+    })
+    .await;
     let weak = Arc::downgrade(&conn);
+    let shared_owner_alive = conn.shared_owner_probe_for_test();
     drop(plane);
     drop(conn);
     assert!(
         weak.upgrade().is_none(),
         "close-only retries cannot retain the connection owner"
     );
+    assert!(
+        !shared_owner_alive(),
+        "cleanup target retained the shared connection owner"
+    );
+    assert!(close.await.unwrap());
+    assert_eq!(closer.pending(), 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -74,7 +98,17 @@ async fn followup_retry_backlog_is_capped_and_overflow_is_counted() {
             handle
         })
         .collect();
-    let results = join_all(handles.into_iter().map(|handle| plane.closer.close(handle))).await;
+    for handle in &handles {
+        let mut attempt = Box::pin(conn.route_close(handle));
+        assert!(futures::poll!(attempt.as_mut()).is_pending());
+    }
+    let results = join_all(
+        handles
+            .iter()
+            .copied()
+            .map(|handle| plane.closer.close(handle)),
+    )
+    .await;
     assert!(results.iter().all(|closed| !closed));
     assert_eq!(
         plane.closer.pending(),
@@ -85,6 +119,15 @@ async fn followup_retry_backlog_is_capped_and_overflow_is_counted() {
         plane.tool_routes_health(&[])["goodbye_retry_overflows_since_boot"],
         1
     );
+    assert_eq!(
+        handles
+            .iter()
+            .filter(|handle| conn.closing_route_exists_for_test(**handle))
+            .count(),
+        1024,
+        "overflow must abandon the rejected closing identity"
+    );
+    assert!(handles.iter().all(|handle| !conn.route_is_open(handle)));
 }
 
 #[tokio::test(start_paused = true)]
@@ -266,4 +309,86 @@ async fn followup_late_open_real_caller_preserves_the_reopened_generation() {
         plane.tool_routes_health(std::slice::from_ref(&ctx.bind))["routes_for_closed_sessions"],
         0
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn review_staggered_arrival_expires_at_its_own_deadline() {
+    let (conn, plane, first, _module) = followup_congested_plane();
+    assert!(!plane.closer.close(first).await);
+    tokio::time::advance(Duration::from_millis(500)).await;
+    let mut second = first;
+    second.channel = 8;
+    conn.install_route_for_test(second);
+    let mut attempt = Box::pin(conn.route_close(&second));
+    assert!(futures::poll!(attempt.as_mut()).is_pending());
+    drop(attempt);
+    let expires = tokio::time::Instant::now() + Duration::from_secs(30);
+    assert!(plane.closer.enqueue_failed(second));
+    assert_eq!(plane.closer.pending(), 2);
+    while tokio::time::Instant::now() < expires {
+        let step = Duration::from_millis(500).min(expires - tokio::time::Instant::now());
+        tokio::time::advance(step).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+    assert_eq!(tokio::time::Instant::now(), expires);
+    assert_eq!(
+        plane.closer.pending(),
+        0,
+        "staggered entry survived its exact age deadline"
+    );
+    assert_eq!(plane.closer.giveups(), 2);
+    assert!(!conn.closing_route_exists_for_test(second));
+}
+
+struct ReviewParallelTarget {
+    started: Arc<AtomicUsize>,
+    release: CancellationToken,
+}
+impl CloseTarget for ReviewParallelTarget {
+    fn attempt(
+        &self,
+        _handle: RouteHandle,
+    ) -> futures::future::BoxFuture<'static, Result<(), ConnError>> {
+        let started = Arc::clone(&self.started);
+        let release = self.release.clone();
+        Box::pin(async move {
+            started.fetch_add(1, Ordering::SeqCst);
+            release.cancelled().await;
+            Ok(())
+        })
+    }
+    fn abandon(&self, _handle: RouteHandle) {}
+}
+
+#[tokio::test(start_paused = true)]
+async fn review_all_close_attempts_start_before_the_shared_deadline() {
+    let started = Arc::new(AtomicUsize::new(0));
+    let release = CancellationToken::new();
+    let closer = RouteCloser::new(Arc::new(ReviewParallelTarget {
+        started: Arc::clone(&started),
+        release: release.clone(),
+    }));
+    assert!(closer.enqueue_failed(RouteHandle::synthetic(1)));
+    assert!(closer.enqueue_failed(RouteHandle::synthetic(2)));
+    let now = tokio::time::Instant::now();
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(tokio::time::Instant::now(), now);
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        2,
+        "a shared deadline alone cannot substitute for concurrent attempt progress"
+    );
+    release.cancel();
+    broca_test_support::wait_until("parallel closes finish", || async {
+        if closer.pending() == 0 {
+            Ok(())
+        } else {
+            Err("closes still pending".into())
+        }
+    })
+    .await;
 }
