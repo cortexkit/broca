@@ -285,6 +285,107 @@ async fn real_daemon_person_and_tool_media_gemini() {
     daemon_round_trip(WireFamilyId::Gemini).await;
 }
 
+async fn daemon_text_only_tool_image(id: WireFamilyId) {
+    let (_, provider, model, route, tool, text) =
+        samples().into_iter().find(|sample| sample.0 == id).unwrap();
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let url = serve_model_responses(bodies.clone(), vec![tool, text]).await;
+    let Some(rig) = Rig::launch_media(&url, Some(catalog_for(provider, model, route))).await else {
+        return;
+    };
+    let _tool = image_tool(&rig).await;
+    assert!(rig.wait_for_module_live().await);
+    send_family(&rig, provider, model, "text-only", json!([]), true).await;
+    let records = session_records(&rig.wal_dir(), "media").unwrap();
+    let starts: Vec<_> = records
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::RunStarted { input, .. } => Some(input),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(starts.len(), 1);
+    assert!(
+        starts[0]
+            .iter()
+            .flat_map(|message| &message.content)
+            .all(|block| !matches!(block, broca_protocol::ContentBlock::Media(_))),
+        "the worker started with text only"
+    );
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(
+        bodies.len(),
+        2,
+        "tool call, then its image-bearing followup"
+    );
+    let followup: Value = serde_json::from_slice(&bodies[1]).unwrap();
+    assert!(
+        payloads(id, &followup).contains(&STANDARD.decode(PNG).unwrap()),
+        "{id:?}: a tool-only PNG must reach the next model request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_daemon_text_only_tool_media_anthropic() {
+    daemon_text_only_tool_image(WireFamilyId::AnthropicMessages).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_daemon_text_only_tool_media_gemini() {
+    daemon_text_only_tool_image(WireFamilyId::Gemini).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_daemon_text_only_tool_media_openai_responses() {
+    daemon_text_only_tool_image(WireFamilyId::OpenAiResponses).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_daemon_media_off_frozen_config_matches_master() {
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let url = serve_model_responses(bodies, vec![ANTHROPIC_SSE]).await;
+    let Some(rig) = Rig::launch_configured(
+        &url,
+        Some(catalog_for("anthropic", CLAUDE, "anthropic/claude-opus-5")),
+        false,
+    )
+    .await
+    else {
+        return;
+    };
+    let _tool = image_tool(&rig).await;
+    assert!(rig.wait_for_module_live().await);
+    send_family(&rig, "anthropic", CLAUDE, "off-text", json!([]), true).await;
+    let mut frozen = session_records(&rig.wal_dir(), "media")
+        .unwrap()
+        .into_iter()
+        .find_map(|record| match record {
+            WalRecord::RunStarted { config, .. } => Some(config.frozen_render_config),
+            _ => None,
+        })
+        .unwrap();
+    frozen["base_url"] = json!("@BASE_URL@");
+    // Endpoint ports and freshly generated persona identities vary between isolated rigs.
+    if let Some(persona) = frozen
+        .get_mut("claude_code_persona")
+        .and_then(Value::as_object_mut)
+    {
+        for (field, token) in [
+            ("cc_version_suffix", "@VERSION_SUFFIX@"),
+            ("device_id", "@DEVICE_ID@"),
+            ("prompt_id", "@PROMPT_ID@"),
+            ("session_id", "@SESSION_ID@"),
+        ] {
+            *persona
+                .get_mut(field)
+                .expect("the master persona contains this field") = json!(token);
+        }
+    }
+    let bytes = serde_json::to_string(&frozen).unwrap();
+    assert_eq!(
+        bytes,
+        include_str!("../golden/text_only_off_frozen.json").trim_end()
+    );
+}
+
 fn restore_media_and_wal(source: &Path, destination: &Path) {
     fn copy_tree(source: &Path, destination: &Path, wal: bool) {
         if !source.exists() {
@@ -411,4 +512,98 @@ async fn real_daemon_portable_media_recovery_after_kill_preserves_request_bytes(
     let followup: Value = serde_json::from_slice(&bodies[3]).unwrap();
     assert!(payloads(WireFamilyId::AnthropicMessages, &followup)
         .contains(&STANDARD.decode(PNG).unwrap()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_daemon_legacy_no_profile_resume_keeps_tool_markers() {
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let url = serve_model_responses_paused(
+        bodies.clone(),
+        vec![ANTHROPIC_TOOL, ANTHROPIC_TOOL, ANTHROPIC_SSE],
+        Some((0, gate.clone())),
+    )
+    .await;
+    let current = catalog_for("anthropic", CLAUDE, "anthropic/claude-opus-5");
+    let mut old = current.clone();
+    old["models"][format!("anthropic/{CLAUDE}")]["capability.input_modalities"] = json!(["text"]);
+    let Some(mut original) = Rig::launch_media(&url, Some(old)).await else {
+        return;
+    };
+    let _original_tool = image_tool(&original).await;
+    assert!(original.wait_for_module_live().await);
+    request(
+        &original,
+        "media",
+        "session.send",
+        json!({"prompt":"Text-only legacy worker","send_id":"legacy","on_restart":"resume",
+        "model":{"provider":"anthropic","model":CLAUDE},"plan":plan()}),
+    )
+    .await
+    .unwrap();
+    broca_test_support::wait_until("legacy request before response", || async {
+        if bodies.lock().unwrap().len() == 1 {
+            Ok(())
+        } else {
+            Err("request not captured".to_owned())
+        }
+    })
+    .await;
+    let records = session_records(&original.wal_dir(), "media").unwrap();
+    assert!(records
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::RunStarted { config, .. } => Some(config),
+            _ => None,
+        })
+        .all(|config| config.frozen_render_config.get("media").is_none()));
+    broca_test_support::kill_and_reap_tree(&mut original.daemon);
+    gate.notify_waiters();
+    let Some(mut restored) = Rig::launch_media(&url, Some(current)).await else {
+        return;
+    };
+    restored.project = original.project.clone();
+    restore_media_and_wal(
+        original.wal_dir().parent().unwrap(),
+        restored.wal_dir().parent().unwrap(),
+    );
+    let _restored_tool = image_tool(&restored).await;
+    assert!(restored.wait_for_module_live().await);
+    let conn = broca_subc::SubcConnection::connect(&restored.connection_file)
+        .await
+        .unwrap();
+    let route = conn
+        .route_open_management("broca", &restored.key("media"))
+        .await
+        .unwrap();
+    let _subscription = conn
+        .subscribe(
+            &route,
+            serde_json::to_vec(&json!({"method":"session.subscribe","params":{"from":"live"}}))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let records = super::super::wait_send_finished(&restored, "media", "legacy").await;
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record, WalRecord::RunStarted { .. }))
+            .count(),
+        1
+    );
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(
+        bodies.len(),
+        3,
+        "original request, resumed request, tool followup"
+    );
+    assert_eq!(
+        bodies[0], bodies[1],
+        "resume must not refreeze a missing media profile"
+    );
+    let followup: Value = serde_json::from_slice(&bodies[2]).unwrap();
+    assert!(!payloads(WireFamilyId::AnthropicMessages, &followup)
+        .contains(&STANDARD.decode(PNG).unwrap()));
+    assert!(followup.to_string().contains("reason=modality"));
 }

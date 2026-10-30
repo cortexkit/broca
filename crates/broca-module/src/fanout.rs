@@ -440,6 +440,7 @@ pub use display_replay::DisplaySender;
 /// and a display ring (fed by the run's live `out` display events). Owned by the actor;
 /// subscribers attach via the actor's Subscribe command.
 pub struct Fanout<W: WalStore> {
+    media_head: Option<Arc<crate::registry::media_head::Live>>,
     approvals: Arc<crate::approval_state::ApprovalState>,
     source_warm: Option<crate::source_warm::Events>,
     ring: LazyRing<Arc<ControlEvent>>,
@@ -636,6 +637,8 @@ impl<W: WalStore + 'static> Fanout<W> {
         source_enabled: bool,
     ) -> (Self, broca_core::RecordObserver) {
         let approvals = Arc::new(crate::approval_state::ApprovalState::default());
+        let media_head = broca_protocol::attachments_enabled()
+            .then(|| Arc::new(crate::registry::media_head::Live::default()));
         let source_warm = source_enabled.then(crate::source_warm::Events::default);
         let ring = LazyRing::new(RING_CAPACITY);
         let display_ring = DisplaySender::new(DISPLAY_RING_CAPACITY);
@@ -659,15 +662,17 @@ impl<W: WalStore + 'static> Fanout<W> {
             crate::diagnostics::observe_outage(record, || &crate::diagnostics::TOOL_OUTAGES);
         };
         let observer = broca_core::RecordObserver::new(obs_tx, gate.observer_slots());
-        // Choose the tap once at open: a disabled source warmer leaves the original
-        // approvals/diagnostics-only record path, without a source channel or per-record work.
-        let observer = match source_warm.clone() {
-            Some(source_tap) => {
-                #[cfg(test)]
-                let source_stats = crate::source_warm::test_stats(&session);
-                observer.with_durable_tap(
-                    Arc::new(move |seq, fence, lineage, record| {
-                        observe(seq, fence, lineage, record);
+        // Choose optional taps once at open. With media and source warming both off, keep the
+        // original approvals/diagnostics path without channels or record clones.
+        let observer = if let Some(media_tap) = media_head.clone() {
+            let source_tap = source_warm.clone();
+            #[cfg(test)]
+            let source_stats = crate::source_warm::test_stats(&session);
+            observer.with_durable_tap(
+                Arc::new(move |seq, fence, lineage, record| {
+                    observe(seq, fence, lineage, record);
+                    media_tap.observe(seq, lineage, record);
+                    if let Some(source_tap) = &source_tap {
                         #[cfg(test)]
                         source_stats.tap_calls.fetch_add(1, Ordering::Relaxed);
                         let cloned = source_tap.observe(seq, record);
@@ -677,14 +682,37 @@ impl<W: WalStore + 'static> Fanout<W> {
                         }
                         #[cfg(not(test))]
                         let _ = cloned;
-                    }),
-                    approvals.healthy.clone(),
-                )
+                    }
+                }),
+                approvals.healthy.clone(),
+            )
+        } else {
+            match source_warm.clone() {
+                Some(source_tap) => {
+                    #[cfg(test)]
+                    let source_stats = crate::source_warm::test_stats(&session);
+                    observer.with_durable_tap(
+                        Arc::new(move |seq, fence, lineage, record| {
+                            observe(seq, fence, lineage, record);
+                            #[cfg(test)]
+                            source_stats.tap_calls.fetch_add(1, Ordering::Relaxed);
+                            let cloned = source_tap.observe(seq, record);
+                            #[cfg(test)]
+                            if cloned {
+                                source_stats.record_clones.fetch_add(1, Ordering::Relaxed);
+                            }
+                            #[cfg(not(test))]
+                            let _ = cloned;
+                        }),
+                        approvals.healthy.clone(),
+                    )
+                }
+                None => observer.with_durable_tap(Arc::new(observe), approvals.healthy.clone()),
             }
-            None => observer.with_durable_tap(Arc::new(observe), approvals.healthy.clone()),
         };
         (
             Self {
+                media_head,
                 approvals,
                 source_warm,
                 ring,
@@ -704,6 +732,10 @@ impl<W: WalStore + 'static> Fanout<W> {
 
     pub(crate) fn approval_state(&self) -> Arc<crate::approval_state::ApprovalState> {
         self.approvals.clone()
+    }
+
+    pub(crate) fn media_head(&self) -> Option<Arc<crate::registry::media_head::Live>> {
+        self.media_head.clone()
     }
 
     pub(crate) fn source_warm_events(

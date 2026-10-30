@@ -376,6 +376,8 @@ impl std::error::Error for OpenError {}
 /// identity, used to detect a stale handle after a re-open).
 #[derive(Clone)]
 pub struct ActorHandle {
+    /// Media-on frozen facts published by this actor's writer after successful barriers.
+    pub(crate) media_head: Option<Arc<media_head::Live>>,
     pub gen: u64,
     pub(crate) tx: mpsc::Sender<crate::actor::LineageCmd>,
     /// Shared with the registry's read-only path while this handle occupies an Open slot.
@@ -626,6 +628,7 @@ pub struct LineageRegistry {
 }
 
 mod media;
+pub(crate) mod media_head;
 #[path = "run_rows.rs"]
 mod run_rows;
 pub use run_rows::OverhaulRunSource;
@@ -777,6 +780,7 @@ struct Inner {
     /// No-actor reads retain a file-identity-scoped proof so transcript pagination does not fsync
     /// again while every requested frame remains within the already-proven durable prefix.
     read_proofs: Mutex<BoundedSessionCache<ReadProof>>,
+    media_heads: Mutex<media_head::Cache>,
     /// Dispatch facts of committed tool turns already worked out, per session; see
     /// [`DispatchCache`].
     dispatch_cache: Mutex<BoundedSessionCache<DispatchCache>>,
@@ -1054,6 +1058,8 @@ const DISPATCH_CACHE_SESSIONS: usize = 4096;
 
 /// One `session.read` snapshot: the page, plus what the same snapshot says beyond it.
 pub struct RouteReadPage {
+    /// Durable WAL sequence covered by the same page snapshot.
+    pub at_seq: u64,
     pub head_facts: broca_core::head::HeadProjection,
     pub head_facts_complete: bool,
     pub page: broca_core::SessionReadPage,
@@ -1442,6 +1448,7 @@ impl LineageRegistry {
                 reader: wal_store.map(|wal_store| ReadSources { wal_store, store }),
                 run_rows,
                 read_proofs: Mutex::new(BoundedSessionCache::new(SESSION_CACHE_SESSIONS)),
+                media_heads: Mutex::default(),
                 dispatch_cache: Mutex::new(BoundedSessionCache::new(DISPATCH_CACHE_SESSIONS)),
                 frozen_senders: Mutex::new(BoundedSessionCache::new(SESSION_CACHE_SESSIONS)),
                 live_ownership: Mutex::new(HashMap::new()),
@@ -3883,6 +3890,14 @@ impl LineageRegistry {
                 }
             }
         }
+        let at_seq = match tail.records() {
+            broca_wal::WalRangeRecords::Complete(records)
+            | broca_wal::WalRangeRecords::Partial(records)
+            | broca_wal::WalRangeRecords::Unknown(records) => records
+                .last()
+                .map_or(snapshot.watermark_seq, |frame| frame.seq),
+            broca_wal::WalRangeRecords::Absent => snapshot.watermark_seq,
+        };
         let (mut page, dispatches) = broca_core::read_session_page_owned_with_dispatches(
             snapshot,
             match tail.records() {
@@ -3945,6 +3960,7 @@ impl LineageRegistry {
             repair_materialized_lineage(store, session, stale_lineage_id, tail).await;
         }
         Ok(RoutedPage::Raw(Box::new(RouteReadPage {
+            at_seq,
             head_facts,
             head_facts_complete,
             page,
@@ -5332,6 +5348,7 @@ mod tests {
         ) -> Result<ActorHandle, OpenError> {
             let (tx, _rx) = mpsc::channel(1);
             Ok(ActorHandle {
+                media_head: None,
                 gen,
                 tx,
                 run_in_flight: Arc::new(AtomicU64::new(0)),
@@ -5837,6 +5854,7 @@ mod tests {
             Entry::Open {
                 gen: open_gen,
                 handle: ActorHandle {
+                    media_head: None,
                     gen: open_gen,
                     tx: dummy_tx,
                     durable_head: Arc::new(AtomicU64::new(0)),
@@ -5876,6 +5894,7 @@ mod tests {
             Entry::Open {
                 gen,
                 handle: ActorHandle {
+                    media_head: None,
                     gen,
                     tx: dummy_tx,
                     durable_head: Arc::new(AtomicU64::new(0)),
@@ -5963,6 +5982,7 @@ mod tests {
             }
             let (tx, _rx) = mpsc::channel(1);
             Ok(ActorHandle {
+                media_head: None,
                 gen,
                 tx,
                 durable_head: Arc::new(AtomicU64::new(0)),
@@ -6313,6 +6333,7 @@ mod tests {
     async fn an_open_but_idle_session_counts_as_open_and_not_in_flight() {
         let registry = LineageRegistry::new(Arc::new(NeverOpener));
         let handle = ActorHandle {
+            media_head: None,
             gen: 1,
             tx: mpsc::channel(1).0,
             durable_head: Arc::new(AtomicU64::new(0)),
@@ -6341,6 +6362,7 @@ mod tests {
         let registry = LineageRegistry::new(Arc::new(NeverOpener));
         let gauge = Arc::new(AtomicU64::new(0));
         let handle = ActorHandle {
+            media_head: None,
             gen: 1,
             tx: mpsc::channel(1).0,
             durable_head: Arc::new(AtomicU64::new(0)),

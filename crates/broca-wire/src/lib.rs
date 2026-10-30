@@ -294,9 +294,8 @@ pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
-/// Shipping builds refuse uploads by name before decoding a send. Debug builds
-/// must explicitly opt into the attachment admission path; neither path permits
-/// a client to supply stored media references inline.
+/// Disabled media admission refuses uploads by name before decoding a send. Neither
+/// runtime mode permits a client to supply stored media references inline.
 pub fn check_upload_references(params: &serde_json::Value) -> Result<(), String> {
     if let Some(content) = params.get("content").filter(|value| !value.is_null()) {
         // A content part is an upload reference and nothing else. A `media` block, or a tool
@@ -1224,6 +1223,34 @@ impl SessionReadMessage {
         }
     }
 
+    pub fn show_media_blocks_with_identity(&mut self) {
+        self.show_media_blocks();
+        if self.has_media_grammar() {
+            let inline = self.described.take().expect("blocks were serialized above");
+            self.identify_content(&inline);
+            self.described = Some(inline);
+        }
+    }
+
+    fn identify_content(&mut self, inline: &serde_json::Value) {
+        use cortexkit_role_llm_runner::read::descriptors::PartDigest;
+        self.digest = Some(cortexkit_role_llm_runner::content_digest::content_digest(
+            inline,
+        ));
+        self.part_digests = Some(
+            inline
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .map(|(index, part)| {
+                    PartDigest::new(broca_protocol::tags::part_key(self.ordinal, index), part)
+                })
+                .collect(),
+        );
+    }
+
     /// Serve this entry as a descriptors read does (llm-runner §4.2): its content identities
     /// before media markers or refs, and large payloads replaced by refs in place, largest first
     /// past the fixed per-message budget. Selection depends only on this message, so every
@@ -1231,26 +1258,19 @@ impl SessionReadMessage {
     /// exceeds the budget, which a descriptors read refuses `reply_too_large`.
     pub fn describe(&mut self) -> Result<(), u64> {
         use cortexkit_role_llm_runner::read::descriptors::{
-            describe, PartDigest, Payload, Reference, DESCRIPTOR_MESSAGE_MAX,
+            describe, Payload, Reference, DESCRIPTOR_MESSAGE_MAX,
         };
         self.described = None;
-        let identity = broca_protocol::caller_message::message_content_identity(&self.message);
-        let inline = identity.inline;
-        self.digest = Some(identity.digest);
+        // `message_content_identity` is also what each compaction notice to the compaction
+        // provider anchors its `through_digest` on, so a notice's digest and this read's digest
+        // always agree. Part digests come from the same bytes.
+        let inline = broca_protocol::caller_message::message_content_identity(&self.message).inline;
+        self.identify_content(&inline);
         let parts = inline
             .get("content")
             .and_then(serde_json::Value::as_array)
             .cloned()
             .unwrap_or_default();
-        self.part_digests = Some(
-            parts
-                .iter()
-                .enumerate()
-                .map(|(index, part)| {
-                    PartDigest::new(broca_protocol::tags::part_key(self.ordinal, index), part)
-                })
-                .collect(),
-        );
         let mut payloads = Vec::new();
         for (index, part) in parts.iter().enumerate() {
             let at = |field: &str| format!("/content/{index}/{field}");

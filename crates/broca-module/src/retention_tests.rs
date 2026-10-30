@@ -4952,6 +4952,7 @@ async fn status_never_expires_a_new_active_run_from_a_captured_old_head() {
                 }
             });
             Ok(crate::registry::ActorHandle {
+                media_head: None,
                 gen,
                 tx,
                 durable_head: self.head.clone(),

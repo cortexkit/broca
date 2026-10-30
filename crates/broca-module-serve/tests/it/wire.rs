@@ -2240,6 +2240,9 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // This process's WAL fsyncs by cause. Asserted below: its four counters exist, and a
         // writer that lost its channel without a shutdown (`disconnect`) never happens here.
         "wal_fsyncs",
+        // Cached tool routes and the route Goodbyes sent when sessions close. Asserted below:
+        // no route outlives its session, and no Goodbye failed, was dropped or is still owed.
+        "tool_routes",
     ]
     .into_iter()
     .collect();
@@ -2282,6 +2285,41 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
     // Every writer here is shut down through its handle. A disconnect sync would mean one was
     // dropped without that, which a healthy daemon never does.
     assert_eq!(fsyncs["disconnect"], serde_json::json!(0));
+    let routes = metrics["tool_routes"]
+        .as_object()
+        .expect("tool_routes is an object");
+    assert_eq!(
+        routes.keys().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "cached_routes",
+            "cached_routes_per_provider",
+            "goodbye_failures_since_boot",
+            "goodbye_giveups_since_boot",
+            "goodbye_retry_overflows_since_boot",
+            "oldest_route_idle_secs",
+            "open_actor_reasons",
+            "open_session_actors",
+            "pending_goodbyes",
+            "routes_for_closed_sessions",
+        ],
+        "tool_routes carries the route and Goodbye counters"
+    );
+    // A route still cached after its session closed is the leak these counters exist to
+    // expose, and on a healthy daemon every Goodbye was delivered: none failed, none overflowed
+    // the retry queue, none was given up, and none is still waiting.
+    for healthy_zero in [
+        "routes_for_closed_sessions",
+        "goodbye_failures_since_boot",
+        "goodbye_retry_overflows_since_boot",
+        "goodbye_giveups_since_boot",
+        "pending_goodbyes",
+    ] {
+        assert_eq!(
+            routes[healthy_zero],
+            serde_json::json!(0),
+            "tool_routes.{healthy_zero} on a healthy daemon: {routes:?}"
+        );
+    }
     let workdirs = metrics["scoped_session_workdirs"]
         .as_object()
         .expect("scoped_session_workdirs is an object");

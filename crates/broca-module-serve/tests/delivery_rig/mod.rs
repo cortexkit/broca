@@ -216,6 +216,7 @@ pub struct Script {
     pub rendered: Mutex<Vec<Vec<u8>>>,
     /// Optional serving-family config for media tests; other scripts keep their legacy bytes.
     pub media_frozen: Mutex<Option<broca_provider::wire::FrozenRenderConfig>>,
+    pub omit_media_profile: Mutex<bool>,
 }
 
 impl Script {
@@ -294,6 +295,10 @@ impl Provider for ScriptedProvider {
 
     fn render_config_blob(&self) -> serde_json::Value {
         if let Some(frozen) = self.0.media_frozen.lock().unwrap().as_ref() {
+            let mut frozen = frozen.clone();
+            if *self.0.omit_media_profile.lock().unwrap() {
+                frozen.media = None;
+            }
             return serde_json::to_value(frozen).unwrap();
         }
         match &self.1 {

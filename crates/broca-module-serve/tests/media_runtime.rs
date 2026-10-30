@@ -1,5 +1,9 @@
 //! Shipping-feature serve coverage. Each boot decision lives in its own process.
 mod delivery_rig;
+#[path = "media_runtime/head_cost.rs"]
+mod head_cost;
+#[path = "media_runtime/refusals.rs"]
+mod refusals;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use broca_core::tool_plane::{BatchCtx, DispatchResult, ToolPlane};
@@ -199,9 +203,14 @@ fn refusal(frame: &Frame) -> Value {
 }
 
 fn child(enabled: bool) {
+    child_case(enabled, "full");
+}
+
+fn child_case(enabled: bool, case: &str) {
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", "media_runtime_child", "--nocapture"])
         .env("BROCA_MEDIA_TEST_ENABLED", enabled.to_string())
+        .env("BROCA_MEDIA_TEST_CASE", case)
         .status()
         .unwrap();
     assert!(status.success(), "media.enabled={enabled} child failed");
@@ -214,6 +223,44 @@ fn shipping_runtime_media_on() {
 #[test]
 fn shipping_runtime_media_off() {
     child(false);
+}
+
+#[test]
+fn media_on_upload_refusals_keep_contract_codes() {
+    child_case(true, "upload-refusals");
+}
+#[test]
+fn media_on_append_replay_is_offset_mismatch() {
+    child_case(true, "strict-append");
+}
+#[test]
+fn media_on_model_view_defaults_to_safe_markers() {
+    child_case(true, "model-media");
+}
+#[test]
+fn media_on_head_mime_facts_match_admission() {
+    child_case(true, "head-mime");
+}
+#[test]
+fn media_on_blocks_identity_matches_content() {
+    child_case(true, "blocks-identity");
+}
+#[test]
+#[ignore = "explicit 1k/150k active-head cost measurement"]
+fn measure_active_media_head_cost() {
+    child_case(true, "head-cost");
+}
+#[test]
+fn media_on_active_head_avoids_replay() {
+    child_case(true, "head-bounded");
+}
+#[test]
+fn media_off_upload_send_and_staging_bytes_match_master() {
+    child_case(false, "off");
+}
+#[test]
+fn media_free_model_view_bytes_match_master() {
+    child_case(true, "model-free");
 }
 
 #[tokio::test]
@@ -229,6 +276,20 @@ async fn media_runtime_child() {
     .unwrap();
     broca_protocol::configure_media(config.enabled).unwrap();
     assert!(broca_protocol::configure_media(!enabled).is_err());
+    let case = std::env::var("BROCA_MEDIA_TEST_CASE").unwrap_or_else(|_| "full".into());
+    if case == "head-cost" || case == "head-bounded" {
+        let sizes: &[usize] = if case == "head-cost" {
+            &[1_000, 150_000]
+        } else {
+            &[1_000]
+        };
+        head_cost::measure(
+            sizes,
+            case == "head-bounded" || std::env::var_os("BROCA_HEAD_COST_ASSERT_BOUNDED").is_some(),
+        )
+        .await;
+        return;
+    }
     let mode = if enabled { "on" } else { "off" };
     if let Some(dir) = std::env::var_os("BROCA_MEDIA_SAMPLE_DIR") {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -241,9 +302,14 @@ async fn media_runtime_child() {
     broca_core::media_store::create_media_directories(&rig.dir).unwrap();
     *rig.script.media_frozen.lock().unwrap() = Some(frozen(WireFamilyId::AnthropicMessages));
     *rig.script.tool_plane.lock().unwrap() = Some(Arc::new(ImageTool));
+    refusals::configure(&rig, &case);
     rig.script.push(&[Step::Text("ready")]);
     rig.send("init", "ready", None).await;
     rig.wait_idle().await;
+    if refusals::run(&mut rig, enabled, &case).await {
+        rig.finish().await;
+        return;
+    }
     let describe = call(&mut rig, "role.describe", json!({})).await;
     let checked = cortexkit_role_llm_runner::describe::check_describe(&result(&describe)).unwrap();
     assert_eq!(

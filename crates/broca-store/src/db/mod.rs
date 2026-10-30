@@ -11,6 +11,7 @@
 mod index;
 mod publication;
 mod rebuild;
+mod reconcile;
 mod schema;
 mod seeds;
 
@@ -21,10 +22,12 @@ use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 pub use index::{IndexOutcome, LogLocation, PublishedSession};
 pub use rebuild::{AddressFloor, CondemnedLineage, LedgerRows};
+pub use reconcile::{ReconcileOutcome, ReconcileSession};
 
 #[derive(Debug)]
 pub enum DbError {
     Io(std::io::Error),
+    Wal(broca_wal::WalError),
     Sqlite(rusqlite::Error),
     Projection(broca_core::projection_plan::ProjectionPlanError),
     Invalid(String),
@@ -34,6 +37,7 @@ impl std::fmt::Display for DbError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => e.fmt(f),
+            Self::Wal(e) => e.fmt(f),
             Self::Sqlite(e) => e.fmt(f),
             Self::Projection(e) => e.fmt(f),
             Self::Invalid(e) => f.write_str(e),
