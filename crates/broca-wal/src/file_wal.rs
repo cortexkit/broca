@@ -83,10 +83,10 @@ fn open_observed(_stage: &'static str) {
 
 /// An optional byte offset for starting a later read without decoding the WAL prefix.
 ///
-/// `file_id` fingerprints the opened file's device and inode on Unix. Other platforms
-/// currently return no anchors, so the optimization is disabled there rather than relying
-/// on a weaker identity. Anchors are derived hints only: every mismatch falls back to a
-/// read from byte zero.
+/// `file_id` fingerprints the opened file's device and inode on Unix, or its volume serial
+/// number and file index on Windows. Platforms without a stable identity return no anchors.
+/// Anchors are derived hints only: ordinary range reads replay from byte zero on a mismatch;
+/// strict reads return `None` so the caller can choose a full replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalByteAnchor {
     pub file_id: u64,
@@ -2129,7 +2129,7 @@ pub fn read_records_range_from_valid_anchor(
         });
     }
     let (Some(file_id), Some(expected_next)) =
-        (metadata_file_id(&metadata), after_seq.checked_add(1))
+        (opened_file_id(&file, &metadata), after_seq.checked_add(1))
     else {
         return Ok(None);
     };
@@ -2206,7 +2206,7 @@ pub fn read_records_range(
             file_size,
         });
     }
-    let file_id = metadata_file_id(&metadata);
+    let file_id = opened_file_id(&file, &metadata);
 
     if let (Some(anchor), Some(file_id), Some(expected_next)) =
         (anchor, file_id, after_seq.checked_add(1))
@@ -2355,7 +2355,7 @@ fn read_records_tail_snapshot(
     access_counter::read_to_end(file.take(file_size - start), start, &mut suffix)
         .map_err(WalError::Io)?;
     let lineage = read_first_frame_lineage(file, max_bytes)?;
-    let file_id = metadata_file_id(metadata);
+    let file_id = opened_file_id(file, metadata);
     if start == 0 {
         let decoded = decode_bytes(&suffix, 0, 1)?;
         return select_decoded_range(decoded, &suffix, 0, file_id, 0, None).map(Some);
@@ -2784,24 +2784,54 @@ fn metadata_file_id(metadata: &std::fs::Metadata) -> Option<u64> {
     Some(std::hash::Hasher::finish(&hasher))
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn metadata_file_id(_metadata: &std::fs::Metadata) -> Option<u64> {
-    // The standard library does not expose a stable Windows file identifier. Return no identity
-    // rather than cache against a weak timestamp surrogate: no identity simply makes each idle
-    // read take its flush-only proof, which under-optimizes but never over-claims durability.
+    // Without a stable native identifier, timestamps cannot prove that a cached file is still
+    // current. Callers must replay from byte zero or synchronize the WAL again rather than
+    // reuse a cached durability proof.
     None
+}
+
+fn opened_file_id(_file: &File, _metadata: &std::fs::Metadata) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use std::hash::Hash;
+
+        let (volume, index) = _file.native_file_identity()?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        volume.hash(&mut hasher);
+        index.hash(&mut hasher);
+        Some(std::hash::Hasher::finish(&hasher))
+    }
+    #[cfg(not(windows))]
+    {
+        metadata_file_id(_metadata)
+    }
 }
 
 /// Return the platform-stable identity of the file currently at `path`, when the platform can
 /// provide one. Read-side durability caches use this only to invalidate a proof after the WAL is
 /// replaced; callers without an identity must take a fresh flush barrier instead.
 pub fn file_identity(path: impl AsRef<Path>) -> Result<Option<u64>, WalError> {
-    let metadata = match fs_ops::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(WalError::Io(error)),
-    };
-    Ok(metadata_file_id(&metadata))
+    #[cfg(windows)]
+    {
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(WalError::Io(error)),
+        };
+        let metadata = file.metadata().map_err(WalError::Io)?;
+        Ok(opened_file_id(&file, &metadata))
+    }
+    #[cfg(not(windows))]
+    {
+        let metadata = match fs_ops::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(WalError::Io(error)),
+        };
+        Ok(metadata_file_id(&metadata))
+    }
 }
 
 /// Like [`replay_path`] but also returns the byte offset where valid frames end (the start of
@@ -4874,6 +4904,60 @@ mod tests {
         assert_eq!(DECODED_BYTE_COUNT.with(std::cell::Cell::get), suffix_bytes);
         assert_eq!(strict, ranged);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn strict_anchor_survives_append_and_rejects_file_replacement() {
+        let path = tmp("range-anchor-native-identity");
+        let old_path = tmp("range-anchor-native-identity-old");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&old_path);
+        let mut wal = FileWal::open(&path).unwrap();
+        for i in 0..32 {
+            wal.append(1, &run_started(i), false).unwrap();
+        }
+        let prefix = read_records_range(&path, DEFAULT_MAX_READ_BYTES, 0, None, None).unwrap();
+        assert_eq!(
+            prefix.next_anchor.map(|anchor| anchor.file_id),
+            file_identity(&path).unwrap()
+        );
+        let anchor = prefix
+            .anchor_at(32)
+            .expect("native file identity supplies an anchor");
+        wal.append(1, &run_started(32), true).unwrap();
+        drop(wal);
+        assert_eq!(file_identity(&path).unwrap(), Some(anchor.file_id));
+
+        DECODED_BYTE_COUNT.with(|count| count.set(0));
+        let suffix =
+            read_records_range_from_valid_anchor(&path, DEFAULT_MAX_READ_BYTES, 32, None, &anchor)
+                .unwrap()
+                .expect("append preserves the anchor");
+        assert_eq!(suffix.records.len(), 1);
+        assert_eq!(suffix.records[0].seq, 33);
+        assert_eq!(
+            DECODED_BYTE_COUNT.with(std::cell::Cell::get),
+            std::fs::metadata(&path).unwrap().len() - anchor.byte_end,
+            "strict reads decode only the suffix"
+        );
+
+        std::fs::rename(&path, &old_path).unwrap();
+        let mut replacement = FileWal::open(&path).unwrap();
+        for i in 0..33 {
+            replacement.append(1, &run_started(i), false).unwrap();
+        }
+        drop(replacement);
+        assert_ne!(file_identity(&path).unwrap(), Some(anchor.file_id));
+        DECODED_BYTE_COUNT.with(|count| count.set(0));
+        assert_eq!(
+            read_records_range_from_valid_anchor(&path, DEFAULT_MAX_READ_BYTES, 32, None, &anchor,)
+                .unwrap(),
+            None
+        );
+        assert_eq!(DECODED_BYTE_COUNT.with(std::cell::Cell::get), 0);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&old_path);
     }
 
     #[cfg(unix)]

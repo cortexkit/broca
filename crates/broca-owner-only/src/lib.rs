@@ -125,6 +125,15 @@ pub fn validate_inheritable_directory(path: impl AsRef<Path>) -> io::Result<()> 
     windows::validate_inheritable_directory(path.as_ref())
 }
 
+/// Return the Windows volume serial number and file index of an opened file.
+///
+/// Querying the handle keeps identity checks tied to the file being read, even if its
+/// path is replaced concurrently. This does not inspect or validate the file's ACL.
+#[cfg(windows)]
+pub fn file_identity(file: &File) -> io::Result<(u32, u64)> {
+    windows::file_identity(file)
+}
+
 pub fn validate_if_exists(path: impl AsRef<Path>) -> io::Result<()> {
     match validate(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),

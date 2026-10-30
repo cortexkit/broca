@@ -1,7 +1,7 @@
 //! Count human prompts in persisted RunStarted inputs without decoding model or tool records.
 
 use super::{
-    fold_lineage_id, metadata_file_id, validate_contiguous_sequence, WalByteAnchor, WalError,
+    fold_lineage_id, opened_file_id, validate_contiguous_sequence, WalByteAnchor, WalError,
 };
 use crate::framing::{self, DecodeStep, FrameError};
 use crate::fs_ops::File;
@@ -34,7 +34,7 @@ pub fn read_human_prompt_count(
 ) -> Result<HumanPromptCount, WalError> {
     let file = File::open(path).map_err(WalError::Io)?;
     let metadata = file.metadata().map_err(WalError::Io)?;
-    let file_id = metadata_file_id(&metadata);
+    let file_id = opened_file_id(&file, &metadata);
     let base = base.filter(|base| {
         base.through_seq <= through_seq
             && base.anchor.is_some_and(|anchor| {
