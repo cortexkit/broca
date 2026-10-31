@@ -204,6 +204,145 @@ pub enum DrainResult {
     Retry,
 }
 
+/// Durable lifecycle publications and a checkpoint of the last projected write-ahead log record.
+/// A broker acknowledgement is required before a pending publication is retired.
+#[async_trait]
+pub trait RunEventStore: Send + Sync {
+    fn enable_bus_events(&self, account: &str) -> Result<(), String>;
+    fn bus_metrics(&self) -> &Metrics;
+    fn bus_metrics_arc(&self) -> Arc<Metrics>;
+    fn begin_bus_event_period(&self, now_ms: u64) -> Result<PeriodStart, StoreError>;
+    fn end_bus_event_period(&self) -> Result<bool, StoreError>;
+    fn bus_event_open_sessions(&self) -> Result<Vec<BindIdentity>, StoreError>;
+    fn bus_event_period_started_ms(&self) -> u64;
+    fn bus_event_checkpoint(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<(String, u64)>, StoreError>;
+    fn bus_event_position(&self, session: &BindIdentity, epoch: &str) -> Result<u64, StoreError>;
+    fn project_new_bus_events(
+        &self,
+        session: &BindIdentity,
+        epoch: &str,
+        records: &[FramedRecord],
+        now_ms: u64,
+    ) -> Result<(), StoreError>;
+    fn retain_bus_progress(
+        &self,
+        session: &BindIdentity,
+        epoch: &str,
+        event: &RunEvent,
+        now_ms: u64,
+    ) -> Result<Option<Publication>, StoreError>;
+    fn get_bus_event(&self, event_key: &str)
+        -> Result<Option<(BindIdentity, Vec<u8>)>, StoreError>;
+    fn pending_bus_event(&self) -> Result<Option<Publication>, StoreError>;
+    fn acknowledge_bus_event(
+        &self,
+        event: &Publication,
+        receipt: PublishReceipt,
+        now_ms: u64,
+    ) -> Result<(), StoreError>;
+    fn skip_stale_bus_events(&self, now_ms: u64) -> Result<SkipSummary, StoreError>;
+    fn prune_bus_events(&self, now_ms: u64) -> Result<usize, StoreError>;
+
+    async fn drain_bus_event(
+        &self,
+        publisher: &dyn BusPublisher,
+        now_ms: u64,
+    ) -> Result<DrainResult, StoreError> {
+        let Some(event) = self.pending_bus_event()? else {
+            return Ok(DrainResult::Empty);
+        };
+        match publisher.publish(&event).await {
+            Ok(receipt) => {
+                self.acknowledge_bus_event(&event, receipt, now_ms)?;
+                Ok(DrainResult::Published)
+            }
+            Err(_) => {
+                self.bus_metrics()
+                    .bus_publish_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(DrainResult::Retry)
+            }
+        }
+    }
+}
+
+impl RunEventStore for SqliteStore {
+    fn enable_bus_events(&self, account: &str) -> Result<(), String> {
+        self.enable_bus_events(account)
+    }
+    fn bus_metrics(&self) -> &Metrics {
+        self.bus_metrics()
+    }
+    fn bus_metrics_arc(&self) -> Arc<Metrics> {
+        self.bus_metrics_arc()
+    }
+    fn begin_bus_event_period(&self, now_ms: u64) -> Result<PeriodStart, StoreError> {
+        self.begin_bus_event_period(now_ms)
+    }
+    fn end_bus_event_period(&self) -> Result<bool, StoreError> {
+        self.end_bus_event_period()
+    }
+    fn bus_event_open_sessions(&self) -> Result<Vec<BindIdentity>, StoreError> {
+        self.bus_event_open_sessions()
+    }
+    fn bus_event_period_started_ms(&self) -> u64 {
+        self.bus_event_period_started_ms()
+    }
+    fn bus_event_checkpoint(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<(String, u64)>, StoreError> {
+        self.bus_event_checkpoint(session)
+    }
+    fn bus_event_position(&self, session: &BindIdentity, epoch: &str) -> Result<u64, StoreError> {
+        self.bus_event_position(session, epoch)
+    }
+    fn project_new_bus_events(
+        &self,
+        session: &BindIdentity,
+        epoch: &str,
+        records: &[FramedRecord],
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        self.project_new_bus_events(session, epoch, records, now_ms)
+    }
+    fn retain_bus_progress(
+        &self,
+        session: &BindIdentity,
+        epoch: &str,
+        event: &RunEvent,
+        now_ms: u64,
+    ) -> Result<Option<Publication>, StoreError> {
+        self.retain_bus_progress(session, epoch, event, now_ms)
+    }
+    fn get_bus_event(
+        &self,
+        event_key: &str,
+    ) -> Result<Option<(BindIdentity, Vec<u8>)>, StoreError> {
+        self.get_bus_event(event_key)
+    }
+    fn pending_bus_event(&self) -> Result<Option<Publication>, StoreError> {
+        self.pending_bus_event()
+    }
+    fn acknowledge_bus_event(
+        &self,
+        event: &Publication,
+        receipt: PublishReceipt,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        self.acknowledge_bus_event(event, receipt, now_ms)
+    }
+    fn skip_stale_bus_events(&self, now_ms: u64) -> Result<SkipSummary, StoreError> {
+        self.skip_stale_bus_events(now_ms)
+    }
+    fn prune_bus_events(&self, now_ms: u64) -> Result<usize, StoreError> {
+        self.prune_bus_events(now_ms)
+    }
+}
+
 impl SqliteStore {
     /// Called only after the bus client attests its machine account and dotted event support.
     pub fn enable_bus_events(&self, account: &str) -> Result<(), String> {

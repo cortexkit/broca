@@ -40,6 +40,46 @@ pub struct ReplacedReceipt {
     pub view_version: String,
 }
 
+/// Receipts are committed before bus delivery acknowledgement and survive inbox loss.
+/// Resolution facts come from the session log, independently of receipt persistence.
+pub trait CompactionReceiptStore: broca_core::SessionRefResolver {
+    fn receive_compaction_view(&self, receipt: &ViewReceipt) -> Result<ReceiptWrite, StoreError>;
+    fn compaction_receipts(
+        &self,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<ViewReceipt>, StoreError>;
+    fn clear_compaction_receipt(&self, receipt: &ViewReceipt) -> Result<(), StoreError>;
+    fn current_compaction_facts(
+        &self,
+        wal: &dyn broca_core::WalStore,
+        session: &broca_protocol::BindIdentity,
+    ) -> Result<crate::compaction_facts::CompactionFacts, String>;
+}
+
+impl CompactionReceiptStore for SqliteStore {
+    fn receive_compaction_view(&self, receipt: &ViewReceipt) -> Result<ReceiptWrite, StoreError> {
+        self.receive_compaction_view(receipt)
+    }
+    fn compaction_receipts(
+        &self,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<ViewReceipt>, StoreError> {
+        self.compaction_receipts(after, limit)
+    }
+    fn clear_compaction_receipt(&self, receipt: &ViewReceipt) -> Result<(), StoreError> {
+        self.clear_compaction_receipt(receipt)
+    }
+    fn current_compaction_facts(
+        &self,
+        wal: &dyn broca_core::WalStore,
+        session: &broca_protocol::BindIdentity,
+    ) -> Result<crate::compaction_facts::CompactionFacts, String> {
+        self.current_compaction_facts(wal, session)
+    }
+}
+
 impl SqliteStore {
     /// Commit before acknowledging the bus delivery. Decimal strings preserve all u64 versions.
     pub fn receive_compaction_view(
