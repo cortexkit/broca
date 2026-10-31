@@ -82,25 +82,22 @@ fn ephemeral_wal_resolves_through_every_store_reader() {
         .store
         .read_records_range(&f.session, 0, None, None)
         .unwrap();
-    // Byte anchors need a stable file identity, which Unix and Windows provide. On a platform
-    // without one the range has no anchor and readers fall back to decoding from the start,
-    // so the anchored read is checked only where an anchor exists.
-    match range.anchor_at(2) {
-        Some(anchor) => {
-            let anchored = f
-                .store
-                .read_records_range_from_valid_anchor(&f.session, 2, None, &anchor)
-                .unwrap()
-                .unwrap();
-            assert_eq!(
-                anchored.records(),
-                broca_wal::WalRangeRecords::Complete(&records[2..])
-            );
-        }
-        #[cfg(unix)]
-        None => panic!("a unix WAL range must carry byte anchors for the ephemeral root too"),
-        #[cfg(not(unix))]
-        None => {}
+    // A stable file identity must produce anchors for ephemeral WALs too.
+    let anchor = range.anchor_at(2);
+    assert_eq!(
+        anchor.map(|anchor| (anchor.file_id, anchor.seq)),
+        f.store.file_identity(&f.session).unwrap().map(|id| (id, 2))
+    );
+    if let Some(anchor) = anchor {
+        let anchored = f
+            .store
+            .read_records_range_from_valid_anchor(&f.session, 2, None, &anchor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            anchored.records(),
+            broca_wal::WalRangeRecords::Complete(&records[2..])
+        );
     }
     assert_eq!(
         f.store.flush_for_read(&f.session).unwrap(),
@@ -139,7 +136,7 @@ fn absent_file_identity_flush_does_not_reopen_a_deleting_wal() {
         .store
         .flush_for_read_with_identity(&f.session, |observed| {
             assert_eq!(observed, path);
-            // Force the no-identity result used off Unix after the real handle has been synced.
+            // Force an identityless backend's result after the real handle has been synced.
             // A redundant live lookup lets deletion move the WAL between its stat and reopen.
             AFTER_LIVE_STAT.with(|hook| {
                 *hook.borrow_mut() = Some(Box::new(move || {

@@ -910,7 +910,7 @@ pub trait Persister: Send + Sync {
     }
 
     /// Persist a derived byte anchor after projection advances its watermark.
-    /// Implementations may ignore `None`, which is the expected value on non-Unix platforms.
+    /// Implementations may ignore `None`, which is expected when the backend has no file identity.
     fn persist_wal_anchor(
         &self,
         _session: &BindIdentity,

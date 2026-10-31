@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 
 use broca_core::{load_prior_wal_snapshot, FileWalStore, MaterializedStore, Persister, WalStore};
 use broca_protocol::{

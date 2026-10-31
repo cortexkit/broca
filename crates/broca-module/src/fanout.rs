@@ -1592,12 +1592,12 @@ mod tests {
 
     use broca_protocol::caller::RunFinishReason;
     use broca_protocol::content::{AssistantMessage, ContentBlock, FinishReason, ToolCall};
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use broca_protocol::error::{ErrorClass, ProviderError};
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use broca_protocol::SubmissionId;
     use broca_protocol::{MessageId, RunId, StepId, ToolCallId, Usage};
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use broca_wal::QueuedAdmissionFailure;
     use broca_wal::{FramedRecord, RunConfig, RunOrigin, WalRecord};
 
@@ -1790,7 +1790,7 @@ mod tests {
         state
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn text_step(step_id: u64) -> WalRecord {
         WalRecord::ModelStepFinished {
             fallback: Default::default(),
@@ -1813,7 +1813,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn failed_retraction() -> WalRecord {
         WalRecord::Retracted {
             submission_id: SubmissionId("sub-r2".into()),
@@ -1870,7 +1870,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn fixed_projection_seed(
         watermark_seq: u64,
         anchor: broca_wal::WalByteAnchor,
@@ -2004,9 +2004,9 @@ mod tests {
         let _ = writer.shutdown().await;
     }
 
-    // File-WAL byte anchors are recorded on unix only; on other platforms the live seed
+    // File-WAL byte anchors require native file identity; without it the live seed
     // path declines the anchor and falls back to full replay, which the fallback tests cover.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn live_seed_matches_full_projection_and_buffers_the_first_post_barrier_record() {
         let root = broca_test_support::scratch_root()
@@ -2165,7 +2165,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn real_store_mid_episode_seed_matches_full_terminal_projection() {
         let root = broca_test_support::scratch_root().join(format!(
@@ -2259,7 +2259,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn real_store_failed_retraction_clears_terminal_finish_reason() {
         let root = broca_test_support::scratch_root().join(format!(
@@ -2438,9 +2438,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    // File-WAL byte anchors are recorded on unix only; on other platforms the live seed
+    // File-WAL byte anchors require native file identity; without it the live seed
     // path declines the anchor and falls back to full replay, which the fallback tests cover.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn live_seed_rejects_a_budget_firing_suffix_without_its_run_config() {
         let root = broca_test_support::scratch_root().join(format!(

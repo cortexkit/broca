@@ -170,7 +170,7 @@ impl Fixture {
             service,
         }
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn notice(&mut self, applied: Option<u64>, refused: Option<u64>) {
         use broca_core::compaction_provider::notice::{AdvanceNotice, Event};
         let mut notice = AdvanceNotice::new(
@@ -203,7 +203,7 @@ impl Fixture {
 }
 
 #[tokio::test]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn twenty_announcements_and_reconcile_passes_do_zero_full_reads_of_a_large_log() {
     let fixture = Fixture::new("compaction-large-log-lookup");
     for version in 1..=20 {
@@ -245,7 +245,7 @@ async fn twenty_announcements_and_reconcile_passes_do_zero_full_reads_of_a_large
 }
 
 #[tokio::test]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn behind_projection_folds_one_bounded_suffix_and_caches_applied_and_refused_versions() {
     let mut fixture = Fixture::new("compaction-behind-lookup");
     fixture.notice(Some(19), Some(20));
@@ -306,7 +306,7 @@ async fn oversized_tail_returns_unknown_without_any_full_read_fallback() {
 }
 
 #[tokio::test]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn replaced_file_identity_invalidates_cached_facts_without_a_full_read() {
     let fixture = Fixture::new("compaction-replaced-lookup");
     let path = fixture

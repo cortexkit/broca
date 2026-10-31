@@ -599,7 +599,7 @@ fn retention_deletion_drops_media_manifest_after_wal_unlink_and_leaves_collectio
     );
 }
 impl Rig {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn overhaul() -> Self {
         let mut rig = Self::new();
         fs::write(
@@ -711,7 +711,7 @@ impl Rig {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[tokio::test]
 async fn relocation_incomplete_preflight_never_expires_or_completes_deletion() {
     let rig = Rig::overhaul();
@@ -778,7 +778,6 @@ async fn relocation_incomplete_preflight_never_expires_or_completes_deletion() {
     assert!(!rig.service.deleting(&rig.key, &id).exists());
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn legacy_same_inode_conflicts_keep_the_existing_retention_error_class() {
     let rig = Rig::new();

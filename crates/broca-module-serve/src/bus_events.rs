@@ -315,8 +315,8 @@ enum VisitError {
 ///
 /// The head is the last sequence decoded BEFORE the read-side flush: the flush proves every
 /// frame written before it, so a frame appended after the read cannot ride on that proof.
-/// `flush_for_read` returns the WAL file's identity (an inode number on Unix, always `None`
-/// elsewhere), never a sequence, so its value is deliberately ignored here. A session whose
+/// `flush_for_read` returns an optional stable WAL file identity, never a sequence, so its
+/// value is deliberately ignored here. A session whose
 /// projection already stands at the head needs no flush: it has nothing left to publish.
 fn recover_session(
     store: &SqliteStore,
@@ -919,7 +919,7 @@ pub(crate) mod tests {
         assert!(!step.incomplete);
         assert_eq!(step.projected, 1);
         // The recovered head is the last durable record's sequence on every platform. It must not
-        // depend on the WAL file's identity, which only Unix provides.
+        // depend on the WAL file's optional native identity.
         let epoch = wal
             .read_records_range(&healthy, 0, None, None)
             .unwrap()

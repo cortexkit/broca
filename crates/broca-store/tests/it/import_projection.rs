@@ -136,8 +136,12 @@ async fn import_materializes_paged_history_and_retry_is_idempotent() {
     assert_eq!(materialized.prefix_len, messages.len() as u64);
     assert_eq!(materialized.watermark_seq, 1);
     assert_eq!(materialized.last_episode_usage, None);
-    #[cfg(unix)]
-    assert!(materialized.anchor.is_some());
+    assert_eq!(
+        materialized
+            .anchor
+            .map(|anchor| (anchor.file_id, anchor.seq)),
+        wal_store.file_identity(&session).unwrap().map(|id| (id, 1))
+    );
     assert_eq!(
         materialized
             .rows

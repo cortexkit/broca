@@ -482,7 +482,7 @@ async fn real_bus_compaction_attach_never_creates_or_modifies_consumers() {
 }
 
 fn project(store: &SqliteStore, wal: &FileWalStore, session: &BindIdentity) {
-    // `flush_for_read` returns the WAL file's identity (only Unix has one), not a sequence. Take
+    // `flush_for_read` returns the WAL file's optional identity, not a sequence. Take
     // the head from the records decoded before the flush, which that flush then proves durable.
     let candidate = wal.read_records_range(session, 0, None, None).unwrap();
     let broca_wal::WalRangeRecords::Complete(candidate) = candidate.records() else {
