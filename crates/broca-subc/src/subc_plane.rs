@@ -705,6 +705,8 @@ pub struct SubcToolPlane {
     closer: Arc<RouteCloser>,
     owns_closer: bool,
     default_module_id: Option<String>,
+    /// Private routing for a single Direct carrier; never stored in the durable conversation identity.
+    direct_carrier_scope: Option<ScopeSelector>,
     routes: Mutex<HashMap<RouteKey, RouteState>>,
     batch_routes: Mutex<BatchRouteMap>,
     batch_presets: Mutex<HashMap<BatchRouteKey, ToolManifest>>,
@@ -957,6 +959,19 @@ impl SubcToolPlane {
         Self::with_connection(Arc::new(conn), module_id)
     }
 
+    /// Route a standalone Direct caller's tool calls under an owner's carrier grant.
+    /// The selector (including its private proof) lives only in this plane. Constructing a
+    /// separate plane keeps its cached routes from mixing with ordinary unscoped routes.
+    pub fn new_with_direct_carrier_scope(
+        conn: SubcConnection,
+        module_id: impl Into<String>,
+        selector: ScopeSelector,
+    ) -> Self {
+        let mut plane = Self::new(conn, module_id);
+        plane.direct_carrier_scope = Some(selector);
+        plane
+    }
+
     fn with_connection(conn: Arc<dyn ToolPlaneConnection>, module_id: impl Into<String>) -> Self {
         let module_id = module_id.into();
         let default_module_id = (!module_id.trim().is_empty()).then_some(module_id);
@@ -971,6 +986,7 @@ impl SubcToolPlane {
             owns_closer,
             conn,
             default_module_id,
+            direct_carrier_scope: None,
             routes: Mutex::new(HashMap::new()),
             batch_routes: Mutex::new(HashMap::new()),
             batch_presets: Mutex::new(HashMap::new()),
@@ -1930,6 +1946,47 @@ impl SubcToolPlane {
         })
     }
 
+    async fn direct_carrier_selector(&self) -> Result<Option<ScopeSelector>, RouteEnsureError> {
+        let Some(selector) = &self.direct_carrier_scope else {
+            return Ok(None);
+        };
+        let refused = |code: &str, detail: &str| {
+            RouteEnsureError::Plane(ToolPlaneError::ScopeRefused {
+                code: code.into(),
+                detail: detail.into(),
+            })
+        };
+        if self.conn.consumer_module_id().is_some() {
+            return Err(refused(
+                SCOPE_UNSUPPORTED,
+                "a private carrier selector requires a Direct connection",
+            ));
+        }
+        if selector.bind_proof.is_none() {
+            return Err(refused(
+                subc_protocol::error_codes::SCOPE_BIND_PROOF_REQUIRED,
+                "a Direct carrier must supply its private bind proof",
+            ));
+        }
+        let capabilities = self.conn.server_capabilities().await.map_err(|_| {
+            refused(
+                SCOPE_UNVERIFIABLE,
+                "could not read the daemon's scope capabilities",
+            )
+        })?;
+        if !capabilities.iter().any(|cap| cap == CAP_SCOPES_V1)
+            || !capabilities
+                .iter()
+                .any(|cap| cap == subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1)
+        {
+            return Err(refused(
+                SCOPE_UNSUPPORTED,
+                "the daemon must advertise scopes/v1 and scope-bind-proof/v1 for a Direct carrier",
+            ));
+        }
+        Ok(Some(selector.clone()))
+    }
+
     /// The selector a scoped route opens under, after checking the daemon admits scoped routes
     /// at all. A daemon without `scopes/v1` would drop the field and open an unscoped route,
     /// so the call is refused instead and nothing is opened.
@@ -2166,11 +2223,12 @@ impl SubcToolPlane {
             }))
         };
         let Some(scope) = scope else {
+            let selector = self.direct_carrier_selector().await?;
             let attempt = || {
                 self.conn.route_open_dispatch(
                     module_id,
                     bind,
-                    None,
+                    selector.as_ref(),
                     tool_result_v1,
                     self.held_reply_declared(),
                 )
@@ -2190,10 +2248,25 @@ impl SubcToolPlane {
             }
             .map(|handle| (handle, None))
             .map_err(|error| match error {
+                // A refusal may quote a request. Keep its code, but never expose a private proof
+                // through diagnostic bodies returned by the daemon or transport.
+                RouteOpenError::Conn(error) if selector.is_some() => {
+                    RouteEnsureError::Plane(ToolPlaneError::ScopeRefused {
+                        code: error.code().unwrap_or(SCOPE_UNVERIFIABLE).into(),
+                        detail: "the Direct carrier route could not be opened".into(),
+                    })
+                }
                 RouteOpenError::Conn(error) => RouteEnsureError::Connection(error),
                 RouteOpenError::Cancelled => cancelled(),
             });
         };
+        if self.direct_carrier_scope.is_some() {
+            return Err(RouteEnsureError::Plane(ToolPlaneError::ScopeRefused {
+                code: SCOPE_UNSUPPORTED.into(),
+                detail: "a private Direct carrier selector cannot replace a frozen session scope"
+                    .into(),
+            }));
+        }
         let selector = self.scoped_selector(scope).await?;
         // The hold is bounded by the scope hold and by the caller's own deadline, whichever
         // comes first. Inside a run there is no caller deadline, so the hold alone bounds it; a
@@ -4062,6 +4135,7 @@ fn legacy_non_text_tool_content_placeholder(block: &serde_json::Value) -> String
 
 #[cfg(test)]
 mod tests {
+    include!("subc_plane/direct_carrier_tests.rs");
     include!("subc_plane/route_close_followup_tests.rs");
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};

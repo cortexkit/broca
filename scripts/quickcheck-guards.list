@@ -20,5 +20,8 @@ broca-catalog|it|fusiform_wire_fixture::|broca-catalog/live|crates/broca-catalog
 broca-catalog|it|base_url_pins::|broca-catalog/live|crates/broca-catalog/tests/it/base_url_pins.rs|served_apis_freeze_to_equivalent_full_request_urls|Checks served full URLs under SDK/renderer conventions and named missing-fact refusals.
 # Checks authored renderer exceptions rather than copied provider inventories.
 broca-catalog|it|wire_family_pins::|broca-catalog/live|crates/broca-catalog/tests/it/wire_family_pins.rs|overlay_cannot_restore_local_model_format_tables|Prevents a local model-format table from reappearing.
+# CLI input guards spawn the built runner but never contact a daemon; quickcheck runs them explicitly
+# because the portable preflight conservatively classifies runner subprocesses as rigs.
+broca-run|scope_input|-|-|crates/broca-run/tests/scope_input.rs|scope_without_proof_is_refused_before_connecting|Pins private proof validation before connection and proves ordinary runs leave stdin unread.
 # Checks fixture cases for rig-test filtering without compiling workspace test binaries.
 python|scripts/test-portable-test-selection.py|PortableRigSelectionTests.test_exact_rig_test_exclusion_keeps_guard_test_selected|-|scripts/test-portable-test-selection.py|test_exact_rig_test_exclusion_keeps_guard_test_selected|Exercises the rig-selection filter's fixture-backed selection check; the full inventory remains in the workspace gate.

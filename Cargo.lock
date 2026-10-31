@@ -566,15 +566,19 @@ dependencies = [
 name = "broca-run"
 version = "0.3.297"
 dependencies = [
+ "base64",
  "broca-catalog",
  "broca-core",
  "broca-module-serve",
  "broca-protocol",
  "broca-provider",
  "broca-subc",
+ "broca-test-support",
  "clap",
  "serde",
  "serde_json",
+ "sha2",
+ "subc-protocol",
  "tokio",
 ]
 

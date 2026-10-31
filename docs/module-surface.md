@@ -56,7 +56,7 @@ whether the daemon flag appears before or after the subcommand, without binding.
 
 broca is an **orchestration tier**: a subc module that runs agentic LLM loops for
 consumer modules while consuming tools, credentials, and model-routing services.
-Its agentic core is shared with the `broca-run` CLI.
+Its agentic core is shared with the [`broca-run` CLI](broca-run.md).
 
 ### 1a. Runtime precondition: a model catalog must be reachable ONCE
 
