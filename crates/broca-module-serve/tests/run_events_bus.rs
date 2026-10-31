@@ -312,6 +312,8 @@ async fn real_bus_compaction_receipt_survives_ack_and_rebuilds_inbox() {
                 ceiling: Some(broca_wal::OpaqueJson::from_json_text("{}").unwrap()),
                 tag_checkpoint: None,
                 ride_wait_ms: None,
+                view_features: None,
+                view_due: None,
             },
             true,
         )

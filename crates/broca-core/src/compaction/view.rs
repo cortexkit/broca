@@ -125,6 +125,8 @@ pub enum AssemblyProblem {
     /// (a byte-identical copy of the transcript is allowed); the view is refused
     /// `provider_constraint`.
     ProviderConstraint,
+    /// A renderer or negotiation refusal, named by compaction-provider/v1 §6.1.
+    Refused(&'static str),
 }
 
 /// The history a request sends under `view` (compaction-provider/v1 §7): for each range in
@@ -138,15 +140,16 @@ pub fn assemble(
     view: &CompactionView,
     prompt: &[Message],
 ) -> Result<Vec<Message>, AssemblyProblem> {
-    assemble_captured(view, prompt, &super::CapturedMedia::default())
+    assemble_captured(view, prompt, &super::CapturedMedia::default(), &[])
 }
 
 fn assemble_captured(
     view: &CompactionView,
     prompt: &[Message],
     captured: &super::CapturedMedia,
+    features: &[String],
 ) -> Result<Vec<Message>, AssemblyProblem> {
-    let mut history = assemble_judged(view, prompt, None)?;
+    let mut history = assemble_judged(view, prompt, None, features)?;
     captured.enforce(&mut history);
     Ok(history)
 }
@@ -161,6 +164,7 @@ fn assemble_judged(
     view: &CompactionView,
     prompt: &[Message],
     stored: Option<super::StoredTranscript<'_>>,
+    features: &[String],
 ) -> Result<Vec<Message>, AssemblyProblem> {
     use crate::compaction_provider::view::ViewRange;
     let stored_at = |ordinal: u64| stored.and_then(|stored| stored.at(ordinal));
@@ -180,17 +184,73 @@ fn assemble_judged(
                     edited.content.clear();
                     for (index, block) in message.content.iter().enumerate() {
                         let key = part_key(ordinal, index);
-                        match mine.iter().find(|edit| edit.part == key) {
+                        let selected = mine.iter().find(|edit| edit.part == key);
+                        let source = stored_at(ordinal).unwrap_or(message);
+                        let container = if source.role == Role::Tool {
+                            cortexkit_role_llm_runner::tags::PartContainer::ToolResult
+                        } else {
+                            cortexkit_role_llm_runner::tags::PartContainer::Other
+                        };
+                        if let Some(edit) = selected {
+                            edit.check_container(container)
+                                .map_err(AssemblyProblem::Rejected)?;
+                        }
+                        match selected {
                             None => edited.content.push(block.clone()),
                             Some(edit) if edit.drop => {}
                             Some(edit) => {
-                                let bytes = edit.bytes.as_deref().unwrap_or_default();
                                 let original = stored
                                     .is_some()
                                     .then(|| stored_at(ordinal).and_then(|m| m.content.get(index)));
-                                edited
-                                    .content
-                                    .push(edited_part(bytes, original, message.role)?);
+                                let number = message
+                                    .tags
+                                    .get()
+                                    .filter(|_| message.tags.is_rendered())
+                                    .and_then(|tags| tags.parts.get(index).copied().flatten());
+                                let rendered;
+                                let bytes = if let Some(mode) = &edit.truncate {
+                                    if !features.iter().any(|f| f == crate::compaction_provider::setup::VIEW_FEATURE_TRUNCATE) {
+                                        return Err(AssemblyProblem::Refused("truncate_kind"));
+                                    }
+                                    let part = serde_json::to_value(
+                                        source.content.get(index).unwrap_or(block),
+                                    )
+                                    .expect("stored content JSON");
+                                    let part = cortexkit_role_llm_runner::tags::truncate_part(
+                                        "owned-broca",
+                                        &part,
+                                        container,
+                                        mode.clone(),
+                                        number,
+                                        edit.drop_attachments,
+                                    )
+                                    .map_err(|refusal| {
+                                        AssemblyProblem::Refused(refusal.reason())
+                                    })?;
+                                    rendered = serde_json::to_string(&part)
+                                        .expect("rendered content JSON");
+                                    rendered.as_str()
+                                } else {
+                                    edit.bytes.as_deref().unwrap_or_default()
+                                };
+                                // Truncation is runner-authored by the shared renderer, which
+                                // preserves signed fields and cannot introduce media references.
+                                // Provider-authored bytes still need the original-part checks.
+                                let authorship = if edit.truncate.is_some() {
+                                    None
+                                } else {
+                                    original
+                                };
+                                let mut part = edited_part(bytes, authorship, message.role)?;
+                                if number.is_some() && (edit.truncate.is_some() || features.iter().any(|f| f == crate::compaction_provider::setup::VIEW_FEATURE_TAG_BYTES_EDITS)) {
+                                        let mut probe = Message::new(message.role, vec![part]);
+                                        let mut tags = message.tags.get().expect("numbered part").clone();
+                                        tags.parts = vec![number];
+                                        probe.tags = broca_protocol::tags::TagSlot::new(Some(std::sync::Arc::new(tags)));
+                                        broca_protocol::tags::render_tags_into(std::slice::from_mut(&mut probe), broca_protocol::tags::TagRendering { assistant_text: true });
+                                        part = probe.content.remove(0);
+                                }
+                                edited.content.push(part);
                             }
                         }
                     }
@@ -362,8 +422,16 @@ pub fn is_prefix_bound(block: &ContentBlock) -> bool {
 /// Setup's initial CompactionMessage (or a replacement the synchronous client applied) in
 /// place of its range, or else the transcript as written.
 pub fn rendered_history(state: &CompactionState, prompt: &[Message]) -> Vec<Message> {
+    if state.view_due.is_some() {
+        return Vec::new();
+    }
     if let Some(applied) = &state.view {
-        if let Ok(mut history) = assemble_captured(&applied.view, prompt, &state.captured) {
+        if let Ok(mut history) = assemble_captured(
+            &applied.view,
+            prompt,
+            &state.captured,
+            state.view_features.as_deref().unwrap_or_default(),
+        ) {
             apply_strips(&mut history, &state.strips, strips_copies(state));
             return history;
         }
@@ -582,12 +650,18 @@ pub(crate) fn decide_stored_at(
     // guidance the prompt shows on the original; the difference that makes is judged below like
     // any other change. Do not fold tags into the copy to make it match: that would put runner
     // bytes inside replaced bytes.
-    let mut next = match assemble_judged(view, prompt, Some(stored)) {
+    let mut next = match assemble_judged(
+        view,
+        prompt,
+        Some(stored),
+        state.view_features.as_deref().unwrap_or_default(),
+    ) {
         Ok(history) => history,
         Err(AssemblyProblem::Rejected(problem)) => return Decision::Rejected(problem),
         Err(AssemblyProblem::ProviderConstraint) => {
             return Decision::Refuse(refusal_reasons::PROVIDER_CONSTRAINT)
         }
+        Err(AssemblyProblem::Refused(reason)) => return Decision::Refuse(reason),
     };
     match conversation(next.iter()) {
         Ok(()) => {}
@@ -691,8 +765,21 @@ pub(crate) fn render(
     state: &CompactionState,
     systems: &[usize],
 ) -> Option<Result<broca_protocol::CallOptions, ViewNotRenderable>> {
+    if let Some(due) = &state.view_due {
+        return Some(Err(ViewNotRenderable {
+            view_version: due.version,
+            problem: AssemblyProblem::Refused(
+                crate::compaction_provider::setup::VIEW_DUE_UNAPPLIED,
+            ),
+        }));
+    }
     let applied = state.view.as_ref()?;
-    let mut history = match assemble_captured(&applied.view, &opts.prompt, &state.captured) {
+    let mut history = match assemble_captured(
+        &applied.view,
+        &opts.prompt,
+        &state.captured,
+        state.view_features.as_deref().unwrap_or_default(),
+    ) {
         Ok(history) => history,
         Err(problem) => {
             return Some(Err(ViewNotRenderable {

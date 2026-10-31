@@ -5465,6 +5465,7 @@ where
         // Stage the model event for decisions; publish these facts only after the turn barrier.
         let mut step_budget_state = budget_state.clone();
         let step_id = StepId(completed_steps + 1);
+        let compaction_step_start_ms = control.now_ms().unwrap_or_else(crate::compaction::now);
 
         // Mark the step boundary durably BEFORE the live StepStarted unit is published
         // (run_step emits it to `out`). Recording first gives the unit a durable cursor,
@@ -5688,6 +5689,32 @@ where
                 .as_ref()
                 .and_then(crate::compaction::view::selection_account_label);
             let session_ref = crate::wal_writer::agent_session_ref(&req.session);
+            if !Box::pin(runtime.apply_due_view(
+                state,
+                crate::compaction::runtime::DueViewAt {
+                    session_ref: &session_ref,
+                    lineage_id: &lineage_id,
+                    prompt: &opts.prompt,
+                    stored: raw,
+                    prefix_bound: provider.reasoning_is_prefix_bound(),
+                    run_start: completed_steps == 0,
+                    step_start_ms: compaction_step_start_ms,
+                },
+            ))
+            .await?
+            {
+                terminal_error = Some(crate::compaction::runtime::error(
+                    Some(Box::new(broca_protocol::error::ProviderRefusal {
+                        provider: state.provider.clone(),
+                        reason: Some(crate::compaction_provider::setup::VIEW_DUE_UNAPPLIED.into()),
+                        provider_detail_code: None,
+                    })),
+                    crate::compaction_provider::setup::VIEW_DUE_UNAPPLIED,
+                    Some("compaction_unavailable".into()),
+                    false,
+                ));
+                break RunFinishReason::Error;
+            }
             // Ride when the prefix is being rewritten anyway, then fetch the newest announced
             // view with `view.get`; either is offered here, at the boundary, and recorded before
             // the request renders.

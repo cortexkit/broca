@@ -3822,6 +3822,8 @@ mod episode_attach_tests {
                 cut: "m3".into(),
             }),
             ride_wait_ms: None,
+            view_features: None,
+            view_due: None,
         });
         records.push(run_finished());
         records.push(run_started("r4", vec![user("after")]));

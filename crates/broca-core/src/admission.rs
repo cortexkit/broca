@@ -4267,6 +4267,8 @@ mod tests {
                 ceiling: None,
                 tag_checkpoint: None,
                 ride_wait_ms: None,
+                view_features: None,
+                view_due: None,
             },
         ));
         let (bytes, positioned) = offset_log(&records);
