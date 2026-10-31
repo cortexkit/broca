@@ -126,6 +126,30 @@ pub fn backfill(conn: &Connection) -> Result<BackfillCounts, StoreError> {
     backfill::run(conn)
 }
 
+pub(crate) fn projection_gap(root: Option<&std::path::Path>) -> Result<bool, StoreError> {
+    root.map(broca_core::session_projection_incomplete)
+        .transpose()
+        .map(|exists| exists.unwrap_or(false))
+        .map_err(|_| {
+            StoreError::InconsistentSnapshot(
+                "cannot inspect session-ref projection incomplete marker",
+            )
+        })
+}
+
+pub(crate) fn projection_complete(conn: &Connection) -> Result<bool, StoreError> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_data_projection WHERE id=1 AND backfilled=1)
+         AND EXISTS(SELECT 1 FROM agent_data_census_done WHERE id=1)
+         AND NOT EXISTS(SELECT 1 FROM agent_data_pending_session)
+         AND NOT EXISTS(SELECT 1 FROM agent_data_census WHERE covered=0)
+         AND NOT EXISTS(SELECT 1 FROM agent_data_census_unreadable u
+             JOIN agent_data_census c ON c.address=u.address WHERE c.covered=0)",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
 impl SqliteStore {
     /// Missing refs are absent only in a complete projection snapshot. Pending
     /// legacy writes, an unfinished backfill, and database failures never prove absence.
@@ -190,29 +214,10 @@ impl SqliteStore {
             .map(std::path::Path::new)
             .and_then(std::path::Path::parent)
             .map(std::path::Path::to_path_buf);
-        let gap = || -> Result<bool, StoreError> {
-            root.as_deref()
-                .map(broca_core::session_projection_incomplete)
-                .transpose()
-                .map(|exists| exists.unwrap_or(false))
-                .map_err(|_| {
-                    StoreError::InconsistentSnapshot(
-                        "cannot inspect session-ref projection incomplete marker",
-                    )
-                })
-        };
+        let gap = || projection_gap(root.as_deref());
         let was_incomplete = gap()?;
         let tx = conn.transaction()?;
-        let complete: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM agent_data_projection WHERE id=1 AND backfilled=1)
-             AND EXISTS(SELECT 1 FROM agent_data_census_done WHERE id=1)
-             AND NOT EXISTS(SELECT 1 FROM agent_data_pending_session)
-             AND NOT EXISTS(SELECT 1 FROM agent_data_census WHERE covered=0)
-             AND NOT EXISTS(SELECT 1 FROM agent_data_census_unreadable u
-                 JOIN agent_data_census c ON c.address=u.address WHERE c.covered=0)",
-            [],
-            |row| row.get(0),
-        )?;
+        let complete = projection_complete(&tx)?;
         let sessions = select(&tx)?;
         tx.commit()?;
         Ok(SessionRefs {

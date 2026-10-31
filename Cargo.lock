@@ -340,6 +340,7 @@ dependencies = [
  "broca-core",
  "broca-module",
  "broca-protocol",
+ "broca-store",
  "broca-test-support",
  "broca-wal",
  "cortexkit-role-llm-runner",

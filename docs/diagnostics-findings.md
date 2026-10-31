@@ -56,6 +56,7 @@ a complete inventory or a pagination cursor.
 | `catalog_stale` | Cached catalog age beyond the 30-minute poll cadence, or timestamped refused/failed polls in the window. Age warns after 30 minutes and errors after six hours; historical poll refusals warn separately with their observed count. |
 | `credential_metadata_missing` | One warn finding naming each currently unmapped credential in the account chooser's scope. These credentials cannot be offered to routing; this does not claim they were actually used by a routed run. |
 | `send_refusals` | Timestamped routing-refused send admissions grouped by routing code. Warn. Unreachable routing is `routing_unavailable`. Invalid/non-token codes are `unattributed`. |
+| `session_address_unavailable` | Timestamped session-bind refusals grouped by `incomplete_inventory`, `gap_marker` or `store_error`. Error from the first refusal; no burst floor. Counts refused binds, not affected sessions or outage episodes. |
 | `run_errors` | Indexed error terminals with provider, error class and observation time, grouped by provider, shared error class and safe provider code. Floors below. A missing optional provider code or credential does not prevent classification. |
 | `tool_outages` | Newly durable attributed unavailable tool results/no-dispatch records, grouped by module. Warn. Counts calls/results, not outage episodes. |
 | `interrupted_runs` | Indexed interrupted terminals with an interruption reason and observation time, other than explicit `runner_shutdown`/`runner_crash` seals, plus observed `transform_unavailable` terminals. Warn; a run is not classified as restart-related based only on its timestamp. |
@@ -67,6 +68,15 @@ Each ring-backed finding's first sample also carries `coverage_since_ms`.
 Empty rings after boot do not create coverage findings or wake an operator.
 Rings retain at most 20,000 events each and at most seven days of history.
 They are process-local, not a durable incident ledger.
+
+`health.check.metrics.session_address_refusals` exposes lifetime counters for
+`incomplete_inventory`, `gap_marker`, `store_error`, `ambiguous` and `invalid_identity`,
+including zeros. Only the three unavailable-inventory reasons create this error finding.
+They also produce a one-line `session_address` WARN, at most once per reason per 60
+seconds; warning throttling never drops counters or diagnostic events. Counters reset
+on restart and findings age with the requested window, so neither is an assertion
+that the inventory remains unavailable now. A failed diagnostics evidence read still
+returns its existing explicit error rather than inventing healthy evidence.
 
 Run-error coverage reports the oldest attributed row in the bounded window
 scan, or the report time when none was observed. Interruption coverage likewise

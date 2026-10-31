@@ -14,6 +14,7 @@ pub const REPLY_LIMIT: usize = 65_536;
 static ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn install(root: PathBuf) {
+    crate::session_address_health::initialize();
     live::initialize();
     let _ = ROOT.set(root);
 }
@@ -96,6 +97,10 @@ pub fn gather(
         retention: live::retention_fences(),
         unmapped_credentials: crate::account_routing::published_unmapped_credentials(),
         rings: [
+            (
+                "session_address_unavailable".into(),
+                crate::session_address_health::snapshot(since, now),
+            ),
             (
                 "send_refusals".into(),
                 live::SEND_REFUSALS.snapshot(since, now),
@@ -537,6 +542,11 @@ pub fn report(mut evidence: Evidence, now: i64, window: i64) -> Reply {
                         let mut f = finding(&check,key,Severity::Warn,at_ms,at_ms,
                             if check == "tool_outages" {"A tool module returned attributed outage results in the window."} else if check == "catalog_stale" {"Catalog refreshes were refused in the observed window."} else {"Routing refused sends in the observed window."},
                             if check == "tool_outages" {"Inspect the tool-plane outage log for the sampled module and code."} else if check == "catalog_stale" {"Inspect health.check catalog_refusals and the fusiform catalog poll log."} else {"Inspect the routing refused account selection log and health.check account_selection counters."});
+                        if check == "session_address_unavailable" {
+                            f.severity = Severity::Error;
+                            f.summary = format!("Session binds were refused because address discovery was unavailable: {}.", f.key.replace('_', " "));
+                            f.hint = "Inspect health.check session_address_refusals and the session_address WARN log; verify inventory completeness and repair before resuming binds.".into();
+                        }
                         f.count=0;f
                     });
                     f.count += 1;

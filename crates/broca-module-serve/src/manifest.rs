@@ -519,8 +519,8 @@ pub fn manifest_configured(
         // flow-scoped bind only to modules that declare it.
         // Agent-run scopes likewise admit only Basal's attested sender, without tools.
         // `scope-workdir/v1` asks the daemon to stamp a scope's session folder and project id
-        // on its binds. Broca measures them against the bind's project_root and still keys
-        // every session by the bind triple.
+        // on its binds. New scoped sessions take workdir; the inventory preserves existing
+        // addresses. Project id never keys a session.
         provides: vec![
             broca_wire::LLM_RUNNER_V1.to_string(),
             broca_wire::agent_data::PROVIDES.to_string(),

@@ -165,8 +165,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = Arc::new(LineageRegistry::new_with_sources(
         Arc::new(opener),
         Some(wal),
-        Some(store),
+        Some(store.clone()),
     ));
+    registry.set_session_address_inventory(store);
     registry.set_retention_service(retention);
     registry.boot_retention().await?;
     for session in 0..sessions {
@@ -222,6 +223,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let (socket, _) = listener.accept().await?;
     let (read, write) = socket.into_split();
+    broca_store::session_refs::migrate(
+        &root.join("run-index.db"),
+        &broca_core::ReadOnlyWalReader::new(&root),
+    )?;
     broca_module_serve::serve_connection_with_catalog(
         read,
         write,

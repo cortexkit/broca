@@ -17,6 +17,10 @@
         "since_ms": 199999000,
         "truncated": false
       },
+      "session_address_unavailable": {
+        "since_ms": 199999000,
+        "truncated": false
+      },
       "tool_outages": {
         "since_ms": 199999000,
         "truncated": false
@@ -65,6 +69,60 @@
         ],
         "severity": "error",
         "summary": "1 runs ended in error in the indexed window."
+      },
+      {
+        "check": "session_address_unavailable",
+        "count": 1,
+        "first_seen_ms": 199999999,
+        "hint": "Inspect health.check session_address_refusals and the session_address WARN log; verify inventory completeness and repair before resuming binds.",
+        "key": "gap_marker",
+        "last_seen_ms": 199999999,
+        "samples": [
+          {
+            "at_ms": 199999999,
+            "code": "gap_marker",
+            "coverage_since_ms": 199999000,
+            "module_id": ""
+          }
+        ],
+        "severity": "error",
+        "summary": "Session binds were refused because address discovery was unavailable: gap marker."
+      },
+      {
+        "check": "session_address_unavailable",
+        "count": 1,
+        "first_seen_ms": 199999999,
+        "hint": "Inspect health.check session_address_refusals and the session_address WARN log; verify inventory completeness and repair before resuming binds.",
+        "key": "incomplete_inventory",
+        "last_seen_ms": 199999999,
+        "samples": [
+          {
+            "at_ms": 199999999,
+            "code": "incomplete_inventory",
+            "coverage_since_ms": 199999000,
+            "module_id": ""
+          }
+        ],
+        "severity": "error",
+        "summary": "Session binds were refused because address discovery was unavailable: incomplete inventory."
+      },
+      {
+        "check": "session_address_unavailable",
+        "count": 1,
+        "first_seen_ms": 199999999,
+        "hint": "Inspect health.check session_address_refusals and the session_address WARN log; verify inventory completeness and repair before resuming binds.",
+        "key": "store_error",
+        "last_seen_ms": 199999999,
+        "samples": [
+          {
+            "at_ms": 199999999,
+            "code": "store_error",
+            "coverage_since_ms": 199999000,
+            "module_id": ""
+          }
+        ],
+        "severity": "error",
+        "summary": "Session binds were refused because address discovery was unavailable: store error."
       },
       {
         "check": "credential_metadata_missing",

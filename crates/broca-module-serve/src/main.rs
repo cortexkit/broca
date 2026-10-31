@@ -712,6 +712,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         Some(store_reader),
         run_rows,
     ));
+    registry.set_session_address_inventory(run_index.clone());
     held_runtime.bind_stopping_signal(registry.stopping_signal());
     registry.set_tool_route_health(Arc::new(move |open| {
         tool_route_health_plane.tool_routes_health(open)

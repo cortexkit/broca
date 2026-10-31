@@ -154,6 +154,14 @@ A consumer can be both. The surface is **session-centric**: consumers address
 
 - **Session / lineage** — the durable conversation. One single-writer **lease**, one
   **WAL**, one **store** partition, keyed `{project_root, harness, session}`.
+  The storage root is resolved before acknowledging a session bind: an existing
+  `(harness, session)` pair keeps its unique inventory root; a new scoped pair uses
+  stamped `workdir`. On subc-protocol 0.33, a new pair without stamped workdir still
+  uses the route root, including for outgoing transport. A stamp's `project_id` never
+  keys a session. Two inventory roots refuse `session_address_ambiguous` (permanent);
+  incomplete discovery refuses `session_address_unavailable` (transient), never a guess.
+  Existing-pair lookups use a read transaction; only absent pairs take the write lock,
+  recheck discovery, and reserve a root before any actor or WAL opens.
 - **Run = one turn's loop execution** — a user message in → the agent loops until its
   response → a terminal. Each run begins with a `RunStarted` **episode marker** (input +
   frozen config + `origin` + `submission_id`). Runs **accumulate** in the lineage WAL:

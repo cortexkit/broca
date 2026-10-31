@@ -752,6 +752,7 @@ pub enum CutLockMode {
 type ToolRouteHealth = dyn Fn(&[LineageKey]) -> serde_json::Value + Send + Sync;
 
 struct Inner {
+    session_address_inventory: std::sync::OnceLock<Arc<broca_store::SqliteStore>>,
     #[cfg(test)]
     raw_pages: std::sync::OnceLock<Arc<RawPageTestBundle>>,
     tool_route_health: std::sync::OnceLock<Arc<ToolRouteHealth>>,
@@ -1211,6 +1212,37 @@ pub struct RegistryHandle {
 }
 
 impl LineageRegistry {
+    /// Supply the durable identity inventory before accepting routed session binds.
+    pub fn set_session_address_inventory(&self, inventory: Arc<broca_store::SqliteStore>) {
+        assert!(
+            self.inner.session_address_inventory.set(inventory).is_ok(),
+            "session address inventory already configured"
+        );
+    }
+
+    pub async fn resolve_session_address(
+        &self,
+        bind: &broca_protocol::BindIdentity,
+        workdir: Option<&std::path::Path>,
+    ) -> Result<broca_protocol::BindIdentity, broca_store::session_address::SessionAddressError>
+    {
+        use broca_store::session_address::SessionAddressError;
+        let inventory = self
+            .inner
+            .session_address_inventory
+            .get()
+            .cloned()
+            .ok_or_else(|| {
+                SessionAddressError::store_error("session address inventory is not configured")
+            })?;
+        let bind = bind.clone();
+        let workdir = workdir.map(std::path::Path::to_path_buf);
+        spawn_blocking(broca_diagnostics::JobKind::StoreWrite, move || {
+            inventory.resolve_session_address(&bind, workdir.as_deref())
+        })
+        .await
+        .map_err(SessionAddressError::store_error)?
+    }
     #[cfg(test)]
     pub(crate) fn with_raw_pages_for_test(self, bundle: Arc<RawPageTestBundle>) -> Self {
         assert!(self.inner.raw_pages.set(bundle).is_ok());
@@ -1506,6 +1538,7 @@ impl LineageRegistry {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                session_address_inventory: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 raw_pages: std::sync::OnceLock::new(),
                 tool_route_health: std::sync::OnceLock::new(),

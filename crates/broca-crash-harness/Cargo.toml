@@ -27,5 +27,6 @@ broca-core = { path = "../broca-core", features = ["test-clock"] }
 # The scope migration test drives the lineage registry the serve layer calls, over the state
 # roots the harness leaves.
 broca-module = { path = "../broca-module" }
+broca-store = { path = "../broca-store" }
 # The role's steer delivery receipt, which the steer kill tests compare across a restart.
 cortexkit-role-llm-runner = { workspace = true }

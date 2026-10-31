@@ -21,3 +21,4 @@ mod observed_wal_fidelity;
 mod plan_manifest_redrive;
 mod scope_migration;
 mod script_fixtures;
+mod session_address;
