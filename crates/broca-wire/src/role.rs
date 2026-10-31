@@ -295,7 +295,20 @@ pub struct RoleDescribeResponse {
     #[serde(flatten)]
     pub role: cortexkit_role_llm_runner::describe::RoleDescribe,
     pub session_class: SessionClassCapability,
+    /// The `step-transform-provider/v1` hooks this runner calls for every session. A plan
+    /// composer adds a step item only when every hook its subscriptions name is listed here, so
+    /// a runner that lists none is never sent one. Omitted when no hook plane is installed.
+    /// The role type gains this member in llm-runner 0.7.35; until broca pins that release it
+    /// is carried here, beside the role's own members, with the same name and meaning.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub step_hooks: Vec<String>,
 }
+
+/// The hook call sites broca's run loop runs once a hook plane is installed: `pre_user` on
+/// every user message before it is written, `pre_tool` and `post_tool` around each tool call,
+/// and `post_assistant` after each model reply. The names are the `Hook` wire names in
+/// broca-core's `hooks.rs`.
+pub const STEP_HOOKS: [&str; 4] = ["pre_user", "pre_tool", "post_tool", "post_assistant"];
 
 impl RoleDescribeResponse {
     /// Advertise live attempt hints only when their publisher is installed. Decoding the
@@ -469,6 +482,11 @@ pub fn broca_role_describe_with_writers(
         role: describe,
         session_class: SessionClassCapability {
             backup_classes: vec!["head".into()],
+        },
+        step_hooks: if hook_writer {
+            STEP_HOOKS.map(String::from).to_vec()
+        } else {
+            Vec::new()
         },
     }
 }
@@ -1229,6 +1247,21 @@ mod pinned_reply_bytes {
                         caps.contains(&serde_json::json!(ORDERED_HOOK_PHASES)),
                         hooks
                     );
+                    // The hook call sites follow the same writer: all four, or the member is
+                    // absent so a plan composer sends this runner no step items.
+                    if hooks {
+                        assert_eq!(
+                            encoded["step_hooks"],
+                            serde_json::json!([
+                                "pre_user",
+                                "pre_tool",
+                                "post_tool",
+                                "post_assistant"
+                            ])
+                        );
+                    } else {
+                        assert!(encoded.get("step_hooks").is_none(), "{encoded}");
+                    }
                     assert_eq!(caps.contains(&serde_json::json!("compaction")), compaction);
                     assert_eq!(caps.contains(&serde_json::json!("model_view")), compaction);
                     assert!(!encoded["majors"][0]["ops"]
@@ -1314,7 +1347,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "0abfabca86baad104e89f6c68e29efb895006ff082ed7aa5d0b0b72c1dea45fb";
+        "c9d2d9cc58f8931abb9fcbd41cb7b2c2a825e63e380c47a8cc270406ef28e893";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

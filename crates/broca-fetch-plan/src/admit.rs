@@ -19,7 +19,7 @@ use broca_wal::{
 };
 use cortexkit_role_llm_runner::baseline::{AbsentItem, BaselineItem};
 use cortexkit_role_step_transform_provider::subscription::{
-    check_item, Declaration, DeclareRequest, ItemRefusal,
+    check_item_with_optional_preset, Declaration, DeclareRequest, ItemAdmissionRefusal,
 };
 use cortexkit_role_tool_provider::catalog::check_reply;
 use cortexkit_role_tool_provider::catalog::{CatalogAnswer, CatalogRequest, SystemTextItem};
@@ -1187,10 +1187,11 @@ pub async fn admit(
                         serde_error_kind(&error),
                     ))),
                 },
-                // A provider that no longer knows the item's preset makes the plan stale.
-                Err(error)
-                    if step.item.preset.is_some() && error.refused_field() == Some("preset") =>
-                {
+                // A provider refusing the preset leaves the item with no declaration: a named
+                // preset it no longer knows makes the plan stale, and a presetless item for a
+                // provider with no default is a planner error (`invalid_params`), both decided
+                // by the shared item check below.
+                Err(error) if error.refused_field() == Some("preset") => {
                     DeclarationOutcome::RefusedPreset(FetchMiss::from_error(error))
                 }
                 Err(error) => DeclarationOutcome::Unanswered(FetchMiss::from_error(error)),
@@ -1451,35 +1452,31 @@ pub async fn admit(
                 unreachable!("an unanswered declaration refused admission above")
             }
         };
-        let checked = match step.item.preset.as_deref() {
-            Some(preset) => check_item(
-                index,
-                &step.item.provider,
-                preset,
-                declaration.as_deref(),
-                &step.subscriptions,
-                reduction_owner,
-            ),
-            None => check_default_item(
-                index,
-                &step.item.provider,
-                declaration.as_deref().expect(
-                    "a refused default declaration stops admission before subscription checks",
-                ),
-                &step.subscriptions,
-                reduction_owner,
-            ),
-        };
+        // The provider role's own item check, the one every runner and the plan composer use,
+        // so all sides give the same admission answer for the role's copied cases.
+        let checked = check_item_with_optional_preset(
+            index,
+            &step.item.provider,
+            step.item.preset.as_deref(),
+            declaration.as_deref(),
+            &step.subscriptions,
+            reduction_owner,
+        );
         match checked {
             Ok(_) => {}
-            Err(ItemRefusal::PlanStale(stale)) => differences.extend(
+            Err(ItemAdmissionRefusal::PlanStale(stale)) => differences.extend(
                 stale
                     .into_iter()
                     .map(|difference| serde_json::to_value(difference).expect("JSON")),
             ),
-            Err(ItemRefusal::InvalidParams(detail)) => {
+            // The role's other refusals (a malformed subscription, a presetless item for a
+            // provider with no default) are `invalid_params`; the detail is the role's own body,
+            // so a missing default reads exactly `{field: "preset"}`. The role marks the enum
+            // non-exhaustive, and the exact version pin means a new variant only arrives with a
+            // deliberate upgrade whose changelog names it.
+            Err(refusal) => {
                 return Err(Refusal::InvalidParams {
-                    detail: serde_json::to_value(detail).expect("JSON"),
+                    detail: refusal.refusal_body()["detail"].clone(),
                 });
             }
         }
@@ -1630,56 +1627,6 @@ pub async fn admit(
             role_versions,
         },
     })
-}
-
-/// A default declaration has no preset name to attach to a `preset_missing` difference.
-/// All other subscription checks retain the provider role's rules and difference shapes.
-fn check_default_item(
-    item: usize,
-    provider: &str,
-    declaration: &Declaration,
-    planned: &[cortexkit_role_step_transform_provider::subscription::Subscription],
-    reduction_owner: Option<&str>,
-) -> Result<Vec<usize>, ItemRefusal> {
-    use cortexkit_role_step_transform_provider::subscription::{
-        check_reduction, InvalidSubscriptionDetail, StaleDifference, SubscriptionProblem,
-    };
-    let mut bounds = Vec::new();
-    let mut differences = Vec::new();
-    for (index, subscription) in planned.iter().enumerate() {
-        match subscription
-            .check()
-            .and_then(|()| check_reduction(subscription, provider, reduction_owner))
-            .and_then(|()| declaration.bound(subscription))
-        {
-            Ok(bound) => bounds.push(bound),
-            Err(SubscriptionProblem::SubscriptionMissing) => {
-                differences.push(StaleDifference::SubscriptionMissing {
-                    provider: provider.into(),
-                    hook: subscription.hook,
-                    phase: subscription.phase,
-                })
-            }
-            Err(SubscriptionProblem::SubscriptionLoosened(field)) => {
-                differences.push(StaleDifference::SubscriptionLoosened {
-                    provider: provider.into(),
-                    hook: subscription.hook,
-                    phase: subscription.phase,
-                    field,
-                })
-            }
-            Err(problem) => {
-                return Err(ItemRefusal::InvalidParams(InvalidSubscriptionDetail::new(
-                    item, index, problem,
-                )));
-            }
-        }
-    }
-    if differences.is_empty() {
-        Ok(bounds)
-    } else {
-        Err(ItemRefusal::PlanStale(differences))
-    }
 }
 
 /// The `session.baseline` facts a manifest froze, read from the manifest alone so the admission
@@ -2298,7 +2245,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_declaration_omits_preset_and_preserves_provider_refusal() {
+    async fn default_declaration_omits_preset_and_a_provider_without_a_default_is_invalid_params() {
         let mut plan = plan_with_declaration("magic-context");
         plan.step_items[0].item.preset = None;
         let session =
@@ -2311,28 +2258,44 @@ mod tests {
         )
         .await
         .unwrap();
-        for code in ["invalid_params", "invalid_request"] {
-            let refusal = admit(
-                &plan,
-                &DefaultDeclaration(Err(FetchError::provider_refused(
-                    code.into(),
-                    Some(json!({"field":"preset"})),
-                    "no default selector",
-                    false,
-                ))),
-                &session,
-                ADMISSION_DEADLINE,
-            )
-            .await
-            .unwrap_err();
-            assert_eq!(refusal.code(), "fetch_unavailable");
-            assert_eq!(
-                refusal.detail(),
-                json!({"provider":"magic-context","reason":"refused","provider_code":code,
-                "op":DECLARE_OP,"message":"no default selector","field":"preset","retryable":false})
-            );
-            assert!(!refusal.detail().to_string().contains("preset_missing"));
-        }
+        let refuse = |code: &str| {
+            DefaultDeclaration(Err(FetchError::provider_refused(
+                code.into(),
+                Some(json!({"field":"preset"})),
+                "no default selector",
+                false,
+            )))
+        };
+        // step-transform-provider 0.4.1: the provider's `invalid_params {field: "preset"}` for
+        // a presetless item means it has no default. That is a planner error, refused exactly
+        // `invalid_params {field: "preset"}`, never `plan_stale` and never a fetch failure.
+        let refusal = admit(
+            &plan,
+            &refuse("invalid_params"),
+            &session,
+            ADMISSION_DEADLINE,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refusal.code(), "invalid_params");
+        assert_eq!(refusal.detail(), json!({"field":"preset"}));
+        // Any other refusal code is the provider's own failure, not the role's no-default
+        // answer, so admission reports it as unanswered with the provider's detail intact.
+        let refusal = admit(
+            &plan,
+            &refuse("invalid_request"),
+            &session,
+            ADMISSION_DEADLINE,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refusal.code(), "fetch_unavailable");
+        assert_eq!(
+            refusal.detail(),
+            json!({"provider":"magic-context","reason":"refused","provider_code":"invalid_request",
+            "op":DECLARE_OP,"message":"no default selector","field":"preset","retryable":false})
+        );
+        assert!(!refusal.detail().to_string().contains("preset_missing"));
     }
 
     #[tokio::test]
