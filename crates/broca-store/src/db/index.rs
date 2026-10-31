@@ -325,6 +325,18 @@ pub(super) fn apply_frame(
     if let Some((cut, checkpoint)) = delta.reanchor {
         reanchor(tx, key, cut, checkpoint, seed)?;
     }
+    super::recovery::observe(
+        tx,
+        key,
+        lineage,
+        seed.episode.as_ref().and_then(|ep| ep.run_id.as_deref()),
+        &frame.framed,
+    )?;
+    super::operational::observe(
+        tx,
+        seed.episode.as_ref().and_then(|ep| ep.run_id.as_deref()),
+        &frame.framed.record,
+    )?;
     Ok(())
 }
 
@@ -532,6 +544,419 @@ mod tests {
             .enumerate()
             .flat_map(|(n, record)| encode(n as u64 + 1, 1, record).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn operational_diagnostics_are_atomic_bounded_and_rebuildable() {
+        use super::super::DiagnosticEvidenceReader;
+        let scratch = database();
+        let source = decoded(&fixture("scripts/fixtures/resume-close-out-sealed.wal"));
+        let mut start = source
+            .iter()
+            .find(|(_, _, f)| matches!(f.record, WalRecord::RunStarted { .. }))
+            .unwrap()
+            .2
+            .record
+            .clone();
+        let mut terminal = source
+            .iter()
+            .find(|(_, _, f)| matches!(f.record, WalRecord::RunFinished { .. }))
+            .unwrap()
+            .2
+            .record
+            .clone();
+        if let WalRecord::RunStarted { ts_ms, .. } = &mut start {
+            *ts_ms = Some(100);
+        }
+        if let WalRecord::RunFinished { reason, ts_ms, .. } = &mut terminal {
+            *reason = broca_protocol::caller::RunFinishReason::Error;
+            *ts_ms = Some(200);
+        }
+        let first = encode_records(&[start.clone()]);
+        let all = encode_records(&[start, terminal]);
+        let bind = bind(&all);
+        scratch.db.index(&publication(&bind, &first)).unwrap();
+        let before = rows(&scratch.db, &["run", "operational_run"]);
+        scratch.db.authoritative_transaction(|tx| {
+            tx.execute_batch("CREATE TRIGGER fail_diagnostic BEFORE UPDATE ON operational_run BEGIN SELECT RAISE(ABORT,'diagnostic cut'); END;")?;
+            Ok(())
+        }).unwrap();
+        assert!(scratch.db.index(&publication(&bind, &all)).is_err());
+        assert_eq!(rows(&scratch.db, &["run", "operational_run"]), before);
+        scratch
+            .db
+            .authoritative_transaction(|tx| {
+                tx.execute_batch("DROP TRIGGER fail_diagnostic")?;
+                Ok(())
+            })
+            .unwrap();
+        scratch.db.index(&publication(&bind, &all)).unwrap();
+        let expected = rows(&scratch.db, &["operational_run"]);
+        let counter = broca_wal::access_counter::WalAccessCounter::default();
+        let evidence = counter
+            .operation("diagnostics")
+            .run(|| scratch.db.diagnostic_evidence(150, 250))
+            .unwrap();
+        assert_eq!(evidence.errors.len(), 1);
+        assert_eq!(evidence.errors[0].at_ms, Some(200));
+        assert!(evidence.live.is_empty());
+        assert!(scratch
+            .db
+            .diagnostic_evidence(201, 250)
+            .unwrap()
+            .errors
+            .is_empty());
+        assert!(
+            counter.snapshot()[0].reads.is_empty(),
+            "diagnostic queries must not read WAL sources"
+        );
+        assert_eq!(counter.snapshot()[0].frames_decoded, 0);
+        let plan = scratch.db.read_snapshot(|tx| {
+            let rows = tx.prepare("EXPLAIN QUERY PLAN SELECT o.run_id FROM operational_run o INDEXED BY operational_run_time JOIN run r USING(run_id) WHERE state='error' AND state_changed_ms>=150 AND state_changed_ms<=250 ORDER BY state_changed_ms DESC LIMIT 20001")?
+                .query_map([],|r|r.get::<_,String>(3))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows.join(" "))
+        }).unwrap();
+        assert!(
+            plan.contains("operational_run_time (state_changed_ms>? AND state_changed_ms<?)"),
+            "{plan}"
+        );
+        scratch
+            .db
+            .authoritative_transaction(|tx| {
+                tx.execute_batch("DROP TABLE operational_run")?;
+                super::super::operational::initialize(tx)?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            scratch.db.diagnostic_evidence(0, 1000).is_err(),
+            "missing attribution must not be reported absent"
+        );
+        scratch.db.forget_session(&bind).unwrap();
+        scratch.db.index(&publication(&bind, &all)).unwrap();
+        assert_eq!(rows(&scratch.db, &["operational_run"]), expected);
+    }
+
+    #[test]
+    fn operational_recovery_discovery_ports_remain_advisory_on_both_adapters() {
+        use broca_core::{RecoveryDiscovery, RunIndex, RunIndexRow, RunIndexState};
+        let scratch = database();
+        let legacy = crate::SqliteStore::open_in_memory().unwrap();
+        let source = decoded(&fixture("scripts/fixtures/resume-close-out-sealed.wal"));
+        let mut start = source
+            .iter()
+            .find(|(_, _, f)| matches!(f.record, WalRecord::RunStarted { .. }))
+            .unwrap()
+            .2
+            .record
+            .clone();
+        let bind = BindIdentity::new("/operational", "runner", "advisory");
+        let id = broca_protocol::RunId("advisory".into());
+        if let WalRecord::RunStarted {
+            session, run_id, ..
+        } = &mut start
+        {
+            *session = bind.clone();
+            *run_id = id.clone();
+        }
+        let first = encode_records(&[start.clone()]);
+        scratch.db.index(&publication(&bind, &first)).unwrap();
+        legacy
+            .index_run_active(&RunIndexRow {
+                run_id: id.0.clone(),
+                session: bind.clone(),
+                submission_id: None,
+                request_identity_digest: None,
+                state: RunIndexState::Active,
+                usage: None,
+                final_step_finish_reason: None,
+                retries_used: 0,
+                title: None,
+                withdrawals_owed: false,
+            })
+            .unwrap();
+        let paused = WalRecord::RunPaused {
+            run_id: id.clone(),
+            ts_ms: Some(200),
+            reason: broca_protocol::PauseReason::AuthRequired,
+            error: None,
+        };
+        let durable = vec![start, paused];
+        // A crash can leave Active in either index after a durable restart pause.
+        for port in [&legacy as &dyn RecoveryDiscovery, &scratch.db] {
+            assert_eq!(
+                port.active_runs().unwrap(),
+                vec![(id.0.clone(), bind.clone())]
+            );
+            assert_eq!(
+                port.restart_resume_candidates().unwrap(),
+                vec![(id.0.clone(), bind.clone())]
+            );
+            assert_eq!(
+                broca_core::reconcile_run_state(&durable, &id.0)
+                    .unwrap()
+                    .state,
+                RunIndexState::Paused
+            );
+        }
+        scratch
+            .db
+            .index(&publication(&bind, &encode_records(&durable)))
+            .unwrap();
+        legacy
+            .index_run_terminal(&id.0, RunIndexState::Paused, None, None, 0)
+            .unwrap();
+        for port in [&legacy as &dyn RecoveryDiscovery, &scratch.db] {
+            assert!(port.active_runs().unwrap().is_empty());
+            assert_eq!(
+                port.restart_resume_candidates().unwrap(),
+                vec![(id.0.clone(), bind.clone())]
+            );
+        }
+    }
+
+    #[test]
+    fn operational_withdrawal_discovery_preserves_active_terminal_acknowledged_and_expired() {
+        use broca_core::{RecoveryDiscovery, RunIndex, RunIndexRow, RunIndexState};
+        use broca_protocol::{BatchId, RunId, ToolCallId};
+        use broca_wal::Wal;
+        fn check(
+            db: &OverhaulDb,
+            legacy: &crate::SqliteStore,
+            wal: &broca_wal::FileWal,
+            bind: &BindIdentity,
+            id: &str,
+            expected: bool,
+        ) {
+            let frames = wal.replay().unwrap();
+            let records: Vec<_> = frames.iter().map(|f| f.record.clone()).collect();
+            let state = broca_core::reconcile_run_state(&records, id).unwrap();
+            legacy
+                .index_run_terminal(id, state.state, None, None, 0)
+                .unwrap();
+            let owes = broca_core::deferred_call_obligations(wal.lineage_id().unwrap(), &frames)
+                .withdrawals
+                .len()
+                == 1;
+            legacy.index_run_withdrawals_owed(id, owes).unwrap();
+            db.index(&publication(
+                bind,
+                &std::fs::read(wal.log_path().unwrap()).unwrap(),
+            ))
+            .unwrap();
+            let expected = if expected {
+                vec![(id.to_owned(), bind.clone())]
+            } else {
+                vec![]
+            };
+            for port in [legacy as &dyn RecoveryDiscovery, db] {
+                let actual: Vec<_> = port
+                    .withdrawal_candidates()
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| (r.run_id.0, r.session))
+                    .collect();
+                assert_eq!(actual, expected);
+            }
+            assert_eq!(
+                db.lookup_run(id).unwrap().unwrap().withdrawals_owed,
+                !expected.is_empty()
+            );
+            assert_eq!(
+                db.lookup_run_retention(id)
+                    .unwrap()
+                    .unwrap()
+                    .withdrawals_owed,
+                !expected.is_empty()
+            );
+        }
+        for expire in [false, true] {
+            let scratch = database();
+            let legacy = crate::SqliteStore::open_in_memory().unwrap();
+            let path = scratch._scratch.0.join("withdrawal.wal");
+            let mut wal = broca_wal::FileWal::open(&path)
+                .unwrap()
+                .with_feature_floor(scratch._scratch.0.join("wal-floor"));
+            let source = decoded(&fixture("scripts/fixtures/resume-close-out-sealed.wal"));
+            let mut start = source
+                .iter()
+                .find(|(_, _, f)| matches!(f.record, WalRecord::RunStarted { .. }))
+                .unwrap()
+                .2
+                .record
+                .clone();
+            let bind = BindIdentity::new("/project", "runner", "withdrawal");
+            let id = "withdrawal-run";
+            if let WalRecord::RunStarted {
+                session, run_id, ..
+            } = &mut start
+            {
+                *session = bind.clone();
+                *run_id = RunId(id.into());
+            }
+            legacy
+                .index_run_active(&RunIndexRow {
+                    run_id: id.into(),
+                    session: bind.clone(),
+                    submission_id: None,
+                    request_identity_digest: None,
+                    state: RunIndexState::Active,
+                    usage: None,
+                    final_step_finish_reason: None,
+                    retries_used: 0,
+                    title: None,
+                    withdrawals_owed: false,
+                })
+                .unwrap();
+            wal.append(1, &start, true).unwrap();
+            let deferred = WalRecord::ToolCallDeferred {
+                deferred_at_ms: None,
+                batch_id: BatchId("batch".into()),
+                call_id: ToolCallId("call".into()),
+                executor: broca_wal::DeferredExecutor::Broca,
+                module: Some("approvals".into()),
+                tool: "tool".into(),
+                schema_pin: None,
+                args_jcs: "{\"PRIVATE_ARGUMENTS\":true}".into(),
+                args_hash: broca_wal::migration::digest(b"{\"PRIVATE_ARGUMENTS\":true}"),
+                scope: serde_json::from_value(
+                    serde_json::json!({"owner":{"kind":"direct"},"ref":"scope","scope_epoch":1}),
+                )
+                .unwrap(),
+                ask: broca_wal::DeferredAsk {
+                    prompt: "PRIVATE_QUESTION".into(),
+                    options: vec![],
+                    expires_at_ms: 9999,
+                    on_expiry: broca_wal::OnExpiry::Deny,
+                    material_damage: false,
+                    late_execution: broca_wal::LateExecution::Execute,
+                },
+            };
+            let seq = wal.append(1, &deferred, true).unwrap();
+            let key = format!("{}:{seq}", wal.lineage_id().unwrap());
+            check(&scratch.db, &legacy, &wal, &bind, id, false);
+            let result = WalRecord::ToolResult {
+                finished_at_ms: None,
+                batch_id: BatchId("batch".into()),
+                result: std::sync::Arc::new(broca_core::resume::not_dispatched_result(
+                    &ToolCallId("call".into()),
+                )),
+                outcome: broca_wal::DispatchOutcome::Interrupted,
+                hooks: None,
+                reason: None,
+                withdraw_elicitation: Some(broca_wal::WithdrawElicitation {
+                    call_key: key.clone(),
+                    elicitation_id: Some("question-id".into()),
+                }),
+                provider_held: None,
+                tags: None,
+            };
+            wal.append(1, &result, true).unwrap();
+            check(&scratch.db, &legacy, &wal, &bind, id, true);
+            let mut terminal = source
+                .iter()
+                .find(|(_, _, f)| matches!(f.record, WalRecord::RunFinished { .. }))
+                .unwrap()
+                .2
+                .record
+                .clone();
+            if let WalRecord::RunFinished { reason, .. } = &mut terminal {
+                *reason = broca_protocol::caller::RunFinishReason::Cancelled;
+            }
+            wal.append(1, &terminal, true).unwrap();
+            check(&scratch.db, &legacy, &wal, &bind, id, true);
+            scratch.db.index_run_withdrawals_owed(id, true).unwrap();
+            let retained = crate::retention::RetentionLineageRow {
+                lineage_id: wal.lineage_id().unwrap().to_string(),
+                session: bind.clone(),
+                retention_s: 1,
+                last_activity_ms: 0,
+                expires_at_ms: Some(1000),
+                wal_bytes: std::fs::metadata(&path).unwrap().len(),
+                expired_at_ms: None,
+            };
+            legacy.upsert_retention_lineage(&retained, &[]).unwrap();
+            scratch.db.upsert_retention_lineage(&retained, &[]).unwrap();
+            assert!(scratch
+                .db
+                .stamp_retained_run_lineage(id, &bind, &retained.lineage_id)
+                .unwrap());
+            legacy
+                .stamp_retained_run_lineage(id, &bind, &retained.lineage_id)
+                .unwrap();
+            assert_eq!(
+                scratch.db.retention_lineages_with_discovery().unwrap(),
+                vec![bind.clone()]
+            );
+            assert!(
+                scratch.db.retention_run_rows(&retained.lineage_id).unwrap()[0]
+                    .run
+                    .withdrawals_owed
+            );
+            assert_eq!(
+                scratch
+                    .db
+                    .read_snapshot(|tx| Ok(
+                        tx.query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0))?
+                    ))
+                    .unwrap(),
+                2
+            );
+            if expire {
+                let row = crate::retention::RetentionLineageRow {
+                    lineage_id: wal.lineage_id().unwrap().to_string(),
+                    session: bind.clone(),
+                    retention_s: 1,
+                    last_activity_ms: 0,
+                    expires_at_ms: None,
+                    wal_bytes: std::fs::metadata(&path).unwrap().len(),
+                    expired_at_ms: Some(1000),
+                };
+                let mut run = scratch.db.lookup_run(id).unwrap().unwrap();
+                run.withdrawals_owed = false;
+                let runs = [crate::retention::RetentionRunRow {
+                    attribution: None,
+                    run,
+                    state_changed_ms: Some(1000),
+                }];
+                legacy.upsert_retention_lineage(&row, &runs).unwrap();
+                scratch.db.upsert_retention_lineage(&row, &runs).unwrap();
+                assert!(RecoveryDiscovery::withdrawal_candidates(&legacy)
+                    .unwrap()
+                    .is_empty());
+                assert!(scratch.db.withdrawal_candidates().unwrap().is_empty());
+            } else {
+                let ack:WalRecord=serde_json::from_value(serde_json::json!({"type":"question_withdrawal_acknowledged","call_key":key,"answer":"acknowledged"})).unwrap();
+                wal.append(1, &ack, true).unwrap();
+                scratch.db.index_run_withdrawals_owed(id, false).unwrap();
+                check(&scratch.db, &legacy, &wal, &bind, id, false);
+                assert!(scratch
+                    .db
+                    .retention_lineages_with_discovery()
+                    .unwrap()
+                    .is_empty());
+            }
+            let expected = rows(&scratch.db, &["withdrawal_call", "actor_withdrawal_hint"]);
+            scratch
+                .db
+                .authoritative_transaction(|tx| {
+                    tx.execute_batch("DROP TABLE withdrawal_call")?;
+                    super::super::recovery::initialize(tx)?;
+                    Ok(())
+                })
+                .unwrap();
+            scratch
+                .db
+                .rebuild_session(&publication(&bind, &std::fs::read(&path).unwrap()))
+                .unwrap();
+            assert_eq!(
+                rows(&scratch.db, &["withdrawal_call", "actor_withdrawal_hint"]),
+                expected
+            );
+            assert!(scratch.db.withdrawal_candidates().unwrap().is_empty());
+            let values = format!("{:?}", rows(&scratch.db, &["withdrawal_call"]));
+            assert!(!values.contains("PRIVATE_ARGUMENTS") && !values.contains("PRIVATE_QUESTION"));
+        }
     }
 
     fn publish_writer(

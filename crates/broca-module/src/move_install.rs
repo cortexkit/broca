@@ -76,11 +76,11 @@ pub fn check_installations(installations: &[Installation<'_>]) -> Result<(), Err
 /// which prevents sends from advancing the installed bytes before recovery checks
 /// them. Without that intent, do not invoke the missing-staging recovery path.
 /// `drop_projection` removes derived session data, never billing facts or floors.
-pub fn install_verified(
+pub fn install_verified<E: broca_core::ImportedRunExclusions + ?Sized>(
     state_root: &Path,
     cut_id: &str,
     installations: &[Installation<'_>],
-    export: &dyn broca_core::ExportIndex,
+    export: &E,
     drop_projection: impl Fn(&BindIdentity) -> Result<(), String>,
 ) -> Result<(), ErrorBody> {
     check_installations(installations)?;

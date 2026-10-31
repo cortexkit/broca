@@ -869,6 +869,84 @@ async fn retry_keeps_discovery_flag_until_full_wal_debt_is_empty() {
     let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
 }
 
+#[tokio::test]
+async fn operational_withdrawal_candidates_enter_the_existing_service_once() {
+    use broca_core::RecoveryDiscovery;
+    use broca_store::db::{LogLocation, OverhaulDb, PublishedSession};
+    for overhaul in [false, true] {
+        for approved in [false, true] {
+            let rig = Rig::new(true);
+            rig.seed(true, false, approved, true);
+            rig.store
+                .index_run_terminal("r", RunIndexState::Interrupted, None, None, 0)
+                .unwrap();
+            rig.store
+                .index_run_withdrawals_owed("r", !approved)
+                .unwrap();
+            std::fs::write(rig.root.join("state-format"), b"broca-state/2\n").unwrap();
+            let db = OverhaulDb::open(&rig.root).unwrap();
+            let publish = || {
+                let bytes = std::fs::read(rig.wal.wal_path(&rig.key)).unwrap();
+                db.index(&PublishedSession {
+                    bind: &rig.key,
+                    session_ref: "approval",
+                    location: LogLocation::Live,
+                    bytes: &bytes,
+                })
+                .unwrap();
+            };
+            publish();
+            let port: &dyn RecoveryDiscovery = if overhaul { &db } else { rig.store.as_ref() };
+            assert_eq!(
+                port.withdrawal_candidates().unwrap().len(),
+                usize::from(!approved)
+            );
+            let writer = Arc::new(WalHandle::spawn(rig.wal.open(&rig.key).unwrap(), 1).unwrap());
+            let questions = rig.executor.questions.as_ref().unwrap();
+            let index = if overhaul {
+                None
+            } else {
+                Some(rig.store.clone() as Arc<dyn RunIndex>)
+            };
+            for _ in 0..2 {
+                assert!(crate::approval::service_pass(
+                    rig.wal.clone(),
+                    rig.key.clone(),
+                    writer.clone(),
+                    index.clone(),
+                    Arc::new(Mutex::new(())),
+                    questions.as_ref(),
+                    &broca_core::Clock::default()
+                )
+                .await
+                .unwrap());
+                publish();
+                assert!(port.withdrawal_candidates().unwrap().is_empty());
+            }
+            assert_eq!(
+                questions.withdrawals.lock().unwrap().len(),
+                usize::from(!approved)
+            );
+            assert_eq!(
+                rig.frames()
+                    .iter()
+                    .filter(|f| matches!(
+                        f.record,
+                        WalRecord::QuestionWithdrawalAcknowledged { .. }
+                    ))
+                    .count(),
+                usize::from(!approved)
+            );
+            Arc::try_unwrap(writer)
+                .ok()
+                .unwrap()
+                .shutdown()
+                .await
+                .unwrap();
+        }
+    }
+}
+
 struct UnknownRead {
     wal: Arc<FileWalStore>,
     fail_at: usize,

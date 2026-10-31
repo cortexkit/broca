@@ -2355,6 +2355,35 @@ fn emit_to(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn read_resolver_uses_overhaul_inventory_without_a_legacy_database() {
+        use broca_core::{SessionInventory, SessionRefIndex};
+        let root = broca_test_support::scratch_root()
+            .join(format!("cli-overhaul-resolver-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
+        let db = broca_store::db::OverhaulDb::open(&root).unwrap();
+        let bind = broca_protocol::BindIdentity::new("/project", "runner", "alfonso:task");
+        db.record_session(&broca_core::session_addr(&bind), &bind)
+            .unwrap();
+        let args = super::Args::try_parse_from([
+            "broca-session",
+            "--state-root",
+            root.to_str().unwrap(),
+            "read",
+            "task",
+        ])
+        .unwrap();
+        assert!(super::bind_identity(&args)
+            .unwrap_err()
+            .contains("incomplete"));
+        db.rebuild_inventory(&root).unwrap();
+        assert_eq!(super::bind_identity(&args).unwrap(), bind);
+        assert!(!root.join("run-index.db").exists());
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn cache_diagnose_accepts_task_ids_and_explicit_offline_binding() {
         use clap::Parser;
         let args = super::OfflineArgs::try_parse_from([

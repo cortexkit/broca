@@ -75,7 +75,7 @@ pub struct AgentDataService {
     cuts: CutStore,
     artifacts: FileCutArtifacts,
     wal: Arc<FileWalStore>,
-    index: Arc<broca_store::SqliteStore>,
+    index: Arc<dyn broca_core::SessionInventory>,
     projection_started: std::sync::atomic::AtomicBool,
     op_counts: [AtomicU64; 10],
 }
@@ -109,11 +109,43 @@ impl AgentDataService {
             op_counts: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
+
+    /// Construct with operational capabilities from one store. Boot must publish
+    /// and reconcile its WAL-derived rows before calling `reconcile_boot`.
+    pub fn with_ports(
+        root: PathBuf,
+        registry: LineageRegistry,
+        wal: Arc<FileWalStore>,
+        index: Arc<dyn broca_core::SessionInventory>,
+        exclusions: Arc<dyn broca_core::ImportedRunExclusions>,
+        door: Arc<dyn SessionDoor>,
+    ) -> Self {
+        wal.set_session_ref_index(index.clone());
+        let driver = Arc::new(Driver {
+            root: root.clone(),
+            wal: wal.clone(),
+            index: index.clone(),
+            door,
+        });
+        Self {
+            cuts: CutStore::new(&root),
+            artifacts: FileCutArtifacts::with_exclusions(
+                root,
+                registry,
+                wal.clone(),
+                exclusions,
+                driver,
+            ),
+            index,
+            wal,
+            projection_started: std::sync::atomic::AtomicBool::new(false),
+            op_counts: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
     pub async fn reconcile_boot(&self) -> Result<(), ErrorBody> {
-        broca_store::session_refs::cleanup_legacy_inventory(
-            self.wal.root().parent().unwrap_or(self.wal.root()),
-        )
-        .map_err(|error| unavailable(format!("cleanup_legacy_inventory: {error}")))?;
+        self.index
+            .prepare_inventory(self.wal.root().parent().unwrap_or(self.wal.root()))
+            .map_err(unavailable)?;
         broca_wal::migration::rebuild_fence_index(
             self.wal.root().parent().unwrap_or(self.wal.root()),
         )
@@ -125,24 +157,18 @@ impl AgentDataService {
                 error.message = format!("cuts.reconcile_boot: {}", error.message);
                 error
             })?;
-        if !self
-            .index
-            .session_refs(std::iter::empty())
-            .map_err(unavailable)?
-            .complete
+        if !self.index.resolve_refs(&[]).map_err(unavailable)?.complete
             && !self.projection_started.swap(true, Ordering::SeqCst)
         {
-            let wal = self.wal.clone();
-            let db = wal
+            let index = self.index.clone();
+            let root = self
+                .wal
                 .root()
                 .parent()
-                .unwrap_or(wal.root())
-                .join("run-index.db");
+                .unwrap_or(self.wal.root())
+                .to_path_buf();
             tokio::task::spawn_blocking(move || {
-                if let Err(error) = broca_store::session_refs::migrate(
-                    &db,
-                    &broca_core::ReadOnlyWalReader::new(wal.root().parent().unwrap_or(wal.root())),
-                ) {
+                if let Err(error) = index.rebuild_inventory(&root) {
                     tracing::warn!(%error, "session-ref migration incomplete; missing refs remain unknown");
                 }
             });
@@ -249,7 +275,7 @@ pub(crate) async fn dispatch(
 struct Driver {
     root: PathBuf,
     wal: Arc<FileWalStore>,
-    index: Arc<broca_store::SqliteStore>,
+    index: Arc<dyn broca_core::SessionInventory>,
     door: Arc<dyn SessionDoor>,
 }
 
@@ -442,7 +468,7 @@ impl Driver {
     fn local_sessions(&self, refs: &Refs) -> SessionInventory {
         match self
             .index
-            .session_refs(refs.iter().map(|r| r.r#ref.as_str()))
+            .resolve_refs(&refs.iter().map(|r| r.r#ref.as_str()).collect::<Vec<_>>())
         {
             Ok(found) => SessionInventory {
                 sessions: found
@@ -807,7 +833,7 @@ impl MoveDriver for Driver {
         })
     }
     fn drop_projection(&self, session: &BindIdentity) -> Result<(), String> {
-        self.index.drop_session_projection(session)
+        self.index.forget_projection(session)
     }
 }
 
@@ -815,4 +841,111 @@ fn source_busy_reason(bytes: &[u8]) -> Result<Option<&'static str>, ErrorBody> {
     let range =
         broca_wal::file_wal::read_verified_member_range(bytes, 0, 0, None).map_err(unavailable)?;
     broca_module::move_files::source_busy_reason(&range)
+}
+
+#[cfg(test)]
+mod operational_port_tests {
+    use super::*;
+    use broca_core::SessionInventory as InventoryPort;
+    use broca_module::registry::{
+        ActorHandle, LineageKey, LineageOpener, OpenError, RegistryHandle,
+    };
+
+    struct NeverOpen;
+    #[async_trait::async_trait]
+    impl LineageOpener for NeverOpen {
+        async fn open(
+            &self,
+            _: &LineageKey,
+            _: u64,
+            _: RegistryHandle,
+        ) -> Result<ActorHandle, OpenError> {
+            panic!("inventory must not open an actor")
+        }
+    }
+    struct NoDoor;
+    #[async_trait::async_trait]
+    impl SessionDoor for NoDoor {
+        async fn cover(&self, _: &str) -> Result<u64, SessionDoorError> {
+            panic!("inventory must not cover remote data")
+        }
+        async fn export(&self, _: &str, _: &[u8]) -> Result<(), SessionDoorError> {
+            panic!("inventory must not export remote data")
+        }
+        async fn read(&self, _: &str, _: u64, _: &str) -> Result<DoorRead, SessionDoorError> {
+            panic!("inventory must not read remote data")
+        }
+    }
+
+    #[tokio::test]
+    async fn boot_and_move_discovery_use_the_selected_inventory_port() {
+        for overhaul in [false, true] {
+            let root = broca_test_support::scratch_root().join(format!(
+                "agent-inventory-port-{}-{overhaul}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(root.join("wal")).unwrap();
+            let wal = Arc::new(FileWalStore::new(root.join("wal")));
+            let registry =
+                LineageRegistry::new_with_sources(Arc::new(NeverOpen), Some(wal.clone()), None);
+            let (index, service): (Arc<dyn InventoryPort>, AgentDataService) = if overhaul {
+                std::fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
+                let db = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
+                (
+                    db.clone(),
+                    AgentDataService::with_ports(
+                        root.clone(),
+                        registry,
+                        wal.clone(),
+                        db.clone(),
+                        db,
+                        Arc::new(NoDoor),
+                    ),
+                )
+            } else {
+                let db =
+                    Arc::new(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
+                (
+                    db.clone(),
+                    AgentDataService::new(
+                        root.clone(),
+                        registry,
+                        wal.clone(),
+                        db,
+                        Arc::new(NoDoor),
+                    ),
+                )
+            };
+            let session = BindIdentity::new("/project", "runner", "moved");
+            index
+                .record_session(&broca_core::session_addr(&session), &session)
+                .unwrap();
+            let refs: Refs =
+                serde_json::from_value(serde_json::json!([contract::session_reference(
+                    "runner", "/project", "moved"
+                )]))
+                .unwrap();
+            let driver = Driver {
+                root: root.clone(),
+                wal,
+                index: index.clone(),
+                door: Arc::new(NoDoor),
+            };
+            assert!(!driver.local_sessions(&refs).unreadable.is_empty());
+            index.rebuild_inventory(&root).unwrap();
+            service.reconcile_boot().await.unwrap();
+            let found = driver.local_sessions(&refs);
+            assert!(found.unreadable.is_empty());
+            assert_eq!(found.sessions.len(), 1);
+            driver.drop_projection(&session).unwrap();
+            assert_eq!(driver.local_sessions(&refs).sessions.len(), 1);
+            if overhaul {
+                assert!(!root.join("run-index.db").exists());
+            }
+            drop(service);
+            drop(driver);
+            drop(index);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
 }
