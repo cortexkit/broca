@@ -153,3 +153,41 @@ Busy probes inspect the requested WAL for active runs, queued sends and unsettle
 approvals, with the existing actor, lease and move-fence observations. INFO events
 report op, cut id, ref count and elapsed milliseconds, including cancelled calls.
 `health.check.metrics.agent_data_ops` reports each operation's cumulative count.
+
+## Offline split-root repair
+
+If a historical WAL re-key left a session's run-index rows and refs under two
+project roots, inspect the stopped store with:
+
+```sh
+store-maintenance repair-session-root STATE_ROOT --harness HARNESS --session SESSION
+```
+
+This is **preview-only by default**. The JSON lists each terminal run row to
+re-point (run ID, old and new identities), each v1 ref and v2 alias to remove
+(including root and session), and any obsolete address discovery rows. Keep a
+backup, review that plan, then repeat with `--write` to apply it. The write prints
+and flushes its plan before applying, rechecks under a SQLite writer transaction,
+and refuses a changed preview. A repaired one-root pair is a no-op on repeat.
+
+**Stop broca and its supervisor for the entire write operation.** Live or unknown
+writer liveness refuses before SQLite opens. The repair additionally acquires
+both canonical session leases to exclude standalone writers; these leases do not
+replace the stopped-supervisor requirement. Preview uses a read-only connection,
+without schema initialization or leases.
+
+Repair requires a complete inventory, exactly two roots, and exactly one address
+with a WAL across all live trees and sealed archive trees. It refuses deletion
+ledgers/tombstones, expired lineage records, move/cut fences, unreadable sources,
+competing logs, and stale transcript/retention projections requiring a merge.
+Each stale run must be terminal and its ID must occur in a matching completed
+episode in the surviving verified WAL. Otherwise repair refuses rather than
+deleting unproven run metadata. Successful repair changes only the proven run
+identities and stale inventory/discovery mappings, in one transaction. It never
+changes log bytes or extracts an archive. All other run metadata is retained.
+
+The bind-time ambiguity rule is unchanged: a missing log alone is not proof that
+an inventory identity can be discarded. Interrupted admissions, expiry and moves
+can legitimately leave identity candidates without local content. The legacy
+`rekey-harness.py` refuses inventoried stores before changing anything; it does
+not implement a general inventory-aware harness or project-root migration.

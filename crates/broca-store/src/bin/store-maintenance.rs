@@ -66,6 +66,12 @@ fn state_root_refusal(
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
+    if args
+        .get(1)
+        .is_some_and(|operation| operation == "repair-session-root")
+    {
+        return repair_session_root(&args[2..]);
+    }
     let (Some(operation), Some(state_root)) = (args.get(1), args.get(2)) else {
         print_usage();
         return ExitCode::from(2);
@@ -296,6 +302,7 @@ fn print_usage() {
         "usage: store-maintenance page-usage|control-head|reconcile-active|private-mode <state-root> [--dry-run]\n\
                  store-maintenance wal-manifest <state-root> [--write]\n\
                  store-maintenance media-sweep <state-root> [--write]\n\
+                 store-maintenance repair-session-root <state-root> --harness H --session S [--write]\n\
                  store-maintenance wal-fold <state-root> [--write] [--resume fold-<unix-ms>.journal] [--abandon|--unfold]"
     );
 }
@@ -459,17 +466,8 @@ fn open_maintenance_store(
     read_only: bool,
     liveness: WriterLiveness,
 ) -> Result<SqliteStore, ExitCode> {
-    if !read_only && liveness.state != "no" {
-        // This wording is the shared liveness contract (scripts/lib/liveness.py prints the same
-        // line for the Python tools, and both suites match its prefix), so the state root goes
-        // after the reason rather than inside the fixed phrase.
-        eprintln!(
-            "store-maintenance: liveness {}; refusing offline mutation: {} (state root {}). Stop the daemon first.",
-            liveness.state,
-            liveness.reason,
-            state_root.display()
-        );
-        return Err(ExitCode::from(3));
+    if !read_only {
+        require_stopped_writer(state_root, &liveness)?;
     }
     let database = state_root.join("run-index.db");
     let result = if read_only {
@@ -484,6 +482,115 @@ fn open_maintenance_store(
         );
         ExitCode::from(2)
     })
+}
+
+fn require_stopped_writer(
+    state_root: &std::path::Path,
+    liveness: &WriterLiveness,
+) -> Result<(), ExitCode> {
+    if liveness.state != "no" {
+        // This wording is the shared liveness contract (scripts/lib/liveness.py prints the same
+        // line for the Python tools), so the state root goes
+        // after the reason rather than inside the fixed phrase.
+        eprintln!(
+            "store-maintenance: liveness {}; refusing offline mutation: {} (state root {}). Stop the daemon first.",
+            liveness.state,
+            liveness.reason,
+            state_root.display()
+        );
+        return Err(ExitCode::from(3));
+    }
+    Ok(())
+}
+
+fn repair_session_root(args: &[String]) -> ExitCode {
+    const HELP: &str = "usage: store-maintenance repair-session-root <state-root> --harness H --session S [--write]\n\
+        Preview by default: prints every run row, v1 ref and v2 alias to change as JSON.\n\
+        --write requires broca AND its supervisor STOPPED for the entire operation.\n\
+        Live or unknown writer liveness refuses before SQLite opens; both session leases\n\
+        also exclude standalone writers. No log bytes are changed. Only a two-root pair\n\
+        with one log (live or archived), no deletion or move fences, and terminal stale\n\
+        run rows proven in that log can be repaired. Keep a backup of the stopped store.";
+    if args.is_empty() || args == ["--help"] {
+        eprintln!("{HELP}");
+        return if args.is_empty() {
+            ExitCode::from(2)
+        } else {
+            ExitCode::SUCCESS
+        };
+    }
+    let state_root = PathBuf::from(&args[0]);
+    let mut harness = None;
+    let mut session = None;
+    let mut write = false;
+    let mut options = args[1..].iter();
+    while let Some(option) = options.next() {
+        match option.as_str() {
+            "--harness" if harness.is_none() => harness = options.next().map(String::as_str),
+            "--session" if session.is_none() => session = options.next().map(String::as_str),
+            "--write" if !write => write = true,
+            _ => {
+                eprintln!("{HELP}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let (Some(harness), Some(session)) = (harness, session) else {
+        eprintln!("{HELP}");
+        return ExitCode::from(2);
+    };
+    if let Some(refusal) = state_root_refusal(
+        "repair-session-root",
+        &state_root,
+        state_root.join("run-index.db").is_file(),
+        true,
+    ) {
+        eprintln!("{refusal}");
+        return ExitCode::from(2);
+    }
+    let liveness = if write {
+        writer_liveness(&state_root)
+    } else {
+        WriterLiveness::stopped()
+    };
+    if write {
+        if let Err(code) = require_stopped_writer(&state_root, &liveness) {
+            return code;
+        }
+    }
+    let result = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let store = SqliteStore::open_read_only(state_root.join("run-index.db"))?;
+        let plan = store.preview_session_root_repair(harness, session)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mode": if write { "write" } else { "preview" }, "plan": plan,
+            }))?
+        );
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        drop(store);
+        if write && plan.stale_identity.is_some() {
+            let store = SqliteStore::open_existing_for_session_root_repair(
+                &state_root.join("run-index.db"),
+            )?;
+            store.apply_session_root_repair(&plan)?;
+            println!(
+                "applied {} run rows, {} v1 refs, {} v2 aliases; log unchanged",
+                plan.repoint_runs.len(),
+                plan.remove_v1_refs.len(),
+                plan.remove_v2_aliases.len()
+            );
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("store-maintenance: repair-session-root harness={harness:?} session={session:?} refused: {error}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 /// Report manifest coverage and per-session project-id observations by default; replace
