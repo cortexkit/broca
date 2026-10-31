@@ -59,7 +59,7 @@ pub(super) use processes::{process_is_in_job, process_snapshot, process_wait_for
 /// that is opening the copy already in place.
 #[cfg(any(test, feature = "test-support"))]
 pub(super) fn move_file_without_replacing(from: &Path, to: &Path) -> io::Result<()> {
-    let (from, to) = (wide(from)?, wide(to)?);
+    let (from, to) = (extended_path(from)?, extended_path(to)?);
     // SAFETY: both arguments are NUL-terminated UTF-16 paths that outlive the call.
     if unsafe {
         windows_sys::Win32::Storage::FileSystem::MoveFileExW(from.as_ptr(), to.as_ptr(), 0)
@@ -212,13 +212,30 @@ impl Drop for Descriptor {
         }
     }
 }
-fn wide(path: &Path) -> io::Result<Vec<u16>> {
+fn extended_path(path: &Path) -> io::Result<Vec<u16>> {
     let mut name: Vec<u16> = path.as_os_str().encode_wide().collect();
     if name.contains(&0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "path contains NUL",
         ));
+    }
+    // Normalize drive and UNC paths; leave verbatim (\\?\) and device (\\.\) prefixes alone.
+    if !name.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16])
+        && !name.starts_with(&[b'\\' as u16, b'\\' as u16, b'.' as u16, b'\\' as u16])
+    {
+        // The extended namespace bypasses Win32's slash and dot-component processing.
+        // Resolve those lexically before adding the prefix, without following links or
+        // requiring the object to exist as filesystem canonicalization would.
+        name = std::path::absolute(path)?
+            .as_os_str()
+            .encode_wide()
+            .collect();
+        if name.starts_with(&[b'\\' as u16, b'\\' as u16]) {
+            name.splice(..2, r"\\?\UNC\".encode_utf16());
+        } else {
+            name.splice(..0, r"\\?\".encode_utf16());
+        }
     }
     name.push(0);
     Ok(name)
@@ -386,7 +403,7 @@ impl Security {
     }
 }
 fn open_inspection(path: &Path, repair: bool) -> io::Result<Handle> {
-    let name = wide(path)?;
+    let name = extended_path(path)?;
     // SAFETY: name is terminated; OPEN_REPARSE_POINT opens a final junction/link itself.
     let handle = unsafe {
         CreateFileW(
@@ -536,7 +553,7 @@ pub(super) fn validate_inheritable_directory(path: &Path) -> io::Result<()> {
 }
 
 pub(super) fn open_file(path: &Path, options: &OpenOptions) -> io::Result<File> {
-    let name = wide(path)?;
+    let name = extended_path(path)?;
     let user = User::current()?;
     let mut security = Security::new(user.sid(), false)?;
     let sa = security.attributes();
@@ -618,7 +635,7 @@ pub(super) fn create_directory(path: &Path, recursive: bool) -> io::Result<()> {
             create_directory(parent, true)?;
         }
     }
-    let name = wide(path)?;
+    let name = extended_path(path)?;
     let user = User::current()?;
     let mut security = Security::new(user.sid(), true)?;
     let sa = security.attributes();
@@ -656,4 +673,66 @@ pub(super) fn repair(path: &Path) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     validate_handle(handle.0)
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    fn assert_path(input: &str, expected: &str) {
+        assert_eq!(
+            extended_path(Path::new(input)).unwrap(),
+            expected.encode_utf16().chain(Some(0)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn drive_and_unc_paths_are_normalized_before_prefixing() {
+        assert_path(r"C:/one/./two/../file", r"\\?\C:\one\file");
+        assert_path(
+            r"\\server\share\one\.\two\..\file",
+            r"\\?\UNC\server\share\one\file",
+        );
+        assert_path("//server/share/one/../file", r"\\?\UNC\server\share\file");
+    }
+
+    #[test]
+    fn relative_paths_are_absolute_and_normalized() {
+        let expected = std::fs::canonicalize(".").unwrap().join("private.txt");
+        assert_eq!(
+            extended_path(Path::new("missing/.././private.txt")).unwrap(),
+            expected
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn already_extended_paths_are_unchanged() {
+        for path in [
+            r"\\?\C:\one\.\two\..\file",
+            r"\\?\UNC\server\share\one\file",
+            r"\\.\C:\one\.\two\..\file",
+        ] {
+            assert_path(path, path);
+        }
+    }
+
+    #[test]
+    fn device_namespace_is_not_rewritten_as_unc() {
+        assert_path(r"\\.\C:\dir\file", r"\\.\C:\dir\file");
+        assert_path(r"\\server\share\dir\file", r"\\?\UNC\server\share\dir\file");
+    }
+
+    #[test]
+    fn embedded_nul_is_rejected() {
+        for path in ["bad\0path", "\\\\?\\C:\\bad\0path"] {
+            assert_eq!(
+                extended_path(Path::new(path)).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
 }
