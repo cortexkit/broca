@@ -1,5 +1,5 @@
 //! The module-level `step-transform-provider/v1` route, shared by hooks and declarations.
-//! No scope selector or tool-call envelope belongs on this role's surface.
+//! Routes carry the session's frozen scope; operations have no tool-call envelope.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,7 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use broca_core::{HookPlane, HookUnavailable, STEP_TRANSFORM_HOOK_CAP};
 use broca_fetch_plan::FetchError;
-use broca_protocol::BindIdentity;
+use broca_protocol::{BindIdentity, SessionScope};
 use cortexkit_role_step_transform_provider::{
     answer::HookAnswer, describe::check_describe, hook::HookCall, ops,
     subscription::DeclareRequest, OpRequest,
@@ -17,7 +17,7 @@ use tokio::time::Instant;
 
 use crate::{connection::SubcConnection, role_route::RoleRoute};
 
-/// Lazily opens one route per caller session and provider. Calls sharing a route serialize;
+/// Lazily opens one route per caller session, provider and frozen scope. Calls sharing a route serialize;
 /// waiting for that route, discovery, route-open retries and the RPC all consume the caller's
 /// deadline. Different sessions and providers have independent route slots.
 pub struct SubcHookPlane {
@@ -47,6 +47,7 @@ impl SubcHookPlane {
         &self,
         provider: &str,
         bind: &BindIdentity,
+        scope: Option<&SessionScope>,
         request: &DeclareRequest,
         deadline: Instant,
     ) -> Result<Value, FetchError> {
@@ -54,6 +55,7 @@ impl SubcHookPlane {
             .call(
                 provider,
                 bind,
+                scope,
                 &OpRequest::new(ops::TRANSFORM_DECLARE, request),
                 deadline,
                 false,
@@ -67,6 +69,7 @@ impl SubcHookPlane {
         &self,
         provider: &str,
         bind: &BindIdentity,
+        scope: Option<&SessionScope>,
         call: HookCall,
         deadline: Instant,
     ) -> Result<HookAnswer, HookUnavailable> {
@@ -81,6 +84,7 @@ impl SubcHookPlane {
             .call(
                 provider,
                 bind,
+                scope,
                 &OpRequest::new(ops::TRANSFORM_HOOK, &call),
                 deadline,
                 true,
@@ -101,6 +105,7 @@ impl HookPlane for SubcHookPlane {
         &self,
         provider: &str,
         bind: &BindIdentity,
+        scope: Option<&SessionScope>,
         call: HookCall,
     ) -> Result<HookAnswer, HookUnavailable> {
         // HookPlane has no budget parameter. Core bounds this future by the subscription's
@@ -108,6 +113,7 @@ impl HookPlane for SubcHookPlane {
         self.hook_with_deadline(
             provider,
             bind,
+            scope,
             call,
             Instant::now() + Duration::from_millis(STEP_TRANSFORM_HOOK_CAP),
         )

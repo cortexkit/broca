@@ -38,6 +38,9 @@ const SCOPE_EPOCH: u64 = 7;
 /// out with corr `SCOPE_SYNC_CORR_BASE + n`, and its reply is recorded under that corr.
 const SCOPE_SYNC_CORR_BASE: u64 = 1_000_000;
 
+#[path = "scope_real_daemon_e2e/compaction_routes.rs"]
+mod compaction_routes;
+
 #[derive(Default)]
 struct AcceptanceCatalog {
     fetched: std::sync::atomic::AtomicBool,

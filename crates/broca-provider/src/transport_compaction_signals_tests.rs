@@ -42,10 +42,10 @@ struct SignalsPlane {
 }
 #[async_trait::async_trait]
 impl CompactionPlane for SignalsPlane {
-    async fn setup(&self, _: &str, _: &BindIdentity, request: SetupRequest) -> Result<SetupAnswer, CompactionUnavailable> {
+    async fn setup(&self, _: &str, _: &BindIdentity, _scope: Option<&broca_protocol::SessionScope>, request: SetupRequest) -> Result<SetupAnswer, CompactionUnavailable> {
         Ok(serde_json::from_value(serde_json::json!({"request_id":request.request_id,"answer":"ready","initial":{"compaction_id":"synthetic-context","version":1,"range":{"from":0,"to":0},"replacement":[]}})).unwrap())
     }
-    async fn ride(&self, _: &str, _: &BindIdentity, request: RideRequest) -> Result<RideAnswer, CompactionUnavailable> {
+    async fn ride(&self, _: &str, _: &BindIdentity, _scope: Option<&broca_protocol::SessionScope>, request: RideRequest) -> Result<RideAnswer, CompactionUnavailable> {
         self.order.lock().unwrap().push("ride");
         self.rides.lock().unwrap().push(request);
         Ok(RideAnswer::nothing())

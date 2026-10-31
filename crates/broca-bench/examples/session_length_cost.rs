@@ -923,16 +923,18 @@ impl CompactionViews for Views {
 }
 
 impl CompactionPlane for Views {
-    fn setup<'life0, 'life1, 'life2, 'async_trait>(
+    fn setup<'life0, 'life1, 'life2, 'life3, 'async_trait>(
         &'life0 self,
         _provider: &'life1 str,
         _bind: &'life2 BindIdentity,
+        _scope: Option<&'life3 broca_protocol::SessionScope>,
         request: SetupRequest,
     ) -> Boxed<'async_trait, Result<SetupAnswer, CompactionUnavailable>>
     where
         'life0: 'async_trait,
         'life1: 'async_trait,
         'life2: 'async_trait,
+        'life3: 'async_trait,
         Self: 'async_trait,
     {
         // The head Setup inserts before the transcript; the first view replaces it.
@@ -942,16 +944,18 @@ impl CompactionPlane for Views {
         Box::pin(async move { serde_json::from_value(answer).map_err(|_| CompactionUnavailable) })
     }
 
-    fn view_get<'life0, 'life1, 'life2, 'async_trait>(
+    fn view_get<'life0, 'life1, 'life2, 'life3, 'async_trait>(
         &'life0 self,
         _provider: &'life1 str,
         _bind: &'life2 BindIdentity,
+        _scope: Option<&'life3 broca_protocol::SessionScope>,
         request: ViewGetRequest,
     ) -> Boxed<'async_trait, Result<ViewGetAnswer, CompactionUnavailable>>
     where
         'life0: 'async_trait,
         'life1: 'async_trait,
         'life2: 'async_trait,
+        'life3: 'async_trait,
         Self: 'async_trait,
     {
         self.fetches.fetch_add(1, Ordering::SeqCst);

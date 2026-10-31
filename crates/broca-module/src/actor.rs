@@ -4339,7 +4339,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         Err(outcome) => return outcome,
                     };
                     let prepared = match self
-                        .prepare_input(input, broca_protocol::Delivery::Steer, manifest)
+                        .prepare_input(input, broca_protocol::Delivery::Steer, manifest, None)
                         .await
                     {
                         Ok(prepared) => prepared,
@@ -4479,7 +4479,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             Err(outcome) => return outcome,
         };
         let prepared = match self
-            .prepare_input(input, broca_protocol::Delivery::Steer, manifest)
+            .prepare_input(input, broca_protocol::Delivery::Steer, manifest, None)
             .await
         {
             Ok(prepared) => prepared,
@@ -5033,6 +5033,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     resolved_request.input.clone(),
                     input_delivery,
                     manifest.clone(),
+                    episode_scope.as_ref(),
                 )
                 .await
                 .map_err(|outcome| {
@@ -5627,7 +5628,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     Err(outcome) => return outcome,
                 };
                 match self
-                    .prepare_input(request.input.clone(), hook_delivery, manifest)
+                    .prepare_input(request.input.clone(), hook_delivery, manifest, None)
                     .await
                 {
                     Ok(prepared) => prepared,
@@ -6086,6 +6087,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 request.input.clone(),
                 broca_protocol::Delivery::Queue,
                 manifest,
+                None,
             )
             .await
         {

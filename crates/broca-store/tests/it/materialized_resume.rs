@@ -2283,6 +2283,7 @@ impl broca_core::compaction::CompactionPlane for HeldViews {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: SetupRequest,
     ) -> Result<SetupAnswer, broca_core::compaction::CompactionUnavailable> {
         if let Some(lineage) = &request.lineage_id {
@@ -2301,6 +2302,7 @@ impl broca_core::compaction::CompactionPlane for HeldViews {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: ViewGetRequest,
     ) -> Result<ViewGetAnswer, broca_core::compaction::CompactionUnavailable> {
         Ok(ViewGetAnswer::view(

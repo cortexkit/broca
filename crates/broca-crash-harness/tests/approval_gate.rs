@@ -131,6 +131,7 @@ impl HookPlane for Hook {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         call: HookCall,
     ) -> Result<HookAnswer, HookUnavailable> {
         if serde_json::to_value(&call.subject).unwrap()["phase"] == "approve" {

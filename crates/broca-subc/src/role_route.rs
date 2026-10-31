@@ -1,20 +1,33 @@
-//! Shared module-level role RPCs: unscoped routes, discovery, caching and deadline cleanup.
+//! Shared module-level role RPCs: frozen session scopes, discovery, caching and deadline cleanup.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use broca_fetch_plan::FetchError;
-use broca_protocol::BindIdentity;
+use broca_protocol::{BindIdentity, SessionScope};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
+use subc_protocol::scope::ScopeSelector;
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard};
 use tokio::time::{timeout_at, Instant};
 
 use crate::connection::{ConnError, RouteHandle, RouteOpenRetry, SubcConnection};
 
-type RouteKey = (BindIdentity, String);
+// The serialized selector includes its owner, ref and frozen epoch. Keeping it in the key
+// prevents a route opened for one scope from serving another, even for the same bind identity.
+type RouteKey = (BindIdentity, String, Option<String>);
 type RouteSlot = Arc<AsyncMutex<Option<RouteHandle>>>;
+
+fn route_key(bind: &BindIdentity, provider: &str, selector: Option<&ScopeSelector>) -> RouteKey {
+    (
+        bind.clone(),
+        provider.to_owned(),
+        selector.map(|selector| {
+            serde_json::to_string(selector).expect("scope selector is serializable")
+        }),
+    )
+}
 
 pub(crate) struct RoleRoute {
     conn: Arc<SubcConnection>,
@@ -45,7 +58,7 @@ impl RoleRoute {
             let mut routes = self.routes.lock().unwrap();
             let keys: Vec<_> = routes
                 .keys()
-                .filter(|(key, _)| key == bind)
+                .filter(|(key, _, _)| key == bind)
                 .cloned()
                 .collect();
             keys.into_iter()
@@ -63,20 +76,22 @@ impl RoleRoute {
         &self,
         provider: &str,
         bind: &BindIdentity,
+        scope: Option<&SessionScope>,
         request: &P,
         deadline: Instant,
         retry_transient: bool,
     ) -> Result<A, FetchError> {
         let body =
             serde_json::to_vec(request).map_err(|error| FetchError::Lost(error.to_string()))?;
-        let slot = self
-            .routes
-            .lock()
-            .unwrap()
-            .entry((bind.clone(), provider.to_owned()))
-            .or_insert_with(|| Arc::new(AsyncMutex::new(None)))
-            .clone();
         timeout_at(deadline, async {
+            let selector = self.selector(scope).await?;
+            let slot = self
+                .routes
+                .lock()
+                .unwrap()
+                .entry(route_key(bind, provider, selector.as_ref()))
+                .or_insert_with(|| Arc::new(AsyncMutex::new(None)))
+                .clone();
             let mut guard = slot.lock().await;
             let mut retried = false;
             loop {
@@ -84,7 +99,14 @@ impl RoleRoute {
                     return Err(expired());
                 }
                 let result = self
-                    .attempt(provider, bind, &body, deadline, &mut guard)
+                    .attempt(
+                        provider,
+                        bind,
+                        selector.clone(),
+                        &body,
+                        deadline,
+                        &mut guard,
+                    )
                     .await;
                 if retry_transient
                     && !retried
@@ -110,6 +132,7 @@ impl RoleRoute {
         &self,
         provider: &str,
         bind: &BindIdentity,
+        selector: Option<ScopeSelector>,
         body: &[u8],
         deadline: Instant,
         guard: &mut MutexGuard<'_, Option<RouteHandle>>,
@@ -127,7 +150,9 @@ impl RoleRoute {
             lease.route = None;
         }
         if lease.route.is_none() {
-            let (opened, describe) = self.open_and_describe(provider, bind, deadline).await?;
+            let (opened, describe) = self
+                .open_and_describe(provider, bind, selector, deadline)
+                .await?;
             lease = opened;
             let describe = describe.map_err(refused)?;
             (self.check_describe)(&describe).map_err(|problems| FetchError::Refused {
@@ -152,10 +177,14 @@ impl RoleRoute {
         &self,
         provider: &str,
         bind: &BindIdentity,
+        scope: Option<&SessionScope>,
         deadline: Instant,
     ) -> Result<Result<Value, subc_protocol::ErrorBody>, FetchError> {
         timeout_at(deadline, async {
-            let (mut lease, describe) = self.open_and_describe(provider, bind, deadline).await?;
+            let selector = self.selector(scope).await?;
+            let (mut lease, describe) = self
+                .open_and_describe(provider, bind, selector, deadline)
+                .await?;
             if let Some(route) = lease.route.take() {
                 let _ = self.conn.route_close(&route).await;
             }
@@ -172,8 +201,10 @@ impl RoleRoute {
         &self,
         provider: &str,
         bind: &BindIdentity,
+        selector: Option<ScopeSelector>,
         deadline: Instant,
     ) -> Result<(RouteLease, Result<Value, subc_protocol::ErrorBody>), FetchError> {
+        let scoped = selector.is_some();
         let route = self
             .conn
             .route_open_role_within(
@@ -181,13 +212,19 @@ impl RoleRoute {
                 bind,
                 self.role,
                 self.version,
+                selector,
                 RouteOpenRetry {
                     budget: deadline.saturating_duration_since(Instant::now()),
                     max_interval: Duration::from_secs(1),
                 },
             )
             .await
-            .map_err(open_error)?;
+            .map_err(|error| {
+                if scoped {
+                    crate::role_route_diagnostics::observe(provider, self.role, bind, &error);
+                }
+                open_error(error)
+            })?;
         let lease = RouteLease {
             conn: self.conn.clone(),
             route: Some(route),
@@ -205,6 +242,37 @@ impl RoleRoute {
             Err(refusal) => Err(refusal),
         };
         Ok((lease, describe))
+    }
+
+    async fn selector(
+        &self,
+        scope: Option<&SessionScope>,
+    ) -> Result<Option<ScopeSelector>, FetchError> {
+        let Some(scope) = scope else {
+            return Ok(None);
+        };
+        let capabilities = self
+            .conn
+            .server_capabilities()
+            .await
+            .map_err(|error| FetchError::Lost(error.to_string()))?;
+        if !capabilities
+            .iter()
+            .any(|capability| capability == subc_protocol::scope::CAP_SCOPES_V1)
+        {
+            return Err(FetchError::Refused {
+                code: "scope_unsupported".into(),
+                detail: None,
+                retryable: false,
+            });
+        }
+        crate::subc_plane::frozen_scope_selector(scope)
+            .map(Some)
+            .map_err(|detail| FetchError::Refused {
+                code: "scope_unverifiable".into(),
+                detail: Some(Value::String(detail)),
+                retryable: false,
+            })
     }
 
     async fn request<A: DeserializeOwned>(
@@ -295,6 +363,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cache_key_includes_scope_owner_ref_and_frozen_epoch() {
+        let bind = BindIdentity::new("/project", "broca", "session");
+        let selector = |owner: &str, reference: &str, epoch| {
+            ScopeSelector::new(
+                subc_protocol::Principal::Reserved {
+                    module_id: owner.into(),
+                },
+                reference,
+                epoch,
+            )
+        };
+        let original = route_key(
+            &bind,
+            "provider",
+            Some(&selector("owner", "scope", Some(1))),
+        );
+        assert_eq!(
+            original,
+            route_key(
+                &bind,
+                "provider",
+                Some(&selector("owner", "scope", Some(1)))
+            )
+        );
+        for other in [
+            None,
+            Some(selector("other", "scope", Some(1))),
+            Some(selector("owner", "other", Some(1))),
+            Some(selector("owner", "scope", Some(2))),
+            Some(selector("owner", "scope", None)),
+        ] {
+            assert_ne!(original, route_key(&bind, "provider", other.as_ref()));
+        }
+    }
+
+    #[test]
     fn admission_opens_use_the_protocol_retry_allowlist() {
         for (code, retryable) in [
             ("module_warming", true),
@@ -304,6 +408,7 @@ mod tests {
             ("unknown_module", false),
             ("module_rejected", false),
             ("permission_denied", false),
+            ("scope_not_carrier", false),
             ("future_code", false),
         ] {
             let body = subc_protocol::ErrorBody::new(code, "module_warming — diagnostic only");

@@ -260,7 +260,13 @@ impl Fetcher for SubcPlanFetcher {
 
     async fn declare(&self, provider: &str, request: &DeclareRequest) -> Result<Value, FetchError> {
         self.hooks
-            .declare(provider, &self.identity, request, self.deadline)
+            .declare(
+                provider,
+                &self.identity,
+                self.scope.as_ref(),
+                request,
+                self.deadline,
+            )
             .await
     }
 
@@ -269,7 +275,7 @@ impl Fetcher for SubcPlanFetcher {
         provider: &str,
     ) -> Result<broca_fetch_plan::DescribeAnswer, FetchError> {
         self.compaction
-            .describe(provider, &self.identity, self.deadline)
+            .describe(provider, &self.identity, self.scope.as_ref(), self.deadline)
             .await
     }
 }
