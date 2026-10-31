@@ -58,14 +58,38 @@ impl WireFamily for Gemini {
         build_request_body(frozen, opts)
     }
 
+    fn shape_with_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Value {
+        build_request_body_with_media_and_provenance(frozen, opts, None, provenance)
+    }
+
     fn shape_with_media(
         &self,
         frozen: &FrozenRenderConfig,
         opts: &CallOptions,
         payloads: &[InlineMedia<'_>],
     ) -> Value {
+        self.shape_with_media_and_provenance(frozen, opts, payloads, None)
+    }
+
+    fn shape_with_media_and_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        payloads: &[InlineMedia<'_>],
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Value {
         let media = MediaRender { frozen, payloads };
-        build_request_body_with_media(frozen, opts, frozen.media.as_ref().map(|_| &media))
+        build_request_body_with_media_and_provenance(
+            frozen,
+            opts,
+            frozen.media.as_ref().map(|_| &media),
+            provenance,
+        )
     }
 
     fn endpoint(
@@ -128,6 +152,15 @@ pub(crate) fn build_request_body_with_media(
     opts: &CallOptions,
     media: Option<&MediaRender<'_>>,
 ) -> Value {
+    build_request_body_with_media_and_provenance(frozen, opts, media, None)
+}
+
+pub(crate) fn build_request_body_with_media_and_provenance(
+    frozen: &FrozenRenderConfig,
+    opts: &CallOptions,
+    media: Option<&MediaRender<'_>>,
+    provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+) -> Value {
     // A run with structured output adds its submit tool or schema instructions here; a run
     // without renders from `opts` unchanged.
     let prepared = crate::structured_output::prepare(frozen, opts);
@@ -135,12 +168,13 @@ pub(crate) fn build_request_body_with_media(
     let view = crate::families::compaction_view(frozen.family_id, opts);
     let opts = view.as_ref();
     let name_map = crate::tool_name_alias::ToolNameMap::build(&opts.tools, &opts.prompt);
-    let contents = convert_contents(
+    let contents = convert_contents_with_provenance(
         &opts.prompt,
         frozen,
         opts.target_model.as_ref(),
         &name_map,
         media,
+        provenance,
     );
 
     let mut body = json!({ "contents": contents });
@@ -244,12 +278,24 @@ fn system_instruction_parts(prompt: &[Message]) -> Vec<Value> {
     out
 }
 
+#[cfg(test)]
 fn convert_contents(
     prompt: &[Message],
     frozen: &FrozenRenderConfig,
     target_model: Option<&ModelHandle>,
     name_map: &crate::tool_name_alias::ToolNameMap,
     media: Option<&MediaRender<'_>>,
+) -> Vec<Value> {
+    convert_contents_with_provenance(prompt, frozen, target_model, name_map, media, None)
+}
+
+fn convert_contents_with_provenance(
+    prompt: &[Message],
+    frozen: &FrozenRenderConfig,
+    target_model: Option<&ModelHandle>,
+    name_map: &crate::tool_name_alias::ToolNameMap,
+    media: Option<&MediaRender<'_>>,
+    mut provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
 ) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     let non_system: Vec<&Message> = prompt.iter().filter(|m| m.role != Role::System).collect();
@@ -264,6 +310,9 @@ fn convert_contents(
                 current_tool_call_names.clear();
                 // Gemini rejects turns left empty after unsupported blocks are stripped.
                 if !parts.is_empty() {
+                    if let Some(sink) = provenance.as_deref_mut() {
+                        sink.record_message(out.len(), m.ordinal);
+                    }
                     out.push(json!({
                         "role": "user",
                         "parts": parts,
@@ -292,6 +341,9 @@ fn convert_contents(
                 );
                 // A foreign model's signed reasoning can be the turn's only block.
                 if !parts.is_empty() {
+                    if let Some(sink) = provenance.as_deref_mut() {
+                        sink.record_message(out.len(), m.ordinal);
+                    }
                     out.push(json!({
                         "role": "model",
                         "parts": parts,
@@ -302,11 +354,15 @@ fn convert_contents(
             Role::Tool => {
                 let mut parts: Vec<Value> = Vec::new();
                 while i < non_system.len() && non_system[i].role == Role::Tool {
+                    let start = provenance.as_ref().map(|_| parts.len());
                     parts.extend(convert_tool_result_parts(
                         non_system[i],
                         &current_tool_call_names,
                         media,
                     ));
+                    if let Some((sink, start)) = provenance.as_deref_mut().zip(start) {
+                        sink.record_parts(out.len(), start, parts.len(), non_system[i].ordinal);
+                    }
                     i += 1;
                 }
                 current_tool_call_names.clear();

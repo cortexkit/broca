@@ -5,7 +5,9 @@ use std::{collections::BTreeMap, path::Path};
 use broca_core::{Clock, FileWalStore};
 use broca_protocol::{BindIdentity, Usage};
 use broca_provider::{
-    cache_evidence::{compare_rendered_requests, TtlKind, View},
+    cache_evidence::{
+        compare_rendered_requests_with_provenance, CacheEvidence, Region, TtlKind, View,
+    },
     spec::WireFamilyId,
     wire::{CacheClass, CacheTtl, FrozenRenderConfig},
 };
@@ -27,7 +29,11 @@ pub fn read(root: &Path, bind: &BindIdentity) -> Result<Vec<Value>, String> {
 
 struct Previous {
     locator: Option<String>,
-    rendered: Option<(FrozenRenderConfig, Vec<u8>)>,
+    rendered: Option<(
+        FrozenRenderConfig,
+        Vec<u8>,
+        broca_protocol::render_provenance::RenderProvenance,
+    )>,
     sent: Option<u64>,
     model: String,
     account: Option<String>,
@@ -98,6 +104,41 @@ fn ttl(frozen: &FrozenRenderConfig) -> (Option<u64>, TtlKind) {
     }
 }
 
+fn enrich_recorded(
+    recorded: &mut CacheEvidence,
+    offline: Option<&CacheEvidence>,
+    same_predecessor: bool,
+) -> (bool, bool) {
+    let Some(divergence) = recorded
+        .first_divergence
+        .as_mut()
+        .filter(|_| same_predecessor)
+    else {
+        return (false, false);
+    };
+    let Some(offline) = offline
+        .and_then(|e| e.first_divergence.as_ref())
+        .filter(|d| {
+            d.region == divergence.region
+                && d.message_index == divergence.message_index
+                && d.part_index == divergence.part_index
+        })
+    else {
+        return (false, false);
+    };
+    let mut field = false;
+    let mut ordinal = false;
+    if divergence.field.is_none() {
+        divergence.field.clone_from(&offline.field);
+        field = divergence.field.is_some();
+    }
+    if divergence.region == Region::Messages && divergence.message_ordinal.is_none() {
+        divergence.message_ordinal = offline.message_ordinal;
+        ordinal = divergence.message_ordinal.is_some();
+    }
+    (field, ordinal)
+}
+
 pub fn rows(frames: &[FramedRecord], lineage: Option<&str>) -> Result<Vec<Value>, String> {
     let records: Vec<_> = frames.iter().map(|f| f.record.clone()).collect();
     let mut rows = Vec::new();
@@ -164,6 +205,7 @@ pub fn rows(frames: &[FramedRecord], lineage: Option<&str>) -> Result<Vec<Value>
                 sent_at_ms,
                 served_account_ref,
                 websocket_request,
+                cache_evidence: recorded_evidence,
                 ..
             } => {
                 let locator = lineage.map(|id| format!("{id}:{}", frame.seq));
@@ -201,33 +243,58 @@ pub fn rows(frames: &[FramedRecord], lineage: Option<&str>) -> Result<Vec<Value>
                         .zip(config)
                         .zip(run)
                         .and_then(|((boundary, config), run)| {
-                            crate::wal_render::render_step_with_output_cap(
+                            let mut provenance =
+                                broca_protocol::render_provenance::RenderProvenance::default();
+                            crate::wal_render::render_step_with_provenance(
                                 &records[..=boundary],
                                 config,
                                 &run.0,
                                 step_id.0,
                                 cap,
+                                Some(&mut provenance),
                             )
                             .ok()
+                            .map(|(frozen, _, body)| (frozen, body, provenance))
                         });
                 let reason = match &rebuilt {
                     None => Some("render_unavailable"),
-                    Some((_, _, body))
+                    Some((_, body, _))
                         if format!("{:x}", Sha256::digest(body)) != *request_body_sha256 =>
                     {
                         Some("digest_mismatch")
                     }
                     _ => None,
                 };
-                let rendered = rebuilt
-                    .filter(|_| reason.is_none())
-                    .map(|(frozen, _, body)| (frozen, body));
+                let rendered = rebuilt.filter(|_| reason.is_none());
+                let recorded = recorded_evidence
+                    .as_ref()
+                    .map(|recorded| {
+                        serde_json::from_value::<CacheEvidence>((**recorded).clone()).map_err(|e| {
+                            format!(
+                                "invalid recorded cache evidence at WAL sequence {}: {e}",
+                                frame.seq
+                            )
+                        })
+                    })
+                    .transpose()?;
+                let needs_offline = recorded.as_ref().is_none_or(|e| {
+                    e.first_divergence.as_ref().is_some_and(|d| {
+                        d.field.is_none()
+                            || (d.region == Region::Messages && d.message_ordinal.is_none())
+                    })
+                });
                 let mut evidence = None;
                 let mut comparison_reason = reason;
-                if let Some(prev) = &previous {
-                    if let (Some((pf, pb)), Some((cf, cb))) = (&prev.rendered, &rendered) {
+                if let Some(prev) = previous.as_ref().filter(|_| needs_offline) {
+                    if let (Some((pf, pb, pp)), Some((cf, cb, cp))) = (&prev.rendered, &rendered) {
                         if pf.family_id == cf.family_id {
-                            let mut e = compare_rendered_requests(cf.family_id, pb, cb)?;
+                            let mut e = compare_rendered_requests_with_provenance(
+                                cf.family_id,
+                                pb,
+                                cb,
+                                Some(pp),
+                                Some(cp),
+                            )?;
                             e.compared_to = prev.locator.clone();
                             e.idle_gap_ms =
                                 prev.sent.zip(sent).map_or(0, |(a, b)| b.saturating_sub(a));
@@ -252,15 +319,31 @@ pub fn rows(frames: &[FramedRecord], lineage: Option<&str>) -> Result<Vec<Value>
                 } else if reason.is_none() {
                     comparison_reason = Some("first_attempt");
                 }
+                let mut field_resolved_offline = false;
+                let mut message_ordinal_resolved_offline = false;
+                let evidence_source = if let Some(mut recorded) = recorded {
+                    let same_predecessor = previous
+                        .as_ref()
+                        .is_some_and(|p| p.locator == recorded.compared_to);
+                    (field_resolved_offline, message_ordinal_resolved_offline) =
+                        enrich_recorded(&mut recorded, evidence.as_ref(), same_predecessor);
+                    evidence = Some(recorded);
+                    comparison_reason = None;
+                    "recorded"
+                } else {
+                    "offline"
+                };
                 let codex = websocket_request.as_ref().and_then(|w| w.codex.as_deref());
                 rows.push(json!({"kind":"cache_attempt", "wal_seq":frame.seq, "lineage_id":lineage,
                     "run_id":run, "step_id":step_id, "attempt":attempt, "attempt_id":attempt_id,
                     "sent_at_ms":sent, "model":model, "account_ref":account,
-                    "wire_family":rendered.as_ref().map(|(f,_)| f.family_id),
+                    "wire_family":rendered.as_ref().map(|(f,_,_)| f.family_id),
                     "verified":rendered.is_some(), "reason":comparison_reason,
                     "idle_gap_known":previous.as_ref().is_some_and(|p| p.sent.zip(sent).is_some()),
                     "account_comparison_known":previous.as_ref().is_some_and(|p| p.account.as_ref().zip(account.as_ref()).is_some()),
                     "cache_evidence":evidence, "usage":usage,
+                    "evidence_source":evidence_source, "field_resolved_offline":field_resolved_offline,
+                    "message_ordinal_resolved_offline":message_ordinal_resolved_offline,
                     "retention":retention(previous.as_ref().and_then(|p| p.usage), usage),
                     "continuation":codex.map(|c| c.continuation),
                     "full_input_reason":codex.and_then(|c| c.full_input_reason.as_deref())}));
@@ -350,6 +433,7 @@ mod tests {
         assert_eq!(e["ttl_kind"], "explicit");
         assert_eq!(e["account_changed"], true);
         assert_eq!(e["extends_previous"], true);
+        assert_eq!(rows[1]["evidence_source"], "offline");
         assert!(e["first_divergence"].is_null());
         let serialized = serde_json::to_string(&rows).unwrap();
         assert!(!serialized.contains("answer"));
@@ -433,6 +517,94 @@ mod tests {
             rows[3]["cache_evidence"]["compared_to"],
             format!("lineage:{}", rows[2]["wal_seq"].as_u64().unwrap())
         );
+        let mut recorded = rows[3]["cache_evidence"].clone();
+        assert_eq!(recorded["first_divergence"]["field"], "model");
+        recorded["first_divergence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("field");
+        recorded["idle_gap_ms"] = json!(777);
+        if let WalRecord::ModelAttemptFinished { cache_evidence, .. } =
+            &mut frames.last_mut().unwrap().record
+        {
+            *cache_evidence = Some(Box::new(recorded));
+        }
+        let enriched = super::rows(&frames, Some("lineage")).unwrap();
+        assert_eq!(enriched[3]["evidence_source"], "recorded");
+        assert_eq!(enriched[3]["cache_evidence"]["idle_gap_ms"], 777);
+        assert_eq!(
+            enriched[3]["cache_evidence"]["first_divergence"]["field"],
+            "model"
+        );
+        assert_eq!(enriched[3]["field_resolved_offline"], true);
+    }
+
+    #[test]
+    fn recorded_message_identity_is_enriched_only_from_the_same_verified_divergence() {
+        let mut recorded = CacheEvidence {
+            first_divergence: Some(
+                serde_json::from_value(
+                    json!({"region":"messages","message_index":0,"part_index":0}),
+                )
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let mut offline = recorded.clone();
+        offline.first_divergence.as_mut().unwrap().message_ordinal = Some(2);
+        offline.first_divergence.as_mut().unwrap().field = Some("text".into());
+        assert_eq!(
+            enrich_recorded(&mut recorded, Some(&offline), false),
+            (false, false)
+        );
+        assert_eq!(
+            recorded.first_divergence.as_ref().unwrap().message_ordinal,
+            None
+        );
+        assert_eq!(
+            enrich_recorded(&mut recorded, Some(&offline), true),
+            (true, true)
+        );
+        assert_eq!(
+            recorded.first_divergence.as_ref().unwrap().message_ordinal,
+            Some(2)
+        );
+        recorded.first_divergence.as_mut().unwrap().message_ordinal = Some(99);
+        assert_eq!(
+            enrich_recorded(&mut recorded, Some(&offline), true),
+            (false, false)
+        );
+        assert_eq!(
+            recorded.first_divergence.as_ref().unwrap().message_ordinal,
+            Some(99)
+        );
+    }
+
+    #[test]
+    fn recorded_evidence_and_open_full_input_reason_survive_unavailable_replay() {
+        let mut frames = fixture();
+        let mut evidence = CacheEvidence {
+            extends_previous: true,
+            compared_to: Some("recorded:42".into()),
+            idle_gap_ms: 123,
+            ..Default::default()
+        };
+        evidence.ttl_kind = TtlKind::Implicit;
+        let mut attempt = serde_json::to_value(&frames[3].record).unwrap();
+        attempt["request_body_sha256"] = json!("unreconstructible");
+        attempt["cache_evidence"] = serde_json::to_value(&evidence).unwrap();
+        attempt["websocket_request"] = json!({"len":1,"sha256":"digest","codex":{"continuation":false,"suffix_item_count":0,"connection_generation":2,"previous_response_id_present":false,"physical_send_count":1,"full_input_reason":"future_transport_cause"}});
+        frames[3].record = record(attempt);
+        let rows = rows(&frames, Some("lineage")).unwrap();
+        assert_eq!(rows[1]["evidence_source"], "recorded");
+        assert_eq!(
+            rows[1]["cache_evidence"],
+            serde_json::to_value(evidence).unwrap()
+        );
+        assert_eq!(rows[1]["full_input_reason"], "future_transport_cause");
+        assert_eq!(rows[1]["verified"], false);
+        assert!(rows[1]["reason"].is_null());
+        assert_eq!(rows[1]["field_resolved_offline"], false);
     }
 
     #[test]

@@ -277,7 +277,13 @@ impl Provider for ScriptedProvider {
     ) -> Result<Vec<u8>, Box<broca_protocol::ProviderError>> {
         if let Some(frozen) = self.0.media_frozen.lock().unwrap().as_ref() {
             if let Some(renderer) = self.2.read().unwrap().as_ref() {
-                return renderer(&serde_json::to_value(frozen).unwrap(), opts, false, false);
+                return renderer(
+                    &serde_json::to_value(frozen).unwrap(),
+                    opts,
+                    false,
+                    false,
+                    None,
+                );
             }
             return Ok(broca_provider::registry::wire_family(frozen.family_id)
                 .unwrap()
@@ -318,7 +324,7 @@ impl Provider for ScriptedProvider {
             *self.0.hold_model.lock().unwrap()
         ));
         let rendered = if let Some(renderer) = self.2.read().unwrap().as_ref() {
-            renderer(&self.render_config_blob(), opts, false, true).unwrap()
+            renderer(&self.render_config_blob(), opts, false, true, None).unwrap()
         } else if let Some(frozen) = self.0.media_frozen.lock().unwrap().as_ref() {
             broca_provider::registry::wire_family(frozen.family_id)
                 .unwrap()
@@ -612,9 +618,11 @@ impl RunExecutor for CoreExec {
                 }),
             )
             .unwrap();
-            provider.set_media_request_renderer(Arc::new(move |frozen, opts, tags, commit| {
-                media.render(frozen, opts, tags, commit)
-            }));
+            provider.set_media_request_renderer(Arc::new(
+                move |frozen, opts, tags, commit, provenance| {
+                    media.render_with_provenance(frozen, opts, tags, commit, provenance)
+                },
+            ));
         }
         let mut control = job.control;
         control.hook_plane = self.hook_plane();

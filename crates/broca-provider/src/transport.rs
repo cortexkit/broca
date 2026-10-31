@@ -80,6 +80,9 @@ mod refusal_fallback_tests;
 #[path = "transport_websocket.rs"]
 mod responses_websocket;
 
+#[path = "transport_cache_evidence.rs"]
+mod cache_runtime;
+
 pub use responses_websocket::Connections as ChatgptConnections;
 
 #[path = "transport_codex_retry.rs"]
@@ -109,6 +112,7 @@ pub struct ProviderHttpClient {
     journaled: Arc<JournaledHttpClients>,
     request_gzip: request_gzip::RequestGzipPolicy,
     chatgpt_connections: ChatgptConnections,
+    cache_sessions: cache_runtime::Sessions,
     #[cfg(feature = "test-harness")]
     warm_reply: Option<Bytes>,
     /// Tests only: when set, every send fails at once with a refused connection, without
@@ -158,6 +162,7 @@ impl ProviderHttpClient {
             }),
             request_gzip,
             chatgpt_connections: ChatgptConnections::default(),
+            cache_sessions: cache_runtime::Sessions::default(),
             #[cfg(feature = "test-harness")]
             warm_reply: None,
             #[cfg(test)]
@@ -258,6 +263,7 @@ impl From<reqwest::Client> for ProviderHttpClient {
             }),
             request_gzip: request_gzip::RequestGzipPolicy::isolated(false),
             chatgpt_connections: ChatgptConnections::default(),
+            cache_sessions: cache_runtime::Sessions::default(),
             #[cfg(feature = "test-harness")]
             warm_reply: None,
             #[cfg(test)]
@@ -301,6 +307,7 @@ pub struct LiveProvider<F: WireFamily + 'static> {
     pub(crate) refresher: Option<Arc<dyn CredentialRefresher>>,
     websocket: Arc<responses_websocket::Session>,
     websocket_lease: std::sync::Mutex<Option<responses_websocket::Lease>>,
+    cache_session: std::sync::Mutex<Option<Arc<cache_runtime::Session>>>,
     #[cfg(test)]
     escape_client_builds: std::sync::Arc<AtomicUsize>,
     #[cfg(any(test, feature = "test-harness"))]
@@ -310,6 +317,9 @@ pub struct LiveProvider<F: WireFamily + 'static> {
 /// Owns the rendered body behind a reference count so retry requests do not copy the prompt.
 #[derive(Clone)]
 struct PreparedHttpRequest {
+    cache_session: Option<(Arc<cache_runtime::Session>, Arc<FrozenRenderConfig>)>,
+    cache_model: Option<String>,
+    cache_provenance: Option<Arc<broca_protocol::render_provenance::RenderProvenance>>,
     attempt_hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
     /// Local diagnostic policy, never part of the rendered request or its digest.
     ephemeral_session: bool,
@@ -344,6 +354,9 @@ impl From<HttpRequest> for PreparedHttpRequest {
     fn from(request: HttpRequest) -> Self {
         Self {
             attempt_hook: None,
+            cache_session: None,
+            cache_model: None,
+            cache_provenance: None,
             ephemeral_session: false,
             codex_wire: false,
             auth_revision: 0,
@@ -367,6 +380,8 @@ impl From<HttpRequest> for PreparedHttpRequest {
 /// Immutable, whole-request input for one blocking render. All expensive input stays behind
 /// shared handles; the closure is the sole owner that releases its prompt snapshot.
 struct RenderJob<F: WireFamily + 'static> {
+    cache_session: Option<Arc<cache_runtime::Session>>,
+    cache_provider: Option<String>,
     subscription_auth: bool,
     media_renderer: Option<Arc<broca_core::provider::MediaRequestRenderer>>,
     media_render_tags: bool,
@@ -429,6 +444,8 @@ struct ChunkWarning {
 /// SSE adaptation, not compressed frames or control-frame payloads.
 #[derive(Clone, Default)]
 struct AttemptTrace {
+    cache_work: cache_runtime::Pending,
+    cache_evidence: Option<Box<Value>>,
     attempt_hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
     response_evidence: Option<crate::normalize::SharedResponseEvidence>,
     vendor_request_id: Option<String>,
@@ -603,6 +620,7 @@ impl AttemptTrace {
             sent_at_ms: self.sent_at_ms,
             transport: self.transport,
             websocket_request: self.websocket_request,
+            cache_evidence: self.cache_evidence,
             websocket_close_code: self.websocket_close_code.and_then(|code| {
                 let code = code.load(Ordering::Acquire);
                 (code != 0).then_some(code)
@@ -632,6 +650,7 @@ fn ratelimit_unified_headers(
 
 impl<F: WireFamily + 'static> RenderJob<F> {
     fn render(self) -> Result<RenderedRequest, Box<ProviderError>> {
+        let mut provenance = broca_protocol::render_provenance::RenderProvenance::default();
         // This scan is deliberately in the same blocking job as rendering: it walks the entire
         // prompt to preserve aliases from historical tool calls on every resumed step.
         let name_map = Arc::new(crate::tool_name_alias::ToolNameMap::build(
@@ -644,13 +663,19 @@ impl<F: WireFamily + 'static> RenderJob<F> {
                 &self.opts,
                 self.media_render_tags,
                 true,
+                Some(&mut provenance),
             )?
         } else {
-            self.family.render(&self.frozen, &self.opts)
+            self.family
+                .render_with_provenance(&self.frozen, &self.opts, Some(&mut provenance))
         };
         let mut request =
             PreparedHttpRequest::from(self.family.endpoint(&self.frozen, &self.auth, body));
         request.ephemeral_session = self.opts.ephemeral_session;
+        request.cache_provenance = Some(Arc::new(provenance));
+        request.cache_session = self
+            .cache_session
+            .map(|session| (session, Arc::clone(&self.frozen)));
         request.codex_wire = self.frozen.chatgpt_wire.is_some();
         request.auth_revision = self.auth_revision;
         if request.codex_wire {
@@ -680,6 +705,9 @@ impl<F: WireFamily + 'static> RenderJob<F> {
             request.account_ref = context.account_ref.clone();
         }
         request.wire_model_id = Some(self.frozen.wire_model_id.clone());
+        request.cache_model = self
+            .cache_provider
+            .map(|provider| format!("{provider}/{}", self.frozen.wire_model_id));
         maybe_dump_rendered_request(&request.body, &self.opts, self.step_id);
         let request_digest = RequestDigest::of(&request.body);
         Ok(RenderedRequest {
@@ -912,7 +940,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             .map_err(broca_core::WarmFailure::Unsupported)?;
         // A zero-output cache read must stay on the addressed model, even when generation
         // opted into server-side fallback. The warm body has already removed that opt-in;
-        // derive its headers without the matching beta as well, leaving prompt bytes alone.
+        // derive headers without the server-side fallback beta opt-in as well, leaving prompt bytes alone.
         let endpoint_frozen = warm_frozen.server_side_fallback.then(|| {
             let mut frozen = (*warm_frozen).clone();
             frozen.server_side_fallback = false;
@@ -1012,6 +1040,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             refresher: None,
             websocket: Arc::new(responses_websocket::Session::default()),
             websocket_lease: std::sync::Mutex::new(None),
+            cache_session: std::sync::Mutex::new(None),
             #[cfg(test)]
             escape_client_builds: std::sync::Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-harness"))]
@@ -1125,6 +1154,17 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             return rx;
         }
         let render_job = RenderJob {
+            cache_session: self.cache_session.lock().unwrap().clone(),
+            cache_provider: if self.routed_fallback().is_some() {
+                self.frozen
+                    .refusal_fallback
+                    .as_ref()
+                    .map(|f| f.model.provider_module_id.clone())
+            } else {
+                opts.target_model
+                    .as_ref()
+                    .map(|m| m.provider_module_id.clone())
+            },
             subscription_auth: self.subscription_auth,
             media_renderer: self.media_renderer.read().unwrap().clone(),
             media_render_tags: self.media_render_tags.load(Ordering::Relaxed),
@@ -1185,6 +1225,24 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
 
 #[async_trait]
 impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
+    fn history_edit_cost(
+        &self,
+    ) -> Option<broca_core::compaction_provider::notice::HistoryEditCost> {
+        use broca_core::compaction_provider::notice::HistoryEditCost;
+        let route = self.route_frozen();
+        Some(
+            if route.chatgpt_wire.is_some() && !self.websocket.forced_https() {
+                HistoryEditCost::FullResend
+            } else {
+                HistoryEditCost::Suffix
+            },
+        )
+    }
+
+    fn prepare_chain_reset(&self) -> bool {
+        self.websocket.prepare_chain_reset()
+    }
+
     fn supports_media_renderer(&self) -> bool {
         broca_protocol::attachments_enabled()
     }
@@ -1207,6 +1265,7 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
     }
 
     fn bind_run_transport(&self, session: &broca_protocol::BindIdentity) {
+        *self.cache_session.lock().unwrap() = Some(self.client.cache_sessions.bind(session));
         if self.frozen.family_id == crate::spec::WireFamilyId::OpenAiResponsesChatgpt
             && self.frozen.chatgpt_wire.is_some()
         {
@@ -1217,6 +1276,43 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
                     .chatgpt_connections
                     .acquire(session, &self.websocket);
             }
+        }
+    }
+
+    fn cache_evidence_needs_seed(&self, lineage: Option<&str>) -> bool {
+        self.cache_session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|s| s.needs_seed(lineage))
+    }
+
+    async fn seed_cache_evidence(
+        &self,
+        frames: Vec<broca_wal::FramedRecord>,
+        lineage: Option<String>,
+    ) {
+        let session = self.cache_session.lock().unwrap().clone();
+        if let Some(session) = session {
+            let _ = tokio::task::spawn_blocking(move || session.seed(&frames, lineage)).await;
+        }
+    }
+
+    fn set_cache_evidence_view(&self, view: Option<u64>) {
+        if let Some(session) = self.cache_session.lock().unwrap().as_ref() {
+            session.set_view(view);
+        }
+    }
+
+    fn annotate_cache_evidence(&self, attempt: &mut ModelAttempt) {
+        if let Some(session) = self.cache_session.lock().unwrap().as_ref() {
+            session.annotate(attempt);
+        }
+    }
+
+    fn cache_attempt_recorded(&self, locator: Option<String>) {
+        if let Some(session) = self.cache_session.lock().unwrap().as_ref() {
+            session.recorded(locator);
         }
     }
 
@@ -1355,6 +1451,7 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
                 opts,
                 self.media_render_tags.load(Ordering::Relaxed),
                 false,
+                None,
             );
         }
         Ok(self.family.render(&frozen, opts))
@@ -2795,6 +2892,9 @@ fn spawn_transport_task<F: WireFamily + 'static>(
         let rebuild = |auth: &AuthHandle, sent: &PreparedHttpRequest| {
             let fresh = family.endpoint(frozen.as_ref(), auth, sent.body.to_vec());
             PreparedHttpRequest {
+                cache_session: sent.cache_session.clone(),
+                cache_model: sent.cache_model.clone(),
+                cache_provenance: sent.cache_provenance.clone(),
                 attempt_hook: sent.attempt_hook.clone(),
                 ephemeral_session: sent.ephemeral_session,
                 codex_wire: sent.codex_wire,
@@ -3044,6 +3144,7 @@ where
             input_transformations_unmeasured: normalizer.input_transformations_unmeasured(),
             ..AttemptTrace::default()
         };
+        trace.cache_work.prepare(&request);
         let stop = tokio::select! {
             biased;
             _ = cancel.cancelled() => AttemptStop::Cancelled,
@@ -3061,6 +3162,12 @@ where
                 &mut trace,
             ) => AttemptStop::Ended(Box::new(result)),
         };
+        // Sample the network retry budget before joining diagnostics for the terminal record.
+        let attempt_elapsed = retry_clock.attempt_elapsed(attempt_started);
+        trace.cache_evidence = trace
+            .cache_work
+            .finish(&request, trace.sent_at_ms, trace.served_account_ref.clone())
+            .await;
         let result = match stop {
             AttemptStop::Cancelled => {
                 if let Some(websocket) = websocket {
@@ -3135,9 +3242,6 @@ where
             Ok(_) => AttemptOutcome::Complete,
             Err(failure) => failure.outcome.clone(),
         };
-        // Preserve the pre-journal retry-policy sampling point. Local settlement time is
-        // not network-attempt time, and legacy sends need no settlement future at all.
-        let attempt_elapsed = retry_clock.attempt_elapsed(attempt_started);
         if trace.attempt_hook.is_some() {
             if let Err(error) = trace
                 .settle_send(request_digest, outcome.clone(), None)
@@ -3813,6 +3917,10 @@ async fn drive_attempt(
             drop(resp);
             if trace.attempt_hook.is_some() {
                 trace.http_status = Some(status);
+                trace.cache_evidence = trace
+                    .cache_work
+                    .finish(request, trace.sent_at_ms, trace.served_account_ref.clone())
+                    .await;
                 trace
                     .settle_send(
                         &RequestDigest::of(&request.body),
@@ -3828,6 +3936,7 @@ async fn drive_attempt(
                     })?;
             }
             *trace = unsent_trace;
+            trace.cache_work.prepare(request);
             trace.send_index = 2;
             resp = send_attempt(
                 client,
@@ -3991,8 +4100,9 @@ async fn send_attempt(
     // lifetime from the request, and after a restart this stamp is what dates it.
     trace.sent_at_ms = Some(now_millis());
     trace.sent_at = Some(std::time::Instant::now());
-    let response = tokio::time::timeout(header_timeout, builder.body(body).send())
-        .await
+    let response = tokio::time::timeout(header_timeout, builder.body(body).send()).await;
+    trace.cache_work.start(request);
+    let response = response
         .map_err(|_| {
             AttemptFailure::transport(
                 stream_timeout_error("waiting for response headers"),
@@ -6022,6 +6132,10 @@ mod tests {
         include!("transport_schema_fallback_tests.rs");
     }
 
+    mod cache_evidence_samples {
+        include!("transport_cache_evidence_samples.rs");
+    }
+
     mod inception {
         include!("transport_inception_tests.rs");
     }
@@ -6039,6 +6153,8 @@ mod tests {
     {
         let direct = family.render(&frozen, &opts);
         let job = super::RenderJob {
+            cache_session: None,
+            cache_provider: None,
             subscription_auth: false,
             media_renderer: None,
             media_render_tags: false,
@@ -7067,6 +7183,8 @@ mod tests {
         let mut frozen = crate::families::anthropic_frozen_config("m");
         frozen.speed = Some("fast".into());
         let rendered = super::RenderJob {
+            cache_session: None,
+            cache_provider: None,
             subscription_auth: false,
             media_renderer: None,
             media_render_tags: false,

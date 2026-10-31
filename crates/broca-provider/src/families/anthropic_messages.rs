@@ -359,17 +359,41 @@ impl WireFamily for AnthropicMessages {
         build_request_body(frozen, opts)
     }
 
+    fn shape_with_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Value {
+        build_request_body_with_media_and_provenance(frozen, opts, None, provenance)
+    }
+
     fn shape_with_media(
         &self,
         frozen: &FrozenRenderConfig,
         opts: &CallOptions,
         media: &[crate::media_render::InlineMedia<'_>],
     ) -> Value {
+        self.shape_with_media_and_provenance(frozen, opts, media, None)
+    }
+
+    fn shape_with_media_and_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        media: &[crate::media_render::InlineMedia<'_>],
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Value {
         let media = crate::media_render::MediaRender {
             frozen,
             payloads: media,
         };
-        build_request_body_with_media(frozen, opts, frozen.media.as_ref().map(|_| &media))
+        build_request_body_with_media_and_provenance(
+            frozen,
+            opts,
+            frozen.media.as_ref().map(|_| &media),
+            provenance,
+        )
     }
 
     fn render_with_media(
@@ -378,14 +402,33 @@ impl WireFamily for AnthropicMessages {
         opts: &CallOptions,
         media: &[crate::media_render::InlineMedia<'_>],
     ) -> Vec<u8> {
-        let body = self.shape_with_media(frozen, opts, media);
+        self.render_with_media_and_provenance(frozen, opts, media, None)
+    }
+
+    fn render_with_media_and_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        media: &[crate::media_render::InlineMedia<'_>],
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Vec<u8> {
+        let body = self.shape_with_media_and_provenance(frozen, opts, media, provenance);
         render_body(frozen, opts, &body)
     }
 
     /// A persona run's bytes are the persona's key order with the `cch` signature written in;
     /// every other run keeps the canonical JSON of its shape.
     fn render(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Vec<u8> {
-        let body = build_request_body(frozen, opts);
+        self.render_with_provenance(frozen, opts, None)
+    }
+
+    fn render_with_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Vec<u8> {
+        let body = self.shape_with_provenance(frozen, opts, provenance);
         render_body(frozen, opts, &body)
     }
 
@@ -581,6 +624,15 @@ fn build_request_body_with_media(
     opts: &CallOptions,
     media: Option<&crate::media_render::MediaRender<'_>>,
 ) -> Value {
+    build_request_body_with_media_and_provenance(frozen, opts, media, None)
+}
+
+fn build_request_body_with_media_and_provenance(
+    frozen: &FrozenRenderConfig,
+    opts: &CallOptions,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+    mut provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+) -> Value {
     // A run with structured output adds its submit tool or schema instructions here; a run
     // without renders from `opts` unchanged.
     let prepared = crate::structured_output::prepare(frozen, opts);
@@ -676,6 +728,9 @@ fn build_request_body_with_media(
         .enumerate()
         .map(|(wire_index, (message, prefix_blocks, prompt_index))| {
             rendered_indices[prompt_index] = Some(wire_index);
+            if let Some(sink) = provenance.as_deref_mut() {
+                sink.record_message(wire_index, opts.prompt[prompt_index].ordinal);
+            }
             (message, prefix_blocks)
         })
         .unzip();

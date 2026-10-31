@@ -1203,6 +1203,7 @@ fn attempt(http_status: Option<u16>, observation: AttemptAccountObservation) -> 
         sent_at_ms: None,
         transport: None,
         websocket_request: None,
+        cache_evidence: None,
         websocket_close_code: None,
         input_transformations: None,
         input_transformations_unmeasured: false,

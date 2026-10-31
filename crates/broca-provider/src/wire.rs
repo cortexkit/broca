@@ -612,13 +612,35 @@ pub trait WireFamily: Send + Sync {
     /// re-emitting bytes.
     fn shape(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value;
 
+    /// Shape once while optionally recording the source of each emitted wire row or part.
+    /// Custom families without provenance support leave the sink empty rather than guess.
+    fn shape_with_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        _provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Value {
+        self.shape(frozen, opts)
+    }
+
     /// Render `opts` to the EXACT, DETERMINISTIC request body bytes this grammar
     /// sends. Defined as `emit∘shape` — `canonical_json_bytes(self.shape(frozen,
     /// opts))` (sorted keys, the deterministic JSON the cache/resume hash is taken
     /// over). A family whose wire is not canonical JSON over its shaped value MAY
-    /// override this, but every current family uses the default.
+    /// override the trace-aware emission hook for its required key order or body signing.
+    /// The ordinary entry point uses that same implementation without a provenance sink.
     fn render(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Vec<u8> {
-        broca_protocol::canonical_json_bytes(&self.shape(frozen, opts))
+        self.render_with_provenance(frozen, opts, None)
+    }
+
+    /// Emit the same request bytes while optionally collecting durable source coordinates.
+    fn render_with_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Vec<u8> {
+        broca_protocol::canonical_json_bytes(&self.shape_with_provenance(frozen, opts, provenance))
     }
 
     /// Low-level shaping with explicit verified payloads. `opts.prompt` is the prepared,
@@ -641,7 +663,29 @@ pub trait WireFamily: Send + Sync {
         opts: &CallOptions,
         media: &[crate::media_render::InlineMedia<'_>],
     ) -> Vec<u8> {
-        broca_protocol::canonical_json_bytes(&self.shape_with_media(frozen, opts, media))
+        self.render_with_media_and_provenance(frozen, opts, media, None)
+    }
+
+    fn shape_with_media_and_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        media: &[crate::media_render::InlineMedia<'_>],
+        _provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Value {
+        self.shape_with_media(frozen, opts, media)
+    }
+
+    fn render_with_media_and_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        media: &[crate::media_render::InlineMedia<'_>],
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Vec<u8> {
+        broca_protocol::canonical_json_bytes(
+            &self.shape_with_media_and_provenance(frozen, opts, media, provenance),
+        )
     }
 
     /// The HTTP shape (method, URL, headers) for `body`. Auth attaches HERE, after

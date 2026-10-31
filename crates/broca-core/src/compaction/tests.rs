@@ -2120,6 +2120,7 @@ async fn step_boundary_logs_applied_and_superseded_views_with_session_ref() {
                         &lineage,
                         "model",
                         &raw,
+                        false,
                         super::StoredTranscript::plain(&raw),
                         false,
                         true,

@@ -217,8 +217,8 @@ async fn reservation_denial_timeout_cancel_then_retry_keep_media_aging_equal_to_
         crate::wire::AuthHandle::None,
     );
     let shared = media.clone();
-    provider.set_media_request_renderer(Arc::new(move |config, opts, tags, commit| {
-        shared.render(config, opts, tags, commit)
+    provider.set_media_request_renderer(Arc::new(move |config, opts, tags, commit, provenance| {
+        shared.render_with_provenance(config, opts, tags, commit, provenance)
     }));
     provider.defer_media_tags(false);
     let opts = Arc::new(CallOptions::new(

@@ -1423,6 +1423,29 @@ mod tests {
     }
 
     #[test]
+    fn cache_diagnostics_are_ignored_by_the_billing_reader() {
+        let mut log = Log::new();
+        log.open(W);
+        let mut terminal = finished(1, false);
+        let reservation = terminal["reservation"].clone();
+        let envelope = terminal["envelope"].clone();
+        terminal["cache_evidence"] = json!({"compared_to":"lineage:2","extends_previous":false,
+            "first_divergence":{"region":"messages","message_index":2,"part_index":0,"message_ordinal":41},"previous_last_breakpoint":null,"idle_gap_ms":123,
+            "cache_ttl_ms":null,"ttl_kind":"implicit","model_changed":false,
+            "account_changed":false,"view":null,"future_evidence_member":true});
+        terminal["websocket_request"] = json!({"len":10,"sha256":"digest","codex":{
+            "continuation":false,"suffix_item_count":0,"connection_generation":2,
+            "previous_response_id_present":false,"physical_send_count":1,
+            "full_input_reason":"future_transport_cause"}});
+        log.push(terminal, W);
+        let (items, _) = log.read(None);
+        assert_eq!(charges(&items).len(), 1);
+        assert!(!items.iter().any(|item| matches!(item, Item::Unreadable(_))));
+        assert_eq!(charges(&items)[0].reservation, reservation);
+        assert_eq!(charges(&items)[0].envelope.as_ref(), Some(&envelope));
+    }
+
+    #[test]
     fn typed_billing_shapes_match_validated_evidence_and_preserve_extensions() {
         let mut log = Log::new();
         log.open(W);

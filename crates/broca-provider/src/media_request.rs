@@ -568,27 +568,42 @@ pub fn render_prepared(
     bundle: Option<&mut PreparedBundle>,
     render_tags: &dyn Fn(&[Message]) -> Vec<Message>,
 ) -> Result<Vec<u8>, PrepareError> {
+    render_prepared_with_provenance(family, frozen, opts, bundle, render_tags, None)
+}
+
+pub fn render_prepared_with_provenance(
+    family: &dyn crate::wire::WireFamily,
+    frozen: &crate::wire::FrozenRenderConfig,
+    opts: &broca_protocol::CallOptions,
+    bundle: Option<&mut PreparedBundle>,
+    render_tags: &dyn Fn(&[Message]) -> Vec<Message>,
+    provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+) -> Result<Vec<u8>, PrepareError> {
     let Some(bundle) = bundle else {
-        return Ok(family.render(frozen, opts));
+        return Ok(family.render_with_provenance(frozen, opts, provenance));
     };
-    let render = |candidate: &PreparedBundle| {
-        let mut options = opts.clone();
-        options.prompt = tagged_prepared_prompt(&opts.prompt, &candidate.prompt, render_tags);
-        let payloads: Vec<_> = candidate
-            .media
-            .iter()
-            .map(|media| crate::media_render::InlineMedia {
-                reference: &media.reference,
-                base64: &media.base64,
-                tool: media.tool,
-            })
-            .collect();
-        family.render_with_media(frozen, &options, &payloads)
-    };
+    let render =
+        |candidate: &PreparedBundle,
+         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>| {
+            let mut options = opts.clone();
+            options.prompt = tagged_prepared_prompt(&opts.prompt, &candidate.prompt, render_tags);
+            let payloads: Vec<_> = candidate
+                .media
+                .iter()
+                .map(|media| crate::media_render::InlineMedia {
+                    reference: &media.reference,
+                    base64: &media.base64,
+                    tool: media.tool,
+                })
+                .collect();
+            family.render_with_media_and_provenance(frozen, &options, &payloads, provenance)
+        };
     if let Some(profile) = &frozen.media {
-        fit_request(profile, bundle, |candidate| render(candidate).len() as u64)?;
+        fit_request(profile, bundle, |candidate| {
+            render(candidate, None).len() as u64
+        })?;
     }
-    Ok(render(bundle))
+    Ok(render(bundle, provenance))
 }
 
 fn tagged_prepared_prompt(

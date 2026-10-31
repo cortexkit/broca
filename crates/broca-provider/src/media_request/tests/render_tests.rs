@@ -455,6 +455,72 @@ fn media_free_marker_looking_text_keeps_legacy_render_bytes() {
 }
 
 #[test]
+fn native_media_provenance_uses_the_same_bytes_and_durable_source_for_every_family() {
+    let fixture = Fixture::new();
+    let mut person = fixture.person();
+    person.ordinal = Some(42);
+    let mut history: Vec<_> = (0..42)
+        .map(|ordinal| {
+            let mut message = Message::new(
+                Role::User,
+                vec![ContentBlock::Text {
+                    text: format!("older input {ordinal}"),
+                }],
+            );
+            message.ordinal = Some(ordinal);
+            message
+        })
+        .collect();
+    history.push(person.clone());
+    let session = fixture.session(&[start(&history), step(1)]);
+    let prompt = vec![person];
+    for id in [
+        WireFamilyId::AnthropicMessages,
+        WireFamilyId::BedrockConverse,
+        WireFamilyId::OpenAiChat,
+        WireFamilyId::OpenAiResponses,
+        WireFamilyId::OpenAiResponsesChatgpt,
+        WireFamilyId::Gemini,
+        WireFamilyId::GoogleCodeAssist,
+    ] {
+        let family = crate::registry::wire_family(id).unwrap();
+        let mut frozen = frozen_config_for_family(id, "model");
+        frozen.project_id = Some("synthetic-project".into());
+        let profile =
+            select_media_profile(id, None, "model", profile().modalities, Some(1_000_000));
+        frozen.media = Some(profile.clone());
+        let (mut bundle, _) = planned(&session, &profile, &prompt, &mut MediaAging::default());
+        let mut opts = CallOptions::new(prompt.clone());
+        opts.step_context = Some(broca_protocol::StepContext {
+            run_id: "media-provenance".into(),
+            step_index: 1,
+            max_output_tokens: None,
+            session_address: None,
+            credential_id: None,
+            account_ref: None,
+        });
+        let plain =
+            render_prepared(&*family, &frozen, &opts, Some(&mut bundle), &|p| p.to_vec()).unwrap();
+        let mut provenance = broca_protocol::render_provenance::RenderProvenance::default();
+        let traced = render_prepared_with_provenance(
+            &*family,
+            &frozen,
+            &opts,
+            Some(&mut bundle),
+            &|p| p.to_vec(),
+            Some(&mut provenance),
+        )
+        .unwrap();
+        assert_eq!(plain, traced, "{id:?}");
+        assert!(
+            (0..provenance.message_count())
+                .any(|index| provenance.message_ordinal(index, Some(0)) == Some(42)),
+            "{id:?}: source ordinal missing"
+        );
+    }
+}
+
+#[test]
 fn frozen_profiles_leave_text_only_request_bytes_unchanged_in_every_family() {
     use crate::media_profile::MediaQuirk;
     use broca_protocol::{

@@ -426,8 +426,8 @@ async fn assert_transport_media<F: crate::wire::WireFamily + 'static>(family: F,
     ));
     let provider =
         crate::transport::LiveProvider::new(family, frozen, crate::wire::AuthHandle::None);
-    provider.set_media_request_renderer(Arc::new(move |config, opts, tags, commit| {
-        media.render(config, opts, tags, commit)
+    provider.set_media_request_renderer(Arc::new(move |config, opts, tags, commit, provenance| {
+        media.render_with_provenance(config, opts, tags, commit, provenance)
     }));
     provider.defer_media_tags(false);
     let expected = provider.try_render_request(&opts).unwrap();

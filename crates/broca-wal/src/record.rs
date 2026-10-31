@@ -912,6 +912,9 @@ pub enum WalRecord {
         transport: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         websocket_request: Option<Box<broca_protocol::provider::WebSocketRequestDigest>>,
+        /// Informational request-prefix evidence. Unknown members remain safe to ignore.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_evidence: Option<Box<serde_json::Value>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         websocket_close_code: Option<u16>,
         /// The provider's own report of what it changed in the request, verbatim (Anthropic's
@@ -1907,6 +1910,7 @@ impl WalRecord {
             sent_at_ms,
             transport,
             websocket_request,
+            cache_evidence,
             websocket_close_code,
             input_transformations,
             input_transformations_unmeasured,
@@ -1934,6 +1938,7 @@ impl WalRecord {
             sent_at_ms,
             transport,
             websocket_request,
+            cache_evidence,
             websocket_close_code,
             input_transformations,
             input_transformations_unmeasured,

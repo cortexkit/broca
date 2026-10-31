@@ -29,6 +29,17 @@ pub fn render_step_with_output_cap(
     step: u64,
     max_output_tokens: Option<u32>,
 ) -> Result<(FrozenRenderConfig, CallOptions, Vec<u8>), String> {
+    render_step_with_provenance(prefix, config, run_id, step, max_output_tokens, None)
+}
+
+pub fn render_step_with_provenance(
+    prefix: &[WalRecord],
+    config: &RunConfig,
+    run_id: &str,
+    step: u64,
+    max_output_tokens: Option<u32>,
+    provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+) -> Result<(FrozenRenderConfig, CallOptions, Vec<u8>), String> {
     let (frozen, mut opts, state) = boundary_options(prefix, config, run_id, step)?;
     let family = broca_provider::registry::wire_family(frozen.family_id)
         .ok_or("no wire family implementation for the frozen family id")?;
@@ -38,7 +49,7 @@ pub fn render_step_with_output_cap(
     if let Some(step_context) = opts.step_context.as_mut() {
         step_context.max_output_tokens = max_output_tokens;
     }
-    let body = family.render(&frozen.for_step(&opts), &opts);
+    let body = family.render_with_provenance(&frozen.for_step(&opts), &opts, provenance);
     Ok((frozen, opts, body))
 }
 
@@ -280,6 +291,21 @@ mod replay_tests {
         ])).unwrap();
         let stored = serde_json::to_vec(&records).unwrap();
         let (_, opts, bytes) = render_step(&records, &config, "r", 1).unwrap();
+        let mut provenance = broca_protocol::render_provenance::RenderProvenance::default();
+        let (_, _, traced) =
+            render_step_with_provenance(&records, &config, "r", 1, None, Some(&mut provenance))
+                .unwrap();
+        assert_eq!(traced, bytes);
+        assert_eq!(
+            provenance.message_ordinal(0, Some(0)),
+            None,
+            "replacement text has no durable transcript ordinal"
+        );
+        assert_eq!(
+            provenance.message_ordinal(1, Some(0)),
+            Some(1),
+            "retained source messages keep their durable ordinal"
+        );
         assert_eq!(opts.render_episodes.compaction_prefix_len, Some(2));
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
