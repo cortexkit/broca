@@ -26,6 +26,10 @@ impl Fixture {
     }
 
     fn with_damage(damage: bool) -> Self {
+        Self::with_damage_and_compaction(damage, false)
+    }
+
+    fn with_damage_and_compaction(damage: bool, compaction: bool) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let root = broca_test_support::scratch_root().join(format!(
             "sqlite-wal-recovery-{}-{}",
@@ -37,10 +41,57 @@ impl Fixture {
         let wals = FileWalStore::with_config(root.join("wal"), WalConfig::OVERHAUL);
         let path = wals.wal_path(&session);
         let mut records = base_records(&session);
-        records.extend(text_turn(2, 1, "retained"));
-        records.extend(text_turn(4, 2, "removed"));
+        if compaction {
+            let WalRecord::RunStarted { manifest, .. } = &mut records[0].record else {
+                unreachable!()
+            };
+            *manifest = Some(Box::new(broca_wal::PlanManifest {
+                rich_ui: None,
+                plan: broca_wal::OpaqueJson::from_json_text(
+                    serde_json::json!({
+                        "compaction_item":{"provider":"magic-context","preset":"head","params":{}}
+                    })
+                    .to_string(),
+                )
+                .unwrap(),
+                plan_identity: "plan".into(),
+                composition_digest: "composition".into(),
+                tools: Arc::new(vec![]),
+                system_text: String::new(),
+                system_digest: String::new(),
+                join_version: 1,
+                role_versions: Default::default(),
+                fetches: vec![],
+                declarations: vec![],
+            }));
+            records.push(FramedRecord {
+                seq: 2,
+                fence: 1,
+                record: WalRecord::CompactionMessage {
+                    provider: "magic-context".into(),
+                    kind: broca_wal::CompactionMessageKind::Setup,
+                    request_id: None,
+                    cursor: None,
+                    compaction_id: "head".into(),
+                    version: 1,
+                    range: broca_wal::CompactionRange { from: 0, to: 0 },
+                    replacement: Arc::new(vec![]),
+                    sha256: broca_wal::compaction_replacement_sha256(&[]).unwrap(),
+                    call_when: None,
+                    stability: None,
+                    ceiling: None,
+                    tag_checkpoint: None,
+                    ride_wait_ms: None,
+                },
+            });
+            records.extend(text_turn(3, 1, "retained"));
+            records.extend(text_turn(5, 2, "removed"));
+        } else {
+            records.extend(text_turn(2, 1, "retained"));
+            records.extend(text_turn(4, 2, "removed"));
+        }
         records.push(FramedRecord {
-            seq: 6,
+            seq: if compaction { 7 } else { 6 },
             fence: 1,
             record: WalRecord::RunFinished {
                 reason: RunFinishReason::Completed,
@@ -62,7 +113,7 @@ impl Fixture {
                 .unwrap();
         let mut cut = 0;
         for (index, record) in records.iter().enumerate() {
-            if index == 3 {
+            if index == if compaction { 1 } else { 3 } {
                 cut = std::fs::metadata(&path).unwrap().len() as usize;
             }
             wal.append(1, &record.record, true).unwrap();
@@ -402,7 +453,7 @@ fn stop_after_invalidation(f: &Fixture) {
 }
 
 #[test]
-fn recovery_pending_fence_refuses_lease_free_summary_readers() {
+fn recovery_pending_fence_withholds_unrebuilt_lease_free_summaries() {
     let f = Fixture::new();
     stop_after_invalidation(&f);
     let reopened = SqliteStore::open(f.root.join("store.db"))
@@ -413,11 +464,9 @@ fn recovery_pending_fence_refuses_lease_free_summary_readers() {
             .lookup_run("r")
             .expect_err("pending rows must not be reported as live");
         assert!(error.contains("recovery") && error.contains("r"));
-        let error = store
-            .diagnostic_evidence(0, i64::MAX)
-            .err()
-            .expect("pending rows are not diagnostic facts");
-        assert!(error.contains("recovery"));
+        let evidence = store.diagnostic_evidence(0, i64::MAX).unwrap();
+        assert_eq!(evidence.pending_recovery.len(), 1);
+        assert_eq!(evidence.pending_recovery[0].session, f.session);
     }
     f.recover().unwrap();
     assert_eq!(
@@ -560,4 +609,246 @@ fn recovery_restores_surviving_terminal_attribution() {
         |row| Ok((row.get::<_, Option<i64>>(0)?,row.get::<_, Option<String>>(1)?,row.get::<_, Option<String>>(2)?,row.get::<_, Option<String>>(3)?,row.get::<_, Option<String>>(4)?))
     ).unwrap();
     assert_eq!(attribution, (Some(42), None, None, None, None));
+}
+
+#[test]
+fn recovery_rejects_pre_cut_compaction_records_after_rebuild() {
+    let f = Fixture::with_damage_and_compaction(true, true);
+    let lineage = f
+        .store
+        .compaction_facts(&f.session)
+        .unwrap()
+        .unwrap()
+        .lineage_id;
+    f.recover().unwrap();
+    let facts = f
+        .store
+        .project_compaction_facts_records(&f.session, &lineage, &f.before, None, None)
+        .unwrap();
+    assert!(
+        !facts.is_some_and(|facts| facts.setup),
+        "pre-cut Setup cannot become current facts after a rebuild"
+    );
+    let rows: i64 = f
+        .store
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM compaction_facts WHERE session=?1",
+            [SqliteStore::key(&f.session)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        rows, 0,
+        "stale source must not resurrect a compaction facts row"
+    );
+}
+
+#[test]
+fn recovery_rejects_lazy_compaction_seed_captured_before_rebuild() {
+    let f = Arc::new(Fixture::with_damage_and_compaction(true, true));
+    assert!(f.store.compaction_facts(&f.session).unwrap().unwrap().setup);
+    f.store
+        .conn
+        .lock()
+        .unwrap()
+        .execute(
+            "DELETE FROM compaction_facts WHERE session=?1",
+            [SqliteStore::key(&f.session)],
+        )
+        .unwrap();
+    let recovering = f.clone();
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = reached.clone();
+    crate::compaction_facts::set_after_seed_hook(move || {
+        observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        recovering.recover().unwrap();
+    });
+    let facts = f.store.compaction_facts(&f.session).unwrap();
+    assert!(
+        reached.load(std::sync::atomic::Ordering::SeqCst),
+        "fixture must actually suspend a lazy checkpoint seed"
+    );
+    assert!(
+        !facts.is_some_and(|facts| facts.setup),
+        "a lazy checkpoint seed cannot cross a recovery epoch"
+    );
+    let rows: i64 = f
+        .store
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM compaction_facts WHERE session=?1",
+            [SqliteStore::key(&f.session)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        rows, 0,
+        "lazy seeding must not restore removed Setup after recovery"
+    );
+}
+
+#[test]
+fn recovery_current_epoch_allows_a_fresh_bounded_compaction_range() {
+    let f = Fixture::with_damage_and_compaction(true, true);
+    let old_epoch = f.store.compaction_projection_epoch(&f.session).unwrap();
+    f.recover().unwrap();
+    let setup = f
+        .before
+        .iter()
+        .find_map(|frame| {
+            matches!(
+                &frame.record,
+                WalRecord::CompactionMessage {
+                    kind: broca_wal::CompactionMessageKind::Setup,
+                    ..
+                }
+            )
+            .then_some(frame.record.clone())
+        })
+        .unwrap();
+    let head = f.wals.read_records(&f.session).unwrap().last().unwrap().seq;
+    let mut wal =
+        FileWal::open_with_recovery(&f.path, WalConfig::OVERHAUL, f.wals.feature_floor_path())
+            .unwrap()
+            .with_feature_floor(f.wals.feature_floor_path());
+    wal.append(1, &setup, true).unwrap();
+    drop(wal);
+    let epoch = f.store.compaction_projection_epoch(&f.session).unwrap();
+    let range =
+        broca_wal::read_records_range(&f.path, DEFAULT_MAX_READ_BYTES, head, None, None).unwrap();
+    let WalRangeRecords::Complete(records) = range.records() else {
+        panic!("fresh suffix must be complete")
+    };
+    assert_eq!(records.len(), 1);
+    assert!(records[0].seq > 1 && matches!(records[0].record, WalRecord::CompactionMessage { .. }));
+    assert!(f
+        .store
+        .project_compaction_facts_at_epoch(&f.session, &range, &old_epoch)
+        .unwrap()
+        .is_none());
+    let facts = f
+        .store
+        .project_compaction_facts_at_epoch(&f.session, &range, &epoch)
+        .unwrap()
+        .unwrap();
+    assert!(facts.setup);
+    assert_eq!(facts.watermark, head + 1);
+}
+
+#[test]
+fn recovery_preserves_run_rows_from_an_older_lineage_at_the_same_address() {
+    let f = Fixture::new();
+    let older_store = FileWalStore::with_config(f.root.join("older/wal"), WalConfig::OVERHAUL);
+    let mut older = older_store.open(&f.session).unwrap();
+    let mut start = f.before[0].record.clone();
+    let WalRecord::RunStarted { run_id, .. } = &mut start else {
+        unreachable!()
+    };
+    *run_id = broca_protocol::RunId("older-lineage-run".into());
+    older.append(1, &start, true).unwrap();
+    assert_ne!(
+        older.lineage_id().map(|id| id.to_string()),
+        f.store
+            .projection_snapshot(&SqliteStore::key(&f.session))
+            .unwrap()
+            .lineage_id
+    );
+    f.store
+        .index_run_active(&RunIndexRow {
+            run_id: "older-lineage-run".into(),
+            session: f.session.clone(),
+            submission_id: None,
+            request_identity_digest: None,
+            state: RunIndexState::Active,
+            usage: None,
+            final_step_finish_reason: None,
+            retries_used: 0,
+            title: None,
+            withdrawals_owed: false,
+        })
+        .unwrap();
+    f.store
+        .index_run_terminal(
+            "older-lineage-run",
+            RunIndexState::Completed,
+            Some(Usage {
+                input_tokens: Some(42),
+                ..Usage::default()
+            }),
+            Some(FinishReason::Stop),
+            3,
+        )
+        .unwrap();
+    let old = f.store.lookup_run("older-lineage-run").unwrap().unwrap();
+    f.recover().unwrap();
+    let current = f.store.lookup_run("older-lineage-run").unwrap().unwrap();
+    assert_eq!(
+        (current.state, current.usage, current.retries_used),
+        (old.state, old.usage, old.retries_used),
+        "repair must not rewrite a completed run absent from the current lineage"
+    );
+}
+
+#[test]
+fn pending_recovery_diagnostics_withhold_only_the_affected_session() {
+    let f = Fixture::new();
+    let other = BindIdentity::new("/healthy-project", "harness", "healthy");
+    for (id, session) in [
+        ("pending-session-live", f.session.clone()),
+        ("healthy-session-live", other),
+    ] {
+        f.store
+            .index_run_active(&RunIndexRow {
+                run_id: id.into(),
+                session,
+                submission_id: None,
+                request_identity_digest: None,
+                state: RunIndexState::Active,
+                usage: None,
+                final_step_finish_reason: None,
+                retries_used: 0,
+                title: None,
+                withdrawals_owed: false,
+            })
+            .unwrap();
+    }
+    stop_after_invalidation(&f);
+    let evidence = f
+        .store
+        .diagnostic_evidence(0, i64::MAX)
+        .expect("one pending session must not refuse whole-server diagnostics");
+    assert!(evidence
+        .live
+        .iter()
+        .any(|run| run.run_id == "healthy-session-live"));
+    assert!(!evidence
+        .live
+        .iter()
+        .any(|run| run.run_id == "pending-session-live"));
+    assert_eq!(evidence.pending_recovery.len(), 1);
+    assert_eq!(evidence.pending_recovery[0].session, f.session);
+    f.store
+        .conn
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE meta SET admission_checkpoint_json=?2 WHERE session=?1",
+            rusqlite::params![
+                SqliteStore::key(&f.session),
+                format!("{FENCE_PREFIX}broken")
+            ],
+        )
+        .unwrap();
+    let unreadable = f.store.diagnostic_evidence(0, i64::MAX).unwrap();
+    assert!(unreadable
+        .live
+        .iter()
+        .any(|run| run.run_id == "healthy-session-live"));
+    assert_eq!(unreadable.pending_recovery.len(), 1);
+    assert!(unreadable.pending_recovery[0].evidence_unreadable);
 }

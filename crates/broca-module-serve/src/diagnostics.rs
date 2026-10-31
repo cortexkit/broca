@@ -436,6 +436,30 @@ fn error_floor(class: &str, code: &str, window: i64) -> (u64, Severity) {
 
 pub fn report(mut evidence: Evidence, now: i64, window: i64) -> Reply {
     let mut findings = std::mem::take(&mut evidence.recovery_cuts);
+    for pending in &evidence.runs.pending_recovery {
+        let session = broca_core::wal_writer::agent_session_ref(&pending.session);
+        let (summary, hint) = if pending.evidence_unreadable {
+            ("A session's recovery metadata is unreadable; its indexed run summaries are withheld.",
+                "Inspect the session's recovery metadata and WAL before restoring or rebuilding its materialized views.")
+        } else {
+            ("WAL recovery is pending for a session; its indexed run summaries are withheld.",
+                "Inspect the session's WAL recovery error and reopen it with a writable, correctly configured owner to finish rebuilding its views.")
+        };
+        let mut warning = finding(
+            "wal_recovery_cut",
+            format!("pending:{session}"),
+            Severity::Warn,
+            now,
+            now,
+            summary,
+            hint,
+        );
+        warning.samples.push(
+            json!({"session":session,"pending":true,"cut_ids":&pending.cut_ids,
+            "evidence_unreadable":pending.evidence_unreadable}),
+        );
+        findings.push(warning);
+    }
     findings.extend(data_quality(&evidence.runs, now));
     let mut coverage = BTreeMap::new();
     let live_truncated = evidence.runs.live.len() > SCAN_LIMIT;

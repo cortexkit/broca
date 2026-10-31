@@ -113,11 +113,20 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   transaction fails, recovery refuses the writable open without shortening the
   log. Both invalidation and completed reprojection enforce and verify SQLite
   `synchronous=FULL` on the actual materialized-store connection before BEGIN.
-  Lease-free run lookup and diagnostics read the recovery fence in the same
-  transaction as their summaries and refuse pending, invalidated state. After
-  rebuilding, unfinished cut runs are Interrupted; explicit surviving terminal
+  Lease-free run lookup reads the fence with its summary and refuses pending
+  state. Diagnostics withholds only the affected session's rows before applying
+  scan limits and reports a session-named pending or unreadable-evidence warning;
+  unrelated sessions remain available. Historical index rows are not rewritten
+  during invalidation. Rebuild updates only runs evidenced in the current WAL
+  lineage or its cuts. Unfinished cut runs are Interrupted; explicit surviving terminal
   states remain unchanged. Already published usage export facts remain immutable during recovery;
   rebuilding the transcript must not revise the billing history.
+  Independent compaction-facts writes and lazy checkpoint seeding validate the
+  session lineage, context epoch and pending fence in the transaction that writes
+  the facts. Bounded compaction readers capture an epoch token before reading WAL
+  bytes and validate it when publishing facts. Inputs without that token must
+  carry the required recovery markers; an old range cannot bootstrap removed
+  Setup or view outcomes after a rebuild.
 
   After the cut and synced recovery marker, recovery rebuilds the session from
   the complete surviving WAL and publishes its checkpoints in one transaction.

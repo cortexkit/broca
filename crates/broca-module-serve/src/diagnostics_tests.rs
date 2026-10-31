@@ -1041,3 +1041,82 @@ fn diagnostics_untimed_overflow_is_explicit_in_finding_and_coverage() {
     assert!(reply.coverage["run_errors"].truncated);
     assert_eq!(finding.samples[0]["scan_limit"], 20000);
 }
+
+#[test]
+fn pending_recovery_is_a_session_finding_not_a_server_refusal() {
+    use broca_core::{MaterializedStore, RunIndex, RunIndexRow, RunIndexState};
+    let root = broca_test_support::scratch_root().join("pending-recovery-diagnostics");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = broca_store::SqliteStore::open(root.join("run-index.db"))
+        .unwrap()
+        .with_wal_config(broca_wal::WalConfig::OVERHAUL);
+    let pending = broca_protocol::BindIdentity::new("/pending-project", "harness", "pending");
+    let healthy = broca_protocol::BindIdentity::new("/healthy-project", "harness", "healthy");
+    for (id, session) in [("pending-run", pending.clone()), ("healthy-run", healthy)] {
+        store
+            .index_run_active(&RunIndexRow {
+                run_id: id.into(),
+                session,
+                submission_id: None,
+                request_identity_digest: None,
+                state: RunIndexState::Active,
+                usage: None,
+                final_step_finish_reason: None,
+                retries_used: 0,
+                title: None,
+                withdrawals_owed: false,
+            })
+            .unwrap();
+    }
+    store
+        .invalidate_wal_recovery(
+            &pending,
+            &broca_wal::recovery::RecoveryCut {
+                cut_id: "pending-cut".into(),
+                sidecar_basename: "log.cut-0".into(),
+                cut_offset: 0,
+                removed_len: 0,
+                removed_sha256: broca_wal::recovery::digest(&[]),
+                reason: broca_wal::recovery::CutReason::UnprovenCorruption,
+                active_run: Some(broca_protocol::RunId("pending-run".into())),
+                runs: vec![],
+                unowned_calls: vec![],
+                unattributed_tool_risk: true,
+            },
+        )
+        .unwrap();
+    let evidence = gather(
+        &root,
+        Ok(0),
+        NOW - 1000,
+        NOW,
+        broca_wal::WalConfig::OVERHAUL,
+    )
+    .expect("pending recovery must not refuse the serving evidence path");
+    assert!(evidence
+        .runs
+        .live
+        .iter()
+        .any(|run| run.run_id == "healthy-run"));
+    assert!(!evidence
+        .runs
+        .live
+        .iter()
+        .any(|run| run.run_id == "pending-run"));
+    let reply = report(evidence, NOW, DEFAULT_WINDOW_MS);
+    let session = broca_core::wal_writer::agent_session_ref(&pending);
+    let finding = reply
+        .findings
+        .iter()
+        .find(|finding| {
+            finding.check == "wal_recovery_cut"
+                && finding
+                    .samples
+                    .iter()
+                    .any(|sample| sample["pending"] == true && sample["session"] == session)
+        })
+        .unwrap();
+    assert_eq!(finding.severity, Severity::Warn);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}

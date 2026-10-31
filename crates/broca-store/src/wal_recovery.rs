@@ -6,7 +6,7 @@ use broca_core::{ProjectionSeed, RunIndexState};
 use broca_wal::{recovery::RecoveryCut, FramedRecord, WalRangeRead, WalRecord};
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 
 pub(super) const FENCE_PREFIX: &str = broca_core::admission::WAL_RECOVERY_FENCE_PREFIX;
 
@@ -14,7 +14,6 @@ pub(super) const FENCE_PREFIX: &str = broca_core::admission::WAL_RECOVERY_FENCE_
 pub(super) struct Fence {
     pub(super) pending: bool,
     cut_ids: Vec<String>,
-    invalidated_runs: Vec<String>,
 }
 
 fn decode_fence(text: &str) -> Result<Option<Fence>, StoreError> {
@@ -50,7 +49,9 @@ pub(super) fn read_fence(tx: &Transaction<'_>, key: &str) -> Result<Option<Fence
         .map(Option::flatten)
 }
 
-pub(super) fn refuse_pending_diagnostics(tx: &Transaction<'_>) -> Result<(), String> {
+pub(super) fn pending_diagnostics(
+    tx: &Transaction<'_>,
+) -> Result<Vec<crate::diagnostics::PendingRecovery>, String> {
     let mut statement = tx.prepare(
         "SELECT session, admission_checkpoint_json FROM meta WHERE admission_checkpoint_json LIKE ?1"
     ).map_err(|error| error.to_string())?;
@@ -59,16 +60,23 @@ pub(super) fn refuse_pending_diagnostics(tx: &Transaction<'_>) -> Result<(), Str
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
         .map_err(|error| error.to_string())?;
+    let mut pending = Vec::new();
     for row in rows {
-        let (session, checkpoint) = row.map_err(|error| error.to_string())?;
-        if decode_fence(&checkpoint)
-            .map_err(|error| error.to_string())?
-            .is_some_and(|fence| fence.pending)
-        {
-            return Err(format!("WAL recovery is pending for session {session}; diagnostic run summaries are unavailable"));
-        }
+        let (key, checkpoint) = row.map_err(|error| error.to_string())?;
+        let (cut_ids, evidence_unreadable) = match decode_fence(&checkpoint) {
+            Ok(Some(fence)) if fence.pending => (fence.cut_ids, false),
+            Ok(_) => continue,
+            Err(_) => (Vec::new(), true),
+        };
+        let session = bind_identity_from_store_key(&key)
+            .ok_or_else(|| format!("invalid session identity in pending WAL recovery: {key}"))?;
+        pending.push(crate::diagnostics::PendingRecovery {
+            session,
+            cut_ids,
+            evidence_unreadable,
+        });
     }
-    Ok(())
+    Ok(pending)
 }
 
 fn require_full_synchronous(conn: &rusqlite::Connection) -> Result<(), StoreError> {
@@ -109,6 +117,13 @@ pub(super) fn required_cut_ids(
         }
     }
     Ok(Vec::new())
+}
+
+pub(super) fn required_cut_ids_in_tx(
+    tx: &Transaction<'_>,
+    key: &str,
+) -> Result<Vec<String>, StoreError> {
+    required_cut_ids(checkpoint(tx, key)?.as_deref(), None)
 }
 
 pub(super) fn preserve_fence(
@@ -163,24 +178,15 @@ impl SqliteStore {
             ));
         }
         let key = Self::key(session);
-        let session_json = serde_json::to_string(session)?;
         let mut conn = self.conn.lock().unwrap();
         require_full_synchronous(&conn)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (_, lineage, epoch) = current_projection_state(&tx, &key, true)?;
         let text = checkpoint(&tx, &key)?;
-        let old = text.as_deref().map(decode_fence).transpose()?.flatten();
         let mut ids: BTreeSet<_> = required_cut_ids(text.as_deref(), None)?
             .into_iter()
             .collect();
         ids.insert(cut.cut_id.clone());
-        let mut runs: BTreeSet<_> = old.into_iter().flat_map(|f| f.invalidated_runs).collect();
-        {
-            let mut query = tx.prepare("SELECT run_id FROM run_index WHERE session=?1")?;
-            for run in query.query_map([&session_json], |row| row.get::<_, String>(0))? {
-                runs.insert(run?);
-            }
-        }
         let epoch = epoch
             .checked_add(1)
             .ok_or(StoreError::InconsistentSnapshot(
@@ -199,14 +205,10 @@ impl SqliteStore {
             "DELETE FROM compaction_view_receipt WHERE session_ref=?1",
             [broca_core::wal_writer::agent_session_ref(session)],
         )?;
-        tx.execute("UPDATE run_index SET state='active',usage_json=NULL,final_step_finish_reason_json=NULL,retries_used=0,
-            state_changed_ms=NULL,error_class=NULL,error_code=NULL,pause_reason=NULL,interrupt_reason=NULL
-            WHERE session=?1", [&session_json])?;
         tx.execute("DELETE FROM meta WHERE session=?1", [&key])?;
         let fence = Fence {
             pending: true,
             cut_ids: ids.into_iter().collect(),
-            invalidated_runs: runs.into_iter().collect(),
         };
         let json = serde_json::to_string(&serde_json::json!({"wal_recovery_fence":fence}))?;
         tx.execute("INSERT INTO meta(session,watermark_seq,lineage_id,context_epoch,prefix_len,admission_checkpoint_json)
@@ -292,7 +294,7 @@ impl SqliteStore {
         let snapshot = Self::projection_snapshot_from_tx(&tx, &key, true)?;
         let plan = Self::prepare_projection(snapshot, records, Some(range))?;
         Self::apply_projection_plan(&tx, &key, plan)?;
-        restore_run_rows(&tx, session, records, &fence.invalidated_runs)?;
+        restore_run_rows(&tx, session, records)?;
         if broca_core::retention::is_retention_lineage(records) {
             if let Some(lineage) = range.lineage_id {
                 let mut facts = broca_core::head::HeadProjection::default();
@@ -313,7 +315,6 @@ impl SqliteStore {
             &key,
             &Fence {
                 pending: false,
-                invalidated_runs: Vec::new(),
                 ..fence
             },
         )?;
@@ -326,16 +327,23 @@ fn restore_run_rows(
     tx: &Transaction<'_>,
     session: &BindIdentity,
     records: &[FramedRecord],
-    runs: &[String],
 ) -> Result<(), StoreError> {
-    let mut present = HashSet::new();
+    let mut present = BTreeSet::new();
+    let mut current_runs = BTreeSet::new();
     for frame in records {
         if let WalRecord::RunStarted { run_id, .. } = &frame.record {
             present.insert(run_id.0.clone());
+            current_runs.insert(run_id.0.clone());
+        }
+        if let WalRecord::RecoveryCut { recovery } = &frame.record {
+            current_runs.extend(recovery.runs.iter().map(|run| run.run_id.0.clone()));
+            current_runs.extend(recovery.active_run.iter().map(|run| run.0.clone()));
         }
     }
     let session_json = serde_json::to_string(session)?;
-    for run in runs {
+    // Session addresses can acquire a fresh lineage after deletion. Only records
+    // and cut evidence in this lineage may authorize rewriting a historical row.
+    for run in &current_runs {
         let belongs: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM run_index WHERE run_id=?1 AND session=?2)",
             params![run, session_json],
@@ -344,6 +352,10 @@ fn restore_run_rows(
         if !belongs {
             continue;
         }
+        tx.execute(
+            "UPDATE run_index SET state_changed_ms=NULL,provider_module_id=NULL,credential_id=NULL,error_class=NULL,error_code=NULL,pause_reason=NULL,interrupt_reason=NULL WHERE run_id=?1 AND session=?2",
+            params![run, session_json],
+        )?;
         let mut state = if present.contains(run) {
             broca_core::reconcile_run_state(
                 records.iter().filter_map(|f| {

@@ -451,10 +451,20 @@ fn current_facts(
     wal: &dyn broca_core::WalStore,
     session: &broca_protocol::BindIdentity,
 ) -> Result<CompactionFacts, String> {
+    let epoch = store
+        .compaction_projection_epoch(session)
+        .map_err(|e| e.to_string())?;
     let facts = store.compaction_facts(session).map_err(|e| e.to_string())?;
     let identity = wal.file_identity(session).map_err(|e| e.to_string())?;
     let bytes = wal.live_wal_bytes(session).map_err(|e| e.to_string())?;
     if let Some(facts) = facts.filter(|f| f.current_file(identity, bytes)) {
+        if store
+            .compaction_projection_epoch(session)
+            .map_err(|e| e.to_string())?
+            != epoch
+        {
+            return Err("compaction facts changed during recovery".into());
+        }
         return Ok(facts);
     }
     // Projection lag must stay cheap even when a message frame is larger than the
@@ -471,7 +481,7 @@ fn current_facts(
         return Err("compaction WAL changed during its durability proof".into());
     }
     store
-        .project_compaction_facts(session, &range)
+        .project_compaction_facts_at_epoch(session, &range, &epoch)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "compaction facts projection cannot cover the bounded WAL suffix".into())
 }
