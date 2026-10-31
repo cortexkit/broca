@@ -184,6 +184,18 @@ impl ObservedWalStore {
 // test in tests/it/observed_wal_fidelity.rs compares these impls with FileWalStore's and
 // FileWal's, so a new production override cannot be missed here silently.
 impl WalStore for ObservedWalStore {
+    fn bind_recovery_projection(
+        &self,
+        session: Option<&BindIdentity>,
+        store: Arc<dyn broca_core::SessionStore>,
+    ) {
+        WalStore::bind_recovery_projection(&self.inner, session, store)
+    }
+
+    fn recover_existing(&self, session: &BindIdentity) -> Result<(), WalError> {
+        WalStore::recover_existing(&self.inner, session)
+    }
+
     fn writer_marker_root(&self) -> Option<PathBuf> {
         WalStore::writer_marker_root(&self.inner)
     }
