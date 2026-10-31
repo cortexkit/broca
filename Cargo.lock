@@ -1099,9 +1099,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-compaction-provider"
-version = "0.7.12"
+version = "0.7.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a83f646d5bc1b57d1475582cf42b23ccbd6aa98c5b2cff08ac96c245906fbb1b"
+checksum = "ad26c900d681f134d09f102c9799994c4c5d839afcdf0487c20b8acd98b2fa5a"
 dependencies = [
  "cortexkit-role-llm-runner",
  "serde",
@@ -1133,9 +1133,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-llm-runner"
-version = "0.7.42"
+version = "0.7.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71482c5b7543ebf729574e55e025ad7fd9b0b25f94664f04d1b733e9fdb4abb3"
+checksum = "3db6c024704209703118907c5655a25fedcdd5fc0108f7bda56a358d248f4b49"
 dependencies = [
  "cortexkit-rich-ui-syntax",
  "serde",
@@ -1146,9 +1146,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-llm-runner-conformance"
-version = "0.16.4"
+version = "0.16.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37dcc2b8640bd3e17791fdca662bc725363c3b91f4116a13ceacce7660eecc03"
+checksum = "252e8fd91b7d5e46b3d587cc2326ae6dc63e4c0ecd483af5db007b7bc0feb04b"
 dependencies = [
  "async-trait",
  "base64",
