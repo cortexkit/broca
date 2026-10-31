@@ -13,9 +13,11 @@ mod index;
 mod inventory;
 pub use inventory::open_session_resolver;
 mod operational;
+mod outbox;
 pub use operational::{
     open_diagnostic_reader, operational_database_name, DiagnosticEvidenceReader,
 };
+pub use outbox::OverhaulRunEventStore;
 mod publication;
 mod readers;
 mod rebuild;
@@ -130,6 +132,7 @@ impl OverhaulDb {
             retention::initialize(tx)?;
             operational::initialize(tx)?;
             recovery::initialize(tx)?;
+            outbox::initialize(tx)?;
             Ok(())
         })?;
         Ok(db)

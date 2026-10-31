@@ -286,8 +286,9 @@ pub(super) fn prepare_cursor(
     let mut seed = None;
     let mut rebuilt = force;
     let outdated = cp.is_some() && !super::recovery::projection_current(tx, key)?;
+    let compaction_outdated = cp.is_some() && !super::outbox::projection_current(tx, key)?;
     if let Some(cp) = &cp {
-        if !force && !outdated && valid_cursor(cp, lineage, end, read)? {
+        if !force && !outdated && !compaction_outdated && valid_cursor(cp, lineage, end, read)? {
             seed = load_locator(tx, key, &cp.locator, read)?;
         }
         rebuilt = seed.is_none();
@@ -295,6 +296,8 @@ pub(super) fn prepare_cursor(
     if cp.is_none() || rebuilt {
         SeedFallback::new(if outdated && !force {
             "withdrawal projection version outdated"
+        } else if compaction_outdated && !force {
+            "compaction resolution locators incomplete"
         } else {
             rebuild_reason.unwrap_or(if cp.is_none() {
                 "publication index missing"

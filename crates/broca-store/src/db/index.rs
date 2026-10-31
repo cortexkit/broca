@@ -165,8 +165,13 @@ pub(super) fn index_in_tx(
     if outdated && !force {
         broca_core::replay::SeedFallback::new("withdrawal projection version outdated");
     }
+    let compaction_outdated = checkpoint.is_some() && !super::outbox::projection_current(tx, &key)?;
+    if compaction_outdated && !force {
+        broca_core::replay::SeedFallback::new("compaction resolution locators incomplete");
+    }
     let rebuilt = force
         || outdated
+        || compaction_outdated
         || checkpoint
             .as_ref()
             .is_some_and(|cp| !matches_checkpoint(cp, log.bytes, &lineage_id));
@@ -299,6 +304,7 @@ pub(super) fn apply_frame(
     frame: &IndexedFrame,
 ) -> Result<(), DbError> {
     let delta = seed.observe(&frame.framed, frame.off, frame.end)?;
+    super::outbox::observe(tx, key, frame)?;
     if matches!(
         frame.framed.record,
         broca_wal::WalRecord::CompactionMessage { .. }
@@ -532,6 +538,25 @@ mod tests {
     }
     fn r_rows(db: &OverhaulDb) -> Vec<(String, Vec<Vec<Value>>)> {
         rows(db, schema::REBUILDABLE_TABLES)
+    }
+
+    fn seed_authoritative_table(tx: &Transaction<'_>, table: &str) -> Result<(), DbError> {
+        match table {
+            "compaction_view_receipt" => {
+                tx.execute("INSERT INTO compaction_view_receipt VALUES('row','lineage','1','0','digest',1)", [])?;
+            }
+            "bus_event_outbox" => {
+                tx.execute("INSERT INTO bus_event_outbox VALUES('row','run',1,'subject','epoch','session',X'000102FF',1,NULL,0)", [])?;
+            }
+            "compaction_notice_outbox" => {
+                tx.execute("INSERT INTO compaction_notice_outbox VALUES('row','session','subject','{}','digest',1,NULL)", [])?;
+            }
+            _ => {
+                // Tables not explicitly handled above must also survive an index rebuild byte-for-byte.
+                tx.execute_batch(&format!("CREATE TABLE {table} (id TEXT PRIMARY KEY, payload BLOB NOT NULL); INSERT INTO {table} VALUES ('row',X'000102FF');"))?;
+            }
+        }
+        Ok(())
     }
     fn qualified_boundaries(db: &OverhaulDb) -> Vec<u64> {
         db.read_snapshot(|tx| {
@@ -2453,13 +2478,16 @@ mod tests {
             "compaction_notice_outbox",
             "classify_claim",
         ];
-        scratch.db.authoritative_transaction(|tx| {
-            tx.execute("INSERT INTO log_reader VALUES ('reader',1,'declared')", [])?;
-            for table in &authoritative_tables[1..] {
-                tx.execute_batch(&format!("CREATE TABLE {table} (id TEXT PRIMARY KEY, payload BLOB NOT NULL); INSERT INTO {table} VALUES ('row',X'000102FF');"))?;
-            }
-            Ok(())
-        }).unwrap();
+        scratch
+            .db
+            .authoritative_transaction(|tx| {
+                tx.execute("INSERT INTO log_reader VALUES ('reader',1,'declared')", [])?;
+                for table in &authoritative_tables[1..] {
+                    seed_authoritative_table(tx, table)?;
+                }
+                Ok(())
+            })
+            .unwrap();
         scratch
             .db
             .index(&publication(&other_bind, &other_bytes))
@@ -4219,15 +4247,15 @@ mod tests {
             "compaction_notice_outbox",
             "classify_claim",
         ];
-        db.db.authoritative_transaction(|tx| {
-            tx.execute("INSERT INTO log_reader VALUES ('reader',1,'declared')", [])?;
-            // Future owners define these state-machine schemas. Unknown tables
-            // must survive rebuild just as the already-owned log_reader does.
-            for table in &tables[1..] {
-                tx.execute_batch(&format!("CREATE TABLE {table} (id TEXT PRIMARY KEY, payload BLOB NOT NULL); INSERT INTO {table} VALUES ('row',X'000102FF');"))?;
-            }
-            Ok(())
-        }).unwrap();
+        db.db
+            .authoritative_transaction(|tx| {
+                tx.execute("INSERT INTO log_reader VALUES ('reader',1,'declared')", [])?;
+                for table in &tables[1..] {
+                    seed_authoritative_table(tx, table)?;
+                }
+                Ok(())
+            })
+            .unwrap();
         let before = rows(&db.db, &tables);
         let bytes = corpus().remove(0);
         let bind = bind(&bytes);
