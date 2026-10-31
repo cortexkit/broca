@@ -12,7 +12,7 @@ use broca_protocol::{
 };
 use broca_store::{
     bus_events::RunEventStore,
-    bus_events::{BusPublisher, DrainResult, Metrics},
+    bus_events::{drain_bus_event, BusPublisher, DrainResult, Metrics},
 };
 use cortexkit_bus_naming::AccountNames;
 use std::{
@@ -737,7 +737,7 @@ impl Service {
                         // backlog clears at the broker's pace rather than a fixed count per pass.
                         let drain_started = tokio::time::Instant::now();
                         while drain_started.elapsed() < DRAIN_SLICE {
-                            match store.drain_bus_event(bus.as_ref(), now_ms()).await {
+                            match drain_bus_event(store.as_ref(), bus.as_ref(), now_ms()).await {
                                 Ok(DrainResult::Published) => {
                                     backoff = Duration::from_secs(1);
                                 }

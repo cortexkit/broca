@@ -88,13 +88,60 @@ pub(crate) struct State {
     /// When the current enabled period began, in Unix milliseconds; zero while none is active.
     /// Read on the WAL writer's thread before every run start, so it is kept in memory.
     period_started_ms: AtomicU64,
+    #[cfg(test)]
+    before_write_unlock: Mutex<Option<WriteObserver>>,
 }
+
+#[cfg(test)]
+type WriteObserver = Box<dyn Fn(&Connection) + Send + Sync>;
 
 pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
-    init_event_schema(conn, true)
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS bus_event_outbox (
+            event_key TEXT PRIMARY KEY, run_id TEXT NOT NULL, seq INTEGER NOT NULL,
+            subject TEXT NOT NULL, epoch TEXT NOT NULL, session TEXT NOT NULL,
+            body BLOB NOT NULL, at_ms INTEGER NOT NULL, published_ms INTEGER,
+            best_effort INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(epoch, run_id, seq, subject)
+         );
+         CREATE INDEX IF NOT EXISTS bus_event_pending ON bus_event_outbox(published_ms, at_ms);
+         -- Unpublished lifecycle rows only, in insertion order (every key is 0, so entries sort
+         -- by rowid). The drain's next-row query and the startup depth count read this index
+         -- instead of scanning a table that also holds a day of published bodies.
+         CREATE INDEX IF NOT EXISTS bus_event_unpublished ON bus_event_outbox(best_effort)
+            WHERE published_ms IS NULL AND best_effort=0;
+         CREATE INDEX IF NOT EXISTS bus_event_age ON bus_event_outbox(at_ms);
+         -- Runs the run index shows live, by when they last changed state, for recovery.
+         CREATE INDEX IF NOT EXISTS bus_event_live_runs ON run_index(state_changed_ms)
+            WHERE state IN ('active','paused');
+         CREATE TABLE IF NOT EXISTS bus_event_projection (
+            session TEXT PRIMARY KEY, epoch TEXT NOT NULL, seq INTEGER NOT NULL,
+            state_json TEXT NOT NULL
+         );
+         -- Sessions whose projection has a run started and not yet seen finish. Recovery after
+         -- process loss visits these and the run index's live runs of the current period.
+         CREATE TABLE IF NOT EXISTS bus_event_open (
+            session TEXT PRIMARY KEY, identity TEXT NOT NULL
+         );
+         -- The one row says when the current enabled period began. Absent means events were
+         -- off at the last start, so the next enable begins a new period.
+         CREATE TABLE IF NOT EXISTS bus_event_period (
+            id INTEGER PRIMARY KEY CHECK (id = 1), started_ms INTEGER NOT NULL
+         );
+         -- Compaction advance notices (compaction-provider/v1 §5), projected from the durable
+         -- WAL like run events. A notice is headers only: the bus message id names the session
+         -- and the notice's sequence number, and the bus digest is the notice digest.
+         CREATE TABLE IF NOT EXISTS compaction_notice_outbox (
+            message_id TEXT PRIMARY KEY, session TEXT NOT NULL, subject TEXT NOT NULL,
+            headers TEXT NOT NULL, digest TEXT NOT NULL, at_ms INTEGER NOT NULL,
+            published_ms INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS compaction_notice_unpublished
+            ON compaction_notice_outbox(at_ms) WHERE published_ms IS NULL;",
+    )
 }
 
-pub(crate) fn init_event_schema(conn: &Connection, legacy: bool) -> rusqlite::Result<()> {
+pub(crate) fn init_overhaul_event_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS bus_event_outbox (
             event_key TEXT PRIMARY KEY, run_id TEXT NOT NULL, seq INTEGER NOT NULL,
@@ -111,14 +158,6 @@ pub(crate) fn init_event_schema(conn: &Connection, legacy: bool) -> rusqlite::Re
             WHERE published_ms IS NULL AND best_effort=0;
           CREATE INDEX IF NOT EXISTS bus_event_age ON bus_event_outbox(at_ms);",
     )?;
-    if legacy {
-        conn.execute_batch(
-            "
-         -- Runs the run index shows live, by when they last changed state, for recovery.
-         CREATE INDEX IF NOT EXISTS bus_event_live_runs ON run_index(state_changed_ms)
-             WHERE state IN ('active','paused');",
-        )?;
-    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS bus_event_projection (
             session TEXT PRIMARY KEY, epoch TEXT NOT NULL, seq INTEGER NOT NULL,
@@ -217,7 +256,6 @@ pub enum DrainResult {
 
 /// Durable lifecycle publications and a checkpoint of the last projected write-ahead log record.
 /// A broker acknowledgement is required before a pending publication is retired.
-#[async_trait]
 pub trait RunEventStore: Send + Sync {
     fn enable_bus_events(&self, account: &str) -> Result<(), String>;
     fn bus_metrics(&self) -> &Metrics;
@@ -256,26 +294,28 @@ pub trait RunEventStore: Send + Sync {
     ) -> Result<(), StoreError>;
     fn skip_stale_bus_events(&self, now_ms: u64) -> Result<SkipSummary, StoreError>;
     fn prune_bus_events(&self, now_ms: u64) -> Result<usize, StoreError>;
+}
 
-    async fn drain_bus_event(
-        &self,
-        publisher: &dyn BusPublisher,
-        now_ms: u64,
-    ) -> Result<DrainResult, StoreError> {
-        let Some(event) = self.pending_bus_event()? else {
-            return Ok(DrainResult::Empty);
-        };
-        match publisher.publish(&event).await {
-            Ok(receipt) => {
-                self.acknowledge_bus_event(&event, receipt, now_ms)?;
-                Ok(DrainResult::Published)
-            }
-            Err(_) => {
-                self.bus_metrics()
-                    .bus_publish_failures
-                    .fetch_add(1, Ordering::Relaxed);
-                Ok(DrainResult::Retry)
-            }
+/// Drain orchestration belongs to the publisher, not the object-safe storage port.
+pub async fn drain_bus_event<S: RunEventStore + ?Sized>(
+    store: &S,
+    publisher: &dyn BusPublisher,
+    now_ms: u64,
+) -> Result<DrainResult, StoreError> {
+    let Some(event) = store.pending_bus_event()? else {
+        return Ok(DrainResult::Empty);
+    };
+    match publisher.publish(&event).await {
+        Ok(receipt) => {
+            store.acknowledge_bus_event(&event, receipt, now_ms)?;
+            Ok(DrainResult::Published)
+        }
+        Err(_) => {
+            store
+                .bus_metrics()
+                .bus_publish_failures
+                .fetch_add(1, Ordering::Relaxed);
+            Ok(DrainResult::Retry)
         }
     }
 }
@@ -480,7 +520,21 @@ impl SqliteStore {
         publisher: &dyn BusPublisher,
         now_ms: u64,
     ) -> Result<DrainResult, StoreError> {
-        RunEventStore::drain_bus_event(self, publisher, now_ms).await
+        let Some(event) = self.pending_bus_event()? else {
+            return Ok(DrainResult::Empty);
+        };
+        match publisher.publish(&event).await {
+            Ok(receipt) => {
+                self.acknowledge_bus_event(&event, receipt, now_ms)?;
+                Ok(DrainResult::Published)
+            }
+            Err(_) => {
+                self.bus_metrics()
+                    .bus_publish_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(DrainResult::Retry)
+            }
+        }
     }
 }
 
@@ -500,11 +554,20 @@ impl EventStore<'_> {
         legacy_transaction: bool,
         write: impl FnOnce(&Connection) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
+        self.write_with_locked_effect(legacy_transaction, write, |_| {})
+    }
+
+    fn write_with_locked_effect<T>(
+        &self,
+        legacy_transaction: bool,
+        write: impl FnOnce(&Connection) -> Result<T, StoreError>,
+        after_write: impl FnOnce(&T),
+    ) -> Result<T, StoreError> {
         let mut conn = self.conn.lock().unwrap();
         if !self.legacy {
             conn.pragma_update(None, "synchronous", "FULL")?;
         }
-        if legacy_transaction || !self.legacy {
+        let result = if legacy_transaction || !self.legacy {
             let behavior = if self.legacy {
                 rusqlite::TransactionBehavior::Deferred
             } else {
@@ -516,7 +579,16 @@ impl EventStore<'_> {
             Ok(result)
         } else {
             write(&conn)
+        };
+        if let Ok(value) = &result {
+            // A depth resync takes the same mutex, so notice gauges must move before unlock.
+            after_write(value);
+            #[cfg(test)]
+            if let Some(observe) = &*self.bus_events.before_write_unlock.lock().unwrap() {
+                observe(&conn);
+            }
         }
+        result
     }
 
     /// Called only after the bus client attests its machine account and dotted event support.
@@ -798,7 +870,7 @@ impl EventStore<'_> {
         let Some(account) = self.bus_events.account.lock().unwrap().clone() else {
             return Ok(());
         };
-        let (inserted, inserted_notices, oversize, dropped) = self.write(true, |tx| {
+        let (inserted, _, oversize, dropped) = self.write_with_locked_effect(true, |tx| {
         let key = Self::key(session);
         let saved: Option<(String, u64, String)> = tx
             .query_row(
@@ -1022,10 +1094,9 @@ impl EventStore<'_> {
             tx.execute("DELETE FROM bus_event_open WHERE session=?1", [&key])?;
         }
         Ok((inserted, inserted_notices, oversize, dropped))
+        }, |(_, inserted_notices, _, _)| {
+            self.bus_metrics().compaction_notice_outbox_pending.fetch_add(*inserted_notices, Ordering::Relaxed);
         })?;
-        self.bus_metrics()
-            .compaction_notice_outbox_pending
-            .fetch_add(inserted_notices, Ordering::Relaxed);
         self.bus_metrics()
             .bus_outbox_depth
             .fetch_add(inserted, Ordering::Relaxed);
@@ -1240,7 +1311,7 @@ impl EventStore<'_> {
         _receipt: PublishReceipt,
         now_ms: u64,
     ) -> Result<(), StoreError> {
-        let (lifecycle, lifecycle_updated, notices_updated) = self.write(false, |conn| {
+        let (lifecycle, lifecycle_updated, notices_updated) = self.write_with_locked_effect(false, |conn| {
         let lifecycle: Option<bool> = conn
             .query_row(
                 "SELECT best_effort=0 FROM bus_event_outbox WHERE event_key=?1 AND published_ms IS NULL",
@@ -1258,8 +1329,7 @@ impl EventStore<'_> {
             params![event.event_key, now_ms],
         )? as u64;
         Ok((lifecycle, lifecycle_updated, notices_updated))
-        })?;
-        self.lower_notice_depth(notices_updated);
+        }, |(_, _, notices_updated)| self.lower_notice_depth(*notices_updated))?;
         let updated = lifecycle_updated + notices_updated;
         self.bus_metrics()
             .bus_events_published
@@ -1271,7 +1341,7 @@ impl EventStore<'_> {
     }
 
     pub fn prune_bus_events(&self, now_ms: u64) -> Result<usize, StoreError> {
-        let (deleted, dropped, notices_dropped) = self.write(false, |conn| {
+        let (deleted, dropped, _) = self.write_with_locked_effect(false, |conn| {
         let cutoff = now_ms.saturating_sub(RETENTION_MS);
         let dropped: u64 = conn.query_row(
             "SELECT count(*) FROM bus_event_outbox INDEXED BY bus_event_unpublished WHERE published_ms IS NULL AND best_effort=0 AND at_ms<?1",
@@ -1288,8 +1358,7 @@ impl EventStore<'_> {
                 [cutoff],
             )?;
         Ok((deleted, dropped, notices_dropped))
-        })?;
-        self.lower_notice_depth(notices_dropped);
+        }, |(_, _, notices_dropped)| self.lower_notice_depth(*notices_dropped))?;
         if dropped > 0 {
             self.lower_bus_depth(dropped);
             self.bus_metrics()
@@ -1420,6 +1489,106 @@ fn insert_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_event_schema_matches_frozen_catalog() {
+        // The fixture records sqlite_schema.sql from the legacy initializer at 6ce6d968d1f5.
+        let expected: Vec<(String, String)> =
+            serde_json::from_str(include_str!("../tests/fixtures/legacy-bus-schema.json")).unwrap();
+        let store = SqliteStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let actual = conn.prepare("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL AND (name LIKE 'bus_event_%' OR name LIKE 'compaction_notice_%') ORDER BY name").unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    fn notice_gauge_precedes_unlock(operation: &str) {
+        use broca_core::compaction_provider::notice::AdvanceNotice;
+        let store = enabled();
+        let notice = AdvanceNotice::new(
+            agent_session_ref(&session()),
+            1,
+            "epoch",
+            0,
+            "a".repeat(64),
+            10,
+            "model",
+        );
+        let frames = [
+            start(),
+            FramedRecord {
+                seq: 2,
+                fence: 1,
+                record: WalRecord::CompactionNotice {
+                    seq: 1,
+                    headers: notice.to_headers(),
+                },
+            },
+        ];
+        if operation != "enqueue" {
+            store
+                .project_bus_events(&session(), "epoch", &frames, 1000)
+                .unwrap();
+        }
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let captured = observations.clone();
+        let metrics = store.bus_metrics_arc();
+        *store.bus_events.before_write_unlock.lock().unwrap() = Some(Box::new(move |conn| {
+            let pending: u64 = conn
+                .query_row(
+                    "SELECT count(*) FROM compaction_notice_outbox WHERE published_ms IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            captured.lock().unwrap().push((
+                metrics
+                    .compaction_notice_outbox_pending
+                    .load(Ordering::Relaxed),
+                pending,
+            ));
+        }));
+        match operation {
+            "enqueue" => store
+                .project_bus_events(&session(), "epoch", &frames, 1000)
+                .unwrap(),
+            "ack" => {
+                let notice = store
+                    .event_store()
+                    .pending_compaction_notice()
+                    .unwrap()
+                    .unwrap();
+                store
+                    .acknowledge_bus_event(&notice, PublishReceipt::new(1, false), 1100)
+                    .unwrap();
+            }
+            "prune" => {
+                store.prune_bus_events(1001 + RETENTION_MS).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        *store.bus_events.before_write_unlock.lock().unwrap() = None;
+        let expected = if operation == "enqueue" { 1 } else { 0 };
+        assert_eq!(
+            *observations.lock().unwrap(),
+            [(expected, expected)],
+            "notice gauge must match committed rows before releasing the connection guard"
+        );
+    }
+
+    #[test]
+    fn legacy_notice_enqueue_gauge_precedes_unlock() {
+        notice_gauge_precedes_unlock("enqueue");
+    }
+    #[test]
+    fn legacy_notice_ack_gauge_precedes_unlock() {
+        notice_gauge_precedes_unlock("ack");
+    }
+    #[test]
+    fn legacy_notice_prune_gauge_precedes_unlock() {
+        notice_gauge_precedes_unlock("prune");
+    }
     use broca_core::{RunIndex, RunIndexState};
     use broca_protocol::{request::ModelHandle, RunFinishReason, StepId, Usage};
     use std::sync::atomic::AtomicBool;

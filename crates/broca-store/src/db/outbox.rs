@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 pub(super) fn initialize(conn: &Connection) -> Result<(), DbError> {
-    bus_events::init_event_schema(conn, false)?;
+    bus_events::init_overhaul_event_schema(conn)?;
     // Retention completion owns receipt cleanup, not a rebuild of locator rows.
     compaction_receipts::init_schema(conn)?;
     conn.execute_batch(
@@ -508,7 +508,9 @@ mod tests {
             sent: Mutex::new(Vec::new()),
         };
         assert_eq!(
-            events.drain_bus_event(&offline, 2001).await.unwrap(),
+            bus_events::drain_bus_event(&events, &offline, 2001)
+                .await
+                .unwrap(),
             DrainResult::Retry
         );
         assert_eq!(
@@ -546,7 +548,9 @@ mod tests {
         };
         normal(&events.db);
         assert_eq!(
-            events.drain_bus_event(&online, 3000).await.unwrap(),
+            bus_events::drain_bus_event(&events, &online, 3000)
+                .await
+                .unwrap(),
             DrainResult::Published
         );
         full(&events.db);

@@ -89,6 +89,9 @@ impl SqliteStore {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let result = receive(&tx, receipt)?;
+        if result == ReceiptWrite::Held {
+            return Ok(result);
+        }
         tx.commit()?;
         Ok(result)
     }
@@ -187,6 +190,44 @@ pub(crate) fn clear(conn: &Connection, receipt: &ViewReceipt) -> Result<(), Stor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_held_receipt_completes_with_rollback() {
+        thread_local! {
+            static COMPLETIONS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        fn trace(sql: &str) {
+            if sql == "COMMIT" || sql == "ROLLBACK" {
+                COMPLETIONS.with(|events| events.borrow_mut().push(sql.into()));
+            }
+        }
+        let store = SqliteStore::open_in_memory().unwrap();
+        let receipt = ViewReceipt {
+            ready: ViewReady::new("a".repeat(32), 2, 3, "b".repeat(64)),
+            lineage_id: "lineage".into(),
+            received_at_ms: 123,
+        };
+        store.conn.lock().unwrap().trace(Some(trace));
+        store.receive_compaction_view(&receipt).unwrap();
+        assert_eq!(
+            COMPLETIONS.with(|events| events.replace(Vec::new())),
+            ["COMMIT"]
+        );
+        for version in [2, 1] {
+            let mut held = receipt.clone();
+            held.ready.view_version = version;
+            assert_eq!(
+                store.receive_compaction_view(&held).unwrap(),
+                ReceiptWrite::Held
+            );
+            assert_eq!(
+                COMPLETIONS.with(|events| events.replace(Vec::new())),
+                ["ROLLBACK"]
+            );
+        }
+        store.conn.lock().unwrap().trace(None);
+    }
+
     #[test]
     fn receipts_are_durable_newest_only_and_compare_deleted() {
         let path = broca_test_support::scratch_root().join("compaction-receipts.db");
