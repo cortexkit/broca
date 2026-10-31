@@ -341,10 +341,37 @@ impl Rig {
         Self::start_configured(None, None, None).await
     }
 
+    async fn start_with_compaction_writer() -> Option<Self> {
+        Self::start_configured_with_compaction_writer(None, None, None, true).await
+    }
+
+    fn write_compaction_config(config_home: &Path) -> PathBuf {
+        let path = config_home.join("cortexkit/broca.jsonc");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "bus_run_events_enabled": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
     async fn start_configured(
         binary: Option<&Path>,
         state: Option<&Path>,
         model_url: Option<&str>,
+    ) -> Option<Self> {
+        Self::start_configured_with_compaction_writer(binary, state, model_url, false).await
+    }
+
+    async fn start_configured_with_compaction_writer(
+        binary: Option<&Path>,
+        state: Option<&Path>,
+        model_url: Option<&str>,
+        compaction_writer: bool,
     ) -> Option<Self> {
         let subc_core = sibling_bin("ck-subc", "SUBC_CORE_BIN");
         let stub = sibling_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN");
@@ -452,7 +479,7 @@ impl Rig {
                 "reserved": true,
             })
         };
-        let config = serde_json::json!({
+        let mut config = serde_json::json!({
             "version": 1,
             "scope_authority_owners": [OWNER],
             "modules": {
@@ -482,6 +509,12 @@ impl Rig {
                 })),
             }
         });
+        if compaction_writer {
+            // Broca calls compaction providers only when bus events are enabled. Without that
+            // startup switch, admission refuses every compaction item before asking its provider.
+            config["modules"]["broca"]["env"]["BROCA_CONFIG_PATH"] =
+                serde_json::json!(Self::write_compaction_config(&config_home));
+        }
         std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
 
         let connection_file = runtime_dir.join("subc-connection.json");

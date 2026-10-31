@@ -10,6 +10,42 @@ use super::*;
 
 const PROVIDER: &str = "scoped-compaction";
 
+fn compaction_plan() -> Value {
+    let composition = json!({"providers":[{"provider":PROVIDER,"tools":[]}],
+        "compaction":{"provider":PROVIDER}, "step_transform_items":[]});
+    json!({"tool_items":[], "system_text_items":[], "step_transform_items":[],
+        "compaction_item":{"provider":PROVIDER,"preset":"head","params":{}},
+        "composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(),
+        "composition":composition})
+}
+
+#[test]
+fn compaction_fixture_opts_into_writer_support_and_uses_a_valid_plan() {
+    let root = broca_test_support::scratch_root().join("compaction-fixture-config");
+    let path = Rig::write_compaction_config(&root);
+    let config: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(
+        config["bus_run_events_enabled"], true,
+        "the fixture must enable bus events so broca accepts compaction items"
+    );
+    let parsed = broca_fetch_plan::parse_plan(
+        &compaction_plan(),
+        broca_fetch_plan::CompactionSupport::Supported,
+    )
+    .expect("the scoped send uses a valid compaction-only writer plan");
+    assert_eq!(parsed.compaction_item.unwrap().provider, PROVIDER);
+    let refused = broca_fetch_plan::parse_plan(
+        &compaction_plan(),
+        broca_fetch_plan::CompactionSupport::Unsupported,
+    )
+    .expect_err("a reader-only fixture cannot admit the same compaction item");
+    assert!(
+        matches!(refused, broca_fetch_plan::Refusal::InvalidParams { detail }
+        if detail["field"] == "plan.compaction_item")
+    );
+    broca_test_support::remove_rig_dir(&root);
+}
+
 #[derive(Default)]
 struct Seen {
     binds: Mutex<HashMap<(u16, u32), Value>>,
@@ -57,7 +93,7 @@ impl ModuleHandler for Compactor {
 async fn scoped_worker_send_stamps_compaction_setup_with_scope_workdir() {
     use subc_protocol::manifest::{Concurrency, ModuleManifest, ProviderRole};
 
-    let Some(rig) = Rig::start().await else {
+    let Some(rig) = Rig::start_with_compaction_writer().await else {
         return;
     };
     let checkout = rig.dir.join("worker-checkout");
@@ -91,15 +127,10 @@ async fn scoped_worker_send_stamps_compaction_setup_with_scope_workdir() {
     let owner = rig.connect_as(OWNER, &rig.owner_nonce).await;
     let identity = rig.session("scoped-worker");
     let route = open_scoped(&owner, &identity).await.unwrap();
-    let composition = json!({"providers":[{"provider":PROVIDER,"tools":[]}],
-        "compaction":{"provider":PROVIDER}, "step_transform_items":[]});
     let reply = owner.route_request(&route, serde_json::to_vec(&json!({
         "method":"session.send", "params":{
             "prompt":"hi", "send_id":"scoped-compaction", "model":{"provider":"mock","model":"mock-model"},
-            "plan":{"tool_items":[], "system_text_items":[], "step_transform_items":[],
-                "compaction_item":{"provider":PROVIDER,"preset":"worker","params":{}},
-                "composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(),
-                "composition":composition}
+            "plan":compaction_plan()
         }
     })).unwrap()).await.unwrap();
     assert_eq!(reply["result"]["state"], "active", "{reply}");
