@@ -269,8 +269,8 @@ mod unix_tests {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
-    use std::io::Write;
-    use test_support::{assert_protected_private, broaden, reset_acl, BroadParent};
+    use std::{io::Read, io::Write, os::windows::ffi::OsStrExt, path::PathBuf};
+    use test_support::{acl_snapshot, assert_protected_private, broaden, reset_acl, BroadParent};
     #[test]
     fn windows_creation_ignores_broad_parent_acl() {
         let fixture = BroadParent::new("helper");
@@ -308,5 +308,161 @@ mod windows_tests {
             .is_err());
         reset_acl(&path);
         assert_eq!(std::fs::read(&path).unwrap(), b"unchanged");
+    }
+
+    struct LongPathFixture {
+        root: PathBuf,
+        directory: PathBuf,
+    }
+
+    impl LongPathFixture {
+        fn new(tag: &str) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("broca-long-path-{tag}-{}", std::process::id()));
+            create_dir(&root).unwrap();
+            let mut directory = root.clone();
+            while directory.as_os_str().encode_wide().count() <= 340 {
+                directory.push("long-component-".repeat(5));
+            }
+            Self { root, directory }
+        }
+    }
+
+    impl Drop for LongPathFixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn windows_long_paths_preserve_private_creation_open_repair_and_rename() {
+        let fixture = LongPathFixture::new("io");
+        let root = &fixture.directory;
+        assert!(!root.as_os_str().to_string_lossy().starts_with(r"\\?\"));
+        create_dir_all(root).unwrap();
+        let dir = root.join("leaf");
+        create_dir(&dir).unwrap();
+        let path = dir.join("private");
+        assert!(path.as_os_str().encode_wide().count() > 300);
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"private")
+            .unwrap();
+        // With create(true), a failed Win32 create must reopen the existing file.
+        OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b" contents")
+            .unwrap();
+        let mut contents = Vec::new();
+        OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .unwrap()
+            .read_to_end(&mut contents)
+            .unwrap();
+        assert_eq!(contents, b"private contents");
+        validate_inheritable_directory(&dir).unwrap();
+        validate(&path).unwrap();
+        assert!(is_private(&path).unwrap());
+        for candidate in [root, &dir, &path] {
+            // PowerShell's independent ACL reader also needs the extended spelling.
+            let extended = std::fs::canonicalize(candidate).unwrap();
+            assert_protected_private(&extended);
+            let before = acl_snapshot(&extended);
+            repair(candidate).unwrap();
+            assert_eq!(acl_snapshot(&extended), before);
+        }
+        let renamed = dir.join("renamed");
+        test_support::move_file_without_replacing(&path, &renamed).unwrap();
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&renamed).unwrap(), b"private contents");
+        assert_protected_private(&std::fs::canonicalize(&renamed).unwrap());
+        std::fs::remove_file(&renamed).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn windows_long_media_objects_and_writer_markers() {
+        let fixture = LongPathFixture::new("staging");
+        let upload_id = "f".repeat(64);
+        let writer_id = "b".repeat(32);
+        let address = "a".repeat(16);
+        for relative in [
+            PathBuf::from("media-uploads/objects").join(&upload_id),
+            PathBuf::from("media-uploads/refs").join(format!("{upload_id}.json.tmp")),
+            PathBuf::from("open-writers").join(format!("{address}.{writer_id}.tmp")),
+        ] {
+            let path = fixture.directory.join(relative);
+            assert!(path.as_os_str().encode_wide().count() > 300);
+            // std prepares the parents so a raw-path regression fails at the writable open,
+            // not at directory creation. The private fixture root supplies the inherited ACL.
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(b"staged bytes").unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+            let mut contents = Vec::new();
+            OpenOptions::new()
+                .read(true)
+                .open(&path)
+                .unwrap()
+                .read_to_end(&mut contents)
+                .unwrap();
+            assert_eq!(contents, b"staged bytes");
+            assert_protected_private(&std::fs::canonicalize(&path).unwrap());
+        }
+    }
+
+    #[test]
+    fn windows_long_path_junction_is_still_refused() {
+        let fixture = LongPathFixture::new("junction");
+        let root = &fixture.directory;
+        create_dir_all(root).unwrap();
+        let external = fixture.root.join("external");
+        std::fs::create_dir(&external).unwrap();
+        let marker = external.join("untouched");
+        std::fs::write(&marker, b"external marker").unwrap();
+        let before = [acl_snapshot(&external), acl_snapshot(&marker)];
+        let link = root.join("junction");
+        let extended_link = std::fs::canonicalize(root).unwrap().join("junction");
+        let result = std::process::Command::new("cmd.exe")
+            .args(["/C", "mklink", "/J"])
+            .arg(&extended_link)
+            .arg(&external)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "junction fixture: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(is_reparse(&std::fs::symlink_metadata(&link).unwrap()));
+        for candidate in [&link, &extended_link] {
+            assert!(validate(candidate)
+                .unwrap_err()
+                .to_string()
+                .contains("reparse"));
+            assert!(repair(candidate)
+                .unwrap_err()
+                .to_string()
+                .contains("reparse"));
+            assert!(create_dir_all(candidate)
+                .unwrap_err()
+                .to_string()
+                .contains("reparse"));
+        }
+        assert_eq!([acl_snapshot(&external), acl_snapshot(&marker)], before);
+        assert_eq!(std::fs::read(&marker).unwrap(), b"external marker");
+        std::fs::remove_dir(&link).unwrap();
     }
 }
