@@ -30,7 +30,7 @@ tracing.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
-rusqlite = { version = "0.32", features = ["hooks"] }
+rusqlite = { version = "0.32", features = ["hooks", "trace"] }
 broca-crash-harness = { path = "../broca-crash-harness" }
 broca-owner-only = { workspace = true, features = ["test-support"] }
 # Test scratch paths live under one owned, self-reclaiming root; see that crate.

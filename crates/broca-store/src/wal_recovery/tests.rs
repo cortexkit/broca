@@ -68,7 +68,11 @@ impl Fixture {
             wal.append(1, &record.record, true).unwrap();
         }
         drop(wal);
-        let store = Arc::new(SqliteStore::open(root.join("store.db")).unwrap());
+        let store = Arc::new(
+            SqliteStore::open(root.join("store.db"))
+                .unwrap()
+                .with_wal_config(WalConfig::OVERHAUL),
+        );
         let range =
             broca_wal::file_wal::read_records_range(&path, DEFAULT_MAX_READ_BYTES, 0, None, None)
                 .unwrap();
@@ -401,7 +405,9 @@ fn stop_after_invalidation(f: &Fixture) {
 fn recovery_pending_fence_refuses_lease_free_summary_readers() {
     let f = Fixture::new();
     stop_after_invalidation(&f);
-    let reopened = SqliteStore::open(f.root.join("store.db")).unwrap();
+    let reopened = SqliteStore::open(f.root.join("store.db"))
+        .unwrap()
+        .with_wal_config(WalConfig::OVERHAUL);
     for store in [&*f.store, &reopened] {
         let error = store
             .lookup_run("r")
@@ -498,7 +504,11 @@ fn recovery_crash_after_invalidation_reopens_without_stale_projection() {
         f.store.project(&f.session, &f.before).is_err(),
         "pre-cut records cannot remove the durable fence"
     );
-    f.store = Arc::new(SqliteStore::open(f.root.join("store.db")).unwrap());
+    f.store = Arc::new(
+        SqliteStore::open(f.root.join("store.db"))
+            .unwrap()
+            .with_wal_config(WalConfig::OVERHAUL),
+    );
     f.wals = FileWalStore::with_config(f.root.join("wal"), WalConfig::OVERHAUL);
     f.wals
         .bind_recovery_projection(Some(&f.session), f.store.clone());

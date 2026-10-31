@@ -65,6 +65,10 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   after an unconfigured open is a typed boot-configuration error, not a second
   recovery pass. Diagnostics receives the same boot decision and scans recovery
   evidence only for overhaul roots.
+  Materialized-store readers receive that same boot configuration. Unconfigured
+  SQLite stores retain legacy queries, including the old transaction-free run
+  lookup and lineage-only projection metadata read; they do not probe the root
+  to infer recovery policy.
 
   Repair retains every complete, checksum-valid contiguous record before the
   first damaged or undecodable record. It repairs both unpublished tails and

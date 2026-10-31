@@ -365,7 +365,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     plane.set_scope_describer(scope_describer.clone());
     let run_index = Arc::new(
         broca_store::SqliteStore::open(state_root.join("run-index.db"))
-            .map_err(|e| ServeIoError(format!("open run index: {e}")))?,
+            .map_err(|e| ServeIoError(format!("open run index: {e}")))?
+            .with_wal_config(wal_config),
     );
     wal_store.set_session_ref_index(run_index.clone());
     broca_core::WalStore::bind_recovery_projection(wal_store.as_ref(), None, run_index.clone());

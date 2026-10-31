@@ -57,13 +57,14 @@ pub fn gather(
     now: i64,
     config: broca_wal::WalConfig,
 ) -> Result<Evidence, ErrorBody> {
-    let store =
-        broca_store::SqliteStore::open_read_only(root.join("run-index.db")).map_err(|_| {
+    let store = broca_store::SqliteStore::open_read_only(root.join("run-index.db"))
+        .map_err(|_| {
             ErrorBody::new(
                 "store_error",
                 "diagnostics.findings cannot read run-index.db",
             )
-        })?;
+        })?
+        .with_wal_config(config);
     let runs = store.diagnostic_evidence(since, now).map_err(|_| {
         ErrorBody::new(
             "store_error",

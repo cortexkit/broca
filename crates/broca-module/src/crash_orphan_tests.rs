@@ -299,7 +299,11 @@ impl Fixture {
         ));
         std::fs::create_dir_all(root.join("project")).unwrap();
         let key = BindIdentity::new(root.join("project"), "runner", "session");
-        let index = Arc::new(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
+        let index = Arc::new(
+            broca_store::SqliteStore::open(root.join("run-index.db"))
+                .unwrap()
+                .with_wal_config(wal_config),
+        );
         let executor = Arc::new(Recording::default());
         let mut wal = FileWalStore::with_config(root.join("wal"), wal_config);
         if let Some(observer) = observer {

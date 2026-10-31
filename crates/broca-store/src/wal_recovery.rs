@@ -157,12 +157,17 @@ impl SqliteStore {
         session: &BindIdentity,
         cut: &RecoveryCut,
     ) -> Result<(), StoreError> {
+        if !self.wal_config.is_overhaul() {
+            return Err(StoreError::InconsistentSnapshot(
+                "overhaul WAL recovery requires a boot-configured materialized store",
+            ));
+        }
         let key = Self::key(session);
         let session_json = serde_json::to_string(session)?;
         let mut conn = self.conn.lock().unwrap();
         require_full_synchronous(&conn)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (_, lineage, epoch) = current_projection_state(&tx, &key)?;
+        let (_, lineage, epoch) = current_projection_state(&tx, &key, true)?;
         let text = checkpoint(&tx, &key)?;
         let old = text.as_deref().map(decode_fence).transpose()?.flatten();
         let mut ids: BTreeSet<_> = required_cut_ids(text.as_deref(), None)?
@@ -284,7 +289,7 @@ impl SqliteStore {
         let fence = read_fence(&tx, &key)?.ok_or(StoreError::InconsistentSnapshot(
             "recovery projection fence missing",
         ))?;
-        let snapshot = Self::projection_snapshot_from_tx(&tx, &key)?;
+        let snapshot = Self::projection_snapshot_from_tx(&tx, &key, true)?;
         let plan = Self::prepare_projection(snapshot, records, Some(range))?;
         Self::apply_projection_plan(&tx, &key, plan)?;
         restore_run_rows(&tx, session, records, &fence.invalidated_runs)?;
