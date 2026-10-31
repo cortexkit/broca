@@ -10,6 +10,13 @@ filename, payload or byte offset.
 
 ## Completeness and admission
 
+Session binds also use this inventory to retain an existing pair's original root.
+Before acknowledging a new pair, an immediate SQLite transaction checks completeness,
+checks the pair's roots, and reserves its first candidate. Competing first binds share
+that writer transaction, so they cannot select different roots. A refused bind or an
+interrupted first send can therefore leave an identity-only candidate without a WAL.
+Candidates still do not prove that content exists or is locally owned.
+
 Before a `RunStarted` append, ordinary and preencoded writers (including
 provider-free imports) attempt to commit the candidate. The connection mutex and
 SQLite write lock share a bounded wait budget matching the store's five-second

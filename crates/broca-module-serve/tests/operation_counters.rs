@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use broca_core::FileWalStore;
 use broca_module::registry::{ActorHandle, LineageOpener, OpenError, RegistryHandle};
 use broca_module::LineageRegistry;
+include!("common/address_inventory.rs");
 use broca_module_serve::serve::VaultGauge;
 use broca_module_serve::serve_connection;
 use broca_protocol::BindIdentity;
@@ -228,11 +229,11 @@ async fn health_check_stream_chunks_session_reads_and_actor_opens_start_at_zero_
         .expect("the isolated counter test owns its tracing subscriber");
 
     let dir = tmpdir("health");
-    let registry = Arc::new(LineageRegistry::new_with_reader(
+    let registry = Arc::new(test_registry(LineageRegistry::new_with_reader(
         Arc::new(RejectingOpener),
         Arc::new(FileWalStore::new(dir.join("wal"))),
         None,
-    ));
+    )));
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (mut client_reader, mut client_writer) = tokio::io::split(client);
     let (server_reader, server_writer) = tokio::io::split(server);

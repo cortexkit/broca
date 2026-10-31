@@ -808,6 +808,11 @@ impl Rig {
     ) -> Self {
         let wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
+        broca_store::session_refs::migrate(
+            &dir.join("store.db"),
+            &broca_core::ReadOnlyWalReader::new(&dir),
+        )
+        .unwrap();
         let script = Arc::new(Script::default());
         let hook_plane = Arc::new(Mutex::new(None));
         let exec = Arc::new(CoreExec {
@@ -831,6 +836,7 @@ impl Rig {
             wal.clone(),
             Some(store.clone()),
         ));
+        registry.set_session_address_inventory(store.clone());
         let (client, server) = tokio::io::duplex(64 * 1024);
         let (mut reader, mut writer) = tokio::io::split(client);
         let (server_read, server_write) = tokio::io::split(server);

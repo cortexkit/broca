@@ -499,9 +499,7 @@ fn run_id_for_send(session: &BrocaBindIdentity, send_id: Option<&str>) -> broca_
     }
 }
 
-/// Map a subc route bind identity to the broca session key. The triples are
-/// field-identical; this ONE mapping is the adapter boundary (like the SubcToolPlane's
-/// identity mapping on the consumer side).
+/// Derive an import's deterministic run id under the already resolved storage identity.
 fn run_id_for_import(session: &BrocaBindIdentity, import_id: &str) -> broca_protocol::RunId {
     let mut seed = send_id_scope(session);
     seed.push_str("import:");
@@ -538,8 +536,8 @@ struct BindObservation {
     /// carries it to admission, which decides the owner check and the scope to freeze.
     scope: broca_protocol::SendScope,
     /// The session folder and project id on the bind's scope stamp, `None` on an unstamped
-    /// bind. Measured against the bind's `project_root` on each scoped send; never part of
-    /// the session key.
+    /// bind. New scoped pairs take its workdir as their storage root; existing pairs keep
+    /// their inventory root. Project id remains attribution only.
     stamped_project: Option<crate::scope_workdir::StampedProject>,
     /// What the consumer declared about reading tool replies, under either version's name for
     /// the reply format.
@@ -813,6 +811,7 @@ struct SubscriptionSlot {
 }
 
 struct BindCompletion {
+    address_refusal: Option<broca_store::session_address::SessionAddressError>,
     header: subc_protocol::EnvelopeHeader,
     channel: u16,
     epoch: u32,
@@ -1883,7 +1882,7 @@ async fn handle_control_request(
             if let Err(error) = if bind.agent_data || bind.role.is_sessionless() {
                 Ok(())
             } else {
-                identity.validate_keyable()
+                BrocaBindIdentity::new("", &identity.harness, &identity.session).validate_keyable()
             } {
                 return send_error(
                     writer,
@@ -1904,6 +1903,7 @@ async fn handle_control_request(
                 previous.cancel();
             }
             let completed = BindCompletion {
+                address_refusal: None,
                 header: frame.header,
                 channel: route_channel,
                 epoch,
@@ -1914,10 +1914,7 @@ async fn handle_control_request(
             };
             // Keep the bind unacknowledged until its history authorizes the stamp. The read
             // runs off ingress so a slow WAL/store cannot hide health probes or GOODBYE.
-            if !completed.bind.agent_data
-                && !completed.bind.role.is_sessionless()
-                && matches!(&completed.bind.scope, broca_protocol::SendScope::Stamped(_))
-            {
+            if !completed.bind.agent_data && !completed.bind.role.is_sessionless() {
                 let registry = health_registry.clone();
                 routes
                     .bind_tasks
@@ -2114,8 +2111,8 @@ async fn handle_control_request(
                     "serve_frames_dropped_unbound_channel": SERVE_FRAMES_DROPPED_UNBOUND_CHANNEL.load(Ordering::Relaxed),
                     "serve_frames_dropped_stale_epoch": SERVE_FRAMES_DROPPED_STALE_EPOCH.load(Ordering::Relaxed),
                     // Distinct scoped sessions whose send's stamped folder matched, differed
-                    // from, or was missing beside the bind's project_root. Sessions stay keyed
-                    // by project_root either way; `sessions_differ` is how many would move if
+                    // from, or was missing beside the resolved storage root. Existing sessions
+                    // retain that root; `sessions_differ` is how many would move if
                     // they were keyed by the stamped folder instead.
                     "scoped_session_workdirs": crate::scope_workdir::health(),
                     // Requests a module sent toward broca on a route, each answered with
@@ -2331,6 +2328,23 @@ async fn authorize_bind(
     mut completed: BindCompletion,
     registry: LineageRegistry,
 ) -> BindCompletion {
+    match registry
+        .resolve_session_address(
+            &completed.identity,
+            completed
+                .bind
+                .stamped_project
+                .as_ref()
+                .and_then(|stamp| stamp.workdir.as_deref()),
+        )
+        .await
+    {
+        Ok(identity) => completed.identity = identity,
+        Err(error) => {
+            completed.address_refusal = Some(error);
+            return completed;
+        }
+    }
     if let broca_protocol::SendScope::Stamped(stamp) = &completed.bind.scope {
         let check = registry.bind_adoption_refusal(
             &completed.identity,
@@ -2364,6 +2378,28 @@ async fn finish_bind(
         return Ok(());
     }
     routes.pending_binds.remove(&completed.channel);
+    if let Some(error) = completed.address_refusal {
+        let class = match error {
+            broca_store::session_address::SessionAddressError::Ambiguous
+            | broca_store::session_address::SessionAddressError::Invalid(_) => "permanent",
+            broca_store::session_address::SessionAddressError::Unavailable(_) => "transient",
+        };
+        let message = format!(
+            "cannot resolve session {:?} in harness {:?}: {error}",
+            completed.identity.session, completed.identity.harness
+        );
+        let body =
+            ErrorBody::new(error.code(), message).with_detail(serde_json::json!({"class":class}));
+        return send_error_body(
+            writer,
+            completed.header.ver,
+            0,
+            0,
+            completed.header.corr,
+            body,
+        )
+        .await;
+    }
     let refusal = match completed.refusal {
         Ok(refusal) => refusal,
         // The adoption check could not read the session's history. Refuse the bind as a
@@ -3143,7 +3179,7 @@ where
             send_req.request.scope = bind.scope.clone();
             send_req.plan = plan;
             // Measured here, after every serve-side refusal, so only sends that reach the
-            // session are counted. The session key above stays the bind triple.
+            // session are counted. Compare against the resolved storage identity.
             if matches!(&bind.scope, broca_protocol::SendScope::Stamped(_)) {
                 crate::scope_workdir::observe_scoped_send(
                     session,
@@ -5746,6 +5782,10 @@ impl std::error::Error for ServeIoError {}
 
 #[cfg(test)]
 mod tests {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/common/address_inventory.rs"
+    ));
     use super::*;
 
     #[test]
@@ -6157,7 +6197,7 @@ mod tests {
                     entered: tokio::sync::Notify::new(),
                     release: tokio::sync::Notify::new(),
                 });
-                let registry = LineageRegistry::new(Arc::new(RefusingOpener));
+                let registry = test_registry(LineageRegistry::new(Arc::new(RefusingOpener)));
                 handle_frame(
                     frame,
                     &writer,
@@ -6510,7 +6550,9 @@ mod tests {
     /// served bytes are pinned by `tests/golden/subscribe_unit_undeliverable.too_large.json`.
     #[tokio::test]
     async fn an_oversized_subscribe_unit_ends_the_stream_with_a_typed_error() {
-        let registry = Arc::new(LineageRegistry::new(Arc::new(RefusingOpener)));
+        let registry = Arc::new(test_registry(LineageRegistry::new(Arc::new(
+            RefusingOpener,
+        ))));
         let mut ingress = BindIngress::new(registry);
         ingress.bind(1, "published", false).await;
         next_written(&mut ingress.written).await;
@@ -7636,6 +7678,9 @@ mod tests {
                 .unwrap(),
             )
             .await;
+            if !stamped {
+                self.complete_bind().await;
+            }
         }
 
         async fn complete_bind(&mut self) {
@@ -7722,11 +7767,11 @@ mod tests {
             finished: tokio::sync::Notify::new(),
             records,
         });
-        let registry = Arc::new(LineageRegistry::new_with_reader(
+        let registry = Arc::new(test_registry(LineageRegistry::new_with_reader(
             Arc::new(RefusingOpener),
             store.clone(),
             None,
-        ));
+        )));
         (
             BindIngress::new(registry),
             store,
@@ -7932,11 +7977,11 @@ mod tests {
 
     #[tokio::test]
     async fn stamped_bind_with_unreadable_history_is_refused_not_published() {
-        let registry = Arc::new(LineageRegistry::new_with_reader(
+        let registry = Arc::new(test_registry(LineageRegistry::new_with_reader(
             Arc::new(RefusingOpener),
             Arc::new(UnreadableBindHistory),
             None,
-        ));
+        )));
         let mut ingress = BindIngress::new(registry);
         ingress.bind(1, "unreadable", true).await;
         ingress.complete_bind().await;
@@ -8016,7 +8061,9 @@ mod tests {
 
     #[tokio::test]
     async fn unauthorized_subscribe_reports_authorization_before_invalid_params() {
-        let registry = Arc::new(LineageRegistry::new(Arc::new(RefusingOpener)));
+        let registry = Arc::new(test_registry(LineageRegistry::new(Arc::new(
+            RefusingOpener,
+        ))));
         let mut ingress = BindIngress::new(registry);
         ingress.bind(1, "published", false).await;
         next_written(&mut ingress.written).await;
@@ -8060,7 +8107,9 @@ mod tests {
 
     #[tokio::test]
     async fn unauthorized_replacement_subscribe_preserves_original_stream_correlation() {
-        let registry = Arc::new(LineageRegistry::new(Arc::new(RefusingOpener)));
+        let registry = Arc::new(test_registry(LineageRegistry::new(Arc::new(
+            RefusingOpener,
+        ))));
         let mut ingress = BindIngress::new(registry);
         ingress.bind(1, "published", false).await;
         next_written(&mut ingress.written).await;
@@ -8111,7 +8160,9 @@ mod tests {
 
     #[tokio::test]
     async fn authorized_invalid_subscribe_preserves_original_stream_correlation() {
-        let registry = Arc::new(LineageRegistry::new(Arc::new(RefusingOpener)));
+        let registry = Arc::new(test_registry(LineageRegistry::new(Arc::new(
+            RefusingOpener,
+        ))));
         let mut ingress = BindIngress::new(registry);
         ingress.bind(1, "published", false).await;
         next_written(&mut ingress.written).await;
@@ -8156,11 +8207,11 @@ mod tests {
             finished: tokio::sync::Notify::new(),
             records: vec![],
         });
-        let registry = Arc::new(LineageRegistry::new_with_reader(
+        let registry = Arc::new(test_registry(LineageRegistry::new_with_reader(
             Arc::new(RefusingOpener),
             store.clone(),
             None,
-        ));
+        )));
         let (mut daemon, module) = tokio::io::duplex(64 * 1024);
         let (reader, writer) = tokio::io::split(module);
         let serve = tokio::spawn(serve_connection(
@@ -8242,7 +8293,9 @@ mod tests {
         routes.pending_binds.insert(7, (1, cancel.clone()));
         let goodbye = Frame::build(FrameType::Goodbye, control_flags(), 7, 1, 0, vec![]).unwrap();
         let (writer, mut written) = broca_diagnostics::channel::<Frame>(4, Arc::default());
-        let registry = Arc::new(LineageRegistry::new(Arc::new(RefusingOpener)));
+        let registry = Arc::new(test_registry(LineageRegistry::new(Arc::new(
+            RefusingOpener,
+        ))));
         handle_frame(
             goodbye,
             &writer,
@@ -8263,6 +8316,7 @@ mod tests {
             .header;
         finish_bind(
             BindCompletion {
+                address_refusal: None,
                 header,
                 channel: 7,
                 epoch: 1,
@@ -8470,7 +8524,9 @@ mod tests {
                 writer,
                 "broca",
                 handler,
-                Arc::new(LineageRegistry::new(Arc::new(RefusingOpener))),
+                Arc::new(test_registry(LineageRegistry::new(Arc::new(
+                    RefusingOpener,
+                )))),
                 VaultGauge::not_in_use(),
             ));
             bind_test_route(&mut daemon, session).await;
@@ -8525,7 +8581,9 @@ mod tests {
             },
             "broca",
             handler.clone(),
-            Arc::new(LineageRegistry::new(Arc::new(RefusingOpener))),
+            Arc::new(test_registry(LineageRegistry::new(Arc::new(
+                RefusingOpener,
+            )))),
             VaultGauge::not_in_use(),
         ));
         bind_test_route(&mut daemon, "reset-response").await;
@@ -8559,7 +8617,7 @@ mod tests {
         });
         let loop_handler = handler.clone();
         let serve = tokio::spawn(async move {
-            let registry = LineageRegistry::new(Arc::new(RefusingOpener));
+            let registry = test_registry(LineageRegistry::new(Arc::new(RefusingOpener)));
             run_frame_loop(
                 &mut module_read,
                 writer,
@@ -8917,7 +8975,7 @@ mod tests {
         let (writer, mut written) =
             broca_diagnostics::channel::<Frame>(EGRESS_BUFFER, Arc::default());
         let serve = tokio::spawn(async move {
-            let registry = LineageRegistry::new(Arc::new(RefusingOpener));
+            let registry = test_registry(LineageRegistry::new(Arc::new(RefusingOpener)));
             run_frame_loop(
                 &mut module_read,
                 writer,
@@ -9090,7 +9148,7 @@ mod tests {
             release: tokio::sync::Notify::new(),
         });
         let serve = tokio::spawn(async move {
-            let registry = LineageRegistry::new(Arc::new(RefusingOpener));
+            let registry = test_registry(LineageRegistry::new(Arc::new(RefusingOpener)));
             run_frame_loop(
                 &mut module_read,
                 writer,
@@ -9245,7 +9303,7 @@ mod tests {
             release: tokio::sync::Notify::new(),
         });
         let serve = tokio::spawn(async move {
-            let registry = LineageRegistry::new(Arc::new(RefusingOpener));
+            let registry = test_registry(LineageRegistry::new(Arc::new(RefusingOpener)));
             let consumer_routes = crate::consumer_routes::ConsumerRoutes::default();
             run_frame_loop(
                 &mut module_read,
@@ -9353,7 +9411,7 @@ mod tests {
         });
         let loop_handler = handler.clone();
         let serve = tokio::spawn(async move {
-            let registry = LineageRegistry::new(Arc::new(RefusingOpener));
+            let registry = test_registry(LineageRegistry::new(Arc::new(RefusingOpener)));
             let consumer_routes = crate::consumer_routes::ConsumerRoutes::default();
             run_frame_loop(
                 &mut module_read,
@@ -9503,7 +9561,7 @@ mod tests {
         });
         let loop_handler = handler.clone();
         let serve = tokio::spawn(async move {
-            let registry = LineageRegistry::new(Arc::new(RefusingOpener));
+            let registry = test_registry(LineageRegistry::new(Arc::new(RefusingOpener)));
             let consumer_routes = crate::consumer_routes::ConsumerRoutes::default();
             run_frame_loop(
                 &mut module_read,

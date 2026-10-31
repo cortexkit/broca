@@ -13,6 +13,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[path = "../common/address_inventory.rs"]
+mod address_inventory;
+use address_inventory::test_registry;
+
 use async_trait::async_trait;
 use broca_catalog::live::{
     resolve_chatgpt_pause_provider_with_client, resolve_provider, AuthMode, ResolveOptions,
@@ -565,15 +569,19 @@ fn registry_and_wal_inner(
         .with_run_index(store.clone())
         .with_materialized_store(store.clone());
     let wal_reader: Arc<dyn broca_core::WalStore> = wal.clone();
-    let store_reader: Arc<dyn broca_core::MaterializedStore> = store;
-    (
-        Arc::new(LineageRegistry::new_with_reader(
-            Arc::new(opener),
-            wal_reader,
-            Some(store_reader),
-        )),
-        wal,
+    let store_reader: Arc<dyn broca_core::MaterializedStore> = store.clone();
+    broca_store::session_refs::migrate(
+        &dir.join("store.db"),
+        &broca_core::ReadOnlyWalReader::new(dir),
     )
+    .unwrap();
+    let reg = Arc::new(broca_module::LineageRegistry::new_with_reader(
+        Arc::new(opener),
+        wal_reader,
+        Some(store_reader),
+    ));
+    reg.set_session_address_inventory(store);
+    (reg, wal)
 }
 
 fn registry(dir: &Path) -> Arc<LineageRegistry> {
@@ -597,14 +605,18 @@ fn registry_with_export(dir: &Path) -> (Arc<LineageRegistry>, Arc<broca_store::S
         .with_charge_basis_resolver(resolver);
     let wal_reader: Arc<dyn broca_core::WalStore> = wal;
     let store_reader: Arc<dyn broca_core::MaterializedStore> = store.clone();
-    (
-        Arc::new(LineageRegistry::new_with_reader(
-            Arc::new(opener),
-            wal_reader,
-            Some(store_reader),
-        )),
-        store,
+    broca_store::session_refs::migrate(
+        &dir.join("store.db"),
+        &broca_core::ReadOnlyWalReader::new(dir),
     )
+    .unwrap();
+    let reg = Arc::new(broca_module::LineageRegistry::new_with_reader(
+        Arc::new(opener),
+        wal_reader,
+        Some(store_reader),
+    ));
+    reg.set_session_address_inventory(store.clone());
+    (reg, store)
 }
 
 /// True when the session holds no committed records: its WAL is absent (the usual result of a
@@ -3147,11 +3159,11 @@ async fn read_route_manifest_and_page_roundtrip() {
     );
     let wal_reader: Arc<dyn broca_core::WalStore> = wal.clone();
     let store_reader: Arc<dyn broca_core::MaterializedStore> = store.clone();
-    let reg = Arc::new(LineageRegistry::new_with_reader(
+    let reg = Arc::new(test_registry(LineageRegistry::new_with_reader(
         opener,
         wal_reader,
         Some(store_reader),
-    ));
+    )));
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (mut creader, mut cwriter) = tokio::io::split(client);
     let (sreader, swriter) = tokio::io::split(server);
@@ -3319,11 +3331,11 @@ async fn same_send_id_same_prompt_reuses_one_episode() {
         reply_text: "answer".into(),
     });
     let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
-    let reg = Arc::new(LineageRegistry::new(Arc::new(
+    let reg = Arc::new(test_registry(LineageRegistry::new(Arc::new(
         DefaultOpener::new(lease, wal.clone(), exec)
             .with_idle_ttl(Duration::from_millis(50))
             .with_run_index(store),
-    )));
+    ))));
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (mut creader, mut cwriter) = tokio::io::split(client);
     let (sreader, swriter) = tokio::io::split(server);
@@ -3482,7 +3494,7 @@ async fn chatgpt_needs_reauth_pauses_and_resumes_original_send() {
         first_attempt_pauses: true,
     });
     let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
-    let reg = Arc::new(LineageRegistry::new_with_reader(
+    let reg = Arc::new(test_registry(LineageRegistry::new_with_reader(
         Arc::new(
             DefaultOpener::new(lease, wal.clone(), exec)
                 .with_idle_ttl(Duration::from_secs(5))
@@ -3490,7 +3502,7 @@ async fn chatgpt_needs_reauth_pauses_and_resumes_original_send() {
         ),
         wal.clone(),
         Some(store),
-    ));
+    )));
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (mut creader, mut cwriter) = tokio::io::split(client);
     let (sreader, swriter) = tokio::io::split(server);
@@ -3753,11 +3765,11 @@ async fn chatgpt_needs_reauth_send_durably_pauses_then_resumes_same_run() {
         first_attempt_pauses: true,
     });
     let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
-    let registry = Arc::new(LineageRegistry::new(Arc::new(
+    let registry = Arc::new(test_registry(LineageRegistry::new(Arc::new(
         DefaultOpener::new(lease, wal.clone(), exec)
             .with_idle_ttl(Duration::from_secs(5))
             .with_run_index(store),
-    )));
+    ))));
     let session = BindIdentity::new(dir.join("proj"), "runner", "fresh-reauth");
     let request = chatgpt_send(session.clone(), "run-chatgpt-reauth", "resume me");
 
@@ -3907,11 +3919,11 @@ async fn queued_chatgpt_needs_reauth_pauses_instead_of_being_tombstoned() {
         first_attempt_pauses: false,
     });
     let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
-    let registry = Arc::new(LineageRegistry::new(Arc::new(
+    let registry = Arc::new(test_registry(LineageRegistry::new(Arc::new(
         DefaultOpener::new(lease, wal.clone(), exec)
             .with_idle_ttl(Duration::from_secs(5))
             .with_run_index(store),
-    )));
+    ))));
     let session = BindIdentity::new(dir.join("proj"), "runner", "queued-reauth");
 
     let first = registry
@@ -4756,11 +4768,11 @@ async fn project_observation_wire(import: bool) {
         .with_run_index(store.clone())
         .with_materialized_store(store.clone()),
     );
-    let reg = Arc::new(LineageRegistry::new_with_reader(
+    let reg = Arc::new(test_registry(LineageRegistry::new_with_reader(
         opener,
         wal.clone(),
         Some(store),
-    ));
+    )));
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (mut reader, mut writer) = tokio::io::split(client);
     let (sr, sw) = tokio::io::split(server);
@@ -5053,11 +5065,11 @@ impl PrincipalRig {
             .with_run_index(store.clone())
             .with_materialized_store(store.clone()),
         );
-        let reg = Arc::new(LineageRegistry::new_with_reader(
+        let reg = Arc::new(test_registry(LineageRegistry::new_with_reader(
             opener,
             wal.clone(),
             Some(store),
-        ));
+        )));
         let (client, server) = tokio::io::duplex(64 * 1024);
         let (mut reader, mut writer) = tokio::io::split(client);
         let (sr, sw) = tokio::io::split(server);
@@ -5472,11 +5484,11 @@ impl PreparedWalRoute {
                     hold: None,
                 }),
             );
-            reg = Arc::new(LineageRegistry::new_with_reader(
+            reg = Arc::new(test_registry(LineageRegistry::new_with_reader(
                 Arc::new(opener),
                 reader,
                 None,
-            ));
+            )));
         }
         let session = BindIdentity::new(dir.join("proj"), "runner", "s1");
         {
@@ -5988,11 +6000,11 @@ impl SendKeyRig {
             .with_run_index(store.clone())
             .with_materialized_store(store.clone()),
         );
-        let registry = Arc::new(LineageRegistry::new_with_reader(
+        let registry = Arc::new(test_registry(LineageRegistry::new_with_reader(
             opener,
             wal.clone(),
             Some(store),
-        ));
+        )));
         let (client, server) = tokio::io::duplex(64 * 1024);
         let (mut reader, mut writer) = tokio::io::split(client);
         let (sr, sw) = tokio::io::split(server);
@@ -7134,11 +7146,11 @@ async fn send_declared_tool_reply_is_validated_frozen_and_inherited_over_the_ser
     );
     let wal_reader: Arc<dyn broca_core::WalStore> = wal.clone();
     let store_reader: Arc<dyn broca_core::MaterializedStore> = store.clone();
-    let reg = Arc::new(LineageRegistry::new_with_reader(
+    let reg = Arc::new(test_registry(LineageRegistry::new_with_reader(
         opener,
         wal_reader,
         Some(store_reader),
-    ));
+    )));
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (mut creader, mut cwriter) = tokio::io::split(client);
     let (sreader, swriter) = tokio::io::split(server);

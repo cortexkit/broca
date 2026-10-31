@@ -4405,6 +4405,15 @@ fn declares_compaction_provider(
     role_versions.is_some_and(|roles| roles.contains_key(broca_core::compaction_provider::ROLE))
 }
 
+/// Storage resolution preserves an existing session's original transport folder.
+/// Keep this choice separate from storage addressing when adopting folderless binds.
+fn outgoing_project_root(
+    storage_identity: &BindIdentity,
+    _current_bind: &BindIdentity,
+) -> std::path::PathBuf {
+    storage_identity.project_root.clone()
+}
+
 fn to_subc_bind(
     identity: &BindIdentity,
     target: &RouteTarget,
@@ -4466,7 +4475,7 @@ fn to_subc_bind(
     // carried and persisted (the session-identity re-key), this becomes "forward what was
     // persisted with the session, else None"; it must not become "forward whatever arrived".
     SubcBindIdentity::new(
-        identity.project_root.clone(),
+        outgoing_project_root(identity, identity),
         harness,
         identity.session.clone(),
     )
@@ -4642,6 +4651,19 @@ impl InProcessModuleEnd {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn outgoing_folder_uses_the_resolved_storage_identity_not_a_new_route_claim() {
+        let stored = broca_protocol::BindIdentity::new("/original/checkout", "runner", "s");
+        let rebound = broca_protocol::BindIdentity::new("/later/checkout", "runner", "s");
+        assert_eq!(
+            super::outgoing_project_root(&stored, &rebound),
+            std::path::PathBuf::from("/original/checkout")
+        );
+        assert_eq!(
+            super::outgoing_project_root(&rebound, &rebound),
+            std::path::PathBuf::from("/later/checkout")
+        );
+    }
     include!("connection/route_close_followup_tests.rs");
     #[tokio::test]
     async fn a_registered_call_waiting_for_egress_cannot_use_a_closing_route() {

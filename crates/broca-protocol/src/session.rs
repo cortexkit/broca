@@ -8,6 +8,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Reserved storage namespace for folderless sessions after subc-protocol 0.34.0 adoption.
+/// It must never be interpreted as an absolute checkout path on any platform.
+pub const UNSCOPED_SESSION_ROOT: &str = "broca-unscoped-v1";
+
 /// A durable, resumable conversation identity — the unit the WAL/store key on,
 /// and the per-session single-writer lease scope.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -242,6 +246,25 @@ pub enum SendScope {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unscoped_namespace_is_pinned_and_not_a_unix_or_windows_absolute_path() {
+        let namespace = super::UNSCOPED_SESSION_ROOT;
+        assert_eq!(namespace, "broca-unscoped-v1");
+        assert!(!namespace.is_empty());
+        assert!(!namespace.contains(['/', '\\', ':']));
+        assert!(!std::path::Path::new(namespace).is_absolute());
+        for absolute in [
+            "/checkout",
+            "C:\\checkout",
+            "C:/checkout",
+            "\\\\server\\share",
+            "\\\\?\\C:\\checkout",
+            "\\checkout",
+            "C:checkout",
+        ] {
+            assert_ne!(namespace, absolute);
+        }
+    }
     use super::*;
 
     #[test]

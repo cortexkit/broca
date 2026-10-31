@@ -2,6 +2,10 @@
 //! hung System One provider never delays session work on the same connection.
 
 use std::collections::BTreeMap;
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/common/address_inventory.rs"
+));
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use broca_module::serve::{
@@ -214,7 +218,7 @@ async fn start_with_basis(table: crate::billing_routing::ChargeBasisTable) -> Ri
         writer,
         "broca",
         handler.clone(),
-        Arc::new(LineageRegistry::new(Arc::new(NoLineages))),
+        Arc::new(test_registry(LineageRegistry::new(Arc::new(NoLineages)))),
         VaultGauge::not_in_use(),
         None,
         crate::wal_archive::WalArchiveConfig::default(),
