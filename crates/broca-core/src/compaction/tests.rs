@@ -1774,6 +1774,7 @@ async fn a_model_change_rides_for_a_view_and_applies_it() {
 
 fn routed_account_selection(account_ref: &str) -> broca_wal::AuthSelection {
     broca_wal::AuthSelection {
+        billing_vault_facts: None,
         credential_id: format!("vault-cred-{account_ref}"),
         account_ref: Some(account_ref.to_owned()),
         resolved_credential_id: Some(format!("vault-cred-{account_ref}")),

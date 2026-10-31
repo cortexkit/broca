@@ -45,3 +45,24 @@ pub(crate) fn must_skip(
     }
     Ok(!unknown.is_empty())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pre_snapshot_tables_refuse_vault_facts_for_both_reader_policies() {
+        let requires = vec!["bill-vault-facts/v1".to_owned()];
+        let older: Vec<_> = crate::checkpoint::KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|f| *f != "bill-vault-facts/v1")
+            .collect();
+        for policy in [Policy::Billing, Policy::All] {
+            assert!(
+                matches!(must_skip(&requires, &older, policy), Err(Error::NewerWriter { features }) if features == requires)
+            );
+            assert!(!must_skip(&requires, crate::checkpoint::KNOWN_FEATURES, policy).unwrap());
+        }
+    }
+}

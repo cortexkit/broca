@@ -943,6 +943,7 @@ mod tests {
             renderer_version: 1,
             frozen_render_config: serde_json::Value::Null,
             auth_selection: credential_id.map(|credential_id| AuthSelection {
+                billing_vault_facts: None,
                 auth_method: None,
                 credential_id: credential_id.into(),
                 account_ref: None,
@@ -2578,6 +2579,7 @@ mod tests {
                 WalRecord::RunAuthRefrozen {
                     ts_ms: Some(150),
                     auth_selection: AuthSelection {
+                        billing_vault_facts: None,
                         auth_method: None,
                         credential_id: "chatgpt:openai".into(),
                         account_ref: Some("acct-resolved".into()),

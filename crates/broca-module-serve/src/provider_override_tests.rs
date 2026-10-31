@@ -14,6 +14,7 @@ fn resolve_runtime_override(
         mode: AuthMode::Secret("test-api-key".into()),
         pause: None,
         selection: Some(broca_core::AuthSelection {
+            billing_vault_facts: None,
             auth_method: None,
             credential_id: "apikey:deepseek".into(),
             account_ref: None,

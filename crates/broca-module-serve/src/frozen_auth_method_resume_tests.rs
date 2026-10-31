@@ -150,6 +150,7 @@ async fn only_a_routed_admission_freezes_its_auth_method_and_requires_the_featur
     };
 
     let selection = configured.selection.expect("a fresh run freezes its selection");
+    assert!(selection.billing_vault_facts.is_none(), "reader release must not capture snapshots");
     assert_eq!(selection.auth_method, None, "{}", selection.credential_id);
     let record = run_started(selection);
     assert!(record.required_features().is_empty());
@@ -158,6 +159,7 @@ async fn only_a_routed_admission_freezes_its_auth_method_and_requires_the_featur
         .contains("auth_method"));
 
     let selection = routed.selection.expect("a routed run freezes its selection");
+    assert!(selection.billing_vault_facts.is_none(), "reader release must not capture snapshots");
     assert_eq!(selection.credential_id, "chatgpt:openai:second");
     assert_eq!(selection.auth_method.as_deref(), Some("chatgpt"));
     let record = run_started(selection);
@@ -169,4 +171,23 @@ async fn only_a_routed_admission_freezes_its_auth_method_and_requires_the_featur
     drop(executor);
     drop(daemon);
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn resume_preserves_the_frozen_billing_snapshot_without_backfilling() {
+    let mut frozen: broca_core::AuthSelection = serde_json::from_value(serde_json::json!({
+        "credential_id":"lookup", "resolved_credential_id":"vault-work",
+        "billing_vault_facts":{"state":"observed","credential_id":"vault-work","record_version":232,
+            "provider_ids":["anthropic"],"plan_tier":"max_20x","plan_tier_source":"operator"}
+    })).unwrap();
+    let mut today = frozen.clone();
+    today.resolved_credential_id = Some("different-witness".into());
+    today.billing_vault_facts = None;
+    let mut selection = Some(today);
+    preserve_billing_vault_snapshot(&mut selection, Some(&frozen));
+    assert_eq!(selection.as_ref().unwrap().billing_vault_facts, frozen.billing_vault_facts);
+    assert_eq!(selection.as_ref().unwrap().resolved_credential_id.as_deref(), Some("different-witness"));
+    frozen.billing_vault_facts = None;
+    preserve_billing_vault_snapshot(&mut selection, Some(&frozen));
+    assert!(selection.unwrap().billing_vault_facts.is_none());
 }
