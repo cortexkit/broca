@@ -167,7 +167,8 @@ This is **preview-only by default**. The JSON lists each terminal run row to
 re-point (run ID, old and new identities, the matched episode's embedded identity
 and terminal state), each v1 ref and v2 alias to remove
 (including root and session), orphaned projection table row counts, the stale
-meta row's lineage and watermark, and any obsolete address discovery rows. Keep a
+meta row's lineage, watermark and last run ID, the projection evidence used, and
+any obsolete address discovery rows. Keep a
 backup, review that plan, then repeat with `--write` to apply it. The write prints
 and flushes its plan before applying, rechecks under a SQLite writer transaction,
 and refuses a changed preview. A repaired one-root pair is a no-op on repeat.
@@ -192,9 +193,20 @@ deleting unproven run metadata. Successful repair changes only the proven run
 identities, stale inventory/discovery mappings, and the stale key's orphaned
 projection rows, in one transaction. It never merges projections, changes live
 key rows, changes log bytes or extracts an archive. All other run metadata is
-retained. A stale meta row must identify the surviving log's lineage; different
-or unverified lineages refuse cleanup. A run row's recorded lineage, when present,
-must also match. The live key must have its own meta row,
+retained. A present stale meta lineage must match the verified surviving log's
+lineage; a known different lineage refuses even if transcript bytes happen to
+match. Legacy NULL meta lineage means unknown, not different: cleanup requires
+every stale `message` row to have a live-key row at the same `ord` with
+byte-identical stored `json`, and stale `meta.last_run_id` must occur in a verified
+live-log `run_started`. Missing or differing rows refuse with
+`null_lineage_prefix_mismatch`; a missing or unrepresented last run ID refuses
+with `null_lineage_last_run_missing`.
+
+Preview reports `stale_projection_evidence.kind` as `lineage_match` or
+`null_lineage_prefix_match`, with `compared_message_rows`. The known-lineage proof
+compares no message rows (count 0); the NULL-lineage proof reports the number of
+stale rows compared, without JSON normalization. A run row's recorded lineage,
+when present, must also match. The live key must have its own meta row,
 or the verified log must support rebuilding the projection. Cleanup never
 rebuilds or rewrites the live key itself.
 

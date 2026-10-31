@@ -49,6 +49,20 @@ pub struct ProjectionTableRows {
 pub struct ProjectionMeta {
     pub lineage_id: Option<String>,
     pub watermark_seq: u64,
+    pub last_run_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionEvidenceKind {
+    LineageMatch,
+    NullLineagePrefixMatch,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ProjectionEvidence {
+    pub kind: ProjectionEvidenceKind,
+    pub compared_message_rows: u64,
 }
 
 // These rows are derived from WAL history, not billing, deletion or move authority.
@@ -80,6 +94,7 @@ pub struct SessionRootRepair {
     pub remove_discovery_rows: Vec<DiscoveryRemoval>,
     pub stale_projection_tables: Vec<ProjectionTableRows>,
     pub stale_meta: Option<ProjectionMeta>,
+    pub stale_projection_evidence: Option<ProjectionEvidence>,
     pub live_log_lineage: Option<String>,
     pub live_meta_present: bool,
     pub remove_retention_discovery_rows: u64,
@@ -265,6 +280,7 @@ fn plan(conn: &Connection, root: &Path, harness: &str, session: &str) -> Result<
         remove_discovery_rows: Vec::new(),
         stale_projection_tables: Vec::new(),
         stale_meta: None,
+        stale_projection_evidence: None,
         live_log_lineage: None,
         live_meta_present: false,
         remove_retention_discovery_rows: 0,
@@ -423,7 +439,7 @@ fn plan(conn: &Connection, root: &Path, harness: &str, session: &str) -> Result<
             });
         }
     }
-    plan_projection_cleanup(conn, root, stale, live, &mut result)?;
+    plan_projection_cleanup(conn, root, stale, live, &records, &mut result)?;
     for run in &result.repoint_runs {
         if run
             .row_lineage_id
@@ -446,6 +462,7 @@ fn plan_projection_cleanup(
     root: &Path,
     stale: &BindIdentity,
     live: &BindIdentity,
+    verified_records: &[broca_wal::FramedRecord],
     result: &mut SessionRootRepair,
 ) -> Result<()> {
     let key = SqliteStore::key(stale);
@@ -482,12 +499,13 @@ fn plan_projection_cleanup(
     }
     result.stale_meta = conn
         .query_row(
-            "SELECT lineage_id,watermark_seq FROM meta WHERE session=?1",
+            "SELECT lineage_id,watermark_seq,last_run_id FROM meta WHERE session=?1",
             [&key],
             |row| {
                 Ok(ProjectionMeta {
                     lineage_id: row.get(0)?,
                     watermark_seq: row.get(1)?,
+                    last_run_id: row.get(2)?,
                 })
             },
         )
@@ -509,13 +527,28 @@ fn plan_projection_cleanup(
     let range = wal.read_records_range(live, 0, None, None)?;
     result.live_log_lineage = range.lineage_id.map(|id| id.to_string());
     if let Some(meta) = &result.stale_meta {
-        if result.live_log_lineage.is_none() || meta.lineage_id != result.live_log_lineage {
-            return Err(format!("stale meta lineage_id {:?} at watermark_seq {} differs from verified live log lineage {:?}; refusing orphaned projection cleanup",
-                meta.lineage_id, meta.watermark_seq, result.live_log_lineage).into());
-        }
+        result.stale_projection_evidence = Some(match &meta.lineage_id {
+            Some(lineage) => {
+                if Some(lineage) != result.live_log_lineage.as_ref() {
+                    return Err(format!("stale meta lineage_id {:?} at watermark_seq {} differs from verified live log lineage {:?}; refusing orphaned projection cleanup",
+                        meta.lineage_id, meta.watermark_seq, result.live_log_lineage).into());
+                }
+                ProjectionEvidence {
+                    kind: ProjectionEvidenceKind::LineageMatch,
+                    compared_message_rows: 0,
+                }
+            }
+            None => null_lineage_prefix_evidence(
+                conn,
+                &key,
+                &SqliteStore::key(live),
+                meta,
+                verified_records,
+            )?,
+        });
     }
-    // Every projection's lineage must match the surviving log. A matching meta
-    // row does not prove that another table's rows came from that same log.
+    // Other lineage-bearing projections still require a match. A NULL-meta
+    // prefix proof cannot authorize discarding another table's different log.
     for table in ["compaction_facts", "retained_head", "retention_lineage"] {
         let different: bool = conn.query_row(
             &format!(
@@ -551,6 +584,43 @@ fn plan_projection_cleanup(
         )?;
     }
     Ok(())
+}
+
+fn null_lineage_prefix_evidence(
+    conn: &Connection,
+    stale_key: &str,
+    live_key: &str,
+    meta: &ProjectionMeta,
+    verified_records: &[broca_wal::FramedRecord],
+) -> Result<ProjectionEvidence> {
+    // Compare stored bytes, not parsed JSON: normalization would hide a differing
+    // row and falsely certify a projection from another history as a live prefix.
+    let mismatch = conn
+        .query_row(
+            "SELECT s.ord FROM message s LEFT JOIN message l ON l.session=?2 AND l.ord=s.ord
+         WHERE s.session=?1 AND (l.ord IS NULL OR CAST(s.json AS BLOB) IS NOT CAST(l.json AS BLOB))
+         ORDER BY s.ord LIMIT 1",
+            params![stale_key, live_key],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if let Some(ordinal) = mismatch {
+        return Err(format!("null_lineage_prefix_mismatch: stale message ord {ordinal} has no byte-identical live-key row; refusing orphaned projection cleanup").into());
+    }
+    if !meta.last_run_id.as_deref().is_some_and(|last_run| verified_records.iter().any(|frame| {
+        matches!(&frame.record, broca_wal::WalRecord::RunStarted { run_id, .. } if run_id.0 == last_run)
+    })) {
+        return Err(format!("null_lineage_last_run_missing: stale meta.last_run_id {:?} is not a run_started ID in the verified surviving log; refusing orphaned projection cleanup", meta.last_run_id).into());
+    }
+    let compared_message_rows = conn.query_row(
+        "SELECT count(*) FROM message WHERE session=?1",
+        [stale_key],
+        |row| row.get(0),
+    )?;
+    Ok(ProjectionEvidence {
+        kind: ProjectionEvidenceKind::NullLineagePrefixMatch,
+        compared_message_rows,
+    })
 }
 
 fn check_fences(

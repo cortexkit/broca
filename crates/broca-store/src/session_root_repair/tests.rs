@@ -160,6 +160,22 @@ impl Fixture {
         }
     }
 
+    fn null_lineage_prefix() -> Self {
+        let fixture = Self::with_recorded_harness("runner");
+        fixture.seed_orphaned_projection(true);
+        fixture
+            .store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE meta SET lineage_id=NULL WHERE session=?1",
+                [SqliteStore::key(&fixture.stale)],
+            )
+            .unwrap();
+        fixture
+    }
+
     fn projection_rows(
         &self,
         identity: &BindIdentity,
@@ -227,6 +243,145 @@ impl Fixture {
         assert_eq!(self.snapshot(), before);
         assert_eq!(std::fs::read(self.wal_path()).unwrap(), bytes);
     }
+}
+
+#[test]
+fn null_lineage_exact_prefix_is_repaired_without_changing_live_history() {
+    let f = Fixture::null_lineage_prefix();
+    let live_before = f.projection_rows(&f.live);
+    let transcript_before = f.store.read_prefix_with_watermark(&f.live).unwrap();
+    assert_eq!(transcript_before.prefix.len(), 48);
+    let bytes = std::fs::read(f.wal_path()).unwrap();
+    let plan = f.preview().unwrap();
+    assert_eq!(plan.repoint_runs.len(), 6);
+    assert_eq!(plan.stale_meta.as_ref().unwrap().lineage_id, None);
+    assert_eq!(
+        plan.stale_meta.as_ref().unwrap().last_run_id.as_deref(),
+        Some("run-07")
+    );
+    assert_eq!(
+        plan.stale_projection_evidence,
+        Some(ProjectionEvidence {
+            kind: ProjectionEvidenceKind::NullLineagePrefixMatch,
+            compared_message_rows: 16,
+        })
+    );
+    let report = serde_json::to_value(&plan).unwrap();
+    assert_eq!(
+        report["stale_projection_evidence"]["kind"],
+        "null_lineage_prefix_match"
+    );
+    assert_eq!(
+        report["stale_projection_evidence"]["compared_message_rows"],
+        16
+    );
+    f.store.apply_session_root_repair(&plan).unwrap();
+    let resolved = f.store.resolve_session_address(&f.stale, None).unwrap();
+    assert_eq!(resolved, f.live);
+    for n in 0..24 {
+        assert_eq!(
+            f.store
+                .lookup_run(&format!("run-{n:02}"))
+                .unwrap()
+                .unwrap()
+                .session,
+            resolved
+        );
+    }
+    assert!(f.projection_rows(&f.stale).values().all(Vec::is_empty));
+    assert_eq!(f.projection_rows(&f.live), live_before);
+    assert_eq!(
+        f.store.read_prefix_with_watermark(&resolved).unwrap(),
+        transcript_before
+    );
+    assert_eq!(std::fs::read(f.wal_path()).unwrap(), bytes);
+    let second = f.preview().unwrap();
+    assert!(second.stale_identity.is_none());
+    assert!(second.stale_projection_evidence.is_none());
+    f.store.apply_session_root_repair(&second).unwrap();
+    assert_eq!(f.projection_rows(&f.live), live_before);
+}
+
+#[test]
+fn null_lineage_prefix_requires_identical_bytes_at_every_ordinal() {
+    for missing_live_row in [false, true] {
+        let f = Fixture::null_lineage_prefix();
+        if missing_live_row {
+            f.store
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "DELETE FROM message WHERE session=?1 AND ord=5",
+                    [SqliteStore::key(&f.live)],
+                )
+                .unwrap();
+        } else {
+            // Even JSON with identical parsed content is not byte-identical evidence.
+            f.store
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE message SET json=json || ' ' WHERE session=?1 AND ord=5",
+                    [SqliteStore::key(&f.stale)],
+                )
+                .unwrap();
+        }
+        let stale_before = f.projection_rows(&f.stale);
+        let live_before = f.projection_rows(&f.live);
+        f.refuses_unchanged("null_lineage_prefix_mismatch: stale message ord 5");
+        assert_eq!(f.projection_rows(&f.stale), stale_before);
+        assert_eq!(f.projection_rows(&f.live), live_before);
+    }
+}
+
+#[test]
+fn null_lineage_prefix_requires_last_run_id_in_the_verified_log() {
+    for last_run_id in [Some("not-in-log"), None] {
+        let f = Fixture::null_lineage_prefix();
+        f.store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE meta SET last_run_id=?1 WHERE session=?2",
+                params![last_run_id, SqliteStore::key(&f.stale)],
+            )
+            .unwrap();
+        let stale_before = f.projection_rows(&f.stale);
+        let live_before = f.projection_rows(&f.live);
+        f.refuses_unchanged("null_lineage_last_run_missing: stale meta.last_run_id");
+        assert_eq!(f.projection_rows(&f.stale), stale_before);
+        assert_eq!(f.projection_rows(&f.live), live_before);
+    }
+}
+
+#[test]
+fn null_lineage_prefix_proof_is_rechecked_before_writing() {
+    let f = Fixture::null_lineage_prefix();
+    let plan = f.preview().unwrap();
+    f.store
+        .conn
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE message SET json=json || ' ' WHERE session=?1 AND ord=5",
+            [SqliteStore::key(&f.stale)],
+        )
+        .unwrap();
+    let rows_before = f.snapshot();
+    let stale_before = f.projection_rows(&f.stale);
+    let live_before = f.projection_rows(&f.live);
+    assert!(f
+        .store
+        .apply_session_root_repair(&plan)
+        .unwrap_err()
+        .to_string()
+        .contains("null_lineage_prefix_mismatch"));
+    assert_eq!(f.snapshot(), rows_before);
+    assert_eq!(f.projection_rows(&f.stale), stale_before);
+    assert_eq!(f.projection_rows(&f.live), live_before);
 }
 
 #[test]
@@ -428,7 +583,19 @@ fn orphaned_projection_repair_preserves_all_24_run_transcript() {
         Some(ProjectionMeta {
             lineage_id: stale_before.lineage_id.clone(),
             watermark_seq: stale_before.watermark_seq,
+            last_run_id: Some("run-07".to_owned()),
         })
+    );
+    assert_eq!(
+        plan.stale_projection_evidence,
+        Some(ProjectionEvidence {
+            kind: ProjectionEvidenceKind::LineageMatch,
+            compared_message_rows: 0,
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(&plan).unwrap()["stale_projection_evidence"]["kind"],
+        "lineage_match"
     );
     assert_eq!(plan.live_log_lineage, live_before.lineage_id);
     assert!(plan.live_meta_present);
