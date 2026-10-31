@@ -2340,7 +2340,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
     }
     assert_eq!(
         metrics["session_address_refusals"],
-        serde_json::json!({"incomplete_inventory":0,"gap_marker":0,"store_error":0,"ambiguous":0,"invalid_identity":0}),
+        serde_json::json!({"incomplete_inventory":0,"gap_marker":0,"store_error":0,"wait_expired":0,"migration_failed":0,"ambiguous":0,"invalid_identity":0,"repairs":{"started":0,"completed":0,"failed":0}}),
         "a healthy inventory and valid identities must not refuse a session address"
     );
     let workdirs = metrics["scoped_session_workdirs"]

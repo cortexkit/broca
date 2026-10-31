@@ -47,6 +47,7 @@ pub mod send_audit;
 pub mod serve;
 mod session_address_health;
 pub mod session_class;
+mod session_inventory;
 pub mod session_lookup;
 pub mod stall;
 pub mod state_root;

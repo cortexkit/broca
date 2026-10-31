@@ -159,9 +159,13 @@ A consumer can be both. The surface is **session-centric**: consumers address
   stamped `workdir`. On subc-protocol 0.33, a new pair without stamped workdir still
   uses the route root, including for outgoing transport. A stamp's `project_id` never
   keys a session. Two inventory roots refuse `session_address_ambiguous` (permanent);
-  incomplete discovery refuses `session_address_unavailable` (transient), never a guess.
-  Existing-pair lookups use a read transaction; only absent pairs take the write lock,
-  recheck discovery, and reserve a root before any actor or WAL opens.
+   Known pairs resolve immediately from positive inventory evidence even during repair.
+   An absent pair waits on shared discovery readiness for at most 60 seconds; incomplete
+   discovery then refuses `session_address_unavailable` (transient), never a guess.
+   Its `detail.reason` distinguishes `wait_expired`, `migration_failed` and a remaining
+   `gap_marker`. Boot and on-demand repairs are single-flight and do not block serve
+   startup. Existing-pair lookups use a read transaction; only absent pairs take the
+   write lock, recheck discovery, and reserve a root before any actor or WAL opens.
 - **Run = one turn's loop execution** — a user message in → the agent loops until its
   response → a terminal. Each run begins with a `RunStarted` **episode marker** (input +
   frozen config + `origin` + `submission_id`). Runs **accumulate** in the lineage WAL:

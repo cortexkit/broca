@@ -2393,8 +2393,11 @@ async fn finish_bind(
             "cannot resolve session {:?} in harness {:?}: {error}",
             completed.identity.session, completed.identity.harness
         );
-        let body =
-            ErrorBody::new(error.code(), message).with_detail(serde_json::json!({"class":class}));
+        let mut detail = serde_json::json!({"class":class});
+        if let broca_store::session_address::SessionAddressError::Unavailable(reason) = &error {
+            detail["reason"] = serde_json::json!(reason.reason());
+        }
+        let body = ErrorBody::new(error.code(), message).with_detail(detail);
         return send_error_body(
             writer,
             completed.header.ver,

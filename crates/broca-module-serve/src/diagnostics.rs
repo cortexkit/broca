@@ -98,6 +98,10 @@ pub fn gather(
         unmapped_credentials: crate::account_routing::published_unmapped_credentials(),
         rings: [
             (
+                "session_inventory_repairs".into(),
+                crate::session_address_health::repair_snapshot(since, now),
+            ),
+            (
                 "session_address_unavailable".into(),
                 crate::session_address_health::snapshot(since, now),
             ),
@@ -546,6 +550,11 @@ pub fn report(mut evidence: Evidence, now: i64, window: i64) -> Reply {
                             f.severity = Severity::Error;
                             f.summary = format!("Session binds were refused because address discovery was unavailable: {}.", f.key.replace('_', " "));
                             f.hint = "Inspect health.check session_address_refusals and the session_address WARN log; verify inventory completeness and repair before resuming binds.".into();
+                        }
+                        if check == "session_inventory_repairs" {
+                            f.severity = if code == "failed" { Severity::Error } else { Severity::Info };
+                            f.summary = format!("Session inventory repairs {} in the observed window.", code);
+                            f.hint = "Inspect health.check session_address_refusals.repairs and the session-ref migration log; known sessions remain available during repair.".into();
                         }
                         f.count=0;f
                     });

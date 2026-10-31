@@ -75,23 +75,54 @@ fn ambiguous_pair_refuses_without_inventory_writes() {
 }
 
 #[test]
-fn incomplete_inventory_never_proves_absence_or_uniqueness() {
-    for known in [false, true] {
-        let store = SqliteStore::open_in_memory().unwrap();
-        if known {
-            let legacy = bind("/legacy/checkout");
-            store
-                .record_session(&broca_core::session_addr(&legacy), &legacy)
-                .unwrap();
-        }
-        let before = store.conn.lock().unwrap().total_changes();
-        let error = store
-            .resolve_session_address(&bind("/new/route"), None)
-            .unwrap_err();
-        assert!(matches!(error, SessionAddressError::Unavailable(_)));
-        assert_eq!(error.code(), "session_address_unavailable");
-        assert_eq!(store.conn.lock().unwrap().total_changes(), before);
-    }
+fn incomplete_inventory_never_proves_absence() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let before = store.conn.lock().unwrap().total_changes();
+    let error = store
+        .resolve_session_address(&bind("/new/route"), None)
+        .unwrap_err();
+    assert!(matches!(error, SessionAddressError::Unavailable(_)));
+    assert_eq!(error.code(), "session_address_unavailable");
+    assert_eq!(store.conn.lock().unwrap().total_changes(), before);
+}
+
+#[test]
+fn recorded_pair_resolves_with_incomplete_inventory_and_a_gap_marker() {
+    let root = broca_test_support::scratch_root()
+        .join(format!("address-known-gap-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let store = SqliteStore::open(root.join("run-index.db")).unwrap();
+    let recorded = bind("/recorded/checkout");
+    store
+        .record_session(&broca_core::session_addr(&recorded), &recorded)
+        .unwrap();
+    assert_eq!(
+        store
+            .resolve_session_address(&bind("/later/route"), None)
+            .unwrap(),
+        recorded
+    );
+    std::fs::write(
+        root.join(broca_core::wal_writer::SESSION_PROJECTION_INCOMPLETE),
+        b"",
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .resolve_session_address(&bind("/later/route"), None)
+            .unwrap(),
+        recorded
+    );
+    let other = bind("/other/checkout");
+    store
+        .record_session(&broca_core::session_addr(&other), &other)
+        .unwrap();
+    assert_eq!(
+        store.resolve_session_address(&bind("/later/route"), None),
+        Err(SessionAddressError::Ambiguous)
+    );
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

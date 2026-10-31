@@ -627,6 +627,13 @@ pub struct LineageRegistry {
     inner: Arc<Inner>,
 }
 
+/// Coordinates discovery needed to prove that an unrecorded session is new.
+#[async_trait]
+pub trait SessionInventoryReadiness: Send + Sync {
+    fn start(&self);
+    async fn wait(&self) -> Result<(), broca_store::session_address::SessionAddressError>;
+}
+
 mod media;
 pub(crate) mod media_head;
 #[path = "run_rows.rs"]
@@ -754,6 +761,7 @@ type ToolRouteHealth = dyn Fn(&[LineageKey]) -> serde_json::Value + Send + Sync;
 struct Inner {
     session_address_inventory: std::sync::OnceLock<Arc<broca_store::SqliteStore>>,
     episode_source: std::sync::OnceLock<Arc<EpisodeReadSource>>,
+    session_inventory_readiness: std::sync::OnceLock<Arc<dyn SessionInventoryReadiness>>,
     #[cfg(test)]
     raw_pages: std::sync::OnceLock<Arc<RawPageTestBundle>>,
     tool_route_health: std::sync::OnceLock<Arc<ToolRouteHealth>>,
@@ -1253,6 +1261,17 @@ impl LineageRegistry {
         );
     }
 
+    /// Share one repair coordinator across services using this registry.
+    pub fn set_session_inventory_readiness(
+        &self,
+        readiness: Arc<dyn SessionInventoryReadiness>,
+    ) -> Arc<dyn SessionInventoryReadiness> {
+        self.inner
+            .session_inventory_readiness
+            .get_or_init(|| readiness)
+            .clone()
+    }
+
     pub async fn resolve_session_address(
         &self,
         bind: &broca_protocol::BindIdentity,
@@ -1270,11 +1289,45 @@ impl LineageRegistry {
             })?;
         let bind = bind.clone();
         let workdir = workdir.map(std::path::Path::to_path_buf);
-        spawn_blocking(broca_diagnostics::JobKind::StoreWrite, move || {
-            inventory.resolve_session_address(&bind, workdir.as_deref())
-        })
-        .await
-        .map_err(SessionAddressError::store_error)?
+        let resolve = || {
+            let inventory = inventory.clone();
+            let bind = bind.clone();
+            let workdir = workdir.clone();
+            spawn_blocking(broca_diagnostics::JobKind::StoreWrite, move || {
+                inventory.resolve_session_address(&bind, workdir.as_deref())
+            })
+        };
+        let first = resolve().await.map_err(SessionAddressError::store_error)?;
+        use broca_store::session_address::InventoryUnavailable;
+        if !matches!(
+            first,
+            Err(SessionAddressError::Unavailable(
+                InventoryUnavailable::IncompleteInventory | InventoryUnavailable::GapMarker
+            ))
+        ) {
+            return first;
+        }
+        let Some(readiness) = self.inner.session_inventory_readiness.get() else {
+            return first;
+        };
+        let ready = readiness.wait().await;
+        let resolved = resolve().await.map_err(SessionAddressError::store_error)?;
+        // Another writer can record the pair while discovery runs. Its positive
+        // evidence remains usable even if unrelated discovery failed or timed out.
+        if resolved.is_ok() || matches!(resolved, Err(SessionAddressError::Ambiguous)) {
+            return resolved;
+        }
+        ready?;
+        match resolved {
+            Err(SessionAddressError::Unavailable(InventoryUnavailable::IncompleteInventory)) => {
+                Err(SessionAddressError::Unavailable(
+                    InventoryUnavailable::MigrationFailed(
+                        "inventory changed before the new session could be reserved".into(),
+                    ),
+                ))
+            }
+            result => result,
+        }
     }
 
     /// Install database episode reads explicitly; boot-time store selection is unchanged.
@@ -1579,6 +1632,7 @@ impl LineageRegistry {
             inner: Arc::new(Inner {
                 session_address_inventory: std::sync::OnceLock::new(),
                 episode_source: std::sync::OnceLock::new(),
+                session_inventory_readiness: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 raw_pages: std::sync::OnceLock::new(),
                 tool_route_health: std::sync::OnceLock::new(),
