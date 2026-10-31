@@ -153,3 +153,77 @@ Busy probes inspect the requested WAL for active runs, queued sends and unsettle
 approvals, with the existing actor, lease and move-fence observations. INFO events
 report op, cut id, ref count and elapsed milliseconds, including cancelled calls.
 `health.check.metrics.agent_data_ops` reports each operation's cumulative count.
+
+## Offline split-root repair
+
+If a historical WAL re-key left a session's run-index rows and refs under two
+project roots, inspect the stopped store with:
+
+```sh
+store-maintenance repair-session-root STATE_ROOT --harness HARNESS --session SESSION
+```
+
+This is **preview-only by default**. The JSON lists each terminal run row to
+re-point (run ID, old and new identities, the matched episode's embedded identity
+and terminal state), each v1 ref and v2 alias to remove
+(including root and session), orphaned projection table row counts, the stale
+meta row's lineage, watermark and last run ID, the projection evidence used, and
+any obsolete address discovery rows. Keep a
+backup, review that plan, then repeat with `--write` to apply it. The write prints
+and flushes its plan before applying, rechecks under a SQLite writer transaction,
+and refuses a changed preview. A repaired one-root pair is a no-op on repeat.
+
+**Stop broca and its supervisor for the entire write operation.** Live or unknown
+writer liveness refuses before SQLite opens. The repair additionally acquires
+both canonical session leases to exclude standalone writers; these leases do not
+replace the stopped-supervisor requirement. Preview uses a read-only connection,
+without schema initialization or leases.
+
+Repair requires a complete inventory, exactly two roots, and exactly one address
+with a WAL across all live trees and sealed archive trees. It refuses deletion
+ledgers/tombstones, expired lineage records, move/cut fences, unreadable sources,
+and competing logs.
+Each stale run must be terminal and match an episode by run ID in the surviving
+verified WAL. That episode must end in a durable `run_finished` whose terminal
+state matches the row. The embedded `run_started` triple is reported as historical
+provenance, not used to match the run: folder and harness re-keys change the
+address or run index without rewriting log records. Missing run IDs, unfinished
+episodes and mismatched terminal states refuse repair rather than
+deleting unproven run metadata. Successful repair changes only the proven run
+identities, stale inventory/discovery mappings, and the stale key's orphaned
+projection rows, in one transaction. It never merges projections, changes live
+key rows, changes log bytes or extracts an archive. All other run metadata is
+retained. A present stale meta lineage must match the verified surviving log's
+lineage; a known different lineage refuses even if transcript bytes happen to
+match. Legacy NULL meta lineage means unknown, not different: cleanup requires
+every stale `message` row to have a live-key row at the same `ord` with
+byte-identical stored `json`, and stale `meta.last_run_id` must occur in a verified
+live-log `run_started`. Missing or differing rows refuse with
+`null_lineage_prefix_mismatch`; a missing or unrepresented last run ID refuses
+with `null_lineage_last_run_missing`.
+
+Preview reports `stale_projection_evidence.kind` as `lineage_match` or
+`null_lineage_prefix_match`, with `compared_message_rows`. The known-lineage proof
+compares no message rows (count 0); the NULL-lineage proof reports the number of
+stale rows compared, without JSON normalization. A run row's recorded lineage,
+when present, must also match. The live key must have its own meta row,
+or the verified log must support rebuilding the projection. Cleanup never
+rebuilds or rewrites the live key itself.
+
+The flat-session-key projection tables checked for cleanup are `meta`, `message`,
+`message_tag`, `episode_span`, `retention_lineage`, `retained_head`,
+`compaction_facts`, `bus_event_projection` and `bus_event_open`. Preview lists
+every existing table with a `session` column and its exact stale-key row count;
+`remove` identifies the known projections. An unrecognized table with stale-key
+rows refuses rather than risking authoritative data. Tables using JSON identities
+or bare session names do not match that flat key and are not deleted. Billing
+facts, `export_imported_runs` records preventing double billing of imported runs,
+`retention_withdrawal` provider-withdrawal work, deletion ledgers and move fences
+remain intact. The existing `retention_lineage` delete trigger also removes its
+derived `retention_discovery` hint; preview reports that count separately.
+
+The bind-time ambiguity rule is unchanged: a missing log alone is not proof that
+an inventory identity can be discarded. Interrupted admissions, expiry and moves
+can legitimately leave identity candidates without local content. The legacy
+`rekey-harness.py` refuses inventoried stores before changing anything; it does
+not implement a general inventory-aware harness or project-root migration.
