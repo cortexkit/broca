@@ -4,7 +4,7 @@ use super::*;
 #[cfg(feature = "writer-id-faults")]
 use std::sync::atomic::Ordering;
 
-fn damaged_image() -> (State, Vec<u8>) {
+pub(super) fn damaged_image() -> (State, Vec<u8>) {
     let (source, states) = images(2);
     let ends = boundaries(&source);
     let state = states

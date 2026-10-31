@@ -2,6 +2,8 @@
 
 #[path = "v4_repair_tests.rs"]
 mod repair;
+#[path = "v4_rereview_tests.rs"]
+mod rereview;
 
 use crate::power_loss::{ChangeKind, OperationKind, RecordingFs, State};
 use broca_protocol::StepId;

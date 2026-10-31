@@ -670,13 +670,18 @@ pub fn manifests(log: &Path, cap: u64) -> Result<Vec<CutManifest>, WalError> {
     paths
         .into_iter()
         .map(|path| {
-            let manifest: CutManifest =
-                serde_json::from_slice(&read_capped(&path, cap)?).map_err(|e| {
-                    WalError::Io(std::io::Error::other(format!(
-                        "invalid recovery manifest {}: {e}",
-                        path.display()
-                    )))
-                })?;
+            let encoded = read_capped(&path, cap).map_err(|error| {
+                WalError::Io(std::io::Error::other(format!(
+                    "cannot read recovery manifest {}: {error}",
+                    path.display()
+                )))
+            })?;
+            let manifest: CutManifest = serde_json::from_slice(&encoded).map_err(|e| {
+                WalError::Io(std::io::Error::other(format!(
+                    "invalid recovery manifest {}: {e}",
+                    path.display()
+                )))
+            })?;
             let raw = parent.join(&manifest.recovery.sidecar_basename);
             if !manifest.integrity_valid()
                 || raw.parent() != Some(parent)
@@ -826,7 +831,7 @@ pub(crate) fn before_open_with_hooks(
     let mut pending = Vec::new();
     let stored_manifests = manifests(log, cap)?;
     let has_manifests = !stored_manifests.is_empty();
-    let mut retry = None;
+    let mut retry_candidates = Vec::new();
     for manifest in &stored_manifests {
         // Only byte-for-byte evidence at the original bound prefix can authorize
         // completing an interrupted repair. Zero bytes model an unpersisted block.
@@ -836,7 +841,7 @@ pub(crate) fn before_open_with_hooks(
             && manifest.recovery.removed_len == (bytes.len() - scan.end) as u64
             && manifest.recovery.removed_sha256 == digest(&bytes[scan.end..]);
         if manifest.marker.matches_prefix(&bytes) || (scan.damaged && original_tail) {
-            retry = Some(manifest.marker.clone());
+            retry_candidates.push(manifest.marker.clone());
         }
         if scan.calls.cut_ids.contains(&manifest.recovery.cut_id) {
             continue;
@@ -850,6 +855,25 @@ pub(crate) fn before_open_with_hooks(
         {
             pending.push(manifest.recovery.clone());
         }
+    }
+    // A later repair can re-assert an earlier cut. Its marker must cover every
+    // pending cut; filenames and wall-clock timestamps are not ordering authority.
+    let retry = retry_candidates
+        .iter()
+        .filter(|marker| {
+            marker.cuts().is_ok_and(|cuts| {
+                pending
+                    .iter()
+                    .all(|required| cuts.iter().any(|cut| cut.cut_id == required.cut_id))
+            })
+        })
+        .max_by_key(|marker| marker.offset)
+        .cloned();
+    if !retry_candidates.is_empty() && retry.is_none() {
+        return Err(WalError::Io(std::io::Error::other(format!(
+            "recovery markers for WAL {} do not cover all pending cuts; refusing ambiguous repair",
+            log.display()
+        ))));
     }
     if has_manifests {
         // The cut manifest rename may have succeeded before its directory sync failed.
