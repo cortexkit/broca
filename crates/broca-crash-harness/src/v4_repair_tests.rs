@@ -23,6 +23,22 @@ fn assert_reopens(state: &State, expected: &[u8]) {
     let root = Scratch::new();
     state.install(&root.0).unwrap();
     let wal = root.open();
+    let manifests = broca_wal::recovery::manifests(&root.log(), 1_000_000).unwrap();
+    assert_eq!(
+        manifests.len(),
+        1,
+        "an interrupted marker must reuse its original cut"
+    );
+    let cuts: Vec<_> = wal
+        .replay()
+        .unwrap()
+        .into_iter()
+        .filter_map(|frame| match frame.record {
+            WalRecord::RecoveryCut { recovery } => Some(recovery.cut_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cuts, [manifests[0].recovery.cut_id.clone()]);
     let records: Vec<_> = wal
         .replay()
         .unwrap()
@@ -41,6 +57,162 @@ fn assert_reopens(state: &State, expected: &[u8]) {
             );
         }
     }
+}
+
+#[test]
+fn v4_recovery_torn_marker_reuses_the_original_cut_and_exact_bytes() {
+    let (state, _) = damaged_image();
+    let root = Scratch::new();
+    state.install(&root.0).unwrap();
+    drop(root.open());
+    let manifest = broca_wal::recovery::manifests(&root.log(), 1_000_000)
+        .unwrap()
+        .remove(0);
+    let complete = std::fs::read(root.log()).unwrap();
+    let start = manifest.recovery.cut_offset as usize;
+    let saved = RecordingFs::new(&root.0)
+        .unwrap()
+        .enumerate(100)
+        .unwrap()
+        .remove(0)
+        .state;
+    for keep in [
+        1,
+        HEADER_LEN,
+        (complete.len() - start) / 2,
+        complete.len() - start - 1,
+    ] {
+        for zero_fill in [false, true] {
+            let next = Scratch::new();
+            saved.install(&next.0).unwrap();
+            let mut damaged = complete[..start + keep].to_vec();
+            if zero_fill {
+                damaged.resize(complete.len(), 0);
+            }
+            std::fs::write(next.log(), damaged).unwrap();
+            drop(next.open());
+            let cuts = broca_wal::recovery::manifests(&next.log(), 1_000_000).unwrap();
+            assert_eq!(cuts.len(), 1, "a torn marker is not a second cut");
+            assert_eq!(cuts[0].recovery.cut_id, manifest.recovery.cut_id);
+            assert_eq!(
+                std::fs::read(next.log()).unwrap(),
+                complete,
+                "retry must write the precommitted exact marker"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "writer-id-faults")]
+#[test]
+fn v4_recovery_refuse_finishes_manifest_directory_failure_before_truncation() {
+    let (state, _) = damaged_image();
+    let root = Scratch::new();
+    state.install(&root.0).unwrap();
+    let original = std::fs::read(root.log()).unwrap();
+    let (fs, recording) =
+        crate::writer_id_tests::recovery_manifest_dir_sync_fault(&root.0, root.log());
+    let (images, retained_len) = with_fs_ops(fs, || {
+        assert!(
+            matches!(root.open_policy(broca_wal::recovery::RecoveryPolicy::Repair),
+            Err(WalError::Io(error)) if error.to_string() == "injected manifest directory sync failure")
+        );
+        assert_eq!(std::fs::read(root.log()).unwrap(), original);
+        let manifest = broca_wal::recovery::manifests(&root.log(), 1_000_000)
+            .unwrap()
+            .remove(0);
+        let start = recording.operation_kinds().len();
+        let wal = root
+            .open_policy(broca_wal::recovery::RecoveryPolicy::Refuse)
+            .unwrap();
+        let ops = recording.operation_kinds();
+        let resize = ops[start..]
+            .iter()
+            .position(|op| *op == OperationKind::Change(vec![ChangeKind::Resize]))
+            .unwrap();
+        assert!(
+            ops[start..start + resize].contains(&OperationKind::SyncDirectory),
+            "retry must repay the manifest directory barrier before truncation"
+        );
+        assert_eq!(
+            broca_wal::recovery::manifests(&root.log(), 1_000_000)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(wal
+            .replay()
+            .unwrap()
+            .iter()
+            .any(|frame| matches!(&frame.record,
+            WalRecord::RecoveryCut { recovery } if recovery.cut_id == manifest.recovery.cut_id)));
+        let final_cut = recording.operation_kinds().len();
+        let images = recording
+            .enumerate(100_000)
+            .unwrap()
+            .into_iter()
+            .filter(|image| image.cut == final_cut)
+            .collect::<Vec<_>>();
+        (images, manifest.recovery.cut_offset as usize)
+    });
+    assert!(!images.is_empty());
+    for image in images {
+        assert!(image
+            .state
+            .files
+            .keys()
+            .any(|p| p.to_string_lossy().ends_with(".json")));
+        assert_reopens(&image.state, &original[..retained_len]);
+    }
+}
+
+#[test]
+fn v4_recovery_refuse_finishes_only_bound_marker_bytes_and_requires_evidence() {
+    let (state, _) = damaged_image();
+    let root = Scratch::new();
+    state.install(&root.0).unwrap();
+    drop(root.open());
+    let manifest = broca_wal::recovery::manifests(&root.log(), 1_000_000)
+        .unwrap()
+        .remove(0);
+    let complete = std::fs::read(root.log()).unwrap();
+    let start = manifest.recovery.cut_offset as usize;
+    std::fs::write(root.log(), &complete[..start + HEADER_LEN]).unwrap();
+    drop(
+        root.open_policy(broca_wal::recovery::RecoveryPolicy::Refuse)
+            .unwrap(),
+    );
+    assert_eq!(std::fs::read(root.log()).unwrap(), complete);
+
+    let mut wal = root.open();
+    wal.append(1, &record(99), true).unwrap();
+    drop(wal);
+    let mut damaged = std::fs::read(root.log()).unwrap();
+    damaged[start + HEADER_LEN] ^= 1;
+    std::fs::write(root.log(), &damaged).unwrap();
+    let error = root
+        .open_policy(broca_wal::recovery::RecoveryPolicy::Refuse)
+        .err()
+        .unwrap();
+    assert!(matches!(error, WalError::Corrupt { .. }));
+    assert_eq!(std::fs::read(root.log()).unwrap(), damaged);
+    let raw = root
+        .log()
+        .parent()
+        .unwrap()
+        .join(&manifest.recovery.sidecar_basename);
+    let path = PathBuf::from(format!("{}.json", raw.display()));
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    json.as_object_mut().unwrap().remove("marker");
+    std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+    let error = root
+        .open_policy(broca_wal::recovery::RecoveryPolicy::Repair)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains(&path.display().to_string()));
+    assert!(error.to_string().contains("marker"));
+    assert_eq!(std::fs::read(root.log()).unwrap(), damaged);
 }
 
 #[test]

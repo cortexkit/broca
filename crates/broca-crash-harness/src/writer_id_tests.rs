@@ -6,6 +6,8 @@ pub(super) mod actual_open_writers;
 #[cfg(feature = "writer-id-faults")]
 mod faults;
 #[cfg(feature = "writer-id-faults")]
+pub(crate) use faults::recovery_manifest_dir_sync_fault;
+#[cfg(feature = "writer-id-faults")]
 pub(crate) use faults::recovery_marker_sync_fault;
 #[cfg(feature = "writer-id-faults")]
 pub(crate) use faults::recovery_sync_fault;

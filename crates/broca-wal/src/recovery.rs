@@ -102,11 +102,64 @@ pub struct RecoveryCut {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecoveryMarker {
+    pub offset: u64,
+    pub prefix_sha256: String,
+    pub bytes: Vec<u8>,
+}
+
+impl RecoveryMarker {
+    fn matches_prefix(&self, bytes: &[u8]) -> bool {
+        let Ok(offset) = usize::try_from(self.offset) else {
+            return false;
+        };
+        bytes
+            .get(..offset)
+            .is_some_and(|prefix| digest(prefix) == self.prefix_sha256)
+            && bytes.get(offset..).is_some_and(|tail| {
+                tail.len() <= self.bytes.len()
+                    && tail
+                        .iter()
+                        .zip(&self.bytes)
+                        .all(|(found, expected)| *found == 0 || found == expected)
+            })
+    }
+
+    fn cuts(&self) -> Result<Vec<RecoveryCut>, WalError> {
+        let mut bytes = self.bytes.as_slice();
+        let mut cuts = Vec::new();
+        while !bytes.is_empty() {
+            let consumed = match framing::decode_next(bytes) {
+                DecodeStep::Lineage { consumed, .. } => consumed,
+                DecodeStep::Record { framed, consumed } => {
+                    if let WalRecord::RecoveryCut { recovery } = framed.record {
+                        cuts.push(*recovery);
+                    } else {
+                        return Err(WalError::Io(std::io::Error::other(
+                            "recovery marker contains a non-recovery record",
+                        )));
+                    }
+                    consumed
+                }
+                _ => {
+                    return Err(WalError::Io(std::io::Error::other(
+                        "recovery marker bytes are incomplete or corrupt",
+                    )))
+                }
+            };
+            bytes = &bytes[consumed..];
+        }
+        Ok(cuts)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CutManifest {
     pub version: u32,
     pub session: String,
     pub prefix_sha256: String,
     pub recovery: RecoveryCut,
+    pub marker: RecoveryMarker,
     pub checksum: String,
 }
 
@@ -117,6 +170,7 @@ impl CutManifest {
             &self.session,
             &self.prefix_sha256,
             &self.recovery,
+            &self.marker,
         ))
         .map(|bytes| digest(&bytes))
         .map_err(|e| WalError::Io(std::io::Error::other(e)))
@@ -124,6 +178,12 @@ impl CutManifest {
 
     pub fn integrity_valid(&self) -> bool {
         self.version == 1
+            && self.marker.offset == self.recovery.cut_offset
+            && self.marker.prefix_sha256 == self.prefix_sha256
+            && self
+                .marker
+                .cuts()
+                .is_ok_and(|cuts| cuts.contains(&self.recovery))
             && self
                 .expected_checksum()
                 .is_ok_and(|sum| sum == self.checksum)
@@ -627,15 +687,9 @@ pub fn manifests(log: &Path, cap: u64) -> Result<Vec<CutManifest>, WalError> {
                     path.display()
                 ))));
             }
-            let bytes = read_capped(&raw, cap)?;
-            if bytes.len() as u64 != manifest.recovery.removed_len
-                || digest(&bytes) != manifest.recovery.removed_sha256
-            {
-                return Err(WalError::Io(std::io::Error::other(format!(
-                    "recovery sidecar {} is incomplete or corrupt",
-                    raw.display()
-                ))));
-            }
+            // The manifest was published only after the raw bytes were synced.
+            // Later loss of raw evidence must not erase the durable identities of
+            // calls whose external effects are unknown and must not be repeated.
             Ok(manifest)
         })
         .collect()
@@ -690,6 +744,49 @@ fn read_head(log: &Path) -> Option<crate::head_proof::HeadProof> {
     crate::head_proof::HeadProof::decode(&bytes)
 }
 
+fn prepare_marker(
+    prefix: &[u8],
+    mut seq: u64,
+    lineage: Option<framing::WalLineageId>,
+    cuts: &[RecoveryCut],
+) -> Result<RecoveryMarker, WalError> {
+    let mut bytes = Vec::new();
+    let lineage = match lineage {
+        Some(lineage) => lineage,
+        None => {
+            let lineage = crate::file_wal::mint_lineage_id()?;
+            bytes.extend_from_slice(&framing::encode_lineage(lineage));
+            lineage
+        }
+    };
+    let mut writer_id = [0; 16];
+    getrandom::fill(&mut writer_id)
+        .map_err(|e| WalError::Io(std::io::Error::other(e.to_string())))?;
+    for cut in cuts {
+        let prepared = framing::PreparedV4Frame::prepare(&WalRecord::RecoveryCut {
+            recovery: Box::new(cut.clone()),
+        })
+        .map_err(WalError::Frame)?;
+        seq += 1;
+        bytes.extend_from_slice(
+            &prepared
+                .stamp(framing::v4::Metadata {
+                    seq,
+                    fence: 0,
+                    appended_ms: now_ms(),
+                    writer_id,
+                })
+                .map_err(WalError::Frame)?,
+        );
+        bytes.extend_from_slice(&framing::encode_lineage(lineage));
+    }
+    Ok(RecoveryMarker {
+        offset: prefix.len() as u64,
+        prefix_sha256: digest(prefix),
+        bytes,
+    })
+}
+
 /// Run before the append handle is opened. Only a supplied boot decision enables
 /// overhaul recovery; unconfigured legacy opens must not probe recovery evidence.
 #[cfg(test)]
@@ -729,11 +826,21 @@ pub(crate) fn before_open_with_hooks(
     let mut pending = Vec::new();
     let stored_manifests = manifests(log, cap)?;
     let has_manifests = !stored_manifests.is_empty();
-    for manifest in stored_manifests {
+    let mut retry = None;
+    for manifest in &stored_manifests {
+        // Only byte-for-byte evidence at the original bound prefix can authorize
+        // completing an interrupted repair. Zero bytes model an unpersisted block.
+        let end = usize::try_from(manifest.recovery.cut_offset).unwrap_or(usize::MAX);
+        let original_tail = end == scan.end
+            && digest(&bytes[..scan.end]) == manifest.prefix_sha256
+            && manifest.recovery.removed_len == (bytes.len() - scan.end) as u64
+            && manifest.recovery.removed_sha256 == digest(&bytes[scan.end..]);
+        if manifest.marker.matches_prefix(&bytes) || (scan.damaged && original_tail) {
+            retry = Some(manifest.marker.clone());
+        }
         if scan.calls.cut_ids.contains(&manifest.recovery.cut_id) {
             continue;
         }
-        let end = usize::try_from(manifest.recovery.cut_offset).unwrap_or(usize::MAX);
         // A later disk fault may remove an earlier recovery marker too. The
         // immutable manifest still attributes those calls to this session. It
         // restores facts only; truncation always follows the current scan, not
@@ -741,8 +848,13 @@ pub(crate) fn before_open_with_hooks(
         if manifest.session == session_name
             || (end <= scan.end && digest(&bytes[..end]) == manifest.prefix_sha256)
         {
-            pending.push(manifest.recovery);
+            pending.push(manifest.recovery.clone());
         }
+    }
+    if has_manifests {
+        // The cut manifest rename may have succeeded before its directory sync failed.
+        // Visibility alone must never authorize destroying the original suffix.
+        fs_ops::sync_dir(log.parent().unwrap_or_else(|| Path::new("."))).map_err(WalError::Io)?;
     }
     if !scan.damaged && pending.is_empty() {
         // A previous marker write may have become visible before its sync
@@ -762,15 +874,19 @@ pub(crate) fn before_open_with_hooks(
         }
         return Ok(());
     }
-    if config.unwrap_or(crate::WalConfig::OVERHAUL).recovery == RecoveryPolicy::Refuse {
-        return Err(WalError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "wal_recovery=refuse: refusing damaged WAL {} at byte {}; file unchanged",
-                log.display(),
-                scan.end
-            ),
-        )));
+    if config.unwrap_or(crate::WalConfig::OVERHAUL).recovery == RecoveryPolicy::Refuse
+        && retry.is_none()
+    {
+        // Preserve the original decoder's typed errors and final-tail behavior.
+        // Refuse never invents a recovery cut for newly discovered damage.
+        crate::file_wal::recover_prefix(&bytes, 0, None, None)?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        return Err(WalError::Io(std::io::Error::other(format!(
+            "wal_recovery=refuse: WAL {} no longer matches its pending recovery marker prefix",
+            log.display()
+        ))));
     }
     let inferred_floor = log
         .parent()
@@ -780,13 +896,13 @@ pub(crate) fn before_open_with_hooks(
     let floor = floor.unwrap_or(&inferred_floor);
     crate::floor::raise_floor(floor, &[FEATURE, framing::FRAME_STAMPS_FEATURE])
         .map_err(|e| WalError::Io(std::io::Error::other(e.to_string())))?;
-    let repeat = scan.damaged
-        && pending.iter().any(|cut| {
-            cut.cut_offset == scan.end as u64
-                && cut.removed_len == (bytes.len() - scan.end) as u64
-                && cut.removed_sha256 == digest(&bytes[scan.end..])
-        });
-    if scan.damaged && !repeat {
+    let completing = retry.is_some();
+    let marker = if let Some(marker) = retry {
+        // A partial marker may contain complete earlier records in the same
+        // recovery batch. Rewind the batch, not just the first undecodable byte.
+        scan = prefix(&bytes[..marker.offset as usize])?;
+        marker
+    } else {
         let active_run = scan.calls.active.clone();
         inspect_removed(&bytes[scan.end..], &mut scan)?;
         for prior in &pending {
@@ -830,19 +946,23 @@ pub(crate) fn before_open_with_hooks(
             unattributed_tool_risk: true,
         };
         atomic_file(&raw, suffix)?;
+        pending.push(cut.clone());
+        let marker = prepare_marker(&bytes[..scan.end], scan.seq, scan.lineage, &pending)?;
         let mut manifest = CutManifest {
             version: 1,
             session: session_name.clone(),
             prefix_sha256: digest(&bytes[..scan.end]),
             recovery: cut.clone(),
+            marker: marker.clone(),
             checksum: String::new(),
         };
         manifest.checksum = manifest.expected_checksum()?;
         let encoded =
             serde_json::to_vec(&manifest).map_err(|e| WalError::Io(std::io::Error::other(e)))?;
         atomic_file(&suffixed(&raw, ".json"), &encoded)?;
-        pending.push(cut);
-    }
+        marker
+    };
+    let pending = marker.cuts()?;
     if let Some(hooks) = hooks {
         for cut in &pending {
             hooks.before_cut(cut)?;
@@ -853,51 +973,22 @@ pub(crate) fn before_open_with_hooks(
         .create_new(missing)
         .open(log)
         .map_err(WalError::Io)?;
-    if scan.damaged {
-        file.set_len(scan.end as u64).map_err(WalError::Io)?;
+    if bytes.len() as u64 != marker.offset {
+        file.set_len(marker.offset).map_err(WalError::Io)?;
         file.sync_all().map_err(WalError::Io)?;
         crate::file_wal::recovery_truncated();
     }
     use std::io::{Seek, SeekFrom};
     file.seek(SeekFrom::End(0)).map_err(WalError::Io)?;
-    let lineage = match scan.lineage {
-        Some(lineage) => lineage,
-        None => {
-            let lineage = crate::file_wal::mint_lineage_id()?;
-            file.write_all(&framing::encode_lineage(lineage))
-                .map_err(WalError::Io)?;
-            lineage
-        }
-    };
-    let mut writer_id = [0; 16];
-    getrandom::fill(&mut writer_id)
-        .map_err(|e| WalError::Io(std::io::Error::other(e.to_string())))?;
+    file.write_all(&marker.bytes).map_err(WalError::Io)?;
+    file.sync_all().map_err(WalError::Io)?;
+    if missing {
+        fs_ops::sync_dir(log.parent().unwrap_or_else(|| Path::new("."))).map_err(WalError::Io)?;
+    }
     for cut in pending {
-        if scan.calls.cut_ids.contains(&cut.cut_id) {
-            continue;
-        }
-        let record = WalRecord::RecoveryCut {
-            recovery: Box::new(cut.clone()),
-        };
-        let prepared = framing::PreparedV4Frame::prepare(&record).map_err(WalError::Frame)?;
-        scan.seq += 1;
-        let mut frame = prepared
-            .stamp(framing::v4::Metadata {
-                seq: scan.seq,
-                fence: 0,
-                appended_ms: now_ms(),
-                writer_id,
-            })
-            .map_err(WalError::Frame)?;
-        frame.extend_from_slice(&framing::encode_lineage(lineage));
-        file.write_all(&frame).map_err(WalError::Io)?;
-        file.sync_all().map_err(WalError::Io)?;
-        if missing {
-            fs_ops::sync_dir(log.parent().unwrap_or_else(|| Path::new(".")))
-                .map_err(WalError::Io)?;
-        }
         tracing::warn!(session = %session_name,
-            wal = %log.display(), reason = cut.reason.as_str(), cut_offset = cut.cut_offset,
+            wal = %log.display(), cut_id = %cut.cut_id, completing,
+            reason = cut.reason.as_str(), cut_offset = cut.cut_offset,
             removed_bytes = cut.removed_len, unattributed_tool_risk = cut.unattributed_tool_risk,
             "WAL recovery preserved a removed suffix and recorded indeterminate-call evidence");
         scan.calls.cut_ids.insert(cut.cut_id.clone());

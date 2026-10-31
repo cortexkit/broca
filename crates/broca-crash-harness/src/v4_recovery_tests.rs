@@ -119,15 +119,25 @@ fn assert_recovery(source: &[u8], state: &State) {
     let refused = Scratch::new();
     state.install(&refused.0).unwrap();
     let result = refused.open_policy(broca_wal::recovery::RecoveryPolicy::Refuse);
-    if data.len() > end {
-        let error = result.err().expect("refuse must reject a damaged image");
-        assert!(error
-            .to_string()
-            .contains(&refused.log().display().to_string()));
-    } else {
-        assert!(result.is_ok());
+    match broca_wal::file_wal::recover_prefix(data, 0, None, None) {
+        Err(expected) => {
+            let error = result
+                .err()
+                .expect("refuse must retain the original typed failure");
+            assert_eq!(format!("{error:?}"), format!("{expected:?}"));
+            assert_eq!(std::fs::read(refused.log()).unwrap(), *data);
+        }
+        Ok(prefix) => {
+            assert!(
+                result.is_ok(),
+                "the original decoder accepts a final torn append"
+            );
+            assert_eq!(
+                std::fs::read(refused.log()).unwrap(),
+                data[..prefix.valid_end as usize]
+            );
+        }
     }
-    assert_eq!(std::fs::read(refused.log()).unwrap(), *data);
     assert!(broca_wal::recovery::manifests(&refused.log(), 1_000_000)
         .unwrap()
         .is_empty());
@@ -359,7 +369,7 @@ fn v4_recovery_refuses_conflicting_lineage_after_damage() {
         std::fs::write(root.log(), image).unwrap();
         assert!(
             matches!(
-                FileWal::open(root.log()),
+                root.open_policy(broca_wal::recovery::RecoveryPolicy::Repair),
                 Err(WalError::ConflictingLineageIds { .. })
             ),
             "foreign lineage following damage at {start} must not be discarded"
@@ -470,7 +480,7 @@ fn v4_recovery_refuse_keeps_every_invalid_proof_image_unchanged() {
         assert!(
             matches!(
                 root.open_policy(broca_wal::recovery::RecoveryPolicy::Refuse),
-                Err(WalError::Io(_))
+                Err(WalError::Corrupt { .. })
             ),
             "proof variant {variant}"
         );
@@ -495,7 +505,7 @@ fn v4_recovery_refuses_mixed_format_before_mutation() {
     data[damaged_start + HEADER_LEN] ^= 1;
     std::fs::write(root.log(), &data).unwrap();
     assert!(matches!(
-        FileWal::open(root.log()),
+        root.open_policy(broca_wal::recovery::RecoveryPolicy::Repair),
         Err(WalError::FrameFormat { .. })
     ));
     assert_eq!(std::fs::read(root.log()).unwrap(), data);

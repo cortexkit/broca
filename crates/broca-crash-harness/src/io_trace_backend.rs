@@ -179,6 +179,7 @@ impl FileOps for TraceFile {
         self.note("try_lock");
         self.inner.try_lock()
     }
+    #[cfg(unix)]
     fn read_exact_at(&self, bytes: &mut [u8], offset: u64) -> io::Result<()> {
         self.note(&format!("read_at {offset} {}", bytes.len()));
         self.inner.read_exact_at(bytes, offset)

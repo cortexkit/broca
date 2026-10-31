@@ -11,6 +11,8 @@ struct FaultFs {
     log: PathBuf,
     fail_sync: Arc<AtomicBool>,
     fail_sync_after: Option<Arc<Mutex<usize>>>,
+    fail_manifest_dir_sync: bool,
+    manifest_renamed: AtomicBool,
     fail_unlink: AtomicBool,
     unlink_attempted: AtomicBool,
 }
@@ -29,6 +31,8 @@ pub(crate) fn recovery_sync_fault(
         log,
         fail_sync: fail_sync.clone(),
         fail_sync_after: None,
+        fail_manifest_dir_sync: false,
+        manifest_renamed: AtomicBool::new(false),
         fail_unlink: AtomicBool::new(false),
         unlink_attempted: AtomicBool::new(false),
     });
@@ -48,6 +52,27 @@ pub(crate) fn recovery_marker_sync_fault(
         log,
         fail_sync: Arc::new(AtomicBool::new(false)),
         fail_sync_after: Some(Arc::new(Mutex::new(2))),
+        fail_manifest_dir_sync: false,
+        manifest_renamed: AtomicBool::new(false),
+        fail_unlink: AtomicBool::new(false),
+        unlink_attempted: AtomicBool::new(false),
+    });
+    (fs, recording)
+}
+
+pub(crate) fn recovery_manifest_dir_sync_fault(
+    root: &Path,
+    log: PathBuf,
+) -> (Arc<dyn FsOps>, Arc<RecordingFs>) {
+    let inner = Arc::new(BatchFs::new());
+    let recording = inner.begin(root);
+    let fs = Arc::new(FaultFs {
+        inner,
+        log,
+        fail_sync: Arc::new(AtomicBool::new(false)),
+        fail_sync_after: None,
+        fail_manifest_dir_sync: true,
+        manifest_renamed: AtomicBool::new(false),
         fail_unlink: AtomicBool::new(false),
         unlink_attempted: AtomicBool::new(false),
     });
@@ -74,7 +99,14 @@ impl FsOps for FaultFs {
         self.inner.create_dir_all(path)
     }
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        self.inner.rename(from, to)
+        self.inner.rename(from, to)?;
+        if to.file_name().is_some_and(|name| {
+            let name = name.to_string_lossy();
+            name.contains(".cut-") && name.ends_with(".json")
+        }) {
+            self.manifest_renamed.store(true, Ordering::SeqCst);
+        }
+        Ok(())
     }
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         if path
@@ -89,6 +121,9 @@ impl FsOps for FaultFs {
         self.inner.remove_file(path)
     }
     fn sync_dir(&self, path: &Path) -> io::Result<()> {
+        if self.fail_manifest_dir_sync && self.manifest_renamed.swap(false, Ordering::SeqCst) {
+            return Err(io::Error::other("injected manifest directory sync failure"));
+        }
         self.inner.sync_dir(path)
     }
     fn create_dir(&self, path: &Path) -> io::Result<()> {
@@ -181,6 +216,8 @@ fn spawn(root: &Scratch) -> (WalHandle, Arc<FaultFs>, Arc<RecordingFs>) {
         log: store.wal_path(&session),
         fail_sync: Arc::new(AtomicBool::new(false)),
         fail_sync_after: None,
+        fail_manifest_dir_sync: false,
+        manifest_renamed: AtomicBool::new(false),
         fail_unlink: AtomicBool::new(false),
         unlink_attempted: AtomicBool::new(false),
     });

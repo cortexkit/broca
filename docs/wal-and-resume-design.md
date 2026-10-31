@@ -80,12 +80,22 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   `<log>.cut-<unix_ms>` through a uniquely named temporary file, file sync,
   rename and directory sync. An immutable `.json` companion records the cut id,
   retained-prefix hash, raw suffix hash/length, session and call attribution; it
+  also binds the exact recovery-marker bytes and their append offset to the
+  retained-prefix hash. The marker evidence is required: an unreadable manifest
+  refuses by name, rather than guessing how a repair should be resumed. The JSON
   follows the same durable publication sequence. Both must be durable before
   truncate and file sync. Neither sidecars nor manifests are ever deleted.
   A pending manifest is finished on the next writable open, even when the log
   already looks clean after a failed or interrupted truncate. A successful
   `RecoveryCut` append is synced before writable open completes. Retrying a
   matching completed cut does not create duplicate recovery records. Later
+  retries re-establish the manifest-directory barrier before changing the log.
+  A torn or zero-filled prefix of the precommitted marker at its bound offset
+  is completed with the same bytes, cut id and sidecar pair, not a second cut.
+  Other bytes are new damage. Loss of the raw sidecar after its durable
+  publication does not discard the manifest's call identities or block recovery;
+  diagnostics warns about the preserved evidence without exposing its contents.
+  Later
   damage that removes an earlier marker can recover its attributed calls from
   the immutable session manifest. Failed repair is not transactional: an I/O
   error can leave the live file shortened, but the durable backup and manifest
@@ -133,8 +143,12 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   repeats of attributed calls, not external effects whose identifiers were
   destroyed by storage damage. Operators who require refusal rather than this
   lost-attribution exposure set `"wal_recovery": "refuse"`.
-  Refuse opens no appendable handle on damage, names the file, and changes
-  neither the log nor recovery sidecars. Read-only replay does not repair.
+  Refuse creates no new cut. New damage uses the original prefix decoder's
+  typed errors and final-tail behavior, including discarding an incomplete final
+  append that the old decoder accepted. A previously started, manifest-evidenced
+  cut is finished under its original identity even under refuse, and the warning
+  names that identity. Unrelated new damage never obtains permission from an old
+  cut. Read-only replay does not repair.
 - **`len` is capped + header-validated before allocation** — never allocate
   on `len` alone.
 - **`fence`** = the writer's lease-tenure epoch (§5), recorded for forensic correlation only;
