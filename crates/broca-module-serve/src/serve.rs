@@ -6232,7 +6232,7 @@ mod tests {
             )
             .await
             .unwrap_or_else(|_| panic!("reader did not reach {phase:?} gate"));
-            let snapshot = witness.snapshot().await;
+            let snapshot = witness.reader_phase_snapshot(phase).await;
             task.abort();
             let _ = task.await;
             assert_eq!(snapshot["kind"], "reader_phase", "{phase:?}");
