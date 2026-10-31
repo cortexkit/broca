@@ -959,6 +959,7 @@ mod automatic_tests {
         )
         .unwrap();
         config.auth_selection = Some(broca_wal::AuthSelection {
+            billing_vault_facts: None,
             auth_method: None,
             credential_id: "oauth:anthropic:credential-suffix-is-not-account".into(),
             account_ref: Some("00000000-0000-4000-8000-00000000000a".into()),

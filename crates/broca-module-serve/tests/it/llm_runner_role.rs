@@ -2605,8 +2605,13 @@ async fn live_attach_after_cancel_discards_the_uncommitted_step() {
     let reply = rig.send("partial", "task", None).await;
     let run_id = result(&reply)["run_id"].as_str().unwrap().to_owned();
     rig.wait_entered().await;
+    // The held model has streamed its partial; wait for that live delta itself, since on a
+    // loaded runner it can arrive after any fixed quiet window.
     let before = rig
-        .subscribe_collect(20, serde_json::json!({}), Duration::from_millis(100))
+        .subscribe_collect_until(20, serde_json::json!({}), Duration::from_millis(100), |f| {
+            serde_json::from_slice::<serde_json::Value>(&f.body).unwrap()["event"]["delta"]
+                == "discarded partial"
+        })
         .await;
     assert!(before.iter().any(
         |f| serde_json::from_slice::<serde_json::Value>(&f.body).unwrap()["event"]["delta"]

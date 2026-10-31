@@ -1830,6 +1830,19 @@ pub trait ServeHandler: Send + Sync {
         Ok(())
     }
 
+    /// Retraction defaults to owner-only unless the handler supports recorded senders.
+    /// The principal must come from the daemon's bind, never from request parameters.
+    async fn authorize_session_retract(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+        _submission_id: Option<&str>,
+    ) -> Result<(), ServeError> {
+        self.authorize_session_owner(session, principal, scope)
+            .await
+    }
+
     /// `session.send` — start or durably queue a run.
     async fn send(&self, req: SendRequest) -> Result<SendResponse, ServeError>;
 
@@ -2518,6 +2531,35 @@ impl ServeHandler for crate::LineageRegistry {
             .map_err(ServeError::ScopeRefused)
     }
 
+    async fn authorize_session_retract(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+        submission_id: Option<&str>,
+    ) -> Result<(), ServeError> {
+        // Runner 0.7.29 CONTRACT.md:2333-2362 (§9.2) extends only session.retract:
+        // owners keep their exact path; another attested sender may withdraw only its
+        // recorded submission. run.cancel remains owner-only, even for that sender.
+        match self
+            .authorize_session_owner(session, principal, scope)
+            .await
+        {
+            Err(refusal @ ServeError::ScopeRefused(_)) => {
+                if let (Some(sender @ broca_protocol::BindPrincipal::Reserved { .. }), Some(id)) =
+                    (principal, submission_id)
+                {
+                    if self.recorded_submission_sender(session, id).await?.as_ref() == Some(sender)
+                    {
+                        return Ok(());
+                    }
+                }
+                Err(refusal)
+            }
+            result => result,
+        }
+    }
+
     async fn upload(
         &self,
         session: &LineageKey,
@@ -2770,6 +2812,13 @@ impl ServeHandler for crate::LineageRegistry {
             .into_iter()
             .map(|frame| frame.record)
             .collect();
+        let own_run =
+            if let Some(sender @ broca_protocol::BindPrincipal::Reserved { .. }) = principal {
+                crate::send_fate::resolve_sender_run_id(&records, &own_run, send_id, sender)
+                    .map_err(|_| ServeError::UnknownSend)?
+            } else {
+                own_run
+            };
         // Ordered senders share a session, not each other's send keys. Legacy owner records
         // omit sent_by, so their principal is the one on Queued or RunStarted.
         let submission = format!("sub-{}", own_run.0);
@@ -2801,8 +2850,11 @@ impl ServeHandler for crate::LineageRegistry {
         {
             return Err(ServeError::UnknownSend);
         }
-        let outcome = crate::send_fate::recorded_send_outcome(&records, &own_run, send_id)
-            .ok_or(ServeError::UnknownSend)?;
+        let legacy_steers = !records.iter().any(|record| matches!(record,
+            broca_wal::WalRecord::DeliveryOrdered { submission_id, .. } if submission_id.0 == submission));
+        let outcome =
+            crate::send_fate::recorded_send_outcome(&records, &own_run, send_id, legacy_steers)
+                .ok_or(ServeError::UnknownSend)?;
         let (result, delivered) = match outcome {
             crate::actor::SendOutcome::Finished {
                 run_id,
@@ -4471,6 +4523,7 @@ mod paused_auth_tests {
                     error: None,
                     pause_reason: Some(reason),
                     auth_selection: Some(broca_wal::AuthSelection {
+                        billing_vault_facts: None,
                         auth_method: None,
                         credential_id: "requested-key".into(),
                         resolved_credential_id: Some("resolved-key".into()),
@@ -4820,8 +4873,214 @@ mod offset_head_tests {
                     cut: "m1".into(),
                 }),
                 ride_wait_ms: None,
+                view_features: None,
+                view_due: None,
             },
         });
         assert!(head_tail_needs_index_up(&with_setup));
+    }
+}
+
+#[cfg(test)]
+mod raw_database_composition_tests {
+    use super::*;
+    use broca_core::FileWalStore;
+    use broca_wal::{Wal, WalRecord};
+    use std::sync::{Arc, Mutex};
+
+    struct NoActor;
+    #[async_trait]
+    impl crate::registry::LineageOpener for NoActor {
+        async fn open(
+            &self,
+            _: &LineageKey,
+            _: u64,
+            _: crate::registry::RegistryHandle,
+        ) -> Result<crate::registry::ActorHandle, crate::registry::OpenError> {
+            panic!("read-only composition must not open an actor")
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_database_test_bundle_preserves_legacy_head_page_and_cursor_bytes() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("raw-composition-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("state-format"), "broca-state/2\n").unwrap();
+        let key = LineageKey::new(root.join("project"), "runner", "session");
+        let wal_store = Arc::new(FileWalStore::with_config(
+            root.join("wal"),
+            broca_wal::WalConfig::OVERHAUL,
+        ));
+        std::fs::create_dir_all(root.join("wal")).unwrap();
+        let mut wal = broca_wal::FileWal::open(wal_store.wal_path(&key))
+            .unwrap()
+            .with_feature_floor(root.join("wal-floor"));
+        let mut start: WalRecord = serde_json::from_str(
+            include_str!("../../broca-wal/tests/fixtures/before_message_times.jsonl")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        if let WalRecord::RunStarted { session, title, .. } = &mut start {
+            *session = key.clone();
+            *title = Some("WAL-only title".into());
+        }
+        let step: WalRecord = serde_json::from_value(serde_json::json!({"type":"model_step_finished","written_at_ms":1234,"step_id":1,"assistant_message":{"message_id":"m","content":[{"type":"text","text":"answer"}]},"usage":{"input_tokens":7,"output_tokens":3},"retries_used":0})).unwrap();
+        let terminal: WalRecord = serde_json::from_value(serde_json::json!({"type":"run_finished","reason":"completed","usage":{"input_tokens":7,"output_tokens":3},"completed_steps":1,"retries_used":0})).unwrap();
+        for record in [
+            start,
+            WalRecord::StepStarted {
+                step_id: broca_protocol::StepId(1),
+            },
+            step,
+            terminal,
+        ] {
+            wal.append(1, &record, false).unwrap();
+        }
+        wal.sync().unwrap();
+        let publication = wal.durable_publication().unwrap();
+        let db = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
+        db.publish(
+            &key,
+            &broca_core::agent_session_ref(&key),
+            broca_store::db::LogLocation::Live,
+            &publication,
+        )
+        .unwrap();
+        let bundle = Arc::new(crate::registry::RawPageTestBundle {
+            db,
+            publications: Mutex::new(std::collections::HashMap::from([(
+                key.clone(),
+                publication,
+            )])),
+        });
+        let legacy = crate::registry::LineageRegistry::new_with_reader(
+            Arc::new(NoActor),
+            wal_store.clone(),
+            None,
+        );
+        let raw =
+            crate::registry::LineageRegistry::new_with_reader(Arc::new(NoActor), wal_store, None)
+                .with_raw_pages_for_test(bundle.clone());
+        let counter = broca_wal::access_counter::WalAccessCounter::default();
+        let raw_head = counter
+            .operation("composed raw head")
+            .run_future(raw.head(&key))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&raw_head).unwrap(),
+            serde_json::to_vec(&legacy.head(&key).await.unwrap()).unwrap()
+        );
+        for from in [None, Some(0), Some(1), Some(500)] {
+            let request = SessionReadRequest::new(key.clone(), from, Some(1));
+            let actual = counter
+                .operation(format!("composed raw page {from:?}"))
+                .run_future(raw.read(request.clone()))
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                serde_json::to_vec(&legacy.read(request).await.unwrap()).unwrap()
+            );
+        }
+        let mut request = SessionReadRequest::new(key.clone(), None, Some(1));
+        request.lineage_id = Some("wrong-lineage".into());
+        assert!(matches!(
+            raw.read(request).await,
+            Err(ServeError::LineageChanged { .. })
+        ));
+        let head = raw.head(&key).await.unwrap();
+        let mut request = SessionReadRequest::new(key.clone(), None, Some(1));
+        request.lineage_id = head.lineage_id;
+        request.after_mid = Some("m0".into());
+        let next = raw.read(request).await.unwrap();
+        assert_eq!(next.messages[0].mid, "m1");
+        let fixture = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../scripts/fixtures/resume-close-out-sealed.wal"),
+        )
+        .unwrap();
+        let mut at = 0;
+        while at < fixture.len() {
+            match broca_wal::framing::decode_next(&fixture[at..]) {
+                broca_wal::framing::DecodeStep::Record { framed, consumed } => {
+                    let mut record = framed.record;
+                    if let WalRecord::RunStarted {
+                        session,
+                        run_id,
+                        written_at_ms,
+                        ..
+                    } = &mut record
+                    {
+                        *session = key.clone();
+                        run_id.0.push_str("-composed");
+                        *written_at_ms = Some(2000);
+                    }
+                    if let WalRecord::ModelStepFinished { written_at_ms, .. } = &mut record {
+                        *written_at_ms = Some(3000);
+                    }
+                    wal.append(1, &record, false).unwrap();
+                    at += consumed;
+                }
+                broca_wal::framing::DecodeStep::Lineage { consumed, .. } => at += consumed,
+                _ => panic!("invalid tool corpus"),
+            }
+        }
+        wal.sync().unwrap();
+        let publication = wal.durable_publication().unwrap();
+        bundle
+            .db
+            .publish(
+                &key,
+                &broca_core::agent_session_ref(&key),
+                broca_store::db::LogLocation::Live,
+                &publication,
+            )
+            .unwrap();
+        bundle
+            .publications
+            .lock()
+            .unwrap()
+            .insert(key.clone(), publication);
+        for from in [None, Some(2), Some(3), Some(4)] {
+            let request = SessionReadRequest::new(key.clone(), from, Some(2));
+            let actual = counter
+                .operation(format!("composed raw tool page {from:?}"))
+                .run_future(raw.read(request.clone()))
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                serde_json::to_vec(&legacy.read(request).await.unwrap()).unwrap()
+            );
+        }
+        assert!(!root.join("run-index.db").exists());
+        for op in counter.snapshot() {
+            assert!(
+                op.seed_fallbacks.is_empty(),
+                "{}: {:?}",
+                op.name,
+                op.seed_fallbacks
+            );
+            assert!(
+                op.reads
+                    .iter()
+                    .all(|r| r.class != broca_wal::access_counter::ReadClass::Origin),
+                "{}: {:?}",
+                op.name,
+                op.reads
+            );
+        }
+        // Close every handle into the root before deleting it: the registries
+        // and the bundle keep broca.db and the log open, and Windows refuses to
+        // delete an open file (OS error 32).
+        drop(raw);
+        drop(legacy);
+        drop(bundle);
+        drop(wal);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

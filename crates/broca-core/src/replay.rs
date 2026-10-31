@@ -288,6 +288,21 @@ pub enum ReplayResolution {
     },
 }
 
+/// Whether the named episode still owns its calls. Pauses and queued submissions do not
+/// end an episode; only its durable finish or a subsequent episode closes that ownership.
+/// Both held-result classification and actor recovery use this definition.
+pub fn run_is_open<'a>(records: impl IntoIterator<Item = &'a WalRecord>, run_id: &RunId) -> bool {
+    let mut open = false;
+    for record in records {
+        match record {
+            WalRecord::RunStarted { run_id: id, .. } => open = id == run_id,
+            WalRecord::RunFinished { .. } => open = false,
+            _ => {}
+        }
+    }
+    open
+}
+
 /// A trailing tool-turn whose batch isn't complete on disk — resume must finish
 /// it WITHOUT re-running the (durable, billed) model step. Reconstructed from the
 /// WAL so a second crash mid-resume still converges.
@@ -4736,6 +4751,7 @@ pub(crate) mod projection_boundary_tests {
     fn paused_reconciliation_retains_only_the_requested_runs_frozen_selection() {
         let mut first = run_started(1, "first").record;
         let selection = broca_wal::AuthSelection {
+            billing_vault_facts: None,
             auth_method: None,
             credential_id: "frozen-key".into(),
             account_ref: None,
@@ -6254,6 +6270,8 @@ mod offset_tail_tests {
                     cut: "m1".into(),
                 }),
                 ride_wait_ms: None,
+                view_features: None,
+                view_due: None,
             },
         }
     }
@@ -6572,6 +6590,8 @@ mod offset_tail_tests {
                 ceiling: None,
                 tag_checkpoint: None,
                 ride_wait_ms: None,
+                view_features: None,
+                view_due: None,
             },
         };
         assert!(!tail_contains_compaction_setup(&[step_answer]));

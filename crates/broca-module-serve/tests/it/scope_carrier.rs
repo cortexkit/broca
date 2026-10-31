@@ -230,8 +230,14 @@ impl Rig {
         let registry = Arc::new(LineageRegistry::new_with_reader(
             opener,
             wal.clone(),
-            Some(store),
+            Some(store.clone()),
         ));
+        broca_store::session_refs::migrate(
+            &dir.join("store.db"),
+            &broca_core::ReadOnlyWalReader::new(&dir),
+        )
+        .unwrap();
+        registry.set_session_address_inventory(store);
         let (client, server) = tokio::io::duplex(64 * 1024);
         let (mut reader, mut writer) = tokio::io::split(client);
         let (server_read, server_write) = tokio::io::split(server);

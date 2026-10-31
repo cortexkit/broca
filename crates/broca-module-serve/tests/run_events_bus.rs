@@ -312,6 +312,8 @@ async fn real_bus_compaction_receipt_survives_ack_and_rebuilds_inbox() {
                 ceiling: Some(broca_wal::OpaqueJson::from_json_text("{}").unwrap()),
                 tag_checkpoint: None,
                 ride_wait_ms: None,
+                view_features: None,
+                view_due: None,
             },
             true,
         )
@@ -482,7 +484,7 @@ async fn real_bus_compaction_attach_never_creates_or_modifies_consumers() {
 }
 
 fn project(store: &SqliteStore, wal: &FileWalStore, session: &BindIdentity) {
-    // `flush_for_read` returns the WAL file's identity (only Unix has one), not a sequence. Take
+    // `flush_for_read` returns the WAL file's optional identity, not a sequence. Take
     // the head from the records decoded before the flush, which that flush then proves durable.
     let candidate = wal.read_records_range(session, 0, None, None).unwrap();
     let broca_wal::WalRangeRecords::Complete(candidate) = candidate.records() else {

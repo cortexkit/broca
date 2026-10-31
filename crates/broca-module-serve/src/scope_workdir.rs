@@ -1,11 +1,6 @@
-//! The session folder and project id a daemon scope stamp carries, compared with the bind's
-//! `project_root`.
-//!
-//! Every session is keyed by its bind triple `(project_root, harness, session)`: that triple
-//! names its WAL, lease, run-index rows, refs and media. The stamp's folder is read here only
-//! to measure how many scoped sessions name a different folder than their bind, so a change to
-//! key sessions by the stamped folder can be sized before it moves any session's address.
-//! Nothing in this module feeds a session key, a reply or a durable record.
+//! Preserve the daemon's stamped folder and project id. Address resolution uses workdir for
+//! new scoped sessions; an existing session keeps its inventory root. The counters compare
+//! the stamped folder with that resolved storage root, exposing retained legacy differences.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -153,7 +148,7 @@ pub(crate) fn health() -> serde_json::Value {
     process_tally().health()
 }
 
-/// Measure one scoped send: compare its stamped folder with the bind's `project_root`, count
+/// Measure one scoped send: compare its stamped folder with the resolved storage root, count
 /// the session once per outcome, and log once per session whose folder differs. The log
 /// names the session by its hashed address and ref, never by either folder.
 pub(crate) fn observe_scoped_send(
@@ -180,7 +175,7 @@ fn observe_into(
             session = %address,
             session_ref = %broca_core::agent_session_ref(session),
             project_id = location.project_id.unwrap_or(""),
-            "scoped session's stamped workdir differs from its bind project_root; the session stays keyed by the bind project_root"
+            "scoped session's stamped workdir differs from its resolved storage root; the session retains its existing address"
         );
     }
     first_difference

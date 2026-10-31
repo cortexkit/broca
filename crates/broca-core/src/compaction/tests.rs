@@ -214,6 +214,8 @@ pub(super) fn setup_record(ceiling: Option<&str>) -> WalRecord {
         ceiling: ceiling.map(|json| OpaqueJson::from_json_text(json).unwrap()),
         tag_checkpoint: None,
         ride_wait_ms: None,
+        view_features: None,
+        view_due: None,
     }
 }
 
@@ -245,6 +247,8 @@ fn synchronous_records() -> Vec<WalRecord> {
             ceiling: None,
             tag_checkpoint: None,
             ride_wait_ms: None,
+            view_features: None,
+            view_due: None,
         },
         WalRecord::CompactionRequest {
             provider: "provider".into(),
@@ -268,6 +272,8 @@ fn synchronous_records() -> Vec<WalRecord> {
             ceiling: None,
             tag_checkpoint: None,
             ride_wait_ms: None,
+            view_features: None,
+            view_due: None,
         },
         WalRecord::CompactionAnswer {
             provider: "provider".into(),
@@ -1768,6 +1774,7 @@ async fn a_model_change_rides_for_a_view_and_applies_it() {
 
 fn routed_account_selection(account_ref: &str) -> broca_wal::AuthSelection {
     broca_wal::AuthSelection {
+        billing_vault_facts: None,
         credential_id: format!("vault-cred-{account_ref}"),
         account_ref: Some(account_ref.to_owned()),
         resolved_credential_id: Some(format!("vault-cred-{account_ref}")),

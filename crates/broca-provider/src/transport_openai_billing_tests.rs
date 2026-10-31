@@ -42,6 +42,7 @@ async fn run_openai(label: &str, script: Vec<ScriptResponse>) -> OpenAiRun {
         script,
         "openai",
         AuthSelection {
+            billing_vault_facts: None,
             auth_method: None,
             credential_id: FROZEN_CREDENTIAL.into(),
             account_ref: None,
@@ -208,6 +209,7 @@ async fn xai_subscription_spending_limit_reaches_the_caller_as_an_untimed_accoun
         }; 6],
         "xai",
         AuthSelection {
+            billing_vault_facts: None,
             auth_method: Some("oauth".into()),
             credential_id: "oauth:xai".into(),
             account_ref: Some("acct-x".into()),

@@ -14,6 +14,7 @@ pub const REPLY_LIMIT: usize = 65_536;
 static ROOT: OnceLock<(PathBuf, broca_wal::WalConfig)> = OnceLock::new();
 
 pub fn install(root: PathBuf, config: broca_wal::WalConfig) {
+    crate::session_address_health::initialize();
     live::initialize();
     let _ = ROOT.set((root, config));
 }
@@ -44,6 +45,7 @@ pub struct Evidence {
     pub recovery_cuts: Vec<Finding>,
     pub runs: Runs,
     pub late_fence_ms: Option<i64>,
+    pub late_delivery_stuck: Vec<Value>,
     pub retention: Result<Vec<Fence>, String>,
     pub catalog_age_ms: Result<i64, String>,
     pub unmapped_credentials: BTreeMap<String, &'static str>,
@@ -95,10 +97,18 @@ pub fn gather(
         },
         runs,
         late_fence_ms,
+        late_delivery_stuck: crate::held_runtime::health_gauges()["late_results_delivery_stuck"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
         catalog_age_ms,
         retention: live::retention_fences(),
         unmapped_credentials: crate::account_routing::published_unmapped_credentials(),
         rings: [
+            (
+                "session_address_unavailable".into(),
+                crate::session_address_health::snapshot(since, now),
+            ),
             (
                 "send_refusals".into(),
                 live::SEND_REFUSALS.snapshot(since, now),
@@ -596,6 +606,14 @@ pub fn report(mut evidence: Evidence, now: i64, window: i64) -> Reply {
             "The late-results rebuild fence is present, so provider-held intake cannot be trusted.",
             "Inspect the late-results-rebuild-required marker and late-results rebuild log before removing the fence."));
     }
+    if !evidence.late_delivery_stuck.is_empty() {
+        let mut f = finding("late_results_delivery_stuck", "delivery".into(), Severity::Error, now, now,
+            "A held call's late result failed delivery identically at least three times; its acknowledgement remains pinned.",
+            "Inspect the sampled session's held terminal and resume refusal. Later entries are delivered without acknowledging past the pin; paging beyond a permanently stuck prefix needs a durable deferred-entry spool, not an unsafe acknowledgement.");
+        f.count = evidence.late_delivery_stuck.len() as u64;
+        f.samples = evidence.late_delivery_stuck.into_iter().take(5).collect();
+        findings.push(f);
+    }
     for (credential, missing) in evidence.unmapped_credentials {
         let mut f = finding("credential_metadata_missing",credential.clone(),Severity::Warn,now,now,
             "A listed model credential lacks recognized routing metadata required for account selection.",
@@ -653,6 +671,11 @@ pub fn report(mut evidence: Evidence, now: i64, window: i64) -> Reply {
                         let mut f = finding(&check,key,Severity::Warn,at_ms,at_ms,
                             if check == "tool_outages" {"A tool module returned attributed outage results in the window."} else if check == "catalog_stale" {"Catalog refreshes were refused in the observed window."} else {"Routing refused sends in the observed window."},
                             if check == "tool_outages" {"Inspect the tool-plane outage log for the sampled module and code."} else if check == "catalog_stale" {"Inspect health.check catalog_refusals and the fusiform catalog poll log."} else {"Inspect the routing refused account selection log and health.check account_selection counters."});
+                        if check == "session_address_unavailable" {
+                            f.severity = Severity::Error;
+                            f.summary = format!("Session binds were refused because address discovery was unavailable: {}.", f.key.replace('_', " "));
+                            f.hint = "Inspect health.check session_address_refusals and the session_address WARN log; verify inventory completeness and repair before resuming binds.".into();
+                        }
                         f.count=0;f
                     });
                     f.count += 1;

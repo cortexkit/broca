@@ -8,6 +8,8 @@ repository.workspace = true
 description = "The real subc tool-plane: a SubcToolPlane (2nd ToolPlane impl) that dispatches the loop's tool calls runner->subc->AFT over an authenticated direct consumer connection."
 
 [features]
+# Test-only observation of client route-open start times.
+test-clock = []
 test-attachments = ["broca-core/test-attachments", "broca-protocol/test-attachments"]
 # Test-only one-shot Goodbye enqueue failure, to exercise cleanup against a real daemon.
 test-route-close = []

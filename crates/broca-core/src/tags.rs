@@ -700,6 +700,8 @@ mod tests {
                 cut: "m0".into(),
             }),
             ride_wait_ms: None,
+            view_features: None,
+            view_due: None,
         };
         let records = vec![
             computed_run_started(0),

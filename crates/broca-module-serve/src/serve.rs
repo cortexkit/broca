@@ -499,9 +499,7 @@ fn run_id_for_send(session: &BrocaBindIdentity, send_id: Option<&str>) -> broca_
     }
 }
 
-/// Map a subc route bind identity to the broca session key. The triples are
-/// field-identical; this ONE mapping is the adapter boundary (like the SubcToolPlane's
-/// identity mapping on the consumer side).
+/// Derive an import's deterministic run id under the already resolved storage identity.
 fn run_id_for_import(session: &BrocaBindIdentity, import_id: &str) -> broca_protocol::RunId {
     let mut seed = send_id_scope(session);
     seed.push_str("import:");
@@ -538,8 +536,8 @@ struct BindObservation {
     /// carries it to admission, which decides the owner check and the scope to freeze.
     scope: broca_protocol::SendScope,
     /// The session folder and project id on the bind's scope stamp, `None` on an unstamped
-    /// bind. Measured against the bind's `project_root` on each scoped send; never part of
-    /// the session key.
+    /// bind. New scoped pairs take its workdir as their storage root; existing pairs keep
+    /// their inventory root. Project id remains attribution only.
     stamped_project: Option<crate::scope_workdir::StampedProject>,
     /// What the consumer declared about reading tool replies, under either version's name for
     /// the reply format.
@@ -813,6 +811,7 @@ struct SubscriptionSlot {
 }
 
 struct BindCompletion {
+    address_refusal: Option<broca_store::session_address::SessionAddressError>,
     header: subc_protocol::EnvelopeHeader,
     channel: u16,
     epoch: u32,
@@ -1883,8 +1882,11 @@ async fn handle_control_request(
             if let Err(error) = if bind.agent_data || bind.role.is_sessionless() {
                 Ok(())
             } else {
-                identity.validate_keyable()
+                BrocaBindIdentity::new("", &identity.harness, &identity.session).validate_keyable()
             } {
+                crate::session_address_health::record_refusal(
+                    &broca_store::session_address::SessionAddressError::Invalid(error.clone()),
+                );
                 return send_error(
                     writer,
                     frame.header.ver,
@@ -1904,6 +1906,7 @@ async fn handle_control_request(
                 previous.cancel();
             }
             let completed = BindCompletion {
+                address_refusal: None,
                 header: frame.header,
                 channel: route_channel,
                 epoch,
@@ -1914,10 +1917,7 @@ async fn handle_control_request(
             };
             // Keep the bind unacknowledged until its history authorizes the stamp. The read
             // runs off ingress so a slow WAL/store cannot hide health probes or GOODBYE.
-            if !completed.bind.agent_data
-                && !completed.bind.role.is_sessionless()
-                && matches!(&completed.bind.scope, broca_protocol::SendScope::Stamped(_))
-            {
+            if !completed.bind.agent_data && !completed.bind.role.is_sessionless() {
                 let registry = health_registry.clone();
                 routes
                     .bind_tasks
@@ -2114,10 +2114,11 @@ async fn handle_control_request(
                     "serve_frames_dropped_unbound_channel": SERVE_FRAMES_DROPPED_UNBOUND_CHANNEL.load(Ordering::Relaxed),
                     "serve_frames_dropped_stale_epoch": SERVE_FRAMES_DROPPED_STALE_EPOCH.load(Ordering::Relaxed),
                     // Distinct scoped sessions whose send's stamped folder matched, differed
-                    // from, or was missing beside the bind's project_root. Sessions stay keyed
-                    // by project_root either way; `sessions_differ` is how many would move if
+                    // from, or was missing beside the resolved storage root. Existing sessions
+                    // retain that root; `sessions_differ` is how many would move if
                     // they were keyed by the stamped folder instead.
                     "scoped_session_workdirs": crate::scope_workdir::health(),
+                    "session_address_refusals": crate::session_address_health::health(),
                     // Requests a module sent toward broca on a route, each answered with
                     // reverse_request_unhandled because broca fronts no person who could answer.
                     // Non-zero means some module is asking and not getting what it wants.
@@ -2331,6 +2332,23 @@ async fn authorize_bind(
     mut completed: BindCompletion,
     registry: LineageRegistry,
 ) -> BindCompletion {
+    match registry
+        .resolve_session_address(
+            &completed.identity,
+            completed
+                .bind
+                .stamped_project
+                .as_ref()
+                .and_then(|stamp| stamp.workdir.as_deref()),
+        )
+        .await
+    {
+        Ok(identity) => completed.identity = identity,
+        Err(error) => {
+            completed.address_refusal = Some(error);
+            return completed;
+        }
+    }
     if let broca_protocol::SendScope::Stamped(stamp) = &completed.bind.scope {
         let check = registry.bind_adoption_refusal(
             &completed.identity,
@@ -2364,6 +2382,29 @@ async fn finish_bind(
         return Ok(());
     }
     routes.pending_binds.remove(&completed.channel);
+    if let Some(error) = completed.address_refusal {
+        crate::session_address_health::record_refusal(&error);
+        let class = match error {
+            broca_store::session_address::SessionAddressError::Ambiguous
+            | broca_store::session_address::SessionAddressError::Invalid(_) => "permanent",
+            broca_store::session_address::SessionAddressError::Unavailable(_) => "transient",
+        };
+        let message = format!(
+            "cannot resolve session {:?} in harness {:?}: {error}",
+            completed.identity.session, completed.identity.harness
+        );
+        let body =
+            ErrorBody::new(error.code(), message).with_detail(serde_json::json!({"class":class}));
+        return send_error_body(
+            writer,
+            completed.header.ver,
+            0,
+            0,
+            completed.header.corr,
+            body,
+        )
+        .await;
+    }
     let refusal = match completed.refusal {
         Ok(refusal) => refusal,
         // The adoption check could not read the session's history. Refuse the bind as a
@@ -2500,7 +2541,7 @@ async fn spawn_vault_audit_request<H: ServeHandler + 'static>(
             .map_err(|_| ServeIoError("request concurrency limiter closed".into()))?;
         let authorization = tokio::select! {
             _ = conn_cancel.cancelled() => return Ok(()),
-            result = authorize_route_request(handler.as_ref(), &session, &bind, &req.method) => result,
+            result = authorize_route_request(handler.as_ref(), &session, &bind, &req.method, None) => result,
         };
         if let Err(error) = authorization {
             return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
@@ -2594,7 +2635,11 @@ where
             PreparedRouteRequest::Request(req) => req.method.as_str(),
             PreparedRouteRequest::Subscribe { .. } => OP_SUBSCRIBE,
         };
-        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method).await {
+        let submission_id = match &prepared {
+            PreparedRouteRequest::Request(req) => req.params.get("submission_id").and_then(serde_json::Value::as_str),
+            PreparedRouteRequest::Subscribe { .. } => None,
+        };
+        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method, submission_id).await {
             return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
         }
         let write = matches!(
@@ -2670,8 +2715,13 @@ async fn authorize_route_request<H: ServeHandler>(
     session: &BrocaBindIdentity,
     bind: &BindObservation,
     method: &str,
+    submission_id: Option<&str>,
 ) -> Result<(), ServeError> {
-    if matches!(method, OP_CANCEL | OP_RETRACT) {
+    if method == OP_RETRACT {
+        handler
+            .authorize_session_retract(session, bind.principal.as_ref(), &bind.scope, submission_id)
+            .await
+    } else if method == OP_CANCEL {
         handler
             .authorize_session_owner(session, bind.principal.as_ref(), &bind.scope)
             .await
@@ -3134,7 +3184,7 @@ where
             send_req.request.scope = bind.scope.clone();
             send_req.plan = plan;
             // Measured here, after every serve-side refusal, so only sends that reach the
-            // session are counted. The session key above stays the bind triple.
+            // session are counted. Compare against the resolved storage identity.
             if matches!(&bind.scope, broca_protocol::SendScope::Stamped(_)) {
                 crate::scope_workdir::observe_scoped_send(
                     session,
@@ -5737,6 +5787,10 @@ impl std::error::Error for ServeIoError {}
 
 #[cfg(test)]
 mod tests {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/common/address_inventory.rs"
+    ));
     use super::*;
 
     #[test]
@@ -6148,7 +6202,7 @@ mod tests {
                     entered: tokio::sync::Notify::new(),
                     release: tokio::sync::Notify::new(),
                 });
-                let registry = LineageRegistry::new(Arc::new(RefusingOpener));
+                let registry = test_registry(LineageRegistry::new(Arc::new(RefusingOpener)));
                 handle_frame(
                     frame,
                     &writer,
@@ -6501,7 +6555,9 @@ mod tests {
     /// served bytes are pinned by `tests/golden/subscribe_unit_undeliverable.too_large.json`.
     #[tokio::test]
     async fn an_oversized_subscribe_unit_ends_the_stream_with_a_typed_error() {
-        let registry = Arc::new(LineageRegistry::new(Arc::new(RefusingOpener)));
+        let registry = Arc::new(test_registry(LineageRegistry::new(Arc::new(
+            RefusingOpener,
+        ))));
         let mut ingress = BindIngress::new(registry);
         ingress.bind(1, "published", false).await;
         next_written(&mut ingress.written).await;
@@ -7627,6 +7683,9 @@ mod tests {
                 .unwrap(),
             )
             .await;
+            if !stamped {
+                self.complete_bind().await;
+            }
         }
 
         async fn complete_bind(&mut self) {
@@ -7713,11 +7772,11 @@ mod tests {
             finished: tokio::sync::Notify::new(),
             records,
         });
-        let registry = Arc::new(LineageRegistry::new_with_reader(
+        let registry = Arc::new(test_registry(LineageRegistry::new_with_reader(
             Arc::new(RefusingOpener),
             store.clone(),
             None,
-        ));
+        )));
         (
             BindIngress::new(registry),
             store,
@@ -7923,11 +7982,11 @@ mod tests {
 
     #[tokio::test]
     async fn stamped_bind_with_unreadable_history_is_refused_not_published() {
-        let registry = Arc::new(LineageRegistry::new_with_reader(
+        let registry = Arc::new(test_registry(LineageRegistry::new_with_reader(
             Arc::new(RefusingOpener),
             Arc::new(UnreadableBindHistory),
             None,
-        ));
+        )));
         let mut ingress = BindIngress::new(registry);
         ingress.bind(1, "unreadable", true).await;
         ingress.complete_bind().await;
@@ -8007,7 +8066,9 @@ mod tests {
 
     #[tokio::test]
     async fn unauthorized_subscribe_reports_authorization_before_invalid_params() {
-        let registry = Arc::new(LineageRegistry::new(Arc::new(RefusingOpener)));
+        let registry = Arc::new(test_registry(LineageRegistry::new(Arc::new(
+            RefusingOpener,
+        ))));
         let mut ingress = BindIngress::new(registry);
         ingress.bind(1, "published", false).await;
         next_written(&mut ingress.written).await;
@@ -8051,7 +8112,9 @@ mod tests {
 
     #[tokio::test]
     async fn unauthorized_replacement_subscribe_preserves_original_stream_correlation() {
-        let registry = Arc::new(LineageRegistry::new(Arc::new(RefusingOpener)));
+        let registry = Arc::new(test_registry(LineageRegistry::new(Arc::new(
+            RefusingOpener,
+        ))));
         let mut ingress = BindIngress::new(registry);
         ingress.bind(1, "published", false).await;
         next_written(&mut ingress.written).await;
@@ -8102,7 +8165,9 @@ mod tests {
 
     #[tokio::test]
     async fn authorized_invalid_subscribe_preserves_original_stream_correlation() {
-        let registry = Arc::new(LineageRegistry::new(Arc::new(RefusingOpener)));
+        let registry = Arc::new(test_registry(LineageRegistry::new(Arc::new(
+            RefusingOpener,
+        ))));
         let mut ingress = BindIngress::new(registry);
         ingress.bind(1, "published", false).await;
         next_written(&mut ingress.written).await;
@@ -8147,11 +8212,11 @@ mod tests {
             finished: tokio::sync::Notify::new(),
             records: vec![],
         });
-        let registry = Arc::new(LineageRegistry::new_with_reader(
+        let registry = Arc::new(test_registry(LineageRegistry::new_with_reader(
             Arc::new(RefusingOpener),
             store.clone(),
             None,
-        ));
+        )));
         let (mut daemon, module) = tokio::io::duplex(64 * 1024);
         let (reader, writer) = tokio::io::split(module);
         let serve = tokio::spawn(serve_connection(
@@ -8233,7 +8298,9 @@ mod tests {
         routes.pending_binds.insert(7, (1, cancel.clone()));
         let goodbye = Frame::build(FrameType::Goodbye, control_flags(), 7, 1, 0, vec![]).unwrap();
         let (writer, mut written) = broca_diagnostics::channel::<Frame>(4, Arc::default());
-        let registry = Arc::new(LineageRegistry::new(Arc::new(RefusingOpener)));
+        let registry = Arc::new(test_registry(LineageRegistry::new(Arc::new(
+            RefusingOpener,
+        ))));
         handle_frame(
             goodbye,
             &writer,
@@ -8254,6 +8321,7 @@ mod tests {
             .header;
         finish_bind(
             BindCompletion {
+                address_refusal: None,
                 header,
                 channel: 7,
                 epoch: 1,
@@ -8461,7 +8529,9 @@ mod tests {
                 writer,
                 "broca",
                 handler,
-                Arc::new(LineageRegistry::new(Arc::new(RefusingOpener))),
+                Arc::new(test_registry(LineageRegistry::new(Arc::new(
+                    RefusingOpener,
+                )))),
                 VaultGauge::not_in_use(),
             ));
             bind_test_route(&mut daemon, session).await;
@@ -8516,7 +8586,9 @@ mod tests {
             },
             "broca",
             handler.clone(),
-            Arc::new(LineageRegistry::new(Arc::new(RefusingOpener))),
+            Arc::new(test_registry(LineageRegistry::new(Arc::new(
+                RefusingOpener,
+            )))),
             VaultGauge::not_in_use(),
         ));
         bind_test_route(&mut daemon, "reset-response").await;
@@ -8550,7 +8622,7 @@ mod tests {
         });
         let loop_handler = handler.clone();
         let serve = tokio::spawn(async move {
-            let registry = LineageRegistry::new(Arc::new(RefusingOpener));
+            let registry = test_registry(LineageRegistry::new(Arc::new(RefusingOpener)));
             run_frame_loop(
                 &mut module_read,
                 writer,
@@ -8727,6 +8799,173 @@ mod tests {
         }
     }
 
+    struct RetractPrincipalProbe;
+
+    #[async_trait::async_trait]
+    impl ServeHandler for RetractPrincipalProbe {
+        async fn authorize_session_owner(
+            &self,
+            _: &BrocaBindIdentity,
+            _: Option<&broca_protocol::BindPrincipal>,
+            _: &broca_protocol::SendScope,
+        ) -> Result<(), ServeError> {
+            Err(ServeError::ScopeRefused(
+                broca_core::ScopeRefusal::SenderNotOwner,
+            ))
+        }
+        async fn authorize_session_retract(
+            &self,
+            _: &BrocaBindIdentity,
+            principal: Option<&broca_protocol::BindPrincipal>,
+            _: &broca_protocol::SendScope,
+            id: Option<&str>,
+        ) -> Result<(), ServeError> {
+            assert_eq!(id, Some("pending"));
+            if principal
+                == Some(&broca_protocol::BindPrincipal::Reserved {
+                    module_id: "actual".into(),
+                })
+            {
+                Ok(())
+            } else {
+                Err(ServeError::ScopeRefused(
+                    broca_core::ScopeRefusal::SenderNotOwner,
+                ))
+            }
+        }
+        async fn retract(
+            &self,
+            _: &BrocaBindIdentity,
+            _: broca_protocol::SubmissionId,
+        ) -> Result<RetractResponse, ServeError> {
+            Ok(RetractResponse::Retracted)
+        }
+        async fn send(&self, _: SendRequest) -> Result<SendResponse, ServeError> {
+            unreachable!()
+        }
+        async fn subscribe(
+            &self,
+            _: &BrocaBindIdentity,
+            _: SubscribeFrom,
+            _: mpsc::Sender<Delivery>,
+        ) -> Result<(), ServeError> {
+            unreachable!()
+        }
+        async fn read(&self, _: SessionReadRequest) -> Result<SessionReadResponse, ServeError> {
+            unreachable!()
+        }
+        async fn cancel(
+            &self,
+            _: &BrocaBindIdentity,
+            _: broca_protocol::RunId,
+        ) -> Result<CancelResponse, ServeError> {
+            unreachable!("run.cancel must remain owner-only")
+        }
+        async fn status(&self, _: &BrocaBindIdentity) -> Result<StatusResponse, ServeError> {
+            unreachable!()
+        }
+        async fn run_status(
+            &self,
+            _: &BrocaBindIdentity,
+            _: broca_protocol::RunId,
+        ) -> Result<RunStatusResponse, ServeError> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn retract_own_send_uses_only_the_bound_daemon_principal_and_never_extends_run_cancel() {
+        let (mut daemon, mut written, serve) =
+            bound_frame_loop(Arc::new(RetractPrincipalProbe), "retract-principal").await;
+        for (epoch, principal, sender, accepted) in [
+            (1, None, "actual", false),
+            (
+                2,
+                Some(subc_protocol::Principal::Reserved {
+                    module_id: "actual".into(),
+                }),
+                "forged",
+                true,
+            ),
+            (
+                3,
+                Some(subc_protocol::Principal::Unverified),
+                "actual",
+                false,
+            ),
+            (4, Some(subc_protocol::Principal::Direct), "actual", false),
+        ] {
+            if epoch > 1 {
+                let bind = ModuleControlRequest::RouteBind {
+                    route_channel: 7,
+                    epoch,
+                    target: subc_protocol::RouteTarget::ManagementSurface {
+                        module_id: "broca".into(),
+                    },
+                    identity: SubcBindIdentity::new("/tmp", "runner", "retract-principal"),
+                    principal,
+                    consumer_capabilities: None,
+                    admission_facts: None,
+                    scope: None,
+                    role_versions: None,
+                    call_mode: None,
+                };
+                write_frame(
+                    &mut daemon,
+                    &Frame::build(
+                        FrameType::Request,
+                        control_flags(),
+                        0,
+                        0,
+                        20,
+                        serde_json::to_vec(&bind).unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    next_written(&mut written).await.header.ty,
+                    FrameType::Response
+                );
+            }
+            for method in [OP_RETRACT, OP_CANCEL] {
+                let params = serde_json::json!({"method":method,"params":{"submission_id":"pending","run_id":"running","sender":sender}});
+                write_frame(
+                    &mut daemon,
+                    &Frame::build(
+                        FrameType::Request,
+                        control_flags(),
+                        7,
+                        epoch,
+                        21,
+                        serde_json::to_vec(&params).unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+                let reply = next_written(&mut written).await;
+                assert_eq!(
+                    reply.header.ty,
+                    if accepted && method == OP_RETRACT {
+                        FrameType::Response
+                    } else {
+                        FrameType::Error
+                    }
+                );
+                if reply.header.ty == FrameType::Response {
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&reply.body).unwrap()["result"],
+                        "retracted"
+                    );
+                }
+            }
+        }
+        drop(daemon);
+        serve.await.unwrap().unwrap();
+    }
+
     /// Start a frame loop serving `handler`, complete its handshake, and bind route channel 7
     /// to `session`. Returns the daemon end of the socket, the loop's egress, and the loop.
     async fn bound_frame_loop<H: ServeHandler + 'static>(
@@ -8741,7 +8980,7 @@ mod tests {
         let (writer, mut written) =
             broca_diagnostics::channel::<Frame>(EGRESS_BUFFER, Arc::default());
         let serve = tokio::spawn(async move {
-            let registry = LineageRegistry::new(Arc::new(RefusingOpener));
+            let registry = test_registry(LineageRegistry::new(Arc::new(RefusingOpener)));
             run_frame_loop(
                 &mut module_read,
                 writer,
@@ -8914,7 +9153,7 @@ mod tests {
             release: tokio::sync::Notify::new(),
         });
         let serve = tokio::spawn(async move {
-            let registry = LineageRegistry::new(Arc::new(RefusingOpener));
+            let registry = test_registry(LineageRegistry::new(Arc::new(RefusingOpener)));
             run_frame_loop(
                 &mut module_read,
                 writer,
@@ -9069,7 +9308,7 @@ mod tests {
             release: tokio::sync::Notify::new(),
         });
         let serve = tokio::spawn(async move {
-            let registry = LineageRegistry::new(Arc::new(RefusingOpener));
+            let registry = test_registry(LineageRegistry::new(Arc::new(RefusingOpener)));
             let consumer_routes = crate::consumer_routes::ConsumerRoutes::default();
             run_frame_loop(
                 &mut module_read,
@@ -9177,7 +9416,7 @@ mod tests {
         });
         let loop_handler = handler.clone();
         let serve = tokio::spawn(async move {
-            let registry = LineageRegistry::new(Arc::new(RefusingOpener));
+            let registry = test_registry(LineageRegistry::new(Arc::new(RefusingOpener)));
             let consumer_routes = crate::consumer_routes::ConsumerRoutes::default();
             run_frame_loop(
                 &mut module_read,
@@ -9327,7 +9566,7 @@ mod tests {
         });
         let loop_handler = handler.clone();
         let serve = tokio::spawn(async move {
-            let registry = LineageRegistry::new(Arc::new(RefusingOpener));
+            let registry = test_registry(LineageRegistry::new(Arc::new(RefusingOpener)));
             let consumer_routes = crate::consumer_routes::ConsumerRoutes::default();
             run_frame_loop(
                 &mut module_read,
@@ -9414,6 +9653,20 @@ mod tests {
                     .as_u64()
                     .is_some(),
                 "health.check includes the scoped-session workdir counter {counter}, zero included"
+            );
+        }
+        for reason in [
+            "incomplete_inventory",
+            "gap_marker",
+            "store_error",
+            "ambiguous",
+            "invalid_identity",
+        ] {
+            assert!(
+                health["metrics"]["session_address_refusals"][reason]
+                    .as_u64()
+                    .is_some(),
+                "health.check includes the address refusal counter {reason}, zero included"
             );
         }
 

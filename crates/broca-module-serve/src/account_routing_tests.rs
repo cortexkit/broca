@@ -1564,6 +1564,7 @@ async fn a_sealed_run_reports_its_interrupted_terminal_once() {
     let client = Arc::new(client(&routing));
     let lineage = lineage();
     let selection = |decision: Option<AccountDecision>| broca_core::AuthSelection {
+        billing_vault_facts: None,
         auth_method: None,
         credential_id: "oauth:anthropic".into(),
         account_ref: None,

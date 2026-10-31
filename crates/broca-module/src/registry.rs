@@ -752,6 +752,9 @@ pub enum CutLockMode {
 type ToolRouteHealth = dyn Fn(&[LineageKey]) -> serde_json::Value + Send + Sync;
 
 struct Inner {
+    session_address_inventory: std::sync::OnceLock<Arc<broca_store::SqliteStore>>,
+    #[cfg(test)]
+    raw_pages: std::sync::OnceLock<Arc<RawPageTestBundle>>,
     tool_route_health: std::sync::OnceLock<Arc<ToolRouteHealth>>,
     actor_idle_holds: Mutex<HashMap<LineageKey, (u64, Vec<&'static str>)>>,
     /// Raised and lowered by the System One batch service; read into `batches_in_flight`.
@@ -1093,6 +1096,78 @@ struct ReadSources {
     store: Option<Arc<dyn broca_core::MaterializedStore>>,
 }
 
+/// Explicitly supplied by tests; boot and all legacy constructors leave this absent.
+#[cfg(test)]
+pub(crate) struct RawPageTestBundle {
+    pub db: Arc<broca_store::db::OverhaulDb>,
+    pub publications: Mutex<HashMap<LineageKey, broca_wal::file_wal::DurablePublication>>,
+}
+
+#[cfg(test)]
+impl RawPageTestBundle {
+    fn page(
+        &self,
+        key: &LineageKey,
+        from: Option<u64>,
+        limit: Option<u64>,
+        tools: bool,
+    ) -> Result<Box<RouteReadPage>, OpenError> {
+        let publications = self.publications.lock().unwrap();
+        let publication = publications
+            .get(key)
+            .ok_or_else(|| OpenError::Open("raw page publication not supplied".into()))?;
+        let raw = self
+            .db
+            .read_raw_page(
+                key,
+                &broca_core::agent_session_ref(key),
+                broca_store::db::LogLocation::Live,
+                publication,
+                broca_store::db::RawPageRequest {
+                    from_ordinal: from,
+                    limit,
+                    include_tools: tools,
+                },
+            )
+            .map_err(|e| OpenError::Open(e.to_string()))?;
+        Ok(Box::new(RouteReadPage {
+            page: raw.page,
+            at_seq: raw.at_seq,
+            head_facts: raw.head,
+            head_facts_complete: true,
+            tools: raw
+                .tools
+                .map(|(run_id, tools)| SessionReadTools { run_id, tools }),
+            dispatches: raw.dispatches,
+            open_batch: None,
+            newest_record_ms: Some(raw.last_write_ms.unwrap_or(0)),
+            retention_activity_ms: raw.retention_activity_ms,
+            last_title: raw.last_title,
+        }))
+    }
+
+    fn tag_location(
+        &self,
+        key: &LineageKey,
+        tag: u64,
+    ) -> Result<Option<broca_core::TagLocation>, OpenError> {
+        let publications = self.publications.lock().unwrap();
+        let publication = publications
+            .get(key)
+            .ok_or_else(|| OpenError::Open("raw tag publication not supplied".into()))?;
+        self.db
+            .read_raw_tag_location(
+                key,
+                &broca_core::agent_session_ref(key),
+                broca_store::db::LogLocation::Live,
+                publication,
+                tag,
+            )
+            .map(Some)
+            .map_err(|e| OpenError::Open(e.to_string()))
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ReadPurpose {
     Session,
@@ -1137,6 +1212,42 @@ pub struct RegistryHandle {
 }
 
 impl LineageRegistry {
+    /// Supply the durable identity inventory before accepting routed session binds.
+    pub fn set_session_address_inventory(&self, inventory: Arc<broca_store::SqliteStore>) {
+        assert!(
+            self.inner.session_address_inventory.set(inventory).is_ok(),
+            "session address inventory already configured"
+        );
+    }
+
+    pub async fn resolve_session_address(
+        &self,
+        bind: &broca_protocol::BindIdentity,
+        workdir: Option<&std::path::Path>,
+    ) -> Result<broca_protocol::BindIdentity, broca_store::session_address::SessionAddressError>
+    {
+        use broca_store::session_address::SessionAddressError;
+        let inventory = self
+            .inner
+            .session_address_inventory
+            .get()
+            .cloned()
+            .ok_or_else(|| {
+                SessionAddressError::store_error("session address inventory is not configured")
+            })?;
+        let bind = bind.clone();
+        let workdir = workdir.map(std::path::Path::to_path_buf);
+        spawn_blocking(broca_diagnostics::JobKind::StoreWrite, move || {
+            inventory.resolve_session_address(&bind, workdir.as_deref())
+        })
+        .await
+        .map_err(SessionAddressError::store_error)?
+    }
+    #[cfg(test)]
+    pub(crate) fn with_raw_pages_for_test(self, bundle: Arc<RawPageTestBundle>) -> Self {
+        assert!(self.inner.raw_pages.set(bundle).is_ok());
+        self
+    }
     pub(crate) fn upload_store(&self) -> Option<broca_core::media_uploads::Uploads> {
         self.inner.reader.as_ref()?.wal_store.uploads()
     }
@@ -1427,6 +1538,9 @@ impl LineageRegistry {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                session_address_inventory: std::sync::OnceLock::new(),
+                #[cfg(test)]
+                raw_pages: std::sync::OnceLock::new(),
                 tool_route_health: std::sync::OnceLock::new(),
                 actor_idle_holds: Mutex::new(HashMap::new()),
                 batches_in_flight: Arc::new(AtomicUsize::new(0)),
@@ -1533,6 +1647,28 @@ impl LineageRegistry {
             }).collect()
             })
         })
+    }
+
+    /// Resolve a run's content-free identity and state hint without replaying any WAL.
+    /// Status and result callers must still authenticate the run through the run-row reader.
+    pub fn overhaul_lookup_run(
+        &self,
+        run_id: &str,
+    ) -> Option<Result<Option<broca_core::RunIndexRow>, String>> {
+        self.inner
+            .run_rows
+            .as_ref()
+            .map(|source| source.lookup_run(run_id))
+    }
+
+    /// Discover possible restart pauses; only WAL-confirmed pause reasons authorize recovery.
+    pub fn overhaul_restart_resume_candidates(
+        &self,
+    ) -> Option<Result<Vec<(String, LineageKey)>, String>> {
+        self.inner
+            .run_rows
+            .as_ref()
+            .map(|source| source.restart_resume_candidates())
     }
 
     /// Install what reads a frozen config's prompt-cache declaration. Set once, before serving;
@@ -1720,8 +1856,25 @@ impl LineageRegistry {
             .map_err(OwnershipReadError::into_open)
     }
 
-    /// Upload standing includes plan-named senders, unlike cancel/retract. Read
-    /// the frozen first manifest without retaining its contents in owner caches.
+    /// Read the submission's original sender even after delivery or retraction, so retries
+    /// retain the same authorization. Missing or ambiguous attribution grants no exception.
+    pub(crate) async fn recorded_submission_sender(
+        &self,
+        key: &LineageKey,
+        submission_id: &str,
+    ) -> Result<Option<broca_protocol::BindPrincipal>, OpenError> {
+        let (records, _) = self
+            .read_durable_wal_for(key, ReadPurpose::Authorization)
+            .await?;
+        let records: Vec<_> = records.into_iter().map(|frame| frame.record).collect();
+        Ok(crate::send_fate::recorded_submission_sender(
+            &records,
+            &broca_protocol::SubmissionId(submission_id.into()),
+        ))
+    }
+
+    /// Upload standing includes every current plan-named sender, not just session owners.
+    /// Read the frozen first manifest without retaining its contents in owner caches.
     pub(crate) async fn upload_ownership(
         &self,
         key: &LineageKey,
@@ -3453,6 +3606,10 @@ impl LineageRegistry {
         tag: u64,
     ) -> Result<Option<broca_core::TagLocation>, OpenError> {
         self.check_expired(key, None).await?;
+        #[cfg(test)]
+        if let Some(bundle) = self.inner.raw_pages.get() {
+            return bundle.tag_location(key, tag);
+        }
         let Some(store) = self
             .inner
             .reader
@@ -3540,6 +3697,19 @@ impl LineageRegistry {
         model: Option<&broca_core::ModelPageRequest>,
     ) -> Result<RoutedPage, OpenError> {
         self.check_expired(key, None).await?;
+        #[cfg(test)]
+        if model.is_none() {
+            if let Some(bundle) = self.inner.raw_pages.get() {
+                let bundle = bundle.clone();
+                let key = key.clone();
+                return spawn_blocking(JobKind::StoreRead, move || {
+                    bundle.page(&key, from_ordinal, limit, include_tools)
+                })
+                .await
+                .map_err(|e| OpenError::Open(e.to_string()))?
+                .map(RoutedPage::Raw);
+            }
+        }
         let Some(reader) = &self.inner.reader else {
             return Err(OpenError::Open(
                 "session.read reader is not configured".into(),
@@ -5368,6 +5538,7 @@ mod tests {
         inner: Arc<FileWalStore>,
         through_seq: Mutex<Vec<Option<u64>>>,
         flushes: AtomicU64,
+        hide_identity: std::sync::atomic::AtomicBool,
         alias_on_flush: Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>>,
     }
 
@@ -5435,11 +5606,22 @@ mod tests {
             if let Some((source, alias)) = self.alias_on_flush.lock().unwrap().take() {
                 std::fs::hard_link(source, alias).map_err(WalError::Io)?;
             }
-            self.inner.flush_for_read(session)
+            // Keep the real durability barrier even when simulating an identityless backend.
+            self.inner.flush_for_read(session).map(|identity| {
+                if self.hide_identity.load(Ordering::Relaxed) {
+                    None
+                } else {
+                    identity
+                }
+            })
         }
 
         fn file_identity(&self, session: &LineageKey) -> Result<Option<u64>, broca_wal::WalError> {
-            self.inner.file_identity(session)
+            if self.hide_identity.load(Ordering::Relaxed) {
+                Ok(None)
+            } else {
+                self.inner.file_identity(session)
+            }
         }
     }
 
@@ -5539,6 +5721,7 @@ mod tests {
                     inner: file_store,
                     through_seq: Mutex::new(Vec::new()),
                     flushes: AtomicU64::new(0),
+                    hide_identity: std::sync::atomic::AtomicBool::new(false),
                     alias_on_flush: Mutex::new(None),
                 });
                 let registry = LineageRegistry::new_with_reader(
@@ -5599,9 +5782,11 @@ mod tests {
     fn read_proof_fixture(
         archived: bool,
     ) -> (LineageRegistry, BindIdentity, Arc<RecordingWalStore>) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = broca_test_support::scratch_root().join(format!(
-            "broca-read-proof-eviction-{}-{archived}",
-            std::process::id()
+            "broca-read-proof-eviction-{}-{archived}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let session = BindIdentity::new(root.join("project"), "runner", "session");
         let file_store = Arc::new(FileWalStore::new(root.join("wal")));
@@ -5631,6 +5816,7 @@ mod tests {
             inner: file_store,
             through_seq: Mutex::new(Vec::new()),
             flushes: AtomicU64::new(0),
+            hide_identity: std::sync::atomic::AtomicBool::new(false),
             alias_on_flush: Mutex::new(None),
         });
         let registry =
@@ -5638,7 +5824,7 @@ mod tests {
         (registry, session, wal_store)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn relocation_between_lookup_and_flush_keeps_its_named_retry_class() {
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -5663,6 +5849,7 @@ mod tests {
             inner,
             through_seq: Mutex::new(Vec::new()),
             flushes: AtomicU64::new(0),
+            hide_identity: std::sync::atomic::AtomicBool::new(false),
             alias_on_flush: Mutex::new(Some((source.clone(), alias.clone()))),
         });
         let registry = LineageRegistry::new_with_reader(Arc::new(NeverOpener), store.clone(), None);
@@ -5696,10 +5883,10 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(windows)]
     #[tokio::test]
     async fn reads_without_file_identity_repeat_the_barrier_without_caching_proofs() {
         let (registry, session, wal_store) = read_proof_fixture(false);
+        wal_store.hide_identity.store(true, Ordering::Relaxed);
         assert_eq!(wal_store.file_identity(&session).unwrap(), None);
         let before = registry.route_read(&session, None, None).await.unwrap();
         let after = registry.route_read(&session, None, None).await.unwrap();
@@ -5718,10 +5905,9 @@ mod tests {
 
     #[tokio::test]
     async fn read_proof_eviction_repeats_the_barrier_and_preserves_the_page() {
-        // Archives have a content-based identity on every platform, including Windows,
-        // where live WALs do not populate the proof cache.
+        // Archive content identities and native live-file identities both key cached proofs.
         check_read_proof_eviction(true).await;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         check_read_proof_eviction(false).await;
     }
 
@@ -6201,6 +6387,7 @@ mod tests {
             inner: Arc::clone(&file_store),
             through_seq: Mutex::new(Vec::new()),
             flushes: AtomicU64::new(0),
+            hide_identity: std::sync::atomic::AtomicBool::new(false),
             alias_on_flush: Mutex::new(None),
         });
         let opener = Arc::new(GaugeOpener {
@@ -6300,9 +6487,9 @@ mod tests {
             .expect("idle read after slot close");
         assert_eq!(idle_read.messages.len(), 2);
         // The idle-read shape depends on whether the platform exposes a stable WAL file
-        // identity. With one (unix inode), the proof cached by the Closing read covers the
-        // candidate head, so the unbounded candidate read is served directly. Without one
-        // (Windows), the proven-head cache is disabled and every idle read takes a fresh
+        // identity. With one, the proof cached by the Closing read covers the candidate
+        // head, so the unbounded candidate read is served directly. Without one, the
+        // proven-head cache is disabled and every idle read takes a fresh
         // flush barrier, re-reading bounded at the candidate head observed before it.
         let expected_idle_bound = if file_store
             .file_identity(&session)
@@ -7261,6 +7448,8 @@ mod offset_page_tests {
                     cut: "m1".into(),
                 }),
                 ride_wait_ms: None,
+                view_features: None,
+                view_due: None,
             },
         });
         assert!(setup_in_tail_needs_index_up(&with_setup));

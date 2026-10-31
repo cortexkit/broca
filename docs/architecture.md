@@ -128,8 +128,9 @@ supervisor can respawn it.
   bytes or `fact_id`.
 - **Interrupted is not Cancelled.** Cancellation is an explicit caller action;
   interruption describes an uncertain or externally stopped run.
-- **Session identity is the triple.** Changing any bind component addresses a
-  different WAL.
+- **Storage identity is the resolved triple.** The session-ref inventory preserves an
+  existing pair's original root; a new scoped pair takes stamped workdir. On subc 0.33,
+  a new unscoped pair still takes the route root. Address and lease encodings do not change.
 - **Classify errors at the source.** The wire classes are `transient`,
   `permanent`, `auth_required` and `context_overflow`; consumers do not infer them.
 

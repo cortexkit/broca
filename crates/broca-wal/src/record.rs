@@ -21,6 +21,10 @@ use broca_protocol::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use broca_wal_reader::vault_facts::{
+    ObservedVaultFacts, VaultBillingFacts, VaultFactsAttribution, VaultFactsIdentity,
+};
+
 mod plan_manifest;
 pub use plan_manifest::{
     FetchOutcome, FrozenDeclaration, FrozenHoldArgument, FrozenProviderDeclarations,
@@ -1592,6 +1596,14 @@ pub enum WalRecord {
         /// reader that dropped it would give the session's rides its own short deadline.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ride_wait_ms: Option<u64>,
+        /// Setup's declared view features. Absent on older lineages, whose edited bytes
+        /// remain final. Requires `compaction-view-negotiation/v1` when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view_features: Option<Vec<String>>,
+        /// A published view that must apply before any model request in this lineage.
+        /// Requires `compaction-view-negotiation/v1` when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view_due: Option<SetupViewDue>,
     },
     /// Every other step outcome and the cursor it moves, in one durable frame. A wait
     /// answer is itself the wait entry, with the reason and bound in the same record.
@@ -2197,6 +2209,20 @@ impl WalRecord {
         } else {
             base
         };
+        let base = if matches!(
+            self,
+            WalRecord::CompactionMessage {
+                view_features: Some(_),
+                ..
+            } | WalRecord::CompactionMessage {
+                view_due: Some(_),
+                ..
+            }
+        ) {
+            with_feature(base, crate::framing::COMPACTION_VIEW_NEGOTIATION_FEATURE)
+        } else {
+            base
+        };
         let base = if self.carries_runner_tags() {
             with_feature(base, crate::framing::RUNNER_TAGS_FEATURE)
         } else {
@@ -2262,6 +2288,11 @@ impl WalRecord {
         } else {
             base
         };
+        let base = if self.carries_billing_vault_facts() {
+            with_feature(base, crate::framing::BILL_VAULT_FACTS_FEATURE)
+        } else {
+            base
+        };
         if matches!(
             self,
             Self::ToolDispatchIntent {
@@ -2285,6 +2316,25 @@ impl WalRecord {
         } else {
             base
         }
+    }
+
+    fn carries_billing_vault_facts(&self) -> bool {
+        let selection = match self {
+            Self::RunStarted { config, .. } => config.auth_selection.as_ref(),
+            Self::RunAuthRefrozen { auth_selection, .. } => Some(auth_selection),
+            Self::AttemptReserved { reservation, .. }
+            | Self::AttemptFinished { reservation, .. }
+            | Self::AttemptReleased { reservation, .. }
+            | Self::AttemptCorrected { reservation, .. } => {
+                reservation.credential.auth_selection.as_ref()
+            }
+            Self::ModelAttemptFinished { reservation, .. }
+            | Self::CacheWarmed { reservation, .. } => reservation
+                .as_ref()
+                .and_then(|reservation| reservation.credential.auth_selection.as_ref()),
+            _ => None,
+        };
+        selection.is_some_and(|selection| selection.billing_vault_facts.is_some())
     }
 
     fn carries_billing_attempt(&self) -> bool {
@@ -3628,6 +3678,13 @@ pub struct SetupTagCheckpoint {
     pub cut: String,
 }
 
+/// Setup's immutable claim check for a view required before the first model request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupViewDue {
+    pub version: u64,
+    pub digest: String,
+}
+
 /// The credential a run resolved at start, frozen for resume. A struct (not a bare string)
 /// so a later frozen field (e.g. a display name) has a home without another `RunConfig`
 /// field. Carries NO secret — the credential id is an opaque routing key; the bearer handle
@@ -3719,6 +3776,12 @@ pub struct AuthSelection {
     /// build would parse the id for its method, so it must refuse such a log instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<String>,
+    /// Billing-only metadata, frozen at admission or an auth-recovery credential change.
+    /// Ordinary resume and same-credential refresh retain it without backfilling.
+    /// Requires `bill-vault-facts/v1` so an older writer cannot discard the snapshot on rollback.
+    /// Boxed to keep the no-snapshot cost to one pointer in run and replay state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_vault_facts: Option<Box<VaultBillingFacts>>,
 }
 
 /// Which path decided a run's provider account, with the admission and decision ids routing
@@ -4209,6 +4272,7 @@ mod schema_tests {
     fn pre_resolved_credential_run_config_bytes_are_unchanged() {
         let mut config = min_config();
         config.auth_selection = Some(AuthSelection {
+            billing_vault_facts: None,
             auth_method: None,
             credential_id: "apikey:kimi-code-plan-global".into(),
             account_ref: None,
@@ -4227,6 +4291,7 @@ mod schema_tests {
     fn pre_vault_request_run_started_bytes_are_unchanged() {
         let mut config = min_config();
         config.auth_selection = Some(AuthSelection {
+            billing_vault_facts: None,
             auth_method: None,
             credential_id: "oauth:anthropic:work".into(),
             account_ref: Some("acct-1".into()),
@@ -4279,6 +4344,7 @@ mod schema_tests {
     fn pre_account_decision_run_started_bytes_are_unchanged() {
         let mut config = min_config();
         config.auth_selection = Some(AuthSelection {
+            billing_vault_facts: None,
             auth_method: None,
             credential_id: "oauth:anthropic:work".into(),
             account_ref: Some("acct-1".into()),
@@ -4331,6 +4397,7 @@ mod schema_tests {
     fn an_account_decision_adds_one_key_and_keeps_its_bytes() {
         const STORED: &str = r#"{"credential_id":"oauth:anthropic:work","account_ref":"acct-1","vault_request":{"min_ttl_ms":600000,"op":"get_scoped"},"account_decision":{"path":"routed","admission_id":"run-1","decision_id":"acd-1"}}"#;
         let selection = AuthSelection {
+            billing_vault_facts: None,
             auth_method: None,
             credential_id: "oauth:anthropic:work".into(),
             account_ref: Some("acct-1".into()),
@@ -5023,6 +5090,7 @@ mod schema_tests {
             WalRecord::RunAuthRefrozen {
                 ts_ms: Some(123),
                 auth_selection: AuthSelection {
+                    billing_vault_facts: None,
                     auth_method: None,
                     credential_id: "chatgpt:openai".into(),
                     account_ref: Some("account-1".into()),
@@ -5500,6 +5568,7 @@ mod schema_tests {
     fn run_config_freezes_only_the_resolved_auth_pin_effect() {
         let mut config = *min_config();
         config.auth_selection = Some(AuthSelection {
+            billing_vault_facts: None,
             auth_method: None,
             credential_id: "apikey:openai:astro".into(),
             account_ref: None,

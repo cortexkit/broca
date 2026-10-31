@@ -176,10 +176,19 @@ pub fn health_gauges() -> serde_json::Value {
         .and_then(|health| health.lock().ok()?.upgrade());
     runtime.map_or_else(
         || {
+            // Same members as `HeldWithdrawals::health`, so a reader sees one shape whether or
+            // not the held runtime has registered yet.
             health_snapshot(
                 false,
                 &RebuildReport::default(),
-                serde_json::json!({"failed": 0, "pending": 0}),
+                serde_json::json!({
+                    "failed": 0,
+                    "pending": 0,
+                    "sweep_running": false,
+                    "rows_remaining": 0,
+                }),
+                0,
+                Vec::new(),
             )
         },
         |runtime| {
@@ -188,6 +197,8 @@ pub fn health_gauges() -> serde_json::Value {
                 runtime.intake.is_rebuilding(),
                 &progress,
                 runtime.withdrawals.health(),
+                runtime.intake.overdue_pins(),
+                runtime.intake.stuck_deliveries(),
             )
         },
     )
@@ -197,6 +208,8 @@ fn health_snapshot(
     rebuilding: bool,
     progress: &RebuildReport,
     withdrawals: serde_json::Value,
+    overdue_pins: usize,
+    stuck_deliveries: Vec<serde_json::Value>,
 ) -> serde_json::Value {
     serde_json::json!({
         "rebuild_required": rebuilding,
@@ -204,6 +217,8 @@ fn health_snapshot(
         "scanned": progress.files, "decoded": progress.decoded,
         "registered": progress.registered, "unreadable": progress.unreadable.len(),
         "withdrawals": withdrawals,
+        "overdue_pins": overdue_pins,
+        "late_results_delivery_stuck": stuck_deliveries,
     })
 }
 
@@ -362,9 +377,37 @@ impl HeldRuntime {
         if opened > 0 || !failed.is_empty() {
             tracing::info!(target: "late_results", opened, failed = failed.len(), "late-results recovery opened registered sessions");
         }
-        if let Err(error) = self.withdrawals.recover().await {
-            tracing::warn!(target: "late_results", "provider-held withdrawal recovery failed: {error}");
+        self.recover_feeds(modules.into_iter().collect(), stopping.clone())
+            .await;
+        // Old inline registrations may belong to a provider with no held calls and no puller.
+        // Sweep a bounded page off the recovery path, rather than scanning every WAL at boot.
+        loop {
+            tokio::select! {
+                biased;
+                _ = stopping.cancelled() => return,
+                _ = tokio::time::sleep(broca_module::late_results_puller::PULL_INTERVAL) => {}
+            }
+            let intake = self.intake.clone();
+            match tokio::task::spawn_blocking(move || intake.sweep_registrations()).await {
+                Ok(Ok(settled)) if settled > 0 => {
+                    tracing::info!(target: "late_results", settled, "retired settled late-results registrations")
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(target: "late_results", "late-results registration sweep failed: {error}")
+                }
+                Err(error) => {
+                    tracing::warn!(target: "late_results", "late-results registration sweep task failed: {error}")
+                }
+            }
         }
+    }
+
+    async fn recover_feeds(
+        &self,
+        modules: Vec<String>,
+        stopping: tokio_util::sync::CancellationToken,
+    ) {
         for module in modules {
             if stopping.is_cancelled() {
                 return;
@@ -373,6 +416,14 @@ impl HeldRuntime {
                 tracing::warn!(target: "late_results", module, "late-results puller did not start: {error}");
             }
         }
+        // Withdrawal retries and old watching rows must never stand between a paused worker
+        // and its late result. The shared stop signal cancels this independent recovery task.
+        let withdrawals = self.withdrawals.clone();
+        tokio::spawn(async move {
+            if let Err(error) = withdrawals.recover().await {
+                tracing::warn!(target: "late_results", "provider-held withdrawal recovery failed: {error}");
+            }
+        });
     }
 }
 
@@ -440,6 +491,10 @@ impl HeldRunResumer for LateBoundResumer {
 }
 
 #[cfg(test)]
+#[path = "held_runtime_tests.rs"]
+mod recovery_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -467,6 +522,8 @@ mod tests {
             true,
             &report,
             serde_json::json!({"failed": 1, "pending": 0}),
+            2,
+            vec![serde_json::json!({"attempts":3})],
         );
         assert_eq!(health["fence"], "late-results-rebuild-required");
         assert_eq!(health["rebuild_required"], true);
@@ -475,8 +532,10 @@ mod tests {
         assert_eq!(health["registered"], 3);
         assert_eq!(health["unreadable"], 1);
         assert_eq!(health["withdrawals"]["failed"], 1);
+        assert_eq!(health["overdue_pins"], 2);
+        assert_eq!(health["late_results_delivery_stuck"][0]["attempts"], 3);
         assert_eq!(
-            health_snapshot(false, &report, serde_json::Value::Null)["fence"],
+            health_snapshot(false, &report, serde_json::Value::Null, 0, Vec::new())["fence"],
             serde_json::Value::Null
         );
     }

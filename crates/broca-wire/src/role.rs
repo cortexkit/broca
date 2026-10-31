@@ -390,6 +390,7 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::HEAD_SENDER,
         cortexkit_role_llm_runner::capabilities::RUN_CANCEL,
         cortexkit_role_llm_runner::capabilities::RETRACT,
+        cortexkit_role_llm_runner::capabilities::RETRACT_OWN_SEND,
         "dispatch_attribution",
         "streaming",
         cortexkit_role_llm_runner::capabilities::LIVE_EVENTS,
@@ -459,6 +460,18 @@ pub fn broca_role_describe_with_writers(
     // `unknown`.
     .with_steer_receipt(steer_receipt::GUARANTEED)
     .with_run_cancel(vec!["now".into(), "step_boundary".into()]);
+    if hook_writer {
+        // Once a hook plane is installed the run loop calls every hook the role names:
+        // `pre_user` on each user message before it is written, `pre_tool` and `post_tool`
+        // around each tool call, `post_assistant` after each model reply. A plan composer adds
+        // a step item only when every hook it subscribes to is listed, so a build without the
+        // plane lists none and is never sent one.
+        describe = describe.with_step_hooks(
+            cortexkit_role_llm_runner::describe::step_hooks::KNOWN
+                .iter()
+                .copied(),
+        );
+    }
     if retention_writer {
         describe.retention = Some(cortexkit_role_llm_runner::describe::Retention::new(
             2_592_000, 3_600_000,
@@ -1150,7 +1163,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "8eec4219b3443c77e9a7e8791d8de77088ec9e492d8d09d8fef350240373792c",
+            "75c61c0d62c66eeb7e38fec6b4be7b1853a7e473d80014cbf945cefd20c674bf",
         );
     }
 
@@ -1228,6 +1241,21 @@ mod pinned_reply_bytes {
                         caps.contains(&serde_json::json!(ORDERED_HOOK_PHASES)),
                         hooks
                     );
+                    // The hook call sites follow the same writer: all four, or the member is
+                    // absent so a plan composer sends this runner no step items.
+                    if hooks {
+                        assert_eq!(
+                            encoded["step_hooks"],
+                            serde_json::json!([
+                                "pre_user",
+                                "pre_tool",
+                                "post_tool",
+                                "post_assistant"
+                            ])
+                        );
+                    } else {
+                        assert!(encoded.get("step_hooks").is_none(), "{encoded}");
+                    }
                     assert_eq!(caps.contains(&serde_json::json!("compaction")), compaction);
                     assert_eq!(caps.contains(&serde_json::json!("model_view")), compaction);
                     assert!(!encoded["majors"][0]["ops"]
@@ -1313,7 +1341,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "827f73184d97f74b5992ee6de8190f88f23976ea161fae364db6724bc366241a";
+        "3efc5e7700af5c23bf1ad38fcefdd7649d914269448944045a10390c07c1ce32";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

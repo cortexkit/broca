@@ -18,7 +18,7 @@
 //! per-route in-flight to the window via a per-route semaphore (permit held from
 //! send to terminal). A Serial provider therefore serializes instead of erroring.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -715,6 +715,7 @@ pub struct SubcToolPlane {
     /// the session was admitted.
     batch_manifests: Mutex<HashMap<BatchRouteKey, broca_core::capability::ToolManifest>>,
     registered_keys: Mutex<RegisteredKeys>,
+    inline_keys: Mutex<HashSet<String>>,
     #[cfg(debug_assertions)]
     reply_fallback_ms: u64,
     /// Lives across batches for the plane's lifetime, but is reused only as the source snapshot
@@ -977,6 +978,7 @@ impl SubcToolPlane {
             provider_held: None,
             batch_manifests: Mutex::new(HashMap::new()),
             registered_keys: Mutex::new(HashMap::new()),
+            inline_keys: Mutex::new(HashSet::new()),
             #[cfg(debug_assertions)]
             reply_fallback_ms: 120_000,
             catalog_memo: Mutex::new(None),
@@ -1718,6 +1720,25 @@ impl SubcToolPlane {
                             }
                             return terminal;
                         }
+                    }
+                }
+                if let Some(key) = key {
+                    // Accepted holds return above. Only inline answers can retire a watch at
+                    // the batch's durability barrier without inspecting the WAL again.
+                    let registered = self
+                        .registered_keys
+                        .lock()
+                        .unwrap()
+                        .get(&Self::batch_route_key(ctx))
+                        .and_then(|keys| keys.get(&call.tool_call_id))
+                        .is_some_and(|(module, registered_key)| {
+                            module == module_id && registered_key == key.call_key
+                        });
+                    if registered {
+                        self.inline_keys
+                            .lock()
+                            .unwrap()
+                            .insert(key.call_key.to_owned());
                     }
                 }
                 let (result, captures) = if has_held {
@@ -3392,6 +3413,30 @@ impl SubcToolPlane {
     }
 
     async fn batch_finished_inner(&self, ctx: &BatchCtx) -> Result<(), ToolPlaneError> {
+        // The run invokes this after syncing terminals and the batch commit. Inline answers
+        // need the same registration retirement as held answers; the provider may publish both.
+        let registered: Vec<_> = self
+            .registered_keys
+            .lock()
+            .unwrap()
+            .get(&Self::batch_route_key(ctx))
+            .map(|calls| calls.values().cloned().collect())
+            .unwrap_or_default();
+        let (inline, held): (Vec<_>, Vec<_>) = {
+            let mut keys = self.inline_keys.lock().unwrap();
+            registered
+                .into_iter()
+                .partition(|(_, key)| keys.remove(key))
+        };
+        let prune = if let Some(support) = &self.provider_held {
+            match support.intake.prune_inline(&inline).await {
+                Ok(()) => support.intake.prune(&held).await,
+                Err(error) => Err(error),
+            }
+            .map_err(ToolPlaneError::Unavailable)
+        } else {
+            Ok(())
+        };
         // Evict this batch's fence entries — the at-most-once guarantee only needs to hold
         // within a batch's life (the WAL is the cross-batch durability), so without eviction
         // the fence would grow unbounded over thousands of batches.
@@ -3420,7 +3465,7 @@ impl SubcToolPlane {
             .lock()
             .unwrap()
             .remove(&Self::batch_route_key(ctx));
-        Ok(())
+        prune
     }
 }
 

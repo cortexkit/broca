@@ -370,9 +370,8 @@ fn records(dir: &std::path::Path) -> Vec<WalRecord> {
 
 /// Byte offset where the frame with `seq` ends, found by decoding the WAL file itself.
 ///
-/// `WalRangeRead::anchor_at` needs the file's device-and-inode identity, which only exists
-/// on Unix, so it reports no anchors on Windows. Walking the frames needs no identity and
-/// finds the same end offset on every platform.
+/// Walking the frames finds the end offset independently of the optional native file
+/// identity used by `WalRangeRead::anchor_at`.
 fn frame_byte_end(path: &std::path::Path, seq: u64) -> u64 {
     let bytes = std::fs::read(path).unwrap();
     let mut offset = 0usize;

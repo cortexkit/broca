@@ -73,6 +73,12 @@ pub trait LateResultsIntake: Send + Sync {
     async fn prune(&self, _calls: &[(String, String)]) -> Result<(), String> {
         Ok(())
     }
+
+    /// The batch committed these calls' inline terminals; none was ever provider-held.
+    /// Implementations may also retire the withdrawal watches created before dispatch.
+    async fn prune_inline(&self, calls: &[(String, String)]) -> Result<(), String> {
+        self.prune(calls).await
+    }
 }
 
 /// The first reply's durable metadata. Interim content is deliberately not representable here.
@@ -96,6 +102,13 @@ pub trait ProviderHeldRecorder: Send + Sync {
 /// live/paused waiting slot, and returns only the eventual terminal, never interim content.
 #[async_trait]
 pub trait ProviderHeldLifecycle: Send + Sync {
+    /// A deposited result still owned by the waiting slot. Recovery uses this only after
+    /// continuation admission is refused, so recording the provider's answer needs no model
+    /// credentials or renderer. The slot retains it until `terminal_synced`.
+    fn deposited_result(&self, _ctx: &BatchCtx, _reply: &ProviderHeldReply) -> Option<ToolResult> {
+        None
+    }
+
     async fn wait(
         &self,
         ctx: &BatchCtx,

@@ -41,6 +41,33 @@ impl Default for HeadProjection {
 }
 
 impl HeadProjection {
+    /// Restore display metadata from its bounded WAL sources, not from stored text.
+    pub fn from_read_fold(
+        fold: &HeadReadFold,
+        first: Option<&WalRecord>,
+        current: Option<&WalRecord>,
+        ownership: crate::SessionOwnershipV1,
+    ) -> Option<Self> {
+        if fold.version != 1 {
+            return None;
+        }
+        let mut head = Self::default();
+        if let Some(first) = first {
+            head.observe(first);
+        }
+        if let Some(current) = current {
+            head.observe(current);
+        }
+        if head.run_id != fold.run_id || head.model != fold.model {
+            return None;
+        }
+        head.ownership = ownership.for_owner_access();
+        head.model = fold.model.clone();
+        head.run_id = fold.run_id.clone();
+        head.usage = fold.usage.clone();
+        Some(head)
+    }
+
     pub fn queued_times(&self) -> &std::collections::BTreeMap<String, u64> {
         &self.queued_times
     }
@@ -176,6 +203,105 @@ impl HeadProjection {
     }
 }
 
+/// A display-only continuation: identifiers and numeric counters, never a billing source.
+/// The `last_run_rich_ui` display metadata and sender authorization come from WAL RunStarted records.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeadReadFold {
+    pub version: u32,
+    model: Option<HeadModel>,
+    run_id: Option<RunId>,
+    usage: Option<SessionUsage>,
+}
+
+impl<'de> Deserialize<'de> for HeadReadFold {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            version: u32,
+            model: Option<serde_json::Value>,
+            run_id: Option<RunId>,
+            usage: Option<serde_json::Value>,
+        }
+        fn counters(value: &serde_json::Value, model: bool) -> bool {
+            let Some(object) = value.as_object() else {
+                return false;
+            };
+            object.iter().all(|(key, value)| match key.as_str() {
+                "provider" | "model" | "variant" if model => value.is_string(),
+                "since" if !model => value.is_string(),
+                "by_model" if !model => value
+                    .as_array()
+                    .is_some_and(|rows| rows.iter().all(|row| counters(row, true))),
+                "steps" | "unreported_steps" => value.is_u64(),
+                "input_tokens"
+                | "output_tokens"
+                | "cached_input_tokens"
+                | "cache_write_tokens"
+                | "reasoning_tokens" => value.is_u64(),
+                _ => false,
+            })
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        if fields.model.as_ref().is_some_and(|value| {
+            value.as_object().is_none_or(|object| {
+                object.iter().any(|(key, value)| {
+                    !matches!(key.as_str(), "provider" | "model" | "variant") || !value.is_string()
+                })
+            })
+        }) || fields
+            .usage
+            .as_ref()
+            .is_some_and(|value| !counters(value, false))
+        {
+            return Err(serde::de::Error::custom(
+                "head read fold contains a non-identifier/non-counter field",
+            ));
+        }
+        Ok(Self {
+            version: fields.version,
+            model: fields
+                .model
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(serde::de::Error::custom)?,
+            run_id: fields.run_id,
+            usage: fields
+                .usage
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(serde::de::Error::custom)?,
+        })
+    }
+}
+
+impl Default for HeadReadFold {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            model: None,
+            run_id: None,
+            usage: None,
+        }
+    }
+}
+
+impl HeadReadFold {
+    pub fn observe(&mut self, record: &WalRecord) {
+        let mut head = HeadProjection {
+            model: self.model.clone(),
+            run_id: self.run_id.clone(),
+            usage: self.usage.take(),
+            ..HeadProjection::default()
+        };
+        head.observe(record);
+        self.model = head.model;
+        self.run_id = head.run_id;
+        self.usage = head.usage;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +326,91 @@ mod tests {
         serde_json::from_value(json!({"type":"model_step_finished", "step_id":1,
             "assistant_message":{"message_id":"m","content":[]},"usage":usage,"retries_used":0}))
         .unwrap()
+    }
+
+    #[test]
+    fn head_read_fold_matches_replay_across_model_sender_and_rich_ui_changes() {
+        let mut first = start("first", Some("deep"));
+        if let WalRecord::RunStarted { principal, .. } = &mut first {
+            *principal = Some(broca_protocol::BindPrincipal::Reserved {
+                module_id: "sender-one".into(),
+            });
+        }
+        let mut second = serde_json::to_value(start("second", None)).unwrap();
+        second["config"]["model"]["model_id"] = json!("other-model");
+        second["principal"] = serde_json::to_value(broca_protocol::BindPrincipal::Reserved {
+            module_id: "sender-two".into(),
+        })
+        .unwrap();
+        second["manifest"] = json!({
+            "rich_ui":{"dialect":"2.0","catalog_digest":"d".repeat(64)},
+            "plan":"{}", "plan_identity":"id", "composition_digest":"digest",
+            "fetches":[], "tools":[], "system_text":"must-not-be-stored", "system_digest":"system",
+            "join_version":1, "role_versions":{}
+        });
+        let second: WalRecord = serde_json::from_value(second).unwrap();
+        let records = [
+            first.clone(),
+            step(json!({"input_tokens":7,"output_tokens":3})),
+            second.clone(),
+            step(json!({"input_tokens":11,"output_tokens":5,"reasoning_tokens":2})),
+        ];
+        let mut fold = HeadReadFold::default();
+        let mut expected = HeadProjection::default();
+        let mut current = &first;
+        for record in &records {
+            if matches!(record, WalRecord::RunStarted { .. }) {
+                current = record;
+            }
+            fold.observe(record);
+            expected.observe(record);
+            let encoded = serde_json::to_string(&fold).unwrap();
+            assert!(!encoded.contains("must-not-be-stored"));
+            assert!(!encoded.contains("rich_ui"));
+            assert!(!encoded.contains("sender-one"));
+            let restored: HeadReadFold = serde_json::from_str(&encoded).unwrap();
+            let actual = HeadProjection::from_read_fold(
+                &restored,
+                Some(&first),
+                Some(current),
+                expected.ownership.clone(),
+            )
+            .unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn head_read_fold_rejects_payload_fields_in_every_nested_object() {
+        let mut fold = HeadReadFold::default();
+        fold.observe(&start("run", None));
+        fold.observe(&step(json!({"input_tokens":1,"output_tokens":2})));
+        let clean = serde_json::to_value(&fold).unwrap();
+        for parent in ["", "/model", "/usage", "/usage/by_model/0"] {
+            for field in [
+                "title",
+                "prompt",
+                "payload",
+                "content",
+                "price",
+                "credentials",
+            ] {
+                let mut value = clean.clone();
+                value
+                    .pointer_mut(parent)
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(field.into(), json!("sentinel"));
+                assert!(
+                    serde_json::from_value::<HeadReadFold>(value).is_err(),
+                    "{parent}/{field}"
+                );
+            }
+        }
+        let mut old = fold;
+        old.version = 0;
+        assert!(HeadProjection::from_read_fold(&old, None, None, Default::default()).is_none());
     }
 
     /// A refused call counts under the model that refused it, and a step routed to the

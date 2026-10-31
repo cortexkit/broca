@@ -45,6 +45,7 @@ pub mod run_routing;
 mod scope_workdir;
 pub mod send_audit;
 pub mod serve;
+mod session_address_health;
 pub mod session_class;
 pub mod session_lookup;
 pub mod stall;

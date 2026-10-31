@@ -4,6 +4,48 @@ use broca_protocol::{BindIdentity, BindScope, SessionScope};
 use std::cell::Cell;
 
 const NOW: i64 = 200_000_000;
+
+#[test]
+fn diagnostics_address_unavailability_is_an_error_from_the_first_refusal_per_reason() {
+    let store = broca_store::SqliteStore::open_in_memory().unwrap();
+    let mut evidence = healthy(&store, NOW - 1000);
+    evidence.rings.insert(
+        "session_address_unavailable".into(),
+        Ok(Snapshot {
+            since_ms: NOW - 1000,
+            truncated: false,
+            events: ["incomplete_inventory", "gap_marker", "store_error"]
+                .into_iter()
+                .map(|code| Event {
+                    at_ms: NOW - 1,
+                    module: String::new(),
+                    code: code.into(),
+                })
+                .collect(),
+        }),
+    );
+    let reply = report(evidence, NOW, 1000);
+    let findings: Vec<_> = reply
+        .findings
+        .iter()
+        .filter(|finding| finding.check == "session_address_unavailable")
+        .collect();
+    assert_eq!(findings.len(), 3);
+    for (reason, words) in [
+        ("incomplete_inventory", "incomplete inventory"),
+        ("gap_marker", "gap marker"),
+        ("store_error", "store error"),
+    ] {
+        let finding = findings
+            .iter()
+            .find(|finding| finding.key == reason)
+            .unwrap();
+        assert_eq!(finding.severity, Severity::Error);
+        assert_eq!(finding.count, 1);
+        assert_eq!(finding.first_seen_ms, NOW - 1);
+        assert!(finding.summary.contains(words));
+    }
+}
 fn principal() -> BindPrincipal {
     BindPrincipal::Reserved {
         module_id: "prefrontal-core".into(),
@@ -31,21 +73,27 @@ fn healthy(store: &broca_store::SqliteStore, since: i64) -> Evidence {
         recovery_cuts: Vec::new(),
         runs: store.diagnostic_evidence(since, NOW).unwrap(),
         late_fence_ms: None,
+        late_delivery_stuck: vec![],
         retention: Ok(vec![]),
         catalog_age_ms: Ok(100),
         unmapped_credentials: BTreeMap::new(),
-        rings: ["send_refusals", "catalog_stale", "tool_outages"]
-            .map(|check| {
-                (
-                    check.into(),
-                    Ok(Snapshot {
-                        since_ms: NOW - 1000,
-                        truncated: false,
-                        events: vec![],
-                    }),
-                )
-            })
-            .into(),
+        rings: [
+            "send_refusals",
+            "catalog_stale",
+            "tool_outages",
+            "session_address_unavailable",
+        ]
+        .map(|check| {
+            (
+                check.into(),
+                Ok(Snapshot {
+                    since_ms: NOW - 1000,
+                    truncated: false,
+                    events: vec![],
+                }),
+            )
+        })
+        .into(),
     }
 }
 
@@ -86,12 +134,30 @@ fn check_recovery_finding(remove_raw: bool) {
     )
     .unwrap();
     drop(wal);
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(&log)
-        .unwrap()
+    let mut pending = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+    pending
         .write_all(b"undecodable private removed content")
         .unwrap();
+    // An intact later frame makes this real corruption, not an ordinary final
+    // torn append that recovery may silently discard without a cut manifest.
+    pending
+        .write_all(
+            &broca_wal::framing::encode_v4(
+                broca_wal::framing::v4::Metadata {
+                    seq: 2,
+                    fence: 1,
+                    appended_ms: 0,
+                    writer_id: [3; 16],
+                },
+                &[broca_wal::framing::FRAME_STAMPS_FEATURE],
+                &WalRecord::StepStarted {
+                    step_id: broca_protocol::StepId(2),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    drop(pending);
     drop(FileWal::open_with_recovery(&log, WalConfig::OVERHAUL, floor.clone()).unwrap());
     if remove_raw {
         let manifests = broca_wal::recovery::manifests(&log, 1_000_000).unwrap();
@@ -911,6 +977,21 @@ fn diagnostics_findings_v1_vectors_match_serving_replies() {
     let reply = answer(json!({}), Some(&principal()), &head, NOW, |since| {
         let mut evidence = healthy(&store, since);
         evidence.unmapped_credentials = unmapped_credentials();
+        evidence.rings.insert(
+            "session_address_unavailable".into(),
+            Ok(Snapshot {
+                since_ms: NOW - 1000,
+                truncated: false,
+                events: ["incomplete_inventory", "gap_marker", "store_error"]
+                    .into_iter()
+                    .map(|reason| Event {
+                        at_ms: NOW - 1,
+                        module: String::new(),
+                        code: reason.into(),
+                    })
+                    .collect(),
+            }),
+        );
         Ok(evidence)
     })
     .unwrap();
@@ -1006,6 +1087,23 @@ fn diagnostics_reads_rebuild_marker_without_session_access() {
         .findings
         .iter()
         .any(|f| f.check == "late_results_rebuild_required" && f.severity == Severity::Error));
+}
+
+#[test]
+fn diagnostics_names_repeated_held_delivery_failure() {
+    let store = broca_store::SqliteStore::open_in_memory().unwrap();
+    let mut evidence = healthy(&store, NOW - 1000);
+    evidence.late_delivery_stuck =
+        vec![json!({"module":"basal", "call_key":"lineage:4", "attempts":3})];
+    let reply = report(evidence, NOW, DEFAULT_WINDOW_MS);
+    let finding = reply
+        .findings
+        .iter()
+        .find(|f| f.check == "late_results_delivery_stuck")
+        .expect("repeated delivery failure needs a named finding");
+    assert_eq!(finding.severity, Severity::Error);
+    assert_eq!(finding.count, 1);
+    assert_eq!(finding.samples[0]["attempts"], 3);
 }
 
 #[test]

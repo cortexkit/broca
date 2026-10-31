@@ -1161,6 +1161,8 @@ mod episode_page_tests {
                 cut: "m3".into(),
             }),
             ride_wait_ms: None,
+            view_features: None,
+            view_due: None,
         }
     }
 

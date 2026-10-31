@@ -334,6 +334,7 @@ impl Fixture {
             fanout,
             run_index: None,
             materialized_store: None,
+            admission_reader: None,
             export_index: None,
             charge_basis_resolver: None,
             startup_recovery_pending: false,

@@ -1160,6 +1160,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
         WalRecord::RunAuthRefrozen {
             ts_ms: None,
             auth_selection: AuthSelection {
+                billing_vault_facts: None,
                 auth_method: None,
                 credential_id: "chatgpt:openai".into(),
                 account_ref: Some("account-all".into()),

@@ -96,10 +96,10 @@ fn open_observed(_stage: &'static str) {
 
 /// An optional byte offset for starting a later read without decoding the WAL prefix.
 ///
-/// `file_id` fingerprints the opened file's device and inode on Unix. Other platforms
-/// currently return no anchors, so the optimization is disabled there rather than relying
-/// on a weaker identity. Anchors are derived hints only: every mismatch falls back to a
-/// read from byte zero.
+/// `file_id` fingerprints the opened file's device and inode on Unix, or its volume serial
+/// number and file index on Windows. Platforms without a stable identity return no anchors.
+/// Anchors are derived hints only: ordinary range reads replay from byte zero on a mismatch;
+/// strict reads return `None` so the caller can choose a full replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalByteAnchor {
     pub file_id: u64,
@@ -2321,7 +2321,7 @@ pub fn read_records_range_from_valid_anchor(
         });
     }
     let (Some(file_id), Some(expected_next)) =
-        (metadata_file_id(&metadata), after_seq.checked_add(1))
+        (opened_file_id(&file, &metadata), after_seq.checked_add(1))
     else {
         return Ok(None);
     };
@@ -2398,7 +2398,7 @@ pub fn read_records_range(
             file_size,
         });
     }
-    let file_id = metadata_file_id(&metadata);
+    let file_id = opened_file_id(&file, &metadata);
 
     if let (Some(anchor), Some(file_id), Some(expected_next)) =
         (anchor, file_id, after_seq.checked_add(1))
@@ -2547,7 +2547,7 @@ fn read_records_tail_snapshot(
     access_counter::read_to_end(file.take(file_size - start), start, &mut suffix)
         .map_err(WalError::Io)?;
     let lineage = read_first_frame_lineage(file, max_bytes)?;
-    let file_id = metadata_file_id(metadata);
+    let file_id = opened_file_id(file, metadata);
     if start == 0 {
         let decoded = decode_bytes(&suffix, 0, 1)?;
         return select_decoded_range(decoded, &suffix, 0, file_id, 0, None).map(Some);
@@ -2979,24 +2979,54 @@ fn metadata_file_id(metadata: &std::fs::Metadata) -> Option<u64> {
     Some(std::hash::Hasher::finish(&hasher))
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn metadata_file_id(_metadata: &std::fs::Metadata) -> Option<u64> {
-    // The standard library does not expose a stable Windows file identifier. Return no identity
-    // rather than cache against a weak timestamp surrogate: no identity simply makes each idle
-    // read take its flush-only proof, which under-optimizes but never over-claims durability.
+    // Without a stable native identifier, timestamps cannot prove that a cached file is still
+    // current. Callers must replay from byte zero or synchronize the WAL again rather than
+    // reuse a cached durability proof.
     None
+}
+
+fn opened_file_id(_file: &File, _metadata: &std::fs::Metadata) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use std::hash::Hash;
+
+        let (volume, index) = _file.native_file_identity()?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        volume.hash(&mut hasher);
+        index.hash(&mut hasher);
+        Some(std::hash::Hasher::finish(&hasher))
+    }
+    #[cfg(not(windows))]
+    {
+        metadata_file_id(_metadata)
+    }
 }
 
 /// Return the platform-stable identity of the file currently at `path`, when the platform can
 /// provide one. Read-side durability caches use this only to invalidate a proof after the WAL is
 /// replaced; callers without an identity must take a fresh flush barrier instead.
 pub fn file_identity(path: impl AsRef<Path>) -> Result<Option<u64>, WalError> {
-    let metadata = match fs_ops::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(WalError::Io(error)),
-    };
-    Ok(metadata_file_id(&metadata))
+    #[cfg(windows)]
+    {
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(WalError::Io(error)),
+        };
+        let metadata = file.metadata().map_err(WalError::Io)?;
+        Ok(opened_file_id(&file, &metadata))
+    }
+    #[cfg(not(windows))]
+    {
+        let metadata = match fs_ops::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(WalError::Io(error)),
+        };
+        Ok(metadata_file_id(&metadata))
+    }
 }
 
 /// Like [`replay_path`] but also returns the byte offset where valid frames end (the start of
@@ -4055,7 +4085,7 @@ mod tests {
         check_damaged_length_before_valid_record(false);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn anchored_damaged_length_before_valid_record_is_not_a_torn_tail() {
         check_damaged_length_before_valid_record(true);
@@ -4075,8 +4105,8 @@ mod tests {
         drop(wal);
         let mut bytes = std::fs::read(&path).unwrap();
         // Layout: lineage frame, record 1, lineage frame, record 2. Record 1 ends where its own
-        // header says; record 2 starts one lineage frame later. Live-file anchors exist only on Unix,
-        // so the anchor is a cross-check where present, never the source of the offset.
+        // header says; record 2 starts one lineage frame later. The optional native-file anchor
+        // is a cross-check, never the source of the offset.
         let first = crate::framing::LINEAGE_FRAME_LEN;
         let first_len = u32::from_le_bytes(bytes[first..first + 4].try_into().unwrap()) as usize;
         let first_end = first + crate::framing::HEADER_LEN + first_len;
@@ -4096,7 +4126,8 @@ mod tests {
                 ..
             })
         ));
-        // Live-file byte anchors require a stable file identity, available only on Unix.
+        // Live-file byte anchors require a stable file identity (Unix and Windows provide one);
+        // a platform without one has no anchor to check.
         if anchored {
             let anchor = anchor.expect("anchored corruption test requires a stable file identity");
             assert!(
@@ -4267,7 +4298,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn large_step(n: u64, text_bytes: usize) -> WalRecord {
         WalRecord::ModelStepFinished {
             fallback: Default::default(),
@@ -4983,16 +5014,17 @@ mod tests {
             vec![2, 3],
             "records flushed past the durable safe head must be excluded"
         );
-        // Anchors are derived from the unix device+inode identity; other platforms
-        // deliberately return none (the fast path is disabled there).
-        #[cfg(unix)]
-        assert_eq!(ranged.next_anchor.unwrap().seq, 3);
-        #[cfg(not(unix))]
-        assert_eq!(ranged.next_anchor, None);
+        // Every native file identity yields an anchor at the requested durable head.
+        assert_eq!(
+            ranged
+                .next_anchor
+                .map(|anchor| (anchor.file_id, anchor.seq)),
+            file_identity(&path).unwrap().map(|identity| (identity, 3))
+        );
         let _ = std::fs::remove_file(&path);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn valid_anchor_fast_path_matches_from_zero_range_scan() {
         let path = tmp("range-anchor-valid");
@@ -5002,7 +5034,9 @@ mod tests {
             wal.append(1, &run_started(i), false).unwrap();
         }
         let prefix = read_records_range(&path, DEFAULT_MAX_READ_BYTES, 0, Some(2), None).unwrap();
-        let anchor = prefix.next_anchor.expect("Unix reads produce byte anchors");
+        let anchor = prefix
+            .next_anchor
+            .expect("native file reads produce byte anchors");
         assert_eq!(anchor.seq, 2);
 
         for i in 2..6 {
@@ -5028,7 +5062,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn single_large_anchored_frame_is_decoded_once_by_both_range_paths() {
         let path = tmp("range-anchor-single-large");
@@ -5038,7 +5072,7 @@ mod tests {
         let anchor = read_records_range(&path, DEFAULT_MAX_READ_BYTES, 0, Some(1), None)
             .unwrap()
             .next_anchor
-            .expect("Unix reads produce byte anchors");
+            .expect("native file reads produce byte anchors");
         let large = large_step(1, 1024 * 1024);
         wal.append(1, &large, false).unwrap();
         let suffix_bytes = std::fs::metadata(&path).unwrap().len() - anchor.byte_end;
@@ -5071,7 +5105,61 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn strict_anchor_survives_append_and_rejects_file_replacement() {
+        let path = tmp("range-anchor-native-identity");
+        let old_path = tmp("range-anchor-native-identity-old");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&old_path);
+        let mut wal = FileWal::open(&path).unwrap();
+        for i in 0..32 {
+            wal.append(1, &run_started(i), false).unwrap();
+        }
+        let prefix = read_records_range(&path, DEFAULT_MAX_READ_BYTES, 0, None, None).unwrap();
+        assert_eq!(
+            prefix.next_anchor.map(|anchor| anchor.file_id),
+            file_identity(&path).unwrap()
+        );
+        let anchor = prefix
+            .anchor_at(32)
+            .expect("native file identity supplies an anchor");
+        wal.append(1, &run_started(32), true).unwrap();
+        drop(wal);
+        assert_eq!(file_identity(&path).unwrap(), Some(anchor.file_id));
+
+        DECODED_BYTE_COUNT.with(|count| count.set(0));
+        let suffix =
+            read_records_range_from_valid_anchor(&path, DEFAULT_MAX_READ_BYTES, 32, None, &anchor)
+                .unwrap()
+                .expect("append preserves the anchor");
+        assert_eq!(suffix.records.len(), 1);
+        assert_eq!(suffix.records[0].seq, 33);
+        assert_eq!(
+            DECODED_BYTE_COUNT.with(std::cell::Cell::get),
+            std::fs::metadata(&path).unwrap().len() - anchor.byte_end,
+            "strict reads decode only the suffix"
+        );
+
+        std::fs::rename(&path, &old_path).unwrap();
+        let mut replacement = FileWal::open(&path).unwrap();
+        for i in 0..33 {
+            replacement.append(1, &run_started(i), false).unwrap();
+        }
+        drop(replacement);
+        assert_ne!(file_identity(&path).unwrap(), Some(anchor.file_id));
+        DECODED_BYTE_COUNT.with(|count| count.set(0));
+        assert_eq!(
+            read_records_range_from_valid_anchor(&path, DEFAULT_MAX_READ_BYTES, 32, None, &anchor,)
+                .unwrap(),
+            None
+        );
+        assert_eq!(DECODED_BYTE_COUNT.with(std::cell::Cell::get), 0);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&old_path);
+    }
+
+    #[cfg(any(unix, windows))]
     #[test]
     fn strict_anchored_range_rejects_a_stale_anchor_without_scanning() {
         let path = tmp("range-anchor-strict-stale");
@@ -5097,7 +5185,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn strict_anchored_range_rejects_an_internal_sequence_gap() {
         let path = tmp("range-anchor-strict-gap");
@@ -5136,7 +5224,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn anchored_large_range_skips_prefix_bytes_and_matches_scan() {
         let path = tmp("range-anchor-large");
@@ -5165,7 +5253,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn anchor_recovers_when_a_torn_next_frame_later_finishes() {
         let path = tmp("range-anchor-torn-grow");
@@ -5210,7 +5298,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn stale_anchor_after_file_replacement_falls_back_to_zero() {
         let path = tmp("range-anchor-replaced");
@@ -5235,7 +5323,7 @@ mod tests {
                 replacement.append(2, &run_started(i), false).unwrap();
             }
         }
-        let replacement_id = metadata_file_id(&std::fs::metadata(&path).unwrap()).unwrap();
+        let replacement_id = file_identity(&path).unwrap().unwrap();
         assert_ne!(anchor.file_id, replacement_id);
 
         let anchored =
@@ -5255,7 +5343,7 @@ mod tests {
         let _ = std::fs::remove_file(&old_path);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn anchor_at_mid_frame_or_garbage_falls_back_to_zero() {
         let path = tmp("range-anchor-bad-offset");
@@ -5292,7 +5380,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn anchor_beyond_a_shrunken_file_falls_back_to_zero() {
         let path = tmp("range-anchor-shrink");
@@ -5324,7 +5412,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn anchored_range_still_fails_loud_on_later_corruption() {
         let path = tmp("range-anchor-corrupt");
@@ -5447,7 +5535,7 @@ mod tests {
     /// range read, the anchored read behind `session.read` (without falling back to a read
     /// from byte zero), and the writer's own open. The frame on disk is a gated frame requiring
     /// `scope/v1`, and the scope comes back intact on each path.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn every_file_reader_decodes_a_scoped_run_started() {
         use crate::framing::{GATED_FRAMING_VERSION, SCOPE_FEATURE};
@@ -5514,9 +5602,8 @@ mod tests {
         let _ = std::fs::remove_file(&floor);
     }
 
-    /// A `RunStarted` carrying a frozen plan manifest, decoded from its bytes. Unix-only, like
-    /// the one test that uses it.
-    #[cfg(unix)]
+    /// A `RunStarted` carrying a frozen plan manifest, decoded from its bytes.
+    #[cfg(any(unix, windows))]
     fn manifest_run_started(run: &str) -> WalRecord {
         serde_json::from_str(
             &include_str!("../tests/fixtures/plan_manifest_run_started.json")
@@ -5531,7 +5618,7 @@ mod tests {
     /// from byte zero), and the writer's own open, which must not treat the frame as a torn tail.
     /// The frame on disk requires `plan-manifest/v1`, the floor names it, and the manifest comes
     /// back intact on each path.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn every_file_reader_decodes_a_manifest_run_started() {
         use crate::framing::{GATED_FRAMING_VERSION, PLAN_MANIFEST_FEATURE};
@@ -5697,7 +5784,7 @@ mod tests {
     /// A fallback would decode the whole prefix only to reach the same frame, so the decoded
     /// bytes must be exactly the suffix between the anchor and the refused frame (the lineage
     /// frame every append leaves behind its record).
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn anchored_read_refuses_a_newer_writer_without_a_full_read() {
         let path = tmp("newer-writer-anchored");
@@ -5744,7 +5831,7 @@ mod tests {
     }
 
     /// A newer-writer frame after the anchor's first record is refused by name too.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn anchored_read_refuses_a_later_newer_writer_frame() {
         let path = tmp("newer-writer-anchored-later");

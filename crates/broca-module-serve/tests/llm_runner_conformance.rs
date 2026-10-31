@@ -52,6 +52,28 @@ const TOOL_MODULE: &str = "conformance-tools";
 const OWNER_MODULE: &str = "conformance-owner";
 const SENDER_MODULE: &str = "conformance-sender";
 const HEAD_SENDER_MODULE: &str = "conformance-head-sender";
+const STRANGER_MODULE: &str = "conformance-stranger";
+
+fn caller_module_nonce<'a>(
+    principal: &'a str,
+    owner_nonce: &Path,
+) -> Result<Option<(&'a str, PathBuf)>, HarnessError> {
+    if principal == "direct" {
+        return Ok(None);
+    }
+    let module = principal
+        .strip_prefix("reserved:")
+        .ok_or_else(|| HarnessError::new("expected a reserved module principal"))?;
+    let nonce = match module {
+        OWNER_MODULE => owner_nonce.to_path_buf(),
+        SENDER_MODULE => owner_nonce.with_file_name("sender.nonce"),
+        HEAD_SENDER_MODULE => owner_nonce.with_file_name("head-sender.nonce"),
+        STRANGER_MODULE => owner_nonce.with_file_name("stranger.nonce"),
+        "magic-context" => owner_nonce.with_file_name("reader.nonce"),
+        _ => return Err(HarnessError::new("unknown conformance module principal")),
+    };
+    Ok(Some((module, nonce)))
+}
 const PLAN_MODEL_PREFIX: &str = "conformance-plan-";
 /// The system-prompt marker naming the session a model request belongs to.
 const SESSION_MARKER: &str = "conformance-session:";
@@ -1277,6 +1299,16 @@ impl BrocaSubject {
                     "enabled": true,
                     "reserved": true,
                 },
+                STRANGER_MODULE: {
+                    "program": sibling_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN"),
+                    "args": [],
+                    "env": {
+                        "FAKE_AFT_MODULE_ID": STRANGER_MODULE,
+                        "FAKE_AFT_LAUNCH_NONCE_PATH": root.join("stranger.nonce"),
+                    },
+                    "enabled": true,
+                    "reserved": true,
+                },
             }
         });
         let mut config = config;
@@ -1404,20 +1436,9 @@ impl BrocaSubject {
         if let Some(connection) = connections.get(&stamp.principal) {
             return Ok(connection.clone());
         }
-        let identity = if stamp.principal == "direct" {
-            None
-        } else {
-            let module = stamp
-                .principal
-                .strip_prefix("reserved:")
-                .ok_or_else(|| HarnessError::new("expected a reserved module principal"))?;
-            let nonce_path = match module {
-                OWNER_MODULE => live.owner_nonce.clone(),
-                SENDER_MODULE => live.owner_nonce.with_file_name("sender.nonce"),
-                HEAD_SENDER_MODULE => live.owner_nonce.with_file_name("head-sender.nonce"),
-                "magic-context" => live.owner_nonce.with_file_name("reader.nonce"),
-                _ => return Err(HarnessError::new("unknown conformance module principal")),
-            };
+        let identity = if let Some((module, nonce_path)) =
+            caller_module_nonce(&stamp.principal, &live.owner_nonce)?
+        {
             let deadline = Instant::now() + Duration::from_secs(20);
             let nonce = loop {
                 if let Ok(text) = std::fs::read_to_string(&nonce_path) {
@@ -1436,6 +1457,8 @@ impl BrocaSubject {
                 module_id: module.into(),
                 launch_nonce: nonce,
             })
+        } else {
+            None
         };
         let connection = Arc::new(
             SubcConnection::connect_with_consumer_identity(&live.connection_file, identity)
@@ -2338,7 +2361,7 @@ impl LlmRunnerSubject for BrocaSubject {
 
     fn stranger_stamp(&self) -> RouteStamp {
         RouteStamp {
-            principal: "direct".into(),
+            principal: format!("reserved:{STRANGER_MODULE}"),
             scope: None,
         }
     }
@@ -2488,6 +2511,18 @@ impl LlmRunnerSubject for BrocaSubject {
         first: bool,
         members: &Map<String, Value>,
     ) -> Option<Map<String, Value>> {
+        let mut members = members.clone();
+        // The shared-send-id case uses the stranger's route label as a plan module.
+        // Translate this fixture label to the module the daemon actually attests.
+        if let Some(senders) = members.get_mut("senders").and_then(Value::as_array_mut) {
+            for sender in senders {
+                if sender.get("module").and_then(Value::as_str)
+                    == Some(format!("reserved:{STRANGER_MODULE}").as_str())
+                {
+                    sender["module"] = STRANGER_MODULE.into();
+                }
+            }
+        }
         // A session with a scripted compaction provider keeps its compaction plan, the extra
         // members beside the plan's own.
         if compaction::known_session(&self.shared, session) {
@@ -3486,6 +3521,12 @@ const REQUIRED_STRUCTURED_OUTPUT_CASES: &[&str] = &[
     "structured_output_sibling_never_dispatched",
 ];
 
+const REQUIRED_RETRACT_OWN_SEND_CASES: &[&str] = &[
+    "retract_own_send_sender_retracted",
+    "retract_own_send_other_sender_refused",
+    "retract_own_send_shared_send_id_isolated",
+];
+
 const STREAMED_SIBLINGS_INAPPLICABLE: &str = "submit_streamed_siblings is not declared; the strict rule is checked by structured_output_sibling_never_dispatched";
 
 /// Additive kit cases must not turn an undeclared capability into a required pass.
@@ -3497,6 +3538,7 @@ fn check_named_contract_cases(
     for name in REQUIRED_INPUT_CAP_CASES
         .iter()
         .chain(REQUIRED_STRUCTURED_OUTPUT_CASES)
+        .chain(REQUIRED_RETRACT_OWN_SEND_CASES)
     {
         let case = cases
             .iter()
@@ -3535,6 +3577,7 @@ mod named_contract_case_tests {
             .filter(|case| {
                 case.name.starts_with("input_token_cap_")
                     || case.name.starts_with("structured_output_")
+                    || case.name.starts_with("retract_own_send_")
             })
             .map(|case| CaseReport {
                 case: case.name,
@@ -3560,6 +3603,7 @@ mod named_contract_case_tests {
         for name in REQUIRED_INPUT_CAP_CASES
             .iter()
             .chain(REQUIRED_STRUCTURED_OUTPUT_CASES)
+            .chain(REQUIRED_RETRACT_OWN_SEND_CASES)
             .copied()
             .chain(std::iter::once("structured_output_streamed_siblings"))
         {
@@ -5368,6 +5412,93 @@ mod held_call_tests {
             #[cfg(feature = "test-clock")]
             mc: None,
         }
+    }
+
+    #[test]
+    fn retract_own_send_kit_plan_names_both_attested_senders() {
+        use cortexkit_role_llm_runner::delivery_order::{admit, Mode, PlanSender};
+        let subject = subject(Arc::new(Shared::default()));
+        let a = subject.plan_sender().unwrap();
+        let b = subject.stranger_stamp();
+        let owner_nonce = Path::new("fixture/owner.nonce");
+        let (module_b, nonce_b) = caller_module_nonce(&b.principal, owner_nonce)
+            .unwrap()
+            .expect("sender B must present a reserved consumer identity");
+        assert_eq!(module_b, STRANGER_MODULE);
+        assert_eq!(nonce_b, PathBuf::from("fixture/stranger.nonce"));
+        assert_ne!(b.principal, subject.owner_stamp().principal);
+
+        // Match the published shared-ID case: B is named by its RouteStamp label,
+        // not by a second PlanSenderIdentity fixture supplied by the adapter.
+        let members = Map::from_iter([(
+            "senders".into(),
+            json!([PlanSender::new(&a.module), PlanSender::new(&b.principal),]),
+        )]);
+        let fields = subject
+            .send_fields_with_plan("shared-id", true, &members)
+            .unwrap();
+        let senders: Vec<PlanSender> =
+            serde_json::from_value(fields["plan"]["senders"].clone()).unwrap();
+        assert_eq!(
+            senders
+                .iter()
+                .map(|s| s.module.as_str())
+                .collect::<Vec<_>>(),
+            [SENDER_MODULE, STRANGER_MODULE]
+        );
+        for module in [a.module.as_str(), module_b] {
+            assert_eq!(
+                admit(module, Some(OWNER_MODULE), &senders, &[Mode::Steer]),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn retract_own_send_stranger_stays_unnamed_elsewhere_and_direct_stays_unidentified() {
+        use cortexkit_role_llm_runner::delivery_order::{admit, Mode, PlanSender};
+        let subject = subject(Arc::new(Shared::default()));
+        let stamp = subject.stranger_stamp();
+        let owner_nonce = Path::new("fixture/owner.nonce");
+        assert!(caller_module_nonce("direct", owner_nonce)
+            .unwrap()
+            .is_none());
+        let (module, _) = caller_module_nonce(&stamp.principal, owner_nonce)
+            .unwrap()
+            .unwrap();
+        for senders in [
+            vec![PlanSender::new(SENDER_MODULE)],
+            subject
+                .head_sender_identities()
+                .unwrap()
+                .iter()
+                .map(|id| PlanSender::new(&id.module))
+                .collect(),
+        ] {
+            assert!(!senders.iter().any(|sender| sender.module == module));
+            assert_eq!(
+                admit(module, Some(OWNER_MODULE), &senders, &[Mode::Steer]),
+                Err((
+                    cortexkit_role_llm_runner::errors::SCOPE_OWNER_MISMATCH,
+                    None
+                ))
+            );
+        }
+        let ownership = broca_core::SessionOwnershipV1 {
+            episodes: 1,
+            first_principal: Some(broca_protocol::BindPrincipal::Reserved {
+                module_id: OWNER_MODULE.into(),
+            }),
+            ..Default::default()
+        };
+        assert!(broca_core::scope_admission::decide_owner_access(
+            &ownership,
+            Some(&broca_protocol::BindPrincipal::Reserved {
+                module_id: module.into()
+            }),
+            &broca_protocol::SendScope::Unstamped,
+        )
+        .is_err());
     }
 
     #[test]

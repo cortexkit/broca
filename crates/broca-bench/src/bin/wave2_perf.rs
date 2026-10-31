@@ -678,7 +678,7 @@ fn assert_shape(rows: &[Row]) {
         (
             "live attach seed must be <3x when file anchors are available",
             live_attach_ratio,
-            cfg!(not(unix)) || live_attach_ratio < 3.0,
+            cfg!(not(any(unix, windows))) || live_attach_ratio < 3.0,
         ),
         ("full replay must be >5x", replay_ratio, replay_ratio > 5.0),
     ];

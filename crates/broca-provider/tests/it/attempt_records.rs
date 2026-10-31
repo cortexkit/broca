@@ -1092,6 +1092,7 @@ mod gated {
         let lease = FileLeaseStore::new(dir.join("lease"));
         let wal = FileWalStore::new(dir.join("wal"));
         let selection = AuthSelection {
+            billing_vault_facts: None,
             auth_method: None,
             credential_id: "oauth:anthropic:resume".into(),
             account_ref: Some("account-a".into()),
@@ -1165,6 +1166,7 @@ mod gated {
                 None,
                 RunControl {
                     auth_selection: Some(AuthSelection {
+                        billing_vault_facts: None,
                         account_ref: Some(served_account.into()),
                         ..selection.clone()
                     }),

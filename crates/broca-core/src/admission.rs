@@ -1429,6 +1429,10 @@ pub struct AdmissionSource {
 }
 
 impl AdmissionSource {
+    pub(crate) fn sequence(&self) -> u64 {
+        self.seq
+    }
+
     pub(crate) fn read(
         &self,
         read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
@@ -1554,7 +1558,7 @@ impl AdmissionSeed {
         read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
         boundary: &crate::replay::SeedBoundary,
         prefix: &[crate::replay::PositionedFrame],
-        media_continuation: bool,
+        source_backed_continuation: bool,
     ) -> Result<Self, crate::replay::SeedFallback> {
         use sha2::Digest;
         let bad = || crate::replay::SeedFallback::new("incomplete admission prefix");
@@ -1573,10 +1577,10 @@ impl AdmissionSeed {
             crate::replay::replay(&frames.iter().map(|p| p.record.clone()).collect::<Vec<_>>())
                 .map_err(|_| bad())?;
         if !(matches!(scalars.compaction, Some(crate::compaction::CompactionCheckpoint::None))
-            || (media_continuation && matches!(scalars.compaction, Some(crate::compaction::CompactionCheckpoint::Captures(_)))))
+            || (source_backed_continuation && scalars.compaction_boundary_complete()))
             || !replay.pending_steers.is_empty()
             || replay.open_tool_turn.is_some()
-            || frames.iter().any(|p| matches!(&p.record, WalRecord::RunStarted { manifest: Some(manifest), .. } if crate::compaction::has_compaction(manifest)))
+            || (!source_backed_continuation && frames.iter().any(|p| matches!(&p.record, WalRecord::RunStarted { manifest: Some(manifest), .. } if crate::compaction::has_compaction(manifest))))
         {
             return Err(crate::replay::SeedFallback::new("admission prefix needs full replay"));
         }
@@ -1786,6 +1790,7 @@ impl AdmissionSeed {
         tail: &[crate::replay::PositionedFrame],
         safe_head: u64,
         episode: Option<&LastEpisodeV1>,
+        continuation: bool,
     ) -> Result<(), crate::replay::SeedFallback> {
         if self.version != 1
             || self.scalars.at_seq != self.boundary.seq
@@ -1796,8 +1801,8 @@ impl AdmissionSeed {
             || self.scalars.head.is_none()
             || self.scalars.has_deferred_calls.is_none()
             || self.scalars.output_reservation.is_none()
-            || crate::replay::tail_contains_compaction_setup(&tail.iter().map(|p| p.framed.clone()).collect::<Vec<_>>())
-            || tail.iter().any(|p| matches!(&p.framed.record, WalRecord::RunStarted { manifest: Some(manifest), .. } if crate::compaction::has_compaction(manifest)))
+            || (!continuation && (crate::replay::tail_contains_compaction_setup(&tail.iter().map(|p| p.framed.clone()).collect::<Vec<_>>())
+                || tail.iter().any(|p| matches!(&p.framed.record, WalRecord::RunStarted { manifest: Some(manifest), .. } if crate::compaction::has_compaction(manifest)))))
         {
             return Err(crate::replay::SeedFallback::new("admission seed incomplete or head mismatch"));
         }
@@ -1837,12 +1842,23 @@ impl AdmissionSeed {
         tail: &[crate::replay::PositionedFrame],
         safe_head: u64,
     ) -> Result<(AdmissionCheckpointV1, AdmissionCheckpointV1), crate::replay::SeedFallback> {
+        self.hydrate_inner(read_at, tail, safe_head, false)
+    }
+
+    fn hydrate_inner(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        tail: &[crate::replay::PositionedFrame],
+        safe_head: u64,
+        continuation: bool,
+    ) -> Result<(AdmissionCheckpointV1, AdmissionCheckpointV1), crate::replay::SeedFallback> {
         let hydrated = self.episode_with_manifest(read_at)?;
         self.validate(
             read_at,
             tail,
             safe_head,
             hydrated.as_ref().map(|h| &h.episode),
+            continuation,
         )?;
         let bad = || crate::replay::SeedFallback::new("incomplete admission scalars");
         if self.scalars.last_episode.is_some()
@@ -1860,13 +1876,14 @@ impl AdmissionSeed {
                 .as_ref()
                 .is_none_or(|e| !e.first_config.is_null())
             || !self.scalars.ownership_complete()
-            || !matches!(
-                self.scalars.compaction,
-                Some(
-                    crate::compaction::CompactionCheckpoint::None
-                        | crate::compaction::CompactionCheckpoint::Captures(_)
-                )
-            )
+            || (!continuation
+                && !matches!(
+                    self.scalars.compaction,
+                    Some(
+                        crate::compaction::CompactionCheckpoint::None
+                            | crate::compaction::CompactionCheckpoint::Captures(_)
+                    )
+                ))
         {
             return Err(bad());
         }
@@ -1948,7 +1965,7 @@ impl AdmissionSeed {
         checkpoint
             .fold_frames(&tail.iter().map(|p| p.framed.clone()).collect::<Vec<_>>())
             .map_err(|_| bad())?;
-        if !checkpoint.compaction_boundary_complete() {
+        if !continuation && !checkpoint.compaction_boundary_complete() {
             return Err(bad());
         }
         Ok((base, checkpoint))
@@ -1976,7 +1993,7 @@ impl AdmissionSeed {
         safe_head: u64,
     ) -> Result<Option<LastEpisodeV1>, crate::replay::SeedFallback> {
         let episode = self.episode(read_at)?;
-        self.validate(read_at, tail, safe_head, episode.as_ref())?;
+        self.validate(read_at, tail, safe_head, episode.as_ref(), false)?;
         let mut checkpoint = AdmissionCheckpointV1::empty();
         checkpoint.last_episode = episode;
         checkpoint
@@ -1995,9 +2012,118 @@ impl AdmissionSeed {
 pub struct AdmissionContinuation {
     seed: AdmissionSeed,
     sources: Vec<AdmissionSource>,
+    media_sources: Option<Vec<AdmissionSource>>,
+    compaction: Option<CompactionContinuation>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CompactionContinuation {
+    version: u32,
+    sources: Vec<CompactionSource>,
+    identity: Vec<u8>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CompactionSource {
+    source: AdmissionSource,
+    prefix_len: u64,
+}
+
+/// Proof that referenced WAL frames matched their saved SHA-256 digests and that
+/// replaying those frames reproduced the saved compaction-state hash.
+pub(crate) struct AuthenticatedCompaction(crate::compaction::CompactionState);
+
+impl AuthenticatedCompaction {
+    pub(crate) fn into_state(self) -> crate::compaction::CompactionState {
+        self.0
+    }
+}
+
+#[derive(Clone, PartialEq)]
+struct ContinuationCompactionFold {
+    checkpoint: crate::compaction::CompactionCheckpoint,
+    history: crate::compaction::CompactionHistory,
+    session: bool,
+}
+
+impl ContinuationCompactionFold {
+    fn observe(
+        &mut self,
+        record: &WalRecord,
+        prefix_len: u64,
+    ) -> Result<(), crate::replay::SeedFallback> {
+        if matches!(record, WalRecord::Unknown) {
+            return Err(crate::replay::SeedFallback::new(
+                "compaction continuation has unknown record",
+            ));
+        }
+        if let WalRecord::RunStarted {
+            manifest: Some(manifest),
+            ..
+        } = record
+        {
+            self.session |= crate::compaction::has_compaction(manifest);
+        }
+        self.checkpoint.fold_at(record, prefix_len);
+        if self.session || self.checkpoint.state().is_some() {
+            self.history.fold(record);
+            if let crate::compaction::CompactionCheckpoint::State(state) = &mut self.checkpoint {
+                state.history = self.history.clone();
+            }
+        }
+        Ok(())
+    }
+
+    fn identity(&self) -> Result<Vec<u8>, crate::replay::SeedFallback> {
+        use sha2::Digest;
+        serde_json::to_vec(&(&self.checkpoint, &self.history, self.session))
+            .map(|bytes| sha2::Sha256::digest(bytes).to_vec())
+            .map_err(|_| {
+                crate::replay::SeedFallback::new("compaction continuation cannot encode identity")
+            })
+    }
 }
 
 impl AdmissionContinuation {
+    /// A full WAL read preserves unanswered deferred calls, late results and
+    /// requests to withdraw outstanding approval questions when the raw prefix
+    /// cannot reconstruct those actions.
+    pub fn raw_read_ownership(&self) -> Result<SessionOwnershipV1, crate::replay::SeedFallback> {
+        if self.compaction.is_some() {
+            return Err(crate::replay::SeedFallback::new(
+                "raw page requires compaction source hydration",
+            ));
+        }
+        if self.seed.scalars.has_deferred_calls != Some(false) {
+            return Err(crate::replay::SeedFallback::new(
+                "raw page deferred prefix state",
+            ));
+        }
+        if self
+            .seed
+            .scalars
+            .compaction
+            .as_ref()
+            .and_then(|c| c.state())
+            .is_some_and(|state| {
+                matches!(
+                    state.ceiling_check,
+                    Some(crate::compaction::CeilingCheck::Waiting { .. })
+                ) || state.ride_wait.is_some()
+            })
+        {
+            return Err(crate::replay::SeedFallback::new(
+                "raw page compaction wait prefix state",
+            ));
+        }
+        self.seed
+            .scalars
+            .ownership
+            .as_ref()
+            .map(SessionOwnershipV1::for_owner_access)
+            .ok_or_else(|| crate::replay::SeedFallback::new("raw page ownership seed missing"))
+    }
+
     pub fn encode(&self) -> Result<String, serde_json::Error> {
         let mut state = serde_json::to_value(&self.seed)?;
         let scalars = state["scalars"].as_object_mut().expect("checkpoint object");
@@ -2023,22 +2149,50 @@ impl AdmissionContinuation {
         if let Some(episode) = state["episode"].as_object_mut() {
             episode.remove("usage");
         }
+        if self.compaction.is_some() {
+            // Applied replacements, view edits and notice text stay in their WAL frames.
+            let captures = self
+                .seed
+                .scalars
+                .compaction
+                .as_ref()
+                .and_then(|c| c.captured())
+                .cloned();
+            state["scalars"]["compaction"] = serde_json::to_value(captures.map_or(
+                crate::compaction::CompactionCheckpoint::None,
+                crate::compaction::CompactionCheckpoint::Captures,
+            ))?;
+        }
         let mut encoded = serde_json::json!({
-            "version": 1, "state": state, "sources": self.sources,
+            "version": self.wire_version(), "state": state, "sources": self.sources,
         });
         // The wire capability follows recorded media state, not a build feature or
         // the current opt-in setting. Media-free histories allocate no media field.
         if self.seed.scalars.media.is_some() {
             encoded["features"] = serde_json::json!(["media-metadata/v1"]);
         }
+        if let Some(sources) = &self.media_sources {
+            encoded["media_sources"] = serde_json::to_value(sources)?;
+        }
+        if let Some(compaction) = &self.compaction {
+            encoded["compaction"] = serde_json::to_value(compaction)?;
+        }
         serde_json::to_string(&encoded)
+    }
+
+    pub(crate) fn wire_version(&self) -> u32 {
+        if self.compaction.is_some() {
+            2
+        } else {
+            1
+        }
     }
 
     /// Unsupported versions and missing media metadata are cache misses, never partial state.
     pub fn decode(encoded: &str) -> Result<Self, crate::replay::SeedFallback> {
         let bad = || crate::replay::SeedFallback::new("unsupported admission continuation");
         let value: serde_json::Value = serde_json::from_str(encoded).map_err(|_| bad())?;
-        if value["version"] != 1 {
+        if value["version"] != 1 && value["version"] != 2 {
             return Err(bad());
         }
         if let Some(features) = value.get("features") {
@@ -2052,12 +2206,51 @@ impl AdmissionContinuation {
             return Err(bad());
         }
         let sources = serde_json::from_value(value["sources"].clone()).map_err(|_| bad())?;
+        let media_sources = value
+            .get("media_sources")
+            .map(|v| serde_json::from_value(v.clone()).map_err(|_| bad()))
+            .transpose()?;
+        let compaction: Option<CompactionContinuation> = value
+            .get("compaction")
+            .map(|v| {
+                serde_json::from_value(v.clone()).map_err(|_| {
+                    crate::replay::SeedFallback::new("unsupported compaction continuation")
+                })
+            })
+            .transpose()?;
+        if (value["version"] == 2) != compaction.is_some()
+            || compaction
+                .as_ref()
+                .is_some_and(|c| c.version != 1 || c.sources.is_empty())
+        {
+            return Err(crate::replay::SeedFallback::new(
+                "unsupported compaction continuation",
+            ));
+        }
+        if matches!(
+            seed.scalars.compaction,
+            Some(crate::compaction::CompactionCheckpoint::State(_))
+        ) {
+            return Err(crate::replay::SeedFallback::new(
+                "compaction continuation contains hydrated content",
+            ));
+        }
         if !seed.scalars.media_seed_complete() {
             return Err(crate::replay::SeedFallback::new(
                 "admission continuation media metadata missing",
             ));
         }
-        Ok(Self { seed, sources })
+        if seed.scalars.has_captured_media() && media_sources.is_none() {
+            return Err(crate::replay::SeedFallback::new(
+                "admission media locators missing",
+            ));
+        }
+        Ok(Self {
+            seed,
+            sources,
+            media_sources,
+            compaction,
+        })
     }
 
     pub fn boundary(&self) -> crate::replay::SeedBoundary {
@@ -2176,7 +2369,59 @@ impl AdmissionContinuation {
                 )
             })
             .collect::<Result<_, _>>()?;
-        Ok(Self { seed, sources })
+        let media_sources = seed
+            .scalars
+            .has_captured_media()
+            .then(|| {
+                prefix
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| {
+                        crate::compaction::CapturedMedia::captures_any(&p.framed.record)
+                    })
+                    .map(|(i, p)| {
+                        AdmissionSource::capture(
+                            read_at,
+                            p,
+                            prefix.get(i + 1).map_or(boundary.frame_end, |p| p.off),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+        let mut fold = ContinuationCompactionFold {
+            checkpoint: crate::compaction::CompactionCheckpoint::None,
+            history: Default::default(),
+            session: false,
+        };
+        let mut placement = crate::placement::Placement::default();
+        let compaction_sources = Self::compaction_sources(
+            read_at,
+            &mut fold,
+            &mut placement,
+            prefix,
+            boundary.frame_end,
+        )?;
+        if Some(&fold.checkpoint) != seed.scalars.compaction.as_ref() {
+            return Err(crate::replay::SeedFallback::new(
+                "compaction continuation fold mismatch",
+            ));
+        }
+        let compaction = if fold.session || fold.checkpoint.state().is_some() {
+            Some(CompactionContinuation {
+                version: 1,
+                sources: compaction_sources,
+                identity: fold.identity()?,
+            })
+        } else {
+            None
+        };
+        Ok(Self {
+            seed,
+            sources,
+            media_sources,
+            compaction,
+        })
     }
 
     fn hydrated_seed(
@@ -2222,13 +2467,84 @@ impl AdmissionContinuation {
         Ok(seed)
     }
 
+    fn compaction_sources(
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        fold: &mut ContinuationCompactionFold,
+        placement: &mut crate::placement::Placement,
+        frames: &[crate::replay::PositionedFrame],
+        end: u64,
+    ) -> Result<Vec<CompactionSource>, crate::replay::SeedFallback> {
+        let mut sources = Vec::new();
+        for (i, p) in frames.iter().enumerate() {
+            let before = fold.clone();
+            let prefix_len = placement.next_ordinal();
+            fold.observe(&p.framed.record, prefix_len)?;
+            placement.observe(&p.framed.record).map_err(|_| {
+                crate::replay::SeedFallback::new("compaction continuation placement invalid")
+            })?;
+            // The canonical fold chooses the dependency set. A new fold input is captured
+            // automatically rather than being lost behind a second record-kind allowlist.
+            if *fold != before {
+                sources.push(CompactionSource {
+                    source: AdmissionSource::capture(
+                        read_at,
+                        p,
+                        frames.get(i + 1).map_or(end, |p| p.off),
+                    )?,
+                    prefix_len,
+                });
+            }
+        }
+        Ok(sources)
+    }
+
+    fn hydrate_compaction_fold(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    ) -> Result<ContinuationCompactionFold, crate::replay::SeedFallback> {
+        let bad =
+            || crate::replay::SeedFallback::new("compaction continuation locators incomplete");
+        let mut fold = ContinuationCompactionFold {
+            checkpoint: crate::compaction::CompactionCheckpoint::None,
+            history: Default::default(),
+            session: false,
+        };
+        let Some(journal) = self.compaction.as_ref() else {
+            fold.checkpoint = self.seed.scalars.compaction.clone().ok_or_else(bad)?;
+            return Ok(fold);
+        };
+        let mut last = 0;
+        for source in &journal.sources {
+            if source.source.seq <= last {
+                return Err(bad());
+            }
+            last = source.source.seq;
+            let frame = source.source.read(read_at, &self.seed.boundary)?;
+            fold.observe(&frame.record, source.prefix_len)?;
+        }
+        if fold.identity()? != journal.identity {
+            return Err(bad());
+        }
+        Ok(fold)
+    }
+
     pub fn hydrate(
         &self,
         read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
         tail: &[crate::replay::PositionedFrame],
         safe_head: u64,
     ) -> Result<(AdmissionCheckpointV1, AdmissionCheckpointV1), crate::replay::SeedFallback> {
+        self.authenticate_media_sources(read_at)?;
         let mut seed = self.hydrated_seed(read_at)?;
+        let mut compaction = self.hydrate_compaction_fold(read_at)?;
+        seed.scalars.compaction = Some(compaction.checkpoint.clone());
+        if self.compaction.is_some() {
+            if let (Some(state), Some(crate::media_request::DurableMediaSeed::Ready(media))) =
+                (compaction.checkpoint.state(), &mut seed.scalars.media)
+            {
+                media.restore_authenticated_compaction(AuthenticatedCompaction(state.clone()));
+            }
+        }
         if seed.scalars.media.is_none()
             && tail
                 .iter()
@@ -2255,7 +2571,90 @@ impl AdmissionContinuation {
                 })?,
             )));
         }
-        seed.hydrate_with_base(read_at, tail, safe_head)
+        let (base, mut head) = seed.hydrate_inner(read_at, tail, safe_head, true)?;
+        let episode = base.last_episode.as_ref();
+        let mut placement = crate::placement::Placement::seeded(
+            self.seed.ordinal_base,
+            episode.map(|e| e.run_id.clone()),
+            episode.and_then(|e| e.config.budget.clone()),
+            episode
+                .and_then(|e| e.budget_replay_state.clone())
+                .unwrap_or_default(),
+            0,
+        );
+        for p in tail {
+            compaction.observe(&p.framed.record, placement.next_ordinal())?;
+            placement.observe(&p.framed.record).map_err(|_| {
+                crate::replay::SeedFallback::new("compaction continuation tail placement invalid")
+            })?;
+        }
+        head.compaction = Some(compaction.checkpoint);
+        if !head.compaction_boundary_complete() {
+            return Err(crate::replay::SeedFallback::new(
+                "compaction continuation boundary incomplete",
+            ));
+        }
+        Ok((base, head))
+    }
+
+    fn authenticate_media_sources(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    ) -> Result<(), crate::replay::SeedFallback> {
+        if !self.seed.scalars.has_captured_media() {
+            return Ok(());
+        }
+        let sources = self
+            .media_sources
+            .as_ref()
+            .ok_or_else(|| crate::replay::SeedFallback::new("admission media locators missing"))?;
+        let mut captures = crate::compaction::CapturedMedia::default();
+        for source in sources {
+            let frame = source.read(read_at, &self.seed.boundary)?;
+            if !crate::compaction::CapturedMedia::captures_any(&frame.record) {
+                return Err(crate::replay::SeedFallback::new(
+                    "admission media locator kind mismatch",
+                ));
+            }
+            captures.fold(&frame.record);
+        }
+        if self
+            .seed
+            .scalars
+            .compaction
+            .as_ref()
+            .and_then(|c| c.captured())
+            != Some(&captures)
+        {
+            return Err(crate::replay::SeedFallback::new(
+                "admission media locators incomplete",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Cancellation needs the paused request, not historical accounting. Authenticate only
+    /// the recorded media captures in addition to the seed's validated request sources.
+    pub fn paused_episode(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        tail: &[crate::replay::PositionedFrame],
+        safe_head: u64,
+    ) -> Result<Option<LastEpisodeV1>, crate::replay::SeedFallback> {
+        if self.compaction.is_some() {
+            return Err(crate::replay::SeedFallback::new(
+                "paused admission requires compaction source hydration",
+            ));
+        }
+        self.authenticate_media_sources(read_at)?;
+        let mut seed = self.seed.clone();
+        // Stored continuations omit accounting. Cancellation neither observes nor returns
+        // those counters, but the in-memory recipe requires their presence for validation.
+        seed.scalars.head = Some(crate::head::HeadProjection::default());
+        seed.scalars.input_budget = Some(crate::input_budget::InputTokenBudget::default());
+        seed.scalars.output_reservation =
+            Some(crate::output_reservation::OutputReservationHistory::default());
+        seed.paused_episode(read_at, tail, safe_head)
     }
 
     /// Consume the suffix after the stored boundary, with the position from the same
@@ -2275,8 +2674,43 @@ impl AdmissionContinuation {
                 "continuation advance boundary mismatch",
             ));
         }
-        let (_, mut scalars) = self.hydrate(read_at, tail, boundary.seq)?;
+        let (base, mut scalars) = self.hydrate(read_at, tail, boundary.seq)?;
         let mut next = self.clone();
+        if self.compaction.is_some()
+            || scalars
+                .compaction
+                .as_ref()
+                .and_then(|c| c.state())
+                .is_some()
+            || tail.iter().any(|p| matches!(&p.framed.record,
+                WalRecord::RunStarted {manifest:Some(manifest),..} if crate::compaction::has_compaction(manifest)))
+        {
+            let episode = base.last_episode.as_ref();
+            let mut placement = crate::placement::Placement::seeded(
+                self.seed.ordinal_base,
+                episode.map(|e| e.run_id.clone()),
+                episode.and_then(|e| e.config.budget.clone()),
+                episode
+                    .and_then(|e| e.budget_replay_state.clone())
+                    .unwrap_or_default(),
+                0,
+            );
+            let mut fold = self.hydrate_compaction_fold(read_at)?;
+            let added = Self::compaction_sources(
+                read_at,
+                &mut fold,
+                &mut placement,
+                tail,
+                boundary.frame_end,
+            )?;
+            let journal = next.compaction.get_or_insert(CompactionContinuation {
+                version: 1,
+                sources: Vec::new(),
+                identity: Vec::new(),
+            });
+            journal.sources.extend(added);
+            journal.identity = fold.identity()?;
+        }
         let mut queued: std::collections::BTreeMap<_, _> = next
             .seed
             .queued
@@ -2292,6 +2726,11 @@ impl AdmissionContinuation {
             )?;
             if Self::accounting_source(&p.framed.record) {
                 next.sources.push(source.clone());
+            }
+            if crate::compaction::CapturedMedia::captures_any(&p.framed.record) {
+                next.media_sources
+                    .get_or_insert_with(Vec::new)
+                    .push(source.clone());
             }
             match &p.framed.record {
                 WalRecord::RunStarted { .. } => {
@@ -2382,14 +2821,6 @@ impl AdmissionContinuation {
         }
         if let Some(effort) = &mut scalars.effort_history {
             effort.first_config = serde_json::Value::Null;
-        }
-        if matches!(
-            scalars.compaction,
-            Some(crate::compaction::CompactionCheckpoint::State(_))
-        ) {
-            return Err(crate::replay::SeedFallback::new(
-                "compaction continuation needs source hydration",
-            ));
         }
         next.seed.scalars = scalars;
         next.seed.boundary = AdmissionSource {
@@ -2849,6 +3280,7 @@ mod tests {
                     ts_ms: None,
                     auth_selection: AuthSelection {
                         credential_id: "apikey:stub".into(),
+                        billing_vault_facts: None,
                         account_ref: None,
                         resolved_credential_id: None,
                         vault_request: None,
@@ -4324,6 +4756,8 @@ mod tests {
                 ceiling: None,
                 tag_checkpoint: None,
                 ride_wait_ms: None,
+                view_features: None,
+                view_due: None,
             },
         ));
         let (bytes, positioned) = offset_log(&records);
@@ -5017,6 +5451,68 @@ mod tests {
     }
 
     #[test]
+    fn future_vault_snapshots_survive_replay_refreeze_and_checkpoint_bytes() {
+        let snapshots: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../broca-wal/tests/fixtures/vault_billing_snapshots.json"
+        ))
+        .unwrap();
+        for snapshot in snapshots {
+            let expected_snapshot = snapshot.clone();
+            let selection: AuthSelection = serde_json::from_value(serde_json::json!({
+                "credential_id":"oauth:anthropic", "resolved_credential_id":"vault-work", "billing_vault_facts":snapshot
+            })).unwrap();
+            assert_eq!(
+                serde_json::to_value(&selection).unwrap()["billing_vault_facts"],
+                expected_snapshot,
+                "the selection decoder must retain the literal future snapshot"
+            );
+            let mut start = started(1, "r", None);
+            let WalRecord::RunStarted { config, .. } = &mut start.record else {
+                unreachable!()
+            };
+            config.auth_selection = Some(selection.clone());
+            let records = [
+                start,
+                frame(
+                    2,
+                    WalRecord::RunAuthRefrozen {
+                        ts_ms: Some(10),
+                        auth_selection: selection.clone(),
+                    },
+                ),
+            ];
+            for end in 1..=records.len() {
+                let frames = &records[..end];
+                let checkpoint = AdmissionCheckpointV1::from_frames(frames).unwrap();
+                let restored =
+                    decode_admission_checkpoint(&encode_admission_checkpoint(&checkpoint).unwrap())
+                        .unwrap();
+                assert_eq!(restored, checkpoint);
+                assert_eq!(
+                    serde_json::to_value(&restored.last_episode.as_ref().unwrap().config).unwrap()
+                        ["auth_selection"]["billing_vault_facts"],
+                    expected_snapshot
+                );
+                assert_eq!(
+                    restored.last_episode.unwrap().config.auth_selection,
+                    Some(selection.clone())
+                );
+                let replay = crate::replay(
+                    &frames
+                        .iter()
+                        .map(|frame| frame.record.clone())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+                assert_eq!(
+                    replay.run_config.unwrap().auth_selection,
+                    Some(selection.clone())
+                );
+            }
+        }
+    }
+
+    #[test]
     fn non_budget_episode_facts_match_independent_replay_authority() {
         let records = corpus();
         let checkpoint = AdmissionCheckpointV1::from_frames(&records).expect("checkpoint");
@@ -5104,6 +5600,7 @@ mod tests {
                 WalRecord::RunAuthRefrozen {
                     ts_ms: Some(10),
                     auth_selection: AuthSelection {
+                        billing_vault_facts: None,
                         auth_method: None,
                         credential_id: "chatgpt:openai".into(),
                         account_ref: Some("first-account".into()),
@@ -5118,6 +5615,7 @@ mod tests {
                 WalRecord::RunAuthRefrozen {
                     ts_ms: Some(20),
                     auth_selection: AuthSelection {
+                        billing_vault_facts: None,
                         auth_method: None,
                         credential_id: "chatgpt:openai".into(),
                         account_ref: Some("second-account".into()),
@@ -5138,6 +5636,7 @@ mod tests {
         )
         .expect("replay accepts independent auth refreezes");
         let expected = AuthSelection {
+            billing_vault_facts: None,
             auth_method: None,
             credential_id: "chatgpt:openai".into(),
             account_ref: Some("second-account".into()),
