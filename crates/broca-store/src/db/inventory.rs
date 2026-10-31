@@ -255,8 +255,9 @@ impl ImportedRunExclusions for OverhaulDb {
         runs: &[RunId],
     ) -> Result<(), ExportError> {
         self.authoritative_transaction(|tx| {
-            // The receiver identity and exclusions become durable together, before
-            // the move domain renames the staged WAL into place.
+            // Persist exclusions before the staged WAL can be served or billed.
+            // The cut coordinator's pending intent fences interrupted installs;
+            // this SQL commit does not contain the rename or cut completion.
             insert(tx, &session_addr(session), session)?;
             for run in runs {
                 tx.execute(

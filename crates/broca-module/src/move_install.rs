@@ -76,6 +76,12 @@ pub fn check_installations(installations: &[Installation<'_>]) -> Result<(), Err
 /// which prevents sends from advancing the installed bytes before recovery checks
 /// them. Without that intent, do not invoke the missing-staging recovery path.
 /// `drop_projection` removes derived session data, never billing facts or floors.
+/// The caller holds the move coordinator's durable activation intent and session
+/// guards. Exclusions become durable before a moved session can be served or
+/// billed; an interrupted install remains fenced until recovery completes it.
+/// This is not one transaction spanning SQLite, filesystem rename and cut state.
+/// Activation cannot be aborted after its intent is recorded. A successful abort
+/// occurs before activation, when no exclusion writes have been attempted.
 pub fn install_verified<E: broca_core::ImportedRunExclusions + ?Sized>(
     state_root: &Path,
     cut_id: &str,

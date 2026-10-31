@@ -1740,6 +1740,112 @@ async fn missing_origin_is_expired_without_blocking_other_owed_calls() {
     assert!(rig.frames().iter().any(|frame| matches!(&frame.record, WalRecord::QuestionWithdrawalAcknowledged { call_key, answer: broca_wal::WithdrawalAnswer::Acknowledged, .. } if call_key == &good_key)));
 }
 
+#[tokio::test]
+async fn overhaul_ownerless_withdrawal_does_not_hide_or_acquire_a_later_owner() {
+    use broca_core::RecoveryDiscovery;
+    use broca_store::db::{LogLocation, OverhaulDb, PublishedSession};
+    let rig = Rig::new(true);
+    rig.seed(true, false, false, true);
+    let source = rig.frames();
+    let started = source[0].record.clone();
+    let mut ownerless = source[3].record.clone();
+    if let WalRecord::ToolCallDeferred { call_id, ask, .. } = &mut ownerless {
+        *call_id = ToolCallId("ownerless".into());
+        ask.expires_at_ms = 1;
+    }
+    std::fs::remove_file(rig.wal.wal_path(&rig.key)).unwrap();
+    let mut file = rig.wal.open(&rig.key).unwrap();
+    file.append(1, &ownerless, true).unwrap();
+    let ownerless_key = format!("{}:1", file.lineage_id().unwrap());
+    file.append(
+        1,
+        &WalRecord::ToolResult {
+            finished_at_ms: None,
+            tags: None,
+            batch_id: broca_protocol::BatchId("b".into()),
+            result: broca_core::not_dispatched_result(&ToolCallId("ownerless".into())).into(),
+            outcome: broca_wal::DispatchOutcome::Interrupted,
+            hooks: None,
+            reason: None,
+            withdraw_elicitation: Some(broca_wal::WithdrawElicitation {
+                call_key: ownerless_key.clone(),
+                elicitation_id: None,
+            }),
+            provider_held: None,
+        },
+        true,
+    )
+    .unwrap();
+    file.append(1, &started, true).unwrap();
+    file.append(1, &source[3].record, true).unwrap();
+    let owned_key = format!("{}:4", file.lineage_id().unwrap());
+    file.append(1, &Rig::closed_result(&owned_key, true), true)
+        .unwrap();
+    drop(file);
+    std::fs::write(rig.root.join("state-format"), b"broca-state/2\n").unwrap();
+    let db = OverhaulDb::open(&rig.root).unwrap();
+    let publish = || {
+        let bytes = std::fs::read(rig.wal.wal_path(&rig.key)).unwrap();
+        db.index(&PublishedSession {
+            bind: &rig.key,
+            session_ref: "mixed-owner",
+            location: LogLocation::Live,
+            bytes: &bytes,
+        })
+        .unwrap();
+    };
+    publish();
+    let candidates = db
+        .withdrawal_candidates()
+        .expect("ownerless debt must not fail the owned candidate scan");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].run_id.0, "r");
+    assert_eq!(candidates[0].session, rig.key);
+    db.read_snapshot(|tx| {
+        let owners: Vec<Option<String>> = tx
+            .prepare("SELECT run_id FROM withdrawal_call ORDER BY call_key")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(owners, vec![None, Some("r".into())]);
+        Ok(())
+    })
+    .unwrap();
+    let writer = Arc::new(WalHandle::spawn(rig.wal.open(&rig.key).unwrap(), 1).unwrap());
+    assert!(crate::approval::service_pass(
+        rig.wal.clone(),
+        rig.key.clone(),
+        writer.clone(),
+        None,
+        Arc::new(Mutex::new(())),
+        rig.executor.questions.as_ref().unwrap().as_ref(),
+        &broca_core::Clock::default()
+    )
+    .await
+    .unwrap());
+    Arc::try_unwrap(writer)
+        .ok()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    publish();
+    assert!(db.withdrawal_candidates().unwrap().is_empty());
+    assert_eq!(
+        rig.executor
+            .questions
+            .as_ref()
+            .unwrap()
+            .withdrawals
+            .lock()
+            .unwrap()
+            .len(),
+        1
+    );
+    let frames = rig.frames();
+    assert!(frames.iter().any(|f| matches!(&f.record,WalRecord::QuestionWithdrawalAcknowledged { call_key,reason:Some(reason),.. } if call_key==&ownerless_key && reason=="expired")));
+    assert!(frames.iter().any(|f| matches!(&f.record,WalRecord::QuestionWithdrawalAcknowledged { call_key,answer:broca_wal::WithdrawalAnswer::Acknowledged,.. } if call_key==&owned_key)));
+}
+
 struct FailingLookup(Arc<broca_store::SqliteStore>);
 impl RunIndex for FailingLookup {
     fn index_run_active(&self, row: &RunIndexRow) -> Result<(), String> {

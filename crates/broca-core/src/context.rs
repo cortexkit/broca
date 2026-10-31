@@ -973,8 +973,11 @@ pub trait RecoveryDiscovery: Send + Sync {
     fn withdrawal_candidates(&self) -> Result<Vec<WithdrawalRun>, String>;
 }
 
-/// Identity-only billing exclusions committed before a moved WAL is installed.
-/// Projection replacement and retention must not remove these authoritative facts.
+/// Identity-only billing exclusions durable before a moved session can be served
+/// or billed. The move coordinator keeps its irreversible activation intent
+/// fenced until installation and cut completion recover; the SQL commit does not
+/// include the filesystem rename or cut completion. Abort before activation writes
+/// no exclusions. Projection replacement and retention preserve these facts.
 pub trait ImportedRunExclusions: Send + Sync {
     fn record_imported_runs(
         &self,

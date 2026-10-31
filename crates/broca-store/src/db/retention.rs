@@ -105,6 +105,7 @@ impl OverhaulDb {
     }
     pub fn retention_lineages_with_discovery(&self) -> Result<Vec<BindIdentity>, DbError> {
         self.read_snapshot(|tx| {
+            super::recovery::ensure_complete(tx)?;
             let rows = tx.prepare("WITH owed AS (SELECT run_id FROM actor_withdrawal_hint WHERE owed=1 UNION SELECT run_id FROM withdrawal_call WHERE decided=0 AND withdrawal_terminal=1 AND acknowledged=0 UNION SELECT run_id FROM retention_run WHERE withdrawals_owed=1) SELECT DISTINCT p.session FROM owed JOIN retention_run r USING(run_id) JOIN retention_progress p USING(lineage_id) WHERE p.expired_at_ms IS NULL")?
                 .query_map([], |r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
             rows.into_iter().map(|s| serde_json::from_str(&s).map_err(invalid)).collect()

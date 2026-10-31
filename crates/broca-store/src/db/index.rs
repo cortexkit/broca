@@ -161,7 +161,12 @@ pub(super) fn index_in_tx(
                 _ => None,
             });
     }
+    let outdated = checkpoint.is_some() && !super::recovery::projection_current(tx, &key)?;
+    if outdated && !force {
+        broca_core::replay::SeedFallback::new("withdrawal projection version outdated");
+    }
     let rebuilt = force
+        || outdated
         || checkpoint
             .as_ref()
             .is_some_and(|cp| !matches_checkpoint(cp, log.bytes, &lineage_id));
@@ -270,6 +275,7 @@ pub(super) fn index_in_tx(
     tx.execute("UPDATE session SET lineage_id=?2,indexed_seq=?3,indexed_off=?4,indexed_end=?5,indexed_identity=?6,head_ord=?7,locator_seed=?8,frozen_policy=?9,last_activity_ms=?10,last_write_ms=?11,title_off=?12,lineage_off=?13 WHERE sid=?1",
         params![key,lineage_id,last_seq.map(u64_to_i64).transpose()?,u64_to_i64(last_off)?,u64_to_i64(offset)?,identity,u64_to_i64(seed.head_ord())?,seed.encode()?,seed.frozen_policy.map(u64_to_i64).transpose()?,seed.last_activity_ms.map(u64_to_i64).transpose()?,seed.last_write_ms.map(u64_to_i64).transpose()?,seed.title_off.map(u64_to_i64).transpose()?,lineage_off.map(u64_to_i64).transpose()?])?;
     super::seeds::publish(tx, &key, &log.bytes[..offset as usize])?;
+    super::recovery::mark_projection_current(tx, &key)?;
     Ok(IndexOutcome {
         rebuilt,
         indexed_seq: last_seq,
@@ -956,6 +962,86 @@ mod tests {
             assert!(scratch.db.withdrawal_candidates().unwrap().is_empty());
             let values = format!("{:?}", rows(&scratch.db, &["withdrawal_call"]));
             assert!(!values.contains("PRIVATE_ARGUMENTS") && !values.contains("PRIVATE_QUESTION"));
+        }
+    }
+
+    #[test]
+    fn old_revision_checkpoint_backfills_withdrawal_projection_before_discovery() {
+        use broca_core::ImportedRunExclusions;
+        use broca_wal::Wal;
+        let old_db = fixture("crates/broca-store/tests/fixtures/operational-v0/broca.db");
+        let bytes = fixture("crates/broca-store/tests/fixtures/operational-v0/debt.wal");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&old_db)),
+            "aa7e0e42415832721e93593a3ad889db2a9294ce67ee6885df6b43aafcaed902"
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            "085a51301cd975726e7f48104f0229c0131bf1c8e8582f159c3dc0c9e63e72cf"
+        );
+        let bind = bind(&bytes);
+        for mode in ["index", "publication", "boot"] {
+            let root = broca_test_support::scratch_root()
+                .join(format!("withdrawal-upgrade-{}-{mode}", std::process::id()));
+            let scratch = Scratch(root);
+            std::fs::create_dir_all(&scratch.0).unwrap();
+            std::fs::write(scratch.0.join("state-format"), b"broca-state/2\n").unwrap();
+            std::fs::write(scratch.0.join("broca.db"), &old_db).unwrap();
+            let path = scratch.0.join("debt.wal");
+            std::fs::write(&path, &bytes).unwrap();
+            let db = OverhaulDb::open(&scratch.0).unwrap();
+            assert!(db.runs_with_withdrawals_owed().is_err(),"an old complete checkpoint without the withdrawal fold must be incomplete, not no candidates");
+            let historical = broca_protocol::RunId("preserved-import".into());
+            db.record_imported_runs(&bind, "preserved-cut", std::slice::from_ref(&historical))
+                .unwrap();
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            let outcome = counter.operation(mode).run(|| match mode {
+                "index" => db.index(&publication(&bind, &bytes)).unwrap(),
+                "publication" => {
+                    let wal = broca_wal::FileWal::open(&path).unwrap();
+                    wal.sync().unwrap();
+                    publish_writer(&db, &bind, &wal)
+                }
+                "boot" => {
+                    db.reconcile_boot([super::super::ReconcileSession {
+                        bind: &bind,
+                        session_ref: "upgrade",
+                        location: LogLocation::Live,
+                        path: &path,
+                    }])
+                    .unwrap()
+                    .remove(0)
+                    .index
+                }
+                _ => unreachable!(),
+            });
+            assert!(outcome.rebuilt, "{mode} trusted an old fold checkpoint");
+            let rows = db.runs_with_withdrawals_owed().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].run_id.0, "upgrade-run");
+            assert_eq!(rows[0].session, bind);
+            assert!(db.is_imported_run(&bind, &historical).unwrap());
+            assert!(
+                db.lookup_run("upgrade-run")
+                    .unwrap()
+                    .unwrap()
+                    .withdrawals_owed
+            );
+            let access = counter.snapshot().remove(0);
+            assert!(
+                access
+                    .seed_fallbacks
+                    .contains(&"withdrawal projection version outdated"),
+                "{mode}: {:?}",
+                access.seed_fallbacks
+            );
+            drop(db);
+            let reopened = OverhaulDb::open(&scratch.0).unwrap();
+            assert_eq!(reopened.runs_with_withdrawals_owed().unwrap().len(), 1);
+            assert!(
+                !reopened.index(&publication(&bind, &bytes)).unwrap().rebuilt,
+                "a current fold must not rescan an unchanged WAL"
+            );
         }
     }
 
