@@ -1839,7 +1839,9 @@ impl BrocaSubject {
             .iter()
             .filter(|(_, state)| state.due || state.preserve_edit_tags)
         {
-            let reference = broca_core::agent_session_ref(&self.bind_identity(session));
+            // Only the bus notice capture below needs the session, and it compiles with test-clock.
+            #[cfg(not(feature = "test-clock"))]
+            let _ = session;
             let case = if state.due {
                 if state.wire_inputs.is_empty() {
                     "view_due_refused_fetch_blocks_model"
@@ -1877,6 +1879,7 @@ impl BrocaSubject {
             }
             #[cfg(feature = "test-clock")]
             if let Some(bus) = self.bus.as_ref() {
+                let reference = broca_core::agent_session_ref(&self.bind_identity(session));
                 for (index, headers) in bus.advance_notices(&reference).iter().enumerate() {
                     save(
                         format!("{case}-notice-{index}.json"),
