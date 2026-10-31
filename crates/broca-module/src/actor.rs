@@ -2196,10 +2196,28 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .await
     }
 
-    /// Dispatch ONE command. Shared by the live `recv` arm and the pre-close drain.
-    /// Returns true when an active run ended without a durable terminal and this actor generation
-    /// must exit so the next generation recovers from the WAL before serving more work.
+    fn discard_stale_admission_view(&mut self) {
+        if self.prior_snapshot.as_ref().is_some_and(|snapshot| {
+            self.writer.as_ref().is_none_or(|writer| {
+                writer.next_record_seq() != snapshot.head_seq.saturating_add(1)
+            })
+        }) {
+            self.prior_snapshot = None;
+        }
+    }
+
+    /// Dispatch one command through the live receive arm or the pre-close drain.
+    /// Return true when an undurable run exit requires a new actor generation to recover the WAL.
     async fn handle_cmd(&mut self, cmd: LineageCmd) -> bool {
+        // Idle commands and delegated warm/recovery work can advance the writer without
+        // starting an episode. Keep a cached admission view only while its head still matches.
+        self.discard_stale_admission_view();
+        let exit = self.handle_cmd_inner(cmd).await;
+        self.discard_stale_admission_view();
+        exit
+    }
+
+    async fn handle_cmd_inner(&mut self, cmd: LineageCmd) -> bool {
         if let LineageCmd::CutLock { reply, mode } = cmd {
             let busy = if matches!(self.state, RunState::Active { .. }) {
                 Some("run_active".into())
@@ -2482,6 +2500,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 } else {
                     Ok(false)
                 };
+                // Applying or refusing a view can append a notice too. The next send must
+                // not depend on a separate queue-wake command to observe those durable records.
+                self.discard_stale_admission_view();
                 // An applied compaction view is a real frozen-prefix rebuild for a pending
                 // `on_prefix_rebuild` change: the next run applies it. A new run alone is not.
                 if matches!(result, Ok(true)) {
@@ -4784,6 +4805,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
             request_identity_digest: request_identity_digest.clone(),
             tools_were_omitted,
         };
+        // A command can queue/cancel work and start its successor in the same actor turn.
+        self.discard_stale_admission_view();
         if self.prior_snapshot.is_none() {
             if let Err(error) = self.refresh_admission_view().await {
                 return Err(StartRunFailure::Infrastructure(error));

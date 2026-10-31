@@ -553,6 +553,26 @@ impl RunExecutor for CoreExec {
             None
         }
     }
+
+    async fn apply_idle_compaction(
+        &self,
+        session: &broca_protocol::BindIdentity,
+        writer: &broca_core::WalHandle,
+        records: Vec<broca_wal::WalRecord>,
+        ready: &broca_core::compaction_provider::notice::ViewReady,
+    ) -> Result<bool, String> {
+        broca_module_serve::compaction_bus::apply_idle(
+            session,
+            writer,
+            &records,
+            ready,
+            &self
+                .compaction_plane()
+                .ok_or("compaction provider unavailable")?,
+            None,
+        )
+        .await
+    }
     fn hook_plane(&self) -> Option<Arc<dyn broca_core::HookPlane>> {
         self.hook_plane.lock().unwrap().clone()
     }
