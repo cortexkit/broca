@@ -32,8 +32,8 @@ pub const DEFAULT_MAX_READ_BYTES: u64 = 1024 * 1024 * 1024;
 static RECOVERY_TAIL_TRUNCATIONS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// File-synced overhaul truncations in this process; marker publication can
-/// still fail afterward and be completed from the durable manifest on retry.
+/// File-synced version 4 (overhaul) truncations in this process. Ordinary final tails have
+/// no marker; a real cut can still need marker completion from its manifest.
 pub fn recovery_tail_truncations() -> u64 {
     RECOVERY_TAIL_TRUNCATIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -1096,41 +1096,49 @@ impl FileWal {
             .as_ref()
             .map_or(WalConfig::LEGACY, |(config, _)| *config);
         let recovered = access_counter::writer_open(&path, true, || {
-            crate::recovery::before_open_with_hooks(
+            let initial = scan_writer_open(&path, max_read_bytes, boot_config.is_overhaul());
+            if matches!(&initial, Err(error) if !matches!(error,
+                WalError::Corrupt { .. } | WalError::SequenceGap { .. } | WalError::NonMonotonic { .. }))
+            {
+                return initial;
+            }
+            let inspection = match &initial {
+                Ok(open) => crate::recovery::OpenInspection {
+                    file_len: open.file_len,
+                    valid_end: Some(open.scan.valid_end),
+                    lineage: open.scan.lineage_id,
+                    legacy_records: open.scan.legacy_records,
+                    missing: open.missing,
+                },
+                Err(_) => crate::recovery::OpenInspection {
+                    file_len: 0,
+                    valid_end: None,
+                    lineage: None,
+                    legacy_records: false,
+                    missing: false,
+                },
+            };
+            let changed = crate::recovery::before_open_with_hooks(
                 &path,
                 recovery.as_ref().map(|r| r.0),
                 recovery.as_ref().map(|r| r.1.as_path()),
                 &session_ref,
                 max_read_bytes,
                 hooks.as_deref(),
+                Some(&inspection),
             )?;
-            match File::open(&path) {
-                Ok(file) => {
-                    let size = file.metadata().map_err(WalError::Io)?.len();
-                    if size > max_read_bytes {
-                        return Err(WalError::TooLarge {
-                            max_bytes: max_read_bytes,
-                            file_size: size,
-                        });
-                    }
-                    scan_prefix(
-                        std::io::BufReader::new(file),
-                        max_read_bytes,
-                        |_| None::<()>,
-                    )
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    scan_prefix(std::io::empty(), max_read_bytes, |_| None::<()>)
-                }
-                Err(error) => Err(WalError::Io(error)),
+            if changed {
+                scan_writer_open(&path, max_read_bytes, boot_config.is_overhaul())
+            } else {
+                initial
             }
         })?;
-        let valid_end = recovered.valid_end;
-        let recovered_lineage_id = recovered.lineage_id;
+        let valid_end = recovered.scan.valid_end;
+        let recovered_lineage_id = recovered.scan.lineage_id;
         // Seq is 1-BASED: the first record is seq 1, so a watermark of 0
         // unambiguously means "nothing projected yet" and `tail_after_seq(0)`
         // includes the first record (the cold-start merge case).
-        let next_seq = recovered.last_seq.map(|seq| seq + 1).unwrap_or(1);
+        let next_seq = recovered.scan.last_seq.map(|seq| seq + 1).unwrap_or(1);
         // If the file is longer than the last valid record, a torn tail exists — truncate it
         // so the file ends exactly at the last valid record, BEFORE opening the append
         // handle. The truncation uses a dedicated WRITE handle: an append-mode handle
@@ -1147,6 +1155,16 @@ impl FileWal {
                     .map_err(WalError::Io)?;
                 trunc.set_len(valid_end).map_err(WalError::Io)?;
                 trunc.sync_all().map_err(WalError::Io)?; // durable before appending after it
+                if boot_config.is_overhaul() {
+                    recovery_truncated();
+                }
+            }
+        }
+        // Projection repair must read the final durable file, after either a real
+        // cut or silent ordinary-tail trimming, before any writable handle escapes.
+        if !recovered.cut_ids.is_empty() {
+            if let Some(hooks) = &hooks {
+                hooks.after_repair(&path, &recovered.cut_ids)?;
             }
         }
         let mut create_opts = OpenOptions::new();
@@ -2063,6 +2081,52 @@ struct PrefixScan<T> {
     valid_end: u64,
     last_seq: Option<u64>,
     lineage_id: Option<WalLineageId>,
+    legacy_records: bool,
+}
+
+struct WriterOpenScan {
+    scan: PrefixScan<()>,
+    file_len: u64,
+    missing: bool,
+    cut_ids: std::collections::BTreeSet<String>,
+}
+
+fn scan_writer_open(path: &Path, cap: u64, overhaul: bool) -> Result<WriterOpenScan, WalError> {
+    let mut cut_ids = std::collections::BTreeSet::new();
+    let mut observe = |frame: &FramedRecord| {
+        if overhaul {
+            if let WalRecord::RecoveryCut { recovery } = &frame.record {
+                cut_ids.insert(recovery.cut_id.clone());
+            }
+        }
+        None::<()>
+    };
+    let (scan, file_len, missing) = match File::open(path) {
+        Ok(file) => {
+            let file_len = file.metadata().map_err(WalError::Io)?.len();
+            if file_len > cap {
+                return Err(WalError::TooLarge {
+                    max_bytes: cap,
+                    file_size: file_len,
+                });
+            }
+            (
+                scan_prefix(std::io::BufReader::new(file), cap, &mut observe)?,
+                file_len,
+                false,
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            (scan_prefix(std::io::empty(), cap, &mut observe)?, 0, true)
+        }
+        Err(error) => return Err(WalError::Io(error)),
+    };
+    Ok(WriterOpenScan {
+        scan,
+        file_len,
+        missing,
+        cut_ids,
+    })
 }
 
 fn read_up_to(file: &mut impl Read, bytes: &mut [u8]) -> Result<usize, WalError> {
@@ -2092,6 +2156,7 @@ fn scan_prefix<T>(
         valid_end: 0,
         last_seq: None,
         lineage_id: None,
+        legacy_records: false,
     };
     loop {
         let offset = scan.valid_end;
@@ -2143,6 +2208,7 @@ fn scan_prefix<T>(
         }
         match decode_next_counted(&frame) {
             DecodeStep::Record { framed, consumed } => {
+                scan.legacy_records |= frame[4] != crate::framing::V4_FRAMING_VERSION;
                 validate_contiguous_sequence(scan.last_seq, 1, framed.seq)?;
                 scan.last_seq = Some(framed.seq);
                 scan.valid_end += consumed as u64;

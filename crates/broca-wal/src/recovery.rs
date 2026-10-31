@@ -118,6 +118,28 @@ pub struct RecoveryMarker {
 }
 
 impl RecoveryMarker {
+    fn lineage(&self) -> Option<framing::WalLineageId> {
+        let mut bytes = self.bytes.as_slice();
+        let mut owner = None;
+        while !bytes.is_empty() {
+            let consumed = match framing::decode_next(bytes) {
+                DecodeStep::Lineage {
+                    lineage_id,
+                    consumed,
+                } => {
+                    if owner.is_some_and(|first| first != lineage_id) {
+                        return None;
+                    }
+                    owner = Some(lineage_id);
+                    consumed
+                }
+                DecodeStep::Record { consumed, .. } => consumed,
+                _ => return None,
+            };
+            bytes = &bytes[consumed..];
+        }
+        owner
+    }
     fn matches_prefix(&self, bytes: &[u8]) -> bool {
         let Ok(offset) = usize::try_from(self.offset) else {
             return false;
@@ -166,6 +188,7 @@ impl RecoveryMarker {
 pub struct CutManifest {
     pub version: u32,
     pub session: String,
+    pub lineage_id: [u8; 16],
     pub prefix_sha256: String,
     pub recovery: RecoveryCut,
     pub marker: RecoveryMarker,
@@ -177,6 +200,7 @@ impl CutManifest {
         serde_json::to_vec(&(
             self.version,
             &self.session,
+            &self.lineage_id,
             &self.prefix_sha256,
             &self.recovery,
             &self.marker,
@@ -187,6 +211,10 @@ impl CutManifest {
 
     pub fn integrity_valid(&self) -> bool {
         self.version == 1
+            && self
+                .marker
+                .lineage()
+                .is_some_and(|lineage| lineage.as_bytes() == self.lineage_id)
             && self.marker.offset == self.recovery.cut_offset
             && self.marker.prefix_sha256 == self.prefix_sha256
             && self
@@ -491,7 +519,7 @@ struct Prefix {
     damaged: bool,
 }
 
-fn prefix(bytes: &[u8]) -> Result<Prefix, WalError> {
+fn prefix(bytes: &[u8], require_v4: bool) -> Result<Prefix, WalError> {
     let mut scan = Prefix {
         end: 0,
         seq: 0,
@@ -502,7 +530,7 @@ fn prefix(bytes: &[u8]) -> Result<Prefix, WalError> {
     while scan.end < bytes.len() {
         match framing::decode_next(&bytes[scan.end..]) {
             DecodeStep::Record { framed, consumed } => {
-                if bytes[scan.end + 4] != framing::V4_FRAMING_VERSION {
+                if require_v4 && bytes[scan.end + 4] != framing::V4_FRAMING_VERSION {
                     return Err(WalError::FrameFormat {
                         log: crate::WalFormat::Overhaul,
                         offered: crate::WalFormat::Legacy,
@@ -558,10 +586,11 @@ fn prefix(bytes: &[u8]) -> Result<Prefix, WalError> {
     Ok(scan)
 }
 
-fn inspect_removed(bytes: &[u8], scan: &mut Prefix) -> Result<(), WalError> {
+fn inspect_removed(bytes: &[u8], scan: &mut Prefix) -> Result<bool, WalError> {
     scan.calls.freeze_planned();
     let mut lineage = scan.lineage;
     let mut offset = 0;
+    let mut undecodable = false;
     while offset < bytes.len() {
         match framing::decode_next(&bytes[offset..]) {
             DecodeStep::Record { framed, consumed } => {
@@ -603,6 +632,7 @@ fn inspect_removed(bytes: &[u8], scan: &mut Prefix) -> Result<(), WalError> {
                 })
             }
             _ => {
+                undecodable = true;
                 // Salvage only a v4 envelope's complete JSON payload, never
                 // arbitrary nested JSON in arguments or assistant content.
                 let tail = &bytes[offset..];
@@ -633,7 +663,7 @@ fn inspect_removed(bytes: &[u8], scan: &mut Prefix) -> Result<(), WalError> {
             }
         }
     }
-    Ok(())
+    Ok(undecodable)
 }
 
 fn read_capped(path: &Path, cap: u64) -> Result<Vec<u8>, WalError> {
@@ -742,7 +772,7 @@ fn suffixed(path: &Path, suffix: &str) -> PathBuf {
     value.into()
 }
 
-fn next_sidecar(log: &Path) -> Result<PathBuf, WalError> {
+fn next_sidecar(log: &Path, lineage: framing::WalLineageId) -> Result<PathBuf, WalError> {
     if log.file_name().and_then(|name| name.to_str()).is_none() {
         return Err(WalError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -751,7 +781,7 @@ fn next_sidecar(log: &Path) -> Result<PathBuf, WalError> {
     }
     let mut stamp = now_ms();
     loop {
-        let path = suffixed(log, &format!(".cut-{stamp}"));
+        let path = suffixed(log, &format!(".cut-{lineage}-{stamp}"));
         if !fs_ops::try_exists(&path).map_err(WalError::Io)?
             && !fs_ops::try_exists(&suffixed(&path, ".tmp")).map_err(WalError::Io)?
             && !fs_ops::try_exists(&suffixed(&path, ".json")).map_err(WalError::Io)?
@@ -776,21 +806,49 @@ fn read_head(log: &Path) -> Option<crate::head_proof::HeadProof> {
     crate::head_proof::HeadProof::decode(&bytes)
 }
 
+fn proven_head(
+    log: &Path,
+    bytes: &[u8],
+    lineage: Option<framing::WalLineageId>,
+) -> Option<crate::head_proof::HeadProof> {
+    let proof = read_head(log)?;
+    if proof.durable_end > bytes.len() as u64
+        || !lineage.is_some_and(|id| id.as_bytes() == proof.lineage_id)
+    {
+        return None;
+    }
+    match crate::head_proof::PublishedLog::open(bytes, &proof.encode()) {
+        Ok(Some(_)) => Some(proof),
+        Err(broca_wal_reader::proof::ProofError::Header { .. }) => Some(proof),
+        Err(broca_wal_reader::proof::ProofError::CorruptPrefix {
+            reason: "noncontiguous record sequence" | "corrupt or conflicting lineage metadata",
+            ..
+        }) => Some(proof),
+        _ => None,
+    }
+}
+
+/// Summary of the normal streaming scan. A decode refusal leaves no valid end
+/// and enters the exceptional recovery path; a clean file reuses that scan.
+pub(crate) struct OpenInspection {
+    pub file_len: u64,
+    pub valid_end: Option<u64>,
+    pub lineage: Option<framing::WalLineageId>,
+    pub legacy_records: bool,
+    pub missing: bool,
+}
+
 fn prepare_marker(
     prefix: &[u8],
     mut seq: u64,
-    lineage: Option<framing::WalLineageId>,
+    lineage: framing::WalLineageId,
+    initial_lineage: bool,
     cuts: &[RecoveryCut],
 ) -> Result<RecoveryMarker, WalError> {
     let mut bytes = Vec::new();
-    let lineage = match lineage {
-        Some(lineage) => lineage,
-        None => {
-            let lineage = crate::file_wal::mint_lineage_id()?;
-            bytes.extend_from_slice(&framing::encode_lineage(lineage));
-            lineage
-        }
-    };
+    if initial_lineage {
+        bytes.extend_from_slice(&framing::encode_lineage(lineage));
+    }
     let mut writer_id = [0; 16];
     getrandom::fill(&mut writer_id)
         .map_err(|e| WalError::Io(std::io::Error::other(e.to_string())))?;
@@ -829,7 +887,7 @@ pub(crate) fn before_open(
     session: &str,
     cap: u64,
 ) -> Result<(), WalError> {
-    before_open_with_hooks(log, config, floor, session, cap, None)
+    before_open_with_hooks(log, config, floor, session, cap, None, None).map(|_| ())
 }
 
 pub(crate) fn before_open_with_hooks(
@@ -839,24 +897,87 @@ pub(crate) fn before_open_with_hooks(
     session: &str,
     cap: u64,
     hooks: Option<&dyn RecoveryHooks>,
-) -> Result<(), WalError> {
+    inspection: Option<&OpenInspection>,
+) -> Result<bool, WalError> {
     let overhaul = config.is_some_and(|config| config.is_overhaul());
     if !overhaul {
-        return Ok(());
+        return Ok(false);
+    }
+    let refuse = config.is_some_and(|config| config.recovery == RecoveryPolicy::Refuse);
+    let mut stored_manifests = manifests(log, cap)?;
+    if inspection.is_some_and(|inspection| inspection.missing) && !stored_manifests.is_empty() {
+        return Err(WalError::Io(std::io::Error::other(format!(
+            "cannot bind recovery manifests for missing WAL {} to a lineage",
+            log.display()
+        ))));
+    }
+    if let Some(lineage) = inspection.and_then(|inspection| inspection.lineage) {
+        stored_manifests.retain(|manifest| manifest.lineage_id == lineage.as_bytes());
+    }
+    if stored_manifests.is_empty() {
+        if refuse {
+            if inspection.is_none() {
+                let bytes = match read_capped(log, cap) {
+                    Ok(bytes) => bytes,
+                    Err(WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Vec::new()
+                    }
+                    Err(error) => return Err(error),
+                };
+                crate::file_wal::recover_prefix(&bytes, 0, None, None)?;
+            }
+            return Ok(false);
+        }
+        if let Some(inspection) = inspection {
+            if inspection.legacy_records {
+                return Err(WalError::FrameFormat {
+                    log: crate::WalFormat::Overhaul,
+                    offered: crate::WalFormat::Legacy,
+                });
+            }
+            if inspection.valid_end == Some(inspection.file_len) {
+                return Ok(false);
+            }
+            if let Some(end) = inspection.valid_end {
+                if inspection.lineage.is_none()
+                    && read_head(log).is_some_and(|proof| {
+                        proof.durable_end <= inspection.file_len && proof.durable_end > end
+                    })
+                {
+                    return Err(WalError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                        format!("WAL {} has a head proof covering an unreadable lineage; refusing ambiguous tail loss", log.display()))));
+                }
+                let protected = read_head(log).is_some_and(|proof| {
+                    proof.durable_end <= inspection.file_len
+                        && proof.durable_end > end
+                        && inspection
+                            .lineage
+                            .is_some_and(|id| id.as_bytes() == proof.lineage_id)
+                });
+                if !protected {
+                    return Ok(false);
+                }
+            }
+        }
     }
     let (bytes, missing) = match read_capped(log, cap) {
         Ok(bytes) => (bytes, false),
         Err(WalError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), true),
         Err(e) => return Err(e),
     };
-    let mut scan = prefix(&bytes)?;
+    if missing && !stored_manifests.is_empty() {
+        return Err(WalError::Io(std::io::Error::other(format!(
+            "cannot bind recovery manifests for missing WAL {} to a lineage",
+            log.display()
+        ))));
+    }
+    let mut scan = prefix(&bytes, !refuse)?;
     let session_name = if session.is_empty() {
         log.display().to_string()
     } else {
         session.to_owned()
     };
     let mut pending = Vec::new();
-    let stored_manifests = manifests(log, cap)?;
     let has_manifests = !stored_manifests.is_empty();
     let mut retry_candidates = Vec::new();
     for manifest in &stored_manifests {
@@ -867,7 +988,15 @@ pub(crate) fn before_open_with_hooks(
             && digest(&bytes[..scan.end]) == manifest.prefix_sha256
             && manifest.recovery.removed_len == (bytes.len() - scan.end) as u64
             && manifest.recovery.removed_sha256 == digest(&bytes[scan.end..]);
-        if manifest.marker.matches_prefix(&bytes) || (scan.damaged && original_tail) {
+        let marker_tail = manifest.marker.matches_prefix(&bytes);
+        let same_lineage = scan
+            .lineage
+            .is_some_and(|id| id.as_bytes() == manifest.lineage_id);
+        let bound = same_lineage || (scan.lineage.is_none() && (marker_tail || original_tail));
+        if !bound {
+            continue;
+        }
+        if marker_tail || (scan.damaged && original_tail) {
             retry_candidates.push(manifest.marker.clone());
         }
         if scan.calls.cut_ids.contains(&manifest.recovery.cut_id) {
@@ -877,11 +1006,7 @@ pub(crate) fn before_open_with_hooks(
         // immutable manifest still attributes those calls to this session. It
         // restores facts only; truncation always follows the current scan, not
         // an older manifest's offset.
-        if manifest.session == session_name
-            || (end <= scan.end && digest(&bytes[..end]) == manifest.prefix_sha256)
-        {
-            pending.push(manifest.recovery.clone());
-        }
+        pending.push(manifest.recovery.clone());
     }
     // A later repair can re-assert an earlier cut. Its marker must cover every
     // pending cut; filenames and wall-clock timestamps are not ordering authority.
@@ -918,12 +1043,26 @@ pub(crate) fn before_open_with_hooks(
                 .sync_all()
                 .map_err(WalError::Io)?;
         }
-        if !scan.calls.cut_ids.is_empty() {
-            if let Some(hooks) = hooks {
-                hooks.after_repair(log, &scan.calls.cut_ids)?;
+        return Ok(false);
+    }
+    if retry.is_none() && pending.is_empty() {
+        if let Ok(baseline) = crate::file_wal::recover_prefix(&bytes, 0, None, None) {
+            if scan.lineage.is_none()
+                && read_head(log).is_some_and(|proof| {
+                    proof.durable_end <= bytes.len() as u64
+                        && proof.durable_end > baseline.valid_end
+                })
+            {
+                return Err(WalError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                    format!("WAL {} has a head proof covering an unreadable lineage; refusing ambiguous tail loss", log.display()))));
+            }
+            if baseline.valid_end < bytes.len() as u64
+                && !proven_head(log, &bytes, scan.lineage)
+                    .is_some_and(|proof| proof.durable_end > baseline.valid_end)
+            {
+                return Ok(false);
             }
         }
-        return Ok(());
     }
     if config.unwrap_or(crate::WalConfig::OVERHAUL).recovery == RecoveryPolicy::Refuse
         && retry.is_none()
@@ -932,7 +1071,7 @@ pub(crate) fn before_open_with_hooks(
         // Refuse never invents a recovery cut for newly discovered damage.
         crate::file_wal::recover_prefix(&bytes, 0, None, None)?;
         if pending.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         return Err(WalError::Io(std::io::Error::other(format!(
             "wal_recovery=refuse: WAL {} no longer matches its pending recovery marker prefix",
@@ -951,11 +1090,11 @@ pub(crate) fn before_open_with_hooks(
     let marker = if let Some(marker) = retry {
         // A partial marker may contain complete earlier records in the same
         // recovery batch. Rewind the batch, not just the first undecodable byte.
-        scan = prefix(&bytes[..marker.offset as usize])?;
+        scan = prefix(&bytes[..marker.offset as usize], !refuse)?;
         marker
     } else {
         let active_run = scan.calls.active.clone();
-        inspect_removed(&bytes[scan.end..], &mut scan)?;
+        let unattributed_tool_risk = inspect_removed(&bytes[scan.end..], &mut scan)?;
         for prior in &pending {
             for run in &prior.runs {
                 scan.calls.merge_run(run);
@@ -964,7 +1103,7 @@ pub(crate) fn before_open_with_hooks(
                 scan.calls.remember_unowned(call.clone());
             }
         }
-        let proof = read_head(log);
+        let proof = proven_head(log, &bytes, scan.lineage);
         let reason = match proof {
             Some(proof)
                 if proof.durable_end <= bytes.len() as u64
@@ -980,12 +1119,26 @@ pub(crate) fn before_open_with_hooks(
             }
             _ => CutReason::UnprovenCorruption,
         };
-        let raw = next_sidecar(log)?;
+        let lineage = match scan.lineage {
+            Some(lineage) => lineage,
+            None => crate::file_wal::mint_lineage_id()?,
+        };
+        let raw = next_sidecar(log, lineage)?;
         let suffix = &bytes[scan.end..];
         let removed_sha256 = digest(suffix);
+        let prefix_sha256 = digest(&bytes[..scan.end]);
         let sidecar_basename = raw.file_name().unwrap().to_string_lossy().into_owned();
         let cut = RecoveryCut {
-            cut_id: digest(format!("{sidecar_basename}:{}:{removed_sha256}", scan.end).as_bytes()),
+            // Invalidation can survive a crash before manifest publication. The
+            // same WAL image must reproduce that fence ID, regardless of clocks
+            // or the new raw-backup filename selected by its retry.
+            cut_id: digest(
+                format!(
+                    "{session_name}:{}:{prefix_sha256}:{removed_sha256}",
+                    scan.end
+                )
+                .as_bytes(),
+            ),
             sidecar_basename,
             cut_offset: scan.end as u64,
             removed_len: suffix.len() as u64,
@@ -994,15 +1147,27 @@ pub(crate) fn before_open_with_hooks(
             active_run,
             runs: std::mem::take(&mut scan.calls.runs),
             unowned_calls: std::mem::take(&mut scan.calls.unowned),
-            unattributed_tool_risk: true,
+            unattributed_tool_risk,
         };
         atomic_file(&raw, suffix)?;
         pending.push(cut.clone());
-        let marker = prepare_marker(&bytes[..scan.end], scan.seq, scan.lineage, &pending)?;
+        let marker = prepare_marker(
+            &bytes[..scan.end],
+            scan.seq,
+            lineage,
+            scan.lineage.is_none(),
+            &pending,
+        )?;
+        if let Some(hooks) = hooks {
+            for cut in marker.cuts()? {
+                hooks.before_cut(&cut)?;
+            }
+        }
         let mut manifest = CutManifest {
             version: 1,
             session: session_name.clone(),
-            prefix_sha256: digest(&bytes[..scan.end]),
+            lineage_id: lineage.as_bytes(),
+            prefix_sha256,
             recovery: cut.clone(),
             marker: marker.clone(),
             checksum: String::new(),
@@ -1014,9 +1179,19 @@ pub(crate) fn before_open_with_hooks(
         marker
     };
     let pending = marker.cuts()?;
-    if let Some(hooks) = hooks {
-        for cut in &pending {
-            hooks.before_cut(cut)?;
+    if completing {
+        if let Some(hooks) = hooks {
+            for cut in &pending {
+                hooks.before_cut(cut)?;
+            }
+        }
+    }
+    if read_head(log).is_some_and(|proof| proof.durable_end > marker.offset) {
+        match fs_ops::remove_file(crate::head_proof::sidecar_path(log)) {
+            Ok(()) => fs_ops::sync_dir(log.parent().unwrap_or_else(|| Path::new(".")))
+                .map_err(WalError::Io)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(WalError::Io(error)),
         }
     }
     let mut file = OpenOptions::new()
@@ -1044,10 +1219,7 @@ pub(crate) fn before_open_with_hooks(
             "WAL recovery preserved a removed suffix and recorded indeterminate-call evidence");
         scan.calls.cut_ids.insert(cut.cut_id.clone());
     }
-    if let Some(hooks) = hooks {
-        hooks.after_repair(log, &scan.calls.cut_ids)?;
-    }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -1055,7 +1227,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recovery_retains_manifest_tombstones_when_the_log_itself_is_missing() {
+    fn recovery_cannot_bind_old_tombstones_to_a_missing_or_fresh_lineage() {
         let root = broca_test_support::scratch_root().join(format!(
             "missing-recovery-log-{}-{}",
             std::process::id(),
@@ -1118,6 +1290,16 @@ mod tests {
         refuse.recovery = RecoveryPolicy::Refuse;
         assert!(before_open(&log, Some(refuse), Some(&floor), "session", 1_000_000).is_err());
         assert!(!log.exists());
+        assert!(before_open(
+            &log,
+            Some(crate::WalConfig::OVERHAUL),
+            Some(&floor),
+            "session",
+            1_000_000,
+        )
+        .is_err());
+        assert!(!log.exists());
+        drop(crate::FileWal::open(&log).unwrap());
         before_open(
             &log,
             Some(crate::WalConfig::OVERHAUL),
@@ -1127,8 +1309,10 @@ mod tests {
         )
         .unwrap();
         let records = crate::file_wal::replay_file(&log, 1_000_000).unwrap();
-        assert!(records.iter().any(|frame| matches!(&frame.record, WalRecord::RecoveryCut { recovery }
-            if recovery.cut_id == saved[0].recovery.cut_id && recovery.runs == saved[0].recovery.runs)));
+        assert!(
+            records.is_empty(),
+            "a fresh lineage must not inherit removed call identities"
+        );
         assert_eq!(
             std::fs::read(
                 log.parent()

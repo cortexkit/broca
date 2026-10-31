@@ -593,8 +593,29 @@ fn recovery_normal_open_does_not_access_sqlite() {
 #[test]
 fn recovery_restores_surviving_terminal_attribution() {
     let f = Fixture::with_damage(false);
+    let mut wal =
+        FileWal::open_with_recovery(&f.path, WalConfig::OVERHAUL, f.wals.feature_floor_path())
+            .unwrap()
+            .with_feature_floor(f.wals.feature_floor_path());
+    let cut = std::fs::metadata(&f.path).unwrap().len() as usize;
+    let writer_id = wal.writer_id().unwrap();
+    let through = wal.last_seq();
+    wal.append(
+        1,
+        &WalRecord::WriterOpened {
+            writer_id,
+            previous_writer_id: None,
+            recovered_through_seq: through,
+            cause: "reopen".into(),
+        },
+        true,
+    )
+    .unwrap();
+    wal.append(1, &WalRecord::WriterClosed { writer_id }, true)
+        .unwrap();
+    drop(wal);
     let mut bytes = std::fs::read(&f.path).unwrap();
-    bytes.extend_from_slice(&[0; 128]);
+    bytes[cut + 4] = 0;
     std::fs::write(&f.path, bytes).unwrap();
     f.store.conn.lock().unwrap().execute_batch(
         "UPDATE run_index SET state_changed_ms=777,error_class='stale',error_code='stale',pause_reason='stale',interrupt_reason='stale';"
@@ -851,4 +872,150 @@ fn pending_recovery_diagnostics_withhold_only_the_affected_session() {
         .any(|run| run.run_id == "healthy-session-live"));
     assert_eq!(unreadable.pending_recovery.len(), 1);
     assert!(unreadable.pending_recovery[0].evidence_unreadable);
+}
+
+#[test]
+#[ignore = "subprocess entry point exercised by recovery_crash_before_manifest_never_exposes_stale_summaries"]
+fn recovery_before_manifest_child() {
+    struct StopBeforeManifest {
+        store: SqliteStore,
+        session: BindIdentity,
+        root: PathBuf,
+    }
+    impl RecoveryHooks for StopBeforeManifest {
+        fn before_cut(&self, cut: &RecoveryCut) -> Result<(), WalError> {
+            self.store
+                .invalidate_wal_recovery_inner(&self.session, cut)
+                .unwrap();
+            let file = std::fs::File::create(self.root.join("before-manifest.ready")).unwrap();
+            file.sync_all().unwrap();
+            broca_wal::fs_ops::sync_dir(&self.root).unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        fn after_repair(&self, _: &Path, _: &BTreeSet<String>) -> Result<(), WalError> {
+            unreachable!()
+        }
+    }
+    let root = PathBuf::from(
+        std::env::var_os("BROCA_RECOVERY_TEST_CHILD_ROOT").expect("subprocess root required"),
+    );
+    let session: BindIdentity =
+        serde_json::from_str(&std::env::var("BROCA_RECOVERY_TEST_CHILD_SESSION").unwrap()).unwrap();
+    let leases = broca_core::FileLeaseStore::new(root.join("leases"));
+    let _lease =
+        broca_core::LeaseStore::acquire(&leases, &broca_core::lease_key_for(&session)).unwrap();
+    let wals = FileWalStore::with_config(root.join("wal"), WalConfig::OVERHAUL);
+    let store = SqliteStore::open(root.join("store.db"))
+        .unwrap()
+        .with_wal_config(WalConfig::OVERHAUL);
+    let _ = FileWal::open_with_manifest_and_recovery_hooks(
+        wals.wal_path(&session),
+        wals.manifest_path(),
+        session_addr(&session),
+        String::new(),
+        broca_core::wal_writer::agent_session_ref(&session),
+        (WalConfig::OVERHAUL, wals.feature_floor_path()),
+        Arc::new(StopBeforeManifest {
+            store,
+            session,
+            root,
+        }),
+    );
+    panic!("recovery must stop at its invalidation barrier");
+}
+
+#[test]
+fn recovery_crash_before_manifest_never_exposes_stale_summaries() {
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut f = Fixture::new();
+    f.wals = FileWalStore::with_config(f.root.join("wal"), WalConfig::OVERHAUL);
+    f.store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let output = std::fs::File::create(f.root.join("recovery-child.log")).unwrap();
+    let mut child = Child(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "wal_recovery::tests::recovery_before_manifest_child",
+                "--nocapture",
+            ])
+            .env("BROCA_RECOVERY_TEST_CHILD_ROOT", &f.root)
+            .env(
+                "BROCA_RECOVERY_TEST_CHILD_SESSION",
+                serde_json::to_string(&f.session).unwrap(),
+            )
+            .stdout(output.try_clone().unwrap())
+            .stderr(output)
+            .spawn()
+            .unwrap(),
+    );
+    broca_test_support::wait_until_sync("durable invalidation before manifest", || {
+        if f.root.join("before-manifest.ready").exists() {
+            return Ok(());
+        }
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "recovery child stopped early: {}",
+            std::fs::read_to_string(f.root.join("recovery-child.log")).unwrap()
+        );
+        Err("child has not reached its invalidation barrier".into())
+    });
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    f.store = Arc::new(
+        SqliteStore::open(f.root.join("store.db"))
+            .unwrap()
+            .with_wal_config(WalConfig::OVERHAUL),
+    );
+    assert!(
+        broca_wal::recovery::manifests(&f.path, 1_000_000)
+            .unwrap()
+            .is_empty(),
+        "the durable pending fence must precede manifest publication"
+    );
+    assert!(f.store.lookup_run("r").is_err());
+    assert_eq!(
+        f.store
+            .diagnostic_evidence(0, i64::MAX)
+            .unwrap()
+            .pending_recovery
+            .len(),
+        1
+    );
+    assert_eq!(std::fs::read(&f.path).unwrap(), f.damaged);
+    let prepared = {
+        let mut conn = f.store.conn.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        read_fence(&tx, &SqliteStore::key(&f.session))
+            .unwrap()
+            .unwrap()
+            .cut_ids
+    };
+    f.wals
+        .bind_recovery_projection(Some(&f.session), f.store.clone());
+    let leases = broca_core::FileLeaseStore::new(f.root.join("leases"));
+    let _lease =
+        broca_core::LeaseStore::acquire(&leases, &broca_core::lease_key_for(&f.session)).unwrap();
+    f.recover().unwrap();
+    f.assert_rebuilt();
+    let records = f.wals.read_records(&f.session).unwrap();
+    let committed: Vec<_> = records
+        .iter()
+        .filter_map(|frame| match &frame.record {
+            WalRecord::RecoveryCut { recovery } => Some(recovery.cut_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        committed, prepared,
+        "retry must reproduce the pre-manifest recovery identity"
+    );
 }

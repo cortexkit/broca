@@ -674,3 +674,81 @@ async fn a_new_run_reuses_removed_sequences_without_reusing_physical_call_keys()
     assert!(ordinary_key.is_ascii() && ordinary_key.len() < 256);
     rig.finish().await;
 }
+
+#[tokio::test]
+async fn a_readable_cut_model_step_interrupts_without_requesting_the_model_again() {
+    let mut rig = Rig::file_backed("pass");
+    let source = rig.root.join("readable-step/wal");
+    replace_writer(&mut rig, &source).await;
+    next_turn(&rig, "readable-step-run").await;
+    let mut bytes = std::fs::read(rig.tools.store.wal_path(&rig.bind)).unwrap();
+    let mut offset = 0;
+    loop {
+        match framing::decode_next(&bytes[offset..]) {
+            framing::DecodeStep::Lineage { consumed, .. } => offset += consumed,
+            framing::DecodeStep::Record { framed, consumed } => {
+                if matches!(framed.record, WalRecord::ModelStepFinished { .. }) {
+                    let header = framing::v4::decode_header(&bytes[offset..])
+                        .unwrap()
+                        .unwrap();
+                    let mut metadata = header.metadata;
+                    metadata.seq += 1;
+                    let requires = header
+                        .requires
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>();
+                    let changed = framing::encode_v4(metadata, &requires, &framed.record).unwrap();
+                    assert_eq!(changed.len(), consumed);
+                    bytes[offset..offset + consumed].copy_from_slice(&changed);
+                    break;
+                }
+                offset += consumed;
+            }
+            _ => panic!("source must decode before the model step"),
+        }
+    }
+    let repaired = rig.root.join("readable-step-repaired/wal");
+    let path = store(&repaired).wal_path(&rig.bind);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, bytes).unwrap();
+    replace_writer(&mut rig, &repaired).await;
+    let cuts = broca_wal::recovery::manifests(&path, 1_000_000).unwrap();
+    assert_eq!(cuts.len(), 1);
+    assert!(!cuts[0].recovery.unattributed_tool_risk);
+    assert!(
+        cuts[0].recovery.runs.is_empty(),
+        "the regression must not rely on a tool-call tombstone"
+    );
+    let mut request = hook_tests::request();
+    request.session = rig.bind.clone();
+    request.run_id = RunId("readable-step-run".into());
+    request.on_restart = Some(broca_protocol::request::OnRestart::Resume);
+    let provider = crate::StubProvider::new(vec![]);
+    let (out, _rx) = mpsc::channel(1000);
+    let summary = tokio::time::timeout(
+        HANG_GUARD,
+        run_loop_on_writer(
+            request,
+            &rig.writer,
+            StartMode::FreshOrResume,
+            &provider,
+            &rig.tools,
+            &crate::AllowAll,
+            &rig.tools.store,
+            None,
+            rig.control.clone(),
+            &out,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(summary.reason, RunFinishReason::Interrupted);
+    assert!(
+        provider.calls().is_empty(),
+        "a cut answer must not be silently requested again"
+    );
+    assert!(rig.tools.sent.lock().unwrap().is_empty());
+    rig.finish().await;
+}

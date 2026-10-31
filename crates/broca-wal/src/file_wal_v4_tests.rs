@@ -451,6 +451,10 @@ fn every_crash_cut_of_a_version_4_log_recovers_its_complete_prefix() {
             .iter()
             .filter(|f| matches!(f.record, WalRecord::RecoveryCut { .. }))
             .count();
+        assert_eq!(
+            repairs, 0,
+            "an ordinary byte cut at {cut} is not a recovery cut"
+        );
         assert_eq!(wal.last_seq(), (survivors + repairs) as u64, "cut at {cut}");
         assert!(len >= valid_end as u64);
         assert!(std::fs::read(wal.log_path().unwrap())
@@ -517,7 +521,13 @@ fn a_damaged_header_crc_is_preserved_even_when_intact_records_follow() {
         assert!(std::fs::read(wal.log_path().unwrap())
             .unwrap()
             .starts_with(&bytes[..retained]));
-        if cut > retained {
+        let mut frame_start = 0;
+        let intact_later = ends.iter().any(|(end, record)| {
+            let follows = *record && frame_start > damaged && *end <= cut;
+            frame_start = *end;
+            follows
+        });
+        if intact_later {
             let manifests =
                 crate::recovery::manifests(wal.log_path().unwrap(), DEFAULT_MAX_READ_BYTES)
                     .unwrap();
@@ -532,6 +542,16 @@ fn a_damaged_header_crc_is_preserved_even_when_intact_records_follow() {
                 std::fs::read(raw).unwrap(),
                 bytes[retained..cut],
                 "cut at {cut}"
+            );
+        } else {
+            assert!(
+                crate::recovery::manifests(wal.log_path().unwrap(), DEFAULT_MAX_READ_BYTES)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                std::fs::read(wal.log_path().unwrap()).unwrap(),
+                bytes[..retained]
             );
         }
     }

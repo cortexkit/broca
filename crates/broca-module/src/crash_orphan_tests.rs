@@ -647,12 +647,32 @@ async fn crash_orphan_seal_pairs_an_indeterminate_call_with_outcome_unknown_befo
 
 #[tokio::test]
 async fn crash_orphan_seal_keeps_a_recovery_tombstone_unknown_when_its_intent_was_cut() {
+    check_recovery_seal(false).await;
+}
+
+#[tokio::test]
+async fn crash_orphan_seal_closes_unknown_when_the_model_step_was_cut() {
+    check_recovery_seal(true).await;
+}
+
+async fn check_recovery_seal(model_step_cut: bool) {
     let f = Fixture::build_with_config(|index| index, None, None, broca_wal::WalConfig::OVERHAUL);
     f.seed(vec![
         run_started(&f.key),
         model_step_with_tool_call(),
         batch_started(),
         dispatch_intent(),
+        WalRecord::ToolResult {
+            finished_at_ms: None,
+            batch_id: BatchId(BATCH.into()),
+            result: Arc::new(broca_core::outcome_unknown_result(&ToolCallId(CALL.into()))),
+            outcome: broca_wal::DispatchOutcome::Unknown,
+            hooks: None,
+            reason: None,
+            withdraw_elicitation: None,
+            provider_held: None,
+            tags: None,
+        },
     ]);
     let path = f.wal_store().wal_path(&f.key);
     let mut bytes = std::fs::read(&path).unwrap();
@@ -660,7 +680,10 @@ async fn crash_orphan_seal_keeps_a_recovery_tombstone_unknown_when_its_intent_wa
     loop {
         match broca_wal::framing::decode_next(&bytes[offset..]) {
             broca_wal::framing::DecodeStep::Record { framed, consumed } => {
-                if matches!(framed.record, WalRecord::ToolDispatchIntent { .. }) {
+                if (model_step_cut && matches!(framed.record, WalRecord::ModelStepFinished { .. }))
+                    || (!model_step_cut
+                        && matches!(framed.record, WalRecord::ToolDispatchIntent { .. }))
+                {
                     bytes[offset + consumed - 1] ^= 1;
                     break;
                 }

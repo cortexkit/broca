@@ -1311,15 +1311,7 @@ mod tests {
                 O,
                 O,
                 O,
-                O, // Read-only version-4 WAL checks before publishing the successor writer.
-                O,
-                O,
-                O,
-                O,
-                O,
-                O,
-                O,
-                O,
+                O, // Streaming WAL checks before publishing the successor writer.
                 S,
                 D,
                 O, // Startup replay on the blocking startup thread is now recorded too.
@@ -1389,7 +1381,7 @@ mod tests {
                 O,
                 Change(vec![RemoveEntry]), // Predecessor marker unlink.
             ],
-            "all 87 reclaim journal operations must complete in order"
+            "all 79 reclaim journal operations must complete in order"
         );
         fs.assert_all_cuts_covered(&states);
         assert!(states

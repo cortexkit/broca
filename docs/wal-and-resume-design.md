@@ -71,12 +71,27 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   to infer recovery policy.
 
   Repair retains every complete, checksum-valid contiguous record before the
-  first damaged or undecodable record. It repairs both unpublished tails and
+  first real corruption boundary. The normal streaming scan decides whether a
+  repair is needed; whole-log buffering and manifest-prefix hashing occur only
+  for damage or existing manifests. An ordinary torn final append with no intact
+  data after it, outside a valid proven prefix, is silently truncated with no cut,
+  tombstones, interruption or warning. The writer syncs each tool-dispatch intent
+  before allowing execution. The power-loss model assumes a successful fsync
+  preserves all preceding writes across the cut, so an incomplete final intent
+  could not have authorized dispatch. Without a usable proof, later corruption
+  of a synced final frame cannot be distinguished from an unacknowledged torn
+  append. The existing final-tail discard rule therefore cannot provide a
+  stronger guarantee against post-sync storage corruption.
+  Real repair handles both unpublished non-tail damage and
   damage within a published prefix. The `.head` proof is evidence for the WARN
   reason (`unpublished_tail`, `published_region_corruption`, or
   `unproven_corruption`), never permission to destroy the only copy of a suffix.
   A proof is only a durability lower bound: fsync acknowledgements can precede
   its unsynced publication. No new proof sync is added to acknowledged batches.
+  A cut that removes bytes covered by an old head claim durably removes that
+  claim before truncation; the next writer republishes its new synced head.
+  An unreadable initial lineage under a covering head claim refuses rather than
+  guessing permission to discard the entire file.
   Intact conflicting lineage or unknown must-understand features still refuse;
   repair must not erase replacement evidence or downgrade a newer writer.
 
@@ -85,8 +100,11 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   rename and directory sync. An immutable `.json` companion records the cut id,
   retained-prefix hash, raw suffix hash/length, session and call attribution; it
   also binds the exact recovery-marker bytes and their append offset to the
-  retained-prefix hash. The marker evidence is required: an unreadable manifest
-  refuses by name, rather than guessing how a repair should be resumed. The JSON
+  retained-prefix hash and the resulting WAL lineage. Cut filenames include that
+  lineage, and a session name alone never authorizes replay into a fresh log.
+  Missing logs cannot authorize old manifest replay. Recovery refuses writable
+  open and names the manifest path when it cannot read the required marker
+  evidence, rather than guessing how a repair should resume. The JSON
   follows the same durable publication sequence. Both must be durable before
   truncate and file sync. Neither sidecars nor manifests are ever deleted.
   A pending manifest is finished on the next writable open, even when the log
@@ -113,6 +131,10 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   transaction fails, recovery refuses the writable open without shortening the
   log. Both invalidation and completed reprojection enforce and verify SQLite
   `synchronous=FULL` on the actual materialized-store connection before BEGIN.
+  Invalidation commits after raw-byte preservation but before manifest publication,
+  so a durable manifest is never visible ahead of the pending reader fence. Cut
+  identity depends on the logical session and the same prefix/suffix image, not a
+  clock or backup filename; a crash before publication can recreate the fence id.
   Lease-free run lookup reads the fence with its summary and refuses pending
   state. Diagnostics withholds only the affected session's rows before applying
   scan limits and reports a session-named pending or unreadable-evidence warning;
@@ -168,6 +190,9 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   repeats of attributed calls, not external effects whose identifiers were
   destroyed by storage damage. Operators who require refusal rather than this
   lost-attribution exposure set `"wal_recovery": "refuse"`.
+  Fully readable sequence damage does not set that risk flag, but a real cut still
+  interrupts its unfinished active episode: a removed answer is not silently
+  requested from the model again merely because its bytes remain attributable.
   Refuse creates no new cut. New damage uses the original prefix decoder's
   typed errors and final-tail behavior, including discarding an incomplete final
   append that the old decoder accepted. A previously started, manifest-evidenced

@@ -628,14 +628,29 @@ async fn unattributed_recovery_risk_interrupts_only_the_current_run() {
         .find(|record| matches!(record, WalRecord::RunStarted { .. }))
         .unwrap();
     wal.append(1, &start, true).unwrap();
+    wal.append(
+        1,
+        &WalRecord::StepStarted {
+            step_id: broca_protocol::StepId(123),
+        },
+        true,
+    )
+    .unwrap();
+    let mut publisher = broca_wal::head_proof::Publisher::from_synced(
+        broca_wal::head_proof::SyncedPrefix::sync(&wal).unwrap(),
+    )
+    .unwrap();
+    publisher.publish(|| 0).unwrap();
+    let proven_end = broca_wal::head_proof::HeadProof::decode(
+        &std::fs::read(broca_wal::head_proof::sidecar_path(&path)).unwrap(),
+    )
+    .unwrap()
+    .durable_end as usize;
+    drop(publisher);
     drop(wal);
-    use std::io::Write;
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .unwrap()
-        .write_all(b"unattributed undecodable bytes")
-        .unwrap();
+    let mut damaged = std::fs::read(&path).unwrap();
+    damaged[proven_end - 1] ^= 1;
+    std::fs::write(&path, damaged).unwrap();
     let store = FileWalStore::with_config(kill.state_root.join("wal"), WalConfig::OVERHAUL);
     let provider = ScriptedProvider::for_scenario(&handle.scenario);
     let plane = HarnessPlane::for_scenario(&handle.scenario);

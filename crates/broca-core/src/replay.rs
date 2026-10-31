@@ -2905,8 +2905,7 @@ fn replay_seeded_with_compaction<'a>(
                 }
             }
             WalRecord::RecoveryCut { recovery } => {
-                if recovery.unattributed_tool_risk
-                    && recovery.active_run.is_some()
+                if recovery.active_run.is_some()
                     && recovery.active_run == run_id
                     && ep.finished.is_none()
                 {
@@ -4037,11 +4036,10 @@ pub fn reconcile_run_state<'a>(
                     .flat_map(|run| run.calls.iter().map(|call| call.tool_call_id.clone()))
                     .collect();
                 if recovery.runs.iter().any(|run| run.run_id.0 == run_id)
-                    || (recovery.unattributed_tool_risk
-                        && recovery
-                            .active_run
-                            .as_ref()
-                            .is_some_and(|run| run.0 == run_id))
+                    || (recovery
+                        .active_run
+                        .as_ref()
+                        .is_some_and(|run| run.0 == run_id))
                 {
                     for call in &calls {
                         indeterminate_tool_calls.record_dispatch_terminal(call, true);

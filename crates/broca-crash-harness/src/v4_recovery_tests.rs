@@ -118,10 +118,26 @@ fn assert_recovery(source: &[u8], state: &State) {
         .last()
         .unwrap();
     assert!(count >= 1);
+    let mut start = 0;
+    let mut previous_count = 0;
+    let mut needs_cut = false;
+    for (frame_end, after_count) in boundaries(source) {
+        if after_count > previous_count
+            && start > end
+            && data.get(start..frame_end) == Some(&source[start..frame_end])
+        {
+            needs_cut = true;
+        }
+        start = frame_end;
+        previous_count = after_count;
+    }
+    let reference = Scratch::new();
+    state.install(&reference.0).unwrap();
+    let old_open = FileWal::open(reference.log());
     let refused = Scratch::new();
     state.install(&refused.0).unwrap();
     let result = refused.open_policy(broca_wal::recovery::RecoveryPolicy::Refuse);
-    match broca_wal::file_wal::recover_prefix(data, 0, None, None) {
+    match old_open {
         Err(expected) => {
             let error = result
                 .err()
@@ -129,14 +145,15 @@ fn assert_recovery(source: &[u8], state: &State) {
             assert_eq!(format!("{error:?}"), format!("{expected:?}"));
             assert_eq!(std::fs::read(refused.log()).unwrap(), *data);
         }
-        Ok(prefix) => {
+        Ok(wal) => {
             assert!(
                 result.is_ok(),
-                "the original decoder accepts a final torn append"
+                "the legacy streaming opener accepts a final torn append"
             );
+            assert_eq!(result.unwrap().last_seq(), wal.last_seq());
             assert_eq!(
                 std::fs::read(refused.log()).unwrap(),
-                data[..prefix.valid_end as usize]
+                std::fs::read(reference.log()).unwrap()
             );
         }
     }
@@ -165,6 +182,8 @@ fn assert_recovery(source: &[u8], state: &State) {
                 .position(|op| *op == OperationKind::Change(vec![ChangeKind::Resize]))
                 .unwrap();
             assert!(operations[resize + 1..].contains(&OperationKind::SyncFile));
+        }
+        if needs_cut {
             let manifests = broca_wal::recovery::manifests(&root.log(), 1_000_000).unwrap();
             assert_eq!(manifests.len(), 1);
             let raw = root
@@ -174,6 +193,15 @@ fn assert_recovery(source: &[u8], state: &State) {
                 .join(&manifests[0].recovery.sidecar_basename);
             assert_eq!(std::fs::read(raw).unwrap(), data[end..]);
             assert!(frames.iter().any(|f| matches!(&f.record, WalRecord::RecoveryCut { recovery } if recovery.cut_id == manifests[0].recovery.cut_id)));
+        } else {
+            assert_eq!(
+                bytes,
+                source[..end],
+                "ordinary final tails keep the exact valid prefix without a marker"
+            );
+            assert!(broca_wal::recovery::manifests(&root.log(), 1_000_000)
+                .unwrap()
+                .is_empty());
         }
         wal.last_seq()
     });
@@ -381,7 +409,7 @@ fn v4_recovery_refuses_conflicting_lineage_after_damage() {
 }
 
 #[test]
-fn v4_recovery_preserves_combined_lineage_and_covered_damage() {
+fn v4_recovery_refuses_ambiguous_combined_lineage_and_covered_damage() {
     let root = Scratch::new();
     drop(published(&root));
     let proof_bytes = std::fs::read(sidecar_path(&root.log())).unwrap();
@@ -390,34 +418,19 @@ fn v4_recovery_preserves_combined_lineage_and_covered_damage() {
     damaged[HEADER_LEN] ^= 1;
     damaged[proof.durable_end as usize - 1] ^= 1;
     std::fs::write(root.log(), &damaged).unwrap();
-    let wal = root.open();
-    let cuts = broca_wal::recovery::manifests(&root.log(), 1_000_000).unwrap();
-    assert_eq!(cuts.len(), 1);
-    assert_eq!(cuts[0].recovery.cut_offset, 0);
-    assert!(cuts[0].recovery.unattributed_tool_risk);
-    assert_eq!(
-        cuts[0].recovery.reason,
-        broca_wal::recovery::CutReason::UnprovenCorruption
-    );
-    assert_eq!(
-        std::fs::read(
-            root.log()
-                .parent()
-                .unwrap()
-                .join(&cuts[0].recovery.sidecar_basename)
-        )
-        .unwrap(),
-        damaged
-    );
-    assert!(wal
-        .replay()
-        .unwrap()
-        .iter()
-        .all(|f| matches!(f.record, WalRecord::RecoveryCut { .. })));
+    let error = root
+        .open_policy(broca_wal::recovery::RecoveryPolicy::Repair)
+        .err()
+        .expect("an unreadable identity cannot authorize loss under a head proof");
+    assert!(error.to_string().contains("lineage"));
+    assert_eq!(std::fs::read(root.log()).unwrap(), damaged);
     assert_eq!(
         std::fs::read(sidecar_path(&root.log())).unwrap(),
         proof_bytes
     );
+    assert!(broca_wal::recovery::manifests(&root.log(), 1_000_000)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
