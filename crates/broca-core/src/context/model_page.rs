@@ -286,7 +286,6 @@ fn full_replay_raw(
 }
 
 /// The model page a replay of the whole log renders.
-#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
 fn full_replay_model_page(
     records: &[FramedRecord],
     request: &ModelPageRequest,
@@ -303,8 +302,7 @@ fn full_replay_model_page(
 /// Every field comes from one index snapshot taken after the index caught up with the log: a
 /// compaction Setup in an unindexed tail renumbers tags that the rows below would still show
 /// with their old numbers.
-#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
-pub(crate) struct EpisodePageIndex<'a> {
+pub struct EpisodePageIndex<'a> {
     /// Every `episode` row of the session, in episode order.
     pub episodes: &'a [crate::projection::IndexedEpisode],
     /// The transcript length (`head_ord`).
@@ -324,8 +322,7 @@ pub(crate) struct EpisodePageIndex<'a> {
 }
 
 /// The frames a model page read by episode decodes for the episodes it shows.
-#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
-pub(crate) struct EpisodeFrames {
+pub struct EpisodeFrames {
     /// The committed projection boundary the replay seeds from (the last qualified one before
     /// the first episode's `RunStarted`), or `None` when `frames` start at the log's first record.
     pub seed: Option<crate::projection::EpisodeSeed>,
@@ -335,9 +332,8 @@ pub(crate) struct EpisodeFrames {
 }
 
 /// A model page and how it was served.
-#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
 #[derive(Debug)]
-pub(crate) struct EpisodeModelPage {
+pub struct EpisodeModelPage {
     pub page: ModelPage,
     /// Why the read replayed the whole log, or `None` when it was served by episode.
     pub fallback: Option<&'static str>,
@@ -354,12 +350,11 @@ pub(crate) struct EpisodeModelPage {
 /// the start of an earlier episode). Any failed check, an unreadable range, or a window the
 /// frames do not cover falls back to `complete_read` and a full replay, so the page is the same
 /// either way.
-#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
-pub(crate) fn read_session_model_page_by_episode(
+pub fn read_session_model_page_by_episode(
     read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
     index: &EpisodePageIndex<'_>,
     request: &ModelPageRequest,
-    load: impl FnOnce(std::ops::Range<usize>) -> Result<EpisodeFrames, String>,
+    load: impl FnOnce(std::ops::Range<usize>) -> Result<EpisodeFrames, crate::replay::SeedFallback>,
     complete_read: impl FnOnce() -> Result<Vec<FramedRecord>, String>,
 ) -> Result<EpisodeModelPage, ModelPageError> {
     if request.after_mid.is_some() {
@@ -370,7 +365,10 @@ pub(crate) fn read_session_model_page_by_episode(
         compaction.fold(&frame.record);
     }
     let applied = compaction.state().and_then(|state| state.applied.as_ref());
-    match episode_page_messages(read_at, index, request, applied, load) {
+    match broca_wal::access_counter::fallback_result(
+        || episode_page_messages(read_at, index, request, applied, load),
+        |reason| *reason,
+    ) {
         Ok(raw) => Ok(EpisodeModelPage {
             page: assemble(raw, applied, request, index.lineage_id.clone(), index.head)?,
             fallback: None,
@@ -395,13 +393,12 @@ pub(crate) fn read_session_model_page_by_episode(
 /// The window is the one [`read_session_model_page`] proves sufficient: from the page's first
 /// visible ordinal through one message past a full page, so [`assemble`] can tell whether a
 /// next page exists. Messages hidden by the applied compaction never enter it.
-#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
 fn episode_page_messages(
     read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
     index: &EpisodePageIndex<'_>,
     request: &ModelPageRequest,
     applied: Option<&AppliedCompaction>,
-    load: impl FnOnce(std::ops::Range<usize>) -> Result<EpisodeFrames, String>,
+    load: impl FnOnce(std::ops::Range<usize>) -> Result<EpisodeFrames, crate::replay::SeedFallback>,
 ) -> Result<Vec<Message>, &'static str> {
     let limit = request
         .limit
@@ -433,7 +430,7 @@ fn episode_page_messages(
         .filter(|last| *last >= first)
         .ok_or("no episode holds the page end")?;
     let EpisodeFrames { seed, frames } =
-        load(first..last + 1).map_err(|_| "episode frames unreadable")?;
+        load(first..last + 1).map_err(|fallback| fallback.reason)?;
     let replayed = crate::projection::replay_from_episode_start(
         read_at,
         seed.as_ref(),
@@ -474,7 +471,6 @@ fn episode_page_messages(
 /// after, so renumbering from the row's base reproduces exactly what a replay of the whole log
 /// shows, including a renumbering by a Setup recorded after this message's episode. A message
 /// whose numbers the stored ledger assigned keeps them.
-#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
 fn renumber_from_row(message: &mut Message, tag_base: Option<u64>) -> Result<(), &'static str> {
     let Some(computed) = message.part_tags().and_then(|tags| tags.computed) else {
         return Ok(());
@@ -1421,7 +1417,9 @@ mod episode_page_tests {
                     .unwrap_or(bytes.len() as u64);
                 Ok(EpisodeFrames {
                     seed,
-                    frames: decode_positioned_frames(&read_at, from, to, Some(decoded))?,
+                    frames: decode_positioned_frames(&read_at, from, to, Some(decoded)).map_err(
+                        |_| crate::replay::SeedFallback::new("episode frames unreadable"),
+                    )?,
                 })
             },
             || Ok(all.clone()),

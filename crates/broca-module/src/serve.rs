@@ -4963,7 +4963,22 @@ mod raw_database_composition_tests {
         );
         let raw =
             crate::registry::LineageRegistry::new_with_reader(Arc::new(NoActor), wal_store, None)
-                .with_raw_pages_for_test(bundle.clone());
+                .with_raw_pages_for_test(bundle.clone())
+                .with_episode_source(Arc::new(crate::registry::EpisodeReadSource::new(
+                    bundle.db.clone(),
+                    Arc::new({
+                        let bundle = bundle.clone();
+                        move |key, _| {
+                            bundle
+                                .publications
+                                .lock()
+                                .unwrap()
+                                .get(key)
+                                .cloned()
+                                .ok_or_else(|| "episode publication missing".into())
+                        }
+                    }),
+                )));
         let counter = broca_wal::access_counter::WalAccessCounter::default();
         let raw_head = counter
             .operation("composed raw head")
@@ -5057,6 +5072,23 @@ mod raw_database_composition_tests {
                 serde_json::to_vec(&legacy.read(request).await.unwrap()).unwrap()
             );
         }
+        for from in [None, Some(0), Some(2), Some(4)] {
+            let request = SessionReadRequest::new(key.clone(), from, Some(2));
+            let actual = counter
+                .operation(format!("composed model page {from:?}"))
+                .run_future(raw.read_model(request.clone()))
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                serde_json::to_vec(&legacy.read_model(request).await.unwrap()).unwrap()
+            );
+        }
+        let mut invalid = SessionReadRequest::new(key.clone(), None, Some(2));
+        invalid.after_mid = Some("m0".into());
+        assert!(
+            matches!(raw.read_model(invalid).await,Err(ServeError::InvalidParams{field,..}) if field=="view")
+        );
         assert!(!root.join("run-index.db").exists());
         for op in counter.snapshot() {
             assert!(

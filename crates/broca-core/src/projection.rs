@@ -1346,6 +1346,27 @@ pub struct EpisodeSeed {
     pub seed_budget: Option<broca_protocol::request::BudgetConfig>,
 }
 
+impl EpisodeSeed {
+    /// Episode reads discard the preceding episode's messages and reset its render
+    /// configuration at RunStarted. Only placement and tag coordinates cross that reset.
+    /// Continuation capture refuses steering messages still waiting for placement
+    /// and unfinished tool batches, so no message payload crosses that reset.
+    pub fn from_continuation(
+        continuation: &crate::projection_plan::ProjectionContinuation,
+    ) -> Self {
+        let (ordinal_base, tag_seed) = continuation.raw_read_position();
+        Self {
+            boundary: continuation.boundary(),
+            ordinal_base,
+            held_steers: Vec::new(),
+            tag_seed,
+            seed_origin: None,
+            seed_run_id: None,
+            seed_budget: None,
+        }
+    }
+}
+
 /// A replay that starts at a validated position and reaches an episode's `RunStarted`.
 #[derive(Debug, Clone)]
 pub struct EpisodeReplay {

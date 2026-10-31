@@ -213,7 +213,6 @@ fn project_attach(
 }
 
 /// Where an attach by episode starts its fold, from the offset index.
-#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
 pub(crate) struct AttachEpisodeStart {
     /// The episode holding the attach cursor, or, for a live attach, the barrier head (see
     /// [`broca_core::projection::episode_holding_seq`]).
@@ -238,7 +237,6 @@ pub(crate) struct AttachEpisodeStart {
 /// projection error falls back to `complete_read` and a full replay, so the delivered units and
 /// the state handed to the live projector are the same either way; the second value names the
 /// fallback reason, `None` when the attach was served by episode.
-#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
 fn replay_for_attach_by_episode(
     read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
     durable_end: u64,
@@ -248,7 +246,10 @@ fn replay_for_attach_by_episode(
     decode_counter: Option<&std::cell::Cell<u64>>,
     complete_read: impl FnOnce() -> Result<Vec<broca_wal::FramedRecord>, String>,
 ) -> Result<(AttachReplay, Option<&'static str>), String> {
-    match attach_by_episode(read_at, durable_end, h, from, start, decode_counter) {
+    match broca_wal::access_counter::fallback_result(
+        || attach_by_episode(read_at, durable_end, h, from, start, decode_counter),
+        |reason| *reason,
+    ) {
         Ok(replay) => Ok((replay, None)),
         Err(reason) => {
             let lineage = broca_core::projection::log_header_info(read_at)
@@ -262,7 +263,6 @@ fn replay_for_attach_by_episode(
     }
 }
 
-#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
 fn attach_by_episode(
     read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
     durable_end: u64,
@@ -341,6 +341,44 @@ fn attach_by_episode(
     let mut state = ControlProjectionState::at_episode_start(start.episode.first_ord);
     state.set_wal_lineage_id(lineage);
     project_attach(&prefix, state, from).map_err(|_| "attach projection refused")
+}
+
+fn replay_for_database_attach(
+    reader: &broca_store::db::DatabaseEpisodeReader,
+    from: AttachFrom,
+) -> Result<AttachReplay, String> {
+    let h = reader.sequence();
+    let at = match from {
+        AttachFrom::Cursor(FromCursor::After(cursor)) => cursor.wal_seq,
+        _ => h,
+    };
+    let start = match broca_wal::access_counter::fallback_result(
+        || reader.attach_start(at),
+        |error| match error {
+            broca_store::db::DbError::SeedFallback(reason) => reason.reason,
+            _ => "attach database snapshot unavailable",
+        },
+    ) {
+        Ok(start) => start.map(|(episode, seed)| AttachEpisodeStart { episode, seed }),
+        Err(_) => {
+            let records = reader.complete_read().map_err(|e| e.to_string())?;
+            let lineage =
+                broca_core::projection::log_header_info(&|off, len| reader.read_at(off, len))
+                    .map_err(|e| e.to_string())?
+                    .1;
+            return replay_for_attach(records, h, from, lineage);
+        }
+    };
+    let (replay, _) = replay_for_attach_by_episode(
+        &|off, len| reader.read_at(off, len),
+        reader.byte_end(),
+        h,
+        from,
+        start.as_ref(),
+        None,
+        || reader.complete_read().map_err(|e| e.to_string()),
+    )?;
+    Ok(replay)
 }
 
 /// The attach-barrier decision for a unit arriving on the LIVE ring (step 2 of the
@@ -440,6 +478,7 @@ pub use display_replay::DisplaySender;
 /// and a display ring (fed by the run's live `out` display events). Owned by the actor;
 /// subscribers attach via the actor's Subscribe command.
 pub struct Fanout<W: WalStore> {
+    episode_source: Option<Arc<crate::registry::EpisodeReadSource>>,
     media_head: Option<Arc<crate::registry::media_head::Live>>,
     approvals: Arc<crate::approval_state::ApprovalState>,
     source_warm: Option<crate::source_warm::Events>,
@@ -515,6 +554,7 @@ struct SubscriberGate {
 }
 
 pub(crate) struct SubscriberSlot {
+    episode_source: Option<Arc<crate::registry::EpisodeReadSource>>,
     gate: SubscriberGate,
     gate_reopen: bool,
     gate_tenure: u64,
@@ -577,6 +617,7 @@ impl SubscriberGate {
         let previous = self.slots.fetch_add(1, Ordering::AcqRel);
         debug_assert_eq!(previous == 0, gate_reopen);
         SubscriberSlot {
+            episode_source: None,
             gate: self.clone(),
             gate_reopen,
             gate_tenure,
@@ -712,6 +753,7 @@ impl<W: WalStore + 'static> Fanout<W> {
         };
         (
             Self {
+                episode_source: None,
                 media_head,
                 approvals,
                 source_warm,
@@ -732,6 +774,12 @@ impl<W: WalStore + 'static> Fanout<W> {
 
     pub(crate) fn approval_state(&self) -> Arc<crate::approval_state::ApprovalState> {
         self.approvals.clone()
+    }
+
+    /// Explicit database composition; legacy constructors leave episode reads absent.
+    pub fn with_episode_source(mut self, source: Arc<crate::registry::EpisodeReadSource>) -> Self {
+        self.episode_source = Some(source);
+        self
     }
 
     pub(crate) fn media_head(&self) -> Option<Arc<crate::registry::media_head::Live>> {
@@ -787,6 +835,7 @@ impl<W: WalStore + 'static> Fanout<W> {
         let rx = self.ring.subscribe();
         let detach_rx = self.detach_ring.subscribe();
         let mut slot = self.gate.begin_attach();
+        slot.episode_source = self.episode_source.clone();
         slot.arm_gate_owner_failure(self.projection_seed.clone());
         (slot, rx, detach_rx)
     }
@@ -812,7 +861,7 @@ impl<W: WalStore + 'static> Fanout<W> {
         self.reap_finished();
         let display = self.display_ring.clone();
         let cancel = CancellationToken::new();
-        let handle = tokio::spawn(subscriber_task(
+        let task = subscriber_task(
             slot,
             from,
             h,
@@ -825,7 +874,11 @@ impl<W: WalStore + 'static> Fanout<W> {
             self.projection_seed.clone(),
             cancel.clone(),
             materialized_store,
-        ));
+        );
+        let handle = match broca_wal::access_counter::inherit_future(task) {
+            Ok(measured) => tokio::spawn(measured),
+            Err(bare) => tokio::spawn(bare),
+        };
         self.subscribers.push(SubscriberTask {
             sink,
             cancel,
@@ -1161,9 +1214,10 @@ async fn subscriber_task<W: WalStore + 'static>(
 ) {
     let gate_reopen = slot.gate_reopen;
     let gate_tenure = slot.gate_tenure;
+    let episode_source = slot.episode_source.clone();
     let mut slot = Some(slot);
 
-    let fast_live_state = if matches!(from, AttachFrom::Live) {
+    let fast_live_state = if episode_source.is_none() && matches!(from, AttachFrom::Live) {
         try_live_projection_seed(wal_store.clone(), session.clone(), materialized_store, h).await
     } else {
         None
@@ -1190,52 +1244,71 @@ async fn subscriber_task<W: WalStore + 'static>(
         // returns committed (fsynced) records; HARD-FILTER seq <= H so a concurrent append of
         // seq > H during the read is excluded, keeping the read prefix-consistent at H.
         // Advisory display replay is snapshotted separately after durable control replay.
-        let (records, lineage) = match spawn_blocking(JobKind::WalRead, {
-            let wal_store = wal_store.clone();
+        let indexed = if let Some(source) = episode_source {
             let session = session.clone();
-            move || wal_store.read_records_with_lineage(&session)
-        })
-        .await
-        {
-            Ok(Ok(recs)) => recs,
-            Ok(Err(error)) => {
-                slot.as_mut()
-                    .expect("subscriber slot remains owned during replay")
-                    .report_gate_owner_failure();
-                let _ = deliver(
-                    &sink,
-                    &cancel,
-                    Delivery::Error(format!("WAL replay failed: {error}")),
+            Some(
+                spawn_blocking(
+                    JobKind::WalRead,
+                    broca_wal::access_counter::inherit(move || {
+                        let reader = source.reader(&session, Some(h))?;
+                        replay_for_database_attach(&reader, from)
+                    }),
                 )
-                .await;
-                return;
-            }
-            Err(error) => {
-                slot.as_mut()
-                    .expect("subscriber slot remains owned during replay")
-                    .report_gate_owner_failure();
-                let _ = deliver(
-                    &sink,
-                    &cancel,
-                    Delivery::Error(format!("WAL replay task failed: {error}")),
-                )
-                .await;
-                return;
-            }
+                .await,
+            )
+        } else {
+            None
         };
-        // Projection is CPU work proportional to the whole prefix, so it runs on the blocking
-        // pool rather than on the runtime worker carrying other sessions' streams.
+        let replay_result = if let Some(indexed) = indexed {
+            indexed
+        } else {
+            let (records, lineage) = match spawn_blocking(JobKind::WalRead, {
+                let wal_store = wal_store.clone();
+                let session = session.clone();
+                move || wal_store.read_records_with_lineage(&session)
+            })
+            .await
+            {
+                Ok(Ok(recs)) => recs,
+                Ok(Err(error)) => {
+                    slot.as_mut()
+                        .expect("subscriber slot remains owned during replay")
+                        .report_gate_owner_failure();
+                    let _ = deliver(
+                        &sink,
+                        &cancel,
+                        Delivery::Error(format!("WAL replay failed: {error}")),
+                    )
+                    .await;
+                    return;
+                }
+                Err(error) => {
+                    slot.as_mut()
+                        .expect("subscriber slot remains owned during replay")
+                        .report_gate_owner_failure();
+                    let _ = deliver(
+                        &sink,
+                        &cancel,
+                        Delivery::Error(format!("WAL replay task failed: {error}")),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            // Projection is CPU work proportional to the whole prefix, so it runs on the blocking
+            // pool rather than on the runtime worker carrying other sessions' streams.
+            spawn_blocking(JobKind::Projection, move || {
+                replay_for_attach(records, h, from, lineage)
+            })
+            .await
+        };
         let AttachReplay {
             state: replay_state,
             seeded_h,
             from,
             units: replay,
             ..
-        } = match spawn_blocking(JobKind::Projection, move || {
-            replay_for_attach(records, h, from, lineage)
-        })
-        .await
-        {
+        } = match replay_result {
             Ok(Ok(replay)) => replay,
             Ok(Err(error)) => {
                 slot.as_mut()
@@ -3770,7 +3843,7 @@ mod episode_attach_tests {
     /// Four episodes: tool turns with reverse-order results and a steer placed at the first
     /// episode's close; a non-attributable import; a third episode recording a compaction
     /// Setup whose cuts fall inside the first episode; and a fourth after it.
-    fn corpus() -> Vec<WalRecord> {
+    pub(super) fn corpus() -> Vec<WalRecord> {
         let mut records = vec![run_started("r1", vec![user("task")])];
         records.extend(tool_step(1, "r1-b1", &["a", "b"]));
         records.extend(step(2, text("done")));
@@ -4215,5 +4288,445 @@ mod episode_attach_tests {
             &replay_for_attach(framed(&records), h, from, None).unwrap(),
             "early cursor",
         );
+    }
+}
+
+#[cfg(test)]
+mod database_attach_tests {
+    use super::*;
+    use broca_core::{FileWalStore, WalHandle};
+    use broca_wal::WalRecord;
+
+    fn records(prefix: usize) -> Vec<WalRecord> {
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../scripts/fixtures/resume-close-out-sealed.wal"),
+        )
+        .unwrap();
+        let frames = broca_core::projection::decode_positioned_frames(
+            &|off, len| Ok(bytes[off as usize..(off + len) as usize].to_vec()),
+            0,
+            bytes.len() as u64,
+            None,
+        )
+        .unwrap();
+        let all: Vec<_> = frames.into_iter().map(|f| f.framed.record).collect();
+        let mut start = all
+            .iter()
+            .find(|r| matches!(r, WalRecord::RunStarted { .. }))
+            .unwrap()
+            .clone();
+        if let WalRecord::RunStarted { input, .. } = &mut start {
+            *input = vec![
+                broca_protocol::Message::new(
+                    broca_protocol::Role::User,
+                    vec![broca_protocol::ContentBlock::Text {
+                        text: "discarded".into()
+                    }]
+                );
+                prefix
+            ]
+            .into();
+        }
+        let lo = all
+            .iter()
+            .position(|r| matches!(r, WalRecord::StepStarted { .. }))
+            .unwrap();
+        let hi = all
+            .iter()
+            .position(|r| matches!(r, WalRecord::TurnFinished { .. }))
+            .unwrap();
+        let terminal = all
+            .iter()
+            .find(|r| matches!(r, WalRecord::RunFinished { .. }))
+            .unwrap()
+            .clone();
+        let mut result = vec![start.clone()];
+        result.extend_from_slice(&all[lo..=hi]);
+        result.push(terminal.clone());
+        if let WalRecord::RunStarted { input, run_id, .. } = &mut start {
+            *input = vec![broca_protocol::Message::new(
+                broca_protocol::Role::User,
+                vec![broca_protocol::ContentBlock::Text {
+                    text: "current".into(),
+                }],
+            )]
+            .into();
+            *run_id = broca_protocol::RunId("attach-current".into());
+        }
+        result.push(start);
+        result.extend_from_slice(&all[lo..=hi]);
+        result.push(terminal);
+        result
+    }
+
+    fn root() -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = broca_test_support::scratch_root().join(format!(
+            "database-attach-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
+        root
+    }
+
+    fn wal(
+        root: &std::path::Path,
+        bind: &BindIdentity,
+    ) -> (Arc<FileWalStore>, Box<dyn broca_wal::Wal + Send>) {
+        let store = Arc::new(FileWalStore::with_config(
+            root.join("wal"),
+            broca_wal::classify_state_root(root).unwrap(),
+        ));
+        let wal = broca_wal::FileWal::open(store.wal_path(bind))
+            .unwrap()
+            .with_feature_floor(root.join("wal-floor"))
+            .with_wal_config(broca_wal::WalConfig::OVERHAUL)
+            .unwrap();
+        (store, Box::new(wal))
+    }
+
+    #[test]
+    fn database_attach_equals_full_replay_at_every_cut() {
+        for records in [records(6), super::episode_attach_tests::corpus()] {
+            let root = root();
+            let WalRecord::RunStarted { session, .. } = &records[0] else {
+                unreachable!()
+            };
+            let bind = session.clone();
+            let (_, mut wal) = wal(&root, &bind);
+            let db = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
+            for record in &records {
+                wal.append(1, record, false).unwrap();
+                wal.sync().unwrap();
+                let publication = wal.durable_publication().unwrap();
+                let h = publication.sequence();
+                let reader = db.episode_reader(bind.clone(), publication).unwrap();
+                let frames = wal.replay().unwrap();
+                let lineage = wal.lineage_id();
+                let controls = replay_for_attach(
+                    frames.clone(),
+                    h,
+                    AttachFrom::Cursor(FromCursor::Start),
+                    lineage,
+                )
+                .unwrap();
+                let mut froms = vec![AttachFrom::Live, AttachFrom::Cursor(FromCursor::Start)];
+                froms.extend(
+                    controls
+                        .units
+                        .iter()
+                        .map(|(cursor, _, _)| AttachFrom::Cursor(FromCursor::After(*cursor))),
+                );
+                for from in froms {
+                    let expected = replay_for_attach(frames.clone(), h, from, lineage).unwrap();
+                    let actual = replay_for_database_attach(&reader, from).unwrap();
+                    assert_eq!(actual.units, expected.units, "h={h},from={from:?}");
+                    assert_eq!(actual.state, expected.state, "h={h},from={from:?}");
+                    assert_eq!(actual.seeded_h, expected.seeded_h);
+                }
+            }
+            drop(wal);
+            drop(db);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn database_attach_snapshot_failures_count_one_typed_fallback() {
+        for (corruption, reason) in [
+            ("missing", "historical episode continuation missing"),
+            ("unsupported", "historical episode continuation unsupported"),
+        ] {
+            let records = records(6);
+            let root = root();
+            let WalRecord::RunStarted { session, .. } = &records[0] else {
+                unreachable!()
+            };
+            let bind = session.clone();
+            let (_, mut wal) = wal(&root, &bind);
+            for record in records {
+                wal.append(1, &record, false).unwrap();
+            }
+            wal.sync().unwrap();
+            let db = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
+            let reader = db
+                .episode_reader(bind, wal.durable_publication().unwrap())
+                .unwrap();
+            let frames = wal.replay().unwrap();
+            let cursor = frames
+                .iter()
+                .rev()
+                .find(|frame| matches!(frame.record, WalRecord::RunStarted { .. }))
+                .unwrap()
+                .seq;
+            let from = AttachFrom::Cursor(FromCursor::After(Cursor::new(cursor, 0)));
+            let expected =
+                replay_for_attach(frames, reader.sequence(), from, wal.lineage_id()).unwrap();
+            assert!(!expected.units.is_empty());
+            db.authoritative_transaction(|tx| {
+                if corruption == "missing" {
+                    tx.execute("DELETE FROM episode_seed WHERE seq=(SELECT min(seq) FROM episode_seed)", [])?;
+                } else {
+                    let encoded: String = tx.query_row("SELECT continuation FROM episode_seed ORDER BY seq LIMIT 1", [], |row| row.get(0))?;
+                    let mut value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+                    value["version"] = serde_json::json!(0);
+                    tx.execute("UPDATE episode_seed SET continuation=?1 WHERE seq=(SELECT min(seq) FROM episode_seed)", [value.to_string()])?;
+                }
+                Ok(())
+            }).unwrap();
+            assert!(
+                matches!(reader.attach_start(cursor), Err(broca_store::db::DbError::SeedFallback(failure)) if failure.reason == reason)
+            );
+
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            let actual = counter
+                .operation(corruption)
+                .run(|| replay_for_database_attach(&reader, from).unwrap());
+            let operation = counter.snapshot().remove(0);
+            // An unsupported seed also reports an internal decoder failure. Attach
+            // must expose only the database reader's final typed fallback reason.
+            assert_eq!(operation.seed_fallbacks, [reason]);
+            assert_eq!(
+                operation
+                    .reads
+                    .iter()
+                    .filter(|read| { read.class == broca_wal::access_counter::ReadClass::Origin })
+                    .count(),
+                1
+            );
+            assert_eq!(actual.units, expected.units);
+            assert_eq!(actual.state, expected.state);
+            assert_eq!(actual.seeded_h, expected.seeded_h);
+            drop(reader);
+            drop(wal);
+            drop(db);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn database_attach_reads_are_independent_of_discarded_prefix() {
+        let mut measurements = Vec::new();
+        for prefix in [1_000, 150_000] {
+            let records = records(prefix);
+            let root = root();
+            let WalRecord::RunStarted { session, .. } = &records[0] else {
+                unreachable!()
+            };
+            let bind = session.clone();
+            let (_, mut wal) = wal(&root, &bind);
+            for record in records {
+                wal.append(1, &record, false).unwrap();
+            }
+            wal.sync().unwrap();
+            let db = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
+            let reader = db
+                .episode_reader(bind, wal.durable_publication().unwrap())
+                .unwrap();
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            counter
+                .operation("database live attach")
+                .run(|| replay_for_database_attach(&reader, AttachFrom::Live).unwrap());
+            let op = &counter.snapshot()[0];
+            use broca_wal::access_counter::{ReadClass as C, ValidationRead as V};
+            let bytes = std::fs::read(wal.durable_publication().unwrap().path()).unwrap();
+            let physical = broca_core::projection::decode_positioned_frames(
+                &|off, len| Ok(bytes[off as usize..(off + len) as usize].to_vec()),
+                0,
+                bytes.len() as u64,
+                None,
+            )
+            .unwrap();
+            let boundary_index = physical
+                .iter()
+                .position(|p| matches!(p.framed.record, WalRecord::TurnFinished { .. }))
+                .unwrap();
+            let boundary = &physical[boundary_index];
+            let broca_wal::framing::DecodeStep::Record { consumed, .. } =
+                broca_wal::framing::decode_next(&bytes[boundary.off as usize..])
+            else {
+                unreachable!()
+            };
+            let boundary_end = boundary.off + consumed as u64;
+            let mut expected = vec![
+                ("attach lineage", 0, 69, C::LineageHeader),
+                (
+                    "covering episodes and handoff",
+                    boundary_end,
+                    bytes.len() as u64 - boundary_end,
+                    C::Source,
+                ),
+                (
+                    "seed lineage gap",
+                    boundary_end,
+                    physical[boundary_index + 1].off - boundary_end,
+                    C::Validation(V::LineageGap),
+                ),
+                (
+                    "seed boundary",
+                    boundary.off,
+                    consumed as u64,
+                    C::Validation(V::BoundaryFrame),
+                ),
+                ("seed lineage", 0, 69, C::LineageHeader),
+            ];
+            for read in &op.reads {
+                let index = expected
+                    .iter()
+                    .position(|(_, off, len, class)| {
+                        (*off, *len, *class) == (read.offset, read.length, read.class)
+                    })
+                    .unwrap_or_else(|| panic!("unlisted read {read:?}; remaining {expected:?}"));
+                expected.remove(index);
+            }
+            assert!(expected.is_empty(), "missing reads {expected:?}");
+            assert_eq!(op.frames_decoded, 31);
+            assert!(op.seed_fallbacks.is_empty(), "{op:?}");
+            assert!(
+                op.reads.iter().all(|r| r.offset != 0 || r.length <= 69),
+                "{op:?}"
+            );
+            measurements.push((
+                op.reads.len(),
+                op.frames_decoded,
+                op.reads.iter().map(|r| r.length).sum::<u64>(),
+            ));
+            drop(wal);
+            drop(db);
+            let _ = std::fs::remove_dir_all(root);
+        }
+        assert_eq!(measurements[0], measurements[1]);
+        eprintln!("bounded attach reads/decodes/bytes: {measurements:?}");
+    }
+
+    #[tokio::test]
+    async fn database_attach_handoff_delivers_each_cursor_once() {
+        let mut records = records(4);
+        let terminal = records.pop().unwrap();
+        let root = root();
+        let WalRecord::RunStarted { session, .. } = &records[0] else {
+            unreachable!()
+        };
+        let bind = session.clone();
+        let (store, wal) = wal(&root, &bind);
+        drop(wal);
+        let db = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
+        let (mut fanout, observer) = Fanout::new(store.clone(), bind.clone());
+        let (published, publications) = tokio::sync::watch::channel(None);
+        use broca_core::LeaseStore;
+        let lease = broca_core::FileLeaseStore::new(root.join("leases"))
+            .acquire(&broca_core::lease_key_for(&bind))
+            .unwrap();
+        let (writer, lease) = WalHandle::open_and_spawn_observed(
+            store.clone(),
+            bind.clone(),
+            lease,
+            Some(observer.with_publications(published)),
+        )
+        .await
+        .unwrap();
+        for record in &records[..records.len() - 1] {
+            writer.record(record.clone());
+        }
+        writer.sync().await.unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let started_tx = Mutex::new(Some(started_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let witness = Arc::new(Mutex::new(None::<broca_wal::file_wal::DurablePublication>));
+        let source = Arc::new(crate::registry::EpisodeReadSource::new(
+            db.clone(),
+            Arc::new({
+                let witness = witness.clone();
+                move |_, _| {
+                    if let Some(tx) = started_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                        release_rx.lock().unwrap().recv().unwrap();
+                    }
+                    Ok(witness.lock().unwrap().clone().unwrap())
+                }
+            }),
+        ));
+        fanout = fanout.with_episode_source(source);
+        let (slot, rx, detach_rx) = fanout.prepare_attach();
+        writer.record(records.last().unwrap().clone());
+        let h = writer.sync().await.unwrap();
+        *witness.lock().unwrap() = publications.borrow().clone();
+        let (sink, mut deliveries) = mpsc::channel(128);
+        let counter = broca_wal::access_counter::WalAccessCounter::default();
+        counter.operation("spawned database attach").run(|| {
+            fanout.spawn_subscriber(
+                slot,
+                AttachFrom::Cursor(FromCursor::Start),
+                h,
+                rx,
+                detach_rx,
+                sink,
+                None,
+            );
+        });
+        started_rx.await.unwrap();
+        writer.record(terminal);
+        writer.sync().await.unwrap();
+        // Publication can overtake the subscriber task. Its saved witness must still
+        // bound replay to H without rewinding the database or consuming H+1 twice.
+        db.episode_reader(bind.clone(), publications.borrow().clone().unwrap())
+            .unwrap();
+        release_tx.send(()).unwrap();
+        let (frames, lineage) = store.read_records_with_lineage(&bind).unwrap();
+        let expected = replay_for_attach(
+            frames,
+            h + 1,
+            AttachFrom::Cursor(FromCursor::Start),
+            lineage,
+        )
+        .unwrap()
+        .units;
+        let mut actual = Vec::new();
+        while actual.len() < expected.len() {
+            let delivery = broca_test_support::event_timeout(
+                "database_attach_handoff_delivers_each_cursor_once",
+                deliveries.recv(),
+                || format!("received {} of {} controls", actual.len(), expected.len()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            match delivery {
+                Delivery::Control(event) => actual.push((*event).clone()),
+                Delivery::Display(_) => {}
+                other => panic!("unexpected attach delivery {other:?}"),
+            }
+        }
+        assert_eq!(actual, expected);
+        let operation = counter.snapshot().remove(0);
+        assert!(
+            !operation.reads.is_empty(),
+            "spawned attach reads must retain their operation"
+        );
+        assert!(operation.seed_fallbacks.is_empty(), "{operation:?}");
+        assert!(
+            operation
+                .reads
+                .iter()
+                .all(|r| r.class != broca_wal::access_counter::ReadClass::Origin),
+            "{operation:?}"
+        );
+        assert_eq!(
+            actual
+                .iter()
+                .map(|e| e.0)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            actual.len()
+        );
+        fanout.teardown().await;
+        writer.shutdown().await.unwrap();
+        drop(lease);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
