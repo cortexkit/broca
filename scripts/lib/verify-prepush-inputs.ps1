@@ -70,7 +70,7 @@ function CheckTool([string]$Name, [string]$Executable, [string]$Pattern) {
 }
 CheckTool 'Python' 'python.exe' '^Python 3\.14\.\d+$'
 CheckTool 'nats-server' 'nats-server.exe' '^nats-server: v2\.15\.0$'
-CheckTool 'Bun' 'bun.exe' '^1\.4\.2$'
+CheckTool 'Bun' 'bun.exe' '^1\.4\.\d+$'
 
 $addedPaths = @()
 function UseOfflineTool([string]$Name, [string]$Archive, [string]$BinDirectory) {

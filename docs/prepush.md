@@ -229,7 +229,10 @@ NOT-RUN (200), naming the first missing/mismatched file, before tests/bootstrap.
 Malformed or incomplete inventories and unlisted input files also refuse the lane.
 
 Windows requires the image's Python **3.14** (`python`), nats-server **2.15.0**
-and Bun **1.4.2**. After manifest verification it probes Node **24** with npm,
+and Bun **1.4.x** (stable patch releases). Bun is checked only as an image
+prerequisite; fixture builds use Cargo and aimock setup uses npm, with no
+patch-specific Bun behavior. After manifest verification, the Windows pre-push
+check probes Node **24** with npm,
 CMake **4.4.5** and Ninja **1.13.2**, preferring matching image tools. Missing or
 unsupported tools use the checked offline ZIPs staged by the caller: Node
 **24.11.1** (including npm), CMake **4.4.5**, Ninja **1.13.2**. Node's image probe

@@ -1610,7 +1610,7 @@ class WindowsInputVerification(unittest.TestCase):
             'python.exe': 'Python 3.14.0', 'node.exe': 'v24.11.1', 'npm.cmd': '11.6.0',
             'nats-server.exe': 'nats-server: v2.15.0',
             'cmake.exe': 'cmake version 4.4.5\n\nCMake suite maintained and supported by Kitware',
-            'ninja.exe': '1.13.2', 'bun.exe': '1.4.2',
+            'ninja.exe': '1.13.2', 'bun.exe': '1.4.4',
         }
 
     def write_manifest(self):
@@ -1653,6 +1653,14 @@ class WindowsInputVerification(unittest.TestCase):
             self.assertIn('TOOL-CALLED ' + name, result.stdout)
         self.assertFalse((self.root / 'tools').exists())
         self.assertEqual((self.root / 'paths').read_text(), '')
+
+    def test_bun_1_4_patch_versions_are_accepted(self):
+        for version in ('1.4.0', '1.4.2', '1.4.4', '1.4.99'):
+            with self.subTest(version=version):
+                self.tools['bun.exe'] = version
+                result = self.verify()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('prepush: tool Bun ' + version, result.stdout)
 
     def test_missing_manifest_refuses_before_tools(self):
         (self.inputs / 'transport-manifest.json').unlink()
@@ -1709,7 +1717,8 @@ class WindowsInputVerification(unittest.TestCase):
 
     def test_supported_format_but_wrong_pinned_tool_version_refuses(self):
         for name, wrong in (('python.exe', 'Python 3.13.5'), ('node.exe', 'v20.20.2'),
-                            ('nats-server.exe', 'nats-server: v2.10.26'), ('bun.exe', '1.4.4')):
+                            ('nats-server.exe', 'nats-server: v2.10.26'), ('bun.exe', '1.3.9'),
+                            ('bun.exe', '1.5.0'), ('bun.exe', '1.4.4-canary')):
             with self.subTest(name=name):
                 version = self.tools[name]
                 self.tools[name] = wrong
