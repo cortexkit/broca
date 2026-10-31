@@ -728,6 +728,13 @@ impl MaterializedStore for LaggingStore {
 }
 
 impl Persister for LaggingStore {
+    fn repair_sender_policy(
+        &self,
+        session: &BindIdentity,
+        range: &broca_wal::WalRangeRead,
+    ) -> Result<u64, String> {
+        self.inner.repair_sender_policy(session, range)
+    }
     fn projection_seed(
         &self,
         session: &BindIdentity,
@@ -858,6 +865,13 @@ impl MaterializedStore for CountingStore {
 }
 
 impl Persister for CountingStore {
+    fn repair_sender_policy(
+        &self,
+        session: &BindIdentity,
+        range: &broca_wal::WalRangeRead,
+    ) -> Result<u64, String> {
+        self.inner.repair_sender_policy(session, range)
+    }
     fn projection_seed(
         &self,
         session: &BindIdentity,
@@ -2611,6 +2625,13 @@ impl MaterializedStore for CountedStore {
 }
 
 impl Persister for CountedStore {
+    fn repair_sender_policy(
+        &self,
+        session: &BindIdentity,
+        range: &broca_wal::WalRangeRead,
+    ) -> Result<u64, String> {
+        self.inner.repair_sender_policy(session, range)
+    }
     fn projection_seed(
         &self,
         session: &BindIdentity,

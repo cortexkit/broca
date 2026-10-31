@@ -559,6 +559,19 @@ fn page(
         ownership,
     )
     .ok_or_else(|| invalid("raw head fold unsupported"))?;
+    continuation
+        .restore_head_sender_admission(read, &mut head)
+        .map_err(DbError::SeedFallback)?;
+    for frame in &tail {
+        if matches!(
+            frame.framed.record,
+            WalRecord::SessionRefreshAccepted { .. }
+                | WalRecord::SessionRefreshPolicyChanged { .. }
+                | WalRecord::SessionPrefixFlushed { .. }
+        ) {
+            head.observe(&frame.framed.record);
+        }
+    }
     for off in seed.admission.queued.values() {
         head.observe(&sources.frame(*off)?.record);
     }

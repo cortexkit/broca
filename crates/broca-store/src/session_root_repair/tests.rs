@@ -754,7 +754,7 @@ fn orphaned_projection_cleanup_includes_all_flat_key_projection_tables() {
             .unwrap();
     }
     tx.execute(
-        "INSERT INTO retained_head VALUES(?1,?2,1,'{}')",
+        "INSERT INTO retained_head(lineage_id,session,at_seq,facts_json) VALUES(?1,?2,1,'{}')",
         params![lineage, key],
     )
     .unwrap();

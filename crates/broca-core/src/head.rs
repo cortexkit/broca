@@ -41,6 +41,39 @@ impl Default for HeadProjection {
 }
 
 impl HeadProjection {
+    /// Cached heads written before sender-policy folding ignored accepted refreshes.
+    pub fn sender_admission_current(&self, session_change_recorded: bool) -> bool {
+        !session_change_recorded
+            || self.ownership.sender_admission_complete() && self.ownership.session_change_recorded
+    }
+
+    fn set_senders(&mut self, manifest: &broca_wal::PlanManifest) {
+        self.senders = crate::admission::manifest_senders(manifest);
+        for sender in &mut self.senders {
+            sender.templates.clear();
+        }
+    }
+
+    pub(crate) fn restore_sender_admission(&mut self, ownership: &crate::SessionOwnershipV1) {
+        self.senders = ownership.effective_senders();
+        for sender in &mut self.senders {
+            sender.templates.clear();
+        }
+        self.restore_sender_marker(ownership);
+    }
+
+    pub(crate) fn restore_sender_marker(&mut self, ownership: &crate::SessionOwnershipV1) {
+        self.ownership.session_change_recorded = ownership.session_change_recorded;
+        self.ownership.sender_admission =
+            ownership
+                .sender_admission
+                .as_ref()
+                .map(|fold| crate::admission::SenderAdmissionV1 {
+                    version: fold.version,
+                    accepted_senders: fold.accepted_senders.as_ref().map(|_| Vec::new()),
+                });
+    }
+
     /// Restore display metadata from its bounded WAL sources, not from stored text.
     pub fn from_read_fold(
         fold: &HeadReadFold,
@@ -86,21 +119,14 @@ impl HeadProjection {
                 if let Some(id) = submission_id {
                     self.queued_times.remove(&id.0);
                 }
-                if self.ownership.episodes == 0 {
-                    self.senders = manifest
-                        .as_ref()
-                        .and_then(|manifest| {
-                            serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text())
-                                .ok()
-                        })
-                        .and_then(|plan| {
-                            plan.as_object().and_then(|plan| {
-                                cortexkit_role_llm_runner::delivery_order::plan_senders(plan).ok()
-                            })
-                        })
-                        .unwrap_or_default();
-                    for sender in &mut self.senders {
-                        sender.templates.clear();
+                if !self
+                    .ownership
+                    .sender_admission
+                    .as_ref()
+                    .is_some_and(|fold| fold.accepted_senders.is_some())
+                {
+                    if let Some(manifest) = manifest {
+                        self.set_senders(manifest);
                     }
                 }
                 self.ownership
@@ -153,6 +179,25 @@ impl HeadProjection {
             | WalRecord::SendDelivered { submission_id, .. } => {
                 self.queued_times.remove(&submission_id.0);
             }
+            WalRecord::SessionRefreshAccepted { manifest, .. } => {
+                self.set_senders(manifest);
+                self.ownership.session_change_recorded = true;
+                // The head keeps template-free grants above; only presence is needed here.
+                self.ownership.sender_admission = Some(crate::admission::SenderAdmissionV1 {
+                    version: 1,
+                    accepted_senders: Some(Vec::new()),
+                });
+            }
+            WalRecord::SessionRefreshPolicyChanged { .. }
+            | WalRecord::SessionPrefixFlushed { .. } => {
+                self.ownership.session_change_recorded = true;
+                self.ownership.sender_admission.get_or_insert(
+                    crate::admission::SenderAdmissionV1 {
+                        version: 1,
+                        accepted_senders: None,
+                    },
+                );
+            }
             _ => {}
         }
     }
@@ -204,7 +249,7 @@ impl HeadProjection {
 }
 
 /// A display-only continuation: identifiers and numeric counters, never a billing source.
-/// The `last_run_rich_ui` display metadata and sender authorization come from WAL RunStarted records.
+/// Display metadata and sender authorization are restored from bounded WAL manifest sources.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeadReadFold {

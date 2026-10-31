@@ -31,6 +31,7 @@ impl OverhaulDb {
         &self,
         bind: &broca_protocol::BindIdentity,
         publication: &broca_wal::file_wal::DurablePublication,
+        require_sender_policy: bool,
     ) -> Result<AdmissionContinuation, DbError> {
         self.read_snapshot(|tx| {
             let row: Option<(String, Option<String>, u64)> = tx.query_row(
@@ -41,7 +42,11 @@ impl OverhaulDb {
             let Some((encoded, lineage, head)) = row else {
                 return Err(DbError::SeedFallback(SeedFallback::new("admission session index missing")));
             };
-            let seed = AdmissionContinuation::decode(&encoded).map_err(DbError::SeedFallback)?;
+            let seed = if require_sender_policy {
+                AdmissionContinuation::decode(&encoded)
+            } else {
+                AdmissionContinuation::decode_for_execution(&encoded)
+            }.map_err(DbError::SeedFallback)?;
             let boundary = seed.boundary();
             let stored = tx.query_row(
                 "SELECT lineage_id,seq,frame_off,frame_end,frame_identity,qualified FROM projection_boundary WHERE sid=?1 AND seq=?2",
@@ -75,6 +80,7 @@ impl DatabaseAdmissionReader {
         &self,
         session: &broca_protocol::BindIdentity,
         safe_head: u64,
+        require_sender_policy: bool,
         work: impl FnOnce(
             &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
             Result<AdmissionContinuation, DbError>,
@@ -101,7 +107,9 @@ impl DatabaseAdmissionReader {
                 .read_to_end(&mut bytes)?;
             Ok(bytes)
         };
-        let seed = self.db.admission_continuation(session, &publication);
+        let seed = self
+            .db
+            .admission_continuation(session, &publication, require_sender_policy);
         work(
             &read_at,
             seed,
@@ -175,30 +183,15 @@ impl broca_core::context::AdmissionReader for DatabaseAdmissionReader {
         session: &broca_protocol::BindIdentity,
         safe_head: u64,
     ) -> Result<broca_core::run::PriorWalSnapshot, String> {
-        self.read(session, safe_head, |read_at, seed, end, lineage| {
-            let seeded = seed.and_then(|seed| {
-                let tail = admission_tail(read_at, &seed, safe_head, end)?;
-                Ok((seed, tail))
-            });
-            match seeded {
-                Ok((seed, tail)) => broca_core::run::load_prior_wal_snapshot_from_seed(
-                    read_at,
-                    &seed,
-                    &tail,
-                    safe_head,
-                    || {
-                        Ok(full_admission(read_at, safe_head, end, lineage)?
-                            .tail
-                            .as_ref()
-                            .clone())
-                    },
-                ),
-                Err(error) => {
-                    count_admission_error(&error);
-                    full_admission(read_at, safe_head, end, lineage)
-                }
-            }
-        })
+        self.snapshot(session, safe_head, false)
+    }
+
+    fn sender_snapshot(
+        &self,
+        session: &broca_protocol::BindIdentity,
+        safe_head: u64,
+    ) -> Result<broca_core::run::PriorWalSnapshot, String> {
+        self.snapshot(session, safe_head, true)
     }
 
     fn paused_episode(
@@ -206,7 +199,7 @@ impl broca_core::context::AdmissionReader for DatabaseAdmissionReader {
         session: &broca_protocol::BindIdentity,
         safe_head: u64,
     ) -> Result<Option<broca_core::admission::LastEpisodeV1>, String> {
-        self.read(session, safe_head, |read_at, seed, end, lineage| {
+        self.read(session, safe_head, false, |read_at, seed, end, lineage| {
             let seeded = seed.and_then(|seed| {
                 let tail = admission_tail(read_at, &seed, safe_head, end)?;
                 seed.paused_episode(read_at, &tail, safe_head)
@@ -225,6 +218,56 @@ impl broca_core::context::AdmissionReader for DatabaseAdmissionReader {
                 }
             }
         })
+    }
+}
+
+impl DatabaseAdmissionReader {
+    fn snapshot(
+        &self,
+        session: &broca_protocol::BindIdentity,
+        safe_head: u64,
+        require_sender_policy: bool,
+    ) -> Result<broca_core::run::PriorWalSnapshot, String> {
+        self.read(
+            session,
+            safe_head,
+            require_sender_policy,
+            |read_at, mut seed, end, lineage| {
+                if require_sender_policy && matches!(&seed, Err(DbError::SeedFallback(reason)) if reason.reason == "sender admission summary predates refresh folding") {
+                    // Only a caller needing sender policy pays for this migration. Reuse the
+                    // existing seed publisher so the repaired fold survives the next send.
+                    let bytes = broca_wal::access_counter::read_at(read_at, 0, end).map_err(|error| error.to_string())?;
+                    let key = super::index::sid(session).map_err(|error| error.to_string())?;
+                    self.db.transaction(false, |tx| publish_inner(tx, &key, &bytes, true)).map_err(|error| error.to_string())?;
+                    seed = self.db.read_snapshot(|tx| {
+                        let encoded: String = tx.query_row("SELECT admission_seed FROM session WHERE sid=?1", [&key], |row| row.get(0))?;
+                        AdmissionContinuation::decode(&encoded).map_err(DbError::SeedFallback)
+                    });
+                }
+                let seeded = seed.and_then(|seed| {
+                    let tail = admission_tail(read_at, &seed, safe_head, end)?;
+                    Ok((seed, tail))
+                });
+                match seeded {
+                    Ok((seed, tail)) => broca_core::run::load_prior_wal_snapshot_from_seed(
+                        read_at,
+                        &seed,
+                        &tail,
+                        safe_head,
+                        || {
+                            Ok(full_admission(read_at, safe_head, end, lineage)?
+                                .tail
+                                .as_ref()
+                                .clone())
+                        },
+                    ),
+                    Err(error) => {
+                        count_admission_error(&error);
+                        full_admission(read_at, safe_head, end, lineage)
+                    }
+                }
+            },
+        )
     }
 }
 
@@ -273,6 +316,15 @@ fn positioned(
 }
 
 pub(super) fn publish(tx: &Transaction<'_>, key: &str, bytes: &[u8]) -> Result<(), DbError> {
+    publish_inner(tx, key, bytes, false)
+}
+
+fn publish_inner(
+    tx: &Transaction<'_>,
+    key: &str,
+    bytes: &[u8],
+    require_sender_policy: bool,
+) -> Result<(), DbError> {
     let boundary = tx.query_row(
         "SELECT lineage_id,seq,frame_off,frame_end,frame_identity,qualified FROM projection_boundary WHERE sid=?1 AND qualified=1 ORDER BY seq DESC LIMIT 1",
         [key], |r| Ok(SeedBoundary { lineage_id: r.get(0)?, seq: r.get(1)?, frame_off: r.get(2)?, frame_end: r.get(3)?, frame_identity: r.get(4)?, qualified: r.get(5)? }),
@@ -297,17 +349,25 @@ pub(super) fn publish(tx: &Transaction<'_>, key: &str, bytes: &[u8]) -> Result<(
     let stored = if tail.is_empty() || tail.contains("\"continuation\":null") {
         None
     } else {
-        ProjectionContinuation::decode(&tail)
-            .and_then(|seed| {
-                let admission = AdmissionContinuation::decode(&admission)?;
-                if admission.encode().ok() != seed.admission().encode().ok() {
-                    return Err(SeedFallback::new(
-                        "stored admission and projection continuations disagree",
-                    ));
-                }
-                Ok(seed)
-            })
-            .ok()
+        (if require_sender_policy {
+            ProjectionContinuation::decode(&tail)
+        } else {
+            ProjectionContinuation::decode_for_execution(&tail)
+        })
+        .and_then(|seed| {
+            let admission = if require_sender_policy {
+                AdmissionContinuation::decode(&admission)
+            } else {
+                AdmissionContinuation::decode_for_execution(&admission)
+            }?;
+            if admission.encode().ok() != seed.admission().encode().ok() {
+                return Err(SeedFallback::new(
+                    "stored admission and projection continuations disagree",
+                ));
+            }
+            Ok(seed)
+        })
+        .ok()
     };
     let next = if let Some(stored) = stored {
         let prior = stored.boundary();

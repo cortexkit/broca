@@ -406,9 +406,9 @@ pub(super) fn publish_seeds(
     let stored = if tail.is_empty() || tail.contains("\"continuation\":null") {
         None
     } else {
-        ProjectionContinuation::decode(&tail)
+        ProjectionContinuation::decode_for_execution(&tail)
             .and_then(|seed| {
-                let admission = AdmissionContinuation::decode(&admission)?;
+                let admission = AdmissionContinuation::decode_for_execution(&admission)?;
                 if admission.encode().ok() != seed.admission().encode().ok() {
                     return Err(SeedFallback::new(
                         "stored admission and projection continuations disagree",

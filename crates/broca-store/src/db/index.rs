@@ -1372,6 +1372,147 @@ mod tests {
     }
 
     #[test]
+    fn raw_head_uses_latest_accepted_senders_without_origin_reads() {
+        use broca_wal::Wal;
+        let (_, base, _) = boundary_cases()
+            .into_iter()
+            .find(|(name, _, _)| *name == "no_tool_terminal")
+            .unwrap();
+        let base = modern_raw_records(base);
+        let bind = bind(&encode_records(&base));
+        let scratch = database();
+        let path = scratch._scratch.0.join("sender-head.wal");
+        let mut wal = broca_wal::FileWal::open(&path)
+            .unwrap()
+            .with_feature_floor(scratch._scratch.0.join("wal-floor"));
+        for record in &base {
+            wal.append(1, record, true).unwrap();
+        }
+        publish_writer(&scratch.db, &bind, &wal);
+        for (generation, sender) in [(1, "occipital"), (2, "replacement")] {
+            let manifest = serde_json::from_value(serde_json::json!({
+                "plan":serde_json::json!({"senders":[{"module":sender,"idle_start":true}]}).to_string(),
+                "plan_identity":sender,"composition_digest":"composition","fetches":[],"tools":[],
+                "system_text":"PRIVATE-REFRESH-TEXT","system_digest":"system","join_version":1,"role_versions":{}
+            })).unwrap();
+            wal.append(
+                1,
+                &WalRecord::SessionRefreshAccepted {
+                    generation,
+                    policy: "on_prefix_rebuild".into(),
+                    manifest: Box::new(manifest),
+                    run_in_progress: false,
+                    applies_from_next_run: false,
+                },
+                true,
+            )
+            .unwrap();
+            publish_writer(&scratch.db, &bind, &wal);
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            let actual = counter
+                .operation("raw sender head")
+                .run(|| raw_read(&scratch.db, &bind, &wal, Some(0), 100));
+            let frames = wal.replay().unwrap();
+            let expected = broca_core::AdmissionCheckpointV1::from_frames(&frames)
+                .unwrap()
+                .head
+                .unwrap();
+            assert_eq!(actual.head, expected);
+            let operations = counter.snapshot();
+            assert!(
+                operations[0].seed_fallbacks.is_empty(),
+                "{:?}",
+                operations[0]
+            );
+            assert!(operations[0]
+                .reads
+                .iter()
+                .all(|read| read.class != broca_wal::access_counter::ReadClass::Origin));
+        }
+        let mut later = base;
+        if let WalRecord::RunStarted { run_id, .. } = &mut later[0] {
+            run_id.0 = "after-refresh".into();
+        }
+        for record in &later {
+            wal.append(1, record, true).unwrap();
+        }
+        publish_writer(&scratch.db, &bind, &wal);
+        let publication = wal.durable_publication().unwrap();
+        let head = publication.sequence();
+        let db = std::sync::Arc::new(scratch.db);
+        let publishing_db = db.clone();
+        let publishing_bind = bind.clone();
+        let reader = db.admission_reader(move |_| {
+            publishing_db
+                .publish(&publishing_bind, "s-test", LogLocation::Live, &publication)
+                .map_err(|error| error.to_string())?;
+            Ok(publication.clone())
+        });
+        db.transaction(false, |tx| {
+            let (encoded, tail): (String, String) =
+                tx.query_row("SELECT admission_seed,tail_seed FROM session", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?;
+            let mut old: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            old["state"]["scalars"]["ownership"]
+                .as_object_mut()
+                .unwrap()
+                .remove("sender_admission");
+            old["state"]
+                .as_object_mut()
+                .unwrap()
+                .remove("latest_refresh");
+            let mut tail: serde_json::Value = serde_json::from_str(&tail).unwrap();
+            tail["admission"] = old.clone();
+            tx.execute(
+                "UPDATE session SET admission_seed=?1,tail_seed=?2",
+                rusqlite::params![old.to_string(), tail.to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let counter = broca_wal::access_counter::WalAccessCounter::default();
+        let owner = counter
+            .operation("execution without sender repair")
+            .run(|| reader.prior_snapshot(&bind, head))
+            .unwrap();
+        assert!(owner.base_watermark > 0);
+        assert!(!owner
+            .checkpoint_at_head
+            .ownership
+            .unwrap()
+            .sender_admission_complete());
+        assert!(counter.snapshot()[0]
+            .reads
+            .iter()
+            .all(|read| read.class != broca_wal::access_counter::ReadClass::Origin));
+        for n in 0..2 {
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            let sender = counter
+                .operation("lazy sender seed repair")
+                .run(|| reader.sender_snapshot(&bind, head))
+                .unwrap();
+            assert_eq!(
+                sender
+                    .checkpoint_at_head
+                    .ownership
+                    .unwrap()
+                    .effective_senders()[0]
+                    .module,
+                "replacement"
+            );
+            let origin_reads = counter.snapshot()[0]
+                .reads
+                .iter()
+                .filter(|read| read.class == broca_wal::access_counter::ReadClass::Origin)
+                .count();
+            // The first repair fetches the file prefix once; publishing the repaired seed
+            // also accounts for replaying those bytes from memory. Neither recurs later.
+            assert_eq!(origin_reads, if n == 0 { 2 } else { 0 });
+        }
+    }
+
+    #[test]
     fn raw_database_tool_pages_match_legacy_including_split_turns_and_tags() {
         use broca_wal::Wal;
         for fixture_name in [
