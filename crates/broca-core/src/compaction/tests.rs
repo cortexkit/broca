@@ -2623,3 +2623,55 @@ async fn a_structured_output_submit_announces_its_step() {
 
 #[path = "ceiling_tests.rs"]
 mod ceiling_tests;
+
+#[tokio::test]
+async fn setup_view_negotiation_records_the_claim_and_rejects_malformed_or_unrequested_due() {
+    use crate::compaction_provider::setup::{
+        VIEW_DUE, VIEW_FEATURE_TAG_BYTES_EDITS, VIEW_FEATURE_TRUNCATE,
+    };
+    assert_eq!(runtime::VIEW_DUE_MAX_MS, 30_000);
+    let request = setup_request()
+        .with_view_due_max_ms(runtime::VIEW_DUE_MAX_MS)
+        .with_view_features(vec![
+            VIEW_FEATURE_TRUNCATE.into(),
+            VIEW_FEATURE_TAG_BYTES_EDITS.into(),
+        ]);
+    let mut answer = ready();
+    answer["view_due"] = json!({"version":7,"digest":"a".repeat(64)});
+    let (result, records) = run_setup_for(request.clone(), answer.clone()).await;
+    let state = result.unwrap();
+    assert_eq!(state.view_due.as_ref().unwrap().version, 7);
+    assert_eq!(
+        state.view_features.as_deref().unwrap(),
+        &["truncate", "tag_bytes_edits"]
+    );
+    assert_eq!(records.len(), 1);
+    assert!(records[0]
+        .required_features()
+        .contains(&broca_wal::framing::COMPACTION_VIEW_NEGOTIATION_FEATURE));
+    for (request, due) in [
+        (
+            setup_request().with_view_due_max_ms(0),
+            json!({"version":7,"digest":"a".repeat(64)}),
+        ),
+        (
+            setup_request(),
+            json!({"version":7,"digest":"a".repeat(64)}),
+        ),
+        (
+            request.clone(),
+            json!({"version":0,"digest":"a".repeat(64)}),
+        ),
+        (request, json!({"version":7,"digest":"A".repeat(64)})),
+    ] {
+        answer["view_due"] = due;
+        let (result, records) = run_setup_for(request, answer.clone()).await;
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.provider_code.as_deref(),
+            Some("compaction_unavailable")
+        );
+        assert_eq!(error.refusal.unwrap().reason.as_deref(), Some(VIEW_DUE));
+        assert!(records.is_empty());
+    }
+}
