@@ -671,6 +671,22 @@ pub struct AdmissionStoreSnapshot {
     pub checkpoint: Option<crate::AdmissionCheckpointV1>,
 }
 
+/// Optional WAL-backed admission capability. Legacy actors do not install one and keep
+/// using their materialized store. Implementations must bind every read to the synced head.
+pub trait AdmissionReader: Send + Sync {
+    fn prior_snapshot(
+        &self,
+        session: &BindIdentity,
+        safe_head: u64,
+    ) -> Result<crate::run::PriorWalSnapshot, String>;
+
+    fn paused_episode(
+        &self,
+        session: &BindIdentity,
+        safe_head: u64,
+    ) -> Result<Option<crate::admission::LastEpisodeV1>, String>;
+}
+
 /// A page-read failure that distinguishes expected attribution migration from store faults.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorePageReadError {
@@ -910,7 +926,7 @@ pub trait Persister: Send + Sync {
     }
 
     /// Persist a derived byte anchor after projection advances its watermark.
-    /// Implementations may ignore `None`, which is the expected value on non-Unix platforms.
+    /// Implementations may ignore `None`, which is expected when the backend has no file identity.
     fn persist_wal_anchor(
         &self,
         _session: &BindIdentity,

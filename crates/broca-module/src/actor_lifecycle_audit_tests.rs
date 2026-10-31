@@ -334,6 +334,7 @@ impl Fixture {
             fanout,
             run_index: None,
             materialized_store: None,
+            admission_reader: None,
             export_index: None,
             charge_basis_resolver: None,
             startup_recovery_pending: false,
@@ -389,6 +390,7 @@ impl Fixture {
         actor.registry.publish_open_slot_for_test(
             &actor.key,
             ActorHandle {
+                media_head: actor.fanout.media_head(),
                 gen: actor.gen,
                 tx: actor.self_tx.clone(),
                 durable_head: actor.writer.as_ref().unwrap().durable_head(),

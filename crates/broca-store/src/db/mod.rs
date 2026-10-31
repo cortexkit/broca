@@ -9,8 +9,12 @@
 //! Reconciliation must still handle an index ahead of a restored or torn log.
 
 mod index;
+mod publication;
+mod readers;
 mod rebuild;
+mod reconcile;
 mod schema;
+mod seeds;
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -18,23 +22,29 @@ use std::sync::Mutex;
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 pub use index::{IndexOutcome, LogLocation, PublishedSession};
+pub use readers::{RawPageRequest, RawPageSnapshot};
 pub use rebuild::{AddressFloor, CondemnedLineage, LedgerRows};
+pub use reconcile::{ReconcileOutcome, ReconcileSession};
 
 #[derive(Debug)]
 pub enum DbError {
     Io(std::io::Error),
+    Wal(broca_wal::WalError),
     Sqlite(rusqlite::Error),
     Projection(broca_core::projection_plan::ProjectionPlanError),
     Invalid(String),
+    SeedFallback(broca_core::replay::SeedFallback),
 }
 
 impl std::fmt::Display for DbError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => e.fmt(f),
+            Self::Wal(e) => e.fmt(f),
             Self::Sqlite(e) => e.fmt(f),
             Self::Projection(e) => e.fmt(f),
             Self::Invalid(e) => f.write_str(e),
+            Self::SeedFallback(e) => f.write_str(e.reason),
         }
     }
 }
@@ -58,6 +68,7 @@ impl From<broca_core::projection_plan::ProjectionPlanError> for DbError {
 
 pub struct OverhaulDb {
     conn: Mutex<Connection>,
+    raw_fallback_notices: Mutex<std::collections::HashSet<String>>,
 }
 
 impl OverhaulDb {
@@ -98,6 +109,7 @@ impl OverhaulDb {
         conn.pragma_update(None, "synchronous", "FULL")?;
         let db = Self {
             conn: Mutex::new(conn),
+            raw_fallback_notices: Mutex::new(Default::default()),
         };
         db.authoritative_transaction(|tx| {
             schema::initialize(tx)?;

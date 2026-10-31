@@ -19,7 +19,6 @@ use super::{
 };
 use crate::compaction_provider::{
     ceiling::{CeilingDecision, CeilingPolicy, WaitEnd},
-    digest::content_digest,
     notice::{
         companion_edits, defer_reasons, headers, refusal_reasons, AdvanceNotice, Event, LastUsage,
         ViewReady,
@@ -773,7 +772,7 @@ pub(crate) struct NoticeAnchor {
 /// Only the ordinal and digest are needed after a view releases the newest raw message.
 pub(crate) fn notice_anchor(through: &Message) -> Option<NoticeAnchor> {
     let through_ordinal = through.ordinal?;
-    let through_digest = content_digest(&serde_json::to_value(through).expect("native JSON"));
+    let through_digest = broca_protocol::caller_message::message_content_identity(through).digest;
     Some(NoticeAnchor {
         ordinal: through_ordinal,
         digest: through_digest,

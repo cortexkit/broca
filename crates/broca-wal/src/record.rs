@@ -1271,7 +1271,7 @@ pub enum WalRecord {
     ///
     /// MUST-UNDERSTAND (feature `session-change/v1`). A reader without it would lose the
     /// pending generation, apply the wrong tools on the next run, or answer a repeat as stale.
-    /// Reader-first: this build decodes and folds it; no production path writes it yet.
+    /// The actor syncs this record before returning the original reply flags.
     SessionRefreshAccepted {
         /// The owner's generation, strictly increasing per session.
         generation: u64,
@@ -1289,7 +1289,7 @@ pub enum WalRecord {
     /// durable record without writing again.
     ///
     /// MUST-UNDERSTAND (feature `session-change/v1`), for the same reason as
-    /// `SessionRefreshAccepted`. Reader-first: decoded and folded, never written yet.
+    /// `SessionRefreshAccepted`. The actor syncs it before returning success.
     SessionRefreshPolicyChanged {
         /// The generation the caller believes is pending.
         generation: u64,
@@ -1302,7 +1302,7 @@ pub enum WalRecord {
     /// whatever its policy, and drops the frozen prefix. Idempotent on `send_id`.
     ///
     /// MUST-UNDERSTAND (feature `session-change/v1`), for the same reason as
-    /// `SessionRefreshAccepted`. Reader-first: decoded and folded, never written yet.
+    /// `SessionRefreshAccepted`. The actor syncs it before returning success.
     SessionPrefixFlushed {
         /// The caller's idempotency key.
         send_id: String,

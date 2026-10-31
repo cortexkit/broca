@@ -52,6 +52,28 @@ const TOOL_MODULE: &str = "conformance-tools";
 const OWNER_MODULE: &str = "conformance-owner";
 const SENDER_MODULE: &str = "conformance-sender";
 const HEAD_SENDER_MODULE: &str = "conformance-head-sender";
+const STRANGER_MODULE: &str = "conformance-stranger";
+
+fn caller_module_nonce<'a>(
+    principal: &'a str,
+    owner_nonce: &Path,
+) -> Result<Option<(&'a str, PathBuf)>, HarnessError> {
+    if principal == "direct" {
+        return Ok(None);
+    }
+    let module = principal
+        .strip_prefix("reserved:")
+        .ok_or_else(|| HarnessError::new("expected a reserved module principal"))?;
+    let nonce = match module {
+        OWNER_MODULE => owner_nonce.to_path_buf(),
+        SENDER_MODULE => owner_nonce.with_file_name("sender.nonce"),
+        HEAD_SENDER_MODULE => owner_nonce.with_file_name("head-sender.nonce"),
+        STRANGER_MODULE => owner_nonce.with_file_name("stranger.nonce"),
+        "magic-context" => owner_nonce.with_file_name("reader.nonce"),
+        _ => return Err(HarnessError::new("unknown conformance module principal")),
+    };
+    Ok(Some((module, nonce)))
+}
 const PLAN_MODEL_PREFIX: &str = "conformance-plan-";
 /// The system-prompt marker naming the session a model request belongs to.
 const SESSION_MARKER: &str = "conformance-session:";
@@ -72,6 +94,29 @@ fn history_display_kit_session(session: &str) -> bool {
     ["cf-display-", "cf-display-sender-", "cf-display-model-"]
         .iter()
         .any(|prefix| session.strip_prefix(*prefix).is_some_and(counter))
+}
+
+/// Refresh fixtures start with a plan so later sends omit legacy `tools` and `system` fields.
+/// Use the same model id for every send: switching models rebuilds the prompt prefix and would
+/// apply an `on_prefix_rebuild` refresh before the fixture's intended trigger.
+fn session_change_kit_session(session: &str) -> bool {
+    [
+        "cf-change-next-run-",
+        "cf-change-rung-",
+        "cf-change-held-",
+        "cf-change-flush-",
+        "cf-change-repeat-",
+        "cf-change-stale-",
+        "cf-change-host-set-",
+    ]
+    .iter()
+    .any(|prefix| {
+        session.strip_prefix(*prefix).is_some_and(|counter| {
+            counter
+                .parse::<u64>()
+                .is_ok_and(|number| number > 0 && number.to_string() == counter)
+        })
+    })
 }
 /// The harness every session the suite opens is bound under.
 const HARNESS: &str = "conformance";
@@ -207,6 +252,7 @@ struct Shared {
     model_holds: Mutex<HashMap<String, Arc<HoldGate>>>,
     stream_holds: Mutex<HashMap<String, usize>>,
     raw_bodies: Mutex<HashMap<String, Vec<Vec<u8>>>>,
+    attachment_models: Mutex<HashMap<String, bool>>,
     compaction: Mutex<HashMap<String, compaction::Session>>,
     session_roots: Mutex<HashMap<String, PathBuf>>,
     session_bindings: Mutex<HashMap<String, broca_protocol::BindIdentity>>,
@@ -368,6 +414,15 @@ fn seed_structured_output_catalog(state_root: &Path) -> std::io::Result<()> {
             ),
             row(support),
         );
+    }
+    for accepts in [true, false] {
+        let mut facts = row(None);
+        facts["capability.input_modalities"] = if accepts {
+            json!(["text", "image"])
+        } else {
+            json!(["text"])
+        };
+        models.insert(format!("xai/conformance-media-{accepts}"), facts);
     }
     models.insert(
         format!("{}/{}", output_refs::PROVIDER, output_refs::MODEL),
@@ -1138,6 +1193,7 @@ struct BrocaSubject {
     backup_classes: Option<Vec<String>>,
     bus_events_enabled: bool,
     process_kills_disabled: bool,
+    media_enabled: bool,
     reserved_reader: bool,
     #[cfg(feature = "test-clock")]
     bus: Option<Arc<bus::BusRig>>,
@@ -1161,6 +1217,8 @@ impl BrocaSubject {
             backup_classes: None,
             bus_events_enabled: true,
             process_kills_disabled: false,
+            media_enabled: std::env::var_os("BROCA_CONFORMANCE_MEDIA").is_some()
+                || cfg!(feature = "test-attachments"),
             reserved_reader: false,
             #[cfg(feature = "test-clock")]
             bus: None,
@@ -1241,6 +1299,16 @@ impl BrocaSubject {
                     "enabled": true,
                     "reserved": true,
                 },
+                STRANGER_MODULE: {
+                    "program": sibling_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN"),
+                    "args": [],
+                    "env": {
+                        "FAKE_AFT_MODULE_ID": STRANGER_MODULE,
+                        "FAKE_AFT_LAUNCH_NONCE_PATH": root.join("stranger.nonce"),
+                    },
+                    "enabled": true,
+                    "reserved": true,
+                },
             }
         });
         let mut config = config;
@@ -1268,8 +1336,8 @@ impl BrocaSubject {
                 &self
                     .backup_classes
                     .as_ref()
-                    .map(|classes| json!({"backup_classes": classes,"bus_run_events_enabled":self.bus_events_enabled}))
-                    .unwrap_or_else(|| json!({"bus_run_events_enabled":self.bus_events_enabled})),
+                    .map(|classes| json!({"backup_classes": classes,"bus_run_events_enabled":self.bus_events_enabled,"media":{"enabled":self.media_enabled}}))
+                    .unwrap_or_else(|| json!({"bus_run_events_enabled":self.bus_events_enabled,"media":{"enabled":self.media_enabled}})),
             )
             .unwrap(),
         )
@@ -1368,20 +1436,9 @@ impl BrocaSubject {
         if let Some(connection) = connections.get(&stamp.principal) {
             return Ok(connection.clone());
         }
-        let identity = if stamp.principal == "direct" {
-            None
-        } else {
-            let module = stamp
-                .principal
-                .strip_prefix("reserved:")
-                .ok_or_else(|| HarnessError::new("expected a reserved module principal"))?;
-            let nonce_path = match module {
-                OWNER_MODULE => live.owner_nonce.clone(),
-                SENDER_MODULE => live.owner_nonce.with_file_name("sender.nonce"),
-                HEAD_SENDER_MODULE => live.owner_nonce.with_file_name("head-sender.nonce"),
-                "magic-context" => live.owner_nonce.with_file_name("reader.nonce"),
-                _ => return Err(HarnessError::new("unknown conformance module principal")),
-            };
+        let identity = if let Some((module, nonce_path)) =
+            caller_module_nonce(&stamp.principal, &live.owner_nonce)?
+        {
             let deadline = Instant::now() + Duration::from_secs(20);
             let nonce = loop {
                 if let Ok(text) = std::fs::read_to_string(&nonce_path) {
@@ -1400,6 +1457,8 @@ impl BrocaSubject {
                 module_id: module.into(),
                 launch_nonce: nonce,
             })
+        } else {
+            None
         };
         let connection = Arc::new(
             SubcConnection::connect_with_consumer_identity(&live.connection_file, identity)
@@ -2015,6 +2074,53 @@ impl RunnerRoute for BrocaRoute {
 
 #[async_trait]
 impl LlmRunnerSubject for BrocaSubject {
+    fn attachment_model_fields(&self, session: &str, accepts: bool) -> Option<Map<String, Value>> {
+        self.shared
+            .attachment_models
+            .lock()
+            .unwrap()
+            .insert(session.into(), accepts);
+        Some(
+            json!({"model":{"provider":"xai","model":format!("conformance-media-{accepts}")}})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+    }
+
+    fn attachment_tool_result(&self, png: &[u8]) -> Option<Value> {
+        use base64::Engine;
+        let image = broca_core::media_validation::validate_media(png, "image/png").unwrap();
+        Some(json!({OWN_CONTENT:[{"type":"text","text":"before-media"},
+            {"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(png),"width":image.width,"height":image.height},
+            {"type":"text","text":"after-media"}]}))
+    }
+
+    async fn restart_attachments(
+        &self,
+        handle: &Live,
+        session: &str,
+    ) -> Result<BrocaRoute, HarnessError> {
+        // Model the permitted loss of unfinished staging, retaining committed uploads and
+        // captured objects. Process-kill recovery of captured media has its own native test.
+        let staging = handle.state_root.join("media-uploads");
+        for entry in
+            std::fs::read_dir(staging.join("refs")).map_err(|e| HarnessError::new(e.to_string()))?
+        {
+            let entry = entry.map_err(|e| HarnessError::new(e.to_string()))?;
+            let bytes =
+                std::fs::read(entry.path()).map_err(|e| HarnessError::new(e.to_string()))?;
+            let mut meta: Value =
+                serde_json::from_slice(&bytes).map_err(|e| HarnessError::new(e.to_string()))?;
+            if meta["committed"] == false {
+                meta["gone"] = json!(true);
+                std::fs::write(entry.path(), serde_json::to_vec(&meta).unwrap())
+                    .map_err(|e| HarnessError::new(e.to_string()))?;
+            }
+        }
+        self.session_route(handle, session, &self.owner_stamp())
+            .await
+    }
     fn supports_model_failure_fixture(&self) -> bool {
         true
     }
@@ -2202,6 +2308,11 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::Compaction,
             Capability::ModelView,
             Capability::ClientMessageId,
+            // The adapter implements the three session_change subject hooks (a tool-free
+            // refresh plan, model request observations and holdable tool calls), so the kit
+            // runs its cases. The host fixes no tool set, so the outside-host-set case
+            // reports inapplicable by name.
+            Capability::SessionChange,
             // role.describe declares system_text_default (tool-provider 0.12), and the
             // adapter implements both of its hooks, so the kit runs those cases.
             Capability::SystemTextDefault,
@@ -2213,6 +2324,9 @@ impl LlmRunnerSubject for BrocaSubject {
         // both admission and the retention group in role.describe.
         if broca_module_serve::RETENTION_WRITER_ENABLED {
             capabilities.extend([Capability::Retention, Capability::RetentionClock]);
+        }
+        if self.media_enabled {
+            capabilities.insert(Capability::Attachments);
         }
         capabilities
     }
@@ -2247,7 +2361,7 @@ impl LlmRunnerSubject for BrocaSubject {
 
     fn stranger_stamp(&self) -> RouteStamp {
         RouteStamp {
-            principal: "direct".into(),
+            principal: format!("reserved:{STRANGER_MODULE}"),
             scope: None,
         }
     }
@@ -2308,12 +2422,36 @@ impl LlmRunnerSubject for BrocaSubject {
     }
 
     fn send_fields(&self, session: &str, first: bool) -> Map<String, Value> {
+        if session_change_kit_session(session)
+            && !self.shared.plan_sessions.lock().unwrap().contains(session)
+        {
+            return self
+                .send_fields_with_plan(session, first, &Map::new())
+                .unwrap();
+        }
         if held_late_results::needs_plan(&self.shared, session)
             && !self.shared.plan_sessions.lock().unwrap().contains(session)
         {
             return self
                 .send_fields_with_plan(session, first, &Map::new())
                 .unwrap();
+        }
+        if let Some(accepts) = self
+            .shared
+            .attachment_models
+            .lock()
+            .unwrap()
+            .get(session)
+            .copied()
+            .or_else(|| (self.media_enabled && session.contains("attachments")).then_some(true))
+        {
+            let mut fields =
+                json!({"model":{"provider":"xai","model":format!("conformance-media-{accepts}")}});
+            if !self.shared.plan_sessions.lock().unwrap().contains(session) {
+                fields["system"] = json!(format!("{SESSION_MARKER}{session}"));
+                fields["tools"] = json!([{"name":SCRIPTED_TOOL,"description":"Answers each call with its scripted result.","input_schema":{"type":"object"},"module":TOOL_MODULE}]);
+            }
+            return fields.as_object().unwrap().clone();
         }
         // The pin fixture uses an admitted provider catalog. Caller-declared
         // legacy tools intentionally have no provider semantics to pin.
@@ -2373,6 +2511,18 @@ impl LlmRunnerSubject for BrocaSubject {
         first: bool,
         members: &Map<String, Value>,
     ) -> Option<Map<String, Value>> {
+        let mut members = members.clone();
+        // The shared-send-id case uses the stranger's route label as a plan module.
+        // Translate this fixture label to the module the daemon actually attests.
+        if let Some(senders) = members.get_mut("senders").and_then(Value::as_array_mut) {
+            for sender in senders {
+                if sender.get("module").and_then(Value::as_str)
+                    == Some(format!("reserved:{STRANGER_MODULE}").as_str())
+                {
+                    sender["module"] = STRANGER_MODULE.into();
+                }
+            }
+        }
         // A session with a scripted compaction provider keeps its compaction plan, the extra
         // members beside the plan's own.
         if compaction::known_session(&self.shared, session) {
@@ -2417,6 +2567,40 @@ impl LlmRunnerSubject for BrocaSubject {
                 SENDER_MODULE,
             ),
         )
+    }
+
+    /// A plan for `session.refresh` of `session`. `ChangedTools` is a tool-free plan: the
+    /// session's first plan offers the scripted tool, so the next run offering no tools
+    /// differs and the cases can tell whether it applied. The host fixes no tool set at
+    /// start (broca never answers `tool_outside_host_set`), so both host-set variants are
+    /// inapplicable by name.
+    fn refresh_plan(
+        &self,
+        _session: &str,
+        variant: cortexkit_role_llm_runner_conformance::RefreshVariant,
+    ) -> Option<cortexkit_role_llm_runner_conformance::RefreshPlan> {
+        use cortexkit_role_llm_runner_conformance::{RefreshPlan, RefreshVariant};
+        match variant {
+            RefreshVariant::ChangedTools => {
+                let composition = serde_json::json!({"providers": [], "step_transform_items": []});
+                let composition_digest =
+                    cortexkit_role_tool_provider::catalog::composition_digest(&composition)
+                        .expect("empty composition digests");
+                let plan = serde_json::json!({
+                    "tool_items": [],
+                    "system_text_items": [],
+                    "step_transform_items": [],
+                    "composition_digest": composition_digest,
+                    "composition": composition,
+                });
+                Some(RefreshPlan::new(
+                    plan.as_object().unwrap().clone(),
+                    Vec::new(),
+                ))
+            }
+            RefreshVariant::OutsideHostSet | RefreshVariant::ChangedDefinition => None,
+            _ => None,
+        }
     }
 
     async fn rich_ui_plan_fields(
@@ -2844,7 +3028,7 @@ impl LlmRunnerSubject for BrocaSubject {
     ) -> Option<Value> {
         use base64::{engine::general_purpose::STANDARD, Engine};
         use cortexkit_role_llm_runner::tags::ToolResultBlock;
-        if !broca_protocol::attachments_enabled()
+        if !self.media_enabled
             && blocks
                 .iter()
                 .any(|block| matches!(block, ToolResultBlock::Image | ToolResultBlock::Media))
@@ -2910,7 +3094,7 @@ impl LlmRunnerSubject for BrocaSubject {
     /// cannot carry arbitrary text; the marker-free numbering fixture checks those images.
     /// Without capture, the legacy placeholder's MIME type can carry the marker.
     fn image_tool_result(&self, marker: &str) -> Option<Value> {
-        if broca_protocol::attachments_enabled() {
+        if self.media_enabled {
             return None;
         }
         Some(json!({ OWN_CONTENT: [{
@@ -3337,6 +3521,12 @@ const REQUIRED_STRUCTURED_OUTPUT_CASES: &[&str] = &[
     "structured_output_sibling_never_dispatched",
 ];
 
+const REQUIRED_RETRACT_OWN_SEND_CASES: &[&str] = &[
+    "retract_own_send_sender_retracted",
+    "retract_own_send_other_sender_refused",
+    "retract_own_send_shared_send_id_isolated",
+];
+
 const STREAMED_SIBLINGS_INAPPLICABLE: &str = "submit_streamed_siblings is not declared; the strict rule is checked by structured_output_sibling_never_dispatched";
 
 /// Additive kit cases must not turn an undeclared capability into a required pass.
@@ -3348,6 +3538,7 @@ fn check_named_contract_cases(
     for name in REQUIRED_INPUT_CAP_CASES
         .iter()
         .chain(REQUIRED_STRUCTURED_OUTPUT_CASES)
+        .chain(REQUIRED_RETRACT_OWN_SEND_CASES)
     {
         let case = cases
             .iter()
@@ -3386,6 +3577,7 @@ mod named_contract_case_tests {
             .filter(|case| {
                 case.name.starts_with("input_token_cap_")
                     || case.name.starts_with("structured_output_")
+                    || case.name.starts_with("retract_own_send_")
             })
             .map(|case| CaseReport {
                 case: case.name,
@@ -3411,6 +3603,7 @@ mod named_contract_case_tests {
         for name in REQUIRED_INPUT_CAP_CASES
             .iter()
             .chain(REQUIRED_STRUCTURED_OUTPUT_CASES)
+            .chain(REQUIRED_RETRACT_OWN_SEND_CASES)
             .copied()
             .chain(std::iter::once("structured_output_streamed_siblings"))
         {
@@ -3510,6 +3703,15 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         eprintln!("{}", subject.failure_evidence());
     }
     assert!(failed.is_empty(), "{}", report.render());
+    if subject.media_enabled {
+        for case in report
+            .cases
+            .iter()
+            .filter(|case| case.case.starts_with("attachments_"))
+        {
+            assert_eq!(case.outcome, CaseOutcome::Passed, "{}", report.render());
+        }
+    }
     // Broca declares these operations, so a case that drifts to skipped or inapplicable
     // must not silently pass. Input-cap and structured-output outcomes are checked by name
     // below, including the undeclared streamed-sibling behavior.
@@ -3537,10 +3739,11 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "output_refs_reference_limit",
         "output_refs_read_limits",
         "output_refs_snapshot_budget",
-        #[cfg(feature = "test-attachments")]
-        "tags_tool_result_blocks_share_one_number",
-        #[cfg(not(feature = "test-attachments"))]
-        "tags_count_only_parts_rendered_with_a_number",
+        if subject.media_enabled {
+            "tags_tool_result_blocks_share_one_number"
+        } else {
+            "tags_count_only_parts_rendered_with_a_number"
+        },
         "compaction_setup_durable_once",
         "model_view_half_open_ranges_and_travel",
         "compaction_unavailable_distinct_from_refuse",
@@ -3559,6 +3762,12 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "no_tools_offered_to_model",
         "no_tools_later_plan_send_refused",
         "send_id_retry_same_answer",
+        "session_refresh_applies_from_next_run",
+        "session_refresh_waits_for_its_rung",
+        "session_refresh_repeat_same_answer",
+        "session_refresh_generation_stale_refused",
+        "session_refresh_never_changes_a_running_run",
+        "flush_prefix_applies_pending",
         "run_attribution_per_message",
         "send_id_reuse_refused_naming_field",
         "delivery_change_refused",
@@ -3606,7 +3815,18 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
             report.render()
         );
     }
-    // Broca has no replan operation; the kit cannot change a live session's frozen teaching.
+    let host_set = report
+        .cases
+        .iter()
+        .find(|case| case.case == "session_refresh_tool_outside_host_set_refused")
+        .unwrap();
+    assert_eq!(
+        host_set.outcome,
+        CaseOutcome::Inapplicable {
+            reason: "the adapter's host does not fix its tool set at start".into(),
+        }
+    );
+    // The kit's rich-UI hook is separate from its tool-refresh fixture.
     let follows = report
         .cases
         .iter()
@@ -5185,11 +5405,283 @@ mod held_call_tests {
             backup_classes: None,
             bus_events_enabled: false,
             process_kills_disabled: true,
+            media_enabled: false,
             reserved_reader: false,
             #[cfg(feature = "test-clock")]
             bus: None,
             #[cfg(feature = "test-clock")]
             mc: None,
+        }
+    }
+
+    #[test]
+    fn retract_own_send_kit_plan_names_both_attested_senders() {
+        use cortexkit_role_llm_runner::delivery_order::{admit, Mode, PlanSender};
+        let subject = subject(Arc::new(Shared::default()));
+        let a = subject.plan_sender().unwrap();
+        let b = subject.stranger_stamp();
+        let owner_nonce = Path::new("fixture/owner.nonce");
+        let (module_b, nonce_b) = caller_module_nonce(&b.principal, owner_nonce)
+            .unwrap()
+            .expect("sender B must present a reserved consumer identity");
+        assert_eq!(module_b, STRANGER_MODULE);
+        assert_eq!(nonce_b, PathBuf::from("fixture/stranger.nonce"));
+        assert_ne!(b.principal, subject.owner_stamp().principal);
+
+        // Match the published shared-ID case: B is named by its RouteStamp label,
+        // not by a second PlanSenderIdentity fixture supplied by the adapter.
+        let members = Map::from_iter([(
+            "senders".into(),
+            json!([PlanSender::new(&a.module), PlanSender::new(&b.principal),]),
+        )]);
+        let fields = subject
+            .send_fields_with_plan("shared-id", true, &members)
+            .unwrap();
+        let senders: Vec<PlanSender> =
+            serde_json::from_value(fields["plan"]["senders"].clone()).unwrap();
+        assert_eq!(
+            senders
+                .iter()
+                .map(|s| s.module.as_str())
+                .collect::<Vec<_>>(),
+            [SENDER_MODULE, STRANGER_MODULE]
+        );
+        for module in [a.module.as_str(), module_b] {
+            assert_eq!(
+                admit(module, Some(OWNER_MODULE), &senders, &[Mode::Steer]),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn retract_own_send_stranger_stays_unnamed_elsewhere_and_direct_stays_unidentified() {
+        use cortexkit_role_llm_runner::delivery_order::{admit, Mode, PlanSender};
+        let subject = subject(Arc::new(Shared::default()));
+        let stamp = subject.stranger_stamp();
+        let owner_nonce = Path::new("fixture/owner.nonce");
+        assert!(caller_module_nonce("direct", owner_nonce)
+            .unwrap()
+            .is_none());
+        let (module, _) = caller_module_nonce(&stamp.principal, owner_nonce)
+            .unwrap()
+            .unwrap();
+        for senders in [
+            vec![PlanSender::new(SENDER_MODULE)],
+            subject
+                .head_sender_identities()
+                .unwrap()
+                .iter()
+                .map(|id| PlanSender::new(&id.module))
+                .collect(),
+        ] {
+            assert!(!senders.iter().any(|sender| sender.module == module));
+            assert_eq!(
+                admit(module, Some(OWNER_MODULE), &senders, &[Mode::Steer]),
+                Err((
+                    cortexkit_role_llm_runner::errors::SCOPE_OWNER_MISMATCH,
+                    None
+                ))
+            );
+        }
+        let ownership = broca_core::SessionOwnershipV1 {
+            episodes: 1,
+            first_principal: Some(broca_protocol::BindPrincipal::Reserved {
+                module_id: OWNER_MODULE.into(),
+            }),
+            ..Default::default()
+        };
+        assert!(broca_core::scope_admission::decide_owner_access(
+            &ownership,
+            Some(&broca_protocol::BindPrincipal::Reserved {
+                module_id: module.into()
+            }),
+            &broca_protocol::SendScope::Unstamped,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn session_refresh_fields_are_plan_driven_without_a_model_switch() {
+        let subject = subject(Arc::new(Shared::default()));
+        for label in [
+            "next-run", "rung", "held", "flush", "repeat", "stale", "host-set",
+        ] {
+            let session = format!("cf-change-{label}-1");
+            let first = subject.send_fields(&session, true);
+            assert!(first.get("plan").is_some(), "{session}: {first:?}");
+            assert!(first["tools"].is_null());
+            assert!(first["system"].is_null());
+            let next = subject.send_fields(&session, false);
+            assert_eq!(next["model"], first["model"], "{session}");
+            for field in ["tools", "system", "plan"] {
+                assert!(!next.contains_key(field), "{session}: {field} in {next:?}");
+            }
+        }
+        for session in [
+            "ordinary-change-next-run-1",
+            "cf-change-next-run-0",
+            "cf-change-next-run-01",
+            "cf-change-next-run-1-other",
+        ] {
+            let fields = subject.send_fields(session, true);
+            assert!(fields.get("plan").is_none(), "{session}");
+            assert!(fields["tools"].is_array(), "{session}");
+            assert_eq!(fields["system"], format!("{SESSION_MARKER}{session}"));
+        }
+    }
+
+    struct RefreshPlanAdmitter;
+
+    #[async_trait]
+    impl broca_fetch_plan::PlanAdmitter for RefreshPlanAdmitter {
+        async fn admit(
+            &self,
+            plan: &broca_fetch_plan::Plan,
+            _: &broca_protocol::BindIdentity,
+            _: Option<&broca_protocol::SessionScope>,
+        ) -> Result<broca_fetch_plan::Admitted, broca_fetch_plan::Refusal> {
+            let tools = plan.composition["providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|provider| provider["tools"].as_array().unwrap())
+                .map(|tool| {
+                    serde_json::from_value(json!({
+                        "name":tool["name"], "description":"scripted fixture",
+                        "input_schema":{"type":"object"}, "module":TOOL_MODULE
+                    }))
+                    .unwrap()
+                })
+                .collect();
+            Ok(broca_fetch_plan::Admitted {
+                manifest: broca_wal::PlanManifest {
+                    rich_ui: None,
+                    plan: broca_wal::OpaqueJson::from_json_text(plan.text.clone()).unwrap(),
+                    plan_identity: plan.identity.clone(),
+                    composition_digest: plan.composition_digest.clone(),
+                    fetches: Vec::new(),
+                    tools: Arc::new(tools),
+                    system_text: String::new(),
+                    system_digest: String::new(),
+                    join_version: 1,
+                    role_versions: Default::default(),
+                    declarations: Vec::new(),
+                },
+            })
+        }
+    }
+
+    /// Build sends from the adapter's real hooks, just as the kit's send_params helper does.
+    async fn send_refresh_fixture(
+        subject: &BrocaSubject,
+        rig: &mut delivery_rig::Rig,
+        session: &str,
+        first: bool,
+    ) -> subc_protocol::Frame {
+        let mut params = subject.send_fields(session, first);
+        params.insert("prompt".into(), json!("scripted refresh prompt"));
+        params.insert(
+            "send_id".into(),
+            json!(if first { "first" } else { "next" }),
+        );
+        rig.request(7, json!({"method":"session.send","params":params}))
+            .await
+    }
+
+    #[tokio::test]
+    async fn session_refresh_adapter_sends_apply_at_the_real_serve_boundary() {
+        use cortexkit_role_llm_runner_conformance::RefreshVariant;
+        use delivery_rig::{result, Rig, Step};
+        use subc_protocol::{FrameType, Principal};
+
+        for (label, policy, active, flush) in [
+            ("next-run", "immediately", false, false),
+            ("held", "immediately", true, false),
+            ("flush", "on_prefix_rebuild", true, true),
+            ("rung", "on_prefix_rebuild", false, false),
+        ] {
+            let subject = subject(Arc::new(Shared::default()));
+            let session = format!("cf-change-{label}-1");
+            let mut rig = Rig::start(&format!("refresh-adapter-{label}")).await;
+            rig.bind_as(
+                7,
+                Some(Principal::Reserved {
+                    module_id: "owner".into(),
+                }),
+            )
+            .await;
+            rig.registry()
+                .set_plan_admitter(Arc::new(RefreshPlanAdmitter));
+            rig.script.push(&[Step::Text("first run")]);
+            rig.script.hold_model(active);
+            let first = send_refresh_fixture(&subject, &mut rig, &session, true).await;
+            assert_eq!(first.header.ty, FrameType::Response, "{first:?}");
+            if active {
+                rig.wait_entered().await;
+            } else {
+                rig.wait_idle().await;
+            }
+            let plan = subject
+                .refresh_plan(&session, RefreshVariant::ChangedTools)
+                .unwrap();
+            let refreshed = rig
+                .request(
+                    7,
+                    json!({"method":"session.refresh","params":{
+                        "plan":plan.plan,"generation":1,"policy":policy
+                    }}),
+                )
+                .await;
+            assert_eq!(refreshed.header.ty, FrameType::Response, "{refreshed:?}");
+            assert_eq!(result(&refreshed)["run_in_progress"], active);
+            assert_eq!(
+                result(&refreshed)["applies_from_next_run"],
+                policy == "immediately"
+            );
+            if flush {
+                let reply = rig
+                    .request(
+                        7,
+                        json!({"method":"session.flush_prefix","params":{"send_id":"flush"}}),
+                    )
+                    .await;
+                assert_eq!(result(&reply)["pending_generation"], 1);
+            }
+            rig.script.hold_model(false);
+            rig.wait_idle().await;
+            rig.script.push(&[Step::Text("next run")]);
+            let next = send_refresh_fixture(&subject, &mut rig, &session, false).await;
+            assert_eq!(next.header.ty, FrameType::Response, "{label}: {next:?}");
+            rig.wait_idle().await;
+            let applied = policy == "immediately" || flush;
+            let offered = rig.script.offered_tools.lock().unwrap().clone();
+            assert_eq!(offered[0], vec![SCRIPTED_TOOL.to_string()]);
+            assert_eq!(
+                offered[1],
+                if applied {
+                    Vec::new()
+                } else {
+                    vec![SCRIPTED_TOOL.to_string()]
+                }
+            );
+            let baseline = rig
+                .request(7, json!({"method":"session.baseline","params":{}}))
+                .await;
+            assert_eq!(
+                result(&baseline)["baseline"]["applied_generation"],
+                u64::from(applied)
+            );
+            let models: Vec<_> = rig
+                .records()
+                .into_iter()
+                .filter_map(|record| match record {
+                    broca_wal::WalRecord::RunStarted { config, .. } => Some(config.model),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(models[0], models[1], "the adapter must not fake a rebuild");
+            rig.finish().await;
         }
     }
 

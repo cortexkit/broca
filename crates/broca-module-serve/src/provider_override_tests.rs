@@ -1308,13 +1308,13 @@ async fn later_persona_admissions_inherit_the_ordinal_without_reading_wal_bytes(
     wal.append(1, &run_started_with_user_text(&req.session, "other-provider", "fifth prompt"), true).unwrap();
     let total = std::fs::metadata(store.wal_path(&req.session)).unwrap().len();
     assert_eq!(executor.session_prompt_ordinal(&req, None, 6).await.unwrap(), 6);
-    #[cfg(unix)]
-    assert_eq!(executor.cc_prompt_wal_bytes.load(Ordering::Relaxed) - read, total - prefix_bytes,
-        "a provider switch reads only the suffix after the memoized anchor");
-    #[cfg(not(unix))]
-    assert_eq!(executor.cc_prompt_wal_bytes.load(Ordering::Relaxed) - read,
+    let expected_bytes = store.file_identity(&req.session).unwrap().map_or(
         total - broca_wal::framing::LINEAGE_FRAME_LEN as u64,
-        "platforms without file-identity anchors retain the bounded selective fallback");
+        |_| total - prefix_bytes,
+    );
+    assert_eq!(executor.cc_prompt_wal_bytes.load(Ordering::Relaxed) - read,
+        expected_bytes,
+        "a provider switch reads only the suffix with an anchor, or the bounded selective fallback without one");
     assert!(executor.session_prompt_ordinal(&req, None, 7).await.is_err(), "an incomplete read fails closed");
     drop(wal);
     drop(executor);

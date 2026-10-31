@@ -83,10 +83,10 @@ fn open_observed(_stage: &'static str) {
 
 /// An optional byte offset for starting a later read without decoding the WAL prefix.
 ///
-/// `file_id` fingerprints the opened file's device and inode on Unix. Other platforms
-/// currently return no anchors, so the optimization is disabled there rather than relying
-/// on a weaker identity. Anchors are derived hints only: every mismatch falls back to a
-/// read from byte zero.
+/// `file_id` fingerprints the opened file's device and inode on Unix, or its volume serial
+/// number and file index on Windows. Platforms without a stable identity return no anchors.
+/// Anchors are derived hints only: ordinary range reads replay from byte zero on a mismatch;
+/// strict reads return `None` so the caller can choose a full replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalByteAnchor {
     pub file_id: u64,
@@ -480,6 +480,11 @@ fn closed_error() -> WalError {
 
 /// The append-only WAL log. The loop depends on the trait, not the impl.
 pub trait Wal {
+    /// The last prefix synced on this writer's descriptor, never speculative EOF.
+    /// Memory logs and wrappers without a durable file witness return `None`.
+    fn durable_publication(&self) -> Option<DurablePublication> {
+        None
+    }
     /// Current file location, including first-send relocation; absent for memory logs.
     fn log_path(&self) -> Option<&Path> {
         None
@@ -587,6 +592,32 @@ struct SyncProbe {
     dir_sync_paths: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
 }
 
+/// An immutable publication witness minted only by a successful writer sync.
+/// Readers must still authenticate lineage, frame hashes and contiguous ranges;
+/// the witness bounds their reads, not the lifetime of the file at its path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurablePublication {
+    path: PathBuf,
+    lineage: WalLineageId,
+    seq: u64,
+    end: u64,
+}
+
+impl DurablePublication {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    pub fn lineage(&self) -> WalLineageId {
+        self.lineage
+    }
+    pub fn sequence(&self) -> u64 {
+        self.seq
+    }
+    pub fn byte_end(&self) -> u64 {
+        self.end
+    }
+}
+
 pub struct FileWal {
     path: PathBuf,
     file: File,
@@ -604,6 +635,7 @@ pub struct FileWal {
     /// compare it with an authority and does not use it to reject an append. The belt catches
     /// the residual case: a draining old writer appending AFTER a new writer already wrote.
     last_write_end: u64,
+    synced_prefix: Cell<Option<(u64, u64)>>,
     /// The first barrier after each open syncs the WAL's parent directory so the
     /// file's name is durable, including when an earlier process did not sync it.
     dir_needs_sync: Cell<bool>,
@@ -1048,6 +1080,7 @@ impl FileWal {
             file,
             next_seq,
             last_write_end,
+            synced_prefix: Cell::new(None),
             dir_needs_sync: Cell::new(true),
             newly_created_dirs: RefCell::new(newly_created_dirs),
             config: WalConfig::LEGACY,
@@ -1139,6 +1172,13 @@ impl FileWal {
             self.dir_needs_sync.set(false);
         }
         Ok(())
+    }
+
+    fn record_synced_prefix(&self) {
+        // Capture the writer's known end, not a path-based EOF that might include
+        // another descriptor's writes. Readers still authenticate this prefix.
+        self.synced_prefix
+            .set(Some((self.next_seq.saturating_sub(1), self.last_write_end)));
     }
 }
 
@@ -1396,11 +1436,23 @@ impl FileWal {
         // Advance our high-water mark past the bytes we just wrote. Only OUR appends move
         // this, so "size unchanged since our last append" ⟺ no foreign write.
         self.last_write_end = current + bytes.len() as u64;
+        if sync {
+            self.record_synced_prefix();
+        }
         Ok(seq)
     }
 }
 
 impl Wal for FileWal {
+    fn durable_publication(&self) -> Option<DurablePublication> {
+        let (seq, end) = self.synced_prefix.get()?;
+        Some(DurablePublication {
+            path: self.path.clone(),
+            lineage: self.lineage_id?,
+            seq,
+            end,
+        })
+    }
     fn log_path(&self) -> Option<&Path> {
         Some(&self.path)
     }
@@ -1471,7 +1523,9 @@ impl Wal for FileWal {
     }
 
     fn sync(&self) -> Result<(), WalError> {
-        self.fsync()
+        self.fsync()?;
+        self.record_synced_prefix();
+        Ok(())
     }
 
     fn replay(&self) -> Result<Vec<FramedRecord>, WalError> {
@@ -1999,14 +2053,7 @@ fn scan_prefix<T>(
                         file_size: offset + frame.len() as u64,
                     });
                 }
-                decode_bytes_seeded(
-                    &frame,
-                    offset,
-                    scan.last_seq,
-                    1,
-                    Vec::new(),
-                    scan.lineage_id,
-                )?;
+                recover_prefix(&frame, offset, scan.last_seq, scan.lineage_id)?;
                 return Ok(scan);
             }
         }
@@ -2082,7 +2129,7 @@ pub fn read_records_range_from_valid_anchor(
         });
     }
     let (Some(file_id), Some(expected_next)) =
-        (metadata_file_id(&metadata), after_seq.checked_add(1))
+        (opened_file_id(&file, &metadata), after_seq.checked_add(1))
     else {
         return Ok(None);
     };
@@ -2159,7 +2206,7 @@ pub fn read_records_range(
             file_size,
         });
     }
-    let file_id = metadata_file_id(&metadata);
+    let file_id = opened_file_id(&file, &metadata);
 
     if let (Some(anchor), Some(file_id), Some(expected_next)) =
         (anchor, file_id, after_seq.checked_add(1))
@@ -2308,7 +2355,7 @@ fn read_records_tail_snapshot(
     access_counter::read_to_end(file.take(file_size - start), start, &mut suffix)
         .map_err(WalError::Io)?;
     let lineage = read_first_frame_lineage(file, max_bytes)?;
-    let file_id = metadata_file_id(metadata);
+    let file_id = opened_file_id(file, metadata);
     if start == 0 {
         let decoded = decode_bytes(&suffix, 0, 1)?;
         return select_decoded_range(decoded, &suffix, 0, file_id, 0, None).map(Some);
@@ -2381,6 +2428,37 @@ struct DecodedBytes {
     records: Vec<(FramedRecord, u64)>,
     valid_end: u64,
     lineage_id: Option<WalLineageId>,
+}
+
+/// A verified prefix, not a durability witness. Only the caller's descriptor
+/// sync can make the returned end eligible for durable index publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalRecoveryPrefix {
+    pub valid_end: u64,
+    pub last_seq: Option<u64>,
+}
+
+/// Recover an already-read suffix using the writer's damage classification.
+/// `absolute_start`, `previous_seq` and `lineage` must describe an authenticated
+/// preceding boundary (or the origin of an unindexed log). An unidentified legacy
+/// log supplies `None` for lineage. Damage before intact data is a typed WAL error;
+/// an incomplete or damaged final append is excluded from the returned prefix.
+/// This function does no I/O, syncing or truncation.
+pub fn recover_prefix(
+    bytes: &[u8],
+    absolute_start: u64,
+    previous_seq: Option<u64>,
+    lineage: Option<WalLineageId>,
+) -> Result<WalRecoveryPrefix, WalError> {
+    let decoded = decode_bytes_seeded(bytes, absolute_start, previous_seq, 1, Vec::new(), lineage)?;
+    Ok(WalRecoveryPrefix {
+        valid_end: decoded.valid_end,
+        last_seq: decoded
+            .records
+            .last()
+            .map(|(framed, _)| framed.seq)
+            .or(previous_seq),
+    })
 }
 
 #[cfg(test)]
@@ -2539,7 +2617,7 @@ fn validate_contiguous_sequence(
 fn has_intact_data_after(bytes: &[u8], mut expected_lineage: Option<WalLineageId>) -> bool {
     (1..bytes.len().saturating_sub(crate::framing::HEADER_LEN - 1)).any(|offset| {
         let suffix = &bytes[offset..];
-        match decode_next(suffix) {
+        match decode_next_counted(suffix) {
             DecodeStep::Record { .. } | DecodeStep::NewerWriter { .. } => true,
             DecodeStep::Corrupt(_) => crate::framing::digest_verifies(suffix),
             DecodeStep::Lineage {
@@ -2706,24 +2784,54 @@ fn metadata_file_id(metadata: &std::fs::Metadata) -> Option<u64> {
     Some(std::hash::Hasher::finish(&hasher))
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn metadata_file_id(_metadata: &std::fs::Metadata) -> Option<u64> {
-    // The standard library does not expose a stable Windows file identifier. Return no identity
-    // rather than cache against a weak timestamp surrogate: no identity simply makes each idle
-    // read take its flush-only proof, which under-optimizes but never over-claims durability.
+    // Without a stable native identifier, timestamps cannot prove that a cached file is still
+    // current. Callers must replay from byte zero or synchronize the WAL again rather than
+    // reuse a cached durability proof.
     None
+}
+
+fn opened_file_id(_file: &File, _metadata: &std::fs::Metadata) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use std::hash::Hash;
+
+        let (volume, index) = _file.native_file_identity()?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        volume.hash(&mut hasher);
+        index.hash(&mut hasher);
+        Some(std::hash::Hasher::finish(&hasher))
+    }
+    #[cfg(not(windows))]
+    {
+        metadata_file_id(_metadata)
+    }
 }
 
 /// Return the platform-stable identity of the file currently at `path`, when the platform can
 /// provide one. Read-side durability caches use this only to invalidate a proof after the WAL is
 /// replaced; callers without an identity must take a fresh flush barrier instead.
 pub fn file_identity(path: impl AsRef<Path>) -> Result<Option<u64>, WalError> {
-    let metadata = match fs_ops::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(WalError::Io(error)),
-    };
-    Ok(metadata_file_id(&metadata))
+    #[cfg(windows)]
+    {
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(WalError::Io(error)),
+        };
+        let metadata = file.metadata().map_err(WalError::Io)?;
+        Ok(opened_file_id(&file, &metadata))
+    }
+    #[cfg(not(windows))]
+    {
+        let metadata = match fs_ops::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(WalError::Io(error)),
+        };
+        Ok(metadata_file_id(&metadata))
+    }
 }
 
 /// Like [`replay_path`] but also returns the byte offset where valid frames end (the start of
@@ -2775,6 +2883,40 @@ fn read_file_capped(path: &Path, max_bytes: u64) -> Result<Vec<u8>, WalError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn durable_publication_is_frozen_at_the_descriptor_sync() {
+        let path = tmp("durable-publication");
+        let mut wal = FileWal::open(&path).unwrap();
+        assert!(wal.durable_publication().is_none());
+        wal.append(
+            1,
+            &WalRecord::StepStarted {
+                step_id: broca_protocol::StepId(1),
+            },
+            false,
+        )
+        .unwrap();
+        assert!(wal.durable_publication().is_none());
+        wal.sync().unwrap();
+        let first = wal.durable_publication().unwrap();
+        assert_eq!(first.sequence(), 1);
+        assert_eq!(first.byte_end(), std::fs::metadata(&path).unwrap().len());
+        wal.append(
+            1,
+            &WalRecord::StepStarted {
+                step_id: broca_protocol::StepId(2),
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(wal.durable_publication().as_ref(), Some(&first));
+        wal.sync().unwrap();
+        assert_eq!(wal.durable_publication().unwrap().sequence(), 2);
+        assert!(wal.durable_publication().unwrap().byte_end() > first.byte_end());
+        drop(wal);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn range_reads_do_not_restore_unused_feature_collection_api_or_pass() {
         let reader = include_str!("file_wal.rs");
@@ -3654,6 +3796,59 @@ mod tests {
     }
 
     #[test]
+    fn suffix_recovery_matches_writer_damage_policy_without_io() {
+        let path = tmp("suffix-recovery");
+        let mut wal = FileWal::open(&path).unwrap();
+        wal.append(1, &run_started(1), true).unwrap();
+        let start = std::fs::metadata(&path).unwrap().len();
+        let lineage = wal.lineage_id();
+        wal.append(1, &run_started(2), true).unwrap();
+        drop(wal);
+        let complete = std::fs::read(&path).unwrap();
+        let suffix = &complete[start as usize..];
+        for cut in [0, 1, suffix.len() / 2, suffix.len() - 1, suffix.len()] {
+            let recovered = recover_prefix(&suffix[..cut], start, Some(1), lineage).unwrap();
+            std::fs::write(&path, &complete[..start as usize + cut]).unwrap();
+            let wal = FileWal::open(&path).unwrap();
+            assert_eq!(wal.last_seq(), recovered.last_seq.unwrap());
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), recovered.valid_end);
+            drop(wal);
+        }
+        let mut damaged = suffix.to_vec();
+        damaged[crate::framing::HEADER_LEN] ^= 0xff;
+        let recovered = recover_prefix(&damaged, start, Some(1), lineage).unwrap();
+        assert_eq!(
+            recovered,
+            WalRecoveryPrefix {
+                valid_end: start,
+                last_seq: Some(1)
+            }
+        );
+        damaged.extend(encode(3, 1, &run_started(3)).unwrap());
+        assert!(matches!(
+            recover_prefix(&damaged, start, Some(1), lineage),
+            Err(WalError::Corrupt { .. })
+        ));
+        assert!(matches!(
+            recover_prefix(
+                &encode(3, 1, &run_started(3)).unwrap(),
+                start,
+                Some(1),
+                lineage
+            ),
+            Err(WalError::SequenceGap { .. })
+        ));
+        let mut conflicting = Vec::new();
+        let other = WalLineageId::from_bytes([0x55; 16]);
+        conflicting.extend(crate::framing::encode_lineage(other));
+        assert!(matches!(
+            recover_prefix(&conflicting, start, Some(1), lineage),
+            Err(WalError::ConflictingLineageIds { .. })
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn full_length_unsynced_tail_recovers_verified_prefix() {
         for (tag, zero, lineage) in [
             ("digest-tail", false, false),
@@ -3695,7 +3890,7 @@ mod tests {
         check_damaged_length_before_valid_record(false);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn anchored_damaged_length_before_valid_record_is_not_a_torn_tail() {
         check_damaged_length_before_valid_record(true);
@@ -3715,8 +3910,8 @@ mod tests {
         drop(wal);
         let mut bytes = std::fs::read(&path).unwrap();
         // Layout: lineage frame, record 1, lineage frame, record 2. Record 1 ends where its own
-        // header says; record 2 starts one lineage frame later. Live-file anchors exist only on Unix,
-        // so the anchor is a cross-check where present, never the source of the offset.
+        // header says; record 2 starts one lineage frame later. The optional native-file anchor
+        // is a cross-check, never the source of the offset.
         let first = crate::framing::LINEAGE_FRAME_LEN;
         let first_len = u32::from_le_bytes(bytes[first..first + 4].try_into().unwrap()) as usize;
         let first_end = first + crate::framing::HEADER_LEN + first_len;
@@ -3736,7 +3931,8 @@ mod tests {
                 ..
             })
         ));
-        // Live-file byte anchors require a stable file identity, available only on Unix.
+        // Live-file byte anchors require a stable file identity (Unix and Windows provide one);
+        // a platform without one has no anchor to check.
         if anchored {
             let anchor = anchor.expect("anchored corruption test requires a stable file identity");
             assert!(
@@ -3907,7 +4103,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn large_step(n: u64, text_bytes: usize) -> WalRecord {
         WalRecord::ModelStepFinished {
             fallback: Default::default(),
@@ -4623,16 +4819,17 @@ mod tests {
             vec![2, 3],
             "records flushed past the durable safe head must be excluded"
         );
-        // Anchors are derived from the unix device+inode identity; other platforms
-        // deliberately return none (the fast path is disabled there).
-        #[cfg(unix)]
-        assert_eq!(ranged.next_anchor.unwrap().seq, 3);
-        #[cfg(not(unix))]
-        assert_eq!(ranged.next_anchor, None);
+        // Every native file identity yields an anchor at the requested durable head.
+        assert_eq!(
+            ranged
+                .next_anchor
+                .map(|anchor| (anchor.file_id, anchor.seq)),
+            file_identity(&path).unwrap().map(|identity| (identity, 3))
+        );
         let _ = std::fs::remove_file(&path);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn valid_anchor_fast_path_matches_from_zero_range_scan() {
         let path = tmp("range-anchor-valid");
@@ -4642,7 +4839,9 @@ mod tests {
             wal.append(1, &run_started(i), false).unwrap();
         }
         let prefix = read_records_range(&path, DEFAULT_MAX_READ_BYTES, 0, Some(2), None).unwrap();
-        let anchor = prefix.next_anchor.expect("Unix reads produce byte anchors");
+        let anchor = prefix
+            .next_anchor
+            .expect("native file reads produce byte anchors");
         assert_eq!(anchor.seq, 2);
 
         for i in 2..6 {
@@ -4668,7 +4867,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn single_large_anchored_frame_is_decoded_once_by_both_range_paths() {
         let path = tmp("range-anchor-single-large");
@@ -4678,7 +4877,7 @@ mod tests {
         let anchor = read_records_range(&path, DEFAULT_MAX_READ_BYTES, 0, Some(1), None)
             .unwrap()
             .next_anchor
-            .expect("Unix reads produce byte anchors");
+            .expect("native file reads produce byte anchors");
         let large = large_step(1, 1024 * 1024);
         wal.append(1, &large, false).unwrap();
         let suffix_bytes = std::fs::metadata(&path).unwrap().len() - anchor.byte_end;
@@ -4711,7 +4910,61 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn strict_anchor_survives_append_and_rejects_file_replacement() {
+        let path = tmp("range-anchor-native-identity");
+        let old_path = tmp("range-anchor-native-identity-old");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&old_path);
+        let mut wal = FileWal::open(&path).unwrap();
+        for i in 0..32 {
+            wal.append(1, &run_started(i), false).unwrap();
+        }
+        let prefix = read_records_range(&path, DEFAULT_MAX_READ_BYTES, 0, None, None).unwrap();
+        assert_eq!(
+            prefix.next_anchor.map(|anchor| anchor.file_id),
+            file_identity(&path).unwrap()
+        );
+        let anchor = prefix
+            .anchor_at(32)
+            .expect("native file identity supplies an anchor");
+        wal.append(1, &run_started(32), true).unwrap();
+        drop(wal);
+        assert_eq!(file_identity(&path).unwrap(), Some(anchor.file_id));
+
+        DECODED_BYTE_COUNT.with(|count| count.set(0));
+        let suffix =
+            read_records_range_from_valid_anchor(&path, DEFAULT_MAX_READ_BYTES, 32, None, &anchor)
+                .unwrap()
+                .expect("append preserves the anchor");
+        assert_eq!(suffix.records.len(), 1);
+        assert_eq!(suffix.records[0].seq, 33);
+        assert_eq!(
+            DECODED_BYTE_COUNT.with(std::cell::Cell::get),
+            std::fs::metadata(&path).unwrap().len() - anchor.byte_end,
+            "strict reads decode only the suffix"
+        );
+
+        std::fs::rename(&path, &old_path).unwrap();
+        let mut replacement = FileWal::open(&path).unwrap();
+        for i in 0..33 {
+            replacement.append(1, &run_started(i), false).unwrap();
+        }
+        drop(replacement);
+        assert_ne!(file_identity(&path).unwrap(), Some(anchor.file_id));
+        DECODED_BYTE_COUNT.with(|count| count.set(0));
+        assert_eq!(
+            read_records_range_from_valid_anchor(&path, DEFAULT_MAX_READ_BYTES, 32, None, &anchor,)
+                .unwrap(),
+            None
+        );
+        assert_eq!(DECODED_BYTE_COUNT.with(std::cell::Cell::get), 0);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&old_path);
+    }
+
+    #[cfg(any(unix, windows))]
     #[test]
     fn strict_anchored_range_rejects_a_stale_anchor_without_scanning() {
         let path = tmp("range-anchor-strict-stale");
@@ -4737,7 +4990,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn strict_anchored_range_rejects_an_internal_sequence_gap() {
         let path = tmp("range-anchor-strict-gap");
@@ -4776,7 +5029,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn anchored_large_range_skips_prefix_bytes_and_matches_scan() {
         let path = tmp("range-anchor-large");
@@ -4805,7 +5058,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn anchor_recovers_when_a_torn_next_frame_later_finishes() {
         let path = tmp("range-anchor-torn-grow");
@@ -4850,7 +5103,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn stale_anchor_after_file_replacement_falls_back_to_zero() {
         let path = tmp("range-anchor-replaced");
@@ -4875,7 +5128,7 @@ mod tests {
                 replacement.append(2, &run_started(i), false).unwrap();
             }
         }
-        let replacement_id = metadata_file_id(&std::fs::metadata(&path).unwrap()).unwrap();
+        let replacement_id = file_identity(&path).unwrap().unwrap();
         assert_ne!(anchor.file_id, replacement_id);
 
         let anchored =
@@ -4895,7 +5148,7 @@ mod tests {
         let _ = std::fs::remove_file(&old_path);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn anchor_at_mid_frame_or_garbage_falls_back_to_zero() {
         let path = tmp("range-anchor-bad-offset");
@@ -4932,7 +5185,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn anchor_beyond_a_shrunken_file_falls_back_to_zero() {
         let path = tmp("range-anchor-shrink");
@@ -4964,7 +5217,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn anchored_range_still_fails_loud_on_later_corruption() {
         let path = tmp("range-anchor-corrupt");
@@ -5087,7 +5340,7 @@ mod tests {
     /// range read, the anchored read behind `session.read` (without falling back to a read
     /// from byte zero), and the writer's own open. The frame on disk is a gated frame requiring
     /// `scope/v1`, and the scope comes back intact on each path.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn every_file_reader_decodes_a_scoped_run_started() {
         use crate::framing::{GATED_FRAMING_VERSION, SCOPE_FEATURE};
@@ -5154,9 +5407,8 @@ mod tests {
         let _ = std::fs::remove_file(&floor);
     }
 
-    /// A `RunStarted` carrying a frozen plan manifest, decoded from its bytes. Unix-only, like
-    /// the one test that uses it.
-    #[cfg(unix)]
+    /// A `RunStarted` carrying a frozen plan manifest, decoded from its bytes.
+    #[cfg(any(unix, windows))]
     fn manifest_run_started(run: &str) -> WalRecord {
         serde_json::from_str(
             &include_str!("../tests/fixtures/plan_manifest_run_started.json")
@@ -5171,7 +5423,7 @@ mod tests {
     /// from byte zero), and the writer's own open, which must not treat the frame as a torn tail.
     /// The frame on disk requires `plan-manifest/v1`, the floor names it, and the manifest comes
     /// back intact on each path.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn every_file_reader_decodes_a_manifest_run_started() {
         use crate::framing::{GATED_FRAMING_VERSION, PLAN_MANIFEST_FEATURE};
@@ -5337,7 +5589,7 @@ mod tests {
     /// A fallback would decode the whole prefix only to reach the same frame, so the decoded
     /// bytes must be exactly the suffix between the anchor and the refused frame (the lineage
     /// frame every append leaves behind its record).
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn anchored_read_refuses_a_newer_writer_without_a_full_read() {
         let path = tmp("newer-writer-anchored");
@@ -5384,7 +5636,7 @@ mod tests {
     }
 
     /// A newer-writer frame after the anchor's first record is refused by name too.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn anchored_read_refuses_a_later_newer_writer_frame() {
         let path = tmp("newer-writer-anchored-later");

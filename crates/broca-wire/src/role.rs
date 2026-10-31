@@ -170,8 +170,8 @@ pub struct HeadResponse {
     /// steer, whichever the WAL holds last). Absent, never empty, when no send carried one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// What a send that names no model can carry (llm-runner 0.5.1 §4.3). A send's prompt is
-    /// text only, so broca states `attachments: "no"` on every written session's answer. A
+    /// What a send that names no model can carry (llm-runner 0.5.1 §4.3). With media disabled,
+    /// broca states `attachments: "no"`; enabled sessions use their frozen media profile. A
     /// never-written session's answer leaves it out with every other member, as the
     /// conformance kit requires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -190,10 +190,8 @@ pub struct HeadResponse {
     pub last_run_error: Option<cortexkit_role_llm_runner::read::LastRunError>,
 }
 
-/// `session.head.input` as broca states it: a send's prompt is text (`prompt` or text
-/// `prompt_blocks`) and broca's message schema has no image, document or file block, so no send
-/// can carry an attachment. That is a known fact, so it is `no`, not `unknown` (llm-runner 0.5.1
-/// §4.3). Modalities and MIME types are left out: with no attachments they say nothing more.
+/// Default-off `session.head.input`. Modalities and MIME types are omitted because
+/// they add no information when attachment admission is disabled.
 pub fn head_input() -> cortexkit_role_llm_runner::read::HeadInput {
     cortexkit_role_llm_runner::read::HeadInput::new(
         cortexkit_role_llm_runner::read::attachments::NO,
@@ -367,6 +365,9 @@ pub fn broca_role_describe_with_writers(
         "session.retract",
         "session.subscribe",
         "session.send",
+        cortexkit_role_llm_runner::ops::SESSION_REFRESH,
+        cortexkit_role_llm_runner::ops::SESSION_REFRESH_POLICY,
+        cortexkit_role_llm_runner::ops::SESSION_FLUSH_PREFIX,
         OP_SESSION_RESOLVE,
         OP_SEND_STATUS,
     ]
@@ -389,6 +390,7 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::HEAD_SENDER,
         cortexkit_role_llm_runner::capabilities::RUN_CANCEL,
         cortexkit_role_llm_runner::capabilities::RETRACT,
+        cortexkit_role_llm_runner::capabilities::RETRACT_OWN_SEND,
         "dispatch_attribution",
         "streaming",
         cortexkit_role_llm_runner::capabilities::LIVE_EVENTS,
@@ -409,6 +411,9 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::NO_TOOLS,
         TAGS_CAPABILITY,
         RUN_TOOL_CALLS_GROUP,
+        // A mid-session plan change: refresh, its policy and a prefix flush. All three
+        // ops are served together, owner-only; the group is declared only then.
+        cortexkit_role_llm_runner::capabilities::SESSION_CHANGE,
         // Ordered sends can land beside tool results, at a running step boundary, or when an
         // idle session starts. `turn_system` has no renderer and is deliberately not advertised.
         DELIVERY_ORDER_GROUP,
@@ -468,6 +473,25 @@ pub fn broca_role_describe_with_writers(
     }
 }
 
+impl RoleDescribeResponse {
+    /// Advertise the whole attachments group only after boot enables its serving paths.
+    pub fn with_media(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.role
+                .capabilities
+                .push(cortexkit_role_llm_runner::capabilities::ATTACHMENTS.into());
+            self.role.majors[0].ops.extend([
+                "session.upload_begin".into(),
+                "session.upload_append".into(),
+                "session.upload_status".into(),
+                "session.upload_commit".into(),
+                cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ.into(),
+            ]);
+        }
+        self
+    }
+}
+
 pub use cortexkit_role_llm_runner::tags::{
     CharRange, ResolveReply as ResolveResponse, ResolveRequest as ResolveParams, RANGE_FIELD,
 };
@@ -499,7 +523,9 @@ pub struct BaselineParams {}
 /// (`{provider, item_digest}`, the provider's catalog digest), the optional items that did not
 /// answer, and the admitted composition digest (excluding absent optional tool providers).
 /// `tool_names` are the model-facing names of the
-/// tools the session runs with. No mid-session change exists yet, so both generations are 0.
+/// tools the session runs with. A runner declaring `session_change` states `rungs` in every
+/// ready baseline, and `pending` and `effective` for its accepted and applied changes; both
+/// generations stay 0 until a refresh is accepted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BaselineWire {
     /// Each fetched plan item's frozen digests; always empty for a session admitted without a
@@ -540,7 +566,10 @@ impl BaselineWire {
             applied_generation: 0,
             pending: None,
             effective: None,
-            rungs: None,
+            rungs: Some(cortexkit_role_llm_runner::baseline::Rungs {
+                tools: vec!["on_prefix_rebuild".into(), "immediately".into()],
+                system_text: vec!["on_prefix_rebuild".into(), "immediately".into()],
+            }),
             cache: None,
         }
     }
@@ -561,7 +590,10 @@ impl BaselineWire {
             applied_generation: 0,
             pending: None,
             effective: None,
-            rungs: None,
+            rungs: Some(cortexkit_role_llm_runner::baseline::Rungs {
+                tools: vec!["on_prefix_rebuild".into(), "immediately".into()],
+                system_text: vec!["on_prefix_rebuild".into(), "immediately".into()],
+            }),
             cache: None,
         }
     }
@@ -1119,7 +1151,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "b3e767c2fc62d637090fd7a286fd19f92544f50743acc9695816ac8f6aa83f83",
+            "75c61c0d62c66eeb7e38fec6b4be7b1853a7e473d80014cbf945cefd20c674bf",
         );
     }
 
@@ -1266,15 +1298,15 @@ mod pinned_reply_bytes {
     const SESSION_HEAD_CACHE_SHA256: &str =
         "cabd121e8604ed081860ea7ed7f5f35879797212a069ddda2f612cefc621d740";
     const SESSION_BASELINE_CACHE_SHA256: &str =
-        "438ccb57deadbc8e53c5450e0d3c5189954093f7f855695a9df9a18f92981348";
+        "653da81354c090f96432d86dc52cc7a43f346b0eea6289dbff47a001778a54d6";
     const SESSION_HEAD_TITLE_SHA256: &str =
         "96eeaa6374e9f8820c01ea8d4e7366dea00b1a8dc190af701fbf8c86e4c4b37b";
     const SESSION_HEAD_SHA256: &str =
         "aec01aab3542523cb8dacf5407a659a9b822e836cac01f00125caa253614467a";
     const SESSION_BASELINE_SHA256: &str =
-        "3d57d32b90a4c32116cb283c0fe5b1c602a65be2477fb2378fea4bb0aff81733";
+        "e450a5b79e0b17af513f8c7c07a9be821e87134d03359e27e75c11e8282c7df1";
     const ADMISSION_REPLY_SHA256: &str =
-        "25bcbeb01466096e24e0209e0b0afeae89517f554e47ab3c8939eac2a1ae0ec7";
+        "0f297c8bbab61c85c565b56b1ed01a50fa592d4dea3d4a2e2e660262c2ccf600";
     const SEND_REPLY_ACTIVE_SHA256: &str =
         "dc7a5ff7296e2da72633c6caaa9ed16fb23352c4b9cfedfa32c393d6a8943c60";
     const SEND_REPLY_FINISHED_SHA256: &str =
@@ -1282,7 +1314,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "a1f17d9bcd6f64639fdedea7e99b0684cc5338c5cffd314ea3577fd85bdf0ffe";
+        "0abfabca86baad104e89f6c68e29efb895006ff082ed7aa5d0b0b72c1dea45fb";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

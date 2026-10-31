@@ -97,6 +97,9 @@ step() {
 summary() {
   local i failed=0
   echo "==> $lane summary"
+  if [[ "$lane" == windows ]]; then
+    printf 'prepush: Windows runner instance=%s\n' "${MOTOR_RUNNER_INSTANCE:-unreported}"
+  fi
   for i in "${!labels[@]}"; do
     printf '%-45s exit=%-3s %ss\n' "${labels[$i]}" "${codes[$i]}" "${times[$i]}"
     if [[ ${codes[$i]} != 0 ]]; then

@@ -99,7 +99,6 @@ pub fn reconstruct_from_offsets(
     {
         return Err(bad("offset resume snapshot does not reach durable head"));
     }
-    #[cfg(feature = "test-attachments")]
     if !seed.admission_checkpoint.media_seed_complete() {
         return Err(bad("offset resume media seed needs full replay"));
     }
@@ -109,7 +108,7 @@ pub fn reconstruct_from_offsets(
         || seed.admission_checkpoint.output_reservation.is_none()
         || (window.is_none() && !matches!(
             seed.admission_checkpoint.compaction,
-            Some(crate::compaction::CompactionCheckpoint::None)
+            Some(crate::compaction::CompactionCheckpoint::None | crate::compaction::CompactionCheckpoint::Captures(_))
         ))
         || crate::replay::tail_contains_compaction_setup(
             &snapshot
@@ -172,14 +171,16 @@ pub fn reconstruct_from_offsets(
     let checkpoint = delta.admission_checkpoint;
     // A tail can introduce the first media capture into a previously media-free prefix.
     // Recheck its folded state: a valid selected window is not a media-state completeness proof.
-    #[cfg(feature = "test-attachments")]
     if !checkpoint.media_seed_complete() {
         return Err(bad("offset resume media seed needs full replay"));
     }
     if window.is_none()
         && !matches!(
             checkpoint.compaction,
-            Some(crate::compaction::CompactionCheckpoint::None)
+            Some(
+                crate::compaction::CompactionCheckpoint::None
+                    | crate::compaction::CompactionCheckpoint::Captures(_)
+            )
         )
     {
         return Err(bad("offset resume compaction needs full replay"));
@@ -887,7 +888,6 @@ mod offset_resume_tests {
     }
 
     #[test]
-    #[cfg(feature = "test-attachments")]
     fn offset_resume_window_rejects_incomplete_media_seed_before_reusing_prefix() {
         let mut records = compacted_tools(1, false);
         if let WalRecord::RunStarted { input, .. } = &mut records[0] {
@@ -938,7 +938,6 @@ mod offset_resume_tests {
     }
 
     #[test]
-    #[cfg(feature = "test-attachments")]
     fn offset_resume_window_checks_media_seed_after_tail_capture() {
         let mut records = compacted_tools(1, false);
         let boundary = records
@@ -1471,6 +1470,54 @@ pub fn close_out_open_batch_for(
     closing.cancel_at = (reason == broca_protocol::RunFinishReason::Cancelled)
         .then_some(broca_wal::record::RunCancelAt::Now);
     close_out_open_batch(&closing, deferred_close)
+}
+
+/// Retain answers already delivered by a held-call provider before refusing continuation.
+/// The returned batch marks only the terminals actually synced here, so close-out cannot
+/// replace those answers or write a second terminal. No model or tool is called.
+pub async fn sync_deposited_held_results(
+    mut batch: Option<crate::replay::OpenToolBatch>,
+    pending: &crate::replay::PendingTurn,
+    ctx: &crate::BatchCtx,
+    writer: &crate::WalHandle,
+    lifecycle: Option<std::sync::Arc<dyn crate::tool_plane::ProviderHeldLifecycle>>,
+) -> Result<Option<crate::replay::OpenToolBatch>, crate::WalWriteError> {
+    let (Some(batch), Some(lifecycle)) = (&mut batch, lifecycle) else {
+        return Ok(batch);
+    };
+    let mut delivered = Vec::new();
+    for held in &pending.provider_held {
+        let Some((_, state)) = batch
+            .calls
+            .iter_mut()
+            .find(|(id, _)| id == &held.tool_call_id)
+        else {
+            continue;
+        };
+        if *state != OpenCallState::ProviderHeld {
+            continue;
+        }
+        if let Some(result) = lifecycle.deposited_result(ctx, &held.reply()) {
+            writer.record(WalRecord::ToolResult {
+                finished_at_ms: None,
+                tags: None,
+                hooks: None,
+                batch_id: ctx.batch_id.clone(),
+                result: Arc::new(result),
+                outcome: DispatchOutcome::Completed,
+                reason: None,
+                withdraw_elicitation: None,
+                provider_held: None,
+            });
+            *state = OpenCallState::Terminated;
+            delivered.push(&held.tool_call_id);
+        }
+    }
+    writer.sync().await?;
+    for id in delivered {
+        lifecycle.terminal_synced(ctx, id).await;
+    }
+    Ok(Some(batch.clone()))
 }
 
 /// The records that keep a tool turn whose remaining calls were never dispatched, written when a

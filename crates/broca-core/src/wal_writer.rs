@@ -475,9 +475,29 @@ fn same_wal_file(left: &Path, right: &Path) -> Result<bool, WalError> {
     Ok(left.dev() == right.dev() && left.ino() == right.ino())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn same_wal_file(left: &Path, right: &Path) -> Result<bool, WalError> {
+    let left = broca_wal::fs_ops::File::open(left).map_err(WalError::Io)?;
+    let right = broca_wal::fs_ops::File::open(right).map_err(WalError::Io)?;
+    // Placement repair may remove an alias, so compare the complete handle identities,
+    // not the lossy hashes used to invalidate read caches.
+    Ok(same_native_file_identity(
+        left.native_file_identity(),
+        right.native_file_identity(),
+    ))
+}
+
+#[cfg(any(windows, test))]
+fn same_native_file_identity(left: Option<(u32, u64)>, right: Option<(u32, u64)>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn same_wal_file(_left: &Path, _right: &Path) -> Result<bool, WalError> {
-    // Never guess file identity on platforms without a safe device/inode pair.
+    // Never guess whether paths are aliases when native file identity is unavailable.
     Ok(false)
 }
 
@@ -1753,7 +1773,7 @@ impl FileWalStore {
         file.sync_all().map_err(WalError::Io)?;
         let identity = read_identity(&path)?;
         // The open handle has already proved durability. A missing identity means the proof
-        // cannot be cached (always the case off Unix), not that another flush is needed.
+        // cannot be cached, not that another flush is needed.
         // Reopening by pathname could race retention deletion and flush a different lineage
         // or fail after the original WAL has moved to its deleting path.
         Ok(identity)
@@ -1764,12 +1784,26 @@ impl FileWalStore {
         // Platforms without file identities still return None for an existing file.
         let path = self.read_path(session)?;
         std::fs::metadata(&path).map_err(WalError::Io)?;
-        let identity = broca_wal::file_identity(path)?;
-        if cfg!(unix) && identity.is_none() {
-            return Err(WalError::Io(io::Error::new(
-                io::ErrorKind::NotFound,
-                "live WAL disappeared again during identity retry",
-            )));
+        #[cfg(test)]
+        AFTER_RETRY_LIVE_STAT.with(|hook| {
+            if let Some(action) = hook.borrow_mut().take() {
+                action();
+            }
+        });
+        let identity = broca_wal::file_identity(&path)?;
+        if identity.is_none() {
+            // The identity helper also returns None when its open misses a disappearing
+            // path. Only an existing identityless backend may return a successful None here.
+            std::fs::metadata(&path).map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    WalError::Io(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "live WAL disappeared again during identity retry",
+                    ))
+                } else {
+                    WalError::Io(error)
+                }
+            })?;
         }
         Ok(identity)
     }
@@ -2357,6 +2391,7 @@ impl WalStore for FileWalStore {
 thread_local! {
     static AFTER_LIVE_STAT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
     static BEFORE_ARCHIVE_RETRY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+    static AFTER_RETRY_LIVE_STAT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
 }
 
 // Content identity invalidates cached proofs when a newer archive changes the payload.
@@ -2663,6 +2698,7 @@ pub struct RecordObserver {
     subscribers: Arc<AtomicUsize>,
     tap: Option<(Arc<DurableRecordTap>, Arc<std::sync::atomic::AtomicBool>)>,
     step_events: Option<StepEventObserver>,
+    publications: Vec<tokio::sync::watch::Sender<Option<broca_wal::file_wal::DurablePublication>>>,
 }
 
 /// Terminal attempt evidence copied after durability for a best-effort live hint. The
@@ -2813,6 +2849,7 @@ impl RecordObserver {
             subscribers,
             tap: None,
             step_events: None,
+            publications: Vec::new(),
         }
     }
 
@@ -2840,6 +2877,28 @@ impl RecordObserver {
     ) -> Self {
         self.tap = Some((tap, healthy));
         self
+    }
+
+    /// Subscribe independently of record fan-out and the bus tap. Watch receivers
+    /// may coalesce events: each witness covers the entire durable prefix, so an
+    /// index subscriber catches up from its own persisted cursor without gaps.
+    pub fn with_publications(
+        mut self,
+        tx: tokio::sync::watch::Sender<Option<broca_wal::file_wal::DurablePublication>>,
+    ) -> Self {
+        self.publications.push(tx);
+        self
+    }
+
+    fn observe_publication(&self, wal: &dyn Wal) {
+        if self.publications.is_empty() {
+            return;
+        }
+        if let Some(publication) = wal.durable_publication() {
+            for tx in &self.publications {
+                tx.send_replace(Some(publication.clone()));
+            }
+        }
     }
 
     fn observe(
@@ -3386,7 +3445,6 @@ pub struct WalHandle {
 impl WalHandle {
     /// A media-free prefix has no captures or aging history to restore. Its already-seeded
     /// placement is sufficient to start tracking the first later capture without rereading it.
-    #[cfg(feature = "test-attachments")]
     pub fn empty_media_checkpoint(
         &self,
         at_seq: u64,
@@ -3447,7 +3505,7 @@ impl WalHandle {
     }
 
     pub(crate) fn bind_media_capture(&mut self, store: &impl WalStore, session: &BindIdentity) {
-        // Tool media shares attachment admission's debug-only, non-shipping opt-in.
+        // Tool and person media share the immutable boot decision.
         self.media_capture = if broca_protocol::attachments_enabled() {
             store
                 .uploads()
@@ -5143,6 +5201,9 @@ fn writer_loop_with_identity(
     // last_seq can include coalesced appends that a crash would lose. Startup has
     // already proved and published the recovered prefix behind writer_opened.
     let mut last_fsynced_seq = wal.last_seq();
+    if let Some(obs) = &observer {
+        obs.observe_publication(&*wal);
+    }
     let mut dirty = false;
     // The sync deadline: the monotonic instant (in ms) by which dirty data must be
     // synced. Set when an append makes a clean writer dirty, and never slid while
@@ -5191,6 +5252,7 @@ fn writer_loop_with_identity(
                         dirty = false;
                         deadline_at_ms = None;
                         if let Some(obs) = &mut observer {
+                            obs.observe_publication(&*wal);
                             if has_tap {
                                 for (seq, record) in &pending_observed {
                                     obs.observe(*seq, fence, record, wal.lineage_id());
@@ -5269,6 +5331,7 @@ fn writer_loop_with_identity(
                         last_fsynced_seq = wal.last_seq();
                         durable_head.store(last_fsynced_seq, Ordering::Release);
                         if let Some(obs) = &mut observer {
+                            obs.observe_publication(&*wal);
                             for (seq, record) in pending_observed.drain(..) {
                                 obs.observe(seq, fence, &record, wal.lineage_id());
                                 if has_tap {
@@ -5363,6 +5426,7 @@ fn writer_loop_with_identity(
                             dirty = false;
                             deadline_at_ms = None;
                             if let Some(obs) = &mut observer {
+                                obs.observe_publication(&*wal);
                                 if has_tap {
                                     for (seq, record) in &pending_observed {
                                         obs.observe(*seq, fence, record, wal.lineage_id());
@@ -5410,6 +5474,7 @@ fn writer_loop_with_identity(
                 if result.is_ok() && dirty {
                     durable_head.store(wal.last_seq(), Ordering::Release);
                     if let Some(obs) = &mut observer {
+                        obs.observe_publication(&*wal);
                         for (seq, record) in pending_observed.drain(..) {
                             obs.observe(seq, fence, &record, wal.lineage_id());
                             if has_tap {
@@ -5490,6 +5555,7 @@ fn close_writer_identity(
         if published {
             durable_head.store(seq, Ordering::Release);
             if let Some(obs) = observer {
+                obs.observe_publication(wal);
                 obs.observe(seq, fence, &record, wal.lineage_id());
                 obs.observe_tap(seq, fence, wal.lineage_id(), wal.writer_id(), &record);
             }
@@ -6086,6 +6152,70 @@ mod tests {
             WalRecord::StepStarted { step_id: StepId(1) }
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn durable_publications_coexist_with_bus_tap_and_fanout() {
+        let path = tmp("publication-observers");
+        let _ = std::fs::remove_file(&path);
+        let wal = broca_wal::FileWal::open(&path).unwrap();
+        let (tx, mut records) = broadcast::channel(8);
+        let (bus, mut bus_inbox) = tokio::sync::mpsc::channel(8);
+        let (publications, mut index) = tokio::sync::watch::channel(None);
+        let mut independent = index.clone();
+        let observer = RecordObserver::new(tx, Arc::new(AtomicUsize::new(1)))
+            .with_durable_tap(
+                Arc::new(move |seq, _, _, _| bus.try_send(seq).unwrap()),
+                Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            )
+            .with_publications(publications);
+        let handle = WalHandle::spawn_observed(Box::new(wal), 7, Some(observer)).unwrap();
+        for step in 1..=2 {
+            handle.record(WalRecord::StepStarted {
+                step_id: StepId(step),
+            });
+        }
+        let (processed, ready) = oneshot::channel();
+        handle
+            .tx
+            .send(WalCommand::AppendDrained(processed))
+            .unwrap();
+        ready.await.unwrap();
+        assert!(index
+            .borrow()
+            .as_ref()
+            .is_none_or(|event| event.sequence() == 0));
+        index.borrow_and_update();
+        assert!(bus_inbox.try_recv().is_err());
+        assert!(records.try_recv().is_err());
+        assert_eq!(handle.sync().await.unwrap(), 2);
+        index.changed().await.unwrap();
+        let first = index.borrow_and_update().clone().unwrap();
+        assert_eq!(first.sequence(), 2);
+        assert_eq!(first.byte_end(), std::fs::metadata(&path).unwrap().len());
+        assert_eq!(independent.borrow_and_update().as_ref(), Some(&first));
+        for seq in 1..=2 {
+            assert_eq!(bus_inbox.recv().await.unwrap(), seq);
+            assert_eq!(records.recv().await.unwrap().seq, seq);
+        }
+        handle.record(WalRecord::StepStarted { step_id: StepId(3) });
+        handle.sync().await.unwrap();
+        index.changed().await.unwrap();
+        let second = index.borrow_and_update().clone().unwrap();
+        assert_eq!(second.sequence(), 3);
+        assert!(second.byte_end() > first.byte_end());
+        assert_eq!(
+            first.sequence(),
+            2,
+            "a witness cannot advance with its writer"
+        );
+        handle.sync().await.unwrap();
+        assert!(
+            !index.has_changed().unwrap(),
+            "clean barriers are not commits"
+        );
+        handle.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]

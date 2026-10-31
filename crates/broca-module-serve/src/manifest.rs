@@ -40,6 +40,9 @@ pub const OP_RUN_RESULT: &str = broca_wire::OP_RUN_RESULT;
 pub const OP_RUN_TOOL_CALLS: &str = broca_wire::OP_RUN_TOOL_CALLS;
 pub const OP_BASELINE: &str = broca_wire::OP_SESSION_BASELINE;
 pub const OP_RESOLVE: &str = broca_wire::OP_SESSION_RESOLVE;
+pub const OP_REFRESH: &str = cortexkit_role_llm_runner::ops::SESSION_REFRESH;
+pub const OP_REFRESH_POLICY: &str = cortexkit_role_llm_runner::ops::SESSION_REFRESH_POLICY;
+pub const OP_FLUSH_PREFIX: &str = cortexkit_role_llm_runner::ops::SESSION_FLUSH_PREFIX;
 /// Re-send a session's most recent model request shaped to generate nothing, keeping the
 /// provider's cached prefix alive between a caller's rounds.
 pub const OP_WARM: &str = broca_wire::OP_SESSION_WARM;
@@ -131,7 +134,7 @@ pub fn manifest_with_archive(
 
 /// The management request list is also the source of `health.check` request-counter names.
 pub(crate) fn management_operations() -> Vec<ManagementOperation> {
-    vec![
+    let mut operations = vec![
         ManagementOperation {
             name: broca_wire::diagnostics::OP.into(),
             kind: ManagementOperationKind::Query,
@@ -312,6 +315,30 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             ),
         },
         ManagementOperation {
+            name: OP_REFRESH.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Accept a mid-session plan change and hold it pending, owner only."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_REFRESH_POLICY.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Change the pending change's rung, owner only, idempotent on send_id."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_FLUSH_PREFIX.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Drop the frozen prefix and apply any pending change at the next run, owner only."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
             name: OP_WARM.to_string(),
             kind: ManagementOperationKind::Mutate,
             description: Some(
@@ -327,7 +354,15 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
                     .to_string(),
             ),
         },
-    ]
+    ];
+    if broca_protocol::attachments_enabled() {
+        operations.push(ManagementOperation {
+            name: cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ.into(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Read bounded media bytes referenced by the bound session.".into()),
+        });
+    }
+    operations
 }
 
 pub(crate) fn registered_management_operation(method: &str) -> bool {

@@ -43,6 +43,7 @@ pub fn admit(principal: Option<&BindPrincipal>, scope: &SendScope) -> Result<(),
 pub struct Evidence {
     pub runs: Runs,
     pub late_fence_ms: Option<i64>,
+    pub late_delivery_stuck: Vec<Value>,
     pub retention: Result<Vec<Fence>, String>,
     pub catalog_age_ms: Result<i64, String>,
     pub unmapped_credentials: BTreeMap<String, &'static str>,
@@ -87,6 +88,10 @@ pub fn gather(
     Ok(Evidence {
         runs,
         late_fence_ms,
+        late_delivery_stuck: crate::held_runtime::health_gauges()["late_results_delivery_stuck"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
         catalog_age_ms,
         retention: live::retention_fences(),
         unmapped_credentials: crate::account_routing::published_unmapped_credentials(),
@@ -466,6 +471,14 @@ pub fn report(mut evidence: Evidence, now: i64, window: i64) -> Reply {
         findings.push(finding("late_results_rebuild_required","late-results-rebuild-required".into(),Severity::Error,first,now,
             "The late-results rebuild fence is present, so provider-held intake cannot be trusted.",
             "Inspect the late-results-rebuild-required marker and late-results rebuild log before removing the fence."));
+    }
+    if !evidence.late_delivery_stuck.is_empty() {
+        let mut f = finding("late_results_delivery_stuck", "delivery".into(), Severity::Error, now, now,
+            "A held call's late result failed delivery identically at least three times; its acknowledgement remains pinned.",
+            "Inspect the sampled session's held terminal and resume refusal. Later entries are delivered without acknowledging past the pin; paging beyond a permanently stuck prefix needs a durable deferred-entry spool, not an unsafe acknowledgement.");
+        f.count = evidence.late_delivery_stuck.len() as u64;
+        f.samples = evidence.late_delivery_stuck.into_iter().take(5).collect();
+        findings.push(f);
     }
     for (credential, missing) in evidence.unmapped_credentials {
         let mut f = finding("credential_metadata_missing",credential.clone(),Severity::Warn,now,now,

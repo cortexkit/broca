@@ -404,13 +404,24 @@ fn open_inspection(path: &Path, repair: bool) -> io::Result<Handle> {
     }
     Ok(Handle(handle))
 }
-fn attributes(handle: HANDLE) -> io::Result<u32> {
+fn file_information(handle: HANDLE) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
     // SAFETY: This Win32 output structure is zero-initializable.
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
     // SAFETY: The handle is live and info is a writable output.
     if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
         return Err(io::Error::last_os_error());
     }
+    Ok(info)
+}
+pub(super) fn file_identity(file: &File) -> io::Result<(u32, u64)> {
+    let info = file_information(file.as_raw_handle())?;
+    Ok((
+        info.dwVolumeSerialNumber,
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
+}
+fn attributes(handle: HANDLE) -> io::Result<u32> {
+    let info = file_information(handle)?;
     if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(refused("reparse points are not private state objects"));
     }

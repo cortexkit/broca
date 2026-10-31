@@ -21,6 +21,8 @@ broca-store = { path = "../broca-store" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 # The late-results wire types: entry kinds, cursors and the custodian's dedupe key.
 cortexkit-role-tool-provider = { workspace = true }
+# Step-transform subscriptions: the approve phase gate for refresh admission.
+cortexkit-role-step-transform-provider = { workspace = true }
 # Fetch-plan admission: the refusals a plan meets and the baseline a frozen manifest answers.
 broca-fetch-plan = { path = "../broca-fetch-plan" }
 # The `llm-runner/v1` role's steer delivery receipt, which a retried steer's answer carries.

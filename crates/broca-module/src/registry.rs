@@ -376,6 +376,8 @@ impl std::error::Error for OpenError {}
 /// identity, used to detect a stale handle after a re-open).
 #[derive(Clone)]
 pub struct ActorHandle {
+    /// Media-on frozen facts published by this actor's writer after successful barriers.
+    pub(crate) media_head: Option<Arc<media_head::Live>>,
     pub gen: u64,
     pub(crate) tx: mpsc::Sender<crate::actor::LineageCmd>,
     /// Shared with the registry's read-only path while this handle occupies an Open slot.
@@ -527,6 +529,8 @@ enum Entry {
 /// executor) so the admission concurrency is deterministically testable.
 #[async_trait]
 pub trait LineageOpener: Send + Sync {
+    /// Retire routes synchronously when retention deletes a session without an actor.
+    fn on_session_deleted(&self, _session: &LineageKey) {}
     fn retire_session_transport(&self, _session: &LineageKey) {}
     fn retire_idle_session_transport(&self, _session: &LineageKey) {}
     fn retire_all_transports(&self) {}
@@ -623,6 +627,8 @@ pub struct LineageRegistry {
     inner: Arc<Inner>,
 }
 
+mod media;
+pub(crate) mod media_head;
 #[path = "run_rows.rs"]
 mod run_rows;
 pub use run_rows::OverhaulRunSource;
@@ -743,10 +749,18 @@ pub enum CutLockMode {
     Mutate,
 }
 
+type ToolRouteHealth = dyn Fn(&[LineageKey]) -> serde_json::Value + Send + Sync;
+
 struct Inner {
+    #[cfg(test)]
+    raw_pages: std::sync::OnceLock<Arc<RawPageTestBundle>>,
+    tool_route_health: std::sync::OnceLock<Arc<ToolRouteHealth>>,
+    actor_idle_holds: Mutex<HashMap<LineageKey, (u64, Vec<&'static str>)>>,
     /// Raised and lowered by the System One batch service; read into `batches_in_flight`.
     batches_in_flight: Arc<AtomicUsize>,
     cut_gates: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    /// Serialize refresh fetches without blocking sends or the actor's running episode.
+    change_gates: Mutex<HashMap<LineageKey, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// Migration notices are deduplicated while the session remains in the bounded cache.
     attribution_notices: Mutex<BoundedSessionCache<()>>,
     retention: std::sync::OnceLock<Arc<crate::retention::RetentionService>>,
@@ -768,6 +782,7 @@ struct Inner {
     /// No-actor reads retain a file-identity-scoped proof so transcript pagination does not fsync
     /// again while every requested frame remains within the already-proven durable prefix.
     read_proofs: Mutex<BoundedSessionCache<ReadProof>>,
+    media_heads: Mutex<media_head::Cache>,
     /// Dispatch facts of committed tool turns already worked out, per session; see
     /// [`DispatchCache`].
     dispatch_cache: Mutex<BoundedSessionCache<DispatchCache>>,
@@ -1045,6 +1060,8 @@ const DISPATCH_CACHE_SESSIONS: usize = 4096;
 
 /// One `session.read` snapshot: the page, plus what the same snapshot says beyond it.
 pub struct RouteReadPage {
+    /// Durable WAL sequence covered by the same page snapshot.
+    pub at_seq: u64,
     pub head_facts: broca_core::head::HeadProjection,
     pub head_facts_complete: bool,
     pub page: broca_core::SessionReadPage,
@@ -1078,10 +1095,84 @@ struct ReadSources {
     store: Option<Arc<dyn broca_core::MaterializedStore>>,
 }
 
+/// Explicitly supplied by tests; boot and all legacy constructors leave this absent.
+#[cfg(test)]
+pub(crate) struct RawPageTestBundle {
+    pub db: Arc<broca_store::db::OverhaulDb>,
+    pub publications: Mutex<HashMap<LineageKey, broca_wal::file_wal::DurablePublication>>,
+}
+
+#[cfg(test)]
+impl RawPageTestBundle {
+    fn page(
+        &self,
+        key: &LineageKey,
+        from: Option<u64>,
+        limit: Option<u64>,
+        tools: bool,
+    ) -> Result<Box<RouteReadPage>, OpenError> {
+        let publications = self.publications.lock().unwrap();
+        let publication = publications
+            .get(key)
+            .ok_or_else(|| OpenError::Open("raw page publication not supplied".into()))?;
+        let raw = self
+            .db
+            .read_raw_page(
+                key,
+                &broca_core::agent_session_ref(key),
+                broca_store::db::LogLocation::Live,
+                publication,
+                broca_store::db::RawPageRequest {
+                    from_ordinal: from,
+                    limit,
+                    include_tools: tools,
+                },
+            )
+            .map_err(|e| OpenError::Open(e.to_string()))?;
+        Ok(Box::new(RouteReadPage {
+            page: raw.page,
+            at_seq: raw.at_seq,
+            head_facts: raw.head,
+            head_facts_complete: true,
+            tools: raw
+                .tools
+                .map(|(run_id, tools)| SessionReadTools { run_id, tools }),
+            dispatches: raw.dispatches,
+            open_batch: None,
+            newest_record_ms: Some(raw.last_write_ms.unwrap_or(0)),
+            retention_activity_ms: raw.retention_activity_ms,
+            last_title: raw.last_title,
+        }))
+    }
+
+    fn tag_location(
+        &self,
+        key: &LineageKey,
+        tag: u64,
+    ) -> Result<Option<broca_core::TagLocation>, OpenError> {
+        let publications = self.publications.lock().unwrap();
+        let publication = publications
+            .get(key)
+            .ok_or_else(|| OpenError::Open("raw tag publication not supplied".into()))?;
+        self.db
+            .read_raw_tag_location(
+                key,
+                &broca_core::agent_session_ref(key),
+                broca_store::db::LogLocation::Live,
+                publication,
+                tag,
+            )
+            .map(Some)
+            .map_err(|e| OpenError::Open(e.to_string()))
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ReadPurpose {
     Session,
     Authorization,
+    /// Require an anchor so an unusable media checkpoint cannot silently scan the prefix.
+    Media,
 }
 
 #[derive(Clone, Copy)]
@@ -1120,6 +1211,11 @@ pub struct RegistryHandle {
 }
 
 impl LineageRegistry {
+    #[cfg(test)]
+    pub(crate) fn with_raw_pages_for_test(self, bundle: Arc<RawPageTestBundle>) -> Self {
+        assert!(self.inner.raw_pages.set(bundle).is_ok());
+        self
+    }
     pub(crate) fn upload_store(&self) -> Option<broca_core::media_uploads::Uploads> {
         self.inner.reader.as_ref()?.wal_store.uploads()
     }
@@ -1144,6 +1240,54 @@ impl LineageRegistry {
                 _ => None,
             })
             .collect()
+    }
+
+    /// In-memory actor identities for route ownership diagnostics; never included in health JSON.
+    pub fn open_sessions(&self) -> Vec<LineageKey> {
+        self.inner
+            .slots
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(key, entry)| match entry {
+                Entry::Open { .. } => Some(key.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn set_tool_route_health(&self, health: Arc<ToolRouteHealth>) {
+        let _ = self.inner.tool_route_health.set(health);
+    }
+
+    pub fn tool_routes_health(&self) -> serde_json::Value {
+        let open = self.open_sessions();
+        let mut health = self.inner.tool_route_health.get().map_or_else(
+            || {
+                serde_json::json!({
+                    "open_session_actors": open.len(), "cached_routes": 0,
+                    "cached_routes_per_provider": {}, "oldest_route_idle_secs": null,
+                    "routes_for_closed_sessions": 0, "goodbye_failures_since_boot": 0,
+                    "pending_goodbyes": 0,
+                    "goodbye_retry_overflows_since_boot": 0,
+                    "goodbye_giveups_since_boot": 0,
+                })
+            },
+            |health| health(&open),
+        );
+        let holds = self.inner.actor_idle_holds.lock().unwrap();
+        let mut reasons = std::collections::BTreeMap::<&str, usize>::new();
+        for key in &open {
+            if let Some((_, held)) = holds.get(key).filter(|(_, held)| !held.is_empty()) {
+                for reason in held {
+                    *reasons.entry(reason).or_default() += 1;
+                }
+            } else {
+                *reasons.entry("idle_ttl").or_default() += 1;
+            }
+        }
+        health["open_actor_reasons"] = serde_json::json!(reasons);
+        health
     }
     pub async fn route_run_event(
         &self,
@@ -1186,6 +1330,23 @@ impl LineageRegistry {
             .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
         gates.insert(reference, Arc::downgrade(&gate));
         gate
+    }
+
+    pub(crate) async fn lock_session_change(
+        &self,
+        key: &LineageKey,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = {
+            let mut gates = self.inner.change_gates.lock().unwrap();
+            gates.retain(|_, gate| gate.strong_count() != 0);
+            let gate = gates
+                .get(key)
+                .and_then(std::sync::Weak::upgrade)
+                .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
+            gates.insert(key.clone(), Arc::downgrade(&gate));
+            gate
+        };
+        gate.lock_owned().await
     }
 
     /// Prevent opening absent actors and pause existing actors, in contract ref
@@ -1345,6 +1506,10 @@ impl LineageRegistry {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                #[cfg(test)]
+                raw_pages: std::sync::OnceLock::new(),
+                tool_route_health: std::sync::OnceLock::new(),
+                actor_idle_holds: Mutex::new(HashMap::new()),
                 batches_in_flight: Arc::new(AtomicUsize::new(0)),
                 attribution_notices: Mutex::new(BoundedSessionCache::new(SESSION_CACHE_SESSIONS)),
                 retention: std::sync::OnceLock::new(),
@@ -1358,11 +1523,13 @@ impl LineageRegistry {
                 plan_admitter: std::sync::OnceLock::new(),
                 slots: Mutex::new(HashMap::new()),
                 cut_gates: Mutex::new(HashMap::new()),
+                change_gates: Mutex::new(HashMap::new()),
                 next_gen: AtomicU64::new(1),
                 opener,
                 reader: wal_store.map(|wal_store| ReadSources { wal_store, store }),
                 run_rows,
                 read_proofs: Mutex::new(BoundedSessionCache::new(SESSION_CACHE_SESSIONS)),
+                media_heads: Mutex::default(),
                 dispatch_cache: Mutex::new(BoundedSessionCache::new(DISPATCH_CACHE_SESSIONS)),
                 frozen_senders: Mutex::new(BoundedSessionCache::new(SESSION_CACHE_SESSIONS)),
                 live_ownership: Mutex::new(HashMap::new()),
@@ -1447,6 +1614,28 @@ impl LineageRegistry {
             }).collect()
             })
         })
+    }
+
+    /// Resolve a run's content-free identity and state hint without replaying any WAL.
+    /// Status and result callers must still authenticate the run through the run-row reader.
+    pub fn overhaul_lookup_run(
+        &self,
+        run_id: &str,
+    ) -> Option<Result<Option<broca_core::RunIndexRow>, String>> {
+        self.inner
+            .run_rows
+            .as_ref()
+            .map(|source| source.lookup_run(run_id))
+    }
+
+    /// Discover possible restart pauses; only WAL-confirmed pause reasons authorize recovery.
+    pub fn overhaul_restart_resume_candidates(
+        &self,
+    ) -> Option<Result<Vec<(String, LineageKey)>, String>> {
+        self.inner
+            .run_rows
+            .as_ref()
+            .map(|source| source.restart_resume_candidates())
     }
 
     /// Install what reads a frozen config's prompt-cache declaration. Set once, before serving;
@@ -1634,8 +1823,25 @@ impl LineageRegistry {
             .map_err(OwnershipReadError::into_open)
     }
 
-    /// Upload standing includes plan-named senders, unlike cancel/retract. Read
-    /// the frozen first manifest without retaining its contents in owner caches.
+    /// Read the submission's original sender even after delivery or retraction, so retries
+    /// retain the same authorization. Missing or ambiguous attribution grants no exception.
+    pub(crate) async fn recorded_submission_sender(
+        &self,
+        key: &LineageKey,
+        submission_id: &str,
+    ) -> Result<Option<broca_protocol::BindPrincipal>, OpenError> {
+        let (records, _) = self
+            .read_durable_wal_for(key, ReadPurpose::Authorization)
+            .await?;
+        let records: Vec<_> = records.into_iter().map(|frame| frame.record).collect();
+        Ok(crate::send_fate::recorded_submission_sender(
+            &records,
+            &broca_protocol::SubmissionId(submission_id.into()),
+        ))
+    }
+
+    /// Upload standing includes every current plan-named sender, not just session owners.
+    /// Read the frozen first manifest without retaining its contents in owner caches.
     pub(crate) async fn upload_ownership(
         &self,
         key: &LineageKey,
@@ -2647,6 +2853,96 @@ impl LineageRegistry {
         }
     }
 
+    /// Route a `session.refresh` acceptance through the lineage actor so it shares the lease
+    /// and writer with runs. The manifest was fetched by the serve layer.
+    pub async fn route_session_refresh(
+        &self,
+        key: &LineageKey,
+        generation: u64,
+        policy: String,
+        manifest: Box<broca_wal::PlanManifest>,
+    ) -> Result<crate::actor::SessionRefreshOutcome, OpenError> {
+        use crate::actor::{LineageCmd, SessionRefreshOutcome};
+        loop {
+            self.check_move(key, true)?;
+            self.check_expired(key, None).await?;
+            let handle = self.actor_for(key).await?;
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            let cmd = LineageCmd::SessionRefresh {
+                generation,
+                policy: policy.clone(),
+                manifest: manifest.clone(),
+                reply,
+            };
+            if handle.send(cmd).await.is_err() {
+                continue;
+            }
+            match rx.await {
+                Ok(SessionRefreshOutcome::Reopen) => continue,
+                Ok(other) => return Ok(other),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Route a `session.refresh_policy` change through the lineage actor.
+    pub async fn route_session_refresh_policy(
+        &self,
+        key: &LineageKey,
+        generation: u64,
+        policy: String,
+        send_id: String,
+    ) -> Result<crate::actor::SessionRefreshPolicyOutcome, OpenError> {
+        use crate::actor::{LineageCmd, SessionRefreshPolicyOutcome};
+        loop {
+            self.check_move(key, true)?;
+            self.check_expired(key, None).await?;
+            let handle = self.actor_for(key).await?;
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            let cmd = LineageCmd::SessionRefreshPolicy {
+                generation,
+                policy: policy.clone(),
+                send_id: send_id.clone(),
+                reply,
+            };
+            if handle.send(cmd).await.is_err() {
+                continue;
+            }
+            match rx.await {
+                Ok(SessionRefreshPolicyOutcome::Reopen) => continue,
+                Ok(other) => return Ok(other),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Route a `session.flush_prefix` through the lineage actor.
+    pub async fn route_session_flush_prefix(
+        &self,
+        key: &LineageKey,
+        send_id: String,
+    ) -> Result<crate::actor::SessionFlushPrefixOutcome, OpenError> {
+        use crate::actor::{LineageCmd, SessionFlushPrefixOutcome};
+        loop {
+            self.check_move(key, true)?;
+            self.check_expired(key, None).await?;
+            let handle = self.actor_for(key).await?;
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            let cmd = LineageCmd::SessionFlushPrefix {
+                send_id: send_id.clone(),
+                reply,
+            };
+            if handle.send(cmd).await.is_err() {
+                continue;
+            }
+            match rx.await {
+                Ok(SessionFlushPrefixOutcome::Reopen) => continue,
+                Ok(other) => return Ok(other),
+                Err(_) => continue,
+            }
+        }
+    }
+
     /// Resolve a specific run's lifecycle state without reopening a closed session whose WAL
     /// already records its terminal or pause. Otherwise use the actor's live state, durable
     /// index and WAL reconciliation. `key` is the session the run belongs to.
@@ -2871,6 +3167,21 @@ impl LineageRegistry {
                     through_seq,
                     read_anchor.as_ref(),
                 ),
+                ReadPurpose::Media => match read_anchor {
+                    Some(anchor) if anchor.seq == after_seq => wal_store
+                        .read_records_range_from_valid_anchor(
+                            &session,
+                            after_seq,
+                            through_seq,
+                            &anchor,
+                        )
+                        .map(|range| {
+                            range.unwrap_or_else(|| {
+                                broca_wal::WalRangeRead::without_anchors(Vec::new())
+                            })
+                        }),
+                    _ => Ok(broca_wal::WalRangeRead::without_anchors(Vec::new())),
+                },
             })
         };
 
@@ -2891,7 +3202,7 @@ impl LineageRegistry {
             let wal_store = reader.wal_store.clone();
             let session = key.clone();
             move || match purpose {
-                ReadPurpose::Session => wal_store.file_identity(&session),
+                ReadPurpose::Session | ReadPurpose::Media => wal_store.file_identity(&session),
                 ReadPurpose::Authorization => wal_store.file_identity_for_authorization(&session),
             }
         })
@@ -2933,7 +3244,7 @@ impl LineageRegistry {
             let wal_store = reader.wal_store.clone();
             let session = key.clone();
             move || match purpose {
-                ReadPurpose::Session => wal_store.flush_for_read(&session),
+                ReadPurpose::Session | ReadPurpose::Media => wal_store.flush_for_read(&session),
                 ReadPurpose::Authorization => wal_store.flush_for_authorization(&session),
             }
         })
@@ -2983,7 +3294,7 @@ impl LineageRegistry {
             let wal_store = reader.wal_store.clone();
             let session = key.clone();
             move || match purpose {
-                ReadPurpose::Session => wal_store.file_identity(&session),
+                ReadPurpose::Session | ReadPurpose::Media => wal_store.file_identity(&session),
                 ReadPurpose::Authorization => wal_store.file_identity_for_authorization(&session),
             }
         })
@@ -3193,7 +3504,7 @@ impl LineageRegistry {
         OpenError,
     > {
         match purpose {
-            ReadPurpose::Session => self.check_expired(key, None).await?,
+            ReadPurpose::Session | ReadPurpose::Media => self.check_expired(key, None).await?,
             ReadPurpose::Authorization => self.check_authorization_expired(key).await?,
         }
         let Some(reader) = &self.inner.reader else {
@@ -3262,6 +3573,10 @@ impl LineageRegistry {
         tag: u64,
     ) -> Result<Option<broca_core::TagLocation>, OpenError> {
         self.check_expired(key, None).await?;
+        #[cfg(test)]
+        if let Some(bundle) = self.inner.raw_pages.get() {
+            return bundle.tag_location(key, tag);
+        }
         let Some(store) = self
             .inner
             .reader
@@ -3349,6 +3664,19 @@ impl LineageRegistry {
         model: Option<&broca_core::ModelPageRequest>,
     ) -> Result<RoutedPage, OpenError> {
         self.check_expired(key, None).await?;
+        #[cfg(test)]
+        if model.is_none() {
+            if let Some(bundle) = self.inner.raw_pages.get() {
+                let bundle = bundle.clone();
+                let key = key.clone();
+                return spawn_blocking(JobKind::StoreRead, move || {
+                    bundle.page(&key, from_ordinal, limit, include_tools)
+                })
+                .await
+                .map_err(|e| OpenError::Open(e.to_string()))?
+                .map(RoutedPage::Raw);
+            }
+        }
         let Some(reader) = &self.inner.reader else {
             return Err(OpenError::Open(
                 "session.read reader is not configured".into(),
@@ -3699,6 +4027,14 @@ impl LineageRegistry {
                 }
             }
         }
+        let at_seq = match tail.records() {
+            broca_wal::WalRangeRecords::Complete(records)
+            | broca_wal::WalRangeRecords::Partial(records)
+            | broca_wal::WalRangeRecords::Unknown(records) => records
+                .last()
+                .map_or(snapshot.watermark_seq, |frame| frame.seq),
+            broca_wal::WalRangeRecords::Absent => snapshot.watermark_seq,
+        };
         let (mut page, dispatches) = broca_core::read_session_page_owned_with_dispatches(
             snapshot,
             match tail.records() {
@@ -3761,6 +4097,7 @@ impl LineageRegistry {
             repair_materialized_lineage(store, session, stale_lineage_id, tail).await;
         }
         Ok(RoutedPage::Raw(Box::new(RouteReadPage {
+            at_seq,
             head_facts,
             head_facts_complete,
             page,
@@ -4721,6 +5058,21 @@ impl RegistryHandle {
                 self.inner.live_ownership.lock().unwrap().remove(key);
             }
         }
+        let mut holds = self.inner.actor_idle_holds.lock().unwrap();
+        if holds.get(key).is_some_and(|(owner, _)| *owner == gen) {
+            holds.remove(key);
+        }
+    }
+
+    pub(crate) fn note_idle_holds(&self, key: &LineageKey, gen: u64, reasons: Vec<&'static str>) {
+        let slots = self.inner.slots.lock().unwrap();
+        if matches!(slots.get(key), Some(Entry::Open { gen: owner, .. }) if *owner == gen) {
+            self.inner
+                .actor_idle_holds
+                .lock()
+                .unwrap()
+                .insert(key.clone(), (gen, reasons));
+        }
     }
 }
 
@@ -4950,10 +5302,14 @@ mod tests {
     struct TransportOpener {
         retired: Mutex<Vec<LineageKey>>,
         shutdowns: AtomicUsize,
+        route_deletions: AtomicUsize,
     }
 
     #[async_trait]
     impl LineageOpener for TransportOpener {
+        fn on_session_deleted(&self, _: &LineageKey) {
+            self.route_deletions.fetch_add(1, Ordering::SeqCst);
+        }
         fn retire_session_transport(&self, session: &LineageKey) {
             self.retired.lock().unwrap().push(session.clone());
         }
@@ -4987,6 +5343,11 @@ mod tests {
             .unwrap();
         registry.evict_retention_caches(&key);
         assert_eq!(*opener.retired.lock().unwrap(), vec![key.clone(), key]);
+        assert_eq!(
+            opener.route_deletions.load(Ordering::SeqCst),
+            0,
+            "post-lease cache eviction cannot tear down a recreated actor's routes"
+        );
     }
 
     #[tokio::test]
@@ -5124,6 +5485,7 @@ mod tests {
         ) -> Result<ActorHandle, OpenError> {
             let (tx, _rx) = mpsc::channel(1);
             Ok(ActorHandle {
+                media_head: None,
                 gen,
                 tx,
                 run_in_flight: Arc::new(AtomicU64::new(0)),
@@ -5143,6 +5505,7 @@ mod tests {
         inner: Arc<FileWalStore>,
         through_seq: Mutex<Vec<Option<u64>>>,
         flushes: AtomicU64,
+        hide_identity: std::sync::atomic::AtomicBool,
         alias_on_flush: Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>>,
     }
 
@@ -5210,11 +5573,22 @@ mod tests {
             if let Some((source, alias)) = self.alias_on_flush.lock().unwrap().take() {
                 std::fs::hard_link(source, alias).map_err(WalError::Io)?;
             }
-            self.inner.flush_for_read(session)
+            // Keep the real durability barrier even when simulating an identityless backend.
+            self.inner.flush_for_read(session).map(|identity| {
+                if self.hide_identity.load(Ordering::Relaxed) {
+                    None
+                } else {
+                    identity
+                }
+            })
         }
 
         fn file_identity(&self, session: &LineageKey) -> Result<Option<u64>, broca_wal::WalError> {
-            self.inner.file_identity(session)
+            if self.hide_identity.load(Ordering::Relaxed) {
+                Ok(None)
+            } else {
+                self.inner.file_identity(session)
+            }
         }
     }
 
@@ -5314,6 +5688,7 @@ mod tests {
                     inner: file_store,
                     through_seq: Mutex::new(Vec::new()),
                     flushes: AtomicU64::new(0),
+                    hide_identity: std::sync::atomic::AtomicBool::new(false),
                     alias_on_flush: Mutex::new(None),
                 });
                 let registry = LineageRegistry::new_with_reader(
@@ -5374,9 +5749,11 @@ mod tests {
     fn read_proof_fixture(
         archived: bool,
     ) -> (LineageRegistry, BindIdentity, Arc<RecordingWalStore>) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = broca_test_support::scratch_root().join(format!(
-            "broca-read-proof-eviction-{}-{archived}",
-            std::process::id()
+            "broca-read-proof-eviction-{}-{archived}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let session = BindIdentity::new(root.join("project"), "runner", "session");
         let file_store = Arc::new(FileWalStore::new(root.join("wal")));
@@ -5406,6 +5783,7 @@ mod tests {
             inner: file_store,
             through_seq: Mutex::new(Vec::new()),
             flushes: AtomicU64::new(0),
+            hide_identity: std::sync::atomic::AtomicBool::new(false),
             alias_on_flush: Mutex::new(None),
         });
         let registry =
@@ -5413,7 +5791,7 @@ mod tests {
         (registry, session, wal_store)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn relocation_between_lookup_and_flush_keeps_its_named_retry_class() {
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -5438,6 +5816,7 @@ mod tests {
             inner,
             through_seq: Mutex::new(Vec::new()),
             flushes: AtomicU64::new(0),
+            hide_identity: std::sync::atomic::AtomicBool::new(false),
             alias_on_flush: Mutex::new(Some((source.clone(), alias.clone()))),
         });
         let registry = LineageRegistry::new_with_reader(Arc::new(NeverOpener), store.clone(), None);
@@ -5471,10 +5850,10 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(windows)]
     #[tokio::test]
     async fn reads_without_file_identity_repeat_the_barrier_without_caching_proofs() {
         let (registry, session, wal_store) = read_proof_fixture(false);
+        wal_store.hide_identity.store(true, Ordering::Relaxed);
         assert_eq!(wal_store.file_identity(&session).unwrap(), None);
         let before = registry.route_read(&session, None, None).await.unwrap();
         let after = registry.route_read(&session, None, None).await.unwrap();
@@ -5493,10 +5872,9 @@ mod tests {
 
     #[tokio::test]
     async fn read_proof_eviction_repeats_the_barrier_and_preserves_the_page() {
-        // Archives have a content-based identity on every platform, including Windows,
-        // where live WALs do not populate the proof cache.
+        // Archive content identities and native live-file identities both key cached proofs.
         check_read_proof_eviction(true).await;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         check_read_proof_eviction(false).await;
     }
 
@@ -5629,6 +6007,7 @@ mod tests {
             Entry::Open {
                 gen: open_gen,
                 handle: ActorHandle {
+                    media_head: None,
                     gen: open_gen,
                     tx: dummy_tx,
                     durable_head: Arc::new(AtomicU64::new(0)),
@@ -5668,6 +6047,7 @@ mod tests {
             Entry::Open {
                 gen,
                 handle: ActorHandle {
+                    media_head: None,
                     gen,
                     tx: dummy_tx,
                     durable_head: Arc::new(AtomicU64::new(0)),
@@ -5755,6 +6135,7 @@ mod tests {
             }
             let (tx, _rx) = mpsc::channel(1);
             Ok(ActorHandle {
+                media_head: None,
                 gen,
                 tx,
                 durable_head: Arc::new(AtomicU64::new(0)),
@@ -5973,6 +6354,7 @@ mod tests {
             inner: Arc::clone(&file_store),
             through_seq: Mutex::new(Vec::new()),
             flushes: AtomicU64::new(0),
+            hide_identity: std::sync::atomic::AtomicBool::new(false),
             alias_on_flush: Mutex::new(None),
         });
         let opener = Arc::new(GaugeOpener {
@@ -6072,9 +6454,9 @@ mod tests {
             .expect("idle read after slot close");
         assert_eq!(idle_read.messages.len(), 2);
         // The idle-read shape depends on whether the platform exposes a stable WAL file
-        // identity. With one (unix inode), the proof cached by the Closing read covers the
-        // candidate head, so the unbounded candidate read is served directly. Without one
-        // (Windows), the proven-head cache is disabled and every idle read takes a fresh
+        // identity. With one, the proof cached by the Closing read covers the candidate
+        // head, so the unbounded candidate read is served directly. Without one, the
+        // proven-head cache is disabled and every idle read takes a fresh
         // flush barrier, re-reading bounded at the candidate head observed before it.
         let expected_idle_bound = if file_store
             .file_identity(&session)
@@ -6105,6 +6487,7 @@ mod tests {
     async fn an_open_but_idle_session_counts_as_open_and_not_in_flight() {
         let registry = LineageRegistry::new(Arc::new(NeverOpener));
         let handle = ActorHandle {
+            media_head: None,
             gen: 1,
             tx: mpsc::channel(1).0,
             durable_head: Arc::new(AtomicU64::new(0)),
@@ -6133,6 +6516,7 @@ mod tests {
         let registry = LineageRegistry::new(Arc::new(NeverOpener));
         let gauge = Arc::new(AtomicU64::new(0));
         let handle = ActorHandle {
+            media_head: None,
             gen: 1,
             tx: mpsc::channel(1).0,
             durable_head: Arc::new(AtomicU64::new(0)),
@@ -6203,7 +6587,13 @@ impl LineageRegistry {
         let inner = Arc::downgrade(&self.inner);
         service.set_evictor(Arc::new(move |key| {
             if let Some(inner) = inner.upgrade() {
-                LineageRegistry { inner }.evict_retention_caches(key);
+                let registry = LineageRegistry { inner };
+                // Deletion invokes this callback while it still holds the session lease.
+                // Repeated cache eviction after that lease is released must not close routes
+                // belonging to a session recreated at the same address.
+                if registry.evict_retention_caches(key) {
+                    registry.inner.opener.on_session_deleted(key);
+                }
             }
         }));
         let _ = self.inner.retention.set(service);
@@ -6416,7 +6806,7 @@ impl LineageRegistry {
         Ok(())
     }
 
-    fn evict_retention_caches(&self, key: &LineageKey) {
+    fn evict_retention_caches(&self, key: &LineageKey) -> bool {
         // A live WAL, archive member or untombstoned meta row belongs to a newer lineage.
         // Address-keyed caches must survive completion of the older lineage's deletion.
         if self.inner.reader.as_ref().is_some_and(|reader| {
@@ -6434,7 +6824,7 @@ impl LineageRegistry {
                 .lineage_exists(key, meta.as_ref())
                 .unwrap_or(true)
         }) {
-            return;
+            return false;
         }
         self.inner.opener.retire_session_transport(key);
         self.inner.read_proofs.lock().unwrap().remove(key);
@@ -6444,6 +6834,7 @@ impl LineageRegistry {
         self.inner.live_ownership.lock().unwrap().remove(key);
         self.inner.owner_snapshots.lock().unwrap().remove(key);
         self.inner.cache.remove(key);
+        true
     }
 }
 

@@ -217,6 +217,36 @@ impl InputModalities {
     pub fn is_unknown(&self) -> bool {
         *self == Self::default()
     }
+
+    /// Unknown facts are not permission to send media.
+    pub fn supports_media(&self) -> bool {
+        [self.image, self.pdf, self.audio, self.video].contains(&Some(true))
+    }
+}
+
+#[cfg(test)]
+mod media_support_tests {
+    use super::InputModalities;
+    use serde_json::json;
+
+    #[test]
+    fn only_known_non_text_modalities_enable_a_profile() {
+        for value in [
+            json!(null),
+            json!([]),
+            json!(["text"]),
+            json!(["text", "unknown-kind"]),
+            json!(["image", 1]),
+        ] {
+            assert!(
+                !InputModalities::from_value(&value).supports_media(),
+                "{value}"
+            );
+        }
+        for kind in ["image", "pdf", "audio", "video"] {
+            assert!(InputModalities::from_value(&json!(["text", kind])).supports_media());
+        }
+    }
 }
 
 /// One catalog capability flag, keeping the three producer statements distinct.

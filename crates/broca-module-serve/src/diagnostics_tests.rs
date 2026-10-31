@@ -30,6 +30,7 @@ fn healthy(store: &broca_store::SqliteStore, since: i64) -> Evidence {
     Evidence {
         runs: store.diagnostic_evidence(since, NOW).unwrap(),
         late_fence_ms: None,
+        late_delivery_stuck: vec![],
         retention: Ok(vec![]),
         catalog_age_ms: Ok(100),
         unmapped_credentials: BTreeMap::new(),
@@ -810,6 +811,23 @@ fn diagnostics_reads_rebuild_marker_without_session_access() {
         .findings
         .iter()
         .any(|f| f.check == "late_results_rebuild_required" && f.severity == Severity::Error));
+}
+
+#[test]
+fn diagnostics_names_repeated_held_delivery_failure() {
+    let store = broca_store::SqliteStore::open_in_memory().unwrap();
+    let mut evidence = healthy(&store, NOW - 1000);
+    evidence.late_delivery_stuck =
+        vec![json!({"module":"basal", "call_key":"lineage:4", "attempts":3})];
+    let reply = report(evidence, NOW, DEFAULT_WINDOW_MS);
+    let finding = reply
+        .findings
+        .iter()
+        .find(|f| f.check == "late_results_delivery_stuck")
+        .expect("repeated delivery failure needs a named finding");
+    assert_eq!(finding.severity, Severity::Error);
+    assert_eq!(finding.count, 1);
+    assert_eq!(finding.samples[0]["attempts"], 3);
 }
 
 #[test]

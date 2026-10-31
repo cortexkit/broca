@@ -193,6 +193,9 @@ impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
 
 #[async_trait]
 impl<L: LeaseStore + 'static, W: WalStore + 'static> LineageOpener for DefaultOpener<L, W> {
+    fn on_session_deleted(&self, session: &LineageKey) {
+        self.executor.on_session_deleted(session);
+    }
     fn run_index_reader(&self) -> Option<Arc<dyn broca_core::RunIndex>> {
         self.run_index.clone()
     }

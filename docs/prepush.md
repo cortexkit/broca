@@ -168,7 +168,8 @@ healthy internal disk so the caller's retained logs are not lost to volume stall
 An integrating agent must use its own clean scratch checkout, not another
 agent's leased worktree, which Motor rejects with an ownership-authorization
 error named `lease_mismatch`. Each dispatched job prints
-`MOTOR_RUNNER_INSTANCE`; its motor event record is retained beside the lane log
+`MOTOR_RUNNER_INSTANCE`; the Windows lane repeats that host name in its final
+summary so a host-specific failure remains identifiable. Its motor event record is retained beside the lane log
 as `LANE.motor.jsonl`. A refusal before job start has no user-process instance
 banner; retain its exact refusal and event record instead of guessing a host.
 `LANE.timing.json` and the final table separately record checkout preparation,

@@ -470,14 +470,56 @@ where
 /// Staged offset-index admission loader. The store supplies one committed seed/boundary snapshot,
 /// a positioned durable tail and a full-read repair callback; legacy materialized-store readers
 /// continue to use `load_prior_wal_snapshot` until the offset store is wired into admission.
+pub trait AdmissionSnapshotSeed {
+    fn hydrate_admission(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        tail: &[crate::replay::PositionedFrame],
+        safe_head: u64,
+    ) -> Result<
+        (crate::AdmissionCheckpointV1, crate::AdmissionCheckpointV1),
+        crate::replay::SeedFallback,
+    >;
+}
+
+impl AdmissionSnapshotSeed for crate::admission::AdmissionSeed {
+    fn hydrate_admission(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        tail: &[crate::replay::PositionedFrame],
+        safe_head: u64,
+    ) -> Result<
+        (crate::AdmissionCheckpointV1, crate::AdmissionCheckpointV1),
+        crate::replay::SeedFallback,
+    > {
+        self.hydrate_with_base(read_at, tail, safe_head)
+    }
+}
+
+impl AdmissionSnapshotSeed for crate::admission::AdmissionContinuation {
+    fn hydrate_admission(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        tail: &[crate::replay::PositionedFrame],
+        safe_head: u64,
+    ) -> Result<
+        (crate::AdmissionCheckpointV1, crate::AdmissionCheckpointV1),
+        crate::replay::SeedFallback,
+    > {
+        self.hydrate(read_at, tail, safe_head)
+    }
+}
+
+/// Hydrate either an in-memory recipe or a stored content-free continuation. Both routes
+/// authenticate the boundary and discard all hydrated state before a full-read repair.
 pub fn load_prior_wal_snapshot_from_seed(
     read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
-    seed: &crate::admission::AdmissionSeed,
+    seed: &dyn AdmissionSnapshotSeed,
     tail: &[crate::replay::PositionedFrame],
     safe_head: u64,
     full_read: impl FnOnce() -> Result<Vec<broca_wal::FramedRecord>, String>,
 ) -> Result<PriorWalSnapshot, String> {
-    if let Ok((mut base, head)) = seed.hydrate_with_base(read_at, tail, safe_head) {
+    if let Ok((mut base, head)) = seed.hydrate_admission(read_at, tail, safe_head) {
         let watermark = base.at_seq;
         base.pending_fifo = Arc::new(Vec::new());
         return Ok(PriorWalSnapshot {
@@ -595,7 +637,8 @@ pub struct RunControl {
     pub cancel: Option<CancellationToken>,
     /// Per-model-call timeout (the provider watchdog). Normal expiry closes Interrupted
     /// and releases the lease after writer shutdown. On overhaul roots, a reservation
-    /// durability failure takes precedence and fails the step with a WAL error instead.
+    /// sync failure takes precedence and fails the step with a WAL error instead;
+    /// cancellation while awaiting permission releases the known-unsent reservation.
     /// This does not bound public run completion: a kernel sync that never returns keeps
     /// exclusive writer ownership and requires supervisor-level process recovery.
     /// `None` leaves the model-stream await unbounded.
@@ -871,6 +914,8 @@ pub enum RunError {
     Config(String),
     /// Person media failed admission before a record could name it.
     MediaUnsupported(String),
+    /// Preserve the upload contract's refusal code and retry class before admission.
+    Upload(crate::media_uploads::UploadError),
     /// Unsupported reasoning variant, refused before durable admission.
     VariantUnsupported(VariantRefusal),
     /// Admission failed because a required dependency is temporarily unavailable. Nothing
@@ -993,6 +1038,7 @@ impl RunError {
     /// failures may recover without changing the logical send.
     pub fn admission_error_class(&self) -> ErrorClass {
         match self {
+            Self::Upload(error) => error.error_class(),
             Self::Config(_)
             | Self::MediaUnsupported(_)
             | Self::VariantUnsupported(_)
@@ -1035,6 +1081,7 @@ impl std::fmt::Display for RunError {
             RunError::VariantUnsupported(s) => write!(f, "run resolution failed: {s}"),
             RunError::Config(s) => write!(f, "run resolution failed: {s}"),
             RunError::MediaUnsupported(s) => write!(f, "{s}"),
+            RunError::Upload(error) => write!(f, "{error}"),
             RunError::Transient(s) => write!(f, "run admission temporarily unavailable: {s}"),
             RunError::SendIdReuse { differing } => write!(
                 f,
@@ -3800,10 +3847,8 @@ where
             }),
         )
     };
-    #[cfg(feature = "test-attachments")]
-    let defer_media_tags = provider.defer_media_tags(render_tags);
-    #[cfg(not(feature = "test-attachments"))]
-    let defer_media_tags = false;
+    let defer_media_tags =
+        broca_protocol::attachments_enabled() && provider.defer_media_tags(render_tags);
     writer.retain_live_tags(render_tags && computed_tags.is_none());
     let context_limit = if is_resume && !append_episode {
         prior
@@ -4502,6 +4547,33 @@ where
                     .as_ref()
                     .and_then(|config| render_config_error(provider, config))
                 {
+                    // A renderer refusal cannot erase a provider's delivered answer. Close
+                    // the original batch before ending the episode, without dispatching it.
+                    let batch = crate::resume::sync_deposited_held_results(
+                        prior.open_tool_batch.clone(),
+                        &pending,
+                        &BatchCtx {
+                            batch_id: pending.batch_id.clone().expect("held batch exists"),
+                            run_id: resolved_run_id.clone(),
+                            bind: req.session.clone(),
+                            scope: req.scope.clone(),
+                            media_capture: None,
+                        },
+                        writer,
+                        control.provider_held_lifecycle.clone(),
+                    )
+                    .await?;
+                    let mut closing = crate::replay(&[]).expect("empty WAL has a valid replay");
+                    closing.open_tool_batch = batch;
+                    for record in crate::resume::close_out_open_batch_for(
+                        &closing,
+                        RunFinishReason::Interrupted,
+                        |_| crate::DeferredCloseKind::NotDispatched,
+                    ) {
+                        writer.record(record);
+                    }
+                    let mut error = error;
+                    error.provider_code = Some("held_resume_refused".into());
                     writer.record(resume_sealing);
                     let (summary, head) = finish_run(
                         writer,
@@ -8820,31 +8892,39 @@ impl AttemptJournal<'_> {
                 };
                 let failure = tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => Some("reservation cancelled before its durability barrier completed"),
-                    _ = step_stopped.cancelled() => Some("step stopped before its reservation barrier completed"),
-                    _ = reply.closed() => Some("reservation receipt closed before its durability barrier completed"),
-                    _ = sealed => Some("shutdown sealed before the reservation barrier completed"),
-                    _ = tokio::time::sleep(RESERVATION_PERMISSION_TIMEOUT) => Some("reservation durability barrier deadline expired"),
+                    _ = cancel.cancelled() => Some((true, "reservation cancelled before its durability barrier completed")),
+                    _ = step_stopped.cancelled() => Some((true, "step stopped before its reservation barrier completed")),
+                    _ = reply.closed() => Some((false, "reservation receipt closed before its durability barrier completed")),
+                    _ = sealed => Some((false, "shutdown sealed before the reservation barrier completed")),
+                    _ = tokio::time::sleep(RESERVATION_PERMISSION_TIMEOUT) => Some((false, "reservation durability barrier deadline expired")),
                     result = self.writer.sync() => { result?; None },
                 };
-                if let Some(detail) = failure {
+                if let Some((stopped, detail)) = failure {
                     let _ = reply.send(Err(attempt_hook_error(detail)));
+                    if stopped {
+                        // Permission has never been handed out, so no bytes can have left.
+                        // Queue the release behind the reservation; the ordinary terminal's
+                        // sync must still persist both before the run can finish normally.
+                        let terminal = self.pending[&id].fallback(id.clone());
+                        self.settle(&id, terminal)?;
+                        return Ok(());
+                    }
                     return Err(WalWriteError::from(format!(
                         "attempt_durability_failed: {detail}"
                     )));
                 }
                 self.pending.get_mut(&id).unwrap().barrier_acknowledged = true;
-                if cancel.is_cancelled() || reply.is_closed() {
+                #[cfg(test)]
+                if let Some((reached, proceed)) = self.before_start.take() {
+                    reached.notify_one();
+                    proceed.notified().await;
+                }
+                if cancel.is_cancelled() || step_stopped.is_cancelled() || reply.is_closed() {
                     let terminal = self.pending[&id].fallback(id.clone());
                     self.settle(&id, terminal)?;
                     let _ =
                         reply.send(Err(attempt_hook_error("send cancelled during reservation")));
                     return Ok(());
-                }
-                #[cfg(test)]
-                if let Some((reached, proceed)) = self.before_start.take() {
-                    reached.notify_one();
-                    proceed.notified().await;
                 }
                 let pending = self.pending.get_mut(&id).unwrap();
                 if self.seal.is_some_and(|seal| {
@@ -11733,7 +11813,7 @@ mod tests {
         )
         .unwrap();
         *hold.0.lock().unwrap() = true;
-        // Release only during teardown, after checking that the step failed while the
+        // Release only during teardown, after checking that the step stopped while the
         // writer remained blocked. A panic also unblocks the writer before its join.
         let unblock = UnblockBarrierOnDrop(hold.clone());
         let cancel = CancellationToken::new();
@@ -11770,8 +11850,15 @@ mod tests {
             },
         );
         let cancel_at_barrier = async {
-            entered.notified().await;
-            if !watchdog {
+            let entered = entered.notified();
+            tokio::pin!(entered);
+            // Keep the paused watchdog from auto-advancing during writer-thread I/O.
+            while futures::poll!(&mut entered).is_pending() {
+                tokio::task::yield_now().await;
+            }
+            if watchdog {
+                tokio::time::advance(Duration::from_millis(50)).await;
+            } else {
                 cancel.cancel();
             }
         };
@@ -11786,14 +11873,18 @@ mod tests {
             *hold.0.lock().unwrap(),
             "the barrier must still be held when the step stops"
         );
-        let error =
-            match result.expect("stuck reservation must not starve cancellation or watchdog") {
-                Err(error) => error,
-                Ok(_) => panic!("durability failure must abort the step"),
-            };
-        assert!(
-            error.to_string().contains("attempt_durability_failed"),
-            "{error}"
+        assert_eq!(
+            result
+                .expect("stuck reservation must not starve cancellation or watchdog")
+                .unwrap()
+                .unwrap()
+                .err()
+                .expect("a stopped step must not produce a model outcome"),
+            if watchdog {
+                RunFinishReason::Interrupted
+            } else {
+                RunFinishReason::Cancelled
+            }
         );
         tokio::time::timeout(Duration::from_millis(100), provider.refused.notified())
             .await
@@ -11822,12 +11913,12 @@ mod tests {
             .any(|record| matches!(record, WalRecord::AttemptFinished { .. })));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn attempt_hook_stuck_barrier_caller_cancel_is_bounded() {
         check_stuck_reservation_barrier(false).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn attempt_hook_stuck_barrier_provider_watchdog_is_pollable() {
         check_stuck_reservation_barrier(true).await;
     }
@@ -11930,12 +12021,9 @@ mod tests {
         })
         .await
         .expect("reservation holds no writer lock across await");
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("attempt_durability_failed"));
-        // The failed barrier leaves an unsent fallback, rather than pretending a release
-        // is already durable. Close it only after the test writer can make progress again.
+        result.unwrap();
+        // The release is queued, not yet durable. A later successful sync persists it,
+        // and sealing must not duplicate the settlement already owned by the journal.
         seal.seal_and_collect(Duration::ZERO).await;
         seal.record_hook_fallbacks(&writer).await.unwrap();
         let (out, _rx) = mpsc::channel(16);
@@ -12447,6 +12535,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attempt_hook_cancel_after_barrier_never_grants_permission() {
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = WalHandle::spawn(
+            Box::new(RecordingWal {
+                records: records.clone(),
+            }),
+            1,
+        )
+        .unwrap();
+        let cancel = CancellationToken::new();
+        let reached = Arc::new(Notify::new());
+        let proceed = Arc::new(Notify::new());
+        let recorded = Default::default();
+        let mut journal = AttemptJournal {
+            writer: &writer,
+            seal: None,
+            template: attempt_template(),
+            pending: Default::default(),
+            recorded: &recorded,
+            before_start: Some((reached.clone(), proceed.clone())),
+        };
+        let (reply, receipt) = tokio::sync::oneshot::channel();
+        let step_stopped = CancellationToken::new();
+        let stop = async {
+            reached.notified().await;
+            cancel.cancel();
+            proceed.notify_one();
+        };
+        let request = AttemptRequest::Reserve {
+            send: physical_send(),
+            cancel: cancel.clone(),
+            reply,
+        };
+        let (result, ()) = tokio::join!(journal.handle(request, &step_stopped), stop);
+        result.unwrap();
+        assert!(
+            receipt.await.unwrap().is_err(),
+            "even an unpolled receipt must never receive permission after cancellation"
+        );
+        journal.close().unwrap();
+        writer.sync().await.unwrap();
+        let records = records.lock().unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record, WalRecord::AttemptReserved { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(records.iter().filter(|record| matches!(record, WalRecord::AttemptReleased { envelope, .. } if envelope.sent == broca_wal::record::AttemptSent::No)).count(), 1);
+        assert!(!records.iter().any(|record| matches!(
+            record,
+            WalRecord::AttemptFinished { .. } | WalRecord::ModelAttemptFinished { .. }
+        )));
+    }
+
+    #[tokio::test]
     async fn attempt_hook_seal_refused_start_releases_through_real_channel() {
         use broca_wal::record::AttemptSent;
         let records = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -12481,9 +12626,8 @@ mod tests {
         };
         let cancel_and_seal = async {
             reached.notified().await;
-            // Force cancellation and sealing after the journal's cancellation check,
-            // but before the seal decides whether the durable reservation may start.
-            cancel.cancel();
+            // Seal after the barrier but before permission, without caller cancellation,
+            // so the seal itself must refuse to start the durable reservation.
             seal.seal_and_collect(Duration::ZERO).await;
             proceed.notify_one();
         };
@@ -14777,7 +14921,6 @@ mod tests {
             trailing_origin: None,
             last_run_id: Some(RunId("budget".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
-                #[cfg(feature = "test-attachments")]
                 media: None,
                 head: None,
                 has_deferred_calls: None,

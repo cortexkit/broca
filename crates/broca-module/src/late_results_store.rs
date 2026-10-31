@@ -319,6 +319,41 @@ impl LateResultsStore {
         self.unpruned_registration_rows()
     }
 
+    /// A bounded maintenance page, without probing every registration's WAL or tombstone.
+    /// The cursor is process-local; deleting settled rows cannot skip a surviving key.
+    pub fn registration_page(
+        &self,
+        after: Option<&(String, String)>,
+        limit: usize,
+    ) -> Result<Vec<RegistrationRow>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT registration, state FROM registrations
+             WHERE ?1 IS NULL OR (module, call_key) > (?1, ?2)
+             ORDER BY module, call_key LIMIT ?3",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                params![
+                    after.map(|key| key.0.as_str()),
+                    after.map(|key| key.1.as_str()),
+                    limit as u64
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            let (json, state) = row.map_err(|error| error.to_string())?;
+            Ok(RegistrationRow {
+                call: serde_json::from_str(&json).map_err(|error| error.to_string())?,
+                state: RegistrationState::from_str(&state),
+            })
+        })
+        .collect()
+    }
+
     fn unpruned_registration_rows(&self) -> Result<Vec<RegistrationRow>, String> {
         #[cfg(test)]
         boot_io::record(|counts| counts.reads += 1);
@@ -698,6 +733,67 @@ impl LateResultsStore {
         Ok(())
     }
 
+    /// Read one outbox key, including done rows, while a per-call active guard is held.
+    pub fn withdrawal_state(
+        &self,
+        module: &str,
+        call_key: &str,
+    ) -> Result<Option<(String, u32)>, String> {
+        self.lock()?
+            .query_row(
+                "SELECT state, attempts FROM held_withdrawals WHERE module=?1 AND call_key=?2",
+                params![module, call_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn withdrawal_call(
+        &self,
+        module: &str,
+        call_key: &str,
+    ) -> Result<Option<LateResultRegistration>, String> {
+        let json: Option<String> = self.lock()?.query_row(
+            "SELECT registration FROM held_withdrawals WHERE module=?1 AND call_key=?2 AND state NOT IN ('done','failed')",
+            params![module, call_key], |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        json.map(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))
+            .transpose()
+    }
+
+    pub fn withdrawal_counts(&self) -> Result<(usize, usize, usize), String> {
+        self.lock()?.query_row(
+            "SELECT count(CASE WHEN state='watching' THEN 1 END), count(CASE WHEN state='pending' THEN 1 END), count(CASE WHEN state='failed' THEN 1 END) FROM held_withdrawals",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).map_err(|error| error.to_string())
+    }
+
+    /// An inline terminal removes its registration and unattempted withdrawal watch in one
+    /// transaction. Keep attempted withdrawals available for recovery if the process crashes
+    /// before withdrawal finishes, independently of ordinary intake pruning.
+    pub fn remove_inline_calls(&self, calls: &[(String, String)]) -> Result<usize, String> {
+        if calls.is_empty() {
+            return Ok(0);
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let mut removed = 0;
+        for (module, key) in calls {
+            transaction
+                .execute(
+                    "DELETE FROM registrations WHERE module=?1 AND call_key=?2",
+                    params![module, key],
+                )
+                .map_err(|error| error.to_string())?;
+            removed += transaction.execute("DELETE FROM held_withdrawals WHERE module=?1 AND call_key=?2 AND state='watching' AND attempts=0", params![module, key]).map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(removed)
+    }
+
     pub fn withdrawal_failure_details(&self) -> Result<Vec<serde_json::Value>, String> {
         let connection = self.lock()?;
         let mut query = connection.prepare("SELECT detail FROM held_withdrawals WHERE state='failed' ORDER BY module, call_key LIMIT 10").map_err(|error| error.to_string())?;
@@ -798,6 +894,10 @@ impl LateResultsIntake for LateResultsStore {
 
     async fn prune(&self, calls: &[(String, String)]) -> Result<(), String> {
         self.remove_calls(calls)
+    }
+
+    async fn prune_inline(&self, calls: &[(String, String)]) -> Result<(), String> {
+        self.remove_inline_calls(calls).map(|_| ())
     }
 }
 
@@ -1036,6 +1136,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.registrations().unwrap(), vec![call("lineage:2")]);
+    }
+
+    #[tokio::test]
+    async fn inline_pruning_retires_its_watch_but_ordinary_pruning_preserves_cancellation_recovery()
+    {
+        let root = scratch("inline-prune");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let store = LateResultsStore::open(&root.join("late-results.db")).unwrap();
+        let inline = call("lineage:1");
+        let held = call("lineage:2");
+        store.register_calls(&[inline, held]).unwrap();
+        store
+            .prune_inline(&[("provider".into(), "lineage:1".into())])
+            .await
+            .unwrap();
+        store
+            .prune(&[("provider".into(), "lineage:2".into())])
+            .await
+            .unwrap();
+        assert!(store.registrations().unwrap().is_empty());
+        assert_eq!(
+            store.withdrawal_state("provider", "lineage:1").unwrap(),
+            None
+        );
+        assert_eq!(
+            store.withdrawal_state("provider", "lineage:2").unwrap(),
+            Some(("watching".into(), 0))
+        );
     }
 
     #[test]

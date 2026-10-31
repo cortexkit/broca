@@ -4846,7 +4846,7 @@ mod tests {
         crate::conformance::wal_anchor_roundtrip_and_stale_filtering(sqlite_store());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn persisted_sqlite_anchor_drives_the_next_wal_range() {
         use broca_core::Persister;
@@ -4882,7 +4882,9 @@ mod tests {
                 },
             )
             .unwrap();
-        let anchor = first.anchor_at(watermark).expect("Unix range mints anchor");
+        let anchor = first
+            .anchor_at(watermark)
+            .expect("native file range mints anchor");
         Persister::persist_wal_anchor(&store, &session, Some(&anchor)).unwrap();
         let seed = Persister::projection_seed(&store, &session)
             .unwrap()
@@ -5212,9 +5214,7 @@ mod tests {
             Persister::project_range(&store, &session, &projection_range).expect("project fixture"),
             safe_head - 1
         );
-        // Byte anchors carry a file identity that only the unix backend provides; without
-        // one the range read still returns the correct tail, just without the byte skip.
-        #[cfg(unix)]
+        // Byte anchors carry the live WAL's file identity, which Unix and Windows both provide.
         assert!(MaterializedStore::read_admission_snapshot(&store, &session)
             .expect("read metadata")
             .expect("metadata row")

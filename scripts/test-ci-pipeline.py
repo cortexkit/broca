@@ -289,6 +289,26 @@ print('Summary: 1 test run: 1 passed')
         self.assertNotRegex(result.stdout, r'windows\s+PASS\s+exit=0')
         self.assertIn('owner-distinct check not run: token cannot assign a foreign owner', result.stdout)
 
+    def test_windows_summary_records_runner_instance(self):
+        import re
+        source = (ROOT / 'scripts/lib/prepush-lane.sh').read_text()
+        summary = re.search(r'^summary\(\) \{.*?^\}', source, re.M | re.S)
+        self.assertIsNotNone(summary)
+        assert summary is not None
+        script = ('set -euo pipefail\nlane=windows; labels=(); codes=(); times=(); files=(); '
+                  'owner_partial=0; begin=$SECONDS; log_dir=fixture; scratch=fixture\n' +
+                  summary.group(0) + '\nsummary\n')
+        for host in ('ally', 'windows', None):
+            with self.subTest(host=host):
+                env = dict(os.environ)
+                env.pop('MOTOR_RUNNER_INSTANCE', None)
+                if host is not None:
+                    env['MOTOR_RUNNER_INSTANCE'] = host
+                result = subprocess.run(['bash', '-c', script], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('==> windows summary', result.stdout)
+                self.assertIn('prepush: Windows runner instance=' + (host or 'unreported'), result.stdout)
+
     def test_concurrent_cpu_requests_never_exceed_32(self):
         (self.root / 'target').mkdir()
         os.mkfifo(self.root / 'target/barrier')

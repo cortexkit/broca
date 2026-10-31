@@ -266,6 +266,116 @@ pub enum PlanState {
     Admitted { frozen: Option<String> },
 }
 
+/// Why a `session.refresh`, `session.refresh_policy` or `session.flush_prefix` is refused,
+/// as the wire reply's code, message and detail. Every refusal writes nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionChangeError {
+    /// The caller is not the session's owner.
+    OwnerMismatch(Box<broca_core::OwnerMismatch>),
+    /// The request is malformed, naming the field.
+    InvalidParams { field: String, message: String },
+    /// A `send_id` was reused with a different body, naming the differing field.
+    SendIdReuse { field: String, message: String },
+    /// The policy names no rung the session supports for a surface the change touches.
+    RungUnsupported { surface: String, rung: String },
+    /// The generation is at or below the accepted one and is not an identical repeat.
+    GenerationStale { accepted: u64 },
+    /// The policy names a generation no longer pending because a later refresh superseded it.
+    PendingSuperseded { generation: u64, pending: u64 },
+    /// The policy names a generation already applied.
+    AlreadyApplied { generation: u64, applied_by: String },
+    /// Fetching the refreshed plan's providers failed as at admission.
+    FetchRefused(broca_fetch_plan::Refusal),
+    /// The session has no baseline yet, or the writer failed. Retryable when transient.
+    Transient(String),
+    /// The op is not served (no session-change state, or the handler cannot tell).
+    Unsupported(String),
+}
+
+impl SessionChangeError {
+    pub fn unsupported(op: impl Into<String>) -> Self {
+        Self::Unsupported(op.into())
+    }
+
+    /// The wire code.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::OwnerMismatch(_) => cortexkit_role_llm_runner::errors::SCOPE_OWNER_MISMATCH,
+            Self::InvalidParams { .. } => cortexkit_role_llm_runner::errors::INVALID_PARAMS,
+            Self::SendIdReuse { .. } => cortexkit_role_llm_runner::errors::SEND_ID_REUSE,
+            Self::RungUnsupported { .. } => cortexkit_role_llm_runner::errors::RUNG_UNSUPPORTED,
+            Self::GenerationStale { .. } => cortexkit_role_llm_runner::errors::GENERATION_STALE,
+            Self::PendingSuperseded { .. } => cortexkit_role_llm_runner::errors::PENDING_SUPERSEDED,
+            Self::AlreadyApplied { .. } => cortexkit_role_llm_runner::errors::ALREADY_APPLIED,
+            Self::FetchRefused(refusal) => refusal.code(),
+            Self::Transient(_) => cortexkit_role_llm_runner::errors::TRANSIENT,
+            Self::Unsupported(_) => "open_failed",
+        }
+    }
+
+    /// Whether the same request may succeed when retried unchanged.
+    pub fn retryable(&self) -> bool {
+        match self {
+            Self::FetchRefused(refusal) => refusal.retryable(),
+            Self::Transient(_) => true,
+            _ => cortexkit_role_llm_runner::errors::is_retryable(self.code()),
+        }
+    }
+}
+
+/// Classify policy retries and refusals without side effects. The serve preflight avoids
+/// opening an actor for a refusal; the actor repeats the check at the serialized write point.
+pub(crate) fn check_session_policy(
+    change: &broca_fetch_plan::session_change::SessionChangeState,
+    generation: u64,
+    policy: &str,
+    send_id: &str,
+) -> Result<bool, SessionChangeError> {
+    if let Some((earlier_generation, earlier_policy)) = change.policy_send_ids.get(send_id) {
+        let field = if generation != *earlier_generation {
+            Some("generation")
+        } else if policy != earlier_policy {
+            Some("policy")
+        } else {
+            None
+        };
+        return match field {
+            None => Ok(true),
+            Some(field) => Err(SessionChangeError::SendIdReuse {
+                field: field.into(),
+                message: format!("send_id {send_id} was used with another {field}"),
+            }),
+        };
+    }
+    if let Some(applied_by) = change.applied.get(&generation) {
+        return Err(SessionChangeError::AlreadyApplied {
+            generation,
+            applied_by: applied_by.clone(),
+        });
+    }
+    let Some(pending) = change
+        .pending
+        .as_ref()
+        .filter(|pending| pending.generation == generation)
+    else {
+        return Err(SessionChangeError::PendingSuperseded {
+            generation,
+            pending: change.accepted_generation,
+        });
+    };
+    if let Some(surface) = broca_fetch_plan::session_change::unsupported_surface(
+        change.current_manifest.as_deref(),
+        &pending.manifest,
+        policy,
+    ) {
+        return Err(SessionChangeError::RungUnsupported {
+            surface: surface.into(),
+            rung: policy.into(),
+        });
+    }
+    Ok(false)
+}
+
 /// A `session.send` response.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -624,7 +734,7 @@ fn final_message_from_prompt(
     })
 }
 
-fn recorded_interrupt_reason(
+pub(crate) fn recorded_interrupt_reason(
     records: &[broca_wal::FramedRecord],
     run_id: &broca_protocol::RunId,
 ) -> Option<String> {
@@ -1651,6 +1761,16 @@ impl std::error::Error for ServeError {}
 /// real outcome or a typed `ServeError`.
 #[async_trait]
 pub trait ServeHandler: Send + Sync {
+    async fn media_read(
+        &self,
+        _session: &LineageKey,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, ServeError> {
+        Err(ServeError::InvalidParams {
+            field: "sha256".into(),
+            message: "session.media_read unavailable".into(),
+        })
+    }
     async fn upload(
         &self,
         _session: &LineageKey,
@@ -1708,6 +1828,19 @@ pub trait ServeHandler: Send + Sync {
         _scope: &broca_protocol::SendScope,
     ) -> Result<(), ServeError> {
         Ok(())
+    }
+
+    /// Retraction defaults to owner-only unless the handler supports recorded senders.
+    /// The principal must come from the daemon's bind, never from request parameters.
+    async fn authorize_session_retract(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+        _submission_id: Option<&str>,
+    ) -> Result<(), ServeError> {
+        self.authorize_session_owner(session, principal, scope)
+            .await
     }
 
     /// `session.send` — start or durably queue a run.
@@ -2081,11 +2214,55 @@ pub trait ServeHandler: Send + Sync {
         false
     }
 
+    /// The session-change identities for drift checks: the effective plan identity and the
+    /// latest accepted plan identity, when the session has session-change state (it received
+    /// a refresh). `None` when the session never received one, keeping today's plain
+    /// different-plan refusal exactly.
     async fn session_change_identities(
         &self,
         _session: &LineageKey,
     ) -> Option<(Option<String>, Option<String>)> {
         None
+    }
+
+    /// Accept a `session.refresh`: fetch, record durably, and hold pending. Implemented by
+    /// the registry through the lineage actor; the default has no session to refresh.
+    async fn session_refresh(
+        &self,
+        _session: &LineageKey,
+        _principal: Option<&broca_protocol::BindPrincipal>,
+        _scope: &broca_protocol::SendScope,
+        _plan: serde_json::Map<String, serde_json::Value>,
+        _policy: String,
+        _generation: u64,
+    ) -> Result<cortexkit_role_llm_runner::session_change::RefreshReply, SessionChangeError> {
+        Err(SessionChangeError::unsupported("session.refresh"))
+    }
+
+    /// Change the pending change's rung.
+    async fn session_refresh_policy(
+        &self,
+        _session: &LineageKey,
+        _principal: Option<&broca_protocol::BindPrincipal>,
+        _scope: &broca_protocol::SendScope,
+        _generation: u64,
+        _policy: String,
+        _send_id: String,
+    ) -> Result<cortexkit_role_llm_runner::session_change::RefreshPolicyReply, SessionChangeError>
+    {
+        Err(SessionChangeError::unsupported("session.refresh_policy"))
+    }
+
+    /// Drop the frozen prefix and apply any pending change at the next run.
+    async fn session_flush_prefix(
+        &self,
+        _session: &LineageKey,
+        _principal: Option<&broca_protocol::BindPrincipal>,
+        _scope: &broca_protocol::SendScope,
+        _send_id: String,
+    ) -> Result<cortexkit_role_llm_runner::session_change::FlushPrefixReply, SessionChangeError>
+    {
+        Err(SessionChangeError::unsupported("session.flush_prefix"))
     }
 }
 
@@ -2307,12 +2484,17 @@ impl ServeHandler for crate::LineageRegistry {
                 requested: req.lineage_id.unwrap(),
             });
         }
-        let page: broca_wire::ModelPage = page.try_into().map_err(|error| {
+        let mut page: broca_wire::ModelPage = page.try_into().map_err(|error| {
             ServeError::Open(
                 format!("model page source: {error}"),
                 Some(broca_protocol::ErrorClass::Permanent),
             )
         })?;
+        if broca_protocol::attachments_enabled()
+            && req.media == cortexkit_role_llm_runner::read::MediaMode::Inline
+        {
+            page.render_inline_media();
+        }
         let subject = model_group_reply_too_large_subject(&page);
         if let Some(error) =
             reply_frame_limit_refusal(broca_wire::serialized_result_frame_bytes(&page), subject)
@@ -2349,6 +2531,35 @@ impl ServeHandler for crate::LineageRegistry {
             .map_err(ServeError::ScopeRefused)
     }
 
+    async fn authorize_session_retract(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+        submission_id: Option<&str>,
+    ) -> Result<(), ServeError> {
+        // Runner 0.7.29 CONTRACT.md:2333-2362 (§9.2) extends only session.retract:
+        // owners keep their exact path; another attested sender may withdraw only its
+        // recorded submission. run.cancel remains owner-only, even for that sender.
+        match self
+            .authorize_session_owner(session, principal, scope)
+            .await
+        {
+            Err(refusal @ ServeError::ScopeRefused(_)) => {
+                if let (Some(sender @ broca_protocol::BindPrincipal::Reserved { .. }), Some(id)) =
+                    (principal, submission_id)
+                {
+                    if self.recorded_submission_sender(session, id).await?.as_ref() == Some(sender)
+                    {
+                        return Ok(());
+                    }
+                }
+                Err(refusal)
+            }
+            result => result,
+        }
+    }
+
     async fn upload(
         &self,
         session: &LineageKey,
@@ -2358,6 +2569,14 @@ impl ServeHandler for crate::LineageRegistry {
         params: serde_json::Value,
     ) -> Result<serde_json::Value, ServeError> {
         crate::uploads::upload(self, session, principal, scope, method, params).await
+    }
+
+    async fn media_read(
+        &self,
+        session: &LineageKey,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, ServeError> {
+        crate::uploads::media_read(self, session, params).await
     }
 
     async fn send(&self, mut req: SendRequest) -> Result<SendResponse, ServeError> {
@@ -2538,6 +2757,7 @@ impl ServeHandler for crate::LineageRegistry {
                 message: format!("joining steer cannot change the active run's frozen {field}"),
             }),
             SendOutcome::VariantUnsupported(e) => Err(ServeError::VariantUnsupported(e)),
+            SendOutcome::Upload(error) => Err(ServeError::Upload(error)),
             // Actor errors can combine replay, storage and lifecycle failures after type erasure.
             SendOutcome::Error(e) => Err(ServeError::Open(e, None)),
             SendOutcome::ClassifiedError { reason, class } => {
@@ -2592,6 +2812,13 @@ impl ServeHandler for crate::LineageRegistry {
             .into_iter()
             .map(|frame| frame.record)
             .collect();
+        let own_run =
+            if let Some(sender @ broca_protocol::BindPrincipal::Reserved { .. }) = principal {
+                crate::send_fate::resolve_sender_run_id(&records, &own_run, send_id, sender)
+                    .map_err(|_| ServeError::UnknownSend)?
+            } else {
+                own_run
+            };
         // Ordered senders share a session, not each other's send keys. Legacy owner records
         // omit sent_by, so their principal is the one on Queued or RunStarted.
         let submission = format!("sub-{}", own_run.0);
@@ -2623,8 +2850,11 @@ impl ServeHandler for crate::LineageRegistry {
         {
             return Err(ServeError::UnknownSend);
         }
-        let outcome = crate::send_fate::recorded_send_outcome(&records, &own_run, send_id)
-            .ok_or(ServeError::UnknownSend)?;
+        let legacy_steers = !records.iter().any(|record| matches!(record,
+            broca_wal::WalRecord::DeliveryOrdered { submission_id, .. } if submission_id.0 == submission));
+        let outcome =
+            crate::send_fate::recorded_send_outcome(&records, &own_run, send_id, legacy_steers)
+                .ok_or(ServeError::UnknownSend)?;
         let (result, delivered) = match outcome {
             crate::actor::SendOutcome::Finished {
                 run_id,
@@ -3015,7 +3245,11 @@ impl ServeHandler for crate::LineageRegistry {
             .await?;
         if req.media == cortexkit_role_llm_runner::read::MediaMode::Blocks {
             for entry in &mut response.messages {
-                entry.show_media_blocks();
+                if broca_protocol::attachments_enabled() {
+                    entry.show_media_blocks_with_identity();
+                } else {
+                    entry.show_media_blocks();
+                }
             }
         }
         if req.media == cortexkit_role_llm_runner::read::MediaMode::Descriptors {
@@ -3057,6 +3291,7 @@ impl ServeHandler for crate::LineageRegistry {
         // so the cost follows what is not yet materialized, never the session's length.
         let crate::registry::RouteReadPage {
             page,
+            at_seq,
             head_facts,
             head_facts_complete,
             newest_record_ms,
@@ -3095,8 +3330,27 @@ impl ServeHandler for crate::LineageRegistry {
                 .find_map(|framed| broca_core::record_time_ms(&framed.record))
                 .unwrap_or(0),
         };
+        let media_facts = if broca_protocol::attachments_enabled() {
+            Some(
+                self.media_facts_for_head(
+                    session,
+                    crate::registry::media_head::Request {
+                        lineage: lineage_id,
+                        at_seq,
+                        run_id: page.lineage_state.last_run_id.as_ref(),
+                        state: page.lineage_state.state.as_str(),
+                        model: head_facts.model.as_ref(),
+                    },
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         let interrupted_reason = if page.lineage_state.state.as_str() == "interrupted" {
-            if let Some(run_id) = &page.lineage_state.last_run_id {
+            if let Some(facts) = &media_facts {
+                facts.interrupt_reason.clone()
+            } else if let Some(run_id) = &page.lineage_state.last_run_id {
                 recorded_interrupt_reason(&self.read_durable_wal(session).await?.0, run_id)
             } else {
                 None
@@ -3129,6 +3383,7 @@ impl ServeHandler for crate::LineageRegistry {
         } else {
             None
         };
+        let input = media_facts.map_or_else(broca_wire::head_input, |facts| facts.input);
         Ok(broca_wire::HeadResponse {
             last_run_rich_ui: head_facts.last_run_rich_ui,
             last_run_error,
@@ -3168,7 +3423,7 @@ impl ServeHandler for crate::LineageRegistry {
                     expiry_basis: broca_wire::EXPIRY_BASIS_ESTIMATED.into(),
                 }),
             title: last_title,
-            input: Some(broca_wire::head_input()),
+            input: Some(input),
         })
     }
 
@@ -3629,18 +3884,16 @@ impl ServeHandler for crate::LineageRegistry {
                 manifest_digest: effective.manifest_digest.clone(),
             }
         });
-        if change.accepted_generation > 0 {
-            baseline.rungs = Some(cortexkit_role_llm_runner::baseline::Rungs {
-                tools: broca_fetch_plan::session_change::TOOLS_RUNGS
-                    .iter()
-                    .map(|rung| rung.to_string())
-                    .collect(),
-                system_text: broca_fetch_plan::session_change::SYSTEM_TEXT_RUNGS
-                    .iter()
-                    .map(|rung| rung.to_string())
-                    .collect(),
-            });
-        }
+        baseline.rungs = Some(cortexkit_role_llm_runner::baseline::Rungs {
+            tools: broca_fetch_plan::session_change::TOOLS_RUNGS
+                .iter()
+                .map(|rung| rung.to_string())
+                .collect(),
+            system_text: broca_fetch_plan::session_change::SYSTEM_TEXT_RUNGS
+                .iter()
+                .map(|rung| rung.to_string())
+                .collect(),
+        });
         Ok(broca_wire::BaselineReply::ready(baseline))
     }
 
@@ -3659,6 +3912,17 @@ impl ServeHandler for crate::LineageRegistry {
                 baseline.cache = self
                     .admitted_cache(session, run_id)
                     .map(|declaration| declaration.to_wire());
+                // The admitting send carries the same rungs `session.baseline` will report.
+                baseline.rungs = Some(cortexkit_role_llm_runner::baseline::Rungs {
+                    tools: broca_fetch_plan::session_change::TOOLS_RUNGS
+                        .iter()
+                        .map(|rung| rung.to_string())
+                        .collect(),
+                    system_text: broca_fetch_plan::session_change::SYSTEM_TEXT_RUNGS
+                        .iter()
+                        .map(|rung| rung.to_string())
+                        .collect(),
+                });
                 baseline
             })
     }
@@ -3692,6 +3956,296 @@ impl ServeHandler for crate::LineageRegistry {
             })
         };
         Some((effective, accepted))
+    }
+
+    async fn session_refresh(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+        plan: serde_json::Map<String, serde_json::Value>,
+        policy: String,
+        generation: u64,
+    ) -> Result<cortexkit_role_llm_runner::session_change::RefreshReply, SessionChangeError> {
+        use cortexkit_role_llm_runner::{rungs, session_change};
+        let _change_guard = self.lock_session_change(session).await;
+        let (records, _) = self.read_durable_wal(session).await.map_err(|error| {
+            SessionChangeError::Transient(format!("cannot read the session WAL: {error}"))
+        })?;
+        let Some(start) = first_run_started(&records) else {
+            return Err(SessionChangeError::Transient(
+                "the session has no baseline yet; send its first send first".into(),
+            ));
+        };
+        if let Some(mismatch) = baseline_owner_mismatch(start, principal, scope) {
+            return Err(SessionChangeError::OwnerMismatch(Box::new(mismatch)));
+        }
+        if !rungs::ALL.contains(&policy.as_str()) {
+            return Err(SessionChangeError::InvalidParams {
+                field: "policy".into(),
+                message: format!(
+                    "policy must be one of {}; got {policy}",
+                    rungs::ALL.join(", ")
+                ),
+            });
+        }
+        let plan_value = serde_json::Value::Object(plan.clone());
+        let plan_identity = broca_fetch_plan::plan_identity(&plan_value).map_err(|_| {
+            SessionChangeError::InvalidParams {
+                field: "plan".into(),
+                message: "the plan is not canonical JSON".into(),
+            }
+        })?;
+        let change = broca_fetch_plan::session_change::SessionChangeState::fold(&records);
+        let earlier = change.earlier(generation);
+        match session_change::refresh_order(
+            change.accepted_generation,
+            generation,
+            &plan_identity,
+            &policy,
+            earlier,
+        ) {
+            session_change::RefreshOrder::Repeat => {
+                let (run_in_progress, applies_from_next_run) = change.accepted_replies[&generation];
+                return Ok(session_change::RefreshReply::new(
+                    cortexkit_role_llm_runner::baseline::PendingChange {
+                        generation,
+                        policy: policy.clone(),
+                    },
+                    run_in_progress,
+                    applies_from_next_run,
+                ));
+            }
+            session_change::RefreshOrder::Stale => {
+                return Err(SessionChangeError::GenerationStale {
+                    accepted: change.accepted_generation,
+                });
+            }
+            session_change::RefreshOrder::New => {}
+        }
+        // Fetch with the same admission code as a first send, never a second copy: parse
+        // the plan, then admit its providers under the deadline. Refusals write nothing.
+        let output_refs = if self
+            .plan_admitter()
+            .is_some_and(|admitter| admitter.admits_output_refs())
+        {
+            broca_fetch_plan::OutputRefsSupport::Supported
+        } else {
+            broca_fetch_plan::OutputRefsSupport::Unsupported
+        };
+        {
+            let params_map = {
+                let mut map = serde_json::Map::new();
+                map.insert("plan".into(), serde_json::Value::Object(plan));
+                map
+            };
+            if let Err(refusal) =
+                broca_fetch_plan::check_send_members_with(&params_map, output_refs)
+            {
+                return Err(SessionChangeError::FetchRefused(refusal));
+            }
+        }
+        let support = if self.compaction_supported() {
+            broca_fetch_plan::CompactionSupport::Supported
+        } else {
+            broca_fetch_plan::CompactionSupport::Unsupported
+        };
+        let parsed = broca_fetch_plan::parse_plan_with(&plan_value, support, output_refs)
+            .map_err(SessionChangeError::FetchRefused)?;
+        if !parsed.step_items.is_empty() && !self.hook_plane_available() {
+            return Err(SessionChangeError::FetchRefused(
+                broca_fetch_plan::Refusal::invalid("plan.step_transform_items"),
+            ));
+        }
+        let Some(admitter) = self.plan_admitter() else {
+            return Err(SessionChangeError::FetchRefused(
+                broca_fetch_plan::Refusal::invalid("plan"),
+            ));
+        };
+        // Scoped and approval checks ride the same gates as a first send, before any fetch.
+        let scope_for_admit = match scope {
+            broca_protocol::SendScope::Stamped(stamp) => Some(&stamp.scope),
+            _ => None,
+        };
+        if scope_for_admit.is_none()
+            && parsed.step_items.iter().any(|item| {
+                item.subscriptions.iter().any(|subscription| {
+                    subscription.phase
+                        == Some(
+                            cortexkit_role_step_transform_provider::subscription::Phase::Approve,
+                        )
+                })
+            })
+        {
+            return Err(SessionChangeError::FetchRefused(
+                broca_fetch_plan::Refusal::invalid("plan.step_transform_items"),
+            ));
+        }
+        if scope_for_admit.is_none()
+            && parsed
+                .tool_items
+                .iter()
+                .any(|item| item.preset.as_deref() == Some(broca_fetch_plan::CONFINED_TOOL_PRESET))
+        {
+            return Err(SessionChangeError::FetchRefused(
+                broca_fetch_plan::Refusal::invalid("plan.tool_items"),
+            ));
+        }
+        let admitted = admitter
+            .admit(&parsed, session, scope_for_admit)
+            .await
+            .map_err(SessionChangeError::FetchRefused)?;
+        if let Some(surface) = broca_fetch_plan::session_change::unsupported_surface(
+            change.current_manifest.as_deref(),
+            &admitted.manifest,
+            &policy,
+        ) {
+            return Err(SessionChangeError::RungUnsupported {
+                surface: surface.into(),
+                rung: policy,
+            });
+        }
+        // Durably record the accepted generation, policy and fetched manifest before replying.
+        match self
+            .route_session_refresh(
+                session,
+                generation,
+                policy.clone(),
+                Box::new(admitted.manifest),
+            )
+            .await
+        {
+            Ok(crate::actor::SessionRefreshOutcome::Accepted {
+                run_in_progress,
+                applies_from_next_run,
+            }) => Ok(session_change::RefreshReply::new(
+                cortexkit_role_llm_runner::baseline::PendingChange { generation, policy },
+                run_in_progress,
+                applies_from_next_run,
+            )),
+            Ok(crate::actor::SessionRefreshOutcome::Reopen) => Err(SessionChangeError::Transient(
+                "the session actor is closing; retry the refresh".into(),
+            )),
+            Ok(crate::actor::SessionRefreshOutcome::Refused(error)) => Err(error),
+            Ok(crate::actor::SessionRefreshOutcome::Error(error)) => {
+                Err(SessionChangeError::Transient(error))
+            }
+            Err(error) => Err(SessionChangeError::Transient(error.to_string())),
+        }
+    }
+
+    async fn session_refresh_policy(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+        generation: u64,
+        policy: String,
+        send_id: String,
+    ) -> Result<cortexkit_role_llm_runner::session_change::RefreshPolicyReply, SessionChangeError>
+    {
+        use cortexkit_role_llm_runner::{rungs, session_change};
+        let _change_guard = self.lock_session_change(session).await;
+        let (records, _) = self
+            .read_durable_wal(session)
+            .await
+            .map_err(|error| SessionChangeError::Transient(error.to_string()))?;
+        let Some(start) = first_run_started(&records) else {
+            return Err(SessionChangeError::Transient(
+                "the session has no baseline yet; send its first send first".into(),
+            ));
+        };
+        if let Some(mismatch) = baseline_owner_mismatch(start, principal, scope) {
+            return Err(SessionChangeError::OwnerMismatch(Box::new(mismatch)));
+        }
+        if !rungs::ALL.contains(&policy.as_str()) {
+            return Err(SessionChangeError::InvalidParams {
+                field: "policy".into(),
+                message: format!(
+                    "policy must be one of {}; got {policy}",
+                    rungs::ALL.join(", ")
+                ),
+            });
+        }
+        if send_id.is_empty() {
+            return Err(SessionChangeError::InvalidParams {
+                field: "send_id".into(),
+                message: "send_id is required".into(),
+            });
+        }
+        let change = broca_fetch_plan::session_change::SessionChangeState::fold(&records);
+        if check_session_policy(&change, generation, &policy, &send_id)? {
+            return Ok(session_change::RefreshPolicyReply::new(
+                cortexkit_role_llm_runner::baseline::PendingChange { generation, policy },
+            ));
+        }
+        match self
+            .route_session_refresh_policy(session, generation, policy.clone(), send_id)
+            .await
+        {
+            Ok(crate::actor::SessionRefreshPolicyOutcome::Changed) => {
+                Ok(session_change::RefreshPolicyReply::new(
+                    cortexkit_role_llm_runner::baseline::PendingChange { generation, policy },
+                ))
+            }
+            Ok(crate::actor::SessionRefreshPolicyOutcome::Refused(error)) => Err(error),
+            Ok(crate::actor::SessionRefreshPolicyOutcome::Reopen) => {
+                Err(SessionChangeError::Transient(
+                    "the session actor is closing; retry the policy change".into(),
+                ))
+            }
+            Ok(crate::actor::SessionRefreshPolicyOutcome::Error(error)) => {
+                Err(SessionChangeError::Transient(error))
+            }
+            Err(error) => Err(SessionChangeError::Transient(error.to_string())),
+        }
+    }
+
+    async fn session_flush_prefix(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+        send_id: String,
+    ) -> Result<cortexkit_role_llm_runner::session_change::FlushPrefixReply, SessionChangeError>
+    {
+        use cortexkit_role_llm_runner::session_change;
+        let _change_guard = self.lock_session_change(session).await;
+        let (records, _) = self.read_durable_wal(session).await.map_err(|error| {
+            SessionChangeError::Transient(format!("cannot read the session WAL: {error}"))
+        })?;
+        let Some(start) = first_run_started(&records) else {
+            return Err(SessionChangeError::Transient(
+                "the session has no baseline yet; send its first send first".into(),
+            ));
+        };
+        if let Some(mismatch) = baseline_owner_mismatch(start, principal, scope) {
+            return Err(SessionChangeError::OwnerMismatch(Box::new(mismatch)));
+        }
+        if send_id.is_empty() {
+            return Err(SessionChangeError::InvalidParams {
+                field: "send_id".into(),
+                message: "send_id is required".into(),
+            });
+        }
+        let change = broca_fetch_plan::session_change::SessionChangeState::fold(&records);
+        if let Some(pending_generation) = change.flush_send_ids.get(&send_id) {
+            return Ok(session_change::FlushPrefixReply::new(*pending_generation));
+        }
+        match self.route_session_flush_prefix(session, send_id).await {
+            Ok(crate::actor::SessionFlushPrefixOutcome::Flushed { pending_generation }) => {
+                Ok(session_change::FlushPrefixReply::new(pending_generation))
+            }
+            Ok(crate::actor::SessionFlushPrefixOutcome::Reopen) => {
+                Err(SessionChangeError::Transient(
+                    "the session actor is closing; retry the flush".into(),
+                ))
+            }
+            Ok(crate::actor::SessionFlushPrefixOutcome::Error(error)) => {
+                Err(SessionChangeError::Transient(error))
+            }
+            Err(error) => Err(SessionChangeError::Transient(error.to_string())),
+        }
     }
 
     fn session_written(&self, session: &LineageKey) -> Result<bool, ServeError> {
@@ -4099,6 +4653,7 @@ mod context_ceiling_tests {
 
 fn media_preflight_error(error: broca_core::RunError) -> ServeError {
     match error {
+        broca_core::RunError::Upload(error) => ServeError::Upload(error),
         broca_core::RunError::MediaUnsupported(message) => ServeError::DeliveryRefused {
             code: "media_unsupported",
             message,
@@ -4320,5 +4875,209 @@ mod offset_head_tests {
             },
         });
         assert!(head_tail_needs_index_up(&with_setup));
+    }
+}
+
+#[cfg(test)]
+mod raw_database_composition_tests {
+    use super::*;
+    use broca_core::FileWalStore;
+    use broca_wal::{Wal, WalRecord};
+    use std::sync::{Arc, Mutex};
+
+    struct NoActor;
+    #[async_trait]
+    impl crate::registry::LineageOpener for NoActor {
+        async fn open(
+            &self,
+            _: &LineageKey,
+            _: u64,
+            _: crate::registry::RegistryHandle,
+        ) -> Result<crate::registry::ActorHandle, crate::registry::OpenError> {
+            panic!("read-only composition must not open an actor")
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_database_test_bundle_preserves_legacy_head_page_and_cursor_bytes() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("raw-composition-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("state-format"), "broca-state/2\n").unwrap();
+        let key = LineageKey::new(root.join("project"), "runner", "session");
+        let wal_store = Arc::new(FileWalStore::with_config(
+            root.join("wal"),
+            broca_wal::WalConfig::OVERHAUL,
+        ));
+        std::fs::create_dir_all(root.join("wal")).unwrap();
+        let mut wal = broca_wal::FileWal::open(wal_store.wal_path(&key))
+            .unwrap()
+            .with_feature_floor(root.join("wal-floor"));
+        let mut start: WalRecord = serde_json::from_str(
+            include_str!("../../broca-wal/tests/fixtures/before_message_times.jsonl")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        if let WalRecord::RunStarted { session, title, .. } = &mut start {
+            *session = key.clone();
+            *title = Some("WAL-only title".into());
+        }
+        let step: WalRecord = serde_json::from_value(serde_json::json!({"type":"model_step_finished","written_at_ms":1234,"step_id":1,"assistant_message":{"message_id":"m","content":[{"type":"text","text":"answer"}]},"usage":{"input_tokens":7,"output_tokens":3},"retries_used":0})).unwrap();
+        let terminal: WalRecord = serde_json::from_value(serde_json::json!({"type":"run_finished","reason":"completed","usage":{"input_tokens":7,"output_tokens":3},"completed_steps":1,"retries_used":0})).unwrap();
+        for record in [
+            start,
+            WalRecord::StepStarted {
+                step_id: broca_protocol::StepId(1),
+            },
+            step,
+            terminal,
+        ] {
+            wal.append(1, &record, false).unwrap();
+        }
+        wal.sync().unwrap();
+        let publication = wal.durable_publication().unwrap();
+        let db = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
+        db.publish(
+            &key,
+            &broca_core::agent_session_ref(&key),
+            broca_store::db::LogLocation::Live,
+            &publication,
+        )
+        .unwrap();
+        let bundle = Arc::new(crate::registry::RawPageTestBundle {
+            db,
+            publications: Mutex::new(std::collections::HashMap::from([(
+                key.clone(),
+                publication,
+            )])),
+        });
+        let legacy = crate::registry::LineageRegistry::new_with_reader(
+            Arc::new(NoActor),
+            wal_store.clone(),
+            None,
+        );
+        let raw =
+            crate::registry::LineageRegistry::new_with_reader(Arc::new(NoActor), wal_store, None)
+                .with_raw_pages_for_test(bundle.clone());
+        let counter = broca_wal::access_counter::WalAccessCounter::default();
+        let raw_head = counter
+            .operation("composed raw head")
+            .run_future(raw.head(&key))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&raw_head).unwrap(),
+            serde_json::to_vec(&legacy.head(&key).await.unwrap()).unwrap()
+        );
+        for from in [None, Some(0), Some(1), Some(500)] {
+            let request = SessionReadRequest::new(key.clone(), from, Some(1));
+            let actual = counter
+                .operation(format!("composed raw page {from:?}"))
+                .run_future(raw.read(request.clone()))
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                serde_json::to_vec(&legacy.read(request).await.unwrap()).unwrap()
+            );
+        }
+        let mut request = SessionReadRequest::new(key.clone(), None, Some(1));
+        request.lineage_id = Some("wrong-lineage".into());
+        assert!(matches!(
+            raw.read(request).await,
+            Err(ServeError::LineageChanged { .. })
+        ));
+        let head = raw.head(&key).await.unwrap();
+        let mut request = SessionReadRequest::new(key.clone(), None, Some(1));
+        request.lineage_id = head.lineage_id;
+        request.after_mid = Some("m0".into());
+        let next = raw.read(request).await.unwrap();
+        assert_eq!(next.messages[0].mid, "m1");
+        let fixture = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../scripts/fixtures/resume-close-out-sealed.wal"),
+        )
+        .unwrap();
+        let mut at = 0;
+        while at < fixture.len() {
+            match broca_wal::framing::decode_next(&fixture[at..]) {
+                broca_wal::framing::DecodeStep::Record { framed, consumed } => {
+                    let mut record = framed.record;
+                    if let WalRecord::RunStarted {
+                        session,
+                        run_id,
+                        written_at_ms,
+                        ..
+                    } = &mut record
+                    {
+                        *session = key.clone();
+                        run_id.0.push_str("-composed");
+                        *written_at_ms = Some(2000);
+                    }
+                    if let WalRecord::ModelStepFinished { written_at_ms, .. } = &mut record {
+                        *written_at_ms = Some(3000);
+                    }
+                    wal.append(1, &record, false).unwrap();
+                    at += consumed;
+                }
+                broca_wal::framing::DecodeStep::Lineage { consumed, .. } => at += consumed,
+                _ => panic!("invalid tool corpus"),
+            }
+        }
+        wal.sync().unwrap();
+        let publication = wal.durable_publication().unwrap();
+        bundle
+            .db
+            .publish(
+                &key,
+                &broca_core::agent_session_ref(&key),
+                broca_store::db::LogLocation::Live,
+                &publication,
+            )
+            .unwrap();
+        bundle
+            .publications
+            .lock()
+            .unwrap()
+            .insert(key.clone(), publication);
+        for from in [None, Some(2), Some(3), Some(4)] {
+            let request = SessionReadRequest::new(key.clone(), from, Some(2));
+            let actual = counter
+                .operation(format!("composed raw tool page {from:?}"))
+                .run_future(raw.read(request.clone()))
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                serde_json::to_vec(&legacy.read(request).await.unwrap()).unwrap()
+            );
+        }
+        assert!(!root.join("run-index.db").exists());
+        for op in counter.snapshot() {
+            assert!(
+                op.seed_fallbacks.is_empty(),
+                "{}: {:?}",
+                op.name,
+                op.seed_fallbacks
+            );
+            assert!(
+                op.reads
+                    .iter()
+                    .all(|r| r.class != broca_wal::access_counter::ReadClass::Origin),
+                "{}: {:?}",
+                op.name,
+                op.reads
+            );
+        }
+        // Close every handle into the root before deleting it: the registries
+        // and the bundle keep broca.db and the log open, and Windows refuses to
+        // delete an open file (OS error 32).
+        drop(raw);
+        drop(legacy);
+        drop(bundle);
+        drop(wal);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

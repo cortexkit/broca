@@ -305,6 +305,34 @@ message and field; it does not invent a `preset_missing` difference for a nonexi
 
 ### Health counters and per-request diagnostics
 
+`health.check.metrics.tool_routes` is an in-memory census of the shared tool-provider route
+cache. It reports `open_session_actors`, `cached_routes`, `cached_routes_per_provider`,
+`oldest_route_idle_secs` (null for an empty cache), `routes_for_closed_sessions` (normally zero),
+`goodbye_failures_since_boot`, `pending_goodbyes`, `goodbye_retry_overflows_since_boot` and
+`goodbye_giveups_since_boot`. Idle age is time since a route was last
+acquired for a batch or warm bind, not time since the last provider frame. Close failures count
+failed or timed-out enqueue attempts, including retries; a successful enqueue is not a remote
+acknowledgement. Failed closes retry independently of tool calls, even after the actor's bounded
+close waiter ends. Session teardown and congested late/abandoned opens share one cleanup queue
+per consumer connection. It holds at most 1,024 distinct route identities; overflow is counted and
+warned. Duplicate close requests can allocate additional waiters, so this identity cap is not a
+bound on total cleanup heap or task allocation.
+Entries expire after 30 seconds with one give-up WARN and an increment to
+`goodbye_giveups_since_boot`. Retry passes run in parallel with one shared five-second budget,
+with a one-second pause between passes, shortened to the earliest pending expiry. Connection loss
+synchronously removes entries for the lost connection generation and rejects later cleanup
+enqueues for that generation;
+cleanup tasks do not retain the connection owner. A give-up is not a remote acknowledgement:
+it stops local retries, and the daemon may retain that channel until the connection ends.
+No session names, project paths, prompts or tool arguments appear in this
+block. `open_actor_reasons` counts non-exclusive hold reasons observed at each actor-loop turn:
+active runs, held calls (or unknown held state), live subscribers, manual/source warming, pending
+work/cancellation, withdrawals and startup recovery. Actors with no observed hold are counted
+under `idle_ttl`; asynchronous holder changes become visible on the next actor turn, at latest
+its ordinary idle tick. A paused held episode alone does not prevent idle-close.
+Session-close INFO records use the hashed WAL address, provider module ids, successful
+Goodbye count and failure count; each failed or timed-out Goodbye also emits a WARN.
+
 `health.check` includes `metrics.management_ops`, a process-lifetime counter for every
 request/response operation in the management manifest and the `session.subscribe` stream. The
 object always contains every operation at zero or above; counts reset when broca restarts. A
@@ -607,10 +635,35 @@ tools is refused before it can freeze that list, even if it queues or steers; it
 retrofit a plan (the existing `plan_drift` rule still applies). Omitting tools does not
 revalidate or replace an older run's frozen tool list.
 
-A session freezes its fetch plan on its first episode, so compaction enrollment happens only on
-a session's first episode, before it has stored messages. A session whose first episode ran
-without a plan, including one seeded by `session.import`, refuses a later plan naming a
+A session freezes its fetch plan on its first episode unless its owner explicitly refreshes it.
+An ordinary later send cannot enroll compaction. A session whose first episode ran
+without a plan, including one seeded by `session.import`, refuses a later send's plan naming a
 compaction provider as `plan_drift`, and the refused send writes nothing.
+
+The `session_change` group serves the owner-only `session.refresh`, `session.refresh_policy`
+and `session.flush_prefix` operations defined by the [llm-runner contract](https://docs.rs/crate/cortexkit-role-llm-runner/0.7.14/source/CONTRACT.md)
+(§10.2). Every ready baseline
+states `rungs` for tools and system text, accepted/applied generations, and any pending/effective
+change. Both surfaces support `immediately` (the next run) and `on_prefix_rebuild` (the first
+run after an applied compaction view, model switch, or prefix flush). A new run alone is not a
+rebuild. A flush is a durable rebuild boundary; with nothing pending it does not change request
+bytes or promise a provider cache miss.
+
+Refresh admission uses the ordinary plan admitter and durably records the fetched manifest and
+original reply before answering. Identical retries fetch and write nothing, even after restart
+or application. Changes never alter a running episode: the applying `RunStarted` freezes its
+own manifest, and an earlier episode resumes from its own manifest. While a change is pending,
+sends may carry either the effective or latest accepted plan; any other identity is `plan_drift`
+against the latest accepted identity. Sessions never refreshed retain the first-plan drift rule.
+The three change records require the must-understand WAL feature `session-change/v1`; its
+reader must be deployed before enabling the writer in a later release.
+
+A refresh carries no model. Before an episode can apply it, broca checks its model-bearing
+items against that episode's resolved model, including an inherited model. A mismatch is
+`plan_model_mismatch`, permanent, with `detail.generation` naming the pending refresh and
+`detail.send_model` naming the resolved model. The refused send writes nothing and leaves the
+change pending. The owner can supersede it with a newer refresh or select the model it expects;
+carrying the old effective plan cannot bypass an immediately pending refresh.
 
 `role.describe.capabilities` includes `send_tool_reply_bound` (a broca extension). A tool
 declared directly in `session.send.tools` may carry `reply: {"max_ms": N}`, the longest one of
@@ -1106,6 +1159,25 @@ there, a newer writer's included, ends the stream with `subscribe_replay_failed`
   crash AFTER ⇒ that run is active/resumable, never double-consumed. FIFO; each queued
   prompt becomes its own episode.
 
+Broca declares `retract_own_send` with `retract`. On a session with a recorded owner,
+`session.retract {submission_id}` also admits the submission's recorded daemon-attested
+sender. Delegated sends retain that sender in `DeliveryOrdered.sent_by`; ordinary sends
+retain it in `Queued.principal`. Request-body sender claims never grant access. Missing,
+unverified or ambiguous attribution grants no exception to the owner's existing path.
+Answers and durable tombstones are identical to an owner's withdrawal: `retracted`,
+`already_started` or `not_pending`. A delivered steer is `not_pending`. This does not
+extend `run.cancel`, which remains owner-only, or change sessions without a recorded owner.
+
+Plan-named senders may share a `send_id` without sharing a submission. The first sender
+keeps the legacy run ID; a later delegated sender colliding with another recorded sender
+uses `<legacy-run-id>-sender-<digest>`, where `digest` is the lowercase, 64-character
+SHA-256 of the fixed bytes `v1\0reserved\0` followed by the daemon-stamped reserved
+principal's `module_id` in UTF-8 (`\0` is a NUL byte). This versioned identity encoding
+does not use serde or any other principal fields. Its submission ID remains `sub-`
+followed by that run ID. Retries and `send.status` resolve the same ID from durable
+attribution, including after restart. Owner IDs and the first episode's recorded model,
+tool configuration, owner scope and plan manifest are unchanged.
+
 ## 12. Session coordinator = a lineage actor
 
 One in-process **lineage actor** per open session with states **`Opening | Open |
@@ -1433,9 +1505,63 @@ refusal is counted in `health.check` as `reverse_requests_refused`.
 **Tool result formats and provider-held calls.** The daemon's dispatch routes declare
 `consumer_capabilities: ["tool-result/v1", "held-reply/v1"]` in every build. Typed result
 decoding still requires the result-format opt-in in the provider's frozen catalog. Text and errors use the same
-stored bytes as legacy replies. Shipping builds append a notice for each omitted image; builds
-with the `test-attachments` feature capture the image instead when dispatch has a media-capture handle. Role discovery and management routes do not
+stored bytes as legacy replies. With media disabled, builds append the existing
+"not shown to the model" notice for each omitted image. With media enabled, dispatch captures
+images and PDFs through the session's media-capture handle. Role discovery and management routes do not
 negotiate tool results.
+
+### Runtime media opt-in
+
+In `broca.jsonc`, `"media": {"enabled": true}` enables media for the process.
+The section is optional and `enabled` defaults to `false`. Only a boolean is accepted;
+unknown keys inside `media` refuse boot by name. The decision is read once before stores
+are opened: enabling or disabling media requires restarting broca. `test-attachments`
+remains a non-shipping feature for test seams, not a deployment prerequisite.
+
+Every fresh enabled episode whose model explicitly supports a non-text input modality
+freezes its adapter media profile, even for text-only input: a tool may return an image
+after the first model request. Requests without media retain their ordinary rendered bytes.
+Resume never adds a profile to an older recorded configuration; those runs keep their media
+markers until a fresh episode is admitted. Existing per-family carrier gates remain in force.
+
+When enabled, `role.describe` declares the llm-runner `attachments` group and its upload
+and `session.media_read` operations. When disabled, it declares neither the group nor
+`session.media_read`; existing upload staging remains available but cannot be sent.
+The operations follow the pinned llm-runner contract §9.12. In particular,
+`session.media_read {sha256, offset, length}` serves at most 2,097,152 decoded bytes as
+`{data, size, mime}`. Zero length omits `data`; EOF returns empty data, and an offset
+past EOF refuses by name. Only durable captures in the bound session authorize a digest:
+another session's objects and unreferenced committed uploads return `unknown_media`.
+Read admission is the same as `session.read`.
+Capture authorization uses the stored admission checkpoint and a strictly anchored durable
+WAL tail, not a replay of the transcript for every chunk. A missing or unusable checkpoint
+requires a named, counted full-replay repair through the shared media-seed fallback counter.
+
+Enabled upload appends are strictly contiguous; replaying a chunk refuses
+`upload_offset_mismatch` with the current `received` count. Disabled legacy staging keeps
+its existing identical-chunk retry behavior. Sends preserve the upload refusal codes
+(`unknown_upload`, `upload_gone`, `upload_not_committed`) instead of reporting a failed
+session open. A disabled send carrying an upload is still refused before admission.
+
+Enabled `session.head.input` quotes a finished episode's next model from the in-memory catalog
+and adapter MIME filter without changing the recorded config or fetching catalog data.
+Active resident heads use frozen facts published by the writer's durable metadata tap.
+Nonresident resumable heads cache the frozen facts by session, lineage and WAL sequence;
+only a cold position requires a historical read. No stored head-projection shape is added.
+
+Default reads keep media as text markers. `session.read` with `media: "blocks"` returns
+stored references; descriptors and history display rows expose refs rather than payload
+bytes. Enabled blocks reads include stored-content message/part identities for media-bearing
+entries. Default enabled model-view reads also use not-requested text markers; explicit
+blocks mode keeps native media references. Provider rendering uses the frozen family's media profile; unsupported person input
+is refused before publication, including ChatGPT audio. Sessions holding media refuse
+agent-data moves before any cut or freeze because move transport currently carries WALs
+only. The existing Engram catalog already includes `media-durable` as a portable filetree
+and excludes temporary, retained and ephemeral media stores; enabling media needs no
+descriptor change.
+
+### Provider-held calls
+
 The daemon installs the provider-held runtime (`broca-module-serve/src/held_runtime.rs`) on
 its tool plane: the waiting slots a held call's batch waits in, a late-results intake store
 (`late-results.db` under the state root, a projection of the WAL kept out of the backup
@@ -1482,11 +1608,22 @@ is mapped with the same `content/v1` mapper a synchronous reply uses (`not_start
 `expired` become error results whose text is pinned by golden), deposited in the call's slot,
 and the session's actor resumes a paused run into its original batch, which writes the result
 as the call's `ToolResult` at the call's position and syncs it. Only then is the entry acked,
-through exactly the cursor the provider returned. An entry whose call already has its terminal,
-an entry of an unknown kind, and an entry no registration names are acked as no-ops; an entry
-whose held record is not yet durable pins the ack. Entries are deduplicated on
+through exactly the cursor the provider returned. An entry whose call already has its terminal
+(including an inline answer), whose dispatching run has ended, whose kind is unknown, or which
+no registration names is acked as a no-op. A durable intent with no terminal or held record is
+pending only while its dispatching run is open; an unreadable WAL remains blocked. An answer
+for an indeterminate call in a sealed run never changes that call or enters a later run.
+Entries are deduplicated on
 `(provider, custodian, call_key, event_id)`, and `cursor_incarnation_changed` re-reads from the
-start. A registration is pruned once its call's terminal and batch commit are durable.
+start. The ack advances only over a settled prefix. An unsettled entry pins the ack: no ack may
+cover that entry until it settles. An entry that pins the ack for five minutes logs one WARN
+per entry with its module, call key and event id; `health.check`'s `provider_held.overdue_pins`
+counts currently pinned entries at least five minutes old, without reading any WAL.
+Batch completion prunes registrations after the terminals and commit are durable. The puller
+also retires old inline-terminal registrations as it encounters them. A maintenance sweep
+checks at most 64 registrations every 3 s, starting after recovery, even for modules without
+a running puller. It lazily retires stale terminal rows without scanning every log at startup;
+held calls that still owe a batch commit keep their registrations for recovery.
 
 At boot tombstoned lineages are pruned from the intake without opening an actor. Every remaining
 session with a registration is opened so its open-time recovery runs, then each
@@ -1512,6 +1649,18 @@ by itself, and a call that completed before its sibling was cancelled is not wit
 registry's stop signal suppresses new withdrawal attempts and retries during drain; an earlier
 request may already have reached the provider. Health exposes pending/failed withdrawals and
 their refusal codes.
+
+Late-result pullers start before withdrawal recovery, which runs independently and obeys the
+registry's stop signal. Withdrawal recovery snapshots the outbox once, groups rows by session,
+and reads each session's WAL once, in batches of at most four sessions separated by 3 s. As it
+reads, it retires inline-terminal watches and their registrations in one transaction; normal
+inline batch completion performs the same retirement without reading the WAL again. Ordinary
+intake pruning still preserves a held call's withdrawal watch if broca crashes after the run's
+cancellation seal is durable but before `tool.withdraw` is sent.
+Each sweep logs one summary with sessions read, rows settled, withdrawals sent and elapsed time.
+`provider_held.withdrawals.sweep_running` and `rows_remaining` report whether a sweep is running
+and how many snapshot rows remain to examine; `watching` counts retained watches at the last
+completed sweep or withdrawal attempt. All these health values are cached, not WAL probes.
 
 Ack guarantee, narrowed: broca puts no bound of its own on a hold. A provider keeps at most
 1,000 unacked results per session and drops the oldest first; a held call whose entry was

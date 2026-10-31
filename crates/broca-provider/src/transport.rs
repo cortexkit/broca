@@ -274,8 +274,7 @@ const ROUTE_FALLBACK: u8 = 1;
 /// A live provider: any wire family + its frozen render config + a runtime auth
 /// credential, driven over reqwest. Generic over the family so the same transport
 /// loop runs every grammar.
-/// Live-media behavior is behind `test-attachments`; fallible-render plumbing also
-/// compiles in shipping builds and delegates to family rendering without that feature.
+/// Media rendering is installed only when the immutable boot setting enables it.
 pub struct LiveProvider<F: WireFamily + 'static> {
     pub(crate) client: ProviderHttpClient,
     clock: Clock,
@@ -283,9 +282,7 @@ pub struct LiveProvider<F: WireFamily + 'static> {
     pub(crate) frozen: Arc<FrozenRenderConfig>,
     subscription_auth: bool,
     grammar_downgraded: std::sync::atomic::AtomicBool,
-    #[cfg(feature = "test-attachments")]
     media_renderer: std::sync::RwLock<Option<Arc<broca_core::provider::MediaRequestRenderer>>>,
-    #[cfg(feature = "test-attachments")]
     media_render_tags: std::sync::atomic::AtomicBool,
     /// The refusal-fallback model's render config, taken from `frozen.refusal_fallback` when
     /// the episode froze one.
@@ -371,9 +368,7 @@ impl From<HttpRequest> for PreparedHttpRequest {
 /// shared handles; the closure is the sole owner that releases its prompt snapshot.
 struct RenderJob<F: WireFamily + 'static> {
     subscription_auth: bool,
-    #[cfg(feature = "test-attachments")]
     media_renderer: Option<Arc<broca_core::provider::MediaRequestRenderer>>,
-    #[cfg(feature = "test-attachments")]
     media_render_tags: bool,
     auth_revision: u64,
     family: Arc<F>,
@@ -643,7 +638,6 @@ impl<F: WireFamily + 'static> RenderJob<F> {
             &self.opts.tools,
             &self.opts.prompt,
         ));
-        #[cfg(feature = "test-attachments")]
         let body = if let Some(renderer) = &self.media_renderer {
             renderer(
                 &serde_json::to_value(&*self.frozen).expect("frozen render config serializes"),
@@ -654,8 +648,6 @@ impl<F: WireFamily + 'static> RenderJob<F> {
         } else {
             self.family.render(&self.frozen, &self.opts)
         };
-        #[cfg(not(feature = "test-attachments"))]
-        let body = self.family.render(&self.frozen, &self.opts);
         let mut request =
             PreparedHttpRequest::from(self.family.endpoint(&self.frozen, &self.auth, body));
         request.ephemeral_session = self.opts.ephemeral_session;
@@ -1004,9 +996,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             frozen: Arc::new(frozen),
             subscription_auth: false,
             grammar_downgraded: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(feature = "test-attachments")]
             media_renderer: std::sync::RwLock::new(None),
-            #[cfg(feature = "test-attachments")]
             media_render_tags: std::sync::atomic::AtomicBool::new(false),
             // Wrapped HERE rather than taken as an Arc, so callers keep passing an owned
             // AuthHandle and the sharing stays inside this file. Each step takes a cheap Arc
@@ -1136,9 +1126,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
         }
         let render_job = RenderJob {
             subscription_auth: self.subscription_auth,
-            #[cfg(feature = "test-attachments")]
             media_renderer: self.media_renderer.read().unwrap().clone(),
-            #[cfg(feature = "test-attachments")]
             media_render_tags: self.media_render_tags.load(Ordering::Relaxed),
             auth_revision: served.revision,
             family: Arc::clone(&self.family),
@@ -1197,20 +1185,19 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
 
 #[async_trait]
 impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
-    #[cfg(feature = "test-attachments")]
     fn supports_media_renderer(&self) -> bool {
-        true
+        broca_protocol::attachments_enabled()
     }
 
-    #[cfg(feature = "test-attachments")]
     fn set_media_request_renderer(
         &self,
         renderer: Arc<broca_core::provider::MediaRequestRenderer>,
     ) {
-        *self.media_renderer.write().unwrap() = Some(renderer);
+        if broca_protocol::attachments_enabled() {
+            *self.media_renderer.write().unwrap() = Some(renderer);
+        }
     }
 
-    #[cfg(feature = "test-attachments")]
     fn defer_media_tags(&self, render_tags: bool) -> bool {
         self.media_render_tags.store(render_tags, Ordering::Relaxed);
         self.media_renderer.read().unwrap().is_some()
@@ -1362,7 +1349,6 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
     fn try_render_request(&self, opts: &CallOptions) -> Result<Vec<u8>, Box<ProviderError>> {
         let route = self.route_frozen();
         let frozen = route.for_step(opts);
-        #[cfg(feature = "test-attachments")]
         if let Some(renderer) = self.media_renderer.read().unwrap().as_ref() {
             return renderer(
                 &serde_json::to_value(&frozen).expect("frozen render config serializes"),
@@ -6016,6 +6002,10 @@ mod tests {
         include!("transport_response_evidence_tests.rs");
     }
 
+    mod attempt_cancellation_tests {
+        include!("transport_attempt_cancellation_tests.rs");
+    }
+
     mod context_overflow {
         include!("transport_context_overflow_tests.rs");
     }
@@ -6050,9 +6040,7 @@ mod tests {
         let direct = family.render(&frozen, &opts);
         let job = super::RenderJob {
             subscription_auth: false,
-            #[cfg(feature = "test-attachments")]
             media_renderer: None,
-            #[cfg(feature = "test-attachments")]
             media_render_tags: false,
             auth_revision: 0,
             family: Arc::new(family),
@@ -7080,9 +7068,7 @@ mod tests {
         frozen.speed = Some("fast".into());
         let rendered = super::RenderJob {
             subscription_auth: false,
-            #[cfg(feature = "test-attachments")]
             media_renderer: None,
-            #[cfg(feature = "test-attachments")]
             media_render_tags: false,
             auth_revision: 0,
             family: Arc::new(AnthropicMessages),
@@ -8120,11 +8106,22 @@ mod tests {
                 ..Default::default()
             };
             let cancel_when_written = async {
-                if exit == "cancel" {
-                    server.written.notified().await;
-                    cancel.cancel();
+                if matches!(exit, "cancel" | "watchdog") {
+                    // Keep paused time from advancing while real socket and WAL I/O run.
+                    while server.request_bodies().is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                    if exit == "cancel" {
+                        cancel.cancel();
+                    } else {
+                        tokio::time::advance(Duration::from_millis(100)).await;
+                        tokio::time::resume();
+                    }
                 }
             };
+            if exit == "watchdog" {
+                tokio::time::pause();
+            }
             let (frames, ()) = tokio::join!(
                 run_recorded_attempt(&root, &provider, control, recording),
                 cancel_when_written
@@ -8140,6 +8137,27 @@ mod tests {
                 )),
                 "{exit}"
             );
+            if matches!(exit, "cancel" | "watchdog") {
+                assert_eq!(server.request_bodies().len(), 1, "{exit}");
+                assert!(
+                    !frames.iter().any(|frame| matches!(
+                        frame.record,
+                        broca_wal::WalRecord::AttemptReleased { .. }
+                    )),
+                    "a sent attempt must not be released as unsent: {exit}"
+                );
+                assert!(
+                    frames.iter().any(|frame| matches!(&frame.record,
+                        broca_wal::WalRecord::ModelAttemptFinished { envelope: Some(envelope), .. }
+                        if envelope.sent == broca_wal::record::AttemptSent::Yes
+                    )),
+                    "{exit}"
+                );
+                assert!(frames.iter().any(|frame| matches!(&frame.record,
+                    broca_wal::WalRecord::RunFinished { reason, .. }
+                    if *reason == if exit == "cancel" { broca_protocol::RunFinishReason::Cancelled } else { broca_protocol::RunFinishReason::Interrupted }
+                )), "{exit}");
+            }
             std::fs::remove_dir_all(root).unwrap();
         }
     }

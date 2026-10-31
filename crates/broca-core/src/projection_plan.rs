@@ -792,6 +792,307 @@ pub struct OffsetAdmissionSeed {
     pub compaction: Vec<u64>,
 }
 
+/// Content-free projection continuation, separate from row indexing and message placement state.
+/// Render inputs and accounting are authenticated WAL references, hydrated only for use.
+#[derive(Debug, Clone)]
+pub struct ProjectionContinuation {
+    admission: crate::admission::AdmissionContinuation,
+    position: ContinuationPosition,
+    render_sources: Vec<Vec<crate::admission::AdmissionSource>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ContinuationPosition {
+    prefix_len: u64,
+    completed_steps: u64,
+    retries_used: u32,
+    last_step_finish_reason: Option<broca_protocol::FinishReason>,
+    trailing_origin: Option<broca_protocol::ModelHandle>,
+    open_episode_span: Option<u64>,
+    episodes: Option<Vec<crate::context::EpisodeRenderProjection>>,
+    tag_high: u64,
+    tag_rules: Option<(bool, bool)>,
+}
+
+impl ProjectionContinuation {
+    pub fn boundary(&self) -> crate::replay::SeedBoundary {
+        self.admission.boundary()
+    }
+
+    pub fn admission(&self) -> &crate::admission::AdmissionContinuation {
+        &self.admission
+    }
+
+    /// Raw readers hydrate only requested messages; the validated replay entry point
+    /// authenticates these coordinates before any stored state reaches the response.
+    pub fn raw_read_position(&self) -> (u64, crate::tags::TagSeed) {
+        (
+            self.position.prefix_len,
+            crate::tags::TagSeed {
+                high: self.position.tag_high,
+                rules: self
+                    .position
+                    .tag_rules
+                    .map(|(render, clean)| broca_protocol::tags::ComputedRules { render, clean }),
+            },
+        )
+    }
+
+    pub fn encode(&self) -> Result<String, serde_json::Error> {
+        let mut position = serde_json::to_value(&self.position)?;
+        if let Some(episodes) = position["episodes"].as_array_mut() {
+            for episode in episodes {
+                episode
+                    .as_object_mut()
+                    .expect("episode coordinates")
+                    .remove("render_config");
+            }
+        }
+        serde_json::to_string(&serde_json::json!({
+            "version": 1, "admission": serde_json::from_str::<serde_json::Value>(&self.admission.encode()?)?,
+            "position": position, "render_sources": self.render_sources,
+        }))
+    }
+
+    pub fn decode(encoded: &str) -> Result<Self, crate::replay::SeedFallback> {
+        let bad = || crate::replay::SeedFallback::new("unsupported projection continuation");
+        let value: serde_json::Value = serde_json::from_str(encoded).map_err(|_| bad())?;
+        if value["version"] != 1 {
+            return Err(bad());
+        }
+        let admission =
+            crate::admission::AdmissionContinuation::decode(&value["admission"].to_string())?;
+        let position = serde_json::from_value(value["position"].clone()).map_err(|_| bad())?;
+        let render_sources =
+            serde_json::from_value(value["render_sources"].clone()).map_err(|_| bad())?;
+        Ok(Self {
+            admission,
+            position,
+            render_sources,
+        })
+    }
+
+    fn position(seed: &ProjectionSeed) -> ContinuationPosition {
+        let mut episodes = seed.projection_episodes.clone();
+        if let Some(episodes) = &mut episodes {
+            for episode in episodes {
+                episode.render_config = None;
+            }
+        }
+        ContinuationPosition {
+            prefix_len: seed.prefix_len,
+            completed_steps: seed.completed_steps,
+            retries_used: seed.retries_used,
+            last_step_finish_reason: seed.last_step_finish_reason,
+            trailing_origin: seed.trailing_origin.clone(),
+            open_episode_span: seed.open_episode_span,
+            episodes,
+            tag_high: seed.tag_seed.high,
+            tag_rules: seed.tag_seed.rules.map(|r| (r.render, r.clean)),
+        }
+    }
+
+    fn extend_render_sources(
+        &mut self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        frames: &[crate::replay::PositionedFrame],
+        end: u64,
+    ) -> Result<(), crate::replay::SeedFallback> {
+        for (i, p) in frames.iter().enumerate() {
+            if matches!(
+                p.framed.record,
+                WalRecord::RunStarted { .. }
+                    | WalRecord::RunConfigRefrozen { .. }
+                    | WalRecord::StructuredOutputDowngraded { .. }
+            ) {
+                let source = crate::admission::AdmissionSource::capture(
+                    read_at,
+                    p,
+                    frames.get(i + 1).map_or(end, |p| p.off),
+                )?;
+                if matches!(p.framed.record, WalRecord::RunStarted { .. }) {
+                    self.render_sources.push(Vec::new());
+                }
+                self.render_sources
+                    .last_mut()
+                    .ok_or_else(|| {
+                        crate::replay::SeedFallback::new("render source without episode")
+                    })?
+                    .push(source);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn capture(
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        boundary: &crate::replay::SeedBoundary,
+        prefix: &[crate::replay::PositionedFrame],
+    ) -> Result<Self, crate::replay::SeedFallback> {
+        let frames: Vec<_> = prefix.iter().map(|p| p.framed.clone()).collect();
+        let prior =
+            replay(&frames.iter().map(|p| p.record.clone()).collect::<Vec<_>>()).map_err(|_| {
+                crate::replay::SeedFallback::new("projection continuation prefix invalid")
+            })?;
+        let delta = replay_projection_tail(&ProjectionSeed::empty(), &frames).map_err(|_| {
+            crate::replay::SeedFallback::new("projection continuation prefix invalid")
+        })?;
+        let seed = ProjectionSeed {
+            prefix_len: prior.extent,
+            completed_steps: prior.completed_steps,
+            retries_used: prior.retries_used,
+            last_step_finish_reason: prior.last_step_finish_reason,
+            trailing_origin: prior.prompt.iter().rev().find_map(|m| m.origin.clone()),
+            open_episode_span: delta.open_episode_span,
+            projection_episodes: delta.episodes,
+            tag_seed: crate::tags::TagSeed::from_prefix(&prior.prompt),
+            ..ProjectionSeed::empty()
+        };
+        let mut continuation = Self {
+            admission: crate::admission::AdmissionContinuation::capture(read_at, boundary, prefix)?,
+            position: Self::position(&seed),
+            render_sources: Vec::new(),
+        };
+        continuation.extend_render_sources(read_at, prefix, boundary.frame_end)?;
+        Ok(continuation)
+    }
+
+    /// Authenticate the boundary and contiguous tail before exposing a transient projection.
+    /// Message rows are deliberately not hydrated here; readers choose their own dense or sparse window.
+    pub fn hydrate(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        tail: &[crate::replay::PositionedFrame],
+        safe_head: u64,
+    ) -> Result<ProjectionSeed, crate::replay::SeedFallback> {
+        let (checkpoint, _) = self.admission.hydrate(read_at, tail, safe_head)?;
+        let bad =
+            || crate::replay::SeedFallback::new("projection continuation metadata incomplete");
+        let mut episodes = self.position.episodes.clone().ok_or_else(bad)?;
+        if episodes.len() != self.render_sources.len() {
+            return Err(bad());
+        }
+        for (episode, sources) in episodes.iter_mut().zip(&self.render_sources) {
+            let mut config = None;
+            for source in sources {
+                match source
+                    .read(read_at, self.admission.source_boundary())?
+                    .record
+                {
+                    WalRecord::RunStarted { config: frozen, .. } => {
+                        config = Some(frozen.frozen_render_config.clone())
+                    }
+                    WalRecord::RunConfigRefrozen {
+                        frozen_render_config,
+                        ..
+                    } => config = Some(frozen_render_config),
+                    WalRecord::StructuredOutputDowngraded { .. } => {
+                        broca_protocol::structured_output::FrozenStructuredOutput::downgrade_render_config(config.as_mut().ok_or_else(bad)?);
+                    }
+                    _ => return Err(bad()),
+                }
+            }
+            episode.render_config = config;
+        }
+        let mut usage = broca_protocol::Usage::default();
+        let mut last_step_usage = None;
+        for frame in self.admission.accounting_frames(read_at)? {
+            match frame.record {
+                WalRecord::RunStarted { .. } => {
+                    usage = broca_protocol::Usage::default();
+                    last_step_usage = None;
+                }
+                WalRecord::ModelStepFinished { .. } | WalRecord::ModelStepRefused { .. } => {
+                    let step =
+                        crate::refusal_fallback::total_step_usage(&frame.record).ok_or_else(bad)?;
+                    usage.accumulate(&step);
+                    if matches!(frame.record, WalRecord::ModelStepFinished { .. }) {
+                        last_step_usage = Some(step);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut earlier = episodes.clone();
+        let open = earlier.pop();
+        Ok(ProjectionSeed {
+            watermark_seq: self.boundary().seq,
+            prefix_len: self.position.prefix_len,
+            completed_steps: self.position.completed_steps,
+            retries_used: self.position.retries_used,
+            usage,
+            last_step_usage,
+            last_step_finish_reason: self.position.last_step_finish_reason,
+            trailing_origin: self.position.trailing_origin.clone(),
+            last_run_id: checkpoint.last_episode.as_ref().map(|e| e.run_id.clone()),
+            admission_checkpoint: checkpoint,
+            projection_episodes: Some(episodes),
+            open_episode: open,
+            earlier_episodes: earlier,
+            open_episode_span: self.position.open_episode_span,
+            tag_seed: crate::tags::TagSeed {
+                high: self.position.tag_high,
+                rules: self
+                    .position
+                    .tag_rules
+                    .map(|(render, clean)| broca_protocol::tags::ComputedRules { render, clean }),
+            },
+            ..ProjectionSeed::empty()
+        })
+    }
+
+    pub fn advance(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        boundary: &crate::replay::SeedBoundary,
+        tail: &[crate::replay::PositionedFrame],
+    ) -> Result<Self, crate::replay::SeedFallback> {
+        let prior = self.hydrate(read_at, tail, boundary.seq)?;
+        let delta = replay_projection_tail(
+            &prior,
+            &tail.iter().map(|p| p.framed.clone()).collect::<Vec<_>>(),
+        )
+        .map_err(|_| crate::replay::SeedFallback::new("projection continuation tail invalid"))?;
+        let tags = if delta.messages.is_empty() {
+            prior.tag_seed
+        } else {
+            let mut tags = crate::tags::TagSeed::from_prefix(&delta.messages);
+            tags.high = tags.high.max(prior.tag_seed.high);
+            tags
+        };
+        let seed = ProjectionSeed {
+            prefix_len: delta.truncate_prefix_to.unwrap_or(prior.prefix_len)
+                + delta.messages.len() as u64,
+            completed_steps: delta.completed_steps,
+            retries_used: delta.retries_used,
+            last_step_finish_reason: delta.last_step_finish_reason,
+            trailing_origin: delta
+                .messages
+                .iter()
+                .rev()
+                .find_map(|m| m.origin.clone())
+                .or(prior.trailing_origin),
+            projection_episodes: delta.episodes,
+            open_episode_span: delta.open_episode_span,
+            tag_seed: tags,
+            ..ProjectionSeed::empty()
+        };
+        let mut next = Self {
+            admission: self
+                .admission
+                .advance(read_at, boundary, tail, (seed.prefix_len, tags))?,
+            position: Self::position(&seed),
+            render_sources: if delta.truncate_prefix_to.is_some() {
+                Vec::new()
+            } else {
+                self.render_sources.clone()
+            },
+        };
+        next.extend_render_sources(read_at, tail, boundary.frame_end)?;
+        Ok(next)
+    }
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OffsetSource {
     pub lo_seq: u64,
@@ -829,6 +1130,19 @@ pub struct OffsetEpisode {
 /// retain source offsets and tag counts, never messages, arguments or results.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OffsetSeed {
+    /// Display counters are separate from accounting/export facts. Missing versions rebuild.
+    #[serde(default)]
+    pub head_fold: Option<crate::head::HeadReadFold>,
+    #[serde(default)]
+    pub qualified_control_head: Option<(u64, u32)>,
+    #[serde(default)]
+    candidate_control_head: Option<(u64, u32)>,
+    #[serde(default)]
+    candidate_boundary_seq: Option<u64>,
+    #[serde(default)]
+    last_tool_control_head: Option<(u64, u32)>,
+    #[serde(default)]
+    assistant_started: bool,
     placement: crate::placement::Placement,
     boundary_state: ProjectionBoundaryState,
     pub episode: Option<OffsetEpisode>,
@@ -874,6 +1188,7 @@ impl OffsetSeed {
     ) -> Option<Self> {
         let (version, mut seed): (u32, Self) = serde_json::from_str(bytes).ok()?;
         if version != OFFSET_SEED_VERSION
+            || seed.head_fold.as_ref().is_none_or(|fold| fold.version != 1)
             || seed.budget_digest != offset_budget_digest(budget.as_ref()).ok()?
         {
             return None;
@@ -914,6 +1229,35 @@ impl OffsetSeed {
     ) -> Result<OffsetDelta, ProjectionPlanError> {
         use crate::placement::{AppendKind, HoldKind, PlacementAction};
         let record = &frame.record;
+        self.head_fold
+            .get_or_insert_with(Default::default)
+            .observe(record);
+        // At a projection boundary with no unfinished tool batch, save its final
+        // control cursor; later controls come from the authenticated tail.
+        match record {
+            WalRecord::StepStarted { .. } => self.assistant_started = true,
+            WalRecord::RunStarted { .. } | WalRecord::ModelStepFinished { .. } => {
+                self.candidate_boundary_seq = Some(frame.seq);
+                if let Some(cursor) =
+                    crate::last_control_cursor_through(std::slice::from_ref(frame), None)
+                {
+                    let correction = u32::from(
+                        matches!(record, WalRecord::ModelStepFinished { .. })
+                            && self.assistant_started,
+                    );
+                    self.candidate_control_head =
+                        Some((cursor.wal_seq, cursor.sub_index - correction));
+                }
+                self.assistant_started = false;
+            }
+            WalRecord::TurnFinished { .. } => {
+                // ToolBatchFinished emitted the tool-message boundary; the later
+                // TurnFinished records the replay boundary but adds no control unit.
+                self.candidate_boundary_seq = Some(frame.seq);
+                self.candidate_control_head = self.last_tool_control_head;
+            }
+            _ => {}
+        }
         let mut delta = OffsetDelta::default();
         if let WalRecord::RunStarted {
             run_id,
@@ -1183,6 +1527,7 @@ impl OffsetSeed {
                 }
                 PlacementAction::Append { first, count, kind } => {
                     if kind == AppendKind::ToolTurn && count != 0 {
+                        self.last_tool_control_head = Some((frame.seq, 0));
                         let mut assistant = self.held_assistant.take().ok_or(
                             ProjectionPlanError::InconsistentSnapshot(
                                 "tool turn lacks assistant source",
@@ -1235,6 +1580,13 @@ impl OffsetSeed {
             ep.end_ord = head;
         }
         delta.boundaries = self.boundary_state.observe_inner(frame, true);
+        for boundary in &delta.boundaries {
+            if boundary.qualified {
+                self.qualified_control_head = self
+                    .candidate_control_head
+                    .filter(|_| self.candidate_boundary_seq == Some(boundary.seq));
+            }
+        }
         Ok(delta)
     }
 }
