@@ -411,9 +411,24 @@ fn parts_numbering(parts: &[crate::ToolOutputPart]) -> (PartKind, Option<usize>)
     use cortexkit_role_llm_runner::tags::{
         numbered_block_index, tool_result_kind, ToolResultBlock,
     };
+    // A capture failure is text in storage. Use the shared image-only rule only when
+    // the entire result has image notices or images; mixed original text keeps its old bytes.
+    let image_only = parts.iter().all(|part| match part {
+        crate::ToolOutputPart::Media { media } => media.kind == crate::MediaKind::Image,
+        crate::ToolOutputPart::Text { text } => {
+            text.is_empty()
+                || crate::content::is_image_only_notice(text)
+                || text
+                    .split('\n')
+                    .all(crate::content::is_generated_image_notice)
+        }
+    });
     let blocks: Vec<_> = parts
         .iter()
         .map(|part| match part {
+            crate::ToolOutputPart::Text { text } if image_only && !text.is_empty() => {
+                ToolResultBlock::Image
+            }
             crate::ToolOutputPart::Text { text } => ToolResultBlock::Text(text),
             crate::ToolOutputPart::Media { media } => match media.kind {
                 crate::MediaKind::Image => ToolResultBlock::Image,

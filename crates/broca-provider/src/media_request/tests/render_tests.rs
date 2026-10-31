@@ -192,7 +192,7 @@ fn image_only_tag_label_does_not_detach_the_prepared_payload() {
             &result["toolResult"]["content"]
         };
         assert_eq!(content.as_array().unwrap().len(), 2);
-        assert!(content[0]["text"].as_str().unwrap().contains('7'));
+        assert_eq!(content[0]["text"], "§7§ [image]");
         assert!(serde_json::to_string(&content[1])
             .unwrap()
             .contains(&base64::Engine::encode(
@@ -200,6 +200,90 @@ fn image_only_tag_label_does_not_detach_the_prepared_payload() {
                 &fixture.bytes
             )));
     }
+}
+
+#[tokio::test]
+async fn failed_image_capture_keeps_the_numbered_label_before_its_failure_line() {
+    let fixture = Fixture::new();
+    let blocked = fixture.root.join("blocked-media-root");
+    std::fs::write(&blocked, b"not a directory").unwrap();
+    let capture = broca_core::tool_media::ToolMediaCapture::new(
+        broca_core::media_uploads::Uploads::at(&blocked),
+        BindIdentity::new(&fixture.root, "tags", "failed-capture"),
+    );
+    let failure = capture
+        .capture(
+            &broca_protocol::BatchId("failed".into()),
+            &broca_protocol::ToolCallId("failed".into()),
+            fixture.bytes.clone(),
+            "image/png".into(),
+        )
+        .await
+        .expect_err("the valid PNG cannot be captured into a file");
+    assert_eq!(failure.reason, MediaMarkerReason::StoreFailed);
+    let line = broca_protocol::content::media_not_shown_marker(
+        failure.media.as_ref().unwrap(),
+        failure.reason,
+    );
+    let stored_output = ToolOutput::Parts {
+        parts: vec![ToolOutputPart::Text { text: line.clone() }],
+    };
+    let stored_bytes = serde_json::to_vec(&stored_output).unwrap();
+    let mut tool = Message::new(
+        Role::Tool,
+        vec![ContentBlock::ToolResult(broca_protocol::ToolResult {
+            tool_call_id: broca_protocol::ToolCallId("failed".into()),
+            output: stored_output,
+            is_error: false,
+        })],
+    );
+    number_message(
+        &mut tool,
+        ComputedRules {
+            render: true,
+            clean: false,
+        },
+        &mut 6,
+    )
+    .unwrap();
+    assert_eq!(tool.part_tags().unwrap().parts, vec![Some(7)]);
+    let prompt = vec![tool];
+    let session = fixture.session(&[start(&[]), step(1), tool_record(&prompt[0]), step(2)]);
+    for id in [
+        WireFamilyId::AnthropicMessages,
+        WireFamilyId::OpenAiResponses,
+        WireFamilyId::Gemini,
+    ] {
+        let family = crate::registry::wire_family(id).unwrap();
+        let frozen = frozen_config_for_family(id, "model");
+        let mut bundle = prepare(&session, None, &prompt, &MediaAging::default()).unwrap();
+        let bytes = render_prepared(
+            &*family,
+            &frozen,
+            &CallOptions::new(prompt.clone()),
+            Some(&mut bundle),
+            &|prompt| {
+                let mut tagged = prompt.to_vec();
+                render_tags_into(&mut tagged, TagRendering::default());
+                tagged
+            },
+        )
+        .unwrap();
+        let rendered = String::from_utf8(bytes).unwrap();
+        let label = "§7§ [image]";
+        let label_at = rendered
+            .find(label)
+            .unwrap_or_else(|| panic!("{id:?}: missing {label}: {rendered}"));
+        let failure_at = rendered
+            .find(&line)
+            .unwrap_or_else(|| panic!("{id:?}: missing failure line: {rendered}"));
+        assert!(label_at < failure_at, "{id:?}: {rendered}");
+        assert_eq!(rendered.matches("§7§").count(), 1, "{id:?}: {rendered}");
+    }
+    let ContentBlock::ToolResult(stored) = &prompt[0].content[0] else {
+        unreachable!()
+    };
+    assert_eq!(serde_json::to_vec(&stored.output).unwrap(), stored_bytes);
 }
 
 #[test]
