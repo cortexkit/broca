@@ -1801,8 +1801,25 @@ impl LineageRegistry {
             .map_err(OwnershipReadError::into_open)
     }
 
-    /// Upload standing includes plan-named senders, unlike cancel/retract. Read
-    /// the frozen first manifest without retaining its contents in owner caches.
+    /// Read the submission's original sender even after delivery or retraction, so retries
+    /// retain the same authorization. Missing or ambiguous attribution grants no exception.
+    pub(crate) async fn recorded_submission_sender(
+        &self,
+        key: &LineageKey,
+        submission_id: &str,
+    ) -> Result<Option<broca_protocol::BindPrincipal>, OpenError> {
+        let (records, _) = self
+            .read_durable_wal_for(key, ReadPurpose::Authorization)
+            .await?;
+        let records: Vec<_> = records.into_iter().map(|frame| frame.record).collect();
+        Ok(crate::send_fate::recorded_submission_sender(
+            &records,
+            &broca_protocol::SubmissionId(submission_id.into()),
+        ))
+    }
+
+    /// Upload standing includes every current plan-named sender, not just session owners.
+    /// Read the frozen first manifest without retaining its contents in owner caches.
     pub(crate) async fn upload_ownership(
         &self,
         key: &LineageKey,

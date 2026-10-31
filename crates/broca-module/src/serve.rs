@@ -1830,6 +1830,19 @@ pub trait ServeHandler: Send + Sync {
         Ok(())
     }
 
+    /// Retraction defaults to owner-only unless the handler supports recorded senders.
+    /// The principal must come from the daemon's bind, never from request parameters.
+    async fn authorize_session_retract(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+        _submission_id: Option<&str>,
+    ) -> Result<(), ServeError> {
+        self.authorize_session_owner(session, principal, scope)
+            .await
+    }
+
     /// `session.send` — start or durably queue a run.
     async fn send(&self, req: SendRequest) -> Result<SendResponse, ServeError>;
 
@@ -2518,6 +2531,35 @@ impl ServeHandler for crate::LineageRegistry {
             .map_err(ServeError::ScopeRefused)
     }
 
+    async fn authorize_session_retract(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+        submission_id: Option<&str>,
+    ) -> Result<(), ServeError> {
+        // Runner 0.7.29 CONTRACT.md:2333-2362 (§9.2) extends only session.retract:
+        // owners keep their exact path; another attested sender may withdraw only its
+        // recorded submission. run.cancel remains owner-only, even for that sender.
+        match self
+            .authorize_session_owner(session, principal, scope)
+            .await
+        {
+            Err(refusal @ ServeError::ScopeRefused(_)) => {
+                if let (Some(sender @ broca_protocol::BindPrincipal::Reserved { .. }), Some(id)) =
+                    (principal, submission_id)
+                {
+                    if self.recorded_submission_sender(session, id).await?.as_ref() == Some(sender)
+                    {
+                        return Ok(());
+                    }
+                }
+                Err(refusal)
+            }
+            result => result,
+        }
+    }
+
     async fn upload(
         &self,
         session: &LineageKey,
@@ -2770,6 +2812,13 @@ impl ServeHandler for crate::LineageRegistry {
             .into_iter()
             .map(|frame| frame.record)
             .collect();
+        let own_run =
+            if let Some(sender @ broca_protocol::BindPrincipal::Reserved { .. }) = principal {
+                crate::send_fate::resolve_sender_run_id(&records, &own_run, send_id, sender)
+                    .map_err(|_| ServeError::UnknownSend)?
+            } else {
+                own_run
+            };
         // Ordered senders share a session, not each other's send keys. Legacy owner records
         // omit sent_by, so their principal is the one on Queued or RunStarted.
         let submission = format!("sub-{}", own_run.0);
@@ -2801,8 +2850,11 @@ impl ServeHandler for crate::LineageRegistry {
         {
             return Err(ServeError::UnknownSend);
         }
-        let outcome = crate::send_fate::recorded_send_outcome(&records, &own_run, send_id)
-            .ok_or(ServeError::UnknownSend)?;
+        let legacy_steers = !records.iter().any(|record| matches!(record,
+            broca_wal::WalRecord::DeliveryOrdered { submission_id, .. } if submission_id.0 == submission));
+        let outcome =
+            crate::send_fate::recorded_send_outcome(&records, &own_run, send_id, legacy_steers)
+                .ok_or(ServeError::UnknownSend)?;
         let (result, delivered) = match outcome {
             crate::actor::SendOutcome::Finished {
                 run_id,
