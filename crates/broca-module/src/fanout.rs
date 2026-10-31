@@ -4379,11 +4379,13 @@ mod database_attach_tests {
             root.join("wal"),
             broca_wal::classify_state_root(root).unwrap(),
         ));
-        let wal = broca_wal::FileWal::open(store.wal_path(bind))
-            .unwrap()
-            .with_feature_floor(root.join("wal-floor"))
-            .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-            .unwrap();
+        let wal = broca_wal::FileWal::open_with_recovery(
+            store.wal_path(bind),
+            broca_wal::WalConfig::OVERHAUL,
+            root.join("wal-floor"),
+        )
+        .unwrap()
+        .with_feature_floor(root.join("wal-floor"));
         (store, Box::new(wal))
     }
 

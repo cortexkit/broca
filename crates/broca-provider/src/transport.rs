@@ -7477,7 +7477,6 @@ mod tests {
         root.canonicalize().unwrap()
     }
 
-    #[cfg(unix)]
     fn attempt_run_request(session: broca_protocol::BindIdentity) -> broca_core::RunRequest {
         let submission = serde_json::from_value(serde_json::json!({
             "model":{"provider_module_id":"test","model_id":"m"}, "input":[], "tools":[]
@@ -8126,7 +8125,6 @@ mod tests {
         store.read_records(&session).unwrap()
     }
 
-    #[cfg(unix)]
     fn assert_attempts_settled_or_superseded(frames: &[broca_wal::FramedRecord]) -> usize {
         use broca_wal::WalRecord;
         let mut writer_id = None;
