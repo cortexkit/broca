@@ -210,3 +210,53 @@ fn concurrent_first_binds_reserve_one_root_across_sqlite_connections() {
     drop(store);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn existing_pair_bind_succeeds_while_another_connection_holds_the_write_lock() {
+    let root = broca_test_support::scratch_root()
+        .join(format!("address-read-only-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("run-index.db");
+    let store = SqliteStore::open(&database).unwrap();
+    complete(&store);
+    let legacy = bind("/original/checkout");
+    store
+        .record_session(&broca_core::session_addr(&legacy), &legacy)
+        .unwrap();
+    // Any attempt to acquire a write transaction fails immediately, rather than
+    // turning a write-lock regression into a slow timing-dependent test.
+    store
+        .conn
+        .lock()
+        .unwrap()
+        .busy_timeout(std::time::Duration::ZERO)
+        .unwrap();
+    let mut writer = rusqlite::Connection::open(&database).unwrap();
+    let held = writer
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    held.execute(
+        "UPDATE agent_data_projection SET backfilled=backfilled WHERE id=1",
+        [],
+    )
+    .unwrap();
+    let before = store.conn.lock().unwrap().total_changes();
+    assert_eq!(
+        store
+            .resolve_session_address(&bind("/later/route"), None)
+            .unwrap(),
+        legacy
+    );
+    assert_eq!(store.conn.lock().unwrap().total_changes(), before);
+    let absent = BindIdentity::new("/new/checkout", "athena", "new-seat");
+    assert!(matches!(
+        store.resolve_session_address(&absent, None),
+        Err(SessionAddressError::Unavailable(
+            InventoryUnavailable::StoreError(_)
+        ))
+    ));
+    drop(held);
+    drop(writer);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}

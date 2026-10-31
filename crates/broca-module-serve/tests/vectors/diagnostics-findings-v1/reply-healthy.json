@@ -17,6 +17,10 @@
         "since_ms": 199999000,
         "truncated": false
       },
+      "session_address_unavailable": {
+        "since_ms": 199999000,
+        "truncated": false
+      },
       "tool_outages": {
         "since_ms": 199999000,
         "truncated": false

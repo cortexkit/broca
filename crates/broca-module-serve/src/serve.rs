@@ -1884,6 +1884,9 @@ async fn handle_control_request(
             } else {
                 BrocaBindIdentity::new("", &identity.harness, &identity.session).validate_keyable()
             } {
+                crate::session_address_health::record_refusal(
+                    &broca_store::session_address::SessionAddressError::Invalid(error.clone()),
+                );
                 return send_error(
                     writer,
                     frame.header.ver,
@@ -2115,6 +2118,7 @@ async fn handle_control_request(
                     // retain that root; `sessions_differ` is how many would move if
                     // they were keyed by the stamped folder instead.
                     "scoped_session_workdirs": crate::scope_workdir::health(),
+                    "session_address_refusals": crate::session_address_health::health(),
                     // Requests a module sent toward broca on a route, each answered with
                     // reverse_request_unhandled because broca fronts no person who could answer.
                     // Non-zero means some module is asking and not getting what it wants.
@@ -2379,6 +2383,7 @@ async fn finish_bind(
     }
     routes.pending_binds.remove(&completed.channel);
     if let Some(error) = completed.address_refusal {
+        crate::session_address_health::record_refusal(&error);
         let class = match error {
             broca_store::session_address::SessionAddressError::Ambiguous
             | broca_store::session_address::SessionAddressError::Invalid(_) => "permanent",
@@ -9648,6 +9653,20 @@ mod tests {
                     .as_u64()
                     .is_some(),
                 "health.check includes the scoped-session workdir counter {counter}, zero included"
+            );
+        }
+        for reason in [
+            "incomplete_inventory",
+            "gap_marker",
+            "store_error",
+            "ambiguous",
+            "invalid_identity",
+        ] {
+            assert!(
+                health["metrics"]["session_address_refusals"][reason]
+                    .as_u64()
+                    .is_some(),
+                "health.check includes the address refusal counter {reason}, zero included"
             );
         }
 

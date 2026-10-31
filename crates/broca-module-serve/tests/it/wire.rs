@@ -2240,10 +2240,13 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // here because this rig serves no model-tool route; the counters themselves are
         // asserted through the route in llm_tools_consent.
         "llm_tools_consent",
-        // Scoped sessions counted by whether the daemon-stamped workdir matches the bind's
-        // project_root. Asserted below: its four counters exist, nothing here binds under a
-        // stamp, and no session ever overflows the per-process dedupe set.
+        // Scoped sessions counted by whether the daemon-stamped workdir matches the resolved
+        // storage root. Every route.bind request in this probe omits the scope stamp;
+        // assert all four counters and no dedupe-set overflow below.
         "scoped_session_workdirs",
+        // A complete inventory and valid session identities refuse no binds in this isolated
+        // healthy process. Pin all reason counters at zero below, not just their presence.
+        "session_address_refusals",
         // Provider-held calls: whether the late-results intake still needs its verified rebuild,
         // what that rebuild has scanned, and tool.withdraw outcomes. Asserted below: a root that
         // never held a call needs no rebuild, scans nothing, and has no failed or pending
@@ -2332,6 +2335,11 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
             "tool_routes.{healthy_zero} on a healthy daemon: {routes:?}"
         );
     }
+    assert_eq!(
+        metrics["session_address_refusals"],
+        serde_json::json!({"incomplete_inventory":0,"gap_marker":0,"store_error":0,"ambiguous":0,"invalid_identity":0}),
+        "a healthy inventory and valid identities must not refuse a session address"
+    );
     let workdirs = metrics["scoped_session_workdirs"]
         .as_object()
         .expect("scoped_session_workdirs is an object");

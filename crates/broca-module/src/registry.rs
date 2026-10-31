@@ -1233,9 +1233,7 @@ impl LineageRegistry {
             .get()
             .cloned()
             .ok_or_else(|| {
-                SessionAddressError::Unavailable(
-                    "session address inventory is not configured".into(),
-                )
+                SessionAddressError::store_error("session address inventory is not configured")
             })?;
         let bind = bind.clone();
         let workdir = workdir.map(std::path::Path::to_path_buf);
@@ -1243,7 +1241,7 @@ impl LineageRegistry {
             inventory.resolve_session_address(&bind, workdir.as_deref())
         })
         .await
-        .map_err(|error| SessionAddressError::Unavailable(error.to_string()))?
+        .map_err(SessionAddressError::store_error)?
     }
     #[cfg(test)]
     pub(crate) fn with_raw_pages_for_test(self, bundle: Arc<RawPageTestBundle>) -> Self {

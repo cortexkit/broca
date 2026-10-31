@@ -109,7 +109,7 @@ async fn send_and_settle(rig: &mut Rig, channel: u16, send_id: &str) -> String {
     run_id
 }
 
-async fn workdir_counters(rig: &mut Rig) -> Value {
+async fn health_metrics(rig: &mut Rig) -> Value {
     let reply = rig
         .request(
             0,
@@ -123,7 +123,11 @@ async fn workdir_counters(rig: &mut Rig) -> Value {
     else {
         panic!("health.check carries metrics");
     };
-    metrics["scoped_session_workdirs"].clone()
+    metrics
+}
+
+async fn workdir_counters(rig: &mut Rig) -> Value {
+    health_metrics(rig).await["scoped_session_workdirs"].clone()
 }
 
 fn counter(counters: &Value, name: &str) -> u64 {
@@ -297,6 +301,7 @@ async fn existing_sessions_keep_their_key_and_new_scoped_sessions_use_workdir() 
 #[tokio::test]
 async fn ambiguous_and_incomplete_addresses_refuse_before_wal_or_lease_creation() {
     let mut rig = Rig::start_with_scopes("address-refusal").await;
+    let counters_before = health_metrics(&mut rig).await["session_address_refusals"].clone();
     let first = BindIdentity::new(
         &rig.session.project_root,
         &rig.session.harness,
@@ -349,6 +354,16 @@ async fn ambiguous_and_incomplete_addresses_refuse_before_wal_or_lease_creation(
         let error: Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(error["code"], code);
         assert_eq!(error["detail"]["class"], class);
+        let reason = if class == "transient" {
+            "incomplete_inventory"
+        } else {
+            "ambiguous"
+        };
+        let after = health_metrics(&mut rig).await;
+        assert_eq!(
+            after["session_address_refusals"][reason].as_u64().unwrap(),
+            counters_before[reason].as_u64().unwrap() + 1
+        );
         assert!(error["message"]
             .as_str()
             .unwrap()

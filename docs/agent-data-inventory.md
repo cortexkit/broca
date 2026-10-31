@@ -11,9 +11,11 @@ filename, payload or byte offset.
 ## Completeness and admission
 
 Session binds also use this inventory to retain an existing pair's original root.
-Before acknowledging a new pair, an immediate SQLite transaction checks completeness,
-checks the pair's roots, and reserves its first candidate. Competing first binds share
-that writer transaction, so they cannot select different roots. A refused bind or an
+An existing `(harness, session)` pair is resolved in a read transaction without
+acquiring SQLite's write lock. Only an absent pair takes an immediate transaction,
+rechecks completeness and the pair's roots, and reserves a candidate if still absent.
+Competing first binds share that writer transaction, so they cannot select different
+roots. A refused bind or an
 interrupted first send can therefore leave an identity-only candidate without a WAL.
 Candidates still do not prove that content exists or is locally owned.
 
@@ -54,6 +56,19 @@ then committed in small keyset-paged batches with a durable run-id cursor. The
 completion marker is recorded only after the source scan finishes. Invalid legacy
 identities leave missing session refs
 unknown rather than certifying that no local copy exists.
+
+Migration is scheduled once by `AgentDataService::reconcile_boot`, not by refused
+binds or a periodic repair loop. An in-flight startup migration can restore completeness
+without another restart. Once that attempt has ended, a new gap marker, an older
+writer's session identity not yet added to the inventory, or an uncovered WAL address
+is not automatically repaired in the running process;
+restart schedules the next automatic attempt. Fix unreadable or malformed source data
+before expecting repair to complete. A temporary store error can clear on a later bind
+without migration when the store recovers and its completeness evidence remains valid.
+Do not remove a gap marker merely to silence refusals: repair verifies coverage and
+briefly takes a per-root filesystem lease to detect concurrent WAL appends or
+installations whose identities could not be recorded in SQLite before durably clearing
+the marker.
 
 Old imports, move activations and interrupted admissions may have WALs without
 `run_index` rows. A one-time metadata census closes those gaps across `wal/`,
