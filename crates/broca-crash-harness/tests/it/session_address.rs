@@ -40,12 +40,61 @@ async fn interrupted_first_send_resumes_under_its_reserved_workdir_address() {
             request().session
         );
     }
+    let reference = broca_core::agent_session_ref(&request().session);
+    let inventory = {
+        let index = broca_store::SqliteStore::open_read_only(&database).unwrap();
+        let inventory = index
+            .session_refs(std::iter::once(reference.as_str()))
+            .unwrap();
+        assert!(
+            inventory.complete,
+            "the closed source inventory must be complete"
+        );
+        assert_eq!(inventory.sessions[&reference].1, request().session);
+        inventory
+    };
+    let snapshot_files: Vec<_> = ["run-index.db", "run-index.db-wal", "run-index.db-shm"]
+        .into_iter()
+        .filter(|name| fixture.join(name).try_exists().unwrap())
+        .collect();
+    assert!(
+        snapshot_files.contains(&"run-index.db-wal"),
+        "the fixture must exercise committed, uncheckpointed SQLite pages"
+    );
+    assert!(
+        std::fs::metadata(fixture.join("run-index.db-wal"))
+            .unwrap()
+            .len()
+            > 0
+    );
     for point in handle.record_boundaries(true) {
         let kill = handle.kill_at(point, KillTrigger::Truncate).await;
         // The bind reservation was committed before the interrupted first send.
-        // Copy its closed SQLite snapshot alongside each durable WAL cut.
+        // Store close deliberately retains uncheckpointed SQLite pages, so the main
+        // database alone is not a snapshot. Copy its closed file family, including
+        // the WAL and any shared-memory index, alongside each durable Broca WAL cut.
         let recovered_database = kill.state_root.join("run-index.db");
-        std::fs::copy(&database, &recovered_database).unwrap();
+        for name in &snapshot_files {
+            let destination = kill.state_root.join(name);
+            assert!(
+                !destination.try_exists().unwrap(),
+                "{}: do not overwrite an existing SQLite snapshot member {name}",
+                kill.label()
+            );
+            std::fs::copy(fixture.join(name), destination).unwrap();
+        }
+        {
+            let index = broca_store::SqliteStore::open_read_only(&recovered_database).unwrap();
+            let copied = index
+                .session_refs(std::iter::once(reference.as_str()))
+                .unwrap();
+            assert!(
+                copied.complete,
+                "{}: copying the snapshot must preserve completeness without repair",
+                kill.label()
+            );
+            assert_eq!(copied.sessions, inventory.sessions, "{}", kill.label());
+        }
         let index = broca_store::SqliteStore::open(&recovered_database).unwrap();
         let rebound = BindIdentity::new("/different/transport", "runner", "address-crash");
         let recovered = index
