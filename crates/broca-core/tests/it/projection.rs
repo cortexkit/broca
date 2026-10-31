@@ -1043,6 +1043,7 @@ fn budget_firing_projects_to_control_stream() {
 /// Multi-unit records deliberately include two calls and a typed terminal error.
 fn all_projection_record_variants() -> Vec<FramedRecord> {
     let queued_request = SubmissionRequest {
+        service_tier_level: None,
         staged_uploads: None,
         content: Vec::new(),
         directives: None,

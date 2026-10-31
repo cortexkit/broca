@@ -477,6 +477,10 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
   queued behind a running turn, its recorded request carries the frozen model itself, so a
   build that does not know the inherited set still runs it on the session's model.
 
+Broca does not send `service_tier` to account routing; a tier chosen by a router reaches broca
+only through the caller's send. Broca does not report `service_tier_applied` or
+`service_tier_served` to account routing.
+
 #### Hard session input-token cap
 
 The `input_token_cap` discovery group enables optional `session.send.budget.max_input_tokens`

@@ -186,6 +186,7 @@ impl SendParamsExt for SendParams {
         user_message.cache_prefix_blocks = cache_prefix_blocks;
         input.push(user_message);
         let submission = SubmissionRequest {
+            service_tier_level: None,
             staged_uploads: None,
             content,
             directives,
@@ -636,6 +637,26 @@ mod tests {
             let params: SendParams = serde_json::from_value(params).unwrap();
             assert_eq!(params.service_tier, None);
         }
+    }
+
+    #[test]
+    fn public_send_does_not_populate_the_reader_only_queued_tier_member() {
+        let params: SendParams = serde_json::from_value(serde_json::json!({
+            "prompt": "hello", "model": {"provider": "openai", "model": "m"},
+            "service_tier_level": "ultrafast"
+        }))
+        .unwrap();
+        let request = params
+            .into_send_request(
+                BindIdentity::new("/unused", "runner", "tier-reader"),
+                RunId("tier-reader".into()),
+            )
+            .unwrap();
+        assert!(request.request.service_tier_level.is_none());
+        assert!(serde_json::to_value(request.request)
+            .unwrap()
+            .get("service_tier_level")
+            .is_none());
     }
 
     /// `fast` is OpenAI's marketing name for priority. It is refused like any unknown value, and

@@ -128,6 +128,9 @@ pub struct ResolveOptions<'a> {
     /// refused, naming the offered tiers. A resume passes the frozen tier through
     /// `EpisodeRenderConfig` instead.
     pub service_tier: Option<ServiceTier>,
+    /// Abstract level recovered from a durable queue written by a later release. Fresh public
+    /// sends never set this reader-only input. Resumed runs use their recorded render bundle.
+    pub queued_service_tier: Option<&'a str>,
     /// Where a fresh token for the run's own credential comes from when the provider rejects
     /// the served one with a 401 mid-run or its token is about to expire. Used only with
     /// [`AuthMode::Secret`]; ChatGPT rebuilds its complete account and session header set.
@@ -921,6 +924,7 @@ fn resolve_provider_inner(
             &mut frozen,
             episode_render.service_tier,
             opts.service_tier,
+            opts.queued_service_tier,
             "openai-compatible",
             model,
             &[],
@@ -1128,6 +1132,7 @@ fn resolve_provider_inner(
             &mut frozen,
             episode_render.service_tier,
             opts.service_tier,
+            opts.queued_service_tier,
             provider_id,
             &format!("{provider_id}/{model_id}"),
             &catalog.priced_modes(provider_id, model_id),
@@ -1294,6 +1299,7 @@ fn resolve_provider_inner(
         &mut frozen,
         episode_render.service_tier,
         opts.service_tier,
+        opts.queued_service_tier,
         provider_id,
         &format!("{provider_id}/{model_id}"),
         &catalog.priced_modes(provider_id, model_id),
@@ -1618,12 +1624,13 @@ fn freeze_refusal_fallback(
             fallback = with_variant;
         }
     }
-    if source.service_tier_request.is_some() {
+    if source.service_tier_request.is_some() || opts.queued_service_tier.is_some() {
         let mut with_tier = fallback.clone();
         if apply_service_tier(
             &mut with_tier,
             None,
             opts.service_tier,
+            opts.queued_service_tier,
             provider_id,
             &catalog_model,
             &catalog.priced_modes(provider_id, fallback_model),
@@ -1631,6 +1638,10 @@ fn freeze_refusal_fallback(
         .is_ok()
         {
             fallback = with_tier;
+        } else if opts.queued_service_tier.is_some() {
+            // A recovered abstract tier is fixed for the run; an ineligible fallback must
+            // not silently send a request at the fallback model's default tier.
+            return Err("fallback cannot apply the queued service_tier_level".into());
         }
     }
     apply_structured_output(
@@ -1756,10 +1767,17 @@ fn apply_service_tier(
     frozen: &mut FrozenRenderConfig,
     restored: Option<ServiceTier>,
     requested: Option<ServiceTier>,
+    queued: Option<&str>,
     provider_id: &str,
     catalog_model: &str,
     priced_modes: &[String],
 ) -> Result<(), String> {
+    if let Some(level) = queued {
+        if restored.is_some() || requested.is_some() {
+            return Err("service_tier_level conflicts with the legacy service_tier member".into());
+        }
+        return apply_queued_service_tier(frozen, level, provider_id, catalog_model, priced_modes);
+    }
     if let Some(restored) = restored {
         return broca_provider::service_tier::freeze_service_tier(frozen, provider_id, restored);
     }
@@ -1780,6 +1798,60 @@ fn apply_service_tier(
         ));
     }
     broca_provider::service_tier::freeze_service_tier(frozen, provider_id, requested)
+}
+
+/// Interpret the abstract level retained by a queued request without extending the legacy
+/// stored enum. Public send admission cannot set this input until the writer release ships.
+fn apply_queued_service_tier(
+    frozen: &mut FrozenRenderConfig,
+    level: &str,
+    provider_id: &str,
+    catalog_model: &str,
+    priced_modes: &[String],
+) -> Result<(), String> {
+    let legacy = match level {
+        "standard" => {
+            // Standard is available even on wires without a service-level request field.
+            if broca_provider::service_tier::tier_bytes(
+                provider_id,
+                frozen.family_id,
+                ServiceTier::Default,
+            )
+            .is_none()
+            {
+                return Ok(());
+            }
+            ServiceTier::Default
+        }
+        "fast" => ServiceTier::Priority,
+        "ultrafast"
+            if provider_id == "openai"
+                && matches!(
+                    frozen.family_id,
+                    WireFamilyId::OpenAiChat
+                        | WireFamilyId::OpenAiResponses
+                        | WireFamilyId::OpenAiResponsesChatgpt
+                )
+                && priced_modes.iter().any(|mode| mode == "ultrafast") =>
+        {
+            frozen.service_tier = Some(level.to_owned());
+            return Ok(());
+        }
+        _ => {
+            return Err(format!(
+                "service_tier_level {level:?} is unsupported for {catalog_model}"
+            ));
+        }
+    };
+    apply_service_tier(
+        frozen,
+        None,
+        Some(legacy),
+        None,
+        provider_id,
+        catalog_model,
+        priced_modes,
+    )
 }
 
 /// Admit a fresh variant on Google Code Assist, where a thinking level is rendered as a backend

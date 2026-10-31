@@ -4261,6 +4261,7 @@ mod executor {
                 // Only fresh admissions resolve caller render choices; resume uses the bundle.
                 variant: job.req.variant.as_deref().filter(|_| fresh_episode),
                 service_tier: job.req.service_tier.filter(|_| fresh_episode),
+                queued_service_tier: job.queued_service_tier.as_deref().filter(|_| fresh_episode),
                 clock: Some(&self.clock),
                 frozen_account_ref: if fresh_episode {
                     resolution
@@ -4806,6 +4807,7 @@ mod executor {
         use super::*;
         include!("provider_override_tests.rs");
         include!("recorded_resume_tests.rs");
+        include!("queued_service_tier_tests.rs");
         include!("vault_request_tests.rs");
         include!("role_plane_tests.rs");
         include!("admission_wal_read_budget_tests.rs");
@@ -4932,6 +4934,7 @@ mod executor {
             let summary = executor
                 .execute(
                     RunJob {
+                        queued_service_tier: None,
                         media: Vec::new(),
                         media_profile: None,
                         conversation_key: None,
@@ -5464,6 +5467,7 @@ mod executor {
                     prompt_cache_key: None,
                     variant: None,
                     service_tier: None,
+                    queued_service_tier: None,
                     secret_refresher: None,
                     structured_output: None,
                     frozen_account_ref: None,
@@ -5494,6 +5498,7 @@ mod executor {
                 prompt_cache_key: None,
                 variant: None,
                 service_tier: None,
+                queued_service_tier: None,
                 secret_refresher: None,
                 structured_output: None,
                 frozen_account_ref: None,

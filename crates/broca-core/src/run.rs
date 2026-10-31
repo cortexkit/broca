@@ -198,6 +198,7 @@ impl RunRequest {
     /// [`from_submission`]: RunRequest::from_submission
     pub fn to_submission(&self) -> SubmissionRequest {
         SubmissionRequest {
+            service_tier_level: None,
             staged_uploads: None,
             content: Vec::new(),
             directives: self.directives.clone(),

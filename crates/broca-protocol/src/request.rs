@@ -569,6 +569,12 @@ pub struct SubmissionRequest {
     /// the run is admitted. Absent costs no bytes on a queued record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<ServiceTier>,
+    /// Abstract tier retained by a queued send from a newer writer. Separate from the legacy
+    /// provider-tier enum so old recorded requests keep their vocabulary. Records preserve
+    /// unfamiliar strings; admission must refuse a level it cannot apply rather than downgrade it.
+    /// This reader accepts the member, but public send admission does not populate it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier_level: Option<String>,
     #[serde(default)]
     pub stop_when: Vec<StopCondition>,
     /// How this session's context is managed, as the caller asked. `None` means the caller
@@ -837,6 +843,7 @@ mod tests {
     #[test]
     fn submission_request_tool_module_round_trips_when_present() {
         let request = SubmissionRequest {
+            service_tier_level: None,
             staged_uploads: None,
             content: Vec::new(),
             directives: None,
@@ -929,6 +936,7 @@ mod budget_compat_tests {
     #[test]
     fn absent_submission_budget_is_omitted_and_defaults_to_none() {
         let request = SubmissionRequest {
+            service_tier_level: None,
             staged_uploads: None,
             content: Vec::new(),
             directives: None,

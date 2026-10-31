@@ -1355,6 +1355,7 @@ async fn an_unreadable_prompt_history_is_refused_through_the_admission_ack() {
     prior_snapshot.head_seq = 5;
     let (ack, admitted) = tokio::sync::oneshot::channel();
     let job = RunJob {
+        queued_service_tier: None,
         media: Vec::new(),
         media_profile: None,
         conversation_key: None,

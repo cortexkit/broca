@@ -187,6 +187,7 @@ async fn assert_media_free_sparse_resume_legacy_render_and_decode(with_tools: bo
         Duration::from_secs(15),
         executor.execute(
             RunJob {
+                queued_service_tier: None,
                 media: Vec::new(),
                 media_profile: None,
                 conversation_key: None,
@@ -306,6 +307,7 @@ async fn fresh_episode_admission_does_not_add_a_full_wal_read() {
     store.ranged.store(0, Ordering::SeqCst);
     let (ack, admitted) = tokio::sync::oneshot::channel();
     let job = RunJob {
+        queued_service_tier: None,
         media: vec![],
         media_profile: None,
         conversation_key: None,
