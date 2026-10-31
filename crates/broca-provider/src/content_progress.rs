@@ -115,7 +115,7 @@ fn classify(family: ContentFamily, name: &str, value: &Value) -> (bool, bool) {
         Gemini | CodeAssist => match name {
             "message" => {
                 let body = if matches!(family, CodeAssist) {
-                    &value["response"]
+                    crate::families::google_codeassist::response_body(value)
                 } else {
                     value
                 };
