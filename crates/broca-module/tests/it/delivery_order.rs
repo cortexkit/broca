@@ -23,6 +23,56 @@ use common::{req, FakeExecutor, Rig};
 const LONG_TTL: Duration = Duration::from_secs(3600);
 const SHORT_TTL: Duration = Duration::from_millis(100);
 
+#[tokio::test]
+async fn keyed_retry_ignores_deadlines_for_owner_and_named_senders() {
+    for sender in ["owner", "ck-mc"] {
+        let mut rig = Rig::new("retry-deadline", FakeExecutor::auto(), LONG_TTL);
+        let key = session_naming_ck_mc(&rig, "deadline", false).await;
+        let original = DeliveryOrder {
+            expires_at_ms: Some(u64::MAX - 100),
+            ..order(&[DeliveryMode::Steer], Some("deadline-key"))
+        };
+        let mut request = send(&key, "deadline-note", Some(original.clone()));
+        request.request.principal = reserved(sender);
+        let receipt = rig.registry.send(request.clone()).await.unwrap();
+        let before = records(&rig, &key);
+        for restarted in [false, true] {
+            if restarted {
+                restart_registry(&mut rig).await;
+            }
+            for deadline in [Some(u64::MAX), None, Some(1)] {
+                request.order.as_mut().unwrap().expires_at_ms = deadline;
+                let retry = rig.registry.send(request.clone()).await.unwrap();
+                assert_eq!(
+                    serde_json::to_value(retry).unwrap(),
+                    serde_json::to_value(&receipt).unwrap()
+                );
+                assert_eq!(
+                    records(&rig, &key),
+                    before,
+                    "a retry must not rewrite its deadline"
+                );
+            }
+            for changed in [
+                DeliveryOrder {
+                    modes: vec![DeliveryMode::ToolResult],
+                    ..original.clone()
+                },
+                DeliveryOrder {
+                    dedupe_key: Some("other".into()),
+                    ..original.clone()
+                },
+            ] {
+                request.order = Some(changed);
+                assert!(
+                    matches!(rig.registry.send(request.clone()).await, Err(ServeError::SendIdReuse { differing }) if differing == "delivery")
+                );
+            }
+            request.order = Some(original.clone());
+        }
+    }
+}
+
 async fn retract_as(
     rig: &Rig,
     key: &broca_protocol::BindIdentity,

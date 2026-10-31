@@ -5709,7 +5709,23 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let submission_id = broca_protocol::SubmissionId(format!("sub-{}", run_id.0));
         let used = self.recorded_send_keys.contains_key(run_id)
             || self.ordered_submissions.contains_key(&submission_id);
-        Ok(used && self.ordered_submissions.get(&submission_id) != self.admitting_order.as_ref())
+        let role_order = |order: &broca_protocol::DeliveryOrder| {
+            let mut published =
+                cortexkit_role_llm_runner::delivery_order::DeliveryOrder::new(order.modes.clone());
+            published.dedupe_key = order.dedupe_key.clone();
+            published.expires_at_ms = order.expires_at_ms;
+            published.template = order.template.clone();
+            published
+        };
+        let same = match (
+            self.ordered_submissions.get(&submission_id),
+            self.admitting_order.as_ref(),
+        ) {
+            (Some(earlier), Some(retry)) => role_order(retry).same_payload(&role_order(earlier)),
+            (None, None) => true,
+            _ => false,
+        };
+        Ok(used && !same)
     }
 
     /// How a send with a legacy string `delivery` is admitted: from the session's owner (or a
@@ -5945,16 +5961,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let submission_id = broca_protocol::SubmissionId(format!("sub-{}", run_id.0));
         let request_scope = request.scope.clone();
         // A retry with the same `send_id` is the same send: answer what became of it.
-        if let Some(existing) = self
+        if self
             .pending_fifo
             .iter()
-            .find(|pending| pending.submission_id == submission_id)
+            .any(|pending| pending.submission_id == submission_id)
         {
-            if existing.order.as_ref() != Some(&order) {
-                return SendOutcome::SendIdReuse {
-                    differing: "delivery",
-                };
-            }
             return SendOutcome::Pending { submission_id };
         }
         if identity.send_id.is_some() {
