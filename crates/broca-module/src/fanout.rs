@@ -352,17 +352,15 @@ fn replay_for_database_attach(
         AttachFrom::Cursor(FromCursor::After(cursor)) => cursor.wal_seq,
         _ => h,
     };
-    let start = match reader.attach_start(at) {
+    let start = match broca_wal::access_counter::fallback_result(
+        || reader.attach_start(at),
+        |error| match error {
+            broca_store::db::DbError::SeedFallback(reason) => reason.reason,
+            _ => "attach database snapshot unavailable",
+        },
+    ) {
         Ok(start) => start.map(|(episode, seed)| AttachEpisodeStart { episode, seed }),
-        Err(error) => {
-            let reason = match error {
-                broca_store::db::DbError::SeedFallback(reason) => reason.reason,
-                _ => {
-                    broca_core::replay::SeedFallback::new("attach database snapshot unavailable")
-                        .reason
-                }
-            };
-            let _ = reason;
+        Err(_) => {
             let records = reader.complete_read().map_err(|e| e.to_string())?;
             let lineage =
                 broca_core::projection::log_header_info(&|off, len| reader.read_at(off, len))
@@ -4433,6 +4431,79 @@ mod database_attach_tests {
             drop(wal);
             drop(db);
             let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn database_attach_snapshot_failures_count_one_typed_fallback() {
+        for (corruption, reason) in [
+            ("missing", "historical episode continuation missing"),
+            ("unsupported", "historical episode continuation unsupported"),
+        ] {
+            let records = records(6);
+            let root = root();
+            let WalRecord::RunStarted { session, .. } = &records[0] else {
+                unreachable!()
+            };
+            let bind = session.clone();
+            let (_, mut wal) = wal(&root, &bind);
+            for record in records {
+                wal.append(1, &record, false).unwrap();
+            }
+            wal.sync().unwrap();
+            let db = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
+            let reader = db
+                .episode_reader(bind, wal.durable_publication().unwrap())
+                .unwrap();
+            let frames = wal.replay().unwrap();
+            let cursor = frames
+                .iter()
+                .rev()
+                .find(|frame| matches!(frame.record, WalRecord::RunStarted { .. }))
+                .unwrap()
+                .seq;
+            let from = AttachFrom::Cursor(FromCursor::After(Cursor::new(cursor, 0)));
+            let expected =
+                replay_for_attach(frames, reader.sequence(), from, wal.lineage_id()).unwrap();
+            assert!(!expected.units.is_empty());
+            db.authoritative_transaction(|tx| {
+                if corruption == "missing" {
+                    tx.execute("DELETE FROM episode_seed WHERE seq=(SELECT min(seq) FROM episode_seed)", [])?;
+                } else {
+                    let encoded: String = tx.query_row("SELECT continuation FROM episode_seed ORDER BY seq LIMIT 1", [], |row| row.get(0))?;
+                    let mut value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+                    value["version"] = serde_json::json!(0);
+                    tx.execute("UPDATE episode_seed SET continuation=?1 WHERE seq=(SELECT min(seq) FROM episode_seed)", [value.to_string()])?;
+                }
+                Ok(())
+            }).unwrap();
+            assert!(
+                matches!(reader.attach_start(cursor), Err(broca_store::db::DbError::SeedFallback(failure)) if failure.reason == reason)
+            );
+
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            let actual = counter
+                .operation(corruption)
+                .run(|| replay_for_database_attach(&reader, from).unwrap());
+            let operation = counter.snapshot().remove(0);
+            // An unsupported seed also reports an internal decoder failure. Attach
+            // must expose only the database reader's final typed fallback reason.
+            assert_eq!(operation.seed_fallbacks, [reason]);
+            assert_eq!(
+                operation
+                    .reads
+                    .iter()
+                    .filter(|read| { read.class == broca_wal::access_counter::ReadClass::Origin })
+                    .count(),
+                1
+            );
+            assert_eq!(actual.units, expected.units);
+            assert_eq!(actual.state, expected.state);
+            assert_eq!(actual.seeded_h, expected.seeded_h);
+            drop(reader);
+            drop(wal);
+            drop(db);
+            std::fs::remove_dir_all(root).unwrap();
         }
     }
 
