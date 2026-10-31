@@ -50,6 +50,40 @@ pub(super) fn read_fence(tx: &Transaction<'_>, key: &str) -> Result<Option<Fence
         .map(Option::flatten)
 }
 
+pub(super) fn refuse_pending_diagnostics(tx: &Transaction<'_>) -> Result<(), String> {
+    let mut statement = tx.prepare(
+        "SELECT session, admission_checkpoint_json FROM meta WHERE admission_checkpoint_json LIKE ?1"
+    ).map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([format!("{FENCE_PREFIX}%")], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?;
+    for row in rows {
+        let (session, checkpoint) = row.map_err(|error| error.to_string())?;
+        if decode_fence(&checkpoint)
+            .map_err(|error| error.to_string())?
+            .is_some_and(|fence| fence.pending)
+        {
+            return Err(format!("WAL recovery is pending for session {session}; diagnostic run summaries are unavailable"));
+        }
+    }
+    Ok(())
+}
+
+fn require_full_synchronous(conn: &rusqlite::Connection) -> Result<(), StoreError> {
+    // Invalidation is the barrier that permits shortening the authoritative WAL.
+    // Enforce the mode on this connection before BEGIN, not on a separate index DB.
+    conn.pragma_update(None, "synchronous", "FULL")?;
+    let mode: i64 = conn.pragma_query_value(None, "synchronous", |row| row.get(0))?;
+    if mode != 2 {
+        return Err(StoreError::InconsistentSnapshot(
+            "WAL recovery requires SQLite synchronous=FULL",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn required_cut_ids(
     text: Option<&str>,
     seed: Option<&ProjectionSeed>,
@@ -126,6 +160,7 @@ impl SqliteStore {
         let key = Self::key(session);
         let session_json = serde_json::to_string(session)?;
         let mut conn = self.conn.lock().unwrap();
+        require_full_synchronous(&conn)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (_, lineage, epoch) = current_projection_state(&tx, &key)?;
         let text = checkpoint(&tx, &key)?;
@@ -244,6 +279,7 @@ impl SqliteStore {
             }
         }
         let mut conn = self.conn.lock().unwrap();
+        require_full_synchronous(&conn)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let fence = read_fence(&tx, &key)?.ok_or(StoreError::InconsistentSnapshot(
             "recovery projection fence missing",
@@ -303,9 +339,7 @@ fn restore_run_rows(
         if !belongs {
             continue;
         }
-        let state = if present.contains(run) {
-            // The index reflects explicit surviving lifecycle records. Recovery
-            // markers govern execution close-out, not an already recorded terminal.
+        let mut state = if present.contains(run) {
             broca_core::reconcile_run_state(
                 records.iter().filter_map(|f| {
                     (!matches!(f.record, WalRecord::RecoveryCut { .. })).then_some(&f.record)
@@ -315,6 +349,20 @@ fn restore_run_rows(
         } else {
             None
         };
+        if let Some(state) = &mut state {
+            // A cut ends unfinished work, but cannot rewrite an explicit terminal
+            // that survived before the cut.
+            if matches!(state.state, RunIndexState::Active | RunIndexState::Paused)
+                && records.iter().any(|frame| {
+                    matches!(&frame.record,
+                    WalRecord::RecoveryCut { recovery }
+                    if recovery.runs.iter().any(|owner| owner.run_id.0 == *run)
+                    || recovery.active_run.as_ref().is_some_and(|owner| owner.0 == *run))
+                })
+            {
+                state.state = RunIndexState::Interrupted;
+            }
+        }
         let usage = state
             .as_ref()
             .and_then(|s| s.usage.as_ref())

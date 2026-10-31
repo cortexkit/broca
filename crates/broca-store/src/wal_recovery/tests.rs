@@ -183,7 +183,7 @@ impl Fixture {
             Some(10)
         );
         let run = self.store.lookup_run("r").unwrap().unwrap();
-        assert_eq!(run.state, RunIndexState::Active);
+        assert_eq!(run.state, RunIndexState::Interrupted);
         assert_eq!(run.usage, None);
         assert_eq!(run.retries_used, 0);
         assert!(!self.pending());
@@ -376,6 +376,91 @@ impl RecoveryHooks for StopAfterInvalidation {
     fn after_repair(&self, _: &Path, _: &BTreeSet<String>) -> Result<(), WalError> {
         unreachable!()
     }
+}
+
+fn stop_after_invalidation(f: &Fixture) {
+    let hooks = Arc::new(StopAfterInvalidation {
+        store: f.store.clone(),
+        session: f.session.clone(),
+    });
+    assert!(FileWal::open_with_manifest_and_recovery_hooks(
+        &f.path,
+        f.wals.manifest_path(),
+        session_addr(&f.session),
+        String::new(),
+        broca_core::wal_writer::agent_session_ref(&f.session),
+        (WalConfig::OVERHAUL, f.wals.feature_floor_path()),
+        hooks,
+    )
+    .is_err());
+    assert!(f.pending());
+    assert_eq!(std::fs::read(&f.path).unwrap(), f.damaged);
+}
+
+#[test]
+fn recovery_pending_fence_refuses_lease_free_summary_readers() {
+    let f = Fixture::new();
+    stop_after_invalidation(&f);
+    let reopened = SqliteStore::open(f.root.join("store.db")).unwrap();
+    for store in [&*f.store, &reopened] {
+        let error = store
+            .lookup_run("r")
+            .expect_err("pending rows must not be reported as live");
+        assert!(error.contains("recovery") && error.contains("r"));
+        let error = store
+            .diagnostic_evidence(0, i64::MAX)
+            .err()
+            .expect("pending rows are not diagnostic facts");
+        assert!(error.contains("recovery"));
+    }
+    f.recover().unwrap();
+    assert_eq!(
+        reopened.lookup_run("r").unwrap().unwrap().state,
+        RunIndexState::Interrupted
+    );
+    assert!(reopened.diagnostic_evidence(0, i64::MAX).is_ok());
+}
+
+#[test]
+fn recovery_invalidation_and_rebuild_enforce_full_synchronous() {
+    let f = Fixture::new();
+    f.store
+        .conn
+        .lock()
+        .unwrap()
+        .pragma_update(None, "synchronous", "OFF")
+        .unwrap();
+    stop_after_invalidation(&f);
+    let mode: i64 = f
+        .store
+        .conn
+        .lock()
+        .unwrap()
+        .pragma_query_value(None, "synchronous", |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        mode, 2,
+        "the pre-cut invalidation must commit under synchronous=FULL"
+    );
+    f.store
+        .conn
+        .lock()
+        .unwrap()
+        .pragma_update(None, "synchronous", "NORMAL")
+        .unwrap();
+    f.recover().unwrap();
+    let mode: i64 = f
+        .store
+        .conn
+        .lock()
+        .unwrap()
+        .pragma_query_value(None, "synchronous", |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        mode, 2,
+        "reprojection must also publish its completed fence durably"
+    );
+    f.assert_rebuilt();
 }
 
 #[test]

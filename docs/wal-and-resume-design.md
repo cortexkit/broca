@@ -107,7 +107,12 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   pending fence lists required cut ids and advances the context epoch, so a
   projection captured before the cut cannot restore the old state. If that
   transaction fails, recovery refuses the writable open without shortening the
-  log. Already published usage export facts remain immutable during recovery;
+  log. Both invalidation and completed reprojection enforce and verify SQLite
+  `synchronous=FULL` on the actual materialized-store connection before BEGIN.
+  Lease-free run lookup and diagnostics read the recovery fence in the same
+  transaction as their summaries and refuse pending, invalidated state. After
+  rebuilding, unfinished cut runs are Interrupted; explicit surviving terminal
+  states remain unchanged. Already published usage export facts remain immutable during recovery;
   rebuilding the transcript must not revise the billing history.
 
   After the cut and synced recovery marker, recovery rebuilds the session from

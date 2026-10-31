@@ -2801,8 +2801,9 @@ impl RunIndex for SqliteStore {
     }
 
     fn lookup_run(&self, run_id: &str) -> Result<Option<RunIndexRow>, String> {
-        let conn = self.conn.lock().unwrap();
-        let row = conn
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let row = tx
             .query_row(
                 "SELECT session, submission_id, request_identity_digest, state, usage_json, \
                            final_step_finish_reason_json, retries_used, title, withdrawals_owed \
@@ -2839,6 +2840,14 @@ impl RunIndex for SqliteStore {
             )) => {
                 let session: BindIdentity =
                     serde_json::from_str(&session_json).map_err(|e| e.to_string())?;
+                if wal_recovery::read_fence(&tx, &Self::key(&session))
+                    .map_err(|error| error.to_string())?
+                    .is_some_and(|fence| fence.pending)
+                {
+                    return Err(format!(
+                        "WAL recovery is pending for run {run_id}; run summary is unavailable"
+                    ));
+                }
                 let state = RunIndexState::parse(&state_str)
                     .ok_or_else(|| format!("unknown run-index state '{state_str}'"))?;
                 let usage = usage_json

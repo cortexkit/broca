@@ -91,6 +91,7 @@ impl SqliteStore {
     pub fn diagnostic_evidence(&self, since: i64, now: i64) -> Result<Evidence, String> {
         let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
+        super::wal_recovery::refuse_pending_diagnostics(&tx)?;
         let queries = queries();
         let read = |query: &str,
                     parameters: &[&dyn rusqlite::ToSql]|
