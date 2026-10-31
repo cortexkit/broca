@@ -14,11 +14,13 @@ pub enum SessionAddressError {
     Unavailable(InventoryUnavailable),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InventoryUnavailable {
     IncompleteInventory,
     GapMarker,
     StoreError(String),
+    WaitExpired,
+    MigrationFailed(String),
 }
 
 impl InventoryUnavailable {
@@ -27,6 +29,8 @@ impl InventoryUnavailable {
             Self::IncompleteInventory => "incomplete_inventory",
             Self::GapMarker => "gap_marker",
             Self::StoreError(_) => "store_error",
+            Self::WaitExpired => "wait_expired",
+            Self::MigrationFailed(_) => "migration_failed",
         }
     }
 }
@@ -50,6 +54,8 @@ impl std::fmt::Display for InventoryUnavailable {
             Self::IncompleteInventory => f.write_str("incomplete inventory"),
             Self::GapMarker => f.write_str("projection gap marker is present"),
             Self::StoreError(message) => write!(f, "store error: {message}"),
+            Self::WaitExpired => f.write_str("inventory readiness wait expired"),
+            Self::MigrationFailed(message) => write!(f, "inventory migration failed: {message}"),
         }
     }
 }
@@ -136,14 +142,19 @@ fn read_existing(
     root: Option<&Path>,
     bind: &BindIdentity,
 ) -> Result<Option<BindIdentity>, SessionAddressError> {
-    require_no_gap(root)?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Deferred)
         .map_err(SessionAddressError::store_error)?;
-    require_complete(&tx, root)?;
     let found = known_identity(&tx, bind)?;
+    // A recorded pair is positive evidence even while discovery is being
+    // repaired. Only absence needs a complete inventory before it can be used.
+    if found.is_none() {
+        require_complete(&tx, root)?;
+    }
     tx.commit().map_err(SessionAddressError::store_error)?;
-    require_no_gap(root)?;
+    if found.is_none() {
+        require_no_gap(root)?;
+    }
     Ok(found)
 }
 
@@ -167,11 +178,14 @@ impl SqliteStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(SessionAddressError::store_error)?;
-        require_complete(&tx, root.as_deref())?;
         let existing = known_identity(&tx, bind)?;
         let resolved = match existing {
-            Some(identity) => identity,
+            Some(identity) => {
+                tx.commit().map_err(SessionAddressError::store_error)?;
+                return Ok(identity);
+            }
             None => {
+                require_complete(&tx, root.as_deref())?;
                 let identity = BindIdentity::new(
                     stamped_workdir.unwrap_or_else(|| new_unscoped_storage_root(bind)),
                     &bind.harness,

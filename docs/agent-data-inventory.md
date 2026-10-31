@@ -11,8 +11,9 @@ filename, payload or byte offset.
 ## Completeness and admission
 
 Session binds also use this inventory to retain an existing pair's original root.
-An existing `(harness, session)` pair is resolved in a read transaction without
-acquiring SQLite's write lock. Only an absent pair takes an immediate transaction,
+An existing `(harness, session)` pair is positive evidence and resolves in a read
+transaction without acquiring SQLite's write lock or waiting for discovery repair.
+Two recorded roots still refuse as ambiguous, including during repair. Only an absent pair takes an immediate transaction,
 rechecks completeness and the pair's roots, and reserves a candidate if still absent.
 Competing first binds share that writer transaction, so they cannot select different
 roots. A refused bind or an
@@ -47,7 +48,7 @@ unknown, using the existing retryable response. Known candidates can still be
 verified independently. SQLite failures likewise never prove absence. Empty ref
 sets bypass discovery.
 
-## One-time migration, not a boot inventory
+## Migration and on-demand repair
 
 Startup creates the additive schema, then schedules migration off the serve path
 on a separate SQLite connection. It does not hold the serving connection's mutex
@@ -57,14 +58,26 @@ completion marker is recorded only after the source scan finishes. Invalid legac
 identities leave missing session refs
 unknown rather than certifying that no local copy exists.
 
-Migration is scheduled once by `AgentDataService::reconcile_boot`, not by refused
-binds or a periodic repair loop. An in-flight startup migration can restore completeness
-without another restart. Once that attempt has ended, a new gap marker, an older
-writer's session identity not yet added to the inventory, or an uncovered WAL address
-is not automatically repaired in the running process;
-restart schedules the next automatic attempt. Fix unreadable or malformed source data
-before expecting repair to complete. A temporary store error can clear on a later bind
-without migration when the store recovers and its completeness evidence remains valid.
+Boot schedules migration without blocking serve startup. A bind for an unrecorded
+pair that finds incomplete inventory joins that migration, or starts one if none is
+running. Concurrent binds share one repair and its readiness signal, rather than
+polling SQLite. Known-session binds, reads and resumes keep serving. Each new bind
+waits at most 60 seconds, then rechecks resolution; a timeout does not cancel the
+shared repair. A later bind may start another attempt after a failed repair.
+
+The refusal remains `session_address_unavailable`, with `detail.class: "transient"`
+and `detail.reason` identifying `wait_expired`, `migration_failed`, or a remaining
+`gap_marker`. The code is not in subc-protocol 0.33.4's retryable route-open set;
+callers must not assume the transient class alone enables transport retries.
+`health.check.session_address_refusals.repairs` counts started, completed and failed
+attempts, and `diagnostics.findings` retains timestamped `session_inventory_repairs`
+evidence. These counts describe repair attempts, not sessions or census rows.
+
+Mid-run gap markers and legacy pending rows can therefore recover on the next
+new-session bind without a restart. There is no periodic repair loop. Fix unreadable
+or malformed source data before expecting repair to complete. A temporary store
+error can clear on a later bind without migration when the store recovers and its
+completeness evidence remains valid.
 Do not remove a gap marker merely to silence refusals: repair verifies coverage and
 briefly takes a per-root filesystem lease to detect concurrent WAL appends or
 installations whose identities could not be recorded in SQLite before durably clearing
@@ -111,7 +124,7 @@ that counter before scanning, reacquires the lease at completion, and clears the
 marker only if the counter increased by exactly one for its own reacquisition.
 Any intervening writer or repair leaves the marker in place. No lock is held for
 the census duration and no session identities are cached in memory.
-A failed or overlapped repair leaves the marker for the next boot, not a false
+A failed or overlapped repair leaves the marker for the next repair attempt, not a false
 absence or a failed run.
 Downgrade-then-reupgrade is outside the projection-completeness guarantee: an older
 binary can add WAL-only sessions that the already-completed migration will not discover.

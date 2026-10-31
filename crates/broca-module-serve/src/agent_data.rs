@@ -75,8 +75,7 @@ pub struct AgentDataService {
     cuts: CutStore,
     artifacts: FileCutArtifacts,
     wal: Arc<FileWalStore>,
-    index: Arc<broca_store::SqliteStore>,
-    projection_started: std::sync::atomic::AtomicBool,
+    inventory_readiness: Arc<dyn broca_module::registry::SessionInventoryReadiness>,
     op_counts: [AtomicU64; 10],
 }
 impl AgentDataService {
@@ -94,6 +93,9 @@ impl AgentDataService {
             index: index.clone(),
             door,
         });
+        let inventory_readiness = registry.set_session_inventory_readiness(Arc::new(
+            crate::session_inventory::SessionInventory::new(root.clone(), index.clone()),
+        ));
         Self {
             cuts: CutStore::new(&root),
             artifacts: FileCutArtifacts::new(
@@ -103,9 +105,8 @@ impl AgentDataService {
                 index.clone(),
                 driver,
             ),
-            index,
             wal,
-            projection_started: std::sync::atomic::AtomicBool::new(false),
+            inventory_readiness,
             op_counts: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
@@ -125,28 +126,7 @@ impl AgentDataService {
                 error.message = format!("cuts.reconcile_boot: {}", error.message);
                 error
             })?;
-        if !self
-            .index
-            .session_refs(std::iter::empty())
-            .map_err(unavailable)?
-            .complete
-            && !self.projection_started.swap(true, Ordering::SeqCst)
-        {
-            let wal = self.wal.clone();
-            let db = wal
-                .root()
-                .parent()
-                .unwrap_or(wal.root())
-                .join("run-index.db");
-            tokio::task::spawn_blocking(move || {
-                if let Err(error) = broca_store::session_refs::migrate(
-                    &db,
-                    &broca_core::ReadOnlyWalReader::new(wal.root().parent().unwrap_or(wal.root())),
-                ) {
-                    tracing::warn!(%error, "session-ref migration incomplete; missing refs remain unknown");
-                }
-            });
-        }
+        self.inventory_readiness.start();
         Ok(())
     }
 }
