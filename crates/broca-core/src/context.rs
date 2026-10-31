@@ -2304,6 +2304,7 @@ pub(crate) fn merge_prefix_and_tail(
     tail_episodes.render = tail_state.render_episodes.clone().unwrap_or_default();
     let state = crate::ReplayState {
         recovered_calls: Vec::new(),
+        recovery_tool_batches: tail_state.recovery_tool_batches,
         extent: tail_state.extent,
         tags_await_setup: tail_state.tags_await_setup,
         input_budget: tail_state.input_budget,

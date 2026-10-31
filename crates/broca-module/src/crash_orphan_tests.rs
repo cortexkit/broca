@@ -1373,27 +1373,65 @@ async fn keyed_resend_reconciles_stale_index_to_finished() {
 async fn crash_orphan_seal_closes_later_batch_calls_while_an_older_batch_remains_open() {
     let f = Fixture::build_with_config(|index| index, None, None, broca_wal::WalConfig::OVERHAUL);
     let later_id = ToolCallId("later-removed-call".into());
-    let mut kept = serde_json::to_value(broca_core::outcome_unknown_result(&ToolCallId(CALL.into()))).unwrap();
-    kept["output"]["text"] = serde_json::json!("kept result"); kept["is_error"] = serde_json::json!(false);
-    let kept: broca_protocol::ToolResult = serde_json::from_value(kept).unwrap();
+    let kept = broca_protocol::ToolResult {
+        tool_call_id: ToolCallId(CALL.into()),
+        output: broca_protocol::ToolOutput::Text {
+            text: "kept result".into(),
+        },
+        is_error: false,
+    };
     let mut later_step = model_step_with_tool_call();
-    let WalRecord::ModelStepFinished { step_id, assistant_message, .. } = &mut later_step else { unreachable!() };
+    let WalRecord::ModelStepFinished {
+        step_id,
+        assistant_message,
+        ..
+    } = &mut later_step
+    else {
+        unreachable!()
+    };
     *step_id = broca_protocol::StepId(2);
     let assistant = Arc::make_mut(assistant_message);
     assistant.message_id = MessageId("later-removed-message".into());
-    let ContentBlock::ToolCall(call) = &mut assistant.content[0] else { unreachable!() };
+    let ContentBlock::ToolCall(call) = &mut assistant.content[0] else {
+        unreachable!()
+    };
     call.tool_call_id = later_id.clone();
     let mut later_intent = dispatch_intent();
-    let WalRecord::ToolDispatchIntent { batch_id, tool_call_id, .. } = &mut later_intent else { unreachable!() };
-    *batch_id = BatchId("later-batch".into()); *tool_call_id = later_id.clone();
+    let WalRecord::ToolDispatchIntent {
+        batch_id,
+        tool_call_id,
+        ..
+    } = &mut later_intent
+    else {
+        unreachable!()
+    };
+    *batch_id = BatchId("later-batch".into());
+    *tool_call_id = later_id.clone();
     f.seed(vec![
-        run_started(&f.key), model_step_with_tool_call(), batch_started(), dispatch_intent(),
-        WalRecord::ToolResult { finished_at_ms: None, batch_id: BatchId(BATCH.into()), result: Arc::new(kept.clone()),
-            outcome: broca_wal::DispatchOutcome::Completed, hooks: None, reason: None,
-            withdraw_elicitation: None, provider_held: None, tags: None },
-        WalRecord::ToolBatchFinished { batch_id: BatchId(BATCH.into()) },
+        run_started(&f.key),
+        model_step_with_tool_call(),
+        batch_started(),
+        dispatch_intent(),
+        WalRecord::ToolResult {
+            finished_at_ms: None,
+            batch_id: BatchId(BATCH.into()),
+            result: Arc::new(kept.clone()),
+            outcome: broca_wal::DispatchOutcome::Completed,
+            hooks: None,
+            reason: None,
+            withdraw_elicitation: None,
+            provider_held: None,
+            tags: None,
+        },
+        WalRecord::ToolBatchFinished {
+            batch_id: BatchId(BATCH.into()),
+        },
         later_step,
-        WalRecord::ToolBatchStarted { batch_id: BatchId("later-batch".into()), step_id: broca_protocol::StepId(2), planned_calls: vec![later_id.clone()] },
+        WalRecord::ToolBatchStarted {
+            batch_id: BatchId("later-batch".into()),
+            step_id: broca_protocol::StepId(2),
+            planned_calls: vec![later_id.clone()],
+        },
         later_intent,
     ]);
     let path = f.wal_store().wal_path(&f.key);
@@ -1403,7 +1441,10 @@ async fn crash_orphan_seal_closes_later_batch_calls_while_an_older_batch_remains
         match broca_wal::framing::decode_next(&bytes[offset..]) {
             broca_wal::framing::DecodeStep::Lineage { consumed, .. } => offset += consumed,
             broca_wal::framing::DecodeStep::Record { framed, consumed } => {
-                if matches!(framed.record, WalRecord::ToolBatchFinished { .. }) { bytes[offset + 4] = 0; break; }
+                if matches!(framed.record, WalRecord::ToolBatchFinished { .. }) {
+                    bytes[offset + 4] = 0;
+                    break;
+                }
                 offset += consumed;
             }
             _ => panic!("source must decode before the removed batch finish"),
@@ -1414,11 +1455,23 @@ async fn crash_orphan_seal_closes_later_batch_calls_while_an_older_batch_remains
     assert_eq!(sweep.sealed, 1, "{sweep:?}");
     assert!(f.executor.executed.lock().unwrap().is_empty());
     let records = f.records();
-    let later: Vec<_> = records.iter().filter_map(|record| match record {
-        WalRecord::ToolResult { result, outcome, .. } if result.tool_call_id == later_id => Some((result.as_ref().clone(), *outcome)), _ => None,
-    }).collect();
-    assert_eq!(later, [(broca_core::outcome_unknown_result(&later_id), broca_wal::DispatchOutcome::Unknown)],
-        "every attributable later-batch call needs exactly one durable Unknown");
+    let later: Vec<_> = records
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::ToolResult {
+                result, outcome, ..
+            } if result.tool_call_id == later_id => Some((result.as_ref().clone(), *outcome)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        later,
+        [(
+            broca_core::outcome_unknown_result(&later_id),
+            broca_wal::DispatchOutcome::Unknown
+        )],
+        "every attributable later-batch call needs exactly one durable Unknown"
+    );
     assert_eq!(records.iter().filter(|record| matches!(record,
         WalRecord::ToolResult { result, outcome: broca_wal::DispatchOutcome::Completed, .. } if **result == kept)).count(), 1);
     f.stop().await;

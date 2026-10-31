@@ -104,6 +104,9 @@ impl std::error::Error for ReplayError {}
 pub struct ReplayState {
     /// Session-scoped recovery tombstones survive episode boundaries.
     pub recovered_calls: Vec<broca_wal::recovery::RecoveryRun>,
+    /// Calls outside the surviving model turn still need close-out-only batches. Their
+    /// removed model steps must not be reconstructed or added to the provider prompt.
+    pub recovery_tool_batches: Vec<OpenToolBatch>,
     /// Next absolute transcript ordinal, including messages not held in the prompt.
     pub extent: u64,
     /// The last episode renders tags under the computed rules on a compaction-managed session,
@@ -1521,6 +1524,7 @@ impl OpenBatch {
 #[derive(Default)]
 struct Episode {
     recovery_interrupted: bool,
+    tool_terminals: HashSet<(BatchId, ToolCallId)>,
     attributable: bool,
     seeded_last_ordinal: Option<u64>,
     /// The index among the replayed records of the step record holding the open tool turn.
@@ -2933,27 +2937,6 @@ fn replay_seeded_with_compaction<'a>(
                             ));
                             ep.open_batch_id =
                                 Some(BatchId(format!("{}-b{}", recovered.run_id.0, step.0)));
-                        } else if !recovered.calls.is_empty() {
-                            // The model step may itself have been removed. Keep a
-                            // close-out-only batch so recovered intents still get
-                            // durable Unknown results without inventing prompt content.
-                            let step = recovered
-                                .calls
-                                .iter()
-                                .find_map(|call| call.step_id)
-                                .unwrap_or(StepId(0));
-                            ep.open_batch = Some(OpenBatch::new(
-                                step,
-                                recovered
-                                    .calls
-                                    .iter()
-                                    .map(|call| call.tool_call_id.clone())
-                                    .collect(),
-                            ));
-                            ep.open_batch_id = Some(BatchId(format!(
-                                "{}-recovery-{}",
-                                recovered.run_id.0, recovery.cut_id
-                            )));
                         }
                     }
                     if let Some(batch) = &mut ep.open_batch {
@@ -2978,7 +2961,20 @@ fn replay_seeded_with_compaction<'a>(
                 {
                     return Err(overlapping_batch_error(run_id.as_ref()));
                 }
-                ep.open_batch = Some(OpenBatch::new(*step_id, planned_calls.clone()));
+                let mut batch = OpenBatch::new(*step_id, planned_calls.clone());
+                for recovered in &recovered_calls {
+                    if Some(&recovered.run_id) == run_id.as_ref() {
+                        for call in &recovered.calls {
+                            let recovered_batch = call.batch_id.clone().unwrap_or_else(|| {
+                                BatchId(format!("{}-recovery", recovered.run_id.0))
+                            });
+                            if &recovered_batch == batch_id {
+                                batch.recovered.insert(call.tool_call_id.clone());
+                            }
+                        }
+                    }
+                }
+                ep.open_batch = Some(batch);
                 ep.open_batch_id = Some(batch_id.clone());
             }
             WalRecord::ToolDispatchIntent { tool_call_id, .. } => {
@@ -3016,6 +3012,10 @@ fn replay_seeded_with_compaction<'a>(
                         if let Some(prepared) = &mut b.prepared[position] {
                             prepared.elicitation_id = elicitation_id.clone();
                             if let Some(result) = closing_result {
+                                if let Some(batch_id) = &ep.open_batch_id {
+                                    ep.tool_terminals
+                                        .insert((batch_id.clone(), call_id.clone()));
+                                }
                                 b.insert_terminal(
                                     call_id,
                                     Terminal::Result(
@@ -3048,11 +3048,14 @@ fn replay_seeded_with_compaction<'a>(
                 }
             }
             WalRecord::ToolNoDispatch {
+                batch_id,
                 tool_call_id,
                 reason,
                 tags,
                 ..
             } => {
+                ep.tool_terminals
+                    .insert((batch_id.clone(), tool_call_id.clone()));
                 if let Some(b) = &mut ep.open_batch {
                     b.insert_terminal(
                         tool_call_id,
@@ -3062,10 +3065,13 @@ fn replay_seeded_with_compaction<'a>(
             }
             WalRecord::ToolResult {
                 result,
+                batch_id,
                 outcome,
                 tags,
                 ..
             } => {
+                ep.tool_terminals
+                    .insert((batch_id.clone(), result.tool_call_id.clone()));
                 if let Some(b) = &mut ep.open_batch {
                     b.insert_terminal(
                         &result.tool_call_id,
@@ -3620,6 +3626,48 @@ fn replay_seeded_with_compaction<'a>(
         }),
         _ => None,
     };
+    let mut recovery_tool_batches: Vec<OpenToolBatch> = Vec::new();
+    if ep.finished.is_none() {
+        for recovered in &recovered_calls {
+            if Some(&recovered.run_id) != run_id.as_ref() {
+                continue;
+            }
+            for call in &recovered.calls {
+                if open_tool_batch
+                    .as_ref()
+                    .is_some_and(|batch| batch.calls.iter().any(|(id, _)| id == &call.tool_call_id))
+                {
+                    continue;
+                }
+                let key = (
+                    call.batch_id
+                        .clone()
+                        .unwrap_or_else(|| BatchId(format!("{}-recovery", recovered.run_id.0))),
+                    call.tool_call_id.clone(),
+                );
+                if ep.tool_terminals.contains(&key) {
+                    continue;
+                }
+                let batch = match recovery_tool_batches
+                    .iter_mut()
+                    .find(|b| b.batch_id == key.0)
+                {
+                    Some(batch) => batch,
+                    None => {
+                        recovery_tool_batches.push(OpenToolBatch {
+                            batch_id: key.0,
+                            step_id: call.step_id.unwrap_or(StepId(0)),
+                            calls: Vec::new(),
+                        });
+                        recovery_tool_batches.last_mut().expect("just pushed")
+                    }
+                };
+                if !batch.calls.iter().any(|(id, _)| id == &key.1) {
+                    batch.calls.push((key.1, OpenCallState::Dispatched));
+                }
+            }
+        }
+    }
     let pending_steers = ep.pending_steers.clone();
     // An intent or a Prepared frame makes the turn durable work: show it while recovery
     // retains its calls, even when no call was dispatched before the approval wait.
@@ -3711,6 +3759,7 @@ fn replay_seeded_with_compaction<'a>(
             .is_some_and(|config| config.render_tags && config.computed_tags.is_some());
     Ok(ReplayState {
         recovered_calls,
+        recovery_tool_batches,
         extent: placement.next_ordinal(),
         tags_await_setup,
         input_budget,

@@ -178,7 +178,10 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   `DispatchOutcome::Unknown`, never a never-executed result, and the existing
   `ResumeStarted`/terminal projection and `run.status` report the indeterminate
   calls. If a model step was removed too, a close-out-only recovery batch records
-  Unknown outcomes without inventing assistant prompt content. Recovery
+  Unknown outcomes without inventing assistant prompt content. Calls outside a
+  surviving batch's plan close in separate, assistant-free batches after that
+  batch commits, preserving their evidenced batch identities. Durable terminals
+  take precedence over repeated recovery attribution on every close-out retry. Recovery
   tombstones match exact Prepared/intent `call_key` values or an owning run and
   call ID, never a bare model-facing ID across the session. A later run may use
   its own Gemini-style `call_0`. After a repair, physical keys include the latest

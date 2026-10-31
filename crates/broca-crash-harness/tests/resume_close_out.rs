@@ -104,11 +104,13 @@ async fn a_fsynced_intent_beyond_a_stale_head_proof_survives_open_and_resume_nev
 
     // Keep the reference lineage while replacing its legacy records with v4.
     std::fs::write(&path, &kill.durable.bytes[..kill.durable.end_of_records(0)]).unwrap();
-    let mut wal = FileWal::open(&path)
-        .unwrap()
-        .with_feature_floor(kill.state_root.join(broca_wal::FEATURE_FLOOR_FILENAME))
-        .with_wal_config(WalConfig::OVERHAUL)
-        .unwrap();
+    let mut wal = FileWal::open_with_recovery(
+        &path,
+        WalConfig::OVERHAUL,
+        kill.state_root.join(broca_wal::FEATURE_FLOOR_FILENAME),
+    )
+    .unwrap()
+    .with_feature_floor(kill.state_root.join(broca_wal::FEATURE_FLOOR_FILENAME));
     let (intent, before_intent) = prefix.split_last().unwrap();
     assert!(
         matches!(intent, WalRecord::ToolDispatchIntent { tool_call_id, .. } if tool_call_id == &t("t1"))
@@ -137,7 +139,12 @@ async fn a_fsynced_intent_beyond_a_stale_head_proof_survives_open_and_resume_nev
     damaged[pending_end - 1] ^= 1;
     std::fs::write(&path, damaged).unwrap();
 
-    let reopened = FileWal::open(&path).unwrap();
+    let reopened = FileWal::open_with_recovery(
+        &path,
+        WalConfig::OVERHAUL,
+        kill.state_root.join(broca_wal::FEATURE_FLOOR_FILENAME),
+    )
+    .unwrap();
     assert_eq!(reopened.last_seq(), intent_seq + 1);
     assert!(std::fs::read(&path).unwrap().starts_with(&through_intent));
     assert_eq!(std::fs::read(sidecar_path(&path)).unwrap(), sidecar);

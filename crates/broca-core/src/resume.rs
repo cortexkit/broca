@@ -1409,6 +1409,41 @@ pub(crate) fn prepared_resume_refusal() -> crate::run::RunError {
 /// result for one call.
 pub fn close_out_open_batch(
     prior: &ReplayState,
+    deferred_close: impl FnMut(&ToolCallId) -> DeferredCloseKind,
+) -> Vec<WalRecord> {
+    let mut records = close_out_surviving_batch(prior, deferred_close);
+    if matches!(prior.resolution, ReplayResolution::Interrupted { .. }) {
+        // These calls have no surviving model step. Close their batches only after
+        // the surviving batch, without inventing unpaired prompt content.
+        for batch in &prior.recovery_tool_batches {
+            records.push(WalRecord::ToolBatchStarted {
+                batch_id: batch.batch_id.clone(),
+                step_id: batch.step_id,
+                planned_calls: batch.calls.iter().map(|(id, _)| id.clone()).collect(),
+            });
+            for (id, _) in &batch.calls {
+                records.push(WalRecord::ToolResult {
+                    finished_at_ms: None,
+                    tags: None,
+                    hooks: None,
+                    batch_id: batch.batch_id.clone(),
+                    result: Arc::new(outcome_unknown_result(id)),
+                    outcome: DispatchOutcome::Unknown,
+                    reason: None,
+                    withdraw_elicitation: None,
+                    provider_held: None,
+                });
+            }
+            records.push(WalRecord::ToolBatchFinished {
+                batch_id: batch.batch_id.clone(),
+            });
+        }
+    }
+    records
+}
+
+fn close_out_surviving_batch(
+    prior: &ReplayState,
     mut deferred_close: impl FnMut(&ToolCallId) -> DeferredCloseKind,
 ) -> Vec<WalRecord> {
     let Some(batch) = &prior.open_tool_batch else {
@@ -1497,6 +1532,7 @@ pub fn close_out_open_batch_for(
 ) -> Vec<WalRecord> {
     let mut closing = crate::replay::replay(&[]).expect("empty WAL has a valid replay");
     closing.open_tool_batch = prior.open_tool_batch.clone();
+    closing.recovery_tool_batches = prior.recovery_tool_batches.clone();
     closing.resolution = ReplayResolution::Interrupted {
         indeterminate: Vec::new(),
     };
@@ -1590,6 +1626,92 @@ mod tests {
     };
     use broca_protocol::{BatchId, PauseReason, RunFinishReason, RunId};
     use broca_wal::DeferredDecision;
+
+    #[test]
+    fn recovery_close_out_keeps_removed_batch_results_out_of_the_surviving_prompt() {
+        use broca_wal::recovery::{CutReason, RecoveryCall, RecoveryCut, RecoveryRun};
+
+        let mut records = batch(&["kept"]);
+        records.push(terminal("kept", None));
+        let recovered = |id: &str, batch: &str| RecoveryCall {
+            tool_call_id: ToolCallId(id.into()),
+            step_id: Some(broca_protocol::StepId(2)),
+            batch_id: Some(BatchId(batch.into())),
+            call_keys: Vec::new(),
+        };
+        records.push(WalRecord::RecoveryCut {
+            recovery: Box::new(RecoveryCut {
+                cut_id: "cut".into(),
+                sidecar_basename: "cut-bytes".into(),
+                cut_offset: 42,
+                removed_len: 17,
+                removed_sha256: "d".repeat(64),
+                reason: CutReason::PublishedRegionCorruption,
+                active_run: Some(RunId("r".into())),
+                runs: vec![RecoveryRun {
+                    run_id: RunId("r".into()),
+                    calls: vec![
+                        recovered("removed-a", "later-a"),
+                        recovered("removed-b", "later-b"),
+                    ],
+                }],
+                unattributed_tool_risk: false,
+                unowned_calls: Vec::new(),
+            }),
+        });
+        let marker = records.last().unwrap().clone();
+        records.push(marker.clone());
+        let close = close_out_open_batch(&replay(&records).unwrap(), |_| {
+            DeferredCloseKind::NotDispatched
+        });
+        for cut in 0..=close.len() {
+            let mut partial = records.clone();
+            partial.extend_from_slice(&close[..cut]);
+            partial.push(marker.clone());
+            let retry = close_out_open_batch(&replay(&partial).unwrap(), |_| {
+                DeferredCloseKind::NotDispatched
+            });
+            partial.extend(retry);
+            for (id, batch) in [("removed-a", "later-a"), ("removed-b", "later-b")] {
+                let results: Vec<_> = partial
+                    .iter()
+                    .filter_map(|record| match record {
+                        WalRecord::ToolResult {
+                            result,
+                            batch_id,
+                            outcome,
+                            ..
+                        } if result.tool_call_id.0 == id => Some((batch_id, result, outcome)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    results.len(),
+                    1,
+                    "one Unknown per removed call after close-out cut {cut}"
+                );
+                assert_eq!(results[0].0, &BatchId(batch.into()));
+                assert_eq!(
+                    results[0].1.as_ref(),
+                    &outcome_unknown_result(&ToolCallId(id.into()))
+                );
+                assert_eq!(results[0].2, &DispatchOutcome::Unknown);
+            }
+            let closed = replay(&partial).unwrap();
+            assert!(closed.open_tool_batch.is_none());
+            assert!(close_out_open_batch(&closed, |_| DeferredCloseKind::NotDispatched).is_empty());
+            assert_eq!(
+                closed
+                    .prompt
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .filter(|block| matches!(block, broca_protocol::ContentBlock::ToolResult(_)))
+                    .count(),
+                1,
+                "removed model steps must not add unpaired results to the prompt"
+            );
+        }
+    }
 
     #[test]
     fn seal_closes_prepared_calls_whatever_the_resolution() {
