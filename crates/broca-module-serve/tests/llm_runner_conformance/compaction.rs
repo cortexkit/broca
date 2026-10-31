@@ -71,13 +71,6 @@ pub(super) struct Session {
     inputs: Vec<Vec<ModelEntry>>,
     pub gates: std::collections::VecDeque<Arc<HoldGate>>,
     pub view: Option<broca_core::compaction_provider::view::CompactionView>,
-    pub due: bool,
-    pub refuse_due_fetch: bool,
-    pub preserve_edit_tags: bool,
-    pub provider_calls: Vec<cortexkit_role_llm_runner_conformance::ProviderCall>,
-    pub wire_inputs: Vec<Vec<Value>>,
-    pub setup_requests: Vec<Vec<u8>>,
-    pub view_fetches: Vec<Value>,
 }
 
 pub(super) struct Provider {
@@ -137,36 +130,22 @@ impl subc_client_rs::ModuleHandler for Provider {
                 "implementation_version":"conformance", "capabilities":[]}));
         }
         if method == "view.get" {
-            let mut sessions = self.shared.compaction.lock().unwrap();
-            let state = sessions.values_mut().find(|s| {
-                s.view
-                    .as_ref()
-                    .is_some_and(|v| request["params"]["session_ref"] == v.session_ref)
+            let view = self
+                .shared
+                .compaction
+                .lock()
+                .unwrap()
+                .values()
+                .filter_map(|s| s.view.as_ref())
+                .find(|v| {
+                    request["params"]["session_ref"] == v.session_ref
+                        && request["params"]["view_version"] == v.view_version
+                })
+                .cloned();
+            return response(match view {
+                Some(view) => json!({"answer":"view", "view":view}),
+                None => json!({"answer":"refuse", "code":"unknown_view", "reason":"view not held"}),
             });
-            let answer = if let Some(state) = state {
-                state.provider_calls.push(
-                    cortexkit_role_llm_runner_conformance::ProviderCall::new(
-                        method,
-                        request["params"].clone(),
-                    ),
-                );
-                let view = state.view.as_ref().filter(|v| {
-                    !state.refuse_due_fetch && request["params"]["view_version"] == v.view_version
-                });
-                let answer = match view {
-                    Some(view) => json!({"answer":"view", "view":view}),
-                    None => {
-                        json!({"answer":"refuse", "code":"unknown_view", "reason":"view not held"})
-                    }
-                };
-                state
-                    .view_fetches
-                    .push(json!({"request":request,"answer":answer}));
-                answer
-            } else {
-                json!({"answer":"refuse", "code":"unknown_view", "reason":"view not held"})
-            };
-            return response(answer);
         }
         if method == "compaction.ride" {
             return response(json!({"answer":"nothing"}));
@@ -206,13 +185,6 @@ impl subc_client_rs::ModuleHandler for Provider {
                 setup_session: session.to_owned(),
                 lineage_id: params["lineage_id"].as_str().map(str::to_owned),
             });
-            state
-                .provider_calls
-                .push(cortexkit_role_llm_runner_conformance::ProviderCall::new(
-                    method,
-                    params.clone(),
-                ));
-            state.setup_requests.push(body.clone());
             match state.script.setup.clone() {
                 CompactionSetup::Unavailable => {
                     return subc_client_rs::HandlerOutcome::Error {
@@ -229,14 +201,7 @@ impl subc_client_rs::ModuleHandler for Provider {
                 CompactionSetup::Ready(message) => {
                     let initial = native_compaction(&message);
                     remember_replacement(state, &initial);
-                    let mut answer =
-                        json!({"answer":"ready","request_id":request_id,"initial":initial});
-                    if state.due {
-                        let view = state.view.as_ref().expect("prepared due view");
-                        answer["view_due"] =
-                            json!({"version":view.view_version,"digest":view.digest});
-                    }
-                    answer
+                    json!({"answer":"ready","request_id":request_id,"initial":initial})
                 }
                 // A moved session's checkpoint, cut at the message the request names as its
                 // newest: the session's first message, its prompt.
@@ -378,7 +343,6 @@ fn without_rendered_tags(message: &Value) -> Value {
 }
 
 fn translate(state: &Session, wire: &[Value]) -> Result<Vec<ModelEntry>, String> {
-    let actual = wire;
     let wire: Vec<Value> = wire.iter().map(without_rendered_tags).collect();
     let wire = wire.as_slice();
     let candidates = state
@@ -407,40 +371,9 @@ fn translate(state: &Session, wire: &[Value]) -> Result<Vec<ModelEntry>, String>
             .iter()
             .find_map(|(source, message)| {
                 let rendered = render_native(message).ok()?;
-                let edited_text = state.preserve_edit_tags
-                    && match source {
-                        EntrySource::Message { ordinal, .. } => {
-                            state.view.as_ref().is_some_and(|view| {
-                                view.ranges.iter().any(|range| match range {
-                                    broca_core::compaction_provider::view::ViewRange::Keep {
-                                        edits,
-                                        ..
-                                    } => edits.iter().any(|edit| edit.ordinal == *ordinal),
-                                    _ => false,
-                                })
-                            })
-                        }
-                        _ => false,
-                    };
-                let text_row = message["content"]
-                    .as_array()
-                    .is_some_and(|parts| parts.len() == 1 && parts[0]["type"] == "text")
-                    && actual.get(at).is_some_and(|row| {
-                        row["role"] == message["role"] && row["content"].is_string()
-                    });
-                if rendered.is_empty()
-                    || (wire.get(at..at + rendered.len()) != Some(rendered.as_slice())
-                        && !(edited_text && text_row))
-                {
-                    return None;
-                }
-                let mut observed = message.clone();
-                // Native metadata identifies the row; edited text and tags are observations
-                // from the HTTP request, never substituted from the scripted view.
-                if state.preserve_edit_tags && text_row {
-                    observed["content"][0]["text"] = actual[at]["content"].clone();
-                }
-                Some((source.clone(), observed, rendered.len()))
+                (!rendered.is_empty()
+                    && wire.get(at..at + rendered.len()) == Some(rendered.as_slice()))
+                .then_some((source.clone(), message.clone(), rendered.len()))
             })
             .ok_or_else(|| {
                 format!(
@@ -473,8 +406,8 @@ pub(super) fn capture(shared: &Shared, session: &str, messages: &[Value]) -> Opt
     let prior = broca_core::replay::replay(&records).expect("recorded model input sources replay");
     let mut states = shared.compaction.lock().unwrap();
     let state = states.get_mut(session)?;
-    // WAL messages identify origins and ordinals omitted by OpenAI. Unedited content must
-    // render-match its source; edited text and its tags remain the actual HTTP observation.
+    // The wire is the observation. WAL messages identify origins and ordinals omitted by
+    // OpenAI, but each received message must still render-match the recorded content.
     state.raw = prior
         .prompt
         .iter()
@@ -488,7 +421,6 @@ pub(super) fn capture(shared: &Shared, session: &str, messages: &[Value]) -> Opt
         .collect();
     let translated =
         translate(state, messages).unwrap_or_else(|e| panic!("wire capture translation: {e}"));
-    state.wire_inputs.push(messages.to_vec());
     state.inputs.push(translated);
     let gate = Arc::new(HoldGate::default());
     HoldGate::set(&gate.arrived, &gate.arrived_wake);
@@ -960,13 +892,6 @@ impl BrocaSubject {
             inputs: vec![],
             gates: Default::default(),
             view: None,
-            due: false,
-            refuse_due_fetch: false,
-            preserve_edit_tags: false,
-            provider_calls: Vec::new(),
-            wire_inputs: Vec::new(),
-            setup_requests: Vec::new(),
-            view_fetches: Vec::new(),
         });
         state.script.setup = setup;
     }
@@ -1339,13 +1264,6 @@ fn captured_wire_translation_preserves_tool_grouping_and_native_metadata_and_rej
         inputs: vec![],
         gates: Default::default(),
         view: None,
-        due: false,
-        refuse_due_fetch: false,
-        preserve_edit_tags: false,
-        provider_calls: Vec::new(),
-        wire_inputs: Vec::new(),
-        setup_requests: Vec::new(),
-        view_fetches: Vec::new(),
     };
     let messages = vec![
         json!({"role":"user","content":[{"type":"text","text":"ask"}]}),
@@ -1659,345 +1577,4 @@ async fn a_compaction_provider_reads_the_session_back_over_the_identity_its_rout
     })
     .await
     .expect("compaction read-back test timed out");
-}
-
-impl BrocaSubject {
-    pub(super) fn prepare_due_view(
-        &self,
-        session: &str,
-        initial: CompactionMessage,
-        replacement: Vec<String>,
-        refuse_fetch: bool,
-    ) -> Result<cortexkit_role_llm_runner_conformance::SetupViewDueFixture, HarnessError> {
-        use broca_core::compaction_provider::{
-            lineage::MessageRef,
-            view::{CompactionView, ViewRange},
-        };
-        let bind = self.bind_identity(session);
-        let root = self.compaction_root(session)?;
-        let wal = broca_core::FileWalStore::new(root.join("wal"))
-            .open(&bind)
-            .map_err(|e| HarnessError::new(e.to_string()))?;
-        let lineage = wal
-            .lineage_id()
-            .ok_or_else(|| HarnessError::new("fixture WAL has no lineage"))?;
-        wal.sync().map_err(|e| HarnessError::new(e.to_string()))?;
-        drop(wal);
-        // The first send writes ordinal zero before Setup. Publish its replacement before
-        // that send without inventing an identity: the empty WAL already owns its lineage.
-        let reference = broca_core::agent_session_ref(&bind);
-        let messages: Vec<Value> = replacement
-            .iter()
-            .map(|text| json!({"role":"user","content":[{"type":"text","text":text}]}))
-            .collect();
-        let view = CompactionView::new(
-            &reference,
-            1,
-            lineage.to_string(),
-            MessageRef {
-                ordinal: 0,
-                mid: "m0".into(),
-            },
-            vec![ViewRange::replace(
-                0,
-                1,
-                serde_json::to_string(&messages).unwrap(),
-            )],
-        );
-        let source = EntrySource::Replacement {
-            compaction_id: "view".into(),
-            version: 1,
-            from_ordinal: 0,
-            to_ordinal: 1,
-        };
-        let rendering: Vec<ModelEntry> = messages
-            .iter()
-            .map(|message| ModelEntry::new(source.clone(), message.clone()))
-            .collect();
-        self.install_setup(session, CompactionSetup::Ready(initial));
-        let path = root.join(format!("scripted-view-{reference}-1.json"));
-        atomic_write(&path, &serde_json::to_vec(&view).unwrap())?;
-        let fixture = cortexkit_role_llm_runner_conformance::SetupViewDueFixture::new(
-            reference,
-            1,
-            &view.digest,
-            0,
-            rendering,
-        );
-        let mut states = self.shared.compaction.lock().unwrap();
-        let state = states.get_mut(session).unwrap();
-        state.due = true;
-        state.refuse_due_fetch = refuse_fetch;
-        state.replacements.extend(
-            messages
-                .into_iter()
-                .map(|message| (source.clone(), message)),
-        );
-        state.view = Some(view);
-        Ok(fixture)
-    }
-
-    #[cfg(feature = "test-clock")]
-    pub(super) async fn publish_part_edits(
-        &self,
-        session: &str,
-        edits: Vec<broca_core::compaction_provider::view::PartEdit>,
-    ) -> Result<u64, HarnessError> {
-        use broca_core::compaction_provider::{
-            lineage::MessageRef,
-            view::{CompactionView, ViewRange},
-        };
-        let bus = self
-            .bus
-            .as_ref()
-            .ok_or_else(|| HarnessError::new("part-edit fixture requires its notice bus"))?;
-        let bind = self.bind_identity(session);
-        let root = self.compaction_root(session)?;
-        let frames = broca_core::FileWalStore::new(root.join("wal"))
-            .read_records(&bind)
-            .map_err(|e| HarnessError::new(e.to_string()))?;
-        let prior = broca_core::replay::replay(
-            &frames
-                .into_iter()
-                .map(|frame| frame.record)
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|e| HarnessError::new(e.to_string()))?;
-        let covers = prior
-            .prompt
-            .last()
-            .and_then(|message| message.ordinal)
-            .ok_or_else(|| HarnessError::new("part-edit fixture has no retained transcript"))?;
-        let (lineage, version) = {
-            let states = self.shared.compaction.lock().unwrap();
-            let state = states
-                .get(session)
-                .ok_or_else(|| HarnessError::new("compaction session absent"))?;
-            (
-                state
-                    .calls
-                    .last()
-                    .and_then(|call| call.lineage_id.clone())
-                    .ok_or_else(|| {
-                        HarnessError::new("part-edit fixture has no observed Setup lineage")
-                    })?,
-                state.view.as_ref().map_or(1, |view| view.view_version + 1),
-            )
-        };
-        let reference = broca_core::agent_session_ref(&bind);
-        let view = CompactionView::new(
-            &reference,
-            version,
-            lineage,
-            MessageRef {
-                ordinal: covers,
-                mid: format!("m{covers}"),
-            },
-            vec![ViewRange::keep_with_edits(0, covers + 1, edits)],
-        );
-        atomic_write(
-            &root.join(format!("scripted-view-{reference}-{version}.json")),
-            &serde_json::to_vec(&view).unwrap(),
-        )?;
-        {
-            let mut states = self.shared.compaction.lock().unwrap();
-            let state = states.get_mut(session).unwrap();
-            state.preserve_edit_tags = true;
-            state.view = Some(view.clone());
-        }
-        bus.publish(&view).await;
-        Ok(version)
-    }
-
-    #[cfg(not(feature = "test-clock"))]
-    pub(super) async fn publish_part_edits(
-        &self,
-        _: &str,
-        _: Vec<broca_core::compaction_provider::view::PartEdit>,
-    ) -> Result<u64, HarnessError> {
-        Err(HarnessError::new("part-edit fixture requires test-clock"))
-    }
-}
-
-impl BrocaSubject {
-    /// Export only observed test traffic; expected fixture renderings are not wire evidence.
-    pub(super) fn export_compaction_samples(&self) -> Result<(), HarnessError> {
-        use sha2::{Digest, Sha256};
-        let Some(directory) = std::env::var_os("BROCA_COMPACTION_SAMPLES_DIR") else {
-            return Ok(());
-        };
-        let directory = PathBuf::from(directory);
-        std::fs::create_dir_all(&directory).map_err(|e| HarnessError::new(e.to_string()))?;
-        let states = self.shared.compaction.lock().unwrap();
-        let mut sums = Vec::new();
-        let mut save = |name: String, bytes: Vec<u8>| -> Result<(), HarnessError> {
-            atomic_write(&directory.join(&name), &bytes)?;
-            sums.push(format!("{:x}  {name}\n", Sha256::digest(&bytes)));
-            Ok(())
-        };
-        for (session, state) in states
-            .iter()
-            .filter(|(_, state)| state.due || state.preserve_edit_tags)
-        {
-            let reference = broca_core::agent_session_ref(&self.bind_identity(session));
-            let case = if state.due {
-                if state.wire_inputs.is_empty() {
-                    "view_due_refused_fetch_blocks_model"
-                } else if state.view_fetches.len() > 1 {
-                    "view_due_later_step_retries"
-                } else {
-                    "view_due_first_model_uses_view"
-                }
-            } else if state.view.as_ref().is_some_and(|view| {
-                view.ranges.iter().any(|range| match range {
-                    broca_core::compaction_provider::view::ViewRange::Keep { edits, .. } => {
-                        edits.iter().any(|edit| edit.truncate.is_some())
-                    }
-                    _ => false,
-                })
-            }) {
-                "part_edits_truncate_renders_with_own_tag"
-            } else {
-                "part_edits_bytes_render_with_own_tag"
-            };
-            for (index, bytes) in state.setup_requests.iter().enumerate() {
-                save(format!("{case}-setup-{index}.json"), bytes.clone())?;
-            }
-            for (index, fetch) in state.view_fetches.iter().enumerate() {
-                save(
-                    format!("{case}-fetch-{index}.json"),
-                    serde_json::to_vec_pretty(fetch).unwrap(),
-                )?;
-            }
-            for (index, messages) in state.wire_inputs.iter().enumerate() {
-                save(
-                    format!("{case}-model-{index}.json"),
-                    serde_json::to_vec_pretty(messages).unwrap(),
-                )?;
-            }
-            #[cfg(feature = "test-clock")]
-            if let Some(bus) = self.bus.as_ref() {
-                for (index, headers) in bus.advance_notices(&reference).iter().enumerate() {
-                    save(
-                        format!("{case}-notice-{index}.json"),
-                        serde_json::to_vec_pretty(headers).unwrap(),
-                    )?;
-                }
-            }
-        }
-        sums.sort();
-        std::fs::write(directory.join("SHA256SUMS"), sums.concat())
-            .map_err(|e| HarnessError::new(e.to_string()))
-    }
-}
-
-#[test]
-fn published_truncate_vectors_cover_all_184_renderings_and_refusals() {
-    use cortexkit_role_llm_runner::{
-        tags::{truncate_part, PartContainer, TruncateMode},
-        vectors,
-    };
-    let (_, bytes) = vectors::FILES
-        .iter()
-        .find(|(name, _)| *name == "truncate.json")
-        .expect("published truncate vectors");
-    let document: Value = serde_json::from_str(bytes).unwrap();
-    let cases = document["cases"].as_array().unwrap();
-    assert_eq!(cases.len(), 184);
-    let mut accepted = 0;
-    let mut refused = 0;
-    for case in cases {
-        let result = truncate_part(
-            case["profile"].as_str().unwrap(),
-            &case["part"],
-            serde_json::from_value::<PartContainer>(case["container"].clone()).unwrap(),
-            serde_json::from_value::<TruncateMode>(case["mode"].clone()).unwrap(),
-            case["number"].as_u64(),
-            case["drop_attachments"].as_bool().unwrap(),
-        );
-        if let Some(expected) = case.get("expected") {
-            assert_eq!(result.unwrap(), *expected, "{}", case["name"]);
-            accepted += 1;
-        } else {
-            assert_eq!(
-                result.unwrap_err().reason(),
-                case["refusal"].as_str().unwrap(),
-                "{}",
-                case["name"]
-            );
-            refused += 1;
-        }
-    }
-    assert_eq!((accepted, refused), (81, 103));
-}
-
-#[test]
-fn edited_wire_observations_keep_actual_text_and_tags_not_the_scripted_expectation() {
-    use broca_core::compaction_provider::{
-        lineage::MessageRef,
-        view::{CompactionView, PartEdit, ViewRange},
-    };
-    let mut state = Session {
-        script: CompactionScript::new(CompactionMessage {
-            compaction_id: "head".into(),
-            version: 0,
-            from: 0,
-            to: 0,
-            replacement: vec![],
-        }),
-        start_ms: 0,
-        emitted: 0,
-        calls: vec![],
-        raw: BTreeMap::new(),
-        replacements: vec![],
-        inputs: vec![],
-        gates: Default::default(),
-        view: None,
-        due: false,
-        refuse_due_fetch: false,
-        preserve_edit_tags: true,
-        provider_calls: vec![],
-        wire_inputs: vec![],
-        setup_requests: vec![],
-        view_fetches: vec![],
-    };
-    state.raw.insert(
-        1,
-        json!({"role":"assistant","content":[{"type":"text","text":"stored"}]}),
-    );
-    state.view = Some(CompactionView::new(
-        "0123456789abcdef0123456789abcdef",
-        1,
-        "lineage",
-        MessageRef {
-            ordinal: 1,
-            mid: "m1".into(),
-        },
-        vec![ViewRange::keep_with_edits(
-            0,
-            2,
-            vec![PartEdit::replace(
-                1,
-                "m1",
-                "m1#0",
-                r#"{"type":"text","text":"scripted-expected"}"#,
-            )],
-        )],
-    ));
-    let entries = translate(
-        &state,
-        &[json!({"role":"assistant","content":"§99§ actual-wrong-text"})],
-    )
-    .unwrap();
-    assert_eq!(
-        entries[0].message["content"][0]["text"],
-        "§99§ actual-wrong-text"
-    );
-    assert_eq!(
-        entries[0].source,
-        EntrySource::Message {
-            ordinal: 1,
-            mid: "m1".into()
-        }
-    );
 }

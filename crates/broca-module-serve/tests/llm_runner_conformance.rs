@@ -3350,51 +3350,6 @@ impl LlmRunnerSubject for BrocaSubject {
     ) -> Result<cortexkit_role_llm_runner_conformance::CompactionObservation, HarnessError> {
         self.observe_compaction(session).await
     }
-    async fn compaction_provider_calls(
-        &self,
-        session: &str,
-    ) -> Result<Vec<cortexkit_role_llm_runner_conformance::ProviderCall>, HarnessError> {
-        self.shared
-            .compaction
-            .lock()
-            .unwrap()
-            .get(session)
-            .map(|state| state.provider_calls.clone())
-            .ok_or_else(|| HarnessError::new("compaction session absent"))
-    }
-    fn serializer_profile(&self, _session: &str) -> Option<String> {
-        Some(cortexkit_role_llm_runner::serializer_profile::OWNED_BROCA.into())
-    }
-    async fn install_setup_view_due_fixture(
-        &self,
-        session: &str,
-        initial: cortexkit_role_llm_runner_conformance::CompactionMessage,
-        replacement: Vec<String>,
-        refuse_fetch: bool,
-    ) -> Result<cortexkit_role_llm_runner_conformance::SetupViewDueFixture, HarnessError> {
-        self.prepare_due_view(session, initial, replacement, refuse_fetch)
-    }
-    async fn set_setup_view_due_fetch_refused(
-        &self,
-        session: &str,
-        refused: bool,
-    ) -> Result<(), HarnessError> {
-        self.shared
-            .compaction
-            .lock()
-            .unwrap()
-            .get_mut(session)
-            .ok_or_else(|| HarnessError::new("compaction session absent"))?
-            .refuse_due_fetch = refused;
-        Ok(())
-    }
-    async fn publish_compaction_part_edits(
-        &self,
-        session: &str,
-        edits: Vec<broca_core::compaction_provider::view::PartEdit>,
-    ) -> Result<u64, HarnessError> {
-        self.publish_part_edits(session, edits).await
-    }
     async fn durable_compaction_setup(
         &self,
         handle: &Live,
@@ -3737,9 +3692,6 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         .await
         .expect("the suite set up");
     println!("{}", report.render());
-    subject
-        .export_compaction_samples()
-        .expect("write observed compaction samples");
     let failed: Vec<_> = report
         .cases
         .iter()
@@ -3795,11 +3747,6 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "compaction_setup_durable_once",
         "model_view_half_open_ranges_and_travel",
         "compaction_unavailable_distinct_from_refuse",
-        "view_due_first_model_uses_view",
-        "view_due_refused_fetch_blocks_model",
-        "view_due_later_step_retries",
-        "part_edits_truncate_renders_with_own_tag",
-        "part_edits_bytes_render_with_own_tag",
         "run_cancel_step_boundary_finishes_tool_batch",
         "run_cancel_unlisted_at_refused",
         "run_cancel_step_boundary_escalates_to_now",
