@@ -353,8 +353,8 @@ pub fn seed_display_placement<W: WalStore + ?Sized>(
     writer.seed_display_placement(snapshot.head_seq, placement);
 }
 
-/// Repair pre-policy admission caches once, while the caller holds the session's writer lease.
-/// A supported sender fold leaves both the WAL and the materialized checkpoint untouched.
+/// Repair unknown sender policy while the caller holds the writer lease. Call only for a
+/// named-sender or template decision; ordinary owner admission does not need this policy.
 pub fn repair_sender_admission_checkpoint<W, S>(
     wal_store: &W,
     session: &BindIdentity,
@@ -367,17 +367,16 @@ where
 {
     let Some(store) = store else { return Ok(()) };
     let needs_repair = store
-        .read_admission_snapshot(session)
-        .ok()
-        .flatten()
+        .read_admission_snapshot(session)?
         .and_then(|snapshot| snapshot.checkpoint)
         .and_then(|checkpoint| checkpoint.ownership)
-        .is_some_and(|ownership| !ownership.sender_admission_complete());
+        .is_none_or(|ownership| !ownership.sender_admission_complete());
     if !needs_repair {
         return Ok(());
     }
-    // The actor already holds the writer lease. Publish the repaired fold at an existing
-    // boundary before checking senders, or every refused send would replay the same old log.
+    // A manifest-aware checkpoint with session_change_recorded=false proves its first plan
+    // still supplies sender policy and returns above without reading or reprojecting the WAL.
+    // Publish unknown policy at an existing boundary so later sends need no full repair.
     let range = wal_store
         .read_records_range(session, 0, Some(safe_head), None)
         .map_err(|error| error.to_string())?;
@@ -387,7 +386,7 @@ where
     if records.last().map(|frame| frame.seq) != Some(safe_head) {
         return Err("sender admission repair did not reach the durable head".into());
     }
-    store.project_range(session, &range)?;
+    store.repair_sender_policy(session, &range)?;
     Ok(())
 }
 

@@ -681,6 +681,16 @@ pub trait AdmissionReader: Send + Sync {
         safe_head: u64,
     ) -> Result<crate::run::PriorWalSnapshot, String>;
 
+    /// Sender and template admission additionally require a complete refresh-policy fold.
+    /// Execution-only reads must not repair this optional admission cache for an owner send.
+    fn sender_snapshot(
+        &self,
+        session: &BindIdentity,
+        safe_head: u64,
+    ) -> Result<crate::run::PriorWalSnapshot, String> {
+        self.prior_snapshot(session, safe_head)
+    }
+
     fn paused_episode(
         &self,
         session: &BindIdentity,
@@ -924,6 +934,16 @@ pub trait Persister: Send + Sync {
         let anchor = range.anchor_at(watermark);
         self.persist_wal_anchor(session, anchor.as_ref())?;
         Ok(watermark)
+    }
+
+    /// Explicitly repair unknown sender policy from a complete durable prefix. Ordinary
+    /// projection must not force this migration merely because an owner started a run.
+    fn repair_sender_policy(
+        &self,
+        session: &BindIdentity,
+        range: &WalRangeRead,
+    ) -> Result<u64, String> {
+        self.project_range(session, range)
     }
 
     /// Persist a derived byte anchor after projection advances its watermark.

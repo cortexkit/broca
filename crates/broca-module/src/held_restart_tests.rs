@@ -165,6 +165,14 @@ struct ObservedAdmissionReader {
 }
 
 impl broca_core::context::AdmissionReader for ObservedAdmissionReader {
+    fn sender_snapshot(
+        &self,
+        session: &BindIdentity,
+        safe_head: u64,
+    ) -> Result<broca_core::run::PriorWalSnapshot, String> {
+        self.inner.sender_snapshot(session, safe_head)
+    }
+
     fn prior_snapshot(
         &self,
         session: &BindIdentity,

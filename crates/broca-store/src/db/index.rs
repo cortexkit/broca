@@ -918,6 +918,87 @@ mod tests {
                 .iter()
                 .all(|read| read.class != broca_wal::access_counter::ReadClass::Origin));
         }
+        let mut later = base;
+        if let WalRecord::RunStarted { run_id, .. } = &mut later[0] {
+            run_id.0 = "after-refresh".into();
+        }
+        for record in &later {
+            wal.append(1, record, true).unwrap();
+        }
+        publish_writer(&scratch.db, &bind, &wal);
+        let publication = wal.durable_publication().unwrap();
+        let head = publication.sequence();
+        let db = std::sync::Arc::new(scratch.db);
+        let publishing_db = db.clone();
+        let publishing_bind = bind.clone();
+        let reader = db.admission_reader(move |_| {
+            publishing_db
+                .publish(&publishing_bind, "s-test", LogLocation::Live, &publication)
+                .map_err(|error| error.to_string())?;
+            Ok(publication.clone())
+        });
+        db.transaction(false, |tx| {
+            let (encoded, tail): (String, String) =
+                tx.query_row("SELECT admission_seed,tail_seed FROM session", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?;
+            let mut old: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            old["state"]["scalars"]["ownership"]
+                .as_object_mut()
+                .unwrap()
+                .remove("sender_admission");
+            old["state"]
+                .as_object_mut()
+                .unwrap()
+                .remove("latest_refresh");
+            let mut tail: serde_json::Value = serde_json::from_str(&tail).unwrap();
+            tail["admission"] = old.clone();
+            tx.execute(
+                "UPDATE session SET admission_seed=?1,tail_seed=?2",
+                rusqlite::params![old.to_string(), tail.to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let counter = broca_wal::access_counter::WalAccessCounter::default();
+        let owner = counter
+            .operation("execution without sender repair")
+            .run(|| reader.prior_snapshot(&bind, head))
+            .unwrap();
+        assert!(owner.base_watermark > 0);
+        assert!(!owner
+            .checkpoint_at_head
+            .ownership
+            .unwrap()
+            .sender_admission_complete());
+        assert!(counter.snapshot()[0]
+            .reads
+            .iter()
+            .all(|read| read.class != broca_wal::access_counter::ReadClass::Origin));
+        for n in 0..2 {
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            let sender = counter
+                .operation("lazy sender seed repair")
+                .run(|| reader.sender_snapshot(&bind, head))
+                .unwrap();
+            assert_eq!(
+                sender
+                    .checkpoint_at_head
+                    .ownership
+                    .unwrap()
+                    .effective_senders()[0]
+                    .module,
+                "replacement"
+            );
+            let origin_reads = counter.snapshot()[0]
+                .reads
+                .iter()
+                .filter(|read| read.class == broca_wal::access_counter::ReadClass::Origin)
+                .count();
+            // The first repair fetches the file prefix once; publishing the repaired seed
+            // also accounts for replaying those bytes from memory. Neither recurs later.
+            assert_eq!(origin_reads, if n == 0 { 2 } else { 0 });
+        }
     }
 
     #[test]

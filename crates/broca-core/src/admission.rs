@@ -637,7 +637,10 @@ impl SessionOwnershipV1 {
     pub fn sender_admission_complete(&self) -> bool {
         match &self.sender_admission {
             Some(fold) => fold.version == 1,
-            None => !self.session_change_recorded,
+            // Manifest-aware checkpoints have folded session-change records since those
+            // records were introduced. A false presence bit proves the first plan still
+            // supplies sender policy; no WAL read or checkpoint rewrite is needed.
+            None => self.plan_manifest_folded && !self.session_change_recorded,
         }
     }
 
@@ -1379,9 +1382,10 @@ impl AdmissionCheckpointV1 {
             && self.input_budget.is_some()
             && self.lineage_retention.is_some()
             && self.tags.is_some()
-            && self.ownership.as_ref().is_some_and(|ownership| {
-                ownership.plan_manifest_folded && ownership.sender_admission_complete()
-            })
+            && self
+                .ownership
+                .as_ref()
+                .is_some_and(|ownership| ownership.plan_manifest_folded)
     }
 }
 
@@ -2304,6 +2308,19 @@ impl AdmissionContinuation {
 
     /// Unsupported versions and missing media metadata are cache misses, never partial state.
     pub fn decode(encoded: &str) -> Result<Self, crate::replay::SeedFallback> {
+        Self::decode_inner(encoded, true)
+    }
+
+    /// Execution needs episode state, not named-sender policy. Keep older refresh-aware
+    /// continuations usable until a sender or template actually needs the newer fold.
+    pub fn decode_for_execution(encoded: &str) -> Result<Self, crate::replay::SeedFallback> {
+        Self::decode_inner(encoded, false)
+    }
+
+    fn decode_inner(
+        encoded: &str,
+        require_sender_policy: bool,
+    ) -> Result<Self, crate::replay::SeedFallback> {
         let bad = || crate::replay::SeedFallback::new("unsupported admission continuation");
         let value: serde_json::Value = serde_json::from_str(encoded).map_err(|_| bad())?;
         if value["version"] != 1 && value["version"] != 2 {
@@ -2319,11 +2336,12 @@ impl AdmissionContinuation {
         if seed.version != 1 {
             return Err(bad());
         }
-        if seed
-            .scalars
-            .ownership
-            .as_ref()
-            .is_none_or(|ownership| !ownership.sender_admission_complete())
+        if require_sender_policy
+            && seed
+                .scalars
+                .ownership
+                .as_ref()
+                .is_none_or(|ownership| !ownership.sender_admission_complete())
         {
             return Err(crate::replay::SeedFallback::new(
                 "sender admission summary predates refresh folding",
@@ -6063,7 +6081,15 @@ mod tests {
         let mut checkpoint = AdmissionCheckpointV1::empty();
         let ownership = checkpoint.ownership.as_mut().unwrap();
         ownership.session_change_recorded = true;
-        assert!(!checkpoint.ownership_complete());
+        assert!(
+            checkpoint.ownership_complete(),
+            "execution metadata remains usable"
+        );
+        assert!(!checkpoint
+            .ownership
+            .as_ref()
+            .unwrap()
+            .sender_admission_complete());
         checkpoint
             .fold_record(
                 1,
@@ -6082,7 +6108,11 @@ mod tests {
             .as_mut()
             .unwrap()
             .version = 2;
-        assert!(!checkpoint.ownership_complete());
+        assert!(!checkpoint
+            .ownership
+            .as_ref()
+            .unwrap()
+            .sender_admission_complete());
     }
 
     /// The ownership summary folds every episode: the first principal, whether any episode

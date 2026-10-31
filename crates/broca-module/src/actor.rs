@@ -5738,6 +5738,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         {
             return Ok(StringSender::Owner);
         }
+        let ownership = self.load_sender_ownership(ownership, module_id).await?;
         let senders = effective_plan_senders(&ownership);
         // Unrefreshed sessions retain legacy string admission. Once a refresh establishes
         // sender policy, a removed sender cannot bypass it through legacy string delivery.
@@ -5835,6 +5836,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 "only the session's owner or a module its plan names may send with an ordered delivery list".into(),
             ));
         };
+        let ownership = self.load_sender_ownership(ownership, module_id).await?;
         let senders = effective_plan_senders(&ownership);
         let Some(sender) = senders.iter().find(|sender| &sender.module == module_id) else {
             return Err(refused(
@@ -5874,10 +5876,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .load_ownership()
             .await
             .map_err(SendOutcome::Transient)?;
-        let senders = effective_plan_senders(&ownership);
         let Some(broca_protocol::BindPrincipal::Reserved { module_id }) = &request.principal else {
             return Err(refused("no template is declared for this caller".into()));
         };
+        let ownership = self.load_sender_ownership(ownership, module_id).await?;
+        let senders = effective_plan_senders(&ownership);
         let templates = senders
             .iter()
             .find(|sender| &sender.module == module_id)
@@ -9068,6 +9071,62 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .ok_or_else(|| "the admission snapshot carries no ownership summary".to_owned())
     }
 
+    /// Only named-sender admission and template rendering need the refresh policy. Ordinary
+    /// owner sends use execution/identity metadata without waiting on this cache repair.
+    async fn load_sender_ownership(
+        &self,
+        ownership: broca_core::SessionOwnershipV1,
+        module_id: &str,
+    ) -> Result<broca_core::SessionOwnershipV1, SendOutcome> {
+        if ownership.sender_admission_complete() {
+            return Ok(ownership);
+        }
+        let repair = async {
+            let safe_head = self
+                .writer
+                .as_ref()
+                .expect("writer live while open")
+                .sync()
+                .await
+                .map_err(|error| error.to_string())?;
+            let wal_store = self.wal_store.clone();
+            let store = self.materialized_store.clone();
+            let reader = self.admission_reader.clone();
+            let key = self.key.clone();
+            spawn_blocking(
+                JobKind::WalRead,
+                broca_wal::access_counter::inherit(move || {
+                    if let Some(reader) = reader {
+                        return reader
+                            .sender_snapshot(&key, safe_head)
+                            .map(|snapshot| snapshot.checkpoint_at_head.ownership);
+                    }
+                    broca_core::run::repair_sender_admission_checkpoint(
+                        wal_store.as_ref(),
+                        &key,
+                        safe_head,
+                        store.as_deref(),
+                    )?;
+                    broca_core::load_prior_wal_snapshot(
+                        wal_store.as_ref(),
+                        &key,
+                        safe_head,
+                        store.as_deref(),
+                    )
+                    .map(|snapshot| snapshot.checkpoint_at_head.ownership)
+                }),
+            )
+            .await
+            .map_err(|error| error.to_string())??
+            .filter(|ownership| ownership.sender_admission_complete())
+            .ok_or_else(|| "effective sender policy is still unknown".to_owned())
+        }
+        .await;
+        repair.map_err(|error| SendOutcome::Transient(format!(
+            "cannot establish effective sender policy for module {module_id}; retry the send: {error}"
+        )))
+    }
+
     fn agent_run_writer_enabled(&self) -> bool {
         #[cfg(all(test, feature = "test-clock"))]
         if self.agent_run_writer_for_test {
@@ -9124,12 +9183,6 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         .prior_snapshot(&key, safe_head)
                         .map(|snapshot| snapshot.checkpoint_at_head);
                 }
-                broca_core::run::repair_sender_admission_checkpoint(
-                    wal_store.as_ref(),
-                    &key,
-                    safe_head,
-                    materialized_store.as_deref(),
-                )?;
                 match broca_core::load_prior_wal_snapshot(
                     wal_store.as_ref(),
                     &key,
@@ -9208,12 +9261,6 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 if let Some(reader) = admission_reader {
                     return reader.prior_snapshot(&key, safe_head);
                 }
-                broca_core::run::repair_sender_admission_checkpoint(
-                    wal_store.as_ref(),
-                    &key,
-                    safe_head,
-                    materialized_store.as_deref(),
-                )?;
                 broca_core::load_prior_wal_snapshot(
                     wal_store.as_ref(),
                     &key,

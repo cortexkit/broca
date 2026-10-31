@@ -198,10 +198,6 @@ pub fn plan_projection(
         .and_then(|range| range.lineage_id)
         .map(|lineage_id| lineage_id.to_string());
     let reset = !snapshot.attribution_complete
-        // A cached refreshed policy cannot be repaired from only a suffix. Rebuild even
-        // at the same projection boundary so an idle session does not keep stale grants.
-        || snapshot.seed.as_ref().and_then(|seed| seed.admission_checkpoint.ownership.as_ref())
-            .is_some_and(|ownership| !ownership.sender_admission_complete())
         || snapshot
             .seed
             .as_ref()
@@ -929,13 +925,31 @@ impl ProjectionContinuation {
     }
 
     pub fn decode(encoded: &str) -> Result<Self, crate::replay::SeedFallback> {
+        Self::decode_inner(encoded, true)
+    }
+
+    /// Execution and indexing can preserve an unknown sender-policy fold until admission
+    /// needs it, without rebuilding an otherwise complete projection continuation.
+    pub fn decode_for_execution(encoded: &str) -> Result<Self, crate::replay::SeedFallback> {
+        Self::decode_inner(encoded, false)
+    }
+
+    fn decode_inner(
+        encoded: &str,
+        require_sender_policy: bool,
+    ) -> Result<Self, crate::replay::SeedFallback> {
         let bad = || crate::replay::SeedFallback::new("unsupported projection continuation");
         let value: serde_json::Value = serde_json::from_str(encoded).map_err(|_| bad())?;
         if value["version"] != 1 && value["version"] != 2 && value["version"] != 3 {
             return Err(bad());
         }
-        let admission =
-            crate::admission::AdmissionContinuation::decode(&value["admission"].to_string())?;
+        let admission = if require_sender_policy {
+            crate::admission::AdmissionContinuation::decode(&value["admission"].to_string())
+        } else {
+            crate::admission::AdmissionContinuation::decode_for_execution(
+                &value["admission"].to_string(),
+            )
+        }?;
         if value["version"] != admission.wire_version()
             && !(value["version"] == 3 && admission.wire_version() == 2)
         {
