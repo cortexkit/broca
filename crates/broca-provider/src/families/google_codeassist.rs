@@ -36,9 +36,7 @@
 use broca_protocol::{provider::NormalizedEvent, request::CallOptions, StepContext, StepId};
 use serde_json::{json, Value};
 
-use crate::families::gemini::{
-    build_request_body, build_request_body_with_media, GeminiNormalizer,
-};
+use crate::families::gemini::{build_request_body, GeminiNormalizer};
 use crate::media_render::{InlineMedia, MediaRender};
 use crate::sse::SseDecoder;
 use crate::wire::{
@@ -131,15 +129,44 @@ impl WireFamily for GoogleCodeAssist {
         build_envelope(frozen, opts, build_request_body(frozen, opts))
     }
 
+    fn shape_with_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Value {
+        build_envelope(
+            frozen,
+            opts,
+            super::gemini::build_request_body_with_media_and_provenance(
+                frozen, opts, None, provenance,
+            ),
+        )
+    }
+
     fn shape_with_media(
         &self,
         frozen: &FrozenRenderConfig,
         opts: &CallOptions,
         payloads: &[InlineMedia<'_>],
     ) -> Value {
+        self.shape_with_media_and_provenance(frozen, opts, payloads, None)
+    }
+
+    fn shape_with_media_and_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        payloads: &[InlineMedia<'_>],
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Value {
         let media = MediaRender { frozen, payloads };
-        let inner =
-            build_request_body_with_media(frozen, opts, frozen.media.as_ref().map(|_| &media));
+        let inner = super::gemini::build_request_body_with_media_and_provenance(
+            frozen,
+            opts,
+            frozen.media.as_ref().map(|_| &media),
+            provenance,
+        );
         build_envelope(frozen, opts, inner)
     }
 

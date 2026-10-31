@@ -799,6 +799,21 @@ pub struct ProjectionContinuation {
     admission: crate::admission::AdmissionContinuation,
     position: ContinuationPosition,
     render_sources: Vec<Vec<crate::admission::AdmissionSource>>,
+    systems: Option<Vec<u64>>,
+    guidance: Option<Vec<EpisodeGuidance>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct EpisodeGuidance {
+    started_seq: u64,
+    spans: Vec<GuidanceSpan>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct GuidanceSpan {
+    from: u64,
+    through: u64,
+    checkpoint: crate::tool_repetition::RepetitionCheckpoint,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -838,6 +853,54 @@ impl ProjectionContinuation {
         )
     }
 
+    /// Absolute system-message coordinates are needed even inside a replaced window.
+    pub fn system_ordinals(&self) -> Option<&[u64]> {
+        self.systems.as_deref()
+    }
+
+    /// Recover the existing repetition fold before a retained message, without reading
+    /// the hidden model steps that produced its counters.
+    pub fn repetition_checkpoint(
+        &self,
+        episode: usize,
+        ordinal: u64,
+    ) -> Result<crate::tool_repetition::RepetitionCheckpoint, crate::replay::SeedFallback> {
+        let bad = || crate::replay::SeedFallback::new("resume repetition checkpoint missing");
+        let stored = self
+            .guidance
+            .as_ref()
+            .and_then(|g| g.get(episode))
+            .ok_or_else(bad)?;
+        if self
+            .render_sources
+            .get(episode)
+            .and_then(|s| s.first())
+            .map(|s| s.sequence())
+            != Some(stored.started_seq)
+        {
+            return Err(bad());
+        }
+        let span = stored
+            .spans
+            .iter()
+            .find(|s| s.from <= ordinal && ordinal <= s.through)
+            .ok_or_else(bad)?;
+        if crate::tool_repetition::RepetitionFold::seeded(&span.checkpoint).is_none() {
+            return Err(crate::replay::SeedFallback::new(
+                "unsupported resume repetition checkpoint",
+            ));
+        }
+        Ok(span.checkpoint.clone())
+    }
+
+    fn wire_version(&self) -> u32 {
+        if self.admission.wire_version() == 2 && self.guidance.is_some() {
+            3
+        } else {
+            self.admission.wire_version()
+        }
+    }
+
     pub fn encode(&self) -> Result<String, serde_json::Error> {
         let mut position = serde_json::to_value(&self.position)?;
         if let Some(episodes) = position["episodes"].as_array_mut() {
@@ -848,27 +911,80 @@ impl ProjectionContinuation {
                     .remove("render_config");
             }
         }
-        serde_json::to_string(&serde_json::json!({
-            "version": 1, "admission": serde_json::from_str::<serde_json::Value>(&self.admission.encode()?)?,
+        let mut encoded = serde_json::json!({
+            "version": self.wire_version(), "admission": serde_json::from_str::<serde_json::Value>(&self.admission.encode()?)?,
             "position": position, "render_sources": self.render_sources,
-        }))
+        });
+        if self.admission.wire_version() == 2 {
+            encoded["systems"] = serde_json::to_value(&self.systems)?;
+        }
+        if self.wire_version() == 3 {
+            encoded["guidance"] = serde_json::to_value(&self.guidance)?;
+        }
+        serde_json::to_string(&encoded)
     }
 
     pub fn decode(encoded: &str) -> Result<Self, crate::replay::SeedFallback> {
         let bad = || crate::replay::SeedFallback::new("unsupported projection continuation");
         let value: serde_json::Value = serde_json::from_str(encoded).map_err(|_| bad())?;
-        if value["version"] != 1 {
+        if value["version"] != 1 && value["version"] != 2 && value["version"] != 3 {
             return Err(bad());
         }
         let admission =
             crate::admission::AdmissionContinuation::decode(&value["admission"].to_string())?;
+        if value["version"] != admission.wire_version()
+            && !(value["version"] == 3 && admission.wire_version() == 2)
+        {
+            return Err(bad());
+        }
         let position = serde_json::from_value(value["position"].clone()).map_err(|_| bad())?;
         let render_sources =
             serde_json::from_value(value["render_sources"].clone()).map_err(|_| bad())?;
+        let systems: Option<Vec<u64>> = value
+            .get("systems")
+            .map(|v| serde_json::from_value(v.clone()).map_err(|_| bad()))
+            .transpose()?
+            .flatten();
+        if (value["version"] == 2 || value["version"] == 3)
+            && systems
+                .as_ref()
+                .is_none_or(|s| s.windows(2).any(|w| w[0] >= w[1]))
+        {
+            return Err(crate::replay::SeedFallback::new(
+                "compaction continuation system coordinates missing",
+            ));
+        }
+        let guidance: Option<Vec<EpisodeGuidance>> = value
+            .get("guidance")
+            .map(|v| {
+                serde_json::from_value(v.clone()).map_err(|_| {
+                    crate::replay::SeedFallback::new("unsupported resume repetition checkpoint")
+                })
+            })
+            .transpose()?
+            .flatten();
+        if value["version"] == 3
+            && guidance.as_ref().is_none_or(|episodes| {
+                episodes.iter().any(|e| {
+                    e.spans.windows(2).any(|w| w[0].through >= w[1].from)
+                        || e.spans.iter().any(|s| {
+                            s.from > s.through
+                                || crate::tool_repetition::RepetitionFold::seeded(&s.checkpoint)
+                                    .is_none()
+                        })
+                })
+            })
+        {
+            return Err(crate::replay::SeedFallback::new(
+                "unsupported resume repetition checkpoint",
+            ));
+        }
         Ok(Self {
             admission,
             position,
             render_sources,
+            systems,
+            guidance,
         })
     }
 
@@ -952,8 +1068,18 @@ impl ProjectionContinuation {
             admission: crate::admission::AdmissionContinuation::capture(read_at, boundary, prefix)?,
             position: Self::position(&seed),
             render_sources: Vec::new(),
+            systems: Some(
+                prior
+                    .prompt
+                    .iter()
+                    .filter(|m| m.role == broca_protocol::Role::System)
+                    .filter_map(|m| m.ordinal)
+                    .collect(),
+            ),
+            guidance: Some(Vec::new()),
         };
         continuation.extend_render_sources(read_at, prefix, boundary.frame_end)?;
+        continuation.extend_guidance(&prior.prompt, 0)?;
         Ok(continuation)
     }
 
@@ -1087,9 +1213,121 @@ impl ProjectionContinuation {
             } else {
                 self.render_sources.clone()
             },
+            systems: self.systems.clone(),
+            guidance: if delta.truncate_prefix_to.is_some() {
+                Some(Vec::new())
+            } else {
+                self.guidance.clone()
+            },
         };
+        if let Some(systems) = &mut next.systems {
+            if let Some(to) = delta.truncate_prefix_to {
+                systems.retain(|o| *o < to);
+            }
+            systems.extend(
+                delta
+                    .messages
+                    .iter()
+                    .filter(|m| m.role == broca_protocol::Role::System)
+                    .filter_map(|m| m.ordinal),
+            );
+        } else if next.admission.wire_version() == 2 {
+            return Err(crate::replay::SeedFallback::new(
+                "compaction continuation system coordinates missing",
+            ));
+        }
         next.extend_render_sources(read_at, tail, boundary.frame_end)?;
+        next.extend_guidance(
+            &delta.messages,
+            delta.truncate_prefix_to.unwrap_or(prior.prefix_len),
+        )?;
         Ok(next)
+    }
+
+    fn extend_guidance(
+        &mut self,
+        messages: &[broca_protocol::Message],
+        base: u64,
+    ) -> Result<(), crate::replay::SeedFallback> {
+        use crate::tool_repetition::RepetitionFold;
+        let bad = || crate::replay::SeedFallback::new("resume repetition checkpoint missing");
+        let episodes = self.position.episodes.as_ref().ok_or_else(bad)?;
+        let previous = self.guidance.take().unwrap_or_default();
+        let mut next = Vec::with_capacity(episodes.len());
+        for (i, episode) in episodes.iter().enumerate() {
+            let started_seq = self
+                .render_sources
+                .get(i)
+                .and_then(|s| s.first())
+                .ok_or_else(bad)?
+                .sequence();
+            let old = previous.iter().find(|g| g.started_seq == started_seq);
+            let mut saved = old.cloned().unwrap_or(EpisodeGuidance {
+                started_seq,
+                spans: Vec::new(),
+            });
+            let Some(first) = episode.first_step().ok_or_else(bad)? else {
+                next.push(saved);
+                continue;
+            };
+            let end = episodes
+                .get(i + 1)
+                .and_then(|e| e.start())
+                .unwrap_or(self.position.prefix_len);
+            if end <= base && old.is_some() {
+                next.push(saved);
+                continue;
+            }
+            let mut fold = if first < base {
+                let checkpoint = saved
+                    .spans
+                    .iter()
+                    .find(|s| s.from <= base && base <= s.through)
+                    .map(|s| &s.checkpoint);
+                match checkpoint.and_then(RepetitionFold::seeded) {
+                    Some(fold) => fold,
+                    None if self.admission.wire_version() == 1 => {
+                        self.guidance = None;
+                        return Ok(());
+                    }
+                    None => return Err(bad()),
+                }
+            } else {
+                RepetitionFold::default()
+            };
+            for message in messages.iter().filter(|m| {
+                m.ordinal
+                    .is_some_and(|o| first <= o && base <= o && o < end)
+            }) {
+                if let Some(checkpoint) = fold.checkpoint() {
+                    push_guidance(&mut saved.spans, message.ordinal.unwrap(), checkpoint);
+                }
+                fold.push(message);
+            }
+            push_guidance(&mut saved.spans, end, fold.checkpoint().ok_or_else(bad)?);
+            next.push(saved);
+        }
+        self.guidance = Some(next);
+        Ok(())
+    }
+}
+
+fn push_guidance(
+    spans: &mut Vec<GuidanceSpan>,
+    ordinal: u64,
+    checkpoint: crate::tool_repetition::RepetitionCheckpoint,
+) {
+    if let Some(last) = spans
+        .last_mut()
+        .filter(|s| s.checkpoint == checkpoint && ordinal <= s.through.saturating_add(1))
+    {
+        last.through = last.through.max(ordinal);
+    } else {
+        spans.push(GuidanceSpan {
+            from: ordinal,
+            through: ordinal,
+            checkpoint,
+        });
     }
 }
 

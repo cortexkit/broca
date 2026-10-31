@@ -460,6 +460,18 @@ pub fn broca_role_describe_with_writers(
     // `unknown`.
     .with_steer_receipt(steer_receipt::GUARANTEED)
     .with_run_cancel(vec!["now".into(), "step_boundary".into()]);
+    if hook_writer {
+        // Once a hook plane is installed the run loop calls every hook the role names:
+        // `pre_user` on each user message before it is written, `pre_tool` and `post_tool`
+        // around each tool call, `post_assistant` after each model reply. A plan composer adds
+        // a step item only when every hook it subscribes to is listed, so a build without the
+        // plane lists none and is never sent one.
+        describe = describe.with_step_hooks(
+            cortexkit_role_llm_runner::describe::step_hooks::KNOWN
+                .iter()
+                .copied(),
+        );
+    }
     if retention_writer {
         describe.retention = Some(cortexkit_role_llm_runner::describe::Retention::new(
             2_592_000, 3_600_000,
@@ -544,7 +556,7 @@ pub struct BaselineWire {
     pub pending: Option<cortexkit_role_llm_runner::baseline::PendingChange>,
     /// The latest applied change, absent while none applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effective: Option<cortexkit_role_llm_runner::baseline::EffectiveBaseline>,
+    pub effective: Option<EffectiveBaselineWire>,
     /// The change-policy rungs this session supports, per surface. Present in every ready
     /// baseline on a runner declaring `session_change`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -552,6 +564,21 @@ pub struct BaselineWire {
     /// What the session's frozen config declares about its prompt cache. Absent when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<crate::CacheDeclarationWire>,
+}
+
+/// The latest applied refresh, whose manifest can differ from the frozen prefix's manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectiveBaselineWire {
+    pub generation: u64,
+    pub applied_by: String,
+    pub manifest_digest: String,
+    /// The applied manifest's composition, not its whole-manifest identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composition_digest: Option<String>,
+    /// Optional items absent from the applied manifest, in the same form as the prefix's
+    /// `absent_items`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub absent_items: Vec<serde_json::Value>,
 }
 
 impl BaselineWire {
@@ -829,6 +856,51 @@ mod pinned_reply_bytes {
             "session_baseline.ready.json",
             SESSION_BASELINE_SHA256,
         );
+    }
+
+    #[test]
+    fn session_baseline_applied_refresh_bytes_are_pinned() {
+        let mut baseline = BaselineWire::planned(
+            vec![],
+            vec![],
+            "prefix-composition".into(),
+            vec!["read".into()],
+        );
+        baseline.accepted_generation = 2;
+        baseline.applied_generation = 2;
+        baseline.effective = Some(EffectiveBaselineWire {
+            generation: 2,
+            applied_by: "append".into(),
+            manifest_digest: "whole-manifest".into(),
+            composition_digest: Some("applied-composition".into()),
+            absent_items: vec![
+                serde_json::json!({"provider":"optional","kind":"tool","reason":"timeout"}),
+            ],
+        });
+        let reply = BaselineReply::ready(baseline);
+        if std::env::var_os("BROCA_CAPTURE_SAMPLES").is_some() {
+            println!(
+                "BROCA_SAMPLE session_baseline.applied.json {}",
+                serde_json::to_string(&reply).unwrap()
+            );
+        }
+        assert_golden(
+            reply,
+            "session_baseline.applied.json",
+            "f91fb9045d07ee70cb53ce9ad80d48d60b482ad9d5ee60fec0c411b82904c7cb",
+        );
+    }
+
+    #[test]
+    fn effective_baseline_without_optional_facts_keeps_legacy_bytes() {
+        let legacy = r#"{"generation":1,"applied_by":"fold","manifest_digest":"manifest"}"#;
+        let effective: EffectiveBaselineWire = serde_json::from_str(legacy).unwrap();
+        assert!(effective.composition_digest.is_none());
+        assert!(effective.absent_items.is_empty());
+        assert_eq!(serde_json::to_string(&effective).unwrap(), legacy);
+        let role: cortexkit_role_llm_runner::baseline::EffectiveBaseline =
+            serde_json::from_str(legacy).unwrap();
+        assert_eq!(serde_json::to_string(&role).unwrap(), legacy);
     }
 
     /// The reply to the send that admitted a session carries its baseline. The reply type is
@@ -1229,6 +1301,21 @@ mod pinned_reply_bytes {
                         caps.contains(&serde_json::json!(ORDERED_HOOK_PHASES)),
                         hooks
                     );
+                    // The hook call sites follow the same writer: all four, or the member is
+                    // absent so a plan composer sends this runner no step items.
+                    if hooks {
+                        assert_eq!(
+                            encoded["step_hooks"],
+                            serde_json::json!([
+                                "pre_user",
+                                "pre_tool",
+                                "post_tool",
+                                "post_assistant"
+                            ])
+                        );
+                    } else {
+                        assert!(encoded.get("step_hooks").is_none(), "{encoded}");
+                    }
                     assert_eq!(caps.contains(&serde_json::json!("compaction")), compaction);
                     assert_eq!(caps.contains(&serde_json::json!("model_view")), compaction);
                     assert!(!encoded["majors"][0]["ops"]
@@ -1314,7 +1401,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "0abfabca86baad104e89f6c68e29efb895006ff082ed7aa5d0b0b72c1dea45fb";
+        "3efc5e7700af5c23bf1ad38fcefdd7649d914269448944045a10390c07c1ce32";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

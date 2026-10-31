@@ -12,6 +12,7 @@ use broca_module::serve::{
     ServeHandler, SessionReadRequest, SessionReadResponse, StatusResponse, SubscribeFrom,
 };
 use broca_module::LineageRegistry;
+include!("common/address_inventory.rs");
 use broca_module_serve::serve::{
     serve_connection_with_services, ServeEnd, ServeIoError, VaultGauge,
 };
@@ -148,11 +149,11 @@ impl Rig {
             writer,
             "broca",
             Arc::new(NoSessions),
-            Arc::new(LineageRegistry::new_with_reader(
+            Arc::new(test_registry(LineageRegistry::new_with_reader(
                 opens.clone(),
                 history.clone(),
                 None,
-            )),
+            ))),
             VaultGauge::not_in_use(),
             None,
             Default::default(),

@@ -657,6 +657,8 @@ mod offset_resume_tests {
                     ceiling: None,
                     tag_checkpoint: None,
                     ride_wait_ms: None,
+                    view_features: None,
+                    view_due: None,
                 });
                 if with_view {
                     use crate::compaction_provider::{

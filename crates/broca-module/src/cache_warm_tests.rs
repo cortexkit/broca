@@ -924,6 +924,7 @@ impl Fixture {
         config.model = broca_protocol::request::ModelHandle::new(provider, "claude-opus-4-8");
         config.frozen_render_config = serde_json::to_value(frozen).unwrap();
         config.auth_selection = credential.map(|id| broca_wal::AuthSelection {
+            billing_vault_facts: None,
             auth_method: None,
             credential_id: id.into(),
             account_ref: None,
@@ -976,6 +977,7 @@ impl Fixture {
                 sent_at_ms: None,
                 transport: None,
                 websocket_request: None,
+                cache_evidence: None,
                 websocket_close_code: None,
                 input_transformations: None,
                 input_transformations_unmeasured: false,

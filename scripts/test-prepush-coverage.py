@@ -11,6 +11,38 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
+KIT_CASE = ('broca-module-serve::llm_runner_conformance', 'ck_broca_passes_the_llm_runner_conformance_suite')
+# Captured conformance output, independently reviewed against kit 0.15.40 metadata.
+KIT_SKIPS = '''SKIP session_retention_honoured (requires session_retention, queue, transcript_reads, run_ops; missing session_retention)
+SKIP session_retention_days_and_archive (requires session_retention, queue, transcript_reads, run_ops, advance_retention_clock; missing session_retention)
+SKIP session_retention_adopt_policy (requires session_retention, adopt, transcript_reads; missing session_retention, adopt)
+SKIP session_retention_queued_never_deleted (requires session_retention, queue, transcript_reads, run_ops, advance_retention_clock; missing session_retention)
+SKIP session_retention_required (requires session_retention, queue, transcript_reads, run_ops; missing session_retention)
+SKIP session_retention_legacy_required (requires session_retention, retention, queue, transcript_reads, run_ops; missing session_retention)
+SKIP session_retention_conflict (requires session_retention, queue, transcript_reads, run_ops; missing session_retention)
+SKIP session_retention_owner_can_release (requires session_retention, queue, transcript_reads, run_ops; missing session_retention)
+SKIP session_retention_parent_cannot_release (requires session_retention, queue, transcript_reads, run_ops; missing session_retention)
+SKIP session_retention_release_idempotent (requires session_retention, queue, transcript_reads, run_ops; missing session_retention)
+SKIP session_retention_deletion_observable (requires session_retention, queue, transcript_reads, run_ops; missing session_retention)
+SKIP session_retention_media_deleted (requires session_retention, queue, transcript_reads, run_ops, attachments; missing session_retention, attachments)
+SKIP session_retention_active_never_deleted (requires session_retention, queue, transcript_reads, run_ops, advance_retention_clock; missing session_retention)
+SKIP session_retention_backup_none_refused (requires session_retention, queue, transcript_reads, run_ops; missing session_retention)
+SKIP session_retention_dumps_preserved (requires session_retention, queue, transcript_reads, run_ops; missing session_retention)
+SKIP session_retention_runner_replaced_once (requires session_retention, queue, transcript_reads, run_ops; missing session_retention)
+SKIP session_retention_pending_durable (requires session_retention, queue, transcript_reads, run_ops, attachments, kill_at:ReleasePending; missing session_retention, attachments, kill_at:ReleasePending)
+SKIP step_events_one_per_recorded_step (requires step_events, queue, transcript_reads; missing step_events)
+SKIP step_events_match_durable_position (requires step_events, queue, transcript_reads; missing step_events)
+SKIP step_events_after_durability (requires step_events, queue, transcript_reads; missing step_events)
+SKIP user_commands_history_isolation (requires user_commands, queue, run_ops, transcript_reads; missing user_commands)
+SKIP user_commands_forward_once (requires user_commands, queue, run_ops; missing user_commands)
+SKIP user_commands_no_person (requires user_commands, queue, run_ops; missing user_commands)
+SKIP user_commands_collision (requires user_commands, queue; missing user_commands)
+SKIP user_commands_progress_order (requires user_commands, queue, run_ops; missing user_commands)
+SKIP user_commands_unsafe_host_menu (requires user_commands, queue, run_ops; missing user_commands)
+SKIP user_commands_owner_only (requires user_commands, queue, run_ops; missing user_commands)
+SKIP user_commands_outcome_unknown (requires user_commands, queue, run_ops, kill_at:UserCommandForwarded; missing user_commands, kill_at:UserCommandForwarded)
+SKIP user_commands_cutoff_after_forward (requires user_commands, queue, run_ops; missing user_commands)
+SKIP user_commands_cutoff_before_forward (requires user_commands, queue, run_ops; missing user_commands)'''
 
 
 class CoverageGuards(unittest.TestCase):
@@ -147,6 +179,77 @@ class CoverageGuards(unittest.TestCase):
         portable = self.inventory('extra.json', {'pkg::it': [('portable_only', False, 'matches')]})
         with self.assertRaisesRegex(ValueError, 'missing from the CI partition'):
             self.helper.integration_map(full, portable, '1/4')
+
+    def audit_kit_skip(self, line, enclosing=KIT_CASE):
+        binary, test = enclosing
+        suite = {binary: [(test, False, 'matches')]}
+        full = self.inventory('kit-full.json', suite)
+        portable = self.inventory('kit-portable.json', suite)
+        clock_binary, sentinel = self.helper.CLOCK
+        log = self.root / 'kit.log'
+        log.write_text(f'PASS [0.01s] {clock_binary} {sentinel}\nSummary [0.01s] 1 test run\n'
+                       f'PASS [0.10s] (1/1) {binary} {test}\n  stdout ───\n    {line}\n'
+                       'Summary [0.10s] 1 test run\n')
+        return self.helper.audit_integration(log, full, portable)
+
+    def test_real_session_retention_skip_is_expected_without_exempting_the_suite(self):
+        line = ('SKIP session_retention_honoured (requires session_retention, queue, '
+                'transcript_reads, run_ops; missing session_retention)')
+        self.assertEqual(self.audit_kit_skip(line),
+                         {'executed': 1, 'portable_executed': 1, 'clock': 'PASS'})
+
+    def test_reviewed_optional_kit_cases_match_the_independent_transcript(self):
+        lines = KIT_SKIPS.splitlines()
+        self.assertEqual(len(lines), 30)
+        self.assertEqual({line.split()[1] for line in lines}, set(self.helper.KIT_SKIP_EXPECTATIONS))
+        for line in lines:
+            with self.subTest(case=line.split()[1]):
+                self.assertEqual(self.audit_kit_skip(line)['portable_executed'], 1)
+
+    def test_expected_kit_skip_requires_the_exact_enclosing_binary_and_test(self):
+        line = KIT_SKIPS.splitlines()[0]
+        for enclosing in [('other::llm_runner_conformance', KIT_CASE[1]),
+                          (KIT_CASE[0], 'another_conformance_test'),
+                          (KIT_CASE[0], KIT_CASE[1] + '_extra')]:
+            with self.subTest(enclosing=enclosing):
+                with self.assertRaisesRegex(ValueError, 'passing fixture skip'):
+                    self.audit_kit_skip(line, enclosing)
+
+    def test_arbitrary_session_and_legacy_retention_skips_stay_strict(self):
+        lines = [
+            'SKIP fixture: absent',
+            'SKIP session_unknown (requires queue; missing queue)',
+            KIT_SKIPS.splitlines()[0].replace('session_retention_honoured', 'session_retention_new_case'),
+            'SKIP step_events_new_case (requires step_events, queue, transcript_reads; missing step_events)',
+            'SKIP user_commands_new_case (requires user_commands, queue; missing user_commands)',
+            'SKIP retention_honoured (requires retention, queue, transcript_reads, run_ops; missing retention)',
+        ]
+        for line in lines:
+            with self.subTest(line=line):
+                with self.assertRaisesRegex(ValueError, 'passing fixture skip'):
+                    self.audit_kit_skip(line)
+
+    def test_kit_skip_requires_exact_full_and_missing_capability_sets(self):
+        line = KIT_SKIPS.splitlines()[0]
+        lines = [line.replace('missing session_retention', 'missing session_retention, queue'),
+                 line.replace('missing session_retention', 'missing retention'),
+                 line.replace('missing session_retention', 'missing '),
+                 line.replace('missing session_retention', 'missing session_retention, session_retention'),
+                 line.replace('session_retention, queue,', 'session_retention,'),
+                 line.replace('session_retention, queue,', 'session_retention, queue, queue,'),
+                 line.replace('run_ops;', 'run_ops, retention;'),
+                 line + ' unrelated output',
+                 KIT_SKIPS.splitlines()[5].replace('missing session_retention', 'missing session_retention, retention')]
+        for invalid in lines:
+            with self.subTest(line=invalid):
+                with self.assertRaisesRegex(ValueError, 'passing fixture skip'):
+                    self.audit_kit_skip(invalid)
+        reordered = line.replace('session_retention, queue, transcript_reads, run_ops;',
+                                 'run_ops, queue, session_retention, transcript_reads;')
+        self.assertEqual(self.audit_kit_skip(reordered)['portable_executed'], 1)
+        reordered_missing = KIT_SKIPS.splitlines()[2].replace('missing session_retention, adopt',
+                                                             'missing adopt, session_retention')
+        self.assertEqual(self.audit_kit_skip(reordered_missing)['portable_executed'], 1)
 
 
 if __name__ == '__main__':

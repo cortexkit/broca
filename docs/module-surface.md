@@ -154,6 +154,18 @@ A consumer can be both. The surface is **session-centric**: consumers address
 
 - **Session / lineage** — the durable conversation. One single-writer **lease**, one
   **WAL**, one **store** partition, keyed `{project_root, harness, session}`.
+  The storage root is resolved before acknowledging a session bind: an existing
+  `(harness, session)` pair keeps its unique inventory root; a new scoped pair uses
+  stamped `workdir`. On subc-protocol 0.33, a new pair without stamped workdir still
+  uses the route root, including for outgoing transport. A stamp's `project_id` never
+  keys a session. Two inventory roots refuse `session_address_ambiguous` (permanent);
+   Known pairs resolve immediately from positive inventory evidence even during repair.
+   An absent pair waits on shared discovery readiness for at most 60 seconds; incomplete
+   discovery then refuses `session_address_unavailable` (transient), never a guess.
+   Its `detail.reason` distinguishes `wait_expired`, `migration_failed` and a remaining
+   `gap_marker`. Boot and on-demand repairs are single-flight and do not block serve
+   startup. Existing-pair lookups use a read transaction; only absent pairs take the
+   write lock, recheck discovery, and reserve a root before any actor or WAL opens.
 - **Run = one turn's loop execution** — a user message in → the agent loops until its
   response → a terminal. Each run begins with a `RunStarted` **episode marker** (input +
   frozen config + `origin` + `submission_id`). Runs **accumulate** in the lineage WAL:
@@ -648,6 +660,14 @@ change. Both surfaces support `immediately` (the next run) and `on_prefix_rebuil
 run after an applied compaction view, model switch, or prefix flush). A new run alone is not a
 rebuild. A flush is a durable rebuild boundary; with nothing pending it does not change request
 bytes or promise a provider cache miss.
+
+In `session.baseline`, top-level composition and absence facts describe the frozen prefix.
+After a refresh applies, `effective.composition_digest` copies the applied manifest's composition
+digest (omitted when unavailable), and `effective.absent_items` reports its absent optional items
+(omitted when empty). These may differ from the prefix after an `append` application; a `fold`
+application rebuilds the prefix from the applied manifest. `effective.manifest_digest` remains the
+identity of the whole applied manifest, not its composition digest. No `effective` object is
+reported before any refresh applies.
 
 Refresh admission uses the ordinary plan admitter and durably records the fetched manifest and
 original reply before answering. Identical retries fetch and write nothing, even after restart
@@ -1891,3 +1911,58 @@ never-written sessions carry no error summary.
 Compaction Setup continues to omit `ride_wait_max_ms`, `view_apply` and child-run
 `session_retention`: broca does not promise provider-chosen ride waits, marked
 next-step view application, or the per-session retention policy group.
+
+## Compaction pricing signals and rollback
+
+`broca.jsonc` accepts the boot-only boolean `compaction_signals` (default `true`).
+A config change takes effect after restarting broca; it is not frozen into a session.
+With it on, advance notices describe the next call's current route with
+`history_edit_cost`: `suffix` for prefix-byte prompt caches (Anthropic, Bedrock,
+Gemini/Code Assist, Chat Completions and ordinary Responses), or `full_resend`
+for ChatGPT's WebSocket response-chain route. A switch to HTTPS changes the hint
+on the next notice, even within the same session. Unknown routes omit the hint.
+The header is a pricing hint, never permission to rewrite history.
+
+Before rendering a ChatGPT step, a known missing chain can also request a bounded
+`compaction.ride` RPC with cause `chain_reset`. Age retirement uses the transport's 40-minute decision, and
+run-start acquisition supplies its existing idle/absent-socket decision. The
+transport records why the socket has no usable completion receipt in the attempt's
+`full_input_reason` (for example, `new_connection_age`). The pre-render request and
+the attempt use that same retirement decision, not an elapsed-gap guess.
+A retry or refusal discovered during sending does
+not re-enter this boundary and never announces a new chain-reset request. Cache
+warms, including warms of the original model after a fallback, neither produce
+these step signals nor replace the previous model request's
+[segment-hash fingerprint](cache-dump.md#offline-cache-diagnosis).
+
+Set `"compaction_signals": false` to omit both new signals from newly created
+notices and chain-reset requests. Disabled notices keep the old header encoding/digest. This does
+**not** strip, suppress or rewrite any notice already durable in the WAL, queued
+in the outbox, or accepted by the broker: notice sequence/headers/digest are immutable.
+Notice readers must support the `history_edit_cost` header and digest rules in
+`cortexkit-role-compaction-provider` 0.7.9 before signals are enabled.
+The reader-only pin ships in broca 0.3.290; the signal writer ships in 0.3.291.
+The writer's broca rollback floor is therefore 0.3.290. An older broca can read
+the WAL header map but cannot correctly re-encode this header's notice digest.
+
+**One-step Magic Context rollback:** the kept rollback build `34a40ebc`
+already accepts both signals. Rolling back to that build needs neither switch-off
+nor a compatibility drain.
+
+**Rollback to `4eac8781` or older:** these builds reject the new notice
+header and requires this order:
+
+1. Set `compaction_signals` to `false` and restart broca, leaving bus events enabled.
+2. Let bus recovery finish, then inspect
+   `health.check.metrics.bus_events.compaction_notice_outbox_pending` until zero
+   (and check that the bus loop is progressing without publication failures).
+   This count covers only unpublished notices in broca's outbox. Zero means only
+   that broca has published the queued notices, **never that Magic Context consumed
+   or acknowledged them**; it is not a substitute for completed WAL recovery.
+3. Separately pass Magic Context's own consumer-ACK drain check for advance notices.
+   This is an MC-owned operational check, not a broca API. Obtain its command or
+   dashboard procedure from the MC operator before attempting this rollback.
+   Broca's inbound `compaction_bus.acked` and JetStream publish receipts are not that
+   check. Do not proceed while the MC-owned check is unavailable or nonzero.
+4. Only then roll the Magic Context reader back. A rollback reader that itself
+   tolerates the new header does not need this compatibility drain.

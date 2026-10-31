@@ -4,6 +4,96 @@ use broca_protocol::{BindIdentity, BindScope, SessionScope};
 use std::cell::Cell;
 
 const NOW: i64 = 200_000_000;
+
+#[test]
+fn diagnostics_address_unavailability_is_an_error_from_the_first_refusal_per_reason() {
+    let store = broca_store::SqliteStore::open_in_memory().unwrap();
+    let mut evidence = healthy(&store, NOW - 1000);
+    evidence.rings.insert(
+        "session_address_unavailable".into(),
+        Ok(Snapshot {
+            since_ms: NOW - 1000,
+            truncated: false,
+            events: [
+                "incomplete_inventory",
+                "gap_marker",
+                "store_error",
+                "wait_expired",
+                "migration_failed",
+            ]
+            .into_iter()
+            .map(|code| Event {
+                at_ms: NOW - 1,
+                module: String::new(),
+                code: code.into(),
+            })
+            .collect(),
+        }),
+    );
+    let reply = report(evidence, NOW, 1000);
+    let findings: Vec<_> = reply
+        .findings
+        .iter()
+        .filter(|finding| finding.check == "session_address_unavailable")
+        .collect();
+    assert_eq!(findings.len(), 5);
+    for (reason, words) in [
+        ("incomplete_inventory", "incomplete inventory"),
+        ("gap_marker", "gap marker"),
+        ("store_error", "store error"),
+        ("wait_expired", "wait expired"),
+        ("migration_failed", "migration failed"),
+    ] {
+        let finding = findings
+            .iter()
+            .find(|finding| finding.key == reason)
+            .unwrap();
+        assert_eq!(finding.severity, Severity::Error);
+        assert_eq!(finding.count, 1);
+        assert_eq!(finding.first_seen_ms, NOW - 1);
+        assert!(finding.summary.contains(words));
+    }
+}
+
+#[test]
+fn diagnostics_inventory_repairs_distinguish_progress_from_failure() {
+    let store = broca_store::SqliteStore::open_in_memory().unwrap();
+    let mut evidence = healthy(&store, NOW - 1000);
+    evidence.rings.insert(
+        "session_inventory_repairs".into(),
+        Ok(Snapshot {
+            since_ms: NOW - 1000,
+            truncated: false,
+            events: ["started", "completed", "failed"]
+                .into_iter()
+                .map(|code| Event {
+                    at_ms: NOW - 1,
+                    module: String::new(),
+                    code: code.into(),
+                })
+                .collect(),
+        }),
+    );
+    let reply = report(evidence, NOW, 1000);
+    let findings: Vec<_> = reply
+        .findings
+        .iter()
+        .filter(|finding| finding.check == "session_inventory_repairs")
+        .collect();
+    assert_eq!(findings.len(), 3);
+    for finding in findings {
+        assert_eq!(finding.count, 1);
+        assert_eq!(
+            finding.severity,
+            if finding.key == "failed" {
+                Severity::Error
+            } else {
+                Severity::Info
+            }
+        );
+        assert!(finding.summary.contains("Session inventory repairs"));
+    }
+}
 fn principal() -> BindPrincipal {
     BindPrincipal::Reserved {
         module_id: "prefrontal-core".into(),
@@ -34,18 +124,23 @@ fn healthy(store: &broca_store::SqliteStore, since: i64) -> Evidence {
         retention: Ok(vec![]),
         catalog_age_ms: Ok(100),
         unmapped_credentials: BTreeMap::new(),
-        rings: ["send_refusals", "catalog_stale", "tool_outages"]
-            .map(|check| {
-                (
-                    check.into(),
-                    Ok(Snapshot {
-                        since_ms: NOW - 1000,
-                        truncated: false,
-                        events: vec![],
-                    }),
-                )
-            })
-            .into(),
+        rings: [
+            "send_refusals",
+            "catalog_stale",
+            "tool_outages",
+            "session_address_unavailable",
+        ]
+        .map(|check| {
+            (
+                check.into(),
+                Ok(Snapshot {
+                    since_ms: NOW - 1000,
+                    truncated: false,
+                    events: vec![],
+                }),
+            )
+        })
+        .into(),
     }
 }
 type SeedDetails<'a> = (
@@ -723,6 +818,21 @@ fn diagnostics_findings_v1_vectors_match_serving_replies() {
     let reply = answer(json!({}), Some(&principal()), &head, NOW, |since| {
         let mut evidence = healthy(&store, since);
         evidence.unmapped_credentials = unmapped_credentials();
+        evidence.rings.insert(
+            "session_address_unavailable".into(),
+            Ok(Snapshot {
+                since_ms: NOW - 1000,
+                truncated: false,
+                events: ["incomplete_inventory", "gap_marker", "store_error"]
+                    .into_iter()
+                    .map(|reason| Event {
+                        at_ms: NOW - 1,
+                        module: String::new(),
+                        code: reason.into(),
+                    })
+                    .collect(),
+            }),
+        );
         Ok(evidence)
     })
     .unwrap();

@@ -27,6 +27,19 @@ pub struct Reservation {
     pub extra: Map<String, Value>,
 }
 
+impl Reservation {
+    /// Decode the optional admission snapshot without inventing facts for older reservations.
+    pub fn vault_billing_facts(
+        &self,
+    ) -> Result<Option<crate::vault_facts::VaultBillingFacts>, serde_json::Error> {
+        self.credential
+            .get("auth_selection")
+            .and_then(|selection| selection.get("billing_vault_facts"))
+            .map(|facts| serde_json::from_value(facts.clone()))
+            .transpose()
+    }
+}
+
 /// Provider counters, preserving the difference between absent evidence and measured zero.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Usage {

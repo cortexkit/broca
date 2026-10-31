@@ -2,9 +2,18 @@
 
 use rusqlite::Connection;
 
-pub(super) const SESSION_TABLES: &[&str] =
-    &["projection_boundary", "message", "episode", "run", "setup"];
+pub(super) const SESSION_TABLES: &[&str] = &[
+    "source_auth",
+    "episode_seed",
+    "projection_boundary",
+    "message",
+    "episode",
+    "run",
+    "setup",
+];
 pub(super) const REBUILDABLE_TABLES: &[&str] = &[
+    "source_auth",
+    "episode_seed",
     "projection_boundary",
     "message",
     "episode",
@@ -75,6 +84,20 @@ pub(super) fn initialize(conn: &Connection) -> rusqlite::Result<()> {
                         AND terminal_end > terminal_off))))
         );
         CREATE INDEX IF NOT EXISTS projection_boundary_qualified ON projection_boundary(sid,qualified,seq);
+        CREATE TABLE IF NOT EXISTS episode_seed (
+            sid TEXT NOT NULL REFERENCES session(sid) ON DELETE CASCADE,
+            seq INTEGER NOT NULL,
+            continuation TEXT NOT NULL,
+            PRIMARY KEY(sid,seq),
+            FOREIGN KEY(sid,seq) REFERENCES projection_boundary(sid,seq) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS source_auth (
+            sid TEXT NOT NULL REFERENCES session(sid) ON DELETE CASCADE,
+            frame_off INTEGER NOT NULL, frame_end INTEGER NOT NULL,
+            seq INTEGER NOT NULL, frame_identity BLOB NOT NULL,
+            PRIMARY KEY(sid,frame_off),
+            CHECK(frame_end > frame_off)
+        );
         CREATE TABLE IF NOT EXISTS condemned (
             addr TEXT NOT NULL, lineage_id TEXT NOT NULL, removed_at_ms INTEGER NOT NULL,
             PRIMARY KEY(addr,lineage_id)

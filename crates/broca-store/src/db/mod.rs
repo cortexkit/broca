@@ -8,11 +8,13 @@
 //! of authoritative state use FULL, which also makes earlier WAL commits durable.
 //! Reconciliation must still handle an index ahead of a restored or torn log.
 
+mod episode_reader;
 mod index;
 mod publication;
 mod readers;
 mod rebuild;
 mod reconcile;
+mod resume_reader;
 mod schema;
 mod seeds;
 
@@ -21,6 +23,7 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
+pub use episode_reader::{DatabaseEpisodeReader, EpisodeSnapshot};
 pub use index::{IndexOutcome, LogLocation, PublishedSession};
 pub use readers::{RawPageRequest, RawPageSnapshot};
 pub use rebuild::{AddressFloor, CondemnedLineage, LedgerRows};

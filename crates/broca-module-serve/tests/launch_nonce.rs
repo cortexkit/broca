@@ -24,6 +24,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use broca_core::{FileLeaseStore, FileWalStore, OutputEvent, RunError, RunSummary};
 use broca_module::executor::{RunExecutor, RunJob};
+include!("common/address_inventory.rs");
 use broca_module::{DefaultOpener, LineageRegistry};
 use subc_protocol::{FrameType, ModuleHelloBody};
 use tokio::sync::mpsc;
@@ -105,10 +106,8 @@ async fn serve_until_hello(
     let dir = scratch(tag);
     let lease = Arc::new(FileLeaseStore::new(dir.join("leases")));
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
-    let registry = Arc::new(LineageRegistry::new(Arc::new(DefaultOpener::new(
-        lease,
-        wal,
-        Arc::new(NoRuns),
+    let registry = Arc::new(test_registry(LineageRegistry::new(Arc::new(
+        DefaultOpener::new(lease, wal, Arc::new(NoRuns)),
     ))));
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (mut client_read, _client_write) = tokio::io::split(client);

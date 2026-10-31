@@ -126,6 +126,14 @@ mismatches, missing clock execution and passing fixture skips from the former
 portable selection. Existing optional/live skips outside that selection keep
 their CI behavior; they are not mistaken for portable coverage.
 
+The pinned llm-runner kit's optional-case skips have explicit expectations only
+inside `broca-module-serve::llm_runner_conformance /
+ck_broca_passes_the_llm_runner_conformance_suite`. Each reviewed case must report
+its exact required and missing capability sets. The undeclared per-session
+retention, step-events and user-command groups do not exempt the enclosing test:
+unknown cases, fixture skips, missing declared capabilities and legacy
+`retention_honoured` skips still fail the guard.
+
 Each check prints its complete output, exit status and wall time. The final
 summary prints the first error lines and replays complete failed-lane output,
 including failing test names, rather

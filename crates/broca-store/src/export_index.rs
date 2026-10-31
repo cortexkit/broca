@@ -736,6 +736,7 @@ mod tests {
                 "token_limit_field": "max_tokens"
             }),
             auth_selection: Some(AuthSelection {
+                billing_vault_facts: None,
                 auth_method: None,
                 credential_id: "apikey:xai:work".into(),
                 account_ref: None,

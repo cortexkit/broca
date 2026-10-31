@@ -297,7 +297,24 @@ fn project(
                         .iter()
                         .any(|f| f == "bill-attempts/v1");
                     let reserving = record["type"] == "attempt_reserved";
-                    let output = if is_billing && !is_attempt_record(&record) {
+                    let snapshot = match record["type"].as_str() {
+                        Some("run_started") => {
+                            record["config"]["auth_selection"].get("billing_vault_facts")
+                        }
+                        Some("run_auth_refrozen") => {
+                            record["auth_selection"].get("billing_vault_facts")
+                        }
+                        _ => None,
+                    };
+                    let invalid_snapshot = snapshot.is_some_and(|value| {
+                        serde_json::from_value::<crate::vault_facts::VaultBillingFacts>(
+                            value.clone(),
+                        )
+                        .is_err()
+                    });
+                    let output = if invalid_snapshot {
+                        Err("invalid vault billing snapshot")
+                    } else if is_billing && !is_attempt_record(&record) {
                         Err("unrecognized billing record")
                     } else {
                         fold.apply(&record, metadata, head.lineage_id)
@@ -883,7 +900,11 @@ fn validate_reservation(v: &Value) -> Result<(), &'static str> {
     {
         return Err("incomplete reservation facts");
     }
-    serde_json::from_value::<Reservation>(v.clone()).map_err(|_| "invalid reservation shape")?;
+    let reservation = serde_json::from_value::<Reservation>(v.clone())
+        .map_err(|_| "invalid reservation shape")?;
+    reservation
+        .vault_billing_facts()
+        .map_err(|_| "invalid vault billing snapshot")?;
     Ok(())
 }
 
@@ -1402,6 +1423,29 @@ mod tests {
     }
 
     #[test]
+    fn cache_diagnostics_are_ignored_by_the_billing_reader() {
+        let mut log = Log::new();
+        log.open(W);
+        let mut terminal = finished(1, false);
+        let reservation = terminal["reservation"].clone();
+        let envelope = terminal["envelope"].clone();
+        terminal["cache_evidence"] = json!({"compared_to":"lineage:2","extends_previous":false,
+            "first_divergence":{"region":"messages","message_index":2,"part_index":0,"message_ordinal":41},"previous_last_breakpoint":null,"idle_gap_ms":123,
+            "cache_ttl_ms":null,"ttl_kind":"implicit","model_changed":false,
+            "account_changed":false,"view":null,"future_evidence_member":true});
+        terminal["websocket_request"] = json!({"len":10,"sha256":"digest","codex":{
+            "continuation":false,"suffix_item_count":0,"connection_generation":2,
+            "previous_response_id_present":false,"physical_send_count":1,
+            "full_input_reason":"future_transport_cause"}});
+        log.push(terminal, W);
+        let (items, _) = log.read(None);
+        assert_eq!(charges(&items).len(), 1);
+        assert!(!items.iter().any(|item| matches!(item, Item::Unreadable(_))));
+        assert_eq!(charges(&items)[0].reservation, reservation);
+        assert_eq!(charges(&items)[0].envelope.as_ref(), Some(&envelope));
+    }
+
+    #[test]
     fn typed_billing_shapes_match_validated_evidence_and_preserve_extensions() {
         let mut log = Log::new();
         log.open(W);
@@ -1447,6 +1491,62 @@ mod tests {
         let models: Vec<UsageByModel> = envelope.usage_by_model.unwrap();
         assert_eq!(models[1].usage.cache_write_tokens, Some(3));
         assert_eq!(models[1].cache_write_1h_tokens, Some(2));
+    }
+
+    #[test]
+    fn vault_snapshot_absence_corrections_and_unreadable_are_distinct() {
+        let mut log = Log::new();
+        log.open(W);
+        log.push(finished(1, false), W);
+        let (items, cp) = log.read(None);
+        assert_eq!(
+            charges(&items)[0]
+                .typed_reservation()
+                .unwrap()
+                .vault_billing_facts()
+                .unwrap(),
+            None
+        );
+        let snapshot = json!({"state":"observed", "credential_id":"vault-id", "record_version":232,
+            "provider_ids":["anthropic"], "plan_tier":"max_5x", "plan_tier_source":"operator"});
+        let mut correction = finished(1, false);
+        correction["type"] = json!("attempt_corrected");
+        correction["correction_id"] = json!("ffeeddccbbaa99887766554433221100");
+        correction["reason"] = json!("credential_attribution_corrected");
+        correction["reservation"]["credential"]["auth_selection"] =
+            json!({"credential_id":"lookup", "billing_vault_facts":snapshot});
+        log.push(correction.clone(), W);
+        let (items, cp) = log.read(Some(&cp));
+        let billed = charges(&items)[0];
+        assert_eq!(billed.kind, BilledKind::Correction);
+        let facts = billed
+            .typed_reservation()
+            .unwrap()
+            .vault_billing_facts()
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::to_value(facts).unwrap(), snapshot);
+        correction["reservation"]["credential"]["auth_selection"]["billing_vault_facts"] =
+            json!({"state":"unavailable", "credential_id":"vault-id", "record_version":232});
+        correction["correction_id"] = json!("ffeeddccbbaa99887766554433221101");
+        log.push(correction.clone(), W);
+        let (items, cp) = log.read(Some(&cp));
+        assert!(matches!(
+            charges(&items)[0]
+                .typed_reservation()
+                .unwrap()
+                .vault_billing_facts()
+                .unwrap(),
+            Some(crate::vault_facts::VaultBillingFacts::Unavailable(_))
+        ));
+        correction["reservation"]["credential"]["auth_selection"]["billing_vault_facts"] =
+            json!({"state":"observed"});
+        correction["correction_id"] = json!("ffeeddccbbaa99887766554433221102");
+        log.push(correction, W);
+        let (items, _) = log.read(Some(&cp));
+        assert!(
+            matches!(&items[..], [Item::Unreadable(e)] if matches!(e.reason, Reason::BillingRecord(_)) && !e.raw_frame.is_empty())
+        );
     }
 
     #[test]

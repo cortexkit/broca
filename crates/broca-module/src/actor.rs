@@ -10141,6 +10141,7 @@ mod tests {
                     WalRecord::RunAuthRefrozen {
                         ts_ms: None,
                         auth_selection: broca_wal::AuthSelection {
+                            billing_vault_facts: None,
                             credential_id: format!("apikey:stub:refrozen{auth}"),
                             account_ref: None,
                             resolved_credential_id: None,
@@ -10576,6 +10577,7 @@ mod tests {
                 WalRecord::RunAuthRefrozen {
                     ts_ms: None,
                     auth_selection: broca_wal::AuthSelection {
+                        billing_vault_facts: None,
                         credential_id: format!("apikey:stub:{auth}"),
                         account_ref: None,
                         resolved_credential_id: None,
@@ -10785,6 +10787,7 @@ mod tests {
             records.push(WalRecord::RunAuthRefrozen {
                 ts_ms: None,
                 auth_selection: broca_wal::AuthSelection {
+                    billing_vault_facts: None,
                     credential_id: "apikey:stub:tail".into(),
                     account_ref: None,
                     resolved_credential_id: None,
@@ -10840,6 +10843,7 @@ mod tests {
             &WalRecord::RunAuthRefrozen {
                 ts_ms: None,
                 auth_selection: broca_wal::AuthSelection {
+                    billing_vault_facts: None,
                     credential_id: "apikey:stub:after-barrier".into(),
                     account_ref: None,
                     resolved_credential_id: None,
@@ -15386,6 +15390,7 @@ mod steer_auth_conflict_tests {
     fn frozen(credential_id: Option<&str>) -> broca_wal::RunConfig {
         let mut config = super::tests::min_config();
         config.auth_selection = credential_id.map(|id| broca_wal::AuthSelection {
+            billing_vault_facts: None,
             auth_method: None,
             credential_id: id.into(),
             account_ref: None,

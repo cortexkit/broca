@@ -47,6 +47,7 @@ pub mod late_results_store;
 mod retained_head;
 pub mod retention;
 pub mod retention_withdrawals;
+pub mod session_address;
 pub mod session_refs;
 pub mod system_one;
 pub use fold_identities::fold_identities;

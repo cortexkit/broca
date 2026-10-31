@@ -42,7 +42,8 @@ pub enum ReadView {
 
 mod model_page;
 pub use model_page::{
-    read_session_model_page, ModelEntry, ModelPage, ModelPageError, ModelPageRequest,
+    read_session_model_page, read_session_model_page_by_episode, EpisodeFrames, EpisodeModelPage,
+    EpisodePageIndex, ModelEntry, ModelPage, ModelPageError, ModelPageRequest,
 };
 
 /// One atomic read from the materialized store: the reconstructed prefix + the
@@ -3832,6 +3833,7 @@ mod tests {
             WalRecord::RunAuthRefrozen {
                 ts_ms: Some(50),
                 auth_selection: AuthSelection {
+                    billing_vault_facts: None,
                     auth_method: None,
                     credential_id: "chatgpt:openai".into(),
                     account_ref: Some("resumed-account".into()),
@@ -3847,6 +3849,7 @@ mod tests {
         assert_eq!(
             recovered.auth_selection,
             Some(AuthSelection {
+                billing_vault_facts: None,
                 auth_method: None,
                 credential_id: "chatgpt:openai".into(),
                 account_ref: Some("resumed-account".into()),

@@ -309,6 +309,7 @@ impl Rig {
             Some(wal.clone()),
             Some(index.clone()),
         ));
+        registry.set_session_address_inventory(index.clone());
         let service = Arc::new(AgentDataService::new(
             root.clone(),
             registry.as_ref().clone(),
@@ -625,6 +626,8 @@ async fn stamped_principal_admission_precedes_json_and_every_store_read() {
         })),
         Some(rig.index.clone()),
     ));
+    rig.registry
+        .set_session_address_inventory(rig.index.clone());
     std::fs::write(
         rig.root.join("wal/not-a-valid-address.wal"),
         b"must not be read",

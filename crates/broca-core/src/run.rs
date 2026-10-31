@@ -730,6 +730,8 @@ pub struct RunControl {
     pub compaction_plane: Option<Arc<dyn crate::compaction::CompactionPlane>>,
     /// The budget for the compaction Setup call. Default uses COMPACTION_CALL_BUDGET_MS.
     pub compaction_config: crate::compaction::CompactionConfig,
+    /// Boot-only rollout gate for notice pricing and pre-render chain-reset requests.
+    pub compaction_signals: bool,
     /// Views fetched from the session's compaction provider, offered at each step boundary.
     /// Absent, the session renders Setup's message and the views it already applied.
     pub compaction_views: Option<Arc<dyn crate::compaction::CompactionViews>>,
@@ -836,6 +838,7 @@ impl Default for RunControl {
             compaction_plane: None,
             compaction_views: None,
             compaction_config: Default::default(),
+            compaction_signals: true,
             #[cfg(feature = "test-clock")]
             test_compaction: None,
             provider_call_timeout: None,
@@ -1712,6 +1715,15 @@ where
             "offset resume requires a broca-state/2 root".into(),
         ));
     }
+    let prepared = match prepare_offset_resume(writer, wal_store, &req.session, offsets).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if let Some(ack) = on_admitted {
+                let _ = ack.send(Err(error.clone()));
+            }
+            return Err(error);
+        }
+    };
     let (append_episode, auth_resolved) = mode.flags();
     run_on_writer(
         &mut req,
@@ -1727,7 +1739,119 @@ where
         out,
         on_admitted,
         None,
-        Some(offsets),
+        Some(prepared),
+    )
+    .await
+}
+
+/// A transient resume selection shared by admission/provider resolution and execution.
+/// Only content-free continuation forms belong in the database, never this hydrated state.
+pub struct PreparedOffsetResume {
+    snapshot: PriorWalSnapshot,
+    prior: Option<ReplayState>,
+    placement: Option<crate::placement::Placement>,
+    lineage: Option<broca_wal::WalLineageId>,
+}
+
+impl PreparedOffsetResume {
+    pub fn snapshot(&self) -> &PriorWalSnapshot {
+        &self.snapshot
+    }
+}
+
+/// Select the validated resume view before resolving the recorded provider and credentials.
+pub async fn prepare_offset_resume<W: WalStore>(
+    writer: &WalHandle,
+    wal_store: &W,
+    session: &BindIdentity,
+    offsets: &dyn crate::resume::OffsetResumeReader,
+) -> Result<Box<PreparedOffsetResume>, RunError> {
+    if !wal_store.wal_config().is_overhaul() {
+        return Err(RunError::Wal(
+            "offset resume requires a broca-state/2 root".into(),
+        ));
+    }
+    let safe_head = writer
+        .sync()
+        .await
+        .map_err(|e| RunError::Wal(e.to_string()))?;
+    let loaded = broca_wal::access_counter::fallback_result(
+        || offsets.snapshot(safe_head),
+        |fallback| fallback.reason,
+    )
+    .and_then(|snapshot| {
+        if writer.lineage_id().map(|id| id.to_string()) != snapshot.boundary.lineage_id {
+            return Err(crate::replay::SeedFallback::new(
+                "offset resume writer lineage mismatch",
+            ));
+        }
+        crate::resume::reconstruct_from_offsets(
+            &|off, len| offsets.read_at(off, len),
+            snapshot,
+            safe_head,
+        )
+    });
+    match loaded {
+        Ok(loaded) => {
+            offsets.reconstructed(None);
+            Ok(Box::new(PreparedOffsetResume {
+                snapshot: loaded.snapshot,
+                prior: Some(loaded.prior),
+                placement: Some(loaded.placement),
+                lineage: writer.lineage_id(),
+            }))
+        }
+        Err(reason) => {
+            offsets.reconstructed(Some(reason));
+            Ok(Box::new(PreparedOffsetResume {
+                snapshot: complete_snapshot(wal_store, session)?,
+                prior: None,
+                placement: None,
+                lineage: writer.lineage_id(),
+            }))
+        }
+    }
+}
+
+/// Execute using the same transient offset selection that supplied admission's prior view.
+/// Writer publication subscribers remain installed. Omitting the legacy materializer keeps
+/// hydrated messages transient instead of persisting another content copy.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_loop_on_writer_with_prepared_resume<P, T, A, W>(
+    mut req: RunRequest,
+    writer: &WalHandle,
+    mode: StartMode,
+    provider: &P,
+    tool_plane: &T,
+    approval: &A,
+    wal_store: &W,
+    control: RunControl,
+    out: &mpsc::Sender<OutputEvent>,
+    on_admitted: Option<tokio::sync::oneshot::Sender<Result<RunId, RunError>>>,
+    prepared: Box<PreparedOffsetResume>,
+) -> Result<RunSummary, RunError>
+where
+    P: Provider,
+    T: ToolPlane,
+    A: ApprovalPolicy,
+    W: WalStore,
+{
+    let (append_episode, auth_resolved) = mode.flags();
+    run_on_writer(
+        &mut req,
+        writer,
+        append_episode,
+        auth_resolved,
+        provider,
+        tool_plane,
+        approval,
+        wal_store,
+        None,
+        &control,
+        out,
+        on_admitted,
+        None,
+        Some(prepared),
     )
     .await
 }
@@ -1751,7 +1875,7 @@ async fn run_on_writer<P, T, A, W>(
     out: &mpsc::Sender<OutputEvent>,
     on_admitted: Option<tokio::sync::oneshot::Sender<Result<RunId, RunError>>>,
     prior_snapshot: Option<&PriorWalSnapshot>,
-    offsets: Option<&dyn crate::resume::OffsetResumeReader>,
+    offsets: Option<Box<PreparedOffsetResume>>,
 ) -> Result<RunSummary, RunError>
 where
     P: Provider,
@@ -1821,6 +1945,30 @@ where
             return Err(e);
         }
     };
+    let evidence_lineage = writer.lineage_id().map(|id| id.to_string());
+    if provider.cache_evidence_needs_seed(evidence_lineage.as_deref()) {
+        let frames = if !is_resume
+            || prior_snapshot.is_some_and(|snapshot| {
+                prior_snapshot_matches_writer_head(writer, snapshot)
+                    && snapshot.checkpoint_at_head.has_model_attempt == Some(false)
+            }) {
+            Ok(Vec::new())
+        } else if let Some(snapshot) = prior_snapshot.filter(|snapshot| {
+            snapshot.base_watermark == 0 && prior_snapshot_matches_writer_head(writer, snapshot)
+        }) {
+            // A complete admission snapshot already contains the previous attempt. Reading
+            // the WAL again would make cold diagnostic state slow down ordinary admission.
+            Ok(snapshot.tail.as_ref().clone())
+        } else {
+            wal_store.read_records(&req.session)
+        };
+        match frames {
+            Ok(frames) => provider.seed_cache_evidence(frames, evidence_lineage).await,
+            Err(_) => {
+                tracing::warn!(target: "provider", "Cache evidence reconstruction unavailable; request execution is unchanged")
+            }
+        }
+    }
     // An applied view can leave the resumed prompt without the episode coordinates of earlier
     // episodes, which ChatGPT effort updates and per-episode repetition guidance render from.
     // The store projects them, so take them from there instead of replaying the whole WAL.
@@ -1926,45 +2074,29 @@ async fn reconstruct_prior<W>(
     wal_store: &W,
     store: Option<Arc<dyn SessionStore>>,
     prior_snapshot: Option<&PriorWalSnapshot>,
-    offsets: Option<&dyn crate::resume::OffsetResumeReader>,
+    offsets: Option<Box<PreparedOffsetResume>>,
 ) -> Result<ReconstructedPrior, RunError>
 where
     W: WalStore,
 {
     require_agent_run_scope_writer(req.scope.as_ref())?;
     let mut offset_prior = None;
-    let snapshot = if let Some(offsets) = offsets {
-        let safe_head = writer
-            .sync()
-            .await
-            .map_err(|e| RunError::Wal(e.to_string()))?;
-        let loaded = broca_wal::access_counter::fallback_result(
-            || offsets.snapshot(safe_head),
-            |fallback| fallback.reason,
-        )
-        .and_then(|snapshot| {
-            if writer.lineage_id().map(|id| id.to_string()) != snapshot.boundary.lineage_id {
-                return Err(crate::replay::SeedFallback::new(
-                    "offset resume writer lineage mismatch",
-                ));
+    let snapshot = if let Some(prepared) = offsets {
+        if prior_snapshot_matches_writer_head(writer, &prepared.snapshot)
+            && prepared.lineage == writer.lineage_id()
+        {
+            if let Some(placement) = prepared.placement {
+                writer.seed_display_placement(prepared.snapshot.head_seq, placement);
             }
-            crate::resume::reconstruct_from_offsets(
-                &|off, len| offsets.read_at(off, len),
-                snapshot,
-                safe_head,
-            )
-        });
-        match loaded {
-            Ok(loaded) => {
-                offsets.reconstructed(None);
-                writer.seed_display_placement(safe_head, loaded.placement);
-                offset_prior = Some(loaded.prior);
-                loaded.snapshot
-            }
-            Err(reason) => {
-                offsets.reconstructed(Some(reason));
-                complete_snapshot(wal_store, &req.session)?
-            }
+            offset_prior = prepared.prior;
+            prepared.snapshot
+        } else {
+            crate::replay::SeedFallback::new("prepared offset resume no longer at durable head");
+            writer
+                .sync()
+                .await
+                .map_err(|e| RunError::Wal(e.to_string()))?;
+            complete_snapshot(wal_store, &req.session)?
         }
     } else {
         match prior_snapshot {
@@ -5508,6 +5640,7 @@ where
         // Stage the model event for decisions; publish these facts only after the turn barrier.
         let mut step_budget_state = budget_state.clone();
         let step_id = StepId(completed_steps + 1);
+        let compaction_step_start_ms = control.now_ms().unwrap_or_else(crate::compaction::now);
 
         // Mark the step boundary durably BEFORE the live StepStarted unit is published
         // (run_step emits it to `out`). Recording first gives the unit a durable cursor,
@@ -5621,6 +5754,10 @@ where
         });
         let mut model_opts = None;
         if let Some(runtime) = &compaction_runtime {
+            let history_edit_cost = notice_history_edit_cost(control, provider);
+            let chain_reset = history_edit_cost
+                == Some(crate::compaction_provider::notice::HistoryEditCost::FullResend)
+                && provider.prepare_chain_reset();
             // A legacy WAL mints its lineage on the first append. StepStarted is only
             // queued above, so wait for its barrier before reading the writer's identity.
             // A WAL backend that still cannot identify this lineage cannot host compaction.
@@ -5731,6 +5868,32 @@ where
                 .as_ref()
                 .and_then(crate::compaction::view::selection_account_label);
             let session_ref = crate::wal_writer::agent_session_ref(&req.session);
+            if !Box::pin(runtime.apply_due_view(
+                state,
+                crate::compaction::runtime::DueViewAt {
+                    session_ref: &session_ref,
+                    lineage_id: &lineage_id,
+                    prompt: &opts.prompt,
+                    stored: raw,
+                    prefix_bound: provider.reasoning_is_prefix_bound(),
+                    run_start: completed_steps == 0,
+                    step_start_ms: compaction_step_start_ms,
+                },
+            ))
+            .await?
+            {
+                terminal_error = Some(crate::compaction::runtime::error(
+                    Some(Box::new(broca_protocol::error::ProviderRefusal {
+                        provider: state.provider.clone(),
+                        reason: Some(crate::compaction_provider::setup::VIEW_DUE_UNAPPLIED.into()),
+                        provider_detail_code: None,
+                    })),
+                    crate::compaction_provider::setup::VIEW_DUE_UNAPPLIED,
+                    Some("compaction_unavailable".into()),
+                    false,
+                ));
+                break RunFinishReason::Error;
+            }
             // Ride when the prefix is being rewritten anyway, then fetch the newest announced
             // view with `view.get`; either is offered here, at the boundary, and recorded before
             // the request renders.
@@ -5760,6 +5923,7 @@ where
                     // the model is sent (tags and loop guidance included); and the stored
                     // copy, against which the view's own bytes are judged.
                     &opts.prompt,
+                    chain_reset,
                     raw,
                     provider.reasoning_is_prefix_bound(),
                     // The run's first step, where a view deferred over an open turn ends.
@@ -5791,6 +5955,7 @@ where
                     state,
                     through,
                     crate::compaction::view::NoticeFacts {
+                        history_edit_cost: history_edit_cost.clone(),
                         session_ref: session_ref.clone(),
                         lineage_id: &lineage_id,
                         est_tokens: estimate,
@@ -5847,6 +6012,7 @@ where
                     state,
                     through,
                     crate::compaction::view::NoticeFacts {
+                        history_edit_cost: history_edit_cost.clone(),
                         session_ref,
                         lineage_id: &lineage_id,
                         est_tokens: crate::compaction::request_estimate(
@@ -5940,7 +6106,7 @@ where
         let journaled_attempts = writer
             .is_overhaul()
             .then(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
-        let record_attempt = |attempt: broca_protocol::ModelAttempt| -> AttemptFuture<'_> {
+        let record_attempt = |mut attempt: broca_protocol::ModelAttempt| -> AttemptFuture<'_> {
             let journaled_attempts = &journaled_attempts;
             step_attempts.fetch_max(
                 attempt.attempt.saturating_add(1),
@@ -5978,15 +6144,28 @@ where
                     }
                     return Ok(());
                 }
+                provider.annotate_cache_evidence(&mut attempt);
                 match &control.account_reporter {
                     Some(reporter) => {
                         let seq = writer
                             .record(WalRecord::model_attempt_finished(step_id, attempt.clone()))
                             .into_result()?;
+                        provider.cache_attempt_recorded(
+                            writer.lineage_id().map(|id| format!("{id}:{seq}")),
+                        );
                         reporter.attempt_recorded(writer.lineage_id(), seq, &attempt);
                     }
                     None => {
-                        writer.record(WalRecord::model_attempt_finished(step_id, attempt));
+                        // Keep append failures on the run's existing error path instead of
+                        // returning earlier merely to collect the appended record's sequence.
+                        if let Ok(seq) = writer
+                            .record(WalRecord::model_attempt_finished(step_id, attempt))
+                            .into_result()
+                        {
+                            provider.cache_attempt_recorded(
+                                writer.lineage_id().map(|id| format!("{id}:{seq}")),
+                            );
+                        }
                     }
                 }
                 if needs_sync {
@@ -6150,6 +6329,12 @@ where
             let attempt_hook = hook_channel
                 .as_ref()
                 .map(|(tx, _)| Arc::new(ChannelAttemptHook(tx.clone())) as Arc<dyn AttemptHook>);
+            provider.set_cache_evidence_view(
+                compaction_state
+                    .as_ref()
+                    .and_then(|state| state.view.as_ref())
+                    .map(|applied| applied.view.view_version),
+            );
             let model_step = Box::pin(run_step_watched(
                 provider,
                 step_id,
@@ -6204,6 +6389,7 @@ where
                     &mut hook_requests,
                     &mut AttemptJournal {
                         writer,
+                        evidence: Some(provider),
                         seal: control.shutdown_seal.as_ref(),
                         template,
                         pending: Default::default(),
@@ -6883,6 +7069,7 @@ where
                         &compaction_history,
                         notice_request_bytes,
                         compaction_notice_floor,
+                        notice_history_edit_cost(control, provider),
                     )
                     .map(|closing| (closing, assembled.content.as_slice())),
                 )
@@ -6940,6 +7127,7 @@ where
                     &compaction_history,
                     notice_request_bytes,
                     compaction_notice_floor,
+                    notice_history_edit_cost(control, provider),
                 )
                 .map(|closing| (closing, assembled.content.as_slice())),
             )
@@ -6983,6 +7171,7 @@ where
                         &compaction_history,
                         notice_request_bytes,
                         compaction_notice_floor,
+                        notice_history_edit_cost(control, provider),
                     )
                     .map(|closing| (closing, assembled.content.as_slice())),
                 )
@@ -7081,6 +7270,7 @@ where
                         &compaction_history,
                         notice_request_bytes,
                         compaction_notice_floor,
+                        notice_history_edit_cost(control, provider),
                     )
                     .map(|closing| (closing, assembled.content.as_slice())),
                 )
@@ -7314,6 +7504,7 @@ where
             &compaction_history,
             notice_request_bytes,
             compaction_notice_floor,
+            notice_history_edit_cost(control, provider),
         ),
     ) {
         if let Some((state, notice)) = closing.notice(&[], &[]) {
@@ -8788,6 +8979,7 @@ impl PendingAttempt {
 
 struct AttemptJournal<'a> {
     writer: &'a WalHandle,
+    evidence: Option<&'a dyn Provider>,
     seal: Option<&'a crate::ShutdownSeal>,
     template: broca_wal::record::AttemptReservation,
     pending: std::collections::BTreeMap<broca_wal::record::AttemptId, PendingAttempt>,
@@ -8943,7 +9135,7 @@ impl AttemptJournal<'_> {
             }
             AttemptRequest::Finish {
                 id,
-                attempt,
+                mut attempt,
                 outcome,
                 response,
                 reply,
@@ -8971,6 +9163,9 @@ impl AttemptJournal<'_> {
                     ..response.map(|response| *response).unwrap_or_default()
                 };
                 let ordinal = attempt.attempt;
+                if let Some(provider) = self.evidence {
+                    provider.annotate_cache_evidence(&mut attempt);
+                }
                 let mut record =
                     WalRecord::model_attempt_finished(pending.reservation.step_id, attempt);
                 if let WalRecord::ModelAttemptFinished {
@@ -8985,6 +9180,11 @@ impl AttemptJournal<'_> {
                     *slot = Some(Box::new(envelope));
                 }
                 if let Some(seq) = self.settle(&id, record)? {
+                    if let Some(provider) = self.evidence {
+                        provider.cache_attempt_recorded(
+                            self.writer.lineage_id().map(|id| format!("{id}:{seq}")),
+                        );
+                    }
                     // Compression refusal produces no stream event. Do not let its
                     // ordinal suppress telemetry for a resend cancelled before sending.
                     if outcome != BillingAttemptOutcome::CompressionRefused {
@@ -11222,6 +11422,16 @@ fn interrupted_result(id: &ToolCallId) -> ToolResult {
     }
 }
 
+fn notice_history_edit_cost(
+    control: &RunControl,
+    provider: &dyn Provider,
+) -> Option<crate::compaction_provider::notice::HistoryEditCost> {
+    control
+        .compaction_signals
+        .then(|| provider.history_edit_cost())
+        .flatten()
+}
+
 /// The advance notice a compaction session records when its run ends, announcing the writes
 /// after its last step boundary (the final answer, and the results of a hard stop) before the
 /// terminal (compaction-provider CONTRACT.md §5: a notice after each durable write). `None`
@@ -11238,6 +11448,7 @@ struct ClosingNotice<'a> {
     history: &'a crate::compaction::CompactionHistory,
     request_bytes: usize,
     floor: u64,
+    history_edit_cost: Option<crate::compaction_provider::notice::HistoryEditCost>,
 }
 
 impl<'a> ClosingNotice<'a> {
@@ -11254,6 +11465,7 @@ impl<'a> ClosingNotice<'a> {
         history: &'a crate::compaction::CompactionHistory,
         request_bytes: usize,
         floor: u64,
+        history_edit_cost: Option<crate::compaction_provider::notice::HistoryEditCost>,
     ) -> Option<Self> {
         Some(Self {
             state: state?,
@@ -11267,6 +11479,7 @@ impl<'a> ClosingNotice<'a> {
             history,
             request_bytes,
             floor,
+            history_edit_cost,
         })
     }
 
@@ -11334,6 +11547,7 @@ impl<'a> ClosingNotice<'a> {
             self.state,
             through,
             crate::compaction::view::NoticeFacts {
+                history_edit_cost: self.history_edit_cost,
                 session_ref: crate::wal_writer::agent_session_ref(self.session),
                 lineage_id: &self.lineage_id,
                 est_tokens: estimate,
@@ -11828,6 +12042,7 @@ mod tests {
         let hook = Arc::new(ChannelAttemptHook(tx));
         let recorded = Default::default();
         let mut journal = AttemptJournal {
+            evidence: None,
             writer: &writer,
             seal: Some(&seal),
             template: attempt_template(),
@@ -11985,6 +12200,7 @@ mod tests {
         let recorded = Default::default();
         let seal = crate::ShutdownSeal::new();
         let mut journal = AttemptJournal {
+            evidence: None,
             writer: &writer,
             seal: Some(&seal),
             template: attempt_template(),
@@ -12109,6 +12325,7 @@ mod tests {
         let hook = ChannelAttemptHook(tx);
         let recorded = Default::default();
         let mut journal = AttemptJournal {
+            evidence: None,
             writer: &writer,
             seal: None,
             template: attempt_template(),
@@ -12160,6 +12377,7 @@ mod tests {
         let hook = ChannelAttemptHook(tx);
         let recorded = Default::default();
         let mut journal = AttemptJournal {
+            evidence: None,
             writer: &writer,
             seal: None,
             template: attempt_template(),
@@ -12253,6 +12471,7 @@ mod tests {
         let hook = ChannelAttemptHook(tx);
         let recorded = Default::default();
         let mut journal = AttemptJournal {
+            evidence: None,
             writer: &writer,
             seal: None,
             template: attempt_template(),
@@ -12335,6 +12554,7 @@ mod tests {
         assert!(writer.is_overhaul());
         let recorded = Default::default();
         let mut journal = AttemptJournal {
+            evidence: None,
             writer: &writer,
             seal: None,
             template,
@@ -12549,6 +12769,7 @@ mod tests {
         let proceed = Arc::new(Notify::new());
         let recorded = Default::default();
         let mut journal = AttemptJournal {
+            evidence: None,
             writer: &writer,
             seal: None,
             template: attempt_template(),
@@ -12610,6 +12831,7 @@ mod tests {
         let hook = ChannelAttemptHook(tx);
         let recorded = Default::default();
         let mut journal = AttemptJournal {
+            evidence: None,
             writer: &writer,
             seal: Some(&seal),
             template: attempt_template(),
@@ -12673,6 +12895,7 @@ mod tests {
             sent_at_ms: None,
             transport: None,
             websocket_request: None,
+            cache_evidence: None,
             websocket_close_code: None,
             input_transformations: report,
             input_transformations_unmeasured: unmeasured,
@@ -14921,6 +15144,7 @@ mod tests {
             trailing_origin: None,
             last_run_id: Some(RunId("budget".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                has_model_attempt: None,
                 media: None,
                 head: None,
                 has_deferred_calls: None,

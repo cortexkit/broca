@@ -95,6 +95,8 @@ fn compaction_record(kind: CompactionMessageKind, text: &str) -> WalRecord {
         ceiling: None,
         tag_checkpoint: None,
         ride_wait_ms: None,
+        view_features: None,
+        view_due: None,
     }
 }
 fn message(session: &BindIdentity, version: u64) -> cortexkit_bus_trait::Message {

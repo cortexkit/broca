@@ -73,6 +73,8 @@ pub(super) fn compaction_message(seq: u64, kind: CompactionMessageKind) -> Frame
             ceiling: None,
             tag_checkpoint: None,
             ride_wait_ms: None,
+            view_features: None,
+            view_due: None,
         },
     )
 }

@@ -61,6 +61,8 @@ pub struct SkipMarker {
 pub struct Metrics {
     pub bus_events_published: AtomicU64,
     pub bus_outbox_depth: AtomicU64,
+    /// Unpublished advance notices only. A publish receipt is not a consumer acknowledgement.
+    pub compaction_notice_outbox_pending: AtomicU64,
     pub bus_publish_failures: AtomicU64,
     pub bus_events_oversize: AtomicU64,
     pub bus_outbox_dropped: AtomicU64,
@@ -71,6 +73,7 @@ impl Metrics {
         serde_json::json!({
             "bus_events_published": self.bus_events_published.load(Ordering::Relaxed),
             "bus_outbox_depth": self.bus_outbox_depth.load(Ordering::Relaxed),
+            "compaction_notice_outbox_pending": self.compaction_notice_outbox_pending.load(Ordering::Relaxed),
             "bus_publish_failures": self.bus_publish_failures.load(Ordering::Relaxed),
             "bus_events_oversize": self.bus_events_oversize.load(Ordering::Relaxed),
             "bus_outbox_dropped": self.bus_outbox_dropped.load(Ordering::Relaxed),
@@ -507,6 +510,7 @@ impl SqliteStore {
         let mut oversize = 0;
         let mut dropped = 0;
         let mut inserted = 0;
+        let mut inserted_notices = 0;
         for frame in records.iter().filter(|r| r.seq > seq).collect::<Vec<_>>() {
             if frame.seq != seq + 1 {
                 return Err(StoreError::BusEvent(
@@ -597,7 +601,14 @@ impl SqliteStore {
                 }
                 // Notices are not run lifecycle work, so they stay out of the outbox depth.
                 WalRecord::CompactionNotice { headers, .. } => {
-                    insert_notice(&tx, &account, session, headers, state.last_at_ms, now_ms)?;
+                    inserted_notices += u64::from(insert_notice(
+                        &tx,
+                        &account,
+                        session,
+                        headers,
+                        state.last_at_ms,
+                        now_ms,
+                    )?);
                     None
                 }
                 WalRecord::RunFinished {
@@ -677,6 +688,9 @@ impl SqliteStore {
             tx.execute("DELETE FROM bus_event_open WHERE session=?1", [&key])?;
         }
         tx.commit()?;
+        self.bus_metrics()
+            .compaction_notice_outbox_pending
+            .fetch_add(inserted_notices, Ordering::Relaxed);
         drop(conn);
         self.bus_metrics()
             .bus_outbox_depth
@@ -923,15 +937,17 @@ impl SqliteStore {
                 |r| r.get(0),
             )
             .optional()?;
-        let updated = conn.execute(
+        let lifecycle_updated = conn.execute(
             "UPDATE bus_event_outbox SET published_ms=?2 WHERE event_key=?1 AND published_ms IS NULL",
             params![event.event_key, now_ms],
-        )? as u64
-            + conn.execute(
-                "UPDATE compaction_notice_outbox SET published_ms=?2 \
+        )? as u64;
+        let notices_updated = conn.execute(
+            "UPDATE compaction_notice_outbox SET published_ms=?2 \
                  WHERE message_id=?1 AND published_ms IS NULL",
-                params![event.event_key, now_ms],
-            )? as u64;
+            params![event.event_key, now_ms],
+        )? as u64;
+        self.lower_notice_depth(notices_updated);
+        let updated = lifecycle_updated + notices_updated;
         drop(conn);
         self.bus_metrics()
             .bus_events_published
@@ -950,11 +966,16 @@ impl SqliteStore {
             [cutoff],
             |r| r.get(0),
         )?;
+        let notices_dropped: u64 = conn.query_row(
+            "SELECT count(*) FROM compaction_notice_outbox INDEXED BY compaction_notice_unpublished WHERE published_ms IS NULL AND at_ms<?1",
+            [cutoff], |r| r.get(0),
+        )?;
         let deleted = conn.execute("DELETE FROM bus_event_outbox WHERE at_ms<?1", [cutoff])?
             + conn.execute(
                 "DELETE FROM compaction_notice_outbox WHERE at_ms<?1",
                 [cutoff],
             )?;
+        self.lower_notice_depth(notices_dropped);
         drop(conn);
         if dropped > 0 {
             self.lower_bus_depth(dropped);
@@ -971,11 +992,19 @@ impl SqliteStore {
     /// every pending row, and running it per projection held the shared connection for the
     /// length of that pass while every other store operation waited.
     fn resync_bus_depth(&self) -> Result<(), StoreError> {
-        let depth = self.conn.lock().unwrap().query_row(
+        let conn = self.conn.lock().unwrap();
+        let depth = conn.query_row(
             "SELECT count(*) FROM bus_event_outbox INDEXED BY bus_event_unpublished WHERE published_ms IS NULL AND best_effort=0",
             [],
             |r| r.get(0),
         )?;
+        let notices = conn.query_row(
+            "SELECT count(*) FROM compaction_notice_outbox INDEXED BY compaction_notice_unpublished WHERE published_ms IS NULL",
+            [], |r| r.get(0),
+        )?;
+        self.bus_metrics()
+            .compaction_notice_outbox_pending
+            .store(notices, Ordering::Relaxed);
         self.bus_metrics()
             .bus_outbox_depth
             .store(depth, Ordering::Relaxed);
@@ -984,6 +1013,19 @@ impl SqliteStore {
 
     fn lower_bus_depth(&self, by: u64) {
         let depth = &self.bus_metrics().bus_outbox_depth;
+        let mut current = depth.load(Ordering::Relaxed);
+        while let Err(seen) = depth.compare_exchange_weak(
+            current,
+            current.saturating_sub(by),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            current = seen;
+        }
+    }
+
+    fn lower_notice_depth(&self, by: u64) {
+        let depth = &self.bus_metrics().compaction_notice_outbox_pending;
         let mut current = depth.load(Ordering::Relaxed);
         while let Err(seen) = depth.compare_exchange_weak(
             current,
@@ -1410,6 +1452,26 @@ mod tests {
         // The run's lifecycle event first, then the notice; the notice naming another session
         // is never published.
         let mut published = Vec::new();
+        assert_eq!(
+            store
+                .bus_metrics()
+                .compaction_notice_outbox_pending
+                .load(Ordering::Relaxed),
+            1
+        );
+        store
+            .bus_metrics()
+            .compaction_notice_outbox_pending
+            .store(99, Ordering::Relaxed);
+        store.resync_bus_depth().unwrap();
+        assert_eq!(
+            store
+                .bus_metrics()
+                .compaction_notice_outbox_pending
+                .load(Ordering::Relaxed),
+            1,
+            "startup restores pending notices from their own outbox"
+        );
         while let Some(event) = store.pending_bus_event().unwrap() {
             published.push(event.clone());
             if event.event_key.contains(":advanced:") {
@@ -1437,6 +1499,14 @@ mod tests {
         );
         assert_eq!(event.headers, notice.to_headers());
         assert_eq!(event.digest().to_string(), notice.digest());
+        assert_eq!(
+            store
+                .bus_metrics()
+                .compaction_notice_outbox_pending
+                .load(Ordering::Relaxed),
+            0,
+            "publication is accounted independently of consumer acknowledgements"
+        );
         assert_eq!(
             store.pending_bus_event().unwrap().map(|e| e.event_key),
             None
@@ -1630,6 +1700,58 @@ mod tests {
             "only the run started during the period is owed"
         );
         assert_eq!(store.bus_event_open_sessions().unwrap(), vec![later]);
+    }
+
+    #[test]
+    fn pending_notice_count_tracks_pruning_without_counting_published_notices() {
+        use broca_core::compaction_provider::notice::AdvanceNotice;
+        let store = enabled();
+        let notice = AdvanceNotice::new(
+            agent_session_ref(&session()),
+            1,
+            "lineage",
+            0,
+            "ab".repeat(32),
+            12,
+            "model",
+        );
+        let records = [
+            start(),
+            FramedRecord {
+                seq: 2,
+                fence: 1,
+                record: WalRecord::CompactionNotice {
+                    seq: 1,
+                    headers: notice.to_headers(),
+                },
+            },
+        ];
+        store
+            .project_bus_events(&session(), "epoch", &records, 1000)
+            .unwrap();
+        assert_eq!(
+            store
+                .bus_metrics()
+                .compaction_notice_outbox_pending
+                .load(Ordering::Relaxed),
+            1
+        );
+        store.prune_bus_events(RETENTION_MS + 1001).unwrap();
+        assert_eq!(
+            store
+                .bus_metrics()
+                .compaction_notice_outbox_pending
+                .load(Ordering::Relaxed),
+            0
+        );
+        store.resync_bus_depth().unwrap();
+        assert_eq!(
+            store
+                .bus_metrics()
+                .compaction_notice_outbox_pending
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 
     /// The depth gauge follows the rows each call inserts and acknowledges; it is not counted

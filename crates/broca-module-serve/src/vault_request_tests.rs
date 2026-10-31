@@ -1137,6 +1137,7 @@ async fn a_wire_auth_failure_is_reported_by_credential_id_on_the_exact_wire_shap
     let vault = executor.vault.as_ref().expect("the vault auth source is wired");
 
     let key = |credential_id: &str| broca_core::AuthSelection {
+        billing_vault_facts: None,
         credential_id: credential_id.into(),
         account_ref: None,
         resolved_credential_id: None,

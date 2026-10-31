@@ -319,10 +319,12 @@ fn media_carrier_inventory_covers_every_content_field() {
         .into_iter()
         .map(|(slot, _)| slot.to_owned())
         .collect();
-    // These JSON fields are configuration, conditions or pre-tool arguments, never native content.
+    // These JSON fields are configuration, conditions, pre-tool arguments or hash-derived
+    // cache diagnostics, never native message content.
     covered.extend(
         [
             "RunConfigRefrozen.frozen_render_config",
+            "ModelAttemptFinished.cache_evidence",
             "ToolDispatchIntent.args",
             "ToolDispatchIntent.hooks",
             "ToolNoDispatch.hooks",

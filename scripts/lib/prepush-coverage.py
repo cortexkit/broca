@@ -9,6 +9,44 @@ import re
 CLOCK = ('broca-module::it', 'test_clock::test_clock_feature_is_enabled_for_retention_tests')
 STATUS = re.compile(r'^\s*(PASS|FAIL)\s+\[[^\]\n]+\]\s+(?:\(\s*\d+/\d+\)\s+)?(\S+)\s+(.+?)\s*$')
 SKIP = re.compile(r'^\s*SKIP [a-z_]')
+KIT_SUITE = ('broca-module-serve::llm_runner_conformance', 'ck_broca_passes_the_llm_runner_conformance_suite')
+KIT_SKIP = re.compile(r'\s*SKIP ([a-z_]+) \(requires ([^;\n]+); missing ([^)\n]+)\)\s*')
+# The kit's per-session retention policy case requires session_retention, which
+# broca does not declare. Legacy retention_honoured still has to execute.
+# StepEvents and UserCommands are also undeclared. Pin each optional case's full
+# requires/missing sets from kit 0.15.40, not its group prefix or enclosing test.
+KIT_SKIP_EXPECTATIONS = {
+    'session_retention_honoured': ('session_retention, queue, transcript_reads, run_ops', 'session_retention'),
+    'session_retention_days_and_archive': ('session_retention, queue, transcript_reads, run_ops, advance_retention_clock', 'session_retention'),
+    'session_retention_adopt_policy': ('session_retention, adopt, transcript_reads', 'session_retention, adopt'),
+    'session_retention_queued_never_deleted': ('session_retention, queue, transcript_reads, run_ops, advance_retention_clock', 'session_retention'),
+    'session_retention_required': ('session_retention, queue, transcript_reads, run_ops', 'session_retention'),
+    'session_retention_legacy_required': ('session_retention, retention, queue, transcript_reads, run_ops', 'session_retention'),
+    'session_retention_conflict': ('session_retention, queue, transcript_reads, run_ops', 'session_retention'),
+    'session_retention_owner_can_release': ('session_retention, queue, transcript_reads, run_ops', 'session_retention'),
+    'session_retention_parent_cannot_release': ('session_retention, queue, transcript_reads, run_ops', 'session_retention'),
+    'session_retention_release_idempotent': ('session_retention, queue, transcript_reads, run_ops', 'session_retention'),
+    'session_retention_deletion_observable': ('session_retention, queue, transcript_reads, run_ops', 'session_retention'),
+    'session_retention_media_deleted': ('session_retention, queue, transcript_reads, run_ops, attachments', 'session_retention, attachments'),
+    'session_retention_active_never_deleted': ('session_retention, queue, transcript_reads, run_ops, advance_retention_clock', 'session_retention'),
+    'session_retention_backup_none_refused': ('session_retention, queue, transcript_reads, run_ops', 'session_retention'),
+    'session_retention_dumps_preserved': ('session_retention, queue, transcript_reads, run_ops', 'session_retention'),
+    'session_retention_runner_replaced_once': ('session_retention, queue, transcript_reads, run_ops', 'session_retention'),
+    'session_retention_pending_durable': ('session_retention, queue, transcript_reads, run_ops, attachments, kill_at:ReleasePending', 'session_retention, attachments, kill_at:ReleasePending'),
+    'step_events_one_per_recorded_step': ('step_events, queue, transcript_reads', 'step_events'),
+    'step_events_match_durable_position': ('step_events, queue, transcript_reads', 'step_events'),
+    'step_events_after_durability': ('step_events, queue, transcript_reads', 'step_events'),
+    'user_commands_history_isolation': ('user_commands, queue, run_ops, transcript_reads', 'user_commands'),
+    'user_commands_forward_once': ('user_commands, queue, run_ops', 'user_commands'),
+    'user_commands_no_person': ('user_commands, queue, run_ops', 'user_commands'),
+    'user_commands_collision': ('user_commands, queue', 'user_commands'),
+    'user_commands_progress_order': ('user_commands, queue, run_ops', 'user_commands'),
+    'user_commands_unsafe_host_menu': ('user_commands, queue, run_ops', 'user_commands'),
+    'user_commands_owner_only': ('user_commands, queue, run_ops', 'user_commands'),
+    'user_commands_outcome_unknown': ('user_commands, queue, run_ops, kill_at:UserCommandForwarded', 'user_commands, kill_at:UserCommandForwarded'),
+    'user_commands_cutoff_after_forward': ('user_commands, queue, run_ops', 'user_commands'),
+    'user_commands_cutoff_before_forward': ('user_commands, queue, run_ops', 'user_commands'),
+}
 SUMMARY = re.compile(r'^test result: \S+\. (\d+) passed; (\d+) failed; (\d+) ignored; \d+ measured; (\d+) filtered out; finished in ([\d.]+)s')
 
 
@@ -86,6 +124,22 @@ def integration_map(full, portable, partition):
             for binary, name in sorted(selected)]
 
 
+def expected_kit_skip(current, line):
+    if current != KIT_SUITE:
+        return False
+    match = KIT_SKIP.fullmatch(line)
+    if match is None:
+        return False
+    expected = KIT_SKIP_EXPECTATIONS.get(match[1])
+    if expected is None:
+        return False
+    for observed, required in zip(match.groups()[1:], expected):
+        tokens = observed.split(', ')
+        if len(tokens) != len(set(tokens)) or set(tokens) != set(required.split(', ')):
+            return False
+    return True
+
+
 def audit_integration(path, full, portable):
     expected, selected = cases(full), cases(portable)
     current = None
@@ -97,7 +151,7 @@ def audit_integration(path, full, portable):
             current = (match[2], match[3])
             if current in expected or current == CLOCK:
                 statuses[current] = match[1]
-        if SKIP.match(line) and current in selected:
+        if SKIP.match(line) and current in selected and not expected_kit_skip(current, line):
             raise ValueError('a former portable integration returned a passing fixture skip: ' + line.strip())
     summaries = re.findall(r'^\s*Summary\s+\[[^\]]+\]\s+(\d+) tests? run', text, re.M)
     if list(map(int, summaries)) != [1, len(expected)]:

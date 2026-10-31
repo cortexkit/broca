@@ -277,7 +277,13 @@ impl Provider for ScriptedProvider {
     ) -> Result<Vec<u8>, Box<broca_protocol::ProviderError>> {
         if let Some(frozen) = self.0.media_frozen.lock().unwrap().as_ref() {
             if let Some(renderer) = self.2.read().unwrap().as_ref() {
-                return renderer(&serde_json::to_value(frozen).unwrap(), opts, false, false);
+                return renderer(
+                    &serde_json::to_value(frozen).unwrap(),
+                    opts,
+                    false,
+                    false,
+                    None,
+                );
             }
             return Ok(broca_provider::registry::wire_family(frozen.family_id)
                 .unwrap()
@@ -318,7 +324,7 @@ impl Provider for ScriptedProvider {
             *self.0.hold_model.lock().unwrap()
         ));
         let rendered = if let Some(renderer) = self.2.read().unwrap().as_ref() {
-            renderer(&self.render_config_blob(), opts, false, true).unwrap()
+            renderer(&self.render_config_blob(), opts, false, true, None).unwrap()
         } else if let Some(frozen) = self.0.media_frozen.lock().unwrap().as_ref() {
             broca_provider::registry::wire_family(frozen.family_id)
                 .unwrap()
@@ -612,9 +618,11 @@ impl RunExecutor for CoreExec {
                 }),
             )
             .unwrap();
-            provider.set_media_request_renderer(Arc::new(move |frozen, opts, tags, commit| {
-                media.render(frozen, opts, tags, commit)
-            }));
+            provider.set_media_request_renderer(Arc::new(
+                move |frozen, opts, tags, commit, provenance| {
+                    media.render_with_provenance(frozen, opts, tags, commit, provenance)
+                },
+            ));
         }
         let mut control = job.control;
         control.hook_plane = self.hook_plane();
@@ -808,6 +816,11 @@ impl Rig {
     ) -> Self {
         let wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
+        broca_store::session_refs::migrate(
+            &dir.join("store.db"),
+            &broca_core::ReadOnlyWalReader::new(&dir),
+        )
+        .unwrap();
         let script = Arc::new(Script::default());
         let hook_plane = Arc::new(Mutex::new(None));
         let exec = Arc::new(CoreExec {
@@ -831,6 +844,7 @@ impl Rig {
             wal.clone(),
             Some(store.clone()),
         ));
+        registry.set_session_address_inventory(store.clone());
         let (client, server) = tokio::io::duplex(64 * 1024);
         let (mut reader, mut writer) = tokio::io::split(client);
         let (server_read, server_write) = tokio::io::split(server);
@@ -924,6 +938,21 @@ impl Rig {
         quiet: Duration,
     ) -> Vec<Frame> {
         self.subscribe_collect_inner(channel, params, quiet, None::<fn()>, |_| true)
+            .await
+    }
+
+    /// `subscribe_collect`, but first waiting under the shared hang guard for a frame matching
+    /// `until`; only then does `quiet` start. A live display delta can reach a loaded runner
+    /// after any fixed quiet window, so a test that needs a particular live frame must wait for
+    /// that frame rather than for the stream to go quiet.
+    pub async fn subscribe_collect_until(
+        &mut self,
+        channel: u16,
+        params: serde_json::Value,
+        quiet: Duration,
+        until: fn(&Frame) -> bool,
+    ) -> Vec<Frame> {
+        self.subscribe_collect_inner(channel, params, quiet, Some(|| {}), until)
             .await
     }
 

@@ -203,6 +203,12 @@ pub struct CompactionState {
     /// the runner then uses its own short ride deadline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ride_wait_ms: Option<u64>,
+    /// The feature tokens declared by this lineage's recorded Setup, never inferred on resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_features: Option<Vec<String>>,
+    /// Retried before every model step until this exact published view applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_due: Option<broca_wal::SetupViewDue>,
     /// The rewrite ride the current step waits for, once its wait is reported
     /// (`CompactionRideWait`): the step and the absolute deadline. Cleared when it resolves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -346,6 +352,8 @@ impl CompactionState {
                 ceiling,
                 tag_checkpoint,
                 ride_wait_ms,
+                view_features,
+                view_due,
                 ..
             } => {
                 self.provider.clone_from(provider);
@@ -355,6 +363,8 @@ impl CompactionState {
                     self.ceiling.clone_from(ceiling);
                     self.tag_checkpoint.clone_from(tag_checkpoint);
                     self.ride_wait_ms = *ride_wait_ms;
+                    self.view_features.clone_from(view_features);
+                    self.view_due.clone_from(view_due);
                 }
                 self.applied = Some(AppliedCompaction {
                     compaction_id: compaction_id.clone(),
@@ -402,6 +412,12 @@ impl CompactionState {
                 // here is a corrupt WAL. Keep rendering what was rendered before rather than
                 // guess at the record's meaning.
                 if let Some(applied) = view::AppliedView::decode(view, choice) {
+                    if self.view_due.as_ref().is_some_and(|due| {
+                        due.version == applied.view.view_version
+                            && due.digest == applied.view.digest
+                    }) {
+                        self.view_due = None;
+                    }
                     if let broca_wal::CompactionViewChoice::Companion { edit, strip } = choice {
                         self.strips.push(*strip);
                         self.unannounced.push(

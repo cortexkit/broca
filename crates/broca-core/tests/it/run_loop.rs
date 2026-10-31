@@ -1952,6 +1952,7 @@ impl broca_core::Provider for AttemptRecordingStub {
                 sent_at_ms: None,
                 transport: None,
                 websocket_request: None,
+                cache_evidence: None,
                 websocket_close_code: None,
                 input_transformations: None,
                 input_transformations_unmeasured: false,
@@ -2006,6 +2007,7 @@ impl broca_core::Provider for HeldAttemptProvider {
             sent_at_ms: None,
             transport: None,
             websocket_request: None,
+            cache_evidence: None,
             websocket_close_code: None,
             input_transformations: None,
             input_transformations_unmeasured: false,
@@ -3360,6 +3362,7 @@ async fn an_account_limit_terminal_names_the_frozen_account_on_every_surface() {
         ]]);
         let control = RunControl {
             auth_selection: Some(broca_core::AuthSelection {
+                billing_vault_facts: None,
                 auth_method: None,
                 credential_id: "oauth:anthropic:acct-a".into(),
                 account_ref: Some("d4bc9dbc".into()),
@@ -3456,6 +3459,7 @@ async fn a_billing_exhausted_terminal_names_the_frozen_account_on_every_surface(
         ]]);
         let control = RunControl {
             auth_selection: selection.map(|account: Option<&str>| broca_core::AuthSelection {
+                billing_vault_facts: None,
                 auth_method: None,
                 credential_id: "apikey:xai:default".into(),
                 account_ref: account.map(str::to_owned),
@@ -3558,6 +3562,7 @@ async fn drive_on_wal(
 #[tokio::test]
 async fn a_resumed_account_limit_terminal_names_the_frozen_or_refrozen_account() {
     let selection = |account: &str| broca_core::AuthSelection {
+        billing_vault_facts: None,
         auth_method: None,
         credential_id: format!("oauth:anthropic:{account}"),
         account_ref: Some(account.into()),
@@ -3847,6 +3852,7 @@ fn prior_snapshot_handoff_excludes_pending_payloads_and_shares_pending_storage()
         tail: Arc::new(Vec::new()),
         checkpoint_at_base: None,
         checkpoint_at_head: AdmissionCheckpointV1 {
+            has_model_attempt: None,
             media: None,
             head: None,
             has_deferred_calls: None,

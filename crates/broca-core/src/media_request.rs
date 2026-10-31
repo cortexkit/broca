@@ -19,6 +19,15 @@ use crate::placement::{AppendKind, Placement, PlacementAction};
 mod seed;
 
 impl seed::MediaCheckpoint {
+    /// Restore the authenticated compaction state without replaying media admissions;
+    /// their occurrence IDs and transcript placement are already restored.
+    pub(crate) fn restore_authenticated_compaction(
+        &mut self,
+        authenticated: crate::admission::AuthenticatedCompaction,
+    ) {
+        self.session.compaction = authenticated.into_state();
+    }
+
     pub(crate) fn prepare_content_free_continuation(&mut self) {
         // Without a replacement view, the saved media references and empty text slots
         // suffice to recompute selection as the tail grows. A MediaChange::Show announces

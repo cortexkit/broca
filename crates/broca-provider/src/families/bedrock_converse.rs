@@ -42,17 +42,41 @@ impl WireFamily for BedrockConverse {
         build_request_body(frozen, opts)
     }
 
+    fn shape_with_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Value {
+        build_request_body_with_media_and_provenance(frozen, opts, None, provenance)
+    }
+
     fn shape_with_media(
         &self,
         frozen: &FrozenRenderConfig,
         opts: &CallOptions,
         media: &[crate::media_render::InlineMedia<'_>],
     ) -> Value {
+        self.shape_with_media_and_provenance(frozen, opts, media, None)
+    }
+
+    fn shape_with_media_and_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        media: &[crate::media_render::InlineMedia<'_>],
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Value {
         let media = crate::media_render::MediaRender {
             frozen,
             payloads: media,
         };
-        build_request_body_with_media(frozen, opts, frozen.media.as_ref().map(|_| &media))
+        build_request_body_with_media_and_provenance(
+            frozen,
+            opts,
+            frozen.media.as_ref().map(|_| &media),
+            provenance,
+        )
     }
 
     fn endpoint(
@@ -152,6 +176,15 @@ fn build_request_body_with_media(
     opts: &CallOptions,
     media: Option<&crate::media_render::MediaRender<'_>>,
 ) -> Value {
+    build_request_body_with_media_and_provenance(frozen, opts, media, None)
+}
+
+fn build_request_body_with_media_and_provenance(
+    frozen: &FrozenRenderConfig,
+    opts: &CallOptions,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+    provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+) -> Value {
     // A run with structured output adds its submit tool or schema instructions here; a run
     // without renders from `opts` unchanged.
     let prepared = crate::structured_output::prepare(frozen, opts);
@@ -175,7 +208,8 @@ fn build_request_body_with_media(
         })
     });
     let system = convert_system(frozen, &opts.prompt, marker_policy.is_some());
-    let messages = convert_messages(frozen, opts, &name_map, &id_map, media);
+    let messages =
+        convert_messages_with_provenance(frozen, opts, &name_map, &id_map, media, provenance);
 
     if !system.is_empty() {
         body.insert("system".to_string(), Value::Array(system));
@@ -442,13 +476,15 @@ fn bedrock_cache_point(ttl: CacheTtl) -> Value {
     json!({ "cachePoint": { "type": "default", "ttl": ttl.as_str() } })
 }
 
-fn convert_messages(
+fn convert_messages_with_provenance(
     frozen: &FrozenRenderConfig,
     opts: &CallOptions,
     name_map: &crate::tool_name_alias::ToolNameMap,
     id_map: &crate::tool_id_alias::ToolIdMap,
     media: Option<&crate::media_render::MediaRender<'_>>,
+    mut provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
 ) -> Vec<Value> {
+    let mut wire_index = 0;
     opts.prompt
         .iter()
         .filter_map(|message| {
@@ -459,14 +495,19 @@ fn convert_messages(
                     message.origin.as_ref(),
                     opts.target_model.as_ref(),
                 );
-            convert_message(message, name_map, id_map, echo_reasoning, media)
-        })
-        // Bedrock rejects messages left empty after unsupported reasoning is stripped.
-        .filter(|message| {
-            message
+            let rendered = convert_message(message, name_map, id_map, echo_reasoning, media)?;
+            if rendered
                 .get("content")
                 .and_then(Value::as_array)
-                .is_none_or(|content| !content.is_empty())
+                .is_some_and(|content| content.is_empty())
+            {
+                return None;
+            }
+            if let Some(sink) = provenance.as_deref_mut() {
+                sink.record_message(wire_index, message.ordinal);
+                wire_index += 1;
+            }
+            Some(rendered)
         })
         .collect()
 }

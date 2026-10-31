@@ -4488,6 +4488,7 @@ pub(crate) mod projection_boundary_tests {
     fn paused_reconciliation_retains_only_the_requested_runs_frozen_selection() {
         let mut first = run_started(1, "first").record;
         let selection = broca_wal::AuthSelection {
+            billing_vault_facts: None,
             auth_method: None,
             credential_id: "frozen-key".into(),
             account_ref: None,
@@ -4615,6 +4616,7 @@ pub(crate) mod projection_boundary_tests {
             trailing_origin: Some(ModelHandle::new("stub", "old-model")),
             last_run_id: Some(RunId("r1".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                has_model_attempt: None,
                 media: None,
                 head: None,
                 has_deferred_calls: None,
@@ -6005,6 +6007,8 @@ mod offset_tail_tests {
                     cut: "m1".into(),
                 }),
                 ride_wait_ms: None,
+                view_features: None,
+                view_due: None,
             },
         }
     }
@@ -6323,6 +6327,8 @@ mod offset_tail_tests {
                 ceiling: None,
                 tag_checkpoint: None,
                 ride_wait_ms: None,
+                view_features: None,
+                view_due: None,
             },
         };
         assert!(!tail_contains_compaction_setup(&[step_answer]));

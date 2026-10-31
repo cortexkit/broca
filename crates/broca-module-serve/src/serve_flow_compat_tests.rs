@@ -1,4 +1,8 @@
 use super::*;
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/common/address_inventory.rs"
+));
 use broca_module::serve::{
     CancelResponse, RetractResponse, RunStatusResponse, SendRequest, SendResponse,
     SessionReadResponse, StatusResponse,
@@ -104,11 +108,11 @@ impl FlowFrames {
         Self {
             routes: Routes::new(true),
             handler: Arc::new(FlowSendHandler { sends: sender }),
-            registry: Arc::new(LineageRegistry::new_with_reader(
+            registry: Arc::new(test_registry(LineageRegistry::new_with_reader(
                 Arc::new(NoFlowActor),
                 Arc::new(EmptyFlowHistory),
                 None,
-            )),
+            ))),
             writer,
             written,
             requests: JoinSet::new(),

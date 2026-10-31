@@ -472,7 +472,15 @@ impl WireFamily for ProbeFamily {
     fn shape(&self, _: &FrozenRenderConfig, _: &CallOptions) -> Value {
         serde_json::from_slice(&self.req.body).unwrap()
     }
-    fn render(&self, _: &FrozenRenderConfig, _: &CallOptions) -> Vec<u8> {
+    fn render(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Vec<u8> {
+        self.render_with_provenance(frozen, opts, None)
+    }
+    fn render_with_provenance(
+        &self,
+        _: &FrozenRenderConfig,
+        _: &CallOptions,
+        _: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Vec<u8> {
         self.req.body.clone()
     }
     fn endpoint(&self, _: &FrozenRenderConfig, _: &AuthHandle, _: Vec<u8>) -> HttpRequest {

@@ -175,6 +175,132 @@ fn require_subc() -> bool {
     std::env::var_os("BROCA_REQUIRE_SUBC").is_some()
 }
 
+async fn project_identity_open(
+    connection: &SubcConnection,
+    identity: &broca_protocol::BindIdentity,
+    scoped: bool,
+) -> broca_subc::RouteHandle {
+    if scoped {
+        open_scoped(connection, identity).await.unwrap()
+    } else {
+        connection
+            .route_open_management_within(
+                "broca",
+                identity,
+                RouteOpenRetry {
+                    budget: Duration::from_secs(30),
+                    max_interval: Duration::from_millis(100),
+                },
+            )
+            .await
+            .unwrap()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn project_identity_existing_unscoped_and_scoped_resume_on_legacy_addresses() {
+    for scoped in [false, true] {
+        let Some(rig) = Rig::start().await else {
+            return;
+        };
+        if scoped {
+            rig.sync_scopes(
+                serde_json::json!([{
+                    "ref": SCOPE_REF, "scope_epoch": SCOPE_EPOCH, "kind":"head",
+                    "workdir": rig.dir.canonicalize().unwrap(), "attributes":{}, "carriers":[],
+                }]),
+                1,
+            )
+            .await;
+        }
+        let owner = rig.connect_as(OWNER, &rig.owner_nonce).await;
+        let legacy = rig.session(if scoped {
+            "scoped-resume"
+        } else {
+            "athena-seat"
+        });
+        let route = project_identity_open(&owner, &legacy, scoped).await;
+        let first = send(&owner, &route, "first-consult-round").await.unwrap();
+        let run_id = first["result"]["run_id"].as_str().unwrap().to_owned();
+        let prefix = std::fs::read(rig.wal_path(&legacy)).unwrap();
+        owner.route_close(&route).await.unwrap();
+        let roster: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                rig.dir
+                    .join("runtime/data-home/cortexkit/run/live-children.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let pid = roster["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|child| child["module_id"] == "broca")
+            .unwrap()["pid"]
+            .as_u64()
+            .unwrap();
+        subc_os::Process::open(u32::try_from(pid).unwrap())
+            .unwrap()
+            .unwrap()
+            .signal(subc_os::Signal::Kill)
+            .unwrap();
+
+        let other_root = rig.dir.join("different-client-folder");
+        std::fs::create_dir_all(&other_root).unwrap();
+        let mut rebound = legacy.clone();
+        rebound.project_root = other_root.canonicalize().unwrap();
+        let reopened = project_identity_open(&owner, &rebound, scoped).await;
+        let second = send(&owner, &reopened, "first-consult-round")
+            .await
+            .unwrap();
+        assert_eq!(second["result"]["run_id"], run_id);
+        let resumed = std::fs::read(rig.wal_path(&legacy)).unwrap();
+        assert_eq!(&resumed[..prefix.len()], prefix);
+        assert!(!rig.wal_path(&rebound).exists());
+        let index =
+            broca_store::SqliteStore::open_read_only(rig.state_root.join("run-index.db")).unwrap();
+        let row = broca_core::RunIndex::lookup_run(&index, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.session, legacy);
+        let leases = broca_core::FileLeaseStore::new(rig.state_root.join("leases"));
+        assert!(matches!(
+            broca_core::LeaseStore::acquire(&leases, &broca_core::lease_key_for(&legacy)),
+            Err(broca_core::LeaseError::Held { .. })
+        ));
+        assert!(
+            broca_core::LeaseStore::acquire(&leases, &broca_core::lease_key_for(&rebound)).is_ok()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn project_identity_new_scoped_session_uses_stamped_workdir() {
+    let Some(rig) = Rig::start().await else {
+        return;
+    };
+    let checkout = rig.dir.join("stamped-checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    let checkout = checkout.canonicalize().unwrap();
+    rig.sync_scopes(
+        serde_json::json!([{
+            "ref":SCOPE_REF, "scope_epoch":SCOPE_EPOCH, "kind":"head",
+            "workdir":checkout, "attributes":{}, "carriers":[],
+        }]),
+        1,
+    )
+    .await;
+    let owner = rig.connect_as(OWNER, &rig.owner_nonce).await;
+    let route_identity = rig.session("new-scoped-workdir");
+    let route = project_identity_open(&owner, &route_identity, true).await;
+    send(&owner, &route, "first").await.unwrap();
+    let mut storage = route_identity.clone();
+    storage.project_root = checkout;
+    assert!(rig.wal_path(&storage).exists());
+    assert!(!rig.wal_path(&route_identity).exists());
+}
+
 struct Rig {
     child: Child,
     dir: PathBuf,

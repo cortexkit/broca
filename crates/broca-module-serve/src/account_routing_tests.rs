@@ -1203,6 +1203,7 @@ fn attempt(http_status: Option<u16>, observation: AttemptAccountObservation) -> 
         sent_at_ms: None,
         transport: None,
         websocket_request: None,
+        cache_evidence: None,
         websocket_close_code: None,
         input_transformations: None,
         input_transformations_unmeasured: false,
@@ -1564,6 +1565,7 @@ async fn a_sealed_run_reports_its_interrupted_terminal_once() {
     let client = Arc::new(client(&routing));
     let lineage = lineage();
     let selection = |decision: Option<AccountDecision>| broca_core::AuthSelection {
+        billing_vault_facts: None,
         auth_method: None,
         credential_id: "oauth:anthropic".into(),
         account_ref: None,
