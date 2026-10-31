@@ -1,4 +1,4 @@
-//! Held results must survive a restart after SQLite has checkpointed the run's earlier turns.
+//! Held results must survive a restart after either admission store has checkpointed earlier turns.
 
 use super::tests::text_req;
 use super::*;
@@ -8,11 +8,11 @@ use crate::opener::DefaultOpener;
 use crate::registry::LineageRegistry;
 use async_trait::async_trait;
 use broca_core::tool_plane::{DispatchKey, LateResultRegistration, ProviderHeldReply};
-use broca_core::Persister;
 use broca_core::{
     AllowAll, BatchCtx, DispatchResult, FileLeaseStore, FileWalStore, StubProvider, ToolManifest,
     ToolPlane, ToolPlaneError,
 };
+use broca_core::{LeaseStore, Persister};
 use broca_protocol::content::{AssistantMessage, ContentBlock, ToolCall};
 use broca_protocol::{BindIdentity, RunFinishReason};
 use broca_protocol::{
@@ -77,7 +77,7 @@ impl ToolPlane for HoldingPlane {
 
 struct Executor {
     wal: Arc<FileWalStore>,
-    store: Arc<broca_store::SqliteStore>,
+    store: Option<Arc<broca_store::SqliteStore>>,
     slots: Arc<HeldSlots>,
     plane: Arc<HoldingPlane>,
     provider: FrozenProvider,
@@ -131,7 +131,9 @@ impl RunExecutor for Executor {
             self.plane.as_ref(),
             &AllowAll,
             self.wal.as_ref(),
-            Some(self.store.clone()),
+            self.store
+                .clone()
+                .map(|store| store as Arc<dyn broca_core::SessionStore>),
             job.control,
             &out,
             job.on_admitted,
@@ -157,16 +159,140 @@ fn step(block: ContentBlock, finish_reason: FinishReason) -> Vec<NormalizedEvent
     ]
 }
 
-async fn restarted_delivery(restarts: usize, refused: bool, queued: bool) {
+struct ObservedAdmissionReader {
+    inner: Arc<dyn broca_core::context::AdmissionReader>,
+    bounded_pauses: Arc<AtomicUsize>,
+}
+
+impl broca_core::context::AdmissionReader for ObservedAdmissionReader {
+    fn prior_snapshot(
+        &self,
+        session: &BindIdentity,
+        safe_head: u64,
+    ) -> Result<broca_core::run::PriorWalSnapshot, String> {
+        let snapshot = self.inner.prior_snapshot(session, safe_head)?;
+        if snapshot
+            .checkpoint_at_head
+            .last_episode
+            .as_ref()
+            .is_some_and(|episode| {
+                episode.disposition == EpisodeDisposition::Paused
+                    && episode.pause_reason == Some(broca_protocol::PauseReason::ToolHeld)
+            })
+        {
+            assert!(
+                snapshot.base_watermark > 0,
+                "held recovery must exercise a stored seed"
+            );
+            assert!(
+                !snapshot
+                    .tail
+                    .iter()
+                    .any(|frame| matches!(frame.record, WalRecord::RunStarted { .. })),
+                "the held episode starts below the admission watermark"
+            );
+            self.bounded_pauses.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(snapshot)
+    }
+
+    fn paused_episode(
+        &self,
+        session: &BindIdentity,
+        safe_head: u64,
+    ) -> Result<Option<broca_core::admission::LastEpisodeV1>, String> {
+        self.inner.paused_episode(session, safe_head)
+    }
+}
+
+struct DatabaseAdmissionOpener {
+    lease_store: Arc<FileLeaseStore>,
+    wal: Arc<CountingWal>,
+    db: Arc<broca_store::db::OverhaulDb>,
+    executor: Arc<dyn RunExecutor>,
+    bounded_pauses: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl crate::registry::LineageOpener for DatabaseAdmissionOpener {
+    async fn open(
+        &self,
+        key: &crate::registry::LineageKey,
+        gen: u64,
+        registry: RegistryHandle,
+    ) -> Result<ActorHandle, crate::registry::OpenError> {
+        use crate::registry::OpenError;
+        let lease = self
+            .lease_store
+            .acquire(&broca_core::lease_key_for(key))
+            .map_err(|e| OpenError::Open(e.to_string()))?;
+        let (fanout, observer) = crate::fanout::Fanout::new(self.wal.clone(), key.clone());
+        let (publications, published) = tokio::sync::watch::channel(None);
+        let (writer, lease) = WalHandle::open_and_spawn_observed(
+            self.wal.clone(),
+            key.clone(),
+            lease,
+            Some(observer.with_publications(publications)),
+        )
+        .await
+        .map_err(|e| OpenError::Open(e.to_string()))?;
+        let writer = Arc::new(writer);
+        let db = self.db.clone();
+        let reader = self.db.admission_reader(move |session| {
+            let publication = published
+                .borrow()
+                .clone()
+                .ok_or("writer has no synced publication")?;
+            db.publish(
+                session,
+                "held-seeded",
+                broca_store::db::LogLocation::Live,
+                &publication,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(publication)
+        });
+        Ok(LineageActor::spawn_with_admission_reader(
+            key.clone(),
+            gen,
+            lease,
+            writer,
+            self.executor.clone(),
+            self.wal.clone(),
+            registry,
+            Duration::from_secs(60),
+            fanout,
+            None,
+            Arc::new(ObservedAdmissionReader {
+                inner: reader,
+                bounded_pauses: self.bounded_pauses.clone(),
+            }),
+        ))
+    }
+}
+
+async fn restarted_delivery(restarts: usize, refused: bool, queued: bool, seeded: bool) {
     let root = broca_test_support::scratch_root().join(format!(
-        "held-materialized-restarts-{restarts}-{refused}-{queued}-{}",
+        "held-admission-restarts-{restarts}-{refused}-{queued}-{seeded}-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("project")).unwrap();
     let key = BindIdentity::new(root.join("project"), "broca", "held");
-    let wal = Arc::new(FileWalStore::new(root.join("wal")));
-    let store = Arc::new(broca_store::SqliteStore::open(root.join("store.db")).unwrap());
+    let wal = Arc::new(FileWalStore::with_config(
+        root.join("wal"),
+        if seeded {
+            broca_wal::WalConfig::OVERHAUL
+        } else {
+            broca_wal::WalConfig::LEGACY
+        },
+    ));
+    let store =
+        (!seeded).then(|| Arc::new(broca_store::SqliteStore::open(root.join("store.db")).unwrap()));
+    let db = seeded.then(|| {
+        std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
+        Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap())
+    });
     let plane = Arc::new(HoldingPlane {
         dispatches: AtomicUsize::new(0),
     });
@@ -221,13 +347,32 @@ async fn restarted_delivery(restarts: usize, refused: bool, queued: bool) {
                 incompatible: refused && generation == restarts,
             },
         });
-        let opener = DefaultOpener::new(
-            Arc::new(FileLeaseStore::new(root.join("leases"))),
-            wal.clone(),
-            executor,
-        )
-        .with_materialized_store(store.clone());
-        let registry = LineageRegistry::new(Arc::new(opener));
+        let counted = Arc::new(CountingWal {
+            inner: wal.clone(),
+            full: AtomicUsize::new(0),
+            ranges: AtomicUsize::new(0),
+            publication_floor: seeded.then(|| root.join("wal-floor")),
+        });
+        let bounded_pauses = Arc::new(AtomicUsize::new(0));
+        let opener: Arc<dyn crate::registry::LineageOpener> = if let Some(db) = &db {
+            Arc::new(DatabaseAdmissionOpener {
+                lease_store: Arc::new(FileLeaseStore::new(root.join("leases"))),
+                wal: counted.clone(),
+                db: db.clone(),
+                executor,
+                bounded_pauses: bounded_pauses.clone(),
+            })
+        } else {
+            Arc::new(
+                DefaultOpener::new(
+                    Arc::new(FileLeaseStore::new(root.join("leases"))),
+                    wal.clone(),
+                    executor,
+                )
+                .with_materialized_store(store.as_ref().unwrap().clone()),
+            )
+        };
+        let registry = LineageRegistry::new(opener);
         if generation == 0 {
             let mut req = text_req(&key, "held");
             req.policy_allowed = ["ask".to_owned()].into_iter().collect();
@@ -299,7 +444,31 @@ async fn restarted_delivery(restarts: usize, refused: bool, queued: bool) {
                 ));
             }
         } else {
+            if seeded {
+                let sweep = registry.mark_crash_orphans(
+                    wal.as_ref(),
+                    vec![(RunId("held".into()), key.clone())],
+                    std::time::SystemTime::now() + Duration::from_secs(1),
+                );
+                assert_eq!(
+                    sweep.marked, 1,
+                    "exercise the crash-orphan recovery selector too"
+                );
+                let sweep = registry.seal_marked_crash_orphans(sweep).await;
+                assert_eq!(sweep.open_failed, 0, "{sweep:?}");
+                assert_eq!(sweep.sealed, 0, "a held episode is not a crash orphan");
+            }
             registry.route_status(&key).await.unwrap();
+            if seeded {
+                assert!(
+                    bounded_pauses.load(Ordering::SeqCst) > 0,
+                    "recovery must consume a bounded admission snapshot"
+                );
+                assert!(
+                    counted.full.load(Ordering::SeqCst) > 0,
+                    "unfinished checkpointed recovery must read the whole log"
+                );
+            }
         }
         if generation == restarts {
             let delivery = SlotDelivery::new(
@@ -374,6 +543,10 @@ async fn restarted_delivery(restarts: usize, refused: bool, queued: bool) {
                 );
                 assert!(frames.iter().any(|f| matches!(&f.record, WalRecord::ToolResult { result, outcome: broca_wal::DispatchOutcome::Completed, .. } if result.tool_call_id.0 == "a" && result.is_error && result.output == ToolOutput::Text { text: "remote_unavailable".into() })));
             }
+            if seeded {
+                assert!(frames.iter().any(|f| matches!(&f.record, WalRecord::ToolResult { result, outcome: broca_wal::DispatchOutcome::Completed, .. } if result.tool_call_id.0 == "a" && result.is_error && result.output == ToolOutput::Text { text: "remote_unavailable".into() })),
+                    "the resumed held batch must durably receive its delivered result");
+            }
             assert_eq!(
                 frames
                     .iter()
@@ -388,9 +561,12 @@ async fn restarted_delivery(restarts: usize, refused: bool, queued: bool) {
             );
         }
         assert!(registry.stop_and_seal().await);
-        let range = wal.read_records_range(&key, 0, None, None).unwrap();
-        store.project_range(&key, &range).unwrap();
-        if generation < restarts {
+        if let Some(store) = &store {
+            let range = wal.read_records_range(&key, 0, None, None).unwrap();
+            store.project_range(&key, &range).unwrap();
+        }
+        if generation < restarts && !seeded {
+            let store = store.as_ref().unwrap();
             use broca_core::MaterializedStore;
             let snapshot = store.read_admission_snapshot(&key).unwrap().unwrap();
             assert!(
@@ -418,41 +594,76 @@ async fn restarted_delivery(restarts: usize, refused: bool, queued: bool) {
             );
         }
     }
+    if seeded {
+        assert!(
+            !root.join("store.db").exists(),
+            "database admission needs no legacy checkpoint store"
+        );
+    }
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]
 async fn held_result_after_materialized_restart() {
-    restarted_delivery(1, false, false).await;
+    restarted_delivery(1, false, false, false).await;
 }
 
 #[tokio::test]
 async fn held_result_after_two_materialized_restarts() {
-    restarted_delivery(2, false, false).await;
+    restarted_delivery(2, false, false, false).await;
 }
 
 #[tokio::test]
 async fn held_result_after_restart_with_frozen_config_refusal() {
-    restarted_delivery(1, true, false).await;
+    restarted_delivery(1, true, false, false).await;
 }
 
 #[tokio::test]
 async fn held_result_precedes_queued_send_after_restart() {
-    restarted_delivery(1, false, true).await;
+    restarted_delivery(1, false, true, false).await;
+}
+
+#[tokio::test]
+async fn held_result_below_database_admission_watermark_survives_restart() {
+    restarted_delivery(1, false, false, true).await;
+}
+
+#[tokio::test]
+async fn held_result_below_database_admission_watermark_survives_two_restarts() {
+    restarted_delivery(2, false, false, true).await;
 }
 
 struct CountingWal {
     inner: Arc<FileWalStore>,
     full: AtomicUsize,
     ranges: AtomicUsize,
+    publication_floor: Option<std::path::PathBuf>,
 }
 
 impl broca_core::WalStore for CountingWal {
+    fn writer_marker_root(&self) -> Option<std::path::PathBuf> {
+        self.inner.writer_marker_root()
+    }
+
+    fn wal_config(&self) -> broca_wal::WalConfig {
+        self.inner.wal_config()
+    }
+
     fn open(
         &self,
         key: &BindIdentity,
     ) -> Result<Box<dyn broca_wal::Wal + Send>, broca_wal::WalError> {
-        self.inner.open(key)
+        if let Some(floor) = &self.publication_floor {
+            // Expose FileWal::durable_publication, the byte end proven by this descriptor's
+            // sync, without changing the file store's read-side path or frame format.
+            Ok(Box::new(
+                broca_wal::FileWal::open(self.inner.wal_path(key))?
+                    .with_wal_config(self.inner.wal_config())?
+                    .with_feature_floor(floor),
+            ))
+        } else {
+            self.inner.open(key)
+        }
     }
     fn read_records(
         &self,
@@ -484,7 +695,7 @@ async fn finished_materialized_open_keeps_baseline_read_counts() {
     let store = Arc::new(broca_store::SqliteStore::open(root.join("store.db")).unwrap());
     let executor = Arc::new(Executor {
         wal: wal.clone(),
-        store: store.clone(),
+        store: Some(store.clone()),
         slots: HeldSlots::new(),
         plane: Arc::new(HoldingPlane {
             dispatches: AtomicUsize::new(0),
@@ -529,6 +740,7 @@ async fn finished_materialized_open_keeps_baseline_read_counts() {
         inner: wal.clone(),
         full: AtomicUsize::new(0),
         ranges: AtomicUsize::new(0),
+        publication_floor: None,
     });
     let registry = LineageRegistry::new(Arc::new(
         DefaultOpener::new(

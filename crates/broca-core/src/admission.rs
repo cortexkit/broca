@@ -1972,6 +1972,7 @@ impl AdmissionSeed {
 pub struct AdmissionContinuation {
     seed: AdmissionSeed,
     sources: Vec<AdmissionSource>,
+    media_sources: Option<Vec<AdmissionSource>>,
 }
 
 impl AdmissionContinuation {
@@ -2042,6 +2043,9 @@ impl AdmissionContinuation {
         if self.seed.scalars.media.is_some() {
             encoded["features"] = serde_json::json!(["media-metadata/v1"]);
         }
+        if let Some(sources) = &self.media_sources {
+            encoded["media_sources"] = serde_json::to_value(sources)?;
+        }
         serde_json::to_string(&encoded)
     }
 
@@ -2063,12 +2067,25 @@ impl AdmissionContinuation {
             return Err(bad());
         }
         let sources = serde_json::from_value(value["sources"].clone()).map_err(|_| bad())?;
+        let media_sources = value
+            .get("media_sources")
+            .map(|v| serde_json::from_value(v.clone()).map_err(|_| bad()))
+            .transpose()?;
         if !seed.scalars.media_seed_complete() {
             return Err(crate::replay::SeedFallback::new(
                 "admission continuation media metadata missing",
             ));
         }
-        Ok(Self { seed, sources })
+        if seed.scalars.has_captured_media() && media_sources.is_none() {
+            return Err(crate::replay::SeedFallback::new(
+                "admission media locators missing",
+            ));
+        }
+        Ok(Self {
+            seed,
+            sources,
+            media_sources,
+        })
     }
 
     pub fn boundary(&self) -> crate::replay::SeedBoundary {
@@ -2186,7 +2203,31 @@ impl AdmissionContinuation {
                 )
             })
             .collect::<Result<_, _>>()?;
-        Ok(Self { seed, sources })
+        let media_sources = seed
+            .scalars
+            .has_captured_media()
+            .then(|| {
+                prefix
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| {
+                        crate::compaction::CapturedMedia::captures_any(&p.framed.record)
+                    })
+                    .map(|(i, p)| {
+                        AdmissionSource::capture(
+                            read_at,
+                            p,
+                            prefix.get(i + 1).map_or(boundary.frame_end, |p| p.off),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+        Ok(Self {
+            seed,
+            sources,
+            media_sources,
+        })
     }
 
     fn hydrated_seed(
@@ -2225,6 +2266,7 @@ impl AdmissionContinuation {
         tail: &[crate::replay::PositionedFrame],
         safe_head: u64,
     ) -> Result<(AdmissionCheckpointV1, AdmissionCheckpointV1), crate::replay::SeedFallback> {
+        self.authenticate_media_sources(read_at)?;
         let mut seed = self.hydrated_seed(read_at)?;
         if seed.scalars.media.is_none()
             && tail
@@ -2253,6 +2295,56 @@ impl AdmissionContinuation {
             )));
         }
         seed.hydrate_with_base(read_at, tail, safe_head)
+    }
+
+    fn authenticate_media_sources(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    ) -> Result<(), crate::replay::SeedFallback> {
+        if !self.seed.scalars.has_captured_media() {
+            return Ok(());
+        }
+        let sources = self
+            .media_sources
+            .as_ref()
+            .ok_or_else(|| crate::replay::SeedFallback::new("admission media locators missing"))?;
+        let mut captures = crate::compaction::CapturedMedia::default();
+        for source in sources {
+            let frame = source.read(read_at, &self.seed.boundary)?;
+            if !crate::compaction::CapturedMedia::captures_any(&frame.record) {
+                return Err(crate::replay::SeedFallback::new(
+                    "admission media locator kind mismatch",
+                ));
+            }
+            captures.fold(&frame.record);
+        }
+        if self.seed.scalars.compaction
+            != Some(crate::compaction::CompactionCheckpoint::Captures(captures))
+        {
+            return Err(crate::replay::SeedFallback::new(
+                "admission media locators incomplete",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Cancellation needs the paused request, not historical accounting. Authenticate only
+    /// the recorded media captures in addition to the seed's validated request sources.
+    pub fn paused_episode(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        tail: &[crate::replay::PositionedFrame],
+        safe_head: u64,
+    ) -> Result<Option<LastEpisodeV1>, crate::replay::SeedFallback> {
+        self.authenticate_media_sources(read_at)?;
+        let mut seed = self.seed.clone();
+        // Stored continuations omit accounting. Cancellation neither observes nor returns
+        // those counters, but the in-memory recipe requires their presence for validation.
+        seed.scalars.head = Some(crate::head::HeadProjection::default());
+        seed.scalars.input_budget = Some(crate::input_budget::InputTokenBudget::default());
+        seed.scalars.output_reservation =
+            Some(crate::output_reservation::OutputReservationHistory::default());
+        seed.paused_episode(read_at, tail, safe_head)
     }
 
     /// Consume the suffix after the stored boundary, with the position from the same
@@ -2289,6 +2381,11 @@ impl AdmissionContinuation {
             )?;
             if Self::accounting_source(&p.framed.record) {
                 next.sources.push(source.clone());
+            }
+            if crate::compaction::CapturedMedia::captures_any(&p.framed.record) {
+                next.media_sources
+                    .get_or_insert_with(Vec::new)
+                    .push(source.clone());
             }
             match &p.framed.record {
                 WalRecord::RunStarted { .. } => {
