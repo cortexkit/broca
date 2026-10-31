@@ -4523,6 +4523,7 @@ mod paused_auth_tests {
                     error: None,
                     pause_reason: Some(reason),
                     auth_selection: Some(broca_wal::AuthSelection {
+                        billing_vault_facts: None,
                         auth_method: None,
                         credential_id: "requested-key".into(),
                         resolved_credential_id: Some("resolved-key".into()),

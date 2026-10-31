@@ -1,0 +1,10 @@
+[
+  {"state":"observed","credential_id":"vault-work","record_version":232,"provider_ids":["anthropic","claude-code"],"plan_tier":"max_20x","plan_tier_source":"operator"},
+  {"state":"unwitnessed"},
+  {"state":"unavailable","credential_id":"vault-work","record_version":232},
+  {"state":"not_listed","credential_id":"vault-work","record_version":232},
+  {"state":"ambiguous","credential_id":"vault-work","record_version":232},
+  {"state":"version_mismatch","credential_id":"vault-work","record_version":232},
+  {"state":"invalid_metadata","credential_id":"vault-work","record_version":232},
+  {"state":"future_reason","future_field":"preserved"}
+]

@@ -9,6 +9,7 @@ pub(crate) const VERSION: u64 = 2;
 // billing fold respectively.
 pub const KNOWN_FEATURES: &[&str] = &[
     "bill-attempts/v1",
+    "bill-vault-facts/v1",
     "chatgpt-codex-wire/v1",
     "frame-stamps/v1",
     "writer-id/v1",

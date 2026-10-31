@@ -99,6 +99,21 @@ to this crate.
   to logs. `Item::Restarted` announces a full replay with a typed reason; previously
   recorded items can be emitted again.
 
+### Frozen vault facts
+
+`Reservation::vault_billing_facts()` decodes the optional snapshot in
+`credential.auth_selection.billing_vault_facts`. A missing snapshot means not captured;
+unknown observation states are not a default plan or zero spend. `VaultBillingFacts::attribution`
+requires the independent send-time `credential_ref` to match the observed vault id before
+exposing the observed facts. Missing and mismatched witnesses have distinct outcomes.
+The three optional reservation credential keys (`provider_ids`, `plan_tier`,
+`plan_tier_source`) remain absent when unknown. Metadata vocabulary strings and future
+snapshot states are preserved. Invalid snapshots yield `Unreadable`, not empty facts.
+
+`bill-vault-facts/v1` is reader-first: this release decodes and preserves snapshots,
+but production admission does not yet capture them. Writers may enable capture only
+in a later release, after this reader has shipped.
+
 ### Published bounds and checkpoints
 
 A missing, torn, or checksum-invalid proof is unavailable, not an empty log:
@@ -129,7 +144,7 @@ and checkpoint-state APIs are not promised until that review closes.
 
 ### Feature compatibility
 
-The billing view currently knows `bill-attempts/v1`, `chatgpt-codex-wire/v1`,
+The billing view currently knows `bill-attempts/v1`, `bill-vault-facts/v1`, `chatgpt-codex-wire/v1`,
 `frame-stamps/v1`, and `writer-id/v1`. An unknown `bill-*` requirement yields
 `ReadError::NewerWriter { features }` atomically: no partial billing iterator or
 checkpoint is returned. Unknown content-only requirements can be skipped by the

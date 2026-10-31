@@ -4488,6 +4488,7 @@ pub(crate) mod projection_boundary_tests {
     fn paused_reconciliation_retains_only_the_requested_runs_frozen_selection() {
         let mut first = run_started(1, "first").record;
         let selection = broca_wal::AuthSelection {
+            billing_vault_facts: None,
             auth_method: None,
             credential_id: "frozen-key".into(),
             account_ref: None,

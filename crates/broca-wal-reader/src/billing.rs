@@ -297,7 +297,24 @@ fn project(
                         .iter()
                         .any(|f| f == "bill-attempts/v1");
                     let reserving = record["type"] == "attempt_reserved";
-                    let output = if is_billing && !is_attempt_record(&record) {
+                    let snapshot = match record["type"].as_str() {
+                        Some("run_started") => {
+                            record["config"]["auth_selection"].get("billing_vault_facts")
+                        }
+                        Some("run_auth_refrozen") => {
+                            record["auth_selection"].get("billing_vault_facts")
+                        }
+                        _ => None,
+                    };
+                    let invalid_snapshot = snapshot.is_some_and(|value| {
+                        serde_json::from_value::<crate::vault_facts::VaultBillingFacts>(
+                            value.clone(),
+                        )
+                        .is_err()
+                    });
+                    let output = if invalid_snapshot {
+                        Err("invalid vault billing snapshot")
+                    } else if is_billing && !is_attempt_record(&record) {
                         Err("unrecognized billing record")
                     } else {
                         fold.apply(&record, metadata, head.lineage_id)
@@ -883,7 +900,11 @@ fn validate_reservation(v: &Value) -> Result<(), &'static str> {
     {
         return Err("incomplete reservation facts");
     }
-    serde_json::from_value::<Reservation>(v.clone()).map_err(|_| "invalid reservation shape")?;
+    let reservation = serde_json::from_value::<Reservation>(v.clone())
+        .map_err(|_| "invalid reservation shape")?;
+    reservation
+        .vault_billing_facts()
+        .map_err(|_| "invalid vault billing snapshot")?;
     Ok(())
 }
 
@@ -1447,6 +1468,62 @@ mod tests {
         let models: Vec<UsageByModel> = envelope.usage_by_model.unwrap();
         assert_eq!(models[1].usage.cache_write_tokens, Some(3));
         assert_eq!(models[1].cache_write_1h_tokens, Some(2));
+    }
+
+    #[test]
+    fn vault_snapshot_absence_corrections_and_unreadable_are_distinct() {
+        let mut log = Log::new();
+        log.open(W);
+        log.push(finished(1, false), W);
+        let (items, cp) = log.read(None);
+        assert_eq!(
+            charges(&items)[0]
+                .typed_reservation()
+                .unwrap()
+                .vault_billing_facts()
+                .unwrap(),
+            None
+        );
+        let snapshot = json!({"state":"observed", "credential_id":"vault-id", "record_version":232,
+            "provider_ids":["anthropic"], "plan_tier":"max_5x", "plan_tier_source":"operator"});
+        let mut correction = finished(1, false);
+        correction["type"] = json!("attempt_corrected");
+        correction["correction_id"] = json!("ffeeddccbbaa99887766554433221100");
+        correction["reason"] = json!("credential_attribution_corrected");
+        correction["reservation"]["credential"]["auth_selection"] =
+            json!({"credential_id":"lookup", "billing_vault_facts":snapshot});
+        log.push(correction.clone(), W);
+        let (items, cp) = log.read(Some(&cp));
+        let billed = charges(&items)[0];
+        assert_eq!(billed.kind, BilledKind::Correction);
+        let facts = billed
+            .typed_reservation()
+            .unwrap()
+            .vault_billing_facts()
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::to_value(facts).unwrap(), snapshot);
+        correction["reservation"]["credential"]["auth_selection"]["billing_vault_facts"] =
+            json!({"state":"unavailable", "credential_id":"vault-id", "record_version":232});
+        correction["correction_id"] = json!("ffeeddccbbaa99887766554433221101");
+        log.push(correction.clone(), W);
+        let (items, cp) = log.read(Some(&cp));
+        assert!(matches!(
+            charges(&items)[0]
+                .typed_reservation()
+                .unwrap()
+                .vault_billing_facts()
+                .unwrap(),
+            Some(crate::vault_facts::VaultBillingFacts::Unavailable(_))
+        ));
+        correction["reservation"]["credential"]["auth_selection"]["billing_vault_facts"] =
+            json!({"state":"observed"});
+        correction["correction_id"] = json!("ffeeddccbbaa99887766554433221102");
+        log.push(correction, W);
+        let (items, _) = log.read(Some(&cp));
+        assert!(
+            matches!(&items[..], [Item::Unreadable(e)] if matches!(e.reason, Reason::BillingRecord(_)) && !e.raw_frame.is_empty())
+        );
     }
 
     #[test]

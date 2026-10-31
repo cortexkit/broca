@@ -215,6 +215,7 @@ impl RunExecutor for Executor {
         provider.set_chatgpt_https_policy(Arc::new(|| true));
         *self.provider.lock().unwrap() = Some(provider.clone());
         job.control.auth_selection = Some(broca_core::AuthSelection {
+            billing_vault_facts: None,
             auth_method: None,
             credential_id: "chatgpt:openai".into(),
             account_ref: None,

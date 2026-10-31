@@ -1511,6 +1511,7 @@ fn only_a_model_change_since_the_last_notice_rides() {
 
 fn routed_selection(account_ref: &str) -> broca_wal::AuthSelection {
     broca_wal::AuthSelection {
+        billing_vault_facts: None,
         credential_id: format!("vault-cred-{account_ref}"),
         account_ref: Some(account_ref.to_owned()),
         resolved_credential_id: Some(format!("vault-cred-{account_ref}")),
@@ -1528,6 +1529,7 @@ fn routed_selection(account_ref: &str) -> broca_wal::AuthSelection {
 
 fn static_selection() -> broca_wal::AuthSelection {
     broca_wal::AuthSelection {
+        billing_vault_facts: None,
         credential_id: "oauth:anthropic".into(),
         account_ref: Some("static-acct".into()),
         resolved_credential_id: Some("vault-static".into()),
@@ -1565,6 +1567,7 @@ fn account_labels_are_truncated_hashes_of_the_vault_account() {
 #[test]
 fn unknown_accounts_send_neither_cause_nor_event() {
     let apikey = broca_wal::AuthSelection {
+        billing_vault_facts: None,
         credential_id: "apikey:deepseek".into(),
         account_ref: None,
         resolved_credential_id: Some("vault-apikey".into()),

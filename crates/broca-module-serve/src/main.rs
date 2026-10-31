@@ -1706,6 +1706,15 @@ mod executor {
     /// `Chatgpt` renders the codex `/responses` (`OpenAiResponsesChatgpt`).
     pub use broca_module_serve::family_for_method;
 
+    fn preserve_billing_vault_snapshot(
+        selection: &mut Option<broca_core::AuthSelection>,
+        frozen: Option<&broca_core::AuthSelection>,
+    ) {
+        if let (Some(selection), Some(frozen)) = (selection, frozen) {
+            selection.billing_vault_facts = frozen.billing_vault_facts.clone();
+        }
+    }
+
     /// The full auth resolution for a run: how to authenticate, whether to pause for re-auth,
     /// what to freeze, and (for the consistency guard) which method was chosen. NO `Debug`
     /// derive — `mode` can carry a secret token.
@@ -3555,6 +3564,7 @@ mod executor {
             // one keeps None rather than retro-stamping its WAL.
             let selection = (fresh_episode || frozen_credential_id.is_some()).then(|| {
                 broca_core::AuthSelection {
+                    billing_vault_facts: None,
                     credential_id: credential_key.clone(),
                     // Freeze the vault-served account id verbatim alongside the credential id so
                     // usage export labels spend with the account this run authenticated with.
@@ -4002,7 +4012,7 @@ mod executor {
                     .and_then(|prior| prior.config.auth_selection.as_ref())
                     .and_then(|selection| selection.account_decision.clone())
             };
-            let resolution = match self
+            let mut resolution = match self
                 .decide_auth_with_account(
                     job.req.model.provider_module_id.as_str(),
                     frozen_credential_id.as_deref(),
@@ -4026,6 +4036,13 @@ mod executor {
                     return Err(e);
                 }
             };
+            // A resolve supplies today's token evidence, not a replacement for frozen billing facts.
+            preserve_billing_vault_snapshot(
+                &mut resolution.selection,
+                prior_run
+                    .as_ref()
+                    .and_then(|prior| prior.config.auth_selection.as_ref()),
+            );
             if resolution.pause.is_some() || resolution.method != Some(AuthMethod::Chatgpt) {
                 self.provider_client
                     .chatgpt_connections()
@@ -5254,6 +5271,7 @@ mod executor {
                     affordable_max_tokens: None,
                 }),
                 selection: Some(broca_core::AuthSelection {
+                    billing_vault_facts: None,
                     auth_method: None,
                     credential_id: "chatgpt:openai".into(),
                     account_ref: None,
@@ -5355,6 +5373,7 @@ mod executor {
         fn report_identity_pairs_served_version_and_requires_a_served_token() {
             let selection = || {
                 Some(broca_core::AuthSelection {
+                    billing_vault_facts: None,
                     auth_method: None,
                     credential_id: "oauth:anthropic".into(),
                     account_ref: None,
@@ -6047,6 +6066,7 @@ mod executor {
             if let broca_wal::WalRecord::RunStarted { config, .. } = &mut started.record {
                 config.model = broca_protocol::request::ModelHandle::new("deepseek", "chat");
                 config.auth_selection = Some(broca_core::AuthSelection {
+                    billing_vault_facts: None,
                     auth_method: None,
                     credential_id: "apikey:deepseek".into(),
                     account_ref: None,

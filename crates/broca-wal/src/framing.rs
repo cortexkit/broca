@@ -203,6 +203,7 @@ pub const TOOL_SCHEMA_PINS_FEATURE: &str = "tool-schema-pins/v1";
 /// placement tooling can refuse to install a build that cannot read what is already on disk.
 pub const KNOWN_FEATURES: &[&str] = &[
     BILL_ATTEMPTS_FEATURE,
+    BILL_VAULT_FACTS_FEATURE,
     crate::head_proof::VISIBILITY_LATE_FEATURE,
     "writer-id/v1",
     INTERRUPT_REASON_FEATURE,
@@ -255,6 +256,10 @@ pub const KNOWN_FEATURES: &[&str] = &[
 
 /// Physical-send reservation and settlement evidence for billing readers.
 pub const BILL_ATTEMPTS_FEATURE: &str = "bill-attempts/v1";
+
+/// Admission-time vault facts must survive replay by any writer resuming the run.
+/// Reader support ships before production admission starts capturing these snapshots.
+pub const BILL_VAULT_FACTS_FEATURE: &str = "bill-vault-facts/v1";
 
 /// A plan manifest that froze a provider's catalog reference slots (`FetchOutcome::Answered`'s
 /// `reference_slots`): the arguments output references are read from (llm-runner §9.13). A
@@ -1511,6 +1516,7 @@ mod tests {
             KNOWN_FEATURES,
             &[
                 BILL_ATTEMPTS_FEATURE,
+                BILL_VAULT_FACTS_FEATURE,
                 crate::head_proof::VISIBILITY_LATE_FEATURE,
                 "writer-id/v1",
                 INTERRUPT_REASON_FEATURE,
@@ -3128,3 +3134,6 @@ mod v4_header_len_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod vault_facts_tests;

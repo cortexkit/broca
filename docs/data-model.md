@@ -326,6 +326,16 @@ A `run_started` or `run_auth_refrozen` whose selection carries `auth_method` is
 **must-understand, feature `auth-selection-method/v1`** (a `ver = 3` frame). `vault_request` is
 `{min_ttl_ms: i64|null (always written), force_refresh: bool (absent on get_scoped),
 op: "get"|"get_scoped"|<unknown string> (absent on older records, meaning "get")}`.
+`billing_vault_facts` is an optional billing-only snapshot on `AuthSelection`. When
+present it requires `bill-vault-facts/v1`, including when embedded in an attempt reservation.
+Reader support ships before production capture. An `observed` snapshot requires the
+vault's exact `credential_id` and `record_version`, and may carry nonempty `provider_ids`,
+`plan_tier`, and `plan_tier_source`. Each absent fact remains unknown. Observation states
+`unwitnessed`, `unavailable`, `not_listed`, `ambiguous`, `version_mismatch`, and
+`invalid_metadata` carry no facts and may retain a witnessed id/version. A missing snapshot
+means not captured; future states remain unknown. Ordinary resume never backfills the snapshot.
+Only a matching independent send witness makes its observed facts attributable to an attempt.
+
 `account_ref` is empty by construction for `apikey` and `antigravity` credentials, so key
 spend on `credential_id`, never on `account_ref`.
 

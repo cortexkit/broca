@@ -21,6 +21,7 @@ pub mod frame;
 pub mod proof;
 pub mod resolve;
 pub mod unreadable;
+pub mod vault_facts;
 
 pub use error::{Error, HeaderCorruption};
 

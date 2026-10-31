@@ -3832,6 +3832,7 @@ mod tests {
             WalRecord::RunAuthRefrozen {
                 ts_ms: Some(50),
                 auth_selection: AuthSelection {
+                    billing_vault_facts: None,
                     auth_method: None,
                     credential_id: "chatgpt:openai".into(),
                     account_ref: Some("resumed-account".into()),
@@ -3847,6 +3848,7 @@ mod tests {
         assert_eq!(
             recovered.auth_selection,
             Some(AuthSelection {
+                billing_vault_facts: None,
                 auth_method: None,
                 credential_id: "chatgpt:openai".into(),
                 account_ref: Some("resumed-account".into()),

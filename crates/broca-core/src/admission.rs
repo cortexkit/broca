@@ -2943,6 +2943,7 @@ mod tests {
                     ts_ms: None,
                     auth_selection: AuthSelection {
                         credential_id: "apikey:stub".into(),
+                        billing_vault_facts: None,
                         account_ref: None,
                         resolved_credential_id: None,
                         vault_request: None,
@@ -5057,6 +5058,68 @@ mod tests {
     }
 
     #[test]
+    fn future_vault_snapshots_survive_replay_refreeze_and_checkpoint_bytes() {
+        let snapshots: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../broca-wal/tests/fixtures/vault_billing_snapshots.json"
+        ))
+        .unwrap();
+        for snapshot in snapshots {
+            let expected_snapshot = snapshot.clone();
+            let selection: AuthSelection = serde_json::from_value(serde_json::json!({
+                "credential_id":"oauth:anthropic", "resolved_credential_id":"vault-work", "billing_vault_facts":snapshot
+            })).unwrap();
+            assert_eq!(
+                serde_json::to_value(&selection).unwrap()["billing_vault_facts"],
+                expected_snapshot,
+                "the selection decoder must retain the literal future snapshot"
+            );
+            let mut start = started(1, "r", None);
+            let WalRecord::RunStarted { config, .. } = &mut start.record else {
+                unreachable!()
+            };
+            config.auth_selection = Some(selection.clone());
+            let records = [
+                start,
+                frame(
+                    2,
+                    WalRecord::RunAuthRefrozen {
+                        ts_ms: Some(10),
+                        auth_selection: selection.clone(),
+                    },
+                ),
+            ];
+            for end in 1..=records.len() {
+                let frames = &records[..end];
+                let checkpoint = AdmissionCheckpointV1::from_frames(frames).unwrap();
+                let restored =
+                    decode_admission_checkpoint(&encode_admission_checkpoint(&checkpoint).unwrap())
+                        .unwrap();
+                assert_eq!(restored, checkpoint);
+                assert_eq!(
+                    serde_json::to_value(&restored.last_episode.as_ref().unwrap().config).unwrap()
+                        ["auth_selection"]["billing_vault_facts"],
+                    expected_snapshot
+                );
+                assert_eq!(
+                    restored.last_episode.unwrap().config.auth_selection,
+                    Some(selection.clone())
+                );
+                let replay = crate::replay(
+                    &frames
+                        .iter()
+                        .map(|frame| frame.record.clone())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+                assert_eq!(
+                    replay.run_config.unwrap().auth_selection,
+                    Some(selection.clone())
+                );
+            }
+        }
+    }
+
+    #[test]
     fn non_budget_episode_facts_match_independent_replay_authority() {
         let records = corpus();
         let checkpoint = AdmissionCheckpointV1::from_frames(&records).expect("checkpoint");
@@ -5144,6 +5207,7 @@ mod tests {
                 WalRecord::RunAuthRefrozen {
                     ts_ms: Some(10),
                     auth_selection: AuthSelection {
+                        billing_vault_facts: None,
                         auth_method: None,
                         credential_id: "chatgpt:openai".into(),
                         account_ref: Some("first-account".into()),
@@ -5158,6 +5222,7 @@ mod tests {
                 WalRecord::RunAuthRefrozen {
                     ts_ms: Some(20),
                     auth_selection: AuthSelection {
+                        billing_vault_facts: None,
                         auth_method: None,
                         credential_id: "chatgpt:openai".into(),
                         account_ref: Some("second-account".into()),
@@ -5178,6 +5243,7 @@ mod tests {
         )
         .expect("replay accepts independent auth refreezes");
         let expected = AuthSelection {
+            billing_vault_facts: None,
             auth_method: None,
             credential_id: "chatgpt:openai".into(),
             account_ref: Some("second-account".into()),
