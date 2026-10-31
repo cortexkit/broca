@@ -130,6 +130,65 @@ fn whole_ref_set_divergence_refuses_before_any_installation_or_floor() {
 }
 
 #[test]
+fn operational_overhaul_activation_recovery_keeps_exclusions_across_the_rename_cut() {
+    let root = root("overhaul-floor");
+    std::fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
+    let session = BindIdentity::new("/receiver", "runner", "moved");
+    let wal_root = root.join("wal");
+    broca_wal::migration::durable_dir(&root, &wal_root).unwrap();
+    let staged = broca_wal::migration::staging_path(&wal_root, "cut", "moved").unwrap();
+    let incoming_path = root.join("incoming.wal");
+    {
+        let mut writer = broca_wal::FileWal::open(&incoming_path).unwrap();
+        episode(&mut writer, &session, "foreign-run");
+    }
+    let incoming = std::fs::read(incoming_path).unwrap();
+    let digest = broca_wal::migration::digest(&incoming);
+    broca_wal::migration::stage(&root, &staged, &incoming, &digest).unwrap();
+    let live = wal_root.join(format!("{}.wal", broca_core::session_addr(&session)));
+    let specs = [Installation {
+        session: &session,
+        staged: &staged,
+        live: &live,
+        local_archive: None,
+        end_offset: incoming.len() as u64,
+        digest: &digest,
+    }];
+    let db = broca_store::db::OverhaulDb::open(&root).unwrap();
+    let error = install_verified(
+        &root,
+        "cut",
+        &specs,
+        &db,
+        |_| Err("cut after rename".into()),
+    )
+    .unwrap_err();
+    assert_eq!(error.code.as_str(), "unavailable");
+    assert_eq!(std::fs::read(&live).unwrap(), incoming);
+    assert!(!staged.exists());
+    drop(db);
+    let db = broca_store::db::OverhaulDb::open(&root).unwrap();
+    assert!(broca_core::ImportedRunExclusions::is_imported_run(
+        &db,
+        &session,
+        &RunId("foreign-run".into())
+    )
+    .unwrap());
+    install_verified(&root, "cut", &specs, &db, |session| {
+        db.forget_session(session).map_err(|e| e.to_string())
+    })
+    .unwrap();
+    assert!(broca_core::ImportedRunExclusions::is_imported_run(
+        &db,
+        &session,
+        &RunId("foreign-run".into())
+    )
+    .unwrap());
+    assert!(!root.join("run-index.db").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn imported_floor_excludes_foreign_runs_and_preserves_local_billing_after_recovery() {
     let root = root("floor");
     let wal = broca_core::FileWalStore::new(root.join("wal"));

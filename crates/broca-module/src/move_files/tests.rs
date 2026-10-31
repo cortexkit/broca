@@ -173,6 +173,407 @@ impl Rig {
     }
 }
 
+struct CutExclusions {
+    db: Arc<broca_store::db::OverhaulDb>,
+    stop_after_commit: AtomicBool,
+}
+impl broca_core::ImportedRunExclusions for CutExclusions {
+    fn record_imported_runs(
+        &self,
+        session: &BindIdentity,
+        cut: &str,
+        runs: &[broca_protocol::RunId],
+    ) -> Result<(), broca_core::ExportError> {
+        broca_core::ImportedRunExclusions::record_imported_runs(
+            self.db.as_ref(),
+            session,
+            cut,
+            runs,
+        )?;
+        if !runs.is_empty() && self.stop_after_commit.load(Ordering::SeqCst) {
+            return Err(broca_core::ExportError::Storage(
+                "crash after exclusion commit".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn is_imported_run(
+        &self,
+        session: &BindIdentity,
+        run: &broca_protocol::RunId,
+    ) -> Result<bool, broca_core::ExportError> {
+        broca_core::ImportedRunExclusions::is_imported_run(self.db.as_ref(), session, run)
+    }
+}
+
+struct CutDriver {
+    inner: Arc<Driver>,
+    db: Arc<broca_store::db::OverhaulDb>,
+    stop_after_rename: AtomicBool,
+}
+#[async_trait::async_trait]
+impl MoveDriver for CutDriver {
+    async fn plan(&self, cut: &str, refs: &Refs, op: Op) -> Result<MovePlans, ErrorBody> {
+        self.inner.plan(cut, refs, op).await
+    }
+    async fn cover(&self, reference: &str) -> Result<u64, ErrorBody> {
+        self.inner.cover(reference).await
+    }
+    async fn export(&self, reference: &str, bytes: &[u8]) -> Result<(), ErrorBody> {
+        self.inner.export(reference, bytes).await
+    }
+    fn reply(
+        &self,
+        op: Op,
+        plans: &[PlannedSession],
+        offsets: &[u64],
+        observations: &[MoveObservation],
+    ) -> Result<Value, ErrorBody> {
+        self.inner.reply(op, plans, offsets, observations)
+    }
+    fn drop_projection(&self, session: &BindIdentity) -> Result<(), String> {
+        if self.stop_after_rename.load(Ordering::SeqCst) {
+            return Err("crash after rename".into());
+        }
+        self.db.forget_session(session).map_err(|e| e.to_string())
+    }
+}
+
+struct OverhaulCutRig {
+    root: PathBuf,
+    wal: Arc<FileWalStore>,
+    db: Arc<broca_store::db::OverhaulDb>,
+    store: CutStore,
+    artifacts: FileCutArtifacts,
+    exclusions: Arc<CutExclusions>,
+    driver: Arc<CutDriver>,
+    params: Value,
+}
+impl OverhaulCutRig {
+    fn new(tag: &str) -> Self {
+        let root = broca_test_support::scratch_root()
+            .join(format!("overhaul-activation-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        migration::durable_dir(&root, &root.join("wal")).unwrap();
+        let source = FileWalStore::new(root.join("incoming"));
+        let mut plans = Vec::new();
+        for name in ["a", "b"] {
+            let session = BindIdentity::new("/p", "runner", name);
+            let mut writer = source.open(&session).unwrap();
+            crate::move_install::tests::episode(writer.as_mut(), &session, name);
+            drop(writer);
+            let bytes = std::fs::read(source.wal_path(&session)).unwrap();
+            let lineage_id = source
+                .read_records_range(&session, 0, None, None)
+                .unwrap()
+                .lineage_id
+                .unwrap()
+                .to_string();
+            let digest = migration::digest(&bytes);
+            plans.push(PlannedSession {
+                reference: broca_wire::agent_data::session_ref("runner", "/p", name),
+                session,
+                end_offset: bytes.len() as u64,
+                sealed_digest: Some(digest.clone()),
+                digest,
+                bytes,
+                format: "broca-wal/v3;features=".into(),
+                lineage_id,
+                local_archive: None,
+                divergence: None,
+                divergence_reason: None,
+            });
+        }
+        std::fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
+        Self::open(root, plans, false, false)
+    }
+    fn open(
+        root: PathBuf,
+        plans: Vec<PlannedSession>,
+        after_commit: bool,
+        after_rename: bool,
+    ) -> Self {
+        let wal = Arc::new(FileWalStore::with_config(
+            root.join("wal"),
+            broca_wal::WalConfig::OVERHAUL,
+        ));
+        let db = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
+        let inner = Arc::new(Driver {
+            second: wal.wal_path(&plans[1].session),
+            plans,
+            fail_reply: AtomicBool::new(false),
+            fail_second: AtomicBool::new(false),
+        });
+        let params = json!({"cutId":CUT,"refs":inner.plans.iter().map(|p|json!({"ref_kind":"broca-session","ref":p.reference})).collect::<Vec<_>>()});
+        let exclusions = Arc::new(CutExclusions {
+            db: db.clone(),
+            stop_after_commit: AtomicBool::new(after_commit),
+        });
+        let driver = Arc::new(CutDriver {
+            inner,
+            db: db.clone(),
+            stop_after_rename: AtomicBool::new(after_rename),
+        });
+        let registry = LineageRegistry::new_with_reader(Arc::new(NeverOpen), wal.clone(), None);
+        let artifacts = FileCutArtifacts::with_exclusions(
+            root.clone(),
+            registry,
+            wal.clone(),
+            exclusions.clone(),
+            driver.clone(),
+        );
+        let store = CutStore::new(&root);
+        Self {
+            root,
+            wal,
+            db,
+            store,
+            artifacts,
+            exclusions,
+            driver,
+            params,
+        }
+    }
+    fn restart(self) -> Self {
+        let root = self.root.clone();
+        let plans = self.driver.inner.plans.clone();
+        let after_commit = self.exclusions.stop_after_commit.load(Ordering::SeqCst);
+        let after_rename = self.driver.stop_after_rename.load(Ordering::SeqCst);
+        drop(self);
+        Self::open(root, plans, after_commit, after_rename)
+    }
+    async fn op(&self, op: Op) -> Result<Value, ErrorBody> {
+        self.store
+            .execute(
+                "reserved:entorhinal",
+                op.method(),
+                &self.params,
+                &self.artifacts,
+            )
+            .await
+    }
+    fn assert_excluded(&self, count: usize) {
+        for plan in self.driver.inner.plans.iter().take(count) {
+            assert!(
+                broca_core::ImportedRunExclusions::is_imported_run(
+                    self.db.as_ref(),
+                    &plan.session,
+                    &broca_protocol::RunId(plan.session.session.clone())
+                )
+                .unwrap(),
+                "imported-run exclusion missing"
+            );
+        }
+    }
+    fn absent_exclusions_control(&self, count: usize) {
+        self.db
+            .authoritative_transaction(|tx| {
+                tx.execute("DELETE FROM imported_run", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let failure =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.assert_excluded(count)))
+                .expect_err("the exclusion assertion must reject an absent floor");
+        let message = failure
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| failure.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(message.contains("imported-run exclusion missing"));
+        for plan in self.driver.inner.plans.iter().take(count) {
+            broca_core::ImportedRunExclusions::record_imported_runs(
+                self.db.as_ref(),
+                &plan.session,
+                CUT,
+                &[broca_protocol::RunId(plan.session.session.clone())],
+            )
+            .unwrap();
+        }
+    }
+    fn assert_pending(&self) {
+        let state: crate::cut_state::CutState = migration::read_json(&self.store.path(CUT))
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.intent.unwrap().op, "activate");
+        for plan in &self.driver.inner.plans {
+            let read = self.artifacts.registry.check_move(&plan.session, false);
+            assert!(
+                matches!(read, Err(OpenError::SessionMoving { .. })),
+                "expected the serving read fence: {read:?}"
+            );
+            assert!(
+                matches!(
+                    self.wal.open(&plan.session),
+                    Err(broca_wal::WalError::SessionMoving { .. })
+                ),
+                "half-installed session admitted a writer"
+            );
+        }
+    }
+    fn assert_completed(&self) {
+        self.assert_excluded(2);
+        let state: crate::cut_state::CutState = migration::read_json(&self.store.path(CUT))
+            .unwrap()
+            .unwrap();
+        assert!(state.intent.is_none());
+        assert!(state.replies.contains_key(Op::Activate.method()));
+        for plan in &self.driver.inner.plans {
+            self.artifacts
+                .registry
+                .check_move(&plan.session, false)
+                .unwrap();
+            assert_eq!(
+                std::fs::read(self.wal.wal_path(&plan.session)).unwrap(),
+                plan.bytes
+            );
+            assert!(!self.wal.read_records(&plan.session).unwrap().is_empty());
+            self.wal.check_move(&plan.session, true).unwrap();
+        }
+        assert!(!self.root.join("run-index.db").exists());
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ActivationCut {
+    ExclusionCommit,
+    Rename,
+    Completion,
+}
+
+async fn activation_cut_recovery(cut: ActivationCut) {
+    let tag = match cut {
+        ActivationCut::ExclusionCommit => "exclusion-commit",
+        ActivationCut::Rename => "rename",
+        ActivationCut::Completion => "completion",
+    };
+    let rig = OverhaulCutRig::new(tag);
+    rig.op(Op::Import).await.unwrap();
+    rig.exclusions.stop_after_commit.store(
+        matches!(cut, ActivationCut::ExclusionCommit),
+        Ordering::SeqCst,
+    );
+    rig.driver
+        .stop_after_rename
+        .store(matches!(cut, ActivationCut::Rename), Ordering::SeqCst);
+    let completed = if matches!(cut, ActivationCut::Completion) {
+        Some(rig.op(Op::Activate).await.unwrap())
+    } else {
+        assert_eq!(
+            rig.op(Op::Activate).await.unwrap_err().code.as_str(),
+            "unavailable"
+        );
+        None
+    };
+    let rig = rig.restart();
+    if completed.is_some() {
+        rig.assert_completed();
+    } else {
+        rig.assert_excluded(1);
+        rig.assert_pending();
+        let first = &rig.driver.inner.plans[0];
+        assert_eq!(
+            rig.wal.wal_path(&first.session).exists(),
+            matches!(cut, ActivationCut::Rename)
+        );
+        assert_eq!(
+            rig.op(Op::Abort).await.unwrap_err().code.as_str(),
+            "invalid_state"
+        );
+        rig.assert_pending();
+    }
+    rig.absent_exclusions_control(if completed.is_some() { 2 } else { 1 });
+    eprintln!("activation {cut:?}: absent-exclusion negative control rejected");
+    rig.exclusions
+        .stop_after_commit
+        .store(false, Ordering::SeqCst);
+    rig.driver.stop_after_rename.store(false, Ordering::SeqCst);
+    rig.store.reconcile_boot(&rig.artifacts).await.unwrap();
+    rig.assert_completed();
+    for plan in &rig.driver.inner.plans {
+        assert!(
+            matches!(
+                rig.artifacts
+                    .registry
+                    .route_status(&plan.session)
+                    .await
+                    .unwrap(),
+                crate::actor::LineageStatus::Idle
+            ),
+            "a completed activation must serve its closed session normally"
+        );
+    }
+    let reply = rig.op(Op::Activate).await.unwrap();
+    if let Some(completed) = completed {
+        assert_eq!(reply, completed);
+    }
+    rig.driver.inner.fail_reply.store(true, Ordering::SeqCst);
+    assert_eq!(
+        rig.op(Op::Activate).await.unwrap(),
+        reply,
+        "completed activation must replay without applying again"
+    );
+    assert_eq!(
+        rig.op(Op::Abort).await.unwrap_err().code.as_str(),
+        "invalid_state"
+    );
+    let root = rig.root.clone();
+    drop(rig);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+async fn abort_before_activation_leaves_later_local_runs_eligible() {
+    let rig = OverhaulCutRig::new("aborted-before-activation");
+    rig.op(Op::Import).await.unwrap();
+    rig.op(Op::Abort).await.unwrap();
+    let rig = rig.restart();
+    let state: crate::cut_state::CutState =
+        migration::read_json(&rig.store.path(CUT)).unwrap().unwrap();
+    assert!(state.intent.is_none());
+    assert!(state.replies.contains_key(Op::Abort.method()));
+    for plan in &rig.driver.inner.plans {
+        let run = broca_protocol::RunId(plan.session.session.clone());
+        assert!(
+            !broca_core::ImportedRunExclusions::is_imported_run(
+                rig.db.as_ref(),
+                &plan.session,
+                &run
+            )
+            .unwrap(),
+            "aborted pre-activation move suppressed a later local run"
+        );
+        let mut writer = rig.wal.open(&plan.session).unwrap();
+        crate::move_install::tests::episode(writer.as_mut(), &plan.session, &run.0);
+        drop(writer);
+        assert!(!broca_core::ImportedRunExclusions::is_imported_run(
+            rig.db.as_ref(),
+            &plan.session,
+            &run
+        )
+        .unwrap());
+    }
+    assert!(!rig.root.join("run-index.db").exists());
+    let root = rig.root.clone();
+    drop(rig);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn overhaul_activation_crash_after_exclusion_commit_keeps_imports_excluded_or_fenced() {
+    activation_cut_recovery(ActivationCut::ExclusionCommit).await;
+}
+
+#[tokio::test]
+async fn overhaul_activation_crash_after_rename_keeps_imports_excluded_or_fenced() {
+    activation_cut_recovery(ActivationCut::Rename).await;
+}
+
+#[tokio::test]
+async fn overhaul_activation_crash_after_completion_replays_without_rebilling() {
+    activation_cut_recovery(ActivationCut::Completion).await;
+    abort_before_activation_leaves_later_local_runs_eligible().await;
+}
+
 #[tokio::test]
 async fn two_cut_ids_cannot_replace_or_abort_the_others_freeze_across_restart() {
     let rig = Rig::new("two-cuts", true);

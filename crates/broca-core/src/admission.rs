@@ -557,6 +557,10 @@ pub struct SessionOwnershipV1 {
     /// retain their old checkpoint bytes and admission need not probe for change records.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub session_change_recorded: bool,
+    /// Versioned sender-policy fold, present only for histories with session-change records.
+    /// Missing on an older refreshed checkpoint means the complete WAL must be folded again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_admission: Option<SenderAdmissionV1>,
     /// Whether this summary was folded by a build that records the first episode's frozen
     /// plan manifest (`FirstEpisodeV1::manifest`). A summary stored by an older build, or
     /// re-stored by one after a rollback, lacks it and may have dropped a manifest, so it is
@@ -578,6 +582,7 @@ impl Default for SessionOwnershipV1 {
             first_episode: None,
             latest_manifest: None,
             session_change_recorded: false,
+            sender_admission: None,
             plan_manifest_folded: true,
         }
     }
@@ -595,7 +600,50 @@ pub struct FirstEpisodeV1 {
     pub manifest: Option<Arc<broca_wal::PlanManifest>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SenderAdmissionV1 {
+    pub version: u32,
+    pub accepted_senders: Option<Vec<cortexkit_role_llm_runner::delivery_order::PlanSender>>,
+}
+
+pub(crate) fn manifest_senders(
+    manifest: &broca_wal::PlanManifest,
+) -> Vec<cortexkit_role_llm_runner::delivery_order::PlanSender> {
+    serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text())
+        .ok()
+        .and_then(|plan| {
+            plan.as_object()
+                .and_then(|plan| cortexkit_role_llm_runner::delivery_order::plan_senders(plan).ok())
+        })
+        .unwrap_or_default()
+}
+
 impl SessionOwnershipV1 {
+    /// Admission policy changes at durable refresh acceptance, independently of when the
+    /// execution manifest applies. Already admitted queued submissions keep their admission.
+    pub fn effective_senders(&self) -> Vec<cortexkit_role_llm_runner::delivery_order::PlanSender> {
+        self.sender_admission
+            .as_ref()
+            .and_then(|fold| fold.accepted_senders.clone())
+            .unwrap_or_else(|| {
+                self.latest_manifest
+                    .as_deref()
+                    .or_else(|| self.first_episode.as_ref()?.manifest.as_deref())
+                    .map(manifest_senders)
+                    .unwrap_or_default()
+            })
+    }
+
+    pub fn sender_admission_complete(&self) -> bool {
+        match &self.sender_admission {
+            Some(fold) => fold.version == 1,
+            // Manifest-aware checkpoints have folded session-change records since those
+            // records were introduced. A false presence bit proves the first plan still
+            // supplies sender policy; no WAL read or checkpoint rewrite is needed.
+            None => self.plan_manifest_folded && !self.session_change_recorded,
+        }
+    }
+
     /// Identity-only state for cancel/retract checks. The first episode also carries tool
     /// names and provider-supplied text, so it must not enter a long-lived owner cache.
     pub fn for_owner_access(&self) -> Self {
@@ -608,6 +656,7 @@ impl SessionOwnershipV1 {
             first_episode: None,
             latest_manifest: None,
             session_change_recorded: false,
+            sender_admission: None,
             plan_manifest_folded: false,
         }
     }
@@ -618,6 +667,7 @@ impl SessionOwnershipV1 {
         self.first_episode = None;
         self.latest_manifest = None;
         self.session_change_recorded = false;
+        self.sender_admission = None;
         self.plan_manifest_folded = false;
         for frame in records {
             if let WalRecord::RunStarted {
@@ -1205,12 +1255,23 @@ impl AdmissionCheckpointV1 {
             | WalRecord::InputTokenBudgetExhausted { .. }
             | WalRecord::StructuredOutputResult { .. }
             | WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
-            // Only a presence bit is needed here; the session-change projection folds the payload.
-            WalRecord::SessionRefreshAccepted { .. }
-            | WalRecord::SessionRefreshPolicyChanged { .. }
+            WalRecord::SessionRefreshAccepted { manifest, .. } => {
+                if let Some(ownership) = &mut self.ownership {
+                    ownership.session_change_recorded = true;
+                    ownership.sender_admission = Some(SenderAdmissionV1 {
+                        version: 1,
+                        accepted_senders: Some(manifest_senders(manifest)),
+                    });
+                }
+            }
+            WalRecord::SessionRefreshPolicyChanged { .. }
             | WalRecord::SessionPrefixFlushed { .. } => {
                 if let Some(ownership) = &mut self.ownership {
                     ownership.session_change_recorded = true;
+                    ownership.sender_admission.get_or_insert(SenderAdmissionV1 {
+                        version: 1,
+                        accepted_senders: None,
+                    });
                 }
             }
         }
@@ -1536,6 +1597,8 @@ pub struct AdmissionSeed {
     qualified: bool,
     scalars: AdmissionCheckpointV1,
     first_run: Option<AdmissionSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_refresh: Option<AdmissionSource>,
     episode: Option<AdmissionEpisodeSeed>,
     queued: Vec<AdmissionQueueSeed>,
     staged: Option<AdmissionSource>,
@@ -1682,6 +1745,9 @@ impl AdmissionSeed {
         }).transpose()?;
         if let Some(ownership) = &mut scalars.ownership {
             ownership.latest_manifest = None;
+            if let Some(fold) = &mut ownership.sender_admission {
+                fold.accepted_senders = None;
+            }
             if let Some(first) = &mut ownership.first_episode {
                 first.manifest = None;
             }
@@ -1702,6 +1768,11 @@ impl AdmissionSeed {
             qualified: boundary.qualified,
             scalars,
             first_run: first.map(source).transpose()?,
+            latest_refresh: frames
+                .iter()
+                .rposition(|frame| matches!(frame.record, WalRecord::SessionRefreshAccepted { .. }))
+                .map(source)
+                .transpose()?,
             episode,
             queued,
             staged,
@@ -1889,6 +1960,21 @@ impl AdmissionSeed {
             return Err(bad());
         }
         let mut checkpoint = self.scalars.clone();
+        if let Some(source) = &self.latest_refresh {
+            let WalRecord::SessionRefreshAccepted { manifest, .. } =
+                source.read(read_at, &self.boundary)?.record
+            else {
+                return Err(bad());
+            };
+            checkpoint
+                .ownership
+                .as_mut()
+                .ok_or_else(bad)?
+                .sender_admission = Some(SenderAdmissionV1 {
+                version: 1,
+                accepted_senders: Some(manifest_senders(&manifest)),
+            });
+        }
         if let Some(HydratedAdmissionEpisode { episode, manifest }) = hydrated {
             checkpoint.last_episode = Some(episode);
             // The episode's authenticated RunStarted already supplied this manifest.
@@ -1931,6 +2017,9 @@ impl AdmissionSeed {
                     .and_then(|first| first.manifest.as_deref())
             {
                 ownership.latest_manifest = None;
+            }
+            if let Some(head) = &mut checkpoint.head {
+                head.restore_sender_admission(ownership);
             }
         }
         let pending = self.queued.iter().map(|seed| {
@@ -2086,6 +2175,34 @@ impl ContinuationCompactionFold {
 }
 
 impl AdmissionContinuation {
+    /// Authenticate the bounded WAL source of the latest accepted admission policy.
+    pub fn restore_head_sender_admission(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        head: &mut crate::head::HeadProjection,
+    ) -> Result<(), crate::replay::SeedFallback> {
+        let ownership =
+            self.seed.scalars.ownership.as_ref().ok_or_else(|| {
+                crate::replay::SeedFallback::new("sender admission summary missing")
+            })?;
+        if !ownership.sender_admission_complete() {
+            return Err(crate::replay::SeedFallback::new(
+                "sender admission summary predates refresh folding",
+            ));
+        }
+        head.restore_sender_marker(ownership);
+        if let Some(source) = &self.seed.latest_refresh {
+            let record = source.read(read_at, &self.seed.boundary)?.record;
+            if !matches!(record, WalRecord::SessionRefreshAccepted { .. }) {
+                return Err(crate::replay::SeedFallback::new(
+                    "sender admission source is not a refresh",
+                ));
+            }
+            head.observe(&record);
+        }
+        Ok(())
+    }
+
     /// A full WAL read preserves unanswered deferred calls, late results and
     /// requests to withdraw outstanding approval questions when the raw prefix
     /// cannot reconstruct those actions.
@@ -2191,6 +2308,19 @@ impl AdmissionContinuation {
 
     /// Unsupported versions and missing media metadata are cache misses, never partial state.
     pub fn decode(encoded: &str) -> Result<Self, crate::replay::SeedFallback> {
+        Self::decode_inner(encoded, true)
+    }
+
+    /// Execution needs episode state, not named-sender policy. Keep older refresh-aware
+    /// continuations usable until a sender or template actually needs the newer fold.
+    pub fn decode_for_execution(encoded: &str) -> Result<Self, crate::replay::SeedFallback> {
+        Self::decode_inner(encoded, false)
+    }
+
+    fn decode_inner(
+        encoded: &str,
+        require_sender_policy: bool,
+    ) -> Result<Self, crate::replay::SeedFallback> {
         let bad = || crate::replay::SeedFallback::new("unsupported admission continuation");
         let value: serde_json::Value = serde_json::from_str(encoded).map_err(|_| bad())?;
         if value["version"] != 1 && value["version"] != 2 {
@@ -2205,6 +2335,17 @@ impl AdmissionContinuation {
             serde_json::from_value(value["state"].clone()).map_err(|_| bad())?;
         if seed.version != 1 {
             return Err(bad());
+        }
+        if require_sender_policy
+            && seed
+                .scalars
+                .ownership
+                .as_ref()
+                .is_none_or(|ownership| !ownership.sender_admission_complete())
+        {
+            return Err(crate::replay::SeedFallback::new(
+                "sender admission summary predates refresh folding",
+            ));
         }
         let sources = serde_json::from_value(value["sources"].clone()).map_err(|_| bad())?;
         let media_sources = value
@@ -2296,9 +2437,8 @@ impl AdmissionContinuation {
             | WalRecord::InputTokenCapFrozen { .. }
             | WalRecord::OutputReservationClamped { .. }
             | WalRecord::RunFinished { .. } => true,
-            // Session changes only set ownership.session_change_recorded, which is kept
-            // in the scalars. Capture/advance strip ownership.latest_manifest and hydration
-            // rebuilds it from the episode's RunStarted, not from these change records.
+            // Execution manifests come from episode starts; admission policy has its own
+            // bounded latest-refresh source, independent of accounting history.
             WalRecord::SessionRefreshAccepted { .. }
             | WalRecord::SessionRefreshPolicyChanged { .. }
             | WalRecord::SessionPrefixFlushed { .. } => false,
@@ -2726,6 +2866,7 @@ impl AdmissionContinuation {
                     .push(source.clone());
             }
             match &p.framed.record {
+                WalRecord::SessionRefreshAccepted { .. } => next.seed.latest_refresh = Some(source),
                 WalRecord::RunStarted { .. } => {
                     next.seed.first_run.get_or_insert(source.clone());
                     next.seed.episode = Some(AdmissionEpisodeSeed {
@@ -2808,6 +2949,9 @@ impl AdmissionContinuation {
         scalars.pending_order = None;
         if let Some(ownership) = &mut scalars.ownership {
             ownership.latest_manifest = None;
+            if let Some(fold) = &mut ownership.sender_admission {
+                fold.accepted_senders = None;
+            }
             if let Some(first) = &mut ownership.first_episode {
                 first.manifest = None;
             }
@@ -3863,6 +4007,14 @@ mod tests {
         }
         let baseline = manifest("baseline", "PRIVATE-BASELINE-MANIFEST");
         let refreshed = manifest("refreshed", "PRIVATE-REFRESHED-MANIFEST");
+        let mut refreshed = refreshed;
+        refreshed.plan = broca_wal::OpaqueJson::from_json_text(
+            serde_json::json!({
+                "senders": [{"module":"occipital", "idle_start":true}]
+            })
+            .to_string(),
+        )
+        .unwrap();
         let mut records = offset_corpus();
         for frame in &mut records {
             if let WalRecord::RunStarted {
@@ -3898,6 +4050,29 @@ mod tests {
             assert!(!AdmissionContinuation::accounting_source(change));
         }
         records.splice(10..10, changes.into_iter().map(|r| frame(0, r)));
+        let mut pending = manifest("pending", "PRIVATE-PENDING-MANIFEST");
+        pending.plan = broca_wal::OpaqueJson::from_json_text(
+            serde_json::json!({
+                "senders":[{"module":"pending-sender","idle_start":true,"templates":[{
+                    "id":"context","text":"PRIVATE-PENDING-TEMPLATE","slots":{}
+                }]}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        records.insert(
+            records.len() - 2,
+            frame(
+                0,
+                WalRecord::SessionRefreshAccepted {
+                    generation: 2,
+                    policy: "on_prefix_rebuild".into(),
+                    manifest: Box::new(pending),
+                    run_in_progress: true,
+                    applies_from_next_run: false,
+                },
+            ),
+        );
         for (i, frame) in records.iter_mut().enumerate() {
             frame.seq = i as u64 + 1;
         }
@@ -3918,6 +4093,7 @@ mod tests {
         let full = AdmissionCheckpointV1::from_frames(&records).unwrap();
         let ownership = full.ownership.as_ref().unwrap();
         assert!(ownership.session_change_recorded);
+        assert_eq!(ownership.effective_senders()[0].module, "pending-sender");
         assert_eq!(ownership.latest_manifest.as_deref(), Some(&refreshed));
         assert_eq!(
             ownership
@@ -3941,7 +4117,12 @@ mod tests {
         for stored in [captured, advanced] {
             let encoded = stored.encode().unwrap();
             assert_content_free_form(&encoded);
-            for payload in ["PRIVATE-BASELINE-MANIFEST", "PRIVATE-REFRESHED-MANIFEST"] {
+            for payload in [
+                "PRIVATE-BASELINE-MANIFEST",
+                "PRIVATE-REFRESHED-MANIFEST",
+                "PRIVATE-PENDING-MANIFEST",
+                "PRIVATE-PENDING-TEMPLATE",
+            ] {
                 assert!(!encoded.contains(payload));
             }
             let wire: serde_json::Value = serde_json::from_str(&encoded).unwrap();
@@ -5895,6 +6076,45 @@ mod tests {
         assert!(AdmissionCheckpointV1::empty().ownership_complete());
     }
 
+    #[test]
+    fn sender_admission_checkpoint_requires_versioned_refresh_fold() {
+        let mut checkpoint = AdmissionCheckpointV1::empty();
+        let ownership = checkpoint.ownership.as_mut().unwrap();
+        ownership.session_change_recorded = true;
+        assert!(
+            checkpoint.ownership_complete(),
+            "execution metadata remains usable"
+        );
+        assert!(!checkpoint
+            .ownership
+            .as_ref()
+            .unwrap()
+            .sender_admission_complete());
+        checkpoint
+            .fold_record(
+                1,
+                &WalRecord::SessionPrefixFlushed {
+                    send_id: "flush".into(),
+                    pending_generation: None,
+                },
+            )
+            .unwrap();
+        assert!(checkpoint.ownership_complete());
+        checkpoint
+            .ownership
+            .as_mut()
+            .unwrap()
+            .sender_admission
+            .as_mut()
+            .unwrap()
+            .version = 2;
+        assert!(!checkpoint
+            .ownership
+            .as_ref()
+            .unwrap()
+            .sender_admission_complete());
+    }
+
     /// The ownership summary folds every episode: the first principal, whether any episode
     /// recorded none, each distinct principal in order, and the latest frozen scope. An
     /// episode that reopened the scope at a later epoch replaces it, and an episode without a
@@ -5932,6 +6152,7 @@ mod tests {
                 first_episode: None,
                 latest_manifest: None,
                 session_change_recorded: false,
+                sender_admission: None,
                 plan_manifest_folded: true,
             }
         );

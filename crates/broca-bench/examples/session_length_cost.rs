@@ -686,6 +686,13 @@ impl MaterializedStore for CountingStore {
 }
 
 impl Persister for CountingStore {
+    fn repair_sender_policy(
+        &self,
+        session: &BindIdentity,
+        range: &broca_wal::WalRangeRead,
+    ) -> Result<u64, String> {
+        self.inner.repair_sender_policy(session, range)
+    }
     fn project_retained_head(
         &self,
         session: &BindIdentity,

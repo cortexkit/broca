@@ -83,10 +83,16 @@ fn a_send_naming_media_inline_is_refused_with_the_upload_rule() {
 }
 
 #[test]
-fn a_send_with_only_upload_references_keeps_its_existing_refusal() {
+fn upload_reference_shape_is_checked_before_model_admission() {
+    assert_eq!(
+        check_upload_references(&json!({"content": [
+            {"type": "upload", "upload_id": "u-1"}
+        ]})),
+        Ok(())
+    );
     let refusal = check_upload_references(&json!({"content": [
-        {"type": "upload", "upload_id": "u-1"}
+        {"type": "upload", "upload_id": 1}
     ]}))
-    .expect_err("attachment admission is not wired yet");
-    assert!(refusal.contains("upload u-1"), "{refusal}");
+    .expect_err("malformed upload reference must still be refused");
+    assert!(refusal.contains("invalid content"), "{refusal}");
 }

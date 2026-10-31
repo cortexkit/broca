@@ -33,7 +33,7 @@ WRITER = pathlib.Path(
                               check=True).stdout)["target_directory"]
 ) / "debug/examples/archive-fixture"
 
-EXPECTED_SUITE_ANCHORS = 4
+EXPECTED_SUITE_ANCHORS = 5
 
 
 def identity(project_root: str, harness: str, session: str) -> str:
@@ -51,6 +51,23 @@ def wal_fixture(text: str) -> bytes:
 
 
 class RekeyHarnessTests(unittest.TestCase):
+    def test_inventoried_store_refuses_before_any_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, home, _, _ = self._fixture(
+                pathlib.Path(tmp), archive_source=False, archive_dest=False
+            )
+            with sqlite3.connect(root / "run-index.db") as db:
+                db.execute("CREATE TABLE agent_data_session_ref (session_ref TEXT)")
+            before = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+            code, output = self._run(root, home)
+            self.assertEqual(code, 2, output)
+            self.assertIn("rekey-harness.py: refusing a store with session-ref inventory", output)
+            self.assertIn("store-maintenance repair-session-root", output)
+            self.assertEqual(
+                {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}, before
+            )
+            self.assertEqual(list(home.iterdir()), [])
+
     def _fixture(self, tmp_path, *, archive_source: bool, archive_dest: bool):
         """One live source, and an archived WAL at whichever end the caller names.
 

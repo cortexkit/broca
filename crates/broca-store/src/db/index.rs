@@ -161,7 +161,12 @@ pub(super) fn index_in_tx(
                 _ => None,
             });
     }
+    let outdated = checkpoint.is_some() && !super::recovery::projection_current(tx, &key)?;
+    if outdated && !force {
+        broca_core::replay::SeedFallback::new("withdrawal projection version outdated");
+    }
     let rebuilt = force
+        || outdated
         || checkpoint
             .as_ref()
             .is_some_and(|cp| !matches_checkpoint(cp, log.bytes, &lineage_id));
@@ -270,6 +275,7 @@ pub(super) fn index_in_tx(
     tx.execute("UPDATE session SET lineage_id=?2,indexed_seq=?3,indexed_off=?4,indexed_end=?5,indexed_identity=?6,head_ord=?7,locator_seed=?8,frozen_policy=?9,last_activity_ms=?10,last_write_ms=?11,title_off=?12,lineage_off=?13 WHERE sid=?1",
         params![key,lineage_id,last_seq.map(u64_to_i64).transpose()?,u64_to_i64(last_off)?,u64_to_i64(offset)?,identity,u64_to_i64(seed.head_ord())?,seed.encode()?,seed.frozen_policy.map(u64_to_i64).transpose()?,seed.last_activity_ms.map(u64_to_i64).transpose()?,seed.last_write_ms.map(u64_to_i64).transpose()?,seed.title_off.map(u64_to_i64).transpose()?,lineage_off.map(u64_to_i64).transpose()?])?;
     super::seeds::publish(tx, &key, &log.bytes[..offset as usize])?;
+    super::recovery::mark_projection_current(tx, &key)?;
     Ok(IndexOutcome {
         rebuilt,
         indexed_seq: last_seq,
@@ -325,6 +331,18 @@ pub(super) fn apply_frame(
     if let Some((cut, checkpoint)) = delta.reanchor {
         reanchor(tx, key, cut, checkpoint, seed)?;
     }
+    super::recovery::observe(
+        tx,
+        key,
+        lineage,
+        seed.episode.as_ref().and_then(|ep| ep.run_id.as_deref()),
+        &frame.framed,
+    )?;
+    super::operational::observe(
+        tx,
+        seed.episode.as_ref().and_then(|ep| ep.run_id.as_deref()),
+        &frame.framed.record,
+    )?;
     Ok(())
 }
 
@@ -532,6 +550,499 @@ mod tests {
             .enumerate()
             .flat_map(|(n, record)| encode(n as u64 + 1, 1, record).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn operational_diagnostics_are_atomic_bounded_and_rebuildable() {
+        use super::super::DiagnosticEvidenceReader;
+        let scratch = database();
+        let source = decoded(&fixture("scripts/fixtures/resume-close-out-sealed.wal"));
+        let mut start = source
+            .iter()
+            .find(|(_, _, f)| matches!(f.record, WalRecord::RunStarted { .. }))
+            .unwrap()
+            .2
+            .record
+            .clone();
+        let mut terminal = source
+            .iter()
+            .find(|(_, _, f)| matches!(f.record, WalRecord::RunFinished { .. }))
+            .unwrap()
+            .2
+            .record
+            .clone();
+        if let WalRecord::RunStarted { ts_ms, .. } = &mut start {
+            *ts_ms = Some(100);
+        }
+        if let WalRecord::RunFinished { reason, ts_ms, .. } = &mut terminal {
+            *reason = broca_protocol::caller::RunFinishReason::Error;
+            *ts_ms = Some(200);
+        }
+        let first = encode_records(&[start.clone()]);
+        let all = encode_records(&[start, terminal]);
+        let bind = bind(&all);
+        scratch.db.index(&publication(&bind, &first)).unwrap();
+        let before = rows(&scratch.db, &["run", "operational_run"]);
+        scratch.db.authoritative_transaction(|tx| {
+            tx.execute_batch("CREATE TRIGGER fail_diagnostic BEFORE UPDATE ON operational_run BEGIN SELECT RAISE(ABORT,'diagnostic cut'); END;")?;
+            Ok(())
+        }).unwrap();
+        assert!(scratch.db.index(&publication(&bind, &all)).is_err());
+        assert_eq!(rows(&scratch.db, &["run", "operational_run"]), before);
+        scratch
+            .db
+            .authoritative_transaction(|tx| {
+                tx.execute_batch("DROP TRIGGER fail_diagnostic")?;
+                Ok(())
+            })
+            .unwrap();
+        scratch.db.index(&publication(&bind, &all)).unwrap();
+        let expected = rows(&scratch.db, &["operational_run"]);
+        let counter = broca_wal::access_counter::WalAccessCounter::default();
+        let evidence = counter
+            .operation("diagnostics")
+            .run(|| scratch.db.diagnostic_evidence(150, 250))
+            .unwrap();
+        assert_eq!(evidence.errors.len(), 1);
+        assert_eq!(evidence.errors[0].at_ms, Some(200));
+        assert!(evidence.live.is_empty());
+        assert!(scratch
+            .db
+            .diagnostic_evidence(201, 250)
+            .unwrap()
+            .errors
+            .is_empty());
+        assert!(
+            counter.snapshot()[0].reads.is_empty(),
+            "diagnostic queries must not read WAL sources"
+        );
+        assert_eq!(counter.snapshot()[0].frames_decoded, 0);
+        let plan = scratch.db.read_snapshot(|tx| {
+            let rows = tx.prepare("EXPLAIN QUERY PLAN SELECT o.run_id FROM operational_run o INDEXED BY operational_run_time JOIN run r USING(run_id) WHERE state='error' AND state_changed_ms>=150 AND state_changed_ms<=250 ORDER BY state_changed_ms DESC LIMIT 20001")?
+                .query_map([],|r|r.get::<_,String>(3))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows.join(" "))
+        }).unwrap();
+        assert!(
+            plan.contains("operational_run_time (state_changed_ms>? AND state_changed_ms<?)"),
+            "{plan}"
+        );
+        scratch
+            .db
+            .authoritative_transaction(|tx| {
+                tx.execute_batch("DROP TABLE operational_run")?;
+                super::super::operational::initialize(tx)?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            scratch.db.diagnostic_evidence(0, 1000).is_err(),
+            "missing attribution must not be reported absent"
+        );
+        scratch.db.forget_session(&bind).unwrap();
+        scratch.db.index(&publication(&bind, &all)).unwrap();
+        assert_eq!(rows(&scratch.db, &["operational_run"]), expected);
+    }
+
+    #[test]
+    fn operational_recovery_discovery_ports_remain_advisory_on_both_adapters() {
+        use broca_core::{RecoveryDiscovery, RunIndex, RunIndexRow, RunIndexState};
+        let scratch = database();
+        let legacy = crate::SqliteStore::open_in_memory().unwrap();
+        let source = decoded(&fixture("scripts/fixtures/resume-close-out-sealed.wal"));
+        let mut start = source
+            .iter()
+            .find(|(_, _, f)| matches!(f.record, WalRecord::RunStarted { .. }))
+            .unwrap()
+            .2
+            .record
+            .clone();
+        let bind = BindIdentity::new("/operational", "runner", "advisory");
+        let id = broca_protocol::RunId("advisory".into());
+        if let WalRecord::RunStarted {
+            session, run_id, ..
+        } = &mut start
+        {
+            *session = bind.clone();
+            *run_id = id.clone();
+        }
+        let first = encode_records(&[start.clone()]);
+        scratch.db.index(&publication(&bind, &first)).unwrap();
+        legacy
+            .index_run_active(&RunIndexRow {
+                run_id: id.0.clone(),
+                session: bind.clone(),
+                submission_id: None,
+                request_identity_digest: None,
+                state: RunIndexState::Active,
+                usage: None,
+                final_step_finish_reason: None,
+                retries_used: 0,
+                title: None,
+                withdrawals_owed: false,
+            })
+            .unwrap();
+        let paused = WalRecord::RunPaused {
+            run_id: id.clone(),
+            ts_ms: Some(200),
+            reason: broca_protocol::PauseReason::AuthRequired,
+            error: None,
+        };
+        let durable = vec![start, paused];
+        // A crash can leave Active in either index after a durable restart pause.
+        for port in [&legacy as &dyn RecoveryDiscovery, &scratch.db] {
+            assert_eq!(
+                port.active_runs().unwrap(),
+                vec![(id.0.clone(), bind.clone())]
+            );
+            assert_eq!(
+                port.restart_resume_candidates().unwrap(),
+                vec![(id.0.clone(), bind.clone())]
+            );
+            assert_eq!(
+                broca_core::reconcile_run_state(&durable, &id.0)
+                    .unwrap()
+                    .state,
+                RunIndexState::Paused
+            );
+        }
+        scratch
+            .db
+            .index(&publication(&bind, &encode_records(&durable)))
+            .unwrap();
+        legacy
+            .index_run_terminal(&id.0, RunIndexState::Paused, None, None, 0)
+            .unwrap();
+        for port in [&legacy as &dyn RecoveryDiscovery, &scratch.db] {
+            assert!(port.active_runs().unwrap().is_empty());
+            assert_eq!(
+                port.restart_resume_candidates().unwrap(),
+                vec![(id.0.clone(), bind.clone())]
+            );
+        }
+    }
+
+    #[test]
+    fn operational_withdrawal_discovery_preserves_active_terminal_acknowledged_and_expired() {
+        use broca_core::{RecoveryDiscovery, RunIndex, RunIndexRow, RunIndexState};
+        use broca_protocol::{BatchId, RunId, ToolCallId};
+        use broca_wal::Wal;
+        fn check(
+            db: &OverhaulDb,
+            legacy: &crate::SqliteStore,
+            wal: &broca_wal::FileWal,
+            bind: &BindIdentity,
+            id: &str,
+            expected: bool,
+        ) {
+            let frames = wal.replay().unwrap();
+            let records: Vec<_> = frames.iter().map(|f| f.record.clone()).collect();
+            let state = broca_core::reconcile_run_state(&records, id).unwrap();
+            legacy
+                .index_run_terminal(id, state.state, None, None, 0)
+                .unwrap();
+            let owes = broca_core::deferred_call_obligations(wal.lineage_id().unwrap(), &frames)
+                .withdrawals
+                .len()
+                == 1;
+            legacy.index_run_withdrawals_owed(id, owes).unwrap();
+            db.index(&publication(
+                bind,
+                &std::fs::read(wal.log_path().unwrap()).unwrap(),
+            ))
+            .unwrap();
+            let expected = if expected {
+                vec![(id.to_owned(), bind.clone())]
+            } else {
+                vec![]
+            };
+            for port in [legacy as &dyn RecoveryDiscovery, db] {
+                let actual: Vec<_> = port
+                    .withdrawal_candidates()
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| (r.run_id.0, r.session))
+                    .collect();
+                assert_eq!(actual, expected);
+            }
+            assert_eq!(
+                db.lookup_run(id).unwrap().unwrap().withdrawals_owed,
+                !expected.is_empty()
+            );
+            assert_eq!(
+                db.lookup_run_retention(id)
+                    .unwrap()
+                    .unwrap()
+                    .withdrawals_owed,
+                !expected.is_empty()
+            );
+        }
+        for expire in [false, true] {
+            let scratch = database();
+            let legacy = crate::SqliteStore::open_in_memory().unwrap();
+            let path = scratch._scratch.0.join("withdrawal.wal");
+            let mut wal = broca_wal::FileWal::open(&path)
+                .unwrap()
+                .with_feature_floor(scratch._scratch.0.join("wal-floor"));
+            let source = decoded(&fixture("scripts/fixtures/resume-close-out-sealed.wal"));
+            let mut start = source
+                .iter()
+                .find(|(_, _, f)| matches!(f.record, WalRecord::RunStarted { .. }))
+                .unwrap()
+                .2
+                .record
+                .clone();
+            let bind = BindIdentity::new("/project", "runner", "withdrawal");
+            let id = "withdrawal-run";
+            if let WalRecord::RunStarted {
+                session, run_id, ..
+            } = &mut start
+            {
+                *session = bind.clone();
+                *run_id = RunId(id.into());
+            }
+            legacy
+                .index_run_active(&RunIndexRow {
+                    run_id: id.into(),
+                    session: bind.clone(),
+                    submission_id: None,
+                    request_identity_digest: None,
+                    state: RunIndexState::Active,
+                    usage: None,
+                    final_step_finish_reason: None,
+                    retries_used: 0,
+                    title: None,
+                    withdrawals_owed: false,
+                })
+                .unwrap();
+            wal.append(1, &start, true).unwrap();
+            let deferred = WalRecord::ToolCallDeferred {
+                deferred_at_ms: None,
+                batch_id: BatchId("batch".into()),
+                call_id: ToolCallId("call".into()),
+                executor: broca_wal::DeferredExecutor::Broca,
+                module: Some("approvals".into()),
+                tool: "tool".into(),
+                schema_pin: None,
+                args_jcs: "{\"PRIVATE_ARGUMENTS\":true}".into(),
+                args_hash: broca_wal::migration::digest(b"{\"PRIVATE_ARGUMENTS\":true}"),
+                scope: serde_json::from_value(
+                    serde_json::json!({"owner":{"kind":"direct"},"ref":"scope","scope_epoch":1}),
+                )
+                .unwrap(),
+                ask: broca_wal::DeferredAsk {
+                    prompt: "PRIVATE_QUESTION".into(),
+                    options: vec![],
+                    expires_at_ms: 9999,
+                    on_expiry: broca_wal::OnExpiry::Deny,
+                    material_damage: false,
+                    late_execution: broca_wal::LateExecution::Execute,
+                },
+            };
+            let seq = wal.append(1, &deferred, true).unwrap();
+            let key = format!("{}:{seq}", wal.lineage_id().unwrap());
+            check(&scratch.db, &legacy, &wal, &bind, id, false);
+            let result = WalRecord::ToolResult {
+                finished_at_ms: None,
+                batch_id: BatchId("batch".into()),
+                result: std::sync::Arc::new(broca_core::resume::not_dispatched_result(
+                    &ToolCallId("call".into()),
+                )),
+                outcome: broca_wal::DispatchOutcome::Interrupted,
+                hooks: None,
+                reason: None,
+                withdraw_elicitation: Some(broca_wal::WithdrawElicitation {
+                    call_key: key.clone(),
+                    elicitation_id: Some("question-id".into()),
+                }),
+                provider_held: None,
+                tags: None,
+            };
+            wal.append(1, &result, true).unwrap();
+            check(&scratch.db, &legacy, &wal, &bind, id, true);
+            let mut terminal = source
+                .iter()
+                .find(|(_, _, f)| matches!(f.record, WalRecord::RunFinished { .. }))
+                .unwrap()
+                .2
+                .record
+                .clone();
+            if let WalRecord::RunFinished { reason, .. } = &mut terminal {
+                *reason = broca_protocol::caller::RunFinishReason::Cancelled;
+            }
+            wal.append(1, &terminal, true).unwrap();
+            check(&scratch.db, &legacy, &wal, &bind, id, true);
+            scratch.db.index_run_withdrawals_owed(id, true).unwrap();
+            let retained = crate::retention::RetentionLineageRow {
+                lineage_id: wal.lineage_id().unwrap().to_string(),
+                session: bind.clone(),
+                retention_s: 1,
+                last_activity_ms: 0,
+                expires_at_ms: Some(1000),
+                wal_bytes: std::fs::metadata(&path).unwrap().len(),
+                expired_at_ms: None,
+            };
+            legacy.upsert_retention_lineage(&retained, &[]).unwrap();
+            scratch.db.upsert_retention_lineage(&retained, &[]).unwrap();
+            assert!(scratch
+                .db
+                .stamp_retained_run_lineage(id, &bind, &retained.lineage_id)
+                .unwrap());
+            legacy
+                .stamp_retained_run_lineage(id, &bind, &retained.lineage_id)
+                .unwrap();
+            assert_eq!(
+                scratch.db.retention_lineages_with_discovery().unwrap(),
+                vec![bind.clone()]
+            );
+            assert!(
+                scratch.db.retention_run_rows(&retained.lineage_id).unwrap()[0]
+                    .run
+                    .withdrawals_owed
+            );
+            assert_eq!(
+                scratch
+                    .db
+                    .read_snapshot(|tx| Ok(
+                        tx.query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0))?
+                    ))
+                    .unwrap(),
+                2
+            );
+            if expire {
+                let row = crate::retention::RetentionLineageRow {
+                    lineage_id: wal.lineage_id().unwrap().to_string(),
+                    session: bind.clone(),
+                    retention_s: 1,
+                    last_activity_ms: 0,
+                    expires_at_ms: None,
+                    wal_bytes: std::fs::metadata(&path).unwrap().len(),
+                    expired_at_ms: Some(1000),
+                };
+                let mut run = scratch.db.lookup_run(id).unwrap().unwrap();
+                run.withdrawals_owed = false;
+                let runs = [crate::retention::RetentionRunRow {
+                    attribution: None,
+                    run,
+                    state_changed_ms: Some(1000),
+                }];
+                legacy.upsert_retention_lineage(&row, &runs).unwrap();
+                scratch.db.upsert_retention_lineage(&row, &runs).unwrap();
+                assert!(RecoveryDiscovery::withdrawal_candidates(&legacy)
+                    .unwrap()
+                    .is_empty());
+                assert!(scratch.db.withdrawal_candidates().unwrap().is_empty());
+            } else {
+                let ack:WalRecord=serde_json::from_value(serde_json::json!({"type":"question_withdrawal_acknowledged","call_key":key,"answer":"acknowledged"})).unwrap();
+                wal.append(1, &ack, true).unwrap();
+                scratch.db.index_run_withdrawals_owed(id, false).unwrap();
+                check(&scratch.db, &legacy, &wal, &bind, id, false);
+                assert!(scratch
+                    .db
+                    .retention_lineages_with_discovery()
+                    .unwrap()
+                    .is_empty());
+            }
+            let expected = rows(&scratch.db, &["withdrawal_call", "actor_withdrawal_hint"]);
+            scratch
+                .db
+                .authoritative_transaction(|tx| {
+                    tx.execute_batch("DROP TABLE withdrawal_call")?;
+                    super::super::recovery::initialize(tx)?;
+                    Ok(())
+                })
+                .unwrap();
+            scratch
+                .db
+                .rebuild_session(&publication(&bind, &std::fs::read(&path).unwrap()))
+                .unwrap();
+            assert_eq!(
+                rows(&scratch.db, &["withdrawal_call", "actor_withdrawal_hint"]),
+                expected
+            );
+            assert!(scratch.db.withdrawal_candidates().unwrap().is_empty());
+            let values = format!("{:?}", rows(&scratch.db, &["withdrawal_call"]));
+            assert!(!values.contains("PRIVATE_ARGUMENTS") && !values.contains("PRIVATE_QUESTION"));
+        }
+    }
+
+    #[test]
+    fn old_revision_checkpoint_backfills_withdrawal_projection_before_discovery() {
+        use broca_core::ImportedRunExclusions;
+        use broca_wal::Wal;
+        let old_db = fixture("crates/broca-store/tests/fixtures/operational-v0/broca.db");
+        let bytes = fixture("crates/broca-store/tests/fixtures/operational-v0/debt.wal");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&old_db)),
+            "aa7e0e42415832721e93593a3ad889db2a9294ce67ee6885df6b43aafcaed902"
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            "085a51301cd975726e7f48104f0229c0131bf1c8e8582f159c3dc0c9e63e72cf"
+        );
+        let bind = bind(&bytes);
+        for mode in ["index", "publication", "boot"] {
+            let root = broca_test_support::scratch_root()
+                .join(format!("withdrawal-upgrade-{}-{mode}", std::process::id()));
+            let scratch = Scratch(root);
+            std::fs::create_dir_all(&scratch.0).unwrap();
+            std::fs::write(scratch.0.join("state-format"), b"broca-state/2\n").unwrap();
+            std::fs::write(scratch.0.join("broca.db"), &old_db).unwrap();
+            let path = scratch.0.join("debt.wal");
+            std::fs::write(&path, &bytes).unwrap();
+            let db = OverhaulDb::open(&scratch.0).unwrap();
+            assert!(db.runs_with_withdrawals_owed().is_err(),"an old complete checkpoint without the withdrawal fold must be incomplete, not no candidates");
+            let historical = broca_protocol::RunId("preserved-import".into());
+            db.record_imported_runs(&bind, "preserved-cut", std::slice::from_ref(&historical))
+                .unwrap();
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            let outcome = counter.operation(mode).run(|| match mode {
+                "index" => db.index(&publication(&bind, &bytes)).unwrap(),
+                "publication" => {
+                    let wal = broca_wal::FileWal::open(&path).unwrap();
+                    wal.sync().unwrap();
+                    publish_writer(&db, &bind, &wal)
+                }
+                "boot" => {
+                    db.reconcile_boot([super::super::ReconcileSession {
+                        bind: &bind,
+                        session_ref: "upgrade",
+                        location: LogLocation::Live,
+                        path: &path,
+                    }])
+                    .unwrap()
+                    .remove(0)
+                    .index
+                }
+                _ => unreachable!(),
+            });
+            assert!(outcome.rebuilt, "{mode} trusted an old fold checkpoint");
+            let rows = db.runs_with_withdrawals_owed().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].run_id.0, "upgrade-run");
+            assert_eq!(rows[0].session, bind);
+            assert!(db.is_imported_run(&bind, &historical).unwrap());
+            assert!(
+                db.lookup_run("upgrade-run")
+                    .unwrap()
+                    .unwrap()
+                    .withdrawals_owed
+            );
+            let access = counter.snapshot().remove(0);
+            assert!(
+                access
+                    .seed_fallbacks
+                    .contains(&"withdrawal projection version outdated"),
+                "{mode}: {:?}",
+                access.seed_fallbacks
+            );
+            drop(db);
+            let reopened = OverhaulDb::open(&scratch.0).unwrap();
+            assert_eq!(reopened.runs_with_withdrawals_owed().unwrap().len(), 1);
+            assert!(
+                !reopened.index(&publication(&bind, &bytes)).unwrap().rebuilt,
+                "a current fold must not rescan an unchanged WAL"
+            );
+        }
     }
 
     fn publish_writer(
@@ -858,6 +1369,147 @@ mod tests {
             })
             .unwrap();
         assert!(!scratch._scratch.0.join("run-index.db").exists());
+    }
+
+    #[test]
+    fn raw_head_uses_latest_accepted_senders_without_origin_reads() {
+        use broca_wal::Wal;
+        let (_, base, _) = boundary_cases()
+            .into_iter()
+            .find(|(name, _, _)| *name == "no_tool_terminal")
+            .unwrap();
+        let base = modern_raw_records(base);
+        let bind = bind(&encode_records(&base));
+        let scratch = database();
+        let path = scratch._scratch.0.join("sender-head.wal");
+        let mut wal = broca_wal::FileWal::open(&path)
+            .unwrap()
+            .with_feature_floor(scratch._scratch.0.join("wal-floor"));
+        for record in &base {
+            wal.append(1, record, true).unwrap();
+        }
+        publish_writer(&scratch.db, &bind, &wal);
+        for (generation, sender) in [(1, "occipital"), (2, "replacement")] {
+            let manifest = serde_json::from_value(serde_json::json!({
+                "plan":serde_json::json!({"senders":[{"module":sender,"idle_start":true}]}).to_string(),
+                "plan_identity":sender,"composition_digest":"composition","fetches":[],"tools":[],
+                "system_text":"PRIVATE-REFRESH-TEXT","system_digest":"system","join_version":1,"role_versions":{}
+            })).unwrap();
+            wal.append(
+                1,
+                &WalRecord::SessionRefreshAccepted {
+                    generation,
+                    policy: "on_prefix_rebuild".into(),
+                    manifest: Box::new(manifest),
+                    run_in_progress: false,
+                    applies_from_next_run: false,
+                },
+                true,
+            )
+            .unwrap();
+            publish_writer(&scratch.db, &bind, &wal);
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            let actual = counter
+                .operation("raw sender head")
+                .run(|| raw_read(&scratch.db, &bind, &wal, Some(0), 100));
+            let frames = wal.replay().unwrap();
+            let expected = broca_core::AdmissionCheckpointV1::from_frames(&frames)
+                .unwrap()
+                .head
+                .unwrap();
+            assert_eq!(actual.head, expected);
+            let operations = counter.snapshot();
+            assert!(
+                operations[0].seed_fallbacks.is_empty(),
+                "{:?}",
+                operations[0]
+            );
+            assert!(operations[0]
+                .reads
+                .iter()
+                .all(|read| read.class != broca_wal::access_counter::ReadClass::Origin));
+        }
+        let mut later = base;
+        if let WalRecord::RunStarted { run_id, .. } = &mut later[0] {
+            run_id.0 = "after-refresh".into();
+        }
+        for record in &later {
+            wal.append(1, record, true).unwrap();
+        }
+        publish_writer(&scratch.db, &bind, &wal);
+        let publication = wal.durable_publication().unwrap();
+        let head = publication.sequence();
+        let db = std::sync::Arc::new(scratch.db);
+        let publishing_db = db.clone();
+        let publishing_bind = bind.clone();
+        let reader = db.admission_reader(move |_| {
+            publishing_db
+                .publish(&publishing_bind, "s-test", LogLocation::Live, &publication)
+                .map_err(|error| error.to_string())?;
+            Ok(publication.clone())
+        });
+        db.transaction(false, |tx| {
+            let (encoded, tail): (String, String) =
+                tx.query_row("SELECT admission_seed,tail_seed FROM session", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?;
+            let mut old: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            old["state"]["scalars"]["ownership"]
+                .as_object_mut()
+                .unwrap()
+                .remove("sender_admission");
+            old["state"]
+                .as_object_mut()
+                .unwrap()
+                .remove("latest_refresh");
+            let mut tail: serde_json::Value = serde_json::from_str(&tail).unwrap();
+            tail["admission"] = old.clone();
+            tx.execute(
+                "UPDATE session SET admission_seed=?1,tail_seed=?2",
+                rusqlite::params![old.to_string(), tail.to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let counter = broca_wal::access_counter::WalAccessCounter::default();
+        let owner = counter
+            .operation("execution without sender repair")
+            .run(|| reader.prior_snapshot(&bind, head))
+            .unwrap();
+        assert!(owner.base_watermark > 0);
+        assert!(!owner
+            .checkpoint_at_head
+            .ownership
+            .unwrap()
+            .sender_admission_complete());
+        assert!(counter.snapshot()[0]
+            .reads
+            .iter()
+            .all(|read| read.class != broca_wal::access_counter::ReadClass::Origin));
+        for n in 0..2 {
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            let sender = counter
+                .operation("lazy sender seed repair")
+                .run(|| reader.sender_snapshot(&bind, head))
+                .unwrap();
+            assert_eq!(
+                sender
+                    .checkpoint_at_head
+                    .ownership
+                    .unwrap()
+                    .effective_senders()[0]
+                    .module,
+                "replacement"
+            );
+            let origin_reads = counter.snapshot()[0]
+                .reads
+                .iter()
+                .filter(|read| read.class == broca_wal::access_counter::ReadClass::Origin)
+                .count();
+            // The first repair fetches the file prefix once; publishing the repaired seed
+            // also accounts for replaying those bytes from memory. Neither recurs later.
+            assert_eq!(origin_reads, if n == 0 { 2 } else { 0 });
+        }
     }
 
     #[test]

@@ -53,7 +53,7 @@ async fn append(rig: &mut Rig, id: &str, offset: usize, bytes: &[u8]) -> Frame {
     .await
 }
 
-pub(super) async fn run(rig: &mut Rig, enabled: bool, case: &str) -> bool {
+pub(super) async fn run(rig: &mut Rig, case: &str) -> bool {
     match case {
         "upload-refusals" => upload_refusals(rig).await,
         "strict-append" => {
@@ -191,31 +191,6 @@ pub(super) async fn run(rig: &mut Rig, enabled: bool, case: &str) -> bool {
                     include_str!("golden/model_read.media_free.json").trim_end()
                 );
             }
-        }
-        "off" => {
-            assert!(!enabled);
-            let before = rig.wal_bytes();
-            let reply = rig
-                .send_with(
-                    "off-upload",
-                    "look",
-                    None,
-                    json!({"content":[{"type":"upload","upload_id":"missing-upload"}]}),
-                )
-                .await;
-            assert_eq!(
-                String::from_utf8(reply.body.to_vec()).unwrap(),
-                r#"{"code":"invalid_params","message":"upload missing-upload cannot be sent: attachment admission is unavailable","detail":{"field":"content"}}"#
-            );
-            assert_eq!(rig.wal_bytes(), before);
-            let id = begin(rig, PNG.len(), digest(PNG)).await;
-            let first = append(rig, &id, 0, &PNG[..3]).await;
-            let replay = append(rig, &id, 0, &PNG[..3]).await;
-            assert_eq!(first.body, replay.body);
-            assert_eq!(
-                String::from_utf8(first.body.to_vec()).unwrap(),
-                r#"{"result":{"received":3}}"#
-            );
         }
         _ => return false,
     }

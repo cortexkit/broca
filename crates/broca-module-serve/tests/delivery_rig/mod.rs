@@ -261,7 +261,7 @@ impl ScriptedProvider {
 #[async_trait]
 impl Provider for ScriptedProvider {
     fn supports_media_renderer(&self) -> bool {
-        broca_protocol::attachments_enabled() && self.0.media_frozen.lock().unwrap().is_some()
+        self.0.media_frozen.lock().unwrap().is_some()
     }
 
     fn set_media_request_renderer(
@@ -534,6 +534,16 @@ impl RunExecutor for CoreExec {
             .as_ref()
             .and_then(|frozen| frozen.media.as_ref())
             .cloned()
+            // The default scripted model is known to be text-only, not an unavailable catalog row.
+            .or_else(|| {
+                Some(broca_provider::media_profile::select_media_profile(
+                    broca_provider::spec::WireFamilyId::OpenAiChat,
+                    None,
+                    "fake",
+                    broca_provider::spec::InputModalities::from_value(&serde_json::json!(["text"])),
+                    None,
+                ))
+            })
             .map(Box::new))
     }
     fn compaction_plane(&self) -> Option<Arc<dyn broca_core::compaction::CompactionPlane>> {

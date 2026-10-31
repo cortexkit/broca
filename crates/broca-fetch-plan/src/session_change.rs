@@ -48,6 +48,10 @@ pub fn unsupported_surface(
     }
     let tools_changed = current.is_none_or(|old| old.tools != next.tools);
     let system_changed = current.is_none_or(|old| old.system_text != next.system_text);
+    // Sender changes affect admission policy, not the model-facing tools or system text.
+    if !tools_changed && !system_changed {
+        return None;
+    }
     Some(if tools_changed || !system_changed {
         "tools"
     } else {
@@ -317,6 +321,33 @@ mod tests {
             applies_from_next_run: policy == "immediately",
             manifest: Box::new(test_manifest(identity, "c")),
         }
+    }
+
+    #[test]
+    fn sender_only_refresh_never_requires_a_surface_rung() {
+        let current = test_manifest("old", "c");
+        let mut next = current.clone();
+        next.plan = broca_wal::OpaqueJson::from_json_text(
+            r#"{"senders":[{"module":"occipital","idle_start":true}]}"#,
+        )
+        .unwrap();
+        for policy in [
+            "immediately",
+            "on_prefix_rebuild",
+            "on_system_rebuild",
+            "on_history_rebuild",
+        ] {
+            assert_eq!(
+                unsupported_surface(Some(&current), &next, policy),
+                None,
+                "{policy}"
+            );
+        }
+        next.system_text = "changed".into();
+        assert_eq!(
+            unsupported_surface(Some(&current), &next, "on_system_rebuild"),
+            Some("system_text")
+        );
     }
 
     /// A `RunStarted` freezing `identity` (or none), with a fixed mock model so consecutive

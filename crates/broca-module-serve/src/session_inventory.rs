@@ -1,4 +1,5 @@
-//! Single-flight, signalled discovery for binds that need to prove absence.
+//! One shared repair task signals callers that must prove a bind identity
+//! is absent from the session inventory.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -9,7 +10,8 @@ use broca_module::registry::SessionInventoryReadiness;
 use broca_store::session_address::{InventoryUnavailable, SessionAddressError};
 use tokio::sync::watch;
 
-// Revalidating a production-sized, already-covered index measured 2.77 seconds.
+// Revalidating a production-sized session inventory with a completed WAL
+// census measured 2.77 seconds.
 // Use twenty times that duration, rounded up to a minute, as a bounded allowance
 // for colder disks and foreground writers, not a worst-case census estimate.
 const INVENTORY_READINESS_WAIT: Duration = Duration::from_secs(60);
@@ -18,7 +20,7 @@ type Completion = Option<Result<(), InventoryUnavailable>>;
 
 struct Inner {
     root: PathBuf,
-    index: Arc<broca_store::SqliteStore>,
+    index: Arc<dyn broca_core::SessionInventory>,
     running: Mutex<Option<watch::Receiver<Completion>>>,
     #[cfg(all(test, feature = "test-clock"))]
     waiting: watch::Sender<usize>,
@@ -33,6 +35,13 @@ pub(crate) struct SessionInventory {
 
 impl SessionInventory {
     pub(crate) fn new(root: PathBuf, index: Arc<broca_store::SqliteStore>) -> Self {
+        Self::with_inventory(root, index)
+    }
+
+    pub(crate) fn with_inventory(
+        root: PathBuf,
+        index: Arc<dyn broca_core::SessionInventory>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 root,
@@ -60,8 +69,8 @@ impl SessionInventory {
             }
             if inner
                 .index
-                .session_refs(std::iter::empty())
-                .map_err(|error| InventoryUnavailable::MigrationFailed(error.to_string()))?
+                .resolve_refs(&[])
+                .map_err(InventoryUnavailable::MigrationFailed)?
                 .complete
             {
                 return Ok(None);
@@ -101,15 +110,14 @@ impl SessionInventory {
 }
 
 fn repair(inner: &Inner) -> Result<(), InventoryUnavailable> {
-    broca_store::session_refs::migrate(
-        &inner.root.join("run-index.db"),
-        &broca_core::ReadOnlyWalReader::new(&inner.root),
-    )
-    .map_err(|error| InventoryUnavailable::MigrationFailed(error.to_string()))?;
+    inner
+        .index
+        .rebuild_inventory(&inner.root)
+        .map_err(InventoryUnavailable::MigrationFailed)?;
     if inner
         .index
-        .session_refs(std::iter::empty())
-        .map_err(|error| InventoryUnavailable::MigrationFailed(error.to_string()))?
+        .resolve_refs(&[])
+        .map_err(InventoryUnavailable::MigrationFailed)?
         .complete
     {
         return Ok(());

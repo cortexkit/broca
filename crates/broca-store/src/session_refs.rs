@@ -8,11 +8,7 @@ use rusqlite::params;
 use rusqlite::Connection;
 use std::collections::BTreeMap;
 
-#[derive(Default, Debug)]
-pub struct SessionRefs {
-    pub sessions: BTreeMap<String, (String, BindIdentity)>,
-    pub complete: bool,
-}
+pub use broca_core::SessionRefs;
 
 #[derive(Default, Debug)]
 pub struct BackfillCounts {
