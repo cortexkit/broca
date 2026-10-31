@@ -1139,6 +1139,29 @@ async fn crash_orphan_pass_skips_a_session_another_process_holds() {
     drop(other_process);
     // The mark is dropped with the skip, so a later open does not act on a stale decision.
     f.registry.actor_for(&f.key).await.unwrap();
+    // Opening can acknowledge admission before the actor handles the recovered run's terminal.
+    broca_test_support::wait_until(
+        "recovered run's durable terminal and completion",
+        || async {
+            let status = f
+                .registry
+                .route_status(&f.key)
+                .await
+                .map_err(|error| format!("recovered run status unavailable: {error:?}"))?;
+            if f.terminals().is_empty() {
+                return Err(format!(
+                    "no durable RunFinished for {ORPHAN}; status: {status:?}"
+                ));
+            }
+            if status != LineageStatus::Idle {
+                return Err(format!(
+                    "durable RunFinished for {ORPHAN}; still {status:?}"
+                ));
+            }
+            Ok(())
+        },
+    )
+    .await;
     assert_eq!(
         f.registry.route_status(&f.key).await.unwrap(),
         LineageStatus::Idle
