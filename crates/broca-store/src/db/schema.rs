@@ -3,6 +3,9 @@
 use rusqlite::Connection;
 
 pub(super) const SESSION_TABLES: &[&str] = &[
+    "withdrawal_projection",
+    "withdrawal_call",
+    "operational_run",
     "source_auth",
     "episode_seed",
     "projection_boundary",
@@ -12,6 +15,9 @@ pub(super) const SESSION_TABLES: &[&str] = &[
     "setup",
 ];
 pub(super) const REBUILDABLE_TABLES: &[&str] = &[
+    "withdrawal_projection",
+    "withdrawal_call",
+    "operational_run",
     "source_auth",
     "episode_seed",
     "projection_boundary",

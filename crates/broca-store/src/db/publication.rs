@@ -285,18 +285,23 @@ pub(super) fn prepare_cursor(
     })).optional()?;
     let mut seed = None;
     let mut rebuilt = force;
+    let outdated = cp.is_some() && !super::recovery::projection_current(tx, key)?;
     if let Some(cp) = &cp {
-        if !force && valid_cursor(cp, lineage, end, read)? {
+        if !force && !outdated && valid_cursor(cp, lineage, end, read)? {
             seed = load_locator(tx, key, &cp.locator, read)?;
         }
         rebuilt = seed.is_none();
     }
     if cp.is_none() || rebuilt {
-        SeedFallback::new(rebuild_reason.unwrap_or(if cp.is_none() {
-            "publication index missing"
+        SeedFallback::new(if outdated && !force {
+            "withdrawal projection version outdated"
         } else {
-            "publication row cursor invalid"
-        }));
+            rebuild_reason.unwrap_or(if cp.is_none() {
+                "publication index missing"
+            } else {
+                "publication row cursor invalid"
+            })
+        });
         index::clear_session(tx, key)?;
     }
     let cp = if rebuilt { None } else { cp };
@@ -363,6 +368,7 @@ pub(super) fn publish_checked_in_tx(
     tx.execute("UPDATE session SET lineage_id=?2,indexed_seq=?3,indexed_off=?4,indexed_end=?5,indexed_identity=?6,head_ord=?7,locator_seed=?8,frozen_policy=?9,last_activity_ms=?10,last_write_ms=?11,title_off=?12,lineage_off=?13 WHERE sid=?1",
         params![key,lineage,range.seq.map(u64_to_i64).transpose()?,u64_to_i64(off)?,u64_to_i64(range.end)?,identity,u64_to_i64(seed.head_ord())?,seed.encode()?,seed.frozen_policy.map(u64_to_i64).transpose()?,seed.last_activity_ms.map(u64_to_i64).transpose()?,seed.last_write_ms.map(u64_to_i64).transpose()?,seed.title_off.map(u64_to_i64).transpose()?,u64_to_i64(lineage_off)?])?;
     publish_seeds(tx, &key, read)?;
+    super::recovery::mark_projection_current(tx, &key)?;
     Ok(IndexOutcome {
         rebuilt,
         indexed_seq: range.seq,

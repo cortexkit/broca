@@ -940,6 +940,69 @@ pub trait Persister: Send + Sync {
 /// The combined session-store seam `run_loop` accepts (read + project). A single
 /// `SqliteStore` implements both halves.
 pub trait SessionStore: MaterializedStore + Persister {}
+
+/// Identity candidates are useful even when discovery is incomplete. Only a complete
+/// snapshot can establish absence or uniqueness; candidates still require WAL checks.
+#[derive(Default, Debug)]
+pub struct SessionRefs {
+    pub sessions: std::collections::BTreeMap<String, (String, BindIdentity)>,
+    pub complete: bool,
+}
+
+pub trait SessionRefResolver: Send + Sync {
+    fn resolve_refs(&self, refs: &[&str]) -> Result<SessionRefs, String>;
+    fn named_refs(&self, name: &str, limit: u32) -> Result<SessionRefs, String>;
+}
+
+/// Identity discovery and projection maintenance do not authorize moving a WAL
+/// or record whether an ownership transfer completed.
+pub trait SessionInventory: SessionRefResolver + crate::SessionRefIndex {
+    /// Synchronous preparation for offline maintenance. Serving starts repair
+    /// through shared readiness instead of blocking on this operation. An empty
+    /// or unfinished census must remain incomplete until repair has finished.
+    fn prepare_inventory(&self, root: &std::path::Path) -> Result<(), String>;
+    fn rebuild_inventory(&self, root: &std::path::Path) -> Result<(), String>;
+    fn retained_sessions(&self) -> Result<Vec<BindIdentity>, String>;
+    fn forget_projection(&self, session: &BindIdentity) -> Result<(), String>;
+}
+
+/// Advisory recovery candidates only. The recovery service must confirm each
+/// candidate against the durable WAL before resuming or interrupting a run.
+pub trait RecoveryDiscovery: Send + Sync {
+    fn active_runs(&self) -> Result<Vec<(String, BindIdentity)>, String>;
+    fn restart_resume_candidates(&self) -> Result<Vec<(String, BindIdentity)>, String>;
+    fn withdrawal_candidates(&self) -> Result<Vec<WithdrawalRun>, String>;
+}
+
+/// Identity-only billing exclusions durable before a moved session can be served
+/// or billed. The move coordinator keeps its irreversible activation intent
+/// fenced until installation and cut completion recover; the SQL commit does not
+/// include the filesystem rename or cut completion. Abort before activation writes
+/// no exclusions. Projection replacement and retention preserve these facts.
+pub trait ImportedRunExclusions: Send + Sync {
+    fn record_imported_runs(
+        &self,
+        session: &BindIdentity,
+        cut_id: &str,
+        run_ids: &[RunId],
+    ) -> Result<(), ExportError>;
+    fn is_imported_run(&self, session: &BindIdentity, run_id: &RunId) -> Result<bool, ExportError>;
+}
+
+impl<T: ExportIndex + ?Sized> ImportedRunExclusions for T {
+    fn record_imported_runs(
+        &self,
+        session: &BindIdentity,
+        cut_id: &str,
+        run_ids: &[RunId],
+    ) -> Result<(), ExportError> {
+        ExportIndex::record_imported_runs(self, session, cut_id, run_ids)
+    }
+
+    fn is_imported_run(&self, session: &BindIdentity, run_id: &RunId) -> Result<bool, ExportError> {
+        ExportIndex::is_imported_run(self, session, run_id)
+    }
+}
 impl<T: MaterializedStore + Persister> SessionStore for T {}
 
 /// A run's coarse lifecycle state in the durable run index. This is the index's view —
@@ -1315,6 +1378,16 @@ impl std::error::Error for ExportError {}
 /// record and the run-index terminal update are durable. The serve adapter uses `read_page` for
 /// a lease-free, daemon-scoped pull.
 pub trait ExportIndex: Send + Sync {
+    fn is_imported_run(
+        &self,
+        _session: &BindIdentity,
+        _run_id: &RunId,
+    ) -> Result<bool, ExportError> {
+        Err(ExportError::Storage(
+            "export index cannot read imported-run exclusions".into(),
+        ))
+    }
+
     /// Durably mark run ids executed on another machine so they are not billed
     /// again here. This additive set (the billing floor) is scoped by the session
     /// and the move's `cut_id`; repeats preserve all previously recorded ids.
