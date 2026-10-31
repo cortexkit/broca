@@ -369,6 +369,9 @@ pub enum PauseReason {
     AuthRequired,
     /// A graceful process stop at a clean boundary; the same episode can resume after boot.
     Restart,
+    /// A source-classified account limit with a durable deadline; the runner resumes the same
+    /// episode and frozen selection when that deadline passes.
+    AccountLimit,
     /// The run waits for the late result of a tool call its provider answered with a `held`
     /// marker (tool-provider contract §4.1, `held-reply/v1`). The caller does not resume it:
     /// the intended design is that broca resumes the same run itself when the provider
@@ -387,6 +390,7 @@ impl PauseReason {
         match self {
             PauseReason::AuthRequired => "auth_required",
             PauseReason::Restart => "restart",
+            PauseReason::AccountLimit => "account_limit",
             PauseReason::ToolHeld => "tool_held",
         }
     }

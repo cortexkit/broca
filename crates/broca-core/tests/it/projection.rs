@@ -40,6 +40,7 @@ fn framed(seq: u64, record: WalRecord) -> FramedRecord {
 
 fn run_config() -> RunConfig {
     RunConfig {
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: None,
@@ -648,6 +649,7 @@ fn paused_run_projects_pause_as_terminal() {
         framed(
             3,
             WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("r1".into()),
                 ts_ms: None,
                 reason: PauseReason::AuthRequired,
@@ -1147,6 +1149,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
             retries_used: 0,
         },
         WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("r-all".into()),
             ts_ms: None,
             reason: PauseReason::AuthRequired,

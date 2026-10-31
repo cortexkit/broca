@@ -593,6 +593,7 @@ mod gated {
             attempts.iter().zip(expected).enumerate()
         {
             let WalRecord::ModelAttemptFinished {
+                account_limit_disposition,
                 step_id,
                 attempt,
                 request_body_len,
@@ -621,6 +622,7 @@ mod gated {
                 unreachable!()
             };
             assert_eq!(step_id, finished_step, "attempt {index}");
+            assert!(account_limit_disposition.is_none());
             // The billing-attempt members are written only once that feature has a writer;
             // today's attempts must still carry none of them.
             assert!(

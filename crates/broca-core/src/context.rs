@@ -1508,6 +1508,7 @@ impl SessionReadReason {
             }
             SessionReadReason::Pause(PauseReason::AuthRequired) => "auth_required",
             SessionReadReason::Pause(PauseReason::Restart) => "restart",
+            SessionReadReason::Pause(PauseReason::AccountLimit) => "account_limit",
             SessionReadReason::Pause(PauseReason::ToolHeld) => "tool_held",
         }
     }
@@ -2295,6 +2296,7 @@ pub(crate) fn merge_prefix_and_tail(
     };
     tail_episodes.render = tail_state.render_episodes.clone().unwrap_or_default();
     let state = crate::ReplayState {
+        account_limit_pause: None,
         extent: tail_state.extent,
         tags_await_setup: tail_state.tags_await_setup,
         input_budget: tail_state.input_budget,
@@ -2741,6 +2743,7 @@ mod catch_up_tests {
             seq: 13,
             fence: 1,
             record: WalRecord::RunPaused {
+                account_limit: None,
                 ts_ms: Some(4000),
                 reason: broca_protocol::PauseReason::Restart,
                 run_id: RunId("paused".into()),
@@ -2873,6 +2876,7 @@ mod tests {
                 session: BindIdentity::new("/tmp/p", "h", "s"),
                 ts_ms: None,
                 config: Box::new(RunConfig {
+                    account_limit_pause: false,
                     turn_directives_v1: None,
                     render_tags: false,
                     computed_tags: None,
@@ -3912,6 +3916,7 @@ mod episode_merge_regression {
 
     fn config(model: &str) -> RunConfig {
         RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,

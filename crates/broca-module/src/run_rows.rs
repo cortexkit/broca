@@ -1052,6 +1052,7 @@ mod tests {
         f.history();
         f.start("paused");
         f.append(WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("paused".into()),
             ts_ms: None,
             reason: broca_protocol::PauseReason::Restart,
@@ -1561,6 +1562,7 @@ mod tests {
         };
         assert!(!qualified(), "a start alone is not a committed cut");
         f.append(WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("zero-step".into()),
             ts_ms: None,
             reason: broca_protocol::PauseReason::AuthRequired,

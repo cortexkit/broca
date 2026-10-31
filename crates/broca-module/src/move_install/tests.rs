@@ -29,6 +29,7 @@ pub(crate) fn started(session: &BindIdentity, id: &str) -> WalRecord {
         session: session.clone(),
         ts_ms: Some(1),
         config: Box::new(RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,

@@ -395,6 +395,7 @@ impl RunExecutor for ReauthCoreExec {
             }
             self.first_pause_release.notified().await;
             job.writer.record(WalRecord::RunPaused {
+                account_limit: None,
                 run_id: job.req.run_id.clone(),
                 ts_ms: None,
                 reason: broca_protocol::PauseReason::AuthRequired,
@@ -517,6 +518,7 @@ impl RunExecutor for ReauthCoreExec {
 
 fn min_config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: None,

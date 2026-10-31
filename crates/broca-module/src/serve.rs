@@ -4402,6 +4402,7 @@ mod held_status_tests {
 
     fn state(index: broca_core::RunIndexState) -> broca_core::ReconciledRunState {
         broca_core::ReconciledRunState {
+            account_limit_pause: None,
             state: index,
             held_calls: Vec::new(),
             budget_detail: None,
@@ -4506,6 +4507,7 @@ mod paused_auth_tests {
                 broca_protocol::PauseReason::AuthRequired,
             ] {
                 let state = broca_core::ReconciledRunState {
+                    account_limit_pause: None,
                     held_calls: Vec::new(),
                     run_usage: Default::default(),
                     budget_detail: None,
@@ -4585,6 +4587,7 @@ mod context_ceiling_tests {
     use super::*;
     fn reconciled(state: broca_core::RunIndexState) -> broca_core::ReconciledRunState {
         broca_core::ReconciledRunState {
+            account_limit_pause: None,
             held_calls: Vec::new(),
             state,
             context_ceiling: None,
@@ -4745,6 +4748,7 @@ mod offset_head_tests {
             run_id: RunId("r1".into()),
             session: BindIdentity::new("/tmp/project", "runner", "session"),
             config: Box::new(RunConfig {
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,

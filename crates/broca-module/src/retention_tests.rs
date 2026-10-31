@@ -1200,6 +1200,7 @@ fn maintenance_is_not_activity_and_nonterminal_runs_never_expire() {
     let paused = framed(vec![
         started(&rig.key, "r1", Some(1), 100),
         WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("r1".into()),
             ts_ms: Some(200),
             reason: broca_protocol::PauseReason::AuthRequired,
@@ -2829,6 +2830,7 @@ impl crate::executor::RunExecutor for QuotaRefusalExecutor {
             .await;
         self.observed.send(tick).await.unwrap();
         job.writer.record(WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("r1".into()),
             reason: broca_protocol::PauseReason::AuthRequired,
             error: None,

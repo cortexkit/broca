@@ -894,6 +894,7 @@ async fn crash_orphan_pass_leaves_a_paused_run_alone() {
         run_started(&f.key),
         model_step_with_tool_call(),
         WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId(ORPHAN.into()),
             ts_ms: None,
             reason: broca_protocol::PauseReason::AuthRequired,
@@ -932,6 +933,7 @@ async fn crash_orphan_restart_policy_does_not_resume_a_torn_pause() {
         1,
         &[],
         &WalRecord::RunPaused {
+            account_limit: None,
             ts_ms: None,
             run_id: RunId(ORPHAN.into()),
             reason: broca_protocol::PauseReason::Restart,

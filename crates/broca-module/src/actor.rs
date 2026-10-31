@@ -660,6 +660,7 @@ pub(crate) fn indexed_run_state(
     let use_index_metadata = row.usage.is_some() && row.state != RunIndexState::Interrupted;
     let use_wal_error = !use_index_metadata || row.state == RunIndexState::Error;
     Ok(Some(ReconciledRunState {
+        account_limit_pause: None,
         context_ceiling: reconciled
             .as_ref()
             .and_then(|state| state.context_ceiling.clone()),
@@ -7391,6 +7392,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                             .unwrap_or_default()
                     };
                 return Ok(Some(ReconciledRunState {
+                    account_limit_pause: None,
                     run_usage,
                     held_calls,
                     budget_detail: None,
@@ -8324,6 +8326,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if !already_paused {
             writer
                 .record(WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: run_id.clone(),
                     reason: broca_protocol::PauseReason::ToolHeld,
                     error: None,
@@ -9831,6 +9834,7 @@ mod tests {
             },
         ];
         records.push(WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("held".into()),
             reason: broca_protocol::PauseReason::ToolHeld,
             error: None,
@@ -9994,6 +9998,7 @@ mod tests {
                 },
             ];
             records.push(WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("held".into()),
                 reason: broca_protocol::PauseReason::ToolHeld,
                 error: None,
@@ -10154,6 +10159,7 @@ mod tests {
             }
             let boundary_cut = records.len();
             records.push(WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("held".into()),
                 ts_ms: None,
                 reason: broca_protocol::PauseReason::AuthRequired,
@@ -10307,6 +10313,7 @@ mod tests {
             // A paused provider-held batch may commit its closing turn before the run's
             // final terminal. A seed at that crash cut already contains the pause.
             records.push(WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("held".into()),
                 ts_ms: None,
                 reason: broca_protocol::PauseReason::ToolHeld,
@@ -10339,6 +10346,7 @@ mod tests {
         let cut = records.len();
         if !empty_tail {
             records.push(WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("held".into()),
                 ts_ms: None,
                 reason: broca_protocol::PauseReason::AuthRequired,
@@ -10600,6 +10608,7 @@ mod tests {
             })
             .unwrap();
         records.push(WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("held".into()),
             ts_ms: None,
             reason: broca_protocol::PauseReason::AuthRequired,
@@ -11375,7 +11384,7 @@ mod tests {
                 let key = BindIdentity::new(root.join("project"), "broca", "held-cancel");
                 let store = Arc::new(FileWalStore::new(root.join("wal")));
                 let mut records = held_close_seed(&key, true);
-                records.push(WalRecord::RunPaused { run_id: RunId("held".into()), reason: broca_protocol::PauseReason::ToolHeld, error: None, ts_ms: Some(43) });
+                records.push(WalRecord::RunPaused { account_limit: None, run_id: RunId("held".into()), reason: broca_protocol::PauseReason::ToolHeld, error: None, ts_ms: Some(43) });
                 seed_held_wal(&store, &key, &records);
                 let executor = Arc::new(HeldCancelCoreExecutor {
                     wal_store: store.clone(), provider: broca_core::StubProvider::new(vec![]), plane: StubToolPlane::new(),
@@ -11512,6 +11521,7 @@ mod tests {
                 sequential: false,
             },
             WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("held".into()),
                 reason: broca_protocol::PauseReason::ToolHeld,
                 error: None,
@@ -11872,6 +11882,7 @@ mod tests {
                         let mut records = held_close_seed(&key, sequential);
                         if paused {
                             records.push(WalRecord::RunPaused {
+                                account_limit: None,
                                 run_id: RunId("held".into()),
                                 reason: broca_protocol::PauseReason::ToolHeld,
                                 error: None,
@@ -11996,6 +12007,7 @@ mod tests {
 
     pub(super) fn min_config() -> broca_wal::RunConfig {
         broca_wal::RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,

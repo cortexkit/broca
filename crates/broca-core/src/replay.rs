@@ -102,6 +102,8 @@ impl std::error::Error for ReplayError {}
 /// The result of replaying a session's WAL — a LINEAGE of one or more episodes.
 #[derive(Debug, Clone)]
 pub struct ReplayState {
+    /// Timed recovery evidence from the current pause, never inferred from an error code.
+    pub account_limit_pause: Option<Box<broca_wal::record::AccountLimitPause>>,
     /// Next absolute transcript ordinal, including messages not held in the prompt.
     pub extent: u64,
     /// The last episode renders tags under the computed rules on a compaction-managed session,
@@ -1511,6 +1513,7 @@ struct Episode {
     /// This episode's non-terminal pause (auth-required), if any. Carries the record's
     /// own run_id so the resolution is self-contained.
     paused: Option<(RunId, PauseReason, Option<ProviderError>)>,
+    account_limit_pause: Option<Box<broca_wal::record::AccountLimitPause>>,
     /// The trailing tool-turn (assistant w/ tool calls) + its batch, held until the
     /// batch completes (then committed to the prompt).
     open_assistant: Option<Arc<AssistantMessage>>,
@@ -3160,6 +3163,7 @@ fn replay_seeded_with_compaction<'a>(
                 // paused-for-auth run writes RunPaused then RunFinished{Interrupted}) —
                 // last-writer-wins, so the run is terminal, not still paused.
                 ep.paused = None;
+                ep.account_limit_pause = None;
             }
             // A non-terminal pause (auth-required) — distinct from a terminal
             // RunFinished. Clears any earlier finished in this episode (last-writer-wins),
@@ -3168,9 +3172,11 @@ fn replay_seeded_with_compaction<'a>(
                 run_id: rid,
                 reason,
                 error,
+                account_limit,
                 ..
             } => {
                 ep.paused = Some((rid.clone(), *reason, error.clone()));
+                ep.account_limit_pause = account_limit.clone();
                 ep.finished = None;
             }
             WalRecord::RunConfigRefrozen {
@@ -3221,6 +3227,7 @@ fn replay_seeded_with_compaction<'a>(
             // attempted, even when the call failed before ModelStepFinished became durable.
             WalRecord::StepStarted { .. } => {
                 ep.paused = None;
+                ep.account_limit_pause = None;
                 ep.provider_call_started = true;
                 // Pending steers are rendered by this step, after everything before it.
                 ep.place_steers(&mut prompt, &actions);
@@ -3529,6 +3536,7 @@ fn replay_seeded_with_compaction<'a>(
         }
     }
     let refused_steps = std::mem::take(&mut ep.refused_steps);
+    let account_limit_pause = ep.account_limit_pause.clone();
     let mut resolution = classify(ep, run_id.as_ref(), cancel_at.is_some());
     if input_budget.exhausted().is_some() {
         match &mut resolution {
@@ -3562,6 +3570,7 @@ fn replay_seeded_with_compaction<'a>(
             .as_ref()
             .is_some_and(|config| config.render_tags && config.computed_tags.is_some());
     Ok(ReplayState {
+        account_limit_pause,
         extent: placement.next_ordinal(),
         tags_await_setup,
         input_budget,
@@ -3695,6 +3704,7 @@ pub(crate) fn reported_step_usage(usage: &Usage) -> cortexkit_role_llm_runner::u
 /// Not `Eq`: `ProviderError` carries an `f64` retry hint.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReconciledRunState {
+    pub account_limit_pause: Option<Box<broca_wal::record::AccountLimitPause>>,
     pub budget_detail: Option<broca_protocol::BudgetExhaustedDetail>,
     pub context_ceiling: Option<broca_protocol::ContextCeilingDetail>,
     pub ceiling_deadline_ms: Option<u64>,
@@ -3800,6 +3810,7 @@ pub fn reconcile_run_state<'a>(
                 if rid.0 == run_id {
                     // Seen this run start; default to Active until a terminal/pause appears.
                     found = Some(ReconciledRunState {
+                        account_limit_pause: None,
                         budget_detail: None,
                         context_ceiling: None,
                         ceiling_deadline_ms: None,
@@ -3938,6 +3949,7 @@ pub fn reconcile_run_state<'a>(
                         })
                     });
                     found = Some(ReconciledRunState {
+                        account_limit_pause: None,
                         budget_detail: budget_detail.clone(),
                         context_ceiling: context_ceiling.clone(),
                         ceiling_deadline_ms: None,
@@ -3964,9 +3976,11 @@ pub fn reconcile_run_state<'a>(
                 run_id: rid,
                 reason,
                 error,
+                account_limit,
                 ..
             } if rid.0 == run_id => {
                 found = Some(ReconciledRunState {
+                    account_limit_pause: account_limit.clone(),
                     budget_detail: None,
                     context_ceiling: None,
                     ceiling_deadline_ms: None,
@@ -3999,6 +4013,7 @@ pub fn reconcile_run_state<'a>(
                 ..
             } if failure.run_id.0 == run_id => {
                 found = Some(ReconciledRunState {
+                    account_limit_pause: None,
                     budget_detail: None,
                     context_ceiling: None,
                     ceiling_deadline_ms: None,
@@ -4024,6 +4039,7 @@ pub fn reconcile_run_state<'a>(
     }
     if active_run.as_deref() == Some(run_id) && active_zero_step_seed {
         return Some(ReconciledRunState {
+            account_limit_pause: None,
             budget_detail: None,
             context_ceiling: None,
             ceiling_deadline_ms: None,
@@ -4299,6 +4315,10 @@ fn commit_tool_turn(
 mod steer_tests;
 
 #[cfg(test)]
+#[path = "replay/account_limit_pause_tests.rs"]
+mod account_limit_pause_tests;
+
+#[cfg(test)]
 pub(crate) mod projection_boundary_tests {
     use broca_protocol::{
         caller::{PauseReason, RunFinishReason},
@@ -4501,6 +4521,7 @@ pub(crate) mod projection_boundary_tests {
         }
         for reason in [PauseReason::Restart, PauseReason::AuthRequired] {
             let pause = WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("first".into()),
                 ts_ms: None,
                 reason,
@@ -4543,6 +4564,7 @@ pub(crate) mod projection_boundary_tests {
                 run_id: RunId(run_id.into()),
                 session: BindIdentity::new("/tmp/project", "runner", "session"),
                 config: Box::new(RunConfig {
+                    account_limit_pause: false,
                     turn_directives_v1: None,
                     render_tags: false,
                     computed_tags: None,
@@ -4630,6 +4652,7 @@ pub(crate) mod projection_boundary_tests {
                 ownership: Some(crate::SessionOwnershipV1::default()),
                 at_seq: 8,
                 last_episode: Some(crate::LastEpisodeV1 {
+                    account_limit_pause: None,
                     cancel_at: None,
                     on_restart: None,
                     pause_reason: None,
@@ -4996,6 +5019,7 @@ pub(crate) mod projection_boundary_tests {
             framed(
                 5,
                 WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: RunId("r1".into()),
                     ts_ms: None,
                     reason: PauseReason::AuthRequired,
@@ -5221,6 +5245,7 @@ pub(crate) mod deferred_tests {
             approval("approved", "key-approved", DeferredDecision::Approved),
             terminal("done", None),
             WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("r".into()),
                 ts_ms: Some(1),
                 reason: PauseReason::Restart,
@@ -5457,6 +5482,7 @@ pub(crate) mod provider_held_tests {
         }
         records.push(second);
         records.push(WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("r".into()),
             reason: PauseReason::ToolHeld,
             error: None,
@@ -5528,6 +5554,7 @@ pub(crate) mod provider_held_tests {
         for reason in [PauseReason::ToolHeld, PauseReason::Restart] {
             let mut paused = records.clone();
             paused.push(WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("r".into()),
                 reason,
                 error: None,
@@ -5636,6 +5663,7 @@ pub(crate) mod provider_held_tests {
         let mut delayed = prefix(false);
         delayed.push(terminal("b", DispatchOutcome::Completed));
         delayed.push(WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("r".into()),
             reason: PauseReason::ToolHeld,
             error: None,
@@ -5868,6 +5896,7 @@ mod offset_tail_tests {
 
     fn run_config() -> Box<RunConfig> {
         Box::new(RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,

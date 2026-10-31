@@ -1874,6 +1874,7 @@ mod tests {
                 sequential: false,
             },
             WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("run".into()),
                 reason: broca_wal::PauseReason::ToolHeld,
                 error: None,
@@ -1889,6 +1890,7 @@ mod tests {
 
     fn min_config() -> broca_wal::RunConfig {
         broca_wal::RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,

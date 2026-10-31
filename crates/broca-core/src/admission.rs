@@ -464,6 +464,9 @@ pub use crate::budget_kernel::{BudgetReplayStateV1, BUDGET_REPLAY_STATE_VERSION}
 /// Admission facts for the last episode at a materialization watermark.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LastEpisodeV1 {
+    /// Timed pause evidence restored from a checkpoint; waking still requires validation against the WAL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_limit_pause: Option<Box<broca_wal::record::AccountLimitPause>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_at: Option<broca_wal::record::RunCancelAt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -970,6 +973,7 @@ impl AdmissionCheckpointV1 {
                     history.observe(&config.frozen_render_config);
                 }
                 self.last_episode = Some(LastEpisodeV1 {
+                    account_limit_pause: None,
                     cancel_at: None,
                     on_restart: *on_restart,
                     pause_reason: None,
@@ -1046,13 +1050,19 @@ impl AdmissionCheckpointV1 {
                     if episode.disposition == EpisodeDisposition::Paused {
                         episode.disposition = EpisodeDisposition::Running;
                         episode.pause_reason = None;
+                        episode.account_limit_pause = None;
                     }
                 }
             }
-            WalRecord::RunPaused { reason, .. } => {
+            WalRecord::RunPaused {
+                reason,
+                account_limit,
+                ..
+            } => {
                 if let Some(episode) = self.last_episode.as_mut() {
                     episode.disposition = EpisodeDisposition::Paused;
                     episode.pause_reason = Some(*reason);
+                    episode.account_limit_pause = account_limit.clone();
                 }
             }
             WalRecord::RunFinished {
@@ -1062,6 +1072,7 @@ impl AdmissionCheckpointV1 {
             } => {
                 if let Some(episode) = self.last_episode.as_mut() {
                     episode.disposition = EpisodeDisposition::Finished;
+                    episode.account_limit_pause = None;
                     episode.usage = Some(*usage);
                     episode.retries_used = *retries_used;
                 }
@@ -1471,6 +1482,8 @@ impl AdmissionSource {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AdmissionEpisodeSeed {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_limit_pause: Option<Box<broca_wal::record::AccountLimitPause>>,
     start: AdmissionSource,
     run_id: RunId,
     refreezes: Vec<AdmissionSource>,
@@ -1637,6 +1650,7 @@ impl AdmissionSeed {
                 provider_call_started: episode.provider_call_started,
                 disposition: episode.disposition,
                 pause_reason: episode.pause_reason,
+                account_limit_pause: episode.account_limit_pause.clone(),
                 cancel_at: episode.cancel_at,
                 usage: episode.usage,
                 retries_used: episode.retries_used,
@@ -1754,6 +1768,7 @@ impl AdmissionSeed {
         episode.provider_call_started = seed.provider_call_started;
         episode.disposition = seed.disposition;
         episode.pause_reason = seed.pause_reason;
+        episode.account_limit_pause = seed.account_limit_pause.clone();
         episode.cancel_at = seed.cancel_at;
         episode.usage = seed.usage;
         episode.retries_used = seed.retries_used;
@@ -2699,6 +2714,7 @@ impl AdmissionContinuation {
                 WalRecord::RunStarted { .. } => {
                     next.seed.first_run.get_or_insert(source.clone());
                     next.seed.episode = Some(AdmissionEpisodeSeed {
+                        account_limit_pause: None,
                         start: source,
                         run_id: scalars
                             .last_episode
@@ -2769,6 +2785,7 @@ impl AdmissionContinuation {
             episode.provider_call_started = current.provider_call_started;
             episode.disposition = current.disposition;
             episode.pause_reason = current.pause_reason;
+            episode.account_limit_pause = current.account_limit_pause.clone();
             episode.cancel_at = current.cancel_at;
             episode.usage = current.usage;
             episode.retries_used = current.retries_used;
@@ -2832,6 +2849,7 @@ mod tests {
 
     fn config(model: &str) -> RunConfig {
         RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -3287,6 +3305,7 @@ mod tests {
             frame(
                 7,
                 WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: RunId("r1".into()),
                     ts_ms: None,
                     reason: PauseReason::AuthRequired,
@@ -3323,6 +3342,7 @@ mod tests {
             frame(
                 13,
                 WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: RunId("r2".into()),
                     ts_ms: None,
                     reason: PauseReason::AuthRequired,
@@ -4580,6 +4600,7 @@ mod tests {
             records.push(frame(
                 0,
                 WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: RunId("r1".into()),
                     ts_ms: None,
                     reason: PauseReason::AuthRequired,
@@ -4858,6 +4879,7 @@ mod tests {
             frame(
                 5,
                 WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: RunId("r".into()),
                     ts_ms: None,
                     reason: PauseReason::AuthRequired,
@@ -5047,6 +5069,7 @@ mod tests {
             frame(
                 6,
                 WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: RunId("r1".into()),
                     ts_ms: None,
                     reason: PauseReason::AuthRequired,
