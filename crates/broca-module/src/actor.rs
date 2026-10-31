@@ -5224,6 +5224,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             // nothing new, so it usually leaves before the seal has to cut it.
             stop_requested: Some(self.registry.stopping_signal()),
             steer: Some(Arc::clone(&steer)),
+            live_steer_after_seq: Some(prior_snapshot.head_seq),
             manifest: manifest.clone(),
             manifest_system_override: self.session_change.applied_generation > 0
                 || (!resuming && self.pending_for_model(&req.model).is_some()),

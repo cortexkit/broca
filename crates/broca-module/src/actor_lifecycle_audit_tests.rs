@@ -132,6 +132,9 @@ struct ProbeExecutor {
     /// Zero refuses held admission; one checks media initialization; two emulates media off.
     media_probe: AtomicUsize,
     requests: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    replay_requests: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    gate_first_probe: AtomicBool,
+    probe_entries: AtomicUsize,
     completed_probe: tokio::sync::Notify,
     session_closes: AtomicUsize,
 }
@@ -144,8 +147,12 @@ impl RunExecutor for ProbeExecutor {
         out: mpsc::Sender<broca_core::OutputEvent>,
     ) -> Result<RunSummary, RunError> {
         if self.hold_admission {
-            self.entered.notify_one();
-            self.release.notified().await;
+            if !self.gate_first_probe.load(Ordering::SeqCst)
+                || self.probe_entries.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
             if self.media_probe.load(Ordering::SeqCst) != 0 {
                 return restart_writes::execute_probe(self, job, out).await;
             }
@@ -185,6 +192,9 @@ enum Seed {
     RestartPaused,
     MediaRestartPaused,
     MediaOffRestartPaused,
+    RunControlRestartPaused,
+    RunControlOffRestartPaused,
+    Existing,
 }
 
 /// Retention deadline of a [`Seed::Retained`] lineage, and a clock reading past it.
@@ -209,6 +219,14 @@ impl Fixture {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        Box::pin(Self::open(root, seed, hold_admission)).await
+    }
+
+    async fn reopen(root: std::path::PathBuf, hold_admission: bool) -> Self {
+        Box::pin(Self::open(root, Seed::Existing, hold_admission)).await
+    }
+
+    async fn open(root: std::path::PathBuf, seed: Seed, hold_admission: bool) -> Self {
         let key = LineageKey::new(root.join("project"), "agent", "session");
         let wal_store = Arc::new(ProbeWal {
             inner: Arc::new(FileWalStore::new(root.join("wal"))),
@@ -217,12 +235,21 @@ impl Fixture {
             read_starved_runtime: AtomicBool::new(false),
         });
         let retained = seed == Seed::Retained;
-        let media_probe = matches!(seed, Seed::MediaRestartPaused | Seed::MediaOffRestartPaused);
+        let media_probe = matches!(
+            seed,
+            Seed::MediaRestartPaused
+                | Seed::MediaOffRestartPaused
+                | Seed::RunControlRestartPaused
+                | Seed::RunControlOffRestartPaused
+        );
         let restart_paused = media_probe || seed == Seed::RestartPaused;
         let mut config = min_config();
         if media_probe {
             let mut frozen = broca_provider::families::openai_chat_frozen_config("fake");
-            if seed == Seed::MediaRestartPaused {
+            if matches!(
+                seed,
+                Seed::MediaRestartPaused | Seed::RunControlRestartPaused
+            ) {
                 frozen.media = Some(broca_provider::media_profile::select_media_profile(
                     broca_provider::spec::WireFamilyId::OpenAiChat,
                     Some(broca_provider::media_profile::MediaQuirk::Openai),
@@ -245,81 +272,84 @@ impl Fixture {
             .inner
             .open_with_retention(&key, retained.then_some(3600))
             .unwrap();
-        wal.append(
-            1,
-            &WalRecord::RunStarted {
-                written_at_ms: None,
-                tags: None,
-                session_class: None,
-                retention: retained.then_some(3600),
-                hooks: None,
-                title: None,
-                on_restart: restart_paused.then_some(broca_protocol::request::OnRestart::Resume),
-                keep_warm: None,
-                marker_order_version: None,
-                manifest: None,
-                scope: None,
-                send_id: None,
-                request_identity_digest: None,
-                project_id: None,
-                principal: None,
-                ts_ms: None,
-                run_id: RunId("prior".into()),
-                session: key.clone(),
-                config: Box::new(config),
-                input: text_req(&key, "prior").input.into(),
-                origin: broca_wal::RunOrigin::Fresh,
-                submission_id: None,
-            },
-            false,
-        )
-        .unwrap();
-        if media_probe {
+        if seed != Seed::Existing {
             wal.append(
                 1,
-                &WalRecord::SessionRefreshAccepted {
-                    generation: 1,
-                    policy: "on_prefix_rebuild".into(),
-                    manifest: Box::new(restart_writes::manifest("pending")),
-                    run_in_progress: false,
-                    applies_from_next_run: false,
+                &WalRecord::RunStarted {
+                    written_at_ms: None,
+                    tags: None,
+                    session_class: None,
+                    retention: retained.then_some(3600),
+                    hooks: None,
+                    title: None,
+                    on_restart: restart_paused
+                        .then_some(broca_protocol::request::OnRestart::Resume),
+                    keep_warm: None,
+                    marker_order_version: None,
+                    manifest: None,
+                    scope: None,
+                    send_id: None,
+                    request_identity_digest: None,
+                    project_id: None,
+                    principal: None,
+                    ts_ms: None,
+                    run_id: RunId("prior".into()),
+                    session: key.clone(),
+                    config: Box::new(config),
+                    input: text_req(&key, "prior").input.into(),
+                    origin: broca_wal::RunOrigin::Fresh,
+                    submission_id: None,
                 },
                 false,
             )
             .unwrap();
+            if matches!(seed, Seed::MediaRestartPaused | Seed::MediaOffRestartPaused) {
+                wal.append(
+                    1,
+                    &WalRecord::SessionRefreshAccepted {
+                        generation: 1,
+                        policy: "on_prefix_rebuild".into(),
+                        manifest: Box::new(restart_writes::manifest("pending")),
+                        run_in_progress: false,
+                        applies_from_next_run: false,
+                    },
+                    false,
+                )
+                .unwrap();
+            }
+            let end = if restart_paused {
+                WalRecord::RunPaused {
+                    run_id: RunId("prior".into()),
+                    ts_ms: None,
+                    reason: broca_protocol::PauseReason::Restart,
+                    error: None,
+                }
+            } else {
+                WalRecord::RunFinished {
+                    interrupt_reason: None,
+                    reason: broca_protocol::RunFinishReason::Completed,
+                    ts_ms: None,
+                    usage: Default::default(),
+                    error: None,
+                    retries_used: 0,
+                }
+            };
+            wal.append(1, &end, true).unwrap();
         }
-        let end = if restart_paused {
-            WalRecord::RunPaused {
-                run_id: RunId("prior".into()),
-                ts_ms: None,
-                reason: broca_protocol::PauseReason::Restart,
-                error: None,
-            }
-        } else {
-            WalRecord::RunFinished {
-                interrupt_reason: None,
-                reason: broca_protocol::RunFinishReason::Completed,
-                ts_ms: None,
-                usage: Default::default(),
-                error: None,
-                retries_used: 0,
-            }
-        };
-        wal.append(1, &end, true).unwrap();
         let fail_appends = Arc::new(AtomicBool::new(false));
+        let lease = FileLeaseStore::new(root.join("leases"))
+            .acquire(&broca_core::lease_key_for(&key))
+            .unwrap();
         let writer = Arc::new(
             WalHandle::spawn(
                 Box::new(FailableWal {
                     inner: wal,
                     fail_appends: fail_appends.clone(),
                 }),
-                1,
+                lease.epoch(),
             )
             .unwrap(),
         );
-        let lease = FileLeaseStore::new(root.join("leases"))
-            .acquire(&broca_core::lease_key_for(&key))
-            .unwrap();
         let executor = Arc::new(ProbeExecutor {
             wal_store: wal_store.clone(),
             hold_admission,
@@ -327,6 +357,9 @@ impl Fixture {
             entered: tokio::sync::Notify::new(),
             media_probe: AtomicUsize::new(0),
             requests: Arc::default(),
+            replay_requests: Arc::default(),
+            gate_first_probe: AtomicBool::new(false),
+            probe_entries: AtomicUsize::new(0),
             completed_probe: tokio::sync::Notify::new(),
             session_closes: AtomicUsize::new(0),
         });
@@ -336,6 +369,12 @@ impl Fixture {
             idle_ttl: Duration::from_secs(60),
             executor: executor.clone(),
         }));
+        if matches!(
+            seed,
+            Seed::RunControlRestartPaused | Seed::RunControlOffRestartPaused | Seed::Existing
+        ) {
+            Box::pin(registry.resume_restart_pauses(wal_store.clone(), Vec::new())).await;
+        }
         if retained {
             let store = Arc::new(broca_store::SqliteStore::open_in_memory().unwrap());
             registry.set_retention_service(Arc::new(

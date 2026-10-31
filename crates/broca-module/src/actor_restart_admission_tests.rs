@@ -20,6 +20,9 @@ pub(super) fn manifest(identity: &str) -> broca_wal::PlanManifest {
 struct Provider {
     frozen: broca_provider::wire::FrozenRenderConfig,
     requests: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    replay_requests: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    wal_store: Arc<ProbeWal>,
+    session: BindIdentity,
 }
 
 #[async_trait::async_trait]
@@ -41,6 +44,26 @@ impl broca_core::Provider for Provider {
         _: broca_protocol::StepId,
         opts: &broca_protocol::CallOptions,
     ) -> mpsc::Receiver<broca_protocol::NormalizedEvent> {
+        let records = self.wal_store.read_records(&self.session).unwrap();
+        let mut replay = broca_core::replay(
+            &records
+                .into_iter()
+                .map(|frame| frame.record)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let mut oracle = opts.clone();
+        if let Some(config) = replay.run_config.as_ref() {
+            oracle.tools = config.tools.clone();
+            oracle.tool_choice = config.tool_choice.clone().into();
+            oracle.generation = config.generation.clone().into();
+        }
+        replay.prompt.append(&mut replay.pending_steers);
+        oracle.prompt = replay.prompt;
+        self.replay_requests
+            .lock()
+            .unwrap()
+            .push(self.render_request(&oracle));
         self.requests
             .lock()
             .unwrap()
@@ -104,11 +127,19 @@ pub(super) async fn execute_probe(
     let provider = Provider {
         frozen: serde_json::from_value(config.frozen_render_config.clone()).unwrap(),
         requests: executor.requests.clone(),
+        replay_requests: executor.replay_requests.clone(),
+        wal_store: executor.wal_store.clone(),
+        session: job.req.session.clone(),
+    };
+    let mode = match job.kind {
+        RunKind::FreshOrResume => broca_core::StartMode::FreshOrResume,
+        RunKind::AppendEpisode => broca_core::StartMode::AppendEpisode,
+        RunKind::ResumeAfterAuth => broca_core::StartMode::ResumeAfterAuth,
     };
     let result = broca_core::run_loop_on_writer_admitted_with_prior_snapshot(
         job.req,
         &job.writer,
-        broca_core::StartMode::FreshOrResume,
+        mode,
         &provider,
         &broca_core::StubToolPlane::new(),
         &broca_core::AllowAll,
@@ -123,6 +154,9 @@ pub(super) async fn execute_probe(
     executor.completed_probe.notify_one();
     result
 }
+
+#[path = "actor_run_control_admission_tests.rs"]
+mod run_control;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mutation {
