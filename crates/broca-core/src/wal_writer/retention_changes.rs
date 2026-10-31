@@ -207,6 +207,13 @@ impl Wal for ObservedWal {
     fn lineage_id(&self) -> Option<broca_wal::WalLineageId> {
         self.inner.lineage_id()
     }
+    fn durable_publication(&self) -> Option<broca_wal::file_wal::DurablePublication> {
+        if self.inner.wal_config().is_overhaul() {
+            self.inner.durable_publication()
+        } else {
+            None
+        }
+    }
     fn append_budget(&self) -> Option<(u64, u64, u64)> {
         self.inner.append_budget()
     }
@@ -221,6 +228,48 @@ impl Wal for ObservedWal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_store_forwards_overhaul_publication_and_preserves_legacy_none() {
+        for overhaul in [false, true] {
+            let root = broca_test_support::scratch_root().join(format!(
+                "observed-publication-{}-{overhaul}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            if overhaul {
+                std::fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
+            }
+            let session:BindIdentity=serde_json::from_value(serde_json::json!({"project_root":root.join("project"),"harness":"h","session":"s"})).unwrap();
+            let store = FileWalStore::with_config(
+                root.join("wal"),
+                if overhaul {
+                    broca_wal::WalConfig::OVERHAUL
+                } else {
+                    broca_wal::WalConfig::LEGACY
+                },
+            );
+            let mut wal = store.open(&session).unwrap();
+            wal.append(
+                1,
+                &WalRecord::StepStarted {
+                    step_id: broca_protocol::StepId(1),
+                },
+                true,
+            )
+            .unwrap();
+            assert_eq!(wal.durable_publication().is_some(), overhaul);
+            if let Some(publication) = wal.durable_publication() {
+                assert_eq!(publication.sequence(), wal.last_seq());
+                assert_eq!(
+                    publication.byte_end(),
+                    std::fs::metadata(store.wal_path(&session)).unwrap().len()
+                );
+            }
+            drop(wal);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
 
     struct BarrierWal {
         synced: Arc<std::sync::atomic::AtomicBool>,

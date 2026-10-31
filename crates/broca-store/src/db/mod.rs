@@ -13,6 +13,7 @@ mod publication;
 mod readers;
 mod rebuild;
 mod reconcile;
+mod resume_reader;
 mod schema;
 mod seeds;
 

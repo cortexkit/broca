@@ -1712,6 +1712,15 @@ where
             "offset resume requires a broca-state/2 root".into(),
         ));
     }
+    let prepared = match prepare_offset_resume(writer, wal_store, &req.session, offsets).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if let Some(ack) = on_admitted {
+                let _ = ack.send(Err(error.clone()));
+            }
+            return Err(error);
+        }
+    };
     let (append_episode, auth_resolved) = mode.flags();
     run_on_writer(
         &mut req,
@@ -1727,7 +1736,119 @@ where
         out,
         on_admitted,
         None,
-        Some(offsets),
+        Some(prepared),
+    )
+    .await
+}
+
+/// A transient resume selection shared by admission/provider resolution and execution.
+/// Only content-free continuation forms belong in the database, never this hydrated state.
+pub struct PreparedOffsetResume {
+    snapshot: PriorWalSnapshot,
+    prior: Option<ReplayState>,
+    placement: Option<crate::placement::Placement>,
+    lineage: Option<broca_wal::WalLineageId>,
+}
+
+impl PreparedOffsetResume {
+    pub fn snapshot(&self) -> &PriorWalSnapshot {
+        &self.snapshot
+    }
+}
+
+/// Select the validated resume view before resolving the recorded provider and credentials.
+pub async fn prepare_offset_resume<W: WalStore>(
+    writer: &WalHandle,
+    wal_store: &W,
+    session: &BindIdentity,
+    offsets: &dyn crate::resume::OffsetResumeReader,
+) -> Result<Box<PreparedOffsetResume>, RunError> {
+    if !wal_store.wal_config().is_overhaul() {
+        return Err(RunError::Wal(
+            "offset resume requires a broca-state/2 root".into(),
+        ));
+    }
+    let safe_head = writer
+        .sync()
+        .await
+        .map_err(|e| RunError::Wal(e.to_string()))?;
+    let loaded = broca_wal::access_counter::fallback_result(
+        || offsets.snapshot(safe_head),
+        |fallback| fallback.reason,
+    )
+    .and_then(|snapshot| {
+        if writer.lineage_id().map(|id| id.to_string()) != snapshot.boundary.lineage_id {
+            return Err(crate::replay::SeedFallback::new(
+                "offset resume writer lineage mismatch",
+            ));
+        }
+        crate::resume::reconstruct_from_offsets(
+            &|off, len| offsets.read_at(off, len),
+            snapshot,
+            safe_head,
+        )
+    });
+    match loaded {
+        Ok(loaded) => {
+            offsets.reconstructed(None);
+            Ok(Box::new(PreparedOffsetResume {
+                snapshot: loaded.snapshot,
+                prior: Some(loaded.prior),
+                placement: Some(loaded.placement),
+                lineage: writer.lineage_id(),
+            }))
+        }
+        Err(reason) => {
+            offsets.reconstructed(Some(reason));
+            Ok(Box::new(PreparedOffsetResume {
+                snapshot: complete_snapshot(wal_store, session)?,
+                prior: None,
+                placement: None,
+                lineage: writer.lineage_id(),
+            }))
+        }
+    }
+}
+
+/// Execute using the same transient offset selection that supplied admission's prior view.
+/// Writer publication subscribers remain installed. Omitting the legacy materializer keeps
+/// hydrated messages transient instead of persisting another content copy.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_loop_on_writer_with_prepared_resume<P, T, A, W>(
+    mut req: RunRequest,
+    writer: &WalHandle,
+    mode: StartMode,
+    provider: &P,
+    tool_plane: &T,
+    approval: &A,
+    wal_store: &W,
+    control: RunControl,
+    out: &mpsc::Sender<OutputEvent>,
+    on_admitted: Option<tokio::sync::oneshot::Sender<Result<RunId, RunError>>>,
+    prepared: Box<PreparedOffsetResume>,
+) -> Result<RunSummary, RunError>
+where
+    P: Provider,
+    T: ToolPlane,
+    A: ApprovalPolicy,
+    W: WalStore,
+{
+    let (append_episode, auth_resolved) = mode.flags();
+    run_on_writer(
+        &mut req,
+        writer,
+        append_episode,
+        auth_resolved,
+        provider,
+        tool_plane,
+        approval,
+        wal_store,
+        None,
+        &control,
+        out,
+        on_admitted,
+        None,
+        Some(prepared),
     )
     .await
 }
@@ -1751,7 +1872,7 @@ async fn run_on_writer<P, T, A, W>(
     out: &mpsc::Sender<OutputEvent>,
     on_admitted: Option<tokio::sync::oneshot::Sender<Result<RunId, RunError>>>,
     prior_snapshot: Option<&PriorWalSnapshot>,
-    offsets: Option<&dyn crate::resume::OffsetResumeReader>,
+    offsets: Option<Box<PreparedOffsetResume>>,
 ) -> Result<RunSummary, RunError>
 where
     P: Provider,
@@ -1926,45 +2047,29 @@ async fn reconstruct_prior<W>(
     wal_store: &W,
     store: Option<Arc<dyn SessionStore>>,
     prior_snapshot: Option<&PriorWalSnapshot>,
-    offsets: Option<&dyn crate::resume::OffsetResumeReader>,
+    offsets: Option<Box<PreparedOffsetResume>>,
 ) -> Result<ReconstructedPrior, RunError>
 where
     W: WalStore,
 {
     require_agent_run_scope_writer(req.scope.as_ref())?;
     let mut offset_prior = None;
-    let snapshot = if let Some(offsets) = offsets {
-        let safe_head = writer
-            .sync()
-            .await
-            .map_err(|e| RunError::Wal(e.to_string()))?;
-        let loaded = broca_wal::access_counter::fallback_result(
-            || offsets.snapshot(safe_head),
-            |fallback| fallback.reason,
-        )
-        .and_then(|snapshot| {
-            if writer.lineage_id().map(|id| id.to_string()) != snapshot.boundary.lineage_id {
-                return Err(crate::replay::SeedFallback::new(
-                    "offset resume writer lineage mismatch",
-                ));
+    let snapshot = if let Some(prepared) = offsets {
+        if prior_snapshot_matches_writer_head(writer, &prepared.snapshot)
+            && prepared.lineage == writer.lineage_id()
+        {
+            if let Some(placement) = prepared.placement {
+                writer.seed_display_placement(prepared.snapshot.head_seq, placement);
             }
-            crate::resume::reconstruct_from_offsets(
-                &|off, len| offsets.read_at(off, len),
-                snapshot,
-                safe_head,
-            )
-        });
-        match loaded {
-            Ok(loaded) => {
-                offsets.reconstructed(None);
-                writer.seed_display_placement(safe_head, loaded.placement);
-                offset_prior = Some(loaded.prior);
-                loaded.snapshot
-            }
-            Err(reason) => {
-                offsets.reconstructed(Some(reason));
-                complete_snapshot(wal_store, &req.session)?
-            }
+            offset_prior = prepared.prior;
+            prepared.snapshot
+        } else {
+            crate::replay::SeedFallback::new("prepared offset resume no longer at durable head");
+            writer
+                .sync()
+                .await
+                .map_err(|e| RunError::Wal(e.to_string()))?;
+            complete_snapshot(wal_store, &req.session)?
         }
     } else {
         match prior_snapshot {

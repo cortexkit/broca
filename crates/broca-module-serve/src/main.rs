@@ -2887,6 +2887,7 @@ mod executor {
     /// threads the admission ack so the coordinator admits a run only once it's durable.
     pub struct LiveLoopExecutor<W = FileWalStore> {
         wal_store: Arc<W>,
+        offset_resume: Option<Arc<ResumeReaderFactory>>,
         /// The SQLite session store is both the durable run index and the materialized
         /// transcript prefix store used by resume and `session.read`.
         session_store: Arc<broca_store::SqliteStore>,
@@ -2955,6 +2956,12 @@ mod executor {
         fn file_store(&self) -> &FileWalStore;
     }
 
+    type ResumeReaderFactory = dyn Fn(
+            &broca_protocol::BindIdentity,
+        ) -> Result<Arc<dyn broca_core::resume::OffsetResumeReader>, String>
+        + Send
+        + Sync;
+
     impl ExecutorWalStore for FileWalStore {
         fn file_store(&self) -> &FileWalStore {
             self
@@ -2968,8 +2975,27 @@ mod executor {
             plane: Arc<SubcToolPlane>,
             provider_base_url: Option<String>,
         ) -> Self {
+            Self::new_with_offset_resume_readers(
+                wal_store,
+                session_store,
+                plane,
+                provider_base_url,
+                None,
+            )
+        }
+
+        /// Construct an opt-in session-local resume composition. Boot still calls `new`.
+        /// The factory runs after the writer syncs; its reader must serve that durable head.
+        pub fn new_with_offset_resume_readers(
+            wal_store: Arc<W>,
+            session_store: Arc<broca_store::SqliteStore>,
+            plane: Arc<SubcToolPlane>,
+            provider_base_url: Option<String>,
+            offset_resume: Option<Arc<ResumeReaderFactory>>,
+        ) -> Self {
             Self {
                 wal_store,
+                offset_resume,
                 session_store,
                 plane,
                 hooks: None,
@@ -3889,7 +3915,36 @@ mod executor {
             );
             // Admission, auth/cache selection, and core reconstruction share the same
             // checkpoint-plus-tail view; a RunStarted may already be behind its watermark.
-            let prior_snapshot = &job.prior_snapshot;
+            let prepared = if let Some(readers) = &self.offset_resume {
+                let loaded = async {
+                    job.writer
+                        .sync()
+                        .await
+                        .map_err(|e| RunError::Wal(e.to_string()))?;
+                    let reader = readers(&job.req.session).map_err(RunError::Wal)?;
+                    broca_core::run::prepare_offset_resume(
+                        &job.writer,
+                        self.wal_store.as_ref(),
+                        &job.req.session,
+                        reader.as_ref(),
+                    )
+                    .await
+                }
+                .await;
+                match loaded {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        if let Some(ack) = job.on_admitted {
+                            let _ = ack.send(Err(error.clone()));
+                        }
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
+            let selected_snapshot = prepared.as_ref().map(|p| p.snapshot().clone());
+            let prior_snapshot = selected_snapshot.as_ref().unwrap_or(&job.prior_snapshot);
             let prior_run = if matches!(job.kind, RunKind::AppendEpisode) {
                 None
             } else {
@@ -4595,21 +4650,38 @@ mod executor {
             resolved
                 .provider
                 .set_chatgpt_https_policy(broca_module_serve::transport_config::default_policy());
-            let summary = run_loop_on_writer_admitted_with_prior_snapshot(
-                job.req,
-                &job.writer,
-                mode,
-                &resolved.provider,
-                self.plane.as_ref(),
-                &AllowAll,
-                self.wal_store.as_ref(),
-                materialized_store,
-                control,
-                &out,
-                job.on_admitted,
-                Some(prior_snapshot),
-            )
-            .await;
+            let summary = if let Some(prepared) = prepared {
+                broca_core::run::run_loop_on_writer_with_prepared_resume(
+                    job.req,
+                    &job.writer,
+                    mode,
+                    &resolved.provider,
+                    self.plane.as_ref(),
+                    &AllowAll,
+                    self.wal_store.as_ref(),
+                    control,
+                    &out,
+                    job.on_admitted,
+                    prepared,
+                )
+                .await
+            } else {
+                run_loop_on_writer_admitted_with_prior_snapshot(
+                    job.req,
+                    &job.writer,
+                    mode,
+                    &resolved.provider,
+                    self.plane.as_ref(),
+                    &AllowAll,
+                    self.wal_store.as_ref(),
+                    materialized_store,
+                    control,
+                    &out,
+                    job.on_admitted,
+                    Some(prior_snapshot),
+                )
+                .await
+            };
 
             // A finished run (not a paused one) has made its terminal durable before the loop
             // returned, and nothing has been appended since, so the durable head is the
@@ -4719,6 +4791,181 @@ mod executor {
         include!("vault_request_tests.rs");
         include!("role_plane_tests.rs");
         include!("admission_wal_read_budget_tests.rs");
+
+        #[tokio::test]
+        async fn database_resume_selects_prior_before_provider_and_keeps_publication() {
+            use broca_core::LeaseStore;
+            let root = fresh_vault_root("database-offset-admission");
+            std::fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
+            let (stand_in, server) = stand_in_executor(&root).await;
+            let http = resume_http_fixture().await;
+            let store = Arc::new(FileWalStore::with_config(
+                root.join("wal"),
+                broca_wal::WalConfig::OVERHAUL,
+            ));
+            let db = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
+            let mut req = drift_request(&root);
+            req.model = broca_protocol::ModelHandle::new("openai", "gpt-test");
+            req.tools.clear();
+            let resolved = broca_catalog::live::resolve_provider(
+                "openai/gpt-test",
+                Some(&http.url),
+                2048,
+                &AuthMode::None,
+                &Default::default(),
+            )
+            .unwrap();
+            let config = drift_run_config(&req, &resolved);
+            let mut started = run_started_with_user_text(&req.session, &req.run_id.0, "question");
+            if let broca_wal::WalRecord::RunStarted { config: frozen, .. } = &mut started {
+                **frozen = config.clone();
+            }
+            let mut previous = started.clone();
+            if let broca_wal::WalRecord::RunStarted { run_id, .. } = &mut previous {
+                run_id.0 = "previous".into();
+            }
+            let records=vec![previous,
+                serde_json::from_value(serde_json::json!({"type":"model_step_finished","step_id":1,"usage":{},"assistant_message":{"message_id":"old","content":[{"type":"text","text":"answer"}]}})).unwrap(),
+                serde_json::from_value(serde_json::json!({"type":"run_finished","reason":"completed","usage":{}})).unwrap(),
+                started,broca_wal::WalRecord::StepStarted {step_id:broca_protocol::StepId(1)}];
+            let mut wal = store.open(&req.session).unwrap();
+            for record in &records {
+                wal.append(1, record, false).unwrap();
+            }
+            wal.sync().unwrap();
+            let witness = wal.durable_publication().unwrap();
+            db.publish(
+                &req.session,
+                "s-resume",
+                broca_store::db::LogLocation::Live,
+                &witness,
+            )
+            .unwrap();
+            let mut wrong = broca_core::PriorWalSnapshot {
+                base_watermark: 0,
+                head_seq: witness.sequence(),
+                checkpoint_at_base: None,
+                checkpoint_at_head: broca_core::AdmissionCheckpointV1::from_frames(
+                    &wal.replay().unwrap(),
+                )
+                .unwrap(),
+                tail: Arc::new(wal.replay().unwrap()),
+            };
+            wrong
+                .checkpoint_at_head
+                .last_episode
+                .as_mut()
+                .unwrap()
+                .config
+                .model = broca_protocol::ModelHandle::new("missing-provider", "must-not-resolve");
+            wrong
+                .checkpoint_at_head
+                .last_episode
+                .as_mut()
+                .unwrap()
+                .config
+                .frozen_render_config = serde_json::json!({"unsupported_recorded_provider":true});
+            let (publication_tx, publication_rx) = tokio::sync::watch::channel(Some(witness));
+            let (fanout, _) = tokio::sync::broadcast::channel(16);
+            let observer = broca_core::wal_writer::RecordObserver::new(
+                fanout,
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            )
+            .with_publications(publication_tx);
+            drop(wal);
+            let leases = broca_core::FileLeaseStore::new(root.join("lease"));
+            let lease = leases
+                .acquire(&broca_core::lease_key_for(&req.session))
+                .unwrap();
+            let (writer, _lease) = broca_core::WalHandle::open_and_spawn_observed(
+                store.clone(),
+                req.session.clone(),
+                lease,
+                Some(observer),
+            )
+            .await
+            .unwrap();
+            let writer = Arc::new(writer);
+            let db_reader = db.clone();
+            let reader_publications = publication_rx.clone();
+            let sessions = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed_sessions = sessions.clone();
+            let executor = LiveLoopExecutor::new_with_offset_resume_readers(
+                store.clone(),
+                stand_in.session_store.clone(),
+                stand_in.plane.clone(),
+                Some(http.url.clone()),
+                Some(Arc::new(move |session| {
+                    observed_sessions.lock().unwrap().push(session.clone());
+                    Ok(db_reader.resume_reader(
+                        session.clone(),
+                        reader_publications
+                            .borrow()
+                            .clone()
+                            .ok_or("publication absent")?,
+                    ))
+                })),
+            );
+            let (_, _, expected) =
+                broca_module_serve::wal_render::render_step(&records, &config, &req.run_id.0, 1)
+                    .unwrap();
+            let bind = req.session.clone();
+            let (out, _) = mpsc::channel(128);
+            let summary = executor
+                .execute(
+                    RunJob {
+                        media: Vec::new(),
+                        media_profile: None,
+                        conversation_key: None,
+                        req,
+                        auth: None,
+                        writer: writer.clone(),
+                        kind: RunKind::FreshOrResume,
+                        skip_materialization: false,
+                        control: Default::default(),
+                        prior_snapshot: wrong,
+                        on_admitted: None,
+                    },
+                    out,
+                )
+                .await
+                .unwrap();
+            assert_eq!(summary.reason, RunFinishReason::Completed);
+            assert_eq!(*sessions.lock().unwrap(), vec![bind.clone()]);
+            assert_eq!(http.requests.lock().unwrap()[0].body, expected);
+            let legacy_prefix = broca_core::MaterializedStore::read_prefix_with_watermark(
+                stand_in.session_store.as_ref(),
+                &bind,
+            )
+            .unwrap();
+            assert!(legacy_prefix.prefix.is_empty());
+            assert_eq!(
+                legacy_prefix.watermark_seq, 0,
+                "offset execution must not persist hydrated messages"
+            );
+            let terminal = publication_rx.borrow().clone().unwrap();
+            assert_eq!(
+                terminal.sequence(),
+                writer.durable_head().load(Ordering::Acquire)
+            );
+            db.publish(
+                &bind,
+                "s-resume",
+                broca_store::db::LogLocation::Live,
+                &terminal,
+            )
+            .unwrap();
+            assert!(db
+                .resume_reader(bind, terminal.clone())
+                .snapshot(terminal.sequence())
+                .is_ok());
+            Arc::try_unwrap(writer)
+                .unwrap_or_else(|_| panic!("writer released"))
+                .shutdown()
+                .await
+                .unwrap();
+            server.abort();
+        }
         include!("credential_source_guard_tests.rs");
         include!("frozen_auth_method_resume_tests.rs");
 
