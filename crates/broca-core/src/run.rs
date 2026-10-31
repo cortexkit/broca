@@ -16459,6 +16459,19 @@ mod approval_gate {
                 .and_then(|queue| queue.pop_front())
             {
                 Slot::Ready(Some(CallPlan::Already(result)))
+            } else if writer.recovery_tombstoned(run_id, &call.tool_call_id)
+                || resume
+                    .intents
+                    .get(&call.tool_call_id)
+                    .and_then(|dispatch| dispatch.call_key.as_deref())
+                    .is_some_and(|key| writer.recovery_tombstoned_key(key))
+                || held
+                    .get(&call.tool_call_id)
+                    .is_some_and(|prepared| writer.recovery_tombstoned_key(&prepared.key))
+            {
+                // A restored approval cannot authorize repeating an external
+                // effect whose outcome recovery marked unknown.
+                Slot::Ready(Some(CallPlan::Recovered(call.tool_call_id.clone())))
             } else if let Some(dispatch) = resume.intents.remove(&call.tool_call_id) {
                 Slot::Ready(Some(CallPlan::Dispatch(dispatch)))
             } else if let Some(prepared) = held.remove(&call.tool_call_id) {

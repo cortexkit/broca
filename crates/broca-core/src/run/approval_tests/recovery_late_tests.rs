@@ -332,3 +332,143 @@ async fn check_cut_late_intent(later_episode: bool) {
     assert!(rig.tools.sent.lock().unwrap().is_empty());
     rig.finish().await;
 }
+
+#[tokio::test]
+async fn approved_prepared_control_dispatches_once_without_recovery() {
+    check_prepared_recovery(false).await;
+}
+
+#[tokio::test]
+async fn recovered_prepared_approval_closes_unknown_without_dispatch() {
+    check_prepared_recovery(true).await;
+}
+
+async fn check_prepared_recovery(cut: bool) {
+    let mut rig = Rig::file_backed("hold");
+    let root = rig.root.join("prepared/wal");
+    replace_writer(&mut rig, &root).await;
+    *rig.questions.answer.lock().unwrap() = "approve";
+    let stop = CancellationToken::new();
+    rig.control.stop_requested = Some(stop.clone());
+    let batch = rig.batch(&crate::AllowAll, vec![call("c")], None, true);
+    let interrupt = async {
+        broca_test_support::wait_until("second approval validation", || async {
+            let count = rig.hooks.validates.load(Ordering::SeqCst);
+            if count >= 2 {
+                Ok(())
+            } else {
+                Err(format!("validation count={count}"))
+            }
+        })
+        .await;
+        stop.cancel();
+    };
+    let (paused, ()) = tokio::time::timeout(HANG_GUARD, async { tokio::join!(batch, interrupt) })
+        .await
+        .unwrap();
+    assert_eq!(paused.interruption, Some(BatchInterruption::RestartPause));
+    assert!(paused.open[0].approved);
+    let frames = rig.frames();
+    let approval = frames
+        .iter()
+        .find_map(|frame| {
+            matches!(
+                &frame.record,
+                WalRecord::ApprovalRecorded {
+                    decision: broca_wal::DeferredDecision::Approved,
+                    ..
+                }
+            )
+            .then_some(Arc::new(frame.record.clone()))
+        })
+        .unwrap();
+    let prepared = frames
+        .iter()
+        .find(|frame| matches!(frame.record, WalRecord::ToolCallDeferred { .. }))
+        .unwrap();
+    let key = crate::context::call_key(rig.writer.lineage_id().unwrap(), prepared.seq);
+    let resume = ResumeCtx {
+        batch_already_started: true,
+        prepared: vec![crate::replay::PreparedCall {
+            record_index: 0,
+            prepared: paused.open[0].prepared.clone(),
+            approval: Some(approval),
+            elicitation_id: paused.open[0].id.clone(),
+        }],
+        ..Default::default()
+    };
+    if cut {
+        let intent: WalRecord = serde_json::from_value(json!({"type":"tool_dispatch_intent",
+            "batch_id":"r-b1", "tool_call_id":"c", "args":{}, "call_key":key}))
+        .unwrap();
+        rig.writer.record(intent).into_result().unwrap();
+        rig.writer.sync().await.unwrap();
+        let mut bytes = std::fs::read(rig.tools.store.wal_path(&rig.bind)).unwrap();
+        let mut offset = 0;
+        loop {
+            match framing::decode_next(&bytes[offset..]) {
+                framing::DecodeStep::Lineage { consumed, .. } => offset += consumed,
+                framing::DecodeStep::Record { framed, consumed } => {
+                    if matches!(framed.record, WalRecord::ToolDispatchIntent { .. }) {
+                        let mut metadata = framing::v4::decode_header(&bytes[offset..])
+                            .unwrap()
+                            .unwrap()
+                            .metadata;
+                        // Keep the intent readable for attribution, but outside
+                        // the contiguous prefix retained by physical recovery.
+                        metadata.seq += 1;
+                        let frame = framing::encode_v4(
+                            metadata,
+                            &[framing::FRAME_STAMPS_FEATURE],
+                            &framed.record,
+                        )
+                        .unwrap();
+                        assert_eq!(frame.len(), consumed);
+                        bytes[offset..offset + consumed].copy_from_slice(&frame);
+                        break;
+                    }
+                    offset += consumed;
+                }
+                _ => panic!("the prepared fixture must decode before its damaged intent"),
+            }
+        }
+        let repaired = rig.root.join("prepared-repaired/wal");
+        let path = store(&repaired).wal_path(&rig.bind);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+        replace_writer(&mut rig, &repaired).await;
+        assert!(rig.writer.recovery_tombstoned_key(&key));
+    }
+    // Direct batch tests bypass the run loop's tag initialization after reopen.
+    rig.writer.seed_lineage_tags(Some(crate::tags::lineage_tags(
+        rig.frames().iter().map(|frame| &frame.record),
+    )));
+    rig.control.stop_requested = None;
+    rig.hooks = Arc::new(Hooks {
+        validates: AtomicUsize::new(0),
+        second: "pass",
+        expires: rig.hooks.expires,
+        seen: Mutex::new(Vec::new()),
+    });
+    rig.control.hook_plane = Some(rig.hooks.clone());
+    let result = rig
+        .batch(&crate::AllowAll, vec![call("c")], Some(resume), true)
+        .await;
+    assert_eq!(result.results.len(), 1);
+    assert_eq!(
+        rig.tools.sent.lock().unwrap().len(),
+        usize::from(!cut),
+        "a recovered approved Prepared call must not execute"
+    );
+    let frames = rig.frames();
+    if cut {
+        assert!(frames.iter().any(|frame| matches!(&frame.record,
+            WalRecord::ToolResult { outcome: DispatchOutcome::Unknown, result, .. }
+            if result.tool_call_id.0 == "c")));
+        assert!(!frames
+            .iter()
+            .any(|frame| matches!(frame.record, WalRecord::ToolDispatchIntent { .. })));
+        assert_eq!(rig.hooks.validates.load(Ordering::SeqCst), 0);
+    }
+    rig.finish().await;
+}

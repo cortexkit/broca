@@ -254,6 +254,18 @@ pub fn recovery_cut_findings(root: &Path, now: i64) -> Vec<Finding> {
             warning.samples.push(json!({"session":manifest.session,"reason":manifest.recovery.reason.as_str(),
                 "cut_offset":manifest.recovery.cut_offset,"removed_bytes":manifest.recovery.removed_len,
                 "unattributed_tool_risk":manifest.recovery.unattributed_tool_risk}));
+            let raw = directory.join(&manifest.recovery.sidecar_basename);
+            let raw_available = !manifest.recovery.sidecar_basename.contains(['/', '\\'])
+                && broca_wal::fs_ops::File::open(&raw)
+                    .and_then(|file| file.metadata())
+                    .is_ok_and(|metadata| {
+                        metadata.is_file() && metadata.len() == manifest.recovery.removed_len
+                    });
+            if !raw_available {
+                warning
+                    .samples
+                    .push(json!({"removed_evidence":"unreadable"}));
+            }
             if !manifest.recovery.unowned_calls.is_empty() {
                 warning.samples.push(json!({"outcome":"unknown",
                     "unowned_calls":manifest.recovery.unowned_calls}));

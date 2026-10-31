@@ -51,6 +51,15 @@ fn healthy(store: &broca_store::SqliteStore, since: i64) -> Evidence {
 
 #[test]
 fn wal_recovery_cut_finding_reports_unattributed_risk_without_removed_content() {
+    check_recovery_finding(false);
+}
+
+#[test]
+fn wal_recovery_unreadable_raw_evidence_warns_without_blocking_reopen() {
+    check_recovery_finding(true);
+}
+
+fn check_recovery_finding(remove_raw: bool) {
     use broca_wal::{FileWal, Wal, WalConfig, WalRecord};
     use std::io::Write;
     let root = broca_test_support::scratch_root().join(format!(
@@ -83,7 +92,20 @@ fn wal_recovery_cut_finding_reports_unattributed_risk_without_removed_content() 
         .unwrap()
         .write_all(b"undecodable private removed content")
         .unwrap();
-    drop(FileWal::open_with_recovery(&log, WalConfig::OVERHAUL, floor).unwrap());
+    drop(FileWal::open_with_recovery(&log, WalConfig::OVERHAUL, floor.clone()).unwrap());
+    if remove_raw {
+        let manifests = broca_wal::recovery::manifests(&log, 1_000_000).unwrap();
+        assert_eq!(manifests.len(), 1);
+        std::fs::remove_file(
+            log.parent()
+                .unwrap()
+                .join(&manifests[0].recovery.sidecar_basename),
+        )
+        .unwrap();
+        let wal = FileWal::open_with_recovery(&log, WalConfig::OVERHAUL, floor).unwrap();
+        assert!(wal.replay().unwrap().iter().any(|frame| matches!(&frame.record,
+            WalRecord::RecoveryCut { recovery } if recovery.cut_id == manifests[0].recovery.cut_id)));
+    }
     let index = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
     let mut evidence = healthy(&index, 0);
     evidence.recovery_cuts = recovery_cut_findings(&root, NOW);
@@ -95,6 +117,12 @@ fn wal_recovery_cut_finding_reports_unattributed_risk_without_removed_content() 
         .unwrap();
     assert_eq!(warning.severity, Severity::Warn);
     assert_eq!(warning.samples[0]["unattributed_tool_risk"], true);
+    if remove_raw {
+        assert!(warning
+            .samples
+            .iter()
+            .any(|sample| sample["removed_evidence"] == "unreadable"));
+    }
     assert!(warning.samples[0]["session"]
         .as_str()
         .unwrap()

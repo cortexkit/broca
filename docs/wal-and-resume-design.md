@@ -130,7 +130,9 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   dispatch intents and results, and every unresolved tool call in a
   surviving `ModelStepFinished`, including a call whose intent was removed.
   These tombstones are consulted before `NotSent` can become a redispatch plan,
-  and before actual dispatch. Close-out writes `outcome_unknown_result` with
+  and before actual dispatch. Approval-gated planning also checks restored
+  Prepared and intent keys; a surviving approval cannot override a tombstone.
+  Close-out writes `outcome_unknown_result` with
   `DispatchOutcome::Unknown`, never a never-executed result, and the existing
   `ResumeStarted`/terminal projection and `run.status` report the indeterminate
   calls. If a model step was removed too, a close-out-only recovery batch records
