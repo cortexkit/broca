@@ -14,7 +14,7 @@ struct CapturingVaultDaemon {
     /// The consumer identity's module id presented on each route open, in order.
     route_open_identities: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     route_opens: Arc<std::sync::atomic::AtomicUsize>,
-    route_open_times: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
+    route_open_starts: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
     errors: Arc<std::sync::Mutex<Vec<String>>>,
     server: tokio::task::JoinHandle<()>,
 }
@@ -118,14 +118,13 @@ impl CapturingVaultDaemon {
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let route_open_identities = Arc::new(std::sync::Mutex::new(Vec::new()));
         let route_opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let route_open_times = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let route_open_starts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let errors = Arc::new(std::sync::Mutex::new(Vec::new()));
         let record = Arc::new(std::sync::Mutex::new(StandInRecord::default()));
         let server = {
             let requests = requests.clone();
             let route_open_identities = route_open_identities.clone();
             let route_opens = route_opens.clone();
-            let route_open_times = route_open_times.clone();
             let errors = errors.clone();
             tokio::spawn(async move {
                 loop {
@@ -135,7 +134,6 @@ impl CapturingVaultDaemon {
                     let (key, requests, errors) = (key.clone(), requests.clone(), errors.clone());
                     let route_open_identities = route_open_identities.clone();
                     let route_opens = route_opens.clone();
-                    let route_open_times = route_open_times.clone();
                     let record = record.clone();
                     tokio::spawn(async move {
                         if let Err(error) = serve_capturing_vault(
@@ -146,7 +144,6 @@ impl CapturingVaultDaemon {
                                 requests,
                                 route_open_identities,
                                 route_opens,
-                                route_open_times,
                             },
                             script,
                             scoped_not_found,
@@ -167,7 +164,7 @@ impl CapturingVaultDaemon {
             requests,
             route_open_identities,
             route_opens,
-            route_open_times,
+            route_open_starts,
             errors,
             server,
         }
@@ -276,7 +273,6 @@ struct CapturedTraffic {
     requests: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
     route_open_identities: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     route_opens: Arc<std::sync::atomic::AtomicUsize>,
-    route_open_times: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -295,7 +291,6 @@ async fn serve_capturing_vault(
         requests,
         route_open_identities,
         route_opens,
-        route_open_times,
     } = captured;
     use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
     use subc_protocol::{Flags, Frame, FrameType, Priority};
@@ -364,7 +359,6 @@ async fn serve_capturing_vault(
                     );
                 }
                 if matches!(request, ClientControlRequest::RouteOpen { .. }) {
-                    route_open_times.lock().unwrap().push(tokio::time::Instant::now());
                     let seen = route_opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let refusal = match script {
                         RouteOpenScript::Accept => None,
@@ -580,12 +574,13 @@ async fn executor_with_vault_addressing(
     credential_ids: broca_module_serve::VaultCredentialIds,
     consumer_identity: Option<subc_control::ConsumerIdentity>,
 ) -> LiveLoopExecutor {
-    let vault_conn = broca_subc::SubcConnection::connect_with_consumer_identity(
+    let mut vault_conn = broca_subc::SubcConnection::connect_with_consumer_identity(
         &daemon.connection_file,
         consumer_identity,
     )
     .await
     .unwrap();
+    vault_conn.record_route_open_attempts_for_test(Arc::clone(&daemon.route_open_starts));
     let tool_conn = broca_subc::SubcConnection::connect(&daemon.connection_file)
         .await
         .unwrap();
@@ -799,7 +794,11 @@ async fn a_vault_route_refusal_that_never_clears_gives_up_within_the_ready_budge
         "the last wire refusal must reach admission: {:?}", result.err());
     daemon.assert_healthy();
     assert!(daemon.route_open_count() > 1);
-    assert!(daemon.route_open_times.lock().unwrap().iter().all(|at| *at < expired),
+    // The daemon can receive a route-open frame after the clock advance even if the client
+    // started the open beforehand.
+    let starts = daemon.route_open_starts.lock().unwrap().clone();
+    assert!(starts.len() > 1, "the client must have recorded its retry");
+    assert!(starts.iter().all(|at| *at < expired),
         "no route open may start after the readiness deadline");
     assert!(daemon.requests().is_empty());
     drop(daemon);
