@@ -2547,6 +2547,22 @@ async fn live_finalize_filter_restreams_the_stored_block_indices() {
 #[tokio::test]
 async fn live_subscribe_limits_cut_only_typed_arguments_not_existing_units() {
     let (mut rig, _) = one_tool_turn("live-limits").await;
+    let unlimited = rig
+        .subscribe_collect(
+            20,
+            serde_json::json!({"from":"start"}),
+            Duration::from_millis(100),
+        )
+        .await;
+    let unlimited = assert_stream_sequences(&unlimited);
+    let unlimited_started = unlimited
+        .iter()
+        .find(|v| v["event"]["type"] == "tool_started")
+        .expect("tool lifecycle replays without limits");
+    assert!(
+        unlimited_started["event"]["call_key"].is_string(),
+        "the projector attaches the call key: {unlimited_started}"
+    );
     let frames = rig.subscribe_collect(20, serde_json::json!({"from":"start","limits":{"arguments_bytes":1,"result_bytes":1,"error_result_bytes":1}}), Duration::from_millis(100)).await;
     let values = assert_stream_sequences(&frames);
     let started = values
@@ -2555,6 +2571,15 @@ async fn live_subscribe_limits_cut_only_typed_arguments_not_existing_units() {
         .expect("tool lifecycle replays");
     assert_eq!(started["event"]["arguments"], "{");
     assert_eq!(started["event"]["arguments_truncated"], true);
+    // Cutting the arguments must not drop the call identity a client joins on.
+    assert_eq!(
+        started["event"]["call_key"],
+        unlimited_started["event"]["call_key"]
+    );
+    assert_eq!(
+        started["event"]["schema_pin"],
+        unlimited_started["event"]["schema_pin"]
+    );
     let call = values
         .iter()
         .find(|v| v["unit"]["type"] == "tool_call")
