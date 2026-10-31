@@ -121,11 +121,47 @@ async fn capture(
             .count(),
         3
     );
+    let config = records
+        .iter()
+        .find_map(|record| match record {
+            broca_wal::WalRecord::RunStarted { config, .. } => Some(config),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(config.model.model_id.as_str(), "fake");
+    assert!(config.frozen_render_config.get("media").is_none());
+    let captured = if mode == "v1" {
+        let output = records
+            .iter()
+            .find_map(|record| match record {
+                broca_wal::WalRecord::ToolResult { result, .. }
+                    if result.tool_call_id.0 == "read-image" =>
+                {
+                    Some(&result.output)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let broca_protocol::ToolOutput::Parts { parts } = output else {
+            panic!("the negotiated PNG must be durably captured: {output:?}");
+        };
+        Some(
+            parts
+                .iter()
+                .find_map(|part| match part {
+                    broca_protocol::ToolOutputPart::Media { media } => Some(media),
+                    _ => None,
+                })
+                .unwrap(),
+        )
+    } else {
+        None
+    };
     let read = rig
         .request(7, json!({"method":"session.read","params":{}}))
         .await;
     let page = result(&read);
-    let outputs = ["text", "image", "error"]
+    let outputs: Vec<Value> = ["text", "image", "error"]
         .into_iter()
         .map(|fixture| {
             page["messages"]
@@ -141,6 +177,15 @@ async fn capture(
                 .clone()
         })
         .collect();
+    if let Some(media) = captured {
+        assert_eq!(
+            outputs[1],
+            json!({"kind":"text","text":format!(
+                "Read image attachment (image/png, 1×1, 69 B).\n{}",
+                broca_protocol::content::media_not_shown_marker(media, broca_protocol::MediaMarkerReason::NotRequested)
+            )})
+        );
+    }
     let log = std::fs::read_to_string(requests).unwrap();
     let binds: Vec<Value> = log
         .lines()
@@ -198,9 +243,11 @@ async fn real_daemon_tool_result_v1_read_stores_notice_or_captures_png() {
         before[1],
         json!({"kind":"text","text":"Read image attachment (image/png, 1×1, 69 B)."})
     );
-    assert_eq!(after[1]["kind"], "parts");
-    assert_eq!(after[1]["parts"][1]["kind"], "media");
-    assert_eq!(after[1]["parts"][1]["media"]["mime"], "image/png");
+    assert_eq!(after[1]["kind"], "text");
+    assert!(after[1]["text"]
+        .as_str()
+        .unwrap()
+        .contains("reason=not_requested"));
     if let Some(dir) = std::env::var_os("BROCA_TOOL_RESULT_SAMPLES") {
         let dir = PathBuf::from(dir);
         std::fs::create_dir_all(&dir).unwrap();

@@ -264,6 +264,25 @@ async fn tool_png_on_next_request(accepts_images: bool) {
         assert!(next.to_string().contains("reason=modality"), "{next}");
         assert!(!next.to_string().contains(&STANDARD.encode(PNG)));
     }
+    let inline = result(&call(&mut rig, "session.read", json!({})).await);
+    let blocks = result(&call(&mut rig, "session.read", json!({"media":"blocks"})).await);
+    let output = |page: &Value| {
+        page["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|entry| entry["message"]["content"].as_array().unwrap())
+            .find(|block| block["tool_call_id"] == "photo" && block["type"] == "tool_result")
+            .unwrap()["output"]
+            .clone()
+    };
+    assert_eq!(output(&inline)["kind"], "text");
+    assert!(output(&inline)["text"]
+        .as_str()
+        .unwrap()
+        .contains("reason=not_requested"));
+    assert_eq!(output(&blocks)["kind"], "parts");
+    assert_eq!(output(&blocks)["parts"][1]["media"]["sha256"], digest(PNG));
     let configs = rig
         .records()
         .into_iter()
