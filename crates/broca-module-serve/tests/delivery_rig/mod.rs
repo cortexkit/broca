@@ -927,6 +927,21 @@ impl Rig {
             .await
     }
 
+    /// `subscribe_collect`, but first waiting under the shared hang guard for a frame matching
+    /// `until`; only then does `quiet` start. A live display delta can reach a loaded runner
+    /// after any fixed quiet window, so a test that needs a particular live frame must wait for
+    /// that frame rather than for the stream to go quiet.
+    pub async fn subscribe_collect_until(
+        &mut self,
+        channel: u16,
+        params: serde_json::Value,
+        quiet: Duration,
+        until: fn(&Frame) -> bool,
+    ) -> Vec<Frame> {
+        self.subscribe_collect_inner(channel, params, quiet, Some(|| {}), until)
+            .await
+    }
+
     /// Subscribe on a route the test already bound with its caller and scope.
     pub async fn subscribe_collect_bound(
         &mut self,
