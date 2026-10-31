@@ -5071,6 +5071,12 @@ mod raw_database_composition_tests {
                 op.reads
             );
         }
+        // Close every handle into the root before deleting it: the registries
+        // and the bundle keep broca.db and the log open, and Windows refuses to
+        // delete an open file (OS error 32).
+        drop(raw);
+        drop(legacy);
+        drop(bundle);
         drop(wal);
         std::fs::remove_dir_all(root).unwrap();
     }
