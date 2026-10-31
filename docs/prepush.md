@@ -60,10 +60,14 @@ its remaining suites are unknown, so this is a known-prefix estimate, not a
 full-green under-20-minute claim. A capacity refusal is
 still NOT-RUN with its exact reason, never retried or counted as coverage.
 Each launch documents its size rather than reserving 12/16 CPUs to influence
-placement. Each remote lane has a persistent
-detached Git worktree in a pool beside the scratch checkout, by default
-`../broca-prepush-lanes/LANE`. Set `BROCA_PREPUSH_LANE_POOL` to choose another
-persistent pool. A lane is checked for dirtiness **before** checkout and must
+placement. Each remote lane has a persistent detached Git worktree at
+`~/Work/Projects/CortexKit-scratch/broca-prepush-lanes/<checkout-id>/LANE`.
+The checkout ID is the invoking checkout's basename plus the first 12 hex digits
+of its absolute path's SHA-256, keeping separate callers' caches isolated.
+Set `BROCA_PREPUSH_LANE_POOL` to override that checkout-specific pool root.
+The default never derives a side-checkout location from the invoking checkout's
+parent: core owns its worker-worktree pool, so persistent lanes belong in the
+scratch project area. A lane is checked for dirtiness **before** checkout and must
 match the exact candidate SHA. Unrelated repositories or dirty lanes fail closed;
 the gate never resets or cleans them.
 
@@ -205,8 +209,11 @@ Windows motor jobs do **not** support `--net`. The dispatcher runs
 npm tarball in `package-lock.json` and prepare the pinned fixture sources. All
 bytes are staged after the clean-tree check in the Windows worktree's
 **untracked, non-ignored `prepush-inputs/`**. Git snapshot visibility is checked
-for every file. No sibling is passed: older runners require siblings beside the
-main checkout, not beside a linked worktree. No runtime archives are committed.
+for every file. The dispatcher refuses any tracked `prepush-inputs` path, and a
+script regression also checks the index so generated inputs cannot be committed.
+The dispatcher passes no `ck motor run --sibling` source-checkout arguments:
+older runners require those repositories beside the main checkout, not beside a
+linked worktree. No runtime archives are committed.
 The exact input folder is removed after a known finished/refused run; an unknown
 outcome retains it and makes the next clean-tree check fail closed.
 An existing input path, including an ignored or empty directory, is never adopted

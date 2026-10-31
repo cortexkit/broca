@@ -20,11 +20,18 @@ command -v ck >/dev/null || {
 mkdir -p target/scratch
 logs="$(mktemp -d "$root/target/scratch/prepush.XXXXXX")"
 candidate="$(git rev-parse HEAD)"
+tracked_inputs="$(git ls-files -- prepush-inputs)"
+if [[ -n "$tracked_inputs" ]]; then
+  printf 'prepush: NOT-RUN: generated prepush-inputs paths must not be tracked:\n%s\n' "$tracked_inputs" >&2
+  exit 200
+fi
 if [[ -n "$(git status --porcelain)" ]]; then
   echo 'prepush: NOT-RUN fast: commit the candidate and start from a clean worktree' >&2
   exit 1
 fi
-checkouts="${BROCA_PREPUSH_LANE_POOL:-$(dirname "$root")/broca-prepush-lanes}"
+# Side worktrees belong in the scratch project area, never in core's worker pool.
+checkout_id="$(basename "$root")-$(python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:12])' "$root")"
+checkouts="${BROCA_PREPUSH_LANE_POOL:-$HOME/Work/Projects/CortexKit-scratch/broca-prepush-lanes/$checkout_id}"
 mkdir -p "$checkouts"
 names=() pids=() results=() durations=() requests=()
 started=$SECONDS
