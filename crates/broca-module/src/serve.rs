@@ -1386,6 +1386,10 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             held_calls: state.held_calls,
         },
         State::Paused => RunStatusResponse::Paused {
+            resume_not_before_ms: state
+                .account_limit_pause
+                .as_ref()
+                .map(|pause| pause.resume_not_before_ms),
             auth_selection,
             pause_reason: state
                 .pause_reason
@@ -1393,6 +1397,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
                     matches!(
                         reason,
                         broca_protocol::PauseReason::Restart
+                            | broca_protocol::PauseReason::AccountLimit
                             | broca_protocol::PauseReason::ToolHeld
                     )
                 })

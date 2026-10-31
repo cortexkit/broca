@@ -232,6 +232,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // block refuses boot by name, like the sections above; without one, both stay off.
     let anthropic_fallbacks = broca_module_serve::config::AnthropicFallbackConfig::load_default()
         .map_err(ServeIoError)?;
+    let account_limit_pause = broca_module_serve::config::AccountLimitPauseConfig::load_default()
+        .map_err(ServeIoError)?;
     let consumer_routes = ConsumerRoutes::resolve(
         std::env::var(broca_module_serve::consumer_routes::TOOL_MODULE_ENV)
             .ok()
@@ -450,6 +452,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // Both content-filter fallback switches, read above with the other early config so the
     // refusal mapping can take its own switch from the same block.
     executor_impl = executor_impl.with_anthropic_fallbacks(anthropic_fallbacks);
+    executor_impl = executor_impl.with_account_limit_pause(account_limit_pause.enabled);
     let charge_basis_table = Arc::new(ChargeBasisTable::load_default_path().map_err(ServeIoError)?);
     if let Some(notice) = charge_basis_table.ignored_version_notice() {
         tracing::warn!(target: "billing", "{notice}");
@@ -2942,6 +2945,7 @@ mod executor {
         /// The operator switches and refusal-resend model mapping for Anthropic OAuth runs.
         /// Consulted only at admission; a resume keeps its recorded policy. Both switches default off.
         anthropic_fallbacks: broca_module_serve::config::AnthropicFallbackConfig,
+        account_limit_pause: bool,
         /// Each session's pinned `cc_version` suffix once computed in this process (`None` when
         /// its WAL could not be read), so the WAL is read for it at most once per session.
         cc_suffix_memo: Arc<std::sync::Mutex<std::collections::HashMap<String, Option<String>>>>,
@@ -3023,6 +3027,7 @@ mod executor {
                 routing: None,
                 claude_code_install_id: None,
                 anthropic_fallbacks: Default::default(),
+                account_limit_pause: false,
                 cc_suffix_memo: Default::default(),
                 cc_suffix_wal_bytes: Default::default(),
                 cc_prompt_memo: Default::default(),
@@ -3167,6 +3172,11 @@ mod executor {
             config: broca_module_serve::config::AnthropicFallbackConfig,
         ) -> Self {
             self.anthropic_fallbacks = config;
+            self
+        }
+
+        pub fn with_account_limit_pause(mut self, enabled: bool) -> Self {
+            self.account_limit_pause = enabled;
             self
         }
 
@@ -4606,6 +4616,7 @@ mod executor {
             // the value is already durable). Mock stays None; a real run carries the
             // method-qualified vault credential id.
             let mut control = job.control;
+            control.account_limit_pause = self.account_limit_pause;
             control.hook_plane = self.hook_plane();
             // Module subscribers source ordinary AssistantMessage/ToolCall/ToolResult units from
             // the durable WAL projector. The actor's live-output task discards those same units,
@@ -6378,6 +6389,14 @@ mod executor {
                     true,
                 ),
                 (
+                    "account-limit pause",
+                    run_outcome(
+                        RunFinishReason::Interrupted,
+                        Some(PauseReason::AccountLimit),
+                    ),
+                    false,
+                ),
+                (
                     "terminal error",
                     run_outcome(RunFinishReason::Error, None),
                     true,
@@ -6409,8 +6428,7 @@ mod executor {
                 ),
             ];
 
-            // PauseReason currently has no non-auth variant. TransformUnavailable is the
-            // other resumable outcome and is represented by a finish reason with paused=None.
+            // An account-limit pause does not authorize a vault auth-failure report.
             for (name, outcome, expected) in cases {
                 assert_eq!(should_check_wire_auth(&outcome), expected, "{name}");
             }

@@ -977,6 +977,8 @@ async fn drive_socket(
         Err(UpgradeFailure::AccountLimit(status, error)) => {
             trace.http_status = Some(status);
             trace.account_observation.limit = Some(broca_protocol::AttemptAccountLimit {
+                disposition: broca_protocol::provider::AccountLimitDisposition::ACCOUNT,
+                observed_at_ms: clock.now_ms(),
                 resets_at_ms: error.resets_at_ms,
                 resets_at_source: error.resets_at_source.clone(),
                 limit_window: error.limit_window.clone(),
@@ -1315,11 +1317,20 @@ pub(super) fn wrapped_error(raw: &[u8], trace: &mut AttemptTrace) -> Option<Atte
     trace.wrapped_error_frame = Some(Box::new(WrappedErrorFrame::read(status, &value)));
     let error = classify_http_error(status, &text, retry, None);
     let error = classify_chatgpt_upstream_key_rejection(family, status, &text, error);
-    let error =
-        classify_account_limit_exhausted(family, status, &headers, &text, SystemTime::now(), error);
+    let observed_at_ms = now_millis();
+    let error = classify_account_limit_exhausted(
+        family,
+        status,
+        &headers,
+        &text,
+        UNIX_EPOCH + Duration::from_millis(observed_at_ms),
+        error,
+    );
     trace.http_status = Some(status);
     if error.is_account_limit_exhausted() {
         trace.account_observation.limit = Some(broca_protocol::AttemptAccountLimit {
+            disposition: broca_protocol::provider::AccountLimitDisposition::ACCOUNT,
+            observed_at_ms,
             resets_at_ms: error.resets_at_ms,
             resets_at_source: error.resets_at_source.clone(),
             limit_window: error.limit_window.clone(),

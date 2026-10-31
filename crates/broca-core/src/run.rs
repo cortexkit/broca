@@ -630,6 +630,8 @@ pub struct RunControl {
     /// Clock shared with the coordinator's expiry decisions, used for `RunStarted`,
     /// `RunFinished` and `RunPaused` timestamps. Unset uses the system clock.
     pub clock: Option<crate::Clock>,
+    /// Operator consent frozen only when a fresh episode is admitted; resumes use its WAL policy.
+    pub account_limit_pause: bool,
     /// Immediate cancellation: abort the model stream and stop dispatch, closing the batch
     /// under the existing at-most-once rules before finishing `Cancelled`. `None` disables
     /// this signal. Boundary cancellation uses the shared `steer` inbox instead, so it can
@@ -832,6 +834,7 @@ impl Default for RunControl {
             #[cfg(all(test, feature = "test-clock"))]
             approval_wait_probe: None,
             clock: None,
+            account_limit_pause: false,
             cancel: None,
             compaction_plane: None,
             compaction_views: None,
@@ -3538,6 +3541,17 @@ where
     A: ApprovalPolicy,
 {
     held_prompt::release_read_metadata(&mut prior);
+    let account_limit_pause_enabled = if is_resume && !append_episode {
+        prior
+            .run_config
+            .as_ref()
+            .is_some_and(|config| config.account_limit_pause)
+    } else {
+        control.account_limit_pause
+    };
+    let mut account_limit_replay = (is_resume && !append_episode)
+        .then(|| prior.account_limit_pause.clone())
+        .flatten();
     // The session's client-side refusal-fallback schedule as replay left it (see
     // `crate::refusal_fallback`). A fresh episode applies the admission rules to it once its
     // `RunStarted` is durable; a resumed one already has them applied by replay.
@@ -4632,6 +4646,7 @@ where
                     let _ = send(
                         out,
                         OutputEvent::Control(ControlUnit::Paused {
+                            resume_not_before_ms: None,
                             run_id: resolved_run_id.clone(),
                             reason: PauseReason::ToolHeld,
                             error: None,
@@ -4716,7 +4731,10 @@ where
             // terminal). Surface the still-paused run and return without sealing it, so
             // a later re-auth resume still sees the pause.
             ReplayResolution::AuthRequired {
-                reason, pending, ..
+                reason,
+                pending,
+                error,
+                ..
             } => {
                 // The last episode is PAUSED awaiting re-auth. A CANCEL while paused WINS
                 // (constraint: a user cancelling a paused-for-auth run wants it gone, not
@@ -4748,6 +4766,42 @@ where
                 // from the reconstructed state and fall through to the loop, exactly like
                 // Resume, writing NO new RunStarted (the run is the same one, not a new
                 // episode).
+                if reason == PauseReason::AccountLimit
+                    && control.auth_selection.as_ref().is_some_and(|selection| {
+                        Some(selection)
+                            != prior
+                                .run_config
+                                .as_ref()
+                                .and_then(|config| config.auth_selection.as_ref())
+                    })
+                {
+                    let error = crate::account_limit_pause::selection_changed_error();
+                    control.close_steers();
+                    let _ = send(
+                        out,
+                        OutputEvent::Control(ControlUnit::Error {
+                            error: error.clone().into(),
+                        }),
+                    )
+                    .await;
+                    let (summary, last_fsynced_seq) = finish_run(
+                        writer,
+                        control,
+                        out,
+                        &resolved_run_id,
+                        RunFinishReason::Interrupted,
+                        prior.completed_steps,
+                        prior.usage,
+                        prior.retries_used,
+                        Some(error),
+                        prior_last_step_finish_reason,
+                    )
+                    .await?;
+                    if let Some(projector) = projector {
+                        projector.enqueue_terminal(last_fsynced_seq);
+                    }
+                    return Ok(summary);
+                }
                 let account_limit_ready = reason == PauseReason::AccountLimit
                     && prior.account_limit_pause.as_ref().is_some_and(|pause| {
                         control
@@ -4763,9 +4817,17 @@ where
                     let _ = send(
                         out,
                         OutputEvent::Control(ControlUnit::Paused {
+                            resume_not_before_ms: prior
+                                .account_limit_pause
+                                .as_ref()
+                                .map(|pause| pause.resume_not_before_ms),
                             run_id: resolved_run_id.clone(),
                             reason,
-                            error: None,
+                            error: if reason == PauseReason::AccountLimit {
+                                error.map(|error| (*error).into())
+                            } else {
+                                None
+                            },
                         }),
                     )
                     .await;
@@ -5042,7 +5104,7 @@ where
             session: req.session.clone(),
             config: remember_warm_config(
                 RunConfig {
-                    account_limit_pause: false,
+                    account_limit_pause: account_limit_pause_enabled,
                     turn_directives_v1: req.directives.clone(),
                     render_tags,
                     computed_tags,
@@ -5739,7 +5801,24 @@ where
             account_ref: run_account_ref.clone(),
         });
         let mut model_opts = None;
-        if let Some(runtime) = &compaction_runtime {
+        if account_limit_replay.is_some() {
+            if let Some(state) = compaction_state.as_ref() {
+                // Waiting for an account reset must not adopt a newer compaction view or call the
+                // compaction provider again.
+                let mut request = crate::compaction::BoundaryRequest::default();
+                request
+                    .refresh_checked(&opts, state, &system_positions, |view| {
+                        provider.try_render_request(view)
+                    })
+                    .map_err(|error| RunError::Wal(error.to_string()))?;
+                notice_request_bytes = request.bytes;
+                model_opts = Some(Arc::new(request.into_options()));
+            }
+        }
+        if let Some(runtime) = compaction_runtime
+            .as_ref()
+            .filter(|_| account_limit_replay.is_none())
+        {
             // A legacy WAL mints its lineage on the first append. StepStarted is only
             // queued above, so wait for its barrier before reading the writer's identity.
             // A WAL backend that still cannot identify this lineage cannot host compaction.
@@ -6085,8 +6164,10 @@ where
         let journaled_attempts = writer
             .is_overhaul()
             .then(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let last_account_limit_attempt = std::sync::Mutex::new(None);
         let record_attempt = |attempt: broca_protocol::ModelAttempt| -> AttemptFuture<'_> {
             let journaled_attempts = &journaled_attempts;
+            let last_account_limit_attempt = &last_account_limit_attempt;
             step_attempts.fetch_max(
                 attempt.attempt.saturating_add(1),
                 std::sync::atomic::Ordering::Relaxed,
@@ -6116,10 +6197,42 @@ where
                     .as_ref()
                     .and_then(|recorded| recorded.lock().unwrap().remove(&attempt.attempt));
                 if let Some(seq) = journaled_seq {
+                    if account_limit_pause_enabled {
+                        *last_account_limit_attempt.lock().unwrap() =
+                            attempt.account_observation.limit.as_ref().map(|_| {
+                                crate::account_limit_pause::FailedAccountLimitAttempt {
+                                    seq,
+                                    attempt: attempt.clone(),
+                                }
+                            });
+                    }
                     // The physical-send journal already wrote the billing terminal. Keep the
                     // account reporter for progress, but never append a second settlement here.
                     if let Some(reporter) = &control.account_reporter {
                         reporter.attempt_recorded(writer.lineage_id(), seq, &attempt);
+                    }
+                    return Ok(());
+                }
+                if account_limit_pause_enabled {
+                    let seq = writer
+                        .record(crate::account_limit_pause::attempt_record(
+                            step_id,
+                            attempt.clone(),
+                            true,
+                        ))
+                        .into_result()?;
+                    if let Some(reporter) = &control.account_reporter {
+                        reporter.attempt_recorded(writer.lineage_id(), seq, &attempt);
+                    }
+                    *last_account_limit_attempt.lock().unwrap() =
+                        attempt.account_observation.limit.as_ref().map(|_| {
+                            crate::account_limit_pause::FailedAccountLimitAttempt {
+                                seq,
+                                attempt: attempt.clone(),
+                            }
+                        });
+                    if needs_sync {
+                        writer.sync().await?;
                     }
                     return Ok(());
                 }
@@ -6289,6 +6402,19 @@ where
                     step_context.max_output_tokens = Some(cap);
                 }
             }
+            if let Some(pause) = account_limit_replay.take() {
+                use sha2::Digest;
+                let bytes = provider
+                    .try_render_request(&step_opts)
+                    .map_err(|error| RunError::Wal(error.message))?;
+                if pause.failed_step != step_id
+                    || pause.request_body_len != bytes.len() as u64
+                    || pause.request_body_sha256 != format!("{:x}", sha2::Sha256::digest(&bytes))
+                {
+                    terminal_error = Some(crate::account_limit_pause::request_changed_error());
+                    break 'steps RunFinishReason::Interrupted;
+                }
+            }
             let hook_channel = writer
                 .is_overhaul()
                 .then(tokio::sync::mpsc::unbounded_channel);
@@ -6348,6 +6474,7 @@ where
                     model_step,
                     &mut hook_requests,
                     &mut AttemptJournal {
+                        account_limit_pause: account_limit_pause_enabled,
                         writer,
                         seal: control.shutdown_seal.as_ref(),
                         template,
@@ -6970,6 +7097,45 @@ where
                         completed_steps,
                         total_usage,
                         total_retries_used,
+                    )
+                    .await;
+                }
+                let account_limit = if account_limit_pause_enabled {
+                    control.now_ms().and_then(|paused_at_ms| {
+                        last_account_limit_attempt
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .and_then(|attempt| {
+                                attempt.pause(
+                                    step_id,
+                                    paused_at_ms,
+                                    &error,
+                                    control.auth_selection.as_ref().or_else(|| {
+                                        prior
+                                            .run_config
+                                            .as_ref()
+                                            .and_then(|config| config.auth_selection.as_ref())
+                                    }),
+                                )
+                            })
+                    })
+                } else {
+                    None
+                };
+                if let Some(pause) = account_limit {
+                    return pause_run_impl(
+                        writer,
+                        out,
+                        control,
+                        resolved_run_id.clone(),
+                        PauseReason::AccountLimit,
+                        Some(error),
+                        Some(pause),
+                        completed_steps,
+                        total_usage,
+                        total_retries_used,
+                        None,
                     )
                     .await;
                 }
@@ -7867,6 +8033,7 @@ async fn pause_run_impl(
     run_id: RunId,
     reason: broca_protocol::PauseReason,
     error: Option<ProviderError>,
+    account_limit: Option<Box<broca_wal::AccountLimitPause>>,
     steps: u64,
     usage: Usage,
     retries_used: u32,
@@ -7936,9 +8103,15 @@ async fn pause_run_impl(
         return Ok(summary);
     }
 
+    let resume_not_before_ms = account_limit
+        .as_ref()
+        .map(|pause| pause.resume_not_before_ms);
     writer.record(WalRecord::RunPaused {
-        account_limit: None,
-        ts_ms: control.now_ms(),
+        ts_ms: account_limit
+            .as_ref()
+            .map(|pause| pause.paused_at_ms)
+            .or_else(|| control.now_ms()),
+        account_limit,
         run_id: run_id.clone(),
         reason,
         error: error.clone(),
@@ -7947,6 +8120,7 @@ async fn pause_run_impl(
     let _ = send(
         out,
         OutputEvent::Control(ControlUnit::Paused {
+            resume_not_before_ms,
             run_id,
             reason,
             error: error.map(SharedProviderError::from),
@@ -8933,6 +9107,7 @@ impl PendingAttempt {
 }
 
 struct AttemptJournal<'a> {
+    account_limit_pause: bool,
     writer: &'a WalHandle,
     seal: Option<&'a crate::ShutdownSeal>,
     template: broca_wal::record::AttemptReservation,
@@ -9117,8 +9292,11 @@ impl AttemptJournal<'_> {
                     ..response.map(|response| *response).unwrap_or_default()
                 };
                 let ordinal = attempt.attempt;
-                let mut record =
-                    WalRecord::model_attempt_finished(pending.reservation.step_id, attempt);
+                let mut record = crate::account_limit_pause::attempt_record(
+                    pending.reservation.step_id,
+                    attempt,
+                    self.account_limit_pause,
+                );
                 if let WalRecord::ModelAttemptFinished {
                     attempt_id,
                     reservation,
@@ -11974,6 +12152,7 @@ mod tests {
         let hook = Arc::new(ChannelAttemptHook(tx));
         let recorded = Default::default();
         let mut journal = AttemptJournal {
+            account_limit_pause: false,
             writer: &writer,
             seal: Some(&seal),
             template: attempt_template(),
@@ -12131,6 +12310,7 @@ mod tests {
         let recorded = Default::default();
         let seal = crate::ShutdownSeal::new();
         let mut journal = AttemptJournal {
+            account_limit_pause: false,
             writer: &writer,
             seal: Some(&seal),
             template: attempt_template(),
@@ -12179,6 +12359,7 @@ mod tests {
             &RunControl::default(),
             RunId("billing-run".into()),
             broca_protocol::PauseReason::AuthRequired,
+            None,
             None,
             0,
             Usage::default(),
@@ -12255,6 +12436,7 @@ mod tests {
         let hook = ChannelAttemptHook(tx);
         let recorded = Default::default();
         let mut journal = AttemptJournal {
+            account_limit_pause: false,
             writer: &writer,
             seal: None,
             template: attempt_template(),
@@ -12306,6 +12488,7 @@ mod tests {
         let hook = ChannelAttemptHook(tx);
         let recorded = Default::default();
         let mut journal = AttemptJournal {
+            account_limit_pause: false,
             writer: &writer,
             seal: None,
             template: attempt_template(),
@@ -12399,6 +12582,7 @@ mod tests {
         let hook = ChannelAttemptHook(tx);
         let recorded = Default::default();
         let mut journal = AttemptJournal {
+            account_limit_pause: false,
             writer: &writer,
             seal: None,
             template: attempt_template(),
@@ -12483,6 +12667,7 @@ mod tests {
         assert!(writer.is_overhaul());
         let recorded = Default::default();
         let mut journal = AttemptJournal {
+            account_limit_pause: false,
             writer: &writer,
             seal: None,
             template,
@@ -12697,6 +12882,7 @@ mod tests {
         let proceed = Arc::new(Notify::new());
         let recorded = Default::default();
         let mut journal = AttemptJournal {
+            account_limit_pause: false,
             writer: &writer,
             seal: None,
             template: attempt_template(),
@@ -12758,6 +12944,7 @@ mod tests {
         let hook = ChannelAttemptHook(tx);
         let recorded = Default::default();
         let mut journal = AttemptJournal {
+            account_limit_pause: false,
             writer: &writer,
             seal: Some(&seal),
             template: attempt_template(),
@@ -18602,7 +18789,7 @@ async fn pause_run(
     retries: u32,
 ) -> Result<RunSummary, RunError> {
     pause_run_impl(
-        writer, out, control, run_id, reason, error, steps, usage, retries, None,
+        writer, out, control, run_id, reason, error, None, steps, usage, retries, None,
     )
     .await
 }
@@ -18641,6 +18828,7 @@ async fn pause_approval(
         } else {
             PauseReason::Restart
         },
+        None,
         None,
         steps,
         usage,

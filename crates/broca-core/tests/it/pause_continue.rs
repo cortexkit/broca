@@ -24,6 +24,10 @@ use broca_wal::{FileWal, RunConfig, Wal, WalRecord};
 use serde_json::json;
 use tokio::sync::mpsc;
 
+#[cfg(feature = "test-clock")]
+#[path = "pause_continue/account_limit.rs"]
+mod account_limit;
+
 #[tokio::test]
 async fn legacy_restart_pause_keeps_its_existing_auth_refreeze_behavior() {
     let root = broca_test_support::scratch_root().join("restart-auth-refreeze-compatibility");

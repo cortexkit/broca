@@ -1297,6 +1297,8 @@ fn account_limit_exhausted_matches_routings_pinned_body() {
         "observed_at_ms": NOW + 1_000,
     });
     let limit = AttemptAccountLimit {
+        disposition: broca_protocol::provider::AccountLimitDisposition::ACCOUNT,
+        observed_at_ms: (NOW + 1_000) as u64,
         resets_at_ms: Some((NOW + 3_600_000) as u64),
         resets_at_source: Some("header".into()),
         limit_window: Some("seven_day".into()),

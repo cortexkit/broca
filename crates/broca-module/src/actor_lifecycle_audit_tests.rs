@@ -298,6 +298,7 @@ impl Fixture {
         let (self_tx, rx) = mpsc::channel(64);
         let (terminal_tx, terminal_rx) = mpsc::unbounded_channel();
         let mut actor = LineageActor {
+            account_limit_timer: None,
             ceiling_drain_held: false,
             compaction_watch: Default::default(),
             admitting_session_class: None,

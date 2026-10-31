@@ -678,7 +678,9 @@ fn paused_run_projects_pause_as_terminal() {
             run_id,
             reason,
             error,
+            resume_not_before_ms,
         } => {
+            assert_eq!(*resume_not_before_ms, None);
             assert_eq!(run_id.0, "r1");
             assert_eq!(*reason, PauseReason::AuthRequired);
             assert_eq!(error.as_ref().map(|e| e.message.as_str()), Some("expired"));

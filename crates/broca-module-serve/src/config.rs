@@ -488,3 +488,73 @@ mod state_format_config_tests {
         );
     }
 }
+/// Root-level consent for writing timed account-limit recovery records. Absence keeps the
+/// legacy terminal-error path and does not raise the WAL reader floor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AccountLimitPauseConfig {
+    pub enabled: bool,
+}
+
+impl AccountLimitPauseConfig {
+    pub fn load_default() -> Result<Self, String> {
+        use crate::config_home::ConfigHome;
+        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
+        {
+            ConfigHome::Resolved { path, .. } => match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    Self::parse(&text).map_err(|error| format!("{}: {error}", path.display()))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+                Err(error) => Err(format!(
+                    "read account_limit_pause from {}: {error}",
+                    path.display()
+                )),
+            },
+            ConfigHome::Unresolvable => Ok(Self::default()),
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self, String> {
+        #[derive(serde::Deserialize)]
+        struct File {
+            #[serde(default)]
+            account_limit_pause: bool,
+        }
+        let text = crate::cache_routing::strip_trailing_commas(
+            &crate::cache_routing::strip_jsonc_comments(text),
+        );
+        let file: File = serde_json::from_str(&text)
+            .map_err(|error| format!("parse account_limit_pause: {error}"))?;
+        Ok(Self {
+            enabled: file.account_limit_pause,
+        })
+    }
+}
+
+#[cfg(test)]
+mod account_limit_pause_config_tests {
+    use super::AccountLimitPauseConfig;
+
+    #[test]
+    fn account_limit_pause_requires_explicit_boolean_consent() {
+        for text in [
+            "{}",
+            r#"{"account_limit_pause":false}"#,
+            r#"{"other":true}"#,
+        ] {
+            assert!(!AccountLimitPauseConfig::parse(text).unwrap().enabled);
+        }
+        assert!(
+            AccountLimitPauseConfig::parse(r#"{"account_limit_pause":true}"#)
+                .unwrap()
+                .enabled
+        );
+        for value in ["null", "1", "\"true\"", "{}", "[]"] {
+            assert!(AccountLimitPauseConfig::parse(&format!(
+                r#"{{"account_limit_pause":{value}}}"#
+            ))
+            .unwrap_err()
+            .contains("account_limit_pause"));
+        }
+    }
+}

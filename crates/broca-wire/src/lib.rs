@@ -1951,6 +1951,9 @@ pub enum RunStatusResponse {
     Paused {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth_selection: Option<String>,
+        /// Absolute send floor from the durable account-limit pause, absent on other pauses.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume_not_before_ms: Option<u64>,
         /// Explicit restart-pause discriminator; authentication-pause replies omit this field to preserve their existing wire shape.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pause_reason: Option<broca_protocol::OpenPauseReason>,
@@ -4859,6 +4862,7 @@ mod tests {
         assert_eq!(
             decoded,
             RunStatusResponse::Paused {
+                resume_not_before_ms: None,
                 held_calls: Vec::new(),
                 auth_selection: None,
                 title: None,
@@ -5439,6 +5443,7 @@ mod restart_wire_tests {
     fn restart_pause_status_and_invalid_policy_match_goldens() {
         scope_refusal_golden::assert_golden(
             RunStatusResponse::Paused {
+                resume_not_before_ms: None,
                 held_calls: Vec::new(),
                 auth_selection: None,
                 title: None,

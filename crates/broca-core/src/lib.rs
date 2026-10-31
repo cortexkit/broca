@@ -170,6 +170,8 @@ pub use wal_writer::{
     SESSION_PROJECTION_INCOMPLETE,
 };
 
+mod account_limit_pause;
+pub use account_limit_pause::account_limit_stale_resets;
 pub mod keep_warm;
 pub mod keep_warm_wait;
 mod plan_system;

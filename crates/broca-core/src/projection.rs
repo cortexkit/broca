@@ -814,12 +814,16 @@ fn project_control_record<S: ControlProjectionSink>(
             run_id,
             reason,
             error,
+            account_limit,
             ..
         } if *reason != broca_protocol::PauseReason::ToolHeld => {
             push!(
                 ControlUnit::Paused {
                     run_id: run_id.clone(),
                     reason: *reason,
+                    resume_not_before_ms: account_limit
+                        .as_ref()
+                        .map(|pause| pause.resume_not_before_ms),
                     error: error.clone().map(SharedProviderError::from),
                 },
                 LiveEvent::RunPaused(live::RunEnded::new(run_id.0.clone(), reason.as_str()))
