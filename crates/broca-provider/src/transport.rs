@@ -6002,6 +6002,10 @@ mod tests {
         include!("transport_response_evidence_tests.rs");
     }
 
+    mod attempt_cancellation_tests {
+        include!("transport_attempt_cancellation_tests.rs");
+    }
+
     mod context_overflow {
         include!("transport_context_overflow_tests.rs");
     }
@@ -8104,11 +8108,22 @@ mod tests {
                 ..Default::default()
             };
             let cancel_when_written = async {
-                if exit == "cancel" {
-                    server.written.notified().await;
-                    cancel.cancel();
+                if matches!(exit, "cancel" | "watchdog") {
+                    // Keep paused time from advancing while real socket and WAL I/O run.
+                    while server.request_bodies().is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                    if exit == "cancel" {
+                        cancel.cancel();
+                    } else {
+                        tokio::time::advance(Duration::from_millis(100)).await;
+                        tokio::time::resume();
+                    }
                 }
             };
+            if exit == "watchdog" {
+                tokio::time::pause();
+            }
             let (frames, ()) = tokio::join!(
                 run_recorded_attempt(&root, &provider, control, recording),
                 cancel_when_written
@@ -8124,6 +8139,27 @@ mod tests {
                 )),
                 "{exit}"
             );
+            if matches!(exit, "cancel" | "watchdog") {
+                assert_eq!(server.request_bodies().len(), 1, "{exit}");
+                assert!(
+                    !frames.iter().any(|frame| matches!(
+                        frame.record,
+                        broca_wal::WalRecord::AttemptReleased { .. }
+                    )),
+                    "a sent attempt must not be released as unsent: {exit}"
+                );
+                assert!(
+                    frames.iter().any(|frame| matches!(&frame.record,
+                        broca_wal::WalRecord::ModelAttemptFinished { envelope: Some(envelope), .. }
+                        if envelope.sent == broca_wal::record::AttemptSent::Yes
+                    )),
+                    "{exit}"
+                );
+                assert!(frames.iter().any(|frame| matches!(&frame.record,
+                    broca_wal::WalRecord::RunFinished { reason, .. }
+                    if *reason == if exit == "cancel" { broca_protocol::RunFinishReason::Cancelled } else { broca_protocol::RunFinishReason::Interrupted }
+                )), "{exit}");
+            }
             std::fs::remove_dir_all(root).unwrap();
         }
     }
