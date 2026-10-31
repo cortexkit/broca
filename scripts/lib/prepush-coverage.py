@@ -16,8 +16,9 @@ KIT_SKIP = re.compile(r'\s*SKIP ([a-z_]+) \(requires ([^;\n]+); missing ([^)\n]+
 # broca does not declare. Legacy retention_honoured still has to execute.
 # StepEvents and UserCommands are also undeclared. Pin each optional case's full
 # requires/missing sets from kit 0.15.40, not its group prefix or enclosing test.
-# This suite's default subject omits media, adopt, run-cause and optional adapter
-# capabilities. session_retention_pending_durable and user_commands_outcome_unknown
+# This suite's subject also omits adopt, run_cause, max_output_tokens,
+# host_metadata_change and hold_context_ceiling.
+# session_retention_pending_durable and user_commands_outcome_unknown
 # also lack their ReleasePending/UserCommandForwarded kill_at hooks. Only those
 # exact missing-hook combinations are allowed, not a general kill skip.
 KIT_SKIP_EXPECTATIONS = {
@@ -32,12 +33,12 @@ KIT_SKIP_EXPECTATIONS = {
     'session_retention_parent_cannot_release': ('session_retention, queue, transcript_reads, run_ops', 'session_retention'),
     'session_retention_release_idempotent': ('session_retention, queue, transcript_reads, run_ops', 'session_retention'),
     'session_retention_deletion_observable': ('session_retention, queue, transcript_reads, run_ops', 'session_retention'),
-    'session_retention_media_deleted': ('session_retention, queue, transcript_reads, run_ops, attachments', 'session_retention, attachments'),
+    'session_retention_media_deleted': ('session_retention, queue, transcript_reads, run_ops, attachments', 'session_retention'),
     'session_retention_active_never_deleted': ('session_retention, queue, transcript_reads, run_ops, advance_retention_clock', 'session_retention'),
     'session_retention_backup_none_refused': ('session_retention, queue, transcript_reads, run_ops', 'session_retention'),
     'session_retention_dumps_preserved': ('session_retention, queue, transcript_reads, run_ops', 'session_retention'),
     'session_retention_runner_replaced_once': ('session_retention, queue, transcript_reads, run_ops', 'session_retention'),
-    'session_retention_pending_durable': ('session_retention, queue, transcript_reads, run_ops, attachments, kill_at:ReleasePending', 'session_retention, attachments, kill_at:ReleasePending'),
+    'session_retention_pending_durable': ('session_retention, queue, transcript_reads, run_ops, attachments, kill_at:ReleasePending', 'session_retention, kill_at:ReleasePending'),
     'step_events_one_per_recorded_step': ('step_events, queue, transcript_reads', 'step_events'),
     'step_events_match_durable_position': ('step_events, queue, transcript_reads', 'step_events'),
     'step_events_after_durability': ('step_events, queue, transcript_reads', 'step_events'),
@@ -53,27 +54,6 @@ KIT_SKIP_EXPECTATIONS = {
     'user_commands_cutoff_before_forward': ('user_commands, queue, run_ops', 'user_commands'),
     'max_output_tokens_caps_response': ('max_output_tokens, run_usage, queue, transcript_reads, run_ops', 'max_output_tokens'),
     'read_stable_across_host_metadata_change': ('queue, transcript_reads, host_metadata_change', 'host_metadata_change'),
-    'attachments_lifecycle': ('attachments, transcript_reads, queue, run_ops', 'attachments'),
-    'attachments_restart_gone': ('attachments, transcript_reads, queue, run_ops', 'attachments'),
-    'attachments_chunk_cap': ('attachments, transcript_reads, queue, run_ops', 'attachments'),
-    'attachments_commit_size': ('attachments, transcript_reads, queue, run_ops', 'attachments'),
-    'attachments_model_unsupported': ('attachments, transcript_reads, queue, run_ops', 'attachments'),
-    'attachments_model_mime': ('attachments, transcript_reads, queue, run_ops', 'attachments'),
-    'attachments_frozen_model': ('attachments, transcript_reads, queue, run_ops, steer, hold_tool_calls', 'attachments'),
-    'attachments_send_uncommitted': ('attachments, transcript_reads, queue, run_ops', 'attachments'),
-    'attachments_send_unknown': ('attachments, transcript_reads, queue, run_ops', 'attachments'),
-    'attachments_send_other_session': ('attachments, transcript_reads, queue, run_ops', 'attachments'),
-    'attachments_upload_other_session_status': ('attachments, transcript_reads, queue, run_ops', 'attachments'),
-    'attachments_upload_other_session_commit': ('attachments, transcript_reads, queue, run_ops', 'attachments'),
-    'attachments_send_gone': ('attachments, transcript_reads, queue, run_ops', 'attachments'),
-    'attachments_default_read': ('attachments, transcript_reads, queue, run_ops', 'attachments'),
-    'attachments_tool_result': ('attachments, transcript_reads, queue, run_ops', 'attachments'),
-    'attachments_media_unreferenced': ('attachments, transcript_reads, queue, run_ops', 'attachments'),
-    'attachments_media_other_session': ('attachments, transcript_reads, queue, run_ops', 'attachments'),
-    'attachments_media_read_admission': ('attachments, transcript_reads, queue, run_ops', 'attachments'),
-    'attachments_admission': ('attachments, transcript_reads, queue, run_ops', 'attachments'),
-    'attachments_plan_sender': ('attachments, delivery_order, transcript_reads, queue, run_ops', 'attachments'),
-    'attachments_retention': ('attachments, advance_retention_clock, transcript_reads, queue, run_ops', 'attachments'),
     'run_context_ceiling_wait_is_not_a_stall': ('queue, transcript_reads, hold_context_ceiling', 'hold_context_ceiling'),
     'adopt_binds_owner_without_a_run': ('adopt, transcript_reads', 'adopt'),
     'adopt_exact_repeat_replays_reply': ('adopt, transcript_reads', 'adopt'),

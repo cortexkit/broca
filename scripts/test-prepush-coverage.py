@@ -12,7 +12,8 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 KIT_CASE = ('broca-module-serve::llm_runner_conformance', 'ck_broca_passes_the_llm_runner_conformance_suite')
-# Captured conformance output, independently reviewed against kit 0.15.40 metadata.
+# Kit 0.15.40 transcript cases; the two per-session media cases use the missing
+# sets after attachments becomes declared.
 KIT_SKIPS = '''SKIP session_retention_honoured (requires session_retention, queue, transcript_reads, run_ops; missing session_retention)
 SKIP session_retention_days_and_archive (requires session_retention, queue, transcript_reads, run_ops, advance_retention_clock; missing session_retention)
 SKIP session_retention_adopt_policy (requires session_retention, adopt, transcript_reads; missing session_retention, adopt)
@@ -24,12 +25,12 @@ SKIP session_retention_owner_can_release (requires session_retention, queue, tra
 SKIP session_retention_parent_cannot_release (requires session_retention, queue, transcript_reads, run_ops; missing session_retention)
 SKIP session_retention_release_idempotent (requires session_retention, queue, transcript_reads, run_ops; missing session_retention)
 SKIP session_retention_deletion_observable (requires session_retention, queue, transcript_reads, run_ops; missing session_retention)
-SKIP session_retention_media_deleted (requires session_retention, queue, transcript_reads, run_ops, attachments; missing session_retention, attachments)
+SKIP session_retention_media_deleted (requires session_retention, queue, transcript_reads, run_ops, attachments; missing session_retention)
 SKIP session_retention_active_never_deleted (requires session_retention, queue, transcript_reads, run_ops, advance_retention_clock; missing session_retention)
 SKIP session_retention_backup_none_refused (requires session_retention, queue, transcript_reads, run_ops; missing session_retention)
 SKIP session_retention_dumps_preserved (requires session_retention, queue, transcript_reads, run_ops; missing session_retention)
 SKIP session_retention_runner_replaced_once (requires session_retention, queue, transcript_reads, run_ops; missing session_retention)
-SKIP session_retention_pending_durable (requires session_retention, queue, transcript_reads, run_ops, attachments, kill_at:ReleasePending; missing session_retention, attachments, kill_at:ReleasePending)
+SKIP session_retention_pending_durable (requires session_retention, queue, transcript_reads, run_ops, attachments, kill_at:ReleasePending; missing session_retention, kill_at:ReleasePending)
 SKIP step_events_one_per_recorded_step (requires step_events, queue, transcript_reads; missing step_events)
 SKIP step_events_match_durable_position (requires step_events, queue, transcript_reads; missing step_events)
 SKIP step_events_after_durability (requires step_events, queue, transcript_reads; missing step_events)
@@ -242,10 +243,27 @@ class CoverageGuards(unittest.TestCase):
                          {'executed': 1, 'portable_executed': 1, 'clock': 'PASS'})
 
     def test_reviewed_optional_kit_cases_match_the_independent_transcript(self):
-        lines = KIT_SKIPS.splitlines()
-        self.assertEqual(len(lines), 66)
+        lines = [line for line in KIT_SKIPS.splitlines() if not line.startswith('SKIP attachments_')]
+        self.assertEqual(len(lines), 45)
         self.assertEqual({line.split()[1] for line in lines}, set(self.helper.KIT_SKIP_EXPECTATIONS))
         for line in lines:
+            with self.subTest(case=line.split()[1]):
+                self.assertEqual(self.audit_kit_skip(line)['portable_executed'], 1)
+
+    def test_attachment_kit_cases_must_execute(self):
+        lines = [line for line in KIT_SKIPS.splitlines() if line.startswith('SKIP attachments_')]
+        self.assertEqual(len(lines), 21)
+        lines += [
+            'SKIP attachments_commit_sha256 (requires attachments, transcript_reads, queue, run_ops; missing attachments)',
+            'SKIP attachments_new_case (requires attachments, transcript_reads, queue, run_ops; missing attachments)',
+        ]
+        for line in lines:
+            with self.subTest(case=line.split()[1]):
+                with self.assertRaisesRegex(ValueError, 'passing fixture skip'):
+                    self.audit_kit_skip(line)
+
+    def test_session_retention_media_skips_keep_the_reduced_missing_sets(self):
+        for line in [KIT_SKIPS.splitlines()[11], KIT_SKIPS.splitlines()[16]]:
             with self.subTest(case=line.split()[1]):
                 self.assertEqual(self.audit_kit_skip(line)['portable_executed'], 1)
 
@@ -303,7 +321,10 @@ class CoverageGuards(unittest.TestCase):
                  line.replace('session_retention, queue,', 'session_retention, queue, queue,'),
                  line.replace('run_ops;', 'run_ops, retention;'),
                  line + ' unrelated output',
-                 KIT_SKIPS.splitlines()[5].replace('missing session_retention', 'missing session_retention, retention')]
+                 KIT_SKIPS.splitlines()[5].replace('missing session_retention', 'missing session_retention, retention'),
+                 KIT_SKIPS.splitlines()[11].replace('missing session_retention', 'missing session_retention, attachments'),
+                 KIT_SKIPS.splitlines()[16].replace('missing session_retention, kill_at:ReleasePending',
+                                                   'missing session_retention, attachments, kill_at:ReleasePending')]
         for invalid in lines:
             with self.subTest(line=invalid):
                 with self.assertRaisesRegex(ValueError, 'passing fixture skip'):
