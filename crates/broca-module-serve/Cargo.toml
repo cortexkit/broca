@@ -98,6 +98,7 @@ clap = { version = "4", features = ["derive"] }
 signal-hook = "0.4"
 
 [dev-dependencies]
+broca-subc = { path = "../broca-subc", features = ["test-clock"] }
 cortexkit-llm-tools = { workspace = true, features = ["test-vectors"] }
 broca-catalog = { path = "../broca-catalog", features = ["test-support"] }
 futures.workspace = true

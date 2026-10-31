@@ -102,6 +102,13 @@ pub trait ProviderHeldRecorder: Send + Sync {
 /// live/paused waiting slot, and returns only the eventual terminal, never interim content.
 #[async_trait]
 pub trait ProviderHeldLifecycle: Send + Sync {
+    /// A deposited result still owned by the waiting slot. Recovery uses this only after
+    /// continuation admission is refused, so recording the provider's answer needs no model
+    /// credentials or renderer. The slot retains it until `terminal_synced`.
+    fn deposited_result(&self, _ctx: &BatchCtx, _reply: &ProviderHeldReply) -> Option<ToolResult> {
+        None
+    }
+
     async fn wait(
         &self,
         ctx: &BatchCtx,

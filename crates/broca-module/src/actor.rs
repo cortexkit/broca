@@ -2813,6 +2813,72 @@ impl<W: WalStore + 'static> LineageActor<W> {
         Ok(())
     }
 
+    /// Admission checkpoints contain coarse episode facts, not a complete replay seed. An
+    /// unfinished episode whose start is below the watermark needs its durable prefix too:
+    /// replaying only its suffix loses run identity, held calls and close-out evidence.
+    /// Both `load_prior_wal_snapshot` and the optional `AdmissionReader` can omit RunStarted;
+    /// a validated bounded checkpoint does not make its suffix a complete recovery log.
+    async fn recovery_records(&self) -> Result<Vec<WalRecord>, String> {
+        let snapshot = self
+            .prior_snapshot
+            .as_ref()
+            .expect("admission snapshot loaded");
+        let needs_prefix = snapshot.base_watermark > 0
+            && snapshot
+                .checkpoint_at_head
+                .last_episode
+                .as_ref()
+                .is_some_and(|episode| {
+                    episode.disposition != EpisodeDisposition::Finished
+                        && !snapshot.tail.iter().any(|frame| {
+                            matches!(&frame.record,
+                        WalRecord::RunStarted { run_id, .. } if run_id == &episode.run_id)
+                        })
+                });
+        if needs_prefix {
+            return self.read_wal_records().await;
+        }
+        Ok(snapshot
+            .tail
+            .iter()
+            .map(|frame| frame.record.clone())
+            .collect())
+    }
+
+    async fn record_refused_held_delivery(&self) -> Result<(), String> {
+        // The failed executor has been joined. It may have written before refusing, so only
+        // the current WAL, not the pre-admission snapshot, can prove a terminal is still owed.
+        let records = self.read_wal_records().await?;
+        let prior = broca_core::replay(&records).map_err(|error| error.to_string())?;
+        let broca_core::ReplayResolution::ProviderHeld {
+            run_id, pending, ..
+        } = &prior.resolution
+        else {
+            return Ok(());
+        };
+        let scope = self
+            .prior_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.checkpoint_at_head.ownership.as_ref())
+            .and_then(|owner| owner.scope.clone());
+        broca_core::resume::sync_deposited_held_results(
+            prior.open_tool_batch.clone(),
+            pending,
+            &broca_core::BatchCtx {
+                batch_id: pending.batch_id.clone().expect("held batch exists"),
+                run_id: run_id.clone(),
+                bind: self.key.clone(),
+                scope,
+                media_capture: None,
+            },
+            self.writer.as_ref().expect("writer live while recovering"),
+            self.executor.provider_held_lifecycle(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     async fn recover_durable_work_inner(&mut self) -> Result<(), String> {
         if !self.pending_cancels.is_empty() && matches!(self.state, RunState::Idle) {
             return self.retry_pending_cancels().await;
@@ -2838,11 +2904,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let episode_pause_reason = episode.pause_reason;
         let episode_input = episode.input.clone();
         let episode_request_identity_digest = episode.request_identity_digest.clone();
-        let tail: Vec<WalRecord> = snapshot
-            .tail
-            .iter()
-            .map(|frame| frame.record.clone())
-            .collect();
+        let tail = self.recovery_records().await?;
+        let episode_open = broca_core::replay::run_is_open(tail.iter(), &episode_run_id);
         let tail_prior = broca_core::replay(&tail).map_err(|error| error.to_string())?;
         if broca_core::resume::provider_held_closing_reason(&tail_prior, tail.iter()).is_some() {
             self.write_interrupted_seal(None, SealCause::CrashOrphan)
@@ -2893,6 +2956,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
             pending, open_held, ..
         } = &tail_resolution
         {
+            if !episode_open {
+                return self.drain_queue_one().await;
+            }
             // A run paused on held calls stays parked, unless a late result for one of them
             // was just deposited: then it resumes into its original batch, whose held call
             // takes the result from its slot.
@@ -2914,7 +2980,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             let mut request = submission_from_config(episode_config, episode_input);
             request.keep_warm = episode_keep_warm;
             request.on_restart = episode_on_restart;
-            return self
+            let resumed = self
                 .start_run(
                     episode_run_id,
                     request,
@@ -2929,8 +2995,40 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     false,
                 )
                 .await
-                .map(|_| ())
-                .map_err(|error| error.to_string());
+                .map(|_| ());
+            return match resumed {
+                Ok(()) => Ok(()),
+                Err(StartRunFailure::Admission(error)) => {
+                    // A refused continuation cannot discard a result the provider already
+                    // delivered. No executor is running now; the actor owns the original batch.
+                    self.record_refused_held_delivery().await?;
+                    let refusal = ProviderError {
+                        class: ErrorClass::Permanent,
+                        message: error.to_string(),
+                        provider_code: Some("held_resume_refused".into()),
+                        provider_details: None,
+                        provider_subcode: None,
+                        refusal: None,
+                        status: None,
+                        retry_after_secs: None,
+                        resets_at_ms: None,
+                        resets_at_source: None,
+                        limit_window: None,
+                        account_ref: None,
+                        credential_id: None,
+                        affordable_max_tokens: None,
+                    };
+                    self.write_interrupted_seal_with_error(
+                        None,
+                        SealCause::CrashOrphan,
+                        Some(refusal),
+                    )
+                    .await?;
+                    self.refresh_admission_view().await?;
+                    self.drain_queue_one().await
+                }
+                Err(error) => Err(error.to_string()),
+            };
         }
 
         if episode_disposition == EpisodeDisposition::Paused
@@ -8176,11 +8274,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             Some(episode)
                 if candidates.contains(&episode.run_id) && episode.cancel_at.is_none() =>
             {
-                let tail: Vec<WalRecord> = snapshot
-                    .tail
-                    .iter()
-                    .map(|frame| frame.record.clone())
-                    .collect();
+                let tail = self.recovery_records().await?;
                 let resolution = broca_core::replay(&tail)
                     .map_err(|error| error.to_string())?
                     .resolution;
@@ -8474,10 +8568,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
             } => {
                 // With no indeterminate sibling, shutdown must leave the provider's obligation
                 // live, including open approval cards, regardless of the restart policy.
-                if closing.is_none() && !open_held.is_empty() {
+                if closing.is_none() && error.is_none() && !open_held.is_empty() {
                     self.park_provider_held(run_id, false).await?;
                 }
-                if closing.is_none() {
+                if closing.is_none() && error.is_none() {
                     return Ok(false);
                 }
             }
@@ -15389,6 +15483,10 @@ mod sealed_attempt_tests;
 #[cfg(test)]
 #[path = "graceful_stop_tests.rs"]
 mod graceful_stop_tests;
+
+#[cfg(test)]
+#[path = "held_restart_tests.rs"]
+mod held_restart_tests;
 
 #[cfg(test)]
 #[path = "crash_orphan_tests.rs"]

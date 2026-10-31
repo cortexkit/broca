@@ -4546,6 +4546,33 @@ where
                     .as_ref()
                     .and_then(|config| render_config_error(provider, config))
                 {
+                    // A renderer refusal cannot erase a provider's delivered answer. Close
+                    // the original batch before ending the episode, without dispatching it.
+                    let batch = crate::resume::sync_deposited_held_results(
+                        prior.open_tool_batch.clone(),
+                        &pending,
+                        &BatchCtx {
+                            batch_id: pending.batch_id.clone().expect("held batch exists"),
+                            run_id: resolved_run_id.clone(),
+                            bind: req.session.clone(),
+                            scope: req.scope.clone(),
+                            media_capture: None,
+                        },
+                        writer,
+                        control.provider_held_lifecycle.clone(),
+                    )
+                    .await?;
+                    let mut closing = crate::replay(&[]).expect("empty WAL has a valid replay");
+                    closing.open_tool_batch = batch;
+                    for record in crate::resume::close_out_open_batch_for(
+                        &closing,
+                        RunFinishReason::Interrupted,
+                        |_| crate::DeferredCloseKind::NotDispatched,
+                    ) {
+                        writer.record(record);
+                    }
+                    let mut error = error;
+                    error.provider_code = Some("held_resume_refused".into());
                     writer.record(resume_sealing);
                     let (summary, head) = finish_run(
                         writer,

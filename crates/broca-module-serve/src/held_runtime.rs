@@ -188,6 +188,7 @@ pub fn health_gauges() -> serde_json::Value {
                     "rows_remaining": 0,
                 }),
                 0,
+                Vec::new(),
             )
         },
         |runtime| {
@@ -197,6 +198,7 @@ pub fn health_gauges() -> serde_json::Value {
                 &progress,
                 runtime.withdrawals.health(),
                 runtime.intake.overdue_pins(),
+                runtime.intake.stuck_deliveries(),
             )
         },
     )
@@ -207,6 +209,7 @@ fn health_snapshot(
     progress: &RebuildReport,
     withdrawals: serde_json::Value,
     overdue_pins: usize,
+    stuck_deliveries: Vec<serde_json::Value>,
 ) -> serde_json::Value {
     serde_json::json!({
         "rebuild_required": rebuilding,
@@ -215,6 +218,7 @@ fn health_snapshot(
         "registered": progress.registered, "unreadable": progress.unreadable.len(),
         "withdrawals": withdrawals,
         "overdue_pins": overdue_pins,
+        "late_results_delivery_stuck": stuck_deliveries,
     })
 }
 
@@ -519,6 +523,7 @@ mod tests {
             &report,
             serde_json::json!({"failed": 1, "pending": 0}),
             2,
+            vec![serde_json::json!({"attempts":3})],
         );
         assert_eq!(health["fence"], "late-results-rebuild-required");
         assert_eq!(health["rebuild_required"], true);
@@ -528,8 +533,9 @@ mod tests {
         assert_eq!(health["unreadable"], 1);
         assert_eq!(health["withdrawals"]["failed"], 1);
         assert_eq!(health["overdue_pins"], 2);
+        assert_eq!(health["late_results_delivery_stuck"][0]["attempts"], 3);
         assert_eq!(
-            health_snapshot(false, &report, serde_json::Value::Null, 0)["fence"],
+            health_snapshot(false, &report, serde_json::Value::Null, 0, Vec::new())["fence"],
             serde_json::Value::Null
         );
     }

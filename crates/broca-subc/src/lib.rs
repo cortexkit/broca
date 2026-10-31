@@ -16,6 +16,9 @@
 //! those checkouts are used only to build integration-test rig binaries.
 #![forbid(unsafe_code)]
 
+#[cfg(all(feature = "test-clock", not(debug_assertions)))]
+compile_error!("broca-subc's test-clock feature must not be enabled in a release build");
+
 pub mod compaction_plane;
 pub mod connection;
 pub mod consent;

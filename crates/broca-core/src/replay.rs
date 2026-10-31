@@ -283,6 +283,21 @@ pub enum ReplayResolution {
     },
 }
 
+/// Whether the named episode still owns its calls. Pauses and queued submissions do not
+/// end an episode; only its durable finish or a subsequent episode closes that ownership.
+/// Both held-result classification and actor recovery use this definition.
+pub fn run_is_open<'a>(records: impl IntoIterator<Item = &'a WalRecord>, run_id: &RunId) -> bool {
+    let mut open = false;
+    for record in records {
+        match record {
+            WalRecord::RunStarted { run_id: id, .. } => open = id == run_id,
+            WalRecord::RunFinished { .. } => open = false,
+            _ => {}
+        }
+    }
+    open
+}
+
 /// A trailing tool-turn whose batch isn't complete on disk — resume must finish
 /// it WITHOUT re-running the (durable, billed) model step. Reconstructed from the
 /// WAL so a second crash mid-resume still converges.

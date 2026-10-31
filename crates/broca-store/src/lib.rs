@@ -5212,9 +5212,7 @@ mod tests {
             Persister::project_range(&store, &session, &projection_range).expect("project fixture"),
             safe_head - 1
         );
-        // Byte anchors carry a file identity that only the unix backend provides; without
-        // one the range read still returns the correct tail, just without the byte skip.
-        #[cfg(unix)]
+        // Byte anchors carry the live WAL's file identity, which Unix and Windows both provide.
         assert!(MaterializedStore::read_admission_snapshot(&store, &session)
             .expect("read metadata")
             .expect("metadata row")

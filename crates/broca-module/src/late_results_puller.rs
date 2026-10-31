@@ -45,6 +45,10 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// An entry that still prevents the feed's ack from advancing after this interval needs
 /// operator attention, even if the provider keeps returning successful feed replies.
 pub const PIN_WARN_AFTER: Duration = Duration::from_secs(5 * 60);
+/// After three identical delivery failures, expose the delivery as stuck in health diagnostics.
+pub const DELIVERY_STUCK_AFTER: u32 = 3;
+/// Bound each reply while allowing later entries to progress behind an unresolved prefix.
+pub const FEED_PAGE_SIZE: u32 = 128;
 /// Limit WAL reads for old registrations to one small page per maintenance pass.
 pub const REGISTRATION_SWEEP_LIMIT: usize = 64;
 /// The bind a feed's route is opened under. The custodian comes from the connection's consumer
@@ -239,6 +243,13 @@ pub struct LateResultsIntake {
     /// registration can be trusted to be missing, so every entry is Blocked and nothing is acked.
     rebuilding: std::sync::atomic::AtomicBool,
     sweep_after: Mutex<Option<(String, String)>>,
+    delivery_failures: Mutex<HashMap<IntakeKey, DeliveryFailure>>,
+}
+
+#[derive(Clone)]
+struct DeliveryFailure {
+    reason: String,
+    attempts: u32,
 }
 
 impl LateResultsIntake {
@@ -258,6 +269,7 @@ impl LateResultsIntake {
             pullers: Mutex::new(HashMap::new()),
             rebuilding: std::sync::atomic::AtomicBool::new(false),
             sweep_after: Mutex::new(None),
+            delivery_failures: Mutex::new(HashMap::new()),
         })
     }
 
@@ -309,6 +321,22 @@ impl LateResultsIntake {
             .values()
             .map(|puller| puller.overdue_pins())
             .sum()
+    }
+
+    /// Content-free, process-local evidence; a successful retry removes its finding.
+    pub fn stuck_deliveries(&self) -> Vec<serde_json::Value> {
+        self.delivery_failures
+            .lock()
+            .expect("delivery failures")
+            .iter()
+            .filter(|(_, failure)| failure.attempts >= DELIVERY_STUCK_AFTER)
+            .map(|(key, failure)| {
+                serde_json::json!({
+                    "module": key.provider, "call_key": key.call_key, "event_id": key.event_id,
+                    "attempts": failure.attempts,
+                })
+            })
+            .collect()
     }
 
     /// Revisit old rows even for providers with no running feed. Each pass reads at most one
@@ -555,7 +583,9 @@ impl LateResultsIntake {
             .map_err(FeedError::Retryable)?
             .and_then(|row| row.position);
         if !puller.pinned().is_empty() {
-            let reply = self.pull(module, read_from.as_ref(), None).await?;
+            let reply = self
+                .pull(module, read_from.as_ref(), Some(FEED_PAGE_SIZE))
+                .await?;
             read_from = Some(FeedPosition {
                 provider_incarnation: reply.cursor.provider_incarnation.clone(),
                 seq: reply.cursor.seq,
@@ -592,11 +622,14 @@ impl LateResultsIntake {
             // A feed with no acked position yet is read from its start: `None` names no cursor,
             // and every cursor broca sends is one the provider returned.
             let from = read_from.clone();
-            let reply = self.pull(module, from.as_ref(), None).await?;
+            let reply = self
+                .pull(module, from.as_ref(), Some(FEED_PAGE_SIZE))
+                .await?;
             let next = Some(FeedPosition {
                 provider_incarnation: reply.cursor.provider_incarnation.clone(),
                 seq: reply.cursor.seq,
             });
+            let pinned_before_page = !puller.pinned().is_empty();
             // An entry delivered on a page is durable before anything can ack that page: a
             // delivery that could not be made pins the ack here instead.
             let (settled, still) = self.settle(module, &reply.entries, &mut views).await?;
@@ -613,7 +646,7 @@ impl LateResultsIntake {
                     .map_err(FeedError::Retryable)?;
             } else if ackable {
                 self.ack(module, &reply.cursor, &reply.entries).await?;
-            } else if settled > 0 {
+            } else if settled > 0 && !pinned_before_page {
                 // The settled entries of this page form one run at its head, so a limit re-pull
                 // of that run returns exactly the cursor to ack. An entry pinned before it is
                 // not one of these, so the ack cannot pass it.
@@ -655,12 +688,6 @@ impl LateResultsIntake {
         let mut pinned = Vec::new();
         for entry in entries {
             let key = entry.intake_key(module);
-            if !pinned.is_empty() {
-                // An ack only advances over a settled run, so delivery stops where the run does.
-                // These entries are classed afresh from the pinned position next tick.
-                pinned.push(key);
-                continue;
-            }
             let kind = self
                 .classify_one(module, entry, &rows, views)
                 .await
@@ -686,11 +713,30 @@ impl LateResultsIntake {
                         event_id = entry.event_id,
                         "late-results delivery not made; the entry stays pinned: {reason}"
                     );
+                    let mut failures = self.delivery_failures.lock().expect("delivery failures");
+                    let failure = failures
+                        .entry(key.clone())
+                        .or_insert_with(|| DeliveryFailure {
+                            reason: reason.clone(),
+                            attempts: 0,
+                        });
+                    if failure.reason != reason {
+                        failure.reason = reason;
+                        failure.attempts = 0;
+                    }
+                    failure.attempts = failure.attempts.saturating_add(1);
                     pinned.push(key);
                     continue;
                 }
             }
-            settled += 1;
+            self.delivery_failures
+                .lock()
+                .expect("delivery failures")
+                .remove(&key);
+            // Delivery may pass a pin, but acknowledgement still covers only a settled prefix.
+            if pinned.is_empty() {
+                settled += 1;
+            }
         }
         if settled > 0 {
             self.store
@@ -1113,23 +1159,22 @@ fn dispatch_fact<'a>(call_key: &str, records: &'a [FramedRecord]) -> Option<Disp
                 }
                 _ => None,
             })?;
-    let mut run_open = records[..index]
+    let run_id = records[..index]
         .iter()
         .rev()
-        .find_map(|frame| match frame.record {
-            WalRecord::RunStarted { .. } => Some(true),
-            WalRecord::RunFinished { .. } => Some(false),
+        .find_map(|frame| match &frame.record {
+            WalRecord::RunStarted { run_id, .. } => Some(run_id),
             _ => None,
-        })
-        .unwrap_or(false);
+        });
+    let run_open = run_id.is_some_and(|run_id| {
+        broca_core::replay::run_is_open(records.iter().map(|frame| &frame.record), run_id)
+    });
     let mut terminal = false;
     for frame in &records[index + 1..] {
         match &frame.record {
             WalRecord::RunStarted { .. } => {
-                run_open = false;
                 break;
             }
-            WalRecord::RunFinished { .. } => run_open = false,
             WalRecord::ToolResult {
                 batch_id: batch,
                 result,
@@ -1679,6 +1724,7 @@ mod tests {
     struct RecordedDelivery {
         delivered: Mutex<Vec<(String, String)>>,
         refuse: Mutex<Option<String>>,
+        refuse_only: Mutex<Option<String>>,
     }
 
     impl Default for RecordedDelivery {
@@ -1686,6 +1732,7 @@ mod tests {
             Self {
                 delivered: Mutex::new(Vec::new()),
                 refuse: Mutex::new(None),
+                refuse_only: Mutex::new(None),
             }
         }
     }
@@ -1699,7 +1746,15 @@ mod tests {
             entry: &LateEntry,
         ) -> Result<(), String> {
             if let Some(reason) = self.refuse.lock().unwrap().clone() {
-                return Err(reason);
+                if self
+                    .refuse_only
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_none_or(|key| key == &registration.call_key)
+                {
+                    return Err(reason);
+                }
             }
             self.delivered
                 .lock()
@@ -4027,6 +4082,114 @@ mod tests {
         let feed = rig.store.feed("tools").unwrap().unwrap();
         assert_eq!(feed.position.map(|position| position.seq), Some(1));
         assert!(!feed.ack_owed);
+    }
+
+    #[tokio::test]
+    async fn repeated_delivery_failure_surfaces_health_without_blocking_the_page() {
+        let bind = session("stuck");
+        let later = session("later");
+        let rig = Rig::new(
+            "stuck-page-progress",
+            Some(("lineage:4", "tools", bind.clone())),
+            vec![
+                registration("lineage:4", "tools", &bind),
+                registration("later:4", "tools", &later),
+            ],
+        )
+        .await;
+        write_wal(
+            &rig.intake.wal,
+            &later,
+            &held_records("later:4", "tools", &later),
+        );
+        let puller = rig.puller("tools");
+        let page = || {
+            reply(
+                vec![
+                    entry(kinds::RESULT, "lineage:4", "stuck"),
+                    entry(kinds::RESULT, "later:4", "later"),
+                ],
+                2,
+                false,
+            )
+        };
+        *rig.delivery.refuse.lock().unwrap() = Some("terminal not synced".into());
+        *rig.delivery.refuse_only.lock().unwrap() = Some("lineage:4".into());
+        for attempt in 1..=DELIVERY_STUCK_AFTER {
+            rig.feed.replies(vec![page()]);
+            rig.intake.tick("tools").await.unwrap();
+            assert_eq!(
+                rig.intake.stuck_deliveries().len(),
+                usize::from(attempt == DELIVERY_STUCK_AFTER)
+            );
+            assert!(
+                rig.feed.acks().is_empty(),
+                "never acknowledge past the failed entry"
+            );
+        }
+        assert_eq!(
+            *rig.delivery.delivered.lock().unwrap(),
+            [("later:4".into(), "later".into())],
+            "the later entry is delivered exactly once despite the pin"
+        );
+        assert!(rig
+            .feed
+            .pulls()
+            .iter()
+            .all(|(_, limit)| *limit == Some(FEED_PAGE_SIZE)));
+        assert_eq!(
+            rig.intake.stuck_deliveries()[0]["attempts"],
+            DELIVERY_STUCK_AFTER
+        );
+        *rig.delivery.refuse.lock().unwrap() = None;
+        rig.feed.replies(vec![page()]);
+        rig.intake.tick("tools").await.unwrap();
+        assert!(rig.intake.stuck_deliveries().is_empty());
+        assert!(puller.pinned().is_empty());
+        assert_eq!(rig.feed.acks(), [cursor(2)]);
+    }
+
+    #[tokio::test]
+    async fn later_pages_deliver_without_acking_past_an_earlier_pin() {
+        let bind = session("stuck-page-one");
+        let later = session("page-two");
+        let rig = Rig::new(
+            "stuck-multiple-pages",
+            Some(("lineage:4", "tools", bind.clone())),
+            vec![
+                registration("lineage:4", "tools", &bind),
+                registration("later:4", "tools", &later),
+            ],
+        )
+        .await;
+        write_wal(
+            &rig.intake.wal,
+            &later,
+            &held_records("later:4", "tools", &later),
+        );
+        let _puller = rig.puller("tools");
+        *rig.delivery.refuse.lock().unwrap() = Some("terminal not synced".into());
+        *rig.delivery.refuse_only.lock().unwrap() = Some("lineage:4".into());
+        let later_page = || reply(vec![entry(kinds::RESULT, "later:4", "later")], 2, false);
+        rig.feed.replies(vec![
+            reply(vec![entry(kinds::RESULT, "lineage:4", "stuck")], 1, true),
+            later_page(),
+            later_page(),
+        ]);
+        rig.intake.tick("tools").await.unwrap();
+        assert_eq!(
+            *rig.delivery.delivered.lock().unwrap(),
+            [("later:4".into(), "later".into())]
+        );
+        assert!(
+            rig.feed.acks().is_empty(),
+            "a later page cannot acknowledge the earlier failed entry"
+        );
+        assert_eq!(
+            rig.feed.pulls().len(),
+            2,
+            "no prefix ack is attempted after a prior-page pin"
+        );
     }
 
     /// A provider feed that keeps what it publishes: a pull answers every entry after `since`
