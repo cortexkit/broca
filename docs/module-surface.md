@@ -1191,6 +1191,13 @@ there, a newer writer's included, ends the stream with `subscribe_replay_failed`
 
 ## 11. Submission lifecycle + durable queue + retract
 
+Broca declares `sender_succession`. A plan sender's optional `succeeds` names one
+predecessor module. For keyed retries and `send.status`, that predecessor's durable
+send record is checked before the caller's own record, even after a refresh removes
+the predecessor from the plan. A conflicting retry is `send_id_reuse`, never a new
+send. Succession is one hop and grants no delivery, cancellation or withdrawal
+permission. The latest accepted refresh supplies the sender policy immediately.
+
 - **Idle send** → starts a run (active, run_id).
 - **Running send** → durably queued as **`Queued{submission_id, message}`** (a WAL
   record carrying IDENTITY, not just the message). State "pending".

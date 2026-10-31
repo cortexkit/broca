@@ -73,6 +73,82 @@ async fn keyed_retry_ignores_deadlines_for_owner_and_named_senders() {
     }
 }
 
+#[tokio::test]
+async fn successor_prefers_removed_predecessor_receipts_after_refresh_and_restart() {
+    let mut rig = Rig::new("succession", FakeExecutor::auto(), LONG_TTL);
+    let key = session_naming_ck_mc(&rig, "succession", false).await;
+    let predecessor = pending_steer(&rig, &key, "ck-mc", "shared").await;
+    refresh_senders(
+        &rig,
+        &key,
+        1,
+        "on_prefix_rebuild",
+        plan_naming("phone", false),
+    )
+    .await;
+    let mut independent = send(&key, "shared", Some(order(&[DeliveryMode::Steer], None)));
+    independent.request.principal = reserved("phone");
+    independent.request.input[0].content = vec![broca_protocol::ContentBlock::Text {
+        text: "different".into(),
+    }];
+    let own_receipt = rig.registry.send(independent.clone()).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(rig.registry.send(independent).await.unwrap()).unwrap(),
+        serde_json::to_value(&own_receipt).unwrap()
+    );
+    let mut plan = plan_naming("phone", false);
+    let manifest = std::sync::Arc::make_mut(plan.manifest.as_mut().unwrap());
+    let mut value: serde_json::Value = serde_json::from_str(manifest.plan.as_json_text()).unwrap();
+    value["senders"][0]["succeeds"] = serde_json::json!("ck-mc");
+    manifest.plan = broca_wal::OpaqueJson::from_json_text(value.to_string()).unwrap();
+    refresh_senders(&rig, &key, 2, "on_prefix_rebuild", plan).await;
+    for restarted in [false, true] {
+        if restarted {
+            restart_registry(&mut rig).await;
+        }
+        let before = records(&rig, &key);
+        assert_eq!(
+            pending_steer(&rig, &key, "phone", "shared").await,
+            predecessor
+        );
+        let status = rig
+            .registry
+            .send_status(
+                &key,
+                broca_protocol::RunId("shared".into()),
+                "send-shared",
+                reserved("phone").as_ref(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(status).unwrap()["submission_id"],
+            predecessor.0
+        );
+        let mut changed = send(&key, "shared", Some(order(&[DeliveryMode::Steer], None)));
+        changed.request.principal = reserved("phone");
+        changed.request.input[0].content = vec![broca_protocol::ContentBlock::Text {
+            text: "different".into(),
+        }];
+        assert!(matches!(
+            rig.registry.send(changed).await,
+            Err(ServeError::SendIdReuse { .. })
+        ));
+        assert_eq!(records(&rig, &key), before);
+        assert!(matches!(
+            retract_as(&rig, &key, reserved("phone"), &predecessor).await,
+            Err(ServeError::ScopeRefused(_))
+        ));
+    }
+    let own = pending_steer(&rig, &key, "owner", "shared").await;
+    assert_ne!(
+        own, predecessor,
+        "the owner's send namespace stays independent"
+    );
+    let fresh = pending_steer(&rig, &key, "phone", "fresh").await;
+    assert_ne!(fresh, predecessor);
+}
+
 async fn retract_as(
     rig: &Rig,
     key: &broca_protocol::BindIdentity,

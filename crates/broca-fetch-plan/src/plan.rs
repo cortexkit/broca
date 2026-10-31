@@ -387,6 +387,13 @@ pub fn parse_plan_with(
     compaction: CompactionSupport,
     output_refs: OutputRefsSupport,
 ) -> Result<Plan, Refusal> {
+    if let Some(object) = plan.as_object() {
+        cortexkit_role_llm_runner::sender_succession::check_plan(
+            object,
+            &[cortexkit_role_llm_runner::capabilities::SENDER_SUCCESSION],
+        )
+        .map_err(Refusal::invalid)?;
+    }
     check_output_refs(plan, output_refs)?;
     let object = plan.as_object().ok_or_else(|| Refusal::invalid("plan"))?;
     let tool_items = items(object, "tool_items", true)?;
@@ -573,6 +580,34 @@ mod sender_tests {
 
     fn senders(value: Value) -> Result<Vec<PlanSender>, Refusal> {
         plan_senders(json!({ "senders": value }).as_object().unwrap())
+    }
+
+    #[test]
+    fn succession_is_checked_before_ordinary_plan_fields() {
+        for (senders, field) in [
+            (
+                json!([{"module":"a","succeeds":"a"}]),
+                "plan.senders[0].succeeds",
+            ),
+            (
+                json!([{"module":"b","succeeds":""}]),
+                "plan.senders[0].succeeds",
+            ),
+            (
+                json!([{"module":"b","succeeds":null}]),
+                "plan.senders[0].succeeds",
+            ),
+            (
+                json!([{"module":"b","succeeds":"a"},{"module":"c","succeeds":"a"}]),
+                "plan.senders[1].succeeds",
+            ),
+        ] {
+            assert_eq!(
+                parse_plan(&json!({"senders":senders}), CompactionSupport::Unsupported)
+                    .unwrap_err(),
+                Refusal::invalid(field)
+            );
+        }
     }
 
     #[test]

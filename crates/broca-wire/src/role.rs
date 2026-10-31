@@ -417,6 +417,7 @@ pub fn broca_role_describe_with_writers(
         // Ordered sends can land beside tool results, at a running step boundary, or when an
         // idle session starts. `turn_system` has no renderer and is deliberately not advertised.
         DELIVERY_ORDER_GROUP,
+        cortexkit_role_llm_runner::capabilities::SENDER_SUCCESSION,
         // A send's client_message_id lives beside its body and is exposed only on display rows.
         cortexkit_role_llm_runner::capabilities::CLIENT_MESSAGE_ID,
     ]
@@ -1216,7 +1217,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "307b50e8217d3a2d21ed6a03455f35c13dcc2ca64aefb23c873df5f2b114222d",
+            "40543943437aab194b6807a49bd12235173f5ab4e937eafce583b796db57370a",
         );
     }
 
@@ -1394,7 +1395,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "48e03e316d1d829bb6686fd45734713150e5c41171d3834c8e146978dea11b0b";
+        "54252d781e0ee90e18eb1d4837aa55ec0fe065ae888b956fc90c7b87cc5e39e8";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

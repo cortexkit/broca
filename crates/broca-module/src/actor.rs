@@ -3362,17 +3362,31 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 request.scope = broca_protocol::SendScope::Internal;
             }
         }
-        let run_id = if let (Some(sender), Some(send_id), true) = (
-            self.admitting_sent_by.clone(),
+        let run_id = if let (
+            Some(sender @ broca_protocol::BindPrincipal::Reserved { .. }),
+            Some(send_id),
+        ) = (
+            self.admitting_sent_by
+                .clone()
+                .or_else(|| request.principal.clone()),
             key.send_id(),
-            self.admitting_order.is_some(),
         ) {
             let records = match self.read_wal_records().await {
                 Ok(records) => records,
                 Err(error) => return SendOutcome::Error(error),
             };
-            match crate::send_fate::resolve_sender_run_id(&records, &run_id, send_id, &sender) {
-                Ok(run_id) => run_id,
+            let ownership = match self.load_ownership().await {
+                Ok(ownership) => ownership,
+                Err(error) => return SendOutcome::Error(error),
+            };
+            match crate::send_fate::resolve_retry_run_id(
+                &records,
+                &run_id,
+                send_id,
+                &sender,
+                &ownership.effective_senders(),
+            ) {
+                Ok((run_id, _)) => run_id,
                 Err(error) => return SendOutcome::Error(error),
             }
         } else {

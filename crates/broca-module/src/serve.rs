@@ -2803,19 +2803,22 @@ impl ServeHandler for crate::LineageRegistry {
         principal: Option<&broca_protocol::BindPrincipal>,
     ) -> Result<broca_wire::SendReplyWire, ServeError> {
         self.check_expired(session, Some(&own_run.0)).await?;
-        let records: Vec<_> = self
-            .read_durable_wal(session)
-            .await?
-            .0
-            .into_iter()
-            .map(|frame| frame.record)
-            .collect();
-        let own_run =
+        let frames = self.read_durable_wal(session).await?.0;
+        let senders = broca_core::AdmissionCheckpointV1::from_frames(&frames)
+            .map_err(|error| ServeError::Open(error.to_string(), None))?
+            .ownership
+            .unwrap_or_default()
+            .effective_senders();
+        let records: Vec<_> = frames.into_iter().map(|frame| frame.record).collect();
+        let (own_run, lookup_sender) =
             if let Some(sender @ broca_protocol::BindPrincipal::Reserved { .. }) = principal {
-                crate::send_fate::resolve_sender_run_id(&records, &own_run, send_id, sender)
-                    .map_err(|_| ServeError::UnknownSend)?
+                crate::send_fate::resolve_retry_run_id(
+                    &records, &own_run, send_id, sender, &senders,
+                )
+                .map(|(id, sender)| (id, Some(sender)))
+                .map_err(|_| ServeError::UnknownSend)?
             } else {
-                own_run
+                (own_run, principal.cloned())
             };
         // Ordered senders share a session, not each other's send keys. Legacy owner records
         // omit sent_by, so their principal is the one on Queued or RunStarted.
@@ -2844,7 +2847,7 @@ impl ServeHandler for crate::LineageRegistry {
         });
         if sender
             .flatten()
-            .is_some_and(|sender| Some(sender) != principal)
+            .is_some_and(|sender| Some(sender) != lookup_sender.as_ref())
         {
             return Err(ServeError::UnknownSend);
         }

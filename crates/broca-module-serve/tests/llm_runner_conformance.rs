@@ -2305,6 +2305,7 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::TagCheckpoint,
             Capability::RenderedModelInput,
             Capability::DeliveryOrder,
+            Capability::SenderSuccession,
             Capability::Compaction,
             Capability::ModelView,
             Capability::ClientMessageId,
@@ -3751,6 +3752,28 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         eprintln!("{}", subject.failure_evidence());
     }
     assert!(failed.is_empty(), "{}", report.render());
+    for name in [
+        "sender_succession_same_payload_receipt",
+        "sender_succession_changed_payload_refused",
+        "sender_succession_third_sender_fresh",
+        "sender_succession_predecessor_status",
+        "sender_succession_undeclared_refused",
+        "delivery_deadline_retry_keeps_original_expiry",
+    ] {
+        let case = report
+            .cases
+            .iter()
+            .find(|case| case.case == name)
+            .expect(name);
+        assert!(
+            matches!(
+                case.outcome,
+                CaseOutcome::Passed | CaseOutcome::Inapplicable { .. }
+            ),
+            "{}",
+            report.render()
+        );
+    }
     if subject.media_enabled {
         for case in report
             .cases

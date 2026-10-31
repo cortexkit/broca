@@ -106,6 +106,32 @@ pub(crate) fn resolve_sender_run_id(
     }
 }
 
+/// A succession selects only one predecessor's durable key, never its grants or its own
+/// predecessor. Absence falls back to the caller's namespace; a found record must be compared
+/// by the ordinary retry path, so a payload conflict cannot fall through to another send.
+pub(crate) fn resolve_retry_run_id(
+    records: &[WalRecord],
+    base: &RunId,
+    send_id: &str,
+    sender: &BindPrincipal,
+    senders: &[cortexkit_role_llm_runner::delivery_order::PlanSender],
+) -> Result<(RunId, BindPrincipal), String> {
+    if let BindPrincipal::Reserved { module_id } = sender {
+        if let Some(module) =
+            cortexkit_role_llm_runner::sender_succession::predecessor(senders, module_id)
+        {
+            let predecessor = BindPrincipal::Reserved {
+                module_id: module.into(),
+            };
+            let id = resolve_sender_run_id(records, base, send_id, &predecessor)?;
+            if run_sender(records, &id).flatten().as_ref() == Some(&predecessor) {
+                return Ok((id, predecessor));
+            }
+        }
+    }
+    resolve_sender_run_id(records, base, send_id, sender).map(|id| (id, sender.clone()))
+}
+
 /// The same fate lookup serves a validated re-send and a read-only `send.status`.
 /// No writer, executor or actor handle is available here: a lookup cannot deliver work.
 /// Ordered sends disable legacy steer lookup because those keys belong to the owner,
