@@ -556,7 +556,7 @@ pub struct BaselineWire {
     pub pending: Option<cortexkit_role_llm_runner::baseline::PendingChange>,
     /// The latest applied change, absent while none applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effective: Option<cortexkit_role_llm_runner::baseline::EffectiveBaseline>,
+    pub effective: Option<EffectiveBaselineWire>,
     /// The change-policy rungs this session supports, per surface. Present in every ready
     /// baseline on a runner declaring `session_change`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -564,6 +564,21 @@ pub struct BaselineWire {
     /// What the session's frozen config declares about its prompt cache. Absent when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<crate::CacheDeclarationWire>,
+}
+
+/// The latest applied refresh, whose manifest can differ from the frozen prefix's manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectiveBaselineWire {
+    pub generation: u64,
+    pub applied_by: String,
+    pub manifest_digest: String,
+    /// The applied manifest's composition, not its whole-manifest identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composition_digest: Option<String>,
+    /// Optional items absent from the applied manifest, in the same form as the prefix's
+    /// `absent_items`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub absent_items: Vec<serde_json::Value>,
 }
 
 impl BaselineWire {
@@ -841,6 +856,51 @@ mod pinned_reply_bytes {
             "session_baseline.ready.json",
             SESSION_BASELINE_SHA256,
         );
+    }
+
+    #[test]
+    fn session_baseline_applied_refresh_bytes_are_pinned() {
+        let mut baseline = BaselineWire::planned(
+            vec![],
+            vec![],
+            "prefix-composition".into(),
+            vec!["read".into()],
+        );
+        baseline.accepted_generation = 2;
+        baseline.applied_generation = 2;
+        baseline.effective = Some(EffectiveBaselineWire {
+            generation: 2,
+            applied_by: "append".into(),
+            manifest_digest: "whole-manifest".into(),
+            composition_digest: Some("applied-composition".into()),
+            absent_items: vec![
+                serde_json::json!({"provider":"optional","kind":"tool","reason":"timeout"}),
+            ],
+        });
+        let reply = BaselineReply::ready(baseline);
+        if std::env::var_os("BROCA_CAPTURE_SAMPLES").is_some() {
+            println!(
+                "BROCA_SAMPLE session_baseline.applied.json {}",
+                serde_json::to_string(&reply).unwrap()
+            );
+        }
+        assert_golden(
+            reply,
+            "session_baseline.applied.json",
+            "f91fb9045d07ee70cb53ce9ad80d48d60b482ad9d5ee60fec0c411b82904c7cb",
+        );
+    }
+
+    #[test]
+    fn effective_baseline_without_optional_facts_keeps_legacy_bytes() {
+        let legacy = r#"{"generation":1,"applied_by":"fold","manifest_digest":"manifest"}"#;
+        let effective: EffectiveBaselineWire = serde_json::from_str(legacy).unwrap();
+        assert!(effective.composition_digest.is_none());
+        assert!(effective.absent_items.is_empty());
+        assert_eq!(serde_json::to_string(&effective).unwrap(), legacy);
+        let role: cortexkit_role_llm_runner::baseline::EffectiveBaseline =
+            serde_json::from_str(legacy).unwrap();
+        assert_eq!(serde_json::to_string(&role).unwrap(), legacy);
     }
 
     /// The reply to the send that admitted a session carries its baseline. The reply type is

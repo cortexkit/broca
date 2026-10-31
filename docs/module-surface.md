@@ -661,6 +661,14 @@ run after an applied compaction view, model switch, or prefix flush). A new run 
 rebuild. A flush is a durable rebuild boundary; with nothing pending it does not change request
 bytes or promise a provider cache miss.
 
+In `session.baseline`, top-level composition and absence facts describe the frozen prefix.
+After a refresh applies, `effective.composition_digest` copies the applied manifest's composition
+digest (omitted when unavailable), and `effective.absent_items` reports its absent optional items
+(omitted when empty). These may differ from the prefix after an `append` application; a `fold`
+application rebuilds the prefix from the applied manifest. `effective.manifest_digest` remains the
+identity of the whole applied manifest, not its composition digest. No `effective` object is
+reported before any refresh applies.
+
 Refresh admission uses the ordinary plan admitter and durably records the fetched manifest and
 original reply before answering. Identical retries fetch and write nothing, even after restart
 or application. Changes never alter a running episode: the applying `RunStarted` freezes its
