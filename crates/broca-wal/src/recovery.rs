@@ -17,6 +17,15 @@ use std::{
 
 pub const FEATURE: &str = "wal-recovery/v1";
 
+/// Physical call identities keep their legacy spelling until a repair. The cut
+/// identity separates new calls from removed records whose sequences may recur.
+pub fn physical_call_key(lineage: &str, seq: u64, generation: Option<&str>) -> String {
+    match generation {
+        Some(generation) => format!("{lineage}~{generation}:{seq}"),
+        None => format!("{lineage}:{seq}"),
+    }
+}
+
 /// A registered derived view is invalidated durably before any cut. Implementors
 /// also finish its projection before a writable log can be returned to an actor.
 pub trait RecoveryHooks: Send + Sync {
@@ -198,6 +207,7 @@ pub fn digest(bytes: &[u8]) -> String {
 /// copied verbatim to the raw sidecar, never into a warning or a finding.
 #[derive(Default)]
 struct Calls {
+    recovery_generation: Option<String>,
     active: Option<RunId>,
     runs: Vec<RecoveryRun>,
     planned: Vec<RecoveryCall>,
@@ -233,7 +243,11 @@ impl Calls {
                 call_keys: Vec::new(),
             });
         call.batch_id = Some(batch_id.clone());
-        let key = format!("{lineage}:{}", frame.seq);
+        let key = physical_call_key(
+            &lineage.to_string(),
+            frame.seq,
+            self.recovery_generation.as_deref(),
+        );
         call.call_keys.push(key.clone());
         call.call_keys.sort();
         call.call_keys.dedup();
@@ -441,6 +455,7 @@ impl Calls {
                 }
             }
             WalRecord::RecoveryCut { recovery } => {
+                self.recovery_generation = Some(recovery.cut_id.clone());
                 if !removed {
                     self.cut_ids.insert(recovery.cut_id.clone());
                 }
@@ -502,7 +517,13 @@ fn prefix(bytes: &[u8]) -> Result<Prefix, WalError> {
                 scan.calls.observe(
                     &framed.record,
                     false,
-                    scan.lineage.map(|id| format!("{id}:{}", framed.seq)),
+                    scan.lineage.map(|id| {
+                        physical_call_key(
+                            &id.to_string(),
+                            framed.seq,
+                            scan.calls.recovery_generation.as_deref(),
+                        )
+                    }),
                 );
                 scan.end += consumed;
             }
@@ -548,7 +569,13 @@ fn inspect_removed(bytes: &[u8], scan: &mut Prefix) -> Result<(), WalError> {
                 scan.calls.observe(
                     &framed.record,
                     true,
-                    lineage.map(|id| format!("{id}:{}", framed.seq)),
+                    lineage.map(|id| {
+                        physical_call_key(
+                            &id.to_string(),
+                            framed.seq,
+                            scan.calls.recovery_generation.as_deref(),
+                        )
+                    }),
                 );
                 offset += consumed;
             }

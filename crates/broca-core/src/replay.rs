@@ -843,10 +843,16 @@ pub struct DeferredCallProjection {
     pub recovery_tombstones: std::collections::BTreeSet<(String, String)>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub recovery_call_keys: std::collections::BTreeSet<String>,
+    /// Latest generation in the folded WAL prefix. Each projected deferred call
+    /// retains the generation that preceded its Prepared frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_generation: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProjectedDeferredCall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_generation: Option<String>,
     pub run_id: Option<RunId>,
     pub prepared_seq: u64,
     pub prepared_fence: u64,
@@ -879,6 +885,7 @@ impl DeferredCallProjection {
             stopped_runs: Some(std::collections::BTreeSet::new()),
             recovery_tombstones: std::collections::BTreeSet::new(),
             recovery_call_keys: std::collections::BTreeSet::new(),
+            recovery_generation: None,
         }
     }
 
@@ -898,10 +905,15 @@ impl DeferredCallProjection {
                     }
                 }
                 WalRecord::ToolCallDeferred { .. } => {
-                    let key = format!("{}:{}", self.lineage_id, frame.seq);
+                    let key = broca_wal::recovery::physical_call_key(
+                        &self.lineage_id,
+                        frame.seq,
+                        self.recovery_generation.as_deref(),
+                    );
                     self.calls
                         .entry(key)
                         .or_insert_with(|| ProjectedDeferredCall {
+                            recovery_generation: self.recovery_generation.clone(),
                             run_id: self.last_run_id.clone(),
                             prepared_seq: frame.seq,
                             prepared_fence: frame.fence,
@@ -1021,6 +1033,7 @@ impl DeferredCallProjection {
                     }
                 }
                 WalRecord::RecoveryCut { recovery } => {
+                    self.recovery_generation = Some(recovery.cut_id.clone());
                     for run in &recovery.runs {
                         self.recovery_tombstones.extend(
                             run.calls
@@ -1083,7 +1096,11 @@ impl DeferredCallProjection {
 
     pub fn recovery_tombstoned(&self, call: &ProjectedDeferredCall) -> bool {
         self.recovery_call_keys
-            .contains(&format!("{}:{}", self.lineage_id, call.prepared_seq))
+            .contains(&broca_wal::recovery::physical_call_key(
+                &self.lineage_id,
+                call.prepared_seq,
+                call.recovery_generation.as_deref(),
+            ))
             || matches!(&*call.prepared, WalRecord::ToolCallDeferred { call_id, .. }
                 if call.run_id.as_ref().is_some_and(|run| self.recovery_tombstones.contains(&(run.0.clone(), call_id.0.clone()))))
     }
@@ -1197,7 +1214,7 @@ pub fn project_deferred_calls(
                     } => &withdrawal.call_key,
                     _ => return None,
                 };
-                Some(key.rsplit_once(':')?.0.to_owned())
+                Some(key.rsplit_once(':')?.0.split('~').next()?.to_owned())
             })
         })?;
     let origin = frames.first().is_some_and(|frame| frame.seq == 1)

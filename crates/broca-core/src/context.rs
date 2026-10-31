@@ -1818,8 +1818,10 @@ pub struct ToolCallDispatch {
 /// An ordinary call's fallback key, from its own `ToolDispatchIntent`.
 ///
 /// Ordinary calls use their own intent: sibling calls share a step record but have
-/// distinct intents. A synced sequence is never reissued, and the log identity
-/// distinguishes replacements at one address. Consent preparation can make a call
+/// distinct intents. This fallback spelling is for unrepaired history. After a
+/// repair the writer records a cut-generation key so reused sequences cannot alias
+/// removed calls. The log identity distinguishes replacements at one address.
+/// Consent preparation can make a call
 /// durable earlier; its key is then recorded on the later intent and preserved by
 /// [`tool_call_key`]. Model ids may repeat without reusing either kind of key.
 /// The spelling is printable ASCII, below the tool-provider role's 256-byte bound.

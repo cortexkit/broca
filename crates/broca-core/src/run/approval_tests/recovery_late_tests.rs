@@ -472,3 +472,205 @@ async fn check_prepared_recovery(cut: bool) {
     }
     rig.finish().await;
 }
+
+#[tokio::test]
+async fn a_new_run_reuses_removed_sequences_without_reusing_physical_call_keys() {
+    let mut rig = Rig::file_backed("pass");
+    let root = rig.root.join("generation-before/wal");
+    replace_writer(&mut rig, &root).await;
+    rig.control.manifest = Some(Arc::new(frozen(
+        vec![vec![
+            sub("pre_tool", Some("approve"), "refuse"),
+            sub("pre_tool", Some("validate"), "pass"),
+        ]],
+        None,
+        false,
+    )));
+    next_turn(&rig, "completed-before-repair").await;
+    let first_removed = rig.writer.next_record_seq();
+    for index in 0..80 {
+        let intent: WalRecord = serde_json::from_value(json!({"type":"tool_dispatch_intent",
+            "batch_id":"old-batch", "tool_call_id":format!("old-{index}"), "args":{}}))
+        .unwrap();
+        rig.writer.record(intent).into_result().unwrap();
+    }
+    rig.writer.sync().await.unwrap();
+    let mut bytes = std::fs::read(rig.tools.store.wal_path(&rig.bind)).unwrap();
+    let mut offset = 0;
+    loop {
+        match framing::decode_next(&bytes[offset..]) {
+            framing::DecodeStep::Lineage { consumed, .. } => offset += consumed,
+            framing::DecodeStep::Record { framed, consumed } => {
+                if framed.seq == first_removed {
+                    let mut metadata = framing::v4::decode_header(&bytes[offset..])
+                        .unwrap()
+                        .unwrap()
+                        .metadata;
+                    metadata.seq += 1;
+                    let changed = framing::encode_v4(
+                        metadata,
+                        &[framing::FRAME_STAMPS_FEATURE],
+                        &framed.record,
+                    )
+                    .unwrap();
+                    assert_eq!(changed.len(), consumed);
+                    bytes[offset..offset + consumed].copy_from_slice(&changed);
+                    break;
+                }
+                offset += consumed;
+            }
+            _ => panic!("the source must be intact before its removed intent interval"),
+        }
+    }
+    let repaired = rig.root.join("generation-after/wal");
+    let path = store(&repaired).wal_path(&rig.bind);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, bytes).unwrap();
+    replace_writer(&mut rig, &repaired).await;
+    let cuts = broca_wal::recovery::manifests(&path, 1_000_000).unwrap();
+    let old_keys: std::collections::BTreeSet<_> = cuts
+        .iter()
+        .flat_map(|cut| {
+            cut.recovery
+                .runs
+                .iter()
+                .flat_map(|run| run.calls.iter())
+                .flat_map(|call| call.call_keys.iter().cloned())
+                .chain(
+                    cut.recovery
+                        .unowned_calls
+                        .iter()
+                        .flat_map(|call| call.call_keys.iter().cloned()),
+                )
+        })
+        .collect();
+    assert!(old_keys.len() >= 79);
+    *rig.questions.answer.lock().unwrap() = "approve";
+    rig.control.manifest = Some(Arc::new(frozen(
+        vec![vec![
+            sub("pre_tool", Some("approve"), "refuse"),
+            sub("pre_tool", Some("validate"), "pass"),
+        ]],
+        None,
+        false,
+    )));
+    let event = |index, content, reason| {
+        vec![
+            NormalizedEvent::Control(ProviderControl::AssistantMessage {
+                message: AssistantMessage {
+                    message_id: broca_protocol::MessageId(format!("generation-{index}")),
+                    content,
+                },
+            }),
+            NormalizedEvent::Control(ProviderControl::Finished {
+                usage: Usage::default(),
+                finish_reason: reason,
+                retries_used: 0,
+            }),
+        ]
+    };
+    let provider = crate::StubProvider::new(vec![
+        event(
+            1,
+            vec![ContentBlock::ToolCall(call("new-call"))],
+            FinishReason::ToolCalls,
+        ),
+        event(
+            2,
+            vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
+            FinishReason::Stop,
+        ),
+    ]);
+    let mut request = hook_tests::request();
+    request.session = rig.bind.clone();
+    request.run_id = RunId("new-after-repair".into());
+    request.on_restart = Some(broca_protocol::request::OnRestart::Resume);
+    request.scope = Some(
+        serde_json::from_value(
+            json!({"owner":{"kind":"reserved","module_id":"agent"},"ref":"s","scope_epoch":1}),
+        )
+        .unwrap(),
+    );
+    let (out, _rx) = mpsc::channel(1000);
+    let summary = tokio::time::timeout(
+        HANG_GUARD,
+        run_loop_on_writer(
+            request,
+            &rig.writer,
+            StartMode::FreshOrResume,
+            &provider,
+            &rig.tools,
+            &crate::AllowAll,
+            &rig.tools.store,
+            None,
+            rig.control.clone(),
+            &out,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        rig.tools.sent.lock().unwrap().len(),
+        1,
+        "new work in the removed sequence interval must execute"
+    );
+    assert_eq!(summary.reason, RunFinishReason::Completed);
+    let prepared = rig
+        .frames()
+        .into_iter()
+        .find(|frame| {
+            matches!(&frame.record,
+        WalRecord::ToolCallDeferred { call_id, .. } if call_id.0 == "new-call")
+        })
+        .unwrap();
+    assert!(prepared.seq > first_removed && prepared.seq < first_removed + 80);
+    let old_spelling = format!("{}:{}", rig.writer.lineage_id().unwrap(), prepared.seq);
+    assert!(
+        old_keys.contains(&old_spelling),
+        "the fixture must reach a genuinely tombstoned physical sequence"
+    );
+    let keys = rig.questions.keys.lock().unwrap().clone();
+    assert_eq!(keys.len(), 1);
+    assert!(
+        !old_keys.contains(&keys[0]),
+        "the post-repair physical key must never alias a removed key"
+    );
+    let mut projection =
+        crate::replay::DeferredCallProjection::new(rig.writer.lineage_id().unwrap());
+    projection.fold_frames(&rig.frames());
+    assert!(
+        projection.calls.contains_key(&keys[0]),
+        "replay must reconstruct the same generated key that was filed"
+    );
+    assert!(!projection.recovery_tombstoned(&projection.calls[&keys[0]]));
+    let restored: crate::replay::DeferredCallProjection =
+        serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
+    assert_eq!(restored, projection);
+
+    let ordinary: WalRecord = serde_json::from_value(json!({"type":"tool_dispatch_intent",
+        "batch_id":"next-ordinary", "tool_call_id":"new-ordinary", "args":{}}))
+    .unwrap();
+    let ordinary_seq = rig.writer.record(ordinary).into_result().unwrap();
+    rig.writer.sync().await.unwrap();
+    assert!(ordinary_seq > first_removed && ordinary_seq < first_removed + 80);
+    let plain = format!("{}:{ordinary_seq}", rig.writer.lineage_id().unwrap());
+    assert!(old_keys.contains(&plain));
+    let frames = rig.frames();
+    let WalRecord::ToolDispatchIntent {
+        call_key: Some(ordinary_key),
+        ..
+    } = &frames
+        .iter()
+        .find(|frame| frame.seq == ordinary_seq)
+        .unwrap()
+        .record
+    else {
+        panic!("post-repair ordinary intents must persist their generated key");
+    };
+    assert!(!old_keys.contains(ordinary_key));
+    assert!(ordinary_key.is_ascii() && ordinary_key.len() < 256);
+    rig.finish().await;
+}

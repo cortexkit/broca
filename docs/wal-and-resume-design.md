@@ -143,7 +143,12 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   Unknown outcomes without inventing assistant prompt content. Recovery
   tombstones match exact Prepared/intent `call_key` values or an owning run and
   call ID, never a bare model-facing ID across the session. A later run may use
-  its own Gemini-style `call_0`. Readable evidence without a recovered run is
+  its own Gemini-style `call_0`. After a repair, physical keys include the latest
+  cut identity as a generation: reusing a removed WAL sequence cannot make a new
+  call inherit a removed call's identity or suppress new work. Retained Prepared keys keep their original
+  generation, and ordinary intents persist the generated key under the writer's
+  sequence-allocation lock. Unrepaired and legacy key spellings are unchanged.
+  Readable evidence without a recovered run is
   recorded in `unowned_calls` as outcome unknown, including any readable or
   derived keys. A bare ID there is diagnostic evidence only: without a readable
   or derived key naming the old physical call, it suppresses nothing.

@@ -9452,17 +9452,13 @@ fn held_resume_intents(
             };
             let mut dispatch = PlannedDispatch::from(call.clone());
             dispatch.input = Arc::clone(args);
-            dispatch.call_key = call_key.clone().or_else(|| {
-                writer
-                    .lineage_id()
-                    .map(|lineage| crate::context::call_key(lineage, frame.seq))
-            });
+            dispatch.call_key = call_key.clone().or_else(|| writer.call_key(frame.seq));
             if let Some(key) = call_key {
                 dispatch.approved = frames.iter().find_map(|frame| match &frame.record {
                     WalRecord::ToolCallDeferred { args_jcs, .. }
-                        if writer.lineage_id().is_some_and(|lineage| {
-                            crate::context::call_key(lineage, frame.seq) == *key
-                        }) =>
+                        if writer
+                            .call_key(frame.seq)
+                            .is_some_and(|found| found == *key) =>
                     {
                         Some(args_jcs.clone())
                     }
@@ -9974,9 +9970,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                             call_key: None,
                         })
                         .into_result()?;
-                    c.call_key = writer
-                        .lineage_id()
-                        .map(|lineage| crate::context::call_key(lineage, seq));
+                    c.call_key = writer.call_key(seq);
                 }
                 CallPlan::NoDispatch {
                     tool_call_id,
@@ -16213,12 +16207,9 @@ mod approval_gate {
         let seq = writer.record(prepared.clone()).into_result()?;
         // No route operation can observe this key until the Prepared frame is durable.
         writer.sync().await?;
-        let key = crate::context::call_key(
-            writer
-                .lineage_id()
-                .ok_or_else(|| RunError::Wal("Prepared lineage missing".into()))?,
-            seq,
-        );
+        let key = writer
+            .call_key(seq)
+            .ok_or_else(|| RunError::Wal("Prepared lineage missing".into()))?;
         history.fold(seq, prepared.clone());
         Ok(Slot::Held(Held {
             key,
@@ -16260,9 +16251,7 @@ mod approval_gate {
                         hooks: call.hooks.clone(),
                     })
                     .into_result()?;
-                call.call_key = writer
-                    .lineage_id()
-                    .map(|lineage| crate::context::call_key(lineage, seq));
+                call.call_key = writer.call_key(seq);
             }
             CallPlan::NoDispatch {
                 tool_call_id,
@@ -17680,10 +17669,9 @@ mod approval_gate {
         projection.recovery_tombstoned(call)
             || matches!(&*call.prepared, WalRecord::ToolCallDeferred { call_id, .. }
                 if call.run_id.as_ref().is_some_and(|run| writer.recovery_tombstoned(run, call_id)))
-            || writer.recovery_tombstoned_key(&format!(
-                "{}:{}",
-                projection.lineage_id, call.prepared_seq
-            ))
+            || writer
+                .call_key(call.prepared_seq)
+                .is_some_and(|key| writer.recovery_tombstoned_key(&key))
     }
 
     async fn close_stopped_late(

@@ -3517,6 +3517,8 @@ pub struct WalHandle {
     recovery_cut_ids: std::collections::BTreeSet<String>,
     recovery_calls: Vec<broca_wal::recovery::RecoveryRun>,
     recovery_call_keys: std::collections::BTreeSet<String>,
+    /// Cut boundaries namespace later calls without changing keys of retained Prepared frames.
+    physical_key_generations: Vec<(u64, String)>,
     /// Advisory display placement follows accepted queue order, not the lagging fsync head.
     display_placement: Mutex<Option<crate::placement::Placement>>,
     /// Zero means unlimited; finite limits only decrease over the writer's lifetime.
@@ -3595,6 +3597,21 @@ impl WalHandle {
     }
     pub(crate) fn recovery_tombstoned_key(&self, key: &str) -> bool {
         self.recovery_call_keys.contains(key)
+    }
+
+    pub(crate) fn call_key(&self, seq: u64) -> Option<String> {
+        let lineage = self.lineage_id()?;
+        let generation = self
+            .physical_key_generations
+            .iter()
+            .rev()
+            .find(|(cut_seq, _)| *cut_seq < seq)
+            .map(|(_, id)| id.as_str());
+        Some(broca_wal::recovery::physical_call_key(
+            &lineage.to_string(),
+            seq,
+            generation,
+        ))
     }
     /// A media-free prefix has no captures or aging history to restore. Its already-seeded
     /// placement is sufficient to start tracking the first later capture without rereading it.
@@ -4245,6 +4262,13 @@ impl WalHandle {
             })
             .flatten()
             .collect();
+        let physical_key_generations = recovered_frames
+            .iter()
+            .filter_map(|frame| match &frame.record {
+                WalRecord::RecoveryCut { recovery } => Some((frame.seq, recovery.cut_id.clone())),
+                _ => None,
+            })
+            .collect();
         let recovery_cut_ids = recovered_frames
             .iter()
             .filter_map(|frame| match &frame.record {
@@ -4450,6 +4474,7 @@ impl WalHandle {
             recovery_cut_ids,
             recovery_calls,
             recovery_call_keys,
+            physical_key_generations,
             display_placement: Mutex::new(unstarted.then(Default::default)),
             input_token_limit: AtomicU64::new(0),
             move_check: None,
@@ -4706,6 +4731,16 @@ impl WalHandle {
         reserved_terminal: bool,
         assigned: &mut Option<Vec<MessageTags>>,
     ) -> RecordOutcome {
+        // The enqueue lock also allocates this sequence. Persist the generated
+        // ordinary key so readers replaying only a WAL suffix need not reconstruct
+        // which repair cut preceded the record.
+        if !self.physical_key_generations.is_empty() {
+            if let WalRecord::ToolDispatchIntent { call_key, .. } = &mut record {
+                if call_key.is_none() {
+                    *call_key = self.call_key(self.next_seq.load(Ordering::SeqCst));
+                }
+            }
+        }
         if let Some(error @ WalWriteError::RelocationIncomplete { .. }) =
             current_write_error(&self.poisoned)
         {
