@@ -1587,6 +1587,68 @@ mod gated {
         }
     }
 
+    #[tokio::test]
+    async fn recorded_media_off_run_resumes_with_identical_tool_markers_and_bytes() {
+        const MARKER: &str = "[image/png not shown to the model: this runner does not pass tool images to models yet]";
+        let dir = broca_test_support::scratch_root()
+            .join(format!("media-off-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let admitted = anthropic_frozen_config("claude-opus-4-8");
+        assert!(admitted.media.is_none());
+        let mut req = request(&dir);
+        req.input = serde_json::from_value(serde_json::json!([
+            {"role":"user","content":[{"type":"text","text":"look"}]},
+            {"role":"assistant","content":[{"type":"tool_call","tool_call_id":"photo","tool_name":"read","input":{}}]},
+            {"role":"tool","content":[{"type":"tool_result","tool_call_id":"photo","output":{"kind":"text","text":MARKER},"is_error":false}]}
+        ])).unwrap();
+        seed_resumable_request(&dir, &req, &admitted);
+        let wal = FileWalStore::new(dir.join("wal"));
+        let prior = read_prior_run_config(&wal, &req.session).unwrap().unwrap();
+        let rebuilt: FrozenRenderConfig =
+            serde_json::from_value(prior.frozen_render_config).unwrap();
+        assert!(rebuilt.media.is_none());
+        let expected = AnthropicMessages.render(&admitted, &CallOptions::new(req.input.clone()));
+        let resumed = FrozenProvider::new(rebuilt);
+        drive_request(&dir, &resumed, req).await.unwrap();
+        let sent = resumed.sent.lock().unwrap();
+        assert_eq!(sent[&0], expected);
+        assert!(String::from_utf8_lossy(&sent[&0]).contains(MARKER));
+        assert!(!String::from_utf8_lossy(&sent[&0]).contains("\"type\":\"image\""));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recorded_media_profile_resumes_with_identical_profile_and_request_bytes() {
+        use broca_provider::{
+            media_profile::select_media_profile,
+            spec::{InputModalities, WireFamilyId},
+        };
+        let dir = broca_test_support::scratch_root()
+            .join(format!("media-profile-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut admitted = anthropic_frozen_config("claude-opus-4-8");
+        admitted.media = Some(select_media_profile(
+            WireFamilyId::AnthropicMessages,
+            Some(broca_provider::media_profile::MediaQuirk::Anthropic),
+            &admitted.wire_model_id,
+            InputModalities::from_value(&serde_json::json!(["text", "image", "pdf"])),
+            Some(128000),
+        ));
+        let expected = seed_crashed_run(&dir, &admitted).await;
+        let wal = FileWalStore::new(dir.join("wal"));
+        let prior = read_prior_run_config(&wal, &request(&dir).session)
+            .unwrap()
+            .unwrap();
+        let rebuilt: FrozenRenderConfig =
+            serde_json::from_value(prior.frozen_render_config).unwrap();
+        assert_eq!(rebuilt.media, admitted.media);
+        assert!(rebuilt.media.is_some());
+        let resumed = FrozenProvider::new(rebuilt);
+        assert_eq!(run_once(&dir, &resumed).await, RunFinishReason::Completed);
+        assert_eq!(resumed.sent.lock().unwrap()[&0], expected);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// First-party Anthropic's no-request default, exactly as `resolve_cache_policy` in
     /// broca-module-serve freezes it (that crate's tests pin the same value).
     #[tokio::test]

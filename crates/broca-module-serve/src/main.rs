@@ -141,8 +141,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(ServeIoError)?;
     broca_module_serve::transport_config::validate_default().map_err(ServeIoError)?;
-    let media = broca_module_serve::config::MediaConfig::load_default().map_err(ServeIoError)?;
-    broca_protocol::configure_media(media.enabled).map_err(|error| ServeIoError(error.into()))?;
+    broca_module_serve::config::warn_obsolete_media_default().map_err(ServeIoError)?;
     let archive_config = broca_module_serve::wal_archive::WalArchiveConfig::load_default_path()
         .map_err(ServeIoError)?;
     let bus_event_config =
@@ -4257,7 +4256,7 @@ mod executor {
                 None
             };
             let resolve_options = broca_catalog::live::ResolveOptions {
-                media: fresh_episode && broca_protocol::attachments_enabled(),
+                media: fresh_episode,
                 media_profile: job.media_profile.as_deref().filter(|_| fresh_episode),
                 claude_code_persona: fresh_persona.as_ref(),
                 auth_method: resolution.method,
@@ -4441,11 +4440,7 @@ mod executor {
                 }
             }
 
-            let uploads = if broca_protocol::attachments_enabled() {
-                self.wal_store.uploads()
-            } else {
-                None
-            };
+            let uploads = self.wal_store.uploads();
             if let Some(uploads) = uploads.filter(|_| {
                 resolved.provider.supports_media_renderer()
                     && (job.has_media_input()
