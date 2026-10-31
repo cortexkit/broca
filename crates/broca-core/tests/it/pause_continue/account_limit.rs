@@ -526,3 +526,76 @@ async fn account_resume_checks_the_recorded_request_digest_before_provider_io() 
         if error.provider_code.as_deref() == Some("account_limit_request_changed"))
     ));
 }
+
+#[tokio::test]
+async fn account_resume_vault_reauth_keeps_the_existing_auth_pause_path() {
+    let root = broca_test_support::scratch_root().join("account-limit-vault-reauth");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("test-clock"), br#"{"now_ms":1000}"#).unwrap();
+    let clock = broca_core::Clock::for_state_root(&root).unwrap();
+    let wal = FileWalStore::new(root.join("wal"));
+    let leases = FileLeaseStore::new(root.join("leases"));
+    let session = BindIdentity::new(root.join("project"), "h", "reauth");
+    let request = req(&session, "hello");
+    let provider = Limited::new(false, true);
+    let plane = StubToolPlane::new();
+    let (paused, _) = drive(request.clone(), &provider, &plane, &leases, &wal, RunControl {
+        account_limit_pause:true, clock:Some(clock.clone()), auth_selection:Some(serde_json::from_value(json!({
+            "credential_id":"oauth:stub:work", "account_ref":"acct-a", "resolved_credential_id":"cred-a"
+        })).unwrap()), ..Default::default()
+    }).await;
+    assert_eq!(paused.paused, Some(PauseReason::AccountLimit));
+    std::fs::write(root.join("test-clock"), br#"{"now_ms":61000}"#).unwrap();
+    clock.refresh().unwrap();
+    let (summary, _) = drive(request, &provider, &plane, &leases, &wal, RunControl {
+        clock:Some(clock), auth_selection:Some(serde_json::from_value(json!({"credential_id":"oauth:stub:work"})).unwrap()),
+        pause_for_auth_at_start:Some(serde_json::from_value(json!({"class":"auth_required", "message":"credential needs reauthentication", "provider_code":"needs_reauth"})).unwrap()),
+        ..Default::default()
+    }).await;
+    assert_eq!(summary.paused, Some(PauseReason::AuthRequired));
+    assert_eq!(provider.sent.lock().unwrap().len(), 1);
+    assert!(!records_of(&wal, &session)
+        .iter()
+        .any(|record| matches!(record, WalRecord::RunAuthRefrozen { .. })));
+}
+
+#[tokio::test]
+async fn account_resume_does_not_mistake_selection_diagnostics_for_an_account_switch() {
+    let root = broca_test_support::scratch_root().join("account-limit-selection-diagnostics");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("test-clock"), br#"{"now_ms":1000}"#).unwrap();
+    let clock = broca_core::Clock::for_state_root(&root).unwrap();
+    let wal = FileWalStore::new(root.join("wal"));
+    let leases = FileLeaseStore::new(root.join("leases"));
+    let session = BindIdentity::new(root.join("project"), "h", "diagnostics");
+    let request = req(&session, "hello");
+    let provider = Limited::new(false, true);
+    let plane = StubToolPlane::new();
+    let (paused, _) = drive(
+        request.clone(),
+        &provider,
+        &plane,
+        &leases,
+        &wal,
+        RunControl {
+            account_limit_pause: true,
+            clock: Some(clock.clone()),
+            auth_selection: Some(
+                serde_json::from_value(json!({"credential_id":"oauth:stub:work"})).unwrap(),
+            ),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(paused.paused, Some(PauseReason::AccountLimit));
+    std::fs::write(root.join("test-clock"), br#"{"now_ms":61000}"#).unwrap();
+    clock.refresh().unwrap();
+    let (summary, _) = drive(request, &provider, &plane, &leases, &wal, RunControl {
+        clock:Some(clock), auth_selection:Some(serde_json::from_value(json!({"credential_id":"oauth:stub:work", "account_decision":{"path":"disabled"}})).unwrap()), ..Default::default()
+    }).await;
+    assert_eq!(summary.reason, RunFinishReason::Completed);
+    assert_eq!(provider.sent.lock().unwrap().len(), 2);
+    assert!(!records_of(&wal, &session)
+        .iter()
+        .any(|record| matches!(record, WalRecord::RunAuthRefrozen { .. })));
+}

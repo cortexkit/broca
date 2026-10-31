@@ -4767,12 +4767,15 @@ where
                 // Resume, writing NO new RunStarted (the run is the same one, not a new
                 // episode).
                 if reason == PauseReason::AccountLimit
+                    && control.pause_for_auth_at_start.is_none()
                     && control.auth_selection.as_ref().is_some_and(|selection| {
-                        Some(selection)
-                            != prior
+                        !crate::account_limit_pause::same_selection(
+                            selection,
+                            prior
                                 .run_config
                                 .as_ref()
-                                .and_then(|config| config.auth_selection.as_ref())
+                                .and_then(|config| config.auth_selection.as_ref()),
+                        )
                     })
                 {
                     let error = crate::account_limit_pause::selection_changed_error();
@@ -4841,6 +4844,24 @@ where
                         retries_used: prior.retries_used,
                         final_step_finish_reason: None,
                     });
+                }
+                if reason == PauseReason::AccountLimit {
+                    // A vault re-login refusal has no provider I/O. Keep the auth pause instead
+                    // of treating missing credential/account IDs as changed selection or render config.
+                    if let Some(error) = control.pause_for_auth_at_start.clone() {
+                        return pause_run(
+                            writer,
+                            out,
+                            control,
+                            resolved_run_id.clone(),
+                            PauseReason::AuthRequired,
+                            Some(error),
+                            prior.completed_steps,
+                            prior.usage,
+                            prior.retries_used,
+                        )
+                        .await;
+                    }
                 }
                 // Auth resolved → continue. A pause before the first provider call may have
                 // frozen an incomplete credential-bound render config (Antigravity has no

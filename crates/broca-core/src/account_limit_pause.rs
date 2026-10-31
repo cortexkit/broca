@@ -49,6 +49,26 @@ pub(crate) fn selection_changed_error() -> ProviderError {
     error
 }
 
+/// Compare identity, not routing or vault-request diagnostics that a resolver may refresh.
+/// Known served IDs must match; missing IDs remain unknown without rewriting frozen config.
+pub(crate) fn same_selection(actual: &AuthSelection, frozen: Option<&AuthSelection>) -> bool {
+    fn known_ids_match(actual: &Option<String>, frozen: &Option<String>) -> bool {
+        actual
+            .as_ref()
+            .zip(frozen.as_ref())
+            .is_none_or(|(actual, frozen)| actual == frozen)
+    }
+    frozen.is_some_and(|frozen| {
+        actual.credential_id == frozen.credential_id
+            && actual.auth_method == frozen.auth_method
+            && known_ids_match(&actual.account_ref, &frozen.account_ref)
+            && known_ids_match(
+                &actual.resolved_credential_id,
+                &frozen.resolved_credential_id,
+            )
+    })
+}
+
 pub(crate) fn resume_floor(
     paused_at_ms: u64,
     observed_at_ms: u64,
@@ -179,6 +199,34 @@ impl FailedAccountLimitAttempt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_selection_identity_rejects_known_changes_and_keeps_unknown_witnesses_unknown() {
+        let frozen: AuthSelection = serde_json::from_value(serde_json::json!({
+            "credential_id":"opaque", "auth_method":"oauth", "account_ref":"acct-a", "resolved_credential_id":"cred-a"
+        })).unwrap();
+        assert!(same_selection(&frozen, Some(&frozen)));
+        assert!(!same_selection(&frozen, None));
+        for field in [
+            "credential_id",
+            "auth_method",
+            "account_ref",
+            "resolved_credential_id",
+        ] {
+            let mut changed = serde_json::to_value(&frozen).unwrap();
+            changed[field] = serde_json::json!("other");
+            assert!(
+                !same_selection(&serde_json::from_value(changed).unwrap(), Some(&frozen)),
+                "{field}"
+            );
+        }
+        let unknown: AuthSelection = serde_json::from_value(
+            serde_json::json!({"credential_id":"opaque", "auth_method":"oauth"}),
+        )
+        .unwrap();
+        assert!(same_selection(&unknown, Some(&frozen)));
+        assert!(same_selection(&frozen, Some(&unknown)));
+    }
 
     #[test]
     fn account_limit_timing_table_pins_both_edges_and_present_values() {
