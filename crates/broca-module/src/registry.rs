@@ -1616,6 +1616,28 @@ impl LineageRegistry {
         })
     }
 
+    /// Resolve a run's content-free identity and state hint without replaying any WAL.
+    /// Status and result callers must still authenticate the run through the run-row reader.
+    pub fn overhaul_lookup_run(
+        &self,
+        run_id: &str,
+    ) -> Option<Result<Option<broca_core::RunIndexRow>, String>> {
+        self.inner
+            .run_rows
+            .as_ref()
+            .map(|source| source.lookup_run(run_id))
+    }
+
+    /// Discover possible restart pauses; only WAL-confirmed pause reasons authorize recovery.
+    pub fn overhaul_restart_resume_candidates(
+        &self,
+    ) -> Option<Result<Vec<(String, LineageKey)>, String>> {
+        self.inner
+            .run_rows
+            .as_ref()
+            .map(|source| source.restart_resume_candidates())
+    }
+
     /// Install what reads a frozen config's prompt-cache declaration. Set once, before serving;
     /// only the first installation takes effect.
     pub fn set_cache_declarer(&self, declarer: Arc<dyn crate::cache::CacheDeclarer>) {

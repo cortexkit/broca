@@ -47,6 +47,19 @@ impl OverhaulRunSource {
         Self { db, wal }
     }
 
+    pub(super) fn lookup_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<broca_core::RunIndexRow>, String> {
+        self.db.lookup_run(run_id).map_err(|e| e.to_string())
+    }
+
+    pub(super) fn restart_resume_candidates(&self) -> Result<Vec<(String, BindIdentity)>, String> {
+        self.db
+            .restart_resume_candidates()
+            .map_err(|e| e.to_string())
+    }
+
     fn row(&self, key: &BindIdentity, run_id: &RunId) -> Result<Option<Row>, DbError> {
         self.db.read_snapshot(|tx| {
             let row = tx.query_row(
@@ -155,7 +168,11 @@ impl OverhaulRunSource {
         if lineage_id.map(|id| id.to_string()) != row.lineage_id {
             return fallback("run row lineage mismatch");
         }
-        let off = row.boundary.as_ref().map_or(0, |b| b.frame_end);
+        // The authenticated lineage header is metadata, not part of the first run's range.
+        let off = row.boundary.as_ref().map_or_else(
+            || lineage_id.map_or(0, |_| broca_wal::framing::LINEAGE_FRAME_LEN as u64),
+            |b| b.frame_end,
+        );
         let end = row.next_off.unwrap_or(len).min(len);
         if off > row.start_off || row.start_off >= end {
             return fallback("run row range outside log");
@@ -317,7 +334,7 @@ impl OverhaulRunSource {
                 Err(_) => return Ok(None),
             }
         } else {
-            // This is an origin replay, not a read resumed from persisted state.
+            // The first episode has no persisted seed; replay all of its records.
             if tail.first().is_none_or(|p| p.framed.seq != 1) {
                 return Err("origin replay does not begin with sequence one".into());
             }
@@ -368,28 +385,13 @@ impl OverhaulRunSource {
         &self,
         fallback: &[(RunId, BindIdentity)],
     ) -> Result<Vec<(RunId, BindIdentity)>, String> {
-        let mut candidates = self
+        let mut candidates: Vec<_> = self
             .db
-            .read_snapshot(|tx| {
-                let mut stmt = tx.prepare(
-                    "SELECT r.run_id,s.project_root,s.harness,s.session_key
-                FROM run r JOIN session s ON s.sid=r.sid WHERE r.state='active'",
-                )?;
-                let rows = stmt
-                    .query_map([], |r| {
-                        Ok((
-                            RunId(r.get(0)?),
-                            BindIdentity::new(
-                                r.get::<_, String>(1)?,
-                                r.get::<_, String>(2)?,
-                                r.get::<_, String>(3)?,
-                            ),
-                        ))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(rows)
-            })
-            .map_err(|e| e.to_string())?;
+            .active_runs()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|(id, key)| (RunId(id), key))
+            .collect();
         // Until publication covers every run, retain legacy candidates too. The registry
         // reconciles them against validated run rows before deciding whether to mark them.
         for (run_id, key) in fallback {
@@ -409,9 +411,9 @@ mod tests {
     use broca_core::WalStore;
     use broca_protocol::content::{AssistantMessage, ContentBlock, Message, Role};
     use broca_protocol::{MessageId, RunFinishReason, StepId, Usage};
-    use broca_store::db::{LogLocation, PublishedSession};
+    use broca_store::db::LogLocation;
     use broca_wal::Wal;
-    use cortexkit_role_llm_runner::tool_calls::ToolCallsRequest;
+    use cortexkit_role_llm_runner::tool_calls::{ToolCallsPage, ToolCallsRequest};
     use serde_json::json;
 
     struct NeverOpen;
@@ -432,6 +434,8 @@ mod tests {
         key: BindIdentity,
         wal: Box<dyn Wal + Send>,
         source: Arc<OverhaulRunSource>,
+        publish_on_append: bool,
+        media: bool,
     }
     impl Fixture {
         fn new(name: &str) -> Self {
@@ -444,7 +448,7 @@ mod tests {
                 root.join("wal"),
                 broca_wal::WalConfig::OVERHAUL,
             ));
-            let wal = store.open(&key).unwrap();
+            let wal = Self::open_writer(&store, &key, &root);
             let source = Arc::new(OverhaulRunSource::new(
                 Arc::new(OverhaulDb::open(&root).unwrap()),
                 store,
@@ -454,6 +458,8 @@ mod tests {
                 key,
                 wal,
                 source,
+                publish_on_append: true,
+                media: false,
             }
         }
         fn registry(&self, indexed: bool) -> crate::LineageRegistry {
@@ -464,18 +470,52 @@ mod tests {
                 indexed.then(|| self.source.clone()),
             )
         }
+        fn open_writer(
+            store: &FileWalStore,
+            key: &BindIdentity,
+            root: &std::path::Path,
+        ) -> Box<dyn Wal + Send> {
+            // Initialize the store's path layout, then keep the concrete FileWal writer open
+            // so publication can use the durable byte end recorded by its successful sync.
+            drop(store.open(key).unwrap());
+            Box::new(
+                broca_wal::FileWal::open(store.wal_path(key))
+                    .unwrap()
+                    .with_feature_floor(root.join("wal-floor"))
+                    .with_wal_config(broca_wal::WalConfig::OVERHAUL)
+                    .unwrap(),
+            )
+        }
         fn append(&mut self, record: WalRecord) {
             self.wal.append(1, &record, true).unwrap();
+            if self.publish_on_append {
+                self.index();
+            }
         }
         fn start(&mut self, id: &str) {
-            self.append(serde_json::from_value(json!({
-                "type":"run_started", "run_id":id, "session":self.key,
-                "config":{"model":{"provider_module_id":"provider","model_id":"model"},
-                    "tools":[], "tool_choice":{"type":"auto"}, "generation":{},
-                    "response_format":{"type":"text"}, "context_epoch":0,"renderer_version":1},
-                "input":[Message::new(Role::User,vec![ContentBlock::Text{text:format!("input-{id}")}])],
-                "origin":{"kind":"fresh"}
-            })).unwrap());
+            let mut content = vec![ContentBlock::Text {
+                text: format!("input-{id}"),
+            }];
+            if self.media {
+                content.push(ContentBlock::Media(
+                    broca_core::media_validation::validate_media(
+                        b"%PDF-1.7\nrun-row fixture\n%%EOF",
+                        "application/pdf",
+                    )
+                    .unwrap(),
+                ));
+            }
+            self.append(
+                serde_json::from_value(json!({
+                    "type":"run_started", "run_id":id, "session":self.key,
+                    "config":{"model":{"provider_module_id":"provider","model_id":"model"},
+                        "tools":[], "tool_choice":{"type":"auto"}, "generation":{},
+                        "response_format":{"type":"text"}, "context_epoch":0,"renderer_version":1},
+                    "input":[Message::new(Role::User,content)],
+                    "origin":{"kind":"fresh"}
+                }))
+                .unwrap(),
+            );
         }
         fn step(&mut self, step: u64, content: Vec<ContentBlock>) {
             let step_id = StepId(step);
@@ -532,15 +572,17 @@ mod tests {
             });
         }
         fn index(&self) {
-            let bytes = std::fs::read(self.source.wal.wal_path(&self.key)).unwrap();
             self.source
                 .db
-                .index(&PublishedSession {
-                    bind: &self.key,
-                    session_ref: "test-ref",
-                    location: LogLocation::Live,
-                    bytes: &bytes,
-                })
+                .publish(
+                    &self.key,
+                    "test-ref",
+                    LogLocation::Live,
+                    &self
+                        .wal
+                        .durable_publication()
+                        .expect("a synced append mints a publication"),
+                )
                 .unwrap();
         }
         fn history(&mut self) {
@@ -611,6 +653,477 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    struct ReadPlan {
+        ranges: Vec<(&'static str, access_counter::WalReadAccess)>,
+        decodes: u64,
+    }
+
+    impl Fixture {
+        fn read_plan(&self, id: &str, preceding: Option<(&str, &str)>) -> ReadPlan {
+            use access_counter::{ReadClass, WalReadAccess};
+            let bytes = std::fs::read(self.source.wal.wal_path(&self.key)).unwrap();
+            let mut frames = Vec::new();
+            let mut metadata = Vec::new();
+            let mut off = broca_wal::framing::LINEAGE_FRAME_LEN as u64;
+            while off < bytes.len() as u64 {
+                match broca_wal::framing::decode_next(&bytes[off as usize..]) {
+                    DecodeStep::Record { framed, consumed } => {
+                        frames.push((off, off + consumed as u64, framed.record));
+                        off += consumed as u64;
+                    }
+                    DecodeStep::Lineage { consumed, .. } => {
+                        metadata.push((off, off + consumed as u64));
+                        off += consumed as u64;
+                    }
+                    _ => panic!("fixture must contain complete records at offset {off}"),
+                }
+            }
+            let start = |id: &str| {
+                frames.iter().position(|(_, _, record)| {
+                matches!(record, WalRecord::RunStarted { run_id, .. } if run_id.0 == id)
+            }).unwrap()
+            };
+            let target = start(id);
+            let next = frames
+                .iter()
+                .enumerate()
+                .skip(target + 1)
+                .find(|(_, (_, _, record))| matches!(record, WalRecord::RunStarted { .. }))
+                .map(|(n, _)| n);
+            let mut ranges = Vec::new();
+            let mut add = |name, offset, length, class| {
+                ranges.push((
+                    name,
+                    WalReadAccess {
+                        offset,
+                        length,
+                        class,
+                        writer_open: None,
+                    },
+                ))
+            };
+            add("lineage header", 0, 69, ReadClass::LineageHeader);
+            let end = next.map_or(bytes.len() as u64, |n| frames[n].0);
+            if let Some(n) = next {
+                add(
+                    "next-run delimiter probe",
+                    frames[n].0,
+                    1024.min(bytes.len() as u64 - frames[n].0),
+                    ReadClass::Validation(ValidationRead::NextRunDelimiter),
+                );
+            }
+            let mut lo = 69;
+            let mut validations = 0;
+            let mut cut = None;
+            if let Some((previous, kind)) = preceding {
+                let previous = start(previous);
+                let n = (previous..target)
+                    .rev()
+                    .find(|&n| match (&frames[n].2, kind) {
+                        (WalRecord::RunStarted { .. }, "zero_step_seed") => true,
+                        (
+                            WalRecord::ModelStepFinished {
+                                assistant_message, ..
+                            },
+                            "no_tool_step",
+                        ) => assistant_message.tool_calls().next().is_none(),
+                        (WalRecord::TurnFinished { .. }, "turn_finished") => true,
+                        _ => false,
+                    })
+                    .unwrap();
+                lo = frames[n].1;
+                cut = Some((n, previous, kind));
+            }
+            add(
+                "target run and contiguous boundary tail",
+                lo,
+                end - lo,
+                ReadClass::Source,
+            );
+            if let Some((n, previous, kind)) = cut {
+                add(
+                    "boundary kind check",
+                    frames[n].0,
+                    frames[n].1 - frames[n].0,
+                    ReadClass::Validation(ValidationRead::BoundaryFrame),
+                );
+                if kind != "turn_finished" {
+                    let terminal = (previous..target)
+                        .rev()
+                        .find(|&n| matches!(frames[n].2, WalRecord::RunFinished { .. }))
+                        .unwrap();
+                    add(
+                        "qualifier terminal",
+                        frames[terminal].0,
+                        frames[terminal].1 - frames[terminal].0,
+                        ReadClass::Validation(ValidationRead::QualifierTerminal),
+                    );
+                    validations += 1;
+                }
+                let first = frames.iter().find(|(off, _, _)| *off >= lo).unwrap().0;
+                if first != lo {
+                    add(
+                        "boundary lineage gap",
+                        lo,
+                        first - lo,
+                        ReadClass::Validation(ValidationRead::LineageGap),
+                    );
+                    validations += metadata
+                        .iter()
+                        .filter(|(off, _)| *off >= lo && *off < first)
+                        .count() as u64;
+                }
+                add(
+                    "validated replay boundary authentication",
+                    frames[n].0,
+                    frames[n].1 - frames[n].0,
+                    ReadClass::Validation(ValidationRead::BoundaryFrame),
+                );
+                add(
+                    "validated replay lineage authentication",
+                    0,
+                    69,
+                    ReadClass::LineageHeader,
+                );
+                validations += 3;
+            }
+            ReadPlan {
+                ranges,
+                decodes: frames
+                    .iter()
+                    .filter(|(off, _, _)| *off >= lo && *off < end)
+                    .count() as u64
+                    + metadata
+                        .iter()
+                        .filter(|(off, _)| *off >= lo && *off < end)
+                        .count() as u64
+                    + 1
+                    + u64::from(next.is_some())
+                    + validations,
+            }
+        }
+    }
+
+    impl ReadPlan {
+        fn assert_operation(&self, measured: &access_counter::OperationAccess) {
+            assert!(measured.seed_fallbacks.is_empty(), "{measured:?}");
+            assert!(measured.writer_opens.is_empty(), "{measured:?}");
+            assert_eq!(measured.frames_decoded, self.decodes, "{}", measured.name);
+            assert_eq!(
+                measured.reads.len(),
+                self.ranges.len(),
+                "{measured:?}; named plan: {:?}",
+                self.ranges
+            );
+            for (actual, (name, expected)) in measured.reads.iter().zip(&self.ranges) {
+                assert_eq!(actual, expected, "{}: {name}", measured.name);
+                assert_ne!(actual.class, access_counter::ReadClass::Origin);
+            }
+        }
+    }
+
+    fn assert_tool_page(actual: &ToolCallsPage, expected: &ToolCallsPage) {
+        assert_eq!(actual.run_id, expected.run_id);
+        assert_eq!(
+            serde_json::to_value(&actual.calls).unwrap(),
+            serde_json::to_value(&expected.calls).unwrap()
+        );
+        match (&actual.next, &expected.next) {
+            (None, None) => {}
+            (Some(actual), Some(expected)) => {
+                let logical = |cursor: &str| {
+                    let mut value: serde_json::Value = serde_json::from_str(cursor).unwrap();
+                    let object = value.as_object_mut().unwrap();
+                    // Opaque cursors may include route-specific anchor_before values.
+                    // Compare every logical position; each route consumes its own signed cursor.
+                    object.remove("anchor_before");
+                    assert!(!object
+                        .remove("authentication")
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .is_empty());
+                    value
+                };
+                assert_eq!(logical(actual), logical(expected));
+            }
+            _ => panic!("both routes must agree whether a continuation exists"),
+        }
+    }
+
+    fn cursor_fixture(name: &str) -> Fixture {
+        let mut f = Fixture::new(name);
+        f.history();
+        f.start("target");
+        f.tool_turn();
+        f.finish(RunFinishReason::MaxSteps);
+        f
+    }
+
+    async fn cursors(f: &Fixture) -> (String, String) {
+        let legacy = f
+            .registry(false)
+            .run_tool_calls(&f.key, ToolCallsRequest::new("target").with_limit(1))
+            .await
+            .unwrap();
+        let indexed = f
+            .registry(true)
+            .run_tool_calls(&f.key, ToolCallsRequest::new("target").with_limit(1))
+            .await
+            .unwrap();
+        assert_tool_page(&indexed, &legacy);
+        (legacy.next.unwrap(), indexed.next.unwrap())
+    }
+
+    async fn assert_cursor_refusals(f: &Fixture, tokens: (String, String)) {
+        for (indexed, token) in [(false, tokens.0), (true, tokens.1)] {
+            let error = f
+                .registry(indexed)
+                .run_tool_calls(&f.key, ToolCallsRequest::new("target").with_after(token))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, crate::serve::ServeError::InvalidParams { ref field, .. } if field == "after"),
+                "both routes must refuse the cursor with invalid params for after, indexed={indexed}: {error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn run_row_cursors_refuse_another_session_like_legacy() {
+        let source = cursor_fixture("cursor-source");
+        let target = cursor_fixture("cursor-other-session");
+        assert_cursor_refusals(&target, cursors(&source).await).await;
+    }
+
+    #[tokio::test]
+    async fn run_row_cursors_refuse_recreated_lineage_like_legacy() {
+        let f = cursor_fixture("cursor-recreated");
+        let tokens = cursors(&f).await;
+        let replacement = cursor_fixture("cursor-new-lineage");
+        let bytes = std::fs::read(replacement.source.wal.wal_path(&replacement.key)).unwrap();
+        std::fs::write(f.source.wal.wal_path(&f.key), bytes).unwrap();
+        assert_cursor_refusals(&f, tokens).await;
+    }
+
+    #[tokio::test]
+    async fn run_row_cursors_refuse_missing_position_like_legacy() {
+        let f = cursor_fixture("cursor-missing-position");
+        let tokens = cursors(&f).await;
+        let token: serde_json::Value = serde_json::from_str(&tokens.0).unwrap();
+        let missing_seq = token["step_seq"].as_u64().unwrap();
+        let path = f.source.wal.wal_path(&f.key);
+        let bytes = std::fs::read(&path).unwrap();
+        let mut off = 0;
+        loop {
+            match broca_wal::framing::decode_next(&bytes[off..]) {
+                DecodeStep::Record { framed, consumed } => {
+                    if framed.seq == missing_seq {
+                        break;
+                    }
+                    off += consumed;
+                }
+                DecodeStep::Lineage { consumed, .. } => off += consumed,
+                _ => panic!("cursor must name a complete fixture record"),
+            }
+        }
+        std::fs::write(path, &bytes[..off]).unwrap();
+        assert_cursor_refusals(&f, tokens).await;
+    }
+
+    #[tokio::test]
+    async fn published_run_rows_have_exact_read_plans_and_legacy_answers() {
+        for media in [false, true] {
+            let mut f = Fixture::new(&format!("publication-plans-{media}"));
+            f.media = media;
+            f.start("zero-first");
+            f.finish(RunFinishReason::Interrupted);
+            f.start("answer");
+            f.step(
+                1,
+                vec![ContentBlock::Text {
+                    text: "answer".into(),
+                }],
+            );
+            f.finish(RunFinishReason::Completed);
+            f.start("tools");
+            f.tool_turn();
+            f.finish(RunFinishReason::MaxSteps);
+            // Reopen the database between runs; subsequent appends still publish automatically.
+            f.source = Arc::new(OverhaulRunSource::new(
+                Arc::new(OverhaulDb::open(&f.root).unwrap()),
+                f.source.wal.clone(),
+            ));
+            f.start("zero-later");
+            f.finish(RunFinishReason::Cancelled);
+            f.start("last");
+            f.step(
+                1,
+                vec![ContentBlock::Text {
+                    text: "last answer".into(),
+                }],
+            );
+            f.finish(RunFinishReason::Completed);
+            let legacy = f.registry(false);
+            let indexed = f.registry(true);
+            for (id, preceding) in [
+                ("zero-first", None),
+                ("answer", Some(("zero-first", "zero_step_seed"))),
+                ("tools", Some(("answer", "no_tool_step"))),
+                ("zero-later", Some(("tools", "turn_finished"))),
+                ("last", Some(("zero-later", "zero_step_seed"))),
+            ] {
+                let plan = f.read_plan(id, preceding);
+                eprintln!(
+                    "run={id}, media={media}: {} reads, {} decodes; named ranges: {:?}",
+                    plan.ranges.len(),
+                    plan.decodes,
+                    plan.ranges
+                );
+                let run = RunId(id.into());
+                let expected_status = legacy.run_status(&f.key, run.clone()).await.unwrap();
+                let expected_result = legacy.run_result(&f.key, run.clone()).await.unwrap();
+                let counter = access_counter::WalAccessCounter::default();
+                let before = f.source.wal.range_reads_for_test();
+                let status = counter
+                    .operation(format!("{id} status"))
+                    .run_future(indexed.run_status(&f.key, run.clone()))
+                    .await
+                    .unwrap();
+                let result = counter
+                    .operation(format!("{id} result"))
+                    .run_future(indexed.run_result(&f.key, run))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(status).unwrap(),
+                    serde_json::to_value(expected_status).unwrap()
+                );
+                assert_eq!(
+                    serde_json::to_value(result).unwrap(),
+                    serde_json::to_value(expected_result).unwrap()
+                );
+                assert_eq!(f.source.wal.range_reads_for_test(), before);
+                let mut after = None;
+                let mut expected_after = None;
+                loop {
+                    let request = ToolCallsRequest::new(id).with_limit(1);
+                    let request = if let Some(cursor) = after {
+                        request.with_after(cursor)
+                    } else {
+                        request
+                    };
+                    let expected_request = ToolCallsRequest::new(id).with_limit(1);
+                    let expected_request = if let Some(cursor) = expected_after {
+                        expected_request.with_after(cursor)
+                    } else {
+                        expected_request
+                    };
+                    let expected = legacy
+                        .run_tool_calls(&f.key, expected_request)
+                        .await
+                        .unwrap();
+                    let before = f.source.wal.range_reads_for_test();
+                    let actual = counter
+                        .operation(format!("{id} tool-call page"))
+                        .run_future(indexed.run_tool_calls(&f.key, request))
+                        .await
+                        .unwrap();
+                    assert_tool_page(&actual, &expected);
+                    assert_eq!(f.source.wal.range_reads_for_test(), before);
+                    after = actual.next;
+                    expected_after = expected.next;
+                    if after.is_none() {
+                        break;
+                    }
+                    assert_eq!(id, "tools");
+                    assert_eq!(actual.calls.len(), 1);
+                }
+                for measured in counter.snapshot() {
+                    plan.assert_operation(&measured);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn published_run_discovery_is_content_free_and_keeps_paused_candidates() {
+        let mut f = Fixture::new("discovery");
+        f.history();
+        f.start("paused");
+        f.append(WalRecord::RunPaused {
+            run_id: RunId("paused".into()),
+            ts_ms: None,
+            reason: broca_protocol::PauseReason::Restart,
+            error: None,
+        });
+        let other = BindIdentity::new(f.root.join("other"), "runner", "active-session");
+        f.source.db.authoritative_transaction(|tx| {
+            tx.execute("UPDATE run SET submission_id='submission',request_identity_digest='digest' WHERE run_id='paused'", [])?;
+            Ok(())
+        }).unwrap();
+        let registry = f.registry(true);
+        let counter = access_counter::WalAccessCounter::default();
+        counter.operation("SQL discovery").run(|| {
+            let row = registry
+                .overhaul_lookup_run("paused")
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.session, f.key);
+            assert_eq!(row.state, broca_core::RunIndexState::Paused);
+            assert_eq!(row.submission_id.as_deref(), Some("submission"));
+            assert_eq!(row.request_identity_digest.as_deref(), Some("digest"));
+            assert!(
+                row.title.is_none()
+                    && row.usage.is_none()
+                    && row.final_step_finish_reason.is_none()
+            );
+            assert_eq!(row.retries_used, 0);
+            assert!(registry
+                .overhaul_lookup_run("missing")
+                .unwrap()
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                registry
+                    .overhaul_restart_resume_candidates()
+                    .unwrap()
+                    .unwrap(),
+                vec![("paused".into(), f.key.clone())]
+            );
+            assert!(f.source.db.active_runs().unwrap().is_empty());
+            assert!(registry
+                .overhaul_lookup_run("history")
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .state
+                .is_terminal());
+        });
+        assert!(counter.snapshot()[0].reads.is_empty());
+        assert!(counter.snapshot()[0].seed_fallbacks.is_empty());
+        assert!(f.registry(false).overhaul_lookup_run("paused").is_none());
+        assert!(f
+            .registry(false)
+            .overhaul_restart_resume_candidates()
+            .is_none());
+        // A newly published active run joins both discovery sets, but terminal history does not.
+        f.key = other;
+        f.wal = Fixture::open_writer(&f.source.wal, &f.key, &f.root);
+        f.start("active");
+        assert_eq!(
+            f.source.db.active_runs().unwrap(),
+            vec![("active".into(), f.key.clone())]
+        );
+        assert_eq!(
+            registry
+                .overhaul_restart_resume_candidates()
+                .unwrap()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -746,12 +1259,32 @@ mod tests {
             .await
             .unwrap();
         let registry = f.registry(true);
+        let expected_first = f
+            .registry(false)
+            .run_tool_calls(&f.key, ToolCallsRequest::new("target").with_limit(1))
+            .await
+            .unwrap();
+        let expected_second = f
+            .registry(false)
+            .run_tool_calls(
+                &f.key,
+                ToolCallsRequest::new("target")
+                    .with_limit(1)
+                    .with_after(expected_first.next.clone().unwrap()),
+            )
+            .await
+            .unwrap();
         let before = f.source.wal.range_reads_for_test();
         let first = registry
             .run_tool_calls(&f.key, ToolCallsRequest::new("target").with_limit(1))
             .await
             .unwrap();
         assert_eq!(first.calls.len(), 1);
+        assert!(
+            first.next.is_some(),
+            "the fixture must exercise a nonempty continuation"
+        );
+        assert_tool_page(&first, &expected_first);
         let second = registry
             .run_tool_calls(
                 &f.key,
@@ -762,12 +1295,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.calls.len(), 1);
+        assert_tool_page(&second, &expected_second);
         assert!(second.next.is_none());
         let calls = [first.calls, second.calls].concat();
         assert_eq!(
             serde_json::to_value(calls).unwrap(),
             serde_json::to_value(expected.calls).unwrap()
         );
+        assert_eq!(f.source.wal.range_reads_for_test(), before);
+        let counter = access_counter::WalAccessCounter::default();
+        let resumed = counter
+            .operation("legacy optimization cursor on indexed route")
+            .run_future(
+                registry.run_tool_calls(
+                    &f.key,
+                    ToolCallsRequest::new("target")
+                        .with_limit(1)
+                        .with_after(expected_first.next.unwrap()),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_tool_page(&resumed, &expected_second);
+        f.read_plan("target", Some(("history", "no_tool_step")))
+            .assert_operation(&counter.snapshot()[0]);
         assert_eq!(f.source.wal.range_reads_for_test(), before);
     }
 
@@ -783,6 +1334,7 @@ mod tests {
             vec![(RunId("target".into()), f.key.clone())]
         );
         // The log's terminal is durable, but its run-row transaction never happened.
+        f.publish_on_append = false;
         f.finish(RunFinishReason::Interrupted);
         let before_bytes = std::fs::read(f.source.wal.wal_path(&f.key)).unwrap();
         let reopened = Arc::new(OverhaulRunSource::new(
@@ -797,8 +1349,15 @@ mod tests {
         );
         let before = f.source.wal.range_reads_for_test();
         assert_eq!(
-            registry
-                .overhaul_active_runs(&[(RunId("target".into()), f.key.clone())])
+            reopened.db.lookup_run("target").unwrap().unwrap().state,
+            broca_core::RunIndexState::Active
+        );
+        let counter = access_counter::WalAccessCounter::default();
+        let plan = f.read_plan("target", Some(("history", "no_tool_step")));
+        assert_eq!(
+            counter
+                .operation("terminal gap candidate reconciliation")
+                .run(|| registry.overhaul_active_runs(&[(RunId("target".into()), f.key.clone())]))
                 .unwrap()
                 .unwrap(),
             Vec::new(),
@@ -825,6 +1384,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(state, "interrupted");
+        plan.assert_operation(&counter.snapshot()[0]);
         assert_eq!(
             std::fs::read(f.source.wal.wal_path(&f.key)).unwrap(),
             before_bytes
@@ -1130,8 +1690,8 @@ mod tests {
             runs.len()
         );
         assert_eq!(
-            origin_runs, 1,
-            "only the first episode replays from the log origin"
+            origin_runs, 0,
+            "the lineage header is read separately from the first episode"
         );
     }
 }
