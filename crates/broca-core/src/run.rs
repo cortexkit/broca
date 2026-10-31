@@ -4840,7 +4840,7 @@ where
                 if let Some(auth_selection) = control
                     .auth_selection
                     .as_ref()
-                    .filter(|_| reason == PauseReason::AuthRequired)
+                    .filter(|_| reason != PauseReason::AccountLimit)
                     .filter(|selection| Some(*selection) != frozen_auth_selection)
                 {
                     if let Some(config) = &mut warm_config {
