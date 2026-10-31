@@ -595,7 +595,8 @@ pub struct RunControl {
     pub cancel: Option<CancellationToken>,
     /// Per-model-call timeout (the provider watchdog). Normal expiry closes Interrupted
     /// and releases the lease after writer shutdown. On overhaul roots, a reservation
-    /// durability failure takes precedence and fails the step with a WAL error instead.
+    /// sync failure takes precedence and fails the step with a WAL error instead;
+    /// cancellation while awaiting permission releases the known-unsent reservation.
     /// This does not bound public run completion: a kernel sync that never returns keeps
     /// exclusive writer ownership and requires supervisor-level process recovery.
     /// `None` leaves the model-stream await unbounded.
@@ -8849,31 +8850,39 @@ impl AttemptJournal<'_> {
                 };
                 let failure = tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => Some("reservation cancelled before its durability barrier completed"),
-                    _ = step_stopped.cancelled() => Some("step stopped before its reservation barrier completed"),
-                    _ = reply.closed() => Some("reservation receipt closed before its durability barrier completed"),
-                    _ = sealed => Some("shutdown sealed before the reservation barrier completed"),
-                    _ = tokio::time::sleep(RESERVATION_PERMISSION_TIMEOUT) => Some("reservation durability barrier deadline expired"),
+                    _ = cancel.cancelled() => Some((true, "reservation cancelled before its durability barrier completed")),
+                    _ = step_stopped.cancelled() => Some((true, "step stopped before its reservation barrier completed")),
+                    _ = reply.closed() => Some((false, "reservation receipt closed before its durability barrier completed")),
+                    _ = sealed => Some((false, "shutdown sealed before the reservation barrier completed")),
+                    _ = tokio::time::sleep(RESERVATION_PERMISSION_TIMEOUT) => Some((false, "reservation durability barrier deadline expired")),
                     result = self.writer.sync() => { result?; None },
                 };
-                if let Some(detail) = failure {
+                if let Some((stopped, detail)) = failure {
                     let _ = reply.send(Err(attempt_hook_error(detail)));
+                    if stopped {
+                        // Permission has never been handed out, so no bytes can have left.
+                        // Queue the release behind the reservation; the ordinary terminal's
+                        // sync must still persist both before the run can finish normally.
+                        let terminal = self.pending[&id].fallback(id.clone());
+                        self.settle(&id, terminal)?;
+                        return Ok(());
+                    }
                     return Err(WalWriteError::from(format!(
                         "attempt_durability_failed: {detail}"
                     )));
                 }
                 self.pending.get_mut(&id).unwrap().barrier_acknowledged = true;
-                if cancel.is_cancelled() || reply.is_closed() {
+                #[cfg(test)]
+                if let Some((reached, proceed)) = self.before_start.take() {
+                    reached.notify_one();
+                    proceed.notified().await;
+                }
+                if cancel.is_cancelled() || step_stopped.is_cancelled() || reply.is_closed() {
                     let terminal = self.pending[&id].fallback(id.clone());
                     self.settle(&id, terminal)?;
                     let _ =
                         reply.send(Err(attempt_hook_error("send cancelled during reservation")));
                     return Ok(());
-                }
-                #[cfg(test)]
-                if let Some((reached, proceed)) = self.before_start.take() {
-                    reached.notify_one();
-                    proceed.notified().await;
                 }
                 let pending = self.pending.get_mut(&id).unwrap();
                 if self.seal.is_some_and(|seal| {
@@ -11762,7 +11771,7 @@ mod tests {
         )
         .unwrap();
         *hold.0.lock().unwrap() = true;
-        // Release only during teardown, after checking that the step failed while the
+        // Release only during teardown, after checking that the step stopped while the
         // writer remained blocked. A panic also unblocks the writer before its join.
         let unblock = UnblockBarrierOnDrop(hold.clone());
         let cancel = CancellationToken::new();
@@ -11799,8 +11808,15 @@ mod tests {
             },
         );
         let cancel_at_barrier = async {
-            entered.notified().await;
-            if !watchdog {
+            let entered = entered.notified();
+            tokio::pin!(entered);
+            // Keep the paused watchdog from auto-advancing during writer-thread I/O.
+            while futures::poll!(&mut entered).is_pending() {
+                tokio::task::yield_now().await;
+            }
+            if watchdog {
+                tokio::time::advance(Duration::from_millis(50)).await;
+            } else {
                 cancel.cancel();
             }
         };
@@ -11815,14 +11831,18 @@ mod tests {
             *hold.0.lock().unwrap(),
             "the barrier must still be held when the step stops"
         );
-        let error =
-            match result.expect("stuck reservation must not starve cancellation or watchdog") {
-                Err(error) => error,
-                Ok(_) => panic!("durability failure must abort the step"),
-            };
-        assert!(
-            error.to_string().contains("attempt_durability_failed"),
-            "{error}"
+        assert_eq!(
+            result
+                .expect("stuck reservation must not starve cancellation or watchdog")
+                .unwrap()
+                .unwrap()
+                .err()
+                .expect("a stopped step must not produce a model outcome"),
+            if watchdog {
+                RunFinishReason::Interrupted
+            } else {
+                RunFinishReason::Cancelled
+            }
         );
         tokio::time::timeout(Duration::from_millis(100), provider.refused.notified())
             .await
@@ -11851,12 +11871,12 @@ mod tests {
             .any(|record| matches!(record, WalRecord::AttemptFinished { .. })));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn attempt_hook_stuck_barrier_caller_cancel_is_bounded() {
         check_stuck_reservation_barrier(false).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn attempt_hook_stuck_barrier_provider_watchdog_is_pollable() {
         check_stuck_reservation_barrier(true).await;
     }
@@ -11959,12 +11979,9 @@ mod tests {
         })
         .await
         .expect("reservation holds no writer lock across await");
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("attempt_durability_failed"));
-        // The failed barrier leaves an unsent fallback, rather than pretending a release
-        // is already durable. Close it only after the test writer can make progress again.
+        result.unwrap();
+        // The release is queued, not yet durable. A later successful sync persists it,
+        // and sealing must not duplicate the settlement already owned by the journal.
         seal.seal_and_collect(Duration::ZERO).await;
         seal.record_hook_fallbacks(&writer).await.unwrap();
         let (out, _rx) = mpsc::channel(16);
@@ -12478,6 +12495,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attempt_hook_cancel_after_barrier_never_grants_permission() {
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = WalHandle::spawn(
+            Box::new(RecordingWal {
+                records: records.clone(),
+            }),
+            1,
+        )
+        .unwrap();
+        let cancel = CancellationToken::new();
+        let reached = Arc::new(Notify::new());
+        let proceed = Arc::new(Notify::new());
+        let recorded = Default::default();
+        let mut journal = AttemptJournal {
+            writer: &writer,
+            seal: None,
+            template: attempt_template(),
+            pending: Default::default(),
+            recorded: &recorded,
+            before_start: Some((reached.clone(), proceed.clone())),
+        };
+        let (reply, receipt) = tokio::sync::oneshot::channel();
+        let step_stopped = CancellationToken::new();
+        let stop = async {
+            reached.notified().await;
+            cancel.cancel();
+            proceed.notify_one();
+        };
+        let request = AttemptRequest::Reserve {
+            send: physical_send(),
+            cancel: cancel.clone(),
+            reply,
+        };
+        let (result, ()) = tokio::join!(journal.handle(request, &step_stopped), stop);
+        result.unwrap();
+        assert!(
+            receipt.await.unwrap().is_err(),
+            "even an unpolled receipt must never receive permission after cancellation"
+        );
+        journal.close().unwrap();
+        writer.sync().await.unwrap();
+        let records = records.lock().unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record, WalRecord::AttemptReserved { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(records.iter().filter(|record| matches!(record, WalRecord::AttemptReleased { envelope, .. } if envelope.sent == broca_wal::record::AttemptSent::No)).count(), 1);
+        assert!(!records.iter().any(|record| matches!(
+            record,
+            WalRecord::AttemptFinished { .. } | WalRecord::ModelAttemptFinished { .. }
+        )));
+    }
+
+    #[tokio::test]
     async fn attempt_hook_seal_refused_start_releases_through_real_channel() {
         use broca_wal::record::AttemptSent;
         let records = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -12512,9 +12586,8 @@ mod tests {
         };
         let cancel_and_seal = async {
             reached.notified().await;
-            // Force cancellation and sealing after the journal's cancellation check,
-            // but before the seal decides whether the durable reservation may start.
-            cancel.cancel();
+            // Seal after the barrier but before permission, without caller cancellation,
+            // so the seal itself must refuse to start the durable reservation.
             seal.seal_and_collect(Duration::ZERO).await;
             proceed.notify_one();
         };
