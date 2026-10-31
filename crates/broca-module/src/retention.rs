@@ -16,6 +16,23 @@ use serde::{Deserialize, Serialize};
 pub const MAX_RETENTION_SECONDS: u64 = 2_592_000;
 pub const SWEEP_INTERVAL_MS: u64 = 300_000;
 
+#[cfg(test)]
+type DeletionBoundaryHook = Box<dyn FnMut(&str)>;
+
+#[cfg(test)]
+thread_local! {
+    static DELETION_BOUNDARY: std::cell::RefCell<Option<DeletionBoundaryHook>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn deletion_boundary(label: &str) {
+    DELETION_BOUNDARY.with(|slot| {
+        if let Some(hook) = &mut *slot.borrow_mut() {
+            hook(label);
+        }
+    });
+}
+
 /// Backends store expiry deadlines and run accounting without transcript content.
 pub trait RetentionIndex: Send + Sync {
     fn runs(&self, _lineage: &str) -> Result<Vec<RetentionRunRow>, String> {
@@ -373,6 +390,10 @@ pub struct Tombstone {
     /// tombstone written before notices existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_notice_seq: Option<u64>,
+    /// Exact basenames captured under the session lease before deletion starts.
+    /// Retry must not enumerate cut files belonging to a fresh lineage here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recovery_artifacts: Vec<String>,
 }
 
 /// Each failed write increments the address's repair generation so an older repair cannot
@@ -681,6 +702,8 @@ impl RetentionService {
         sync_dir(parent)?;
         sync_dir(parent.parent().expect("ephemeral root"))?;
         if stone.completed_at_ms.is_some() {
+            #[cfg(test)]
+            deletion_boundary("completion_synced");
             self.index.deletion_pending(&stone.lineage_id, key, false)?;
         }
         Ok(())
@@ -1586,6 +1609,7 @@ impl RetentionService {
                 (row.lineage_id, deadline)
             }
         };
+        let recovery_artifacts = self.capture_recovery_artifacts(&path)?;
         let state_root = self
             .wal
             .root()
@@ -1700,6 +1724,7 @@ impl RetentionService {
             completed_at_ms: None,
             next_tag,
             next_notice_seq,
+            recovery_artifacts,
         };
         self.remember_session(key)?;
         self.write_tombstone(key, &stone)?;
@@ -1707,17 +1732,112 @@ impl RetentionService {
         Ok(Some(id))
     }
 
+    fn capture_recovery_artifacts(&self, path: &Path) -> Result<Vec<String>, String> {
+        if !self.wal.wal_config().is_overhaul() {
+            return Ok(Vec::new());
+        }
+        if path.parent() != Some(self.wal.ephemeral_root().as_path()) {
+            return Err(
+                "retention recovery artifacts are outside the ephemeral WAL directory".into(),
+            );
+        }
+        let prefix = format!(
+            "{}.cut-",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .ok_or("retention WAL basename is not UTF-8")?
+        );
+        let mut names = Vec::new();
+        for entry in fs::read_dir(path.parent().unwrap()).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with(&prefix) {
+                names.push(
+                    name.into_string()
+                        .map_err(|_| "retention recovery artifact basename is not UTF-8")?,
+                );
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    fn validate_recovery_artifacts(
+        &self,
+        key: &BindIdentity,
+        names: &[String],
+    ) -> Result<(), String> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        let path = self.wal.ephemeral_wal_path(key);
+        let prefix = format!(
+            "{}.cut-",
+            path.file_name()
+                .unwrap()
+                .to_str()
+                .ok_or("retention WAL basename is not UTF-8")?
+        );
+        if names
+            .iter()
+            .any(|name| !name.starts_with(&prefix) || name.contains(['/', '\\']))
+        {
+            return Err("retention tombstone names a recovery artifact outside its session".into());
+        }
+        Ok(())
+    }
+
+    fn remove_recovery_artifacts(
+        &self,
+        key: &BindIdentity,
+        names: &[String],
+    ) -> Result<(), String> {
+        if !self.wal.wal_config().is_overhaul() || names.is_empty() {
+            return Ok(());
+        }
+        self.validate_recovery_artifacts(key, names)?;
+        let directory = self.wal.ephemeral_root();
+        for name in names {
+            let path = directory.join(name);
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "cannot remove recovery artifact {}: {error}",
+                        path.display()
+                    ))
+                }
+            }
+            #[cfg(test)]
+            deletion_boundary("artifact_removed");
+        }
+        sync_dir(&directory)?;
+        #[cfg(test)]
+        deletion_boundary("artifacts_synced");
+        Ok(())
+    }
+
     /// Recovery infers progress from disk and never moves a different lineage's live WAL.
-    fn complete(
+    fn complete(&self, key: &BindIdentity, stone: Tombstone, now_ms: u64) -> Result<(), String> {
+        if self.defer_overhaul() {
+            crate::diagnostics::retention_fenced(key, "overhaul_deferred", now_ms);
+            return Err("retention deferred: overhaul".into());
+        }
+        self.complete_deletion(key, stone, now_ms)
+    }
+
+    /// Caller holds the session lease; `complete` checks whether deletion is
+    /// currently deferred for overhaul roots.
+    fn complete_deletion(
         &self,
         key: &BindIdentity,
         mut stone: Tombstone,
         now_ms: u64,
     ) -> Result<(), String> {
-        if self.defer_overhaul() {
-            crate::diagnostics::retention_fenced(key, "overhaul_deferred", now_ms);
-            return Err("retention deferred: overhaul".into());
-        }
+        self.validate_recovery_artifacts(key, &stone.recovery_artifacts)?;
+        #[cfg(test)]
+        deletion_boundary("prepared");
         self.wal.check_move(key, true).map_err(|e| e.to_string())?;
         let moved = self.deleting(key, &stone.lineage_id);
         if let Some(path) = self
@@ -1729,8 +1849,27 @@ impl RetentionService {
                 Err(_) => Some(self.initial_lineage(&path)?),
             };
             if identity.as_deref() == Some(stone.lineage_id.as_str()) {
-                fs::rename(path, &moved).map_err(|e| e.to_string())?;
+                if self.wal.wal_config().is_overhaul()
+                    && moved.try_exists().map_err(|error| error.to_string())?
+                    && self.initial_lineage(&moved)? != stone.lineage_id
+                {
+                    return Err("deleting WAL identity mismatch".into());
+                }
+                fs::rename(&path, &moved).map_err(|e| e.to_string())?;
                 sync_dir(&self.wal.ephemeral_root())?;
+                #[cfg(test)]
+                deletion_boundary("moved");
+                if self.wal.wal_config().is_overhaul()
+                    && path.try_exists().map_err(|error| error.to_string())?
+                    && self.initial_lineage(&path)? == stone.lineage_id
+                {
+                    // A power-lost rename can retain both names for the same old
+                    // inode. rename is then a no-op; unlink its live alias too.
+                    fs::remove_file(&path).map_err(|error| error.to_string())?;
+                    sync_dir(&self.wal.ephemeral_root())?;
+                    #[cfg(test)]
+                    deletion_boundary("alias_removed");
+                }
             }
         }
         if moved.exists() {
@@ -1785,9 +1924,13 @@ impl RetentionService {
             };
             self.index
                 .expire_with_withdrawals(&row, &runs, &questions)?;
+            #[cfg(test)]
+            deletion_boundary("expired_index");
             self.withdrawal_wake.notify_one();
             fs::remove_file(&moved).map_err(|e| e.to_string())?;
             sync_dir(&self.wal.ephemeral_root())?;
+            #[cfg(test)]
+            deletion_boundary("unlinked");
         } else {
             // Once the WAL is deleted, the transaction committed before deletion is the
             // remaining proof of the lineage's expiry and each run's terminal state.
@@ -1816,8 +1959,12 @@ impl RetentionService {
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error.to_string()),
                 }
+                #[cfg(test)]
+                deletion_boundary("identity_sidecar");
             }
             sync_dir(&self.wal.ephemeral_root())?;
+            #[cfg(test)]
+            deletion_boundary("identity_synced");
             let state_root = self
                 .wal
                 .root()
@@ -1838,12 +1985,15 @@ impl RetentionService {
             .root()
             .parent()
             .ok_or("WAL tree has no state root")?;
+        self.remove_recovery_artifacts(key, &stone.recovery_artifacts)?;
         crate::late_results_store::remove_retained_lineage(state_root, &stone.lineage_id)?;
         // Completion is durable only after identity sidecars are removed and the directory is synced.
         // A crash or removal failure before this point leaves an incomplete tombstone to retry.
         stone.completed_at_ms = Some(now_ms);
         self.write_tombstone(key, &stone)?;
         crate::diagnostics::retention_deleted(key);
+        #[cfg(test)]
+        deletion_boundary("completed");
         Ok(())
     }
 

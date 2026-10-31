@@ -106,7 +106,14 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   open and names the manifest path when it cannot read the required marker
   evidence, rather than guessing how a repair should resume. The JSON
   follows the same durable publication sequence. Both must be durable before
-  truncate and file sync. Neither sidecars nor manifests are ever deleted.
+  truncate and file sync. Recovery never deletes those evidence files. Whole-session
+  retention deletion captures their exact basenames under the session lease before
+  writing deletion progress, including orphan raw files and temporary raw/JSON
+  files. Completion removes that captured inventory and syncs the directory before
+  declaring deletion complete. Retries replay the same names, never a fresh
+  lineage's inventory; lineage-namespaced filenames prevent name reuse. The
+  existing check that defers retention for overhaul roots remains in place;
+  this cleanup does not enable destructive background retention on those roots.
   A pending manifest is finished on the next writable open, even when the log
   already looks clean after a failed or interrupted truncate. A successful
   `RecoveryCut` append is synced before writable open completes. Retrying a

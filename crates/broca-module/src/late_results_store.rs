@@ -892,6 +892,7 @@ mod tests {
         std::fs::write(
             tombstone,
             serde_json::to_vec(&crate::retention::Tombstone {
+                recovery_artifacts: Vec::new(),
                 lineage_id: deleted.lineage,
                 expired_at_ms: 1,
                 seq: 1,
@@ -1175,6 +1176,7 @@ mod tests {
         std::fs::write(
             tombstone,
             serde_json::to_vec(&crate::retention::Tombstone {
+                recovery_artifacts: Vec::new(),
                 lineage_id: deleted.lineage,
                 expired_at_ms: 1,
                 seq: 1,
