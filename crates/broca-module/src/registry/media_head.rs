@@ -192,6 +192,7 @@ fn input(profile: &broca_provider::media_profile::MediaProfile) -> HeadInput {
 
 fn quote_request(model: &HeadModel) -> SubmissionRequest {
     SubmissionRequest {
+        service_tier_level: None,
         staged_uploads: None,
         content: Vec::new(),
         directives: None,

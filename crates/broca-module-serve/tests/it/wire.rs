@@ -142,6 +142,7 @@ fn chatgpt_test_options<'a>(account_id: Option<&'a str>) -> ResolveOptions<'a> {
         prompt_cache_key: None,
         variant: None,
         service_tier: None,
+        queued_service_tier: None,
         secret_refresher: None,
         structured_output: None,
         frozen_account_ref: None,
@@ -656,6 +657,7 @@ fn chatgpt_send(session: BindIdentity, run_id: &str, prompt: &str) -> SendReques
         run_id: RunId(run_id.into()),
         send_id: Some(format!("send-{run_id}")),
         request: Box::new(SubmissionRequest {
+            service_tier_level: None,
             staged_uploads: None,
             content: Vec::new(),
             directives: None,

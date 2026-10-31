@@ -92,6 +92,7 @@ pub fn submission_difference(
         work_class: _,
         variant: existing_variant,
         service_tier: existing_service_tier,
+        service_tier_level: existing_service_tier_level,
         stop_when: existing_stop_when,
         context_management: existing_context_management,
         inherit_frozen: existing_inherit_frozen,
@@ -122,6 +123,7 @@ pub fn submission_difference(
         work_class: _,
         variant: requested_variant,
         service_tier: requested_service_tier,
+        service_tier_level: requested_service_tier_level,
         stop_when: requested_stop_when,
         context_management: requested_context_management,
         inherit_frozen: requested_inherit_frozen,
@@ -160,6 +162,10 @@ pub fn submission_difference(
         (
             existing_service_tier != requested_service_tier,
             "service_tier",
+        ),
+        (
+            existing_service_tier_level != requested_service_tier_level,
+            "service_tier_level",
         ),
         (existing_stop_when != requested_stop_when, "stop_when"),
         (
@@ -218,6 +224,8 @@ struct SubmissionIdentityDigestV1 {
     /// Omitted when the send carried no service tier, for the same reason as `variant`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    service_tier_level: Option<String>,
     stop_when: String,
     /// Absent when the caller omitted the field, so every digest stored before the field existed
     /// still compares equal to the same request sent today.
@@ -318,6 +326,7 @@ fn identity_digest_v1(
         work_class: _,
         variant,
         service_tier,
+        service_tier_level,
         stop_when,
         context_management,
         inherit_frozen,
@@ -352,6 +361,7 @@ fn identity_digest_v1(
             .as_ref()
             .map(|variant| digest_json(serde_json::json!(variant))),
         service_tier: service_tier.map(|tier| digest_json(serde_json::json!(tier))),
+        service_tier_level: service_tier_level.clone(),
         stop_when: digest_json(serde_json::json!(stop_when)),
         context_management: context_management
             .as_ref()
@@ -434,6 +444,10 @@ pub fn send_identity_difference_with_conversation_key(
         (
             stored.service_tier != requested.service_tier,
             "service_tier",
+        ),
+        (
+            stored.service_tier_level != requested.service_tier_level,
+            "service_tier_level",
         ),
         (stored.stop_when != requested.stop_when, "stop_when"),
         (
@@ -3039,6 +3053,7 @@ mod tests {
 
     fn request(text: &str) -> SubmissionRequest {
         SubmissionRequest {
+            service_tier_level: None,
             staged_uploads: None,
             content: Vec::new(),
             directives: None,

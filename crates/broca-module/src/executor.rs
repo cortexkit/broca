@@ -39,6 +39,8 @@ pub struct RunJob {
     pub media_profile: Option<Box<broca_provider::media_profile::MediaProfile>>,
     /// Routing affinity supplied by the admitting send, including a drained queued send.
     pub conversation_key: Option<String>,
+    /// Abstract level recovered from a durable queued request, not a fresh public send.
+    pub queued_service_tier: Option<String>,
     pub req: RunRequest,
     /// Caller-scoped credential selection carried separately from core's provider-agnostic request.
     /// The executor resolves it at admission and freezes only the resulting credential id.
